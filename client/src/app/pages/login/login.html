@@ -1,0 +1,52 @@
+<div class="wrap">
+  <form class="card" (ngSubmit)="submit()">
+    <div class="logo">
+      <img src="logo.svg" alt="Ameto" class="logo-img" />
+      <span class="logo-name">Ameto</span>
+      <p class="logo-slogan">High-performance, lightweight log storage and analytics for .NET and beyond.</p>
+    </div>
+
+    <div class="field">
+      <label class="field-label" for="uname">Username</label>
+      <input
+        id="uname"
+        class="field-input"
+        type="text"
+        autocomplete="username"
+        [(ngModel)]="username"
+        name="username"
+        [disabled]="loading()"
+        placeholder="admin"
+      />
+    </div>
+
+    <div class="field">
+      <label class="field-label" for="pwd">Password</label>
+      <input
+        id="pwd"
+        class="field-input"
+        type="password"
+        autocomplete="current-password"
+        [(ngModel)]="password"
+        name="password"
+        [disabled]="loading()"
+      />
+    </div>
+
+    @if (error()) {
+      <div class="error-msg">
+        <lucide-icon name="circle-alert" [size]="13" />
+        {{ error() }}
+      </div>
+    }
+
+    <button class="btn-login" type="submit" [disabled]="loading()">
+      @if (loading()) {
+        <lucide-icon name="loader-circle" [size]="14" />
+        Signing in…
+      } @else {
+        Sign in
+      }
+    </button>
+  </form>
+</div>

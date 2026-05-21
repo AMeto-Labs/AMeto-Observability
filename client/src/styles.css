@@ -1,0 +1,172 @@
+@import '@angular/cdk/overlay-prebuilt.css';
+
+/* ── Design tokens – dark (default) ─────────────────────────────────── */
+:root {
+  /* Backgrounds */
+  --bg:            #0B1020;
+  --surface:       #111827;
+  --surface-up:    #172033;
+  --surface-hover: #24304F;
+  --border:        #2C3A5D;
+  --border-sub:    rgba(255,255,255,.03);
+
+  /* Text */
+  --txt:       #F3F6FF;
+  --txt-muted: #7D8AA5;
+  --txt-dim:   #56627A;
+
+  /* Accent — blue */
+  --accent:     #4DA3FF;
+  --accent-hov: #6BB5FF;
+  --accent-dim: rgba(77,163,255,.15);
+
+  /* Log levels */
+  --lvl-v:  #56627A; --lvl-v-bg: rgba(86,98,122,.10);
+  --lvl-d:  #38BDF8; --lvl-d-bg: #0E1B24;
+  --lvl-i:  #22C55E; --lvl-i-bg: #0F1F17;
+  --lvl-w:  #F59E0B; --lvl-w-bg: #241A0A;
+  --lvl-e:  #EF4444; --lvl-e-bg: #2A1010;
+  --lvl-f:  #FF4D8D; --lvl-f-bg: #2A1020;
+
+  /* Syntax tokens */
+  --c-str:  #4ADE80;
+  --c-num:  #38BDF8;
+  --c-obj:  #34D399;
+  --c-null: #56627A;
+
+  /* Layout */
+  --nav-w:     100px;
+  --panel-w:   264px;
+  --toolbar-h: 44px;
+  --radius:    6px;
+  --radius-sm: 4px;
+  --shadow-sm: 0 0 0 1px rgba(255,255,255,.02), 0 8px 32px rgba(0,0,0,.35);
+  --shadow:    0 0 0 1px rgba(255,255,255,.02), 0 16px 48px rgba(0,0,0,.50);
+  --mono: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', ui-monospace, monospace;
+  --ui:   'Inter', 'Segoe UI', system-ui, sans-serif;
+}
+
+/* ── Light theme override ─────────────────────────────────────────── */
+[data-theme="light"] {
+  --bg:            #F0F6FF;
+  --surface:       #FFFFFF;
+  --surface-up:    #EAF2FF;
+  --surface-hover: #D9EAFF;
+  --border:        #C2D9F5;
+  --border-sub:    #E0EDFF;
+  --txt:           #253B5E;
+  --txt-muted:     #3A6899;
+  --txt-dim:       #8AADCC;
+  --accent:        #2F80FF;
+  --accent-hov:    #0062D6;
+  --accent-dim:    rgba(47,128,255,.12);
+
+  --lvl-v:    #6B8CAE; --lvl-v-bg:  rgba(107,140,174,.09);
+  --lvl-d:    #0284C7; --lvl-d-bg:  rgba(2,132,199,.09);
+  --lvl-i:    #10B981; --lvl-i-bg:  rgba(16,185,129,.09);
+  --lvl-w:    #D97706; --lvl-w-bg:  rgba(217,119,6,.10);
+  --lvl-e:    #DC2626; --lvl-e-bg:  rgba(220,38,38,.10);
+  --lvl-f:    #E11D48; --lvl-f-bg:  rgba(225,29,72,.10);
+
+  --c-str:  #16A34A;
+  --c-num:  #0284C7;
+  --c-obj:  #0D9488;
+  --c-null: #8AADCC;
+
+  --shadow-sm: 0 2px 8px rgba(8,14,28,.12);
+  --shadow:    0 6px 24px rgba(8,14,28,.20);
+}
+
+/* ── Reset ───────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html, body {
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--txt);
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+a { color: var(--accent); text-decoration: none; }
+button { font-family: inherit; font-size: inherit; cursor: pointer; }
+input, textarea, select { font-family: inherit; font-size: inherit; }
+
+/* ── Text selection ──────────────────────────────────────────────── */
+::selection {
+  background: rgba(59,130,246,.30);
+  color: inherit;
+}
+[data-theme="light"] ::selection {
+  background: rgba(47,128,255,.22);
+}
+
+/* ── Scrollbars (webkit) ─────────────────────────────────────────── */
+::-webkit-scrollbar              { width: 8px; height: 8px; }
+::-webkit-scrollbar-track        { background: transparent; }
+::-webkit-scrollbar-thumb        { background: #2C3A5D; border-radius: 999px; }
+::-webkit-scrollbar-thumb:hover  { background: #3D4F7A; }
+::-webkit-scrollbar-corner       { background: transparent; }
+
+/* ── CLEF value spans – MUST be global (used via [innerHTML]) ─────── */
+.msg-val   { color: var(--c-str); }
+.msg-num   { color: var(--c-num); }
+.msg-obj   { color: var(--c-obj); }
+.msg-null  { color: var(--c-null); font-style: italic; }
+.tmpl-token { color: var(--txt-dim); }
+.ex-trace  { color: var(--lvl-e); white-space: pre-wrap; font-size: 11px; margin-top: 8px; }
+
+/* ── Context menus – MUST be global (fixed position) ─────────────── */
+.ctx-menu {
+  z-index: 9000;
+  min-width: 200px;
+  background: var(--surface-up);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 4px 0;
+  overflow: hidden;
+}
+.ctx-menu button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 14px;
+  text-align: left;
+  background: none;
+  border: none;
+  color: var(--txt);
+  white-space: nowrap;
+  font-size: 12px;
+  line-height: 1.4;
+  cursor: pointer;
+}
+.ctx-menu button lucide-icon { opacity: .6; flex-shrink: 0; }
+.ctx-menu button:hover { background: var(--surface-hover); }
+.ctx-menu button.danger { color: var(--lvl-e); }
+.ctx-menu hr  { border: none; border-top: 1px solid var(--border); margin: 4px 0; }
+.ctx-label    { padding: 3px 14px; color: var(--txt-dim); font-size: 11px; }
+
+/* ── Scrollbars ─────────────────────────────────────────────────── */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--txt-dim); }
+
+/* ── Loading bar animation ───────────────────────────────────────── */
+.loading-bar {
+  height: 2px;
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  background: linear-gradient(90deg, transparent 0%, var(--accent) 50%, transparent 100%);
+  background-size: 200% 100%;
+  animation: loading-slide 1.2s linear infinite;
+  z-index: 10;
+}
+@keyframes loading-slide {
+  from { background-position:  200% 0; }
+  to   { background-position: -200% 0; }
+}

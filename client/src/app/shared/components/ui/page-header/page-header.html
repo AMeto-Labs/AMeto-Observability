@@ -1,0 +1,16 @@
+<header class="page-header">
+  <div class="page-header__copy">
+    <h1 class="page-header__title">
+      <lucide-icon [name]="icon()" [size]="16" [strokeWidth]="1.5" />
+      {{ title() }}
+    </h1>
+
+    @if (subtitle()) {
+      <p class="page-header__subtitle">{{ subtitle() }}</p>
+    }
+  </div>
+
+  <div class="page-header__actions">
+    <ng-content />
+  </div>
+</header>

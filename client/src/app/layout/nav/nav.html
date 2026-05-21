@@ -1,0 +1,45 @@
+<nav class="nav">
+  <!-- Logo -->
+  <div class="nav-logo">
+    <img src="logo.svg" alt="Ameto" class="logo-img" />
+  </div>
+
+  <!-- Main nav items -->
+  <div class="nav-items">
+    @for (item of mainItems; track item.path) {
+      <a class="nav-item"
+         [routerLink]="item.path"
+         routerLinkActive="nav-item--active"
+         [title]="item.label">
+        <lucide-icon [name]="item.icon" [size]="18" [strokeWidth]="1.5" />
+        <span class="nav-label">{{ item.label }}</span>
+      </a>
+    }
+  </div>
+
+  <!-- Bottom: settings + theme + env + user -->
+  <div class="nav-bottom">
+    <a class="nav-item"
+       [routerLink]="settingsItem.path"
+       routerLinkActive="nav-item--active"
+       [title]="settingsItem.label">
+      <lucide-icon [name]="settingsItem.icon" [size]="18" [strokeWidth]="1.5" />
+      <span class="nav-label">{{ settingsItem.label }}</span>
+    </a>
+
+    <button
+      class="nav-item nav-item--sm"
+      (click)="theme.toggle()"
+      [title]="theme.theme() === 'dark' ? 'Light mode' : 'Dark mode'">
+      <lucide-icon [name]="theme.theme() === 'dark' ? 'sun' : 'moon'" [size]="14" [strokeWidth]="1.5" />
+    </button>
+
+
+
+    <div class="nav-user" (click)="auth.logout()" title="Sign out">
+      <div class="user-avatar">{{ userInitials }}</div>
+      <span class="user-name">{{ userLabel }}</span>
+      <lucide-icon name="chevron-down" [size]="10" class="user-caret" />
+    </div>
+  </div>
+</nav>

@@ -1,0 +1,16 @@
+<section class="section">
+  @if (title()) {
+    <header class="section__header">
+      <h2 class="section__title">{{ title() }}</h2>
+      <div class="section__actions">
+        <ng-content select="[section-actions]" />
+      </div>
+    </header>
+  }
+
+  @if (description()) {
+    <p class="section__description">{{ description() }}</p>
+  }
+
+  <ng-content />
+</section>

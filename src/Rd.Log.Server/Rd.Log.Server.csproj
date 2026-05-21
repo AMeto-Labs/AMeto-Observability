@@ -1,0 +1,49 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <ItemGroup>
+    <ProjectReference Include="..\Rd.Log.Core\Rd.Log.Core.csproj" />
+    <ProjectReference Include="..\Rd.Log.Ingestion\Rd.Log.Ingestion.csproj" />
+    <ProjectReference Include="..\Rd.Log.Query\Rd.Log.Query.csproj" />
+    <ProjectReference Include="..\Rd.Log.Storage\Rd.Log.Storage.csproj" />
+    <ProjectReference Include="..\Rd.Log.Indexing\Rd.Log.Indexing.csproj" />
+    <ProjectReference Include="..\Rd.Log.Alerts\Rd.Log.Alerts.csproj" />
+    <ProjectReference Include="..\Rd.Log.Replication\Rd.Log.Replication.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="10.0.0" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="9.0.0" />
+    <PackageReference Include="NetEscapades.Configuration.Yaml" Version="3.1.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <Folder Include="wwwroot\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- App-specific configuration; ship instead of appsettings*.json. -->
+    <Content Include="config.yml" CopyToOutputDirectory="PreserveNewest" />
+    <Content Remove="rd.config.json" />
+    <None Remove="rd.config.json" />
+    <!-- Make sure framework-default appsettings*.json items are NOT included. -->
+    <Content Remove="appsettings.json" />
+    <Content Remove="appsettings.*.json" />
+    <None Remove="appsettings.json" />
+    <None Remove="appsettings.*.json" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+
+    <!-- Minimal publish output: no debug symbols, no XML docs, no satellite resources. -->
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <PublishDocumentationFile>false</PublishDocumentationFile>
+    <PublishDocumentationFiles>false</PublishDocumentationFiles>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <!-- We host via Kestrel, not IIS — no web.config needed. -->
+    <IsTransformWebConfigDisabled>true</IsTransformWebConfigDisabled>
+  </PropertyGroup>
+
+</Project>

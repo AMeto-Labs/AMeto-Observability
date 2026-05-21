@@ -1,0 +1,15 @@
+:host { display: contents; }
+
+.shell {
+  display: flex;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.shell-content {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}

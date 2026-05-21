@@ -1,0 +1,418 @@
+<div class="events-page">
+
+  <!-- ── Row 1: Main filter bar ──────────────────────────────────────── -->
+  <div class="toolbar">
+    <div class="filter-wrap">
+      <lucide-icon name="search" [size]="13" class="filter-icon" />
+      <div class="filter-hl-wrap">
+        <div class="filter-hl" [innerHTML]="filterHighlight()" aria-hidden="true"></div>
+        <textarea
+          #filterEl
+          class="filter-input"
+          placeholder="Filter expression… (Enter = run, Ctrl+Enter = newline, Ctrl+Space = suggest)"
+          [rows]="filterRows()"
+          (input)="onFilterInput($any($event.target).value)"
+          (keydown)="onFilterKeydown($event)"
+          (blur)="closeSuggest()"
+          spellcheck="false"
+          autocomplete="off"
+          wrap="soft"></textarea>
+        @if (suggestOpen() && suggestItems().length) {
+          <div class="suggest-pop" role="listbox" aria-label="Filter suggestions" (mousedown)="$event.preventDefault()">
+            @for (item of suggestItems(); track item; let i = $index) {
+              <div
+                class="suggest-item"
+                role="option"
+                [class.active]="i === suggestIndex()"
+                (mouseenter)="suggestIndex.set(i)"
+                (click)="selectSuggestion(item)">{{ item }}</div>
+            }
+          </div>
+        }
+      </div>
+      @if (filterInput()) {
+        <button class="filter-clear" (click)="applyFilter('')" title="Clear filter">
+          <lucide-icon name="x" [size]="12" />
+        </button>
+      }
+      <span class="kbd-hint">⌘K</span>
+    </div>
+
+    <div class="toolbar-right">
+      <div class="sep-v"></div>
+      <button class="tb-live-btn fb-apply-btn" [disabled]="!canSearch()" (click)="search()">
+        <lucide-icon name="play" [size]="12" />
+        Apply
+      </button>
+      <button class="tb-live-btn" (click)="resetAll()">
+        <lucide-icon name="x" [size]="12" />
+        Clear
+      </button>
+      <div class="sep-v"></div>
+      <button
+        class="tb-live-btn"
+        [class.live-on]="liveActive()"
+        (click)="toggleLive()"
+        title="Live tail">
+        <span class="live-dot" [class.on]="liveActive()"></span>
+        <span>Live</span>
+      </button>
+      <button
+        class="tb-icon-btn"
+        [class.tb-icon-btn--on]="signalsPanelOpen()"
+        (click)="signalsPanelOpen.update(v => !v)"
+        title="Signals / Alerts">
+        <lucide-icon name="bell" [size]="16" [strokeWidth]="1.5" />
+      </button>
+    </div>
+  </div>
+
+  <!-- ── Row 2: Filter options bar ───────────────────────────────────── -->
+  <div class="filter-bar">
+  <div class="filter-bar-inner">
+
+    <!-- Date range -->
+    <div #dateFbGroup class="fb-group" (click)="$event.stopPropagation()">
+      <button class="fb-btn" [class.open]="dateDropdownOpen()" (click)="openDateDropdown()">
+        <lucide-icon name="calendar" [size]="13" />
+        <span>{{ dateRangeLabel() }}</span>
+        <lucide-icon name="chevron-down" [size]="11" class="fb-caret" [class.rotated]="dateDropdownOpen()" />
+      </button>
+      @if (dateDropdownOpen()) {
+        <div class="fb-dropdown date-dd" [style.top.px]="ddPos().top" [style.left.px]="ddPos().left">
+          <!-- Header -->
+          <div class="dd-panel-header">
+            <span class="dd-panel-title">Date range</span>
+            <button class="dd-close-btn" title="Close" (click)="dateDropdownOpen.set(false)">
+              <lucide-icon name="x" [size]="13" />
+            </button>
+          </div>
+          <!-- Body: two columns -->
+          <div class="date-dd-body">
+          <!-- Left: preset list -->
+          <div class="date-preset-list">
+            @for (p of datePresets; track p.value) {
+              <button
+                class="date-preset-item"
+                [class.active]="timePreset() === p.value"
+                [class.is-custom]="p.value === 'custom'"
+                (click)="setTimePreset(p.value)">
+                {{ p.label }}
+              </button>
+            }
+          </div>
+          <!-- Right: calendar + inputs -->
+          <div class="date-cal-panel">
+            <div class="cal-header">
+              <button class="cal-nav-btn" title="Previous month" (click)="prevCalendarMonth()">
+                <lucide-icon name="chevron-left" [size]="13" />
+              </button>
+              <span class="cal-month-label">{{ calendarMonthLabel() }}</span>
+              <button class="cal-nav-btn" title="Next month" (click)="nextCalendarMonth()">
+                <lucide-icon name="chevron-right" [size]="13" />
+              </button>
+            </div>
+            <div class="cal-pick-hint" [class.picking-end]="calPickingEnd()">
+              {{ calPickingEnd() ? 'Click to set end date' : 'Click to set start date' }}
+            </div>
+            <div class="cal-grid">
+              @for (d of calendarWeekDays; track d) {
+                <div class="cal-dow">{{ d }}</div>
+              }
+              @for (day of calendarDays(); track day.year + '-' + day.month + '-' + day.day) {
+                <button
+                  class="cal-day"
+                  [class.other-month]="!day.isCurrentMonth"
+                  [class.today]="day.isToday"
+                  [class.cal-from]="day.isFrom"
+                  [class.cal-to]="day.isTo"
+                  [class.cal-in-range]="day.inRange"
+                  (click)="selectCalendarDay(day)">
+                  {{ day.day }}
+                </button>
+              }
+            </div>
+            <!-- Date inputs -->
+            <div class="cal-inputs">
+              <div class="cal-input-row">
+                <span class="cal-input-lbl">Start</span>
+                <div class="cal-field-wrap is-date" [class.invalid]="customFrom() && !customFromValid()">
+                  <input
+                    type="text"
+                    class="cal-field-input"
+                    placeholder="yyyy-mm-dd"
+                    [value]="fromDatePart()"
+                    dateMask dateMaskType="date" dateMaskMode="start"
+                    (valueChange)="setFromDatePart($event)"
+                    (keydown.enter)="onDateKeydown($event)"
+                    spellcheck="false"
+                    autocomplete="off" />
+                  <lucide-icon name="calendar" [size]="12" class="cal-field-icon" />
+                </div>
+                <div class="cal-field-wrap is-time">
+                  <input
+                    type="text"
+                    class="cal-field-input"
+                    placeholder="HH:mm"
+                    [value]="fromTimePart()"
+                    dateMask dateMaskType="time" dateMaskMode="start"
+                    (valueChange)="setFromTimePart($event)"
+                    (blur)="setFromTimePartOnBlur($any($event.target).value)"
+                    (keydown.enter)="onDateKeydown($event)"
+                    spellcheck="false"
+                    autocomplete="off" />
+                  <lucide-icon name="clock" [size]="12" class="cal-field-icon" />
+                </div>
+              </div>
+              <div class="cal-input-row">
+                <span class="cal-input-lbl">End</span>
+                <div class="cal-field-wrap is-date" [class.invalid]="customTo() && !customToValid()">
+                  <input
+                    type="text"
+                    class="cal-field-input"
+                    placeholder="yyyy-mm-dd"
+                    [value]="toDatePart()"
+                    dateMask dateMaskType="date" dateMaskMode="end"
+                    (valueChange)="setToDatePart($event)"
+                    (keydown.enter)="onDateKeydown($event)"
+                    spellcheck="false"
+                    autocomplete="off" />
+                  <lucide-icon name="calendar" [size]="12" class="cal-field-icon" />
+                </div>
+                <div class="cal-field-wrap is-time">
+                  <input
+                    type="text"
+                    class="cal-field-input"
+                    title="End time (HH:mm)"
+                    [placeholder]="toDatePart() ? 'HH:mm' : 'Now'"
+                    [value]="toTimePart()"
+                    dateMask dateMaskType="time" dateMaskMode="end"
+                    (valueChange)="setToTimePart($event)"
+                    (blur)="setToTimePartOnBlur($any($event.target).value)"
+                    (keydown.enter)="onDateKeydown($event)"
+                    spellcheck="false"
+                    autocomplete="off" />
+                  <lucide-icon name="clock" [size]="12" class="cal-field-icon" />
+                </div>
+              </div>
+            </div>
+            <div class="dd-footer-actions">
+              <button class="dd-cancel-btn" (click)="dateDropdownOpen.set(false)">Cancel</button>
+              <button class="dd-apply-btn" [disabled]="!canSearch()" (click)="search(); dateDropdownOpen.set(false)">Apply</button>
+            </div>
+          </div>
+          </div>
+        </div>
+      }
+    </div>
+
+    <!-- All levels -->
+    <div #levelsFbGroup class="fb-group" (click)="$event.stopPropagation()">
+      <button class="fb-btn" [class.open]="levelsDropdownOpen()" [class.filtered]="!allLevelsActive()" (click)="openLevelsDropdown()">
+        <lucide-icon name="sparkles" [size]="13" />
+        <span>{{ levelsLabel() }}</span>
+        <lucide-icon name="chevron-down" [size]="11" class="fb-caret" [class.rotated]="levelsDropdownOpen()" />
+      </button>
+      @if (levelsDropdownOpen()) {
+        <div class="fb-dropdown lvl-dd" [style.top.px]="ddPos().top" [style.left.px]="ddPos().left">
+          <div class="dd-panel-header">
+            <span class="dd-panel-title">Levels</span>
+            <button class="dd-close-btn" title="Close" (click)="levelsDropdownOpen.set(false)">
+              <lucide-icon name="x" [size]="13" />
+            </button>
+          </div>
+          <label class="dd-select-all-row">
+            <input
+              type="checkbox"
+              [checked]="allPendingLevelsActive()"
+              [indeterminate]="!allPendingLevelsActive() && pendingLevels().size > 0"
+              (change)="toggleAllPendingLevels()" />
+            <span class="dd-select-all-lbl">Select all</span>
+            <span class="dd-total-count">{{ fmtCount(totalCount()) }}</span>
+          </label>
+          <div class="dd-scroll">
+            @for (lvl of levelItems; track lvl.key) {
+              <label class="lvl-dd-row" [attr.data-level]="lvl.key.toLowerCase()">
+                <input type="checkbox" [checked]="isPendingLevelActive(lvl.key)" (change)="togglePendingLevel(lvl.key)" />
+                <span class="lvl-dot"></span>
+                <span class="lvl-name">{{ lvl.key }}</span>
+                <span class="lvl-count">{{ fmtCount(levelCounts()[lvl.key] || 0) }}</span>
+              </label>
+            }
+          </div>
+          <div class="dd-footer-actions">
+            <button class="dd-reset-btn" (click)="resetLevels()">Reset</button>
+            <button class="dd-apply-btn" (click)="applyLevels()">Apply</button>
+          </div>
+        </div>
+      }
+    </div>
+
+    <!-- All services -->
+    <div #svcFbGroup class="fb-group" (click)="$event.stopPropagation()">
+      <button class="fb-btn" [class.open]="serviceDropdownOpen()" [class.filtered]="selectedServices().size > 0" (click)="openServicesDropdown()">
+        <lucide-icon name="boxes" [size]="13" />
+        <span>{{ serviceLabel() }}</span>
+        <lucide-icon name="chevron-down" [size]="11" class="fb-caret" [class.rotated]="serviceDropdownOpen()" />
+      </button>
+      @if (serviceDropdownOpen()) {
+        <div class="fb-dropdown svc-dd" [style.top.px]="ddPos().top" [style.left.px]="ddPos().left">
+          <div class="dd-panel-header">
+            <span class="dd-panel-title">Services</span>
+            <button class="dd-close-btn" title="Close" (click)="serviceDropdownOpen.set(false)">
+              <lucide-icon name="x" [size]="13" />
+            </button>
+          </div>
+          <div class="svc-search-wrap">
+            <lucide-icon name="search" [size]="12" class="svc-search-icon" />
+            <input
+              type="text"
+              class="svc-search-input"
+              placeholder="Search services"
+              [value]="serviceSearch()"
+              (input)="serviceSearch.set($any($event.target).value)" />
+          </div>
+          <label class="dd-select-all-row">
+            <input
+              type="checkbox"
+              [checked]="allPendingServicesActive()"
+              [indeterminate]="!allPendingServicesActive() && pendingServices().size < filteredServices().length"
+              (change)="resetServices()" />
+            <span class="dd-select-all-lbl">Select all</span>
+            <span class="dd-total-count">{{ availableServices().length }}</span>
+          </label>
+          <div class="dd-scroll">
+            @for (svc of (showMoreServices() ? filteredServices() : filteredServices().slice(0, 8)); track svc) {
+              <label class="svc-dd-row">
+                <input type="checkbox" [checked]="isPendingServiceActive(svc)" (change)="togglePendingService(svc)" />
+                <span class="svc-color-dot" [style.background]="serviceColor(svc)"></span>
+                <span class="svc-name">{{ svc }}</span>
+                <span class="svc-count">{{ fmtCount(serviceCounts()[svc] || 0) }}</span>
+                <span class="svc-pct">{{ servicePercent(svc) }}</span>
+              </label>
+            }
+            @if (!showMoreServices() && filteredServices().length > 8) {
+              <button class="svc-show-more" (click)="showMoreServices.set(true)">
+                Show {{ filteredServices().length - 8 }} more
+              </button>
+            }
+            @if (!filteredServices().length) {
+              <div class="svc-empty">No services found</div>
+            }
+          </div>
+          <div class="dd-footer-actions">
+            <button class="dd-reset-btn" (click)="resetServices()">Reset</button>
+            <button class="dd-apply-btn" (click)="applyServices()">Apply</button>
+          </div>
+        </div>
+      }
+    </div>
+
+    <!-- Level count chips -->
+    <div class="sep-v"></div>
+    <div class="lc-chips">
+      <button class="lc-chip lc-all" [class.active]="allLevelsActive()" (click)="toggleAllLevels()">
+        ALL <span class="lc-num">{{ fmtCount(totalCount()) }}</span>
+      </button>
+      @for (lvl of levelItems; track lvl.key) {
+        <button
+          class="lc-chip"
+          [class.active]="isLevelActive(lvl.key)"
+          [attr.data-level]="lvl.key.toLowerCase()"
+          (click)="toggleLevel(lvl.key)">
+          {{ lvl.short }} <span class="lc-num">{{ fmtCount(levelCounts()[lvl.key.toLowerCase()]) }}</span>
+        </button>
+      }
+    </div>
+    <div class="sep-v"></div>
+
+    <!-- Page size (right-aligned) -->
+    <select
+      class="page-size-select"
+      (change)="onPageSizeChange($any($event.target).value)"
+      title="Events per request">
+      @for (n of pageSizeOptions; track n) {
+        <option [value]="n" [selected]="n === pageSize()">{{ n }}</option>
+      }
+    </select>
+  </div>
+  </div>
+
+  <!-- ── Main body ────────────────────────────────────────────────────── -->
+  <div class="events-body">
+    <div class="events-list-wrap">
+      <!-- Column headers -->
+      <div class="events-header">
+        <span class="ev-h-expand"></span>
+        <span class="ev-h-stripe"></span>
+        <span class="ev-h-col ev-h-ts">TIME <lucide-icon name="arrow-up" [size]="10" /></span>
+        <span class="ev-h-col ev-h-lvl">LEVEL</span>
+        <span class="ev-h-col ev-h-svc">SERVICE</span>
+        <span class="ev-h-col ev-h-msg">
+          MESSAGE
+          <button class="ev-h-wrap-btn tb-icon-btn" [class.tb-icon-btn--on]="wrapMessages()" (click)="wrapMessages.update(v => !v)" title="Wrap messages">
+            <lucide-icon name="text-wrap" [size]="13" [strokeWidth]="1.5" />
+          </button>
+        </span>
+      </div>
+
+      @if (loading()) {
+        <div class="loading-bar"></div>
+      }
+      @if (error()) {
+        <div class="error-banner">
+          <lucide-icon name="circle-alert" [size]="14" />
+          {{ error() }}
+          <button class="err-retry" (click)="loadEvents()">Retry</button>
+        </div>
+      }
+      <cdk-virtual-scroll-viewport
+        #viewport
+        class="events-list"
+        itemSize="29"
+        minBufferPx="600"
+        maxBufferPx="1200"
+        (scrolledIndexChange)="onVirtualScroll($event)">
+        <app-event-row
+          *cdkVirtualFor="let ev of displayedEvents(); trackBy: trackEvent"
+          [event]="ev"
+          [wrap]="wrapMessages()"
+          (filterSelected)="applyFilter($event)"
+          (seekRequested)="seek($event.from, $event.to)"
+        />
+        @if (loadingMore()) {
+          <div class="load-more"><span class="load-more-spin"></span></div>
+        }
+        @if (!loading() && !error() && displayedEvents().length === 0) {
+          <app-empty-state icon="inbox" text="No events match the current filter"></app-empty-state>
+        }
+      </cdk-virtual-scroll-viewport>
+
+      <!-- Footer -->
+      <div class="events-footer">
+        <span class="ev-footer-count">Showing {{ displayedEvents().length }} of {{ fmtCount(totalCount()) }} events</span>
+        <div class="ev-footer-nav">
+          <button class="ev-footer-btn" (click)="scrollToOlderLogs()">
+            <lucide-icon name="arrow-up" [size]="12" /> Older logs
+          </button>
+          <button class="ev-footer-btn" (click)="scrollToNewerLogs()">
+            <lucide-icon name="arrow-down" [size]="12" /> Newer logs
+          </button>
+        </div>
+        <button class="ev-footer-live" (click)="toggleLive()">
+          Jump to live <lucide-icon name="arrow-right" [size]="12" />
+        </button>
+      </div>
+    </div>
+
+    @if (signalsPanelOpen()) {
+      <app-signals-panel
+        [currentFilter]="filter()"
+        (filterSelected)="applyFilter($event)"
+        (closed)="signalsPanelOpen.set(false)"
+      />
+    }
+  </div>
+
+</div>
+

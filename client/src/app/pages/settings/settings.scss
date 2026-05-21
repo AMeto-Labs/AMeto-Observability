@@ -1,0 +1,195 @@
+:host {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.label {
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+.sublabel {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.toggle:hover {
+  color: var(--text-primary);
+}
+
+.retention-grid {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px 16px;
+  align-items: center;
+}
+
+.level-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.dot-v {
+  background: var(--lvl-v);
+}
+
+.dot-d {
+  background: var(--lvl-d);
+}
+
+.dot-i {
+  background: var(--lvl-i);
+}
+
+.dot-w {
+  background: var(--lvl-w);
+}
+
+.dot-e {
+  background: var(--lvl-e);
+}
+
+.dot-f {
+  background: var(--lvl-f);
+}
+
+.days-control {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.days-input {
+  width: 72px;
+  padding: 4px 8px;
+  background: var(--bg-main);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 12px;
+  text-align: right;
+  outline: none;
+}
+
+.days-input:focus {
+  border-color: var(--primary);
+}
+
+.days-unit {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.retention-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 4px;
+  gap: 8px;
+}
+
+.run-result {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.run-result.ok {
+  color: var(--success);
+}
+
+.btn-group {
+  display: flex;
+  gap: 6px;
+}
+
+.action-cell {
+  width: 32px;
+  text-align: center;
+}
+
+.role-badge {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 99px;
+  background: var(--bg-main);
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+}
+
+.role-badge.admin {
+  border-color: var(--primary);
+  color: var(--primary);
+}
+
+.inline-form {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+  margin-top: 4px;
+}
+
+.field-select {
+  padding: 5px 8px;
+  background: var(--bg-main);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 12px;
+  outline: none;
+}
+
+.form-error {
+  font-size: 11px;
+  color: var(--error);
+}
+
+.key-reveal {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  background: var(--bg-main);
+  border: 1px solid var(--primary);
+  border-radius: var(--radius);
+}
+
+.key-text {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--primary);
+  flex: 1;
+  word-break: break-all;
+}

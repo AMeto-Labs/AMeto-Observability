@@ -1,0 +1,23 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Rd.Log.Alerts/Rd.Log.Alerts.csproj" />
+    <Project Path="src/Rd.Log.Replication/Rd.Log.Replication.csproj" />
+    <Project Path="src/Rd.Log.Core/Rd.Log.Core.csproj" />
+    <Project Path="src/Rd.Log.Indexing/Rd.Log.Indexing.csproj" />
+    <Project Path="src/Rd.Log.Ingestion/Rd.Log.Ingestion.csproj" />
+    <Project Path="src/Rd.Log.Query/Rd.Log.Query.csproj" />
+    <Project Path="src/Rd.Log.Serilog/Rd.Log.Serilog.csproj" />
+    <Project Path="src/Rd.Log.Server/Rd.Log.Server.csproj" />
+    <Project Path="src/Rd.Log.Storage/Rd.Log.Storage.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Rd.Log.Core.Tests/Rd.Log.Core.Tests.csproj" />
+    <Project Path="tests/Rd.Log.Integration.Tests/Rd.Log.Integration.Tests.csproj" />
+    <Project Path="tests/Rd.Log.Perf/Rd.Log.Perf.csproj" />
+    <Project Path="tests/Rd.Log.Query.Tests/Rd.Log.Query.Tests.csproj" />
+    <Project Path="tests/Rd.Log.Storage.Tests/Rd.Log.Storage.Tests.csproj" />
+  </Folder>
+  <Folder Name="/tools/">
+    <Project Path="tools/Rd.Log.LoadTest/Rd.Log.LoadTest.csproj" />
+  </Folder>
+</Solution>

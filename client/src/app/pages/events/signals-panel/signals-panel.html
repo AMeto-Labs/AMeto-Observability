@@ -1,0 +1,68 @@
+<div class="sig-header">
+  <span class="sig-title">
+    <lucide-icon name="bell" [size]="13" [strokeWidth]="1.8" />
+    Signals
+  </span>
+  <div class="sig-header-actions">
+    <button class="sig-icon-btn" (click)="startCreate()" title="Create signal from current filter">
+      <lucide-icon name="plus" [size]="14" [strokeWidth]="1.8" />
+    </button>
+    <button class="sig-icon-btn" (click)="closed.emit()" title="Close">
+      <lucide-icon name="x" [size]="14" [strokeWidth]="1.8" />
+    </button>
+  </div>
+</div>
+
+@if (creating()) {
+  <div class="sig-create">
+    @if (currentFilter()) {
+      <div class="sig-create-filter">{{ currentFilter() }}</div>
+    }
+    <input
+      class="sig-name-input"
+      type="text"
+      placeholder="Signal name…"
+      [(ngModel)]="draftName"
+      (keydown.enter)="saveNew()"
+      (keydown.escape)="cancelCreate()"
+      autofocus />
+    <div class="sig-create-btns">
+      <button class="sig-cancel-btn" (click)="cancelCreate()">Cancel</button>
+      <button class="sig-save-btn" (click)="saveNew()" [disabled]="!draftName.trim() || saving()">Save</button>
+    </div>
+  </div>
+}
+
+<div class="sig-list">
+  @if (loading()) {
+    <div class="sig-loading">
+      <lucide-icon name="loader" [size]="16" [strokeWidth]="1.5" />
+    </div>
+  } @else if (signals().length === 0) {
+    <div class="sig-empty">
+      <lucide-icon name="bell-off" [size]="20" [strokeWidth]="1.5" />
+      <span>No signals yet</span>
+      <span class="sig-hint">Click + to create one from the current filter</span>
+    </div>
+  } @else {
+    @for (s of signals(); track s.id) {
+      <div class="sig-item" [class.sig-item--off]="!s.enabled" (click)="applyFilter(s.filter)">
+        <div class="sig-dot" [class.sig-dot--off]="!s.enabled"></div>
+        <div class="sig-info">
+          <span class="sig-name">{{ s.name }}</span>
+          @if (s.filter) {
+            <span class="sig-filter">{{ s.filter }}</span>
+          }
+        </div>
+        <div class="sig-item-actions">
+          <button class="sig-icon-btn" (click)="toggle(s, $event)" [title]="s.enabled ? 'Disable' : 'Enable'">
+            <lucide-icon [name]="s.enabled ? 'pause' : 'play'" [size]="12" [strokeWidth]="1.8" />
+          </button>
+          <button class="sig-icon-btn danger" (click)="delete(s.id, $event)" title="Delete">
+            <lucide-icon name="trash-2" [size]="12" [strokeWidth]="1.8" />
+          </button>
+        </div>
+      </div>
+    }
+  }
+</div>

@@ -1,0 +1,21 @@
+<div class="page">
+  <app-page-header icon="network" title="Cluster Nodes"></app-page-header>
+
+  @if (loading()) {
+    <p class="loading-text">Loading…</p>
+  }
+
+  @for (node of nodes(); track node.id) {
+    <div class="node-card">
+      <div class="status-dot" [class.healthy]="node.healthy" [class.unhealthy]="!node.healthy"></div>
+      <div class="node-info">
+        <div class="node-addr">{{ node.address }}</div>
+        <div class="node-meta">{{ node.role }} · last seen {{ node.lastSeenUtc }}</div>
+      </div>
+    </div>
+  }
+
+  @if (!loading() && nodes().length === 0) {
+    <app-empty-state text="No cluster nodes found."></app-empty-state>
+  }
+</div>

@@ -1,0 +1,181 @@
+@if (event(); as ev) {
+  <!-- Main row -->
+  <div class="ev-main" (click)="toggleExpand($event)">
+    <button class="ev-expand-btn" (click)="toggleExpand($event)" title="Expand row">
+      <lucide-icon name="chevron-right" [size]="11" />
+    </button>
+    <span class="ev-stripe"></span>
+    <span class="ev-ts" [title]="ev['@t']">{{ ev['@t'] | date: 'yyyy-MM-dd HH:mm:ss.SSS' }}</span>
+    <span class="ev-level">
+      <span class="ev-lvl-badge">{{ levelShort() }}</span>
+    </span>
+    @if (service()) {
+      <span class="ev-svc">
+        <lucide-icon name="box" [size]="12" class="ev-svc-icon" />
+        <span class="ev-svc-name">{{ service() }}</span>
+      </span>
+    }
+    <span class="ev-msg" [innerHTML]="renderedHtml()" (contextmenu)="openMenu($event, 'message')">
+    </span>
+    @if (propsCount() > 0 && !expanded()) {
+      <span class="ev-props-hint">
+        @for (kv of topProps(); track kv.k) {
+          <span class="ev-kv">
+            <span class="ev-pk">{{ kv.k }}</span
+            ><span class="ev-sep"> = </span><span class="ev-pv">{{ kv.v }}</span>
+          </span>
+        }
+        @if (propsCount() > 3) {
+          <span class="ev-more-props">+{{ propsCount() - 3 }}</span>
+        }
+      </span>
+    }
+    <button class="ev-more-btn" (click)="openMenu($event, 'export')" title="More options">
+      <lucide-icon name="ellipsis-vertical" [size]="12" />
+    </button>
+  </div>
+
+  <!-- Detail panel -->
+  @if (expanded()) {
+    <div class="ev-detail">
+      <div class="ev-tabs">
+        <button [class.active]="detailTab() === 'props'" (click)="detailTab.set('props')">
+          Properties
+        </button>
+        <button [class.active]="detailTab() === 'raw'" (click)="detailTab.set('raw')">Raw</button>
+        @if (hasException()) {
+          <button
+            class="tab-exc"
+            [class.active]="detailTab() === 'exception'"
+            (click)="detailTab.set('exception')"
+          >
+            Exception
+          </button>
+        }
+      </div>
+      <div class="ev-detail-body">
+        @if (detailTab() === 'props') {
+          <table class="props-table">
+            <tr>
+              <td class="pk">Date time</td>
+              <td class="pv">{{ event()['@t'] | date: 'yyyy-MM-dd HH:mm:ss.SSS' }}</td>
+            </tr>
+            <tr>
+              <td class="pk">Level</td>
+              <td class="pv" [attr.data-level]="levelKey()">{{ event()['@l'] }}</td>
+            </tr>
+            @if (event().id) {
+              <tr>
+                <td class="pk">id</td>
+                <td class="pv">{{ event().id }}</td>
+              </tr>
+            }
+            @for (kv of allProps(); track kv.path) {
+              @if (kv.isGroup) {
+                <tr (click)="openPropMenu($event, kv.path, '', true)" class="prop-row group">
+                  <td class="pk" [style.padding-left.px]="kv.depth * 14">
+                    <button
+                      class="prop-toggle"
+                      type="button"
+                      aria-label="Toggle group"
+                      (click)="toggleGroup($event, kv.path)"
+                      [title]="isCollapsed(kv.path) ? 'Expand' : 'Collapse'"
+                    >
+                      <lucide-icon
+                        [name]="isCollapsed(kv.path) ? 'chevron-right' : 'chevron-down'"
+                        [size]="11"
+                      />
+                    </button>
+                    {{ kv.label }}
+                  </td>
+                  <td class="pv pv-obj">{{ kv.value || '{ … }' }}</td>
+                </tr>
+              } @else {
+                <tr (click)="openPropMenu($event, kv.path, kv.value)" class="prop-row">
+                  <td class="pk" [style.padding-left.px]="kv.depth * 14 + 17">{{ kv.label }}</td>
+                  <td class="pv">{{ kv.value }}</td>
+                </tr>
+              }
+            }
+          </table>
+        }
+        @if (detailTab() === 'exception') {
+          @if (event()['@x']; as exc) {
+            <div class="ev-exception">
+              <ng-container *ngTemplateOutlet="excBlock; context: { $implicit: exc, depth: 0 }" />
+            </div>
+          }
+        }
+        @if (detailTab() === 'raw') {
+          <pre class="ev-raw">{{ rawJson() }}</pre>
+        }
+      </div>
+    </div>
+  }
+}
+
+<ng-template #excBlock let-exc let-depth="depth">
+  <div class="exc-frame" [style.margin-left.px]="depth * 12">
+    <div class="exc-head">
+      <span class="exc-type">{{ exc.type }}</span>
+      @if (exc.message) {
+        <span class="exc-msg">: {{ exc.message }}</span>
+      }
+    </div>
+    @if (exc.stack) {
+      <pre class="exc-stack">{{ exc.stack }}</pre>
+    }
+    @if (exc.inner; as inner) {
+      <div class="exc-inner-label">Caused by →</div>
+      <ng-container *ngTemplateOutlet="excBlock; context: { $implicit: inner, depth: depth + 1 }" />
+    }
+  </div>
+</ng-template>
+
+<!-- Context menus (rendered into a CDK overlay attached to body) -->
+<ng-template #ctxMenuTpl>
+  <div class="ctx-menu">
+    @if (menuType() === 'message') {
+      <div class="ctx-label">Message</div>
+      <button (click)="findSimilar()">
+        <lucide-icon name="search" [size]="13" />Find all like this
+      </button>
+      <hr />
+      <button (click)="findFrom()">
+        <lucide-icon name="arrow-right" [size]="13" />Show events after this
+      </button>
+      <button (click)="findTo()">
+        <lucide-icon name="arrow-left" [size]="13" />Show events before this
+      </button>
+      <hr />
+      <button (click)="copyMessage()">
+        <lucide-icon name="copy" [size]="13" />Copy message
+      </button>
+      <hr />
+      <div class="ctx-label">Seek window</div>
+      <button (click)="seek(10)"><lucide-icon name="clock" [size]="13" />± 10 seconds</button>
+      <button (click)="seek(30)"><lucide-icon name="clock" [size]="13" />± 30 seconds</button>
+      <button (click)="seek(60)"><lucide-icon name="clock" [size]="13" />± 1 minute</button>
+      <button (click)="seek(300)"><lucide-icon name="clock" [size]="13" />± 5 minutes</button>
+    }
+    @if (menuType() === 'level') {
+      <div class="ctx-label">Level: {{ event()['@l'] }}</div>
+      <button (click)="filterLevel()">
+        <lucide-icon name="filter" [size]="13" />Show only {{ event()['@l'] }}
+      </button>
+      <button (click)="excludeLevel()">
+        <lucide-icon name="filter-x" [size]="13" />Exclude {{ event()['@l'] }}
+      </button>
+    }
+    @if (menuType() === 'export') {
+      <button (click)="copyRaw()"><lucide-icon name="file-json" [size]="13" />Copy raw JSON</button>
+      <button (click)="copyLink()"><lucide-icon name="link" [size]="13" />Copy event link</button>
+    }
+    @if (menuType() === 'prop') {
+      <div class="ctx-label">{{ selectedProp()?.k }}</div>
+      <button (click)="propFind()"><lucide-icon name="search" [size]="13" />Find</button>
+      <button (click)="propCopy()"><lucide-icon name="copy" [size]="13" />Copy</button>
+      <button (click)="propExclude()"><lucide-icon name="ban" [size]="13" />Exclude</button>
+    }
+  </div>
+</ng-template>

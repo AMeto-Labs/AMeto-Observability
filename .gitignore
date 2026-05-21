@@ -1,0 +1,88 @@
+## ── ASP.NET Core ─────────────────────────────────────────────────────────────
+
+# Build outputs
+[Bb]in/
+[Oo]bj/
+[Oo]ut/
+
+# NuGet
+*.nupkg
+*.snupkg
+**/[Pp]ackages/
+!**/[Pp]ackages/build/
+nuget.config
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+# dotnet publish output
+publish/
+
+# .NET user secrets
+**/secrets.json
+**/appsettings.Development.json
+**/appsettings.Local.json
+
+# .NET tools
+.config/dotnet-tools.json
+
+# Roslyn cache
+.vs/
+*.user
+*.suo
+*.userprefs
+*.usertasks
+*.sln.docstates
+
+# Rider
+.idea/
+*.sln.iml
+
+# Coverage
+coverage*/
+*.coverage
+*.coveragexml
+TestResults/
+
+# BenchmarkDotNet
+BenchmarkDotNet.Artifacts/
+
+# Log files from the server itself
+data/
+*.wal
+*.seg
+*.met
+*.trc
+
+## ── Angular / Node ───────────────────────────────────────────────────────────
+
+client/node_modules/
+client/dist/
+client/tmp/
+client/out-tsc/
+client/.angular/cache/
+
+# npm / yarn
+npm-debug.log*
+yarn-error.log*
+yarn-debug.log*
+.pnpm-debug.log*
+package-lock.json
+yarn.lock
+
+## ── OS ───────────────────────────────────────────────────────────────────────
+
+.DS_Store
+Thumbs.db
+desktop.ini
+
+## ── IDE ──────────────────────────────────────────────────────────────────────
+
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+!.vscode/mcp.json
+*.swp
+*~

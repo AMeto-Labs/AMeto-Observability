@@ -1,0 +1,43 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="ametoGradient" x1="64" y1="64" x2="448" y2="448" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#2F80FF"></stop>
+      <stop offset="100%" stop-color="#7B2CFF"></stop>
+    </linearGradient>
+  </defs>
+
+  <!-- Hexagon -->
+  <path d="M256 48
+       L400 128
+       Q448 154 448 208
+       L448 304
+       Q448 358 400 384
+       L256 464
+       Q208 490 160 464
+       L64 384
+       Q16 358 16 304
+       L16 208
+       Q16 154 64 128
+       L208 48
+       Q232 32 256 48Z" stroke="url(#ametoGradient)" stroke-width="18" fill="none" stroke-linejoin="round"></path>
+
+  <!-- Left storage bars -->
+  <rect x="96" y="196" width="144" height="36" rx="18" fill="url(#ametoGradient)"></rect>
+  <rect x="96" y="256" width="176" height="36" rx="18" fill="url(#ametoGradient)"></rect>
+  <rect x="96" y="316" width="208" height="36" rx="18" fill="url(#ametoGradient)"></rect>
+
+  <!-- Storage dots -->
+  <circle cx="120" cy="214" r="8" fill="white"></circle>
+  <circle cx="120" cy="274" r="8" fill="white"></circle>
+  <circle cx="120" cy="334" r="8" fill="white"></circle>
+
+  <!-- Stylized A -->
+  <path d="M248 120
+       Q272 96 296 120
+       L392 336
+       Q404 364 380 384
+       Q352 404 328 372
+       L240 212
+       L192 212
+       Z" fill="url(#ametoGradient)"></path>
+</svg>

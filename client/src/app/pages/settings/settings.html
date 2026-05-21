@@ -1,0 +1,203 @@
+<div class="page">
+  <app-page-header icon="settings" title="Settings"></app-page-header>
+
+  <app-section title="Dashboards">
+    <div class="row">
+      <div>
+        <span class="label">Dashboards</span>
+        <span class="sublabel">View metrics, diagnostics and system dashboards.</span>
+      </div>
+      <a class="toggle" routerLink="/diagnostics">
+        <lucide-icon name="layout-dashboard" [size]="14" />
+        Open Dashboards
+      </a>
+    </div>
+  </app-section>
+
+  <app-section title="Appearance">
+    <div class="row">
+      <span class="label">Theme</span>
+      <button class="toggle" (click)="theme.toggle()">
+        <lucide-icon [name]="theme.theme() === 'dark' ? 'sun' : 'moon'" [size]="14" />
+        {{ theme.theme() === 'dark' ? 'Switch to light' : 'Switch to dark' }}
+      </button>
+    </div>
+  </app-section>
+
+  <app-section title="Retention policy">
+    <span class="sublabel">
+      How long events are kept per log level. The retention worker runs every hour.
+      Changes take effect on the next run.
+    </span>
+
+    @if (retentionLoading()) {
+      <span class="sublabel">Loading…</span>
+    } @else {
+      <div class="retention-grid">
+        <div class="level-label"><div class="dot dot-v"></div> Verbose</div>
+        <div class="days-control">
+          <input class="days-input" type="number" min="1" [(ngModel)]="verboseDays" title="Verbose retention days" />
+          <span class="days-unit">days</span>
+        </div>
+
+        <div class="level-label"><div class="dot dot-d"></div> Debug</div>
+        <div class="days-control">
+          <input class="days-input" type="number" min="1" [(ngModel)]="debugDays" title="Debug retention days" />
+          <span class="days-unit">days</span>
+        </div>
+
+        <div class="level-label"><div class="dot dot-i"></div> Information</div>
+        <div class="days-control">
+          <input class="days-input" type="number" min="1" [(ngModel)]="informationDays" title="Information retention days" />
+          <span class="days-unit">days</span>
+        </div>
+
+        <div class="level-label"><div class="dot dot-w"></div> Warning</div>
+        <div class="days-control">
+          <input class="days-input" type="number" min="1" [(ngModel)]="warningDays" title="Warning retention days" />
+          <span class="days-unit">days</span>
+        </div>
+
+        <div class="level-label"><div class="dot dot-e"></div> Error</div>
+        <div class="days-control">
+          <input class="days-input" type="number" min="1" [(ngModel)]="errorDays" title="Error retention days" />
+          <span class="days-unit">days</span>
+        </div>
+
+        <div class="level-label"><div class="dot dot-f"></div> Fatal</div>
+        <div class="days-control">
+          <input class="days-input" type="number" min="1" [(ngModel)]="fatalDays" title="Fatal retention days" />
+          <span class="days-unit">days</span>
+        </div>
+      </div>
+
+      <div class="retention-footer">
+        @if (runResult(); as r) {
+          <span class="run-result ok">
+            Deleted {{ r.deletedSegments }} segment(s) · freed {{ (r.freedBytes / 1048576).toFixed(1) }} MB
+          </span>
+        } @else {
+          <span></span>
+        }
+        <div class="btn-group">
+          <button class="btn" [disabled]="retentionRunning() || retentionSaving()" (click)="runRetention()">
+            <lucide-icon [name]="retentionRunning() ? 'loader-circle' : 'play'" [size]="13" />
+            {{ retentionRunning() ? 'Running…' : 'Run now' }}
+          </button>
+          <button class="btn primary" [disabled]="retentionSaving() || retentionRunning()" (click)="saveRetention()">
+            <lucide-icon [name]="retentionSaving() ? 'loader-circle' : 'save'" [size]="13" />
+            {{ retentionSaving() ? 'Saving…' : 'Save' }}
+          </button>
+        </div>
+      </div>
+    }
+  </app-section>
+
+  @if (authService.isAdmin()) {
+    <!-- ── Users ──────────────────────────────────────────────────── -->
+    <app-section title="Users">
+      @if (usersLoading()) {
+        <span class="sublabel">Loading…</span>
+      } @else {
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>Username</th>
+              <th>Role</th>
+              <th>Created</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            @for (u of users(); track u.id) {
+              <tr>
+                <td>{{ u.username }}</td>
+                <td><span class="role-badge" [class.admin]="u.role === 'admin'">{{ u.role }}</span></td>
+                <td class="muted">{{ u.createdAt | date:'yyyy-MM-dd' }}</td>
+                <td class="action-cell">
+                  <button class="btn-icon danger" title="Delete user" (click)="removeUser(u.id)">
+                    <lucide-icon name="trash-2" [size]="13" />
+                  </button>
+                </td>
+              </tr>
+            }
+          </tbody>
+        </table>
+
+        <form class="inline-form" (ngSubmit)="addUser()">
+          <input class="field-input" type="text" placeholder="Username" [(ngModel)]="newUsername" name="uname" />
+          <input class="field-input" type="password" placeholder="Password" [(ngModel)]="newPassword" name="pwd" />
+          <select class="field-select" [(ngModel)]="newRole" name="role">
+            <option value="manager">manager</option>
+            <option value="admin">admin</option>
+          </select>
+          <button class="btn primary" type="submit">
+            <lucide-icon name="user-plus" [size]="13" />
+            Add user
+          </button>
+        </form>
+        @if (userError()) {
+          <span class="form-error">{{ userError() }}</span>
+        }
+      }
+    </app-section>
+  }
+
+  <!-- ── API Keys ──────────────────────────────────────────────── -->
+  <app-section title="API Keys">
+    @if (createdKey(); as ck) {
+      <div class="key-reveal">
+        <lucide-icon name="key" [size]="14" />
+        <span class="key-text">{{ ck.key }}</span>
+        <button class="btn-icon" title="Dismiss" (click)="dismissCreatedKey()">
+          <lucide-icon name="x" [size]="13" />
+        </button>
+      </div>
+      <span class="sublabel">Copy this key now — it won't be shown again.</span>
+    }
+
+    @if (keysLoading()) {
+      <span class="sublabel">Loading…</span>
+    } @else {
+      <table class="data-table">
+        <thead>
+          <tr>
+            <th>Name</th>
+            <th>Key</th>
+            <th>Created by</th>
+            <th>Created</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          @for (k of apiKeys(); track k.id) {
+            <tr>
+              <td>{{ k.name }}</td>
+              <td class="mono muted">{{ k.keyPreview }}</td>
+              <td class="muted">{{ k.createdBy }}</td>
+              <td class="muted">{{ k.createdAt | date:'yyyy-MM-dd' }}</td>
+              <td class="action-cell">
+                <button class="btn-icon danger" title="Revoke key" (click)="removeApiKey(k.id)">
+                  <lucide-icon name="trash-2" [size]="13" />
+                </button>
+              </td>
+            </tr>
+          }
+        </tbody>
+      </table>
+
+      <form class="inline-form" (ngSubmit)="addApiKey()">
+        <input class="field-input" type="text" placeholder="Key name" [(ngModel)]="newKeyName" name="kname" />
+        <input class="field-input" type="text" placeholder="Manual key (optional)" [(ngModel)]="newKeyManual" name="kval" />
+        <button class="btn primary" type="submit">
+          <lucide-icon name="plus" [size]="13" />
+          Create
+        </button>
+      </form>
+      @if (keyError()) {
+        <span class="form-error">{{ keyError() }}</span>
+      }
+    }
+  </app-section>
+</div>
+

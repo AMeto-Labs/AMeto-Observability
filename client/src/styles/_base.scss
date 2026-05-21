@@ -1,0 +1,162 @@
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg-main);
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
+a {
+  color: var(--primary);
+  text-decoration: none;
+}
+
+button,
+input,
+textarea,
+select {
+  font-family: inherit;
+  font-size: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+::selection {
+  background: var(--primary-soft);
+  color: inherit;
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-muted);
+}
+
+.msg-val {
+  color: var(--param-string);
+  font-family: var(--font-mono);
+}
+
+.msg-num {
+  color: var(--param-integer);
+  font-family: var(--font-mono);
+}
+
+.msg-obj {
+  color: var(--param-bool);
+  font-family: var(--font-mono);
+}
+
+.msg-null {
+  color: var(--param-null);
+  font-family: var(--font-mono);
+  font-style: italic;
+}
+
+.tmpl-token {
+  color: var(--text-muted);
+}
+
+.ex-trace {
+  color: var(--error);
+  white-space: pre-wrap;
+  font-size: 11px;
+  margin-top: 8px;
+}
+
+.ctx-menu {
+  z-index: 9000;
+  min-width: 200px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 4px 0;
+  overflow: hidden;
+}
+
+.ctx-menu button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 14px;
+  text-align: left;
+  background: none;
+  border: none;
+  color: var(--text-primary);
+  white-space: nowrap;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.ctx-menu button lucide-icon {
+  opacity: .6;
+  flex-shrink: 0;
+}
+
+.ctx-menu button:hover {
+  background: var(--bg-hover);
+}
+
+.ctx-menu button.danger {
+  color: var(--error);
+}
+
+.ctx-menu hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 4px 0;
+}
+
+.ctx-label {
+  padding: 3px 14px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.loading-bar {
+  height: 2px;
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  background: linear-gradient(90deg, transparent 0%, var(--primary) 50%, transparent 100%);
+  background-size: 200% 100%;
+  animation: loading-slide 1.2s linear infinite;
+  z-index: 10;
+}
+
+@keyframes loading-slide {
+  from {
+    background-position: 200% 0;
+  }
+
+  to {
+    background-position: -200% 0;
+  }
+}
