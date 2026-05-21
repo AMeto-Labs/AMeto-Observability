@@ -44,8 +44,6 @@ public sealed class CompiledFilter
         switch (node)
         {
             case CompareNode { Op: CompareOp.Eq } cmp:
-                // Nested paths are not indexed — skip hint to avoid false negatives.
-                if (PropertyPath.IsNested(cmp.Property)) return false;
                 prop = cmp.Property;
                 val  = cmp.Value;
                 return true;
@@ -56,7 +54,6 @@ public sealed class CompiledFilter
                 return true;
 
             case InNode inNode when inNode.Values.Length == 1:
-                if (PropertyPath.IsNested(inNode.Property)) return false;
                 prop = inNode.Property;
                 val  = inNode.Values[0];
                 return true;

@@ -1,3 +1,5 @@
+using Rd.Log.Core;
+
 namespace Rd.Log.Query.Filtering;
 
 /// <summary>
@@ -13,7 +15,7 @@ public static class PropertyPath
 {
     /// <summary>U+0001 START OF HEADING — chosen as separator because it is
     /// excluded from JSON property names produced by MessagePack/CLEF.</summary>
-    public const char Separator = '\u0001';
+    public const char Separator = ClefFields.PropertyPathSeparator;
 
     /// <summary>U+0002 START OF TEXT — segment prefix marking that the segment
     /// is a numeric array index (originating from <c>Foo[0]</c> style paths).

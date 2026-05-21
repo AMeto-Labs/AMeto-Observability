@@ -8,6 +8,7 @@
         "dotnet test": true,
         "ForEach-Object": true,
         "git stash": true,
-        "WarningsOnly": true
+        "WarningsOnly": true,
+        "git -C \"C:\\Users\\ruslan.akhmetov\\Desktop\\Processing\\Rd.Log\"": true
     }
 }

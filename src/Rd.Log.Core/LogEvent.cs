@@ -93,6 +93,13 @@ public sealed class LogEvent
 /// </summary>
 public static class ClefFields
 {
+    /// <summary>
+    /// Separator used to join property path segments in index keys.
+    /// U+0001 matches the internal encoding used by FilterParser/PropertyPath,
+    /// preventing collisions with property names that contain literal dots.
+    /// </summary>
+    public const char PropertyPathSeparator = '\u0001';
+
     public const string Timestamp       = "@t";
     public const string MessageTemplate = "@mt";
     public const string Level           = "@l";

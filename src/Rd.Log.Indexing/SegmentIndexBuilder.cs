@@ -102,7 +102,7 @@ public sealed class SegmentIndexBuilder
 
         foreach (var (k, v) in dict)
         {
-            string flatKey = prefix.Length == 0 ? k : string.Concat(prefix, ".", k);
+            string flatKey = prefix.Length == 0 ? k : string.Concat(prefix, ClefFields.PropertyPathSeparator, k);
             FlattenValue(flatKey, v, offset, depth);
         }
     }
