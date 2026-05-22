@@ -33,8 +33,8 @@ internal sealed class SeqEventStore
             return;
         }
 
-        //using var stream = File.OpenRead(path);
-        //_events = JsonSerializer.Deserialize(stream, AppJsonCtx.Default.SeqEventArray) ?? [];
+        using var stream = File.OpenRead(path);
+        _events = JsonSerializer.Deserialize(stream, AppJsonCtx.Default.SeqEventArray) ?? [];
     }
 
     public SeqEvent? GetRandom() =>
