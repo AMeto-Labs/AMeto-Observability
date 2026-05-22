@@ -5,10 +5,13 @@
     <Project Path="src/Rd.Log.Core/Rd.Log.Core.csproj" />
     <Project Path="src/Rd.Log.Indexing/Rd.Log.Indexing.csproj" />
     <Project Path="src/Rd.Log.Ingestion/Rd.Log.Ingestion.csproj" />
+    <Project Path="src/Rd.Log.Metrics/Rd.Log.Metrics.csproj" />
+    <Project Path="src/Rd.Log.Otel/Rd.Log.Otel.csproj" />
     <Project Path="src/Rd.Log.Query/Rd.Log.Query.csproj" />
     <Project Path="src/Rd.Log.Serilog/Rd.Log.Serilog.csproj" />
     <Project Path="src/Rd.Log.Server/Rd.Log.Server.csproj" />
     <Project Path="src/Rd.Log.Storage/Rd.Log.Storage.csproj" />
+    <Project Path="src/Rd.Log.Tracing/Rd.Log.Tracing.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/Rd.Log.Core.Tests/Rd.Log.Core.Tests.csproj" />
@@ -19,5 +22,6 @@
   </Folder>
   <Folder Name="/tools/">
     <Project Path="tools/Rd.Log.LoadTest/Rd.Log.LoadTest.csproj" />
+    <Project Path="../Rd.Log/tools/Rd.Log.OtlpDemo/Rd.Log.OtlpDemo.csproj" />
   </Folder>
 </Solution>

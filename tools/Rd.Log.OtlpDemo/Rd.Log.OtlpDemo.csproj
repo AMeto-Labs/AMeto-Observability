@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- Server GC for high-throughput log generation -->
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+    <RootNamespace>Rd.Log.OtlpDemo</RootNamespace>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- OpenTelemetry: logs + traces + metrics via OTLP/HTTP -->
+    <PackageReference Include="OpenTelemetry.Extensions.Hosting"            Version="1.15.3" />
+    <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.15.3" />
+    <PackageReference Include="OpenTelemetry.Instrumentation.AspNetCore"     Version="1.12.0" />
+    <PackageReference Include="OpenTelemetry.Instrumentation.Runtime"        Version="1.15.1" />
+  </ItemGroup>
+
+</Project>
