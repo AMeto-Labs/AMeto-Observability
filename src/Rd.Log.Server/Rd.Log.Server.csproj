@@ -8,6 +8,9 @@
     <ProjectReference Include="..\Rd.Log.Indexing\Rd.Log.Indexing.csproj" />
     <ProjectReference Include="..\Rd.Log.Alerts\Rd.Log.Alerts.csproj" />
     <ProjectReference Include="..\Rd.Log.Replication\Rd.Log.Replication.csproj" />
+    <ProjectReference Include="..\Rd.Log.Otel\Rd.Log.Otel.csproj" />
+    <ProjectReference Include="..\Rd.Log.Tracing\Rd.Log.Tracing.csproj" />
+    <ProjectReference Include="..\Rd.Log.Metrics\Rd.Log.Metrics.csproj" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="10.0.0" />

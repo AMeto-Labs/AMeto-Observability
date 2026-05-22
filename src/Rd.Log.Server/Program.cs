@@ -3,10 +3,13 @@ using Rd.Log.Replication;
 using Rd.Log.Core;
 using Rd.Log.Indexing;
 using Rd.Log.Ingestion;
+using Rd.Log.Metrics;
+using Rd.Log.Otel;
 using Rd.Log.Query;
 using Rd.Log.Server;
 using Rd.Log.Server.Auth;
 using Rd.Log.Storage;
+using Rd.Log.Tracing;
 
 var builder = WebApplication.CreateBuilder(new WebApplicationOptions
 {
@@ -71,6 +74,12 @@ builder.Services
 // Alert rules store + evaluator
 builder.Services.AddRdLogAlerts(serverOptions.DataDirectory);
 
+// Distributed tracing
+builder.Services.AddRdLogTracing(serverOptions.DataDirectory);
+
+// Metrics
+builder.Services.AddRdLogMetrics(serverOptions.DataDirectory);
+
 var repOpts = builder.Configuration.GetSection("RdLog:Replication").Get<ReplicationOptions>() ?? new ReplicationOptions();
 builder.Services.AddRdLogReplication(repOpts);
 
@@ -110,6 +119,7 @@ app.MapAlertEndpoints();
 app.MapRetentionEndpoints();
 app.MapDiagnosticsEndpoints();
 app.MapReplicationEndpoints();
+app.MapOtlpEndpoints();
 
 // SPA fallback — Angular handles client-side routing
 app.MapFallbackToFile("index.html");

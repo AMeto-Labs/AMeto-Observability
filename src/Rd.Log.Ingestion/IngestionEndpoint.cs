@@ -151,4 +151,32 @@ public sealed class IngestionEndpoint
             ArrayPool<byte>.Shared.Return(bodyBuf);
         }
     }
+
+    /// <summary>
+    /// Directly enqueue pre-decoded <see cref="LogEvent"/> objects into the ring buffer.
+    /// Used by the OTLP adapter to bypass HTTP parsing while reusing the same storage path.
+    /// Returns (ingested, dropped) counts.
+    /// </summary>
+    public (int Ingested, int Dropped) IngestEvents(IReadOnlyList<LogEvent> events)
+    {
+        int ingested = 0, dropped = 0;
+        foreach (var ev in events)
+        {
+            int tmplIdx = string.IsNullOrEmpty(ev.MessageTemplate)
+                ? -1
+                : _pool.Intern(ev.MessageTemplate);
+
+            bool ok = _ring.TryEnqueue(
+                ev.Timestamp.UtcTicks,
+                (byte)ev.Level,
+                tmplIdx,
+                ev.MessageTemplate,
+                ev.Exception,
+                ev.RawProperties.Span);
+
+            if (ok) ingested++;
+            else    dropped++;
+        }
+        return (ingested, dropped);
+    }
 }
