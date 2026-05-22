@@ -19,6 +19,7 @@
   </Folder>
   <Folder Name="/tools/">
     <Project Path="tools/Rd.Log.LoadTest/Rd.Log.LoadTest.csproj" />
+    <Project Path="tools/Rd.Log.OtlpDemo/Rd.Log.OtlpDemo.csproj" />
   </Folder>
   <Project Path="../Rd.Log-otlp/src/Rd.Log.Core/Rd.Log.Core.csproj" />
   <Project Path="../Rd.Log-otlp/src/Rd.Log.Ingestion/Rd.Log.Ingestion.csproj" />

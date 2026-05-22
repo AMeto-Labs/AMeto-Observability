@@ -9,6 +9,8 @@
         "ForEach-Object": true,
         "git stash": true,
         "WarningsOnly": true,
-        "git -C \"C:\\Users\\ruslan.akhmetov\\Desktop\\Processing\\Rd.Log\"": true
+        "git -C \"C:\\Users\\ruslan.akhmetov\\Desktop\\Processing\\Rd.Log\"": true,
+        "Get-Item": true,
+        "gh": true
     }
 }

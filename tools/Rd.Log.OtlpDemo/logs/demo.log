@@ -1,0 +1,395 @@
+﻿[2026-05-21T12:17:14.8793691Z ERR] Microsoft.Extensions.Hosting.Internal.Host - Hosting failed to start
+System.Text.Json.JsonException: The JSON value could not be converted to SeqEvent[]. Path: $ | LineNumber: 0 | BytePositionInLine: 1.
+   at System.Text.Json.ThrowHelper.ThrowJsonException_DeserializeUnableToConvertValue(Type propertyType)
+   at System.Text.Json.Serialization.JsonCollectionConverter`2.OnTryRead(Utf8JsonReader& reader, Type typeToConvert, JsonSerializerOptions options, ReadStack& state, TCollection& value)
+   at System.Text.Json.Serialization.JsonConverter`1.TryRead(Utf8JsonReader& reader, Type typeToConvert, JsonSerializerOptions options, ReadStack& state, T& value, Boolean& isPopulatedValue)
+   at System.Text.Json.Serialization.JsonConverter`1.ReadCore(Utf8JsonReader& reader, T& value, JsonSerializerOptions options, ReadStack& state)
+   at System.Text.Json.Serialization.Metadata.JsonTypeInfo`1.ContinueDeserialize[TReadBufferState,TStream](TReadBufferState& bufferState, JsonReaderState& jsonReaderState, ReadStack& readStack, T& value)
+   at System.Text.Json.Serialization.Metadata.JsonTypeInfo`1.Deserialize(Stream utf8Json)
+   at SeqEventStore..ctor(String path) in C:\Users\ruslan.akhmetov\Desktop\Processing\Rd.Log\tools\Rd.Log.OtlpDemo\SeqEvent.cs:line 37
+   at Program.<>c__DisplayClass0_0.<<Main>$>b__5(IServiceProvider _) in C:\Users\ruslan.akhmetov\Desktop\Processing\Rd.Log\tools\Rd.Log.OtlpDemo\Program.cs:line 68
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteRuntimeResolver.VisitRootCache(ServiceCallSite callSite, RuntimeResolverContext context)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteVisitor`2.VisitCallSite(ServiceCallSite callSite, TArgument argument)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteRuntimeResolver.VisitConstructor(ConstructorCallSite constructorCallSite, RuntimeResolverContext context)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteRuntimeResolver.VisitRootCache(ServiceCallSite callSite, RuntimeResolverContext context)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteVisitor`2.VisitCallSite(ServiceCallSite callSite, TArgument argument)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteRuntimeResolver.VisitIEnumerable(IEnumerableCallSite enumerableCallSite, RuntimeResolverContext context)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteRuntimeResolver.VisitRootCache(ServiceCallSite callSite, RuntimeResolverContext context)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteVisitor`2.VisitCallSite(ServiceCallSite callSite, TArgument argument)
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.CallSiteRuntimeResolver.Resolve(ServiceCallSite callSite, ServiceProviderEngineScope scope)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.CreateServiceAccessor(ServiceIdentifier serviceIdentifier)
+   at System.Collections.Concurrent.ConcurrentDictionary`2.GetOrAdd(TKey key, Func`2 valueFactory)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.GetService(ServiceIdentifier serviceIdentifier, ServiceProviderEngineScope serviceProviderEngineScope)
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.GetService(Type serviceType)
+   at Microsoft.Extensions.DependencyInjection.ServiceProviderServiceExtensions.GetRequiredService(IServiceProvider provider, Type serviceType)
+   at Microsoft.Extensions.DependencyInjection.ServiceProviderServiceExtensions.GetRequiredService[T](IServiceProvider provider)
+   at Microsoft.Extensions.Hosting.Internal.Host.StartAsync(CancellationToken cancellationToken)
+[2026-05-21T12:17:14.9433408Z INF] System.Net.Http.HttpClient.OtlpLogExporter.LogicalHandler - Start processing HTTP request POST http://localhost:4318/
+[2026-05-21T12:17:14.9439735Z INF] System.Net.Http.HttpClient.OtlpLogExporter.ClientHandler - Sending HTTP request POST http://localhost:4318/
+[2026-05-21T12:17:19.2336314Z INF] System.Net.Http.HttpClient.OtlpLogExporter.ClientHandler - HTTP request failed after 4285.6701ms
+System.Net.Http.HttpRequestException: No connection could be made because the target machine actively refused it. (localhost:4318)
+ ---> System.Net.Sockets.SocketException (10061): No connection could be made because the target machine actively refused it.
+   at System.Net.Sockets.Socket.AwaitableSocketAsyncEventArgs.ThrowException(SocketError error, CancellationToken cancellationToken)
+   at System.Net.Sockets.Socket.AwaitableSocketAsyncEventArgs.System.Threading.Tasks.Sources.IValueTaskSource.GetResult(Int16 token)
+   at System.Net.Http.HttpConnectionPool.ConnectToTcpHostAsync(String host, Int32 port, HttpRequestMessage initialRequest, Boolean async, CancellationToken cancellationToken)
+   --- End of inner exception stack trace ---
+   at System.Net.Http.HttpConnectionPool.ConnectToTcpHostAsync(String host, Int32 port, HttpRequestMessage initialRequest, Boolean async, CancellationToken cancellationToken)
+   at System.Net.Http.HttpConnectionPool.ConnectAsync(HttpRequestMessage request, Boolean async, CancellationToken cancellationToken)
+   at System.Net.Http.HttpConnectionPool.CreateHttp11ConnectionAsync(HttpRequestMessage request, Boolean async, CancellationToken cancellationToken)
+   at System.Net.Http.HttpConnectionPool.InjectNewHttp11ConnectionAsync(QueueItem queueItem)
+   at System.Threading.Tasks.TaskCompletionSourceWithCancellation`1.WaitWithCancellation(CancellationToken cancellationToken)
+   at System.Threading.Tasks.TaskCompletionSourceWithCancellation`1.WaitWithCancellationAsync(Boolean async, CancellationToken cancellationToken)
+   at System.Net.Http.HttpConnectionWaiter`1.WaitForConnectionWithTelemetryAsync(HttpRequestMessage request, HttpConnectionPool pool, Boolean async, CancellationToken requestCancellationToken)
+   at System.Net.Http.HttpConnectionPool.SendWithVersionDetectionAndRetryAsync(HttpRequestMessage request, Boolean async, Boolean doRequestAuth, CancellationToken cancellationToken)
+   at System.Net.Http.HttpMessageHandlerStage.Send(HttpRequestMessage request, CancellationToken cancellationToken)
+   at System.Net.Http.Metrics.MetricsHandler.SendAsync(HttpRequestMessage request, Boolean async, CancellationToken cancellationToken)
+   at System.Net.Http.HttpMessageHandlerStage.Send(HttpRequestMessage request, CancellationToken cancellationToken)
+   at System.Net.Http.DiagnosticsHandler.SendAsyncCore(HttpRequestMessage request, Boolean async, CancellationToken cancellationToken)
+   at System.Net.Http.RedirectHandler.SendAsync(HttpRequestMessage request, Boolean async, CancellationToken cancellationToken)
+   at System.Net.Http.HttpMessageHandlerStage.Send(HttpRequestMessage request, CancellationToken cancellationToken)
+   at System.Net.Http.SocketsHttpHandler.Send(HttpRequestMessage request, CancellationToken cancellationToken)
+   at Microsoft.Extensions.Http.Logging.LoggingHttpMessageHandler.<SendCoreAsync>g__Core|4_0(HttpRequestMessage request, Boolean useAsync, CancellationToken cancellationToken)
+[2026-05-21T12:17:19.2535559Z INF] System.Net.Http.HttpClient.OtlpLogExporter.LogicalHandler - HTTP request failed after 4312.1663ms
+System.Net.Http.HttpRequestException: No connection could be made because the target machine actively refused it. (localhost:4318)
+ ---> System.Net.Sockets.SocketException (10061): No connection could be made because the target machine actively refused it.
+   at System.Net.Sockets.Socket.AwaitableSocketAsyncEventArgs.ThrowException(SocketError error, CancellationToken cancellationToken)
+   at System.Net.Sockets.Socket.AwaitableSocketAsyncEventArgs.System.Threading.Tasks.Sources.IValueTaskSource.GetResult(Int16 token)
+   at System.Net.Http.HttpConnectionPool.ConnectToTcpHostAsync(String host, Int32 port, HttpRequestMessage initialRequest, Boolean async, CancellationToken cancellationToken)
+   --- End of inner exception stack trace ---
+   at System.Net.Http.HttpConnectionPool.ConnectToTcpHostAsync(String host, Int32 port, HttpRequestMessage initialRequest, Boolean async, CancellationToken cancellationToken)
+   at System.Net.Http.HttpConnectionPool.ConnectAsync(HttpRequestMessage request, Boolean async, CancellationToken cancellationToken)
+   at System.Net.Http.HttpConnectionPool.CreateHttp11ConnectionAsync(HttpRequestMessage request, Boolean async, CancellationToken cancellationToken)
+   at System.Net.Http.HttpConnectionPool.InjectNewHttp11ConnectionAsync(QueueItem queueItem)
+   at System.Threading.Tasks.TaskCompletionSourceWithCancellation`1.WaitWithCancellation(CancellationToken cancellationToken)
+   at System.Threading.Tasks.TaskCompletionSourceWithCancellation`1.WaitWithCancellationAsync(Boolean async, CancellationToken cancellationToken)
+   at System.Net.Http.HttpConnectionWaiter`1.WaitForConnectionWithTelemetryAsync(HttpRequestMessage request, HttpConnectionPool pool, Boolean async, CancellationToken requestCancellationToken)
+   at System.Net.Http.HttpConnectionPool.SendWithVersionDetectionAndRetryAsync(HttpRequestMessage request, Boolean async, Boolean doRequestAuth, CancellationToken cancellationToken)
+   at System.Net.Http.HttpMessageHandlerStage.Send(HttpRequestMessage request, CancellationToken cancellationToken)
+   at System.Net.Http.Metrics.MetricsHandler.SendAsync(HttpRequestMessage request, Boolean async, CancellationToken cancellationToken)
+   at System.Net.Http.HttpMessageHandlerStage.Send(HttpRequestMessage request, CancellationToken cancellationToken)
+   at System.Net.Http.DiagnosticsHandler.SendAsyncCore(HttpRequestMessage request, Boolean async, CancellationToken cancellationToken)
+   at System.Net.Http.RedirectHandler.SendAsync(HttpRequestMessage request, Boolean async, CancellationToken cancellationToken)
+   at System.Net.Http.HttpMessageHandlerStage.Send(HttpRequestMessage request, CancellationToken cancellationToken)
+   at System.Net.Http.SocketsHttpHandler.Send(HttpRequestMessage request, CancellationToken cancellationToken)
+   at Microsoft.Extensions.Http.Logging.LoggingHttpMessageHandler.<SendCoreAsync>g__Core|4_0(HttpRequestMessage request, Boolean useAsync, CancellationToken cancellationToken)
+   at Microsoft.Extensions.Http.Logging.LoggingHttpMessageHandler.Send(HttpRequestMessage request, CancellationToken cancellationToken)
+   at Microsoft.Extensions.Http.Logging.LoggingScopeHttpMessageHandler.<SendCoreAsync>g__Core|4_0(HttpRequestMessage request, Boolean useAsync, CancellationToken cancellationToken)
+[2026-05-21T12:20:46.3445373Z WRN] SeqReplayService - SeqReplayService: no events loaded — check SeqReplay:DataPath in appsettings.json
+[2026-05-21T12:20:46.5507798Z ERR] Microsoft.Extensions.Hosting.Internal.Host - Hosting failed to start
+System.InvalidOperationException: Call UseKestrelHttpsConfiguration() on IWebHostBuilder to automatically enable HTTPS when an https:// address is used.
+   at Microsoft.AspNetCore.Server.Kestrel.Core.HttpsConfigurationService.EnsureInitialized(String uninitializedError)
+   at Microsoft.AspNetCore.Server.Kestrel.Core.HttpsConfigurationService.UseHttpsWithDefaults(ListenOptions listenOptions)
+   at Microsoft.AspNetCore.Server.Kestrel.Core.Internal.AddressBinder.AddressesStrategy.BindAsync(AddressBindContext context, CancellationToken cancellationToken)
+   at Microsoft.AspNetCore.Server.Kestrel.Core.KestrelServerImpl.BindAsync(CancellationToken cancellationToken)
+   at Microsoft.AspNetCore.Server.Kestrel.Core.KestrelServerImpl.StartAsync[TContext](IHttpApplication`1 application, CancellationToken cancellationToken)
+   at Microsoft.AspNetCore.Hosting.GenericWebHostService.StartAsync(CancellationToken cancellationToken)
+   at Microsoft.Extensions.Hosting.Internal.Host.<StartAsync>b__14_1(IHostedService service, CancellationToken token)
+   at Microsoft.Extensions.Hosting.Internal.Host.ForeachService[T](IEnumerable`1 services, CancellationToken token, Boolean concurrent, Boolean abortOnFirstException, List`1 exceptions, Func`3 operation)
+[2026-05-21T12:20:46.5920563Z INF] System.Net.Http.HttpClient.OtlpMetricExporter.LogicalHandler - Start processing HTTP request POST http://localhost:4318/
+[2026-05-21T12:20:46.5935993Z INF] System.Net.Http.HttpClient.OtlpMetricExporter.ClientHandler - Sending HTTP request POST http://localhost:4318/
+[2026-05-21T12:20:46.6743940Z INF] LogGeneratorService - Operation notification.sent succeeded for eve@example.com duration=190.4ms
+[2026-05-21T12:20:46.6750240Z INF] LogGeneratorService - Operation session.expired succeeded for frank@example.com duration=64.7ms
+[2026-05-21T12:20:46.6753880Z INF] LogGeneratorService - Operation payment.refunded succeeded for dave@example.com duration=190.4ms
+[2026-05-21T12:20:46.6759460Z ERR] LogGeneratorService - Operation report.generated failed for carol@example.com status=500 duration=346.6ms traceId=735dd0c7b4734282988917bd70a18240
+[2026-05-21T12:20:46.6761957Z INF] LogGeneratorService - Operation webhook.delivered succeeded for alice@example.com duration=306.3ms
+[2026-05-21T12:20:46.6764080Z INF] LogGeneratorService - Operation payment.refunded succeeded for alice@example.com duration=220.3ms
+[2026-05-21T12:20:46.6766190Z INF] LogGeneratorService - Operation order.shipped succeeded for dave@example.com duration=499.1ms
+[2026-05-21T12:20:46.6768259Z INF] LogGeneratorService - Operation notification.sent succeeded for dave@example.com duration=323.1ms
+[2026-05-21T12:20:46.6770268Z ERR] LogGeneratorService - Operation payment.processed failed for alice@example.com status=500 duration=388.1ms traceId=31334f27c78b445f89e868ef742a88d1
+[2026-05-21T12:20:46.6772161Z INF] LogGeneratorService - Operation user.login succeeded for carol@example.com duration=108.9ms
+[2026-05-21T12:20:46.6773974Z INF] LogGeneratorService - Operation payment.failed succeeded for bob@example.com duration=242.3ms
+[2026-05-21T12:20:46.6776305Z ERR] LogGeneratorService - Operation auth.token.refresh failed for carol@example.com status=500 duration=309.1ms traceId=1e124d83bd7a42c6a01f41329cac4aed
+[2026-05-21T12:20:46.6778218Z INF] LogGeneratorService - Operation user.registered succeeded for carol@example.com duration=433.7ms
+[2026-05-21T12:20:46.6780053Z INF] LogGeneratorService - Operation cache.miss succeeded for dave@example.com duration=334.2ms
+[2026-05-21T12:20:46.6782080Z INF] LogGeneratorService - Operation search.executed succeeded for bob@example.com duration=414.9ms
+[2026-05-21T12:20:46.6785616Z INF] LogGeneratorService - Operation file.uploaded succeeded for dave@example.com duration=477.1ms
+[2026-05-21T12:20:46.6788031Z INF] LogGeneratorService - Operation session.expired succeeded for frank@example.com duration=494.8ms
+[2026-05-21T12:20:46.6790032Z INF] LogGeneratorService - Operation order.shipped succeeded for dave@example.com duration=138.0ms
+[2026-05-21T12:20:46.6791893Z INF] LogGeneratorService - Operation user.login succeeded for alice@example.com duration=39.2ms
+[2026-05-21T12:20:46.6793680Z INF] LogGeneratorService - Operation search.executed succeeded for bob@example.com duration=150.6ms
+[2026-05-21T12:20:48.6933983Z INF] LogGeneratorService - Operation user.login succeeded for frank@example.com duration=101.4ms
+[2026-05-21T12:20:48.6940243Z ERR] LogGeneratorService - Operation user.logout failed for carol@example.com status=500 duration=66.8ms traceId=20ae4f41f95e4970bf7844fb772a3905
+[2026-05-21T12:20:48.6946735Z INF] LogGeneratorService - Operation report.generated succeeded for dave@example.com duration=363.3ms
+[2026-05-21T12:20:48.6952216Z INF] LogGeneratorService - Operation user.registered succeeded for bob@example.com duration=358.2ms
+[2026-05-21T12:20:48.6957298Z INF] LogGeneratorService - Operation user.registered succeeded for carol@example.com duration=118.0ms
+[2026-05-21T12:20:48.6962780Z ERR] LogGeneratorService - Operation cache.miss failed for frank@example.com status=500 duration=77.8ms traceId=5b4411bace194d5d823ba2ed80f8dbad
+[2026-05-21T12:20:48.6968250Z INF] LogGeneratorService - Operation file.uploaded succeeded for bob@example.com duration=440.8ms
+[2026-05-21T12:20:48.6973306Z INF] LogGeneratorService - Operation order.cancelled succeeded for carol@example.com duration=397.7ms
+[2026-05-21T12:20:48.6978094Z INF] LogGeneratorService - Operation payment.refunded succeeded for bob@example.com duration=313.5ms
+[2026-05-21T12:20:48.6984114Z INF] LogGeneratorService - Operation order.placed succeeded for eve@example.com duration=215.9ms
+[2026-05-21T12:20:48.6989004Z INF] LogGeneratorService - Operation user.logout succeeded for dave@example.com duration=215.9ms
+[2026-05-21T12:20:48.6994373Z INF] LogGeneratorService - Operation user.logout succeeded for alice@example.com duration=45.8ms
+[2026-05-21T12:20:48.7001483Z INF] LogGeneratorService - Operation order.shipped succeeded for frank@example.com duration=82.2ms
+[2026-05-21T12:20:48.7007784Z INF] LogGeneratorService - Operation order.shipped succeeded for dave@example.com duration=117.7ms
+[2026-05-21T12:20:48.7013937Z INF] LogGeneratorService - Operation order.shipped succeeded for frank@example.com duration=27.3ms
+[2026-05-21T12:20:48.7020170Z INF] LogGeneratorService - Operation search.executed succeeded for frank@example.com duration=357.7ms
+[2026-05-21T12:20:48.7026568Z ERR] LogGeneratorService - Operation user.registered failed for frank@example.com status=500 duration=49.6ms traceId=e8b6d1c0e09741cd92b19c8c0a07ea18
+[2026-05-21T12:20:48.7034742Z INF] LogGeneratorService - Operation auth.token.refresh succeeded for bob@example.com duration=99.2ms
+[2026-05-21T12:20:48.7040450Z INF] LogGeneratorService - Operation notification.sent succeeded for eve@example.com duration=89.4ms
+[2026-05-21T12:20:48.7045400Z INF] LogGeneratorService - Operation webhook.delivered succeeded for carol@example.com duration=466.4ms
+[2026-05-21T12:20:50.7531885Z INF] LogGeneratorService - Operation user.logout succeeded for alice@example.com duration=224.8ms
+[2026-05-21T12:20:50.7541713Z INF] LogGeneratorService - Operation cache.miss succeeded for bob@example.com duration=483.4ms
+[2026-05-21T12:20:50.7766385Z INF] LogGeneratorService - Operation user.logout succeeded for bob@example.com duration=369.3ms
+[2026-05-21T12:20:50.8151432Z INF] LogGeneratorService - Operation user.login succeeded for eve@example.com duration=462.1ms
+[2026-05-21T12:20:50.8314769Z INF] LogGeneratorService - Operation auth.token.refresh succeeded for carol@example.com duration=177.5ms
+[2026-05-21T12:20:50.8499792Z INF] LogGeneratorService - Operation file.uploaded succeeded for carol@example.com duration=495.5ms
+[2026-05-21T12:20:50.9060435Z ERR] LogGeneratorService - Operation payment.failed failed for frank@example.com status=500 duration=190.7ms traceId=a5b93c8ab0704a52932a52e4ccf5318a
+[2026-05-21T12:20:50.9525549Z ERR] LogGeneratorService - Operation session.expired failed for eve@example.com status=500 duration=197.1ms traceId=82bb596b9c424b76953c6626e1eb9f2e
+[2026-05-21T12:20:50.9889283Z INF] LogGeneratorService - Operation payment.failed succeeded for eve@example.com duration=95.7ms
+[2026-05-21T12:20:50.9893931Z INF] LogGeneratorService - Operation order.cancelled succeeded for carol@example.com duration=324.4ms
+[2026-05-21T12:20:50.9896807Z INF] LogGeneratorService - Operation payment.failed succeeded for frank@example.com duration=102.9ms
+[2026-05-21T12:20:50.9902339Z INF] LogGeneratorService - Operation user.login succeeded for eve@example.com duration=178.2ms
+[2026-05-21T12:20:50.9907437Z INF] LogGeneratorService - Operation order.shipped succeeded for eve@example.com duration=75.6ms
+[2026-05-21T12:20:50.9912538Z INF] LogGeneratorService - Operation payment.refunded succeeded for eve@example.com duration=375.1ms
+[2026-05-21T12:20:50.9917294Z ERR] LogGeneratorService - Operation inventory.updated failed for eve@example.com status=500 duration=90.6ms traceId=d1d66096393a4a098bdd1bd9cd6d1da5
+[2026-05-21T12:20:50.9922033Z ERR] LogGeneratorService - Operation session.expired failed for alice@example.com status=500 duration=187.0ms traceId=5ae40dc6e8824be6a1c28d160f5f0bee
+[2026-05-21T12:20:50.9926316Z INF] LogGeneratorService - Operation inventory.updated succeeded for carol@example.com duration=40.5ms
+[2026-05-21T12:20:50.9930636Z INF] LogGeneratorService - Operation user.login succeeded for carol@example.com duration=254.5ms
+[2026-05-21T12:20:50.9935071Z INF] LogGeneratorService - Operation webhook.delivered succeeded for carol@example.com duration=164.8ms
+[2026-05-21T12:20:50.9940017Z INF] LogGeneratorService - Operation inventory.updated succeeded for frank@example.com duration=285.3ms
+[2026-05-21T12:20:50.9956235Z INF] System.Net.Http.HttpClient.OtlpMetricExporter.ClientHandler - HTTP request failed after 4394.4883ms
+System.Net.Http.HttpRequestException: No connection could be made because the target machine actively refused it. (localhost:4318)
+ ---> System.Net.Sockets.SocketException (10061): No connection could be made because the target machine actively refused it.
+   at System.Net.Sockets.Socket.AwaitableSocketAsyncEventArgs.ThrowException(SocketError error, CancellationToken cancellationToken)
+   at System.Net.Sockets.Socket.AwaitableSocketAsyncEventArgs.System.Threading.Tasks.Sources.IValueTaskSource.GetResult(Int16 token)
+   at System.Net.Http.HttpConnectionPool.ConnectToTcpHostAsync(String host, Int32 port, HttpRequestMessage initialRequest, Boolean async, CancellationToken cancellationToken)
+   --- End of inner exception stack trace ---
+   at System.Net.Http.HttpConnectionPool.ConnectToTcpHostAsync(String host, Int32 port, HttpRequestMessage initialRequest, Boolean async, CancellationToken cancellationToken)
+   at System.Net.Http.HttpConnectionPool.ConnectAsync(HttpRequestMessage request, Boolean async, CancellationToken cancellationToken)
+   at System.Net.Http.HttpConnectionPool.CreateHttp11ConnectionAsync(HttpRequestMessage request, Boolean async, CancellationToken cancellationToken)
+   at System.Net.Http.HttpConnectionPool.InjectNewHttp11ConnectionAsync(QueueItem queueItem)
+   at System.Threading.Tasks.TaskCompletionSourceWithCancellation`1.WaitWithCancellation(CancellationToken cancellationToken)
+   at System.Threading.Tasks.TaskCompletionSourceWithCancellation`1.WaitWithCancellationAsync(Boolean async, CancellationToken cancellationToken)
+   at System.Net.Http.HttpConnectionWaiter`1.WaitForConnectionWithTelemetryAsync(HttpRequestMessage request, HttpConnectionPool pool, Boolean async, CancellationToken requestCancellationToken)
+   at System.Net.Http.HttpConnectionPool.SendWithVersionDetectionAndRetryAsync(HttpRequestMessage request, Boolean async, Boolean doRequestAuth, CancellationToken cancellationToken)
+   at System.Net.Http.HttpMessageHandlerStage.Send(HttpRequestMessage request, CancellationToken cancellationToken)
+   at System.Net.Http.Metrics.MetricsHandler.SendAsync(HttpRequestMessage request, Boolean async, CancellationToken cancellationToken)
+   at System.Net.Http.HttpMessageHandlerStage.Send(HttpRequestMessage request, CancellationToken cancellationToken)
+   at System.Net.Http.DiagnosticsHandler.SendAsyncCore(HttpRequestMessage request, Boolean async, CancellationToken cancellationToken)
+   at System.Net.Http.RedirectHandler.SendAsync(HttpRequestMessage request, Boolean async, CancellationToken cancellationToken)
+   at System.Net.Http.HttpMessageHandlerStage.Send(HttpRequestMessage request, CancellationToken cancellationToken)
+   at System.Net.Http.SocketsHttpHandler.Send(HttpRequestMessage request, CancellationToken cancellationToken)
+   at Microsoft.Extensions.Http.Logging.LoggingHttpMessageHandler.<SendCoreAsync>g__Core|4_0(HttpRequestMessage request, Boolean useAsync, CancellationToken cancellationToken)
+[2026-05-21T12:20:51.1950512Z INF] System.Net.Http.HttpClient.OtlpMetricExporter.LogicalHandler - HTTP request failed after 4442.4865ms
+System.Net.Http.HttpRequestException: No connection could be made because the target machine actively refused it. (localhost:4318)
+ ---> System.Net.Sockets.SocketException (10061): No connection could be made because the target machine actively refused it.
+   at System.Net.Sockets.Socket.AwaitableSocketAsyncEventArgs.ThrowException(SocketError error, CancellationToken cancellationToken)
+   at System.Net.Sockets.Socket.AwaitableSocketAsyncEventArgs.System.Threading.Tasks.Sources.IValueTaskSource.GetResult(Int16 token)
+   at System.Net.Http.HttpConnectionPool.ConnectToTcpHostAsync(String host, Int32 port, HttpRequestMessage initialRequest, Boolean async, CancellationToken cancellationToken)
+   --- End of inner exception stack trace ---
+   at System.Net.Http.HttpConnectionPool.ConnectToTcpHostAsync(String host, Int32 port, HttpRequestMessage initialRequest, Boolean async, CancellationToken cancellationToken)
+   at System.Net.Http.HttpConnectionPool.ConnectAsync(HttpRequestMessage request, Boolean async, CancellationToken cancellationToken)
+   at System.Net.Http.HttpConnectionPool.CreateHttp11ConnectionAsync(HttpRequestMessage request, Boolean async, CancellationToken cancellationToken)
+   at System.Net.Http.HttpConnectionPool.InjectNewHttp11ConnectionAsync(QueueItem queueItem)
+   at System.Threading.Tasks.TaskCompletionSourceWithCancellation`1.WaitWithCancellation(CancellationToken cancellationToken)
+   at System.Threading.Tasks.TaskCompletionSourceWithCancellation`1.WaitWithCancellationAsync(Boolean async, CancellationToken cancellationToken)
+   at System.Net.Http.HttpConnectionWaiter`1.WaitForConnectionWithTelemetryAsync(HttpRequestMessage request, HttpConnectionPool pool, Boolean async, CancellationToken requestCancellationToken)
+   at System.Net.Http.HttpConnectionPool.SendWithVersionDetectionAndRetryAsync(HttpRequestMessage request, Boolean async, Boolean doRequestAuth, CancellationToken cancellationToken)
+   at System.Net.Http.HttpMessageHandlerStage.Send(HttpRequestMessage request, CancellationToken cancellationToken)
+   at System.Net.Http.Metrics.MetricsHandler.SendAsync(HttpRequestMessage request, Boolean async, CancellationToken cancellationToken)
+   at System.Net.Http.HttpMessageHandlerStage.Send(HttpRequestMessage request, CancellationToken cancellationToken)
+   at System.Net.Http.DiagnosticsHandler.SendAsyncCore(HttpRequestMessage request, Boolean async, CancellationToken cancellationToken)
+   at System.Net.Http.RedirectHandler.SendAsync(HttpRequestMessage request, Boolean async, CancellationToken cancellationToken)
+   at System.Net.Http.HttpMessageHandlerStage.Send(HttpRequestMessage request, CancellationToken cancellationToken)
+   at System.Net.Http.SocketsHttpHandler.Send(HttpRequestMessage request, CancellationToken cancellationToken)
+   at Microsoft.Extensions.Http.Logging.LoggingHttpMessageHandler.<SendCoreAsync>g__Core|4_0(HttpRequestMessage request, Boolean useAsync, CancellationToken cancellationToken)
+   at Microsoft.Extensions.Http.Logging.LoggingHttpMessageHandler.Send(HttpRequestMessage request, CancellationToken cancellationToken)
+   at Microsoft.Extensions.Http.Logging.LoggingScopeHttpMessageHandler.<SendCoreAsync>g__Core|4_0(HttpRequestMessage request, Boolean useAsync, CancellationToken cancellationToken)
+[2026-05-21T12:20:51.2308001Z ERR] Microsoft.Extensions.Hosting.Internal.Host - BackgroundService failed
+System.ObjectDisposedException: Cannot access a disposed object.
+Object name: 'IServiceProvider'.
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.ThrowHelper.ThrowObjectDisposedException()
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.CreateScope()
+   at Microsoft.Extensions.Http.DefaultHttpClientFactory.CreateHandlerEntry(String name)
+   at System.Lazy`1.ViaFactory(LazyThreadSafetyMode mode)
+   at System.Lazy`1.ExecutionAndPublication(LazyHelper executionAndPublication, Boolean useDefaultConstructor)
+   at System.Lazy`1.CreateValue()
+   at Microsoft.Extensions.Http.DefaultHttpClientFactory.CreateHandler(String name)
+   at Microsoft.Extensions.Http.DefaultHttpClientFactory.CreateClient(String name)
+   at SeqSignalSender.SendAsync(LogEntry entry) in C:\Users\ruslan.akhmetov\Desktop\Processing\Rd.Log\tools\Rd.Log.OtlpDemo\SeqSignalMapper.cs:line 26
+   at LogGeneratorService.ExecuteAsync(CancellationToken stoppingToken) in C:\Users\ruslan.akhmetov\Desktop\Processing\Rd.Log\tools\Rd.Log.OtlpDemo\LogGeneratorService.cs:line 48
+   at Microsoft.Extensions.Hosting.Internal.Host.TryExecuteBackgroundServiceAsync(BackgroundService backgroundService)
+[2026-05-21T12:20:51.2317062Z CRT] Microsoft.Extensions.Hosting.Internal.Host - The HostOptions.BackgroundServiceExceptionBehavior is configured to StopHost. A BackgroundService has thrown an unhandled exception, and the IHost instance is stopping. To avoid this behavior, configure this to Ignore; however the BackgroundService will not be restarted.
+System.ObjectDisposedException: Cannot access a disposed object.
+Object name: 'IServiceProvider'.
+   at Microsoft.Extensions.DependencyInjection.ServiceLookup.ThrowHelper.ThrowObjectDisposedException()
+   at Microsoft.Extensions.DependencyInjection.ServiceProvider.CreateScope()
+   at Microsoft.Extensions.Http.DefaultHttpClientFactory.CreateHandlerEntry(String name)
+   at System.Lazy`1.ViaFactory(LazyThreadSafetyMode mode)
+   at System.Lazy`1.ExecutionAndPublication(LazyHelper executionAndPublication, Boolean useDefaultConstructor)
+   at System.Lazy`1.CreateValue()
+   at Microsoft.Extensions.Http.DefaultHttpClientFactory.CreateHandler(String name)
+   at Microsoft.Extensions.Http.DefaultHttpClientFactory.CreateClient(String name)
+   at SeqSignalSender.SendAsync(LogEntry entry) in C:\Users\ruslan.akhmetov\Desktop\Processing\Rd.Log\tools\Rd.Log.OtlpDemo\SeqSignalMapper.cs:line 26
+   at LogGeneratorService.ExecuteAsync(CancellationToken stoppingToken) in C:\Users\ruslan.akhmetov\Desktop\Processing\Rd.Log\tools\Rd.Log.OtlpDemo\LogGeneratorService.cs:line 48
+   at Microsoft.Extensions.Hosting.Internal.Host.TryExecuteBackgroundServiceAsync(BackgroundService backgroundService)
+[2026-05-21T12:20:51.2347242Z INF] System.Net.Http.HttpClient.OtlpLogExporter.LogicalHandler - Start processing HTTP request POST http://localhost:4318/
+[2026-05-21T12:20:51.2348542Z INF] System.Net.Http.HttpClient.OtlpLogExporter.ClientHandler - Sending HTTP request POST http://localhost:4318/
+[2026-05-21T12:27:00.0300187Z WRN] SeqReplayService - SeqReplayService: no events loaded — check SeqReplay:DataPath in appsettings.json
+[2026-05-21T12:27:00.2871635Z ERR] Microsoft.Extensions.Hosting.Internal.Host - Hosting failed to start
+System.InvalidOperationException: Call UseKestrelHttpsConfiguration() on IWebHostBuilder to automatically enable HTTPS when an https:// address is used.
+   at Microsoft.AspNetCore.Server.Kestrel.Core.HttpsConfigurationService.EnsureInitialized(String uninitializedError)
+   at Microsoft.AspNetCore.Server.Kestrel.Core.HttpsConfigurationService.UseHttpsWithDefaults(ListenOptions listenOptions)
+   at Microsoft.AspNetCore.Server.Kestrel.Core.Internal.AddressBinder.AddressesStrategy.BindAsync(AddressBindContext context, CancellationToken cancellationToken)
+   at Microsoft.AspNetCore.Server.Kestrel.Core.KestrelServerImpl.BindAsync(CancellationToken cancellationToken)
+   at Microsoft.AspNetCore.Server.Kestrel.Core.KestrelServerImpl.StartAsync[TContext](IHttpApplication`1 application, CancellationToken cancellationToken)
+   at Microsoft.AspNetCore.Hosting.GenericWebHostService.StartAsync(CancellationToken cancellationToken)
+   at Microsoft.Extensions.Hosting.Internal.Host.<StartAsync>b__14_1(IHostedService service, CancellationToken token)
+   at Microsoft.Extensions.Hosting.Internal.Host.ForeachService[T](IEnumerable`1 services, CancellationToken token, Boolean concurrent, Boolean abortOnFirstException, List`1 exceptions, Func`3 operation)
+[2026-05-21T12:27:00.3309778Z INF] System.Net.Http.HttpClient.OtlpMetricExporter.LogicalHandler - Start processing HTTP request POST http://localhost:5341/
+[2026-05-21T12:27:00.3317227Z INF] System.Net.Http.HttpClient.OtlpMetricExporter.ClientHandler - Sending HTTP request POST http://localhost:5341/
+[2026-05-21T12:27:00.3506998Z ERR] LogGeneratorService - Operation payment.failed failed for frank@example.com status=500 duration=125.0ms traceId=0cb5de66ad6145ab9d4ba73560492935
+[2026-05-21T12:27:00.3511867Z INF] LogGeneratorService - Operation file.uploaded succeeded for dave@example.com duration=43.5ms
+[2026-05-21T12:27:00.3516311Z INF] LogGeneratorService - Operation cache.miss succeeded for carol@example.com duration=459.3ms
+[2026-05-21T12:27:00.3519431Z INF] LogGeneratorService - Operation order.cancelled succeeded for dave@example.com duration=165.5ms
+[2026-05-21T12:27:00.3522649Z ERR] LogGeneratorService - Operation order.shipped failed for dave@example.com status=500 duration=198.2ms traceId=4a40ed4f475c405fb1d047ae374352a6
+[2026-05-21T12:27:00.3525443Z INF] LogGeneratorService - Operation inventory.updated succeeded for dave@example.com duration=423.1ms
+[2026-05-21T12:27:00.3527582Z INF] LogGeneratorService - Operation session.expired succeeded for frank@example.com duration=454.8ms
+[2026-05-21T12:27:00.3529648Z INF] LogGeneratorService - Operation notification.sent succeeded for bob@example.com duration=351.3ms
+[2026-05-21T12:27:00.3532303Z INF] LogGeneratorService - Operation order.cancelled succeeded for bob@example.com duration=216.4ms
+[2026-05-21T12:27:00.3535840Z INF] LogGeneratorService - Operation notification.sent succeeded for frank@example.com duration=405.4ms
+[2026-05-21T12:27:00.3538301Z INF] LogGeneratorService - Operation payment.processed succeeded for alice@example.com duration=179.2ms
+[2026-05-21T12:27:00.3540655Z INF] LogGeneratorService - Operation cache.miss succeeded for carol@example.com duration=171.4ms
+[2026-05-21T12:27:00.3545091Z INF] LogGeneratorService - Operation webhook.delivered succeeded for dave@example.com duration=267.9ms
+[2026-05-21T12:27:00.3548550Z ERR] LogGeneratorService - Operation payment.refunded failed for bob@example.com status=500 duration=94.8ms traceId=65d137e9d1664ee2b99d7ae3fd3a907f
+[2026-05-21T12:27:00.3551984Z INF] LogGeneratorService - Operation cache.miss succeeded for alice@example.com duration=199.6ms
+[2026-05-21T12:27:00.3556381Z ERR] LogGeneratorService - Operation order.cancelled failed for carol@example.com status=500 duration=112.3ms traceId=4e6da3632b7e4eaf9063d4f64730858d
+[2026-05-21T12:27:00.3600862Z INF] LogGeneratorService - Operation cache.miss succeeded for frank@example.com duration=493.4ms
+[2026-05-21T12:27:00.3604810Z INF] LogGeneratorService - Operation cache.miss succeeded for eve@example.com duration=376.1ms
+[2026-05-21T12:27:00.3607366Z INF] LogGeneratorService - Operation payment.refunded succeeded for bob@example.com duration=451.7ms
+[2026-05-21T12:27:00.3610162Z INF] LogGeneratorService - Operation user.logout succeeded for dave@example.com duration=191.9ms
+[2026-05-21T12:27:00.3964424Z INF] System.Net.Http.HttpClient.OtlpMetricExporter.ClientHandler - Received HTTP response headers after 61.0381ms - 405
+[2026-05-21T12:27:00.3967929Z INF] System.Net.Http.HttpClient.OtlpMetricExporter.LogicalHandler - End processing HTTP request after 68.1295ms - 405
+[2026-05-21T12:27:00.4429574Z ERR] Microsoft.Extensions.Hosting.Internal.Host - BackgroundService failed
+System.Threading.Tasks.TaskCanceledException: A task was canceled.
+   at LogGeneratorService.ExecuteAsync(CancellationToken stoppingToken) in C:\Users\ruslan.akhmetov\Desktop\Processing\Rd.Log\tools\Rd.Log.OtlpDemo\LogGeneratorService.cs:line 50
+   at Microsoft.Extensions.Hosting.Internal.Host.TryExecuteBackgroundServiceAsync(BackgroundService backgroundService)
+[2026-05-21T12:27:00.4435617Z CRT] Microsoft.Extensions.Hosting.Internal.Host - The HostOptions.BackgroundServiceExceptionBehavior is configured to StopHost. A BackgroundService has thrown an unhandled exception, and the IHost instance is stopping. To avoid this behavior, configure this to Ignore; however the BackgroundService will not be restarted.
+System.Threading.Tasks.TaskCanceledException: A task was canceled.
+   at LogGeneratorService.ExecuteAsync(CancellationToken stoppingToken) in C:\Users\ruslan.akhmetov\Desktop\Processing\Rd.Log\tools\Rd.Log.OtlpDemo\LogGeneratorService.cs:line 50
+   at Microsoft.Extensions.Hosting.Internal.Host.TryExecuteBackgroundServiceAsync(BackgroundService backgroundService)
+[2026-05-21T12:27:00.4457920Z INF] System.Net.Http.HttpClient.OtlpLogExporter.LogicalHandler - Start processing HTTP request POST http://localhost:5341/
+[2026-05-21T12:27:00.4458608Z INF] System.Net.Http.HttpClient.OtlpLogExporter.ClientHandler - Sending HTTP request POST http://localhost:5341/
+[2026-05-21T12:27:00.4540552Z INF] System.Net.Http.HttpClient.OtlpLogExporter.ClientHandler - Received HTTP response headers after 8.0777ms - 405
+[2026-05-21T12:27:00.4541071Z INF] System.Net.Http.HttpClient.OtlpLogExporter.LogicalHandler - End processing HTTP request after 8.3802ms - 405
+[2026-05-21T12:27:27.0221767Z WRN] SeqReplayService - SeqReplayService: no events loaded — check SeqReplay:DataPath in appsettings.json
+[2026-05-21T12:27:27.2254139Z ERR] Microsoft.Extensions.Hosting.Internal.Host - Hosting failed to start
+System.InvalidOperationException: Call UseKestrelHttpsConfiguration() on IWebHostBuilder to automatically enable HTTPS when an https:// address is used.
+   at Microsoft.AspNetCore.Server.Kestrel.Core.HttpsConfigurationService.EnsureInitialized(String uninitializedError)
+   at Microsoft.AspNetCore.Server.Kestrel.Core.HttpsConfigurationService.UseHttpsWithDefaults(ListenOptions listenOptions)
+   at Microsoft.AspNetCore.Server.Kestrel.Core.Internal.AddressBinder.AddressesStrategy.BindAsync(AddressBindContext context, CancellationToken cancellationToken)
+   at Microsoft.AspNetCore.Server.Kestrel.Core.KestrelServerImpl.BindAsync(CancellationToken cancellationToken)
+   at Microsoft.AspNetCore.Server.Kestrel.Core.KestrelServerImpl.StartAsync[TContext](IHttpApplication`1 application, CancellationToken cancellationToken)
+   at Microsoft.AspNetCore.Hosting.GenericWebHostService.StartAsync(CancellationToken cancellationToken)
+   at Microsoft.Extensions.Hosting.Internal.Host.<StartAsync>b__14_1(IHostedService service, CancellationToken token)
+   at Microsoft.Extensions.Hosting.Internal.Host.ForeachService[T](IEnumerable`1 services, CancellationToken token, Boolean concurrent, Boolean abortOnFirstException, List`1 exceptions, Func`3 operation)
+[2026-05-21T12:27:27.2891454Z INF] System.Net.Http.HttpClient.OtlpMetricExporter.LogicalHandler - Start processing HTTP request POST http://localhost:5341/
+[2026-05-21T12:27:27.2903613Z INF] System.Net.Http.HttpClient.OtlpMetricExporter.ClientHandler - Sending HTTP request POST http://localhost:5341/
+[2026-05-21T12:27:27.3559534Z INF] LogGeneratorService - Operation cache.miss succeeded for carol@example.com duration=473.9ms
+[2026-05-21T12:27:27.3570752Z INF] LogGeneratorService - Operation session.expired succeeded for bob@example.com duration=324.1ms
+[2026-05-21T12:27:27.3574469Z INF] LogGeneratorService - Operation notification.sent succeeded for frank@example.com duration=236.3ms
+[2026-05-21T12:27:27.3582511Z ERR] LogGeneratorService - Operation report.generated failed for frank@example.com status=500 duration=264.9ms traceId=da2e139efc754b1ca8645af39e7c6241
+[2026-05-21T12:27:27.3586194Z ERR] LogGeneratorService - Operation auth.token.refresh failed for alice@example.com status=500 duration=33.1ms traceId=2505d9085b8b418f8a2b93920cff17c3
+[2026-05-21T12:27:27.3589578Z INF] LogGeneratorService - Operation payment.failed succeeded for carol@example.com duration=431.0ms
+[2026-05-21T12:27:27.3593351Z INF] LogGeneratorService - Operation session.expired succeeded for eve@example.com duration=255.3ms
+[2026-05-21T12:27:27.3596337Z ERR] LogGeneratorService - Operation order.shipped failed for bob@example.com status=500 duration=442.3ms traceId=836a5b5eacd34444a84bc72ecf2b23a3
+[2026-05-21T12:27:27.3599379Z INF] LogGeneratorService - Operation search.executed succeeded for alice@example.com duration=402.4ms
+[2026-05-21T12:27:27.3601951Z INF] LogGeneratorService - Operation user.registered succeeded for eve@example.com duration=173.7ms
+[2026-05-21T12:27:27.3604217Z INF] LogGeneratorService - Operation payment.failed succeeded for bob@example.com duration=386.8ms
+[2026-05-21T12:27:27.3607292Z INF] LogGeneratorService - Operation payment.refunded succeeded for dave@example.com duration=313.7ms
+[2026-05-21T12:27:27.3610597Z INF] LogGeneratorService - Operation order.cancelled succeeded for bob@example.com duration=420.9ms
+[2026-05-21T12:27:27.3613597Z INF] LogGeneratorService - Operation order.cancelled succeeded for bob@example.com duration=89.1ms
+[2026-05-21T12:27:27.3616427Z INF] LogGeneratorService - Operation order.placed succeeded for frank@example.com duration=105.3ms
+[2026-05-21T12:27:27.3619401Z INF] LogGeneratorService - Operation user.registered succeeded for eve@example.com duration=162.1ms
+[2026-05-21T12:27:27.3621877Z INF] LogGeneratorService - Operation user.logout succeeded for alice@example.com duration=209.0ms
+[2026-05-21T12:27:27.3624912Z ERR] LogGeneratorService - Operation report.generated failed for carol@example.com status=500 duration=392.4ms traceId=72b81886171a4d87bf640bb07373d4b5
+[2026-05-21T12:27:27.3627657Z INF] LogGeneratorService - Operation payment.refunded succeeded for frank@example.com duration=155.8ms
+[2026-05-21T12:27:27.3629860Z INF] LogGeneratorService - Operation search.executed succeeded for carol@example.com duration=119.2ms
+[2026-05-21T12:27:27.3682999Z INF] System.Net.Http.HttpClient.OtlpMetricExporter.ClientHandler - Received HTTP response headers after 74.054ms - 405
+[2026-05-21T12:27:27.3687023Z INF] System.Net.Http.HttpClient.OtlpMetricExporter.LogicalHandler - End processing HTTP request after 82.9109ms - 405
+[2026-05-21T12:27:27.4063116Z ERR] Microsoft.Extensions.Hosting.Internal.Host - BackgroundService failed
+System.Threading.Tasks.TaskCanceledException: A task was canceled.
+   at LogGeneratorService.ExecuteAsync(CancellationToken stoppingToken) in C:\Users\ruslan.akhmetov\Desktop\Processing\Rd.Log\tools\Rd.Log.OtlpDemo\LogGeneratorService.cs:line 50
+   at Microsoft.Extensions.Hosting.Internal.Host.TryExecuteBackgroundServiceAsync(BackgroundService backgroundService)
+[2026-05-21T12:27:27.4066567Z CRT] Microsoft.Extensions.Hosting.Internal.Host - The HostOptions.BackgroundServiceExceptionBehavior is configured to StopHost. A BackgroundService has thrown an unhandled exception, and the IHost instance is stopping. To avoid this behavior, configure this to Ignore; however the BackgroundService will not be restarted.
+System.Threading.Tasks.TaskCanceledException: A task was canceled.
+   at LogGeneratorService.ExecuteAsync(CancellationToken stoppingToken) in C:\Users\ruslan.akhmetov\Desktop\Processing\Rd.Log\tools\Rd.Log.OtlpDemo\LogGeneratorService.cs:line 50
+   at Microsoft.Extensions.Hosting.Internal.Host.TryExecuteBackgroundServiceAsync(BackgroundService backgroundService)
+[2026-05-21T12:27:27.4089942Z INF] System.Net.Http.HttpClient.OtlpLogExporter.LogicalHandler - Start processing HTTP request POST http://localhost:5341/
+[2026-05-21T12:27:27.4090359Z INF] System.Net.Http.HttpClient.OtlpLogExporter.ClientHandler - Sending HTTP request POST http://localhost:5341/
+[2026-05-21T12:27:27.4151362Z INF] System.Net.Http.HttpClient.OtlpLogExporter.ClientHandler - Received HTTP response headers after 6.065ms - 405
+[2026-05-21T12:27:27.4151761Z INF] System.Net.Http.HttpClient.OtlpLogExporter.LogicalHandler - End processing HTTP request after 6.2288ms - 405
+[2026-05-21T12:28:49.3152129Z WRN] SeqReplayService - SeqReplayService: no events loaded — check SeqReplay:DataPath in appsettings.json
+[2026-05-21T12:28:49.4729920Z ERR] Microsoft.Extensions.Hosting.Internal.Host - Hosting failed to start
+System.InvalidOperationException: Call UseKestrelHttpsConfiguration() on IWebHostBuilder to automatically enable HTTPS when an https:// address is used.
+   at Microsoft.AspNetCore.Server.Kestrel.Core.HttpsConfigurationService.EnsureInitialized(String uninitializedError)
+   at Microsoft.AspNetCore.Server.Kestrel.Core.HttpsConfigurationService.UseHttpsWithDefaults(ListenOptions listenOptions)
+   at Microsoft.AspNetCore.Server.Kestrel.Core.Internal.AddressBinder.AddressesStrategy.BindAsync(AddressBindContext context, CancellationToken cancellationToken)
+   at Microsoft.AspNetCore.Server.Kestrel.Core.KestrelServerImpl.BindAsync(CancellationToken cancellationToken)
+   at Microsoft.AspNetCore.Server.Kestrel.Core.KestrelServerImpl.StartAsync[TContext](IHttpApplication`1 application, CancellationToken cancellationToken)
+   at Microsoft.AspNetCore.Hosting.GenericWebHostService.StartAsync(CancellationToken cancellationToken)
+   at Microsoft.Extensions.Hosting.Internal.Host.<StartAsync>b__14_1(IHostedService service, CancellationToken token)
+   at Microsoft.Extensions.Hosting.Internal.Host.ForeachService[T](IEnumerable`1 services, CancellationToken token, Boolean concurrent, Boolean abortOnFirstException, List`1 exceptions, Func`3 operation)
+[2026-05-21T12:28:49.5169716Z INF] System.Net.Http.HttpClient.OtlpMetricExporter.LogicalHandler - Start processing HTTP request POST http://localhost:5341/
+[2026-05-21T12:28:49.5176132Z INF] System.Net.Http.HttpClient.OtlpMetricExporter.ClientHandler - Sending HTTP request POST http://localhost:5341/
+[2026-05-21T12:28:49.5695755Z INF] System.Net.Http.HttpClient.OtlpMetricExporter.ClientHandler - Received HTTP response headers after 48.5202ms - 405
+[2026-05-21T12:28:49.5699307Z INF] System.Net.Http.HttpClient.OtlpMetricExporter.LogicalHandler - End processing HTTP request after 55.151ms - 405
+[2026-05-21T12:28:49.6075979Z ERR] Microsoft.Extensions.Hosting.Internal.Host - BackgroundService failed
+System.Threading.Tasks.TaskCanceledException: A task was canceled.
+   at LogGeneratorService.ExecuteAsync(CancellationToken stoppingToken) in C:\Users\ruslan.akhmetov\Desktop\Processing\Rd.Log\tools\Rd.Log.OtlpDemo\LogGeneratorService.cs:line 40
+   at Microsoft.Extensions.Hosting.Internal.Host.TryExecuteBackgroundServiceAsync(BackgroundService backgroundService)
+[2026-05-21T12:28:49.6080296Z CRT] Microsoft.Extensions.Hosting.Internal.Host - The HostOptions.BackgroundServiceExceptionBehavior is configured to StopHost. A BackgroundService has thrown an unhandled exception, and the IHost instance is stopping. To avoid this behavior, configure this to Ignore; however the BackgroundService will not be restarted.
+System.Threading.Tasks.TaskCanceledException: A task was canceled.
+   at LogGeneratorService.ExecuteAsync(CancellationToken stoppingToken) in C:\Users\ruslan.akhmetov\Desktop\Processing\Rd.Log\tools\Rd.Log.OtlpDemo\LogGeneratorService.cs:line 40
+   at Microsoft.Extensions.Hosting.Internal.Host.TryExecuteBackgroundServiceAsync(BackgroundService backgroundService)
+[2026-05-21T12:28:49.6109068Z INF] System.Net.Http.HttpClient.OtlpLogExporter.LogicalHandler - Start processing HTTP request POST http://localhost:5341/
+[2026-05-21T12:28:49.6109643Z INF] System.Net.Http.HttpClient.OtlpLogExporter.ClientHandler - Sending HTTP request POST http://localhost:5341/
+[2026-05-21T12:28:49.6143023Z INF] System.Net.Http.HttpClient.OtlpLogExporter.ClientHandler - Received HTTP response headers after 3.3049ms - 405
+[2026-05-21T12:28:49.6143334Z INF] System.Net.Http.HttpClient.OtlpLogExporter.LogicalHandler - End processing HTTP request after 3.5064ms - 405
+[2026-05-21T12:29:33.2928247Z WRN] SeqReplayService - SeqReplayService: no events loaded — check SeqReplay:DataPath in appsettings.json
+[2026-05-21T12:29:33.5248491Z ERR] Microsoft.Extensions.Hosting.Internal.Host - Hosting failed to start
+System.InvalidOperationException: Call UseKestrelHttpsConfiguration() on IWebHostBuilder to automatically enable HTTPS when an https:// address is used.
+   at Microsoft.AspNetCore.Server.Kestrel.Core.HttpsConfigurationService.EnsureInitialized(String uninitializedError)
+   at Microsoft.AspNetCore.Server.Kestrel.Core.HttpsConfigurationService.UseHttpsWithDefaults(ListenOptions listenOptions)
+   at Microsoft.AspNetCore.Server.Kestrel.Core.Internal.AddressBinder.AddressesStrategy.BindAsync(AddressBindContext context, CancellationToken cancellationToken)
+   at Microsoft.AspNetCore.Server.Kestrel.Core.KestrelServerImpl.BindAsync(CancellationToken cancellationToken)
+   at Microsoft.AspNetCore.Server.Kestrel.Core.KestrelServerImpl.StartAsync[TContext](IHttpApplication`1 application, CancellationToken cancellationToken)
+   at Microsoft.AspNetCore.Hosting.GenericWebHostService.StartAsync(CancellationToken cancellationToken)
+   at Microsoft.Extensions.Hosting.Internal.Host.<StartAsync>b__14_1(IHostedService service, CancellationToken token)
+   at Microsoft.Extensions.Hosting.Internal.Host.ForeachService[T](IEnumerable`1 services, CancellationToken token, Boolean concurrent, Boolean abortOnFirstException, List`1 exceptions, Func`3 operation)
+[2026-05-21T12:29:33.5707473Z INF] System.Net.Http.HttpClient.OtlpMetricExporter.LogicalHandler - Start processing HTTP request POST http://localhost:5341/
+[2026-05-21T12:29:33.5714717Z INF] System.Net.Http.HttpClient.OtlpMetricExporter.ClientHandler - Sending HTTP request POST http://localhost:5341/
+[2026-05-21T12:29:36.1219795Z INF] LogGeneratorService - Operation order.shipped succeeded for alice@example.com duration=434.8ms
+[2026-05-21T12:29:36.1227386Z ERR] LogGeneratorService - Operation order.placed failed for carol@example.com status=500 duration=264.7ms traceId=5b87269ab38642a9bed363a587459af1
+[2026-05-21T12:29:36.1231922Z INF] LogGeneratorService - Operation user.login succeeded for dave@example.com duration=320.4ms
+[2026-05-21T12:29:36.1235589Z INF] LogGeneratorService - Operation session.expired succeeded for eve@example.com duration=190.1ms
+[2026-05-21T12:29:36.1239062Z INF] LogGeneratorService - Operation webhook.delivered succeeded for dave@example.com duration=254.9ms
+[2026-05-21T12:29:36.1250827Z INF] LogGeneratorService - Operation notification.sent succeeded for alice@example.com duration=303.7ms
+[2026-05-21T12:29:36.1254933Z INF] LogGeneratorService - Operation user.logout succeeded for dave@example.com duration=54.1ms
+[2026-05-21T12:29:36.1257894Z INF] LogGeneratorService - Operation auth.token.refresh succeeded for carol@example.com duration=226.5ms
+[2026-05-21T12:29:36.1261207Z INF] LogGeneratorService - Operation webhook.delivered succeeded for dave@example.com duration=165.5ms
+[2026-05-21T12:29:36.1265940Z ERR] LogGeneratorService - Operation inventory.updated failed for dave@example.com status=500 duration=162.7ms traceId=fdf823b959a542478f3794e82b0c6ba8
+[2026-05-21T12:29:36.1268762Z ERR] LogGeneratorService - Operation webhook.delivered failed for eve@example.com status=500 duration=459.8ms traceId=f1ed1f4b7fb74d39b1554d37a1fd703e
+[2026-05-21T12:29:36.1271041Z INF] LogGeneratorService - Operation payment.failed succeeded for carol@example.com duration=282.1ms
+[2026-05-21T12:29:36.1273228Z INF] LogGeneratorService - Operation user.registered succeeded for bob@example.com duration=307.9ms
+[2026-05-21T12:29:36.1275465Z INF] LogGeneratorService - Operation user.registered succeeded for dave@example.com duration=433.3ms
+[2026-05-21T12:29:36.1278382Z INF] LogGeneratorService - Operation order.cancelled succeeded for eve@example.com duration=286.6ms
+[2026-05-21T12:29:36.1281672Z ERR] LogGeneratorService - Operation user.login failed for bob@example.com status=500 duration=76.9ms traceId=ac0cf9aa93b74f4b9a1bf931b58b74f8
+[2026-05-21T12:29:36.1284366Z INF] LogGeneratorService - Operation user.login succeeded for alice@example.com duration=431.7ms
+[2026-05-21T12:29:36.1286681Z INF] LogGeneratorService - Operation session.expired succeeded for eve@example.com duration=285.7ms
+[2026-05-21T12:29:36.1289369Z INF] LogGeneratorService - Operation payment.failed succeeded for frank@example.com duration=283.1ms
+[2026-05-21T12:29:36.1291979Z ERR] LogGeneratorService - Operation order.cancelled failed for alice@example.com status=500 duration=287.5ms traceId=2e7caa9daa3b44d7bffc41f55ef19fe6
+[2026-05-21T12:29:36.1340331Z INF] System.Net.Http.HttpClient.OtlpMetricExporter.ClientHandler - Received HTTP response headers after 2553.4109ms - 405
+[2026-05-21T12:29:40.9759340Z INF] System.Net.Http.HttpClient.OtlpMetricExporter.LogicalHandler - End processing HTTP request after 7406.6827ms - 405
+[2026-05-21T12:29:44.7818834Z ERR] Microsoft.Extensions.Hosting.Internal.Host - BackgroundService failed
+System.Threading.Tasks.TaskCanceledException: A task was canceled.
+   at LogGeneratorService.ExecuteAsync(CancellationToken stoppingToken) in C:\Users\ruslan.akhmetov\Desktop\Processing\Rd.Log\tools\Rd.Log.OtlpDemo\LogGeneratorService.cs:line 50
+   at Microsoft.Extensions.Hosting.Internal.Host.TryExecuteBackgroundServiceAsync(BackgroundService backgroundService)
+[2026-05-21T12:29:44.7822384Z CRT] Microsoft.Extensions.Hosting.Internal.Host - The HostOptions.BackgroundServiceExceptionBehavior is configured to StopHost. A BackgroundService has thrown an unhandled exception, and the IHost instance is stopping. To avoid this behavior, configure this to Ignore; however the BackgroundService will not be restarted.
+System.Threading.Tasks.TaskCanceledException: A task was canceled.
+   at LogGeneratorService.ExecuteAsync(CancellationToken stoppingToken) in C:\Users\ruslan.akhmetov\Desktop\Processing\Rd.Log\tools\Rd.Log.OtlpDemo\LogGeneratorService.cs:line 50
+   at Microsoft.Extensions.Hosting.Internal.Host.TryExecuteBackgroundServiceAsync(BackgroundService backgroundService)
+[2026-05-21T12:29:44.7827857Z INF] System.Net.Http.HttpClient.OtlpLogExporter.LogicalHandler - Start processing HTTP request POST http://localhost:5341/
+[2026-05-21T12:29:44.7828262Z INF] System.Net.Http.HttpClient.OtlpLogExporter.ClientHandler - Sending HTTP request POST http://localhost:5341/
+[2026-05-21T12:29:44.7851165Z INF] System.Net.Http.HttpClient.OtlpLogExporter.ClientHandler - Received HTTP response headers after 2.2474ms - 405
+[2026-05-21T12:29:44.7851685Z INF] System.Net.Http.HttpClient.OtlpLogExporter.LogicalHandler - End processing HTTP request after 2.403ms - 405
