@@ -24,10 +24,4 @@
     <Project Path="tools/Rd.Log.LoadTest/Rd.Log.LoadTest.csproj" />
     <Project Path="tools/Rd.Log.OtlpDemo/Rd.Log.OtlpDemo.csproj" />
   </Folder>
-  <Project Path="../Rd.Log-otlp/src/Rd.Log.Core/Rd.Log.Core.csproj" />
-  <Project Path="../Rd.Log-otlp/src/Rd.Log.Ingestion/Rd.Log.Ingestion.csproj" />
-  <Project Path="../Rd.Log-otlp/src/Rd.Log.Metrics/Rd.Log.Metrics.csproj" />
-  <Project Path="../Rd.Log-otlp/src/Rd.Log.Otel/Rd.Log.Otel.csproj" />
-  <Project Path="../Rd.Log-otlp/src/Rd.Log.Storage/Rd.Log.Storage.csproj" />
-  <Project Path="../Rd.Log-otlp/src/Rd.Log.Tracing/Rd.Log.Tracing.csproj" />
 </Solution>
