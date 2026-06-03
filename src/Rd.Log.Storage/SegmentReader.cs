@@ -16,7 +16,7 @@ public sealed class SegmentReader : ISegmentReader
 {
     private const uint   MagicHeader      = 0x52_44_4C_47;
     private const uint   MagicFooter      = 0x52_44_46_54;
-    private const ushort SupportedVersion = 3;
+    private const ushort SupportedVersion = 4;
 
     private readonly long _invertedIndexOffset;
     private readonly long _trigramIndexOffset;
@@ -180,6 +180,7 @@ public sealed class SegmentReader : ISegmentReader
 
         ReadOnlySpan<byte> colT  = default, colL = default, colI = default;
         ReadOnlySpan<byte> colMt = default, colEx = default, colPr = default;
+        ReadOnlySpan<byte> colTr = default, colSp = default, colSvc = default;
 
         for (int c = 0; c < colCount; c++)
         {
@@ -188,12 +189,15 @@ public sealed class SegmentReader : ISegmentReader
             var  data    = span.Slice(pos, byteLen); pos += byteLen;
             switch (id)
             {
-                case 1: colT  = data; break;
-                case 2: colL  = data; break;
-                case 3: colI  = data; break;
-                case 4: colMt = data; break;
-                case 5: colEx = data; break;
-                case 6: colPr = data; break;
+                case 1: colT   = data; break;
+                case 2: colL   = data; break;
+                case 3: colI   = data; break;
+                case 4: colMt  = data; break;
+                case 5: colEx  = data; break;
+                case 6: colPr  = data; break;
+                case 7: colTr  = data; break;
+                case 8: colSp  = data; break;
+                case 9: colSvc = data; break;
                 default: break; // unknown columns ignored for forward compat
             }
         }
@@ -206,6 +210,8 @@ public sealed class SegmentReader : ISegmentReader
         var exPayload    = colEx.Slice(offsetsBytes);
         var prOffsets    = colPr.Slice(0, offsetsBytes);
         var prPayload    = colPr.Slice(offsetsBytes);
+        var svcOffsets   = colSvc.Length >= offsetsBytes ? colSvc.Slice(0, offsetsBytes) : default;
+        var svcPayload   = colSvc.Length >= offsetsBytes ? colSvc.Slice(offsetsBytes) : default;
 
         var list = new List<LogEvent>(eventCount);
         for (int i = 0; i < eventCount; i++)
@@ -213,6 +219,25 @@ public sealed class SegmentReader : ISegmentReader
             long  tDelta = BinaryPrimitives.ReadInt64LittleEndian (colT.Slice(i * 8, 8));
             byte  lvl    = colL[i];
             ulong iDelta = BinaryPrimitives.ReadUInt64LittleEndian(colI.Slice(i * 8, 8));
+
+            ulong trHi = colTr.Length >= (i + 1) * 16
+                ? BinaryPrimitives.ReadUInt64LittleEndian(colTr.Slice(i * 16, 8))
+                : 0;
+            ulong trLo = colTr.Length >= (i + 1) * 16
+                ? BinaryPrimitives.ReadUInt64LittleEndian(colTr.Slice(i * 16 + 8, 8))
+                : 0;
+            ulong spId = colSp.Length >= (i + 1) * 8
+                ? BinaryPrimitives.ReadUInt64LittleEndian(colSp.Slice(i * 8, 8))
+                : 0;
+
+            string? svcName = null;
+            if (svcOffsets.Length > 0)
+            {
+                uint sStart = BinaryPrimitives.ReadUInt32LittleEndian(svcOffsets.Slice(i * 4, 4));
+                uint sEnd   = BinaryPrimitives.ReadUInt32LittleEndian(svcOffsets.Slice((i + 1) * 4, 4));
+                if (sEnd > sStart)
+                    svcName = Encoding.UTF8.GetString(svcPayload.Slice((int)sStart, (int)(sEnd - sStart)));
+            }
 
             uint mtStart = BinaryPrimitives.ReadUInt32LittleEndian(mtOffsets.Slice(i * 4, 4));
             uint mtEnd   = BinaryPrimitives.ReadUInt32LittleEndian(mtOffsets.Slice((i + 1) * 4, 4));
@@ -238,6 +263,10 @@ public sealed class SegmentReader : ISegmentReader
                 MessageTemplate = mt,
                 Exception       = exc,
                 Properties      = props,
+                TraceIdHi       = trHi,
+                TraceIdLo       = trLo,
+                SpanId          = spId,
+                ServiceName     = svcName,
             });
         }
 

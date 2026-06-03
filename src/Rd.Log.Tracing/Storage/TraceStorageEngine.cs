@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using MessagePack;
 using Microsoft.Extensions.Logging;
+using Rd.Log.Core;
 
 namespace Rd.Log.Tracing.Storage;
 
@@ -13,7 +14,7 @@ namespace Rd.Log.Tracing.Storage;
 /// Cold tier: flushed as <c>.trc</c> files by <see cref="SpanWriter"/>
 /// when the hot segment reaches its size/time threshold.
 /// </summary>
-public sealed class TraceStorageEngine : ITraceProvider, IDisposable
+public sealed class TraceStorageEngine : ITraceProvider, IRetentionTarget, IDisposable
 {
     // ── Hot tier ─────────────────────────────────────────────────────────────
     private readonly List<SpanRecord>                          _hotSpans  = new();
@@ -25,7 +26,8 @@ public sealed class TraceStorageEngine : ITraceProvider, IDisposable
     private readonly List<SpanSegmentInfo>                     _coldSegments = new();
     private readonly ILogger<TraceStorageEngine>               _logger;
 
-    private const int HotFlushThreshold = 50_000; // spans before flush
+    private const int HotFlushThreshold    = 50_000;  // spans before flush
+    private const int CompactionThreshold  = 10_000;  // merge cold segments smaller than this
 
     public TraceStorageEngine(string dataDir, ILogger<TraceStorageEngine> logger)
     {
@@ -114,12 +116,14 @@ public sealed class TraceStorageEngine : ITraceProvider, IDisposable
     }
 
     public async IAsyncEnumerable<SpanRecord> SearchSpansAsync(
-        DateTimeOffset?   from        = null,
-        DateTimeOffset?   to          = null,
-        string?           serviceName = null,
-        string?           spanName    = null,
-        SpanStatusCode?   status      = null,
-        int               limit       = 200,
+        DateTimeOffset?   from             = null,
+        DateTimeOffset?   to               = null,
+        string?           serviceName      = null,
+        string?           spanName         = null,
+        SpanStatusCode?   status           = null,
+        long?             minDurationNanos = null,
+        long?             maxDurationNanos = null,
+        int               limit            = 200,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
         long fromNano = from.HasValue ? from.Value.ToUnixTimeMilliseconds() * 1_000_000L : long.MinValue;
@@ -136,9 +140,11 @@ public sealed class TraceStorageEngine : ITraceProvider, IDisposable
                 .Where(s =>
                     s.StartTimeUnixNano >= fromNano &&
                     s.StartTimeUnixNano <= toNano   &&
-                    (serviceName is null || s.ServiceName.Equals(serviceName, StringComparison.OrdinalIgnoreCase)) &&
-                    (spanName    is null || s.Name.Contains(spanName, StringComparison.OrdinalIgnoreCase)) &&
-                    (status      is null || s.Status == status.Value))
+                    (serviceName      is null || s.ServiceName.Equals(serviceName, StringComparison.OrdinalIgnoreCase)) &&
+                    (spanName         is null || s.Name.Contains(spanName, StringComparison.OrdinalIgnoreCase)) &&
+                    (status           is null || s.Status == status.Value) &&
+                    (minDurationNanos is null || s.DurationNanos >= minDurationNanos.Value) &&
+                    (maxDurationNanos is null || s.DurationNanos <= maxDurationNanos.Value))
                 .OrderByDescending(s => s.StartTimeUnixNano)
                 .Take(limit)
                 .ToList();
@@ -162,7 +168,7 @@ public sealed class TraceStorageEngine : ITraceProvider, IDisposable
             if (seg.MaxStartNano < fromNano || seg.MinStartNano > toNano) continue;
             ct.ThrowIfCancellationRequested();
 
-            await foreach (var r in SpanReader.SearchAsync(seg.FilePath, fromNano, toNano, serviceName, spanName, status, ct))
+            await foreach (var r in SpanReader.SearchAsync(seg.FilePath, fromNano, toNano, serviceName, spanName, status, minDurationNanos, maxDurationNanos, ct))
             {
                 if (yielded++ >= limit) yield break;
                 yield return r;
@@ -209,6 +215,41 @@ public sealed class TraceStorageEngine : ITraceProvider, IDisposable
             }
         }
         _logger.LogInformation("Loaded {Count} cold span segments", _coldSegments.Count);
+        CompactSmallSegments();
+    }
+
+    internal void CompactSmallSegments()
+    {
+        var small = _coldSegments.Where(s => s.SpanCount < CompactionThreshold).ToList();
+        if (small.Count < 2) return;
+
+        var allSpans = new List<SpanRecord>();
+        foreach (var seg in small)
+        {
+            try   { allSpans.AddRange(SpanReader.ReadAll(seg.FilePath)); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Compaction: failed to read {File}", seg.FilePath); }
+        }
+
+        if (allSpans.Count == 0) return;
+
+        try
+        {
+            var merged = SpanWriter.Write(_dataDir, allSpans);
+            _logger.LogInformation("Compacted {Count} small segments → {File} ({Spans} spans)",
+                small.Count, Path.GetFileName(merged.FilePath), allSpans.Count);
+
+            foreach (var seg in small)
+            {
+                _coldSegments.Remove(seg);
+                try   { File.Delete(seg.FilePath); }
+                catch (Exception ex) { _logger.LogWarning(ex, "Compaction: failed to delete {File}", seg.FilePath); }
+            }
+            _coldSegments.Add(merged);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Compaction: failed to write merged segment");
+        }
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -231,6 +272,34 @@ public sealed class TraceStorageEngine : ITraceProvider, IDisposable
         try { FlushHotTierLocked(); }
         finally { _lock.ExitWriteLock(); }
         _lock.Dispose();
+    }
+
+    // ── IRetentionTarget ───────────────────────────────────────────────────
+
+    public string RetentionKey => "traces";
+
+    public Task<int> PruneAsync(TimeSpan ttl, CancellationToken ct = default)
+    {
+        var cutoffNano = DateTimeOffset.UtcNow.Subtract(ttl).ToUnixTimeMilliseconds() * 1_000_000L;
+
+        List<SpanSegmentInfo> toDelete;
+        _lock.EnterWriteLock();
+        try
+        {
+            toDelete = _coldSegments.Where(s => s.MaxStartNano < cutoffNano).ToList();
+            foreach (var s in toDelete)
+                _coldSegments.Remove(s);
+        }
+        finally { _lock.ExitWriteLock(); }
+
+        foreach (var s in toDelete)
+            try { File.Delete(s.FilePath); } catch { /* best effort */ }
+
+        if (toDelete.Count > 0)
+            _logger.LogInformation("Retention pruned {Count} trace file(s) older than {Days} days",
+                toDelete.Count, (int)ttl.TotalDays);
+
+        return Task.FromResult(toDelete.Count);
     }
 }
 

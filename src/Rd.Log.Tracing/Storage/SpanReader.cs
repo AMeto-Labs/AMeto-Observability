@@ -58,6 +58,8 @@ internal static class SpanReader
         string?          serviceName,
         string?          spanName,
         SpanStatusCode?  status,
+        long?            minDurationNanos,
+        long?            maxDurationNanos,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct)
     {
         var all = ReadAllSpansFromFile(filePath);
@@ -65,9 +67,11 @@ internal static class SpanReader
         {
             ct.ThrowIfCancellationRequested();
             if (s.StartTimeUnixNano < fromNano || s.StartTimeUnixNano > toNano) continue;
-            if (serviceName is not null && !s.ServiceName.Equals(serviceName, StringComparison.OrdinalIgnoreCase)) continue;
-            if (spanName    is not null && !s.Name.Contains(spanName, StringComparison.OrdinalIgnoreCase)) continue;
-            if (status      is not null && s.Status != status.Value) continue;
+            if (serviceName      is not null && !s.ServiceName.Equals(serviceName, StringComparison.OrdinalIgnoreCase)) continue;
+            if (spanName         is not null && !s.Name.Contains(spanName, StringComparison.OrdinalIgnoreCase)) continue;
+            if (status           is not null && s.Status != status.Value) continue;
+            if (minDurationNanos is not null && s.DurationNanos < minDurationNanos.Value) continue;
+            if (maxDurationNanos is not null && s.DurationNanos > maxDurationNanos.Value) continue;
             yield return s;
         }
     }
@@ -104,6 +108,8 @@ internal static class SpanReader
 
         return [];
     }
+
+    internal static List<SpanRecord> ReadAll(string filePath) => ReadAllSpansFromFile(filePath);
 
     private static List<SpanRecord> ReadAllSpansFromFile(string filePath)
     {

@@ -1,0 +1,394 @@
+<div class="traces-page">
+
+  <!-- ── Page header ──────────────────────────────────────────────────────── -->
+  <div class="page-hdr">
+    <div class="page-title">
+      <h1>Traces</h1>
+      <span class="page-subtitle">Request flow and distributed tracing</span>
+    </div>
+    <div class="hdr-actions">
+      <div class="preset-group">
+        @for (p of ['15m','30m','1h','3h','6h','12h','24h']; track p) {
+          <button class="preset-btn" [class.active]="preset === p"
+                  (click)="preset = p; loadAll()">{{ p }}</button>
+        }
+      </div>
+      <div class="live-badge">
+        <span class="live-dot"></span>Live
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Jump to trace ───────────────────────────────────────────────────── -->
+  <div class="jump-bar">
+    <lucide-icon name="search" [size]="14" class="search-icon" />
+    <input class="jump-input" [(ngModel)]="traceIdInput"
+           placeholder="Paste trace ID to open directly…"
+           (keyup.enter)="jumpToTrace()" />
+    <button class="btn-jump" [disabled]="!traceIdInput.trim()" (click)="jumpToTrace()">
+      <lucide-icon name="arrow-right" [size]="13" />
+      Open
+    </button>
+  </div>
+
+  <!-- ── Filter bar ───────────────────────────────────────────────────────── -->
+  <div class="filter-bar">
+    <div class="filter-search">
+      <lucide-icon name="filter" [size]="14" class="search-icon" />
+      <input class="filter-search-input" [(ngModel)]="filterName"
+             placeholder="Operation / span name"
+             (keyup.enter)="applyFilters()" />
+    </div>
+
+    <select class="filter-select" [(ngModel)]="filterService">
+      <option value="">All services</option>
+      @for (sv of services(); track sv) { <option [value]="sv">{{ sv }}</option> }
+    </select>
+
+    <select class="filter-select" [(ngModel)]="filterStatus">
+      <option value="">All statuses</option>
+      <option value="Ok">OK</option>
+      <option value="Error">Error</option>
+    </select>
+
+    <div class="duration-filter">
+      <lucide-icon name="clock" [size]="13" class="dur-icon" />
+      <input class="duration-input" type="number" min="1"
+             [(ngModel)]="filterMinDurationMs"
+             placeholder="Min ms" title="Minimum root span duration (ms)" />
+    </div>
+
+    <div class="duration-filter">
+      <lucide-icon name="clock" [size]="13" class="dur-icon" />
+      <input class="duration-input" type="number" min="1"
+             [(ngModel)]="filterMaxDurationMs"
+             placeholder="Max ms" title="Maximum root span duration (ms)" />
+    </div>
+
+    <select class="filter-select filter-select--http" [(ngModel)]="filterHttpStatus">
+      <option value="">All HTTP</option>
+      <option value="2xx">2xx</option>
+      <option value="3xx">3xx</option>
+      <option value="4xx">4xx</option>
+      <option value="5xx">5xx</option>
+      <option value="400">400</option>
+      <option value="401">401</option>
+      <option value="403">403</option>
+      <option value="404">404</option>
+      <option value="500">500</option>
+      <option value="502">502</option>
+      <option value="503">503</option>
+    </select>
+
+    <button class="btn-apply" (click)="applyFilters()">Apply</button>
+    <button class="btn-clear" (click)="filterName=''; filterService=''; filterStatus=''; filterMinDurationMs=null; filterMaxDurationMs=null; filterHttpStatus=''; applyFilters()">
+      Clear all
+    </button>
+  </div>
+
+  <!-- ── Stats row ─────────────────────────────────────────────────────────── -->
+  <div class="stats-row">
+    @let st = stats();
+
+    <div class="stat-card">
+      <div class="stat-info">
+        <span class="stat-label">Total traces</span>
+        <span class="stat-value">{{ st ? fmtStat(st.totalTraces, 'count') : '—' }}</span>
+      </div>
+      @if (st) {
+        <svg class="sparkline" viewBox="0 0 80 28" preserveAspectRatio="none">
+          <polyline [attr.points]="sparkline(st.totalSparkline)"
+                    fill="none" stroke="var(--info)" stroke-width="1.5" stroke-linejoin="round" />
+        </svg>
+      }
+    </div>
+
+    <div class="stat-card stat-error">
+      <div class="stat-info">
+        <span class="stat-label">Error rate</span>
+        <span class="stat-value">{{ st ? fmtStat(st.errorRate, 'pct') : '—' }}</span>
+      </div>
+      @if (st) {
+        <svg class="sparkline" viewBox="0 0 80 28" preserveAspectRatio="none">
+          <polyline [attr.points]="sparkline(st.errorSparkline)"
+                    fill="none" stroke="var(--error)" stroke-width="1.5" stroke-linejoin="round" />
+        </svg>
+      }
+    </div>
+
+    <div class="stat-card">
+      <div class="stat-info">
+        <span class="stat-label">P50 latency</span>
+        <span class="stat-value">{{ st ? fmtStat(st.p50LatencyMs, 'ms') : '—' }}</span>
+      </div>
+      @if (st) {
+        <svg class="sparkline" viewBox="0 0 80 28" preserveAspectRatio="none">
+          <polyline [attr.points]="sparkline(st.totalSparkline)"
+                    fill="none" stroke="var(--info)" stroke-width="1.5" stroke-linejoin="round" />
+        </svg>
+      }
+    </div>
+
+    <div class="stat-card">
+      <div class="stat-info">
+        <span class="stat-label">P95 latency</span>
+        <span class="stat-value">{{ st ? fmtStat(st.p95LatencyMs, 'ms') : '—' }}</span>
+      </div>
+      @if (st) {
+        <svg class="sparkline" viewBox="0 0 80 28" preserveAspectRatio="none">
+          <polyline [attr.points]="sparkline(st.totalSparkline)"
+                    fill="none" stroke="var(--info)" stroke-width="1.5" stroke-linejoin="round" />
+        </svg>
+      }
+    </div>
+
+    <div class="stat-card stat-success">
+      <div class="stat-info">
+        <span class="stat-label">Throughput</span>
+        <span class="stat-value">{{ st ? fmtStat(st.throughputRps, 'rps') : '—' }}</span>
+      </div>
+      @if (st) {
+        <svg class="sparkline" viewBox="0 0 80 28" preserveAspectRatio="none">
+          <polyline [attr.points]="sparkline(st.totalSparkline)"
+                    fill="none" stroke="var(--success)" stroke-width="1.5" stroke-linejoin="round" />
+        </svg>
+      }
+    </div>
+  </div>
+
+  <!-- ── Main content ──────────────────────────────────────────────────────── -->
+  <div class="main-content">
+
+    <!-- Left: trace list -->
+    <div class="trace-list-panel" [class.narrow]="selectedTraceId()">
+
+      <div class="list-header">
+        <span class="list-title">
+          Traces&nbsp;
+          @if (!loading()) { <strong>{{ filteredTraces().length }}</strong> results }
+        </span>
+        <button class="icon-btn" (click)="loadAll()" title="Refresh">
+          <lucide-icon name="refresh-cw" [size]="13" [class.spin]="loading()" />
+        </button>
+      </div>
+
+      @if (loading() && traces().length === 0) {
+        <div class="panel-empty">
+          <lucide-icon name="loader" [size]="18" class="spin" />
+          Loading traces…
+        </div>
+      } @else if (filteredTraces().length === 0) {
+        <div class="panel-empty">No traces found</div>
+      } @else {
+        <div class="trace-rows">
+          @for (trace of filteredTraces(); track trace.traceId) {
+            <div class="trace-row"
+                 [class.active]="selectedTraceId() === trace.traceId"
+                 (click)="openTrace(trace.traceId)">
+
+              <span class="status-dot" [class]="statusCls(trace.status)"></span>
+
+              <div class="trace-row-body">
+                <div class="trace-ts">{{ fmtTraceTime(trace.startTimeUnixNano) }}</div>
+                <div class="trace-path-line">
+                  @if (trace.httpMethod) {
+                    <span class="http-method" [class]="'m-' + trace.httpMethod.toLowerCase()">
+                      {{ trace.httpMethod }}
+                    </span>
+                  }
+                  <span class="trace-path">{{ trace.httpPath || trace.name }}</span>
+                </div>
+                <div class="trace-svc">{{ trace.serviceName }}</div>
+              </div>
+
+              <div class="trace-row-right">
+                <span class="status-badge" [class]="statusBadgeCls(trace.httpStatusCode, trace.status)">
+                  {{ statusBadgeLabel(trace.httpStatusCode, trace.status) }}
+                </span>
+                <span class="trace-dur mono">{{ fmtDurNs(trace.durationNanos) }}</span>
+              </div>
+            </div>
+          }
+        </div>
+      }
+    </div>
+
+    <!-- Right: trace detail panel -->
+    @if (selectedTraceId()) {
+      <div class="trace-detail-panel">
+
+        @if (traceLoading()) {
+          <div class="panel-empty">
+            <lucide-icon name="loader" [size]="18" class="spin" />
+            Loading trace…
+          </div>
+        } @else {
+
+          <!-- Detail header -->
+          <div class="detail-header">
+            <div class="detail-title">
+              <span class="detail-trace-label">Trace:</span>
+              <span class="detail-trace-id mono">{{ selectedTraceId()!.substring(0, 16) }}</span>
+              <lucide-icon name="copy" [size]="12" class="copy-icon" title="Copy" />
+            </div>
+            <div class="detail-meta">
+              <span class="meta-chip">{{ totalDurLabel() }}</span>
+              <span class="meta-chip">{{ traceSpans().length }} spans</span>
+            </div>
+            <button class="icon-btn" (click)="closeTrace()">
+              <lucide-icon name="x" [size]="16" />
+            </button>
+          </div>
+
+          <!-- Tabs -->
+          <div class="detail-tabs">
+            <button class="tab-btn" [class.active]="activeTraceTab === 'timeline'"
+                    (click)="activeTraceTab = 'timeline'">Timeline</button>
+            <button class="tab-btn" [class.active]="activeTraceTab === 'details'"
+                    (click)="activeTraceTab = 'details'">Details</button>
+          </div>
+
+          <!-- ── Timeline ─────────────────────────────────────────────────── -->
+          @if (activeTraceTab === 'timeline') {
+
+            <div class="waterfall">
+
+              <!-- Time-axis header -->
+              <div class="wf-axis-row">
+                <div class="wf-label-col">Service / Operation</div>
+                <div class="wf-bar-col">
+                  @for (tick of wfTimeTicks(); track tick.pct) {
+                    <span class="wf-tick" [style.left.%]="tick.pct">{{ tick.label }}</span>
+                  }
+                </div>
+                <div class="wf-dur-col">Duration</div>
+              </div>
+
+              <!-- Span rows -->
+              <div class="wf-body">
+                @for (span of traceSpans(); track span.spanId) {
+                  <div class="wf-row"
+                       [class.selected-span]="selectedSpan()?.spanId === span.spanId"
+                       [class.error-span]="span.status === 'Error'"
+                       (click)="selectSpan(span)">
+
+                    <div class="wf-label-col" [style.padding-left.px]="spanDepth(span) * 14 + 8">
+                      <span class="svc-dot" [style.background]="svcColor(span.serviceName)"></span>
+                      <div class="wf-names">
+                        <span class="wf-svc">{{ span.serviceName }}</span>
+                        <span class="wf-op">{{ span.name }}</span>
+                      </div>
+                    </div>
+
+                    <div class="wf-bar-col">
+                      <div class="wf-bar"
+                           [class.bar-error]="span.status === 'Error'"
+                           [style.left.%]="waterfallLeft(span)"
+                           [style.width.%]="waterfallWidth(span)"
+                           [style.background]="svcColor(span.serviceName)">
+                      </div>
+                    </div>
+
+                    <div class="wf-dur-col mono">{{ fmtDurNs(span.durationNanos) }}</div>
+                  </div>
+                }
+              </div>
+            </div>
+
+            <!-- ── Span detail bottom panel ──────────────────────────────── -->
+            @if (selectedSpan(); as span) {
+              <div class="span-detail">
+
+                <div class="span-detail-left">
+                  <div class="sd-field">
+                    <span class="sd-key">Service</span>
+                    <span class="sd-val">
+                      <span class="svc-dot sm" [style.background]="svcColor(span.serviceName)"></span>
+                      {{ span.serviceName }}
+                    </span>
+                  </div>
+                  <div class="sd-field">
+                    <span class="sd-key">Operation</span>
+                    <span class="sd-val">{{ span.name }}</span>
+                  </div>
+                  <div class="sd-field">
+                    <span class="sd-key">Span ID</span>
+                    <span class="sd-val mono small">{{ span.spanId }}</span>
+                  </div>
+                  <div class="sd-field">
+                    <span class="sd-key">Parent Span ID</span>
+                    <span class="sd-val mono small">{{ span.parentSpanId || '—' }}</span>
+                  </div>
+                  <div class="sd-field">
+                    <span class="sd-key">Start time</span>
+                    <span class="sd-val mono small">{{ fmtTraceTime(span.startTimeUnixNano) }}</span>
+                  </div>
+                  <div class="sd-field">
+                    <span class="sd-key">Duration</span>
+                    <span class="sd-val mono">{{ fmtDurNs(span.durationNanos) }}</span>
+                  </div>
+                </div>
+
+                <div class="span-detail-right">
+                  <div class="span-tab-bar">
+                    <button class="stab active">Tags ({{ selectedSpanTags().length }})</button>
+                  </div>
+                  <div class="tags-wrap">
+                    @if (selectedSpanTags().length === 0) {
+                      <div class="tags-empty">No attributes</div>
+                    } @else {
+                      <table class="tags-table">
+                        <thead><tr><th>Key</th><th>Value</th></tr></thead>
+                        <tbody>
+                          @for (tag of selectedSpanTags(); track tag.key) {
+                            <tr>
+                              <td class="tag-key mono">{{ tag.key }}</td>
+                              <td class="tag-val">{{ tag.value }}</td>
+                            </tr>
+                          }
+                        </tbody>
+                      </table>
+                    }
+                  </div>
+                </div>
+
+              </div>
+            }
+
+          <!-- ── Details ──────────────────────────────────────────────────── -->
+          } @else {
+            <div class="detail-info-tab">
+              <div class="di-row">
+                <span class="di-k">Trace ID</span>
+                <span class="di-v mono small">{{ selectedTraceId() }}</span>
+              </div>
+              <div class="di-row">
+                <span class="di-k">Spans</span>
+                <span class="di-v">{{ traceSpans().length }}</span>
+              </div>
+              <div class="di-row">
+                <span class="di-k">Duration</span>
+                <span class="di-v">{{ totalDurLabel() }}</span>
+              </div>
+              <div class="di-row">
+                <span class="di-k">Services</span>
+                <span class="di-v svc-chips">
+                  @for (svc of uniqueServices(); track svc) {
+                    <span class="svc-chip"
+                          [style.background]="svcColor(svc) + '22'"
+                          [style.color]="svcColor(svc)"
+                          [style.border-color]="svcColor(svc) + '55'">
+                      {{ svc }}
+                    </span>
+                  }
+                </span>
+              </div>
+            </div>
+          }
+
+        }
+      </div>
+    }
+
+  </div>
+</div>

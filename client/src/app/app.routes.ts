@@ -36,6 +36,14 @@ export const routes: Routes = [
         path: 'diagnostics',
         loadComponent: () => import('./pages/diagnostics/diagnostics').then(m => m.DiagnosticsComponent),
       },
+      {
+        path: 'traces',
+        loadComponent: () => import('./pages/traces/traces').then(m => m.TracesComponent),
+      },
+      {
+        path: 'metrics',
+        loadComponent: () => import('./pages/metrics/metrics').then(m => m.MetricsComponent),
+      },
     ],
   },
   {

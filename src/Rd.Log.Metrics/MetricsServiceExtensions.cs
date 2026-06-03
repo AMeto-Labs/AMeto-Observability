@@ -1,6 +1,7 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Rd.Log.Core;
 using Rd.Log.Metrics.Storage;
 
 namespace Rd.Log.Metrics;
@@ -21,6 +22,7 @@ public static class MetricsServiceExtensions
 
         services.AddSingleton<IMetricIngester>(sp => sp.GetRequiredService<MetricStorageEngine>());
         services.AddSingleton<IMetricQuery>(sp => sp.GetRequiredService<MetricStorageEngine>());
+        services.AddSingleton<IRetentionTarget>(sp => sp.GetRequiredService<MetricStorageEngine>());
 
         services.AddHostedService<MetricStorageHostedService>();
 

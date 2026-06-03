@@ -69,12 +69,26 @@
           <input class="days-input" type="number" min="1" [(ngModel)]="fatalDays" title="Fatal retention days" />
           <span class="days-unit">days</span>
         </div>
+
+        <div class="level-label"><lucide-icon name="bar-chart-2" [size]="12" style="margin-right:4px"/> Metrics</div>
+        <div class="days-control">
+          <input class="days-input" type="number" min="1" [(ngModel)]="metricsDays" title="Metrics retention days" />
+          <span class="days-unit">days</span>
+        </div>
+
+        <div class="level-label"><lucide-icon name="git-branch" [size]="12" style="margin-right:4px"/> Traces</div>
+        <div class="days-control">
+          <input class="days-input" type="number" min="1" [(ngModel)]="tracesDays" title="Traces retention days" />
+          <span class="days-unit">days</span>
+        </div>
       </div>
 
       <div class="retention-footer">
         @if (runResult(); as r) {
           <span class="run-result ok">
-            Deleted {{ r.deletedSegments }} segment(s) · freed {{ (r.freedBytes / 1048576).toFixed(1) }} MB
+            Logs: {{ r.deletedSegments }} seg · {{ (r.freedBytes / 1048576).toFixed(1) }} MB freed
+            @if (r.deletedMetricFiles > 0) { &nbsp;· Metrics: {{ r.deletedMetricFiles }} file(s) }
+            @if (r.deletedTraceFiles > 0) { &nbsp;· Traces: {{ r.deletedTraceFiles }} file(s) }
           </span>
         } @else {
           <span></span>

@@ -270,12 +270,15 @@ internal sealed class DynamicObjectConverter : JsonConverter<object>
 /// <summary>JSON-serialisable view of a <see cref="LogEvent"/>.</summary>
 internal sealed class LogEventDto
 {
-    [JsonPropertyName("@t")]  public string Timestamp       { get; init; } = "";
-    [JsonPropertyName("@mt")] public string MessageTemplate { get; init; } = "";
-    [JsonPropertyName("@l")]  public string Level           { get; init; } = "";
-    [JsonPropertyName("@x")]  public ExceptionInfoDto? Exception { get; init; }
-    [JsonPropertyName("id")]  public string Id              { get; init; } = "";
-    [JsonPropertyName("props")] public Dictionary<string, object?>? Properties { get; init; }
+    [JsonPropertyName("@t")]            public string Timestamp       { get; init; } = "";
+    [JsonPropertyName("@mt")]           public string MessageTemplate { get; init; } = "";
+    [JsonPropertyName("@l")]            public string Level           { get; init; } = "";
+    [JsonPropertyName("@x")]            public ExceptionInfoDto? Exception { get; init; }
+    [JsonPropertyName("id")]            public string Id              { get; init; } = "";
+    [JsonPropertyName("@tr")]           public string? TraceId        { get; init; }
+    [JsonPropertyName("@sp")]           public string? SpanId         { get; init; }
+    [JsonPropertyName("service.name")]  public string? ServiceName    { get; init; }
+    [JsonPropertyName("props")]         public Dictionary<string, object?>? Properties { get; init; }
 
     public static LogEventDto From(LogEvent ev) => new()
     {
@@ -284,6 +287,9 @@ internal sealed class LogEventDto
         Level           = ev.Level.ToSeqString(),
         Exception       = ExceptionInfoDto.From(ev.Exception),
         Id              = ev.Id.RawValue.ToString(),
+        TraceId         = TraceIdHelper.FormatTraceId(ev.TraceIdHi, ev.TraceIdLo),
+        SpanId          = TraceIdHelper.FormatSpanId(ev.SpanId),
+        ServiceName     = ev.ServiceName,
         Properties      = ev.Properties,
     };
 }

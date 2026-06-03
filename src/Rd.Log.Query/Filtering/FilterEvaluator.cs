@@ -53,6 +53,9 @@ public static class FilterEvaluator
             case "@x\u0001inner\u0001type"    or "Exception\u0001Inner\u0001Type":    return ev.Exception?.Inner?.Type;
             case "@x\u0001inner\u0001message" or "Exception\u0001Inner\u0001Message": return ev.Exception?.Inner?.Message;
             case "@t" or "Timestamp":        return ev.Timestamp.ToString("O");
+            case "@tr" or "TraceId":         return TraceIdHelper.FormatTraceId(ev.TraceIdHi, ev.TraceIdLo);
+            case "@sp" or "SpanId":          return TraceIdHelper.FormatSpanId(ev.SpanId);
+            case ClefFields.ServiceName:     return ev.ServiceName;
         }
 
         if (ev.Properties is null) return null;

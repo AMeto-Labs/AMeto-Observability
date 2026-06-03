@@ -127,13 +127,16 @@ public sealed class IngestionEndpoint
                     ? -1
                     : _pool.Intern(ev.MessageTemplate);
 
+                int svcIdx = ev.ServiceName is not null ? _pool.Intern(ev.ServiceName) : -1;
+
                 bool ok = _ring.TryEnqueue(
                     ev.Timestamp.UtcTicks,
                     (byte)ev.Level,
                     tmplIdx,
                     ev.MessageTemplate,
                     ev.Exception,
-                    ev.RawProperties.Span);
+                    ev.RawProperties.Span,
+                    ev.TraceIdHi, ev.TraceIdLo, ev.SpanId, svcIdx);
 
                 if (ok) ingested++;
                 else    dropped++;
@@ -166,13 +169,16 @@ public sealed class IngestionEndpoint
                 ? -1
                 : _pool.Intern(ev.MessageTemplate);
 
+            int svcIdx = ev.ServiceName is not null ? _pool.Intern(ev.ServiceName) : -1;
+
             bool ok = _ring.TryEnqueue(
                 ev.Timestamp.UtcTicks,
                 (byte)ev.Level,
                 tmplIdx,
                 ev.MessageTemplate,
                 ev.Exception,
-                ev.RawProperties.Span);
+                ev.RawProperties.Span,
+                ev.TraceIdHi, ev.TraceIdLo, ev.SpanId, svcIdx);
 
             if (ok) ingested++;
             else    dropped++;

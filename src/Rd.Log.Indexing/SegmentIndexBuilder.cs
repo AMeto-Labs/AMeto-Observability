@@ -77,6 +77,33 @@ public sealed class SegmentIndexBuilder
                 }
             }
 
+            // TraceId — inverted + bloom (no trigram — exact hex lookup only)
+            if (header.HasTraceId)
+            {
+                string traceHex = TraceIdHelper.FormatTraceId(header.TraceIdHi, header.TraceIdLo)!;
+                _inverted.Add(localOffset, ClefFields.TraceId, traceHex);
+                _bloom.Add(traceHex);
+            }
+
+            // SpanId — inverted + bloom
+            if (header.HasSpanId)
+            {
+                string spanHex = TraceIdHelper.FormatSpanId(header.SpanId)!;
+                _inverted.Add(localOffset, ClefFields.SpanId, spanHex);
+                _bloom.Add(spanHex);
+            }
+
+            // ServiceName — inverted + bloom
+            if (header.ServiceNamePoolIndex >= 0)
+            {
+                string svcName = pool.Get(header.ServiceNamePoolIndex);
+                if (!string.IsNullOrEmpty(svcName))
+                {
+                    _inverted.Add(localOffset, ClefFields.ServiceName, svcName);
+                    _bloom.Add(svcName);
+                }
+            }
+
             // Properties — recursive flatten → inverted + bloom + trigram
             var props = hot.ReadPropertiesPayload(i, pool);
             if (props is not null)

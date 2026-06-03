@@ -70,6 +70,24 @@
                 <td class="pv">{{ event().id }}</td>
               </tr>
             }
+            @if (service()) {
+              <tr (click)="openPropMenu($event, 'service.name', service())" class="prop-row">
+                <td class="pk">service.name</td>
+                <td class="pv">{{ service() }}</td>
+              </tr>
+            }
+            @if (traceId()) {
+              <tr (click)="openPropMenu($event, '@tr', traceId())" class="prop-row">
+                <td class="pk">@tr</td>
+                <td class="pv ev-trace-id">{{ traceId() }}</td>
+              </tr>
+            }
+            @if (spanId()) {
+              <tr (click)="openPropMenu($event, '@sp', spanId())" class="prop-row">
+                <td class="pk">@sp</td>
+                <td class="pv ev-span-id">{{ spanId() }}</td>
+              </tr>
+            }
             @for (kv of allProps(); track kv.path) {
               @if (kv.isGroup) {
                 <tr (click)="openPropMenu($event, kv.path, '', true)" class="prop-row group">

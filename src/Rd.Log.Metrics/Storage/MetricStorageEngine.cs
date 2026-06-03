@@ -3,6 +3,7 @@ using System.Runtime.CompilerServices;
 using K4os.Compression.LZ4;
 using MessagePack;
 using Microsoft.Extensions.Logging;
+using Rd.Log.Core;
 
 namespace Rd.Log.Metrics.Storage;
 
@@ -26,11 +27,11 @@ namespace Rd.Log.Metrics.Storage;
 /// 1-hour-granularity aggregates. Raw files are deleted after rollup.
 /// </para>
 /// </summary>
-public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IAsyncDisposable
+public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IRetentionTarget, IAsyncDisposable
 {
     // ── Configuration ─────────────────────────────────────────────────────────
-    private const int HotFlushThreshold   = 500_000;   // total points before forced flush
-    private const int FlushIntervalSeconds = 60;
+    private const int HotFlushThreshold    = 500_000;   // total points before forced flush
+    private const int FlushIntervalSeconds  = 300;        // 5 minutes
 
     // ── Hot tier ─────────────────────────────────────────────────────────────
     private readonly ConcurrentDictionary<SeriesKey, HotSeries> _hot = new();
@@ -258,15 +259,25 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IAsyncD
 
     private Task PerformRollupAsync(CancellationToken ct)
     {
+        // Compact raw files older than 10 min but newer than the 1-h rollup cutoff
+        // (merges many small flush files into one without downsampling)
+        var compactCutoff = DateTimeOffset.UtcNow.AddMinutes(-10).ToUnixTimeMilliseconds() * 1_000_000L;
+
         // Rollup raw files older than 1 hour → 5-min buckets
         var cutoff1h   = DateTimeOffset.UtcNow.AddHours(-1).ToUnixTimeMilliseconds()  * 1_000_000L;
         var cutoff24h  = DateTimeOffset.UtcNow.AddHours(-24).ToUnixTimeMilliseconds() * 1_000_000L;
 
+        List<MetricSegmentInfo> toCompact;
         List<MetricSegmentInfo> toRollup5m;
         List<MetricSegmentInfo> toRollup1h;
         _coldLock.EnterReadLock();
         try
         {
+            toCompact  = _coldSegments
+                .Where(s => s.Granularity == MetricGranularity.Raw
+                         && s.MaxNano < compactCutoff
+                         && s.MaxNano >= cutoff1h)
+                .ToList();
             toRollup5m = _coldSegments
                 .Where(s => s.Granularity == MetricGranularity.Raw && s.MaxNano < cutoff1h)
                 .ToList();
@@ -276,12 +287,66 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IAsyncD
         }
         finally { _coldLock.ExitReadLock(); }
 
-        if (toRollup5m.Count > 0)
-            Rollup(toRollup5m, MetricGranularity.FiveMin, TimeSpan.FromMinutes(5));
-        if (toRollup1h.Count > 0)
-            Rollup(toRollup1h, MetricGranularity.OneHour, TimeSpan.FromHours(1));
+        if (toCompact.Count >= 2)  CompactRawSegments(toCompact);
+        if (toRollup5m.Count > 0)  Rollup(toRollup5m, MetricGranularity.FiveMin, TimeSpan.FromMinutes(5));
+        if (toRollup1h.Count > 0)  Rollup(toRollup1h, MetricGranularity.OneHour, TimeSpan.FromHours(1));
 
         return Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// Merges multiple small raw segments for the same metric into one file
+    /// without downsampling. Reduces file count for the current-hour window.
+    /// </summary>
+    private void CompactRawSegments(List<MetricSegmentInfo> sources)
+    {
+        foreach (var group in sources.GroupBy(s => s.MetricName))
+        {
+            var segs = group.ToList();
+            if (segs.Count < 2) continue;
+
+            try
+            {
+                var allSeries = new Dictionary<SeriesKey, List<MetricDataPoint>>();
+                foreach (var seg in segs)
+                {
+                    foreach (var series in MetricReader.ReadAllSync(seg.FilePath))
+                    {
+                        var key = new SeriesKey(series.Name, series.Kind, series.Unit, series.Labels);
+                        if (!allSeries.TryGetValue(key, out var pts))
+                        {
+                            pts = new List<MetricDataPoint>();
+                            allSeries[key] = pts;
+                        }
+                        pts.AddRange(series.Points);
+                    }
+                }
+
+                var merged = allSeries
+                    .Select(kv => (kv.Key, new HotSeries(kv.Value.OrderBy(p => p.TimestampUnixNano).ToList())))
+                    .ToList();
+
+                var newInfos = MetricWriter.Write(_dataDir, merged, MetricGranularity.Raw);
+
+                _coldLock.EnterWriteLock();
+                try
+                {
+                    foreach (var s in segs) _coldSegments.Remove(s);
+                    _coldSegments.AddRange(newInfos);
+                }
+                finally { _coldLock.ExitWriteLock(); }
+
+                foreach (var s in segs)
+                    try { File.Delete(s.FilePath); } catch { /* best effort */ }
+
+                _logger.LogDebug("Compacted {Count} raw segments for metric '{Metric}'",
+                    segs.Count, group.Key);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Raw compaction failed for metric '{Metric}'", group.Key);
+            }
+        }
     }
 
     private void Rollup(
@@ -411,6 +476,34 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IAsyncD
         catch (OperationCanceledException) { }
         _cts.Dispose();
         _coldLock.Dispose();
+    }
+
+    // ── IRetentionTarget ──────────────────────────────────────────────────────
+
+    public string RetentionKey => "metrics";
+
+    public Task<int> PruneAsync(TimeSpan ttl, CancellationToken ct = default)
+    {
+        var cutoffNano = DateTimeOffset.UtcNow.Subtract(ttl).ToUnixTimeMilliseconds() * 1_000_000L;
+
+        List<MetricSegmentInfo> toDelete;
+        _coldLock.EnterWriteLock();
+        try
+        {
+            toDelete = _coldSegments.Where(s => s.MaxNano < cutoffNano).ToList();
+            foreach (var s in toDelete)
+                _coldSegments.Remove(s);
+        }
+        finally { _coldLock.ExitWriteLock(); }
+
+        foreach (var s in toDelete)
+            try { File.Delete(s.FilePath); } catch { /* best effort */ }
+
+        if (toDelete.Count > 0)
+            _logger.LogInformation("Retention pruned {Count} metric file(s) older than {Days} days",
+                toDelete.Count, (int)ttl.TotalDays);
+
+        return Task.FromResult(toDelete.Count);
     }
 }
 

@@ -63,6 +63,8 @@ public sealed class RetentionConfig
     public int WarningDays     { get; init; } = 90;
     public int ErrorDays       { get; init; } = 90;
     public int FatalDays       { get; init; } = 90;
+    public int MetricsDays     { get; init; } = 30;
+    public int TracesDays      { get; init; } = 14;
 }
 
 /// <summary>

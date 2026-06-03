@@ -48,11 +48,13 @@ public interface ITraceProvider
     /// by service name and/or span name substring.
     /// </summary>
     IAsyncEnumerable<SpanRecord> SearchSpansAsync(
-        DateTimeOffset?  from        = null,
-        DateTimeOffset?  to          = null,
-        string?          serviceName = null,
-        string?          spanName    = null,
-        SpanStatusCode?  status      = null,
-        int              limit       = 200,
-        CancellationToken ct         = default);
+        DateTimeOffset?  from             = null,
+        DateTimeOffset?  to               = null,
+        string?          serviceName      = null,
+        string?          spanName         = null,
+        SpanStatusCode?  status           = null,
+        long?            minDurationNanos = null,
+        long?            maxDurationNanos = null,
+        int              limit            = 200,
+        CancellationToken ct              = default);
 }

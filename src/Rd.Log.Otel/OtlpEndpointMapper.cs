@@ -24,8 +24,9 @@ namespace Rd.Log.Otel;
 /// </summary>
 public static class OtlpEndpointMapper
 {
-    private const int    MaxBodyBytes = 8 * 1024 * 1024; // 8 MB
-    private const string JsonContentType = "application/json";
+    private const int    MaxBodyBytes        = 8 * 1024 * 1024; // 8 MB
+    private const string JsonContentType     = "application/json";
+    private const string ProtobufContentType = "application/x-protobuf";
 
     private static readonly JsonSerializerOptions _jsonOptions = new()
     {
@@ -46,8 +47,10 @@ public static class OtlpEndpointMapper
             ExportTraceServiceRequest? request;
             try
             {
-                // Deserialize directly from pooled buffer — no ToArray() copy
-                request = JsonSerializer.Deserialize<ExportTraceServiceRequest>(body.AsSpan(0, bodyLen), _jsonOptions);
+                bool isProto = ctx.Request.ContentType?.StartsWith(ProtobufContentType, StringComparison.OrdinalIgnoreCase) ?? false;
+                request = isProto
+                    ? OtlpProtoDecoder.DecodeTraces(body, bodyLen)
+                    : JsonSerializer.Deserialize<ExportTraceServiceRequest>(body.AsSpan(0, bodyLen), _jsonOptions);
             }
             catch { ctx.Response.StatusCode = 400; return; }
             finally { ArrayPool<byte>.Shared.Return(body); }
@@ -77,7 +80,10 @@ public static class OtlpEndpointMapper
             ExportMetricsServiceRequest? request;
             try
             {
-                request = JsonSerializer.Deserialize<ExportMetricsServiceRequest>(body.AsSpan(0, bodyLen), _jsonOptions);
+                bool isProto = ctx.Request.ContentType?.StartsWith(ProtobufContentType, StringComparison.OrdinalIgnoreCase) ?? false;
+                request = isProto
+                    ? OtlpProtoDecoder.DecodeMetrics(body, bodyLen)
+                    : JsonSerializer.Deserialize<ExportMetricsServiceRequest>(body.AsSpan(0, bodyLen), _jsonOptions);
             }
             catch { ctx.Response.StatusCode = 400; return; }
             finally { ArrayPool<byte>.Shared.Return(body); }
@@ -100,7 +106,10 @@ public static class OtlpEndpointMapper
             ExportLogsServiceRequest? request;
             try
             {
-                request = JsonSerializer.Deserialize<ExportLogsServiceRequest>(body.AsSpan(0, bodyLen), _jsonOptions);
+                bool isProto = ctx.Request.ContentType?.StartsWith(ProtobufContentType, StringComparison.OrdinalIgnoreCase) ?? false;
+                request = isProto
+                    ? OtlpProtoDecoder.DecodeLogs(body, bodyLen)
+                    : JsonSerializer.Deserialize<ExportLogsServiceRequest>(body.AsSpan(0, bodyLen), _jsonOptions);
             }
             catch { ctx.Response.StatusCode = 400; return; }
             finally { ArrayPool<byte>.Shared.Return(body); }
@@ -112,46 +121,6 @@ public static class OtlpEndpointMapper
             var (ingested, dropped) = endpoint.IngestEvents(events);
             await WriteJsonOk(ctx, ingested, dropped);
         });
-
-        // ── Query: traces ─────────────────────────────────────────────────────
-        app.MapGet("/api/traces", async (
-            HttpContext  ctx,
-            ITraceProvider provider,
-            string?      traceId     = null,
-            string?      service     = null,
-            string?      spanName    = null,
-            string?      status      = null,
-            string?      from        = null,
-            string?      to          = null,
-            int          count       = 100) =>
-        {
-            if (traceId is not null)
-            {
-                if (!Rd.Log.Tracing.TraceId.TryParseHex(traceId.AsSpan(), out var tid))
-                    return Results.BadRequest("Invalid traceId hex format.");
-
-                var spans = new List<SpanRecord>();
-                await foreach (var s in provider.GetTraceAsync(tid))
-                    spans.Add(s);
-                return Results.Ok(spans.Select(MapSpanToDto));
-            }
-            else
-            {
-                DateTimeOffset? fromDt = from is not null ? DateTimeOffset.Parse(from) : null;
-                DateTimeOffset? toDt   = to   is not null ? DateTimeOffset.Parse(to)   : null;
-                SpanStatusCode? statusCode = status?.ToLowerInvariant() switch
-                {
-                    "ok"    => SpanStatusCode.Ok,
-                    "error" => SpanStatusCode.Error,
-                    _       => null,
-                };
-
-                var spans = new List<SpanRecord>();
-                await foreach (var s in provider.SearchSpansAsync(fromDt, toDt, service, spanName, statusCode, count))
-                    spans.Add(s);
-                return Results.Ok(spans.Select(MapSpanToDto));
-            }
-        }).RequireAuthorization();
 
         // ── Query: metrics ────────────────────────────────────────────────────
         app.MapGet("/api/metrics/names", (IMetricQuery query, string? prefix) =>

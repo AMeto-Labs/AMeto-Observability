@@ -436,7 +436,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             _logger.LogInformation("Retention: deleted segment {Id} (expires {Max})", seg.Id, seg.MaxTimestamp);
         }
 
-        return new RetentionRunResult(expired.Count, expired.Sum(s => s.CompressedBytes), now);
+        return new RetentionRunResult(expired.Count, expired.Sum(s => s.CompressedBytes), 0, 0, now);
     }
 
     // ── Startup recovery ──────────────────────────────────────────────────────

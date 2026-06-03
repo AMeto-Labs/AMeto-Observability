@@ -11,6 +11,14 @@
         "WarningsOnly": true,
         "git -C \"C:\\Users\\ruslan.akhmetov\\Desktop\\Processing\\Rd.Log\"": true,
         "Get-Item": true,
-        "gh": true
+        "gh": true,
+        "msbuild": true,
+        "&": true,
+        "Out-File": true,
+        "dotnet list": true,
+        "Group-Object": true,
+        "npm install": true,
+        "npx ng": true,
+        "Tee-Object": true
     }
 }

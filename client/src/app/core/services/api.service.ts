@@ -7,6 +7,8 @@ import { NodeDto } from '../models/node.model';
 import { RetentionDto, RetentionRunResult } from '../models/retention.model';
 import { DiagnosticsDto } from '../models/diagnostics.model';
 import { ApiKeyDto, CreatedApiKeyDto, UserDto } from '../models/auth.model';
+import { SpanDto, SpanQueryParams, TraceRowDto, TraceStatsDto } from '../models/span.model';
+import { MetricSeriesDto } from '../models/metric.model';
 import { AuthService } from './auth.service';
 
 @Injectable({ providedIn: 'root' })
@@ -118,4 +120,43 @@ export class ApiService {
     return this.http.post<CreatedApiKeyDto>('/api/auth/keys', { name, key: key || null });
   }
   deleteApiKey(id: string): Observable<void>  { return this.http.delete<void>(`/api/auth/keys/${id}`); }
+
+  // ── Traces ─────────────────────────────────────────────────────────────────
+  getTraceStats(from: string, to?: string): Observable<TraceStatsDto> {
+    const p = new URLSearchParams({ from });
+    if (to) p.set('to', to);
+    return this.http.get<TraceStatsDto>(`/api/traces/stats?${p.toString()}`);
+  }
+
+  searchTraces(params: SpanQueryParams = {}): Observable<TraceRowDto[]> {
+    const p = new URLSearchParams();
+    if (params.from)           p.set('from',           params.from);
+    if (params.to)             p.set('to',             params.to);
+    if (params.service)        p.set('service',        params.service);
+    if (params.spanName)       p.set('name',           params.spanName);
+    if (params.status)         p.set('status',         params.status);
+    if (params.minDurationMs)  p.set('minDurationMs',  String(params.minDurationMs));
+    if (params.maxDurationMs)  p.set('maxDurationMs',  String(params.maxDurationMs));
+    if (params.httpStatus)     p.set('httpStatus',     params.httpStatus);
+    if (params.limit)          p.set('limit',          String(params.limit));
+    return this.http.get<TraceRowDto[]>(`/api/traces?${p.toString()}`);
+  }
+
+  getTrace(traceId: string): Observable<SpanDto[]> {
+    return this.http.get<SpanDto[]>(`/api/traces/${encodeURIComponent(traceId)}`);
+  }
+
+  // ── Metrics ────────────────────────────────────────────────────────────────
+  getMetricNames(prefix?: string): Observable<string[]> {
+    const p = prefix ? `?prefix=${encodeURIComponent(prefix)}` : '';
+    return this.http.get<string[]>(`/api/metrics/names${p}`);
+  }
+
+  queryMetric(name: string, from?: string, to?: string, step?: string): Observable<MetricSeriesDto[]> {
+    const p = new URLSearchParams({ metric: name });
+    if (from) p.set('from', from);
+    if (to)   p.set('to',   to);
+    if (step) p.set('step', step);
+    return this.http.get<MetricSeriesDto[]>(`/api/metrics?${p.toString()}`);
+  }
 }

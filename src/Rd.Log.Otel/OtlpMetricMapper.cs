@@ -14,26 +14,41 @@ public static class OtlpMetricMapper
         var result = new List<MetricIngestItem>();
 
         foreach (var rm in request.ResourceMetrics ?? [])
-        foreach (var sm in rm.ScopeMetrics ?? [])
-        foreach (var metric in sm.Metrics ?? [])
         {
-            if (metric.Name is null) continue;
+            string? serviceName = ExtractServiceName(rm.Resource?.Attributes);
+            foreach (var sm in rm.ScopeMetrics ?? [])
+            foreach (var metric in sm.Metrics ?? [])
+            {
+                if (metric.Name is null) continue;
 
-            if (metric.Gauge is not null)
-                MapNumberPoints(metric.Name, metric.Unit ?? "", MetricKind.Gauge,
-                    metric.Gauge.DataPoints, result);
+                if (metric.Gauge is not null)
+                    MapNumberPoints(metric.Name, metric.Unit ?? "", MetricKind.Gauge,
+                        metric.Gauge.DataPoints, serviceName, result);
 
-            else if (metric.Sum is not null)
-                MapNumberPoints(metric.Name, metric.Unit ?? "",
-                    metric.Sum.IsMonotonic ? MetricKind.Counter : MetricKind.Gauge,
-                    metric.Sum.DataPoints, result);
+                else if (metric.Sum is not null)
+                    MapNumberPoints(metric.Name, metric.Unit ?? "",
+                        metric.Sum.IsMonotonic ? MetricKind.Counter : MetricKind.Gauge,
+                        metric.Sum.DataPoints, serviceName, result);
 
-            else if (metric.Histogram is not null)
-                MapHistogramPoints(metric.Name, metric.Unit ?? "",
-                    metric.Histogram.DataPoints, result);
+                else if (metric.Histogram is not null)
+                    MapHistogramPoints(metric.Name, metric.Unit ?? "",
+                        metric.Histogram.DataPoints, serviceName, result);
+            }
         }
 
         return result;
+    }
+
+    private static string? ExtractServiceName(List<OtlpKeyValue>? attrs)
+    {
+        if (attrs is null) return null;
+        for (int i = 0; i < attrs.Count; i++)
+        {
+            var kv = attrs[i];
+            if (kv.Key == "service.name" && kv.Value?.StringValue is { } sv)
+                return sv;
+        }
+        return null;
     }
 
     private static void MapNumberPoints(
@@ -41,6 +56,7 @@ public static class OtlpMetricMapper
         string                      unit,
         MetricKind                  kind,
         List<OtlpNumberDataPoint>?  points,
+        string?                     serviceName,
         List<MetricIngestItem>      result)
     {
         foreach (var dp in points ?? [])
@@ -53,7 +69,7 @@ public static class OtlpMetricMapper
                 Name              = name,
                 Unit              = unit,
                 Kind              = kind,
-                Labels            = ExtractLabels(dp.Attributes),
+                Labels            = ExtractLabels(dp.Attributes, serviceName),
                 TimestampUnixNano = OtlpTraceMapper.ParseNanoString(dp.TimeUnixNano),
                 ScalarValue       = value,
             });
@@ -64,6 +80,7 @@ public static class OtlpMetricMapper
         string                          name,
         string                          unit,
         List<OtlpHistogramDataPoint>?   points,
+        string?                         serviceName,
         List<MetricIngestItem>          result)
     {
         foreach (var dp in points ?? [])
@@ -92,7 +109,7 @@ public static class OtlpMetricMapper
                 Name              = name,
                 Unit              = unit,
                 Kind              = MetricKind.Histogram,
-                Labels            = ExtractLabels(dp.Attributes),
+                Labels            = ExtractLabels(dp.Attributes, serviceName),
                 TimestampUnixNano = OtlpTraceMapper.ParseNanoString(dp.TimeUnixNano),
                 HistogramCount    = count,
                 HistogramSum      = dp.Sum ?? 0,
@@ -102,16 +119,25 @@ public static class OtlpMetricMapper
         }
     }
 
-    private static LabelSet ExtractLabels(List<OtlpKeyValue>? attrs)
+    private static LabelSet ExtractLabels(List<OtlpKeyValue>? attrs, string? serviceName = null)
     {
-        if (attrs is null || attrs.Count == 0) return LabelSet.Empty;
+        var capacity = (attrs?.Count ?? 0) + (serviceName is not null ? 1 : 0);
+        if (capacity == 0) return LabelSet.Empty;
 
         // for loop — avoids two LINQ iterator object allocations per data point
-        var pairs = new List<KeyValuePair<string, string>>(attrs.Count);
+        var pairs = new List<KeyValuePair<string, string>>(capacity);
+        if (serviceName is not null)
+            pairs.Add(new KeyValuePair<string, string>("service.name", serviceName));
+        if (attrs is not null)
         for (int i = 0; i < attrs.Count; i++)
         {
             var kv = attrs[i];
-            if (kv.Key is not null && kv.Value?.StringValue is { } sv)
+            if (kv.Key is null || kv.Value is null) continue;
+            var sv = kv.Value.StringValue
+                ?? kv.Value.IntValue
+                ?? kv.Value.DoubleValue?.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                ?? (kv.Value.BoolValue.HasValue ? kv.Value.BoolValue.Value.ToString().ToLowerInvariant() : null);
+            if (sv is not null)
                 pairs.Add(new KeyValuePair<string, string>(kv.Key, sv));
         }
         return pairs.Count == 0 ? LabelSet.Empty : new LabelSet(pairs);

@@ -43,6 +43,12 @@ public static class OtlpTraceMapper
         if (!TraceId.TryParseHex(span.TraceId.AsSpan(), out var traceId)) return null;
         if (!SpanId.TryParseHex(span.SpanId.AsSpan(), out var spanId))    return null;
 
+        // Drop outbound HTTP spans that are calls to Rd.Log's own ingestion endpoints.
+        // These appear when the app has AddHttpClientInstrumentation() and the Rd.Log
+        // Serilog sink (or any OTLP exporter) ships telemetry back to this server.
+        if (span.Kind == 3 /* CLIENT */ && IsRdLogInternalSpan(span.Attributes))
+            return null;
+
         SpanId parentId = default;
         if (!string.IsNullOrEmpty(span.ParentSpanId))
             SpanId.TryParseHex(span.ParentSpanId.AsSpan(), out parentId);
@@ -75,6 +81,27 @@ public static class OtlpTraceMapper
             2 => SpanStatusCode.Error,
             _ => SpanStatusCode.Unset,
         };
+
+    /// <summary>
+    /// Returns <c>true</c> for outbound CLIENT spans whose URL targets Rd.Log's own
+    /// ingestion or OTLP endpoints (/api/events, /otlp/v1/*).
+    /// </summary>
+    private static bool IsRdLogInternalSpan(List<OtlpKeyValue>? attrs)
+    {
+        if (attrs is null) return false;
+        foreach (var kv in attrs)
+        {
+            // Both old (http.url / http.target) and new (url.full / url.path) semconv
+            var key = kv.Key;
+            if (key is not ("url.full" or "url.path" or "http.url" or "http.target")) continue;
+            var val = kv.Value?.StringValue;
+            if (val is null) continue;
+            if (val.Contains("/api/events", StringComparison.OrdinalIgnoreCase) ||
+                val.Contains("/otlp/v1/",   StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
 
     internal static string ExtractServiceName(OtlpResource? resource)
     {

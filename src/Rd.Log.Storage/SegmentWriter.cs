@@ -33,7 +33,7 @@ public sealed class SegmentWriter : IDisposable
 {
     private const uint   MagicHeader = 0x52_44_4C_47; // "RDLG"
     private const uint   MagicFooter = 0x52_44_46_54; // "RDFT"
-    private const ushort SegVersion  = 3;             // v3: columnar block layout + structured exceptions
+    private const ushort SegVersion  = 4;             // v4: + TraceId/SpanId/ServiceName columns
     private const int    BlockSize   = 64 * 1024;      // 64 KB target uncompressed block size
 
     public  const byte   FlagCompressed = 0x01;
@@ -206,6 +206,8 @@ public sealed class SegmentWriter : IDisposable
         var colT = new byte[n * 8];
         var colL = new byte[n];
         var colI = new byte[n * 8];
+        var colTr = new byte[n * 16];  // TraceId: Hi(8) + Lo(8) per event
+        var colSp = new byte[n * 8];   // SpanId: 8 bytes per event
 
         var tmplOffsets  = new uint[n + 1];
         var tmplBytes    = new MemoryStream(1024);
@@ -213,6 +215,8 @@ public sealed class SegmentWriter : IDisposable
         var excBytes     = new MemoryStream(256);
         var propsOffsets = new uint[n + 1];
         var propsBytes   = new MemoryStream(2048);
+        var svcOffsets   = new uint[n + 1];
+        var svcBytes     = new MemoryStream(256);
 
         ulong firstEventId = 0;
 
@@ -226,6 +230,10 @@ public sealed class SegmentWriter : IDisposable
             BinaryPrimitives.WriteInt64LittleEndian(colT.AsSpan(k * 8), h.TimestampUtcTicks - blockMinTs);
             colL[k] = (byte)h.Level;
             BinaryPrimitives.WriteUInt64LittleEndian(colI.AsSpan(k * 8), h.Id - blockMinId);
+
+            BinaryPrimitives.WriteUInt64LittleEndian(colTr.AsSpan(k * 16),     h.TraceIdHi);
+            BinaryPrimitives.WriteUInt64LittleEndian(colTr.AsSpan(k * 16 + 8), h.TraceIdLo);
+            BinaryPrimitives.WriteUInt64LittleEndian(colSp.AsSpan(k * 8),      h.SpanId);
 
             string template = hot.GetTemplate(i) ?? templatePool.Get(h.MessageTemplatePoolIndex) ?? string.Empty;
             tmplOffsets[k]  = (uint)tmplBytes.Length;
@@ -253,16 +261,34 @@ public sealed class SegmentWriter : IDisposable
             var props = hot.GetPropertiesPayload(i);
             if (props.Length > 0)
                 propsBytes.Write(props);
+
+            // ServiceName string column
+            svcOffsets[k] = (uint)svcBytes.Length;
+            string? svcName = h.ServiceNamePoolIndex >= 0
+                ? templatePool.Get(h.ServiceNamePoolIndex)
+                : null;
+            if (!string.IsNullOrEmpty(svcName))
+            {
+                int byteLen = Encoding.UTF8.GetByteCount(svcName);
+                var tmp     = ArrayPool<byte>.Shared.Rent(byteLen);
+                try
+                {
+                    int written = Encoding.UTF8.GetBytes(svcName, 0, svcName.Length, tmp, 0);
+                    svcBytes.Write(tmp, 0, written);
+                }
+                finally { ArrayPool<byte>.Shared.Return(tmp); }
+            }
         }
         tmplOffsets[n]  = (uint)tmplBytes.Length;
         excOffsets[n]   = (uint)excBytes.Length;
         propsOffsets[n] = (uint)propsBytes.Length;
+        svcOffsets[n]   = (uint)svcBytes.Length;
 
         var blk = new MemoryStream(BlockSize);
         WriteUInt32(blk, (uint)n);
         WriteInt64(blk, blockMinTs);
         WriteUInt64(blk, blockMinId);
-        blk.WriteByte(6);
+        blk.WriteByte(9);
 
         WriteColumn(blk, 1, colT);
         WriteColumn(blk, 2, colL);
@@ -270,6 +296,9 @@ public sealed class SegmentWriter : IDisposable
         WriteStringColumn(blk, 4, tmplOffsets, tmplBytes);
         WriteStringColumn(blk, 5, excOffsets,  excBytes);
         WriteStringColumn(blk, 6, propsOffsets, propsBytes);
+        WriteColumn(blk, 7, colTr);
+        WriteColumn(blk, 8, colSp);
+        WriteStringColumn(blk, 9, svcOffsets, svcBytes);
 
         byte[] uncompressed = blk.ToArray();
         int    maxOut       = LZ4Codec.MaximumOutputSize(uncompressed.Length);

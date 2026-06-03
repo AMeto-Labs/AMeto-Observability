@@ -87,6 +87,19 @@ public interface ISegmentManager
 }
 
 /// <summary>
+/// Implemented by metric / trace storage engines to support time-based data pruning.
+/// Called by <c>RetentionBackgroundService</c> every hour and by the manual /run endpoint.
+/// </summary>
+public interface IRetentionTarget
+{
+    /// <summary>Logical name used to look up the TTL in <c>RetentionDto</c>: "metrics" or "traces".</summary>
+    string RetentionKey { get; }
+
+    /// <summary>Deletes cold segments whose max timestamp is older than <paramref name="ttl"/>.</summary>
+    Task<int> PruneAsync(TimeSpan ttl, CancellationToken ct = default);
+}
+
+/// <summary>
 /// Per-segment index: inverted index, bloom filter, trigram.
 /// Used during flush to build the index, and during query to consult it.
 /// </summary>

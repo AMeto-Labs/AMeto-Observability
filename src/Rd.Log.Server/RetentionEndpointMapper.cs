@@ -1,3 +1,4 @@
+using Rd.Log.Core;
 using Rd.Log.Storage;
 
 namespace Rd.Log.Server;
@@ -22,10 +23,31 @@ public static class RetentionEndpointMapper
             return Results.Ok(store.Get());
         }).RequireAuthorization();
 
-        app.MapPost("/api/retention/run", async (StorageEngine storage) =>
+        app.MapPost("/api/retention/run", async (
+            StorageEngine storage,
+            RetentionStore store,
+            IEnumerable<IRetentionTarget> targets) =>
         {
-            var result = await storage.EnforceRetentionAsync();
-            return Results.Ok(result);
+            var logResult = await storage.EnforceRetentionAsync();
+            var dto = store.Get();
+            var metricFiles = 0;
+            var traceFiles  = 0;
+            foreach (var target in targets)
+            {
+                var days = target.RetentionKey switch
+                {
+                    "metrics" => dto.MetricsDays,
+                    "traces"  => dto.TracesDays,
+                    _         => 30,
+                };
+                var pruned = await target.PruneAsync(TimeSpan.FromDays(Math.Max(1, days)));
+                if (target.RetentionKey == "metrics") metricFiles += pruned;
+                else if (target.RetentionKey == "traces") traceFiles += pruned;
+            }
+            return Results.Ok(new RetentionRunResult(
+                logResult.DeletedSegments, logResult.FreedBytes,
+                metricFiles, traceFiles,
+                logResult.RanAt));
         }).RequireAuthorization();
     }
 }

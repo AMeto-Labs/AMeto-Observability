@@ -262,6 +262,14 @@
 .pv[data-level="error"]       { color: var(--lvl-e); }
 .pv[data-level="fatal"]       { color: var(--lvl-f); }
 
+.ev-trace-id,
+.ev-span-id {
+  font-family: 'Consolas', 'Menlo', monospace;
+  font-size: 11px;
+  color: var(--info);
+  letter-spacing: 0.02em;
+}
+
 .ev-raw {
   font-size: 11px;
   white-space: pre-wrap;

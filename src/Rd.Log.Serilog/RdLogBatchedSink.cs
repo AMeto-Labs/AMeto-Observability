@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Diagnostics;
 using System.Net.Http.Headers;
 using MessagePack;
 using Serilog.Debugging;
@@ -16,17 +17,21 @@ internal sealed class RdLogBatchedSink : IBatchedLogEventSink, IDisposable
 {
     private static readonly MediaTypeHeaderValue MsgPackMedia = new("application/x-msgpack");
 
-    private readonly Uri        _endpoint;
-    private readonly string?    _apiKey;
-    private readonly HttpClient _http;
-    private readonly bool       _ownsHttp;
+    private readonly Uri                  _endpoint;
+    private readonly string?              _apiKey;
+    private readonly ReadOnlyMemory<byte> _serviceNameUtf8;
+    private readonly HttpClient           _http;
+    private readonly bool                 _ownsHttp;
+    private readonly PooledBufferWriter   _bufWriter = new(65_536);
 
-    public RdLogBatchedSink(string serverUrl, string? apiKey, HttpClient? httpClient)
+    public RdLogBatchedSink(string serverUrl, string? apiKey, string? serviceName, HttpClient? httpClient)
     {
-        // Normalise: allow trailing slash, append the ingestion path.
-        var baseUri = new Uri(serverUrl, UriKind.Absolute);
-        _endpoint   = new Uri(baseUri, "api/events");
-        _apiKey     = apiKey;
+        var baseUri      = new Uri(serverUrl, UriKind.Absolute);
+        _endpoint        = new Uri(baseUri, "api/events");
+        _apiKey          = apiKey;
+        _serviceNameUtf8 = serviceName is not null
+            ? System.Text.Encoding.UTF8.GetBytes(serviceName)
+            : ReadOnlyMemory<byte>.Empty;
 
         if (httpClient is null)
         {
@@ -42,15 +47,19 @@ internal sealed class RdLogBatchedSink : IBatchedLogEventSink, IDisposable
 
     public async Task EmitBatchAsync(IEnumerable<LogEvent> batch)
     {
-        // Materialise to a list once so we can both count and re-iterate.
-        var list    = batch as IList<LogEvent> ?? batch.ToList();
+        var list = batch as IList<LogEvent> ?? batch.ToList();
         if (list.Count == 0) return;
 
-        byte[] payload = Serialize(list);
+        ReadOnlyMemory<byte> payload = Serialize(list);
 
+        // Detach from any active OTel trace context so that HttpClient instrumentation
+        // won't create a child span inside the calling application's traces.
+        // The POST to /api/events is infrastructure noise, not business logic.
+        var savedActivity = Activity.Current;
+        Activity.Current = null;
         try
         {
-            using var content = new ByteArrayContent(payload);
+            using var content = new ReadOnlyMemoryContent(payload);
             content.Headers.ContentType = MsgPackMedia;
 
             using var request = new HttpRequestMessage(HttpMethod.Post, _endpoint) { Content = content };
@@ -70,24 +79,27 @@ internal sealed class RdLogBatchedSink : IBatchedLogEventSink, IDisposable
             SelfLog.WriteLine("Rd.Log sink: failed to emit batch: {0}", ex);
             throw; // PeriodicBatchingSink handles retry/queue-back-off
         }
+        finally
+        {
+            Activity.Current = savedActivity;
+        }
     }
 
     /// <summary>
-    /// Encodes the batch as a top-level MessagePack array of CLEF maps.
-    /// Kept in a non-async method because <see cref="MessagePackWriter"/> is a
-    /// <c>ref struct</c> and may not cross async suspension points.
+    /// Encodes the batch into the reused pooled buffer. Returns a slice of that
+    /// buffer — valid only until the next call to <see cref="Serialize"/>.
     /// </summary>
-    private static byte[] Serialize(IList<LogEvent> events)
+    private ReadOnlyMemory<byte> Serialize(IList<LogEvent> events)
     {
-        var buffer = new ArrayBufferWriter<byte>(4096);
-        var writer = new MessagePackWriter(buffer);
+        _bufWriter.Reset();
+        var writer = new MessagePackWriter(_bufWriter);
 
         writer.WriteArrayHeader(events.Count);
         foreach (var evt in events)
-            RdLogClefFormatter.Write(ref writer, evt);
+            RdLogClefFormatter.Write(ref writer, evt, _serviceNameUtf8);
         writer.Flush();
 
-        return buffer.WrittenSpan.ToArray();
+        return _bufWriter.WrittenMemory;
     }
 
     public Task OnEmptyBatchAsync() => Task.CompletedTask;
@@ -101,5 +113,53 @@ internal sealed class RdLogBatchedSink : IBatchedLogEventSink, IDisposable
     public void Dispose()
     {
         if (_ownsHttp) _http.Dispose();
+        _bufWriter.Dispose();
+    }
+}
+
+/// <summary>
+/// <see cref="IBufferWriter{T}"/> backed by a rented <see cref="ArrayPool{T}"/> buffer.
+/// Resizes automatically (returning the old buffer) and is reused across batches via <see cref="Reset"/>.
+/// </summary>
+internal sealed class PooledBufferWriter : IBufferWriter<byte>, IDisposable
+{
+    private byte[] _buf;
+    private int    _pos;
+
+    public PooledBufferWriter(int initialCapacity)
+        => _buf = ArrayPool<byte>.Shared.Rent(initialCapacity);
+
+    public void Advance(int count) => _pos += count;
+
+    public Memory<byte> GetMemory(int sizeHint = 0)
+    {
+        Grow(sizeHint == 0 ? 256 : sizeHint);
+        return _buf.AsMemory(_pos);
+    }
+
+    public Span<byte> GetSpan(int sizeHint = 0)
+    {
+        Grow(sizeHint == 0 ? 256 : sizeHint);
+        return _buf.AsSpan(_pos);
+    }
+
+    public ReadOnlyMemory<byte> WrittenMemory => _buf.AsMemory(0, _pos);
+
+    public void Reset() => _pos = 0;
+
+    private void Grow(int needed)
+    {
+        if (_pos + needed <= _buf.Length) return;
+        int newSize = Math.Max(_buf.Length * 2, _pos + needed);
+        var next = ArrayPool<byte>.Shared.Rent(newSize);
+        _buf.AsSpan(0, _pos).CopyTo(next);
+        ArrayPool<byte>.Shared.Return(_buf);
+        _buf = next;
+    }
+
+    public void Dispose()
+    {
+        var tmp = System.Threading.Interlocked.Exchange(ref _buf, null!);
+        if (tmp is not null) ArrayPool<byte>.Shared.Return(tmp);
     }
 }

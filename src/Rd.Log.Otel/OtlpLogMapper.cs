@@ -59,6 +59,20 @@ public static class OtlpLogMapper
         var level = MapSeverity(rec.SeverityNumber, rec.SeverityText);
         string mt = rec.Body?.StringValue ?? string.Empty;
 
+        // Extract first-class correlation fields directly
+        TraceIdHelper.TryParseTraceId(rec.TraceId, out ulong traceIdHi, out ulong traceIdLo);
+        TraceIdHelper.TryParseSpanId(rec.SpanId, out ulong spanId);
+
+        // Extract service.name from resource attributes
+        string? serviceName = null;
+        if (resourceAttrs is not null)
+            for (int j = 0; j < resourceAttrs.Count; j++)
+                if (resourceAttrs[j].Key == "service.name")
+                {
+                    serviceName = resourceAttrs[j].Value?.StringValue;
+                    break;
+                }
+
         // Serialize all props directly — no intermediate Dictionary<> clone per record
         var rawProps = SerializeAllProps(resourceAttrs, rec.Attributes, rec.TraceId, rec.SpanId);
 
@@ -70,6 +84,10 @@ public static class OtlpLogMapper
             MessageTemplate = mt,
             Properties      = null,   // RawProperties is authoritative; no dict alloc
             RawProperties   = rawProps,
+            TraceIdHi       = traceIdHi,
+            TraceIdLo       = traceIdLo,
+            SpanId          = spanId,
+            ServiceName     = serviceName,
         };
     }
 
@@ -96,8 +114,8 @@ public static class OtlpLogMapper
         w.WriteMapHeader(count);
         WriteKeyValues(ref w, resourceAttrs);
         WriteKeyValues(ref w, recordAttrs);
-        if (!string.IsNullOrEmpty(traceId)) { w.Write("TraceId"); w.Write(traceId); }
-        if (!string.IsNullOrEmpty(spanId))  { w.Write("SpanId");  w.Write(spanId);  }
+        if (!string.IsNullOrEmpty(traceId)) { w.Write("@tr"); w.Write(traceId); }
+        if (!string.IsNullOrEmpty(spanId))  { w.Write("@sp"); w.Write(spanId);  }
         w.Flush();
         return buf.WrittenMemory;
     }

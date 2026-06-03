@@ -34,6 +34,8 @@ public sealed class RetentionStore
                 WarningDays     = options.Retention.WarningDays,
                 ErrorDays       = options.Retention.ErrorDays,
                 FatalDays       = options.Retention.FatalDays,
+                MetricsDays     = options.Retention.MetricsDays,
+                TracesDays      = options.Retention.TracesDays,
             };
             SaveToDb(_current);
         }
@@ -99,6 +101,8 @@ public sealed class RetentionStore
             WarningDays     = dict.GetValueOrDefault("warning",     90),
             ErrorDays       = dict.GetValueOrDefault("error",       90),
             FatalDays       = dict.GetValueOrDefault("fatal",       90),
+            MetricsDays     = dict.GetValueOrDefault("metrics",     30),
+            TracesDays      = dict.GetValueOrDefault("traces",      14),
         };
     }
 
@@ -112,6 +116,8 @@ public sealed class RetentionStore
             ("warning",     dto.WarningDays),
             ("error",       dto.ErrorDays),
             ("fatal",       dto.FatalDays),
+            ("metrics",     dto.MetricsDays),
+            ("traces",      dto.TracesDays),
         };
 
         using var conn = OpenConn();
@@ -146,6 +152,8 @@ public sealed class RetentionStore
 public sealed record RetentionRunResult(
     int              DeletedSegments,
     long             FreedBytes,
+    int              DeletedMetricFiles,
+    int              DeletedTraceFiles,
     DateTimeOffset   RanAt);
 
 /// <summary>
@@ -159,6 +167,8 @@ public sealed class RetentionDto
     public int WarningDays     { get; set; } = 90;
     public int ErrorDays       { get; set; } = 90;
     public int FatalDays       { get; set; } = 90;
+    public int MetricsDays     { get; set; } = 30;
+    public int TracesDays      { get; set; } = 14;
 
     public static RetentionDto FromPolicy(RetentionPolicy policy) => new()
     {

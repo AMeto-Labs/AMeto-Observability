@@ -31,10 +31,15 @@
 .PARAMETER SkipBuild
     Reuse an existing .nupkg in $OutputDir (skip pack step).
 
+.PARAMETER CopyTo
+    After packing, copy the produced .nupkg / .snupkg to this folder as well.
+    Example: -CopyTo "C:\path\to\local\feed"
+
 .EXAMPLE
     .\publish-nuget.ps1                           # use csproj version + $env:NUGET_API_KEY
     .\publish-nuget.ps1 -Version 0.2.0            # bump version, pack & push
     .\publish-nuget.ps1 -NoPush                   # just produce the .nupkg
+    .\publish-nuget.ps1 -NoPush -CopyTo "C:\local\nupkgs"  # pack + copy locally, no push
     .\publish-nuget.ps1 -ApiKey oy2... -Source https://api.nuget.org/v3/index.json
 #>
 param(
@@ -43,6 +48,7 @@ param(
     [string]$ApiKey        = $env:NUGET_API_KEY,
     [string]$Source        = "https://api.nuget.org/v3/index.json",
     [string]$OutputDir     = "artifacts/nuget",
+    [string]$CopyTo        = "C:\Users\ruslan.akhmetov\Desktop\Processing\NT.Processing-c\Services\nupkgs",
     [switch]$NoPush,
     [switch]$SkipBuild
 )
@@ -90,6 +96,19 @@ $nupkg = Get-ChildItem $outFull -Filter "Rd.Log.Serilog.*.nupkg" `
 
 if (-not $nupkg) { throw "No .nupkg produced in $outFull" }
 Write-Host "        Package: $($nupkg.FullName)" -ForegroundColor Green
+
+# ── 1b. Copy to local feed ────────────────────────────────────────────────────
+if ($CopyTo) {
+    New-Item -ItemType Directory -Force -Path $CopyTo | Out-Null
+    Copy-Item $nupkg.FullName -Destination $CopyTo -Force
+    Write-Host "        Copied .nupkg -> $CopyTo" -ForegroundColor Cyan
+    $snupkg = Get-ChildItem $outFull -Filter "Rd.Log.Serilog.*.snupkg" `
+              | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($snupkg) {
+        Copy-Item $snupkg.FullName -Destination $CopyTo -Force
+        Write-Host "        Copied .snupkg -> $CopyTo" -ForegroundColor Cyan
+    }
+}
 
 # ── 2. Push ───────────────────────────────────────────────────────────────────
 if ($NoPush) {

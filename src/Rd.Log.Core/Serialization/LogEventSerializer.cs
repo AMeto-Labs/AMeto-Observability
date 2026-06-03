@@ -117,6 +117,8 @@ public static class LogEventSerializer
         string? levelStr        = null;
         string? messageFallback = null;   // CLEF @m — promoted to @mt only if @mt missing
         ExceptionInfo? exception = null;
+        ulong   traceIdHi = 0, traceIdLo = 0, spanId = 0;
+        string? serviceName = null;
 
         ArrayBufferWriter<byte>? rawPropsBuf = null;
         int                      rawPropsCount = 0;
@@ -146,6 +148,21 @@ public static class LogEventSerializer
                     break;
                 case ClefFields.Exception:
                     exception = ExceptionInfo.Read(ref reader);
+                    break;
+                case ClefFields.TraceId:
+                {
+                    string? hex = reader.ReadString();
+                    TraceIdHelper.TryParseTraceId(hex, out traceIdHi, out traceIdLo);
+                    break;
+                }
+                case ClefFields.SpanId:
+                {
+                    string? hex = reader.ReadString();
+                    TraceIdHelper.TryParseSpanId(hex, out spanId);
+                    break;
+                }
+                case ClefFields.ServiceName:
+                    serviceName = reader.ReadString();
                     break;
                 default:
                     // Skip the value without decoding it; then copy the raw
@@ -204,6 +221,10 @@ public static class LogEventSerializer
             Exception       = exception,
             Properties      = null,
             RawProperties   = rawProps,
+            TraceIdHi       = traceIdHi,
+            TraceIdLo       = traceIdLo,
+            SpanId          = spanId,
+            ServiceName     = serviceName,
         };
     }
 

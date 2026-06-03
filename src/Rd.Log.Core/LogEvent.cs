@@ -12,7 +12,6 @@ public enum LogEventFlags : byte
     None         = 0,
     /// <summary>The event has a non-null <see cref="LogEvent.Exception"/> payload.</summary>
     HasException = 1 << 0,
-    /// <summary>Reserved for future use (trace id, span id, …).</summary>
     Reserved1    = 1 << 1,
 }
 
@@ -21,9 +20,9 @@ public enum LogEventFlags : byte
 /// Variable-length data (message template, properties bytes, exception) is stored separately
 /// in parallel arrays / payload buffers; offsets below point into the payload arena.
 ///
-/// Total size: 40 bytes — fits in a single cache line together with neighbours.
+/// Total size: 64 bytes — one full cache line.
 /// </summary>
-[StructLayout(LayoutKind.Sequential, Pack = 1, Size = 40)]
+[StructLayout(LayoutKind.Sequential, Pack = 1, Size = 64)]
 public struct LogEventHeader
 {
     /// <summary>Monotonic event id — NodeId (hi 32) + Sequence (lo 32).</summary>
@@ -41,16 +40,32 @@ public struct LogEventHeader
     /// <summary>Byte length of the msgpack properties blob.</summary>
     public int    PropertiesByteLength;
 
+    /// <summary>Intern-pool index of the <c>service.name</c> / service identifier string (-1 if absent).</summary>
+    public int    ServiceNamePoolIndex;
+
     /// <summary>Log level.</summary>
     public LogLevel Level;
 
     /// <summary>Packed bitflags — see <see cref="LogEventFlags"/>.</summary>
     public byte   Flags;
 
-    // 2 bytes padding to reach Size = 40
-    private short _pad;
+    // 2 bytes padding
+    private byte  _pad1;
+    private short _pad2;
+
+    /// <summary>High 64 bits of the 128-bit TraceId (0 when absent).</summary>
+    public ulong  TraceIdHi;
+
+    /// <summary>Low 64 bits of the 128-bit TraceId (0 when absent).</summary>
+    public ulong  TraceIdLo;
+
+    /// <summary>64-bit SpanId (0 when absent).</summary>
+    public ulong  SpanId;
 
     public static int SizeOf => Unsafe.SizeOf<LogEventHeader>();
+
+    public bool HasTraceId => (TraceIdHi | TraceIdLo) != 0;
+    public bool HasSpanId  => SpanId != 0;
 
     /// <summary>Convenience: read / set <see cref="LogEventFlags.HasException"/>.</summary>
     public bool HasException
@@ -80,6 +95,18 @@ public sealed class LogEvent
 
     /// <summary>Raw msgpack bytes of the properties map (for re-serialization without re-deserializing).</summary>
     public ReadOnlyMemory<byte> RawProperties            { get; init; }
+
+    /// <summary>High 64 bits of the 128-bit distributed TraceId (0 when absent).</summary>
+    public ulong TraceIdHi   { get; init; }
+
+    /// <summary>Low 64 bits of the 128-bit distributed TraceId (0 when absent).</summary>
+    public ulong TraceIdLo   { get; init; }
+
+    /// <summary>64-bit SpanId (0 when absent).</summary>
+    public ulong SpanId      { get; init; }
+
+    /// <summary>Service name (<c>service.name</c> from OTLP resource attributes, or Serilog SourceContext namespace).</summary>
+    public string? ServiceName { get; init; }
 }
 
 /// <summary>
@@ -110,4 +137,6 @@ public static class ClefFields
     public const string SpanId          = "@sp";
     /// <summary>Per-event 64-bit Snowflake EventId (Rd.Log extension to CLEF, persisted in cold-tier).</summary>
     public const string EventId         = "@i";
+    /// <summary>Service/application name — OTLP resource attribute key and Rd.Log canonical property key.</summary>
+    public const string ServiceName     = "service.name";
 }

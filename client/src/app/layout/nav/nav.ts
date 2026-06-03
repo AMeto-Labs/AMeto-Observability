@@ -22,8 +22,8 @@ export class NavComponent {
 
   readonly mainItems: NavItem[] = [
     { path: '/events',  icon: 'list',       label: 'Logs'    },
-    { path: '/live',    icon: 'activity',   label: 'Traces'  },
-    { path: '/nodes',   icon: 'chart-bar',  label: 'Metrics' },
+    { path: '/traces',  icon: 'activity',   label: 'Traces'  },
+    { path: '/metrics', icon: 'chart-bar',  label: 'Metrics' },
     { path: '/signals', icon: 'bell',       label: 'Alerts'  },
   ];
 

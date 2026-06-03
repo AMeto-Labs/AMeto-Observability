@@ -84,8 +84,12 @@ function joinPath(prefix: string, key: string): string {
   return `${prefix}['${escaped}']`;
 }
 
+/** Top-level keys promoted to dedicated rows in the detail panel — skip in the generic props list. */
+const PROMOTED_KEYS = new Set(['@tr', '@sp', 'service.name']);
+
 function flattenProps(obj: Record<string, unknown>, prefix = '', depth = 0, out: PropEntry[] = []): PropEntry[] {
   for (const [k, v] of Object.entries(obj)) {
+    if (depth === 0 && PROMOTED_KEYS.has(k)) continue;
     const path = joinPath(prefix, k);
     appendValue(path, k, v, depth, out);
   }
@@ -220,7 +224,24 @@ export class EventRowComponent {
 
   levelShort = computed(() => LEVEL_SHORT[this.levelKey()] ?? this.levelKey().slice(0, 3).toUpperCase());
 
-  service = computed(() => (this.event().props?.['ApplicationContext'] as string) ?? '');
+  service = computed(() =>
+    (this.event()['service.name'] as string | undefined) ??
+    (this.event().props?.['service.name'] as string | undefined) ??
+    (this.event().props?.['ApplicationContext'] as string | undefined) ??
+    ''
+  );
+
+  traceId = computed(() =>
+    (this.event()['@tr'] as string | undefined) ??
+    (this.event().props?.['@tr'] as string | undefined) ??
+    ''
+  );
+
+  spanId = computed(() =>
+    (this.event()['@sp'] as string | undefined) ??
+    (this.event().props?.['@sp'] as string | undefined) ??
+    ''
+  );
 
   // timestamp = computed(() => {
   //   const raw = this.event()['@t'];

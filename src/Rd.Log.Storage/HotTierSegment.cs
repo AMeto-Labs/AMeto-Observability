@@ -279,6 +279,12 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
             Exception       = GetException(index),
             Properties      = props,
             RawProperties   = payloadSpan.ToArray(),
+            TraceIdHi       = h.TraceIdHi,
+            TraceIdLo       = h.TraceIdLo,
+            SpanId          = h.SpanId,
+            ServiceName     = (h.ServiceNamePoolIndex >= 0 && pool is not null)
+                                  ? pool.Get(h.ServiceNamePoolIndex)
+                                  : null,
         };
     }
 

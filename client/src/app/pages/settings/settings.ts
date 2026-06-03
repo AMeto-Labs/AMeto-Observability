@@ -34,6 +34,8 @@ export class SettingsComponent implements OnInit {
   warningDays     = 90;
   errorDays       = 90;
   fatalDays       = 90;
+  metricsDays     = 30;
+  tracesDays      = 14;
 
   // ── Users ──────────────────────────────────────────────────────────────────
   users       = signal<UserDto[]>([]);
@@ -61,6 +63,8 @@ export class SettingsComponent implements OnInit {
         this.warningDays     = r.warningDays;
         this.errorDays       = r.errorDays;
         this.fatalDays       = r.fatalDays;
+        this.metricsDays     = r.metricsDays;
+        this.tracesDays      = r.tracesDays;
         this.retentionLoading.set(false);
         this.cdr.markForCheck();
       },
@@ -81,6 +85,8 @@ export class SettingsComponent implements OnInit {
       warningDays:     this.warningDays,
       errorDays:       this.errorDays,
       fatalDays:       this.fatalDays,
+      metricsDays:     this.metricsDays,
+      tracesDays:      this.tracesDays,
     };
     this.retentionSaving.set(true);
     this.api.putRetention(dto).subscribe({

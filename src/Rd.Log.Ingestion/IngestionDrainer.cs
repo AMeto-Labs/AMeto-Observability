@@ -60,7 +60,9 @@ public sealed class IngestionDrainer : IAsyncDisposable
                 if (!_ring.TryDequeue(
                         out long tsTicks, out byte level, out int tmplIdx,
                         out string? tmpl, out ExceptionInfo? exception,
-                        _payloadBuf, out int payloadLen))
+                        _payloadBuf, out int payloadLen,
+                        out ulong traceIdHi, out ulong traceIdLo,
+                        out ulong spanId, out int serviceNameIdx))
                     break;
 
                 var payload = new ReadOnlySpan<byte>(_payloadBuf, 0, payloadLen);
@@ -73,6 +75,10 @@ public sealed class IngestionDrainer : IAsyncDisposable
                     MessageTemplatePoolIndex = tmplIdx,
                     PropertiesArenaOffset    = 0,  // filled by TryWrite
                     PropertiesByteLength     = payloadLen,
+                    ServiceNamePoolIndex     = serviceNameIdx,
+                    TraceIdHi                = traceIdHi,
+                    TraceIdLo                = traceIdLo,
+                    SpanId                   = spanId,
                     Flags                    = (byte)(exception is not null ? LogEventFlags.HasException : LogEventFlags.None),
                 };
 

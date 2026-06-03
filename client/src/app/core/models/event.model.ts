@@ -10,6 +10,9 @@ export interface EventDto {
   '@mt': string;
   '@l': string;
   '@x'?: ExceptionInfoDto;
+  '@tr'?: string;
+  '@sp'?: string;
+  'service.name'?: string;
   id: string;
   props?: Record<string, unknown>;
 }

@@ -42,9 +42,11 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
         [FieldOffset(18)] public ushort  _pad2;
         [FieldOffset(20)] public int     PayloadLen;
         [FieldOffset(24)] public int     TemplateIdx;
-        [FieldOffset(28)] public int     _pad3;
-        [FieldOffset(32)] public IntPtr  PayloadPtr; // byte* into PayloadBuf
-        // bytes 40-63 padding (cache line)
+        [FieldOffset(28)] public int     ServiceNameIdx;   // intern-pool index (-1 if absent)
+        [FieldOffset(32)] public IntPtr  PayloadPtr;       // byte* into PayloadBuf
+        [FieldOffset(40)] public ulong   TraceIdHi;        // hi 64 bits of 128-bit TraceId
+        [FieldOffset(48)] public ulong   TraceIdLo;        // lo 64 bits of 128-bit TraceId
+        [FieldOffset(56)] public ulong   SpanId;           // 64-bit SpanId
     }
 
     private readonly int    _capacity;   // power of two
@@ -141,7 +143,11 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
         int     templateIdx,
         string? template,
         ExceptionInfo? exception,
-        ReadOnlySpan<byte> payload)
+        ReadOnlySpan<byte> payload,
+        ulong   traceIdHi      = 0,
+        ulong   traceIdLo      = 0,
+        ulong   spanId         = 0,
+        int     serviceNameIdx = -1)
     {
         if (payload.Length > _maxPayloadBytes)
             return false; // drop oversized event
@@ -178,11 +184,15 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
         _slotTemplates [pos & _mask] = template;
         _slotExceptions[pos & _mask] = exception;
 
-        slot->TimestampTicks = timestampTicks;
-        slot->Level          = level;
-        slot->TemplateIdx    = templateIdx;
-        slot->PayloadLen     = payload.Length;
-        slot->PayloadPtr     = (IntPtr)buf;
+        slot->TimestampTicks  = timestampTicks;
+        slot->Level            = level;
+        slot->TemplateIdx      = templateIdx;
+        slot->PayloadLen       = payload.Length;
+        slot->PayloadPtr       = (IntPtr)buf;
+        slot->TraceIdHi        = traceIdHi;
+        slot->TraceIdLo        = traceIdLo;
+        slot->SpanId           = spanId;
+        slot->ServiceNameIdx   = serviceNameIdx;
 
         // Publish: advance sequence to pos+1
         Volatile.Write(ref slot->Sequence, pos + 1);
@@ -203,7 +213,11 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
         out string? template,
         out ExceptionInfo? exception,
         Span<byte> payloadBuffer,
-        out int  payloadLength)
+        out int    payloadLength,
+        out ulong  traceIdHi,
+        out ulong  traceIdLo,
+        out ulong  spanId,
+        out int    serviceNameIdx)
     {
         timestampTicks = 0;
         level          = 0;
@@ -211,6 +225,10 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
         template       = null;
         exception      = null;
         payloadLength  = 0;
+        traceIdHi      = 0;
+        traceIdLo      = 0;
+        spanId         = 0;
+        serviceNameIdx = -1;
 
         long pos;
         Slot* slot;
@@ -248,6 +266,10 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
         level          = slot->Level;
         templateIdx    = slot->TemplateIdx;
         payloadLength  = len;
+        traceIdHi      = slot->TraceIdHi;
+        traceIdLo      = slot->TraceIdLo;
+        spanId         = slot->SpanId;
+        serviceNameIdx = slot->ServiceNameIdx;
 
         // Hand off the template / exception refs and clear the slot so the GC can
         // collect them when no longer referenced.

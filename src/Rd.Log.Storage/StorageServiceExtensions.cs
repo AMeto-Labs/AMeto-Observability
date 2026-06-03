@@ -11,14 +11,22 @@ namespace Rd.Log.Storage;
 /// </summary>
 public sealed class RetentionBackgroundService : BackgroundService
 {
-    private readonly StorageEngine            _storage;
-    private readonly ILogger<RetentionBackgroundService> _logger;
-    private static readonly TimeSpan          _interval = TimeSpan.FromHours(1);
+    private readonly StorageEngine                        _storage;
+    private readonly RetentionStore                       _retentionStore;
+    private readonly IEnumerable<IRetentionTarget>        _targets;
+    private readonly ILogger<RetentionBackgroundService>  _logger;
+    private static readonly TimeSpan                      _interval = TimeSpan.FromHours(1);
 
-    public RetentionBackgroundService(StorageEngine storage, ILogger<RetentionBackgroundService> logger)
+    public RetentionBackgroundService(
+        StorageEngine storage,
+        RetentionStore retentionStore,
+        IEnumerable<IRetentionTarget> targets,
+        ILogger<RetentionBackgroundService> logger)
     {
-        _storage = storage;
-        _logger  = logger;
+        _storage        = storage;
+        _retentionStore = retentionStore;
+        _targets        = targets;
+        _logger         = logger;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -35,6 +43,21 @@ public sealed class RetentionBackgroundService : BackgroundService
                     _logger.LogInformation(
                         "Retention run: deleted {Count} segments, freed {Bytes:N0} bytes",
                         result.DeletedSegments, result.FreedBytes);
+
+                var dto = _retentionStore.Get();
+                foreach (var target in _targets)
+                {
+                    var days = target.RetentionKey switch
+                    {
+                        "metrics" => dto.MetricsDays,
+                        "traces"  => dto.TracesDays,
+                        _         => 30,
+                    };
+                    var pruned = await target.PruneAsync(TimeSpan.FromDays(Math.Max(1, days)), stoppingToken);
+                    if (pruned > 0)
+                        _logger.LogInformation(
+                            "Retention run: pruned {Count} {Key} file(s)", pruned, target.RetentionKey);
+                }
             }
             catch (OperationCanceledException) { break; }
             catch (Exception ex)
