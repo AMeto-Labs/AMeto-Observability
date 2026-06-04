@@ -168,6 +168,7 @@ internal static class SpanReader
         string         svc        = string.Empty;
         SpanKind       kind       = SpanKind.Unspecified;
         SpanStatusCode status     = SpanStatusCode.Unset;
+        byte[]?        attrBytes  = null;
 
         for (int i = 0; i < fields; i++)
         {
@@ -183,6 +184,12 @@ internal static class SpanReader
                 case "svc": svc    = r.ReadString() ?? string.Empty; break;
                 case "k":   kind   = (SpanKind)r.ReadByte();         break;
                 case "st":  status = (SpanStatusCode)r.ReadByte();   break;
+                case "attr":
+                {
+                    var seq = r.ReadBytes();
+                    if (seq.HasValue) attrBytes = System.Buffers.BuffersExtensions.ToArray(seq.Value);
+                    break;
+                }
                 default:    r.Skip(); break;
             }
         }
@@ -198,6 +205,7 @@ internal static class SpanReader
             ServiceName       = svc,
             Kind              = kind,
             Status            = status,
+            Attributes        = attrBytes is { Length: > 0 } ? DeserializeAttributes(attrBytes) : null,
         };
     }
 
@@ -213,6 +221,12 @@ internal static class SpanReader
             pos += segment.Length;
         }
         return arr;
+    }
+
+    private static IReadOnlyDictionary<string, object?>? DeserializeAttributes(byte[] bytes)
+    {
+        try { return MessagePackSerializer.Deserialize<Dictionary<string, object?>>(bytes); }
+        catch { return null; }
     }
 
     private static FileStream OpenRead(string path) =>

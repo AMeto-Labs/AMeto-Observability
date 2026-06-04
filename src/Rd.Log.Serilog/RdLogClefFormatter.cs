@@ -1,6 +1,5 @@
 using System.Globalization;
 using MessagePack;
-using Serilog.Debugging;
 using Serilog.Events;
 
 namespace Rd.Log.Serilog;
@@ -24,29 +23,24 @@ internal static class RdLogClefFormatter
   private static readonly string[] s_levelStrings =
       ["Verbose", "Debug", "Information", "Warning", "Error", "Fatal"];
 
-  public static void Write(ref MessagePackWriter writer, LogEvent evt, ReadOnlyMemory<byte> serviceNameUtf8)
+  public static void Write(scoped ref MessagePackWriter writer, LogEvent evt, ReadOnlyMemory<byte> serviceNameUtf8)
   {
     bool hasException = evt.Exception is not null;
 
-    if(evt.TraceId is not null)
-    {
-      Console.WriteLine("Rd.Log: event has TraceId {0} at {1}: {2}", evt.TraceId, evt.Timestamp, evt.MessageTemplate);
-      SelfLog.WriteLine("Rd.Log: event has TraceId {0} at {1}: {2}", evt.TraceId, evt.Timestamp, evt.MessageTemplate);
-    }
-
-
     bool hasService = !serviceNameUtf8.IsEmpty;
     int extraFields = (evt.TraceId is not null ? 1 : 0) + (evt.SpanId is not null ? 1 : 0) + (hasService ? 1 : 0);
-    int fieldCount = 3 /* @t @mt @l */
+    int fieldCount = 3 
                     + (hasException ? 1 : 0)
                     + extraFields
                     + evt.Properties.Count;
 
     writer.WriteMapHeader(fieldCount);
 
-    // UTF-8 literal keys avoid per-event encoding; level cache avoids enum.ToString().
+    // Timestamp — stackalloc avoids one string allocation per event.
+    Span<char> tsCharBuf = stackalloc char[33];
+    evt.Timestamp.TryFormat(tsCharBuf, out int tsLen, "o", CultureInfo.InvariantCulture);
     writer.WriteString("@t"u8);
-    writer.Write(evt.Timestamp.ToString("o", CultureInfo.InvariantCulture));
+    WriteAsciiString(ref writer, tsCharBuf[..tsLen]);
 
     writer.WriteString("@mt"u8);
     writer.Write(evt.MessageTemplate.Text);
@@ -60,19 +54,18 @@ internal static class RdLogClefFormatter
       writer.WriteString("@x"u8);
       WriteException(ref writer, evt.Exception!, 0);
     }
-    Console.WriteLine("Rd.Log: writing event at {0}: {1}", evt.Timestamp, evt.MessageTemplate);
 
-    SelfLog.WriteLine("Rd.Log: writing event {0} at {1}: {2}", traceId, evt.Timestamp, evt.MessageTemplate);
-
-    if (traceId is not null)
-    { 
+    if (evt.TraceId.HasValue)
+    {
       writer.WriteString("@tr"u8);
-      writer.Write(traceId); 
-      SelfLog.WriteLine("Rd.Log: writing TraceId {0} for event at {1}: {2}", traceId, evt.Timestamp, evt.MessageTemplate);
-      Console.WriteLine("Rd.Log: writing event at {0}: {1}", evt.Timestamp, evt.MessageTemplate);
-
+      writer.Write(evt.TraceId.Value.ToHexString());
     }
-    if (spanId is not null) { writer.WriteString("@sp"u8); writer.Write(spanId); }
+
+    if (evt.SpanId.HasValue)
+    {
+      writer.WriteString("@sp"u8);
+      writer.Write(evt.SpanId.Value.ToHexString());
+    }
     if (hasService) { writer.WriteString("service.name"u8); writer.WriteString(serviceNameUtf8.Span); }
 
     foreach (var kv in evt.Properties)
@@ -84,7 +77,7 @@ internal static class RdLogClefFormatter
 
   // ── Property values ──────────────────────────────────────────────────────
 
-  private static void WriteValue(ref MessagePackWriter writer, LogEventPropertyValue value)
+  private static void WriteValue(scoped ref MessagePackWriter writer, LogEventPropertyValue value)
   {
     switch (value)
     {
@@ -104,7 +97,7 @@ internal static class RdLogClefFormatter
         writer.WriteMapHeader(str.Properties.Count + (hasType ? 1 : 0));
         if (hasType)
         {
-          writer.Write("$type");
+          writer.WriteString("$type"u8);
           writer.Write(str.TypeTag);
         }
         foreach (var p in str.Properties)
@@ -131,8 +124,11 @@ internal static class RdLogClefFormatter
     }
   }
 
-  private static void WriteScalar(ref MessagePackWriter writer, object? v)
+  private static void WriteScalar(scoped ref MessagePackWriter writer, object? v)
   {
+    // Shared stack buffer — 64 chars covers all formatted scalar types (Guid=36, ISO-8601=33, etc.)
+    Span<char> charBuf = stackalloc char[64];
+    int len;
     switch (v)
     {
       case null: writer.WriteNil(); break;
@@ -149,10 +145,22 @@ internal static class RdLogClefFormatter
       case float f: writer.Write(f); break;
       case double d: writer.Write(d); break;
       case decimal dec: writer.Write(dec.ToString(CultureInfo.InvariantCulture)); break;
-      case DateTime dt: writer.Write(dt.ToString("o", CultureInfo.InvariantCulture)); break;
-      case DateTimeOffset dto: writer.Write(dto.ToString("o", CultureInfo.InvariantCulture)); break;
-      case TimeSpan ts: writer.Write(ts.ToString("c", CultureInfo.InvariantCulture)); break;
-      case Guid g: writer.Write(g.ToString()); break;
+      case DateTime dt:
+        dt.TryFormat(charBuf, out len, "o", CultureInfo.InvariantCulture);
+        WriteAsciiString(ref writer, charBuf[..len]);
+        break;
+      case DateTimeOffset dto:
+        dto.TryFormat(charBuf, out len, "o", CultureInfo.InvariantCulture);
+        WriteAsciiString(ref writer, charBuf[..len]);
+        break;
+      case TimeSpan ts:
+        ts.TryFormat(charBuf, out len, "c");
+        WriteAsciiString(ref writer, charBuf[..len]);
+        break;
+      case Guid g:
+        g.TryFormat(charBuf, out len, "D");
+        WriteAsciiString(ref writer, charBuf[..len]);
+        break;
       case Uri u: writer.Write(u.ToString()); break;
       case Enum e: writer.Write(e.ToString()); break;
       case byte[] bytes: writer.Write(bytes); break;
@@ -162,7 +170,7 @@ internal static class RdLogClefFormatter
 
   // ── Exception ────────────────────────────────────────────────────────────
 
-  private static void WriteException(ref MessagePackWriter writer, Exception ex, int depth)
+  private static void WriteException(scoped ref MessagePackWriter writer, Exception ex, int depth)
   {
     bool hasMessage = !string.IsNullOrEmpty(ex.Message);
     bool hasStack = !string.IsNullOrEmpty(ex.StackTrace);
@@ -175,25 +183,53 @@ internal static class RdLogClefFormatter
 
     writer.WriteMapHeader(fields);
 
-    writer.Write("type");
+    writer.WriteString("type"u8);
     writer.Write(ex.GetType().FullName ?? ex.GetType().Name);
 
     if (hasMessage)
     {
-      writer.Write("msg");
+      writer.WriteString("msg"u8);
       writer.Write(ex.Message);
     }
 
     if (hasStack)
     {
-      writer.Write("stk");
+      writer.WriteString("stk"u8);
       writer.Write(ex.StackTrace);
     }
 
     if (hasInner)
     {
-      writer.Write("inner");
+      writer.WriteString("inner"u8);
       WriteException(ref writer, ex.InnerException!, depth + 1);
     }
+  }
+
+  /// <summary>
+  /// Writes all-ASCII <paramref name="chars"/> as a MessagePack string directly via
+  /// <c>GetSpan</c>/<c>Advance</c>, avoiding CS8352 (stackalloc Span passed to a ref-struct method).
+  /// Suitable for timestamps, GUIDs, TimeSpan, DateTime — all produce ASCII-only output.
+  /// </summary>
+  private static void WriteAsciiString(scoped ref MessagePackWriter writer, scoped ReadOnlySpan<char> chars)
+  {
+    int len = chars.Length;
+    int headerSize;
+    Span<byte> span;
+    if (len <= 31)
+    {
+      span = writer.GetSpan(1 + len);
+      span[0] = (byte)(0xa0 | len); // fixstr
+      headerSize = 1;
+    }
+    else
+    {
+      span = writer.GetSpan(2 + len); // str8 — all our values are < 255 bytes
+      span[0] = 0xd9;
+      span[1] = (byte)len;
+      headerSize = 2;
+    }
+    for (int i = 0; i < len; i++)
+      span[headerSize + i] = (byte)chars[i]; // safe: all chars are ASCII (0–27f)
+    writer.Advance(headerSize + len);
   }
 }

@@ -125,7 +125,8 @@ internal static class SpanWriter
             offsets.Add(globalOffset);
 
             // Serialize span as map with fixed keys
-            writer.WriteMapHeader(9);
+            bool hasAttrs = s.Attributes is { Count: > 0 };
+            writer.WriteMapHeader(hasAttrs ? 10 : 9);
             writer.Write("tid");  WriteTraceId(ref writer, s.TraceId);
             writer.Write("sid");  WriteSpanId(ref writer, s.SpanId);
             writer.Write("pid");  WriteSpanId(ref writer, s.ParentSpanId);
@@ -135,6 +136,15 @@ internal static class SpanWriter
             writer.Write("svc");  writer.Write(s.ServiceName);
             writer.Write("k");    writer.Write((byte)s.Kind);
             writer.Write("st");   writer.Write((byte)s.Status);
+            if (hasAttrs)
+            {
+                writer.Write("attr");
+                var attrBytes = MessagePackSerializer.Serialize(
+                    s.Attributes is Dictionary<string, object?> d
+                        ? d
+                        : new Dictionary<string, object?>(s.Attributes!));
+                writer.Write(new ReadOnlySpan<byte>(attrBytes));
+            }
         }
 
         writer.Flush();
