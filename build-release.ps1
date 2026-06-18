@@ -3,39 +3,14 @@
 .SYNOPSIS
     Build a self-contained Ameto release for Windows or Linux.
 
-.DESCRIPTION
-    1. Builds the Angular SPA (production)
-    2. Runs dotnet publish (self-contained) for the chosen target OS
-    3. Bundles the OS-specific installer into release/<os>/
-
-.PARAMETER OS
-    Target OS: "windows", "linux", or "both".
-    If omitted, an interactive menu is shown.
-
-.PARAMETER Arch
-    CPU architecture: "x64" (default) or "arm64".
-
 .PARAMETER OutDir
     Root output directory. Default: ./release
 
 .PARAMETER SkipClient
     Skip Angular build (useful when re-packaging after a client build).
-
-.EXAMPLE
-    .\build-release.ps1
-    .\build-release.ps1 -OS windows
-    .\build-release.ps1 -OS linux -Arch arm64
-    .\build-release.ps1 -OS both
 #>
 param(
-    [ValidateSet("windows", "linux", "both", "")]
-    [string]$OS = "",
-
-    [ValidateSet("x64", "arm64")]
-    [string]$Arch = "x64",
-
-    [string]$OutDir = "release",
-
+    [string]$OutDir     = "release",
     [switch]$SkipClient
 )
 
@@ -45,38 +20,104 @@ $clientDir  = Join-Path $root "client"
 $serverProj = Join-Path $root "src\Ameto.Server\Ameto.Server.csproj"
 $wwwroot    = Join-Path $root "src\Ameto.Server\wwwroot"
 
-function Write-Banner([string]$msg) {
+# ── Arrow-key menu ────────────────────────────────────────────────────────────
+function Invoke-Menu {
+    param(
+        [string]   $Title,
+        [string[]] $Items
+    )
+
+    $selected = 0
+    [Console]::CursorVisible = $false
+
+    # Print title + blank line once (stays fixed above the menu)
     Write-Host ""
-    Write-Host "═══════════════════════════════════════════" -ForegroundColor Cyan
-    Write-Host "  $msg" -ForegroundColor Cyan
-    Write-Host "═══════════════════════════════════════════" -ForegroundColor Cyan
+    Write-Host "  $Title" -ForegroundColor Cyan
     Write-Host ""
+
+    # Remember where the list starts so we can redraw in-place
+    $menuTop = [Console]::CursorTop
+
+    function Render {
+        [Console]::SetCursorPosition(0, $menuTop)
+        for ($i = 0; $i -lt $Items.Count; $i++) {
+            if ($i -eq $selected) {
+                Write-Host ("  > " + $Items[$i]).PadRight([Console]::WindowWidth - 1) `
+                    -ForegroundColor Black -BackgroundColor Cyan
+            } else {
+                Write-Host ("    " + $Items[$i]).PadRight([Console]::WindowWidth - 1) `
+                    -ForegroundColor Gray
+            }
+        }
+    }
+
+    Render
+
+    try {
+        while ($true) {
+            $key = [Console]::ReadKey($true)
+            switch ($key.Key) {
+                'UpArrow'   { if ($selected -gt 0)               { $selected-- }; Render }
+                'DownArrow' { if ($selected -lt $Items.Count - 1) { $selected++ }; Render }
+                'Enter'     {
+                    # Print confirmed selection and move past the menu block
+                    [Console]::SetCursorPosition(0, $menuTop)
+                    for ($i = 0; $i -lt $Items.Count; $i++) {
+                        if ($i -eq $selected) {
+                            Write-Host ("  > " + $Items[$i]).PadRight([Console]::WindowWidth - 1) `
+                                -ForegroundColor Cyan
+                        } else {
+                            Write-Host (" " * ([Console]::WindowWidth - 1))
+                        }
+                    }
+                    Write-Host ""
+                    return $selected
+                }
+                'Escape' { Write-Host ""; exit 0 }
+            }
+        }
+    }
+    finally {
+        [Console]::CursorVisible = $true
+    }
 }
+
+# ── Banner ────────────────────────────────────────────────────────────────────
+Clear-Host
+Write-Host ""
+Write-Host "  ═══════════════════════════════════════════" -ForegroundColor DarkCyan
+Write-Host "    Ameto  ·  Build Release" -ForegroundColor Cyan
+Write-Host "  ═══════════════════════════════════════════" -ForegroundColor DarkCyan
+
+# ── Select OS ─────────────────────────────────────────────────────────────────
+$osItems = @(
+    "Windows   (win-x64)"
+    "Windows   (win-arm64)"
+    "Linux     (linux-x64)"
+    "Linux     (linux-arm64)"
+    "Both      (win-x64 + linux-x64)"
+)
+
+$osIndex = Invoke-Menu -Title "Target OS / Architecture:" -Items $osItems
+
+$targets = switch ($osIndex) {
+    0 { @(@{ OS = "windows"; Arch = "x64"   }) }
+    1 { @(@{ OS = "windows"; Arch = "arm64" }) }
+    2 { @(@{ OS = "linux";   Arch = "x64"   }) }
+    3 { @(@{ OS = "linux";   Arch = "arm64" }) }
+    4 { @(@{ OS = "windows"; Arch = "x64" }; @{ OS = "linux"; Arch = "x64" }) }
+}
+
+Write-Host ""
+Write-Host "  ═══════════════════════════════════════════" -ForegroundColor DarkCyan
+Write-Host ""
 
 function Write-Step([string]$n, [string]$msg) {
     Write-Host "[ $n ] $msg" -ForegroundColor Yellow
 }
-
 function Write-Ok([string]$msg) {
     Write-Host "      $msg" -ForegroundColor Green
 }
-
-# ── OS selection ──────────────────────────────────────────────────────────────
-if (-not $OS) {
-    Write-Banner "Ameto  ·  Build Release"
-    Write-Host "  Target OS:" -ForegroundColor Cyan
-    Write-Host "    [1] Windows  (win-$Arch)" -ForegroundColor Gray
-    Write-Host "    [2] Linux    (linux-$Arch)" -ForegroundColor Gray
-    Write-Host "    [3] Both" -ForegroundColor Gray
-    Write-Host ""
-    do { $choice = Read-Host "  Choice (1/2/3)" } while ($choice -notin '1','2','3')
-
-    $OS = switch ($choice) { '1' { 'windows' } '2' { 'linux' } '3' { 'both' } }
-}
-
-$targets = if ($OS -eq "both") { @("windows","linux") } else { @($OS) }
-
-Write-Banner "Ameto  ·  Build Release  [$($targets -join ', ')-$Arch]"
 
 # ── Step 1: Build Angular ─────────────────────────────────────────────────────
 if (-not $SkipClient) {
@@ -96,23 +137,20 @@ if (-not $SkipClient) {
     }
     finally { Pop-Location }
     Write-Ok "Angular build complete → $wwwroot"
-}
-else {
+} else {
     Write-Step "1/3" "Skipping Angular build (-SkipClient)."
 }
 
-# ── Step 2: dotnet publish for each target ────────────────────────────────────
+# ── Step 2: dotnet publish ────────────────────────────────────────────────────
 Write-Step "2/3" "Publishing .NET server (self-contained)..."
 
-foreach ($targetOS in $targets) {
-    $rid       = "$targetOS-$Arch"
-    $targetDir = Join-Path $root $OutDir $targetOS
-    $exe       = if ($targetOS -eq "windows") { "Ameto.Server.exe" } else { "Ameto.Server" }
+foreach ($t in $targets) {
+    $rid       = "$($t.OS)-$($t.Arch)"
+    $targetDir = Join-Path $root $OutDir $t.OS
 
     Write-Host ""
     Write-Host "      → $rid  →  $targetDir" -ForegroundColor DarkCyan
 
-    # Clean previous output so stale files don't accumulate
     if (Test-Path $targetDir) { Remove-Item $targetDir -Recurse -Force }
     New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
 
@@ -138,49 +176,47 @@ foreach ($targetOS in $targets) {
         Remove-Item -Force -ErrorAction SilentlyContinue
     Remove-Item (Join-Path $targetDir 'dotnet-tools.json') -Force -ErrorAction SilentlyContinue
 
-    Write-Ok "$rid publish complete → $targetDir"
+    Write-Ok "$rid complete → $targetDir"
 }
 
-# ── Step 3: Bundle installer into each target folder ─────────────────────────
+# ── Step 3: Bundle installer ──────────────────────────────────────────────────
 Write-Step "3/3" "Bundling installers..."
 
-foreach ($targetOS in $targets) {
-    $targetDir = Join-Path $root $OutDir $targetOS
+foreach ($t in $targets) {
+    $targetDir = Join-Path $root $OutDir $t.OS
 
-    if ($targetOS -eq "windows") {
-        $installerSrc = Join-Path $root "install\windows\install.ps1"
-        $installerDst = Join-Path $targetDir "install.ps1"
-        Copy-Item $installerSrc $installerDst -Force
-        Write-Ok "Windows: install.ps1  →  $installerDst"
-    }
-    else {
-        $installerSrc = Join-Path $root "install\linux\install.sh"
-        $installerDst = Join-Path $targetDir "install.sh"
-        Copy-Item $installerSrc $installerDst -Force
-        # Ensure Unix line endings so the script is executable on Linux
-        $content = [System.IO.File]::ReadAllText($installerDst) -replace "`r`n", "`n"
-        [System.IO.File]::WriteAllText($installerDst, $content, [System.Text.Encoding]::UTF8)
-        Write-Ok "Linux:   install.sh   →  $installerDst"
+    if ($t.OS -eq "windows") {
+        $src = Join-Path $root "install\windows\install.ps1"
+        $dst = Join-Path $targetDir "install.ps1"
+        Copy-Item $src $dst -Force
+        Write-Ok "Windows: install.ps1  →  $dst"
+    } else {
+        $src = Join-Path $root "install\linux\install.sh"
+        $dst = Join-Path $targetDir "install.sh"
+        Copy-Item $src $dst -Force
+        # Ensure Unix line endings
+        $content = [System.IO.File]::ReadAllText($dst) -replace "`r`n", "`n"
+        [System.IO.File]::WriteAllText($dst, $content, [System.Text.Encoding]::UTF8)
+        Write-Ok "Linux:   install.sh   →  $dst"
     }
 }
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 Write-Host ""
-Write-Host "═══════════════════════════════════════════" -ForegroundColor Green
-Write-Host "  Release ready!" -ForegroundColor Green
-Write-Host "═══════════════════════════════════════════" -ForegroundColor Green
+Write-Host "  ═══════════════════════════════════════════" -ForegroundColor DarkCyan
+Write-Host "    Release ready!" -ForegroundColor Green
+Write-Host "  ═══════════════════════════════════════════" -ForegroundColor DarkCyan
 Write-Host ""
 
-foreach ($targetOS in $targets) {
-    $targetDir = Join-Path $root $OutDir $targetOS
-    Write-Host "  $targetOS" -ForegroundColor Cyan
-    Write-Host "    Folder:    $targetDir" -ForegroundColor Gray
-
-    if ($targetOS -eq "windows") {
-        Write-Host "    Install:   (Admin PowerShell) .\install.ps1" -ForegroundColor Gray
-    }
-    else {
-        Write-Host "    Install:   sudo bash install.sh" -ForegroundColor Gray
+foreach ($t in $targets) {
+    $targetDir = Join-Path $root $OutDir $t.OS
+    $rid = "$($t.OS)-$($t.Arch)"
+    Write-Host "  $rid" -ForegroundColor Cyan
+    Write-Host "    $targetDir" -ForegroundColor Gray
+    if ($t.OS -eq "windows") {
+        Write-Host "    Install: (Admin PS) .\install.ps1" -ForegroundColor DarkGray
+    } else {
+        Write-Host "    Install: sudo bash install.sh" -ForegroundColor DarkGray
     }
     Write-Host ""
 }
