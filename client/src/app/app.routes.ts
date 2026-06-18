@@ -7,6 +7,11 @@ export const routes: Routes = [
     loadComponent: () => import('./pages/login/login').then(m => m.LoginComponent),
   },
   {
+    // OAuth redirect lands here with ?token=...&expiresIn=...&role=...
+    path: 'oauth-callback',
+    loadComponent: () => import('./pages/oauth-callback/oauth-callback').then(m => m.OauthCallbackComponent),
+  },
+  {
     path: '',
     canActivate: [authGuard],
     loadComponent: () => import('./layout/shell/shell').then(m => m.ShellComponent),

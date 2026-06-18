@@ -1,0 +1,12 @@
+{
+  "profiles": {
+    "Ameto.LoadTest": {
+      "commandName": "Project",
+      "launchBrowser": true,
+      "environmentVariables": {
+        "ASPNETCORE_ENVIRONMENT": "Development"
+      },
+      "applicationUrl": "https://localhost:56529;http://localhost:56530"
+    }
+  }
+}

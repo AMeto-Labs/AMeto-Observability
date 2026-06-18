@@ -1,0 +1,27 @@
+{
+  "Ameto": {
+    "NodeId": 0,
+    "DataDirectory": "data",
+    "HttpPort": 5341,
+
+    "SslCertPath": "",
+    "SslCertPassword": "",
+
+    "RamTargetPercent": 99,
+    "HotTier": {
+      "MaxSizeBytes": 268435456,
+      "MaxAgeSeconds": 300
+    },
+    "Indexing": {
+      "MaxPropertyFlattenDepth": 5
+    },
+    "Retention": {
+      "VerboseRetentionDays": 3,
+      "DebugRetentionDays": 3,
+      "InformationRetentionDays": 90,
+      "WarningRetentionDays": 90,
+      "ErrorRetentionDays": 90,
+      "FatalRetentionDays": 90
+    }
+  }
+}

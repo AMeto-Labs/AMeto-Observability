@@ -1,0 +1,54 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <ItemGroup>
+    <ProjectReference Include="..\Ameto.Core\Ameto.Core.csproj" />
+    <ProjectReference Include="..\Ameto.Ingestion\Ameto.Ingestion.csproj" />
+    <ProjectReference Include="..\Ameto.Query\Ameto.Query.csproj" />
+    <ProjectReference Include="..\Ameto.Storage\Ameto.Storage.csproj" />
+    <ProjectReference Include="..\Ameto.Indexing\Ameto.Indexing.csproj" />
+    <ProjectReference Include="..\Ameto.Alerts\Ameto.Alerts.csproj" />
+    <ProjectReference Include="..\Ameto.Replication\Ameto.Replication.csproj" />
+    <ProjectReference Include="..\Ameto.Otel\Ameto.Otel.csproj" />
+    <ProjectReference Include="..\Ameto.Tracing\Ameto.Tracing.csproj" />
+    <ProjectReference Include="..\Ameto.Metrics\Ameto.Metrics.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" Version="10.0.0" />
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.Google" Version="10.0.0" />
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.MicrosoftAccount" Version="10.0.0" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="9.0.0" />
+    <PackageReference Include="NetEscapades.Configuration.Yaml" Version="3.1.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <Folder Include="wwwroot\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- App-specific configuration; ship instead of appsettings*.json. -->
+    <Content Include="config.yml" CopyToOutputDirectory="PreserveNewest" />
+    <Content Remove="rd.config.json" />
+    <None Remove="rd.config.json" />
+    <!-- Make sure framework-default appsettings*.json items are NOT included. -->
+    <Content Remove="appsettings.json" />
+    <Content Remove="appsettings.*.json" />
+    <None Remove="appsettings.json" />
+    <None Remove="appsettings.*.json" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+
+    <!-- Minimal publish output: no debug symbols, no XML docs, no satellite resources. -->
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <PublishDocumentationFile>false</PublishDocumentationFile>
+    <PublishDocumentationFiles>false</PublishDocumentationFiles>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <!-- We host via Kestrel, not IIS — no web.config needed. -->
+    <IsTransformWebConfigDisabled>true</IsTransformWebConfigDisabled>
+  </PropertyGroup>
+
+</Project>

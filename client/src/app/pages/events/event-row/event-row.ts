@@ -10,7 +10,9 @@ import { TemplatePortal } from '@angular/cdk/portal';
 import { LucideAngularModule } from 'lucide-angular';
 
 import { EventDto } from '../../../core/models/event.model';
+import { UserPreferencesService } from '../../../core/services/user-preferences.service';
 import { renderMessageHtml, escapeHtmlExport } from '../../../shared/utils/clef-renderer';
+import { PropViewerComponent } from './prop-viewer/prop-viewer';
 
 const LEVEL_SHORT: Record<string, string> = {
   verbose: 'VRB', debug: 'DBG', information: 'INF',
@@ -122,7 +124,7 @@ function appendValue(path: string, label: string, v: unknown, depth: number, out
 
 @Component({
   selector: 'app-event-row',
-  imports: [LucideAngularModule, NgTemplateOutlet, DatePipe],
+  imports: [LucideAngularModule, NgTemplateOutlet, DatePipe, PropViewerComponent],
   providers: [DatePipe],
   templateUrl: './event-row.html',
   styleUrl: './event-row.scss',
@@ -142,20 +144,27 @@ export class EventRowComponent {
   // ── Inputs / outputs ──────────────────────────────────────────────────
   event = input.required<EventDto>();
   wrap  = input<boolean>(false);
+  expandedEventIds = input<ReadonlySet<string>>(new Set());
   filterSelected = output<string>();
   seekRequested  = output<{ from: Date; to: Date }>();
+  expandRequested = output<string>();
 
   // ── Local state ───────────────────────────────────────────────────────
-  expanded  = signal(false);
-  detailTab = signal<'props' | 'raw' | 'exception'>('props');
+  expanded  = computed(() => this.expandedEventIds().has(this.event().id));
+  messageExpanded = signal(false);
+  detailTab = signal<'overview' | 'json' | 'exception' | 'trace' | 'metrics'>('overview');
   menuType  = signal<'message' | 'level' | 'export' | 'prop' | null>(null);
   menuPos   = signal({ x: 0, y: 0 });
   selectedProp = signal<{ k: string; v: string; isGroup: boolean } | null>(null);
   /** Set of group paths currently collapsed (children hidden). */
   collapsed = signal<ReadonlySet<string>>(new Set());
 
+  /** Prop viewer modal state */
+  viewerProp = signal<{ key: string; value: unknown } | null>(null);
+
   private sanitizer = inject(DomSanitizer);
   private datePipe  = inject(DatePipe);
+  private prefs = inject(UserPreferencesService);
   private overlay = inject(Overlay);
   private vcr = inject(ViewContainerRef);
   private overlayRef: OverlayRef | null = null;
@@ -168,11 +177,11 @@ export class EventRowComponent {
     effect(() => {
       this.event(); // track input identity
       untracked(() => {
-        this.expanded.set(false);
         this.menuType.set(null);
         this.selectedProp.set(null);
         this.collapsed.set(new Set());
-        this.detailTab.set('props');
+        this.messageExpanded.set(false);
+        this.detailTab.set('overview');
       });
     });
 
@@ -225,10 +234,7 @@ export class EventRowComponent {
   levelShort = computed(() => LEVEL_SHORT[this.levelKey()] ?? this.levelKey().slice(0, 3).toUpperCase());
 
   service = computed(() =>
-    (this.event()['service.name'] as string | undefined) ??
-    (this.event().props?.['service.name'] as string | undefined) ??
-    (this.event().props?.['ApplicationContext'] as string | undefined) ??
-    ''
+    (this.event()['service.name'] as string | undefined) ?? ''
   );
 
   traceId = computed(() =>
@@ -304,14 +310,61 @@ export class EventRowComponent {
   propsCount   = computed(() => Object.keys(this.event().props ?? {}).length);
   hasException  = computed(() => !!this.event()['@x']);
 
+  overviewCustomItems = computed(() => {
+    const props = this.event().props ?? {};
+    return this.prefs.overviewCustomProps()
+      .map(k => ({ key: k, value: props[k] }))
+      .filter(it => it.value !== undefined && it.value !== null && String(it.value).length > 0)
+      .map(it => ({ key: it.key, value: formatInline(it.value) }));
+  });
+
+  metricItems = computed(() => Object.entries(this.event().props ?? {})
+    .filter(([, v]) => typeof v === 'number')
+    .map(([k, v]) => ({ key: k, value: Number(v).toLocaleString() }))
+  );
+
+  traceAttrs = computed(() => Object.entries(this.event().props ?? {})
+    .filter(([k]) =>
+      k.startsWith('trace.') ||
+      k.startsWith('span.') ||
+      k.startsWith('otel.') ||
+      k === 'trace_id' ||
+      k === 'span_id')
+    .map(([k, v]) => ({ key: k, value: formatInline(v) }))
+  );
+
+  labelChips = computed(() => {
+    const p = this.event().props ?? {};
+    const chips: Array<{ k: string; v: string }> = [];
+    const keys = ['version', 'instance', 'region', 'host', 'environment', 'env'];
+    for (const k of keys) {
+      const v = p[k];
+      if (v !== null && v !== undefined && String(v).length > 0) {
+        chips.push({ k, v: String(v) });
+      }
+    }
+    return chips;
+  });
+
+  durationLabel = computed(() => {
+    const p = this.event().props ?? {};
+    const candidates = ['durationMs', 'duration', 'elapsedMs', 'Elapsed', 'elapsed'];
+    for (const k of candidates) {
+      const v = p[k];
+      if (typeof v === 'number' && Number.isFinite(v)) return `${v}ms`;
+      if (typeof v === 'string' && v.trim().length > 0) return v;
+    }
+    return 'n/a';
+  });
+
   // ── Interaction ───────────────────────────────────────────────────────
   toggleExpand(e: Event): void {
     e.stopPropagation();
     if (this.menuType()) { this.menuType.set(null); return; }
     const opening = !this.expanded();
-    this.expanded.update(v => !v);
+    this.expandRequested.emit(this.event().id);
     if (opening && this.hasException()) this.detailTab.set('exception');
-    else if (opening)                   this.detailTab.set('props');
+    else if (opening)                   this.detailTab.set('overview');
   }
 
   openPropMenu(e: MouseEvent, k: string, v: string, isGroup = false): void {
@@ -324,6 +377,30 @@ export class EventRowComponent {
     if (y + 180 > window.innerHeight) y = e.clientY - 180;
     this.menuType.set('prop');
     this.menuPos.set({ x, y });
+  }
+
+  /** Opens the prop-viewer modal for a structured value (JSON object/array or XML string). */
+  openPropViewer(e: MouseEvent, key: string, value: unknown): void {
+    e.stopPropagation();
+    e.preventDefault();
+    this.viewerProp.set({ key, value });
+  }
+
+  closePropViewer(): void {
+    this.viewerProp.set(null);
+  }
+
+  /** True when a value should be rendered as a structured viewer button. */
+  isStructuredValue(v: unknown): boolean {
+    if (v !== null && typeof v === 'object') return true;
+    if (typeof v === 'string') {
+      const s = (v as string).trimStart();
+      if ((s.startsWith('{') || s.startsWith('[')) && s.length > 2) {
+        try { JSON.parse(s); return true; } catch { /* */ }
+      }
+      if (s.startsWith('<') && s.includes('>')) return true;
+    }
+    return false;
   }
 
   openMenu(e: MouseEvent, type: 'message' | 'level' | 'export'): void {

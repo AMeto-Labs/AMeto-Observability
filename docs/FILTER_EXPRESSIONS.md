@@ -1,6 +1,6 @@
 # Seq Filter Expression Reference
 
-Rd.Log implements the [Seq Filter Expression](https://docs.datalust.co/docs/filter-expressions) syntax.
+Ameto implements the [Seq Filter Expression](https://docs.datalust.co/docs/filter-expressions) syntax.
 
 ## Comparison operators
 
@@ -114,6 +114,154 @@ Case-insensitive substring search.
 
 ```
 ci_contains(@mt, 'failed')
+```
+
+### `endsWith(Property, 'suffix')`
+
+Case-sensitive suffix match.
+
+```
+endsWith(@mt, 'completed')
+```
+
+### `length(Property)` (in comparisons)
+
+Returns string/array length and is used with comparison operators.
+
+```
+length(UserId) > 3
+length(Tags) >= 2
+```
+
+### `toJson(Property)` (in comparisons)
+
+Serializes the property value to JSON string.
+
+```
+toJson(StatusCode) = '200'
+toJson(Payload) like '%"id":42%'
+```
+
+### `fromJson(Property)` (in comparisons)
+
+Parses JSON from string property and compares parsed value.
+
+```
+fromJson(JsonValue) = 42
+fromJson(JsonFlag) = true
+```
+
+### `coalesce(arg0, arg1, ..., fallback)` (in comparisons)
+
+Returns the first non-null argument.
+
+```
+coalesce(UserId, RequestId, 'anonymous') = 'anonymous'
+```
+
+### `toLower(Property)` / `toUpper(Property)` (in comparisons)
+
+String case conversion.
+
+```
+toLower(UserName) = 'alice'
+toUpper(UserName) = 'ALICE'
+```
+
+### `toNumber(Property)` (in comparisons)
+
+Parses string/number property into numeric value.
+
+```
+toNumber(StatusCode) >= 400
+```
+
+### `substring(Property, start, length?)` (in comparisons)
+
+Extracts substring from string property.
+
+```
+substring(Path, 1, 3) = 'api'
+substring(Path, 1) like 'api%'
+```
+
+### `indexOf(Property, 'text')` / `lastIndexOf(Property, 'text')` (in comparisons)
+
+Returns zero-based index or -1 when not found.
+
+```
+indexOf(Path, '/api') = 0
+lastIndexOf(Path, '/') >= 0
+```
+
+### `replace(Property, 'from', 'to')` (in comparisons)
+
+Replaces all literal occurrences.
+
+```
+replace(Path, '/api', '/v1') = '/v1/users'
+```
+
+### `concat(arg0, arg1, ...)` (in comparisons)
+
+Concatenates string arguments.
+
+```
+concat(FirstName, ' ', LastName) = 'John Smith'
+```
+
+### `datePart(Property, 'part', offsetHours?)` (in comparisons)
+
+Supported parts: `year`, `month`, `day`, `hour`, `minute`, `second`, `weekday`.
+
+```
+datePart(StartedAt, 'hour', 0) = 10
+```
+
+### `timeOfDay(Property, offsetHours)` (in comparisons)
+
+Returns time-of-day as ticks.
+
+```
+timeOfDay(StartedAt, 0) > 0
+```
+
+### `timeSpan(Property)` / `totalMilliseconds(Property)` (in comparisons)
+
+`timeSpan()` parses a timespan string into ticks. `totalMilliseconds()` converts ticks/time-span text to milliseconds.
+
+```
+timeSpan(DurationText) > 0
+totalMilliseconds(DurationTicks) >= 1000
+```
+
+### `toTimeString(Property)` / `toHexString(Property)` (in comparisons)
+
+```
+toTimeString(DurationTicks) = '00:00:01'
+toHexString(StatusCode) = '0xc8'
+```
+
+### `bucket(Property, error)` (in comparisons)
+
+```
+bucket(Duration, 0.1) > 0
+```
+
+### `offsetIn('TimeZoneId', InstantProperty)` (in comparisons)
+
+Returns offset ticks for timezone at instant.
+
+```
+offsetIn('UTC', StartedAt) = 0
+```
+
+### `arrived(Property)` (in comparisons)
+
+Can be used with `@id`.
+
+```
+arrived(@id) > 0
 ```
 
 ## `in` operator

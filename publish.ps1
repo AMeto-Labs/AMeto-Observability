@@ -66,26 +66,26 @@ if (-not $NoRestart -and -not $Restart) {
 }
 
 $clientDir  = Join-Path $root "client"
-$serverProj = Join-Path $root "src\Rd.Log.Server\Rd.Log.Server.csproj"
-$wwwroot     = Join-Path $root "src\Rd.Log.Server\wwwroot"
+$serverProj = Join-Path $root "src\Ameto.Server\Ameto.Server.csproj"
+$wwwroot     = Join-Path $root "src\Ameto.Server\wwwroot"
 $outputDir   = Join-Path $root $Output
-$serverDll   = Join-Path $outputDir "Rd.Log.Server.dll"
-$serverApp   = Join-Path $outputDir $(if ($runtimeId.StartsWith('win-')) { 'Rd.Log.Server.exe' } else { 'Rd.Log.Server' })
+$serverDll   = Join-Path $outputDir "Ameto.Server.dll"
+$serverApp   = Join-Path $outputDir $(if ($runtimeId.StartsWith('win-')) { 'Ameto.Server.exe' } else { 'Ameto.Server' })
 
 # Resolve full output dir path early so process matching works before publish.
 $outputDirFull = [System.IO.Path]::GetFullPath($outputDir)
 $serverDllFull = [System.IO.Path]::GetFullPath($serverDll)
 $serverAppFull = [System.IO.Path]::GetFullPath($serverApp)
 
-function Stop-RdLogServer {
+function Stop-AmetoServer {
     # Match by command line so we only kill OUR server, not unrelated dotnet processes.
     # Get-CimInstance reads Win32_Process.CommandLine which includes the full args.
-    $procs = Get-CimInstance Win32_Process -Filter "Name = 'dotnet.exe' OR Name = 'Rd.Log.Server.exe' OR Name = 'Rd.Log.Server'" -ErrorAction SilentlyContinue |
+    $procs = Get-CimInstance Win32_Process -Filter "Name = 'dotnet.exe' OR Name = 'Ameto.Server.exe' OR Name = 'Ameto.Server'" -ErrorAction SilentlyContinue |
         Where-Object {
             $_.CommandLine -and (
-                $_.CommandLine -like "*Rd.Log.Server.dll*" -or
-                $_.CommandLine -like "*Rd.Log.Server.exe*" -or
-                $_.CommandLine -like "*Rd.Log.Server*"
+                $_.CommandLine -like "*Ameto.Server.dll*" -or
+                $_.CommandLine -like "*Ameto.Server.exe*" -or
+                $_.CommandLine -like "*Ameto.Server*"
             )
         }
 
@@ -106,7 +106,7 @@ function Stop-RdLogServer {
     return $true
 }
 
-function Start-RdLogServer {
+function Start-AmetoServer {
     if (-not (Test-Path $serverAppFull)) {
         Write-Warning "Published app not found at $serverAppFull — skipping start."
         return
@@ -120,7 +120,7 @@ function Start-RdLogServer {
 
 Write-Host ""
 Write-Host "═══════════════════════════════════════════" -ForegroundColor Cyan
-Write-Host "  Rd.Log  ·  publish" -ForegroundColor Cyan
+Write-Host "  Ameto  ·  publish" -ForegroundColor Cyan
 Write-Host "═══════════════════════════════════════════" -ForegroundColor Cyan
 Write-Host ""
 
@@ -147,8 +147,8 @@ Write-Host "        Angular build complete → $wwwroot" -ForegroundColor Green
 
 # ── 2. Stop running server (so we can overwrite the publish dir) ──────────────
 Write-Host ""
-Write-Host "[ 2/4 ] Stopping running Rd.Log.Server (if any)..." -ForegroundColor Yellow
-$wasRunning = Stop-RdLogServer
+Write-Host "[ 2/4 ] Stopping running Ameto.Server (if any)..." -ForegroundColor Yellow
+$wasRunning = Stop-AmetoServer
 if (-not $wasRunning) {
     Write-Host "        No running server found." -ForegroundColor DarkGray
 }
@@ -187,8 +187,8 @@ if ($NoRestart) {
     Write-Host "  Run:  $serverApp" -ForegroundColor Cyan
 }
 else {
-    Write-Host "[ 4/4 ] Starting Rd.Log.Server..." -ForegroundColor Yellow
-    Start-RdLogServer
+    Write-Host "[ 4/4 ] Starting Ameto.Server..." -ForegroundColor Yellow
+    Start-AmetoServer
 }
 
 Write-Host ""

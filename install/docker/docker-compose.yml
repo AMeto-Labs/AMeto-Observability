@@ -1,0 +1,42 @@
+services:
+
+  Ameto:
+    build:
+      context: ../..          # repo root (so COPY can reach src/ and client/)
+      dockerfile: install/docker/Dockerfile
+    image: Ameto:latest
+    container_name: Ameto
+    restart: unless-stopped
+    ports:
+      - "5341:5341"
+    volumes:
+      # Persist log data across restarts
+      - Ameto-data:/data
+      # Optional: mount your own config.yml (uncomment to use)
+      # - ./config.yml:/app/config.yml:ro
+    environment:
+      # Override individual config values via env vars if needed.
+      # Ameto uses YAML config; environment overrides are not yet supported.
+      # Use a mounted config.yml for production tuning.
+      DOTNET_RUNNING_IN_CONTAINER: "true"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:5341/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ── Optional: second node for replication testing ─────────────────────────
+  # Ameto-node1:
+  #   image: Ameto:latest
+  #   container_name: Ameto-node1
+  #   restart: unless-stopped
+  #   ports:
+  #     - "5342:5341"
+  #   volumes:
+  #     - Ameto-node1-data:/data
+  #     - ./config-node1.yml:/app/config.yml:ro
+
+volumes:
+  Ameto-data:
+  # Ameto-node1-data:

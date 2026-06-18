@@ -52,8 +52,9 @@
   --radius: 6px;
   --radius-sm: 4px;
   --font-ui: Inter, "Segoe UI", sans-serif;
-  --font-mono: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
-  --mono: var(--font-mono);
+  --font-mono: Inter, "Segoe UI", sans-serif;
+  --mono: var(--font-ui);
+  --ui: var(--font-ui);
   --log-font-size: 13px;
   --log-line-height: 1.6;
   --log-letter-spacing: 0;
@@ -71,18 +72,19 @@
   --accent-dim: var(--accent-soft);
   --accent-bg: var(--accent-soft);
 
-  --lvl-v: var(--neutral);
-  --lvl-d: var(--info);
-  --lvl-i: var(--success);
-  --lvl-w: var(--warning);
-  --lvl-e: var(--error);
-  --lvl-f: var(--accent);
-  --lvl-v-bg: var(--neutral-soft);
-  --lvl-d-bg: var(--info-soft);
-  --lvl-i-bg: var(--success-soft);
-  --lvl-w-bg: var(--warning-soft);
-  --lvl-e-bg: var(--error-soft);
-  --lvl-f-bg: var(--accent-soft);
+  --lvl-v: #9CA3AF;
+  --lvl-d: #3982F6;
+  --lvl-i: #22C55E;
+  --lvl-w: #F59E0B;
+  --lvl-e: #EF4444;
+  --lvl-f: #A855F7;
+  --lvl-v-bg: #37415133;
+  --lvl-d-bg: #1E3A8A33;
+  --lvl-i-bg: #16653433;
+  --lvl-w-bg: #92400E33;
+  --lvl-e-bg: #991B1B33;
+  --lvl-f-bg: #6B21A833;
+  --svc-color: #A78BFA;
 
   --c-str: var(--param-string);
   --c-num: var(--param-integer);

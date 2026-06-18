@@ -366,27 +366,50 @@
           <button class="err-retry" (click)="loadEvents()">Retry</button>
         </div>
       }
-      <cdk-virtual-scroll-viewport
-        #viewport
-        class="events-list"
-        itemSize="29"
-        minBufferPx="600"
-        maxBufferPx="1200"
-        (scrolledIndexChange)="onVirtualScroll($event)">
-        <app-event-row
-          *cdkVirtualFor="let ev of displayedEvents(); trackBy: trackEvent"
-          [event]="ev"
-          [wrap]="wrapMessages()"
-          (filterSelected)="applyFilter($event)"
-          (seekRequested)="seek($event.from, $event.to)"
-        />
-        @if (loadingMore()) {
-          <div class="load-more"><span class="load-more-spin"></span></div>
-        }
-        @if (!loading() && !error() && displayedEvents().length === 0) {
-          <app-empty-state icon="inbox" text="No events match the current filter"></app-empty-state>
-        }
-      </cdk-virtual-scroll-viewport>
+      @if (!hasExpandedRows()) {
+        <cdk-virtual-scroll-viewport
+          #viewport
+          class="events-list"
+          itemSize="29"
+          minBufferPx="600"
+          maxBufferPx="1200"
+          (scrolledIndexChange)="onVirtualScroll($event)">
+          <app-event-row
+            *cdkVirtualFor="let ev of displayedEvents(); trackBy: trackEvent"
+            [event]="ev"
+            [wrap]="wrapMessages()"
+            [expandedEventIds]="expandedEventIds()"
+            (expandRequested)="onExpandRequested($event)"
+            (filterSelected)="applyFilter($event)"
+            (seekRequested)="seek($event.from, $event.to)"
+          />
+          @if (loadingMore()) {
+            <div class="load-more"><span class="load-more-spin"></span></div>
+          }
+          @if (!loading() && !error() && displayedEvents().length === 0) {
+            <app-empty-state icon="inbox" text="No events match the current filter"></app-empty-state>
+          }
+        </cdk-virtual-scroll-viewport>
+      } @else {
+        <div #plainList class="events-list events-list--plain" (scroll)="onPlainScroll($event)">
+          @for (ev of displayedEvents(); track ev.id) {
+            <app-event-row
+              [event]="ev"
+              [wrap]="wrapMessages()"
+              [expandedEventIds]="expandedEventIds()"
+              (expandRequested)="onExpandRequested($event)"
+              (filterSelected)="applyFilter($event)"
+              (seekRequested)="seek($event.from, $event.to)"
+            />
+          }
+          @if (loadingMore()) {
+            <div class="load-more"><span class="load-more-spin"></span></div>
+          }
+          @if (!loading() && !error() && displayedEvents().length === 0) {
+            <app-empty-state icon="inbox" text="No events match the current filter"></app-empty-state>
+          }
+        </div>
+      }
 
       <!-- Footer -->
       <div class="events-footer">

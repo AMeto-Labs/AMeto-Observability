@@ -1,0 +1,18 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Ameto.Alerts/Ameto.Alerts.csproj" />
+    <Project Path="src/Ameto.Replication/Ameto.Replication.csproj" />
+    <Project Path="src/Ameto.Core/Ameto.Core.csproj" />
+    <Project Path="src/Ameto.Indexing/Ameto.Indexing.csproj" />
+    <Project Path="src/Ameto.Ingestion/Ameto.Ingestion.csproj" />
+    <Project Path="src/Ameto.Metrics/Ameto.Metrics.csproj" />
+    <Project Path="src/Ameto.Otel/Ameto.Otel.csproj" />
+    <Project Path="src/Ameto.Query/Ameto.Query.csproj" />
+    <Project Path="src/Ameto.Serilog/Ameto.Serilog.csproj" />
+    <Project Path="src/Ameto.Storage/Ameto.Storage.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Ameto.Core.Tests/Ameto.Core.Tests.csproj" />
+    <Project Path="tests/Ameto.Query.Tests/Ameto.Query.Tests.csproj" />
+  </Folder>
+</Solution>

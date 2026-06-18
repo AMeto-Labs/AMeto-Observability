@@ -1,4 +1,4 @@
-# Rd.Log — Architecture Document
+# Ameto — Architecture Document
 
 > **For AI assistants**: This document is the single source of truth for the project. Read it fully before making any changes.
 
@@ -6,7 +6,7 @@
 
 ## Overview
 
-Rd.Log is a high-performance, self-hosted structured log server — a full alternative to [Datalust Seq](https://datalust.co/docs/posting-raw-events).
+Ameto is a high-performance, self-hosted structured log server — a full alternative to [Datalust Seq](https://datalust.co/docs/posting-raw-events).
 
 **Goals:**
 - Ingest **100,000 log events/second** sustained
@@ -38,30 +38,30 @@ Rd.Log is a high-performance, self-hosted structured log server — a full alter
 ## Project Structure
 
 ```
-Rd.Log.sln
+Ameto.sln
 ├── src/
-│   ├── Rd.Log.Core/
-│   ├── Rd.Log.Ingestion/
-│   ├── Rd.Log.Storage/
-│   ├── Rd.Log.Indexing/
-│   ├── Rd.Log.Query/
-│   ├── Rd.Log.Cluster/
-│   ├── Rd.Log.Alerts/
-│   ├── Rd.Log.Server/
-│   └── Rd.Log.UI/
+│   ├── Ameto.Core/
+│   ├── Ameto.Ingestion/
+│   ├── Ameto.Storage/
+│   ├── Ameto.Indexing/
+│   ├── Ameto.Query/
+│   ├── Ameto.Cluster/
+│   ├── Ameto.Alerts/
+│   ├── Ameto.Server/
+│   └── Ameto.UI/
 └── tests/
-    ├── Rd.Log.Core.Tests/
-    ├── Rd.Log.Storage.Tests/
-    ├── Rd.Log.Query.Tests/
-    ├── Rd.Log.Integration.Tests/
-    └── Rd.Log.Perf/
+    ├── Ameto.Core.Tests/
+    ├── Ameto.Storage.Tests/
+    ├── Ameto.Query.Tests/
+    ├── Ameto.Integration.Tests/
+    └── Ameto.Perf/
 ```
 
 ---
 
 ## Module Responsibilities
 
-### `Rd.Log.Core`
+### `Ameto.Core`
 - `LogEvent` — **struct** (value type, no heap alloc in hot path)
 - `LogLevel` — enum: `Verbose | Debug | Information | Warning | Error | Fatal`
 - Interfaces: `ILogStorage`, `ILogIndex`, `IQueryExecutor`, `ISegmentWriter`
@@ -81,7 +81,7 @@ public readonly struct LogEvent
 }
 ```
 
-### `Rd.Log.Ingestion`
+### `Ameto.Ingestion`
 - **MPMC Ring Buffer**: power-of-2 slots, `NativeMemory`-backed, cache-line padded
 - HTTP endpoint: `POST /api/events` — accepts `application/x-msgpack` batch
 - Zero-copy parsing: `ReadOnlySequence<byte>` → `Span<byte>`, no intermediate arrays
@@ -104,7 +104,7 @@ Array of events, each event = Map {
 Rendered messages are **not** stored on the server — the client renders
 `@mt` + properties on the fly.
 
-### `Rd.Log.Storage`
+### `Ameto.Storage`
 Three-tier storage:
 
 #### Hot-Tier
@@ -153,7 +153,7 @@ Three-tier storage:
 - A segment is deleted only if **all** events in it are expired
 - No defragmentation — whole-segment deletion only
 
-### `Rd.Log.Indexing`
+### `Ameto.Indexing`
 Per-segment indexes, built during flush and embedded in `.seg` files:
 
 | Index | Purpose |
@@ -165,7 +165,7 @@ Per-segment indexes, built during flush and embedded in `.seg` files:
 
 Hot-tier maintains a live in-memory version of all indexes above.
 
-### `Rd.Log.Query`
+### `Ameto.Query`
 - **Seq Filter Expression** compatible: full lexer + recursive descent parser → AST
 - Supported operators: `=`, `<>`, `<`, `>`, `<=`, `>=`, `like`, `not like`, `in`, `not in`, `has`, `is null`, `is not null`, `and`, `or`, `not`
 - Built-in properties: `@l` (level), `@t` (timestamp), `@mt`, `@m`, `@x`
@@ -178,7 +178,7 @@ Hot-tier maintains a live in-memory version of all indexes above.
 - Result streaming: `IAsyncEnumerable<LogEvent>` — no full result materialization
 - Hot + cold tier queried in parallel, results merged by timestamp
 
-### `Rd.Log.Cluster`
+### `Ameto.Cluster`
 - **Topology**: Leader (writes) + Read Replicas (reads only)
 - **Leader election**: Raft-lite — leader lease + heartbeat (no log replication for election)
 - **Replication**:
@@ -187,13 +187,13 @@ Hot-tier maintains a live in-memory version of all indexes above.
 - **Node registry**: each node broadcasts via UDP multicast or configured static list
 - **Health**: `/api/health` endpoint, read replicas redirect writes to leader
 
-### `Rd.Log.Alerts`
+### `Ameto.Alerts`
 - Alert rule: `{ Name, FilterExpression (Seq syntax), Threshold, Window, Channels }`
 - **Evaluator**: sliding window counter per rule, runs on ingestion hot path (non-blocking)
 - **Channels**: Webhook (HTTP POST JSON) and SMTP email
 - Rules stored in local JSON config file, hot-reloaded
 
-### `Rd.Log.Server`
+### `Ameto.Server`
 - Kestrel composition root, DI wiring
 - **REST API**:
   - `POST /api/events` — ingest batch (msgpack)
@@ -207,7 +207,7 @@ Hot-tier maintains a live in-memory version of all indexes above.
 - API key authentication (`X-Api-Key` header), per-app keys
 - `application/x-msgpack` preferred, `application/json` fallback
 
-### `Rd.Log.UI`
+### `Ameto.UI`
 - **Blazor Server** (.NET 10)
 - Pages:
   - **Live Tail** — real-time event stream with filter bar
@@ -337,16 +337,16 @@ Offset  Content
 
 ## Implementation Order
 
-1. `Rd.Log.Core` — models, interfaces, MessagePack contracts
-2. `Rd.Log.Storage` — hot-tier, WAL, cold-tier, retention
-3. `Rd.Log.Indexing` — inverted index, bloom, trigram, RoaringBitmap
-4. `Rd.Log.Ingestion` — ring buffer, HTTP endpoint
-5. `Rd.Log.Query` — Seq Filter Expression parser + executor
-6. `Rd.Log.Server` — Kestrel host, REST + SSE API
-7. `Rd.Log.Alerts` — alert rules + dispatcher
-8. `Rd.Log.Cluster` — leader election + replication
-9. `Rd.Log.UI` — Blazor Server app
-10. `Rd.Log.Perf` — BenchmarkDotNet suite
+1. `Ameto.Core` — models, interfaces, MessagePack contracts
+2. `Ameto.Storage` — hot-tier, WAL, cold-tier, retention
+3. `Ameto.Indexing` — inverted index, bloom, trigram, RoaringBitmap
+4. `Ameto.Ingestion` — ring buffer, HTTP endpoint
+5. `Ameto.Query` — Seq Filter Expression parser + executor
+6. `Ameto.Server` — Kestrel host, REST + SSE API
+7. `Ameto.Alerts` — alert rules + dispatcher
+8. `Ameto.Cluster` — leader election + replication
+9. `Ameto.UI` — Blazor Server app
+10. `Ameto.Perf` — BenchmarkDotNet suite
 
 ---
 

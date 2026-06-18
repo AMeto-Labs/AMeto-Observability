@@ -1,6 +1,6 @@
 # REST API Reference
 
-Base URL: `http://localhost:5341` (configurable via `RdLog.HttpPort`).
+Base URL: `http://localhost:5341` (configurable via `Ameto.HttpPort`).
 
 All responses are JSON unless noted.
 
@@ -335,7 +335,7 @@ Delete a saved query. Only the owner or an `admin` may delete.
 
 ## Replication
 
-All replication endpoints are registered only when `RdLog.Replication.Enabled = true`.
+All replication endpoints are registered only when `Ameto.Replication.Enabled = true`.
 
 ### `GET /api/replication/nodes`
 

@@ -112,3 +112,44 @@
   opacity: .5;
   cursor: default;
 }
+
+.divider {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--txt-dim);
+  font-size: 11px;
+
+  &::before, &::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: var(--border);
+  }
+}
+
+.btn-oauth {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 9px 12px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--txt);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  transition: background .15s, border-color .15s;
+  cursor: pointer;
+  width: 100%;
+
+  &:hover {
+    background: var(--bg-elevated);
+    border-color: var(--txt-dim);
+  }
+}
+
+.oauth-icon { flex-shrink: 0; }
+

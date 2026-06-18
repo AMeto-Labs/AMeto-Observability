@@ -1,7 +1,13 @@
+export type UserRole = 'admin' | 'manager' | 'viewer';
+export type UserProvider = 'local' | 'google' | 'microsoft';
+
 export interface UserDto {
   id: string;
   username: string;
-  role: 'admin' | 'manager';
+  displayName: string;
+  email: string;
+  provider: UserProvider;
+  role: UserRole;
   createdAt: string;
 }
 
@@ -24,4 +30,11 @@ export interface CreatedApiKeyDto {
 export interface LoginResponseDto {
   token: string;
   expiresIn: number;
+  role: UserRole;
+}
+
+export interface AuthProvidersDto {
+  local: boolean;
+  google: boolean;
+  microsoft: boolean;
 }

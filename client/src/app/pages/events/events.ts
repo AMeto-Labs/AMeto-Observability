@@ -27,8 +27,16 @@ const BUILTIN_SUGGESTIONS = [
   '@i', '@r', '@sp', '@tr',
   'and', 'or', 'not', 'in', 'like',
   'true', 'false', 'null',
-  'has(', 'isDefined(', 'startsWith(', 'contains(',
+  'has(', 'isDefined(', 'startsWith(', 'contains(', 'endsWith(',
   'ci_startsWith(', 'ci_contains(',
+  'length(', 'coalesce(', 'fromJson(', 'toJson(',
+  'toLower(', 'toUpper(', 'toNumber(',
+  'substring(', 'indexOf(', 'lastIndexOf(', 'replace(', 'concat(',
+  'ci_endsWith(', 'typeOf(', 'elementAt(', 'keys(', 'values(',
+  'round(', 'now(', 'dateTime(', 'toIsoString(',
+  'datePart(', 'timeOfDay(', 'timeSpan(', 'totalMilliseconds(',
+  'toTimeString(', 'toHexString(', 'bucket(', 'offsetIn(', 'arrived(',
+  'fromXml(', 'fromBase64(', 'toBase64(', 'regexMatch(', 'regexExtract(',
 ];
 
 /** Safe identifier as accepted by the server-side lexer (letter/digit/_/@). */
@@ -68,6 +76,59 @@ function collectPropPaths(
 /** Milliseconds between .NET DateTime min (0001-01-01 UTC) and Unix epoch (1970-01-01 UTC). */
 const DOTNET_TICKS_UNIX_EPOCH_MS = 62_135_596_800_000;
 
+/**
+ * Removes all matches of `pattern` from a filter expression string, then
+ * cleans up dangling `and`/`or` connectives and extra whitespace.
+ * Used by applyLevels / applyServices to splice out a previous clause before
+ * inserting a new one, without erasing the user's own expression.
+ */
+function stripFilterClause(expr: string, pattern: RegExp): string {
+  let s = expr.replace(pattern, '');
+  // Remove dangling connectives like "and and", leading/trailing "and"/"or"
+  s = s.replace(/\s+and\s+and\s+/gi, ' and ')
+       .replace(/^\s*(and|or)\s+/gi, '')
+       .replace(/\s+(and|or)\s*$/gi, '')
+       .trim();
+  return s;
+}
+
+/**
+ * Extracts the active log levels from a filter expression string.
+ * Recognises: @l = 'Error'  |  @l in ['Error', 'Fatal']
+ * Returns full set (all levels) when no @l clause is present.
+ */
+function parseLevelsFromFilter(expr: string): Set<string> {
+  // @l in ['A','B',...]
+  const inMatch = expr.match(/@l\s+in\s*\[([^\]]+)\]/i);
+  if (inMatch) {
+    const levels = new Set<string>();
+    for (const m of inMatch[1].matchAll(/'([^']+)'/g)) levels.add(m[1]);
+    return levels.size > 0 ? levels : new Set(LEVELS as unknown as string[]);
+  }
+  // @l = 'X'
+  const eqMatch = expr.match(/@l\s*=\s*'([^']+)'/i);
+  if (eqMatch) return new Set([eqMatch[1]]);
+  return new Set(LEVELS as unknown as string[]);
+}
+
+/**
+ * Extracts selected service names from a filter expression string.
+ * Recognises: ['service.name'] = 'X'  |  ['service.name'] in ['A','B']
+ */
+function parseServicesFromFilter(expr: string): Set<string> {
+  // ['service.name'] in ['A','B']
+  const inMatch = expr.match(/\['service\.name'\]\s+in\s*\[([^\]]+)\]/i);
+  if (inMatch) {
+    const svcs = new Set<string>();
+    for (const m of inMatch[1].matchAll(/'([^']+)'/g)) svcs.add(m[1]);
+    return svcs;
+  }
+  // ['service.name'] = 'X'
+  const eqMatch = expr.match(/\['service\.name'\]\s*=\s*'([^']+)'/i);
+  if (eqMatch) return new Set([eqMatch[1]]);
+  return new Set<string>();
+}
+
 /** Converts JS milliseconds-since-Unix-epoch into .NET UTC ticks (100ns since 0001-01-01). */
 function msToDotNetUtcTicks(ms: number): number {
   return (ms + DOTNET_TICKS_UNIX_EPOCH_MS) * 10_000;
@@ -101,19 +162,24 @@ export class EventsComponent implements OnInit, OnDestroy {
   hasMore       = signal(true);
   error         = signal<string | null>(null);
   signalsPanelOpen    = signal(false);
-  activeLevels        = signal(new Set(LEVELS as unknown as string[]));
+  // activeLevels and selectedServices are derived from filterInput (single source of truth).
+  // Dropdowns read/write only the filter string — no separate state to desync.
+  activeLevels  = computed(() => parseLevelsFromFilter(this.filterInput()));
+  selectedServices = computed(() => parseServicesFromFilter(this.filterInput()));
   liveActive          = signal(false);
   autoScroll          = signal(true);
   wrapMessages        = signal(false);
+  expandedEventIds    = signal<ReadonlySet<string>>(new Set());
   levelsDropdownOpen  = signal(false);
   serviceDropdownOpen = signal(false);
   dateDropdownOpen    = signal(false);
-  // Services: multi-select with pending/apply pattern
-  selectedServices    = signal<Set<string>>(new Set());
+  // Pending state for dropdowns (edits before Apply)
   pendingServices     = signal<Set<string>>(new Set());
   serviceSearch       = signal('');
   showMoreServices    = signal(false);
-  // Levels: pending/apply pattern
+  // Services loaded from backend (independent of loaded events)
+  backendServices     = signal<string[]>([]);
+  // Pending levels for dropdown
   pendingLevels       = signal<Set<string>>(new Set(LEVELS as unknown as string[]));
   // Calendar for date picker
   calendarNav         = signal<{ year: number; month: number }>({
@@ -177,21 +243,52 @@ export class EventsComponent implements OnInit, OnDestroy {
     return this.maskPattern.slice(value.length);
   }
 
+  onExpandRequested(eventId: string): void {
+    if (!eventId) return; // guard: ignore events without id
+    const wasFirstExpand = this.expandedEventIds().size === 0;
+    const isOpening = !this.expandedEventIds().has(eventId);
+    this.expandedEventIds.update(prev => {
+      const next = new Set(prev);
+      if (next.has(eventId)) next.delete(eventId);
+      else next.add(eventId);
+      return next;
+    });
+
+    // Only scroll on the very first expand (virtual→plain mode switch).
+    // For all subsequent expands the user is already in plain list mode and
+    // has manually scrolled to the row they want — don't fight their scroll.
+    if (isOpening && wasFirstExpand) {
+      const index = this.displayedEvents().findIndex(e => e.id === eventId);
+      if (index >= 0) {
+        setTimeout(() => {
+          const plain = this.plainList()?.nativeElement;
+          if (plain && plain.scrollHeight > 0) {
+            const approxOffset = Math.max(0, index * 29 - 120);
+            plain.scrollTo({ top: approxOffset });
+          }
+        }, 50); // wait for Angular to finish rendering plain list
+      }
+    }
+  }
+
+  hasExpandedRows = computed(() => this.expandedEventIds().size > 0);
+
   // ── Computed ───────────────────────────────────────────────────────────
   /** Events list — optionally filtered client-side by service and quick-search. */
   displayedEvents = computed(() => {
     let evs = this.events();
     const svcs = this.selectedServices();
-    if (svcs.size > 0) evs = evs.filter(e => svcs.has((e.props?.['ApplicationContext'] as string) ?? ''));
+    if (svcs.size > 0) evs = evs.filter(e => svcs.has((e['service.name'] as string) ?? ''));
     const q = this.quickSearch().trim().toLowerCase();
     if (q) evs = evs.filter(e => (e['@mt'] ?? '').toLowerCase().includes(q));
     return evs;
   });
 
   availableServices = computed<string[]>(() => {
-    const svcs = new Set<string>();
+    // Merge backend-known services with any additional ones seen in current events
+    const svcs = new Set<string>(this.backendServices());
     for (const ev of this.events()) {
-      const svc = ev.props?.['ApplicationContext'] as string;
+      const svc = ev['service.name'] as string | undefined;
       if (svc) svcs.add(svc);
     }
     return [...svcs].sort();
@@ -259,7 +356,7 @@ export class EventsComponent implements OnInit, OnDestroy {
   serviceCounts = computed(() => {
     const counts: Record<string, number> = {};
     for (const ev of this.events()) {
-      const svc = ev.props?.['ApplicationContext'] as string;
+      const svc = ev['service.name'] as string | undefined;
       if (svc) counts[svc] = (counts[svc] ?? 0) + 1;
     }
     return counts;
@@ -284,6 +381,7 @@ export class EventsComponent implements OnInit, OnDestroy {
   // ── View refs / sync ──────────────────────────────────────────────────
   private filterRef    = viewChild<ElementRef<HTMLTextAreaElement>>('filterEl');
   private viewport      = viewChild<CdkVirtualScrollViewport>('viewport');
+  private plainList     = viewChild<ElementRef<HTMLElement>>('plainList');
   private dateFbGroup   = viewChild<ElementRef<HTMLElement>>('dateFbGroup');
   private levelsFbGroup = viewChild<ElementRef<HTMLElement>>('levelsFbGroup');
   private svcFbGroup    = viewChild<ElementRef<HTMLElement>>('svcFbGroup');
@@ -334,7 +432,21 @@ export class EventsComponent implements OnInit, OnDestroy {
       this.applyPresetDates(urlPreset);
     }
     if (urlLevels) {
-      this.activeLevels.set(new Set(urlLevels.split(',').filter(Boolean)));
+      // Legacy: old URLs had a separate `levels=` param. Only apply it if the
+      // filter string does NOT already contain an @l clause (avoids duplicate on F5).
+      const alreadyInFilter = /@l\s*(=|in)/i.test(urlFilter);
+      if (!alreadyInFilter) {
+        const lvlSet = new Set(urlLevels.split(',').filter(Boolean));
+        if (lvlSet.size < LEVELS.length) {
+          const clause = lvlSet.size === 1
+            ? `@l = '${[...lvlSet][0]}'`
+            : `@l in [${[...lvlSet].map(l => `'${l}'`).join(', ')}]`;
+          const base = urlFilter.trim();
+          const merged = base ? `${clause} and ${base}` : clause;
+          this.filterInput.set(merged);
+          this.filter.set(merged);
+        }
+      }
     }
 
     this.loadEvents();
@@ -353,14 +465,15 @@ export class EventsComponent implements OnInit, OnDestroy {
   }
 
   private syncRoute(): void {
-    const lvls = this.activeLevels();
-    const allSelected = lvls.size === LEVELS.length;
+    // levels is no longer stored as a separate URL param — the @l clause in
+    // `filter` is the single source of truth. We keep null here so old `levels=`
+    // params are removed from the URL on the first navigation after upgrade.
     const qp: Record<string, string | null> = {
       filter: this.filter() || null,
       preset:  this.timePreset(),
       from:    this.customFrom() || null,
       to:      this.customTo()   || null,
-      levels:  allSelected ? null : [...lvls].join(','),
+      levels:  null,
       size:    this.pageSize() === 50 ? null : String(this.pageSize()),
     };
     this.router.navigate([], { queryParams: qp, replaceUrl: true });
@@ -479,6 +592,9 @@ export class EventsComponent implements OnInit, OnDestroy {
     this.error.set(null);
     this.events.set([]);
     this.hasMore.set(true);
+    // Reset expanded state: stale IDs from a previous result set must not
+    // persist, otherwise unrelated events with the same ID would appear expanded.
+    this.expandedEventIds.set(new Set());
 
     const acc: EventDto[] = [];
     const size = this.pageSize();
@@ -546,7 +662,13 @@ export class EventsComponent implements OnInit, OnDestroy {
       next: ev => acc.push(ev),
       complete: () => {
         if (acc.length > 0) {
-          this.events.update(evs => [...evs, ...acc]);
+          this.events.update(evs => {
+            // Deduplicate: server cursor overlap can occasionally return the same
+            // event twice; duplicate IDs would cause multiple rows to appear expanded.
+            const seen = new Set(evs.map(e => e.id));
+            const fresh = acc.filter(e => !seen.has(e.id));
+            return fresh.length > 0 ? [...evs, ...fresh] : evs;
+          });
         }
         this.loadingMore.set(false);
         this.hasMore.set(acc.length >= size);
@@ -573,13 +695,34 @@ export class EventsComponent implements OnInit, OnDestroy {
     if (remaining < 400) this.loadMore();
   }
 
+  /** Infinite-scroll trigger for plain list mode (used when rows are expanded). */
+  onPlainScroll(event: Event): void {
+    const el = event.target as HTMLElement | null;
+    if (!el) return;
+    const remaining = el.scrollHeight - el.scrollTop - el.clientHeight;
+    if (remaining < 400) this.loadMore();
+  }
+
   scrollToOlderLogs(): void {
-    this.viewport()?.scrollToIndex(0, 'smooth');
+    const vp = this.viewport();
+    if (vp) {
+      vp.scrollToIndex(0, 'smooth');
+      return;
+    }
+    const plain = this.plainList()?.nativeElement;
+    plain?.scrollTo({ top: 0, behavior: 'smooth' });
   }
 
   scrollToNewerLogs(): void {
-    const last = this.displayedEvents().length - 1;
-    if (last >= 0) this.viewport()?.scrollToIndex(last, 'smooth');
+    const vp = this.viewport();
+    if (vp) {
+      const last = this.displayedEvents().length - 1;
+      if (last >= 0) vp.scrollToIndex(last, 'smooth');
+      return;
+    }
+    const plain = this.plainList()?.nativeElement;
+    if (!plain) return;
+    plain.scrollTo({ top: plain.scrollHeight, behavior: 'smooth' });
   }
 
   /** TrackBy for *cdkVirtualFor over event rows. */
@@ -702,7 +845,6 @@ export class EventsComponent implements OnInit, OnDestroy {
     this.filterInput.set('');
     this.filter.set('');
     this.timePreset.set('1d');
-    this.activeLevels.set(new Set(LEVELS as unknown as string[]));
     this.applyPresetDates('1d');
     this.loadEvents();
   }
@@ -728,12 +870,20 @@ export class EventsComponent implements OnInit, OnDestroy {
   }
 
   toggleLevel(level: string): void {
-    this.activeLevels.update(set => {
-      const next = new Set(set);
-      if (next.has(level)) next.delete(level);
-      else next.add(level);
-      return next;
+    // Toggle by patching the filter string
+    const current = this.activeLevels();
+    const next = new Set(current);
+    if (next.has(level)) next.delete(level); else next.add(level);
+    const allActive = next.size === LEVELS.length;
+    this.filterInput.update(q => {
+      const stripped = stripFilterClause(q, /@l\s*(=|in|!=)[^)\n]+(\))?/g);
+      if (allActive) return stripped;
+      const clause = next.size === 1
+        ? `@l = '${[...next][0]}'`
+        : `@l in [${[...next].map(l => `'${l}'`).join(', ')}]`;
+      return stripped.trim() ? `${clause} and ${stripped.trim()}` : clause;
     });
+    this.filter.set(this.filterInput());
     this.loadEvents();
   }
 
@@ -821,12 +971,13 @@ export class EventsComponent implements OnInit, OnDestroy {
   }
 
   toggleAllLevels(): void {
-    this.activeLevels.set(new Set(LEVELS as unknown as string[]));
+    // Remove @l clause from filter — no clause means all levels
+    this.filterInput.update(q => stripFilterClause(q, /@l\s*(=|in|!=)[^)\n]+(\))?/g));
+    this.filter.set(this.filterInput());
     this.loadEvents();
   }
 
   resetAll(): void {
-    this.selectedServices.set(new Set());
     this.quickSearch.set('');
     this.reset();
   }
@@ -892,6 +1043,9 @@ export class EventsComponent implements OnInit, OnDestroy {
 
   // ── Levels dropdown (pending/apply) ───────────────────────────────────
   openLevelsDropdown(): void {
+    // Close all other dropdowns first (fixes: old dropdown stays open)
+    this.serviceDropdownOpen.set(false);
+    this.dateDropdownOpen.set(false);
     this.computeDdPos(this.levelsFbGroup()?.nativeElement);
     this.pendingLevels.set(new Set(this.activeLevels()));
     this.levelsDropdownOpen.set(true);
@@ -916,8 +1070,19 @@ export class EventsComponent implements OnInit, OnDestroy {
   }
 
   applyLevels(): void {
-    this.activeLevels.set(new Set(this.pendingLevels()));
+    const levels = new Set(this.pendingLevels());
     this.levelsDropdownOpen.set(false);
+    // Write @l clause into filter as single source of truth
+    const allActive = levels.size === LEVELS.length;
+    this.filterInput.update(q => {
+      const stripped = stripFilterClause(q, /@l\s*(=|in|!=)[^)\n]+(\))?/g);
+      if (allActive) return stripped;
+      const clause = levels.size === 1
+        ? `@l = '${[...levels][0]}'`
+        : `@l in [${[...levels].map(l => `'${l}'`).join(', ')}]`;
+      return stripped.trim() ? `${clause} and ${stripped.trim()}` : clause;
+    });
+    this.filter.set(this.filterInput());
     this.loadEvents();
   }
 
@@ -930,6 +1095,16 @@ export class EventsComponent implements OnInit, OnDestroy {
 
   // ── Services dropdown (pending/apply) ─────────────────────────────────
   openServicesDropdown(): void {
+    // Close all other dropdowns first (fixes: old dropdown stays open)
+    this.levelsDropdownOpen.set(false);
+    this.dateDropdownOpen.set(false);
+    // Lazy-load backend services if not yet loaded
+    if (this.backendServices().length === 0) {
+      this.api.getServiceNames().subscribe({
+        next: s => { this.backendServices.set(s); this.cdr.markForCheck(); },
+        error: () => {},
+      });
+    }
     this.computeDdPos(this.svcFbGroup()?.nativeElement);
     this.pendingServices.set(new Set(this.selectedServices()));
     this.serviceSearch.set('');
@@ -950,8 +1125,28 @@ export class EventsComponent implements OnInit, OnDestroy {
   }
 
   applyServices(): void {
-    this.selectedServices.set(new Set(this.pendingServices()));
-    this.serviceDropdownOpen.set(false);
+    const svcs = new Set(this.pendingServices());
+    // selectedServices is computed from filterInput, so just patch the filter\n    this.serviceDropdownOpen.set(false);
+    // Use bracket notation ['service.name'] so the parser treats it as a single
+    // segment — matches the ev.ServiceName dedicated field fast-path on the backend.
+    this.filterInput.update(q => {
+      const stripped = stripFilterClause(
+        q, /\['service\.name'\]\s*=\s*'[^']*'|\['service\.name'\]\s*in\s*\[[^\]]*\]|\(service\.name\s*=\s*'[^']*'\s*or\s*ApplicationContext\s*=\s*'[^']*'\)/g
+      );
+      if (svcs.size === 0) return stripped;
+      const clause = svcs.size === 1
+        ? `['service.name'] = '${[...svcs][0]}'`
+        : `['service.name'] in [${[...svcs].map(s => `'${s}'`).join(', ')}]`;
+      // Place AFTER @l clause if present, before everything else
+      const lvlMatch = stripped.match(/^(@l\s*(?:=|in)\s*\[[^\]]+\]|@l\s*=\s*'[^']*')(\s+and\s+|$)/i);
+      if (lvlMatch) {
+        const rest = stripped.slice(lvlMatch[0].length).trim();
+        return rest ? `${lvlMatch[1]} and ${clause} and ${rest}` : `${lvlMatch[1]} and ${clause}`;
+      }
+      return stripped.trim() ? `${clause} and ${stripped.trim()}` : clause;
+    });
+    this.filter.set(this.filterInput());
+    this.loadEvents();
   }
 
   resetServices(): void {

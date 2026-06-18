@@ -6,6 +6,7 @@ import { LucideAngularModule } from 'lucide-angular';
 import { ThemeService } from '../../core/services/theme.service';
 import { ApiService } from '../../core/services/api.service';
 import { AuthService } from '../../core/services/auth.service';
+import { UserPreferencesService } from '../../core/services/user-preferences.service';
 import { RetentionDto, RetentionRunResult } from '../../core/models/retention.model';
 import { UserDto, ApiKeyDto, CreatedApiKeyDto } from '../../core/models/auth.model';
 import { PageHeaderComponent, SectionComponent } from '../../shared/components/ui';
@@ -20,8 +21,11 @@ import { PageHeaderComponent, SectionComponent } from '../../shared/components/u
 export class SettingsComponent implements OnInit {
   theme       = inject(ThemeService);
   authService = inject(AuthService);
+  prefs       = inject(UserPreferencesService);
   private api = inject(ApiService);
   private cdr = inject(ChangeDetectorRef);
+
+  overviewCustomPropsCsv = '';
 
   retentionLoading = signal(false);
   retentionSaving  = signal(false);
@@ -42,8 +46,16 @@ export class SettingsComponent implements OnInit {
   usersLoading = signal(false);
   newUsername = '';
   newPassword = '';
-  newRole: 'admin' | 'manager' = 'manager';
+  newRole: 'admin' | 'manager' | 'viewer' = 'viewer';
   userError = signal<string | null>(null);
+
+  // OAuth user form
+  newOAuthEmail    = '';
+  newOAuthDisplay  = '';
+  newOAuthProvider: 'google' | 'microsoft' = 'google';
+  newOAuthRole: 'admin' | 'manager' | 'viewer' = 'viewer';
+  oauthUserError = signal<string | null>(null);
+  addUserTab: 'local' | 'oauth' = 'local';
 
   // ── API Keys ───────────────────────────────────────────────────────────────
   apiKeys       = signal<ApiKeyDto[]>([]);
@@ -54,6 +66,7 @@ export class SettingsComponent implements OnInit {
   createdKey    = signal<CreatedApiKeyDto | null>(null);
 
   ngOnInit(): void {
+    this.overviewCustomPropsCsv = this.prefs.overviewCustomPropsCsv();
     this.retentionLoading.set(true);
     this.api.getRetention().subscribe({
       next: r => {
@@ -121,10 +134,40 @@ export class SettingsComponent implements OnInit {
     this.api.createUser(this.newUsername.trim(), this.newPassword.trim(), this.newRole).subscribe({
       next: u => {
         this.users.update(arr => [...arr, u]);
-        this.newUsername = ''; this.newPassword = ''; this.newRole = 'manager';
+        this.newUsername = ''; this.newPassword = ''; this.newRole = 'viewer';
         this.cdr.markForCheck();
       },
       error: () => { this.userError.set('Failed to create user.'); this.cdr.markForCheck(); },
+    });
+  }
+
+  addOAuthUser(): void {
+    if (!this.newOAuthEmail.trim()) {
+      this.oauthUserError.set('Email is required.'); return;
+    }
+    this.oauthUserError.set(null);
+    this.api.createOAuthUser(
+      this.newOAuthEmail.trim(),
+      this.newOAuthDisplay.trim() || this.newOAuthEmail.trim(),
+      this.newOAuthProvider,
+      this.newOAuthRole,
+    ).subscribe({
+      next: u => {
+        this.users.update(arr => [...arr, u]);
+        this.newOAuthEmail = ''; this.newOAuthDisplay = '';
+        this.newOAuthProvider = 'google'; this.newOAuthRole = 'viewer';
+        this.cdr.markForCheck();
+      },
+      error: () => { this.oauthUserError.set('Failed to add OAuth user. Email may already exist.'); this.cdr.markForCheck(); },
+    });
+  }
+
+  changeRole(id: string, role: string): void {
+    this.api.updateUserRole(id, role).subscribe({
+      next: () => {
+        this.users.update(arr => arr.map(u => u.id === id ? { ...u, role: role as any } : u));
+        this.cdr.markForCheck();
+      },
     });
   }
 
@@ -165,5 +208,11 @@ export class SettingsComponent implements OnInit {
   }
 
   dismissCreatedKey(): void { this.createdKey.set(null); this.cdr.markForCheck(); }
+
+  saveOverviewPrefs(): void {
+    this.prefs.setOverviewCustomPropsFromCsv(this.overviewCustomPropsCsv);
+    this.overviewCustomPropsCsv = this.prefs.overviewCustomPropsCsv();
+    this.cdr.markForCheck();
+  }
 }
 

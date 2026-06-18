@@ -121,7 +121,7 @@
   border-radius: 6px;
   color: var(--text-primary);
   font-size: 12px;
-  font-family: monospace;
+  font-family: var(--font-ui);
   outline: none;
   box-sizing: border-box;
 
@@ -306,7 +306,7 @@
   font-size: 20px;
   font-weight: 700;
   color: var(--text-primary);
-  font-family: 'JetBrains Mono', monospace;
+  font-family: var(--font-ui);
 }
 
 .sparkline {
@@ -432,7 +432,7 @@
 .trace-ts {
   font-size: 11px;
   color: var(--text-muted);
-  font-family: 'JetBrains Mono', monospace;
+  font-family: var(--font-ui);
 }
 
 .trace-path-line {
@@ -466,7 +466,7 @@
 .trace-dur {
   font-size: 11px;
   color: var(--text-muted);
-  font-family: 'JetBrains Mono', monospace;
+  font-family: var(--font-ui);
 }
 
 // ── HTTP method badge ──────────────────────────────────────────────────────
@@ -709,7 +709,7 @@
   text-align: right;
   color: var(--text-muted);
   font-size: 11px;
-  font-family: 'JetBrains Mono', monospace;
+  font-family: var(--font-ui);
 }
 
 // ── Span detail panel ──────────────────────────────────────────────────────────
@@ -762,7 +762,7 @@
   gap: 5px;
   word-break: break-all;
 
-  &.mono  { font-family: 'JetBrains Mono', monospace; }
+  &.mono  { font-family: var(--font-ui); }
   &.small { font-size: 11px; }
 }
 
@@ -822,7 +822,7 @@
     vertical-align: top;
     color: var(--text-primary);
 
-    &.tag-key { color: var(--info); font-family: 'JetBrains Mono', monospace; white-space: nowrap; }
+    &.tag-key { color: var(--info); font-family: var(--font-ui); white-space: nowrap; }
     &.tag-val { word-break: break-all; }
   }
 }
@@ -858,7 +858,7 @@
   color: var(--text-primary);
   word-break: break-all;
 
-  &.mono  { font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+  &.mono  { font-family: var(--font-ui); font-size: 12px; }
   &.small { font-size: 11px; }
 }
 
@@ -877,7 +877,7 @@
 }
 
 // ── Shared utilities ──────────────────────────────────────────────────────────
-.mono { font-family: 'JetBrains Mono', monospace; }
+.mono { font-family: var(--font-ui); }
 
 @keyframes spin { to { transform: rotate(360deg); } }
 .spin { animation: spin 1s linear infinite; }
@@ -990,7 +990,7 @@
   td { padding: 10px 12px; color: var(--text-primary); vertical-align: middle; }
 }
 
-.mono   { font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+.mono   { font-family: var(--font-ui); font-size: 12px; }
 .time   { color: var(--text-muted); }
 .trace-id { color: var(--info); }
 .span-name { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

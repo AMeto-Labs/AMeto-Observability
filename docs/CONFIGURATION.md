@@ -1,11 +1,11 @@
 # Configuration Reference
 
-All settings live in `src/Rd.Log.Server/config.yml` under the `RdLog` key.
+All settings live in `src/Ameto.Server/config.yml` under the `Ameto` key.
 
 Environment variables override config file values using `__` as the hierarchy separator:
 
 ```bash
-RdLog__DataDirectory=/mnt/logs RdLog__HttpPort=5342 ./Rd.Log.Server
+Ameto__DataDirectory=/mnt/logs Ameto__HttpPort=5342 ./Ameto.Server
 ```
 
 ---
@@ -23,7 +23,7 @@ RdLog__DataDirectory=/mnt/logs RdLog__HttpPort=5342 ./Rd.Log.Server
 
 ---
 
-## Hot-tier options (`RdLog:HotTier`)
+## Hot-tier options (`Ameto:HotTier`)
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -32,7 +32,7 @@ RdLog__DataDirectory=/mnt/logs RdLog__HttpPort=5342 ./Rd.Log.Server
 
 ---
 
-## Indexing options (`RdLog:Indexing`)
+## Indexing options (`Ameto:Indexing`)
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -40,7 +40,7 @@ RdLog__DataDirectory=/mnt/logs RdLog__HttpPort=5342 ./Rd.Log.Server
 
 ---
 
-## Retention (`RdLog:Retention`)
+## Retention (`Ameto:Retention`)
 
 These values seed the SQLite retention table **on first run only**. After that, use `PUT /api/retention` to change them.
 
@@ -55,7 +55,7 @@ These values seed the SQLite retention table **on first run only**. After that, 
 
 ---
 
-## Replication options (`RdLog:Replication`)
+## Replication options (`Ameto:Replication`)
 
 Symmetric replication: each node replicates its own flushed cold segments to all healthy peers. There is no leader election.
 
@@ -73,7 +73,7 @@ A node is considered **healthy** if its last successful ping was within 30 secon
 
 **Node 0** `config.yml`:
 ```yaml
-RdLog:
+Ameto:
   NodeId: 0
   HttpPort: 5341
   Replication:
@@ -85,7 +85,7 @@ RdLog:
 
 **Node 1** `config.yml`:
 ```yaml
-RdLog:
+Ameto:
   NodeId: 1
   HttpPort: 5341
   Replication:
@@ -100,9 +100,9 @@ RdLog:
 ## TLS
 
 ```yaml
-RdLog:
+Ameto:
   HttpPort: 5341
-  SslCertPath: "/etc/rdlog/cert.pfx"
+  SslCertPath: "/etc/Ameto/cert.pfx"
   SslCertPassword: "changeme"
 ```
 
@@ -113,7 +113,7 @@ The certificate is hot-reloaded on every new TLS handshake — replace the `.pfx
 ## Full `config.yml` reference
 
 ```yaml
-RdLog:
+Ameto:
   NodeId: 0
   DataDirectory: data
   HttpPort: 5341

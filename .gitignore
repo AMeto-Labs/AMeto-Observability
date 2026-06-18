@@ -18,6 +18,9 @@ artifacts/
 # dotnet publish output
 publish/
 
+# Release packages (build-release.ps1 output)
+release/
+
 # .NET user secrets
 **/secrets.json
 **/appsettings.Development.json

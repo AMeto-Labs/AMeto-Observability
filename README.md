@@ -1,4 +1,4 @@
-# Rd.Log
+# Ameto
 
 A high-performance, self-hosted structured log server — a full open-source alternative to [Datalust Seq](https://datalust.co).
 
@@ -36,12 +36,12 @@ A high-performance, self-hosted structured log server — a full open-source alt
 ### 2. Run the server
 
 ```bash
-cd src/Rd.Log.Server
+cd src/Ameto.Server
 dotnet run -c Release
 ```
 
 The server starts on `http://localhost:5341` by default.
-Configuration lives in `src/Rd.Log.Server/config.yml` (see [docs/CONFIGURATION.md](docs/CONFIGURATION.md)).
+Configuration lives in `src/Ameto.Server/config.yml` (see [docs/CONFIGURATION.md](docs/CONFIGURATION.md)).
 
 On first start a seed admin account is created automatically:
 
@@ -90,24 +90,24 @@ npm start   # proxies /api/* to http://localhost:5341
 ### 6. Run tests
 
 ```bash
-dotnet test tests/Rd.Log.Core.Tests
-dotnet test tests/Rd.Log.Query.Tests
-dotnet test tests/Rd.Log.Storage.Tests
-dotnet test tests/Rd.Log.Integration.Tests
+dotnet test tests/Ameto.Core.Tests
+dotnet test tests/Ameto.Query.Tests
+dotnet test tests/Ameto.Storage.Tests
+dotnet test tests/Ameto.Integration.Tests
 
 # BenchmarkDotNet perf suite
-cd tests/Rd.Log.Perf
+cd tests/Ameto.Perf
 dotnet run -c Release
 ```
 
 ## Configuration
 
-Configuration lives in `src/Rd.Log.Server/config.yml`. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for the full reference.
+Configuration lives in `src/Ameto.Server/config.yml`. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for the full reference.
 
 Minimal example:
 
 ```yaml
-RdLog:
+Ameto:
   NodeId: 0
   DataDirectory: data
   HttpPort: 5341
@@ -127,26 +127,26 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the detailed module breakdown.
 ## Project layout
 
 ```
-Rd.Log.slnx
+Ameto.slnx
 ├── src/
-│   ├── Rd.Log.Core/          — shared models, interfaces, serialization
-│   ├── Rd.Log.Storage/       — hot-tier NativeMemory arena, WAL, cold LZ4 segments
-│   ├── Rd.Log.Indexing/      — inverted index, trigram index, Bloom filter
-│   ├── Rd.Log.Ingestion/     — MPMC ring buffer, HTTP ingest endpoint
-│   ├── Rd.Log.Query/         — Seq Filter parser, evaluator, query executor
-│   ├── Rd.Log.Alerts/        — threshold rules, webhook/SMTP dispatch
-│   ├── Rd.Log.Replication/   — symmetric segment replication, peer probing
-│   └── Rd.Log.Server/        — Kestrel host, REST/SSE endpoints, Angular SPA
+│   ├── Ameto.Core/          — shared models, interfaces, serialization
+│   ├── Ameto.Storage/       — hot-tier NativeMemory arena, WAL, cold LZ4 segments
+│   ├── Ameto.Indexing/      — inverted index, trigram index, Bloom filter
+│   ├── Ameto.Ingestion/     — MPMC ring buffer, HTTP ingest endpoint
+│   ├── Ameto.Query/         — Seq Filter parser, evaluator, query executor
+│   ├── Ameto.Alerts/        — threshold rules, webhook/SMTP dispatch
+│   ├── Ameto.Replication/   — symmetric segment replication, peer probing
+│   └── Ameto.Server/        — Kestrel host, REST/SSE endpoints, Angular SPA
 ├── client/                   — Angular 21 SPA (served from wwwroot at runtime)
 ├── tests/
-│   ├── Rd.Log.Core.Tests/
-│   ├── Rd.Log.Storage.Tests/
-│   ├── Rd.Log.Query.Tests/
-│   ├── Rd.Log.Integration.Tests/
-│   └── Rd.Log.Perf/          — BenchmarkDotNet benchmarks
+│   ├── Ameto.Core.Tests/
+│   ├── Ameto.Storage.Tests/
+│   ├── Ameto.Query.Tests/
+│   ├── Ameto.Integration.Tests/
+│   └── Ameto.Perf/          — BenchmarkDotNet benchmarks
 └── tools/
-    ├── Rd.Log.DemoGen/        — demo event generator
-    └── Rd.Log.LoadTest/       — load test harness
+    ├── Ameto.DemoGen/        — demo event generator
+    └── Ameto.LoadTest/       — load test harness
 ```
 
 ## License

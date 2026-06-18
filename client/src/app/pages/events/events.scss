@@ -792,6 +792,11 @@
   text-rendering: optimizeLegibility;
 }
 
+.events-list--plain {
+  display: block;
+  contain: none;
+}
+
 cdk-virtual-scroll-viewport.events-list {
   display: block;
   contain: strict;

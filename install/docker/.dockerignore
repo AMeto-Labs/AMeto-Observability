@@ -1,0 +1,42 @@
+# Git
+.git
+.gitignore
+.gitattributes
+.github
+
+# IDE / editor
+.vs
+.vscode
+*.user
+*.suo
+
+# Build output (will be rebuilt inside Docker)
+**/bin/
+**/obj/
+client/node_modules/
+client/dist/
+src/Rd.Log.Server/wwwroot/
+
+# Publish artifacts
+publish/
+artifacts/
+
+# Test projects (not needed in production image)
+tests/
+tools/
+
+# Install scripts (not needed in image)
+install/
+
+# Docs
+docs/
+*.md
+ARCHITECTURE.md
+
+# Runtime data (never bake data into image)
+data/
+
+# Misc
+*.ps1
+*.sh
+*.nupkg

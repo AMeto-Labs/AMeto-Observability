@@ -1,10 +1,10 @@
 #Requires -Version 7
 <#
 .SYNOPSIS
-    Pack and push the Rd.Log.Serilog NuGet package.
+    Pack and push the Ameto.Serilog NuGet package.
 
 .DESCRIPTION
-    1. dotnet pack -c Release  -> ./artifacts/nuget/Rd.Log.Serilog.<Version>.nupkg
+    1. dotnet pack -c Release  -> ./artifacts/nuget/Ameto.Serilog.<Version>.nupkg
     2. dotnet nuget push        -> nuget.org (or the source you pass via -Source)
 
     The API key is read from the parameter, the env var NUGET_API_KEY, or
@@ -55,7 +55,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $root      = $PSScriptRoot
-$proj      = Join-Path $root "src\Rd.Log.Serilog\Rd.Log.Serilog.csproj"
+$proj      = Join-Path $root "src\Ameto.Serilog\Ameto.Serilog.csproj"
 $outFull   = Join-Path $root $OutputDir
 
 if (-not (Test-Path $proj)) { throw "Project not found: $proj" }
@@ -63,7 +63,7 @@ New-Item -ItemType Directory -Force -Path $outFull | Out-Null
 
 Write-Host ""
 Write-Host "═══════════════════════════════════════════" -ForegroundColor Cyan
-Write-Host "  Rd.Log.Serilog  ·  NuGet publish" -ForegroundColor Cyan
+Write-Host "  Ameto.Serilog  ·  NuGet publish" -ForegroundColor Cyan
 Write-Host "═══════════════════════════════════════════" -ForegroundColor Cyan
 Write-Host ""
 
@@ -89,7 +89,7 @@ else {
 }
 
 # Resolve the .nupkg we are going to push
-$nupkg = Get-ChildItem $outFull -Filter "Rd.Log.Serilog.*.nupkg" `
+$nupkg = Get-ChildItem $outFull -Filter "Ameto.Serilog.*.nupkg" `
         | Where-Object { $_.Name -notlike "*.symbols.nupkg" } `
         | Sort-Object LastWriteTime -Descending `
         | Select-Object -First 1
@@ -102,7 +102,7 @@ if ($CopyTo) {
     New-Item -ItemType Directory -Force -Path $CopyTo | Out-Null
     Copy-Item $nupkg.FullName -Destination $CopyTo -Force
     Write-Host "        Copied .nupkg -> $CopyTo" -ForegroundColor Cyan
-    $snupkg = Get-ChildItem $outFull -Filter "Rd.Log.Serilog.*.snupkg" `
+    $snupkg = Get-ChildItem $outFull -Filter "Ameto.Serilog.*.snupkg" `
               | Sort-Object LastWriteTime -Descending | Select-Object -First 1
     if ($snupkg) {
         Copy-Item $snupkg.FullName -Destination $CopyTo -Force

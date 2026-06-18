@@ -54,6 +54,10 @@ export class ApiService {
     return this.http.get<string[]>('/api/events/props');
   }
 
+  getServiceNames(days = 7): Observable<string[]> {
+    return this.http.get<string[]>(`/api/events/services?days=${days}`);
+  }
+
   getSignals(): Observable<AlertRule[]> {
     return this.http.get<AlertRule[]>('/api/signals');
   }
@@ -111,6 +115,12 @@ export class ApiService {
   getUsers(): Observable<UserDto[]>           { return this.http.get<UserDto[]>('/api/users'); }
   createUser(username: string, password: string, role: string): Observable<UserDto> {
     return this.http.post<UserDto>('/api/users', { username, password, role });
+  }
+  createOAuthUser(email: string, displayName: string, provider: string, role: string): Observable<UserDto> {
+    return this.http.post<UserDto>('/api/users/oauth', { email, displayName, provider, role });
+  }
+  updateUserRole(id: string, role: string): Observable<void> {
+    return this.http.patch<void>(`/api/users/${id}/role`, { role });
   }
   deleteUser(id: string): Observable<void>    { return this.http.delete<void>(`/api/users/${id}`); }
 

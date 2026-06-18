@@ -10,7 +10,7 @@
 
 ## Phase 1 — OTLP-приём
 
-**Новый проект `Rd.Log.Otel`**
+**Новый проект `Ameto.Otel`**
 
 ```
 POST /v1/traces   → ExportTraceServiceRequest   (protobuf)
@@ -27,7 +27,7 @@ POST /v1/logs     → ExportLogsServiceRequest     (protobuf)  ← OTLP-альт
 
 ## Phase 2 — Traces
 
-**Новый проект `Rd.Log.Traces`**
+**Новый проект `Ameto.Traces`**
 
 ### Модель данных
 
@@ -65,7 +65,7 @@ GET /api/services           ← список сервисов
 
 ## Phase 3 — Metrics
 
-**Новый проект `Rd.Log.Metrics`**
+**Новый проект `Ameto.Metrics`**
 
 ### Модель данных
 
@@ -134,15 +134,15 @@ Waterfall view для трейсов — отдельный сложный Angul
 
 ```
 src/
-  Rd.Log.Core/         ← добавить SpanEvent, MetricPoint, MetricSeries
-  Rd.Log.Otel/         ← NEW: OTLP HTTP endpoints + конвертеры
-  Rd.Log.Traces/       ← NEW: SpanIngester, TracesStorage, TracesQuery
-  Rd.Log.Metrics/      ← NEW: MetricIngester, MetricStorage, MetricQuery
-  Rd.Log.Ingestion/    ← без изменений (logs only)
-  Rd.Log.Storage/      ← переиспользуется traces/metrics
-  Rd.Log.Indexing/     ← переиспользуется для .trc/.met
-  Rd.Log.Query/        ← минимальные расширения для traces
-  Rd.Log.Server/       ← добавить новые endpoints
+  Ameto.Core/         ← добавить SpanEvent, MetricPoint, MetricSeries
+  Ameto.Otel/         ← NEW: OTLP HTTP endpoints + конвертеры
+  Ameto.Traces/       ← NEW: SpanIngester, TracesStorage, TracesQuery
+  Ameto.Metrics/      ← NEW: MetricIngester, MetricStorage, MetricQuery
+  Ameto.Ingestion/    ← без изменений (logs only)
+  Ameto.Storage/      ← переиспользуется traces/metrics
+  Ameto.Indexing/     ← переиспользуется для .trc/.met
+  Ameto.Query/        ← минимальные расширения для traces
+  Ameto.Server/       ← добавить новые endpoints
 ```
 
 ---

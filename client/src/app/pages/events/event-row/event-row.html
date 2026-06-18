@@ -1,4 +1,12 @@
 @if (event(); as ev) {
+  <!-- Prop viewer modal -->
+  @if (viewerProp(); as vp) {
+    <app-prop-viewer
+      [propKey]="vp.key"
+      [rawValue]="vp.value"
+      (close)="closePropViewer()"
+    />
+  }
   <!-- Main row -->
   <div class="ev-main" (click)="toggleExpand($event)">
     <button class="ev-expand-btn" (click)="toggleExpand($event)" title="Expand row">
@@ -39,10 +47,12 @@
   @if (expanded()) {
     <div class="ev-detail">
       <div class="ev-tabs">
-        <button [class.active]="detailTab() === 'props'" (click)="detailTab.set('props')">
-          Properties
+        <button [class.active]="detailTab() === 'overview'" (click)="detailTab.set('overview')">
+          Overview
         </button>
-        <button [class.active]="detailTab() === 'raw'" (click)="detailTab.set('raw')">Raw</button>
+        <button [class.active]="detailTab() === 'json'" (click)="detailTab.set('json')">
+          JSON
+        </button>
         @if (hasException()) {
           <button
             class="tab-exc"
@@ -52,80 +62,143 @@
             Exception
           </button>
         }
+        <button [class.active]="detailTab() === 'trace'" (click)="detailTab.set('trace')">
+          Trace
+        </button>
+        <button [class.active]="detailTab() === 'metrics'" (click)="detailTab.set('metrics')">
+          Metrics
+        </button>
       </div>
       <div class="ev-detail-body">
-        @if (detailTab() === 'props') {
-          <table class="props-table">
-            <tr>
-              <td class="pk">Date time</td>
-              <td class="pv">{{ event()['@t'] | date: 'yyyy-MM-dd HH:mm:ss.SSS' }}</td>
-            </tr>
-            <tr>
-              <td class="pk">Level</td>
-              <td class="pv" [attr.data-level]="levelKey()">{{ event()['@l'] }}</td>
-            </tr>
-            @if (event().id) {
-              <tr>
-                <td class="pk">id</td>
-                <td class="pv">{{ event().id }}</td>
-              </tr>
-            }
-            @if (service()) {
-              <tr (click)="openPropMenu($event, 'service.name', service())" class="prop-row">
-                <td class="pk">service.name</td>
-                <td class="pv">{{ service() }}</td>
-              </tr>
-            }
-            @if (traceId()) {
-              <tr (click)="openPropMenu($event, '@tr', traceId())" class="prop-row">
-                <td class="pk">@tr</td>
-                <td class="pv ev-trace-id">{{ traceId() }}</td>
-              </tr>
-            }
-            @if (spanId()) {
-              <tr (click)="openPropMenu($event, '@sp', spanId())" class="prop-row">
-                <td class="pk">@sp</td>
-                <td class="pv ev-span-id">{{ spanId() }}</td>
-              </tr>
-            }
-            @for (kv of allProps(); track kv.path) {
-              @if (kv.isGroup) {
-                <tr (click)="openPropMenu($event, kv.path, '', true)" class="prop-row group">
-                  <td class="pk" [style.padding-left.px]="kv.depth * 14">
-                    <button
-                      class="prop-toggle"
-                      type="button"
-                      aria-label="Toggle group"
-                      (click)="toggleGroup($event, kv.path)"
-                      [title]="isCollapsed(kv.path) ? 'Expand' : 'Collapse'"
-                    >
-                      <lucide-icon
-                        [name]="isCollapsed(kv.path) ? 'chevron-right' : 'chevron-down'"
-                        [size]="11"
-                      />
-                    </button>
-                    {{ kv.label }}
-                  </td>
-                  <td class="pv pv-obj">{{ kv.value || '{ … }' }}</td>
+        @if (detailTab() === 'overview') {
+          <div class="ev-panel-grid">
+            <section class="ev-card ev-card--left">
+              <table class="meta-table">
+                <tr>
+                  <td class="pk">Service</td>
+                  <td class="pv">{{ service() || 'n/a' }}</td>
                 </tr>
-              } @else {
-                <tr (click)="openPropMenu($event, kv.path, kv.value)" class="prop-row">
-                  <td class="pk" [style.padding-left.px]="kv.depth * 14 + 17">{{ kv.label }}</td>
-                  <td class="pv">{{ kv.value }}</td>
+                <tr>
+                  <td class="pk">Timestamp</td>
+                  <td class="pv">{{ event()['@t'] | date: 'yyyy-MM-dd HH:mm:ss.SSS' }}</td>
                 </tr>
-              }
-            }
-          </table>
+                <tr>
+                  <td class="pk">Level</td>
+                  <td class="pv"><span class="ev-log-badge" [attr.data-level]="levelKey()">{{ event()['@l'] }}</span></td>
+                </tr>
+                <tr>
+                  <td class="pk">TraceId</td>
+                  <td class="pv ev-trace-id">{{ traceId() || '—' }}</td>
+                </tr>
+                <tr>
+                  <td class="pk">SpanId</td>
+                  <td class="pv ev-span-id">{{ spanId() || '—' }}</td>
+                </tr>
+                @for (it of overviewCustomItems(); track it.key) {
+                  <tr>
+                    <td class="pk">{{ it.key }}</td>
+                    <td class="pv">{{ it.value }}</td>
+                  </tr>
+                }
+              </table>
+            </section>
+
+            <section class="ev-card ev-card--props">
+              <div class="ev-message-text" [innerHTML]="renderedHtml()"></div>
+              <div class="ev-card-subtitle">Properties</div>
+              <table class="props-table">
+                @for (kv of allProps(); track kv.path) {
+                  @if (kv.isGroup) {
+                    <tr (click)="openPropMenu($event, kv.path, '', true)" class="prop-row group">
+                      <td class="pk" [style.padding-left.px]="kv.depth * 14">
+                        <button
+                          class="prop-toggle"
+                          type="button"
+                          aria-label="Toggle group"
+                          (click)="toggleGroup($event, kv.path)"
+                          [title]="isCollapsed(kv.path) ? 'Expand' : 'Collapse'"
+                        >
+                          <lucide-icon
+                            [name]="isCollapsed(kv.path) ? 'chevron-right' : 'chevron-down'"
+                            [size]="11"
+                          />
+                        </button>
+                        {{ kv.label }}
+                      </td>
+                      <td class="pv pv-obj">{{ kv.value || '{ … }' }}</td>
+                    </tr>
+                  } @else {
+                    <tr (click)="openPropMenu($event, kv.path, kv.value)" class="prop-row">
+                      <td class="pk" [style.padding-left.px]="kv.depth * 14 + 17">{{ kv.path }}</td>
+                      <td class="pv">
+                        @if (isStructuredValue(event().props?.[kv.label])) {
+                          <button class="prop-view-btn" (click)="openPropViewer($event, kv.path, event().props?.[kv.label])">
+                            <lucide-icon name="braces" [size]="11" />
+                            View
+                          </button>
+                        } @else {
+                          {{ kv.value }}
+                        }
+                      </td>
+                    </tr>
+                  }
+                }
+              </table>
+            </section>
+          </div>
+        }
+        @if (detailTab() === 'json') {
+          <section class="ev-card ev-card--single">
+            <div class="ev-card-title">JSON</div>
+            <pre class="ev-raw">{{ rawJson() }}</pre>
+          </section>
         }
         @if (detailTab() === 'exception') {
           @if (event()['@x']; as exc) {
             <div class="ev-exception">
               <ng-container *ngTemplateOutlet="excBlock; context: { $implicit: exc, depth: 0 }" />
             </div>
+          } @else {
+            <div class="ev-no-exception">No exception</div>
           }
         }
-        @if (detailTab() === 'raw') {
-          <pre class="ev-raw">{{ rawJson() }}</pre>
+        @if (detailTab() === 'trace') {
+          <section class="ev-card ev-card--single">
+            <div class="ev-card-title">Trace</div>
+            <table class="props-table">
+              <tr>
+                <td class="pk">TraceId</td>
+                <td class="pv ev-trace-id">{{ traceId() || '—' }}</td>
+              </tr>
+              <tr>
+                <td class="pk">SpanId</td>
+                <td class="pv ev-span-id">{{ spanId() || '—' }}</td>
+              </tr>
+              @for (kv of traceAttrs(); track kv.key) {
+                <tr>
+                  <td class="pk">{{ kv.key }}</td>
+                  <td class="pv">{{ kv.value }}</td>
+                </tr>
+              }
+            </table>
+          </section>
+        }
+        @if (detailTab() === 'metrics') {
+          <section class="ev-card ev-card--single">
+            <div class="ev-card-title">Metrics</div>
+            @if (metricItems().length === 0) {
+              <div class="ev-no-exception">No numeric metrics in props for this event.</div>
+            } @else {
+              <table class="props-table">
+                @for (m of metricItems(); track m.key) {
+                  <tr>
+                    <td class="pk">{{ m.key }}</td>
+                    <td class="pv">{{ m.value }}</td>
+                  </tr>
+                }
+              </table>
+            }
+          </section>
         }
       </div>
     </div>
