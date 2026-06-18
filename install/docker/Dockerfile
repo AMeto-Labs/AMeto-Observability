@@ -23,16 +23,16 @@ FROM mcr.microsoft.com/dotnet/sdk:10.0 AS server-build
 WORKDIR /build
 
 # Restore NuGet packages first (cached layer — only re-runs when csproj files change)
-COPY Rd.Log.slnx ./
+COPY Ameto.slnx ./
 COPY src/ ./src/
 
-RUN dotnet restore src/Rd.Log.Server/Rd.Log.Server.csproj \
+RUN dotnet restore src/Ameto.Server/Ameto.Server.csproj \
         --runtime linux-x64
 
 # Copy Angular output into wwwroot before publish
-COPY --from=client-build /build/wwwroot ./src/Rd.Log.Server/wwwroot/
+COPY --from=client-build /build/wwwroot ./src/Ameto.Server/wwwroot/
 
-RUN dotnet publish src/Rd.Log.Server/Rd.Log.Server.csproj \
+RUN dotnet publish src/Ameto.Server/Ameto.Server.csproj \
         --configuration Release \
         --output /publish \
         --runtime linux-x64 \
@@ -55,19 +55,19 @@ RUN find /publish -name '*.pdb' -delete && \
 # bundling the managed .NET runtime — the binary already contains it.
 FROM mcr.microsoft.com/dotnet/runtime-deps:10.0
 
-LABEL org.opencontainers.image.title="Rd.Log Server" \
+LABEL org.opencontainers.image.title="Ameto Server" \
       org.opencontainers.image.description="High-performance self-hosted structured log server" \
       org.opencontainers.image.licenses="MIT"
 
 # Dedicated non-root user
-RUN groupadd --system rdlog && useradd --system --no-create-home --gid rdlog rdlog
+RUN groupadd --system ameto && useradd --system --no-create-home --gid ameto ameto
 
 WORKDIR /app
 COPY --from=server-build /publish ./
-RUN chmod +x ./Rd.Log.Server
+RUN chmod +x ./Ameto.Server
 
 # Data volume — persists log segments across container restarts
-RUN mkdir -p /data && chown rdlog:rdlog /data
+RUN mkdir -p /data && chown ameto:ameto /data
 VOLUME ["/data"]
 
 # Default config — mounts over the baked-in config.yml at runtime
@@ -75,6 +75,6 @@ VOLUME ["/data"]
 
 EXPOSE 5341
 
-USER rdlog
+USER ameto
 
-ENTRYPOINT ["./Rd.Log.Server"]
+ENTRYPOINT ["./Ameto.Server"]

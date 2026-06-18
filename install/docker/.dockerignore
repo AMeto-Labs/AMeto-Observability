@@ -15,7 +15,7 @@
 **/obj/
 client/node_modules/
 client/dist/
-src/Rd.Log.Server/wwwroot/
+src/Ameto.Server/wwwroot/
 
 # Publish artifacts
 publish/
