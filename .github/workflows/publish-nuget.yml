@@ -47,35 +47,35 @@ jobs:
             -p:Version=${{ steps.version.outputs.value }}
 
       # Exchange GitHub OIDC token for a short-lived NuGet API token.
-      # NuGet.org must have a Trusted Publisher configured for this repo first —
-      # see README for setup instructions.
+      # NuGet.org must have a Trusted Publisher configured for this repo first.
       - name: Get NuGet token via OIDC
         id: nuget-token
-        run: |
-          OIDC_TOKEN=$(curl -sSf \
-            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=nuget.org" \
-            | jq -r '.value')
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const oidcToken = await core.getIDToken('nuget.org');
 
-          if [ -z "$OIDC_TOKEN" ] || [ "$OIDC_TOKEN" = "null" ]; then
-            echo "::error::Failed to obtain GitHub OIDC token."
-            exit 1
-          fi
+            const response = await fetch('https://api.nuget.org/v1/token-from-oidc', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ oidcToken })
+            });
 
-          RESPONSE=$(curl -s \
-            -X POST "https://api.nuget.org/v1/token-from-oidc" \
-            -H "Content-Type: application/json" \
-            -d "{\"oidcToken\": \"${OIDC_TOKEN}\"}")
+            const text = await response.text();
 
-          NUGET_TOKEN=$(echo "$RESPONSE" | jq -r '.token // empty')
+            if (!response.ok) {
+              core.setFailed(`NuGet token exchange failed (${response.status}): ${text}`);
+              return;
+            }
 
-          if [ -z "$NUGET_TOKEN" ]; then
-            echo "::error::NuGet OIDC exchange failed. Response: $RESPONSE"
-            echo "::error::Make sure Trusted Publishers is configured on nuget.org for this repo."
-            exit 1
-          fi
+            const { token } = JSON.parse(text);
 
-          echo "token=${NUGET_TOKEN}" >> "$GITHUB_OUTPUT"
+            if (!token) {
+              core.setFailed(`NuGet OIDC exchange returned no token. Response: ${text}`);
+              return;
+            }
+
+            core.setOutput('token', token);
 
       - name: Push to NuGet.org
         run: |
