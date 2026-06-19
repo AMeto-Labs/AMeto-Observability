@@ -15,6 +15,13 @@ jobs:
     name: Pack & Publish NuGet
     runs-on: ubuntu-latest
 
+    # Must match the environment name configured in NuGet.org Trusted Publishers.
+    environment: nuget
+
+    permissions:
+      id-token: write  # required for OIDC token request
+      contents: read
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -39,9 +46,40 @@ jobs:
             -p:ContinuousIntegrationBuild=true \
             -p:Version=${{ steps.version.outputs.value }}
 
+      # Exchange GitHub OIDC token for a short-lived NuGet API token.
+      # NuGet.org must have a Trusted Publisher configured for this repo first —
+      # see README for setup instructions.
+      - name: Get NuGet token via OIDC
+        id: nuget-token
+        run: |
+          OIDC_TOKEN=$(curl -sSf \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api://AzureADTokenExchange" \
+            | jq -r '.value')
+
+          if [ -z "$OIDC_TOKEN" ] || [ "$OIDC_TOKEN" = "null" ]; then
+            echo "::error::Failed to obtain GitHub OIDC token."
+            exit 1
+          fi
+
+          RESPONSE=$(curl -s \
+            -X POST "https://api.nuget.org/v1/token-from-oidc" \
+            -H "Content-Type: application/json" \
+            -d "{\"oidcToken\": \"${OIDC_TOKEN}\"}")
+
+          NUGET_TOKEN=$(echo "$RESPONSE" | jq -r '.token // empty')
+
+          if [ -z "$NUGET_TOKEN" ]; then
+            echo "::error::NuGet OIDC exchange failed. Response: $RESPONSE"
+            echo "::error::Make sure Trusted Publishers is configured on nuget.org for this repo."
+            exit 1
+          fi
+
+          echo "token=${NUGET_TOKEN}" >> "$GITHUB_OUTPUT"
+
       - name: Push to NuGet.org
         run: |
           dotnet nuget push "nupkg/*.nupkg" \
             --source https://api.nuget.org/v3/index.json \
-            --api-key ${{ secrets.NUGET_API_KEY }} \
+            --api-key ${{ steps.nuget-token.outputs.token }} \
             --skip-duplicate
