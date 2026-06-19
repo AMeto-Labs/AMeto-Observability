@@ -6,7 +6,7 @@ using Serilog.Debugging;
 using Serilog.Events;
 using Serilog.Sinks.PeriodicBatching;
 
-namespace Ameto.Serilog;
+namespace Serilog.Sinks.Ameto;
 
 /// <summary>
 /// Batched Serilog sink that serialises events as Ameto's MessagePack CLEF array

@@ -2,7 +2,7 @@ using System.Globalization;
 using MessagePack;
 using Serilog.Events;
 
-namespace Ameto.Serilog;
+namespace Serilog.Sinks.Ameto;
 
 /// <summary>
 /// Writes a single Serilog <see cref="LogEvent"/> as a MessagePack CLEF map

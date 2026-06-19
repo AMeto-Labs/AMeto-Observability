@@ -4,7 +4,7 @@ using Serilog.Core;
 using Serilog.Events;
 using Serilog.Sinks.PeriodicBatching;
 
-namespace Ameto.Serilog;
+namespace Serilog.Sinks.Ameto;
 
 /// <summary>
 /// <see cref="LoggerSinkConfiguration"/> extensions for the Ameto sink.

@@ -3,17 +3,17 @@
 # Usage:
 #   sudo ./install.sh                            # interactive
 #   sudo ./install.sh --binary /path/to/Ameto.Server
-#   sudo ./install.sh --port 5341 --data /var/lib/Ameto/data
+#   sudo ./install.sh --port 5341 --data /var/lib/ameto/data
 #   sudo ./install.sh --uninstall
 set -euo pipefail
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
 BINARY_PATH=""
-INSTALL_DIR="/opt/Ameto"
-DATA_DIR="/var/lib/Ameto/data"
+INSTALL_DIR="/opt/ameto"
+DATA_DIR="/var/lib/ameto/data"
 HTTP_PORT=5341
-SERVICE_NAME="Ameto"
-SERVICE_USER="Ameto"
+SERVICE_NAME="ameto"
+SERVICE_USER="ameto"
 UNINSTALL=0
 
 # ── Argument parsing ──────────────────────────────────────────────────────────

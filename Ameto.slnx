@@ -8,7 +8,7 @@
     <Project Path="src/Ameto.Metrics/Ameto.Metrics.csproj" />
     <Project Path="src/Ameto.Otel/Ameto.Otel.csproj" />
     <Project Path="src/Ameto.Query/Ameto.Query.csproj" />
-    <Project Path="src/Ameto.Serilog/Ameto.Serilog.csproj" />
+    <Project Path="src/Serilog.Sinks.Ameto/Serilog.Sinks.Ameto.csproj" />
     <Project Path="src/Ameto.Storage/Ameto.Storage.csproj" />
   </Folder>
   <Folder Name="/tests/">

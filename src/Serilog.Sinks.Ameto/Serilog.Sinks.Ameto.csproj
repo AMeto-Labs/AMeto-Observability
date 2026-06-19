@@ -5,15 +5,15 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
 
-    <RootNamespace>Ameto.Serilog</RootNamespace>
-    <AssemblyName>Ameto.Serilog</AssemblyName>
+    <RootNamespace>Serilog.Sinks.Ameto</RootNamespace>
+    <AssemblyName>Serilog.Sinks.Ameto</AssemblyName>
 
     <!-- NuGet metadata -->
-    <PackageId>Ameto.Serilog</PackageId>
+    <PackageId>Serilog.Sinks.Ameto</PackageId>
     <Version>0.1.0</Version>
     <Authors>Ameto</Authors>
     <Description>Serilog sink that ships events to an Ameto server (Seq-compatible CLEF over MessagePack).</Description>
-    <PackageTags>serilog;sink;logging;Ameto;seq;clef</PackageTags>
+    <PackageTags>serilog;sink;logging;ameto;seq;clef</PackageTags>
   </PropertyGroup>
 
   <ItemGroup>
