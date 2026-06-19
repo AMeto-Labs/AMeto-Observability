@@ -54,7 +54,7 @@ jobs:
         run: |
           OIDC_TOKEN=$(curl -sSf \
             -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api://AzureADTokenExchange" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=nuget.org" \
             | jq -r '.value')
 
           if [ -z "$OIDC_TOKEN" ] || [ "$OIDC_TOKEN" = "null" ]; then
