@@ -15,18 +15,6 @@ jobs:
     name: Pack & Publish NuGet
     runs-on: ubuntu-latest
 
-    # "nuget" environment must be configured in repo Settings → Environments.
-    # On NuGet.org: package → Manage → Trusted Publishers → add GitHub Actions:
-    #   Owner:        AMeto-Observability
-    #   Repository:   AMeto-Observability
-    #   Workflow:     publish-nuget.yml
-    #   Environment:  nuget
-    environment: nuget
-
-    permissions:
-      id-token: write   # required for NuGet trusted publishing (OIDC)
-      contents: read
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -51,27 +39,9 @@ jobs:
             -p:ContinuousIntegrationBuild=true \
             -p:Version=${{ steps.version.outputs.value }}
 
-      # Trusted publishing: exchange the GitHub OIDC token for a short-lived
-      # NuGet API key — no long-lived secret stored in GitHub.
-      - name: Get NuGet token via OIDC
-        id: nuget-token
-        run: |
-          OIDC_TOKEN=$(curl -sSf \
-            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api://AzureADTokenExchange" \
-            | jq -r '.value')
-
-          NUGET_TOKEN=$(curl -sSf \
-            -X POST "https://api.nuget.org/v1/token-from-oidc" \
-            -H "Content-Type: application/json" \
-            -d "{\"oidcToken\": \"${OIDC_TOKEN}\"}" \
-            | jq -r '.token')
-
-          echo "token=${NUGET_TOKEN}" >> "$GITHUB_OUTPUT"
-
       - name: Push to NuGet.org
         run: |
           dotnet nuget push "nupkg/*.nupkg" \
             --source https://api.nuget.org/v3/index.json \
-            --api-key ${{ steps.nuget-token.outputs.token }} \
+            --api-key ${{ secrets.NUGET_API_KEY }} \
             --skip-duplicate
