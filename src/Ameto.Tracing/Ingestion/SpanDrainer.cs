@@ -39,7 +39,9 @@ internal sealed class SpanDrainer : IAsyncDisposable
             int count = _ring.TryDequeueMany(_batch, BatchSize);
             if (count == 0)
             {
-                await Task.Delay(5, ct).ConfigureAwait(false);
+                // Park until a producer signals new spans (or 50 ms as a safety
+                // net) instead of polling every 5 ms, which burned idle CPU.
+                await _ring.WaitForItemsAsync(50, ct).ConfigureAwait(false);
                 continue;
             }
 

@@ -101,12 +101,37 @@ else
     ok "User '$SERVICE_USER' created."
 fi
 
+# ── Stop running service (upgrade-safe) ─────────────────────────────────────────
+# If an existing instance is running it holds the binary open, which makes the
+# copy below fail with "Text file busy". Stop it first; it is restarted at the end.
+if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+    step "Stopping running service '$SERVICE_NAME' for upgrade ..."
+    systemctl stop "$SERVICE_NAME"
+    ok "Service stopped."
+fi
+
 # ── Install files ─────────────────────────────────────────────────────────────
 step "Installing to $INSTALL_DIR ..."
 mkdir -p "$INSTALL_DIR"
 SOURCE_DIR="$(dirname "$BINARY_PATH")"
+
+# Preserve the user's existing config across the copy. The release bundle ships
+# a default config.yml; a plain `cp -r` would clobber a customised one (e.g. a
+# changed HttpPort). Stash it first and restore it after the copy.
+PRESERVED_CONFIG=""
+if [[ -f "$INSTALL_DIR/config.yml" ]]; then
+    PRESERVED_CONFIG="$(mktemp)"
+    cp "$INSTALL_DIR/config.yml" "$PRESERVED_CONFIG"
+fi
+
 cp -r "$SOURCE_DIR/." "$INSTALL_DIR/"
 chmod +x "$INSTALL_DIR/Ameto.Server"
+
+if [[ -n "$PRESERVED_CONFIG" ]]; then
+    cp "$PRESERVED_CONFIG" "$INSTALL_DIR/config.yml"
+    rm -f "$PRESERVED_CONFIG"
+    warn "Preserved existing config.yml — your settings (e.g. HttpPort) are kept."
+fi
 
 # ── Create data directory ─────────────────────────────────────────────────────
 step "Creating data directory: $DATA_DIR"

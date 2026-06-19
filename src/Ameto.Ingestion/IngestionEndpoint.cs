@@ -31,16 +31,19 @@ public sealed class IngestionEndpoint
 
     private readonly IngestionRingBuffer     _ring;
     private readonly StringInternPool        _pool;
+    private readonly IngestionDrainer        _drainer;
     private readonly ILogger<IngestionEndpoint> _logger;
 
     public IngestionEndpoint(
         IngestionRingBuffer ring,
         StringInternPool pool,
+        IngestionDrainer drainer,
         ILogger<IngestionEndpoint> logger)
     {
-        _ring   = ring;
-        _pool   = pool;
-        _logger = logger;
+        _ring    = ring;
+        _pool    = pool;
+        _drainer = drainer;
+        _logger  = logger;
     }
 
     public async Task HandleAsync(HttpContext ctx)
@@ -142,6 +145,9 @@ public sealed class IngestionEndpoint
                 else    dropped++;
             }
 
+            if (ingested > 0)
+                _drainer.NotifyEnqueued();
+
             // ── 4. Response ───────────────────────────────────────────────────
             ctx.Response.StatusCode  = StatusCodes.Status200OK;
             ctx.Response.ContentType = "application/json";
@@ -183,6 +189,10 @@ public sealed class IngestionEndpoint
             if (ok) ingested++;
             else    dropped++;
         }
+
+        if (ingested > 0)
+            _drainer.NotifyEnqueued();
+
         return (ingested, dropped);
     }
 }

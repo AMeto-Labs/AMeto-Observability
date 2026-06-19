@@ -194,9 +194,12 @@ foreach ($t in $targets) {
         $src = Join-Path $root "install\linux\install.sh"
         $dst = Join-Path $targetDir "install.sh"
         Copy-Item $src $dst -Force
-        # Ensure Unix line endings
-        $content = [System.IO.File]::ReadAllText($dst) -replace "`r`n", "`n"
-        [System.IO.File]::WriteAllText($dst, $content, [System.Text.Encoding]::UTF8)
+        # Ensure Unix line endings AND no UTF-8 BOM. A BOM makes the kernel
+        # fail to parse the shebang ("#!/usr/bin/env: not found") and the
+        # script falls back to sh, breaking `set -o pipefail`.
+        $content   = [System.IO.File]::ReadAllText($dst) -replace "`r`n", "`n"
+        $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+        [System.IO.File]::WriteAllText($dst, $content, $utf8NoBom)
         Write-Ok "Linux:   install.sh   →  $dst"
     }
 }

@@ -29,6 +29,10 @@ public sealed class IngestionDrainer : IAsyncDisposable
     // Reusable payload buffer per drain call (max 64 KB per event)
     private readonly byte[] _payloadBuf = new byte[64 * 1024];
 
+    // Signal: producers release once when enqueueing into an empty buffer.
+    // Drainer blocks here instead of polling, eliminating idle CPU usage.
+    private readonly SemaphoreSlim _signal = new(0, 1);
+
     public IngestionDrainer(
         IngestionRingBuffer ring,
         StorageEngine storage,
@@ -40,9 +44,22 @@ public sealed class IngestionDrainer : IAsyncDisposable
         _loop    = Task.Run(() => DrainLoopAsync(_cts.Token));
     }
 
+    /// <summary>
+    /// Called by producers after successfully enqueuing into the ring buffer.
+    /// Wakes the drain loop if it is currently idle.
+    /// </summary>
+    internal void NotifyEnqueued()
+    {
+        if (_signal.CurrentCount == 0)
+        {
+            try { _signal.Release(); }
+            catch (SemaphoreFullException) { } // already signaled — fine
+        }
+    }
+
     private async Task DrainLoopAsync(CancellationToken ct)
     {
-        int backoffUs = 0;
+        int storageBackoffMs = 0;
 
         while (!ct.IsCancellationRequested)
         {
@@ -54,7 +71,7 @@ public sealed class IngestionDrainer : IAsyncDisposable
             {
                 // Guard: stop before touching native storage if shutdown was requested.
                 // The outer while-check runs only after a full batch; this closes the window
-                // where a timer-driven Task.Delay continuation could resume after disposal.
+                // where a signal-continuation could resume after disposal.
                 if (ct.IsCancellationRequested) return;
 
                 if (!_ring.TryDequeue(
@@ -87,19 +104,23 @@ public sealed class IngestionDrainer : IAsyncDisposable
                 {
                     // Hot tier full — re-enqueue is not possible without risking ordering issues,
                     // so we park briefly and retry from ring on next iteration.
-                    backoffUs = Math.Min(backoffUs + 100, 5_000);
+                    storageBackoffMs = Math.Min(storageBackoffMs + 1, 5);
                     break;
                 }
 
                 drained++;
-                backoffUs = 0;
+                storageBackoffMs = 0;
             }
 
-            if (drained == 0)
+            if (storageBackoffMs > 0 && drained == 0)
             {
-                // Nothing to drain — yield to avoid busy-spinning
-                await Task.Delay(backoffUs == 0 ? 1 : backoffUs / 1000 + 1, ct).ConfigureAwait(false);
-                backoffUs = Math.Min(backoffUs + 50, 2_000);
+                await Task.Delay(storageBackoffMs, ct).ConfigureAwait(false);
+            }
+            else if (drained == 0)
+            {
+                // Nothing in the ring — block until a producer signals or 50 ms elapse.
+                // This replaces the old 1–3 ms busy-poll that kept CPU at 3-5% when idle.
+                await _signal.WaitAsync(50, ct).ConfigureAwait(false);
             }
             }
             catch (ObjectDisposedException) { return; } // ring buffer disposed during shutdown

@@ -17,6 +17,9 @@ internal sealed class SpanRingBuffer : IDisposable
     private long                       _head; // next write position
     private long                       _tail; // next read position
 
+    // Signal so the consumer can block while idle instead of polling every 5 ms.
+    private readonly SemaphoreSlim _signal = new(0, 1);
+
     public SpanRingBuffer(int capacity = DefaultCapacity)
     {
         if (BitOperations.IsPow2(capacity) is false)
@@ -25,6 +28,13 @@ internal sealed class SpanRingBuffer : IDisposable
         _slots = new SpanIngestItem?[capacity];
         _mask  = capacity - 1;
     }
+
+    /// <summary>
+    /// Blocks until a producer signals new items or <paramref name="timeoutMs"/> elapses.
+    /// Lets the single consumer park while idle instead of busy-polling.
+    /// </summary>
+    public Task WaitForItemsAsync(int timeoutMs, CancellationToken ct) =>
+        _signal.WaitAsync(timeoutMs, ct);
 
     /// <summary>Returns a value in [0, 1] representing how full the buffer is.</summary>
     public double FillFraction
@@ -54,6 +64,12 @@ internal sealed class SpanRingBuffer : IDisposable
             if (Interlocked.CompareExchange(ref _head, head + 1, head) == head)
             {
                 _slots[head & _mask] = item;
+                // Wake the drainer if it is parked. Cheap when already signaled.
+                if (_signal.CurrentCount == 0)
+                {
+                    try { _signal.Release(); }
+                    catch (SemaphoreFullException) { }
+                }
                 return true;
             }
         }
@@ -83,7 +99,7 @@ internal sealed class SpanRingBuffer : IDisposable
         return count;
     }
 
-    public void Dispose() { /* slots array is managed memory */ }
+    public void Dispose() => _signal.Dispose();
 }
 
 // Alias for System.Numerics.BitOperations available in net6+
