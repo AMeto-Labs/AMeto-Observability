@@ -3,7 +3,7 @@
 A high-performance, self-hosted structured log server — a full open-source alternative to [Datalust Seq](https://datalust.co).
 
 ## Features
-
+1
 - **100,000 events/second** sustained ingestion throughput
 - **Seq-compatible Filter Expressions** — use the same query syntax you know
 - **Off-heap storage** — ring buffer + hot-tier arena in `NativeMemory`, LZ4-compressed cold segments
