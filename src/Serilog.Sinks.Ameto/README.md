@@ -8,7 +8,7 @@ MessagePack CLEF endpoint (`POST /api/events`).
 ```xml
 <PackageReference Include="Ameto.Serilog" Version="0.1.0" />
 ```
-
+test
 ## Usage
 
 ```csharp
