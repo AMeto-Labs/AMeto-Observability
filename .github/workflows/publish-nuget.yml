@@ -1,0 +1,64 @@
+name: Publish Serilog.Sinks.Ameto
+
+# Publishes the sink to NuGet.org on every push to main that touches it.
+# The package version is taken straight from <Version> in the .csproj —
+# bump it there to release a new version. Pushes that don't change <Version>
+# are no-ops thanks to --skip-duplicate.
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/Serilog.Sinks.Ameto/**'
+      - '.github/workflows/publish-nuget.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Pack & Publish NuGet
+    runs-on: ubuntu-latest
+
+    # "nuget" environment must match the Environment field in the
+    # NuGet.org Trusted Publishing policy (leave blank in policy if not using environments).
+    environment: nuget
+
+    permissions:
+      id-token: write  # required for NuGet/login OIDC
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.x'
+
+      # Version is read from <Version> in the .csproj — no -p:Version override.
+      - name: Pack
+        run: |
+          dotnet pack src/Serilog.Sinks.Ameto/Serilog.Sinks.Ameto.csproj \
+            --configuration Release \
+            --output nupkg \
+            --include-symbols \
+            -p:SymbolPackageFormat=snupkg \
+            -p:ContinuousIntegrationBuild=true
+
+      # Official NuGet trusted publishing action.
+      # Exchanges the GitHub OIDC token for a short-lived NuGet API key automatically.
+      # Docs: https://github.com/NuGet/login
+      - name: NuGet login (OIDC → temp API key)
+        uses: NuGet/login@v1
+        id: login
+        with:
+          user: ${{ secrets.NUGET_USER }}  # your nuget.org username (not email)
+
+      - name: Push to NuGet.org
+        run: |
+          dotnet nuget push "nupkg/*.nupkg" \
+            --source https://api.nuget.org/v3/index.json \
+            --api-key ${{ steps.login.outputs.NUGET_API_KEY }} \
+            --skip-duplicate
