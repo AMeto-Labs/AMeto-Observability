@@ -47,6 +47,21 @@ public sealed class RamPressureService : BackgroundService
             {
                 int pct = GetSystemRamPercent();
 
+                // Memory attribution snapshot — lets us split process RSS into
+                // managed heap vs. native hot tier from the journal without
+                // hitting the authorized /api/diagnostics endpoint.
+                var gc = GC.GetGCMemoryInfo();
+                const long MB = 1024 * 1024;
+                _logger.LogInformation(
+                    "MEM ws={WS}MB gc_heap={Heap}MB gc_committed={Committed}MB gc_frag={Frag}MB hot_tier={Hot}MB mode={Mode} sys_ram={Pct}%",
+                    Environment.WorkingSet      / MB,
+                    gc.HeapSizeBytes            / MB,
+                    gc.TotalCommittedBytes      / MB,
+                    gc.FragmentedBytes          / MB,
+                    _storage.HotTierAllocatedBytes / MB,
+                    System.Runtime.GCSettings.IsServerGC ? "Server" : "Workstation",
+                    pct);
+
                 if (pct > _options.RamTargetPercent)
                 {
                     if (DateTimeOffset.UtcNow - lastFlush >= _cooldown)

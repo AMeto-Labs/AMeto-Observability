@@ -10,10 +10,10 @@ namespace Ameto.Storage;
 ///
 /// On Windows this calls <c>SetProcessWorkingSetSizeEx(-1, -1)</c>, the
 /// documented way to request that the OS release as many resident pages as
-/// possible without affecting the process's virtual address space. On other
-/// platforms this is a no-op — Linux returns pages to the kernel
-/// automatically via <c>madvise(MADV_DONTNEED)</c> inside the allocator and
-/// no equivalent process-wide API exists.
+/// possible without affecting the process's virtual address space. On Linux
+/// this calls glibc <c>malloc_trim(0)</c>: free()'d hot-tier chunks leave the
+/// allocator holding the freed arenas, so without an explicit trim the RSS
+/// stays inflated long after a flush.
 /// </summary>
 internal static class WorkingSetTrimmer
 {
@@ -21,7 +21,8 @@ internal static class WorkingSetTrimmer
     {
         try
         {
-            if (OperatingSystem.IsWindows()) TrimWindows();
+            if (OperatingSystem.IsWindows())    TrimWindows();
+            else if (OperatingSystem.IsLinux()) TrimLinux();
         }
         catch
         {
@@ -36,6 +37,9 @@ internal static class WorkingSetTrimmer
         SetProcessWorkingSetSizeEx(handle, (IntPtr)(-1), (IntPtr)(-1), 0);
     }
 
+    [SupportedOSPlatform("linux")]
+    private static void TrimLinux() => malloc_trim(0);
+
     [DllImport("kernel32.dll", SetLastError = true)]
     [SupportedOSPlatform("windows")]
     private static extern bool SetProcessWorkingSetSizeEx(
@@ -43,4 +47,9 @@ internal static class WorkingSetTrimmer
         IntPtr dwMinimumWorkingSetSize,
         IntPtr dwMaximumWorkingSetSize,
         uint   Flags);
+
+    // glibc: returns freed heap memory at the top of the arena to the OS.
+    [DllImport("libc", SetLastError = false)]
+    [SupportedOSPlatform("linux")]
+    private static extern int malloc_trim(nuint pad);
 }

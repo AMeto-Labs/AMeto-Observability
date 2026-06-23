@@ -116,6 +116,25 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             .ToList();
     }
 
+    /// <summary>
+    /// Total native bytes held by the hot tier right now: the live segment plus
+    /// any frozen segments still being drained to cold storage during a flush
+    /// overlap. This is process RSS that lives outside the GC heap.
+    /// </summary>
+    public long HotTierAllocatedBytes
+    {
+        get
+        {
+            lock (_frozenLock)
+            {
+                long total = _hot.AllocatedBytes;
+                for (int i = 0; i < _frozenHot.Count; i++)
+                    total += _frozenHot[i].Tier.AllocatedBytes;
+                return total;
+            }
+        }
+    }
+
     public IHotTierReader OpenHotTierReader()
     {
         HotTierSegment    current;

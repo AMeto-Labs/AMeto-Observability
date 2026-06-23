@@ -73,6 +73,14 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
     public bool IsFrozen => _frozen;
 
     /// <summary>
+    /// Total native (off-GC-heap) bytes currently committed by this segment:
+    /// every allocated chunk reserves <see cref="ChunkTotalBytes"/> via
+    /// <c>NativeMemory.AllocZeroed</c>. Lets live diagnostics attribute process
+    /// RSS to the hot tier vs. the managed heap instead of guessing.
+    /// </summary>
+    public long AllocatedBytes => (long)_chunksAllocated * ChunkTotalBytes;
+
+    /// <summary>
     /// True when the segment is near its event or payload limit.
     /// Used by <see cref="StorageEngine"/> as a hint to trigger an async flush.
     /// </summary>
