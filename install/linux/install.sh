@@ -198,6 +198,11 @@ ExecStart=$INSTALL_DIR/Ameto.Server
 Restart=on-failure
 RestartSec=5s
 
+# Cap glibc malloc arenas. .NET on Linux otherwise spawns up to 8×ncpu
+# per-thread arenas that retain freed native memory, inflating RSS by tens
+# of MB. Two arenas is plenty for this workload and cut anon RSS ~60 MB.
+Environment=MALLOC_ARENA_MAX=2
+
 # Hardening
 NoNewPrivileges=true
 ProtectSystem=strict

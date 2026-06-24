@@ -75,12 +75,16 @@ public sealed class RamPressureService : BackgroundService
 
                         // Ask the GC to reclaim any freed managed memory.
                         GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
-                        // Ask the OS to release resident pages we no longer need.
-                        WorkingSetTrimmer.TryTrim();
 
                         lastFlush = DateTimeOffset.UtcNow;
                     }
                 }
+
+                // Return freed native memory to the OS every cycle, not only
+                // under RAM pressure. glibc retains free()'d hot-tier blocks in
+                // its arenas, so without a regular malloc_trim the RSS drifts
+                // upward between flushes. The call is cheap and idempotent.
+                WorkingSetTrimmer.TryTrim();
             }
             catch (OperationCanceledException) { break; }
             catch (Exception ex)
