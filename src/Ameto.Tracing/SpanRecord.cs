@@ -176,6 +176,10 @@ public struct SpanHeader
     public byte           Flags;            // 1 byte (reserved)
     private byte          _pad;             // 1 byte
 
+    /// <summary>Promoted HTTP response status code (0 = not set). Avoids msgpack attr scan on filter.</summary>
+    public short          HttpStatusCode;   // 2 bytes
+    private short         _pad2;            // 2 bytes — keeps Size = 76
+
     public static int SizeOf => Unsafe.SizeOf<SpanHeader>();
 }
 
@@ -193,6 +197,9 @@ public sealed class SpanRecord
     public string         ServiceName         { get; init; } = string.Empty;
     public SpanKind       Kind                { get; init; }
     public SpanStatusCode Status              { get; init; }
+
+    /// <summary>Promoted HTTP response status code (0 = not extracted from attributes).</summary>
+    public short HttpStatusCode { get; init; }
 
     /// <summary>Decoded key-value attributes (lazy — null until read).</summary>
     public IReadOnlyDictionary<string, object?>? Attributes { get; init; }

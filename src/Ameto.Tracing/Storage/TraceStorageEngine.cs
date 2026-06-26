@@ -14,7 +14,7 @@ namespace Ameto.Tracing.Storage;
 /// Cold tier: flushed as <c>.trc</c> files by <see cref="SpanWriter"/>
 /// when the hot segment reaches its size/time threshold.
 /// </summary>
-public sealed class TraceStorageEngine : ITraceProvider, IRetentionTarget, IDisposable
+public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IRetentionTarget, IDisposable
 {
     // ── Hot tier ─────────────────────────────────────────────────────────────
     private readonly List<SpanRecord>                          _hotSpans  = new();
@@ -52,6 +52,7 @@ public sealed class TraceStorageEngine : ITraceProvider, IRetentionTarget, IDisp
             ServiceName       = item.ServiceName,
             Kind              = item.Kind,
             Status            = item.Status,
+            HttpStatusCode    = item.HttpStatusCode,  // promoted — no attrs deserialization
             Attributes        = item.AttributesBytes.Length > 0
                                     ? DeserializeAttributes(item.AttributesBytes)
                                     : null,
@@ -123,6 +124,7 @@ public sealed class TraceStorageEngine : ITraceProvider, IRetentionTarget, IDisp
         SpanStatusCode?   status           = null,
         long?             minDurationNanos = null,
         long?             maxDurationNanos = null,
+        short?            httpStatusCode   = null,
         int               limit            = 200,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
@@ -143,6 +145,7 @@ public sealed class TraceStorageEngine : ITraceProvider, IRetentionTarget, IDisp
                     (serviceName      is null || s.ServiceName.Equals(serviceName, StringComparison.OrdinalIgnoreCase)) &&
                     (spanName         is null || s.Name.Contains(spanName, StringComparison.OrdinalIgnoreCase)) &&
                     (status           is null || s.Status == status.Value) &&
+                    (httpStatusCode   is null || s.HttpStatusCode == httpStatusCode.Value) &&
                     (minDurationNanos is null || s.DurationNanos >= minDurationNanos.Value) &&
                     (maxDurationNanos is null || s.DurationNanos <= maxDurationNanos.Value))
                 .OrderByDescending(s => s.StartTimeUnixNano)
@@ -162,13 +165,21 @@ public sealed class TraceStorageEngine : ITraceProvider, IRetentionTarget, IDisp
 
         if (yielded >= limit) yield break;
 
-        // Cold tier
+        // Cold tier — segment-level service pre-filter, then block-level skip inside SpanReader
         foreach (var seg in _coldSegments.OrderByDescending(s => s.MaxStartNano))
         {
             if (seg.MaxStartNano < fromNano || seg.MinStartNano > toNano) continue;
+            // Skip entire segment if it doesn't contain the requested service
+            if (serviceName is not null && seg.Services.Length > 0 &&
+                !Array.Exists(seg.Services, s => s.Equals(serviceName, StringComparison.OrdinalIgnoreCase)))
+                continue;
+
             ct.ThrowIfCancellationRequested();
 
-            await foreach (var r in SpanReader.SearchAsync(seg.FilePath, fromNano, toNano, serviceName, spanName, status, minDurationNanos, maxDurationNanos, ct))
+            await foreach (var r in SpanReader.SearchAsync(
+                seg.FilePath, fromNano, toNano,
+                serviceName, spanName, status, httpStatusCode,
+                minDurationNanos, maxDurationNanos, ct))
             {
                 if (yielded++ >= limit) yield break;
                 yield return r;
@@ -211,7 +222,10 @@ public sealed class TraceStorageEngine : ITraceProvider, IRetentionTarget, IDisp
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "Could not load cold span segment {File}", file);
+                // v1 files (12-byte footer) will fail with wrong footer magic — delete them.
+                _logger.LogWarning(ex, "Unreadable segment {File} — deleting (likely format v1)", file);
+                try { File.Delete(file); } catch { /* best effort */ }
+                try { File.Delete(Path.ChangeExtension(file, ".stats")); } catch { /* best effort */ }
             }
         }
         _logger.LogInformation("Loaded {Count} cold span segments", _coldSegments.Count);
@@ -266,6 +280,83 @@ public sealed class TraceStorageEngine : ITraceProvider, IRetentionTarget, IDisp
         }
     }
 
+    // ── ITraceStatsProvider ────────────────────────────────────────────────────
+
+    public Task<IReadOnlyList<ServiceSegmentStats>> GetAggregateStatsAsync(
+        DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default)
+    {
+        long fromNano = from.ToUnixTimeMilliseconds() * 1_000_000L;
+        long toNano   = to.ToUnixTimeMilliseconds()   * 1_000_000L;
+
+        // Accumulator: service name → mutable bucket array + counters
+        var agg = new Dictionary<string, (uint[] Buckets, uint Spans, uint Errors, long MinDur, long MaxDur)>(
+            StringComparer.OrdinalIgnoreCase);
+
+        void Merge(ServiceSegmentStats s)
+        {
+            if (!agg.TryGetValue(s.ServiceName, out var a))
+            {
+                var b = new uint[HistogramBuckets.Count];
+                a = (b, 0, 0, long.MaxValue, long.MinValue);
+            }
+            for (int i = 0; i < HistogramBuckets.Count; i++) a.Buckets[i] += s.Buckets[i];
+            a.Spans  += s.SpanCount;
+            a.Errors += s.ErrorCount;
+            if (s.MinDurationNanos < a.MinDur) a.MinDur = s.MinDurationNanos;
+            if (s.MaxDurationNanos > a.MaxDur) a.MaxDur = s.MaxDurationNanos;
+            agg[s.ServiceName] = a;
+        }
+
+        // Hot tier — compute on demand (≤50K spans, fast)
+        _lock.EnterReadLock();
+        try
+        {
+            foreach (var s in _hotSpans)
+            {
+                if (s.StartTimeUnixNano < fromNano || s.StartTimeUnixNano > toNano) continue;
+                Merge(new ServiceSegmentStats
+                {
+                    ServiceName      = s.ServiceName,
+                    SpanCount        = 1,
+                    ErrorCount       = s.Status == SpanStatusCode.Error ? 1u : 0u,
+                    MinDurationNanos = s.DurationNanos,
+                    MaxDurationNanos = s.DurationNanos,
+                    Buckets          = BucketOf(s.DurationNanos),
+                });
+            }
+        }
+        finally { _lock.ExitReadLock(); }
+
+        // Cold tier — read .stats sidecar files only (no span deserialization)
+        foreach (var seg in _coldSegments)
+        {
+            if (seg.MaxStartNano < fromNano || seg.MinStartNano > toNano) continue;
+            foreach (var s in SpanReader.ReadStats(seg.FilePath))
+                Merge(s);
+        }
+
+        var result = new List<ServiceSegmentStats>(agg.Count);
+        foreach (var (name, (buckets, spans, errors, minDur, maxDur)) in agg)
+            result.Add(new ServiceSegmentStats
+            {
+                ServiceName      = name,
+                SpanCount        = spans,
+                ErrorCount       = errors,
+                MinDurationNanos = minDur == long.MaxValue ? 0 : minDur,
+                MaxDurationNanos = maxDur == long.MinValue ? 0 : maxDur,
+                Buckets          = buckets,
+            });
+
+        return Task.FromResult<IReadOnlyList<ServiceSegmentStats>>(result);
+    }
+
+    private static uint[] BucketOf(long durationNanos)
+    {
+        var b = new uint[HistogramBuckets.Count];
+        b[HistogramBuckets.IndexOf(durationNanos)] = 1;
+        return b;
+    }
+
     public void Dispose()
     {
         _lock.EnterWriteLock();
@@ -306,8 +397,10 @@ public sealed class TraceStorageEngine : ITraceProvider, IRetentionTarget, IDisp
 /// <summary>Metadata about a cold-tier span segment file.</summary>
 public sealed class SpanSegmentInfo
 {
-    public string FilePath     { get; init; } = string.Empty;
-    public long   MinStartNano { get; init; }
-    public long   MaxStartNano { get; init; }
-    public int    SpanCount    { get; init; }
+    public string   FilePath     { get; init; } = string.Empty;
+    public long     MinStartNano { get; init; }
+    public long     MaxStartNano { get; init; }
+    public int      SpanCount    { get; init; }
+    /// <summary>Service names present in this segment — enables O(1) cold-tier pre-filter.</summary>
+    public string[] Services     { get; init; } = [];
 }

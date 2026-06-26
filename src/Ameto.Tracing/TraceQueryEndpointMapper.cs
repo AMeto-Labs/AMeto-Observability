@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
+using Ameto.Tracing.Storage;
 
 namespace Ameto.Tracing;
 
@@ -9,31 +10,40 @@ public static class TraceQueryEndpointMapper
     public static void MapTraceEndpoints(this WebApplication app)
     {
         // GET /api/traces/stats?from=&to=
+        // Uses .stats sidecar files — no span deserialization, sub-millisecond for large datasets.
         app.MapGet("/api/traces/stats", async (HttpContext ctx) =>
         {
-            var provider  = ctx.RequestServices.GetRequiredService<ITraceProvider>();
-            var (from, to) = ParseFromTo(ctx);
+            var statsProvider = ctx.RequestServices.GetRequiredService<ITraceStatsProvider>();
+            var (from, to)    = ParseFromTo(ctx);
 
-            var allSpans = new List<SpanRecord>();
+            var perService = await statsProvider.GetAggregateStatsAsync(from, to, ctx.RequestAborted);
+
+            uint   totalSpans  = 0;
+            uint   errorSpans  = 0;
+            var    mergedBuckets = new uint[HistogramBuckets.Count];
+
+            foreach (var svc in perService)
+            {
+                totalSpans += svc.SpanCount;
+                errorSpans += svc.ErrorCount;
+                for (int i = 0; i < HistogramBuckets.Count; i++)
+                    mergedBuckets[i] += svc.Buckets[i];
+            }
+
+            double windowSeconds = Math.Max(1, (to - from).TotalSeconds);
+
+            // Sparklines: we still need a quick scan for time-bucketed data.
+            // Use the trace search but with a coarser limit.
+            var provider       = ctx.RequestServices.GetRequiredService<ITraceProvider>();
+            var allSpans       = new List<SpanRecord>();
             await foreach (var s in provider.SearchSpansAsync(from, to, limit: 10_000, ct: ctx.RequestAborted))
                 allSpans.Add(s);
 
             var groups = allSpans.GroupBy(s => s.TraceId).ToList();
-            int totalTraces = groups.Count;
-            int errorTraces = groups.Count(g => g.Any(s => s.Status == SpanStatusCode.Error));
 
-            var durations = groups
-                .Select(g => (GetRootSpan(g) ?? g.OrderBy(s => s.StartTimeUnixNano).First()).DurationNanos / 1_000_000.0)
-                .Where(d => d > 0)
-                .OrderBy(d => d)
-                .ToList();
-
-            double windowSeconds = Math.Max(1, (to - from).TotalSeconds);
-
-            const int BUCKETS = 20;
-            long fromNano  = from.ToUnixTimeMilliseconds() * 1_000_000L;
-            long rangeNano = Math.Max(1L, to.ToUnixTimeMilliseconds() * 1_000_000L - fromNano);
-
+            const int BUCKETS  = 20;
+            long fromNano      = from.ToUnixTimeMilliseconds() * 1_000_000L;
+            long rangeNano     = Math.Max(1L, to.ToUnixTimeMilliseconds() * 1_000_000L - fromNano);
             var totalSparkline = new double[BUCKETS];
             var errorSparkline = new double[BUCKETS];
 
@@ -45,12 +55,16 @@ public static class TraceQueryEndpointMapper
                 if (g.Any(s => s.Status == SpanStatusCode.Error)) errorSparkline[bucket]++;
             }
 
+            int totalTraces = groups.Count;
+            int errorTraces = groups.Count(g => g.Any(s => s.Status == SpanStatusCode.Error));
+
             var stats = new TraceStatsDto
             {
                 TotalTraces    = totalTraces,
                 ErrorRate      = totalTraces > 0 ? (double)errorTraces / totalTraces * 100.0 : 0,
-                P50LatencyMs   = Percentile(durations, 0.50),
-                P95LatencyMs   = Percentile(durations, 0.95),
+                P50LatencyMs   = HistogramBuckets.Percentile(mergedBuckets, 0.50),
+                P95LatencyMs   = HistogramBuckets.Percentile(mergedBuckets, 0.95),
+                P99LatencyMs   = HistogramBuckets.Percentile(mergedBuckets, 0.99),
                 ThroughputRps  = totalTraces / windowSeconds,
                 TotalSparkline = totalSparkline,
                 ErrorSparkline = errorSparkline,
@@ -59,8 +73,7 @@ public static class TraceQueryEndpointMapper
             await ctx.Response.WriteAsJsonAsync(stats);
         });
 
-        // GET /api/traces?from=&to=&service=&name=&status=&limit=
-        // Returns one TraceRowDto per distinct trace (using the root span).
+        // GET /api/traces?from=&to=&service=&name=&status=&limit=&minDurationMs=&maxDurationMs=&httpStatus=
         app.MapGet("/api/traces", async (HttpContext ctx) =>
         {
             var provider  = ctx.RequestServices.GetRequiredService<ITraceProvider>();
@@ -72,13 +85,15 @@ public static class TraceQueryEndpointMapper
             if (ctx.Request.Query.TryGetValue("status", out var sv)
                 && Enum.TryParse<SpanStatusCode>(sv, ignoreCase: true, out var sParsed))
                 status = sParsed;
-            int    limit          = ParseInt(ctx.Request.Query["limit"], 200, 1, 1000);
-            long?  minDurNanos    = ParseLong(ctx.Request.Query["minDurationMs"]) is long minMs ? minMs * 1_000_000L : null;
-            long?  maxDurNanos    = ParseLong(ctx.Request.Query["maxDurationMs"]) is long maxMs ? maxMs * 1_000_000L : null;
-            string httpStatusRaw  = ctx.Request.Query["httpStatus"].ToString();
+
+            int    limit         = ParseInt(ctx.Request.Query["limit"], 200, 1, 1000);
+            long?  minDurNanos   = ParseLong(ctx.Request.Query["minDurationMs"]) is long minMs ? minMs * 1_000_000L : null;
+            long?  maxDurNanos   = ParseLong(ctx.Request.Query["maxDurationMs"]) is long maxMs ? maxMs * 1_000_000L : null;
+            string httpStatusRaw = ctx.Request.Query["httpStatus"].ToString();
 
             var allSpans = new List<SpanRecord>();
-            await foreach (var s in provider.SearchSpansAsync(from, to, service, name, status, minDurNanos, maxDurNanos, limit * 5, ctx.RequestAborted))
+            await foreach (var s in provider.SearchSpansAsync(from, to, service, name, status,
+                               minDurNanos, maxDurNanos, limit: limit * 5, ct: ctx.RequestAborted))
                 allSpans.Add(s);
 
             var traces = allSpans
@@ -88,16 +103,19 @@ public static class TraceQueryEndpointMapper
                     var spans   = g.ToList();
                     var root    = GetRootSpan(g) ?? spans.OrderBy(s => s.StartTimeUnixNano).First();
                     bool hasErr = spans.Any(s => s.Status == SpanStatusCode.Error);
+                    // Collect all unique service names across spans in this trace
+                    var services = spans.Select(s => s.ServiceName).Distinct().ToArray();
                     return new TraceRowDto
                     {
                         TraceId           = root.TraceId.ToString(),
                         SpanId            = root.SpanId.ToString(),
                         Name              = root.Name,
                         ServiceName       = root.ServiceName,
+                        Services          = services,
                         Status            = hasErr ? "Error" : root.Status.ToString(),
                         HttpMethod        = GetAttr(root.Attributes, "http.request.method", "http.method"),
                         HttpPath          = GetAttr(root.Attributes, "url.path", "http.target", "http.route", "url.full", "http.url"),
-                        HttpStatusCode    = GetIntAttr(root.Attributes, "http.response.status_code", "http.status_code"),
+                        HttpStatusCode    = root.HttpStatusCode != 0 ? root.HttpStatusCode : null,
                         StartTimeUnixNano = root.StartTimeUnixNano,
                         DurationNanos     = root.DurationNanos,
                         SpanCount         = spans.Count,
@@ -147,10 +165,6 @@ public static class TraceQueryEndpointMapper
     private static long? ParseLong(string? s) =>
         long.TryParse(s, out var v) && v > 0 ? v : null;
 
-    /// <summary>
-    /// Matches HTTP status code against a filter string.
-    /// Supports: empty (pass all), "4xx", "5xx", exact integer ("404", "500").
-    /// </summary>
     private static bool MatchHttpStatus(int? code, string filter)
     {
         if (string.IsNullOrEmpty(filter)) return true;
@@ -165,11 +179,7 @@ public static class TraceQueryEndpointMapper
     private static SpanRecord? GetRootSpan(IEnumerable<SpanRecord> spans)
     {
         foreach (var s in spans)
-        {
-            var p = s.ParentSpanId.ToString();
-            if (string.IsNullOrEmpty(p) || p.All(c => c == '0'))
-                return s;
-        }
+            if (s.ParentSpanId.IsEmpty) return s;
         return null;
     }
 
@@ -181,34 +191,24 @@ public static class TraceQueryEndpointMapper
                 return v.ToString() ?? string.Empty;
         return string.Empty;
     }
-
-    private static int? GetIntAttr(IReadOnlyDictionary<string, object?>? attrs, params string[] keys)
-    {
-        var s = GetAttr(attrs, keys);
-        return int.TryParse(s, out var v) ? v : null;
-    }
-
-    private static double Percentile(List<double> sorted, double p)
-    {
-        if (sorted.Count == 0) return 0;
-        return sorted[Math.Clamp((int)(p * (sorted.Count - 1)), 0, sorted.Count - 1)];
-    }
 }
 
 /// <summary>One row per trace (root span) for the trace list view.</summary>
 public sealed class TraceRowDto
 {
-    public string TraceId           { get; init; } = string.Empty;
-    public string SpanId            { get; init; } = string.Empty;
-    public string Name              { get; init; } = string.Empty;
-    public string ServiceName       { get; init; } = string.Empty;
-    public string Status            { get; init; } = string.Empty;
-    public string HttpMethod        { get; init; } = string.Empty;
-    public string HttpPath          { get; init; } = string.Empty;
-    public int?   HttpStatusCode    { get; init; }
-    public long   StartTimeUnixNano { get; init; }
-    public long   DurationNanos     { get; init; }
-    public int    SpanCount         { get; init; }
+    public string   TraceId           { get; init; } = string.Empty;
+    public string   SpanId            { get; init; } = string.Empty;
+    public string   Name              { get; init; } = string.Empty;
+    public string   ServiceName       { get; init; } = string.Empty;
+    /// <summary>All unique service names across all spans in this trace.</summary>
+    public string[] Services          { get; init; } = [];
+    public string   Status            { get; init; } = string.Empty;
+    public string   HttpMethod        { get; init; } = string.Empty;
+    public string   HttpPath          { get; init; } = string.Empty;
+    public int?     HttpStatusCode    { get; init; }
+    public long     StartTimeUnixNano { get; init; }
+    public long     DurationNanos     { get; init; }
+    public int      SpanCount         { get; init; }
 }
 
 /// <summary>JSON DTO for a single span, returned to the Angular client.</summary>
@@ -223,6 +223,7 @@ public sealed class SpanDto
     public string                    ServiceName       { get; init; } = string.Empty;
     public string                    Kind              { get; init; } = string.Empty;
     public string                    Status            { get; init; } = string.Empty;
+    public int                       HttpStatusCode    { get; init; }
     public Dictionary<string,string> Attributes        { get; init; } = [];
 
     public static SpanDto From(SpanRecord s) => new()
@@ -236,6 +237,7 @@ public sealed class SpanDto
         ServiceName       = s.ServiceName,
         Kind              = s.Kind.ToString(),
         Status            = s.Status.ToString(),
+        HttpStatusCode    = s.HttpStatusCode,
         Attributes        = s.Attributes?.ToDictionary(kv => kv.Key, kv => kv.Value?.ToString() ?? string.Empty) ?? [],
     };
 }
@@ -247,6 +249,7 @@ public sealed class TraceStatsDto
     public double   ErrorRate      { get; init; }
     public double   P50LatencyMs   { get; init; }
     public double   P95LatencyMs   { get; init; }
+    public double   P99LatencyMs   { get; init; }
     public double   ThroughputRps  { get; init; }
     public double[] TotalSparkline { get; init; } = [];
     public double[] ErrorSparkline { get; init; } = [];

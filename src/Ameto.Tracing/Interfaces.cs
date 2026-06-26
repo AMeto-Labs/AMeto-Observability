@@ -30,6 +30,22 @@ public sealed class SpanIngestItem
 
     /// <summary>Pre-serialised msgpack attributes blob. May be empty.</summary>
     public byte[]         AttributesBytes     { get; init; } = [];
+
+    /// <summary>Promoted HTTP response status code (0 = absent). Extracted before msgpack serialisation.</summary>
+    public short          HttpStatusCode      { get; init; }
+}
+
+/// <summary>
+/// Returns pre-aggregated per-service stats (from .stats sidecar files — no span scan).
+/// </summary>
+public interface ITraceStatsProvider
+{
+    /// <summary>
+    /// Merges per-service histograms for all segments in [from, to].
+    /// Returns one entry per service name across all matching segments + hot tier.
+    /// </summary>
+    Task<IReadOnlyList<Ameto.Tracing.Storage.ServiceSegmentStats>> GetAggregateStatsAsync(
+        DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default);
 }
 
 /// <summary>
@@ -55,6 +71,7 @@ public interface ITraceProvider
         SpanStatusCode?  status           = null,
         long?            minDurationNanos = null,
         long?            maxDurationNanos = null,
+        short?           httpStatusCode   = null,
         int              limit            = 200,
         CancellationToken ct              = default);
 }
