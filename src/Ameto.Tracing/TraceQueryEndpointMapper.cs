@@ -3,6 +3,7 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
 using Ameto.Tracing.Storage;
 using Ameto.Tracing.TraceQL;
+using HistogramBuckets = Ameto.Tracing.Storage.HistogramBuckets;
 
 namespace Ameto.Tracing;
 
@@ -130,6 +131,61 @@ public static class TraceQueryEndpointMapper
             await ctx.Response.WriteAsJsonAsync(traces);
         });
 
+        // GET /api/traces/latency?from=&to=&service=
+        // Returns per-service duration histograms + p50/p95/p99/p999 from .stats sidecars.
+        app.MapGet("/api/traces/latency", async (HttpContext ctx) =>
+        {
+            var statsProvider = ctx.RequestServices.GetRequiredService<ITraceStatsProvider>();
+            var (from, to)    = ParseFromTo(ctx);
+            string? service   = NullIfEmpty(ctx.Request.Query["service"]);
+
+            var allStats = await statsProvider.GetAggregateStatsAsync(from, to, ctx.RequestAborted);
+
+            var result = allStats
+                .Where(s => service is null || s.ServiceName.Equals(service, StringComparison.OrdinalIgnoreCase))
+                .Select(s =>
+                {
+                    var buckets = s.Buckets;
+                    var bounds  = HistogramBuckets.Bounds;
+                    var dto = new
+                    {
+                        service    = s.ServiceName,
+                        spanCount  = s.SpanCount,
+                        errorCount = s.ErrorCount,
+                        p50Ms      = HistogramBuckets.Percentile(buckets, 0.50),
+                        p95Ms      = HistogramBuckets.Percentile(buckets, 0.95),
+                        p99Ms      = HistogramBuckets.Percentile(buckets, 0.99),
+                        p999Ms     = HistogramBuckets.Percentile(buckets, 0.999),
+                        buckets    = BuildBucketList(s.Buckets),
+                    };
+                    return dto;
+                })
+                .ToList();
+
+            await ctx.Response.WriteAsJsonAsync(result);
+        });
+
+        // GET /api/traces/compare?a={traceId}&b={traceId}
+        app.MapGet("/api/traces/compare", async (HttpContext ctx) =>
+        {
+            var provider = ctx.RequestServices.GetRequiredService<ITraceProvider>();
+            string? aHex = ctx.Request.Query["a"];
+            string? bHex = ctx.Request.Query["b"];
+
+            if (!TraceId.TryParseHex(aHex, out var tidA) || !TraceId.TryParseHex(bHex, out var tidB))
+            {
+                ctx.Response.StatusCode = 400;
+                await ctx.Response.WriteAsync("'a' and 'b' must be valid 32-char hex trace IDs");
+                return;
+            }
+
+            var taskA = CollectSpansAsync(provider, tidA, ctx.RequestAborted);
+            var taskB = CollectSpansAsync(provider, tidB, ctx.RequestAborted);
+            await Task.WhenAll(taskA, taskB);
+
+            await ctx.Response.WriteAsJsonAsync(new { traceA = taskA.Result, traceB = taskB.Result });
+        });
+
         // GET /api/traces/service-graph?from=&to=
         app.MapGet("/api/traces/service-graph", async (HttpContext ctx) =>
         {
@@ -172,6 +228,23 @@ public static class TraceQueryEndpointMapper
             await ctx.Response.WriteAsJsonAsync(results);
         });
 
+        // GET /api/traces/{traceId}/flamegraph
+        app.MapGet("/api/traces/{traceId}/flamegraph", async (HttpContext ctx, string traceId) =>
+        {
+            if (!TraceId.TryParseHex(traceId, out var tid))
+            {
+                ctx.Response.StatusCode = 400;
+                return;
+            }
+            var provider = ctx.RequestServices.GetRequiredService<ITraceProvider>();
+            var spans    = await CollectSpansRawAsync(provider, tid, ctx.RequestAborted);
+
+            if (spans.Count == 0) { ctx.Response.StatusCode = 404; return; }
+
+            var flame = BuildFlamegraph(spans);
+            await ctx.Response.WriteAsJsonAsync(flame);
+        });
+
         // GET /api/traces/{traceId}
         app.MapGet("/api/traces/{traceId}", async (HttpContext ctx, string traceId) =>
         {
@@ -207,6 +280,86 @@ public static class TraceQueryEndpointMapper
 
     private static long? ParseLong(string? s) =>
         long.TryParse(s, out var v) && v > 0 ? v : null;
+
+    // ── Flamegraph builder ────────────────────────────────────────────────────
+
+    private static FlamegraphNode? BuildFlamegraph(List<SpanRecord> spans)
+    {
+        // Index for O(1) lookup
+        var byId       = new Dictionary<SpanId, SpanRecord>(spans.Count);
+        var children   = new Dictionary<SpanId, List<SpanRecord>>(spans.Count);
+
+        foreach (var s in spans)
+        {
+            byId[s.SpanId] = s;
+            if (!children.ContainsKey(s.SpanId)) children[s.SpanId] = [];
+        }
+
+        SpanRecord? root = null;
+        foreach (var s in spans)
+        {
+            if (s.ParentSpanId.IsEmpty || !byId.ContainsKey(s.ParentSpanId))
+            { root = s; continue; }
+            children[s.ParentSpanId].Add(s);
+        }
+
+        return root is null ? null : BuildNode(root, children);
+    }
+
+    private static FlamegraphNode BuildNode(
+        SpanRecord span, Dictionary<SpanId, List<SpanRecord>> childMap)
+    {
+        var kids    = childMap.TryGetValue(span.SpanId, out var c) ? c : [];
+        var kidNodes = kids.Select(k => BuildNode(k, childMap)).ToArray();
+
+        double totalMs = span.DurationNanos / 1_000_000.0;
+        double childMs = kidNodes.Sum(n => n.TotalMs);
+        double selfMs  = Math.Max(0, totalMs - childMs);
+
+        return new FlamegraphNode
+        {
+            SpanId   = span.SpanId.ToString(),
+            Name     = span.Name,
+            Service  = span.ServiceName,
+            Kind     = span.Kind.ToString(),
+            Status   = span.Status.ToString(),
+            TotalMs  = Math.Round(totalMs, 3),
+            SelfMs   = Math.Round(selfMs,  3),
+            Children = kidNodes,
+        };
+    }
+
+    // ── Misc helpers ──────────────────────────────────────────────────────────
+
+    private static async Task<List<SpanDto>> CollectSpansAsync(
+        ITraceProvider provider, TraceId tid, CancellationToken ct)
+    {
+        var list = new List<SpanDto>();
+        await foreach (var s in provider.GetTraceAsync(tid, ct))
+            list.Add(SpanDto.From(s));
+        return list;
+    }
+
+    private static async Task<List<SpanRecord>> CollectSpansRawAsync(
+        ITraceProvider provider, TraceId tid, CancellationToken ct)
+    {
+        var list = new List<SpanRecord>();
+        await foreach (var s in provider.GetTraceAsync(tid, ct))
+            list.Add(s);
+        return list;
+    }
+
+    private static object[] BuildBucketList(uint[] buckets)
+    {
+        var bounds = Ameto.Tracing.Storage.HistogramBuckets.Bounds;
+        var result = new object[buckets.Length];
+        for (int i = 0; i < buckets.Length; i++)
+        {
+            double upperMs = i < bounds.Length ? bounds[i] / 1_000_000.0 : double.MaxValue;
+            result[i] = new { upperMs, count = buckets[i] };
+        }
+        return result;
+    }
 
     private static DateTimeOffset? ParseDate(string? s) =>
         DateTimeOffset.TryParse(s, out var v) ? v : null;
@@ -286,6 +439,19 @@ public sealed class SpanDto
         HttpStatusCode    = s.HttpStatusCode,
         Attributes        = s.Attributes?.ToDictionary(kv => kv.Key, kv => kv.Value?.ToString() ?? string.Empty) ?? [],
     };
+}
+
+/// <summary>Single node in a trace flamegraph tree.</summary>
+public sealed class FlamegraphNode
+{
+    public string          SpanId   { get; init; } = string.Empty;
+    public string          Name     { get; init; } = string.Empty;
+    public string          Service  { get; init; } = string.Empty;
+    public string          Kind     { get; init; } = string.Empty;
+    public string          Status   { get; init; } = string.Empty;
+    public double          TotalMs  { get; init; }
+    public double          SelfMs   { get; init; }
+    public FlamegraphNode[] Children { get; init; } = [];
 }
 
 /// <summary>Request body for POST /api/traces/query.</summary>
