@@ -36,6 +36,43 @@ public sealed class SpanIngestItem
 }
 
 /// <summary>
+/// Returns a service dependency graph for a time window.
+/// Built from .svcgraph sidecar files — no span deserialisation.
+/// </summary>
+public interface IServiceGraphProvider
+{
+    Task<ServiceGraphDto> GetServiceGraphAsync(
+        DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default);
+}
+
+/// <summary>Service-level aggregate for one node in the graph.</summary>
+public sealed class ServiceNodeDto
+{
+    public string ServiceName { get; init; } = string.Empty;
+    public uint   SpanCount   { get; init; }
+    public double ErrorRate   { get; init; }  // 0–1
+    public double P95Ms       { get; init; }
+}
+
+/// <summary>Directed call edge between two services.</summary>
+public sealed class ServiceEdgeDto
+{
+    public string From       { get; init; } = string.Empty;
+    public string To         { get; init; } = string.Empty;
+    public uint   CallCount  { get; init; }
+    public uint   ErrorCount { get; init; }
+    public double ErrorRate  { get; init; }  // 0–1
+    public double P95Ms      { get; init; }
+}
+
+/// <summary>Full service dependency graph response.</summary>
+public sealed class ServiceGraphDto
+{
+    public ServiceNodeDto[] Nodes { get; init; } = [];
+    public ServiceEdgeDto[] Edges { get; init; } = [];
+}
+
+/// <summary>
 /// Returns pre-aggregated per-service stats (from .stats sidecar files — no span scan).
 /// </summary>
 public interface ITraceStatsProvider

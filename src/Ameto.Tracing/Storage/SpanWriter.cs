@@ -120,9 +120,12 @@ internal static class SpanWriter
         bw.Write((ulong)svcIdxOffset);
         bw.Write(FooterMagic);
 
-        // ── .stats sidecar (separate file, no impact on .trc read path) ────────
+        // ── .stats sidecar ─────────────────────────────────────────────────────
         string statsPath = Path.Combine(dataDir, baseName + ".stats");
         WriteStatsSidecar(statsPath, svcStats);
+
+        // ── .svcgraph sidecar ──────────────────────────────────────────────────
+        ServiceGraphSidecar.Write(trcPath, spans);
 
         var services = new string[svcBlockMap.Count];
         svcBlockMap.Keys.CopyTo(services, 0);

@@ -14,7 +14,7 @@ namespace Ameto.Tracing.Storage;
 /// Cold tier: flushed as <c>.trc</c> files by <see cref="SpanWriter"/>
 /// when the hot segment reaches its size/time threshold.
 /// </summary>
-public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IRetentionTarget, IDisposable
+public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IServiceGraphProvider, IRetentionTarget, IDisposable
 {
     // ── Hot tier ─────────────────────────────────────────────────────────────
     private readonly List<SpanRecord>                          _hotSpans  = new();
@@ -348,6 +348,107 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IR
             });
 
         return Task.FromResult<IReadOnlyList<ServiceSegmentStats>>(result);
+    }
+
+    // ── IServiceGraphProvider ──────────────────────────────────────────────────
+
+    public Task<ServiceGraphDto> GetServiceGraphAsync(
+        DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default)
+    {
+        long fromNano = from.ToUnixTimeMilliseconds() * 1_000_000L;
+        long toNano   = to.ToUnixTimeMilliseconds()   * 1_000_000L;
+
+        // Accumulate edges: (from, to) → (calls, errors, buckets)
+        var edgeAgg = new Dictionary<(string, string), (uint Calls, uint Errors, uint[] Buckets)>(32);
+
+        void MergeEdge(string f, string t, uint calls, uint errors, uint[] buckets)
+        {
+            var key = (f, t);
+            if (!edgeAgg.TryGetValue(key, out var acc))
+                acc = (0, 0, new uint[HistogramBuckets.Count]);
+            acc.Calls  += calls;
+            acc.Errors += errors;
+            for (int i = 0; i < HistogramBuckets.Count; i++) acc.Buckets[i] += buckets[i];
+            edgeAgg[key] = acc;
+        }
+
+        // Hot tier: derive edges on-demand (all spans in memory, accurate)
+        _lock.EnterReadLock();
+        try
+        {
+            if (_hotSpans.Count > 0)
+            {
+                var spanSvc = new Dictionary<SpanId, string>(_hotSpans.Count);
+                foreach (var s in _hotSpans)
+                    if (s.StartTimeUnixNano >= fromNano && s.StartTimeUnixNano <= toNano)
+                        spanSvc[s.SpanId] = s.ServiceName;
+
+                foreach (var s in _hotSpans)
+                {
+                    if (s.StartTimeUnixNano < fromNano || s.StartTimeUnixNano > toNano) continue;
+                    if (s.ParentSpanId.IsEmpty) continue;
+                    if (!spanSvc.TryGetValue(s.ParentSpanId, out var psvc)) continue;
+                    if (string.Equals(psvc, s.ServiceName, StringComparison.Ordinal)) continue;
+                    MergeEdge(psvc, s.ServiceName, 1,
+                              s.Status == SpanStatusCode.Error ? 1u : 0u,
+                              BucketOf(s.DurationNanos));
+                }
+            }
+        }
+        finally { _lock.ExitReadLock(); }
+
+        // Cold tier — read .svcgraph sidecars (no span deserialization)
+        foreach (var seg in _coldSegments)
+        {
+            if (seg.MaxStartNano < fromNano || seg.MinStartNano > toNano) continue;
+            foreach (var e in ServiceGraphSidecar.ReadEdges(seg.FilePath))
+                MergeEdge(e.From, e.To, e.CallCount, e.ErrorCount, e.Buckets);
+        }
+
+        // Build edges list
+        var edgeDtos = new List<ServiceEdgeDto>(edgeAgg.Count);
+        foreach (var ((from2, to2), (calls, errors, buckets)) in edgeAgg)
+            edgeDtos.Add(new ServiceEdgeDto
+            {
+                From      = from2,
+                To        = to2,
+                CallCount = calls,
+                ErrorCount= errors,
+                ErrorRate = calls > 0 ? (double)errors / calls : 0,
+                P95Ms     = HistogramBuckets.Percentile(buckets, 0.95),
+            });
+
+        // Derive nodes from edges + stats provider
+        // Union all service names from edges
+        var nodeNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var e in edgeDtos) { nodeNames.Add(e.From); nodeNames.Add(e.To); }
+
+        // Load per-service stats for node metrics (reuse existing stats aggregation)
+        // We call GetAggregateStatsAsync synchronously since it's Task.FromResult internally
+        var statsTask = GetAggregateStatsAsync(from, to, ct);
+        var statsMap  = new Dictionary<string, ServiceSegmentStats>(StringComparer.OrdinalIgnoreCase);
+        // statsTask is already completed (Task.FromResult)
+        foreach (var s in statsTask.Result)
+            statsMap[s.ServiceName] = s;
+
+        var nodeDtos = new List<ServiceNodeDto>(nodeNames.Count);
+        foreach (var name in nodeNames)
+        {
+            statsMap.TryGetValue(name, out var st);
+            nodeDtos.Add(new ServiceNodeDto
+            {
+                ServiceName = name,
+                SpanCount   = st?.SpanCount ?? 0,
+                ErrorRate   = st is { SpanCount: > 0 } ? (double)st.ErrorCount / st.SpanCount : 0,
+                P95Ms       = st is not null ? HistogramBuckets.Percentile(st.Buckets, 0.95) : 0,
+            });
+        }
+
+        return Task.FromResult(new ServiceGraphDto
+        {
+            Nodes = [.. nodeDtos],
+            Edges = [.. edgeDtos],
+        });
     }
 
     private static uint[] BucketOf(long durationNanos)

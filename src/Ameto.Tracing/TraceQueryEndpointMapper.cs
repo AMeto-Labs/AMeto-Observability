@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
 using Ameto.Tracing.Storage;
+using Ameto.Tracing.TraceQL;
 
 namespace Ameto.Tracing;
 
@@ -129,6 +130,48 @@ public static class TraceQueryEndpointMapper
             await ctx.Response.WriteAsJsonAsync(traces);
         });
 
+        // GET /api/traces/service-graph?from=&to=
+        app.MapGet("/api/traces/service-graph", async (HttpContext ctx) =>
+        {
+            var graphProvider = ctx.RequestServices.GetRequiredService<IServiceGraphProvider>();
+            var (from, to)    = ParseFromTo(ctx);
+            var graph = await graphProvider.GetServiceGraphAsync(from, to, ctx.RequestAborted);
+            await ctx.Response.WriteAsJsonAsync(graph);
+        });
+
+        // POST /api/traces/query  — TraceQL
+        // Body: { "query": "{ .http.status_code = 500 }", "from": "...", "to": "...", "limit": 100 }
+        app.MapPost("/api/traces/query", async (HttpContext ctx) =>
+        {
+            TraceQueryRequest? req = null;
+            try { req = await ctx.Request.ReadFromJsonAsync<TraceQueryRequest>(ctx.RequestAborted); }
+            catch { ctx.Response.StatusCode = 400; await ctx.Response.WriteAsync("Invalid JSON"); return; }
+
+            if (req is null || string.IsNullOrWhiteSpace(req.Query))
+            {
+                ctx.Response.StatusCode = 400;
+                await ctx.Response.WriteAsync("'query' field is required");
+                return;
+            }
+
+            SpanPredicate predicate;
+            try   { predicate = TraceQLParser.Parse(req.Query); }
+            catch (TraceQLException ex)
+            {
+                ctx.Response.StatusCode = 400;
+                await ctx.Response.WriteAsync($"TraceQL parse error: {ex.Message}");
+                return;
+            }
+
+            var from  = ParseDate(req.From) ?? DateTimeOffset.UtcNow.AddHours(-1);
+            var to    = ParseDate(req.To)   ?? DateTimeOffset.UtcNow;
+            int limit = Math.Clamp(req.Limit, 1, 1000);
+
+            var provider = ctx.RequestServices.GetRequiredService<ITraceProvider>();
+            var results  = await TraceQLExecutor.ExecuteAsync(provider, predicate, from, to, limit, ctx.RequestAborted);
+            await ctx.Response.WriteAsJsonAsync(results);
+        });
+
         // GET /api/traces/{traceId}
         app.MapGet("/api/traces/{traceId}", async (HttpContext ctx, string traceId) =>
         {
@@ -164,6 +207,9 @@ public static class TraceQueryEndpointMapper
 
     private static long? ParseLong(string? s) =>
         long.TryParse(s, out var v) && v > 0 ? v : null;
+
+    private static DateTimeOffset? ParseDate(string? s) =>
+        DateTimeOffset.TryParse(s, out var v) ? v : null;
 
     private static bool MatchHttpStatus(int? code, string filter)
     {
@@ -240,6 +286,15 @@ public sealed class SpanDto
         HttpStatusCode    = s.HttpStatusCode,
         Attributes        = s.Attributes?.ToDictionary(kv => kv.Key, kv => kv.Value?.ToString() ?? string.Empty) ?? [],
     };
+}
+
+/// <summary>Request body for POST /api/traces/query.</summary>
+public sealed class TraceQueryRequest
+{
+    public string  Query { get; init; } = string.Empty;
+    public string? From  { get; init; }
+    public string? To    { get; init; }
+    public int     Limit { get; init; } = 100;
 }
 
 /// <summary>Aggregate stats for the trace stats cards.</summary>
