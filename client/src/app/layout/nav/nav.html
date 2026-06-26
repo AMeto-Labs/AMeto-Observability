@@ -27,13 +27,6 @@
       <span class="nav-label">{{ settingsItem.label }}</span>
     </a>
 
-    <button
-      class="nav-item nav-item--sm"
-      (click)="theme.toggle()"
-      [title]="theme.theme() === 'dark' ? 'Light mode' : 'Dark mode'">
-      <lucide-icon [name]="theme.theme() === 'dark' ? 'sun' : 'moon'" [size]="14" [strokeWidth]="1.5" />
-    </button>
-
 
 
     <div class="nav-user" (click)="auth.logout()" title="Sign out">

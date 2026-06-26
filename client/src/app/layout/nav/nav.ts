@@ -1,7 +1,6 @@
 import { Component, inject } from '@angular/core';
 import { RouterLink, RouterLinkActive } from '@angular/router';
 import { LucideAngularModule } from 'lucide-angular';
-import { ThemeService } from '../../core/services/theme.service';
 import { AuthService } from '../../core/services/auth.service';
 
 interface NavItem {
@@ -17,8 +16,7 @@ interface NavItem {
   styleUrl: './nav.scss',
 })
 export class NavComponent {
-  theme = inject(ThemeService);
-  auth  = inject(AuthService);
+  auth = inject(AuthService);
 
   readonly mainItems: NavItem[] = [
     { path: '/events',  icon: 'list',       label: 'Logs'    },

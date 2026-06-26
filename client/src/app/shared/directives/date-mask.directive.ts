@@ -1,8 +1,9 @@
 import { Directive, ElementRef, inject, input, output } from '@angular/core';
 
-/** Formats a text input as  yyyy-MM-dd  or  HH:mm  while typing.
- *  dateMaskType="date"  → digits auto-formatted as yyyy-MM-dd
- *  dateMaskType="time"  → digits auto-formatted as HH:mm
+/** Formats a text input as  yyyy-MM-dd ,  HH:mm , or  yyyy-MM-dd HH:mm  while typing.
+ *  dateMaskType="date"     → yyyy-MM-dd
+ *  dateMaskType="time"     → HH:mm
+ *  dateMaskType="datetime" → yyyy-MM-dd HH:mm  (emits suggestion when date part complete)
  */
 @Directive({
   selector: '[dateMask]',
@@ -14,7 +15,7 @@ import { Directive, ElementRef, inject, input, output } from '@angular/core';
 export class DateMaskDirective {
   private el = inject(ElementRef<HTMLInputElement>);
 
-  dateMaskType = input<'date' | 'time'>('date');
+  dateMaskType = input<'date' | 'time' | 'datetime'>('date');
   /** 'start' auto-completes time as 00:00, 'end' as 23:59 */
   dateMaskMode = input<'start' | 'end'>('start');
 
@@ -36,10 +37,19 @@ export class DateMaskDirective {
         if (i === 4 || i === 6) formatted += '-';
         formatted += digits[i];
       }
-    } else {
+    } else if (type === 'time') {
       const digits = oldVal.replace(/\D/g, '').slice(0, 4);
       for (let i = 0; i < digits.length; i++) {
         if (i === 2) formatted += ':';
+        formatted += digits[i];
+      }
+    } else {
+      // datetime: yyyy-MM-dd HH:mm (12 significant digits)
+      const digits = oldVal.replace(/\D/g, '').slice(0, 12);
+      for (let i = 0; i < digits.length; i++) {
+        if (i === 4 || i === 6) formatted += '-';
+        else if (i === 8) formatted += ' ';
+        else if (i === 10) formatted += ':';
         formatted += digits[i];
       }
     }
@@ -54,8 +64,27 @@ export class DateMaskDirective {
     }
     inp.setSelectionRange(newPos, newPos);
 
-    this.activeSuggestion = '';
-    this.suggestionChange.emit('');
+    // Progressive suggestions for datetime input
+    if (type === 'datetime') {
+      if (formatted.length === 7) {
+        // yyyy-MM complete → suggest today's day
+        const today = new Date();
+        const day = String(today.getDate()).padStart(2, '0');
+        this.activeSuggestion = `-${day}`;
+        this.suggestionChange.emit(`-${day}`);
+      } else if (formatted.length === 10) {
+        // yyyy-MM-dd complete → suggest default time
+        const defaultTime = this.dateMaskMode() === 'end' ? '23:59' : '00:00';
+        this.activeSuggestion = ` ${defaultTime}`;
+        this.suggestionChange.emit(` ${defaultTime}`);
+      } else {
+        this.activeSuggestion = '';
+        this.suggestionChange.emit('');
+      }
+    } else {
+      this.activeSuggestion = '';
+      this.suggestionChange.emit('');
+    }
     this.valueChange.emit(formatted);
   }
 

@@ -14,17 +14,7 @@
     </div>
   </app-section>
 
-  <app-section title="Appearance">
-    <div class="row">
-      <span class="label">Theme</span>
-      <button class="toggle" (click)="theme.toggle()">
-        <lucide-icon [name]="theme.theme() === 'dark' ? 'sun' : 'moon'" [size]="14" />
-        {{ theme.theme() === 'dark' ? 'Switch to light' : 'Switch to dark' }}
-      </button>
-    </div>
-  </app-section>
-
-  <app-section title="Events">
+<app-section title="Events">
     <div class="row" style="align-items:flex-start;">
       <div style="flex:1; min-width: 320px;">
         <span class="label">Overview custom props</span>

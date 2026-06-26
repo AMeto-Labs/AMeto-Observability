@@ -32,6 +32,15 @@ button {
   cursor: pointer;
 }
 
+/* Lucide icons render inline by default — force flex so SVG aligns to center */
+lucide-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  line-height: 1;
+}
+
 ::selection {
   background: var(--primary-soft);
   color: inherit;
@@ -137,6 +146,20 @@ button {
   padding: 3px 14px;
   color: var(--text-muted);
   font-size: 11px;
+  max-width: 360px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Filter-expression preview inside context-menu items. */
+.ctx-menu code {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--accent, #F59E0B);
+  max-width: 300px;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .loading-bar {
