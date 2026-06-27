@@ -83,7 +83,6 @@ public static class OtlpEndpointMapper
         app.MapPost("/otlp/v1/metrics", async (HttpContext ctx) =>
         {
             var ingester = ctx.RequestServices.GetRequiredService<IMetricIngester>();
-            var logger   = ctx.RequestServices.GetRequiredService<ILoggerFactory>().CreateLogger("Ameto.Otel.Metrics");
 
             var (body, bodyLen) = await ReadBodyAsync(ctx);
             if (body is null) return;
@@ -102,19 +101,6 @@ public static class OtlpEndpointMapper
             if (request is null) { ctx.Response.StatusCode = 400; return; }
 
             var points = OtlpMetricMapper.Map(request);
-
-            // TEMP diagnostic: confirm histogram bucket bounds/counts survive decoding.
-            if (logger.IsEnabled(LogLevel.Information))
-            {
-                foreach (var p in points)
-                {
-                    if (p.Kind != MetricKind.Histogram) continue;
-                    logger.LogInformation("HIST {Name}: bounds={Bounds} counts={Counts} hcount={HCount}",
-                        p.Name, p.BucketBounds?.Length ?? -1, p.BucketCounts?.Length ?? -1, p.HistogramCount);
-                    break;
-                }
-            }
-
             ingester.Ingest(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(points));
             await WriteJsonOk(ctx, points.Count, 0);
         });
