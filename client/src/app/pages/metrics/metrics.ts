@@ -2,6 +2,7 @@ import {
   Component, signal, computed, inject, OnInit, OnDestroy,
   ChangeDetectionStrategy, ChangeDetectorRef, ViewChild, ElementRef,
 } from '@angular/core';
+import { Router, ActivatedRoute } from '@angular/router';
 import { FormsModule } from '@angular/forms';
 import { LucideAngularModule } from 'lucide-angular';
 import { Chart, registerables } from 'chart.js';
@@ -10,8 +11,9 @@ import { forkJoin, of } from 'rxjs';
 import { catchError } from 'rxjs/operators';
 import { ApiService } from '../../core/services/api.service';
 import {
-  MetricSeriesDto, MetricCatalogDto, MetricQueryRequest, HeatmapDto, MetricAggregation,
+  MetricSeriesDto, MetricCatalogDto, MetricQueryRequest, HeatmapDto, MetricAggregation, ExemplarDto,
 } from '../../core/models/metric.model';
+import { TraceRowDto } from '../../core/models/span.model';
 import { HeatmapComponent } from './heatmap/heatmap';
 
 Chart.register(...registerables);
@@ -34,8 +36,12 @@ interface RuntimePanel { title: string; unit: string; series: MetricSeriesDto[];
   changeDetection: ChangeDetectionStrategy.OnPush,
 })
 export class MetricsComponent implements OnInit, OnDestroy {
-  private api = inject(ApiService);
-  private cdr = inject(ChangeDetectorRef);
+  private api    = inject(ApiService);
+  private cdr    = inject(ChangeDetectorRef);
+  private router = inject(Router);
+  private route  = inject(ActivatedRoute);
+
+  private pendingExplore: { metric: string; agg: MetricAggregation; q: number; gb: string[] } | null = null;
 
   @ViewChild('rateCanvas') rateRef?: ElementRef<HTMLCanvasElement>;
   @ViewChild('latCanvas')  latRef?:  ElementRef<HTMLCanvasElement>;
@@ -58,6 +64,8 @@ export class MetricsComponent implements OnInit, OnDestroy {
   latencyScale = signal(1);
   private rateSeries: MetricSeriesDto[] = [];
   private latSeries:  MetricSeriesDto[] = [];
+  private exemplars:  ExemplarDto[]     = [];
+  exemplarCount = signal(0);
 
   // Runtime
   runtimePanels = signal<RuntimePanel[]>([]);
@@ -71,6 +79,13 @@ export class MetricsComponent implements OnInit, OnDestroy {
   exGroupBy     = signal<string[]>([]);
   exHeatmap     = signal<HeatmapDto | null>(null);
   exLoading     = signal(false);
+
+  // Correlation drawer (metric → traces → logs)
+  corrOpen    = signal(false);
+  corrLoading = signal(false);
+  corrTitle   = signal('');
+  corrSub     = signal('');
+  corrTraces  = signal<TraceRowDto[]>([]);
 
   filteredCatalog = computed(() => {
     const q = this.catalogSearch().toLowerCase();
@@ -95,8 +110,10 @@ export class MetricsComponent implements OnInit, OnDestroy {
 
   // ── Lifecycle ─────────────────────────────────────────────────────────────
   ngOnInit() {
+    this.restoreFromUrl();
     this.loadCatalog();
-    this.loadOverview();
+    if (this.tab() === 'overview') this.loadOverview();
+    else if (this.tab() === 'runtime') this.loadRuntime();
     this._poll = setInterval(() => this.refresh(), 30_000);
   }
   ngOnDestroy() {
@@ -105,16 +122,54 @@ export class MetricsComponent implements OnInit, OnDestroy {
     if (this._poll) clearInterval(this._poll);
   }
 
+  // ── URL state sync (survives F5 / deep-link) ──────────────────────────────
+  private restoreFromUrl() {
+    const q = this.route.snapshot.queryParamMap;
+    const tab = q.get('tab');
+    if (tab === 'runtime' || tab === 'explore' || tab === 'overview') this.tab.set(tab);
+    const range = q.get('range');
+    if (range) this.preset.set(range);
+
+    const metric = q.get('metric');
+    if (metric) {
+      this.pendingExplore = {
+        metric,
+        agg: (q.get('agg') as MetricAggregation) || 'rate',
+        q:   q.get('q') ? +q.get('q')! : 0.95,
+        gb:  q.get('gb') ? q.get('gb')!.split(',').filter(Boolean) : [],
+      };
+      if (this.tab() !== 'explore') this.tab.set('explore');
+    }
+  }
+
+  private syncUrl() {
+    const inExplore = this.tab() === 'explore';
+    const sel = this.selectedMetric();
+    const qp: Record<string, string | null> = {
+      tab:    this.tab() === 'overview' ? null : this.tab(),
+      range:  this.preset() === '1h' ? null : this.preset(),
+      metric: inExplore && sel ? sel.name : null,
+      agg:    inExplore && sel ? this.exAggregation() : null,
+      q:      inExplore && sel && this.exAggregation() === 'quantile' ? String(this.exQuantile()) : null,
+      gb:     inExplore && sel && this.exGroupBy().length ? this.exGroupBy().join(',') : null,
+    };
+    this.router.navigate([], {
+      relativeTo: this.route, queryParams: qp, queryParamsHandling: 'merge', replaceUrl: true,
+    });
+  }
+
   setTab(t: Tab) {
     this.tab.set(t);
+    this.syncUrl();
     if (t === 'overview') this.loadOverview();
     else if (t === 'runtime') this.loadRuntime();
     else this.loadCatalog();
   }
-  onPreset(p: string) { this.preset.set(p); this.refresh(); }
+  onPreset(p: string) { this.preset.set(p); this.syncUrl(); this.refresh(); }
   private refresh() {
     if (this.tab() === 'overview') this.loadOverview();
     else if (this.tab() === 'runtime') this.loadRuntime();
+    else if (this.tab() === 'explore' && this.selectedMetric()) this.runExplore();
   }
 
   // ── Time helpers ──────────────────────────────────────────────────────────
@@ -131,6 +186,52 @@ export class MetricsComponent implements OnInit, OnDestroy {
     if (h <= 12)  return '5m';
     return '10m';
   }
+  private stepMs(): number {
+    const s = this.step();
+    const n = parseFloat(s);
+    return s.endsWith('m') ? n * 60_000 : n * 1000;
+  }
+
+  // ── Correlation: metric point → traces in window → trace detail ────────────
+  /** Heatmap cell clicked: find traces in this time bucket with matching latency. */
+  onHeatmapCell(e: { tsMs: number; loMs: number; hiMs: number; count: number }) {
+    const half = this.stepMs();
+    const from = new Date(e.tsMs - half).toISOString();
+    const to   = new Date(e.tsMs + half).toISOString();
+    const hiLabel = isFinite(e.hiMs) ? `${fmt(e.hiMs)}ms` : '∞';
+    this.corrTitle.set(`Traces · ${fmt(e.loMs)}–${hiLabel}`);
+    this.corrSub.set(`around ${format(new Date(e.tsMs), 'HH:mm:ss')} · ${e.count} samples`);
+    this.openCorr({
+      from, to,
+      minDurationMs: Math.max(1, Math.floor(e.loMs)),
+      maxDurationMs: isFinite(e.hiMs) ? Math.ceil(e.hiMs) : undefined,
+    });
+  }
+
+  private openCorr(params: { from: string; to: string; minDurationMs?: number; maxDurationMs?: number }) {
+    this.corrOpen.set(true);
+    this.corrLoading.set(true);
+    this.corrTraces.set([]);
+    this.api.searchTraces({ ...params, limit: 50 }).pipe(catchError(() => of([] as TraceRowDto[])))
+      .subscribe(rows => {
+        this.corrTraces.set(rows.sort((a, b) => b.durationNanos - a.durationNanos));
+        this.corrLoading.set(false);
+        this.cdr.markForCheck();
+      });
+  }
+
+  closeCorr() { this.corrOpen.set(false); }
+
+  /** Jump to the trace detail (Traces page opens it via ?trace= URL state). */
+  openTrace(traceId: string) {
+    this.router.navigate(['/traces'], { queryParams: { trace: traceId } });
+  }
+
+  corrFmtTime(nanos: number): string { return format(new Date(Math.round(nanos / 1e6)), 'HH:mm:ss.SSS'); }
+  corrFmtDur(nanos: number): string {
+    const ms = nanos / 1e6;
+    return ms >= 1000 ? (ms / 1000).toFixed(2) + 's' : ms.toFixed(1) + 'ms';
+  }
 
   // ── Catalog ───────────────────────────────────────────────────────────────
   private loadCatalog() {
@@ -141,6 +242,21 @@ export class MetricsComponent implements OnInit, OnDestroy {
         if (req) { this.reqMetric.set(req.name); this.latencyScale.set(req.unit === 's' ? 1000 : 1); }
       }
       this.cdr.markForCheck();
+
+      // Restore a deep-linked Explore selection once the catalog is available.
+      if (this.pendingExplore) {
+        const pe = this.pendingExplore;
+        this.pendingExplore = null;
+        const m = c.find(x => x.name === pe.metric);
+        if (m) {
+          this.selectedMetric.set(m);
+          this.exAggregation.set(pe.agg);
+          this.exQuantile.set(pe.q);
+          this.exGroupBy.set(pe.gb);
+          this.runExplore();
+        }
+      }
+
       if (this.tab() === 'overview') this.loadOverview();
     });
   }
@@ -165,7 +281,10 @@ export class MetricsComponent implements OnInit, OnDestroy {
       byCode: q({ aggregation: 'rate', groupBy: ['http.response.status_code'] }),
       byRoute: q({ aggregation: 'rate', groupBy: ['http.route'], topk: 8 }),
       heat:   this.api.getMetricHeatmap(metric, from, undefined, step).pipe(catchError(() => of(null as any))),
+      exemplars: this.api.getMetricExemplars(metric, from, undefined, undefined, 500).pipe(catchError(() => of([] as ExemplarDto[]))),
     }).subscribe(r => {
+      this.exemplars = r.exemplars;
+      this.exemplarCount.set(r.exemplars.length);
       this.rateSeries = r.rate;
       this.latSeries  = [
         this.renameSeries(r.p50, 'p50'),
@@ -215,7 +334,45 @@ export class MetricsComponent implements OnInit, OnDestroy {
   private renderOverviewCharts() {
     this.destroyCharts();
     if (this.rateRef) this.charts.push(this.lineChart(this.rateRef.nativeElement, this.rateSeries, ['#38BDF8'], 1));
-    if (this.latRef)  this.charts.push(this.lineChart(this.latRef.nativeElement, this.latSeries, ['#22C55E', '#F59E0B', '#EF4444'], this.latencyScale()));
+    if (this.latRef)  this.charts.push(this.latencyChart(this.latRef.nativeElement, this.latSeries, this.latencyScale(), this.exemplars));
+  }
+
+  /** Latency percentile lines + exemplar dots (click a dot → jump to its trace). */
+  private latencyChart(canvas: HTMLCanvasElement, series: MetricSeriesDto[], scale: number, exemplars: ExemplarDto[]): Chart {
+    const colors = ['#22C55E', '#F59E0B', '#EF4444'];
+    const datasets: any[] = series.slice(0, 12).map((s, i) => {
+      const color = colors[i % colors.length];
+      return {
+        type: 'line', label: this.seriesLabel(s),
+        data: s.points.map(p => ({ x: Math.round(p.ts / 1e6), y: p.value * scale })),
+        borderColor: color, backgroundColor: color + '18',
+        fill: false, tension: 0.3, pointRadius: 0, borderWidth: 1.5,
+      };
+    });
+    const exIdx = datasets.length;
+    if (exemplars.length) {
+      datasets.push({
+        type: 'scatter', label: 'exemplars',
+        data: exemplars.map(e => ({ x: Math.round(e.ts / 1e6), y: e.value * scale })),
+        backgroundColor: '#f43f5e', borderColor: '#fff', borderWidth: 1,
+        radius: 4, hoverRadius: 6, order: -1,
+      });
+    }
+    const opts = lineOpts(true);
+    opts.onClick = (_e: any, els: any[]) => {
+      for (const el of els) {
+        if (el.datasetIndex === exIdx) {
+          const tid = exemplars[el.index]?.traceId;
+          if (tid) this.openTrace(tid);
+          return;
+        }
+      }
+    };
+    opts.onHover = (e: any, els: any[]) => {
+      const hit = els.some(el => el.datasetIndex === exIdx);
+      const t = e?.native?.target; if (t) t.style.cursor = hit ? 'pointer' : 'default';
+    };
+    return new Chart(canvas, { type: 'line', data: { datasets }, options: opts });
   }
 
   // ── Runtime (USE) ─────────────────────────────────────────────────────────
@@ -279,6 +436,7 @@ export class MetricsComponent implements OnInit, OnDestroy {
   runExplore() {
     const m = this.selectedMetric();
     if (!m) return;
+    this.syncUrl();
     this.exLoading.set(true);
     this.exHeatmap.set(null);
     const from = this.fromIso(), step = this.step();

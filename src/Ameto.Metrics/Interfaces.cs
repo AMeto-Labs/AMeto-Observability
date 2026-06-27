@@ -63,6 +63,20 @@ public interface IMetricCatalog
 }
 
 /// <summary>
+/// Exemplar store — recent sampled measurements linked to traces, for metric→trace jumps.
+/// </summary>
+public interface IMetricExemplars
+{
+    /// <summary>Exemplars for a metric within a window, newest first (capped by limit).</summary>
+    IReadOnlyList<ExemplarSample> GetExemplars(
+        string            metricName,
+        DateTimeOffset?   from,
+        DateTimeOffset?   to,
+        IReadOnlyDictionary<string, string>? filters,
+        int               limit = 200);
+}
+
+/// <summary>
 /// Server-side aggregation engine: rate/increase/avg/min/max/last/sum/quantile,
 /// group-by, top-K, and histogram heatmaps. Operates on raw series from
 /// <see cref="IMetricQuery"/> so it is independent of the storage format.

@@ -195,6 +195,30 @@ public sealed class OtlpHistogramDataPoint
 
     [JsonPropertyName("bucketCounts")]
     public List<string>? BucketCounts { get; set; }
+
+    [JsonPropertyName("exemplars")]
+    public List<OtlpExemplar>? Exemplars { get; set; }
+}
+
+/// <summary>OTLP Exemplar — links a sampled measurement to a trace/span.</summary>
+public sealed class OtlpExemplar
+{
+    [JsonPropertyName("timeUnixNano")]
+    public string? TimeUnixNano { get; set; }
+
+    [JsonPropertyName("asDouble")]
+    public double? AsDouble { get; set; }
+
+    [JsonPropertyName("asInt")]
+    public string? AsInt { get; set; }
+
+    /// <summary>16-char lowercase hex (set by the protobuf decoder).</summary>
+    [JsonPropertyName("spanId")]
+    public string? SpanId { get; set; }
+
+    /// <summary>32-char lowercase hex (set by the protobuf decoder).</summary>
+    [JsonPropertyName("traceId")]
+    public string? TraceId { get; set; }
 }
 
 // ── OTLP/JSON Logs models ─────────────────────────────────────────────────────

@@ -104,6 +104,27 @@ public static class OtlpMetricMapper
                     bucketBounds[i] = eb[i];
             }
 
+            MetricExemplar[]? exemplars = null;
+            if (dp.Exemplars is { Count: > 0 } exs)
+            {
+                var list = new List<MetricExemplar>(exs.Count);
+                for (int i = 0; i < exs.Count; i++)
+                {
+                    var e = exs[i];
+                    if (string.IsNullOrEmpty(e.TraceId)) continue; // only exemplars with a trace link are useful
+                    double v = e.AsDouble
+                        ?? (e.AsInt is not null && long.TryParse(e.AsInt, out var iv) ? iv : 0);
+                    list.Add(new MetricExemplar
+                    {
+                        TimestampUnixNano = OtlpTraceMapper.ParseNanoString(e.TimeUnixNano),
+                        Value             = v,
+                        TraceId           = e.TraceId!,
+                        SpanId            = e.SpanId ?? string.Empty,
+                    });
+                }
+                if (list.Count > 0) exemplars = list.ToArray();
+            }
+
             result.Add(new MetricIngestItem
             {
                 Name              = name,
@@ -115,6 +136,7 @@ public static class OtlpMetricMapper
                 HistogramSum      = dp.Sum ?? 0,
                 BucketBounds      = bucketBounds,
                 BucketCounts      = bucketCounts,
+                Exemplars         = exemplars,
             });
         }
     }

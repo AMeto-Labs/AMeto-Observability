@@ -8,7 +8,7 @@ import { RetentionDto, RetentionRunResult } from '../models/retention.model';
 import { DiagnosticsDto } from '../models/diagnostics.model';
 import { ApiKeyDto, CreatedApiKeyDto, UserDto } from '../models/auth.model';
 import { CompareTracesDto, LatencyServiceDto, SpanDto, SpanQueryParams, TraceQueryRequest, TraceRowDto, TraceStatsDto } from '../models/span.model';
-import { MetricSeriesDto, MetricCatalogDto, MetricQueryRequest, HeatmapDto } from '../models/metric.model';
+import { MetricSeriesDto, MetricCatalogDto, MetricQueryRequest, HeatmapDto, ExemplarDto } from '../models/metric.model';
 import { AuthService } from './auth.service';
 
 @Injectable({ providedIn: 'root' })
@@ -239,6 +239,20 @@ export class ApiService {
     }
     const qs = p.toString();
     return this.http.get<HeatmapDto>(`/api/metrics/${encodeURIComponent(name)}/heatmap${qs ? '?' + qs : ''}`);
+  }
+
+  /** Exemplars (sampled measurements linked to traces) for a metric. */
+  getMetricExemplars(name: string, from?: string, to?: string,
+                     filters?: Record<string, string>, limit = 200): Observable<ExemplarDto[]> {
+    const p = new URLSearchParams();
+    if (from) p.set('from', from);
+    if (to)   p.set('to',   to);
+    if (filters) {
+      const f = Object.entries(filters).map(([k, v]) => `${k}:${v}`).join(',');
+      if (f) p.set('filters', f);
+    }
+    p.set('limit', String(limit));
+    return this.http.get<ExemplarDto[]>(`/api/metrics/${encodeURIComponent(name)}/exemplars?${p.toString()}`);
   }
 
   /** Raw series (no aggregation). */

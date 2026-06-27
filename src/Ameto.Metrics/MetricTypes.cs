@@ -98,6 +98,23 @@ public sealed class MetricIngestItem
     public double[]?  BucketBounds      { get; init; }
     /// <summary>Counts per bucket, length == BucketBounds.Length + 1 (overflow bucket).</summary>
     public long[]?    BucketCounts      { get; init; }
+
+    /// <summary>Sampled exemplars linking individual measurements to traces (may be null).</summary>
+    public MetricExemplar[]? Exemplars   { get; init; }
+}
+
+/// <summary>
+/// An exemplar: a sampled measurement linked to the trace/span that produced it.
+/// Enables jumping from a metric (e.g. a latency spike) straight to the exact trace.
+/// </summary>
+public sealed class MetricExemplar
+{
+    public long   TimestampUnixNano { get; init; }
+    public double Value             { get; init; }
+    /// <summary>32-char lowercase hex trace id (empty if absent).</summary>
+    public string TraceId           { get; init; } = string.Empty;
+    /// <summary>16-char lowercase hex span id (empty if absent).</summary>
+    public string SpanId            { get; init; } = string.Empty;
 }
 
 /// <summary>
@@ -192,6 +209,16 @@ public sealed class MetricQueryRequest
     public IReadOnlyDictionary<string, string>? Filters { get; init; }
     /// <summary>Keep only the top-K resulting series by their latest value.</summary>
     public int?               TopK        { get; init; }
+}
+
+/// <summary>A stored exemplar returned from a query (sample + its series labels).</summary>
+public sealed class ExemplarSample
+{
+    public long     TimestampUnixNano { get; init; }
+    public double   Value             { get; init; }
+    public string   TraceId           { get; init; } = string.Empty;
+    public string   SpanId            { get; init; } = string.Empty;
+    public LabelSet Labels            { get; init; } = LabelSet.Empty;
 }
 
 /// <summary>One column of a latency/distribution heatmap (one time step).</summary>

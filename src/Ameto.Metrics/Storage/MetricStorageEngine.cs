@@ -27,7 +27,7 @@ namespace Ameto.Metrics.Storage;
 /// 1-hour-granularity aggregates. Raw files are deleted after rollup.
 /// </para>
 /// </summary>
-public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetricCatalog, IRetentionTarget, IAsyncDisposable
+public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetricCatalog, IMetricExemplars, IRetentionTarget, IAsyncDisposable
 {
     // ── Configuration ─────────────────────────────────────────────────────────
     private const int HotFlushThreshold    = 500_000;   // total points before forced flush
@@ -40,6 +40,11 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
     // ── Metadata catalog (maintained at ingestion, survives hot-tier drains) ───
     private readonly ConcurrentDictionary<string, MetricMeta> _meta =
+        new(StringComparer.Ordinal);
+
+    // ── Exemplars (recent, in-memory ring per metric — for metric→trace jumps) ──
+    private const int ExemplarsPerMetric = 4_000;
+    private readonly ConcurrentDictionary<string, ExemplarRing> _exemplars =
         new(StringComparer.Ordinal);
 
     // ── Cold tier ─────────────────────────────────────────────────────────────
@@ -86,6 +91,20 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
             series.Append(point, item.BucketBounds);
             UpdateMeta(item);
+
+            if (item.Exemplars is { Length: > 0 } exs)
+            {
+                var ring = _exemplars.GetOrAdd(item.Name, static _ => new ExemplarRing(ExemplarsPerMetric));
+                foreach (var ex in exs)
+                    ring.Add(new ExemplarSample
+                    {
+                        TimestampUnixNano = ex.TimestampUnixNano,
+                        Value             = ex.Value,
+                        TraceId           = ex.TraceId,
+                        SpanId            = ex.SpanId,
+                        Labels            = item.Labels,
+                    });
+            }
 
             int total = System.Threading.Interlocked.Increment(ref _hotPointCount);
             if (total >= HotFlushThreshold)
@@ -143,6 +162,28 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         _meta.TryGetValue(metricName, out var meta) && meta.LabelValues.TryGetValue(labelKey, out var values)
             ? values.Keys.OrderBy(v => v, StringComparer.Ordinal).ToList()
             : [];
+
+    // ── IMetricExemplars ──────────────────────────────────────────────────────
+
+    public IReadOnlyList<ExemplarSample> GetExemplars(
+        string metricName, DateTimeOffset? from, DateTimeOffset? to,
+        IReadOnlyDictionary<string, string>? filters, int limit = 200)
+    {
+        if (!_exemplars.TryGetValue(metricName, out var ring)) return [];
+
+        long fromNano = from.HasValue ? from.Value.ToUnixTimeMilliseconds() * 1_000_000L : long.MinValue;
+        long toNano   = to.HasValue   ? to.Value.ToUnixTimeMilliseconds()   * 1_000_000L : long.MaxValue;
+
+        var result = new List<ExemplarSample>(Math.Min(limit, 256));
+        foreach (var ex in ring.Snapshot())
+        {
+            if (ex.TimestampUnixNano < fromNano || ex.TimestampUnixNano > toNano) continue;
+            if (!MatchesLabels(ex.Labels, filters)) continue;
+            result.Add(ex);
+        }
+        result.Sort(static (a, b) => b.TimestampUnixNano.CompareTo(a.TimestampUnixNano)); // newest first
+        return result.Count > limit ? result.GetRange(0, limit) : result;
+    }
 
     // ── IMetricQuery ──────────────────────────────────────────────────────────
 
@@ -599,6 +640,44 @@ internal readonly record struct SeriesKey(
     MetricKind Kind,
     string    Unit,
     LabelSet  Labels);
+
+/// <summary>
+/// Fixed-capacity circular buffer of exemplars for one metric (newest overwrite oldest).
+/// Thread-safe; exemplars are recent correlation hints, not durable history.
+/// </summary>
+internal sealed class ExemplarRing
+{
+    private readonly ExemplarSample[] _buf;
+    private readonly object _lock = new();
+    private int _count;
+    private int _head; // next write index
+
+    public ExemplarRing(int capacity) => _buf = new ExemplarSample[capacity];
+
+    public void Add(ExemplarSample s)
+    {
+        lock (_lock)
+        {
+            _buf[_head] = s;
+            _head = (_head + 1) % _buf.Length;
+            if (_count < _buf.Length) _count++;
+        }
+    }
+
+    public ExemplarSample[] Snapshot()
+    {
+        lock (_lock)
+        {
+            var outArr = new ExemplarSample[_count];
+            for (int i = 0; i < _count; i++)
+            {
+                int idx = (_head - _count + i + _buf.Length) % _buf.Length;
+                outArr[i] = _buf[idx];
+            }
+            return outArr;
+        }
+    }
+}
 
 /// <summary>
 /// In-memory metadata for one metric name. Survives hot-tier drains so the Explore

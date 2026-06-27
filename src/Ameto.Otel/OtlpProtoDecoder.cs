@@ -232,11 +232,34 @@ internal static class OtlpProtoDecoder
                     while (!sub.IsAtEnd) dp.ExplicitBounds.Add(sub.ReadDouble());
                     break;
                 }
+                case 66: // field 8: exemplars (repeated Exemplar)
+                    dp.Exemplars ??= [];
+                    dp.Exemplars.Add(ReadExemplar(SubStream(cis)));
+                    break;
                 case 74: dp.Attributes.Add(ReadKeyValue(SubStream(cis))); break;    // field 9: attributes
                 default: cis.SkipLastField(); break;
             }
         }
         return dp;
+    }
+
+    private static OtlpExemplar ReadExemplar(CodedInputStream cis)
+    {
+        var ex = new OtlpExemplar();
+        uint tag;
+        while ((tag = cis.ReadTag()) != 0)
+        {
+            switch (tag)
+            {
+                case 17: ex.TimeUnixNano = cis.ReadFixed64().ToString(); break; // field 2: time_unix_nano (fixed64)
+                case 25: ex.AsDouble     = cis.ReadDouble();             break; // field 3: as_double
+                case 34: ex.SpanId       = HexFromBytes(cis.ReadBytes()); break; // field 4: span_id (bytes)
+                case 42: ex.TraceId      = HexFromBytes(cis.ReadBytes()); break; // field 5: trace_id (bytes)
+                case 49: ex.AsInt        = cis.ReadSFixed64().ToString(); break; // field 6: as_int (sfixed64)
+                default: cis.SkipLastField(); break;                            // field 7: filtered_attributes (skip)
+            }
+        }
+        return ex;
     }
 
     // ── Traces ────────────────────────────────────────────────────────────────
