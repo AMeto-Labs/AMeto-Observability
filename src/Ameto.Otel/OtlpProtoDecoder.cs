@@ -197,16 +197,30 @@ internal static class OtlpProtoDecoder
                 case 25: dp.TimeUnixNano = cis.ReadFixed64().ToString(); break;      // field 3: time_unix_nano
                 case 33: dp.Count        = cis.ReadFixed64().ToString(); break;       // field 4: count (fixed64, OTel .NET SDK encodes as fixed64 not varint)
                 case 41: dp.Sum          = cis.ReadDouble();             break;      // field 5: sum
-                case 49: // field 6: bucket_counts (OTel .NET SDK encodes as repeated fixed64, not packed)
+                case 49: // field 6: bucket_counts — unpacked repeated fixed64
                 {
                     dp.BucketCounts ??= [];
                     dp.BucketCounts.Add(cis.ReadFixed64().ToString());
                     break;
                 }
-                case 57: // field 7: explicit_bounds (OTel .NET SDK encodes as repeated double, not packed)
+                case 50: // field 6: bucket_counts — packed repeated fixed64 (proto3 default)
+                {
+                    dp.BucketCounts ??= [];
+                    var sub = SubStream(cis);
+                    while (!sub.IsAtEnd) dp.BucketCounts.Add(sub.ReadFixed64().ToString());
+                    break;
+                }
+                case 57: // field 7: explicit_bounds — unpacked repeated double
                 {
                     dp.ExplicitBounds ??= [];
                     dp.ExplicitBounds.Add(cis.ReadDouble());
+                    break;
+                }
+                case 58: // field 7: explicit_bounds — packed repeated double (proto3 default)
+                {
+                    dp.ExplicitBounds ??= [];
+                    var sub = SubStream(cis);
+                    while (!sub.IsAtEnd) dp.ExplicitBounds.Add(sub.ReadDouble());
                     break;
                 }
                 case 74: dp.Attributes.Add(ReadKeyValue(SubStream(cis))); break;    // field 9: attributes
