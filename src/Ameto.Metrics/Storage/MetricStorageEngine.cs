@@ -27,15 +27,20 @@ namespace Ameto.Metrics.Storage;
 /// 1-hour-granularity aggregates. Raw files are deleted after rollup.
 /// </para>
 /// </summary>
-public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IRetentionTarget, IAsyncDisposable
+public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetricCatalog, IRetentionTarget, IAsyncDisposable
 {
     // ── Configuration ─────────────────────────────────────────────────────────
     private const int HotFlushThreshold    = 500_000;   // total points before forced flush
     private const int FlushIntervalSeconds  = 300;        // 5 minutes
+    private const int MaxLabelValuesPerKey  = 2_000;      // cap to bound catalog memory
 
     // ── Hot tier ─────────────────────────────────────────────────────────────
     private readonly ConcurrentDictionary<SeriesKey, HotSeries> _hot = new();
     private          int _hotPointCount;
+
+    // ── Metadata catalog (maintained at ingestion, survives hot-tier drains) ───
+    private readonly ConcurrentDictionary<string, MetricMeta> _meta =
+        new(StringComparer.Ordinal);
 
     // ── Cold tier ─────────────────────────────────────────────────────────────
     private readonly List<MetricSegmentInfo>      _coldSegments = new();
@@ -76,15 +81,68 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IRetent
                                         : item.ScalarValue,
                 Count             = item.HistogramCount,
                 Sum               = item.HistogramSum,
+                BucketCounts      = item.BucketCounts,   // preserved for real percentiles + heatmap
             };
 
-            series.Append(point);
+            series.Append(point, item.BucketBounds);
+            UpdateMeta(item);
 
             int total = System.Threading.Interlocked.Increment(ref _hotPointCount);
             if (total >= HotFlushThreshold)
                 _ = Task.Run(FlushHotTierAsync);
         }
     }
+
+    private void UpdateMeta(MetricIngestItem item)
+    {
+        var meta = _meta.GetOrAdd(item.Name, static _ => new MetricMeta());
+        meta.Kind = item.Kind;
+        if (!string.IsNullOrEmpty(item.Unit)) meta.Unit = item.Unit;
+
+        long ms = item.TimestampUnixNano / 1_000_000L;
+        if (ms > meta.LastSeenMs) meta.LastSeenMs = ms;
+
+        foreach (var (k, v) in item.Labels.Pairs)
+        {
+            var values = meta.LabelValues.GetOrAdd(k, static _ => new ConcurrentDictionary<string, byte>(StringComparer.Ordinal));
+            if (values.Count < MaxLabelValuesPerKey) values.TryAdd(v, 0);
+        }
+
+        meta.AddSeries(item.Labels.GetHashCode());
+    }
+
+    // ── IMetricCatalog ────────────────────────────────────────────────────────
+
+    public IReadOnlyList<MetricCatalogEntry> GetCatalog(string? search = null)
+    {
+        var result = new List<MetricCatalogEntry>(_meta.Count);
+        foreach (var (name, meta) in _meta)
+        {
+            if (search is not null && !name.Contains(search, StringComparison.OrdinalIgnoreCase)) continue;
+            var keys = meta.LabelValues.Keys.OrderBy(k => k, StringComparer.Ordinal).ToArray();
+            result.Add(new MetricCatalogEntry
+            {
+                Name        = name,
+                Kind        = meta.Kind,
+                Unit        = meta.Unit,
+                LabelKeys   = keys,
+                Cardinality = meta.Cardinality,
+                LastSeenMs  = meta.LastSeenMs,
+            });
+        }
+        result.Sort(static (a, b) => string.CompareOrdinal(a.Name, b.Name));
+        return result;
+    }
+
+    public IReadOnlyList<string> GetLabelKeys(string metricName) =>
+        _meta.TryGetValue(metricName, out var meta)
+            ? meta.LabelValues.Keys.OrderBy(k => k, StringComparer.Ordinal).ToList()
+            : [];
+
+    public IReadOnlyList<string> GetLabelValues(string metricName, string labelKey) =>
+        _meta.TryGetValue(metricName, out var meta) && meta.LabelValues.TryGetValue(labelKey, out var values)
+            ? values.Keys.OrderBy(v => v, StringComparer.Ordinal).ToList()
+            : [];
 
     // ── IMetricQuery ──────────────────────────────────────────────────────────
 
@@ -128,11 +186,12 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IRetent
 
             yield return new MetricSeries
             {
-                Name   = key.Name,
-                Kind   = key.Kind,
-                Unit   = key.Unit,
-                Labels = key.Labels,
-                Points = step.HasValue ? Downsample(points, step.Value) : points,
+                Name         = key.Name,
+                Kind         = key.Kind,
+                Unit         = key.Unit,
+                Labels       = key.Labels,
+                BucketBounds = series.Bounds,
+                Points       = step.HasValue ? Downsample(points, step.Value, key.Kind) : points,
             };
         }
 
@@ -153,14 +212,15 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IRetent
             ct.ThrowIfCancellationRequested();
             await foreach (var series in MetricReader.ReadAsync(seg.FilePath, metricName, fromNano, toNano, labelMatchers, ct))
             {
-                var points = step.HasValue ? Downsample(series.Points, step.Value) : series.Points;
+                var points = step.HasValue ? Downsample(series.Points, step.Value, series.Kind) : series.Points;
                 yield return new MetricSeries
                 {
-                    Name   = series.Name,
-                    Kind   = series.Kind,
-                    Unit   = series.Unit,
-                    Labels = series.Labels,
-                    Points = points,
+                    Name         = series.Name,
+                    Kind         = series.Kind,
+                    Unit         = series.Unit,
+                    Labels       = series.Labels,
+                    BucketBounds = series.BucketBounds,
+                    Points       = points,
                 };
             }
         }
@@ -182,11 +242,12 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IRetent
 
             yield return new MetricSeries
             {
-                Name   = key.Name,
-                Kind   = key.Kind,
-                Unit   = key.Unit,
-                Labels = key.Labels,
-                Points = [latest.Value],
+                Name         = key.Name,
+                Kind         = key.Kind,
+                Unit         = key.Unit,
+                Labels       = key.Labels,
+                BucketBounds = series.Bounds,
+                Points       = [latest.Value],
             };
         }
         await Task.CompletedTask; // satisfy async iterator requirement
@@ -308,6 +369,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IRetent
             try
             {
                 var allSeries = new Dictionary<SeriesKey, List<MetricDataPoint>>();
+                var bounds    = new Dictionary<SeriesKey, double[]?>();
                 foreach (var seg in segs)
                 {
                     foreach (var series in MetricReader.ReadAllSync(seg.FilePath))
@@ -319,11 +381,14 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IRetent
                             allSeries[key] = pts;
                         }
                         pts.AddRange(series.Points);
+                        if (series.BucketBounds is not null) bounds[key] = series.BucketBounds;
                     }
                 }
 
                 var merged = allSeries
-                    .Select(kv => (kv.Key, new HotSeries(kv.Value.OrderBy(p => p.TimestampUnixNano).ToList())))
+                    .Select(kv => (kv.Key, new HotSeries(
+                        kv.Value.OrderBy(p => p.TimestampUnixNano).ToList(),
+                        bounds.GetValueOrDefault(kv.Key))))
                     .ToList();
 
                 var newInfos = MetricWriter.Write(_dataDir, merged, MetricGranularity.Raw);
@@ -363,6 +428,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IRetent
             {
                 // Read all series from sources for this metric
                 var allSeries = new Dictionary<SeriesKey, List<MetricDataPoint>>();
+                var bounds    = new Dictionary<SeriesKey, double[]?>();
                 foreach (var seg in group)
                 {
                     foreach (var series in MetricReader.ReadAllSync(seg.FilePath))
@@ -374,27 +440,17 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IRetent
                             allSeries[key] = pts;
                         }
                         pts.AddRange(series.Points);
+                        if (series.BucketBounds is not null) bounds[key] = series.BucketBounds;
                     }
                 }
 
-                // Aggregate into buckets
+                // Aggregate into time buckets — type-aware (see Downsample).
                 var rolled = new List<(SeriesKey Key, HotSeries Series)>();
-                long bucketNanos = (long)bucketSize.TotalMilliseconds * 1_000_000L;
                 foreach (var (key, pts) in allSeries)
                 {
-                    var bucketed = pts
-                        .GroupBy(p => p.TimestampUnixNano / bucketNanos * bucketNanos)
-                        .Select(g => new MetricDataPoint
-                        {
-                            TimestampUnixNano = g.Key,
-                            Value             = g.Average(p => p.Value),
-                            Count             = g.Sum(p => p.Count),
-                            Sum               = g.Sum(p => p.Sum),
-                        })
-                        .OrderBy(p => p.TimestampUnixNano)
+                    var bucketed = Downsample(pts.OrderBy(p => p.TimestampUnixNano).ToList(), bucketSize, key.Kind)
                         .ToList();
-
-                    rolled.Add((key, new HotSeries(bucketed)));
+                    rolled.Add((key, new HotSeries(bucketed, bounds.GetValueOrDefault(key))));
                 }
 
                 var newInfos = MetricWriter.Write(_dataDir, rolled, targetGranularity);
@@ -434,19 +490,46 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IRetent
         return true;
     }
 
+    /// <summary>
+    /// Type-aware downsample into fixed time buckets:
+    /// <list type="bullet">
+    ///   <item>Counter / Histogram (cumulative): take the LAST point in each bucket so the
+    ///   monotonic cumulative series — and the bucket-count snapshot — are preserved for
+    ///   later rate/quantile computation. Averaging would corrupt them.</item>
+    ///   <item>Gauge: average within the bucket.</item>
+    /// </list>
+    /// </summary>
     private static IReadOnlyList<MetricDataPoint> Downsample(
         IReadOnlyList<MetricDataPoint> points,
-        TimeSpan step)
+        TimeSpan step,
+        MetricKind kind)
     {
         long bucketNanos = (long)step.TotalMilliseconds * 1_000_000L;
+        bool takeLast = kind is MetricKind.Counter or MetricKind.Histogram;
+
         return points
             .GroupBy(p => p.TimestampUnixNano / bucketNanos * bucketNanos)
-            .Select(g => new MetricDataPoint
+            .Select(g =>
             {
-                TimestampUnixNano = g.Key,
-                Value             = g.Average(p => p.Value),
-                Count             = g.Sum(p => p.Count),
-                Sum               = g.Sum(p => p.Sum),
+                if (takeLast)
+                {
+                    var last = g.OrderBy(p => p.TimestampUnixNano).Last();
+                    return new MetricDataPoint
+                    {
+                        TimestampUnixNano = g.Key,
+                        Value             = last.Value,
+                        Count             = last.Count,
+                        Sum               = last.Sum,
+                        BucketCounts      = last.BucketCounts,
+                    };
+                }
+                return new MetricDataPoint
+                {
+                    TimestampUnixNano = g.Key,
+                    Value             = g.Average(p => p.Value),
+                    Count             = g.Sum(p => p.Count),
+                    Sum               = g.Sum(p => p.Sum),
+                };
             })
             .OrderBy(p => p.TimestampUnixNano)
             .ToList();
@@ -463,7 +546,9 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IRetent
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "Could not load cold metric segment {File}", file);
+                // v1 files (no bucket data) are incompatible with the v2 format — delete them.
+                _logger.LogWarning(ex, "Unreadable metric segment {File} — deleting (likely format v1)", file);
+                try { File.Delete(file); } catch { /* best effort */ }
             }
         }
         _logger.LogInformation("Loaded {Count} cold metric segments", _coldSegments.Count);
@@ -515,18 +600,66 @@ internal readonly record struct SeriesKey(
     string    Unit,
     LabelSet  Labels);
 
+/// <summary>
+/// In-memory metadata for one metric name. Survives hot-tier drains so the Explore
+/// catalog stays complete. Cardinality is tracked as distinct label-set hashes (capped).
+/// </summary>
+internal sealed class MetricMeta
+{
+    private const int MaxTrackedSeries = 50_000;
+
+    public MetricKind Kind        { get; set; }
+    public string     Unit        { get; set; } = string.Empty;
+    public long       LastSeenMs  { get; set; }
+
+    /// <summary>label key → set of observed values (capped per key).</summary>
+    public ConcurrentDictionary<string, ConcurrentDictionary<string, byte>> LabelValues { get; } =
+        new(StringComparer.Ordinal);
+
+    private readonly HashSet<int> _seriesHashes = new();
+    private readonly object       _lock         = new();
+
+    public int Cardinality
+    {
+        get { lock (_lock) return _seriesHashes.Count; }
+    }
+
+    public void AddSeries(int labelSetHash)
+    {
+        lock (_lock)
+        {
+            if (_seriesHashes.Count < MaxTrackedSeries)
+                _seriesHashes.Add(labelSetHash);
+        }
+    }
+}
+
 internal sealed class HotSeries
 {
     private readonly List<MetricDataPoint> _points;
     private readonly object _lock = new();
 
+    /// <summary>
+    /// Histogram bucket upper bounds shared by every point. Set once from the first
+    /// histogram point; null for scalar series.
+    /// </summary>
+    public double[]? Bounds { get; private set; }
+
     public HotSeries() => _points = new List<MetricDataPoint>(64);
 
-    public HotSeries(List<MetricDataPoint> points) => _points = points;
-
-    public void Append(MetricDataPoint p)
+    public HotSeries(List<MetricDataPoint> points, double[]? bounds = null)
     {
-        lock (_lock) _points.Add(p);
+        _points = points;
+        Bounds  = bounds;
+    }
+
+    public void Append(MetricDataPoint p, double[]? bounds = null)
+    {
+        lock (_lock)
+        {
+            if (bounds is not null && Bounds is null) Bounds = bounds;
+            _points.Add(p);
+        }
     }
 
     public List<MetricDataPoint> Drain()

@@ -6,11 +6,11 @@ namespace Ameto.Metrics.Storage;
 /// <summary>
 /// Writes metric series to <c>.mts</c> files.
 ///
-/// <para>File format v1 — "RDMT":</para>
+/// <para>File format v2 — "RDMT":</para>
 /// <code>
 ///   [Header]
 ///     0  Magic       : uint32  "RDMT"
-///     4  Version     : uint16  1
+///     4  Version     : uint16  2
 ///     6  Granularity : uint8
 ///     7  SeriesCount : uint32
 ///    11  MinNano     : int64
@@ -18,6 +18,8 @@ namespace Ameto.Metrics.Storage;
 ///    27  Flags       : byte
 ///   [Series blocks — LZ4-compressed msgpack]
 ///     N × { uncompSize uint32 | compSize uint32 | LZ4 bytes }
+///     block map: { k, u, lbs, bnds(double[]), pts, cnt }
+///       point: [ ts, value, count, sum, bucketCounts(long[] | nil) ]
 ///   [MetricName index]
 ///     nameCount uint32
 ///     per-name: nameLen uint16 | name bytes | blockOffset uint64 | blockCount uint32
@@ -25,12 +27,18 @@ namespace Ameto.Metrics.Storage;
 ///     nameIdxOffset uint64
 ///     footerMagic   uint32  "RDMF"
 /// </code>
+/// <para>
+/// v2 adds histogram fidelity: bucket bounds are stored once per series ("bnds") and
+/// per-point bucket counts are stored on each point, enabling real percentiles
+/// (histogram_quantile) and latency heatmaps. v1 files are not read — they are deleted
+/// on load (see <see cref="MetricStorageEngine"/>).
+/// </para>
 /// </summary>
 internal static class MetricWriter
 {
     private const uint   Magic       = 0x52_44_4D_54; // "RDMT"
     private const uint   FooterMagic = 0x52_44_4D_46; // "RDMF"
-    private const ushort Version     = 1;
+    private const ushort Version     = 2;
 
     /// <summary>
     /// Writes one <c>.mts</c> file per distinct metric name found in <paramref name="series"/>.
@@ -103,7 +111,7 @@ internal static class MetricWriter
         {
             var pts = hs.GetPoints(long.MinValue, long.MaxValue);
             blockOffsets.Add(fs.Position);
-            WriteSeriesBlock(bw, key, pts);
+            WriteSeriesBlock(bw, key, hs.Bounds, pts);
         }
 
         // Name index
@@ -123,15 +131,17 @@ internal static class MetricWriter
     private static void WriteSeriesBlock(
         BinaryWriter bw,
         SeriesKey key,
+        double[]? bounds,
         IReadOnlyList<MetricDataPoint> points)
     {
         var bufWriter = new System.Buffers.ArrayBufferWriter<byte>();
         var w = new MessagePackWriter(bufWriter);
 
-        w.WriteMapHeader(5);
+        w.WriteMapHeader(6);
         w.Write("k");    w.Write((byte)key.Kind);
         w.Write("u");    w.Write(key.Unit);
         w.Write("lbs");  WriteLabels(ref w, key.Labels);
+        w.Write("bnds"); WriteBounds(ref w, bounds);
         w.Write("pts");  WritePoints(ref w, points);
         w.Write("cnt");  w.Write((uint)points.Count);
         w.Flush();
@@ -155,16 +165,32 @@ internal static class MetricWriter
         }
     }
 
+    private static void WriteBounds(ref MessagePackWriter w, double[]? bounds)
+    {
+        if (bounds is null) { w.WriteArrayHeader(0); return; }
+        w.WriteArrayHeader(bounds.Length);
+        foreach (var b in bounds) w.Write(b);
+    }
+
     private static void WritePoints(ref MessagePackWriter w, IReadOnlyList<MetricDataPoint> pts)
     {
         w.WriteArrayHeader(pts.Count);
         foreach (var p in pts)
         {
-            w.WriteArrayHeader(4);
+            w.WriteArrayHeader(5);
             w.Write(p.TimestampUnixNano);
             w.Write(p.Value);
             w.Write(p.Count);
             w.Write(p.Sum);
+            if (p.BucketCounts is { Length: > 0 } bc)
+            {
+                w.WriteArrayHeader(bc.Length);
+                foreach (var c in bc) w.Write(c);
+            }
+            else
+            {
+                w.WriteNil();
+            }
         }
     }
 

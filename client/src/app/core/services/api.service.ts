@@ -7,8 +7,8 @@ import { NodeDto } from '../models/node.model';
 import { RetentionDto, RetentionRunResult } from '../models/retention.model';
 import { DiagnosticsDto } from '../models/diagnostics.model';
 import { ApiKeyDto, CreatedApiKeyDto, UserDto } from '../models/auth.model';
-import { SpanDto, SpanQueryParams, TraceRowDto, TraceStatsDto } from '../models/span.model';
-import { MetricSeriesDto } from '../models/metric.model';
+import { CompareTracesDto, LatencyServiceDto, SpanDto, SpanQueryParams, TraceQueryRequest, TraceRowDto, TraceStatsDto } from '../models/span.model';
+import { MetricSeriesDto, MetricCatalogDto, MetricQueryRequest, HeatmapDto } from '../models/metric.model';
 import { AuthService } from './auth.service';
 
 @Injectable({ providedIn: 'root' })
@@ -156,17 +156,98 @@ export class ApiService {
     return this.http.get<SpanDto[]>(`/api/traces/${encodeURIComponent(traceId)}`);
   }
 
+  queryTraces(req: TraceQueryRequest): Observable<TraceRowDto[]> {
+    return this.http.post<TraceRowDto[]>('/api/traces/query', req);
+  }
+
+  getSpanLogs(spanId: string, from?: string, to?: string): Observable<EventDto[]> {
+    const p = new URLSearchParams();
+    if (from) p.set('from', from);
+    if (to)   p.set('to', to);
+    const qs = p.toString();
+    return this.http.get<EventDto[]>(`/api/spans/${encodeURIComponent(spanId)}/logs${qs ? '?' + qs : ''}`);
+  }
+
+  /** All logs correlated to a trace (filtered on @tr). Primary trace↔logs view. */
+  getTraceLogs(traceId: string, from?: string, to?: string): Observable<EventDto[]> {
+    const p = new URLSearchParams();
+    if (from) p.set('from', from);
+    if (to)   p.set('to', to);
+    const qs = p.toString();
+    return this.http.get<EventDto[]>(`/api/traces/${encodeURIComponent(traceId)}/logs${qs ? '?' + qs : ''}`);
+  }
+
+  getFlamegraph(traceId: string): Observable<any> {
+    return this.http.get<any>(`/api/traces/${encodeURIComponent(traceId)}/flamegraph`);
+  }
+
+  compareTraces(a: string, b: string): Observable<CompareTracesDto> {
+    return this.http.get<CompareTracesDto>(
+      `/api/traces/compare?a=${encodeURIComponent(a)}&b=${encodeURIComponent(b)}`);
+  }
+
+  getLatency(from?: string, to?: string, service?: string): Observable<LatencyServiceDto[]> {
+    const p = new URLSearchParams();
+    if (from)    p.set('from',    from);
+    if (to)      p.set('to',      to);
+    if (service) p.set('service', service);
+    return this.http.get<LatencyServiceDto[]>(`/api/traces/latency?${p.toString()}`);
+  }
+
+  getServiceGraph(from?: string, to?: string): Observable<{ nodes: any[]; edges: any[] }> {
+    const p = new URLSearchParams();
+    if (from) p.set('from', from);
+    if (to)   p.set('to', to);
+    return this.http.get<{ nodes: any[]; edges: any[] }>(`/api/traces/service-graph?${p.toString()}`);
+  }
+
   // ── Metrics ────────────────────────────────────────────────────────────────
   getMetricNames(prefix?: string): Observable<string[]> {
     const p = prefix ? `?prefix=${encodeURIComponent(prefix)}` : '';
     return this.http.get<string[]>(`/api/metrics/names${p}`);
   }
 
-  queryMetric(name: string, from?: string, to?: string, step?: string): Observable<MetricSeriesDto[]> {
-    const p = new URLSearchParams({ metric: name });
+  /** Full metric catalog with type/unit/labels/cardinality/last-seen. */
+  getMetricCatalog(search?: string): Observable<MetricCatalogDto[]> {
+    const p = search ? `?search=${encodeURIComponent(search)}` : '';
+    return this.http.get<MetricCatalogDto[]>(`/api/metrics/catalog${p}`);
+  }
+
+  getMetricLabelKeys(name: string): Observable<string[]> {
+    return this.http.get<string[]>(`/api/metrics/${encodeURIComponent(name)}/labels`);
+  }
+
+  getMetricLabelValues(name: string, key: string): Observable<string[]> {
+    return this.http.get<string[]>(
+      `/api/metrics/${encodeURIComponent(name)}/labels/${encodeURIComponent(key)}/values`);
+  }
+
+  /** Server-side typed aggregation (rate/quantile/sum-by/topk). */
+  queryMetricAgg(req: MetricQueryRequest): Observable<MetricSeriesDto[]> {
+    return this.http.post<MetricSeriesDto[]>('/api/metrics/query', req);
+  }
+
+  getMetricHeatmap(name: string, from?: string, to?: string, step?: string,
+                   filters?: Record<string, string>): Observable<HeatmapDto> {
+    const p = new URLSearchParams();
     if (from) p.set('from', from);
     if (to)   p.set('to',   to);
     if (step) p.set('step', step);
-    return this.http.get<MetricSeriesDto[]>(`/api/metrics?${p.toString()}`);
+    if (filters) {
+      const f = Object.entries(filters).map(([k, v]) => `${k}:${v}`).join(',');
+      if (f) p.set('filters', f);
+    }
+    const qs = p.toString();
+    return this.http.get<HeatmapDto>(`/api/metrics/${encodeURIComponent(name)}/heatmap${qs ? '?' + qs : ''}`);
+  }
+
+  /** Raw series (no aggregation). */
+  queryMetric(name: string, from?: string, to?: string, step?: string): Observable<MetricSeriesDto[]> {
+    const p = new URLSearchParams();
+    if (from) p.set('from', from);
+    if (to)   p.set('to',   to);
+    if (step) p.set('step', step);
+    const qs = p.toString();
+    return this.http.get<MetricSeriesDto[]>(`/api/metrics/${encodeURIComponent(name)}${qs ? '?' + qs : ''}`);
   }
 }

@@ -189,6 +189,19 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
 
     // ── Flush ─────────────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Flushes the in-memory hot tier to a cold segment. No-op when empty.
+    /// Thread-safe — called periodically by <see cref="Ingestion.SpanDrainer"/> so
+    /// spans are not stranded in RAM (and lost on restart) under low-traffic loads
+    /// that never reach <see cref="HotFlushThreshold"/>.
+    /// </summary>
+    internal void FlushHotTier()
+    {
+        _lock.EnterWriteLock();
+        try { FlushHotTierLocked(); }
+        finally { _lock.ExitWriteLock(); }
+    }
+
     private void FlushHotTierLocked()
     {
         if (_hotSpans.Count == 0) return;

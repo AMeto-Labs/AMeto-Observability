@@ -1,442 +1,209 @@
-<!-- ── Page top ──────────────────────────────────────────────────────────── -->
-<div class="page-top">
-  <div class="page-top__info">
-    <h1 class="page-title">Metrics</h1>
-    <p class="page-subtitle">Monitor your system performance and health in real-time</p>
-  </div>
-  <div class="page-top__actions">
-    <button class="toolbar-btn">
-      <lucide-icon name="bookmark" [size]="13" /> Save view
-    </button>
-    <div class="toolbar-refresh">
-      <lucide-icon name="refresh-cw" [size]="13" />
-      Auto refresh
-      <span class="refresh-num">30s</span>
-      <lucide-icon name="chevron-down" [size]="11" />
-    </div>
-    <button class="toolbar-btn">
-      <lucide-icon name="share-2" [size]="13" /> Share
-    </button>
-    <div class="live-badge">
-      <span class="live-dot"></span> Live
-    </div>
-    <button class="toolbar-btn icon-only">
-      <lucide-icon name="ellipsis" [size]="15" />
-    </button>
-  </div>
-</div>
+<div class="metrics-page">
 
-<!-- ── Filter bar ─────────────────────────────────────────────────────────── -->
-<div class="filter-bar">
-  <div class="filter-bar__left">
-    <div class="preset-group">
-      @for (p of ['15m','30m','1h','3h','6h','12h','24h']; track p) {
-        <button class="preset-btn" [class.active]="preset() === p"
-                (click)="onPreset(p)">{{ p }}</button>
-      }
+  <!-- Header -->
+  <div class="page-hdr">
+    <div class="page-title">
+      <h1>Metrics</h1>
+      <span class="page-subtitle">Rates, errors, latency &amp; resources</span>
     </div>
-    <select class="filter-select" aria-label="Filter by service" [ngModel]="serviceFilter()" (ngModelChange)="serviceFilter.set($event)">
-      <option value="">All services</option>
-      @for (svc of allServices(); track svc) { <option [value]="svc">{{ svc }}</option> }
-    </select>
-    <button class="filter-pill">All instances <lucide-icon name="chevron-down" [size]="11" /></button>
-    <button class="filter-pill">Metric: All <lucide-icon name="chevron-down" [size]="11" /></button>
-    <button class="filter-pill add-filter">
-      <lucide-icon name="plus" [size]="12" /> Add filter
-    </button>
-  </div>
-  <div class="filter-bar__right">
-    <div class="metric-search-wrap">
-      <lucide-icon name="search" [size]="12" class="search-ico" />
-      <input
-        class="metric-search-input"
-        [ngModel]="metricSearch()"
-        (ngModelChange)="metricSearch.set($event)"
-        placeholder="Search metrics (e.g. http.server.duration, requests.total)" />
-      <span class="search-hint">&#8984;K</span>
-    </div>
-    <div class="view-tabs">
-      <button [class.active]="viewMode() === 'timeseries'" (click)="viewMode.set('timeseries')">Time series</button>
-      <button [class.active]="viewMode() === 'table'"      (click)="viewMode.set('table')">Table</button>
-      <button [class.active]="viewMode() === 'heatmap'"    (click)="viewMode.set('heatmap')">Heatmap</button>
-    </div>
-    <button class="apply-btn" (click)="loadAll()">Apply</button>
-    <button class="reset-btn">Reset</button>
-  </div>
-</div>
-
-<!-- ── Stats row ─────────────────────────────────────────────────────────── -->
-<div class="stats-row">
-  @for (card of statCards(); track card.label) {
-    <div class="stat-card">
-      <div class="stat-card__label">{{ card.label }}</div>
-      <div class="stat-card__value">
-        {{ card.value }}
-        @if (card.unit) { <span class="stat-unit">{{ card.unit }}</span> }
+    <div class="hdr-actions">
+      <div class="preset-group">
+        @for (p of ['15m','30m','1h','3h','6h','12h','24h']; track p) {
+          <button class="preset-btn" [class.active]="preset() === p" (click)="onPreset(p)">{{ p }}</button>
+        }
       </div>
-      @if (card.change !== 0) {
-        <div class="stat-change" [class.positive]="card.changePositive" [class.negative]="!card.changePositive">
-          {{ card.trendUp ? '↑' : '↓' }} {{ fmtChange(card.change) }} vs previous 1h
+    </div>
+  </div>
+
+  <!-- Tabs -->
+  <div class="main-tabs">
+    <button class="main-tab" [class.active]="tab() === 'overview'" (click)="setTab('overview')">
+      <lucide-icon name="activity" [size]="13" /> Overview
+    </button>
+    <button class="main-tab" [class.active]="tab() === 'runtime'" (click)="setTab('runtime')">
+      <lucide-icon name="cpu" [size]="13" /> Runtime
+    </button>
+    <button class="main-tab" [class.active]="tab() === 'explore'" (click)="setTab('explore')">
+      <lucide-icon name="search" [size]="13" /> Explore
+    </button>
+  </div>
+
+  <!-- ══ OVERVIEW ══════════════════════════════════════════════════════════ -->
+  @if (tab() === 'overview') {
+    @if (!reqMetric()) {
+      <div class="panel-empty">No <code>http.server.request.duration</code> histogram found yet. Send some traffic.</div>
+    } @else {
+      <!-- Stat cards -->
+      <div class="stats-row">
+        @for (c of statCards(); track c.label) {
+          <div class="stat-card" [style.border-top-color]="toneColor(c.tone)">
+            <div class="stat-info">
+              <span class="stat-label">{{ c.label }}</span>
+              <span class="stat-value">{{ c.value }}<span class="stat-unit">{{ c.unit }}</span></span>
+            </div>
+            @if (c.gaugePct !== undefined) {
+              <svg class="stat-gauge" viewBox="0 0 36 36">
+                <path class="g-bg" d="M18 4 a14 14 0 1 1 0 28 a14 14 0 1 1 0 -28" fill="none" stroke-width="3"/>
+                <path [attr.stroke]="toneColor(c.tone)" fill="none" stroke-width="3" stroke-linecap="round"
+                      [attr.stroke-dasharray]="(c.gaugePct/100*88) + ' 88'"
+                      d="M18 4 a14 14 0 1 1 0 28 a14 14 0 1 1 0 -28"/>
+              </svg>
+            } @else if (c.spark.length) {
+              <svg class="sparkline" viewBox="0 0 100 28" preserveAspectRatio="none">
+                <polyline [attr.points]="sparkPath(c.spark)" fill="none" [attr.stroke]="toneColor(c.tone)" stroke-width="1.5"/>
+              </svg>
+            }
+          </div>
+        }
+      </div>
+
+      <!-- Charts row -->
+      <div class="grid-2">
+        <div class="panel">
+          <div class="panel-hdr">Request rate <span class="panel-sub">rps</span></div>
+          <div class="chart-wrap"><canvas #rateCanvas></canvas></div>
         </div>
-      }
-      @if (card.sparkline.length > 1) {
-        <app-sparkline class="stat-sparkline"
-          [values]="card.sparkline"
-          [color]="card.changePositive ? '#22C55E' : '#EF4444'">
-        </app-sparkline>
-      }
+        <div class="panel">
+          <div class="panel-hdr">Latency percentiles <span class="panel-sub">ms</span></div>
+          <div class="chart-wrap"><canvas #latCanvas></canvas></div>
+        </div>
+      </div>
+
+      <!-- Heatmap -->
+      <div class="panel">
+        <div class="panel-hdr">Latency distribution <span class="panel-sub">heatmap</span></div>
+        <app-heatmap [data]="heatmap()" [scale]="latencyScale()" />
+      </div>
+
+      <!-- Top-K + status -->
+      <div class="grid-2">
+        <div class="panel">
+          <div class="panel-hdr">Top routes <span class="panel-sub">by rate</span></div>
+          <div class="topk">
+            @for (r of topRows(); track r.label) {
+              <div class="topk-row">
+                <span class="topk-label" [title]="r.label">{{ r.label }}</span>
+                <div class="topk-bar-wrap"><div class="topk-bar" [style.width.%]="r.pct"></div></div>
+                <span class="topk-val">{{ fmtCardinality(r.value) }}</span>
+              </div>
+            } @empty { <div class="panel-empty sm">No route labels</div> }
+          </div>
+        </div>
+        <div class="panel">
+          <div class="panel-hdr">Status codes</div>
+          <div class="donut-wrap">
+            <svg viewBox="0 0 80 80" class="donut">
+              @for (seg of donutDash(); track seg.key) {
+                <circle cx="40" cy="40" r="30" fill="none" [attr.stroke]="seg.color" stroke-width="12"
+                        [attr.stroke-dasharray]="seg.dash + ' 999'"
+                        [attr.stroke-dashoffset]="seg.offset" transform="rotate(-90 40 40)"/>
+              }
+            </svg>
+            <div class="donut-legend">
+              @for (k of ['2xx','3xx','4xx','5xx']; track k) {
+                <span class="dl-item"><span class="dl-dot" [style.background]="statusColor(k)"></span>{{ k }}
+                  <b>{{ fmtCardinality(statusPcts()[k]) }}</b></span>
+              }
+            </div>
+          </div>
+        </div>
+      </div>
+    }
+  }
+
+  <!-- ══ RUNTIME ═══════════════════════════════════════════════════════════ -->
+  @if (tab() === 'runtime') {
+    @if (!runtimePanels().length) {
+      <div class="panel-empty">No runtime metrics found. Enable .NET runtime instrumentation.</div>
+    } @else {
+      <div class="grid-2">
+        @for (p of runtimePanels(); track p.canvasId) {
+          <div class="panel">
+            <div class="panel-hdr">{{ p.title }} @if (p.unit) { <span class="panel-sub">{{ p.unit }}</span> }</div>
+            <div class="chart-wrap sm"><canvas [id]="p.canvasId"></canvas></div>
+          </div>
+        }
+      </div>
+    }
+  }
+
+  <!-- ══ EXPLORE ═══════════════════════════════════════════════════════════ -->
+  @if (tab() === 'explore') {
+    <div class="explore">
+      <!-- Catalog -->
+      <div class="catalog-panel">
+        <div class="catalog-search">
+          <lucide-icon name="search" [size]="13" class="cs-icon" />
+          <input class="cs-input" [ngModel]="catalogSearch()" (ngModelChange)="catalogSearch.set($event)"
+                 placeholder="Filter metrics…" />
+        </div>
+        <div class="catalog-list">
+          @for (m of filteredCatalog(); track m.name) {
+            <button class="cat-row" [class.active]="selectedMetric()?.name === m.name" (click)="selectMetric(m)">
+              <span class="cat-type" [style.background]="catalogTone(m.type) + '22'" [style.color]="catalogTone(m.type)">
+                {{ m.type[0] }}
+              </span>
+              <span class="cat-name" [title]="m.name">{{ m.name }}</span>
+              <span class="cat-meta">{{ fmtCardinality(m.cardinality) }} · {{ fmtLastSeen(m.lastSeenMs) }}</span>
+            </button>
+          } @empty { <div class="panel-empty sm">No metrics</div> }
+        </div>
+      </div>
+
+      <!-- Builder + chart -->
+      <div class="explore-main">
+        @if (!selectedMetric()) {
+          <div class="panel-empty">Select a metric to graph it</div>
+        } @else {
+          @let m = selectedMetric()!;
+          <div class="builder">
+            <div class="b-title">
+              <span class="cat-type" [style.background]="catalogTone(m.type) + '22'" [style.color]="catalogTone(m.type)">{{ m.type }}</span>
+              <span class="b-name">{{ m.name }}</span>
+              @if (m.unit) { <span class="b-unit">{{ m.unit }}</span> }
+            </div>
+            <div class="b-controls">
+              <label class="b-field">
+                <span>Aggregation</span>
+                <select [ngModel]="exAggregation()" (ngModelChange)="exAggregation.set($event); runExplore()">
+                  @if (m.type === 'Histogram') { <option value="quantile">quantile</option> }
+                  @if (m.type === 'Counter') { <option value="rate">rate</option> <option value="increase">increase</option> }
+                  <option value="avg">avg</option><option value="min">min</option>
+                  <option value="max">max</option><option value="last">last</option><option value="sum">sum</option>
+                </select>
+              </label>
+              @if (exAggregation() === 'quantile') {
+                <label class="b-field">
+                  <span>Quantile</span>
+                  <select [ngModel]="exQuantile()" (ngModelChange)="exQuantile.set(+$event); runExplore()">
+                    <option [ngValue]="0.5">p50</option><option [ngValue]="0.9">p90</option>
+                    <option [ngValue]="0.95">p95</option><option [ngValue]="0.99">p99</option>
+                  </select>
+                </label>
+              }
+              <button class="b-run" (click)="runExplore()"><lucide-icon name="play" [size]="12" /> Run</button>
+            </div>
+            @if (m.labelKeys.length) {
+              <div class="b-groupby">
+                <span class="gb-label">Group by:</span>
+                @for (k of m.labelKeys; track k) {
+                  <button class="gb-chip" [class.on]="exGroupBy().includes(k)" (click)="toggleGroupBy(k); runExplore()">{{ k }}</button>
+                }
+              </div>
+            }
+          </div>
+
+          <div class="panel">
+            <div class="chart-wrap"><canvas #exploreCanvas></canvas></div>
+          </div>
+          @if (exHeatmap()) {
+            <div class="panel">
+              <div class="panel-hdr">Distribution <span class="panel-sub">heatmap</span></div>
+              <app-heatmap [data]="exHeatmap()" [scale]="m.unit === 's' ? 1000 : 1" />
+            </div>
+          }
+        }
+      </div>
     </div>
   }
 </div>
-
-@if (viewMode() === 'timeseries') {
-
-  <!-- ── 3 main charts ────────────────────────────────────────────────────── -->
-  <div class="charts-row">
-
-    <div class="chart-card">
-      <div class="chart-card__header">
-        <div class="chart-card__title">
-          Request rate
-          <span class="chart-badge">{{ statCards()[0].value }} {{ statCards()[0].unit }}</span>
-        </div>
-        <div class="chart-controls">
-          <button class="ctrl-btn active">Rate</button>
-          <button class="ctrl-btn">Sum</button>
-          <button class="ctrl-btn active">Line</button>
-          <button class="ctrl-btn icon-only"><lucide-icon name="ellipsis" [size]="13" /></button>
-        </div>
-      </div>
-      <div class="chart-body"><canvas #reqCanvas></canvas></div>
-      <div class="chart-legend">
-        @for (lbl of ['api-gateway','payment-service','user-service','inventory-service']; track lbl; let i = $index) {
-          <span class="legend-item">
-            <span class="legend-dot" [style.background]="['#F59E0B','#38BDF8','#22C55E','#f97316'][i]"></span>
-            {{ lbl }}
-          </span>
-        }
-      </div>
-    </div>
-
-    <div class="chart-card">
-      <div class="chart-card__header">
-        <div class="chart-card__title">Latency <span class="chart-unit">(ms)</span></div>
-        <div class="chart-controls">
-          <button class="ctrl-btn active">P50</button>
-          <button class="ctrl-btn">P95</button>
-          <button class="ctrl-btn">P99</button>
-          <button class="ctrl-btn icon-only"><lucide-icon name="ellipsis" [size]="13" /></button>
-        </div>
-      </div>
-      <div class="chart-body"><canvas #latCanvas></canvas></div>
-      <div class="chart-legend">
-        @for (lbl of ['P50','P95','P99']; track lbl; let i = $index) {
-          <span class="legend-item">
-            <span class="legend-dot" [style.background]="['#38BDF8','#a78bfa','#22C55E'][i]"></span>
-            {{ lbl }}
-          </span>
-        }
-      </div>
-    </div>
-
-    <div class="chart-card">
-      <div class="chart-card__header">
-        <div class="chart-card__title">
-          Error rate <span class="chart-unit">(%)</span>
-        </div>
-        <div class="chart-controls">
-          <button class="ctrl-btn active">Rate</button>
-          <button class="ctrl-btn active">Line</button>
-          <button class="ctrl-btn icon-only"><lucide-icon name="ellipsis" [size]="13" /></button>
-        </div>
-      </div>
-      <div class="chart-body"><canvas #errCanvas></canvas></div>
-      <div class="chart-legend">
-        <span class="legend-item"><span class="legend-dot" style="background:#EF4444"></span>Error rate</span>
-      </div>
-    </div>
-
-  </div>
-
-  <!-- ── Bottom row ───────────────────────────────────────────────────────── -->
-  <div class="bottom-row">
-
-    <div class="bottom-card donut-card">
-      <div class="bottom-card__title">Requests by status code</div>
-      <div class="donut-body">
-        <div class="donut-ring-wrap">
-          <canvas #donutCanvas></canvas>
-        </div>
-        <div class="donut-legend">
-          @for (row of [['2xx','#22C55E'],['3xx','#F59E0B'],['4xx','#f97316'],['5xx','#EF4444']]; track row[0]) {
-            <div class="donut-row">
-              <span class="legend-dot" [style.background]="row[1]"></span>
-              <span class="donut-lbl">{{ row[0] }}</span>
-              <span class="donut-pct">{{ statusPcts()[row[0]] }}%</span>
-            </div>
-          }
-        </div>
-      </div>
-    </div>
-
-    <div class="bottom-card services-card">
-      <div class="bottom-card__title">Top services by request rate</div>
-      <div class="services-list">
-        @for (svc of topServices(); track svc.name) {
-          <div class="svc-row">
-            <span class="svc-name">{{ svc.name }}</span>
-            <div class="svc-bar-track">
-              <div class="svc-bar-fill" [style.width.%]="svc.pct"></div>
-            </div>
-            <span class="svc-val">{{ fmtSvcVal(svc.value) }}</span>
-          </div>
-        }
-        @if (!topServices().length) {
-          <div class="no-data">No service data</div>
-        }
-      </div>
-    </div>
-
-    <div class="bottom-card mini-card">
-      <div class="mini-header">
-        <span class="bottom-card__title">CPU usage</span>
-        <div class="mini-kpi">
-          <span class="mini-val">{{ statCards()[5].value }}%</span>
-          <span class="mini-trend" [class.neg]="!statCards()[5].changePositive">
-            {{ statCards()[5].trendUp ? '↑' : '↓' }}
-          </span>
-        </div>
-      </div>
-      <div class="mini-wrap">
-        <div class="mini-y">
-          <span>100%</span><span>75%</span><span>50%</span><span>25%</span><span>0%</span>
-        </div>
-        <div class="mini-chart-area"><canvas #cpuCanvas></canvas></div>
-      </div>
-    </div>
-
-    <div class="bottom-card mini-card">
-      <div class="mini-header">
-        <span class="bottom-card__title">Memory usage</span>
-        <div class="mini-kpi">
-          <span class="mini-val">{{ statCards()[4].value }}</span>
-        </div>
-      </div>
-      <div class="mini-wrap">
-        <div class="mini-y">
-          <span>100%</span><span>75%</span><span>50%</span><span>25%</span><span>0%</span>
-        </div>
-        <div class="mini-chart-area"><canvas #memCanvas></canvas></div>
-      </div>
-    </div>
-
-  </div>
-
-  <!-- ── Recent metrics table ─────────────────────────────────────────────── -->
-  <div class="recent-section">
-    <div class="recent-header">
-      <span class="recent-title">
-        Metrics
-        <span class="recent-count">{{ sortedFiltered().length }}</span>
-      </span>
-      <div class="recent-search-wrap">
-        <lucide-icon name="search" [size]="12" />
-        <input [ngModel]="metricSearch()" (ngModelChange)="metricSearch.set($event)" placeholder="Search metrics..." />
-      </div>
-      <a class="view-all-link" href="#">View all</a>
-    </div>
-    <table class="metrics-table">
-      <thead>
-        <tr>
-          <th class="th-sortable" (click)="toggleSort('name')">
-            Metric name
-            <span class="sort-arrow" [class.active]="sortCol() === 'name'">{{ sortCol() === 'name' ? (sortAsc() ? '↑' : '↓') : '↕' }}</span>
-          </th>
-          <th>Type</th>
-          <th>Service</th>
-          <th>Unit</th>
-          <th class="th-sortable" (click)="toggleSort('value')">
-            Last value
-            <span class="sort-arrow" [class.active]="sortCol() === 'value'">{{ sortCol() === 'value' ? (sortAsc() ? '↑' : '↓') : '↕' }}</span>
-          </th>
-          <th class="th-sortable" (click)="toggleSort('change')">
-            Change (1h)
-            <span class="sort-arrow" [class.active]="sortCol() === 'change'">{{ sortCol() === 'change' ? (sortAsc() ? '↑' : '↓') : '↕' }}</span>
-          </th>
-          <th>Last seen</th>
-          <th>Trend</th>
-        </tr>
-      </thead>
-      <tbody>
-        @for (group of groupedMetrics(); track group.ns) {
-          <tr class="group-row" (click)="toggleGroup(group.ns)">
-            <td colspan="8">
-              <div class="group-cell">
-                <lucide-icon [name]="group.collapsed ? 'chevron-right' : 'chevron-down'" [size]="12" />
-                <span class="group-ns">{{ group.ns }}</span>
-                <span class="group-count">{{ group.count }}</span>
-              </div>
-            </td>
-          </tr>
-          @if (!group.collapsed) {
-            @for (row of group.items; track row.name) {
-              <tr class="metric-row" [class.is-expanded]="expandedRow() === row.name" (click)="toggleRow(row.name)">
-                <td class="name-cell">
-                  <span class="ki" [class]="'ki-' + row.kind.toLowerCase()"></span>
-                  <span class="mname">{{ row.name }}</span>
-                  <button class="copy-btn" (click)="copyName(row.name, $event)" title="Copy metric name">
-                    <lucide-icon name="copy" [size]="11" />
-                  </button>
-                  @if (row.cardinality > 1) {
-                    <span class="card-badge" [class.high-card]="row.cardinality > 50">×{{ row.cardinality }}</span>
-                  }
-                </td>
-                <td><span class="kbadge" [class]="'kb-' + row.kind.toLowerCase()">{{ row.kind }}</span></td>
-                <td class="muted">{{ row.service }}</td>
-                <td class="muted">{{ row.unit || '—' }}</td>
-                <td class="val-cell">{{ row.lastValue }}</td>
-                <td>
-                  @if (row.change !== 0) {
-                    <span class="chg" [class.pos]="row.trendUp" [class.neg]="!row.trendUp">
-                      {{ row.trendUp ? '↑' : '↓' }} {{ fmtChange(row.change) }}
-                    </span>
-                  } @else {
-                    <span class="muted">—</span>
-                  }
-                </td>
-                <td>
-                  <span class="last-seen" [class]="stalenessClass(row.lastTs)">{{ fmtLastSeen(row.lastTs) }}</span>
-                </td>
-                <td>
-                  @if (row.sparkline.length > 1) {
-                    <app-sparkline class="tbl-spark" [values]="row.sparkline" [color]="row.trendUp ? '#38BDF8' : '#EF4444'" />
-                  }
-                </td>
-              </tr>
-              @if (expandedRow() === row.name) {
-                <tr class="inline-chart-row" (click)="$event.stopPropagation()">
-                  <td colspan="8">
-                    <div class="inline-chart-wrap">
-                      <canvas [id]="getCanvasId(row.name)" class="inline-canvas"></canvas>
-                    </div>
-                  </td>
-                </tr>
-              }
-            }
-          }
-        }
-      </tbody>
-    </table>
-  </div>
-
-}
-
-@if (viewMode() === 'table') {
-  <div class="recent-section mt0">
-    <div class="recent-header">
-      <span class="recent-title">
-        All metrics
-        <span class="recent-count">{{ sortedFiltered().length }}</span>
-      </span>
-      <div class="recent-search-wrap">
-        <lucide-icon name="search" [size]="12" />
-        <input [ngModel]="metricSearch()" (ngModelChange)="metricSearch.set($event)" placeholder="Search metrics..." />
-      </div>
-    </div>
-    <table class="metrics-table full">
-      <thead>
-        <tr>
-          <th class="th-sortable" (click)="toggleSort('name')">
-            Metric name
-            <span class="sort-arrow" [class.active]="sortCol() === 'name'">{{ sortCol() === 'name' ? (sortAsc() ? '↑' : '↓') : '↕' }}</span>
-          </th>
-          <th>Type</th>
-          <th>Service</th>
-          <th>Unit</th>
-          <th class="th-sortable" (click)="toggleSort('value')">
-            Last value
-            <span class="sort-arrow" [class.active]="sortCol() === 'value'">{{ sortCol() === 'value' ? (sortAsc() ? '↑' : '↓') : '↕' }}</span>
-          </th>
-          <th class="th-sortable" (click)="toggleSort('change')">
-            Change (1h)
-            <span class="sort-arrow" [class.active]="sortCol() === 'change'">{{ sortCol() === 'change' ? (sortAsc() ? '↑' : '↓') : '↕' }}</span>
-          </th>
-          <th>Last seen</th>
-          <th>Trend</th>
-        </tr>
-      </thead>
-      <tbody>
-        @for (group of groupedMetrics(); track group.ns) {
-          <tr class="group-row" (click)="toggleGroup(group.ns)">
-            <td colspan="8">
-              <div class="group-cell">
-                <lucide-icon [name]="group.collapsed ? 'chevron-right' : 'chevron-down'" [size]="12" />
-                <span class="group-ns">{{ group.ns }}</span>
-                <span class="group-count">{{ group.count }}</span>
-              </div>
-            </td>
-          </tr>
-          @if (!group.collapsed) {
-            @for (row of group.items; track row.name) {
-              <tr class="metric-row" [class.is-expanded]="expandedRow() === row.name" (click)="toggleRow(row.name)">
-                <td class="name-cell">
-                  <span class="ki" [class]="'ki-' + row.kind.toLowerCase()"></span>
-                  <span class="mname">{{ row.name }}</span>
-                  <button class="copy-btn" (click)="copyName(row.name, $event)" title="Copy metric name">
-                    <lucide-icon name="copy" [size]="11" />
-                  </button>
-                  @if (row.cardinality > 1) {
-                    <span class="card-badge" [class.high-card]="row.cardinality > 50">×{{ row.cardinality }}</span>
-                  }
-                </td>
-                <td><span class="kbadge" [class]="'kb-' + row.kind.toLowerCase()">{{ row.kind }}</span></td>
-                <td class="muted">{{ row.service }}</td>
-                <td class="muted">{{ row.unit || '—' }}</td>
-                <td class="val-cell">{{ row.lastValue }}</td>
-                <td>
-                  @if (row.change !== 0) {
-                    <span class="chg" [class.pos]="row.trendUp" [class.neg]="!row.trendUp">
-                      {{ row.trendUp ? '↑' : '↓' }} {{ fmtChange(row.change) }}
-                    </span>
-                  } @else {
-                    <span class="muted">—</span>
-                  }
-                </td>
-                <td>
-                  <span class="last-seen" [class]="stalenessClass(row.lastTs)">{{ fmtLastSeen(row.lastTs) }}</span>
-                </td>
-                <td>
-                  @if (row.sparkline.length > 1) {
-                    <app-sparkline class="tbl-spark" [values]="row.sparkline" [color]="row.trendUp ? '#38BDF8' : '#EF4444'" />
-                  }
-                </td>
-              </tr>
-              @if (expandedRow() === row.name) {
-                <tr class="inline-chart-row" (click)="$event.stopPropagation()">
-                  <td colspan="8">
-                    <div class="inline-chart-wrap">
-                      <canvas [id]="getCanvasId(row.name)" class="inline-canvas"></canvas>
-                    </div>
-                  </td>
-                </tr>
-              }
-            }
-          }
-        }
-      </tbody>
-    </table>
-  </div>
-}
-
-@if (viewMode() === 'heatmap') {
-  <div class="heatmap-ph">
-    <lucide-icon name="grid-3x3" [size]="32" />
-    <p>Heatmap view coming soon</p>
-  </div>
-}
-
-@if (loading()) {
-  <div class="loading-overlay">
-    <lucide-icon name="loader" [size]="20" class="spin" />
-  </div>
-}

@@ -89,3 +89,5 @@ desktop.ini
 !.vscode/mcp.json
 *.swp
 *~
+
+.claude/launch.json
