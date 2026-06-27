@@ -3,6 +3,9 @@ import {
   input, output, ChangeDetectionStrategy, effect, untracked,
   viewChild, TemplateRef, ViewContainerRef,
 } from '@angular/core';
+import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
+import { forkJoin, of } from 'rxjs';
+import { switchMap, catchError, map } from 'rxjs/operators';
 import { DomSanitizer } from '@angular/platform-browser';
 import { NgTemplateOutlet, DatePipe } from '@angular/common';
 import { Overlay, OverlayRef } from '@angular/cdk/overlay';
@@ -10,9 +13,16 @@ import { TemplatePortal } from '@angular/cdk/portal';
 import { LucideAngularModule } from 'lucide-angular';
 
 import { EventDto } from '../../../core/models/event.model';
+import { SpanDto } from '../../../core/models/span.model';
+import { MetricSeriesDto } from '../../../core/models/metric.model';
 import { UserPreferencesService } from '../../../core/services/user-preferences.service';
+import { ApiService } from '../../../core/services/api.service';
 import { renderMessageHtml, escapeHtmlExport } from '../../../shared/utils/clef-renderer';
-import { PropViewerComponent } from './prop-viewer/prop-viewer';
+import { JsonViewerComponent } from '../../../shared/components/json-viewer/json-viewer';
+import { MetricSparkComponent } from '../../../shared/components/metric-spark/metric-spark';
+import {
+  JsonViewerActions, JvMenuRequest, jvLiteral, jvWildcard,
+} from '../../../shared/components/json-viewer/json-viewer.actions';
 
 const LEVEL_SHORT: Record<string, string> = {
   verbose: 'VRB', debug: 'DBG', information: 'INF',
@@ -22,18 +32,14 @@ const LEVEL_SHORT: Record<string, string> = {
 export interface PropEntry {
   /** Full dot-path usable in filter expressions, e.g. "Payload.Customer.Id" */
   path: string;
-  /** Last segment, shown in the table */
+  /** Property key, shown in the table */
   label: string;
-  /** Stringified value; empty for group rows */
+  /** Stringified value for scalar props; empty for structured (object/array) props */
   value: string;
-  /** Nesting depth (0 = top-level) */
-  depth: number;
-  /** True for object-header rows (non-clickable, no value column) */
-  isGroup: boolean;
-}
-
-function isPlainObject(v: unknown): v is Record<string, unknown> {
-  return v !== null && typeof v === 'object' && !Array.isArray(v);
+  /** Raw value — passed to the inline JSON viewer when {@link isStructured} is true */
+  raw: unknown;
+  /** True when the value is a non-empty object/array (rendered as an expandable JSON viewer) */
+  isStructured: boolean;
 }
 
 function formatInline(v: unknown): string {
@@ -45,31 +51,6 @@ function formatInline(v: unknown): string {
 
 /** Safe identifier as accepted by the server-side lexer (letter/digit/_/@). */
 const IDENT_RE = /^[A-Za-z_@][A-Za-z0-9_@]*$/;
-
-/** Numeric literal accepted by the filter lexer (int/decimal, optional sign). */
-const NUMBER_RE = /^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$/;
-
-/**
- * Convert the stringified property value (as produced by {@link formatInline})
- * back into a filter-language literal:
- *   - `null` / `true` / `false`           → as-is keyword
- *   - numeric                              → as-is
- *   - valid JSON object/array              → as-is (server may not support, but preserved)
- *   - anything else                        → single-quoted string with `'` escaped
- */
-function toFilterLiteral(v: string): string {
-  if (v === 'null' || v === 'true' || v === 'false') return v;
-  if (NUMBER_RE.test(v)) return v;
-  if ((v.startsWith('{') && v.endsWith('}')) || (v.startsWith('[') && v.endsWith(']'))) {
-    try { JSON.parse(v); return v; } catch { /* fall through to string */ }
-  }
-  return `'${v.replace(/'/g, "''")}'`;
-}
-
-/** Append an array-index segment, e.g. `Tags` + 0 → `Tags[0]`. */
-function joinIndex(prefix: string, index: number): string {
-  return `${prefix}[${index}]`;
-}
 
 /**
  * Append a child segment to a property path, using bracket notation when the
@@ -89,43 +70,40 @@ function joinPath(prefix: string, key: string): string {
 /** Top-level keys promoted to dedicated rows in the detail panel — skip in the generic props list. */
 const PROMOTED_KEYS = new Set(['@tr', '@sp', 'service.name']);
 
-function flattenProps(obj: Record<string, unknown>, prefix = '', depth = 0, out: PropEntry[] = []): PropEntry[] {
+/**
+ * Builds the flat top-level property list. Scalar values become text rows;
+ * non-empty objects/arrays become a single structured row rendered by the
+ * inline JSON viewer (Seq/Datalust-style — collapsed to one line, expandable).
+ * Nesting is handled by the viewer itself, so values are no longer flattened
+ * into many indented rows.
+ */
+function buildProps(obj: Record<string, unknown>): PropEntry[] {
+  const out: PropEntry[] = [];
   for (const [k, v] of Object.entries(obj)) {
-    if (depth === 0 && PROMOTED_KEYS.has(k)) continue;
-    const path = joinPath(prefix, k);
-    appendValue(path, k, v, depth, out);
+    if (PROMOTED_KEYS.has(k)) continue;
+    const structured = v !== null && typeof v === 'object' && Object.keys(v as object).length > 0;
+    out.push({
+      path: joinPath('', k),
+      label: k,
+      value: structured ? '' : formatInline(v),
+      raw: v,
+      isStructured: structured,
+    });
   }
   return out;
 }
 
-/**
- * Recursively appends a single value at <paramref name="path"/> to the flattened
- * list. Plain objects become a group header plus children; arrays become a
- * group header plus indexed children (<c>Tags[0]</c>, <c>Tags[1]</c>, …); leaves
- * become a single row.
- */
-function appendValue(path: string, label: string, v: unknown, depth: number, out: PropEntry[]): void {
-  if (isPlainObject(v)) {
-    out.push({ path, label, value: '', depth, isGroup: true });
-    for (const [ck, cv] of Object.entries(v)) {
-      appendValue(joinPath(path, ck), ck, cv, depth + 1, out);
-    }
-    return;
-  }
-  if (Array.isArray(v)) {
-    out.push({ path, label, value: `[${v.length}]`, depth, isGroup: true });
-    for (let i = 0; i < v.length; i++) {
-      appendValue(joinIndex(path, i), String(i), v[i], depth + 1, out);
-    }
-    return;
-  }
-  out.push({ path, label, value: formatInline(v), depth, isGroup: false });
+function wfFmtMs(ms: number): string {
+  if (ms < 0.001) return `${(ms * 1_000_000).toFixed(0)}ns`;
+  if (ms < 1)     return `${(ms * 1_000).toFixed(0)}µs`;
+  if (ms < 1_000) return `${ms.toFixed(2)}ms`;
+  return `${(ms / 1_000).toFixed(3)}s`;
 }
 
 @Component({
   selector: 'app-event-row',
-  imports: [LucideAngularModule, NgTemplateOutlet, DatePipe, PropViewerComponent],
-  providers: [DatePipe],
+  imports: [LucideAngularModule, NgTemplateOutlet, DatePipe, JsonViewerComponent, MetricSparkComponent],
+  providers: [DatePipe, JsonViewerActions],
   templateUrl: './event-row.html',
   styleUrl: './event-row.scss',
   changeDetection: ChangeDetectionStrategy.OnPush,
@@ -149,28 +127,59 @@ export class EventRowComponent {
   seekRequested  = output<{ from: Date; to: Date }>();
   expandRequested = output<string>();
 
+  private api = inject(ApiService);
+
   // ── Local state ───────────────────────────────────────────────────────
   expanded  = computed(() => this.expandedEventIds().has(this.event().id));
   messageExpanded = signal(false);
-  detailTab = signal<'overview' | 'json' | 'exception' | 'trace' | 'metrics'>('overview');
-  menuType  = signal<'message' | 'level' | 'export' | 'prop' | null>(null);
+  detailTab  = signal<'overview' | 'message' | 'json' | 'exception' | 'trace' | 'metrics'>('overview');
+  jsonSearch = signal('');
+  menuType  = signal<'message' | 'level' | 'export' | 'jv' | null>(null);
   menuPos   = signal({ x: 0, y: 0 });
-  selectedProp = signal<{ k: string; v: string; isGroup: boolean } | null>(null);
-  /** Set of group paths currently collapsed (children hidden). */
-  collapsed = signal<ReadonlySet<string>>(new Set());
+  /** Active JSON-viewer node context (path/value/kind) when {@link menuType} is 'jv'. */
+  jvMenu = signal<JvMenuRequest | null>(null);
 
-  /** Prop viewer modal state */
-  viewerProp = signal<{ key: string; value: unknown } | null>(null);
+  // ── Trace waterfall state ─────────────────────────────────────────────
+  readonly traceSpans        = signal<SpanDto[]>([]);
+  readonly traceSpansLoading = signal(false);
+  readonly selectedWfSpan    = signal<SpanDto | null>(null);
+  readonly lastFetchedTid    = signal('');
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private traceSubRef?: any;
+
+  /** Key of the copy button showing the "copied" confirmation, null otherwise. */
+  copiedKey = signal<string | null>(null);
+  private copiedTimer?: ReturnType<typeof setTimeout>;
+
+  // ── Correlated metrics state ──────────────────────────────────────────
+  readonly metricSeries      = signal<{ name: string; series: MetricSeriesDto[] }[]>([]);
+  readonly metricsLoading    = signal(false);
+  private lastFetchedMetricId = '';
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private metricsSubRef?: any;
 
   private sanitizer = inject(DomSanitizer);
   private datePipe  = inject(DatePipe);
   private prefs = inject(UserPreferencesService);
   private overlay = inject(Overlay);
   private vcr = inject(ViewContainerRef);
+  private jvActions = inject(JsonViewerActions);
   private overlayRef: OverlayRef | null = null;
   ctxMenuTpl = viewChild<TemplateRef<unknown>>('ctxMenuTpl');
 
   constructor() {
+    // A filter icon inside the inline JSON viewer was clicked → open the
+    // context menu (CDK overlay) at the click position with that node's path.
+    this.jvActions.menu.pipe(takeUntilDestroyed()).subscribe(req => {
+      this.jvMenu.set(req);
+      let x = req.x;
+      let y = req.y + 6;
+      if (x + 240 > window.innerWidth)  x = req.x - 240;
+      if (y + 200 > window.innerHeight) y = req.y - 200;
+      this.menuPos.set({ x, y });
+      this.menuType.set('jv');
+    });
+
     // CDK virtual scroll recycles row instances across different events.
     // Reset local UI state whenever the bound event changes so an expanded /
     // menu-open state from a previous row does not leak onto a new one.
@@ -178,10 +187,83 @@ export class EventRowComponent {
       this.event(); // track input identity
       untracked(() => {
         this.menuType.set(null);
-        this.selectedProp.set(null);
-        this.collapsed.set(new Set());
+        this.jvMenu.set(null);
         this.messageExpanded.set(false);
         this.detailTab.set('overview');
+        this.lastFetchedTid.set('');
+        this.traceSpans.set([]);
+        this.traceSpansLoading.set(false);
+        this.selectedWfSpan.set(null);
+        this.lastFetchedMetricId = '';
+        this.metricSeries.set([]);
+        this.metricsLoading.set(false);
+      });
+    });
+
+    // Fetch trace spans lazily when the Trace tab is first opened.
+    effect(() => {
+      const tab = this.detailTab();
+      const tid = this.traceId();
+      if (tab !== 'trace' || !tid) return;
+      if (this.lastFetchedTid() === tid) return;
+
+      untracked(() => {
+        this.traceSubRef?.unsubscribe();
+        this.lastFetchedTid.set(tid);
+        this.traceSpansLoading.set(true);
+        this.traceSpans.set([]);
+        this.selectedWfSpan.set(null);
+
+        this.traceSubRef = this.api.getTrace(tid).subscribe({
+          next: spans => {
+            this.traceSpans.set([...spans].sort((a, b) => a.startTimeUnixNano - b.startTimeUnixNano));
+            this.traceSpansLoading.set(false);
+          },
+          error: () => this.traceSpansLoading.set(false),
+        });
+      });
+    });
+
+    // Fetch correlated metrics when the Metrics tab is first opened.
+    effect(() => {
+      const tab     = this.detailTab();
+      const eventId = this.event().id;
+      if (tab !== 'metrics') return;
+      if (this.lastFetchedMetricId === eventId) return;
+
+      const numericKeys = Object.entries(this.event().props ?? {})
+        .filter(([, v]) => typeof v === 'number')
+        .map(([k]) => k);
+
+      untracked(() => {
+        this.metricsSubRef?.unsubscribe();
+        this.lastFetchedMetricId = eventId;
+        this.metricsLoading.set(true);
+        this.metricSeries.set([]);
+
+        if (!numericKeys.length) { this.metricsLoading.set(false); return; }
+
+        const ts   = new Date(this.event()['@t'] as unknown as string).getTime();
+        const from = new Date(ts - 10 * 60_000).toISOString();
+        const to   = new Date(ts + 10 * 60_000).toISOString();
+
+        this.metricsSubRef = this.api.getMetricNames().pipe(
+          switchMap(names => {
+            const matching = numericKeys.filter(k => names.includes(k));
+            if (!matching.length) return of([] as { name: string; series: MetricSeriesDto[] }[]);
+            return forkJoin(
+              Object.fromEntries(
+                matching.map(k => [k, this.api.queryMetric(k, from, to).pipe(catchError(() => of([])))])
+              )
+            ).pipe(
+              map(res => Object.entries(res).map(([name, series]) => ({ name, series: series as MetricSeriesDto[] })))
+            );
+          }),
+          catchError(() => of([] as { name: string; series: MetricSeriesDto[] }[])),
+        ).subscribe({
+          next:  entries => { this.metricSeries.set(entries); this.metricsLoading.set(false); },
+          error: ()       => this.metricsLoading.set(false),
+        });
       });
     });
 
@@ -197,7 +279,7 @@ export class EventRowComponent {
   }
 
   private syncOverlay(
-    type: 'message' | 'level' | 'export' | 'prop' | null,
+    type: 'message' | 'level' | 'export' | 'jv' | null,
     pos: { x: number; y: number },
     tpl: TemplateRef<unknown> | undefined,
   ): void {
@@ -224,9 +306,16 @@ export class EventRowComponent {
   }
 
   ngOnDestroy(): void {
+    clearTimeout(this.copiedTimer);
+    this.traceSubRef?.unsubscribe();
+    this.metricsSubRef?.unsubscribe();
     this.overlayRef?.dispose();
     this.overlayRef = null;
   }
+
+  eventTsMs = computed(() =>
+    new Date(this.event()['@t'] as unknown as string).getTime()
+  );
 
   // ── Derived ───────────────────────────────────────────────────────────
   levelKey = computed(() => (this.event()['@l'] ?? 'information').toLowerCase());
@@ -268,6 +357,26 @@ export class EventRowComponent {
 
   rawJson = computed(() => JSON.stringify(this.event(), null, 2));
 
+  /**
+   * CLEF-style flat view of the event: system fields + user props at the same
+   * level, matching how the server filter language addresses them.
+   * Used by the JSON tab so filter-path expressions are correct (e.g.
+   * `Headers.Authorization`, not `props.Headers.Authorization`).
+   */
+  clefView = computed<Record<string, unknown>>(() => {
+    const ev = this.event();
+    const view: Record<string, unknown> = {};
+    if (ev['@t']           !== undefined) view['@t']           = ev['@t'];
+    if (ev['@l']           !== undefined) view['@l']           = ev['@l'];
+    if (ev['@mt']          !== undefined) view['@mt']          = ev['@mt'];
+    if (ev['@x']           !== undefined) view['@x']           = ev['@x'];
+    if (ev['@tr']          !== undefined) view['@tr']          = ev['@tr'];
+    if (ev['@sp']          !== undefined) view['@sp']          = ev['@sp'];
+    if (ev['service.name'] !== undefined) view['service.name'] = ev['service.name'];
+    Object.assign(view, ev.props ?? {});
+    return view;
+  });
+
   topProps = computed(() =>
     Object.entries(this.event().props ?? {})
       .slice(0, 3)
@@ -275,37 +384,12 @@ export class EventRowComponent {
   );
 
   /**
-   * Flattened property tree:
-   *  - Plain values   → leaf row { path:'A.B', label:'B', value:'42', depth, isGroup:false }
-   *  - Plain objects  → group header row + recursive children
-   *  - Arrays / null  → leaf row (arrays serialized as JSON; array search not yet supported server-side)
-   * Children of collapsed group rows are hidden.
+   * Flat top-level property list:
+   *  - Scalar values  → text row { path:'A', label:'A', value:'42', isStructured:false }
+   *  - Object/array   → structured row rendered inline by the JSON viewer
+   *                     (collapsed to one line, expandable — Seq/Datalust-style)
    */
-  allProps = computed(() => {
-    const all = flattenProps(this.event().props ?? {});
-    const col = this.collapsed();
-    if (col.size === 0) return all;
-    return all.filter(e => {
-      for (const c of col) {
-        if (e.path === c) continue;
-        // Children appear under `Parent.Child`, `Parent['Child']`, or `Parent[0]`.
-        if (e.path.startsWith(c + '.') ||
-            e.path.startsWith(c + '[')) return false;
-      }
-      return true;
-    });
-  });
-
-  isCollapsed(path: string): boolean { return this.collapsed().has(path); }
-
-  toggleGroup(e: MouseEvent, path: string): void {
-    e.stopPropagation();
-    this.collapsed.update(s => {
-      const ns = new Set(s);
-      if (ns.has(path)) ns.delete(path); else ns.add(path);
-      return ns;
-    });
-  }
+  allProps = computed(() => buildProps(this.event().props ?? {}));
 
   propsCount   = computed(() => Object.keys(this.event().props ?? {}).length);
   hasException  = computed(() => !!this.event()['@x']);
@@ -332,6 +416,128 @@ export class EventRowComponent {
       k === 'span_id')
     .map(([k, v]) => ({ key: k, value: formatInline(v) }))
   );
+
+  parentSpanId = computed(() => {
+    const p = this.event().props ?? {};
+    return (p['parentSpanId'] as string | undefined) ??
+      (p['ParentSpanId'] as string | undefined) ??
+      (p['parent_span_id'] as string | undefined) ??
+      '';
+  });
+
+  /** Duration of this span in milliseconds, null if not available. */
+  traceDuration = computed<number | null>(() => {
+    const p = this.event().props ?? {};
+    for (const k of ['durationMs', 'DurationMs', 'duration', 'Duration', 'elapsedMs', 'ElapsedMs', 'elapsed', 'Elapsed']) {
+      const v = p[k];
+      if (typeof v === 'number' && Number.isFinite(v)) return v;
+      if (typeof v === 'string') { const n = parseFloat(v); if (!isNaN(n)) return n; }
+    }
+    return null;
+  });
+
+  traceDurationLabel = computed(() => {
+    const ms = this.traceDuration();
+    if (ms === null) return '';
+    if (ms >= 1000) return `${(ms / 1000).toFixed(2)} s`;
+    if (ms >= 0.1) return `${Math.round(ms)} ms`;
+    return `${(ms * 1000).toFixed(0)} µs`;
+  });
+
+  traceparent = computed(() => {
+    const tid = this.traceId().replace(/-/g, '');
+    const sid = this.spanId().replace(/-/g, '');
+    if (!tid || !sid) return '';
+    return `00-${tid.padStart(32, '0')}-${sid.padStart(16, '0')}-01`;
+  });
+
+  httpInfo = computed(() => {
+    const p = this.event().props ?? {};
+    const method = String(p['http.method'] ?? p['http.request.method'] ?? '');
+    const status = String(p['http.status_code'] ?? p['http.response.status_code'] ?? p['statusCode'] ?? '');
+    const url = String(p['http.url'] ?? p['http.target'] ?? p['http.route'] ?? '');
+    return { method, status, url };
+  });
+
+  /** All OTel-convention attributes: http.*, db.*, span.*, otel.*, trace.*, rpc.*, messaging.*, plus common trace IDs. */
+  otelAttrs = computed(() => {
+    const prefixes = ['http.', 'db.', 'span.', 'otel.', 'trace.', 'rpc.', 'messaging.', 'enduser.', 'net.', 'peer.', 'exception.'];
+    const exact = new Set(['trace_id', 'span_id', 'parent_span_id', 'parentSpanId', 'ParentSpanId']);
+    return Object.entries(this.event().props ?? {})
+      .filter(([k]) => prefixes.some(p => k.startsWith(p)) || exact.has(k))
+      .map(([k, v]) => ({ key: k, raw: v, value: formatInline(v) }));
+  });
+
+  // ── Trace waterfall computed ──────────────────────────────────────────
+  private wfRange = computed<{ minNs: number; totalNs: number }>(() => {
+    const spans = this.traceSpans();
+    if (!spans.length) return { minNs: 0, totalNs: 1 };
+    let minNs = spans[0].startTimeUnixNano;
+    let maxEnd = spans[0].startTimeUnixNano + spans[0].durationNanos;
+    for (const s of spans) {
+      if (s.startTimeUnixNano < minNs) minNs = s.startTimeUnixNano;
+      const end = s.startTimeUnixNano + s.durationNanos;
+      if (end > maxEnd) maxEnd = end;
+    }
+    return { minNs, totalNs: Math.max(1, maxEnd - minNs) };
+  });
+
+  private wfDepthMap = computed(() => {
+    const spans = this.traceSpans();
+    const byId  = new Map(spans.map(s => [s.spanId, s]));
+    const map   = new Map<string, number>();
+    for (const span of spans) {
+      let depth = 0, cur: SpanDto | undefined = span;
+      while (cur?.parentSpanId && !/^0+$/.test(cur.parentSpanId)) {
+        cur = byId.get(cur.parentSpanId);
+        if (++depth > 20) break;
+      }
+      map.set(span.spanId, depth);
+    }
+    return map;
+  });
+
+  wfTicks = computed(() => {
+    const { totalNs } = this.wfRange();
+    const totalMs = totalNs / 1_000_000;
+    return Array.from({ length: 5 }, (_, i) => ({
+      pct:   (i / 4) * 100,
+      label: wfFmtMs(totalMs * i / 4),
+    }));
+  });
+
+  selectedWfSpanTags = computed(() => {
+    const span = this.selectedWfSpan();
+    if (!span?.attributes) return [];
+    return Object.entries(span.attributes).map(([k, v]) => ({ k, v }));
+  });
+
+  wfLeft(span: SpanDto): number {
+    const { minNs, totalNs } = this.wfRange();
+    return ((span.startTimeUnixNano - minNs) / totalNs) * 100;
+  }
+
+  wfWidth(span: SpanDto): number {
+    const { totalNs } = this.wfRange();
+    return Math.max(0.3, (span.durationNanos / totalNs) * 100);
+  }
+
+  wfDepth(span: SpanDto): number {
+    return this.wfDepthMap().get(span.spanId) ?? 0;
+  }
+
+  wfSvcColor(name: string): string {
+    const PALETTE = ['#38BDF8', '#F59E0B', '#22C55E', '#a78bfa', '#f97316', '#ec4899', '#06b6d4', '#84cc16'];
+    let h = 0;
+    for (const c of name) h = (h * 31 + c.charCodeAt(0)) & 0x7fff_ffff;
+    return PALETTE[h % PALETTE.length];
+  }
+
+  wfFmt(nanos: number): string { return wfFmtMs(nanos / 1_000_000); }
+
+  selectWfSpan(span: SpanDto): void {
+    this.selectedWfSpan.update(s => s?.spanId === span.spanId ? null : span);
+  }
 
   labelChips = computed(() => {
     const p = this.event().props ?? {};
@@ -365,42 +571,58 @@ export class EventRowComponent {
     this.expandRequested.emit(this.event().id);
     if (opening && this.hasException()) this.detailTab.set('exception');
     else if (opening)                   this.detailTab.set('overview');
+    if (opening) this.jsonSearch.set('');
   }
 
-  openPropMenu(e: MouseEvent, k: string, v: string, isGroup = false): void {
-    e.stopPropagation();
-    e.preventDefault();
-    this.selectedProp.set({ k, v, isGroup });
-    let x = e.clientX;
-    let y = e.clientY + 6;
-    if (x + 210 > window.innerWidth)  x = e.clientX - 210;
-    if (y + 180 > window.innerHeight) y = e.clientY - 180;
-    this.menuType.set('prop');
-    this.menuPos.set({ x, y });
+  // ── JSON-viewer context menu ──────────────────────────────────────────
+  /** `path = value` (leaf) — exact match. */
+  jvEqExpr = computed(() => {
+    const m = this.jvMenu();
+    return m ? `${m.path} = ${jvLiteral(m.rawValue)}` : '';
+  });
+
+  /** `path <> value` (leaf) — exclude. */
+  jvNeExpr = computed(() => {
+    const m = this.jvMenu();
+    return m ? `${m.path} <> ${jvLiteral(m.rawValue)}` : '';
+  });
+
+  /** `items[%].id = value` — match the leaf in any array element (null if no index). */
+  jvAnyExpr = computed(() => {
+    const m = this.jvMenu();
+    if (!m) return null;
+    const wild = jvWildcard(m.path);
+    return wild ? `${wild} = ${jvLiteral(m.rawValue)}` : null;
+  });
+
+  private emitFilter(expr: string): void {
+    this.filterSelected.emit(expr);
+    this.menuType.set(null);
   }
 
-  /** Opens the prop-viewer modal for a structured value (JSON object/array or XML string). */
-  openPropViewer(e: MouseEvent, key: string, value: unknown): void {
-    e.stopPropagation();
-    e.preventDefault();
-    this.viewerProp.set({ key, value });
+  jvFind(): void {
+    const m = this.jvMenu();
+    if (!m) return;
+    this.emitFilter(m.isContainer ? `has(${m.path})` : this.jvEqExpr());
   }
 
-  closePropViewer(): void {
-    this.viewerProp.set(null);
+  jvExclude(): void {
+    const m = this.jvMenu();
+    if (!m) return;
+    this.emitFilter(m.isContainer ? `not has(${m.path})` : this.jvNeExpr());
   }
 
-  /** True when a value should be rendered as a structured viewer button. */
-  isStructuredValue(v: unknown): boolean {
-    if (v !== null && typeof v === 'object') return true;
-    if (typeof v === 'string') {
-      const s = (v as string).trimStart();
-      if ((s.startsWith('{') || s.startsWith('[')) && s.length > 2) {
-        try { JSON.parse(s); return true; } catch { /* */ }
-      }
-      if (s.startsWith('<') && s.includes('>')) return true;
-    }
-    return false;
+  jvFindAny(): void {
+    const expr = this.jvAnyExpr();
+    if (expr) this.emitFilter(expr);
+  }
+
+  async jvCopy(): Promise<void> {
+    const m = this.jvMenu();
+    if (!m) return;
+    const text = m.isContainer ? m.path : jvLiteral(m.rawValue);
+    await navigator.clipboard.writeText(text);
+    this.menuType.set(null);
   }
 
   openMenu(e: MouseEvent, type: 'message' | 'level' | 'export'): void {
@@ -461,6 +683,22 @@ export class EventRowComponent {
     tmp.innerHTML = this.renderedHtml() as string;
     await navigator.clipboard.writeText(tmp.textContent ?? '');
     this.menuType.set(null);
+    this.flashCopied('message');
+  }
+
+  async copyText(text: string, key?: string): Promise<void> {
+    await navigator.clipboard.writeText(text);
+    this.flashCopied(key ?? text);
+  }
+
+  private flashCopied(key: string): void {
+    clearTimeout(this.copiedTimer);
+    this.copiedKey.set(key);
+    this.copiedTimer = setTimeout(() => this.copiedKey.set(null), 1800);
+  }
+
+  filterAttr(key: string, raw: unknown): void {
+    this.filterSelected.emit(`${key} = ${jvLiteral(raw)}`);
   }
 
   async copyRaw(): Promise<void> {
@@ -471,35 +709,6 @@ export class EventRowComponent {
   copyLink(): void {
     const url = `${window.location.origin}/events?id=${encodeURIComponent(this.event().id ?? '')}`;
     navigator.clipboard.writeText(url);
-    this.menuType.set(null);
-  }
-
-  propFind(): void {
-    const p = this.selectedProp();
-    if (!p) return;
-    if (p.isGroup) {
-      this.filterSelected.emit(`has(${p.k})`);
-    } else {
-      this.filterSelected.emit(`${p.k} = ${toFilterLiteral(p.v)}`);
-    }
-    this.menuType.set(null);
-  }
-
-  async propCopy(): Promise<void> {
-    const p = this.selectedProp();
-    if (!p) return;
-    await navigator.clipboard.writeText(p.isGroup ? p.k : p.v);
-    this.menuType.set(null);
-  }
-
-  propExclude(): void {
-    const p = this.selectedProp();
-    if (!p) return;
-    if (p.isGroup) {
-      this.filterSelected.emit(`not has(${p.k})`);
-    } else {
-      this.filterSelected.emit(`${p.k} <> ${toFilterLiteral(p.v)}`);
-    }
     this.menuType.set(null);
   }
 

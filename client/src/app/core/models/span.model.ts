@@ -4,6 +4,7 @@ export interface TraceRowDto {
   spanId:            string;
   name:              string;
   serviceName:       string;
+  services:          string[];
   status:            string;
   httpMethod:        string;
   httpPath:          string;
@@ -22,9 +23,17 @@ export interface SpanDto {
   serviceName:       string;
   kind:              string;
   status:            string;
+  httpStatusCode:    number | null;
   startTimeUnixNano: number;
   durationNanos:     number;
   attributes:        Record<string, string>;
+}
+
+export interface TraceQueryRequest {
+  query: string;
+  from?:  string;
+  to?:    string;
+  limit?: number;
 }
 
 /** Aggregate stats for the stats cards. */
@@ -52,4 +61,25 @@ export interface SpanQueryParams {
 
 export const SPAN_STATUSES = ['Unset', 'Ok', 'Error'] as const;
 export type  SpanStatus    = (typeof SPAN_STATUSES)[number];
+
+export interface LatencyBucketDto {
+  upperMs: number;
+  count:   number;
+}
+
+export interface LatencyServiceDto {
+  service:    string;
+  spanCount:  number;
+  errorCount: number;
+  p50Ms:      number;
+  p95Ms:      number;
+  p99Ms:      number;
+  p999Ms:     number;
+  buckets:    LatencyBucketDto[];
+}
+
+export interface CompareTracesDto {
+  traceA: SpanDto[];
+  traceB: SpanDto[];
+}
 

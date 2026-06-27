@@ -199,8 +199,10 @@ public sealed class QueryExecutor : IQueryExecutor
         CancellationToken          ct)
     {
         // GetTrigramHints() returns a pre-computed list — no .ToList() allocation needed.
-        var trigramHints = filter.GetTrigramHints();
-        bool hasIndexHint = !filter.IsMatchAll && filter.TryGetIndexHint(out _, out _);
+        var trigramHints   = filter.GetTrigramHints();
+        var invertedHints  = filter.GetInvertedHints();
+        bool hasIndexHint  = !filter.IsMatchAll && filter.TryGetIndexHint(out _, out _);
+        bool hasInvHints   = invertedHints.Count > 0;
 
         // Fast path: nothing to prefilter — pass every segment through.
         if (!hasIndexHint && trigramHints.Count == 0)
@@ -277,6 +279,33 @@ public sealed class QueryExecutor : IQueryExecutor
                                 if (acc.Count == 0) return ValueTask.CompletedTask;
                             }
                             candidates = acc?.ToArray();
+                        }
+
+                        // Inverted-index event-level narrowing: AND posting lists for all
+                        // equality predicates. This gives exact event offsets within the
+                        // segment — the reader will only deserialise those events.
+                        if (hasInvHints)
+                        {
+                            var invOffsets = idx.LookupIntersect(invertedHints);
+                            if (invOffsets is not null)
+                            {
+                                if (invOffsets.Length == 0)
+                                    return ValueTask.CompletedTask;
+
+                                if (candidates is null)
+                                {
+                                    candidates = invOffsets;
+                                }
+                                else
+                                {
+                                    var invSet = new HashSet<uint>(invOffsets);
+                                    var merged = new List<uint>(Math.Min(candidates.Length, invOffsets.Length));
+                                    foreach (var o in candidates)
+                                        if (invSet.Contains(o)) merged.Add(o);
+                                    if (merged.Count == 0) return ValueTask.CompletedTask;
+                                    candidates = [.. merged];
+                                }
+                            }
                         }
                     }
 

@@ -51,4 +51,8 @@ public sealed class SegmentIndexReader : ISegmentIndex
     /// <inheritdoc/>
     public uint[]? LookupTrigram(ReadOnlySpan<char> text) =>
         _trigram.Lookup(text);
+
+    /// <inheritdoc/>
+    public uint[]? LookupIntersect(IReadOnlyList<(string property, object? value)> predicates) =>
+        _inverted.LookupIntersect(predicates);
 }

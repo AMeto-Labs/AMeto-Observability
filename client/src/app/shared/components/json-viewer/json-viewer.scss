@@ -1,0 +1,120 @@
+:host {
+  display: inline;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.55;
+  vertical-align: top;
+}
+
+.jv-node {
+  display: inline;
+}
+
+/* Expanded containers lay their children out as an indented block. */
+.jv-node.jv-open {
+  display: inline-block;
+  vertical-align: top;
+}
+
+.jv-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  padding: 0;
+  margin-right: 2px;
+  vertical-align: middle;
+  background: none;
+  border: none;
+  color: var(--txt-muted, #6B7280);
+  cursor: pointer;
+  border-radius: 3px;
+
+  &:hover { color: var(--txt, #F9FAFB); background: var(--surface-up, #1F2937); }
+}
+
+/* Header line: toggle + (preview | opening bracket) + filter icon. */
+.jv-head { display: inline; }
+
+.jv-preview {
+  color: var(--txt-muted, #93A1B5);
+  cursor: pointer;
+  white-space: pre;
+
+  &:hover { color: var(--txt, #F9FAFB); }
+}
+
+/* The collapsed preview is injected via [innerHTML], so its token spans do not
+   carry this component's encapsulation attribute — reach them with ::ng-deep
+   (scoped under .jv-preview, so it stays local to the viewer). */
+.jv-preview ::ng-deep {
+  .jv-bracket { color: #E2E8F0; }
+  .jv-key     { color: #93C5FD; }
+  .jv-colon   { color: #64748B; }
+  .jv-str     { color: #86EFAC; }
+  .jv-num     { color: #FCD34D; }
+  .jv-bool    { color: #F9A8D4; }
+  .jv-null    { color: #94A3B8; }
+}
+
+.jv-leaf { display: inline; }
+
+/* Filter affordance — hidden until its row/header is hovered. */
+.jv-menu-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 14px;
+  padding: 0;
+  margin-left: 4px;
+  vertical-align: middle;
+  background: none;
+  border: none;
+  border-radius: 3px;
+  color: var(--txt-muted, #6B7280);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity .1s, color .1s, background .1s;
+
+  &:hover { color: var(--accent, #F59E0B); background: var(--surface-up, #1F2937); }
+}
+
+.jv-head:hover > .jv-menu-btn,
+.jv-row:hover > .jv-menu-btn,
+.jv-leaf:hover > .jv-menu-btn { opacity: 1; }
+
+.jv-children {
+  display: block;
+  padding-left: 14px;
+  border-left: 1px solid var(--border, #263244);
+  margin-left: 4px;
+}
+
+.jv-row {
+  display: block;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.jv-bracket { color: #E2E8F0; }
+.jv-key     { color: #93C5FD; }   /* blue   — key names */
+.jv-colon   { color: #64748B; }
+.jv-str     { color: #86EFAC; }   /* green  — strings */
+.jv-num     { color: #FCD34D; }   /* amber  — numbers */
+.jv-bool    { color: #F9A8D4; }   /* pink   — booleans */
+.jv-null    { color: #94A3B8; }   /* muted  — null */
+.jv-empty   { color: #94A3B8; }   /* muted  — empty {}/[]  */
+
+/* ── Search highlight ───────────────────────────────────────────── */
+mark.jv-hit {
+  background: rgba(245, 158, 11, .35);
+  color: inherit;
+  border-radius: 2px;
+  padding: 0 1px;
+  outline: 1px solid rgba(245, 158, 11, .55);
+}
+
+.jv-row--hit > .jv-key,
+.jv-row--hit > .jv-colon { opacity: 1; }

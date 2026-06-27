@@ -1,7 +1,10 @@
+export type MetricKind = 'Counter' | 'Gauge' | 'Histogram';
+
 export interface MetricPointDto {
   ts:    number;
   value: number;
-  count: number | null;
+  count: number;
+  sum:   number;
 }
 
 export interface MetricSeriesDto {
@@ -12,4 +15,40 @@ export interface MetricSeriesDto {
   points: MetricPointDto[];
 }
 
-export type MetricKind = 'Counter' | 'Gauge' | 'Histogram';
+/** Catalog entry — powers the Explore metric list. */
+export interface MetricCatalogDto {
+  name:        string;
+  type:        MetricKind | string;
+  unit:        string;
+  labelKeys:   string[];
+  cardinality: number;
+  lastSeenMs:  number;
+}
+
+export type MetricAggregation =
+  'none' | 'rate' | 'increase' | 'avg' | 'min' | 'max' | 'last' | 'sum' | 'quantile';
+
+/** Body for POST /api/metrics/query. */
+export interface MetricQueryRequest {
+  metric:       string;
+  from?:        string;
+  to?:          string;
+  step?:        string;          // "15s", "5m", "1h" or seconds
+  aggregation?: MetricAggregation;
+  quantile?:    number;          // 0..1 for aggregation = 'quantile'
+  groupBy?:     string[];
+  filters?:     Record<string, string>;
+  topk?:        number;
+}
+
+/** One time-step column of a histogram heatmap. */
+export interface HeatmapColumnDto {
+  ts:     number;
+  counts: number[];
+}
+
+export interface HeatmapDto {
+  bounds:  number[];           // bucket upper bounds
+  unit:    string;
+  columns: HeatmapColumnDto[];
+}

@@ -224,6 +224,91 @@ public static class EndpointMapper
                 }
             }
         }).RequireAuthorization();
+
+        // ── Span logs: GET /api/spans/{spanId}/logs ───────────────────────────
+        // Returns up to 500 log events that were emitted within the given span.
+        // spanId must be a 16-char lowercase hex string (W3C 64-bit span id).
+        app.MapGet("/api/spans/{spanId}/logs", async (
+            HttpContext    ctx,
+            IQueryExecutor executor,
+            string         spanId,
+            string?        from  = null,
+            string?        to    = null,
+            int            count = 500) =>
+        {
+            if (!Ameto.Core.TraceIdHelper.TryParseSpanId(spanId, out _))
+            {
+                ctx.Response.StatusCode = 400;
+                await ctx.Response.WriteAsync("spanId must be a 16-char hex string");
+                return;
+            }
+
+            // Build filter that hits the inverted index on @sp
+            string spanFilter = $"@sp = '{spanId}'";
+
+            var request = new QueryRequest
+            {
+                Filter    = spanFilter,
+                FromUtc   = from is null ? null
+                            : DateTimeOffset.Parse(from, null,
+                                System.Globalization.DateTimeStyles.RoundtripKind).ToUniversalTime(),
+                ToUtc     = to is null ? null
+                            : DateTimeOffset.Parse(to, null,
+                                System.Globalization.DateTimeStyles.RoundtripKind).ToUniversalTime(),
+                Count     = Math.Clamp(count, 1, 5_000),
+                Direction = QueryDirection.Forward,
+            };
+
+            var results = new List<LogEventDto>();
+            await foreach (var ev in executor.ExecuteAsync(request, ctx.RequestAborted))
+                results.Add(LogEventDto.From(ev));
+
+            await ctx.Response.WriteAsJsonAsync(results, _json, ctx.RequestAborted);
+        }).RequireAuthorization();
+
+        // ── Trace logs: GET /api/traces/{traceId}/logs ────────────────────────
+        // Returns every log event correlated to the trace (filtered on @tr). This is
+        // the primary trace↔logs correlation: logs are written under child spans, so
+        // a trace-wide query is what actually surfaces them. The client narrows to a
+        // single span by matching @sp on its side.
+        // traceId must be a 32-char lowercase hex string (W3C 128-bit trace id).
+        app.MapGet("/api/traces/{traceId}/logs", async (
+            HttpContext    ctx,
+            IQueryExecutor executor,
+            string         traceId,
+            string?        from  = null,
+            string?        to    = null,
+            int            count = 2000) =>
+        {
+            if (!Ameto.Core.TraceIdHelper.TryParseTraceId(traceId, out _, out _))
+            {
+                ctx.Response.StatusCode = 400;
+                await ctx.Response.WriteAsync("traceId must be a 32-char hex string");
+                return;
+            }
+
+            // Build filter that hits the inverted index on @tr
+            string traceFilter = $"@tr = '{traceId}'";
+
+            var request = new QueryRequest
+            {
+                Filter    = traceFilter,
+                FromUtc   = from is null ? null
+                            : DateTimeOffset.Parse(from, null,
+                                System.Globalization.DateTimeStyles.RoundtripKind).ToUniversalTime(),
+                ToUtc     = to is null ? null
+                            : DateTimeOffset.Parse(to, null,
+                                System.Globalization.DateTimeStyles.RoundtripKind).ToUniversalTime(),
+                Count     = Math.Clamp(count, 1, 5_000),
+                Direction = QueryDirection.Forward,
+            };
+
+            var results = new List<LogEventDto>();
+            await foreach (var ev in executor.ExecuteAsync(request, ctx.RequestAborted))
+                results.Add(LogEventDto.From(ev));
+
+            await ctx.Response.WriteAsJsonAsync(results, _json, ctx.RequestAborted);
+        }).RequireAuthorization();
     }
 
     // ── API-key extraction (ingest path only) ─────────────────────────────────

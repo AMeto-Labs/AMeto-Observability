@@ -14,12 +14,14 @@ public sealed class CompiledFilter
     private readonly FilterNode _root;
 
     // Pre-computed at compile time so QueryExecutor pays zero allocation per query.
-    private readonly IReadOnlyList<(string property, string text)> _trigramHints;
+    private readonly IReadOnlyList<(string property, string text)>    _trigramHints;
+    private readonly IReadOnlyList<(string property, object? value)>  _invertedHints;
 
     private CompiledFilter(FilterNode root)
     {
-        _root = root;
-        _trigramHints = BuildTrigramHints(root);
+        _root          = root;
+        _trigramHints  = BuildTrigramHints(root);
+        _invertedHints = BuildInvertedHints(root);
     }
 
     public static CompiledFilter Compile(string? expression) =>
@@ -80,6 +82,41 @@ public sealed class CompiledFilter
     /// Pre-computed once at <see cref="Compile"/> time — zero allocation per query.
     /// </summary>
     public IReadOnlyList<(string property, string text)> GetTrigramHints() => _trigramHints;
+
+    /// <summary>
+    /// Returns all equality predicates from the AND-chain of the filter.
+    /// Used by QueryExecutor to call <see cref="ISegmentIndex.LookupIntersect"/> for
+    /// event-level offset narrowing inside a segment (not just segment-level skip).
+    /// </summary>
+    public IReadOnlyList<(string property, object? value)> GetInvertedHints() => _invertedHints;
+
+    private static IReadOnlyList<(string, object?)> BuildInvertedHints(FilterNode root)
+    {
+        var list = new List<(string, object?)>(4);
+        CollectInvertedHints(root, list);
+        return list.Count == 0 ? Array.Empty<(string, object?)>() : list;
+    }
+
+    private static void CollectInvertedHints(FilterNode node, List<(string, object?)> out_)
+    {
+        switch (node)
+        {
+            case CompareNode { Op: CompareOp.Eq } cmp:
+                out_.Add((cmp.Property, cmp.Value));
+                break;
+            case LevelNode lvl:
+                out_.Add(("@l", lvl.Level.ToSeqString()));
+                break;
+            case InNode inNode when inNode.Values.Length == 1:
+                out_.Add((inNode.Property, inNode.Values[0]));
+                break;
+            case AndNode and:
+                CollectInvertedHints(and.Left,  out_);
+                CollectInvertedHints(and.Right, out_);
+                break;
+            // Deliberately skip OrNode — OR is too broad for intersection
+        }
+    }
 
     private static IReadOnlyList<(string, string)> BuildTrigramHints(FilterNode root)
     {

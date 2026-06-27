@@ -30,6 +30,59 @@ public sealed class SpanIngestItem
 
     /// <summary>Pre-serialised msgpack attributes blob. May be empty.</summary>
     public byte[]         AttributesBytes     { get; init; } = [];
+
+    /// <summary>Promoted HTTP response status code (0 = absent). Extracted before msgpack serialisation.</summary>
+    public short          HttpStatusCode      { get; init; }
+}
+
+/// <summary>
+/// Returns a service dependency graph for a time window.
+/// Built from .svcgraph sidecar files — no span deserialisation.
+/// </summary>
+public interface IServiceGraphProvider
+{
+    Task<ServiceGraphDto> GetServiceGraphAsync(
+        DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default);
+}
+
+/// <summary>Service-level aggregate for one node in the graph.</summary>
+public sealed class ServiceNodeDto
+{
+    public string ServiceName { get; init; } = string.Empty;
+    public uint   SpanCount   { get; init; }
+    public double ErrorRate   { get; init; }  // 0–1
+    public double P95Ms       { get; init; }
+}
+
+/// <summary>Directed call edge between two services.</summary>
+public sealed class ServiceEdgeDto
+{
+    public string From       { get; init; } = string.Empty;
+    public string To         { get; init; } = string.Empty;
+    public uint   CallCount  { get; init; }
+    public uint   ErrorCount { get; init; }
+    public double ErrorRate  { get; init; }  // 0–1
+    public double P95Ms      { get; init; }
+}
+
+/// <summary>Full service dependency graph response.</summary>
+public sealed class ServiceGraphDto
+{
+    public ServiceNodeDto[] Nodes { get; init; } = [];
+    public ServiceEdgeDto[] Edges { get; init; } = [];
+}
+
+/// <summary>
+/// Returns pre-aggregated per-service stats (from .stats sidecar files — no span scan).
+/// </summary>
+public interface ITraceStatsProvider
+{
+    /// <summary>
+    /// Merges per-service histograms for all segments in [from, to].
+    /// Returns one entry per service name across all matching segments + hot tier.
+    /// </summary>
+    Task<IReadOnlyList<Ameto.Tracing.Storage.ServiceSegmentStats>> GetAggregateStatsAsync(
+        DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default);
 }
 
 /// <summary>
@@ -55,6 +108,7 @@ public interface ITraceProvider
         SpanStatusCode?  status           = null,
         long?            minDurationNanos = null,
         long?            maxDurationNanos = null,
+        short?           httpStatusCode   = null,
         int              limit            = 200,
         CancellationToken ct              = default);
 }

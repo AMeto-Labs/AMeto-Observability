@@ -16,10 +16,11 @@ import { EventRowComponent } from './event-row/event-row';
 import { SignalsPanelComponent } from './signals-panel/signals-panel';
 import { DateMaskDirective } from '../../shared/directives/date-mask.directive';
 import { highlightFilterExpression } from '../../shared/utils/filter-highlight';
-import { ScrollingModule, CdkVirtualScrollViewport } from '@angular/cdk/scrolling';
+import { injectVirtualizer } from '@tanstack/angular-virtual';
+import { VmeasureDirective } from '../../shared/directives/virtual-measure.directive';
 import { EmptyStateComponent } from '../../shared/components/ui';
 
-type TimePreset = '5m' | '15m' | '30m' | '1h' | '3h' | '6h' | '12h' | '24h' | '7d' | '14d' | '30d' | 'custom' | '1d' | '3d';
+type TimePreset = '5m' | '15m' | '30m' | '1d' | '7d' | '2w' | '1mo' | 'custom';
 
 /** Built-in tokens always offered by the filter autocomplete popup. */
 const BUILTIN_SUGGESTIONS = [
@@ -136,7 +137,7 @@ function msToDotNetUtcTicks(ms: number): number {
 
 @Component({
   selector: 'app-events',
-  imports: [FormsModule, LucideAngularModule, EventRowComponent, SignalsPanelComponent, ScrollingModule, EmptyStateComponent, DateMaskDirective],
+  imports: [FormsModule, LucideAngularModule, EventRowComponent, SignalsPanelComponent, EmptyStateComponent, DateMaskDirective, VmeasureDirective],
   templateUrl: './events.html',
   styleUrl: './events.scss',
   changeDetection: ChangeDetectionStrategy.OnPush,
@@ -222,12 +223,14 @@ export class EventsComponent implements OnInit, OnDestroy {
     { key: 'Fatal',       short: 'FTL' },
   ];
 
-  readonly presets: TimePreset[] = ['1d', '3d', '7d'];
-
   readonly datePresets: { label: string; value: TimePreset }[] = [
-    { label: 'Last 1 day',    value: '1d'     },
-    { label: 'Last 3 days',  value: '3d'     },
+    { label: 'Last 5 min',   value: '5m'     },
+    { label: 'Last 15 min',  value: '15m'    },
+    { label: 'Last 30 min',  value: '30m'    },
+    { label: 'Last 1 day',   value: '1d'     },
     { label: 'Last 7 days',  value: '7d'     },
+    { label: 'Last 2 weeks', value: '2w'     },
+    { label: 'Last 1 month', value: '1mo'    },
     { label: 'Custom range', value: 'custom' },
   ];
 
@@ -244,31 +247,13 @@ export class EventsComponent implements OnInit, OnDestroy {
   }
 
   onExpandRequested(eventId: string): void {
-    if (!eventId) return; // guard: ignore events without id
-    const wasFirstExpand = this.expandedEventIds().size === 0;
-    const isOpening = !this.expandedEventIds().has(eventId);
+    if (!eventId) return;
     this.expandedEventIds.update(prev => {
       const next = new Set(prev);
       if (next.has(eventId)) next.delete(eventId);
       else next.add(eventId);
       return next;
     });
-
-    // Only scroll on the very first expand (virtual→plain mode switch).
-    // For all subsequent expands the user is already in plain list mode and
-    // has manually scrolled to the row they want — don't fight their scroll.
-    if (isOpening && wasFirstExpand) {
-      const index = this.displayedEvents().findIndex(e => e.id === eventId);
-      if (index >= 0) {
-        setTimeout(() => {
-          const plain = this.plainList()?.nativeElement;
-          if (plain && plain.scrollHeight > 0) {
-            const approxOffset = Math.max(0, index * 29 - 120);
-            plain.scrollTo({ top: approxOffset });
-          }
-        }, 50); // wait for Angular to finish rendering plain list
-      }
-    }
   }
 
   hasExpandedRows = computed(() => this.expandedEventIds().size > 0);
@@ -380,14 +365,25 @@ export class EventsComponent implements OnInit, OnDestroy {
 
   // ── View refs / sync ──────────────────────────────────────────────────
   private filterRef    = viewChild<ElementRef<HTMLTextAreaElement>>('filterEl');
-  private viewport      = viewChild<CdkVirtualScrollViewport>('viewport');
-  private plainList     = viewChild<ElementRef<HTMLElement>>('plainList');
-  private dateFbGroup   = viewChild<ElementRef<HTMLElement>>('dateFbGroup');
+  private eventsScroll = viewChild<ElementRef<HTMLElement>>('eventsScroll');
+  private dateFbGroup  = viewChild<ElementRef<HTMLElement>>('dateFbGroup');
   private levelsFbGroup = viewChild<ElementRef<HTMLElement>>('levelsFbGroup');
   private svcFbGroup    = viewChild<ElementRef<HTMLElement>>('svcFbGroup');
 
   /** Position (fixed) for the currently-open dropdown. */
   ddPos = signal<{ top: number; left: number }>({ top: 0, left: 0 });
+
+  // ── TanStack Virtual ──────────────────────────────────────────────────
+  readonly virtualizer = injectVirtualizer(() => ({
+    count: this.displayedEvents().length,
+    scrollElement: this.eventsScroll(),
+    estimateSize: () => 29,
+    overscan: 20,
+    getItemKey: (i: number) => this.displayedEvents()[i]?.id ?? i,
+  }));
+
+  /** Stable ref to measureElement — avoids creating a new closure every CD cycle. */
+  readonly measureRow = (el: Element) => this.virtualizer.measureElement(el);
 
   private computeDdPos(el: HTMLElement | undefined): void {
     if (!el) return;
@@ -488,10 +484,8 @@ export class EventsComponent implements OnInit, OnDestroy {
     const now = new Date();
     const msMap: Partial<Record<TimePreset, number>> = {
       '5m': 5 * 60_000, '15m': 15 * 60_000, '30m': 30 * 60_000,
-      '1h': 3_600_000,  '3h': 10_800_000,    '6h': 21_600_000, '12h': 43_200_000,
-      '24h': 86_400_000,
     };
-    const daysMap: Partial<Record<TimePreset, number>> = { '1d': 1, '3d': 3, '7d': 7, '14d': 14, '30d': 30 };
+    const daysMap: Partial<Record<TimePreset, number>> = { '1d': 1, '7d': 7, '2w': 14, '1mo': 30 };
     if (msMap[preset] !== undefined) {
       this.customFrom.set(this.fmtDateInput(new Date(now.getTime() - msMap[preset]!)));
     } else if (daysMap[preset] !== undefined) {
@@ -530,48 +524,39 @@ export class EventsComponent implements OnInit, OnDestroy {
   });
   readonly canSearch       = computed(() => this.customFromValid() && this.customToValid());
 
-  // ── Split date / time parts for the 4-field date picker UI ───────────
-  readonly fromDatePart = computed(() => this.customFrom().split(' ')[0] ?? '');
-  readonly fromTimePart = computed(() => this.customFrom().split(' ')[1] ?? '');
-  readonly toDatePart   = computed(() => this.customTo().split(' ')[0] ?? '');
-  readonly toTimePart   = computed(() => this.customTo().split(' ')[1] ?? '');
-
-  setFromDatePart(d: string): void {
-    const time = this.fromTimePart() || '00:00';
-    this.customFrom.set(d ? `${d} ${time}` : '');
-    this.customFromSuggestion.set('');
+  setFrom(v: string): void {
+    this.customFrom.set(v);
     this.timePreset.set('custom');
+    // suggestion is managed by (suggestionChange) binding — don't clear it here
   }
 
-  setFromTimePart(t: string): void {
-    const date = this.fromDatePart();
-    if (date) this.customFrom.set(t ? `${date} ${t}` : date);
-    this.customFromSuggestion.set('');
+  setTo(v: string): void {
+    this.customTo.set(v);
     this.timePreset.set('custom');
+    // suggestion is managed by (suggestionChange) binding — don't clear it here
   }
 
-  setFromTimePartOnBlur(t: string): void {
-    const date = this.fromDatePart();
-    if (date && !t) this.customFrom.set(`${date} 00:00`);
+  acceptFromSuggestion(): void {
+    const s = this.customFromSuggestion();
+    if (s) {
+      this.customFrom.update(v => v + s);
+      this.customFromSuggestion.set('');
+      this.timePreset.set('custom');
+    }
   }
 
-  setToDatePart(d: string): void {
-    const time = this.toTimePart() || '23:59';
-    this.customTo.set(d ? `${d} ${time}` : '');
-    this.customToSuggestion.set('');
-    this.timePreset.set('custom');
+  acceptToSuggestion(): void {
+    const s = this.customToSuggestion();
+    if (s) {
+      this.customTo.update(v => v + s);
+      this.customToSuggestion.set('');
+      this.timePreset.set('custom');
+    }
   }
 
-  setToTimePart(t: string): void {
-    const date = this.toDatePart();
-    this.customTo.set(date ? (t ? `${date} ${t}` : date) : '');
-    this.customToSuggestion.set('');
-    this.timePreset.set('custom');
-  }
-
-  setToTimePartOnBlur(t: string): void {
-    const date = this.toDatePart();
-    if (date && !t) this.customTo.set(`${date} 23:59`);
+  /** Strips leading `-` or space from suggestion for display (e.g. `-26` → `26`, ` 00:00` → `00:00`). */
+  suggestionLabel(s: string): string {
+    return s.replace(/^[-\s]+/, '');
   }
 
   private getFromDate(): Date {
@@ -592,8 +577,6 @@ export class EventsComponent implements OnInit, OnDestroy {
     this.error.set(null);
     this.events.set([]);
     this.hasMore.set(true);
-    // Reset expanded state: stale IDs from a previous result set must not
-    // persist, otherwise unrelated events with the same ID would appear expanded.
     this.expandedEventIds.set(new Set());
 
     const acc: EventDto[] = [];
@@ -682,47 +665,18 @@ export class EventsComponent implements OnInit, OnDestroy {
     });
   }
 
-  /**
-   * Infinite-scroll trigger for the cdk-virtual-scroll-viewport.
-   * Called whenever the first visible item index changes \u2014 we use that
-   * to detect when the user is approaching the bottom of the rendered list.
-   */
-  onVirtualScroll(_firstVisibleIndex: number): void {
-    const vp = this.viewport();
-    if (!vp) return;
-    // measureScrollOffset('bottom') returns pixels from the bottom edge.
-    const remaining = vp.measureScrollOffset('bottom');
-    if (remaining < 400) this.loadMore();
-  }
-
-  /** Infinite-scroll trigger for plain list mode (used when rows are expanded). */
-  onPlainScroll(event: Event): void {
-    const el = event.target as HTMLElement | null;
-    if (!el) return;
-    const remaining = el.scrollHeight - el.scrollTop - el.clientHeight;
-    if (remaining < 400) this.loadMore();
+  onEventsScroll(e: Event): void {
+    const el = e.target as HTMLElement;
+    if (el.scrollHeight - el.scrollTop - el.clientHeight < 400) this.loadMore();
   }
 
   scrollToOlderLogs(): void {
-    const vp = this.viewport();
-    if (vp) {
-      vp.scrollToIndex(0, 'smooth');
-      return;
-    }
-    const plain = this.plainList()?.nativeElement;
-    plain?.scrollTo({ top: 0, behavior: 'smooth' });
+    this.virtualizer.scrollToOffset(0, { behavior: 'smooth' });
   }
 
   scrollToNewerLogs(): void {
-    const vp = this.viewport();
-    if (vp) {
-      const last = this.displayedEvents().length - 1;
-      if (last >= 0) vp.scrollToIndex(last, 'smooth');
-      return;
-    }
-    const plain = this.plainList()?.nativeElement;
-    if (!plain) return;
-    plain.scrollTo({ top: plain.scrollHeight, behavior: 'smooth' });
+    const last = this.displayedEvents().length - 1;
+    if (last >= 0) this.virtualizer.scrollToIndex(last, { behavior: 'smooth' });
   }
 
   /** TrackBy for *cdkVirtualFor over event rows. */
@@ -987,6 +941,8 @@ export class EventsComponent implements OnInit, OnDestroy {
 
   // ── Date dropdown ─────────────────────────────────────────────────────
   openDateDropdown(): void {
+    this.levelsDropdownOpen.set(false);
+    this.serviceDropdownOpen.set(false);
     this.computeDdPos(this.dateFbGroup()?.nativeElement);
     this.calPickingEnd.set(false);
     const d = this.parseCustomDate(this.customFrom()) ?? new Date();
@@ -1010,8 +966,7 @@ export class EventsComponent implements OnInit, OnDestroy {
     const date    = new Date(d.year, d.month, d.day);
     const dateStr = format(date, 'yyyy-MM-dd');
     if (!this.calPickingEnd()) {
-      // First click — set start date, clear end date
-      const time = this.fromTimePart() || '00:00';
+      const time = this.customFrom().split(' ')[1] || '00:00';
       this.customFrom.set(`${dateStr} ${time}`);
       this.customTo.set('');
       this.customFromSuggestion.set('');
@@ -1019,20 +974,16 @@ export class EventsComponent implements OnInit, OnDestroy {
       this.timePreset.set('custom');
       this.calPickingEnd.set(true);
     } else {
-      // Second click — set end date (or restart if before start)
       const fromDate = this.parseCustomDate(this.customFrom());
       if (fromDate && date < fromDate) {
-        // Clicked before start → restart: set as new start
-        const time = this.fromTimePart() || '00:00';
+        const time = this.customFrom().split(' ')[1] || '00:00';
         this.customFrom.set(`${dateStr} ${time}`);
         this.customTo.set('');
         this.customFromSuggestion.set('');
         this.customToSuggestion.set('');
         this.timePreset.set('custom');
-        // stay in picking-end stage
       } else {
-        // Valid end date
-        const time = this.toTimePart() || '23:59';
+        const time = this.customTo().split(' ')[1] || '23:59';
         this.customTo.set(`${dateStr} ${time}`);
         this.customToSuggestion.set('');
         this.timePreset.set('custom');

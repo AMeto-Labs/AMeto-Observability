@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using System.Buffers;
 using System.Text.Json;
 using Ameto.Ingestion;
@@ -37,9 +38,9 @@ public static class OtlpEndpointMapper
     public static void MapOtlpEndpoints(this WebApplication app)
     {
         // ── Traces ────────────────────────────────────────────────────────────
-        app.MapPost("/otlp/v1/traces", async (HttpContext ctx) =>
+        app.MapPost("/otlp/v1/traces", async (HttpContext ctx, ISpanIngester ingester, ILoggerFactory logFactory) =>
         {
-            var ingester = ctx.RequestServices.GetRequiredService<ISpanIngester>();
+            var logger = logFactory.CreateLogger("Ameto.Otel.Traces");
 
             var (body, bodyLen) = await ReadBodyAsync(ctx);
             if (body is null) return;
@@ -52,12 +53,21 @@ public static class OtlpEndpointMapper
                     ? OtlpProtoDecoder.DecodeTraces(body, bodyLen)
                     : JsonSerializer.Deserialize<ExportTraceServiceRequest>(body.AsSpan(0, bodyLen), _jsonOptions);
             }
-            catch { ctx.Response.StatusCode = 400; return; }
+            catch (Exception ex)
+            {
+                logger.LogWarning(ex, "OTLP /v1/traces: failed to decode body ({Bytes} bytes, Content-Type: {Ct})",
+                    bodyLen, ctx.Request.ContentType);
+                ctx.Response.StatusCode = 400;
+                return;
+            }
             finally { ArrayPool<byte>.Shared.Return(body); }
 
             if (request is null) { ctx.Response.StatusCode = 400; return; }
 
             var spans = OtlpTraceMapper.Map(request);
+            logger.LogDebug("OTLP /v1/traces: decoded {SpanCount} spans from {ResourceSpanCount} resource spans",
+                spans.Count, request.ResourceSpans?.Count ?? 0);
+
             if (spans.Count > 0)
             {
                 ingester.TryIngest(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(spans), out int accepted);
@@ -122,40 +132,8 @@ public static class OtlpEndpointMapper
             await WriteJsonOk(ctx, ingested, dropped);
         });
 
-        // ── Query: metrics ────────────────────────────────────────────────────
-        app.MapGet("/api/metrics/names", (IMetricQuery query, string? prefix) =>
-            Results.Ok(query.GetMetricNames(prefix))
-        ).RequireAuthorization();
-
-        app.MapGet("/api/metrics", async (
-            HttpContext   ctx,
-            IMetricQuery  query,
-            string        metric,
-            string?       from   = null,
-            string?       to     = null,
-            int?          step   = null,
-            string?       labels = null) =>
-        {
-            DateTimeOffset? fromDt = from is not null ? DateTimeOffset.Parse(from) : null;
-            DateTimeOffset? toDt   = to   is not null ? DateTimeOffset.Parse(to)   : null;
-            TimeSpan? stepTs       = step.HasValue ? TimeSpan.FromSeconds(step.Value) : null;
-
-            // Parse label matchers: "key=value,key2=value2"
-            Dictionary<string, string>? labelMatchers = null;
-            if (!string.IsNullOrEmpty(labels))
-            {
-                labelMatchers = labels.Split(',')
-                    .Select(s => s.Split('=', 2))
-                    .Where(p => p.Length == 2)
-                    .ToDictionary(p => p[0], p => p[1]);
-            }
-
-            var series = new List<object>();
-            await foreach (var s in query.QueryAsync(metric, fromDt, toDt, stepTs, labelMatchers))
-                series.Add(MapSeriesToDto(s));
-
-            return Results.Ok(series);
-        }).RequireAuthorization();
+        // Metric query endpoints live in Ameto.Metrics.MetricQueryEndpointMapper
+        // (mapped via app.MapMetricEndpoints()).
     }
 
     // ── DTO mappers ───────────────────────────────────────────────────────────
@@ -171,20 +149,6 @@ public static class OtlpEndpointMapper
         status       = s.Status.ToString(),
         startTime    = s.StartTime,
         durationMs   = s.Duration.TotalMilliseconds,
-    };
-
-    private static object MapSeriesToDto(MetricSeries s) => new
-    {
-        name   = s.Name,
-        kind   = s.Kind.ToString(),
-        unit   = s.Unit,
-        labels = s.Labels.Pairs.ToDictionary(t => t.Key, t => t.Value),
-        points = s.Points.Select(p => new
-        {
-            ts    = p.TimestampUnixNano,
-            value = p.Value,
-            count = p.Count > 0 ? p.Count : (long?)null,
-        }),
     };
 
     // ── Body reading ──────────────────────────────────────────────────────────

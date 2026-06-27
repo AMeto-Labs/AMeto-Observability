@@ -51,4 +51,14 @@
     <IsTransformWebConfigDisabled>true</IsTransformWebConfigDisabled>
   </PropertyGroup>
 
+  <PropertyGroup>
+    <!-- Workstation GC: a single heap instead of one-per-core. The Web SDK
+         defaults to Server GC, which keeps per-CPU heaps and is reluctant to
+         return memory to the OS — wasteful for a log server on a small host.
+         Concurrent + non-retained VM keeps the resident set close to live data. -->
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
+    <RetainVMGarbageCollection>false</RetainVMGarbageCollection>
+  </PropertyGroup>
+
 </Project>

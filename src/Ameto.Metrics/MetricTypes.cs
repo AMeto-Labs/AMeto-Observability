@@ -1,4 +1,3 @@
-using System.Runtime.InteropServices;
 using System.Text;
 
 namespace Ameto.Metrics;
@@ -104,7 +103,6 @@ public sealed class MetricIngestItem
 /// <summary>
 /// A stored data point in a time series.
 /// </summary>
-[StructLayout(LayoutKind.Sequential)]
 public struct MetricDataPoint
 {
     /// <summary>Unix nanoseconds.</summary>
@@ -115,6 +113,12 @@ public struct MetricDataPoint
     public long   Count;
     /// <summary>Histogram sum; 0 for scalar metrics.</summary>
     public double Sum;
+    /// <summary>
+    /// Per-bucket counts for Histogram points (length == series BucketBounds.Length + 1,
+    /// last entry is the +Inf overflow bucket). Null for scalar metrics. The bucket
+    /// upper bounds themselves are stored once per series on <see cref="MetricSeries.BucketBounds"/>.
+    /// </summary>
+    public long[]? BucketCounts;
 }
 
 /// <summary>
@@ -127,6 +131,82 @@ public sealed class MetricSeries
     public string       Unit   { get; init; } = string.Empty;
     public LabelSet     Labels { get; init; } = LabelSet.Empty;
 
+    /// <summary>
+    /// Histogram bucket upper bounds (explicit-bucket boundaries), shared by every
+    /// point in the series. Null/empty for scalar metrics. A point's
+    /// <see cref="MetricDataPoint.BucketCounts"/> has length <c>BucketBounds.Length + 1</c>.
+    /// </summary>
+    public double[]?    BucketBounds { get; init; }
+
     /// <summary>Data points ordered by timestamp ascending.</summary>
     public IReadOnlyList<MetricDataPoint> Points { get; init; } = [];
+}
+
+/// <summary>
+/// Catalog entry describing one metric stream (name) — fed to the Explore UI.
+/// </summary>
+public sealed class MetricCatalogEntry
+{
+    public string     Name        { get; init; } = string.Empty;
+    public MetricKind Kind        { get; init; }
+    public string     Unit        { get; init; } = string.Empty;
+    /// <summary>Distinct label keys observed across the metric's series.</summary>
+    public string[]   LabelKeys   { get; init; } = [];
+    /// <summary>Approximate number of distinct time series (label-set cardinality).</summary>
+    public int        Cardinality { get; init; }
+    /// <summary>Most recent data-point timestamp (Unix ms), 0 if unknown.</summary>
+    public long       LastSeenMs  { get; init; }
+}
+
+/// <summary>Server-side aggregation operator applied to a metric query.</summary>
+public enum MetricAggregation : byte
+{
+    /// <summary>Raw values, no aggregation across time (downsample only).</summary>
+    None     = 0,
+    /// <summary>Per-second rate of a cumulative counter (reset-aware).</summary>
+    Rate     = 1,
+    /// <summary>Total increase of a cumulative counter over each step (reset-aware).</summary>
+    Increase = 2,
+    Avg      = 3,
+    Min      = 4,
+    Max      = 5,
+    Last     = 6,
+    Sum      = 7,
+    /// <summary>Histogram percentile via histogram_quantile over bucket deltas.</summary>
+    Quantile = 8,
+}
+
+/// <summary>A server-side aggregated metric query.</summary>
+public sealed class MetricQueryRequest
+{
+    public string             Metric      { get; init; } = string.Empty;
+    public DateTimeOffset?    From        { get; init; }
+    public DateTimeOffset?    To          { get; init; }
+    public TimeSpan?          Step        { get; init; }
+    public MetricAggregation  Aggregation { get; init; } = MetricAggregation.None;
+    /// <summary>Quantile in [0,1] when <see cref="Aggregation"/> is Quantile (e.g. 0.95).</summary>
+    public double?            Quantile    { get; init; }
+    /// <summary>Label keys to group by; series sharing these labels are combined.</summary>
+    public string[]?          GroupBy     { get; init; }
+    /// <summary>Exact label matchers (key → value) applied before aggregation.</summary>
+    public IReadOnlyDictionary<string, string>? Filters { get; init; }
+    /// <summary>Keep only the top-K resulting series by their latest value.</summary>
+    public int?               TopK        { get; init; }
+}
+
+/// <summary>One column of a latency/distribution heatmap (one time step).</summary>
+public sealed class HeatmapColumn
+{
+    /// <summary>Bucket start timestamp, Unix ms.</summary>
+    public long   Ts     { get; init; }
+    /// <summary>Per-bucket counts within this time step (reset-aware delta).</summary>
+    public double[] Counts { get; init; } = [];
+}
+
+/// <summary>Histogram heatmap result: shared bucket bounds + per-step columns.</summary>
+public sealed class HeatmapResult
+{
+    public double[]        Bounds  { get; init; } = [];
+    public HeatmapColumn[] Columns { get; init; } = [];
+    public string          Unit    { get; init; } = string.Empty;
 }

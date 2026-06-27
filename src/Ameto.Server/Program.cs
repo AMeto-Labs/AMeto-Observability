@@ -121,6 +121,7 @@ app.MapRetentionEndpoints();
 app.MapDiagnosticsEndpoints();
 app.MapReplicationEndpoints();
 app.MapOtlpEndpoints();
+app.MapMetricEndpoints();
 app.MapTraceEndpoints();
 
 // SPA fallback — Angular handles client-side routing

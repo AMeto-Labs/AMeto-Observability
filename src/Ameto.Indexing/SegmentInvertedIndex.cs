@@ -15,10 +15,14 @@ namespace Ameto.Indexing;
 /// </summary>
 public sealed class SegmentInvertedIndex : ISegmentIndex
 {
-    // propertyName → (serialisedValue → sorted offsets)
+    // Build-phase: propertyName → (serialisedValue → sorted offsets)
     private readonly Dictionary<string, Dictionary<string, List<int>>> _index
         = new(StringComparer.Ordinal);
     private readonly object _writeLock = new();
+
+    // Query-phase (populated after Deserialise): keeps RoaringBitmaps in memory
+    // instead of converting to List<int>, so AND-intersection is O(bitmap) not O(n×m).
+    private Dictionary<string, Dictionary<string, RoaringBitmap>>? _bitmaps;
 
     // ── Build (hot path) ──────────────────────────────────────────────────────
 
@@ -61,23 +65,74 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
     public uint[]? Lookup(string propertyName, object? value)
     {
         string serialised = SerialiseValue(value);
+
+        // Query mode: enumerate from bitmap (no List<int> kept after deserialization)
+        if (_bitmaps is not null)
+        {
+            if (_bitmaps.TryGetValue(propertyName, out var bmValues) &&
+                bmValues.TryGetValue(serialised, out var bm))
+                return EnumerateBitmap(bm);
+            return null;
+        }
+
+        // Build mode: enumerate from List<int>
         if (_index.TryGetValue(propertyName, out var values) &&
             values.TryGetValue(serialised, out var list))
-        {
             return list.Select(x => (uint)x).ToArray();
-        }
+
         return null;
+    }
+
+    public uint[]? LookupIntersect(IReadOnlyList<(string property, object? value)> predicates)
+    {
+        if (_bitmaps is null || predicates.Count == 0) return null;
+
+        HashSet<uint>? result = null;
+        foreach (var (prop, val) in predicates)
+        {
+            string serialised = SerialiseValue(val);
+            if (!_bitmaps.TryGetValue(prop, out var bmValues) ||
+                !bmValues.TryGetValue(serialised, out var bm))
+                return Array.Empty<uint>(); // this predicate has zero matches → AND = empty
+
+            if (result is null)
+            {
+                result = new HashSet<uint>();
+                foreach (int x in bm) result.Add((uint)x);
+            }
+            else
+            {
+                // Intersect: keep only offsets present in both sets
+                var keep = new HashSet<uint>(capacity: result.Count);
+                foreach (int x in bm)
+                {
+                    uint u = (uint)x;
+                    if (result.Contains(u)) keep.Add(u);
+                }
+                result = keep;
+                if (result.Count == 0) return Array.Empty<uint>();
+            }
+        }
+
+        if (result is null) return null;
+        var arr = new uint[result.Count];
+        result.CopyTo(arr);
+        Array.Sort(arr); // offsets must be ascending for ScanSegmentAsync
+        return arr;
     }
 
     public bool MightContain(string propertyName, object? value)
     {
-        // If the property was never added to this inverted index (e.g. @mt, which is
-        // indexed only in the trigram/bloom structures), we cannot conclude absence —
-        // return true so the segment is not falsely eliminated.
+        string serialised = SerialiseValue(value);
+
+        if (_bitmaps is not null)
+        {
+            if (!_bitmaps.ContainsKey(propertyName)) return true; // property not indexed → can't conclude absence
+            return _bitmaps[propertyName].ContainsKey(serialised);
+        }
+
         if (!_index.TryGetValue(propertyName, out var values))
             return true;
-
-        string serialised = SerialiseValue(value);
         return values.ContainsKey(serialised);
     }
 
@@ -136,6 +191,8 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
         var idx = new SegmentInvertedIndex();
         if (data.IsEmpty) return idx;
 
+        idx._bitmaps = new Dictionary<string, Dictionary<string, RoaringBitmap>>(StringComparer.Ordinal);
+
         int pos        = 0;
         uint propCount = BinaryPrimitives.ReadUInt32LittleEndian(data[pos..]); pos += 4;
 
@@ -145,31 +202,36 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
             string propName = System.Text.Encoding.UTF8.GetString(data.Slice(pos, nameLen)); pos += nameLen;
 
             uint valCount   = BinaryPrimitives.ReadUInt32LittleEndian(data[pos..]); pos += 4;
-            var values      = new Dictionary<string, List<int>>(StringComparer.Ordinal);
+            var bmValues    = new Dictionary<string, RoaringBitmap>(StringComparer.Ordinal);
 
             for (uint v = 0; v < valCount; v++)
             {
                 ushort valLen  = BinaryPrimitives.ReadUInt16LittleEndian(data[pos..]); pos += 2;
                 string valStr  = System.Text.Encoding.UTF8.GetString(data.Slice(pos, valLen)); pos += valLen;
 
-                uint bitmapLen    = BinaryPrimitives.ReadUInt32LittleEndian(data[pos..]); pos += 4;
-                var bitmapBytes   = data.Slice(pos, (int)bitmapLen).ToArray(); pos += (int)bitmapLen;
+                uint bitmapLen  = BinaryPrimitives.ReadUInt32LittleEndian(data[pos..]); pos += 4;
+                var bitmapBytes = data.Slice(pos, (int)bitmapLen).ToArray(); pos += (int)bitmapLen;
 
                 using var bitmapMs = new MemoryStream(bitmapBytes);
-                var bm    = RoaringBitmap.Deserialize(bitmapMs);
-                var list  = new List<int>();
-                foreach (int x in bm) list.Add(x);
-
-                values[valStr] = list;
+                // Keep the RoaringBitmap in memory — no conversion to List<int>.
+                // LookupIntersect() uses bitmaps directly for O(n) AND intersection.
+                bmValues[valStr] = RoaringBitmap.Deserialize(bitmapMs);
             }
 
-            idx._index[propName] = values;
+            idx._bitmaps[propName] = bmValues;
         }
 
         return idx;
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    private static uint[] EnumerateBitmap(RoaringBitmap bm)
+    {
+        var list = new List<uint>();
+        foreach (int x in bm) list.Add((uint)x);
+        return [.. list];
+    }
 
     private static string SerialiseValue(object? value) => value switch
     {

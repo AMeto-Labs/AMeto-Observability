@@ -35,7 +35,7 @@
           <lucide-icon name="x" [size]="12" />
         </button>
       }
-      <span class="kbd-hint">⌘K</span>
+      <span class="kbd-hint">Ctrl+Space</span>
     </div>
 
     <div class="toolbar-right">
@@ -136,63 +136,60 @@
             <div class="cal-inputs">
               <div class="cal-input-row">
                 <span class="cal-input-lbl">Start</span>
-                <div class="cal-field-wrap is-date" [class.invalid]="customFrom() && !customFromValid()">
-                  <input
-                    type="text"
-                    class="cal-field-input"
-                    placeholder="yyyy-mm-dd"
-                    [value]="fromDatePart()"
-                    dateMask dateMaskType="date" dateMaskMode="start"
-                    (valueChange)="setFromDatePart($event)"
-                    (keydown.enter)="onDateKeydown($event)"
-                    spellcheck="false"
-                    autocomplete="off" />
-                  <lucide-icon name="calendar" [size]="12" class="cal-field-icon" />
-                </div>
-                <div class="cal-field-wrap is-time">
-                  <input
-                    type="text"
-                    class="cal-field-input"
-                    placeholder="HH:mm"
-                    [value]="fromTimePart()"
-                    dateMask dateMaskType="time" dateMaskMode="start"
-                    (valueChange)="setFromTimePart($event)"
-                    (blur)="setFromTimePartOnBlur($any($event.target).value)"
-                    (keydown.enter)="onDateKeydown($event)"
-                    spellcheck="false"
-                    autocomplete="off" />
-                  <lucide-icon name="clock" [size]="12" class="cal-field-icon" />
+                <div class="cal-input-field-wrap">
+                  <div class="cal-field-wrap is-datetime" [class.invalid]="customFrom() && !customFromValid()">
+                    <input
+                      type="text"
+                      class="cal-field-input"
+                      placeholder="yyyy-mm-dd HH:mm"
+                      [value]="customFrom()"
+                      dateMask dateMaskType="datetime" dateMaskMode="start"
+                      (valueChange)="setFrom($event)"
+                      (suggestionChange)="customFromSuggestion.set($event)"
+                      (blur)="customFromSuggestion.set('')"
+                      (keydown.enter)="onDateKeydown($event)"
+                      spellcheck="false"
+                      autocomplete="off" />
+                    <lucide-icon name="calendar" [size]="12" class="cal-field-icon" />
+                  </div>
+                  @if (customFromSuggestion()) {
+                    <button
+                      class="cal-time-tip"
+                      tabindex="-1"
+                      (mousedown)="$event.preventDefault(); acceptFromSuggestion()">
+                      {{ suggestionLabel(customFromSuggestion()) }}
+                      <span class="cal-time-tip-kbd">Tab ↵</span>
+                    </button>
+                  }
                 </div>
               </div>
               <div class="cal-input-row">
                 <span class="cal-input-lbl">End</span>
-                <div class="cal-field-wrap is-date" [class.invalid]="customTo() && !customToValid()">
-                  <input
-                    type="text"
-                    class="cal-field-input"
-                    placeholder="yyyy-mm-dd"
-                    [value]="toDatePart()"
-                    dateMask dateMaskType="date" dateMaskMode="end"
-                    (valueChange)="setToDatePart($event)"
-                    (keydown.enter)="onDateKeydown($event)"
-                    spellcheck="false"
-                    autocomplete="off" />
-                  <lucide-icon name="calendar" [size]="12" class="cal-field-icon" />
-                </div>
-                <div class="cal-field-wrap is-time">
-                  <input
-                    type="text"
-                    class="cal-field-input"
-                    title="End time (HH:mm)"
-                    [placeholder]="toDatePart() ? 'HH:mm' : 'Now'"
-                    [value]="toTimePart()"
-                    dateMask dateMaskType="time" dateMaskMode="end"
-                    (valueChange)="setToTimePart($event)"
-                    (blur)="setToTimePartOnBlur($any($event.target).value)"
-                    (keydown.enter)="onDateKeydown($event)"
-                    spellcheck="false"
-                    autocomplete="off" />
-                  <lucide-icon name="clock" [size]="12" class="cal-field-icon" />
+                <div class="cal-input-field-wrap">
+                  <div class="cal-field-wrap is-datetime" [class.invalid]="customTo() && !customToValid()">
+                    <input
+                      type="text"
+                      class="cal-field-input"
+                      [placeholder]="customTo() ? 'yyyy-mm-dd HH:mm' : 'Now (open range)'"
+                      [value]="customTo()"
+                      dateMask dateMaskType="datetime" dateMaskMode="end"
+                      (valueChange)="setTo($event)"
+                      (suggestionChange)="customToSuggestion.set($event)"
+                      (blur)="customToSuggestion.set('')"
+                      (keydown.enter)="onDateKeydown($event)"
+                      spellcheck="false"
+                      autocomplete="off" />
+                    <lucide-icon name="calendar" [size]="12" class="cal-field-icon" />
+                  </div>
+                  @if (customToSuggestion()) {
+                    <button
+                      class="cal-time-tip"
+                      tabindex="-1"
+                      (mousedown)="$event.preventDefault(); acceptToSuggestion()">
+                      {{ suggestionLabel(customToSuggestion()) }}
+                      <span class="cal-time-tip-kbd">Tab ↵</span>
+                    </button>
+                  }
                 </div>
               </div>
             </div>
@@ -366,50 +363,33 @@
           <button class="err-retry" (click)="loadEvents()">Retry</button>
         </div>
       }
-      @if (!hasExpandedRows()) {
-        <cdk-virtual-scroll-viewport
-          #viewport
-          class="events-list"
-          itemSize="29"
-          minBufferPx="600"
-          maxBufferPx="1200"
-          (scrolledIndexChange)="onVirtualScroll($event)">
-          <app-event-row
-            *cdkVirtualFor="let ev of displayedEvents(); trackBy: trackEvent"
-            [event]="ev"
-            [wrap]="wrapMessages()"
-            [expandedEventIds]="expandedEventIds()"
-            (expandRequested)="onExpandRequested($event)"
-            (filterSelected)="applyFilter($event)"
-            (seekRequested)="seek($event.from, $event.to)"
-          />
-          @if (loadingMore()) {
-            <div class="load-more"><span class="load-more-spin"></span></div>
-          }
-          @if (!loading() && !error() && displayedEvents().length === 0) {
-            <app-empty-state icon="inbox" text="No events match the current filter"></app-empty-state>
-          }
-        </cdk-virtual-scroll-viewport>
-      } @else {
-        <div #plainList class="events-list events-list--plain" (scroll)="onPlainScroll($event)">
-          @for (ev of displayedEvents(); track ev.id) {
-            <app-event-row
-              [event]="ev"
-              [wrap]="wrapMessages()"
-              [expandedEventIds]="expandedEventIds()"
-              (expandRequested)="onExpandRequested($event)"
-              (filterSelected)="applyFilter($event)"
-              (seekRequested)="seek($event.from, $event.to)"
-            />
-          }
-          @if (loadingMore()) {
-            <div class="load-more"><span class="load-more-spin"></span></div>
-          }
-          @if (!loading() && !error() && displayedEvents().length === 0) {
-            <app-empty-state icon="inbox" text="No events match the current filter"></app-empty-state>
+      <!-- Single virtual-scroll container — TanStack handles fixed + expanded rows -->
+      <div #eventsScroll class="events-list" (scroll)="onEventsScroll($event)">
+        <div [style.height.px]="virtualizer.getTotalSize()" style="position:relative">
+          @for (vRow of virtualizer.getVirtualItems(); track vRow.key) {
+            <div
+              class="ev-vrow"
+              [attr.data-index]="vRow.index"
+              [style.transform]="'translateY(' + vRow.start + 'px)'"
+              [vmeasure]="measureRow">
+              <app-event-row
+                [event]="displayedEvents()[vRow.index]"
+                [wrap]="wrapMessages()"
+                [expandedEventIds]="expandedEventIds()"
+                (expandRequested)="onExpandRequested($event)"
+                (filterSelected)="applyFilter($event)"
+                (seekRequested)="seek($event.from, $event.to)"
+              />
+            </div>
           }
         </div>
-      }
+        @if (loadingMore()) {
+          <div class="load-more"><span class="load-more-spin"></span></div>
+        }
+        @if (!loading() && !error() && displayedEvents().length === 0) {
+          <app-empty-state icon="inbox" text="No events match the current filter"></app-empty-state>
+        }
+      </div>
 
       <!-- Footer -->
       <div class="events-footer">

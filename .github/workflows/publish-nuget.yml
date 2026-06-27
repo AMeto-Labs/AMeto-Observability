@@ -7,7 +7,7 @@ name: Publish Serilog.Sinks.Ameto
 on:
   push:
     branches:
-      - main
+      - dev
     paths:
       - 'src/Serilog.Sinks.Ameto/**'
       - '.github/workflows/publish-nuget.yml'

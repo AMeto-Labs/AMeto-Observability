@@ -113,4 +113,10 @@ public interface ISegmentIndex
 
     /// <summary>Returns local event offsets whose message template or rendered message contains the trigram.</summary>
     uint[]? LookupTrigram(ReadOnlySpan<char> text);
+
+    /// <summary>
+    /// AND-intersects inverted-index posting lists for multiple equality predicates.
+    /// Returns null if not supported; empty array if no events match all predicates.
+    /// </summary>
+    uint[]? LookupIntersect(IReadOnlyList<(string property, object? value)> predicates) => null;
 }

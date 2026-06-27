@@ -5,8 +5,9 @@ namespace Ameto.Metrics.Storage;
 
 internal static class MetricReader
 {
-    private const uint Magic       = 0x52_44_4D_54; // "RDMT"
-    private const uint FooterMagic = 0x52_44_4D_46; // "RDMF"
+    private const uint   Magic       = 0x52_44_4D_54; // "RDMT"
+    private const uint   FooterMagic = 0x52_44_4D_46; // "RDMF"
+    private const ushort Version     = 2;
 
     public static MetricSegmentInfo ReadSegmentInfo(string filePath)
     {
@@ -16,7 +17,8 @@ internal static class MetricReader
         uint magic = br.ReadUInt32();
         if (magic != Magic) throw new InvalidDataException($"Invalid .mts magic in {filePath}");
 
-        br.ReadUInt16();  // version
+        ushort version = br.ReadUInt16();
+        if (version != Version) throw new InvalidDataException($"Unsupported .mts version {version} (expected {Version}) in {filePath}");
         var granularity = (MetricGranularity)br.ReadByte();
         br.ReadUInt32();  // seriesCount
         long minNano = br.ReadInt64();
@@ -78,7 +80,8 @@ internal static class MetricReader
         uint magic = br.ReadUInt32();
         if (magic != Magic) yield break;
 
-        br.ReadUInt16(); // version
+        ushort version = br.ReadUInt16();
+        if (version != Version) yield break; // v1 — incompatible, skipped (deleted on load)
         br.ReadByte();   // granularity
         int seriesCount = (int)br.ReadUInt32();
         br.ReadInt64();  // minNano
@@ -118,6 +121,7 @@ internal static class MetricReader
         MetricKind kind    = MetricKind.Counter;
         string     unit    = string.Empty;
         LabelSet   labels  = LabelSet.Empty;
+        double[]?  bounds  = null;
         var        points  = new List<MetricDataPoint>();
 
         for (int i = 0; i < fields; i++)
@@ -125,22 +129,33 @@ internal static class MetricReader
             var key = r.ReadString();
             switch (key)
             {
-                case "k":   kind   = (MetricKind)r.ReadByte(); break;
-                case "u":   unit   = r.ReadString() ?? string.Empty; break;
-                case "lbs": labels = ReadLabels(ref r); break;
-                case "pts": points = ReadPoints(ref r); break;
-                default:    r.Skip(); break;
+                case "k":    kind   = (MetricKind)r.ReadByte(); break;
+                case "u":    unit   = r.ReadString() ?? string.Empty; break;
+                case "lbs":  labels = ReadLabels(ref r); break;
+                case "bnds": bounds = ReadBounds(ref r); break;
+                case "pts":  points = ReadPoints(ref r); break;
+                default:     r.Skip(); break;
             }
         }
 
         return new MetricSeries
         {
-            Name   = metricName,
-            Kind   = kind,
-            Unit   = unit,
-            Labels = labels,
-            Points = points,
+            Name         = metricName,
+            Kind         = kind,
+            Unit         = unit,
+            Labels       = labels,
+            BucketBounds = bounds,
+            Points       = points,
         };
+    }
+
+    private static double[]? ReadBounds(ref MessagePackReader r)
+    {
+        int count = r.ReadArrayHeader();
+        if (count == 0) return null;
+        var b = new double[count];
+        for (int i = 0; i < count; i++) b[i] = r.ReadDouble();
+        return b;
     }
 
     private static LabelSet ReadLabels(ref MessagePackReader r)
@@ -162,13 +177,32 @@ internal static class MetricReader
         var pts   = new List<MetricDataPoint>(count);
         for (int i = 0; i < count; i++)
         {
-            r.ReadArrayHeader(); // 4 fields
+            int n = r.ReadArrayHeader(); // 5 fields in v2
+            long   ts  = r.ReadInt64();
+            double val = r.ReadDouble();
+            long   cnt = r.ReadInt64();
+            double sum = r.ReadDouble();
+            long[]? buckets = null;
+            if (n >= 5)
+            {
+                if (r.TryReadNil())
+                {
+                    // scalar point — no buckets
+                }
+                else
+                {
+                    int bn = r.ReadArrayHeader();
+                    buckets = new long[bn];
+                    for (int j = 0; j < bn; j++) buckets[j] = r.ReadInt64();
+                }
+            }
             pts.Add(new MetricDataPoint
             {
-                TimestampUnixNano = r.ReadInt64(),
-                Value             = r.ReadDouble(),
-                Count             = r.ReadInt64(),
-                Sum               = r.ReadDouble(),
+                TimestampUnixNano = ts,
+                Value             = val,
+                Count             = cnt,
+                Sum               = sum,
+                BucketCounts      = buckets,
             });
         }
         return pts;

@@ -3,7 +3,6 @@ import { FormsModule } from '@angular/forms';
 import { DatePipe } from '@angular/common';
 import { RouterLink } from '@angular/router';
 import { LucideAngularModule } from 'lucide-angular';
-import { ThemeService } from '../../core/services/theme.service';
 import { ApiService } from '../../core/services/api.service';
 import { AuthService } from '../../core/services/auth.service';
 import { UserPreferencesService } from '../../core/services/user-preferences.service';
@@ -19,7 +18,6 @@ import { PageHeaderComponent, SectionComponent } from '../../shared/components/u
   changeDetection: ChangeDetectionStrategy.OnPush,
 })
 export class SettingsComponent implements OnInit {
-  theme       = inject(ThemeService);
   authService = inject(AuthService);
   prefs       = inject(UserPreferencesService);
   private api = inject(ApiService);

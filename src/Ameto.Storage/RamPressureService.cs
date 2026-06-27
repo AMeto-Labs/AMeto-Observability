@@ -47,6 +47,21 @@ public sealed class RamPressureService : BackgroundService
             {
                 int pct = GetSystemRamPercent();
 
+                // Memory attribution snapshot — lets us split process RSS into
+                // managed heap vs. native hot tier from the journal without
+                // hitting the authorized /api/diagnostics endpoint.
+                var gc = GC.GetGCMemoryInfo();
+                const long MB = 1024 * 1024;
+                _logger.LogInformation(
+                    "MEM ws={WS}MB gc_heap={Heap}MB gc_committed={Committed}MB gc_frag={Frag}MB hot_tier={Hot}MB mode={Mode} sys_ram={Pct}%",
+                    Environment.WorkingSet      / MB,
+                    gc.HeapSizeBytes            / MB,
+                    gc.TotalCommittedBytes      / MB,
+                    gc.FragmentedBytes          / MB,
+                    _storage.HotTierAllocatedBytes / MB,
+                    System.Runtime.GCSettings.IsServerGC ? "Server" : "Workstation",
+                    pct);
+
                 if (pct > _options.RamTargetPercent)
                 {
                     if (DateTimeOffset.UtcNow - lastFlush >= _cooldown)
@@ -60,12 +75,16 @@ public sealed class RamPressureService : BackgroundService
 
                         // Ask the GC to reclaim any freed managed memory.
                         GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
-                        // Ask the OS to release resident pages we no longer need.
-                        WorkingSetTrimmer.TryTrim();
 
                         lastFlush = DateTimeOffset.UtcNow;
                     }
                 }
+
+                // Return freed native memory to the OS every cycle, not only
+                // under RAM pressure. glibc retains free()'d hot-tier blocks in
+                // its arenas, so without a regular malloc_trim the RSS drifts
+                // upward between flushes. The call is cheap and idempotent.
+                WorkingSetTrimmer.TryTrim();
             }
             catch (OperationCanceledException) { break; }
             catch (Exception ex)

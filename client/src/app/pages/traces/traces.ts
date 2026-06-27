@@ -2,23 +2,31 @@ import {
   Component, signal, computed, inject, OnInit, OnDestroy,
   ChangeDetectionStrategy, ChangeDetectorRef,
 } from '@angular/core';
+import { Router, ActivatedRoute } from '@angular/router';
 import { FormsModule } from '@angular/forms';
 import { LucideAngularModule } from 'lucide-angular';
 import { format } from 'date-fns';
 import { ApiService } from '../../core/services/api.service';
+import { EventDto } from '../../core/models/event.model';
 import { SpanDto, TraceRowDto, TraceStatsDto } from '../../core/models/span.model';
 import { subHours, formatISO } from 'date-fns';
+import { ServiceGraphComponent } from './service-graph/service-graph';
+import { FlamegraphComponent } from './flame-graph/flame-graph';
+import { LatencyComponent } from './latency/latency';
+import { CompareTraceComponent } from './compare-trace/compare-trace';
 
 @Component({
   selector: 'app-traces',
-  imports: [FormsModule, LucideAngularModule],
+  imports: [FormsModule, LucideAngularModule, ServiceGraphComponent, FlamegraphComponent, LatencyComponent, CompareTraceComponent],
   templateUrl: './traces.html',
   styleUrl: './traces.scss',
   changeDetection: ChangeDetectionStrategy.OnPush,
 })
 export class TracesComponent implements OnInit, OnDestroy {
-  private api = inject(ApiService);
-  private cdr = inject(ChangeDetectorRef);
+  private api    = inject(ApiService);
+  private cdr    = inject(ChangeDetectorRef);
+  private router = inject(Router);
+  private route  = inject(ActivatedRoute);
 
   // ── Loading / data ────────────────────────────────────────────────────────
   statsLoading  = signal(false);
@@ -31,8 +39,32 @@ export class TracesComponent implements OnInit, OnDestroy {
   traceLoading    = signal(false);
   selectedSpan    = signal<SpanDto | null>(null);
 
-  activeTraceTab: 'timeline' | 'details' = 'timeline';
-  activeSpanTab:  'tags'                 = 'tags';
+  activeMainTab:  'traces' | 'graph' | 'latency' | 'compare' = 'traces';
+  activeTraceTab: 'timeline' | 'flamegraph' | 'details' = 'timeline';
+  activeSpanTab:  'tags' | 'logs' = 'tags';
+
+  // Trace logs (correlated by @tr — primary trace↔logs view).
+  // Loaded once per trace; the selected span narrows them client-side.
+  traceLogs        = signal<EventDto[]>([]);
+  traceLogsLoading = signal(false);
+  traceLogsLoaded  = signal(false);
+  onlyThisSpan     = signal(false);
+
+  /** Logs shown in the Logs tab: all trace logs, or only those of the selected span. */
+  visibleLogs = computed(() => {
+    const all = this.traceLogs();
+    if (!this.onlyThisSpan()) return all;
+    const sp = this.selectedSpan()?.spanId;
+    if (!sp) return all;
+    return all.filter(l => l['@sp'] === sp);
+  });
+
+  /** How many logs belong to the currently selected span (for the badge). */
+  spanLogCount = computed(() => {
+    const sp = this.selectedSpan()?.spanId;
+    if (!sp) return 0;
+    return this.traceLogs().reduce((n, l) => n + (l['@sp'] === sp ? 1 : 0), 0);
+  });
 
   // ── Filters ───────────────────────────────────────────────────────────────
   traceIdInput       = '';
@@ -43,6 +75,11 @@ export class TracesComponent implements OnInit, OnDestroy {
   filterMaxDurationMs: number | null = null;
   filterHttpStatus   = '';
   preset             = '1h';
+
+  // TraceQL
+  traceqlInput   = '';
+  traceqlMode    = signal(false);
+  traceqlError   = signal('');
 
   private _poll: ReturnType<typeof setInterval> | null = null;
 
@@ -96,8 +133,84 @@ export class TracesComponent implements OnInit, OnDestroy {
 
   // ── Lifecycle ─────────────────────────────────────────────────────────────
   ngOnInit() {
+    this.restoreFromUrl();
     this.loadAll();
     this._poll = setInterval(() => this.loadAll(), 15_000);
+  }
+
+  // ── URL state sync (survives F5 / deep-link) ──────────────────────────────
+  private restoreFromUrl() {
+    const q = this.route.snapshot.queryParamMap;
+
+    const tab = q.get('tab');
+    if (tab === 'graph' || tab === 'latency' || tab === 'compare' || tab === 'traces')
+      this.activeMainTab = tab;
+
+    const range = q.get('range');
+    if (range) this.preset = range;
+
+    const dtab = q.get('dtab');
+    if (dtab === 'flamegraph' || dtab === 'details' || dtab === 'timeline')
+      this.activeTraceTab = dtab;
+
+    this.filterService    = q.get('svc')    ?? '';
+    this.filterName       = q.get('name')   ?? '';
+    this.filterStatus     = q.get('status') ?? '';
+    this.filterHttpStatus = q.get('http')   ?? '';
+    const min = q.get('min'); this.filterMinDurationMs = min ? +min : null;
+    const max = q.get('max'); this.filterMaxDurationMs = max ? +max : null;
+
+    const ql = q.get('ql');
+    if (ql) { this.traceqlInput = ql; this.traceqlMode.set(true); }
+
+    const trace = q.get('trace');
+    if (trace) this.openTrace(trace);
+  }
+
+  /** Reflect the current page state into the URL query string (replaceUrl — no history spam). */
+  private syncUrl() {
+    const qp: Record<string, string | null> = {
+      tab:    this.activeMainTab === 'traces'    ? null : this.activeMainTab,
+      trace:  this.selectedTraceId() ?? null,
+      dtab:   this.activeTraceTab === 'timeline' ? null : this.activeTraceTab,
+      range:  this.preset === '1h'               ? null : this.preset,
+      svc:    this.filterService    || null,
+      name:   this.filterName       || null,
+      status: this.filterStatus     || null,
+      http:   this.filterHttpStatus || null,
+      min:    this.filterMinDurationMs != null ? String(this.filterMinDurationMs) : null,
+      max:    this.filterMaxDurationMs != null ? String(this.filterMaxDurationMs) : null,
+      ql:     this.traceqlMode() && this.traceqlInput.trim() ? this.traceqlInput.trim() : null,
+    };
+    this.router.navigate([], {
+      relativeTo:          this.route,
+      queryParams:         qp,
+      queryParamsHandling: 'merge',
+      replaceUrl:          true,
+    });
+  }
+
+  // ── State setters that also persist to URL ────────────────────────────────
+  setMainTab(tab: 'traces' | 'graph' | 'latency' | 'compare') {
+    this.activeMainTab = tab;
+    this.syncUrl();
+  }
+
+  setTraceTab(tab: 'timeline' | 'flamegraph' | 'details') {
+    this.activeTraceTab = tab;
+    this.syncUrl();
+  }
+
+  setPreset(p: string) {
+    this.preset = p;
+    this.syncUrl();
+    this.loadAll();
+  }
+
+  setTraceqlMode(on: boolean) {
+    this.traceqlMode.set(on);
+    this.traceqlError.set('');
+    this.syncUrl();
   }
 
   ngOnDestroy() {
@@ -120,6 +233,10 @@ export class TracesComponent implements OnInit, OnDestroy {
   }
 
   loadTraces(from: string) {
+    if (this.traceqlMode() && this.traceqlInput.trim()) {
+      this.runTraceQL();
+      return;
+    }
     this.loading.set(true);
     this.api.searchTraces({
       from,
@@ -136,7 +253,29 @@ export class TracesComponent implements OnInit, OnDestroy {
     });
   }
 
-  applyFilters() { this.loadAll(); }
+  runTraceQL() {
+    const q = this.traceqlInput.trim();
+    if (!q) return;
+    this.syncUrl();
+    this.loading.set(true);
+    this.traceqlError.set('');
+    this.api.queryTraces({ query: q, from: this.fromIso(), limit: 200 }).subscribe({
+      next: rows => { this.traces.set(rows); this.loading.set(false); this.cdr.markForCheck(); },
+      error: (err) => {
+        this.loading.set(false);
+        this.traceqlError.set(err?.error?.message ?? 'Query error');
+        this.cdr.markForCheck();
+      },
+    });
+  }
+
+  applyFilters() { this.syncUrl(); this.loadAll(); }
+
+  toggleTraceQL() {
+    this.traceqlMode.update(v => !v);
+    this.traceqlError.set('');
+    this.syncUrl();
+  }
 
   jumpToTrace() {
     const id = this.traceIdInput.trim();
@@ -148,6 +287,8 @@ export class TracesComponent implements OnInit, OnDestroy {
     if (this.selectedTraceId() === traceId) return;
     this.selectedTraceId.set(traceId);
     this.selectedSpan.set(null);
+    this.resetLogs();
+    this.syncUrl();
     this.traceLoading.set(true);
     this.api.getTrace(traceId).subscribe({
       next: spans => {
@@ -163,11 +304,63 @@ export class TracesComponent implements OnInit, OnDestroy {
     this.selectedTraceId.set(null);
     this.traceSpans.set([]);
     this.selectedSpan.set(null);
+    this.resetLogs();
+    this.syncUrl();
   }
 
   selectSpan(span: SpanDto) {
-    this.selectedSpan.set(this.selectedSpan()?.spanId === span.spanId ? null : span);
+    const same = this.selectedSpan()?.spanId === span.spanId;
+    this.selectedSpan.set(same ? null : span);
+    if (!same) this.activeSpanTab = 'tags';
   }
+
+  private resetLogs() {
+    this.traceLogs.set([]);
+    this.traceLogsLoaded.set(false);
+    this.onlyThisSpan.set(false);
+  }
+
+  /** Opens the Logs tab and lazily loads all logs for the trace (once). */
+  openSpanLogs() {
+    this.activeSpanTab = 'logs';
+    if (this.traceLogsLoaded() || this.traceLogsLoading()) return;
+
+    const traceId = this.selectedTraceId();
+    const spans   = this.traceSpans();
+    if (!traceId || !spans.length) return;
+
+    // Bound the query to the trace's own time span (+ buffer) so the executor
+    // can skip far segments. Logs are written by the same processes that own
+    // the spans, so their @t falls inside [traceStart, traceEnd].
+    let minNs = spans[0].startTimeUnixNano;
+    let maxNs = spans[0].startTimeUnixNano + spans[0].durationNanos;
+    for (const s of spans) {
+      if (s.startTimeUnixNano < minNs) minNs = s.startTimeUnixNano;
+      const end = s.startTimeUnixNano + s.durationNanos;
+      if (end > maxNs) maxNs = end;
+    }
+    const BUF_MS = 60_000;
+    const from = new Date(minNs / 1_000_000 - BUF_MS).toISOString();
+    const to   = new Date(maxNs / 1_000_000 + BUF_MS).toISOString();
+
+    this.traceLogsLoading.set(true);
+    this.api.getTraceLogs(traceId, from, to).subscribe({
+      next: logs => {
+        this.traceLogs.set(logs);
+        this.traceLogsLoaded.set(true);
+        this.traceLogsLoading.set(false);
+        this.cdr.markForCheck();
+      },
+      error: () => { this.traceLogsLoading.set(false); this.cdr.markForCheck(); },
+    });
+  }
+
+  logMatchesSelectedSpan(log: EventDto): boolean {
+    const sp = this.selectedSpan()?.spanId;
+    return !!sp && log['@sp'] === sp;
+  }
+
+  fromIsoPublic(): string { return this.fromIso(); }
 
   private fromIso(): string {
     const map: Record<string, number> = {
@@ -203,6 +396,10 @@ export class TracesComponent implements OnInit, OnDestroy {
   totalDurLabel(): string {
     const { totalNs } = this.traceRange();
     return fmtMs(totalNs / 1_000_000);
+  }
+
+  traceServicesLabel(trace: TraceRowDto): string[] {
+    return trace.services?.length ? trace.services : [trace.serviceName].filter(Boolean);
   }
 
   // ── Formatting ────────────────────────────────────────────────────────────
@@ -257,6 +454,29 @@ export class TracesComponent implements OnInit, OnDestroy {
     if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(1)}M`;
     if (v >= 1_000)     return `${(v / 1_000).toFixed(1)}K`;
     return String(Math.round(v));
+  }
+
+  logLevel(log: EventDto): string {
+    return log['@l'] ?? 'Information';
+  }
+
+  logMessage(log: EventDto): string {
+    return log['@mt'] ?? '';
+  }
+
+  logTs(log: EventDto): string {
+    const t = log['@t'];
+    if (!t) return '';
+    const s = typeof t === 'string' ? t : t.toISOString();
+    return s.substring(11, 23);
+  }
+
+  logLevelCls(log: EventDto): string {
+    const l = this.logLevel(log).toLowerCase();
+    if (l === 'error' || l === 'fatal') return 'lvl-error';
+    if (l === 'warning' || l === 'warn') return 'lvl-warn';
+    if (l === 'debug' || l === 'verbose') return 'lvl-debug';
+    return 'lvl-info';
   }
 }
 

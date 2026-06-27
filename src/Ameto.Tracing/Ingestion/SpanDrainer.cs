@@ -12,11 +12,20 @@ internal sealed class SpanDrainer : IAsyncDisposable
 {
     private const int BatchSize = 512;
 
+    /// <summary>
+    /// How often the in-memory hot tier is flushed to disk regardless of fill level.
+    /// Bounds data loss on restart to this interval under low-traffic loads that never
+    /// reach the engine's 50k-span flush threshold.
+    /// </summary>
+    private static readonly TimeSpan FlushInterval = TimeSpan.FromSeconds(30);
+
     private readonly SpanRingBuffer       _ring;
     private readonly TraceStorageEngine   _storage;
     private readonly ILogger<SpanDrainer> _logger;
     private readonly Task                 _drainTask;
     private readonly CancellationTokenSource _cts = new();
+
+    private DateTime _lastFlush = DateTime.UtcNow;
 
     private readonly SpanIngestItem?[] _batch = new SpanIngestItem?[BatchSize];
 
@@ -39,6 +48,7 @@ internal sealed class SpanDrainer : IAsyncDisposable
             int count = _ring.TryDequeueMany(_batch, BatchSize);
             if (count == 0)
             {
+                MaybeFlush();
                 // Park until a producer signals new spans (or 50 ms as a safety
                 // net) instead of polling every 5 ms, which burned idle CPU.
                 await _ring.WaitForItemsAsync(50, ct).ConfigureAwait(false);
@@ -58,6 +68,8 @@ internal sealed class SpanDrainer : IAsyncDisposable
             {
                 _logger.LogError(ex, "SpanDrainer: error writing batch of {Count} spans", count);
             }
+
+            MaybeFlush();
         }
 
         // Drain remaining items before shutdown
@@ -73,11 +85,26 @@ internal sealed class SpanDrainer : IAsyncDisposable
         } while (remaining > 0);
     }
 
+    /// <summary>Flushes the hot tier when <see cref="FlushInterval"/> has elapsed. No-op when empty.</summary>
+    private void MaybeFlush()
+    {
+        if (DateTime.UtcNow - _lastFlush < FlushInterval) return;
+        _lastFlush = DateTime.UtcNow;
+        try { _storage.FlushHotTier(); }
+        catch (Exception ex) { _logger.LogWarning(ex, "SpanDrainer: periodic hot-tier flush failed"); }
+    }
+
     public async ValueTask DisposeAsync()
     {
         _cts.Cancel();
         try { await _drainTask.ConfigureAwait(false); }
         catch (OperationCanceledException) { }
+
+        // Final flush so spans drained from the ring buffer at shutdown reach disk
+        // even if the engine's own Dispose flush is cut short by the host timeout.
+        try { _storage.FlushHotTier(); }
+        catch (Exception ex) { _logger.LogWarning(ex, "SpanDrainer: shutdown hot-tier flush failed"); }
+
         _cts.Dispose();
     }
 }

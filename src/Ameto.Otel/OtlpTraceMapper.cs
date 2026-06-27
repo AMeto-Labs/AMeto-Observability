@@ -57,7 +57,8 @@ public static class OtlpTraceMapper
         long endNano   = ParseNanoString(span.EndTimeUnixNano);
         long duration  = endNano > startNano ? endNano - startNano : 0;
 
-        byte[] attrBytes = SerializeAttributes(span.Attributes);
+        byte[] attrBytes    = SerializeAttributes(span.Attributes);
+        short  httpStatus   = ExtractHttpStatusCode(span.Attributes);
 
         return new SpanIngestItem
         {
@@ -71,6 +72,7 @@ public static class OtlpTraceMapper
             Kind              = (SpanKind)(span.Kind & 0x07),
             Status            = MapStatus(span.Status),
             AttributesBytes   = attrBytes,
+            HttpStatusCode    = httpStatus,
         };
     }
 
@@ -194,6 +196,26 @@ public static class OtlpTraceMapper
             return d;
         }
         return null;
+    }
+
+    private static short ExtractHttpStatusCode(List<OtlpKeyValue>? attrs)
+    {
+        if (attrs is null) return 0;
+        // Prefer new semconv key; fall back to old
+        short result = 0;
+        for (int i = 0; i < attrs.Count; i++)
+        {
+            var key = attrs[i].Key;
+            if (key is not ("http.response.status_code" or "http.status_code")) continue;
+            var sv = attrs[i].Value?.StringValue
+                     ?? attrs[i].Value?.IntValue;
+            if (sv is not null && short.TryParse(sv, out var code))
+            {
+                result = code;
+                if (key == "http.response.status_code") break; // prefer new key
+            }
+        }
+        return result;
     }
 
     internal static long ParseNanoString(string? s)

@@ -159,6 +159,7 @@ foreach ($t in $targets) {
         --output $targetDir `
         --runtime $rid `
         --self-contained true `
+        /p:PublishReadyToRun=true `
         /p:DebugType=None `
         /p:DebugSymbols=false `
         /p:GenerateDocumentationFile=false

@@ -10,7 +10,7 @@
       <div class="preset-group">
         @for (p of ['15m','30m','1h','3h','6h','12h','24h']; track p) {
           <button class="preset-btn" [class.active]="preset === p"
-                  (click)="preset = p; loadAll()">{{ p }}</button>
+                  (click)="setPreset(p)">{{ p }}</button>
         }
       </div>
       <div class="live-badge">
@@ -19,71 +19,120 @@
     </div>
   </div>
 
-  <!-- ── Jump to trace ───────────────────────────────────────────────────── -->
-  <div class="jump-bar">
-    <lucide-icon name="search" [size]="14" class="search-icon" />
-    <input class="jump-input" [(ngModel)]="traceIdInput"
-           placeholder="Paste trace ID to open directly…"
-           (keyup.enter)="jumpToTrace()" />
-    <button class="btn-jump" [disabled]="!traceIdInput.trim()" (click)="jumpToTrace()">
-      <lucide-icon name="arrow-right" [size]="13" />
-      Open
-    </button>
-  </div>
+  <!-- ── Search / filter area ─────────────────────────────────────────────── -->
+  <div class="search-area">
 
-  <!-- ── Filter bar ───────────────────────────────────────────────────────── -->
-  <div class="filter-bar">
-    <div class="filter-search">
-      <lucide-icon name="filter" [size]="14" class="search-icon" />
-      <input class="filter-search-input" [(ngModel)]="filterName"
-             placeholder="Operation / span name"
-             (keyup.enter)="applyFilters()" />
+    <!-- Mode toggle -->
+    <div class="mode-toggle">
+      <button class="mode-btn" [class.active]="!traceqlMode()" (click)="setTraceqlMode(false)">
+        <lucide-icon name="sliders-horizontal" [size]="12" />
+        Filter
+      </button>
+      <button class="mode-btn" [class.active]="traceqlMode()" (click)="setTraceqlMode(true)">
+        <lucide-icon name="terminal" [size]="12" />
+        TraceQL
+      </button>
     </div>
 
-    <select class="filter-select" [(ngModel)]="filterService">
-      <option value="">All services</option>
-      @for (sv of services(); track sv) { <option [value]="sv">{{ sv }}</option> }
-    </select>
+    @if (!traceqlMode()) {
+      <!-- ── Filter bar ───────────────────────────────────────────────────── -->
+      <div class="filter-bar">
+        <div class="filter-search">
+          <lucide-icon name="search" [size]="13" class="fi-icon" />
+          <input class="fi-input" [(ngModel)]="filterName"
+                 placeholder="Operation / span name"
+                 (keyup.enter)="applyFilters()" />
+        </div>
 
-    <select class="filter-select" [(ngModel)]="filterStatus">
-      <option value="">All statuses</option>
-      <option value="Ok">OK</option>
-      <option value="Error">Error</option>
-    </select>
+        <select class="filter-select" [(ngModel)]="filterService">
+          <option value="">All services</option>
+          @for (sv of services(); track sv) { <option [value]="sv">{{ sv }}</option> }
+        </select>
 
-    <div class="duration-filter">
-      <lucide-icon name="clock" [size]="13" class="dur-icon" />
-      <input class="duration-input" type="number" min="1"
-             [(ngModel)]="filterMinDurationMs"
-             placeholder="Min ms" title="Minimum root span duration (ms)" />
+        <select class="filter-select" [(ngModel)]="filterStatus">
+          <option value="">All statuses</option>
+          <option value="Ok">OK</option>
+          <option value="Error">Error</option>
+        </select>
+
+        <div class="dur-wrap">
+          <lucide-icon name="clock" [size]="12" class="fi-icon" />
+          <input class="dur-input" type="number" min="1" [(ngModel)]="filterMinDurationMs" placeholder="Min ms" />
+        </div>
+
+        <div class="dur-wrap">
+          <lucide-icon name="clock" [size]="12" class="fi-icon" />
+          <input class="dur-input" type="number" min="1" [(ngModel)]="filterMaxDurationMs" placeholder="Max ms" />
+        </div>
+
+        <select class="filter-select filter-select--http" [(ngModel)]="filterHttpStatus">
+          <option value="">All HTTP</option>
+          <option value="2xx">2xx</option>
+          <option value="4xx">4xx</option>
+          <option value="5xx">5xx</option>
+          <option value="400">400</option>
+          <option value="401">401</option>
+          <option value="403">403</option>
+          <option value="404">404</option>
+          <option value="500">500</option>
+          <option value="502">502</option>
+          <option value="503">503</option>
+        </select>
+
+        <button class="btn-apply" (click)="applyFilters()">Apply</button>
+        <button class="btn-clear" (click)="filterName=''; filterService=''; filterStatus=''; filterMinDurationMs=null; filterMaxDurationMs=null; filterHttpStatus=''; applyFilters()">
+          Clear
+        </button>
+      </div>
+
+    } @else {
+      <!-- ── TraceQL search bar ─────────────────────────────────────────── -->
+      <div class="traceql-bar">
+        <div class="tql-wrap" [class.has-error]="traceqlError()">
+          <lucide-icon name="braces" [size]="13" class="tql-icon" />
+          <input class="tql-input"
+                 [(ngModel)]="traceqlInput"
+                 placeholder='{ .http.status_code = 500 && duration > 500ms }'
+                 spellcheck="false"
+                 autocomplete="off"
+                 (keyup.enter)="runTraceQL()" />
+          @if (traceqlInput) {
+            <button class="tql-clear" (click)="traceqlInput = ''; traces.set([])" title="Clear">
+              <lucide-icon name="x" [size]="11" />
+            </button>
+          }
+        </div>
+        <button class="btn-apply" (click)="runTraceQL()">
+          <lucide-icon name="play" [size]="12" />
+          Run
+        </button>
+      </div>
+      @if (traceqlError()) {
+        <div class="tql-error">
+          <lucide-icon name="alert-circle" [size]="12" />
+          {{ traceqlError() }}
+        </div>
+      }
+      <div class="tql-hints">
+        <span class="tql-hint-label">Examples:</span>
+        <button class="tql-hint-chip" (click)="traceqlInput = '{ status = error }'">&#123; status = error &#125;</button>
+        <button class="tql-hint-chip" (click)="traceqlInput = '{ duration > 500ms }'">&#123; duration > 500ms &#125;</button>
+        <button class="tql-hint-chip" (click)="traceqlInput = '{ .http.status_code = 500 }'">&#123; .http.status_code = 500 &#125;</button>
+        <button class="tql-hint-chip" (click)="traceqlInput = '{ service = \'api\' && duration > 200ms }'">&#123; service = "api" &amp;&amp; duration > 200ms &#125;</button>
+      </div>
+    }
+
+    <!-- Jump to trace -->
+    <div class="jump-bar">
+      <lucide-icon name="hash" [size]="13" class="fi-icon" />
+      <input class="jump-input" [(ngModel)]="traceIdInput"
+             placeholder="Paste trace ID to jump directly…"
+             (keyup.enter)="jumpToTrace()" />
+      <button class="btn-jump" [disabled]="!traceIdInput.trim()" (click)="jumpToTrace()">
+        <lucide-icon name="arrow-right" [size]="12" />
+        Open
+      </button>
     </div>
-
-    <div class="duration-filter">
-      <lucide-icon name="clock" [size]="13" class="dur-icon" />
-      <input class="duration-input" type="number" min="1"
-             [(ngModel)]="filterMaxDurationMs"
-             placeholder="Max ms" title="Maximum root span duration (ms)" />
-    </div>
-
-    <select class="filter-select filter-select--http" [(ngModel)]="filterHttpStatus">
-      <option value="">All HTTP</option>
-      <option value="2xx">2xx</option>
-      <option value="3xx">3xx</option>
-      <option value="4xx">4xx</option>
-      <option value="5xx">5xx</option>
-      <option value="400">400</option>
-      <option value="401">401</option>
-      <option value="403">403</option>
-      <option value="404">404</option>
-      <option value="500">500</option>
-      <option value="502">502</option>
-      <option value="503">503</option>
-    </select>
-
-    <button class="btn-apply" (click)="applyFilters()">Apply</button>
-    <button class="btn-clear" (click)="filterName=''; filterService=''; filterStatus=''; filterMinDurationMs=null; filterMaxDurationMs=null; filterHttpStatus=''; applyFilters()">
-      Clear all
-    </button>
   </div>
 
   <!-- ── Stats row ─────────────────────────────────────────────────────────── -->
@@ -121,12 +170,6 @@
         <span class="stat-label">P50 latency</span>
         <span class="stat-value">{{ st ? fmtStat(st.p50LatencyMs, 'ms') : '—' }}</span>
       </div>
-      @if (st) {
-        <svg class="sparkline" viewBox="0 0 80 28" preserveAspectRatio="none">
-          <polyline [attr.points]="sparkline(st.totalSparkline)"
-                    fill="none" stroke="var(--info)" stroke-width="1.5" stroke-linejoin="round" />
-        </svg>
-      }
     </div>
 
     <div class="stat-card">
@@ -134,12 +177,6 @@
         <span class="stat-label">P95 latency</span>
         <span class="stat-value">{{ st ? fmtStat(st.p95LatencyMs, 'ms') : '—' }}</span>
       </div>
-      @if (st) {
-        <svg class="sparkline" viewBox="0 0 80 28" preserveAspectRatio="none">
-          <polyline [attr.points]="sparkline(st.totalSparkline)"
-                    fill="none" stroke="var(--info)" stroke-width="1.5" stroke-linejoin="round" />
-        </svg>
-      }
     </div>
 
     <div class="stat-card stat-success">
@@ -156,16 +193,44 @@
     </div>
   </div>
 
+  <!-- ── Main tabs ────────────────────────────────────────────────────────── -->
+  <div class="main-tabs">
+    <button class="main-tab" [class.active]="activeMainTab === 'traces'" (click)="setMainTab('traces')">
+      <lucide-icon name="list" [size]="13" />
+      Traces
+    </button>
+    <button class="main-tab" [class.active]="activeMainTab === 'graph'" (click)="setMainTab('graph')">
+      <lucide-icon name="share-2" [size]="13" />
+      Service Graph
+    </button>
+    <button class="main-tab" [class.active]="activeMainTab === 'latency'" (click)="setMainTab('latency')">
+      <lucide-icon name="bar-chart-2" [size]="13" />
+      Latency
+    </button>
+    <button class="main-tab" [class.active]="activeMainTab === 'compare'" (click)="setMainTab('compare')">
+      <lucide-icon name="git-compare" [size]="13" />
+      Compare
+    </button>
+  </div>
+
   <!-- ── Main content ──────────────────────────────────────────────────────── -->
-  <div class="main-content">
+  @if (activeMainTab === 'graph') {
+    <app-service-graph class="graph-panel" [from]="fromIsoPublic()" />
+  } @else if (activeMainTab === 'latency') {
+    <app-latency class="graph-panel" [from]="fromIsoPublic()" />
+  } @else if (activeMainTab === 'compare') {
+    <app-compare-trace class="graph-panel" />
+  }
+
+  <div class="main-content" [class.hidden]="activeMainTab !== 'traces'">
 
     <!-- Left: trace list -->
     <div class="trace-list-panel" [class.narrow]="selectedTraceId()">
 
       <div class="list-header">
         <span class="list-title">
-          Traces&nbsp;
-          @if (!loading()) { <strong>{{ filteredTraces().length }}</strong> results }
+          @if (!loading()) { <strong>{{ filteredTraces().length }}</strong> traces }
+          @else { Loading… }
         </span>
         <button class="icon-btn" (click)="loadAll()" title="Refresh">
           <lucide-icon name="refresh-cw" [size]="13" [class.spin]="loading()" />
@@ -175,7 +240,6 @@
       @if (loading() && traces().length === 0) {
         <div class="panel-empty">
           <lucide-icon name="loader" [size]="18" class="spin" />
-          Loading traces…
         </div>
       } @else if (filteredTraces().length === 0) {
         <div class="panel-empty">No traces found</div>
@@ -198,7 +262,18 @@
                   }
                   <span class="trace-path">{{ trace.httpPath || trace.name }}</span>
                 </div>
-                <div class="trace-svc">{{ trace.serviceName }}</div>
+
+                <!-- Service chips -->
+                <div class="trace-svc-chips">
+                  @for (svc of traceServicesLabel(trace); track svc) {
+                    <span class="trace-svc-chip"
+                          [style.background]="svcColor(svc) + '18'"
+                          [style.color]="svcColor(svc)"
+                          [style.border-color]="svcColor(svc) + '44'">
+                      {{ svc }}
+                    </span>
+                  }
+                </div>
               </div>
 
               <div class="trace-row-right">
@@ -206,6 +281,9 @@
                   {{ statusBadgeLabel(trace.httpStatusCode, trace.status) }}
                 </span>
                 <span class="trace-dur mono">{{ fmtDurNs(trace.durationNanos) }}</span>
+                @if (trace.spanCount > 1) {
+                  <span class="span-count">{{ trace.spanCount }} spans</span>
+                }
               </div>
             </div>
           }
@@ -220,32 +298,32 @@
         @if (traceLoading()) {
           <div class="panel-empty">
             <lucide-icon name="loader" [size]="18" class="spin" />
-            Loading trace…
           </div>
         } @else {
 
           <!-- Detail header -->
           <div class="detail-header">
             <div class="detail-title">
-              <span class="detail-trace-label">Trace:</span>
-              <span class="detail-trace-id mono">{{ selectedTraceId()!.substring(0, 16) }}</span>
-              <lucide-icon name="copy" [size]="12" class="copy-icon" title="Copy" />
+              <span class="detail-trace-label">Trace</span>
+              <span class="detail-trace-id mono">{{ selectedTraceId()!.substring(0, 16) }}…</span>
             </div>
             <div class="detail-meta">
               <span class="meta-chip">{{ totalDurLabel() }}</span>
               <span class="meta-chip">{{ traceSpans().length }} spans</span>
             </div>
-            <button class="icon-btn" (click)="closeTrace()">
-              <lucide-icon name="x" [size]="16" />
+            <button class="icon-btn" (click)="closeTrace()" title="Close">
+              <lucide-icon name="x" [size]="14" />
             </button>
           </div>
 
           <!-- Tabs -->
           <div class="detail-tabs">
             <button class="tab-btn" [class.active]="activeTraceTab === 'timeline'"
-                    (click)="activeTraceTab = 'timeline'">Timeline</button>
+                    (click)="setTraceTab('timeline')">Timeline</button>
+            <button class="tab-btn" [class.active]="activeTraceTab === 'flamegraph'"
+                    (click)="setTraceTab('flamegraph')">Flamegraph</button>
             <button class="tab-btn" [class.active]="activeTraceTab === 'details'"
-                    (click)="activeTraceTab = 'details'">Details</button>
+                    (click)="setTraceTab('details')">Details</button>
           </div>
 
           <!-- ── Timeline ─────────────────────────────────────────────────── -->
@@ -311,16 +389,26 @@
                     <span class="sd-key">Operation</span>
                     <span class="sd-val">{{ span.name }}</span>
                   </div>
+                  @if (span.httpStatusCode) {
+                    <div class="sd-field">
+                      <span class="sd-key">HTTP Status</span>
+                      <span class="sd-val">
+                        <span class="status-badge" [class]="statusBadgeCls(span.httpStatusCode, span.status)">
+                          {{ span.httpStatusCode }}
+                        </span>
+                      </span>
+                    </div>
+                  }
                   <div class="sd-field">
                     <span class="sd-key">Span ID</span>
                     <span class="sd-val mono small">{{ span.spanId }}</span>
                   </div>
                   <div class="sd-field">
-                    <span class="sd-key">Parent Span ID</span>
+                    <span class="sd-key">Parent</span>
                     <span class="sd-val mono small">{{ span.parentSpanId || '—' }}</span>
                   </div>
                   <div class="sd-field">
-                    <span class="sd-key">Start time</span>
+                    <span class="sd-key">Start</span>
                     <span class="sd-val mono small">{{ fmtTraceTime(span.startTimeUnixNano) }}</span>
                   </div>
                   <div class="sd-field">
@@ -331,31 +419,84 @@
 
                 <div class="span-detail-right">
                   <div class="span-tab-bar">
-                    <button class="stab active">Tags ({{ selectedSpanTags().length }})</button>
+                    <button class="stab" [class.active]="activeSpanTab === 'tags'"
+                            (click)="activeSpanTab = 'tags'">
+                      Tags ({{ selectedSpanTags().length }})
+                    </button>
+                    <button class="stab" [class.active]="activeSpanTab === 'logs'"
+                            (click)="openSpanLogs()">
+                      Logs
+                      @if (traceLogsLoaded() && spanLogCount()) {
+                        <span class="stab-count">{{ spanLogCount() }}</span>
+                      }
+                    </button>
                   </div>
-                  <div class="tags-wrap">
-                    @if (selectedSpanTags().length === 0) {
-                      <div class="tags-empty">No attributes</div>
-                    } @else {
-                      <table class="tags-table">
-                        <thead><tr><th>Key</th><th>Value</th></tr></thead>
-                        <tbody>
-                          @for (tag of selectedSpanTags(); track tag.key) {
-                            <tr>
-                              <td class="tag-key mono">{{ tag.key }}</td>
-                              <td class="tag-val">{{ tag.value }}</td>
-                            </tr>
-                          }
-                        </tbody>
-                      </table>
+
+                  @if (activeSpanTab === 'tags') {
+                    <div class="tags-wrap">
+                      @if (selectedSpanTags().length === 0) {
+                        <div class="tags-empty">No attributes</div>
+                      } @else {
+                        <table class="tags-table">
+                          <thead><tr><th>Key</th><th>Value</th></tr></thead>
+                          <tbody>
+                            @for (tag of selectedSpanTags(); track tag.key) {
+                              <tr>
+                                <td class="tag-key mono">{{ tag.key }}</td>
+                                <td class="tag-val">{{ tag.value }}</td>
+                              </tr>
+                            }
+                          </tbody>
+                        </table>
+                      }
+                    </div>
+                  }
+
+                  @if (activeSpanTab === 'logs') {
+                    @if (traceLogsLoaded() && traceLogs().length) {
+                      <div class="logs-toolbar">
+                        <label class="logs-toggle">
+                          <input type="checkbox"
+                                 [checked]="onlyThisSpan()"
+                                 (change)="onlyThisSpan.set(!onlyThisSpan())" />
+                          Only this span
+                          @if (spanLogCount()) { <span class="logs-toggle-count">{{ spanLogCount() }}</span> }
+                        </label>
+                        <span class="logs-total">{{ visibleLogs().length }} / {{ traceLogs().length }} logs</span>
+                      </div>
                     }
-                  </div>
+                    <div class="logs-wrap">
+                      @if (traceLogsLoading()) {
+                        <div class="logs-empty">
+                          <lucide-icon name="loader" [size]="14" class="spin" /> Loading logs…
+                        </div>
+                      } @else if (visibleLogs().length === 0) {
+                        <div class="logs-empty">
+                          @if (onlyThisSpan()) { No logs for this span }
+                          @else { No logs for this trace }
+                        </div>
+                      } @else {
+                        @for (log of visibleLogs(); track $index) {
+                          <div class="log-row" [class.log-row--match]="logMatchesSelectedSpan(log)">
+                            <span class="log-level" [class]="logLevelCls(log)">{{ logLevel(log) }}</span>
+                            <span class="log-ts mono">{{ logTs(log) }}</span>
+                            <span class="log-msg">{{ logMessage(log) }}</span>
+                          </div>
+                        }
+                      }
+                    </div>
+                  }
+
                 </div>
 
               </div>
             }
 
-          <!-- ── Details ──────────────────────────────────────────────────── -->
+          <!-- ── Flamegraph ───────────────────────────────────────────────── -->
+          } @else if (activeTraceTab === 'flamegraph') {
+            <app-flame-graph class="fg-host" [traceId]="selectedTraceId()" />
+
+          <!-- ── Details tab ──────────────────────────────────────────────── -->
           } @else {
             <div class="detail-info-tab">
               <div class="di-row">
