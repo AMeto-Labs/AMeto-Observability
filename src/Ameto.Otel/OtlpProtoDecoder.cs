@@ -197,17 +197,26 @@ internal static class OtlpProtoDecoder
                 case 25: dp.TimeUnixNano = cis.ReadFixed64().ToString(); break;      // field 3: time_unix_nano
                 case 33: dp.Count        = cis.ReadFixed64().ToString(); break;       // field 4: count (fixed64, OTel .NET SDK encodes as fixed64 not varint)
                 case 41: dp.Sum          = cis.ReadDouble();             break;      // field 5: sum
-                case 49: // field 6: bucket_counts — unpacked repeated fixed64
+                case 48: // field 6: bucket_counts — unpacked varint (uint64)
+                {
+                    dp.BucketCounts ??= [];
+                    dp.BucketCounts.Add(cis.ReadUInt64().ToString());
+                    break;
+                }
+                case 49: // field 6: bucket_counts — unpacked fixed64
                 {
                     dp.BucketCounts ??= [];
                     dp.BucketCounts.Add(cis.ReadFixed64().ToString());
                     break;
                 }
-                case 50: // field 6: bucket_counts — packed repeated fixed64 (proto3 default)
+                case 50: // field 6: bucket_counts — packed; auto-detect fixed64 vs varint
                 {
                     dp.BucketCounts ??= [];
-                    var sub = SubStream(cis);
-                    while (!sub.IsAtEnd) dp.BucketCounts.Add(sub.ReadFixed64().ToString());
+                    var bytes = cis.ReadBytes();
+                    var sub   = new Google.Protobuf.CodedInputStream(bytes.ToByteArray());
+                    bool asFixed = bytes.Length % 8 == 0;   // N×fixed64 → multiple of 8
+                    while (!sub.IsAtEnd)
+                        dp.BucketCounts.Add((asFixed ? sub.ReadFixed64() : sub.ReadUInt64()).ToString());
                     break;
                 }
                 case 57: // field 7: explicit_bounds — unpacked repeated double
