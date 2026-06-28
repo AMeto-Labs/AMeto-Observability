@@ -261,15 +261,18 @@ public sealed class AlertEvaluator : IAsyncDisposable
             Filters = rule.Labels,
         }, ct);
 
-        // value = max latest across resulting series (worst case)
-        double worst = double.NaN;
+        // Reduce over the whole window (not just the last point — a quiet final
+        // interval would read 0 and miss the spike). For ">" thresholds take the
+        // peak; for "<" thresholds take the trough.
+        bool wantMax = rule.Comparator is AlertComparator.GreaterThan or AlertComparator.GreaterOrEqual;
+        double acc = double.NaN;
         foreach (var s in series)
-        {
-            if (s.Points.Count == 0) continue;
-            double v = s.Points[^1].Value;
-            if (double.IsNaN(worst) || v > worst) worst = v;
-        }
-        return double.IsNaN(worst) ? 0 : worst;
+            foreach (var p in s.Points)
+            {
+                if (double.IsNaN(acc)) acc = p.Value;
+                else acc = wantMax ? Math.Max(acc, p.Value) : Math.Min(acc, p.Value);
+            }
+        return double.IsNaN(acc) ? 0 : acc;
     }
 
     private async Task<double> TraceValueAsync(AlertRule rule, DateTimeOffset from, DateTimeOffset to, CancellationToken ct)
