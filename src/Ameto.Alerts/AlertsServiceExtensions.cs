@@ -1,38 +1,26 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using Ameto.Core;
-using Ameto.Storage;
 
 namespace Ameto.Alerts;
 
 /// <summary>
-/// Hosted service that wires <see cref="AlertEvaluator"/> into
-/// <see cref="StorageEngine.EventWritten"/> at application startup.
+/// Hosted wrapper that owns the periodic <see cref="AlertEvaluator"/> lifecycle
+/// (its eval loop starts in the constructor and stops on disposal).
 /// </summary>
-internal sealed class AlertsWiring : IHostedService
+internal sealed class AlertsHostedService : IHostedService, IAsyncDisposable
 {
     private readonly AlertEvaluator _evaluator;
-    private readonly StorageEngine  _engine;
-
-    public AlertsWiring(AlertEvaluator evaluator, StorageEngine engine)
-    {
-        _evaluator = evaluator;
-        _engine    = engine;
-    }
-
-    public Task StartAsync(CancellationToken cancellationToken)
-    {
-        _evaluator.Attach(_engine);
-        return Task.CompletedTask;
-    }
-
-    public Task StopAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+    public AlertsHostedService(AlertEvaluator evaluator) => _evaluator = evaluator;
+    public Task StartAsync(CancellationToken ct) => Task.CompletedTask;
+    public async Task StopAsync(CancellationToken ct) => await _evaluator.DisposeAsync();
+    public async ValueTask DisposeAsync() => await _evaluator.DisposeAsync();
 }
 
 /// <summary>
-/// DI extension for registering alert services.
-/// Must be called after <c>AddAmetoStorage</c>.
+/// DI extension for registering alert services. Must be called after the log/metric/trace
+/// query services are registered (the evaluator consumes IQueryExecutor / IMetricAggregator /
+/// ITraceStatsProvider).
 /// </summary>
 public static class AlertsServiceExtensions
 {
@@ -41,28 +29,12 @@ public static class AlertsServiceExtensions
         string dataDirectory)
     {
         services.AddSingleton<AlertRuleStore>(sp =>
-            new AlertRuleStore(
-                dataDirectory,
-                sp.GetRequiredService<ILogger<AlertRuleStore>>()));
+            new AlertRuleStore(dataDirectory, sp.GetRequiredService<ILogger<AlertRuleStore>>()));
 
         services.AddSingleton<AlertDispatcher>();
         services.AddSingleton<AlertEvaluator>();
-        services.AddHostedService<AlertsWiring>();
+        services.AddHostedService<AlertsHostedService>();
 
         return services;
     }
-}
-
-// ── Request DTO ────────────────────────────────────────────────
-
-public sealed class AlertRuleUpsertRequest
-{
-    public string?                  Id              { get; init; }
-    public string?                  Name            { get; init; }
-    public string?                  Filter          { get; init; }
-    public int                      Threshold       { get; init; } = 1;
-    public int                      WindowSeconds   { get; init; } = 300;
-    public int                      CooldownSeconds { get; init; } = 900;
-    public bool                     Enabled         { get; init; } = true;
-    public IReadOnlyList<AlertChannel>? Channels    { get; init; }
 }

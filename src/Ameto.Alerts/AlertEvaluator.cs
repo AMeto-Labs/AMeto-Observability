@@ -1,142 +1,322 @@
 using System.Collections.Concurrent;
 using Microsoft.Extensions.Logging;
 using Ameto.Core;
-using Ameto.Query.Filtering;
-using Ameto.Storage;
+using Ameto.Metrics;
+using Ameto.Tracing;
+using Ameto.Tracing.Storage;
 
 namespace Ameto.Alerts;
 
 /// <summary>
-/// Evaluates alert rules against every ingested event using a sliding-window counter.
+/// Periodic, unified evaluator for log / metric / trace alert rules.
 ///
-/// Design:
-/// - One <see cref="RuleState"/> per enabled rule, keyed by rule id.
-/// - Hooks into <see cref="StorageEngine.EventWritten"/> — called on the ingestion write path.
-/// - Builds a minimal <see cref="LogEvent"/> from header + template for filter evaluation.
-/// - Thread-safe: multiple ingestion threads may call Evaluate concurrently.
-/// - Non-blocking: firing is dispatched to the thread pool, never blocks the caller.
+/// Every <see cref="EvalInterval"/> it computes one numeric value per enabled rule,
+/// compares it to the threshold, and drives a state machine:
+/// OK → (condition true) → Pending → (held for <c>For</c>) → Firing → (condition false) → OK.
+/// Firing/resolve transitions are dispatched to channels (unless silenced) and recorded
+/// in the in-memory history ring.
 /// </summary>
-public sealed class AlertEvaluator
+public sealed class AlertEvaluator : IAsyncDisposable
 {
-    private readonly AlertRuleStore              _store;
-    private readonly AlertDispatcher             _dispatcher;
-    private readonly ILogger<AlertEvaluator>     _logger;
-    private readonly ConcurrentDictionary<string, RuleState> _states = new();
+    private static readonly TimeSpan EvalInterval = TimeSpan.FromSeconds(15);
+    private const int HistoryCapacity = 2_000;
+
+    private readonly AlertRuleStore        _store;
+    private readonly AlertDispatcher       _dispatcher;
+    private readonly IQueryExecutor        _logQuery;
+    private readonly IMetricAggregator     _metrics;
+    private readonly ITraceStatsProvider   _traceStats;
+    private readonly ILogger<AlertEvaluator> _logger;
+
+    private readonly ConcurrentDictionary<string, MutableState> _states = new();
+    private readonly ConcurrentDictionary<string, AlertSilence> _silences = new();
+    private readonly AlertHistoryEntry[]   _history = new AlertHistoryEntry[HistoryCapacity];
+    private readonly object                _histLock = new();
+    private int _histCount, _histHead;
+
+    private readonly CancellationTokenSource _cts = new();
+    private readonly Task _loop;
 
     public AlertEvaluator(
-        AlertRuleStore          store,
-        AlertDispatcher         dispatcher,
+        AlertRuleStore store, AlertDispatcher dispatcher,
+        IQueryExecutor logQuery, IMetricAggregator metrics, ITraceStatsProvider traceStats,
         ILogger<AlertEvaluator> logger)
     {
-        _store      = store;
-        _dispatcher = dispatcher;
-        _logger     = logger;
-
-        RebuildStates();
-        _store.RulesChanged += RebuildStates;
+        _store = store; _dispatcher = dispatcher;
+        _logQuery = logQuery; _metrics = metrics; _traceStats = traceStats;
+        _logger = logger;
+        _loop = Task.Run(EvalLoopAsync);
     }
 
-    /// <summary>
-    /// Wires this evaluator into <paramref name="engine"/> by setting its
-    /// <see cref="StorageEngine.EventWritten"/> hook.
-    /// </summary>
-    public void Attach(StorageEngine engine)
+    // ── Public API (read by endpoints) ─────────────────────────────────────────
+
+    public IReadOnlyList<AlertStateSnapshot> GetStates()
     {
-        engine.EventWritten = Evaluate;
-    }
-
-    private void Evaluate(LogEventHeader header, string messageTemplate)
-    {
-        if (_states.IsEmpty) return;
-
-        // Build a lightweight LogEvent — no properties, just enough for filter evaluation.
-        var ev = new LogEvent
+        var rules = _store.GetAll();
+        var list = new List<AlertStateSnapshot>(rules.Count);
+        foreach (var r in rules)
         {
-            Id              = new Ameto.Core.EventId(header.Id),
-            Timestamp       = new DateTimeOffset(header.TimestampUtcTicks, TimeSpan.Zero),
-            Level           = (Ameto.Core.LogLevel)header.Level,
-            MessageTemplate = messageTemplate,
-        };
-
-        foreach (var (_, state) in _states)
-            state.Push(ev);
-    }
-
-    private void RebuildStates()
-    {
-        var rules   = _store.GetAll();
-        var newKeys = new HashSet<string>(rules.Select(r => r.Id));
-
-        foreach (var key in _states.Keys)
-            if (!newKeys.Contains(key))
-                _states.TryRemove(key, out _);
-
-        foreach (var rule in rules.Where(r => r.Enabled))
-        {
-            _states.AddOrUpdate(
-                rule.Id,
-                _  => new RuleState(rule, _dispatcher, _logger),
-                (_, _) => new RuleState(rule, _dispatcher, _logger));
-        }
-    }
-
-    // ── Per-rule state ────────────────────────────────────────────────────────
-
-    private sealed class RuleState
-    {
-        private readonly AlertRule       _rule;
-        private readonly CompiledFilter  _filter;
-        private readonly AlertDispatcher _dispatcher;
-        private readonly ILogger         _logger;
-
-        private readonly Queue<(long ticks, LogEvent ev)> _window = new();
-        private readonly object _lock = new();
-        private long _lastFiredTicks = long.MinValue;
-
-        public RuleState(AlertRule rule, AlertDispatcher dispatcher, ILogger logger)
-        {
-            _rule       = rule;
-            _filter     = CompiledFilter.Compile(rule.Filter);
-            _dispatcher = dispatcher;
-            _logger     = logger;
-        }
-
-        public void Push(LogEvent ev)
-        {
-            if (!_filter.Matches(ev)) return;
-
-            long nowTicks    = ev.Timestamp.UtcTicks;
-            long windowTicks = _rule.Window.Ticks;
-
-            lock (_lock)
+            var s = _states.GetValueOrDefault(r.Id);
+            list.Add(new AlertStateSnapshot
             {
-                _window.Enqueue((nowTicks, ev));
+                RuleId = r.Id,
+                State = s?.State ?? AlertState.Ok,
+                LastValue = s?.LastValue ?? 0,
+                PendingSince = s?.PendingSince,
+                LastFiredAt = s?.LastFiredAt,
+                EvaluatedAt = s?.EvaluatedAt ?? DateTimeOffset.MinValue,
+            });
+        }
+        return list;
+    }
 
-                // Expire old events
-                while (_window.Count > 0 && nowTicks - _window.Peek().ticks > windowTicks)
-                    _window.Dequeue();
+    public IReadOnlyList<AlertHistoryEntry> GetHistory(int limit = 200)
+    {
+        lock (_histLock)
+        {
+            int n = Math.Min(limit, _histCount);
+            var outArr = new AlertHistoryEntry[n];
+            for (int i = 0; i < n; i++)            // newest first
+                outArr[i] = _history[(_histHead - 1 - i + HistoryCapacity) % HistoryCapacity];
+            return outArr;
+        }
+    }
 
-                if (_window.Count < _rule.Threshold) return;
+    public IReadOnlyList<AlertSilence> GetSilences()
+    {
+        PurgeExpiredSilences();
+        return _silences.Values.OrderByDescending(s => s.Until).ToList();
+    }
 
-                // Check cooldown
-                if (nowTicks - _lastFiredTicks < _rule.Cooldown.Ticks) return;
+    public AlertSilence AddSilence(AlertSilence s) { _silences[s.Id] = s; return s; }
+    public bool RemoveSilence(string id) => _silences.TryRemove(id, out _);
 
-                _lastFiredTicks = nowTicks;
+    /// <summary>Evaluate a rule's value right now without affecting state (for the editor preview).</summary>
+    public async Task<double> PreviewAsync(AlertRule rule, CancellationToken ct = default)
+        => await ComputeValueAsync(rule, DateTimeOffset.UtcNow, ct);
 
-                var sample = _window.Take(5).Select(x => x.ev).ToList();
-                int count  = _window.Count;
-                _window.Clear();
+    // ── Eval loop ───────────────────────────────────────────────────────────────
 
-                var fired = new AlertFiredEvent
-                {
-                    Rule         = _rule,
-                    Count        = count,
-                    FiredAt      = new DateTimeOffset(nowTicks, TimeSpan.Zero),
-                    SampleEvents = sample,
-                };
+    private async Task EvalLoopAsync()
+    {
+        var ct = _cts.Token;
+        while (!ct.IsCancellationRequested)
+        {
+            try { await Task.Delay(EvalInterval, ct); }
+            catch (OperationCanceledException) { break; }
 
-                _ = Task.Run(() => _dispatcher.DispatchAsync(fired));
+            try { await EvaluateAllAsync(ct); }
+            catch (Exception ex) { _logger.LogError(ex, "Alert evaluation cycle failed"); }
+        }
+    }
+
+    private async Task EvaluateAllAsync(CancellationToken ct)
+    {
+        var now = DateTimeOffset.UtcNow;
+        foreach (var rule in _store.GetAll())
+        {
+            if (!rule.Enabled) { _states.TryRemove(rule.Id, out _); continue; }
+            try
+            {
+                double value = await ComputeValueAsync(rule, now, ct);
+                Transition(rule, value, now);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to evaluate alert rule {Rule}", rule.Id);
             }
         }
+    }
+
+    // ── State machine ───────────────────────────────────────────────────────────
+
+    private void Transition(AlertRule rule, double value, DateTimeOffset now)
+    {
+        var st = _states.GetOrAdd(rule.Id, _ => new MutableState());
+        st.LastValue   = value;
+        st.EvaluatedAt = now;
+
+        bool breached = Compare(value, rule.Comparator, rule.Threshold);
+
+        if (!breached)
+        {
+            // Resolve if we were firing
+            if (st.State == AlertState.Firing)
+            {
+                st.State = AlertState.Ok;
+                st.PendingSince = null;
+                Record(rule, AlertState.Ok, value, now);
+                Dispatch(rule, AlertState.Ok, value, now);
+            }
+            else
+            {
+                st.State = AlertState.Ok;
+                st.PendingSince = null;
+            }
+            return;
+        }
+
+        // breached
+        if (st.State is AlertState.Ok or AlertState.NoData)
+        {
+            st.PendingSince = now;
+            st.State = rule.For <= TimeSpan.Zero ? AlertState.Firing : AlertState.Pending;
+        }
+
+        if (st.State == AlertState.Pending && st.PendingSince is { } since && now - since >= rule.For)
+            st.State = AlertState.Firing;
+
+        if (st.State == AlertState.Firing)
+        {
+            // Cooldown gate on repeated firing notifications
+            bool cooled = st.LastFiredAt is null || now - st.LastFiredAt >= rule.Cooldown;
+            if (cooled && !st.Notified)
+            {
+                st.LastFiredAt = now;
+                st.Notified = true;
+                Record(rule, AlertState.Firing, value, now);
+                Dispatch(rule, AlertState.Firing, value, now);
+            }
+        }
+
+        if (st.State != AlertState.Firing) st.Notified = false;
+    }
+
+    private void Dispatch(AlertRule rule, AlertState state, double value, DateTimeOffset now)
+    {
+        if (IsSilenced(rule.Id)) return;
+        var fired = new AlertFiredEvent { Rule = rule, State = state, Value = value, At = now };
+        _ = Task.Run(() => _dispatcher.DispatchAsync(fired));
+    }
+
+    private void Record(AlertRule rule, AlertState state, double value, DateTimeOffset now)
+    {
+        var entry = new AlertHistoryEntry
+        {
+            RuleId = rule.Id, RuleName = rule.Name, Severity = rule.Severity,
+            State = state, Value = value, Threshold = rule.Threshold, At = now,
+        };
+        lock (_histLock)
+        {
+            _history[_histHead] = entry;
+            _histHead = (_histHead + 1) % HistoryCapacity;
+            if (_histCount < HistoryCapacity) _histCount++;
+        }
+    }
+
+    private bool IsSilenced(string ruleId)
+    {
+        PurgeExpiredSilences();
+        foreach (var s in _silences.Values)
+            if (s.RuleId == ruleId && s.Until > DateTimeOffset.UtcNow) return true;
+        return false;
+    }
+
+    private void PurgeExpiredSilences()
+    {
+        var now = DateTimeOffset.UtcNow;
+        foreach (var (id, s) in _silences)
+            if (s.Until <= now) _silences.TryRemove(id, out _);
+    }
+
+    // ── Value computation per source ────────────────────────────────────────────
+
+    private async Task<double> ComputeValueAsync(AlertRule rule, DateTimeOffset now, CancellationToken ct)
+    {
+        var from = now - rule.Window;
+        return rule.Source switch
+        {
+            AlertSource.Metric => await MetricValueAsync(rule, from, now, ct),
+            AlertSource.Trace  => await TraceValueAsync(rule, from, now, ct),
+            _                  => await LogValueAsync(rule, from, now, ct),
+        };
+    }
+
+    private async Task<double> LogValueAsync(AlertRule rule, DateTimeOffset from, DateTimeOffset to, CancellationToken ct)
+    {
+        var req = new QueryRequest
+        {
+            Filter = rule.Filter,
+            FromUtc = from,
+            ToUtc = to,
+            Count = 10_000,
+            Direction = QueryDirection.Backward,
+        };
+        int count = 0;
+        await foreach (var _ in _logQuery.ExecuteAsync(req, ct))
+            if (++count >= 10_000) break;
+        return count;
+    }
+
+    private async Task<double> MetricValueAsync(AlertRule rule, DateTimeOffset from, DateTimeOffset to, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(rule.Metric)) return 0;
+        var series = await _metrics.QueryAsync(new MetricQueryRequest
+        {
+            Metric = rule.Metric,
+            From = from, To = to,
+            Aggregation = Enum.TryParse<MetricAggregation>(rule.Aggregation, true, out var a) ? a : MetricAggregation.Last,
+            Quantile = rule.Quantile,
+            GroupBy = rule.GroupBy,
+            Filters = rule.Labels,
+        }, ct);
+
+        // Reduce over the whole window (not just the last point — a quiet final
+        // interval would read 0 and miss the spike). For ">" thresholds take the
+        // peak; for "<" thresholds take the trough.
+        bool wantMax = rule.Comparator is AlertComparator.GreaterThan or AlertComparator.GreaterOrEqual;
+        double acc = double.NaN;
+        foreach (var s in series)
+            foreach (var p in s.Points)
+            {
+                if (double.IsNaN(acc)) acc = p.Value;
+                else acc = wantMax ? Math.Max(acc, p.Value) : Math.Min(acc, p.Value);
+            }
+        return double.IsNaN(acc) ? 0 : acc;
+    }
+
+    private async Task<double> TraceValueAsync(AlertRule rule, DateTimeOffset from, DateTimeOffset to, CancellationToken ct)
+    {
+        var stats = await _traceStats.GetAggregateStatsAsync(from, to, ct);
+        var svc = stats.FirstOrDefault(s =>
+            string.IsNullOrEmpty(rule.Service) ||
+            s.ServiceName.Equals(rule.Service, StringComparison.OrdinalIgnoreCase));
+        if (svc is null) return 0;
+
+        return rule.TraceMetric switch
+        {
+            TraceMetricKind.ErrorRatePct => svc.SpanCount > 0 ? (double)svc.ErrorCount / svc.SpanCount * 100.0 : 0,
+            TraceMetricKind.SpanCount    => svc.SpanCount,
+            TraceMetricKind.P50Ms        => HistogramBuckets.Percentile(svc.Buckets, 0.50),
+            TraceMetricKind.P95Ms        => HistogramBuckets.Percentile(svc.Buckets, 0.95),
+            TraceMetricKind.P99Ms        => HistogramBuckets.Percentile(svc.Buckets, 0.99),
+            _                            => HistogramBuckets.Percentile(svc.Buckets, 0.50),
+        };
+    }
+
+    private static bool Compare(double value, AlertComparator cmp, double threshold) => cmp switch
+    {
+        AlertComparator.GreaterThan    => value >  threshold,
+        AlertComparator.GreaterOrEqual => value >= threshold,
+        AlertComparator.LessThan       => value <  threshold,
+        AlertComparator.LessOrEqual    => value <= threshold,
+        _                              => false,
+    };
+
+    public async ValueTask DisposeAsync()
+    {
+        _cts.Cancel();
+        try { await _loop; } catch (OperationCanceledException) { }
+        _cts.Dispose();
+    }
+
+    private sealed class MutableState
+    {
+        public AlertState      State;
+        public double          LastValue;
+        public DateTimeOffset? PendingSince;
+        public DateTimeOffset? LastFiredAt;
+        public DateTimeOffset  EvaluatedAt;
+        public bool            Notified;
     }
 }

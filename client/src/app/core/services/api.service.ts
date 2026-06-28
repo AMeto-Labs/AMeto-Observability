@@ -2,7 +2,10 @@ import { Injectable, inject } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { Observable } from 'rxjs';
 import { EventDto, EventQueryParams, StatsDto } from '../models/event.model';
-import { AlertRule, AlertRuleUpsertRequest } from '../models/alert.model';
+import {
+  AlertRule, AlertRuleUpsertRequest, AlertStateSnapshot, AlertHistoryEntry,
+  AlertSilence, AlertPreviewResult,
+} from '../models/alert.model';
 import { NodeDto } from '../models/node.model';
 import { RetentionDto, RetentionRunResult } from '../models/retention.model';
 import { DiagnosticsDto } from '../models/diagnostics.model';
@@ -58,20 +61,36 @@ export class ApiService {
     return this.http.get<string[]>(`/api/events/services?days=${days}`);
   }
 
-  getSignals(): Observable<AlertRule[]> {
-    return this.http.get<AlertRule[]>('/api/signals');
+  // ── Alerts ───────────────────────────────────────────────────────────────
+  getAlerts(): Observable<AlertRule[]> {
+    return this.http.get<AlertRule[]>('/api/alerts');
   }
-
-  createSignal(req: AlertRuleUpsertRequest): Observable<AlertRule> {
-    return this.http.post<AlertRule>('/api/signals', req);
+  createAlert(req: AlertRuleUpsertRequest): Observable<AlertRule> {
+    return this.http.post<AlertRule>('/api/alerts', req);
   }
-
-  updateSignal(id: string, req: AlertRuleUpsertRequest): Observable<AlertRule> {
-    return this.http.put<AlertRule>(`/api/signals/${id}`, req);
+  updateAlert(id: string, req: AlertRuleUpsertRequest): Observable<AlertRule> {
+    return this.http.put<AlertRule>(`/api/alerts/${id}`, req);
   }
-
-  deleteSignal(id: string): Observable<void> {
-    return this.http.delete<void>(`/api/signals/${id}`);
+  deleteAlert(id: string): Observable<void> {
+    return this.http.delete<void>(`/api/alerts/${id}`);
+  }
+  getAlertState(): Observable<AlertStateSnapshot[]> {
+    return this.http.get<AlertStateSnapshot[]>('/api/alerts/state');
+  }
+  getAlertHistory(limit = 200): Observable<AlertHistoryEntry[]> {
+    return this.http.get<AlertHistoryEntry[]>(`/api/alerts/history?limit=${limit}`);
+  }
+  getAlertSilences(): Observable<AlertSilence[]> {
+    return this.http.get<AlertSilence[]>('/api/alerts/silences');
+  }
+  createAlertSilence(ruleId: string, minutes: number, reason?: string): Observable<AlertSilence> {
+    return this.http.post<AlertSilence>('/api/alerts/silences', { ruleId, minutes, reason });
+  }
+  deleteAlertSilence(id: string): Observable<void> {
+    return this.http.delete<void>(`/api/alerts/silences/${id}`);
+  }
+  previewAlert(req: AlertRuleUpsertRequest): Observable<AlertPreviewResult> {
+    return this.http.post<AlertPreviewResult>('/api/alerts/preview', req);
   }
 
   getNodes(): Observable<NodeDto[]> {

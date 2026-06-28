@@ -4,6 +4,8 @@
     <ProjectReference Include="..\Ameto.Core\Ameto.Core.csproj" />
     <ProjectReference Include="..\Ameto.Query\Ameto.Query.csproj" />
     <ProjectReference Include="..\Ameto.Storage\Ameto.Storage.csproj" />
+    <ProjectReference Include="..\Ameto.Metrics\Ameto.Metrics.csproj" />
+    <ProjectReference Include="..\Ameto.Tracing\Ameto.Tracing.csproj" />
   </ItemGroup>
 
   <ItemGroup>

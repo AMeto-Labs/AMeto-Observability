@@ -1,194 +1,242 @@
-<div class="page">
+<div class="alerts-page">
 
-  <!-- ── Header ─────────────────────────────────────────────────────────── -->
-  <app-page-header icon="bell" title="Signals">
-    <button class="btn primary" (click)="openCreate()">
-      <lucide-icon name="plus" [size]="13" />
-      New signal
+  <!-- Header -->
+  <div class="page-hdr">
+    <div class="page-title">
+      <h1>Alerts</h1>
+      <span class="page-subtitle">Log, metric &amp; trace alerting</span>
+      @if (firingCount()) {
+        <span class="firing-pill"><span class="fp-dot"></span>{{ firingCount() }} firing</span>
+      }
+    </div>
+    <button class="btn-primary" (click)="newRule()"><lucide-icon name="plus" [size]="14" /> New rule</button>
+  </div>
+
+  <!-- Tabs -->
+  <div class="main-tabs">
+    <button class="main-tab" [class.active]="tab() === 'rules'" (click)="setTab('rules')">
+      <lucide-icon name="bell" [size]="13" /> Rules
     </button>
-  </app-page-header>
+    <button class="main-tab" [class.active]="tab() === 'history'" (click)="setTab('history')">
+      <lucide-icon name="history" [size]="13" /> History
+    </button>
+    <button class="main-tab" [class.active]="tab() === 'silences'" (click)="setTab('silences')">
+      <lucide-icon name="bell-off" [size]="13" /> Silences
+    </button>
+  </div>
 
-  <!-- ── Create / Edit form ──────────────────────────────────────────────── -->
-  @if (showForm()) {
-    <app-section [title]="editId() ? 'Edit signal' : 'New signal'">
-      <div class="field-row">
-        <span class="field-label">Name *</span>
-        <input class="field-input" type="text" placeholder="e.g. High error rate"
-               [(ngModel)]="formName" name="sig-name" />
-      </div>
+  <!-- ══ RULES ═════════════════════════════════════════════════════════════ -->
+  @if (tab() === 'rules') {
+    @if (!rules().length && !loading()) {
+      <div class="panel-empty">No alert rules yet. Click <b>New rule</b> to create one.</div>
+    } @else {
+      <div class="rules">
+        @for (r of rules(); track r.id) {
+          <div class="rule-row" [class.disabled]="!r.enabled">
+            <span class="rule-state" [class]="stateCls(r.id)" [title]="stateLabel(r.id)"></span>
 
-      <div class="field-row">
-        <span class="field-label">Filter</span>
-        <input class="field-input mono" type="text" placeholder="@l = 'Error'"
-               [(ngModel)]="formFilter" name="sig-filter" />
-      </div>
-
-      <div class="row3">
-        <div class="field-group">
-          <span class="field-sub">Threshold (events)</span>
-          <input class="field-input" type="number" min="1"
-                 [(ngModel)]="formThreshold" name="sig-threshold" />
-        </div>
-        <div class="field-group">
-          <span class="field-sub">Window (seconds)</span>
-          <input class="field-input" type="number" min="1"
-                 [(ngModel)]="formWindowSeconds" name="sig-window" />
-        </div>
-        <div class="field-group">
-          <span class="field-sub">Cooldown (seconds)</span>
-          <input class="field-input" type="number" min="0"
-                 [(ngModel)]="formCooldownSeconds" name="sig-cooldown" />
-        </div>
-      </div>
-
-      <label class="checkbox-row">
-        <input type="checkbox" [(ngModel)]="formEnabled" name="sig-enabled" />
-        Enabled
-      </label>
-
-      <!-- Channels -->
-      <div class="section-subtitle channels-title">Notification channels</div>
-
-      <div class="ch-list">
-        @for (ch of formChannels; track $index) {
-          <div class="ch-card">
-            <div class="ch-hdr">
-              <select class="ch-type-sel"
-                      [ngModel]="ch.type"
-                      (ngModelChange)="setChannelType($index, $event)"
-                      name="ch-type-{{ $index }}">
-                <option value="webhook">Webhook</option>
-                <option value="smtp">SMTP</option>
-              </select>
-              <button class="ch-remove" type="button" (click)="removeChannel($index)" title="Remove">
-                <lucide-icon name="x" [size]="12" />
-              </button>
+            <div class="rule-main">
+              <div class="rule-top">
+                <span class="sev-tag" [class]="sevCls(r.severity)">{{ r.severity }}</span>
+                <lucide-icon [name]="sourceIcon(r.source)" [size]="13" class="src-icon" [title]="r.source" />
+                <span class="rule-name">{{ r.name }}</span>
+                <span class="state-text" [class]="stateCls(r.id)">{{ stateLabel(r.id) }}</span>
+              </div>
+              <div class="rule-cond">
+                @if (r.source === 'Log') { <code>count({{ r.filter || '*' }})</code> }
+                @else if (r.source === 'Metric') { <code>{{ r.aggregation }}({{ r.metric }})</code> }
+                @else { <code>{{ r.service || '*' }} · {{ r.traceMetric }}</code> }
+                <span class="cond-op">{{ cmpLabel(r.comparator) }} {{ r.threshold }}</span>
+                <span class="cond-meta">window {{ fmtSecs(secsOf(r.window)) }}@if (secsOf(r.for)) { · for {{ fmtSecs(secsOf(r.for)) }} }</span>
+              </div>
             </div>
 
-            @if (ch.type === 'webhook') {
-              <input class="field-input mono" type="url"
-                     placeholder="https://hooks.example.com/…"
-                     [(ngModel)]="formChannels[$index].url"
-                     name="ch-url-{{ $index }}" />
+            <div class="rule-right">
+              <span class="rule-value">{{ lastValue(r.id) }}</span>
+              <span class="rule-ago">{{ fmtAgo(stateOf(r.id)?.evaluatedAt) }}</span>
+            </div>
+
+            <div class="rule-actions">
+              <button class="ic" (click)="toggleEnabled(r)" [title]="r.enabled ? 'Disable' : 'Enable'">
+                <lucide-icon [name]="r.enabled ? 'toggle-right' : 'toggle-left'" [size]="16" />
+              </button>
+              <button class="ic" (click)="silence(r)" title="Silence"><lucide-icon name="bell-off" [size]="14" /></button>
+              <button class="ic" (click)="edit(r)" title="Edit"><lucide-icon name="pencil" [size]="14" /></button>
+              <button class="ic danger" (click)="remove(r)" title="Delete"><lucide-icon name="trash-2" [size]="14" /></button>
+            </div>
+          </div>
+        }
+      </div>
+    }
+  }
+
+  <!-- ══ HISTORY ═══════════════════════════════════════════════════════════ -->
+  @if (tab() === 'history') {
+    @if (!history().length) {
+      <div class="panel-empty">No alert events recorded yet.</div>
+    } @else {
+      <div class="history">
+        @for (h of history(); track $index) {
+          <div class="hist-row">
+            <span class="hist-state" [class]="h.state === 'Firing' ? 'st-firing' : 'st-ok'">
+              <lucide-icon [name]="h.state === 'Firing' ? 'flame' : 'check'" [size]="13" />
+              {{ h.state === 'Firing' ? 'FIRING' : 'RESOLVED' }}
+            </span>
+            <span class="sev-tag" [class]="sevCls(h.severity)">{{ h.severity }}</span>
+            <span class="hist-name">{{ h.ruleName }}</span>
+            <span class="hist-val">value {{ h.value }} · threshold {{ h.threshold }}</span>
+            <span class="hist-time">{{ fmtTime(h.at) }}</span>
+          </div>
+        }
+      </div>
+    }
+  }
+
+  <!-- ══ SILENCES ══════════════════════════════════════════════════════════ -->
+  @if (tab() === 'silences') {
+    @if (!silences().length) {
+      <div class="panel-empty">No active silences.</div>
+    } @else {
+      <div class="silences">
+        @for (s of silences(); track s.id) {
+          <div class="sil-row">
+            <lucide-icon name="bell-off" [size]="14" class="sil-icon" />
+            <span class="sil-name">{{ ruleName(s.ruleId) }}</span>
+            @if (s.reason) { <span class="sil-reason">{{ s.reason }}</span> }
+            <span class="sil-until">until {{ fmtTime(s.until) }}</span>
+            <button class="ic danger" (click)="removeSilence(s)" title="Remove"><lucide-icon name="x" [size]="14" /></button>
+          </div>
+        }
+      </div>
+    }
+  }
+
+  <!-- ══ EDITOR (slide-over) ═══════════════════════════════════════════════ -->
+  @if (editing(); as d) {
+    <div class="ed-backdrop" (click)="cancel()"></div>
+    <aside class="ed-drawer">
+      <div class="ed-hdr">
+        <span class="ed-title">{{ d.id ? 'Edit rule' : 'New rule' }}</span>
+        <button class="ic" (click)="cancel()"><lucide-icon name="x" [size]="16" /></button>
+      </div>
+
+      <div class="ed-body">
+        <label class="fld"><span>Name</span>
+          <input [(ngModel)]="d.name" placeholder="High p99 latency" /></label>
+
+        <div class="fld-row">
+          <label class="fld"><span>Source</span>
+            <select [(ngModel)]="d.source">
+              @for (s of sources; track s) { <option [value]="s">{{ s }}</option> }
+            </select></label>
+          <label class="fld"><span>Severity</span>
+            <select [(ngModel)]="d.severity">
+              @for (s of severities; track s) { <option [value]="s">{{ s }}</option> }
+            </select></label>
+        </div>
+
+        @if (d.source === 'Log') {
+          <label class="fld"><span>Filter (Seq expression)</span>
+            <input [(ngModel)]="d.filter" placeholder="@l = 'Error'" spellcheck="false" /></label>
+          <label class="chk"><input type="checkbox" [(ngModel)]="d.noData" /> Fire on absence (dead-man's switch)</label>
+        } @else if (d.source === 'Metric') {
+          <label class="fld"><span>Metric</span>
+            <input [(ngModel)]="d.metric" placeholder="http.server.request.duration" spellcheck="false" /></label>
+          <div class="fld-row">
+            <label class="fld"><span>Aggregation</span>
+              <select [(ngModel)]="d.aggregation">
+                @for (a of aggregations; track a) { <option [value]="a">{{ a }}</option> }
+              </select></label>
+            @if (d.aggregation === 'quantile') {
+              <label class="fld"><span>Quantile</span>
+                <select [(ngModel)]="d.quantile">
+                  <option [ngValue]="0.5">p50</option><option [ngValue]="0.9">p90</option>
+                  <option [ngValue]="0.95">p95</option><option [ngValue]="0.99">p99</option>
+                </select></label>
+            }
+          </div>
+        } @else {
+          <label class="fld"><span>Service</span>
+            <input [(ngModel)]="d.service" placeholder="LinkUpBot" spellcheck="false" /></label>
+          <label class="fld"><span>Trace metric</span>
+            <select [(ngModel)]="d.traceMetric">
+              @for (t of traceMetrics; track t) { <option [value]="t">{{ t }}</option> }
+            </select></label>
+        }
+
+        <div class="fld-row">
+          <label class="fld sm"><span>Condition</span>
+            <select [(ngModel)]="d.comparator">
+              @for (c of comparators; track c.v) { <option [value]="c.v">{{ c.label }}</option> }
+            </select></label>
+          <label class="fld"><span>Threshold</span>
+            <input type="number" [(ngModel)]="d.threshold" /></label>
+        </div>
+
+        <div class="fld-row">
+          <label class="fld"><span>Window (s)</span><input type="number" [(ngModel)]="d.windowSeconds" /></label>
+          <label class="fld"><span>For (s)</span><input type="number" [(ngModel)]="d.forSeconds" /></label>
+          <label class="fld"><span>Cooldown (s)</span><input type="number" [(ngModel)]="d.cooldownSeconds" /></label>
+        </div>
+
+        <div class="preview-bar">
+          <button class="btn-secondary" (click)="runPreview()" [disabled]="previewing()">
+            <lucide-icon name="play" [size]="12" /> Preview
+          </button>
+          @if (preview(); as p) {
+            <span class="pv-result" [class.fires]="p.wouldFire">
+              value <b>{{ fmtNum(p.value) }}</b> {{ cmpLabel(d.comparator) }} {{ p.threshold }}
+              → {{ p.wouldFire ? 'WOULD FIRE' : 'ok' }}
+            </span>
+          }
+        </div>
+
+        <div class="ch-hdr">
+          <span>Channels</span>
+          <div class="ch-add">
+            <button (click)="addChannel('telegram')">+ Telegram</button>
+            <button (click)="addChannel('webhook')">+ Webhook</button>
+            <button (click)="addChannel('smtp')">+ Email</button>
+          </div>
+        </div>
+        @for (c of d.channels; track $index) {
+          <div class="ch-card">
+            <div class="ch-card-hdr">
+              <span class="ch-type">{{ c.type }}</span>
+              <button class="ic danger" (click)="removeChannel($index)"><lucide-icon name="x" [size]="13" /></button>
+            </div>
+            @if (c.type === 'telegram') {
+              <input [(ngModel)]="c.botToken" placeholder="Bot token" spellcheck="false" />
+              <input [(ngModel)]="c.chatId" placeholder="Chat ID" spellcheck="false" />
+            } @else if (c.type === 'webhook') {
+              <input [(ngModel)]="c.url" placeholder="https://hooks.example.com/..." spellcheck="false" />
             } @else {
-              <div class="row3">
-                <div class="field-group">
-                  <span class="field-sub">Host</span>
-                  <input class="field-input" type="text" placeholder="smtp.example.com"
-                         [(ngModel)]="formChannels[$index].host"
-                         name="ch-host-{{ $index }}" />
-                </div>
-                <div class="field-group">
-                  <span class="field-sub">Port</span>
-                  <input class="field-input" type="number"
-                         [(ngModel)]="formChannels[$index].port"
-                         name="ch-port-{{ $index }}" />
-                </div>
-                <div class="field-group tls-field">
-                  <label class="checkbox-row">
-                    <input type="checkbox"
-                           [(ngModel)]="formChannels[$index].useSsl"
-                           name="ch-ssl-{{ $index }}" />
-                    TLS
-                  </label>
-                </div>
+              <div class="fld-row">
+                <input [(ngModel)]="c.host" placeholder="smtp.host" />
+                <input type="number" [(ngModel)]="c.port" placeholder="587" style="width:80px" />
               </div>
-              <div class="row3">
-                <div class="field-group">
-                  <span class="field-sub">SMTP username</span>
-                  <input class="field-input" type="text"
-                         [(ngModel)]="formChannels[$index].smtpUsername"
-                         name="ch-smtpuser-{{ $index }}" />
-                </div>
-                <div class="field-group">
-                  <span class="field-sub">SMTP password</span>
-                  <input class="field-input" type="password"
-                         [(ngModel)]="formChannels[$index].smtpPassword"
-                         name="ch-smtppwd-{{ $index }}" />
-                </div>
-                <div></div>
+              <div class="fld-row">
+                <input [(ngModel)]="c.from" placeholder="from@x.com" />
+                <input [(ngModel)]="c.to" placeholder="to@x.com" />
               </div>
-              <div class="row3">
-                <div class="field-group">
-                  <span class="field-sub">From</span>
-                  <input class="field-input" type="email" placeholder="alerts@example.com"
-                         [(ngModel)]="formChannels[$index].from"
-                         name="ch-from-{{ $index }}" />
-                </div>
-                <div class="field-group">
-                  <span class="field-sub">To</span>
-                  <input class="field-input" type="email" placeholder="oncall@example.com"
-                         [(ngModel)]="formChannels[$index].to"
-                         name="ch-to-{{ $index }}" />
-                </div>
-                <div></div>
+              <div class="fld-row">
+                <input [(ngModel)]="c.username" placeholder="username" />
+                <input [(ngModel)]="c.password" type="password" placeholder="password" />
               </div>
             }
           </div>
         }
+
+        <label class="fld"><span>Message template (optional)</span>
+          <textarea [(ngModel)]="d.template" rows="2" spellcheck="false"></textarea></label>
       </div>
 
-      <div>
-        <button class="btn" type="button" (click)="addChannel()">
-          <lucide-icon name="plus" [size]="13" />
-          Add channel
+      <div class="ed-footer">
+        <button class="btn-secondary" (click)="cancel()">Cancel</button>
+        <button class="btn-primary" (click)="save()" [disabled]="!d.name.trim()">
+          {{ d.id ? 'Save' : 'Create' }}
         </button>
       </div>
-
-      <div class="btn-row form-actions">
-        <button class="btn primary" [disabled]="saving() || !formName.trim()" (click)="save()">
-          <lucide-icon [name]="saving() ? 'loader-circle' : 'save'" [size]="13" />
-          {{ saving() ? 'Saving…' : (editId() ? 'Update' : 'Create') }}
-        </button>
-        <button class="btn" (click)="closeForm()">Cancel</button>
-      </div>
-    </app-section>
+    </aside>
   }
-
-  <!-- ── Signal list ─────────────────────────────────────────────────────── -->
-  @if (loading()) {
-    <p class="loading-text">Loading…</p>
-  }
-
-  <div class="sig-list">
-    @for (s of signals(); track s.id) {
-      <div class="sig-card">
-        <div class="sig-dot" [class.off]="!s.enabled"></div>
-        <div class="sig-body">
-          <div class="sig-name">{{ s.name }}</div>
-          @if (s.filter) {
-            <div class="sig-filter">{{ s.filter }}</div>
-          }
-          <div class="sig-meta">
-            threshold: <b>{{ s.threshold }}</b> ·
-            window: <b>{{ fmtDuration(s.window) }}</b> ·
-            cooldown: <b>{{ fmtDuration(s.cooldown) }}</b>
-          </div>
-          @if (s.channels.length > 0) {
-            <div class="sig-channels">
-              @for (ch of s.channels; track $index) {
-                <span class="ch-badge">{{ ch.type }}</span>
-              }
-            </div>
-          }
-        </div>
-        <div class="actions">
-          <button class="btn-icon" (click)="openEdit(s)" title="Edit">
-            <lucide-icon name="pencil" [size]="13" />
-          </button>
-          <button class="btn-icon" (click)="toggle(s)"
-                  [title]="s.enabled ? 'Disable' : 'Enable'">
-            <lucide-icon [name]="s.enabled ? 'pause' : 'play'" [size]="13" />
-          </button>
-          <button class="btn-icon danger" (click)="delete(s.id)" title="Delete">
-            <lucide-icon name="trash-2" [size]="13" />
-          </button>
-        </div>
-      </div>
-    }
-    @if (!loading() && signals().length === 0) {
-      <app-empty-state text='No signals defined. Click "New signal" to create one.'></app-empty-state>
-    }
-  </div>
-
 </div>
