@@ -88,6 +88,27 @@ public static class MetricQueryEndpointMapper
             });
         }).RequireAuthorization();
 
+        // GET /api/metrics/{name}/exemplars?from=&to=&filters=k:v&limit=
+        app.MapGet("/api/metrics/{name}/exemplars", (HttpContext ctx, IMetricExemplars store, string name) =>
+        {
+            var from    = ParseDate(ctx.Request.Query["from"]);
+            var to      = ParseDate(ctx.Request.Query["to"]);
+            var filters = ParseFilters(ctx.Request.Query["filters"]);
+            int limit   = int.TryParse(ctx.Request.Query["limit"], out var l) ? Math.Clamp(l, 1, 1000) : 200;
+
+            var result = store.GetExemplars(name, from, to, filters, limit)
+                .Select(e => new ExemplarDto
+                {
+                    Ts      = e.TimestampUnixNano,
+                    Value   = e.Value,
+                    TraceId = e.TraceId,
+                    SpanId  = e.SpanId,
+                    Labels  = e.Labels.Pairs.ToDictionary(t => t.Key, t => t.Value),
+                })
+                .ToList();
+            return Results.Json(result);
+        }).RequireAuthorization();
+
         // GET /api/metrics/{name}?from=&to=&step=  — raw series (no aggregation)
         app.MapGet("/api/metrics/{name}", async (HttpContext ctx, IMetricQuery query, string name) =>
         {
@@ -193,6 +214,16 @@ public sealed class MetricSeriesDto
     public string                     Unit   { get; init; } = string.Empty;
     public Dictionary<string, string> Labels { get; init; } = [];
     public List<MetricPointDto>       Points { get; init; } = [];
+}
+
+/// <summary>An exemplar: sampled measurement linked to a trace.</summary>
+public sealed class ExemplarDto
+{
+    public long                       Ts      { get; init; }
+    public double                     Value   { get; init; }
+    public string                     TraceId { get; init; } = string.Empty;
+    public string                     SpanId  { get; init; } = string.Empty;
+    public Dictionary<string, string> Labels  { get; init; } = [];
 }
 
 /// <summary>A single data point in a metric time series.</summary>

@@ -197,23 +197,69 @@ internal static class OtlpProtoDecoder
                 case 25: dp.TimeUnixNano = cis.ReadFixed64().ToString(); break;      // field 3: time_unix_nano
                 case 33: dp.Count        = cis.ReadFixed64().ToString(); break;       // field 4: count (fixed64, OTel .NET SDK encodes as fixed64 not varint)
                 case 41: dp.Sum          = cis.ReadDouble();             break;      // field 5: sum
-                case 49: // field 6: bucket_counts (OTel .NET SDK encodes as repeated fixed64, not packed)
+                case 48: // field 6: bucket_counts — unpacked varint (uint64)
+                {
+                    dp.BucketCounts ??= [];
+                    dp.BucketCounts.Add(cis.ReadUInt64().ToString());
+                    break;
+                }
+                case 49: // field 6: bucket_counts — unpacked fixed64
                 {
                     dp.BucketCounts ??= [];
                     dp.BucketCounts.Add(cis.ReadFixed64().ToString());
                     break;
                 }
-                case 57: // field 7: explicit_bounds (OTel .NET SDK encodes as repeated double, not packed)
+                case 50: // field 6: bucket_counts — packed; auto-detect fixed64 vs varint
+                {
+                    dp.BucketCounts ??= [];
+                    var bytes = cis.ReadBytes();
+                    var sub   = new Google.Protobuf.CodedInputStream(bytes.ToByteArray());
+                    bool asFixed = bytes.Length % 8 == 0;   // N×fixed64 → multiple of 8
+                    while (!sub.IsAtEnd)
+                        dp.BucketCounts.Add((asFixed ? sub.ReadFixed64() : sub.ReadUInt64()).ToString());
+                    break;
+                }
+                case 57: // field 7: explicit_bounds — unpacked repeated double
                 {
                     dp.ExplicitBounds ??= [];
                     dp.ExplicitBounds.Add(cis.ReadDouble());
                     break;
                 }
+                case 58: // field 7: explicit_bounds — packed repeated double (proto3 default)
+                {
+                    dp.ExplicitBounds ??= [];
+                    var sub = SubStream(cis);
+                    while (!sub.IsAtEnd) dp.ExplicitBounds.Add(sub.ReadDouble());
+                    break;
+                }
+                case 66: // field 8: exemplars (repeated Exemplar)
+                    dp.Exemplars ??= [];
+                    dp.Exemplars.Add(ReadExemplar(SubStream(cis)));
+                    break;
                 case 74: dp.Attributes.Add(ReadKeyValue(SubStream(cis))); break;    // field 9: attributes
                 default: cis.SkipLastField(); break;
             }
         }
         return dp;
+    }
+
+    private static OtlpExemplar ReadExemplar(CodedInputStream cis)
+    {
+        var ex = new OtlpExemplar();
+        uint tag;
+        while ((tag = cis.ReadTag()) != 0)
+        {
+            switch (tag)
+            {
+                case 17: ex.TimeUnixNano = cis.ReadFixed64().ToString(); break; // field 2: time_unix_nano (fixed64)
+                case 25: ex.AsDouble     = cis.ReadDouble();             break; // field 3: as_double
+                case 34: ex.SpanId       = HexFromBytes(cis.ReadBytes()); break; // field 4: span_id (bytes)
+                case 42: ex.TraceId      = HexFromBytes(cis.ReadBytes()); break; // field 5: trace_id (bytes)
+                case 49: ex.AsInt        = cis.ReadSFixed64().ToString(); break; // field 6: as_int (sfixed64)
+                default: cis.SkipLastField(); break;                            // field 7: filtered_attributes (skip)
+            }
+        }
+        return ex;
     }
 
     // ── Traces ────────────────────────────────────────────────────────────────

@@ -1,5 +1,5 @@
 import {
-  Component, input, computed, effect, viewChild, ElementRef,
+  Component, input, output, computed, effect, viewChild, ElementRef,
   ChangeDetectionStrategy, OnDestroy,
 } from '@angular/core';
 import { Chart, LinearScale, Tooltip } from 'chart.js';
@@ -36,6 +36,8 @@ export class HeatmapComponent implements OnDestroy {
   readonly data  = input<HeatmapDto | null>(null);
   /** Multiply bucket bounds for display (e.g. 1000 for seconds → ms). */
   readonly scale = input<number>(1);
+  /** Emitted when a cell is clicked — for trace correlation (values already scaled). */
+  readonly cellClick = output<{ tsMs: number; loMs: number; hiMs: number; count: number }>();
 
   private cv = viewChild<ElementRef<HTMLCanvasElement>>('cv');
   private chart?: Chart;
@@ -105,6 +107,18 @@ export class HeatmapComponent implements OnDestroy {
         responsive: true,
         maintainAspectRatio: false,
         animation: false,
+        onHover: (e: any, els: any[]) => {
+          const t = e?.native?.target; if (t) t.style.cursor = els.length ? 'pointer' : 'default';
+        },
+        onClick: (_e: any, els: any[]) => {
+          if (!els.length) return;
+          const raw = (this.chart!.data.datasets[0].data as any[])[els[0].index];
+          if (!raw) return;
+          const bi = raw.y as number;
+          const lo = bi === 0 ? 0 : d.bounds[bi - 1] * scale;
+          const hi = bi < d.bounds.length ? d.bounds[bi] * scale : Number.POSITIVE_INFINITY;
+          this.cellClick.emit({ tsMs: raw.x as number, loMs: lo, hiMs: hi, count: raw.v as number });
+        },
         scales: {
           x: {
             type: 'linear',

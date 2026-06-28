@@ -52,3 +52,12 @@ export interface HeatmapDto {
   unit:    string;
   columns: HeatmapColumnDto[];
 }
+
+/** An exemplar: a sampled measurement linked to the trace that produced it. */
+export interface ExemplarDto {
+  ts:      number;             // unix nanos
+  value:   number;
+  traceId: string;
+  spanId:  string;
+  labels:  Record<string, string>;
+}

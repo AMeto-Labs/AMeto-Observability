@@ -64,15 +64,19 @@
           <div class="chart-wrap"><canvas #rateCanvas></canvas></div>
         </div>
         <div class="panel">
-          <div class="panel-hdr">Latency percentiles <span class="panel-sub">ms</span></div>
+          <div class="panel-hdr">Latency percentiles <span class="panel-sub">ms</span>
+            @if (exemplarCount()) {
+              <span class="panel-sub exemplar-hint">· <span class="ex-dot"></span>{{ exemplarCount() }} exemplars — click to open trace</span>
+            }
+          </div>
           <div class="chart-wrap"><canvas #latCanvas></canvas></div>
         </div>
       </div>
 
       <!-- Heatmap -->
       <div class="panel">
-        <div class="panel-hdr">Latency distribution <span class="panel-sub">heatmap</span></div>
-        <app-heatmap [data]="heatmap()" [scale]="latencyScale()" />
+        <div class="panel-hdr">Latency distribution <span class="panel-sub">heatmap · click a cell to see traces</span></div>
+        <app-heatmap [data]="heatmap()" [scale]="latencyScale()" (cellClick)="onHeatmapCell($event)" />
       </div>
 
       <!-- Top-K + status -->
@@ -198,12 +202,53 @@
           </div>
           @if (exHeatmap()) {
             <div class="panel">
-              <div class="panel-hdr">Distribution <span class="panel-sub">heatmap</span></div>
-              <app-heatmap [data]="exHeatmap()" [scale]="m.unit === 's' ? 1000 : 1" />
+              <div class="panel-hdr">Distribution <span class="panel-sub">heatmap · click a cell to see traces</span></div>
+              <app-heatmap [data]="exHeatmap()" [scale]="m.unit === 's' ? 1000 : 1" (cellClick)="onHeatmapCell($event)" />
             </div>
           }
         }
       </div>
     </div>
+  }
+
+  <!-- ══ Correlation drawer: metric → traces → logs ════════════════════════ -->
+  @if (corrOpen()) {
+    <div class="corr-backdrop" (click)="closeCorr()"></div>
+    <aside class="corr-drawer">
+      <div class="corr-hdr">
+        <div class="corr-titles">
+          <span class="corr-title">{{ corrTitle() }}</span>
+          <span class="corr-sub">{{ corrSub() }}</span>
+        </div>
+        <button class="corr-close" (click)="closeCorr()" aria-label="Close">
+          <lucide-icon name="x" [size]="16" />
+        </button>
+      </div>
+      <div class="corr-body">
+        @if (corrLoading()) {
+          <div class="corr-empty"><lucide-icon name="loader" [size]="16" class="spin" /> Loading traces…</div>
+        } @else if (!corrTraces().length) {
+          <div class="corr-empty">No traces in this window/latency range</div>
+        } @else {
+          @for (t of corrTraces(); track t.traceId) {
+            <button class="corr-row" (click)="openTrace(t.traceId)">
+              <span class="corr-dot" [class.err]="t.status === 'Error'"></span>
+              <div class="corr-row-main">
+                <div class="corr-row-top">
+                  @if (t.httpMethod) { <span class="corr-method">{{ t.httpMethod }}</span> }
+                  <span class="corr-path">{{ t.httpPath || t.name }}</span>
+                </div>
+                <div class="corr-row-meta">
+                  <span class="corr-svc">{{ t.serviceName }}</span>
+                  <span class="corr-time">{{ corrFmtTime(t.startTimeUnixNano) }}</span>
+                </div>
+              </div>
+              <span class="corr-dur">{{ corrFmtDur(t.durationNanos) }}</span>
+              <lucide-icon name="arrow-right" [size]="13" class="corr-arrow" />
+            </button>
+          }
+        }
+      </div>
+    </aside>
   }
 </div>
