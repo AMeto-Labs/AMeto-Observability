@@ -6,7 +6,7 @@ namespace Ameto.Tracing.Storage;
 /// Histogram boundaries (upper-exclusive) in nanoseconds — 19 edges = 20 buckets.
 /// Bucket 19 catches everything ≥ 1800s.
 /// </summary>
-internal static class HistogramBuckets
+public static class HistogramBuckets
 {
     // Upper-exclusive bounds in nanoseconds
     internal static ReadOnlySpan<long> Bounds => new long[]
