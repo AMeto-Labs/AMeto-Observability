@@ -32,8 +32,8 @@ export class SignalsPanelComponent implements OnInit {
 
   load(): void {
     this.loading.set(true);
-    this.api.getSignals().subscribe({
-      next: list => { this.signals.set(list); this.loading.set(false); this.cdr.markForCheck(); },
+    this.api.getAlerts().subscribe({
+      next: (list: AlertRule[]) => { this.signals.set(list); this.loading.set(false); this.cdr.markForCheck(); },
       error: ()   => { this.loading.set(false); this.cdr.markForCheck(); },
     });
   }
@@ -48,8 +48,18 @@ export class SignalsPanelComponent implements OnInit {
   saveNew(): void {
     if (!this.draftName.trim()) return;
     this.saving.set(true);
-    this.api.createSignal({ name: this.draftName.trim(), filter: this.currentFilter() || undefined, enabled: true })
-      .subscribe({
+    this.api.createAlert({
+      name: this.draftName.trim(),
+      enabled: true,
+      severity: 'Warning',
+      source: 'Log',
+      comparator: 'GreaterOrEqual',
+      threshold: 1,
+      windowSeconds: 300,
+      forSeconds: 0,
+      cooldownSeconds: 900,
+      filter: this.currentFilter() || undefined,
+    }).subscribe({
         next: () => { this.saving.set(false); this.creating.set(false); this.load(); },
         error: () => { this.saving.set(false); this.cdr.markForCheck(); },
       });
@@ -61,12 +71,17 @@ export class SignalsPanelComponent implements OnInit {
 
   toggle(s: AlertRule, event: MouseEvent): void {
     event.stopPropagation();
-    this.api.updateSignal(s.id, { name: s.name, enabled: !s.enabled })
-      .subscribe(() => this.load());
+    this.api.updateAlert(s.id, {
+      name: s.name, enabled: !s.enabled, severity: s.severity, source: s.source,
+      comparator: s.comparator, threshold: s.threshold,
+      windowSeconds: 300, forSeconds: 0, cooldownSeconds: 900,
+      filter: s.filter, metric: s.metric, aggregation: s.aggregation, quantile: s.quantile,
+      service: s.service, traceMetric: s.traceMetric, channels: s.channels, template: s.template,
+    }).subscribe(() => this.load());
   }
 
   delete(id: string, event: MouseEvent): void {
     event.stopPropagation();
-    this.api.deleteSignal(id).subscribe(() => this.load());
+    this.api.deleteAlert(id).subscribe(() => this.load());
   }
 }
