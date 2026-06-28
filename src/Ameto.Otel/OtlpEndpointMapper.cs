@@ -101,24 +101,6 @@ public static class OtlpEndpointMapper
             if (request is null) { ctx.Response.StatusCode = 400; return; }
 
             var points = OtlpMetricMapper.Map(request);
-
-            // TEMP diagnostic: how many histogram exemplars arrive vs get mapped.
-            var dlog = ctx.RequestServices.GetRequiredService<ILoggerFactory>().CreateLogger("Ameto.Otel.Exemplars");
-            if (dlog.IsEnabled(LogLevel.Information))
-            {
-                int rawDp = 0, rawEx = 0;
-                foreach (var rm in request.ResourceMetrics ?? [])
-                foreach (var sm in rm.ScopeMetrics ?? [])
-                foreach (var m in sm.Metrics ?? [])
-                foreach (var dp in m.Histogram?.DataPoints ?? [])
-                { rawDp++; rawEx += dp.Exemplars?.Count ?? 0; }
-                int mappedEx = 0;
-                foreach (var p in points) mappedEx += p.Exemplars?.Length ?? 0;
-                if (rawDp > 0)
-                    dlog.LogInformation("EXEMPLAR diag: histDataPoints={Dp} rawExemplars={Raw} mappedExemplars={Mapped}",
-                        rawDp, rawEx, mappedEx);
-            }
-
             ingester.Ingest(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(points));
             await WriteJsonOk(ctx, points.Count, 0);
         });
