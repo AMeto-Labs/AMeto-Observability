@@ -33,6 +33,7 @@
     "@tanstack/angular-virtual": "^5.0.6",
     "chart.js": "^4.5.1",
     "chartjs-chart-matrix": "^3.0.4",
+    "chartjs-plugin-zoom": "^2.2.0",
     "date-fns": "^4.1.0",
     "lucide-angular": "^1.0.0",
     "rxjs": "~7.8.0",

@@ -51,24 +51,28 @@ public static class MetricQueryEndpointMapper
             if (dto is null || string.IsNullOrWhiteSpace(dto.Metric))
                 return Results.BadRequest("'metric' is required");
 
-            if (!Enum.TryParse<MetricAggregation>(dto.Aggregation, ignoreCase: true, out var agOp))
-                agOp = MetricAggregation.None;
-
-            var request = new MetricQueryRequest
-            {
-                Metric      = dto.Metric,
-                From        = ParseDate(dto.From),
-                To          = ParseDate(dto.To),
-                Step        = ParseStep(dto.Step),
-                Aggregation = agOp,
-                Quantile    = dto.Quantile,
-                GroupBy     = dto.GroupBy,
-                Filters     = dto.Filters,
-                TopK        = dto.Topk,
-            };
-
-            var series = await agg.QueryAsync(request, ctx.RequestAborted);
+            var series = await agg.QueryAsync(ToRequest(dto), ctx.RequestAborted);
             return Results.Json(series.Select(ToDto).ToList());
+        }).RequireAuthorization();
+
+        // POST /api/metrics/expr  — binary metric expression (A op B)
+        app.MapPost("/api/metrics/expr", async (HttpContext ctx, IMetricAggregator agg) =>
+        {
+            MetricExprDto? dto;
+            try { dto = await ctx.Request.ReadFromJsonAsync<MetricExprDto>(ctx.RequestAborted); }
+            catch { return Results.BadRequest("Invalid JSON"); }
+            if (dto?.Left is null || dto.Right is null) return Results.BadRequest("'left' and 'right' are required");
+
+            var req = new MetricExprRequest
+            {
+                Left  = ToRequest(dto.Left),
+                Right = ToRequest(dto.Right),
+                Op    = Enum.TryParse<MetricExprOp>(dto.Op, true, out var op) ? op : MetricExprOp.Div,
+                Scale = dto.Scale is > 0 ? dto.Scale.Value : 1,
+                Name  = dto.Name,
+            };
+            var series = await agg.EvalExprAsync(req, ctx.RequestAborted);
+            return Results.Json(ToDto(series));
         }).RequireAuthorization();
 
         // GET /api/metrics/{name}/heatmap?from=&to=&step=&filters=k:v,k2:v2
@@ -125,6 +129,19 @@ public static class MetricQueryEndpointMapper
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    private static MetricQueryRequest ToRequest(MetricQueryDto dto) => new()
+    {
+        Metric      = dto.Metric,
+        From        = ParseDate(dto.From),
+        To          = ParseDate(dto.To),
+        Step        = ParseStep(dto.Step),
+        Aggregation = Enum.TryParse<MetricAggregation>(dto.Aggregation, true, out var a) ? a : MetricAggregation.None,
+        Quantile    = dto.Quantile,
+        GroupBy     = dto.GroupBy,
+        Filters     = dto.Filters,
+        TopK        = dto.Topk,
+    };
 
     private static MetricSeriesDto ToDto(MetricSeries s) => new()
     {
@@ -193,6 +210,16 @@ public sealed class MetricQueryDto
     public string[]?                   GroupBy     { get; init; }
     public Dictionary<string, string>? Filters     { get; init; }
     public int?                        Topk        { get; init; }
+}
+
+/// <summary>Request body for POST /api/metrics/expr.</summary>
+public sealed class MetricExprDto
+{
+    public MetricQueryDto? Left  { get; init; }
+    public MetricQueryDto? Right { get; init; }
+    public string?         Op    { get; init; }
+    public double?         Scale { get; init; }
+    public string?         Name  { get; init; }
 }
 
 /// <summary>Catalog entry for the Explore UI.</summary>

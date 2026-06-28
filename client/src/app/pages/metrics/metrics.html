@@ -156,7 +156,47 @@
 
       <!-- Builder + chart -->
       <div class="explore-main">
-        @if (!selectedMetric()) {
+        <!-- Mode toggle -->
+        <div class="ex-modebar">
+          <div class="ex-modes">
+            <button class="ex-mode" [class.active]="!exprMode()" (click)="exprMode.set(false)">Single metric</button>
+            <button class="ex-mode" [class.active]="exprMode()" (click)="exprMode.set(true)">Expression (A op B)</button>
+          </div>
+          @if (!exprMode()) {
+            <label class="ex-cmp"><input type="checkbox" [checked]="comparePrev()"
+              (change)="comparePrev.set(!comparePrev()); runExplore()" /> Compare prev period</label>
+          }
+          <button class="ex-reset" (click)="resetZoom()" title="Reset zoom"><lucide-icon name="zoom-out" [size]="13" /> Reset zoom</button>
+        </div>
+
+        @if (exprMode()) {
+          <!-- Expression builder -->
+          <div class="builder">
+            <div class="expr-row">
+              <input class="expr-metric" [(ngModel)]="exprLeft.metric" placeholder="metric A (e.g. http…5xx count)" spellcheck="false" />
+              <select [(ngModel)]="exprLeft.agg">
+                <option value="rate">rate</option><option value="increase">increase</option>
+                <option value="sum">sum</option><option value="avg">avg</option><option value="last">last</option>
+              </select>
+              <select class="expr-op" [ngModel]="exprOp()" (ngModelChange)="exprOp.set($event)">
+                <option value="div">÷</option><option value="mul">×</option><option value="add">+</option><option value="sub">−</option>
+              </select>
+              <input class="expr-metric" [(ngModel)]="exprRight.metric" placeholder="metric B (e.g. http total count)" spellcheck="false" />
+              <select [(ngModel)]="exprRight.agg">
+                <option value="rate">rate</option><option value="increase">increase</option>
+                <option value="sum">sum</option><option value="avg">avg</option><option value="last">last</option>
+              </select>
+            </div>
+            <div class="b-controls">
+              <label class="b-field"><span>× Scale</span>
+                <input type="number" [ngModel]="exprScale()" (ngModelChange)="exprScale.set(+$event)" style="width:90px" /></label>
+              <span class="expr-hint">e.g. rate(errors) ÷ rate(total) × 100 = error rate %</span>
+              <button class="b-run" (click)="runExpr()"><lucide-icon name="play" [size]="12" /> Run</button>
+            </div>
+          </div>
+          <div class="panel"><div class="chart-wrap"><canvas #exploreCanvas></canvas></div></div>
+
+        } @else if (!selectedMetric()) {
           <div class="panel-empty">Select a metric to graph it</div>
         } @else {
           @let m = selectedMetric()!;

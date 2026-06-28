@@ -6,6 +6,7 @@ import { Router, ActivatedRoute } from '@angular/router';
 import { FormsModule } from '@angular/forms';
 import { LucideAngularModule } from 'lucide-angular';
 import { Chart, registerables } from 'chart.js';
+import zoomPlugin from 'chartjs-plugin-zoom';
 import { format, subHours, formatISO } from 'date-fns';
 import { forkJoin, of } from 'rxjs';
 import { catchError } from 'rxjs/operators';
@@ -16,7 +17,7 @@ import {
 import { TraceRowDto } from '../../core/models/span.model';
 import { HeatmapComponent } from './heatmap/heatmap';
 
-Chart.register(...registerables);
+Chart.register(...registerables, zoomPlugin);
 
 type Tab = 'overview' | 'runtime' | 'explore';
 
@@ -79,6 +80,14 @@ export class MetricsComponent implements OnInit, OnDestroy {
   exGroupBy     = signal<string[]>([]);
   exHeatmap     = signal<HeatmapDto | null>(null);
   exLoading     = signal(false);
+  comparePrev   = signal(false);
+
+  // Expression mode (A op B)
+  exprMode    = signal(false);
+  exprLeft    = { metric: '', agg: 'rate' as MetricAggregation };
+  exprRight   = { metric: '', agg: 'rate' as MetricAggregation };
+  exprOp      = signal<'div' | 'mul' | 'add' | 'sub'>('div');
+  exprScale   = signal(100);
 
   // Correlation drawer (metric → traces → logs)
   corrOpen    = signal(false);
@@ -434,6 +443,7 @@ export class MetricsComponent implements OnInit, OnDestroy {
     this.exGroupBy.set(cur.includes(key) ? cur.filter(k => k !== key) : [...cur, key]);
   }
   runExplore() {
+    if (this.exprMode()) { this.runExpr(); return; }
     const m = this.selectedMetric();
     if (!m) return;
     this.syncUrl();
@@ -441,45 +451,97 @@ export class MetricsComponent implements OnInit, OnDestroy {
     this.exHeatmap.set(null);
     const from = this.fromIso(), step = this.step();
     const agg = this.exAggregation();
+    const scale = m.type === 'Histogram' && m.unit === 's' ? 1000 : 1;
 
     if (m.type === 'Histogram' && agg === 'quantile' && this.exGroupBy().length === 0) {
-      // also offer heatmap alongside the percentile line
       this.api.getMetricHeatmap(m.name, from, undefined, step)
         .pipe(catchError(() => of(null as any))).subscribe(h => { this.exHeatmap.set(h); this.cdr.markForCheck(); });
     }
 
-    this.api.queryMetricAgg({
+    const req: MetricQueryRequest = {
       metric: m.name, from, step, aggregation: agg,
       quantile: agg === 'quantile' ? this.exQuantile() : undefined,
       groupBy: this.exGroupBy().length ? this.exGroupBy() : undefined,
       topk: 12,
-    }).pipe(catchError(() => of([] as MetricSeriesDto[]))).subscribe(series => {
+    };
+    const main$ = this.api.queryMetricAgg(req).pipe(catchError(() => of([] as MetricSeriesDto[])));
+
+    // Compare-to-previous-period: shift a prior window forward onto the same axis.
+    const hrs = this.hours();
+    const prev$ = this.comparePrev()
+      ? this.api.queryMetricAgg({ ...req, from: formatISO(subHours(new Date(), hrs * 2)), to: from })
+          .pipe(catchError(() => of([] as MetricSeriesDto[])))
+      : of([] as MetricSeriesDto[]);
+
+    forkJoin({ main: main$, prev: prev$ }).subscribe(({ main, prev }) => {
       this.exLoading.set(false);
       this.cdr.detectChanges();
       setTimeout(() => {
         const canvas = this.exploreRef?.nativeElement;
         if (canvas) {
           this.destroyChart(canvas);
-          const scale = m.type === 'Histogram' && m.unit === 's' ? 1000 : 1;
-          this.charts.push(this.lineChart(canvas, series, PALETTE, scale));
+          this.charts.push(this.lineChart(canvas, main, PALETTE, scale, this.shiftSeries(prev, hrs)));
         }
         this.cdr.markForCheck();
       }, 0);
     });
   }
 
+  /** Expression mode: evaluate left op right and graph the single result series. */
+  runExpr() {
+    if (!this.exprLeft.metric || !this.exprRight.metric) return;
+    this.exLoading.set(true);
+    this.exHeatmap.set(null);
+    const from = this.fromIso(), step = this.step();
+    const side = (s: { metric: string; agg: MetricAggregation }): MetricQueryRequest =>
+      ({ metric: s.metric, from, step, aggregation: s.agg });
+    this.api.queryMetricExpr({
+      left: side(this.exprLeft), right: side(this.exprRight),
+      op: this.exprOp(), scale: this.exprScale(), name: 'expression',
+    }).pipe(catchError(() => of(null as any))).subscribe((series: MetricSeriesDto | null) => {
+      this.exLoading.set(false);
+      this.cdr.detectChanges();
+      setTimeout(() => {
+        const canvas = this.exploreRef?.nativeElement;
+        if (canvas) {
+          this.destroyChart(canvas);
+          this.charts.push(this.lineChart(canvas, series ? [series] : [], ['#38BDF8'], 1));
+        }
+        this.cdr.markForCheck();
+      }, 0);
+    });
+  }
+
+  toggleExprMode() { this.exprMode.update(v => !v); }
+  resetZoom() { for (const c of this.charts) (c as any).resetZoom?.(); }
+
+  private shiftSeries(series: MetricSeriesDto[], hours: number): MetricSeriesDto[] {
+    const shiftMs = hours * 3600_000;
+    return series.map(s => ({ ...s, name: 'prev · ' + s.name,
+      points: s.points.map(p => ({ ...p, ts: p.ts + shiftMs * 1e6 })) }));
+  }
+
   // ── Chart.js helpers ──────────────────────────────────────────────────────
-  private lineChart(canvas: HTMLCanvasElement, series: MetricSeriesDto[], colors: string[], scale: number): Chart {
-    const datasets = series.slice(0, 12).map((s, i) => {
+  private lineChart(canvas: HTMLCanvasElement, series: MetricSeriesDto[], colors: string[], scale: number,
+                    compare: MetricSeriesDto[] = []): Chart {
+    const datasets: any[] = series.slice(0, 12).map((s, i) => {
       const color = colors[i % colors.length];
       return {
         label: this.seriesLabel(s),
         data: s.points.map(p => ({ x: Math.round(p.ts / 1e6), y: p.value * scale })),
         borderColor: color, backgroundColor: color + '18',
-        fill: series.length === 1, tension: 0.3, pointRadius: 0, borderWidth: 1.5,
+        fill: series.length === 1 && !compare.length, tension: 0.3, pointRadius: 0, borderWidth: 1.5,
       };
     });
-    return new Chart(canvas, { type: 'line', data: { datasets }, options: lineOpts(series.length > 1) });
+    for (const s of compare.slice(0, 12)) {
+      datasets.push({
+        label: this.seriesLabel(s),
+        data: s.points.map(p => ({ x: Math.round(p.ts / 1e6), y: p.value * scale })),
+        borderColor: '#64748b', borderDash: [4, 4], fill: false, tension: 0.3, pointRadius: 0, borderWidth: 1,
+      });
+    }
+    const showLegend = (series.length + compare.length) > 1;
+    return new Chart(canvas, { type: 'line', data: { datasets }, options: lineOpts(showLegend) });
   }
   private destroyChart(canvas: HTMLCanvasElement) {
     const existing = Chart.getChart(canvas);
@@ -568,6 +630,11 @@ function lineOpts(showLegend: boolean): any {
     plugins: {
       legend: { display: showLegend, labels: { color: '#94a3b8', font: { size: 10 }, boxWidth: 10, boxHeight: 10 } },
       tooltip: { backgroundColor: '#0f172a', borderColor: '#263244', borderWidth: 1, titleColor: '#e2e8f0', bodyColor: '#94a3b8', padding: 8 },
+      zoom: {
+        pan:  { enabled: true, mode: 'x', modifierKey: 'shift' },
+        zoom: { drag: { enabled: true, backgroundColor: 'rgba(56,189,248,0.15)', borderColor: '#38BDF8', borderWidth: 1 },
+                wheel: { enabled: true }, mode: 'x' },
+      },
     },
   };
 }

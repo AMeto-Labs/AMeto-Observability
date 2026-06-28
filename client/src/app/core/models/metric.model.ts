@@ -41,6 +41,17 @@ export interface MetricQueryRequest {
   topk?:        number;
 }
 
+export type MetricExprOp = 'div' | 'mul' | 'add' | 'sub';
+
+/** Binary metric expression: left op right, optionally scaled. */
+export interface MetricExprRequest {
+  left:   MetricQueryRequest;
+  right:  MetricQueryRequest;
+  op:     MetricExprOp;
+  scale?: number;
+  name?:  string;
+}
+
 /** One time-step column of a histogram heatmap. */
 export interface HeatmapColumnDto {
   ts:     number;
