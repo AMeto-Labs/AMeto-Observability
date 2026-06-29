@@ -31,6 +31,9 @@ public static class AlertsServiceExtensions
         services.AddSingleton<AlertRuleStore>(sp =>
             new AlertRuleStore(dataDirectory, sp.GetRequiredService<ILogger<AlertRuleStore>>()));
 
+        services.AddSingleton<AlertPersistence>(sp =>
+            new AlertPersistence(dataDirectory, sp.GetRequiredService<ILogger<AlertPersistence>>()));
+
         services.AddSingleton<AlertDispatcher>();
         services.AddSingleton<AlertEvaluator>();
         services.AddHostedService<AlertsHostedService>();

@@ -84,8 +84,8 @@ export class MetricsComponent implements OnInit, OnDestroy {
 
   // Expression mode (A op B)
   exprMode    = signal(false);
-  exprLeft    = { metric: '', agg: 'rate' as MetricAggregation };
-  exprRight   = { metric: '', agg: 'rate' as MetricAggregation };
+  exprLeft    = { metric: '', agg: 'rate' as MetricAggregation, filters: '' };
+  exprRight   = { metric: '', agg: 'rate' as MetricAggregation, filters: '' };
   exprOp      = signal<'div' | 'mul' | 'add' | 'sub'>('div');
   exprScale   = signal(100);
 
@@ -493,8 +493,8 @@ export class MetricsComponent implements OnInit, OnDestroy {
     this.exLoading.set(true);
     this.exHeatmap.set(null);
     const from = this.fromIso(), step = this.step();
-    const side = (s: { metric: string; agg: MetricAggregation }): MetricQueryRequest =>
-      ({ metric: s.metric, from, step, aggregation: s.agg });
+    const side = (s: { metric: string; agg: MetricAggregation; filters: string }): MetricQueryRequest =>
+      ({ metric: s.metric, from, step, aggregation: s.agg, filters: this.parseFilters(s.filters) });
     this.api.queryMetricExpr({
       left: side(this.exprLeft), right: side(this.exprRight),
       op: this.exprOp(), scale: this.exprScale(), name: 'expression',
@@ -514,6 +514,18 @@ export class MetricsComponent implements OnInit, OnDestroy {
 
   toggleExprMode() { this.exprMode.update(v => !v); }
   resetZoom() { for (const c of this.charts) (c as any).resetZoom?.(); }
+
+  /** Parse "key=value, key2=value2" into a label-matcher map (undefined if empty). */
+  private parseFilters(raw: string): Record<string, string> | undefined {
+    const out: Record<string, string> = {};
+    for (const pair of (raw || '').split(',')) {
+      const eq = pair.indexOf('=');
+      if (eq <= 0) continue;
+      const k = pair.slice(0, eq).trim(), v = pair.slice(eq + 1).trim();
+      if (k && v) out[k] = v;
+    }
+    return Object.keys(out).length ? out : undefined;
+  }
 
   private shiftSeries(series: MetricSeriesDto[], hours: number): MetricSeriesDto[] {
     const shiftMs = hours * 3600_000;
