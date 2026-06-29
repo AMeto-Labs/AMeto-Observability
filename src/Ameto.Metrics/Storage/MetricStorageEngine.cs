@@ -593,6 +593,40 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
             }
         }
         _logger.LogInformation("Loaded {Count} cold metric segments", _coldSegments.Count);
+        SeedCatalogFromCold();
+    }
+
+    /// <summary>
+    /// Rebuilds the in-memory metric catalog from cold segments on startup so the
+    /// Explore catalog / Overview detection work immediately after a restart, instead
+    /// of staying blank until the next live export repopulates metadata.
+    /// </summary>
+    private void SeedCatalogFromCold()
+    {
+        int seeded = 0;
+        foreach (var seg in _coldSegments)
+        {
+            try
+            {
+                foreach (var s in MetricReader.ReadAllSync(seg.FilePath))
+                {
+                    var meta = _meta.GetOrAdd(s.Name, static _ => new MetricMeta());
+                    meta.Kind = s.Kind;
+                    if (!string.IsNullOrEmpty(s.Unit)) meta.Unit = s.Unit;
+                    long lastMs = (s.Points.Count > 0 ? s.Points[^1].TimestampUnixNano : seg.MaxNano) / 1_000_000L;
+                    if (lastMs > meta.LastSeenMs) meta.LastSeenMs = lastMs;
+                    foreach (var (k, v) in s.Labels.Pairs)
+                    {
+                        var values = meta.LabelValues.GetOrAdd(k, static _ => new ConcurrentDictionary<string, byte>(StringComparer.Ordinal));
+                        if (values.Count < MaxLabelValuesPerKey) values.TryAdd(v, 0);
+                    }
+                    meta.AddSeries(s.Labels.GetHashCode());
+                    seeded++;
+                }
+            }
+            catch (Exception ex) { _logger.LogWarning(ex, "Catalog seed failed for {File}", seg.FilePath); }
+        }
+        if (seeded > 0) _logger.LogInformation("Seeded metric catalog with {Count} series from cold segments", seeded);
     }
 
     public async ValueTask DisposeAsync()
