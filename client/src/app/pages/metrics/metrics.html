@@ -173,19 +173,25 @@
           <!-- Expression builder -->
           <div class="builder">
             <div class="expr-row">
-              <input class="expr-metric" [(ngModel)]="exprLeft.metric" placeholder="metric A (e.g. http…5xx count)" spellcheck="false" />
-              <select [(ngModel)]="exprLeft.agg">
-                <option value="rate">rate</option><option value="increase">increase</option>
-                <option value="sum">sum</option><option value="avg">avg</option><option value="last">last</option>
-              </select>
+              <div class="expr-side">
+                <input class="expr-metric" [(ngModel)]="exprLeft.metric" placeholder="metric A" spellcheck="false" />
+                <select [(ngModel)]="exprLeft.agg">
+                  <option value="rate">rate</option><option value="increase">increase</option>
+                  <option value="sum">sum</option><option value="avg">avg</option><option value="last">last</option>
+                </select>
+                <input class="expr-filters" [(ngModel)]="exprLeft.filters" placeholder="filters: status=500, method=GET" spellcheck="false" />
+              </div>
               <select class="expr-op" [ngModel]="exprOp()" (ngModelChange)="exprOp.set($event)">
                 <option value="div">÷</option><option value="mul">×</option><option value="add">+</option><option value="sub">−</option>
               </select>
-              <input class="expr-metric" [(ngModel)]="exprRight.metric" placeholder="metric B (e.g. http total count)" spellcheck="false" />
-              <select [(ngModel)]="exprRight.agg">
-                <option value="rate">rate</option><option value="increase">increase</option>
-                <option value="sum">sum</option><option value="avg">avg</option><option value="last">last</option>
-              </select>
+              <div class="expr-side">
+                <input class="expr-metric" [(ngModel)]="exprRight.metric" placeholder="metric B" spellcheck="false" />
+                <select [(ngModel)]="exprRight.agg">
+                  <option value="rate">rate</option><option value="increase">increase</option>
+                  <option value="sum">sum</option><option value="avg">avg</option><option value="last">last</option>
+                </select>
+                <input class="expr-filters" [(ngModel)]="exprRight.filters" placeholder="filters: (optional)" spellcheck="false" />
+              </div>
             </div>
             <div class="b-controls">
               <label class="b-field"><span>× Scale</span>

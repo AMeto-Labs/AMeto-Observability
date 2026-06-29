@@ -203,15 +203,18 @@
   font-size: 12px; padding: 4px 10px; cursor: pointer;
   &:hover { border-color: var(--accent); color: var(--accent); }
 }
-.expr-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+.expr-row { display: flex; align-items: flex-start; gap: 8px; flex-wrap: wrap;
   input, select {
     height: 32px; padding: 0 8px; background: var(--bg-elevated); border: 1px solid var(--border);
     border-radius: 6px; color: var(--text-primary); font-size: 12px; outline: none; box-sizing: border-box;
     &:focus { border-color: var(--accent); }
   }
 }
-.expr-metric { flex: 1; min-width: 160px; font-family: var(--font-ui); }
-.expr-op { width: 52px; text-align: center; }
+.expr-side { flex: 1; min-width: 220px; display: flex; flex-direction: column; gap: 6px;
+  & > select { width: 110px; } }
+.expr-metric { width: 100%; font-family: var(--font-ui); }
+.expr-filters { width: 100%; font-family: var(--font-ui); }
+.expr-op { width: 52px; text-align: center; align-self: center; }
 .expr-hint { font-size: 11px; color: var(--text-muted); }
 
 // ── Correlation drawer (metric → traces → logs) ─────────────────────────────

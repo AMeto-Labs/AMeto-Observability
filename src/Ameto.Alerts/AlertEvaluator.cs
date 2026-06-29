@@ -23,6 +23,7 @@ public sealed class AlertEvaluator : IAsyncDisposable
 
     private readonly AlertRuleStore        _store;
     private readonly AlertDispatcher       _dispatcher;
+    private readonly AlertPersistence      _persist;
     private readonly IQueryExecutor        _logQuery;
     private readonly IMetricAggregator     _metrics;
     private readonly ITraceStatsProvider   _traceStats;
@@ -38,14 +39,38 @@ public sealed class AlertEvaluator : IAsyncDisposable
     private readonly Task _loop;
 
     public AlertEvaluator(
-        AlertRuleStore store, AlertDispatcher dispatcher,
+        AlertRuleStore store, AlertDispatcher dispatcher, AlertPersistence persist,
         IQueryExecutor logQuery, IMetricAggregator metrics, ITraceStatsProvider traceStats,
         ILogger<AlertEvaluator> logger)
     {
-        _store = store; _dispatcher = dispatcher;
+        _store = store; _dispatcher = dispatcher; _persist = persist;
         _logQuery = logQuery; _metrics = metrics; _traceStats = traceStats;
         _logger = logger;
+        LoadFromDb();
         _loop = Task.Run(EvalLoopAsync);
+    }
+
+    /// <summary>Restore silences, per-rule state, and recent history from SQLite on startup.</summary>
+    private void LoadFromDb()
+    {
+        foreach (var s in _persist.LoadSilences())
+            if (s.Until > DateTimeOffset.UtcNow) _silences[s.Id] = s;
+
+        foreach (var (ruleId, state, lastValue, pending, fired) in _persist.LoadStates())
+            _states[ruleId] = new MutableState
+            {
+                State = state, LastValue = lastValue, PendingSince = pending,
+                LastFiredAt = fired, Notified = state == AlertState.Firing,
+            };
+
+        var hist = _persist.LoadHistory(HistoryCapacity);
+        // LoadHistory returns newest-first; fill ring oldest-first so newest-first read works.
+        for (int i = hist.Count - 1; i >= 0; i--)
+        {
+            _history[_histHead] = hist[i];
+            _histHead = (_histHead + 1) % HistoryCapacity;
+            if (_histCount < HistoryCapacity) _histCount++;
+        }
     }
 
     // ── Public API (read by endpoints) ─────────────────────────────────────────
@@ -88,8 +113,13 @@ public sealed class AlertEvaluator : IAsyncDisposable
         return _silences.Values.OrderByDescending(s => s.Until).ToList();
     }
 
-    public AlertSilence AddSilence(AlertSilence s) { _silences[s.Id] = s; return s; }
-    public bool RemoveSilence(string id) => _silences.TryRemove(id, out _);
+    public AlertSilence AddSilence(AlertSilence s) { _silences[s.Id] = s; _persist.UpsertSilence(s); return s; }
+    public bool RemoveSilence(string id)
+    {
+        bool ok = _silences.TryRemove(id, out _);
+        if (ok) _persist.DeleteSilence(id);
+        return ok;
+    }
 
     /// <summary>Evaluate a rule's value right now without affecting state (for the editor preview).</summary>
     public async Task<double> PreviewAsync(AlertRule rule, CancellationToken ct = default)
@@ -135,6 +165,7 @@ public sealed class AlertEvaluator : IAsyncDisposable
         var st = _states.GetOrAdd(rule.Id, _ => new MutableState());
         st.LastValue   = value;
         st.EvaluatedAt = now;
+        var prevState  = st.State;
 
         bool breached = Compare(value, rule.Comparator, rule.Threshold);
 
@@ -153,6 +184,7 @@ public sealed class AlertEvaluator : IAsyncDisposable
                 st.State = AlertState.Ok;
                 st.PendingSince = null;
             }
+            if (st.State != prevState) PersistState(rule.Id, st);
             return;
         }
 
@@ -180,7 +212,12 @@ public sealed class AlertEvaluator : IAsyncDisposable
         }
 
         if (st.State != AlertState.Firing) st.Notified = false;
+
+        if (st.State != prevState) PersistState(rule.Id, st);
     }
+
+    private void PersistState(string ruleId, MutableState st) =>
+        _persist.SaveState(ruleId, st.State, st.LastValue, st.PendingSince, st.LastFiredAt);
 
     private void Dispatch(AlertRule rule, AlertState state, double value, DateTimeOffset now)
     {
@@ -202,6 +239,7 @@ public sealed class AlertEvaluator : IAsyncDisposable
             _histHead = (_histHead + 1) % HistoryCapacity;
             if (_histCount < HistoryCapacity) _histCount++;
         }
+        _persist.AppendHistory(entry);
     }
 
     private bool IsSilenced(string ruleId)
