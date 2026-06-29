@@ -44,6 +44,46 @@ public sealed class MetricAggregator : IMetricAggregator
         return result;
     }
 
+    public async Task<MetricSeries> EvalExprAsync(MetricExprRequest req, CancellationToken ct = default)
+    {
+        var left  = SumToSingle(await QueryAsync(req.Left, ct));
+        var right = SumToSingle(await QueryAsync(req.Right, ct));
+
+        // Align by timestamp (left drives the grid; right value looked up, else carried).
+        var rightByTs = new Dictionary<long, double>(right.Count);
+        foreach (var (ts, v) in right) rightByTs[ts] = v;
+
+        var pts = new List<MetricDataPoint>(left.Count);
+        foreach (var (ts, l) in left)
+        {
+            if (!rightByTs.TryGetValue(ts, out var r)) continue;
+            double v = req.Op switch
+            {
+                MetricExprOp.Div => r != 0 ? l / r : 0,
+                MetricExprOp.Mul => l * r,
+                MetricExprOp.Add => l + r,
+                MetricExprOp.Sub => l - r,
+                _                => 0,
+            } * req.Scale;
+            pts.Add(new MetricDataPoint { TimestampUnixNano = ts, Value = v });
+        }
+
+        return new MetricSeries
+        {
+            Name = req.Name ?? "expr", Kind = MetricKind.Gauge, Unit = "", Labels = LabelSet.Empty, Points = pts,
+        };
+    }
+
+    /// <summary>Reduces a multi-series result to (ts → summed value) pairs ordered by time.</summary>
+    private static List<(long Ts, double Value)> SumToSingle(IReadOnlyList<MetricSeries> series)
+    {
+        var byTs = new SortedDictionary<long, double>();
+        foreach (var s in series)
+            foreach (var p in s.Points)
+                byTs[p.TimestampUnixNano] = byTs.GetValueOrDefault(p.TimestampUnixNano) + p.Value;
+        return byTs.Select(kv => (kv.Key, kv.Value)).ToList();
+    }
+
     public async Task<HeatmapResult> HeatmapAsync(
         string            metricName,
         DateTimeOffset?   from,

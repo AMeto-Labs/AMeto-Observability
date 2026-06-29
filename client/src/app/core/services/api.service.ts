@@ -11,7 +11,7 @@ import { RetentionDto, RetentionRunResult } from '../models/retention.model';
 import { DiagnosticsDto } from '../models/diagnostics.model';
 import { ApiKeyDto, CreatedApiKeyDto, UserDto } from '../models/auth.model';
 import { CompareTracesDto, LatencyServiceDto, SpanDto, SpanQueryParams, TraceQueryRequest, TraceRowDto, TraceStatsDto } from '../models/span.model';
-import { MetricSeriesDto, MetricCatalogDto, MetricQueryRequest, HeatmapDto, ExemplarDto } from '../models/metric.model';
+import { MetricSeriesDto, MetricCatalogDto, MetricQueryRequest, HeatmapDto, ExemplarDto, MetricExprRequest } from '../models/metric.model';
 import { AuthService } from './auth.service';
 
 @Injectable({ providedIn: 'root' })
@@ -244,6 +244,11 @@ export class ApiService {
   /** Server-side typed aggregation (rate/quantile/sum-by/topk). */
   queryMetricAgg(req: MetricQueryRequest): Observable<MetricSeriesDto[]> {
     return this.http.post<MetricSeriesDto[]>('/api/metrics/query', req);
+  }
+
+  /** Binary metric expression (A op B → single series). */
+  queryMetricExpr(req: MetricExprRequest): Observable<MetricSeriesDto> {
+    return this.http.post<MetricSeriesDto>('/api/metrics/expr', req);
   }
 
   getMetricHeatmap(name: string, from?: string, to?: string, step?: string,

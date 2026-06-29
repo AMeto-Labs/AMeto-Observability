@@ -221,6 +221,25 @@ public sealed class ExemplarSample
     public LabelSet Labels            { get; init; } = LabelSet.Empty;
 }
 
+/// <summary>Binary operator for a metric expression (A op B).</summary>
+public enum MetricExprOp { Div, Mul, Add, Sub }
+
+/// <summary>
+/// A binary metric expression: combine two aggregated queries pointwise by timestamp.
+/// Each side is reduced to a single series (summed across its result series), then
+/// <c>left op right</c> is computed per timestamp and optionally scaled (e.g. ×100 for %).
+/// Enables ratios like error-rate = rate(5xx) / rate(total) × 100.
+/// </summary>
+public sealed class MetricExprRequest
+{
+    public required MetricQueryRequest Left  { get; init; }
+    public required MetricQueryRequest Right { get; init; }
+    public MetricExprOp                Op    { get; init; } = MetricExprOp.Div;
+    /// <summary>Multiply the result (e.g. 100 to turn a ratio into a percentage).</summary>
+    public double                      Scale { get; init; } = 1;
+    public string?                     Name  { get; init; }
+}
+
 /// <summary>One column of a latency/distribution heatmap (one time step).</summary>
 public sealed class HeatmapColumn
 {

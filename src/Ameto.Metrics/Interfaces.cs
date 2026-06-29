@@ -88,6 +88,11 @@ public interface IMetricAggregator
         MetricQueryRequest request,
         CancellationToken  ct = default);
 
+    /// <summary>Evaluates a binary metric expression (A op B) into a single series.</summary>
+    Task<MetricSeries> EvalExprAsync(
+        MetricExprRequest request,
+        CancellationToken ct = default);
+
     /// <summary>
     /// Builds a histogram heatmap: per-step bucket-count deltas over the window.
     /// Returns empty bounds if the metric is not a histogram.
