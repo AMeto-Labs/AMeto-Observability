@@ -1,7 +1,7 @@
 import { Injectable, inject } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { Observable } from 'rxjs';
-import { EventDto, EventQueryParams, StatsDto } from '../models/event.model';
+import { EventDto, EventQueryParams, StatsDto, EventCountsDto } from '../models/event.model';
 import {
   AlertRule, AlertRuleUpsertRequest, AlertStateSnapshot, AlertHistoryEntry,
   AlertSilence, AlertPreviewResult,
@@ -9,7 +9,7 @@ import {
 import { NodeDto } from '../models/node.model';
 import { RetentionDto, RetentionRunResult } from '../models/retention.model';
 import { DiagnosticsDto } from '../models/diagnostics.model';
-import { ApiKeyDto, CreatedApiKeyDto, UserDto } from '../models/auth.model';
+import { ApiKeyDto, CreatedApiKeyDto, OAuthDomainDto, UserDto } from '../models/auth.model';
 import { CompareTracesDto, LatencyServiceDto, SpanDto, SpanQueryParams, TraceQueryRequest, TraceRowDto, TraceStatsDto } from '../models/span.model';
 import { MetricSeriesDto, MetricCatalogDto, MetricQueryRequest, HeatmapDto, ExemplarDto, MetricExprRequest } from '../models/metric.model';
 import { AuthService } from './auth.service';
@@ -59,6 +59,17 @@ export class ApiService {
 
   getServiceNames(days = 7): Observable<string[]> {
     return this.http.get<string[]>(`/api/events/services?days=${days}`);
+  }
+
+  /** Per-service event counts bucketed over time (Dashboard "Log events" chart). */
+  getEventCounts(params: { from?: string; to?: string; bucket?: number; limit?: number; service?: string } = {}): Observable<EventCountsDto> {
+    const p = new URLSearchParams();
+    if (params.from)    p.set('from',    params.from);
+    if (params.to)      p.set('to',      params.to);
+    if (params.bucket)  p.set('bucket',  String(params.bucket));
+    if (params.limit)   p.set('limit',   String(params.limit));
+    if (params.service) p.set('service', params.service);
+    return this.http.get<EventCountsDto>(`/api/events/counts?${p.toString()}`);
   }
 
   // ── Alerts ───────────────────────────────────────────────────────────────
@@ -132,6 +143,7 @@ export class ApiService {
 
   // ── Users ──────────────────────────────────────────────────────────────────
   getUsers(): Observable<UserDto[]>           { return this.http.get<UserDto[]>('/api/users'); }
+  getUser(id: string): Observable<UserDto>    { return this.http.get<UserDto>(`/api/users/${encodeURIComponent(id)}`); }
   createUser(username: string, password: string, role: string): Observable<UserDto> {
     return this.http.post<UserDto>('/api/users', { username, password, role });
   }
@@ -141,12 +153,28 @@ export class ApiService {
   updateUserRole(id: string, role: string): Observable<void> {
     return this.http.patch<void>(`/api/users/${id}/role`, { role });
   }
+  updateUser(id: string, displayName: string, role: string): Observable<void> {
+    return this.http.patch<void>(`/api/users/${encodeURIComponent(id)}`, { displayName, role });
+  }
   deleteUser(id: string): Observable<void>    { return this.http.delete<void>(`/api/users/${id}`); }
+
+  // ── OAuth domain allowlist ──────────────────────────────────────────────────
+  getOAuthDomains(): Observable<OAuthDomainDto[]> {
+    return this.http.get<OAuthDomainDto[]>('/api/users/oauth-domains');
+  }
+  createOAuthDomain(domain: string, provider: string, role: string): Observable<OAuthDomainDto> {
+    return this.http.post<OAuthDomainDto>('/api/users/oauth-domains', { domain, provider, role });
+  }
+  deleteOAuthDomain(id: string): Observable<void> {
+    return this.http.delete<void>(`/api/users/oauth-domains/${encodeURIComponent(id)}`);
+  }
 
   // ── API Keys ───────────────────────────────────────────────────────────────
   getApiKeys(): Observable<ApiKeyDto[]>       { return this.http.get<ApiKeyDto[]>('/api/auth/keys'); }
-  createApiKey(name: string, key?: string): Observable<CreatedApiKeyDto> {
-    return this.http.post<CreatedApiKeyDto>('/api/auth/keys', { name, key: key || null });
+  createApiKey(name: string, description: string, minimumLevel: number, key?: string): Observable<CreatedApiKeyDto> {
+    return this.http.post<CreatedApiKeyDto>('/api/auth/keys', {
+      name, description, minimumLevel, key: key || null,
+    });
   }
   deleteApiKey(id: string): Observable<void>  { return this.http.delete<void>(`/api/auth/keys/${id}`); }
 

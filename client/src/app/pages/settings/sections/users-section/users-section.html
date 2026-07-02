@@ -1,0 +1,141 @@
+<app-section title="Users">
+  @if (loading()) {
+    <span class="sublabel">Loading…</span>
+  } @else {
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Username / Email</th>
+          <th>Display name</th>
+          <th>Provider</th>
+          <th>Role</th>
+          <th>Created</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        @for (u of users(); track u.id) {
+          <tr class="user-row" (click)="openUser(u.id)">
+            <td class="mono-sm">{{ u.email || u.username }}</td>
+            <td class="muted">{{ u.displayName }}</td>
+            <td>
+              <span class="provider-badge" [attr.data-provider]="u.provider">{{ u.provider }}</span>
+            </td>
+            <td>
+              <span class="role-badge" [class.admin]="u.role === 'admin'">{{ u.role }}</span>
+            </td>
+            <td class="muted">{{ u.createdAt | date: 'yyyy-MM-dd' }}</td>
+            <td class="action-cell">
+              <button class="btn-icon" title="Open details" (click)="openUser(u.id); $event.stopPropagation()">
+                <lucide-icon name="chevron-right" [size]="14" />
+              </button>
+            </td>
+          </tr>
+        }
+      </tbody>
+    </table>
+
+    <div class="add-user-tabs">
+      <button class="add-tab" [class.active]="addUserTab() === 'local'" (click)="addUserTab.set('local')">
+        <lucide-icon name="user" [size]="12" /> Local user
+      </button>
+      <button class="add-tab" [class.active]="addUserTab() === 'oauth-email'" (click)="addUserTab.set('oauth-email')">
+        <lucide-icon name="mail" [size]="12" /> OAuth email
+      </button>
+      <button class="add-tab" [class.active]="addUserTab() === 'oauth-domain'" (click)="addUserTab.set('oauth-domain')">
+        <lucide-icon name="globe" [size]="12" /> OAuth domain
+      </button>
+    </div>
+
+    @if (addUserTab() === 'local') {
+      <form class="inline-form" (ngSubmit)="addUser()">
+        <input class="field-input" type="text" placeholder="Username" [ngModel]="newUsername()" (ngModelChange)="newUsername.set($event)" name="uname" />
+        <input class="field-input" type="password" placeholder="Password" [ngModel]="newPassword()" (ngModelChange)="newPassword.set($event)" name="pwd" />
+        <select class="field-select" [ngModel]="newRole()" (ngModelChange)="newRole.set($event)" name="role">
+          <option value="viewer">viewer</option>
+          <option value="manager">manager</option>
+          <option value="admin">admin</option>
+        </select>
+        <button class="btn primary" type="submit">
+          <lucide-icon name="user-plus" [size]="13" />
+          Add local user
+        </button>
+      </form>
+      @if (userError()) { <span class="form-error">{{ userError() }}</span> }
+    }
+
+    @if (addUserTab() === 'oauth-email') {
+      <form class="inline-form" (ngSubmit)="addOAuthUser()">
+        <input class="field-input" type="email" placeholder="Email" [ngModel]="newOAuthEmail()" (ngModelChange)="newOAuthEmail.set($event)" name="oemail" />
+        <input class="field-input" type="text" placeholder="Display name (optional)" [ngModel]="newOAuthDisplay()" (ngModelChange)="newOAuthDisplay.set($event)" name="odname" />
+        <select class="field-select" [ngModel]="newOAuthProvider()" (ngModelChange)="newOAuthProvider.set($event)" name="oprov">
+          <option value="google">Google</option>
+          <option value="microsoft">Microsoft</option>
+        </select>
+        <select class="field-select" [ngModel]="newOAuthRole()" (ngModelChange)="newOAuthRole.set($event)" name="orole">
+          <option value="viewer">viewer</option>
+          <option value="manager">manager</option>
+          <option value="admin">admin</option>
+        </select>
+        <button class="btn primary" type="submit">
+          <lucide-icon name="user-plus" [size]="13" />
+          Add to allowlist
+        </button>
+      </form>
+      <span class="sublabel">Allow a specific email to sign in via the selected OAuth provider.</span>
+      @if (oauthUserError()) { <span class="form-error">{{ oauthUserError() }}</span> }
+    }
+
+    @if (addUserTab() === 'oauth-domain') {
+      <form class="inline-form" (ngSubmit)="addDomain()">
+        <input class="field-input" type="text" placeholder="ameto.com" [ngModel]="newDomain()" (ngModelChange)="newDomain.set($event)" name="domain" />
+        <select class="field-select" [ngModel]="newDomainProvider()" (ngModelChange)="newDomainProvider.set($event)" name="dprov">
+          <option value="google">Google</option>
+          <option value="microsoft">Microsoft</option>
+        </select>
+        <select class="field-select" [ngModel]="newDomainRole()" (ngModelChange)="newDomainRole.set($event)" name="drole">
+          <option value="viewer">viewer</option>
+          <option value="manager">manager</option>
+          <option value="admin">admin</option>
+        </select>
+        <button class="btn primary" type="submit">
+          <lucide-icon name="plus" [size]="13" />
+          Add domain
+        </button>
+      </form>
+      <span class="sublabel">Any user whose email ends with this domain may sign in via the provider (auto-provisioned on first login).</span>
+      @if (domainError()) { <span class="form-error">{{ domainError() }}</span> }
+
+      @if (domainsLoading()) {
+        <span class="sublabel">Loading…</span>
+      } @else if (domains().length > 0) {
+        <table class="data-table domain-table">
+          <thead>
+            <tr>
+              <th>Domain</th>
+              <th>Provider</th>
+              <th>Role</th>
+              <th>Added</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            @for (d of domains(); track d.id) {
+              <tr>
+                <td class="mono-sm">@{{ d.domain }}</td>
+                <td><span class="provider-badge" [attr.data-provider]="d.provider">{{ d.provider }}</span></td>
+                <td><span class="role-badge" [class.admin]="d.role === 'admin'">{{ d.role }}</span></td>
+                <td class="muted">{{ d.createdAt | date: 'yyyy-MM-dd' }}</td>
+                <td class="action-cell">
+                  <button class="btn-icon danger" title="Remove domain" (click)="removeDomain(d.id)">
+                    <lucide-icon name="trash-2" [size]="13" />
+                  </button>
+                </td>
+              </tr>
+            }
+          </tbody>
+        </table>
+      }
+    }
+  }
+</app-section>

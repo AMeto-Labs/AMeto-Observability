@@ -1,0 +1,122 @@
+.sublabel {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.mono-sm {
+  font-size: 11px;
+  font-family: var(--font-mono);
+}
+
+.action-cell {
+  width: 32px;
+  text-align: center;
+}
+
+.user-row {
+  cursor: pointer;
+
+  &:hover {
+    background: var(--bg-hover);
+  }
+}
+
+.role-badge {
+  font-size: 11px;
+  padding: 1px 6px;
+  border-radius: 99px;
+  background: var(--bg-main);
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+
+  &.admin { border-color: var(--primary); color: var(--primary); }
+}
+
+.domain-table {
+  margin-top: 8px;
+}
+
+.role-select {
+  padding: 2px 6px;
+  background: var(--bg-main);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+
+  &:hover {
+    border-color: var(--accent);
+  }
+}
+
+.provider-badge {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 99px;
+  background: var(--bg-main);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: .4px;
+
+  &[data-provider='google']    { border-color: #4285F4; color: #4285F4; }
+  &[data-provider='microsoft'] { border-color: #0078D4; color: #0078D4; }
+  &[data-provider='local']     { border-color: var(--accent); color: var(--accent); }
+}
+
+.add-user-tabs {
+  display: flex;
+  gap: 4px;
+  margin: 12px 0 8px;
+}
+
+.add-tab {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  border-radius: var(--radius-sm);
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: 11px;
+  cursor: pointer;
+  transition: all .12s;
+
+  &:hover {
+    color: var(--text-primary);
+    border-color: var(--text-muted);
+  }
+
+  &.active {
+    color: var(--accent);
+    border-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
+  }
+}
+
+.inline-form {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
+  margin-top: 4px;
+}
+
+.field-select {
+  padding: 5px 8px;
+  background: var(--bg-main);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 12px;
+  outline: none;
+}
+
+.form-error {
+  font-size: 11px;
+  color: var(--error);
+}

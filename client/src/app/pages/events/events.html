@@ -396,10 +396,10 @@
         <span class="ev-footer-count">Showing {{ displayedEvents().length }} of {{ fmtCount(totalCount()) }} events</span>
         <div class="ev-footer-nav">
           <button class="ev-footer-btn" (click)="scrollToOlderLogs()">
-            <lucide-icon name="arrow-up" [size]="12" /> Older logs
+            <lucide-icon name="arrow-down" [size]="12" /> Older logs
           </button>
           <button class="ev-footer-btn" (click)="scrollToNewerLogs()">
-            <lucide-icon name="arrow-down" [size]="12" /> Newer logs
+            <lucide-icon name="arrow-up" [size]="12" /> Newer logs
           </button>
         </div>
         <button class="ev-footer-live" (click)="toggleLive()">

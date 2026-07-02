@@ -1,0 +1,92 @@
+<app-section title="API Keys">
+  <div class="row">
+    <span class="sublabel">Issue keys for programmatic ingestion. The full key is shown only once at creation.</span>
+    <button class="btn primary" (click)="openCreateModal()">
+      <lucide-icon name="plus" [size]="13" />
+      Create API key
+    </button>
+  </div>
+
+  @if (loading()) {
+    <span class="sublabel">Loading…</span>
+  } @else {
+    <table class="data-table">
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Description</th>
+          <th>Min level</th>
+          <th>Key</th>
+          <th>Created by</th>
+          <th>Created</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        @for (k of apiKeys(); track k.id) {
+          <tr>
+            <td>{{ k.name }}</td>
+            <td class="muted">{{ k.description || '—' }}</td>
+            <td><span class="level-pill">{{ levelLabel(k.minimumLevel) }}</span></td>
+            <td class="mono muted">{{ k.keyPreview }}</td>
+            <td class="muted">{{ k.createdBy }}</td>
+            <td class="muted">{{ k.createdAt | date: 'yyyy-MM-dd' }}</td>
+            <td class="action-cell">
+              <button class="btn-icon danger" title="Revoke key" (click)="removeApiKey(k.id)">
+                <lucide-icon name="trash-2" [size]="13" />
+              </button>
+            </td>
+          </tr>
+        }
+      </tbody>
+    </table>
+  }
+</app-section>
+
+<app-modal [open]="modalOpen()" title="Create API key" [dismissable]="!createdKey()" (close)="closeCreateModal()">
+  @if (createdKey(); as ck) {
+    <div class="key-reveal">
+      <lucide-icon name="key" [size]="14" />
+      <span class="key-text">{{ ck.key }}</span>
+      <button class="btn-icon" title="Copy" (click)="copyCreatedKey()">
+        <lucide-icon [name]="copied() ? 'check' : 'copy'" [size]="13" />
+      </button>
+    </div>
+    <span class="sublabel">Copy this key now — it won't be shown again.</span>
+    <div class="modal-actions">
+      <button class="btn primary" (click)="acknowledgeCreatedKey()">Done</button>
+    </div>
+  } @else {
+    <label class="field">
+      <span class="label">Name</span>
+      <input class="field-input" placeholder="Production ingest" [ngModel]="newName()" (ngModelChange)="newName.set($event)" />
+    </label>
+    <label class="field">
+      <span class="label">Description</span>
+      <input class="field-input" placeholder="What is this key used for?" [ngModel]="newDescription()" (ngModelChange)="newDescription.set($event)" />
+    </label>
+    <label class="field">
+      <span class="label">Minimum level</span>
+      <select class="field-select" [ngModel]="newMinimumLevel()" (ngModelChange)="newMinimumLevel.set(+$event)">
+        @for (lvl of levels; track lvl; let i = $index) {
+          <option [value]="i">{{ lvl }}+</option>
+        }
+      </select>
+      <span class="hint">Events below this level will be rejected by this key (business logic applied later).</span>
+    </label>
+    <label class="field">
+      <span class="label">Manual key (optional)</span>
+      <input class="field-input" placeholder="Leave empty to auto-generate" [ngModel]="newKeyManual()" (ngModelChange)="newKeyManual.set($event)" />
+    </label>
+
+    @if (keyError()) { <span class="form-error">{{ keyError() }}</span> }
+
+    <div class="modal-actions">
+      <button class="btn" (click)="closeCreateModal()" [disabled]="creating()">Cancel</button>
+      <button class="btn primary" (click)="create()" [disabled]="creating()">
+        <lucide-icon [name]="creating() ? 'loader-circle' : 'plus'" [size]="13" />
+        {{ creating() ? 'Creating…' : 'Create' }}
+      </button>
+    </div>
+  }
+</app-modal>

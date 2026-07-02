@@ -28,6 +28,8 @@ interface StatCard {
 }
 interface TopRow { label: string; value: number; pct: number; }
 interface RuntimePanel { title: string; unit: string; series: MetricSeriesDto[]; canvasId: string; }
+/** One row of the per-service breakdown table (RED metrics per service). */
+interface ServiceRow { service: string; rps: number; errPct: number; p50: number; p95: number; p99: number; }
 
 @Component({
   selector: 'app-metrics',
@@ -74,6 +76,13 @@ export class MetricsComponent implements OnInit, OnDestroy {
   // Explore
   catalog       = signal<MetricCatalogDto[]>([]);
   catalogSearch = signal('');
+
+  // Per-service dimension for Overview: filter (scope cards/charts to one service)
+  // + breakdown table (RED metrics per service, since global percentiles across
+  // heterogeneous services are meaningless).
+  services         = signal<string[]>([]);
+  selectedServices = signal<string[]>([]);   // empty = all services
+  serviceRows      = signal<ServiceRow[]>([]);
   selectedMetric = signal<MetricCatalogDto | null>(null);
   exAggregation = signal<MetricAggregation>('rate');
   exQuantile    = signal(0.95);
@@ -139,6 +148,9 @@ export class MetricsComponent implements OnInit, OnDestroy {
     const range = q.get('range');
     if (range) this.preset.set(range);
 
+    const svc = q.get('svc');
+    if (svc) this.selectedServices.set(svc.split(',').filter(Boolean));
+
     const metric = q.get('metric');
     if (metric) {
       this.pendingExplore = {
@@ -157,6 +169,7 @@ export class MetricsComponent implements OnInit, OnDestroy {
     const qp: Record<string, string | null> = {
       tab:    this.tab() === 'overview' ? null : this.tab(),
       range:  this.preset() === '1h' ? null : this.preset(),
+      svc:    this.selectedServices().length ? this.selectedServices().join(',') : null,
       metric: inExplore && sel ? sel.name : null,
       agg:    inExplore && sel ? this.exAggregation() : null,
       q:      inExplore && sel && this.exAggregation() === 'quantile' ? String(this.exQuantile()) : null,
@@ -175,6 +188,41 @@ export class MetricsComponent implements OnInit, OnDestroy {
     else this.loadCatalog();
   }
   onPreset(p: string) { this.preset.set(p); this.syncUrl(); this.refresh(); }
+
+  /** Label-matcher applied to every query when one or more services are selected.
+   *  Multiple values are '|'-joined so the backend merges their series (correct
+   *  quantiles over the union). Empty selection = all services (no filter). */
+  private svcFilter(): Record<string, string> | undefined {
+    const s = this.selectedServices();
+    return s.length ? { 'service.name': s.join('|') } : undefined;
+  }
+
+  /** Header dropdown adds a service to the selection; resets back to the placeholder. */
+  onAddService(e: Event) {
+    const sel = e.target as HTMLSelectElement;
+    const v = sel.value;
+    sel.value = '';
+    if (v) this.toggleService(v);
+  }
+  removeService(svc: string) {
+    this.selectedServices.update(l => l.filter(s => s !== svc));
+    this.syncUrl();
+    this.refresh();
+  }
+  clearServices() {
+    this.selectedServices.set([]);
+    this.syncUrl();
+    this.refresh();
+  }
+
+  /** Toggle a service in/out of the multi-selection (used by the dropdown + table rows). */
+  toggleService(svc: string) {
+    this.selectedServices.update(l => l.includes(svc) ? l.filter(s => s !== svc) : [...l, svc]);
+    this.syncUrl();
+    this.refresh();
+  }
+  /** Back-compat alias used by the service table rows. */
+  selectService(svc: string) { this.toggleService(svc); }
   private refresh() {
     if (this.tab() === 'overview') this.loadOverview();
     else if (this.tab() === 'runtime') this.loadRuntime();
@@ -248,7 +296,14 @@ export class MetricsComponent implements OnInit, OnDestroy {
       this.catalog.set(c);
       if (!this.reqMetric()) {
         const req = c.find(m => m.type === 'Histogram' && /request.*duration|http.*server.*duration/i.test(m.name));
-        if (req) { this.reqMetric.set(req.name); this.latencyScale.set(req.unit === 's' ? 1000 : 1); }
+        if (req) {
+          this.reqMetric.set(req.name);
+          this.latencyScale.set(req.unit === 's' ? 1000 : 1);
+          // Populate the service filter dropdown from the metric's service.name values.
+          this.api.getMetricLabelValues(req.name, 'service.name')
+            .pipe(catchError(() => of([] as string[])))
+            .subscribe(v => { this.services.set([...v].sort()); this.cdr.markForCheck(); });
+        }
       }
       this.cdr.markForCheck();
 
@@ -266,7 +321,10 @@ export class MetricsComponent implements OnInit, OnDestroy {
         }
       }
 
+      // Catalog drives both tabs' metric discovery — (re)load the active one now
+      // that it's available (fixes empty panels on deep-link / F5 into runtime).
       if (this.tab() === 'overview') this.loadOverview();
+      else if (this.tab() === 'runtime') this.loadRuntime();
     });
   }
 
@@ -277,9 +335,12 @@ export class MetricsComponent implements OnInit, OnDestroy {
     this.loading.set(true);
     const from = this.fromIso(), step = this.step();
     const scale = this.latencyScale();
+    const filters = this.svcFilter();
+
+    this.loadServiceTable();
 
     const q = (req: Partial<MetricQueryRequest>) =>
-      this.api.queryMetricAgg({ metric, from, step, ...req } as MetricQueryRequest)
+      this.api.queryMetricAgg({ metric, from, step, filters, ...req } as MetricQueryRequest)
         .pipe(catchError(() => of([] as MetricSeriesDto[])));
 
     forkJoin({
@@ -289,8 +350,8 @@ export class MetricsComponent implements OnInit, OnDestroy {
       p99:    q({ aggregation: 'quantile', quantile: 0.99 }),
       byCode: q({ aggregation: 'rate', groupBy: ['http.response.status_code'] }),
       byRoute: q({ aggregation: 'rate', groupBy: ['http.route'], topk: 8 }),
-      heat:   this.api.getMetricHeatmap(metric, from, undefined, step).pipe(catchError(() => of(null as any))),
-      exemplars: this.api.getMetricExemplars(metric, from, undefined, undefined, 500).pipe(catchError(() => of([] as ExemplarDto[]))),
+      heat:   this.api.getMetricHeatmap(metric, from, undefined, step, filters).pipe(catchError(() => of(null as any))),
+      exemplars: this.api.getMetricExemplars(metric, from, undefined, filters, 500).pipe(catchError(() => of([] as ExemplarDto[]))),
     }).subscribe(r => {
       this.exemplars = r.exemplars;
       this.exemplarCount.set(r.exemplars.length);
@@ -337,6 +398,50 @@ export class MetricsComponent implements OnInit, OnDestroy {
       this.loading.set(false);
       this.cdr.detectChanges();
       setTimeout(() => { this.renderOverviewCharts(); this.cdr.markForCheck(); }, 0);
+    });
+  }
+
+  /** Per-service breakdown (RED): one row per service.name, so many services read
+   *  as a sortable table instead of overlapping lines / a meaningless global quantile. */
+  private loadServiceTable() {
+    const metric = this.reqMetric();
+    if (!metric) return;
+    const from = this.fromIso(), step = this.step(), scale = this.latencyScale();
+    const q = (req: Partial<MetricQueryRequest>) =>
+      this.api.queryMetricAgg({ metric, from, step, ...req } as MetricQueryRequest)
+        .pipe(catchError(() => of([] as MetricSeriesDto[])));
+
+    forkJoin({
+      rate: q({ aggregation: 'rate',     groupBy: ['service.name'] }),
+      err:  q({ aggregation: 'rate',     groupBy: ['service.name', 'http.response.status_code'] }),
+      p50:  q({ aggregation: 'quantile', quantile: 0.50, groupBy: ['service.name'] }),
+      p95:  q({ aggregation: 'quantile', quantile: 0.95, groupBy: ['service.name'] }),
+      p99:  q({ aggregation: 'quantile', quantile: 0.99, groupBy: ['service.name'] }),
+    }).subscribe(r => {
+      const rows = new Map<string, ServiceRow>();
+      const row = (svc: string) => {
+        let x = rows.get(svc);
+        if (!x) { x = { service: svc, rps: 0, errPct: 0, p50: 0, p95: 0, p99: 0 }; rows.set(svc, x); }
+        return x;
+      };
+      for (const s of r.rate) row(s.labels['service.name'] || '?').rps += this.lastVal([s]);
+
+      const total = new Map<string, number>(), errors = new Map<string, number>();
+      for (const s of r.err) {
+        const svc = s.labels['service.name'] || '?';
+        const v = this.lastVal([s]);
+        total.set(svc, (total.get(svc) ?? 0) + v);
+        if ((s.labels['http.response.status_code'] || '').startsWith('5'))
+          errors.set(svc, (errors.get(svc) ?? 0) + v);
+      }
+      for (const [svc, t] of total) row(svc).errPct = t > 0 ? (errors.get(svc) ?? 0) / t * 100 : 0;
+
+      for (const s of r.p50) row(s.labels['service.name'] || '?').p50 = this.lastVal([s]) * scale;
+      for (const s of r.p95) row(s.labels['service.name'] || '?').p95 = this.lastVal([s]) * scale;
+      for (const s of r.p99) row(s.labels['service.name'] || '?').p99 = this.lastVal([s]) * scale;
+
+      this.serviceRows.set([...rows.values()].sort((a, b) => b.rps - a.rps));
+      this.cdr.markForCheck();
     });
   }
 
@@ -401,7 +506,7 @@ export class MetricsComponent implements OnInit, OnDestroy {
       const m = cat.find(c => w.rx.test(c.name));
       if (!m) return of(null);
       const agg: MetricAggregation = m.type === 'Counter' ? 'rate' : w.agg;
-      return this.api.queryMetricAgg({ metric: m.name, from, step, aggregation: agg })
+      return this.api.queryMetricAgg({ metric: m.name, from, step, aggregation: agg, filters: this.svcFilter() })
         .pipe(catchError(() => of([] as MetricSeriesDto[])),
               // attach meta
               );
@@ -454,7 +559,7 @@ export class MetricsComponent implements OnInit, OnDestroy {
     const scale = m.type === 'Histogram' && m.unit === 's' ? 1000 : 1;
 
     if (m.type === 'Histogram' && agg === 'quantile' && this.exGroupBy().length === 0) {
-      this.api.getMetricHeatmap(m.name, from, undefined, step)
+      this.api.getMetricHeatmap(m.name, from, undefined, step, this.svcFilter())
         .pipe(catchError(() => of(null as any))).subscribe(h => { this.exHeatmap.set(h); this.cdr.markForCheck(); });
     }
 
@@ -462,6 +567,7 @@ export class MetricsComponent implements OnInit, OnDestroy {
       metric: m.name, from, step, aggregation: agg,
       quantile: agg === 'quantile' ? this.exQuantile() : undefined,
       groupBy: this.exGroupBy().length ? this.exGroupBy() : undefined,
+      filters: this.svcFilter(),
       topk: 12,
     };
     const main$ = this.api.queryMetricAgg(req).pipe(catchError(() => of([] as MetricSeriesDto[])));

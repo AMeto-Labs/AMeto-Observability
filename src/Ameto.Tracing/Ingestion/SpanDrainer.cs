@@ -49,9 +49,9 @@ internal sealed class SpanDrainer : IAsyncDisposable
             if (count == 0)
             {
                 MaybeFlush();
-                // Park until a producer signals new spans (or 50 ms as a safety
-                // net) instead of polling every 5 ms, which burned idle CPU.
-                await _ring.WaitForItemsAsync(50, ct).ConfigureAwait(false);
+                // Park until a producer signals new spans. The 1 s timeout is only a
+                // missed-signal safety net (was 50 ms, which burned ~20 idle wake-ups/sec).
+                await _ring.WaitForItemsAsync(1000, ct).ConfigureAwait(false);
                 continue;
             }
 

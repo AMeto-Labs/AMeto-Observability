@@ -2,6 +2,7 @@ using System.Security.Claims;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Google;
 using Microsoft.AspNetCore.Authentication.MicrosoftAccount;
+using CoreLogLevel = Ameto.Core.LogLevel;
 
 namespace Ameto.Server.Auth;
 
@@ -88,6 +89,20 @@ internal static class AuthEndpoints
             }));
         }).RequireAuthorization();
 
+        // ── Users: get one (detail page) ───────────────────────────────────────
+        app.MapGet("/api/users/{id}", (HttpContext ctx, string id, AuthStore store) =>
+        {
+            if (!IsAdmin(ctx)) return Results.Forbid();
+            var u = store.GetUser(id);
+            return u is null
+                ? Results.NotFound()
+                : Results.Ok(new
+                {
+                    u.Id, u.Username, u.DisplayName, u.Email, u.Provider, u.Role,
+                    CreatedAt = u.CreatedAt.ToString("O"),
+                });
+        }).RequireAuthorization();
+
         // ── Users: create local ───────────────────────────────────────────────
         app.MapPost("/api/users", (HttpContext ctx, CreateUserRequest req, AuthStore store) =>
         {
@@ -140,6 +155,60 @@ internal static class AuthEndpoints
             return store.UpdateUserRole(id, role) ? Results.NoContent() : Results.NotFound();
         }).RequireAuthorization();
 
+        // ── Users: update display name + role (detail page) ───────────────────
+        app.MapPatch("/api/users/{id}", (HttpContext ctx, string id, UpdateUserRequest req, AuthStore store) =>
+        {
+            if (!IsAdmin(ctx)) return Results.Forbid();
+            var name = req.DisplayName?.Trim();
+            if (string.IsNullOrEmpty(name))
+                return Results.BadRequest(new { error = "Display name is required." });
+            var role = AuthStore.NormaliseRole(req.Role ?? "viewer");
+            return store.UpdateUser(id, name, role) ? Results.NoContent() : Results.NotFound();
+        }).RequireAuthorization();
+
+        // ── OAuth domain allowlist: list / create / delete ────────────────────
+        app.MapGet("/api/users/oauth-domains", (HttpContext ctx, AuthStore store) =>
+        {
+            if (!IsAdmin(ctx)) return Results.Forbid();
+            return Results.Ok(store.ListOAuthDomains().Select(d => new
+            {
+                d.Id, d.Provider, d.Domain, d.Role,
+                CreatedAt = d.CreatedAt.ToString("O"),
+            }));
+        }).RequireAuthorization();
+
+        app.MapPost("/api/users/oauth-domains", (HttpContext ctx, CreateOAuthDomainRequest req, AuthStore store) =>
+        {
+            if (!IsAdmin(ctx)) return Results.Forbid();
+            var domain = req.Domain?.Trim().TrimStart('@').ToLowerInvariant();
+            if (string.IsNullOrEmpty(domain) || domain.IndexOf('@') >= 0)
+                return Results.BadRequest(new { error = "A valid domain (e.g. ameto.com) is required." });
+
+            var provider = req.Provider?.ToLowerInvariant() is "google" or "microsoft"
+                ? req.Provider.ToLowerInvariant() : "google";
+            var role = AuthStore.NormaliseRole(req.Role ?? "viewer");
+
+            try
+            {
+                var d = store.CreateOAuthDomain(provider, domain, role);
+                return Results.Ok(new
+                {
+                    d.Id, d.Provider, d.Domain, d.Role,
+                    CreatedAt = d.CreatedAt.ToString("O"),
+                });
+            }
+            catch (Microsoft.Data.Sqlite.SqliteException ex) when (ex.SqliteErrorCode == 19)
+            {
+                return Results.Conflict(new { error = "Domain rule already exists for this provider." });
+            }
+        }).RequireAuthorization();
+
+        app.MapDelete("/api/users/oauth-domains/{id}", (HttpContext ctx, string id, AuthStore store) =>
+        {
+            if (!IsAdmin(ctx)) return Results.Forbid();
+            return store.DeleteOAuthDomain(id) ? Results.NoContent() : Results.NotFound();
+        }).RequireAuthorization();
+
         // ── Users: delete ─────────────────────────────────────────────────────
         app.MapDelete("/api/users/{id}", (HttpContext ctx, string id, AuthStore store) =>
         {
@@ -156,7 +225,9 @@ internal static class AuthEndpoints
         app.MapGet("/api/auth/keys", (AuthStore store) =>
             Results.Ok(store.ListApiKeys().Select(k => new
             {
-                k.Id, k.Name, k.CreatedBy,
+                k.Id, k.Name, k.Description,
+                MinimumLevel = (int)k.MinimumLevel,
+                k.CreatedBy,
                 KeyPreview = k.KeyHash[..8] + "…",
                 CreatedAt  = k.CreatedAt.ToString("O"),
             })))
@@ -170,10 +241,19 @@ internal static class AuthEndpoints
                 return Results.BadRequest(new { error = "Name is required." });
 
             var createdBy = ctx.User.FindFirst(ClaimTypes.Name)?.Value ?? "unknown";
-            var rec = store.CreateApiKey(req.Name.Trim(), createdBy, req.Key?.Trim());
+            var minLevel = req.MinimumLevel is { } ml && ml >= CoreLogLevel.Verbose && ml <= CoreLogLevel.Fatal
+                ? ml : CoreLogLevel.Verbose;
+            var rec = store.CreateApiKey(
+                req.Name.Trim(), req.Description?.Trim() ?? string.Empty,
+                minLevel, createdBy, req.Key?.Trim());
             cache.Invalidate();
-            return Results.Ok(new { rec.Id, rec.Name, rec.Key, rec.CreatedBy,
-                                    CreatedAt = rec.CreatedAt.ToString("O") });
+            return Results.Ok(new
+            {
+                rec.Id, rec.Name, rec.Description,
+                MinimumLevel = (int)rec.MinimumLevel,
+                rec.Key, rec.CreatedBy,
+                CreatedAt = rec.CreatedAt.ToString("O"),
+            });
         }).RequireAuthorization(AuthServiceExtensions.PolicyManager);
 
         // ── API keys: delete (manager+) ───────────────────────────────────────
@@ -193,5 +273,11 @@ internal sealed record LoginRequest(string Username, string Password);
 internal sealed record CreateUserRequest(string Username, string Password, string Role = "viewer");
 internal sealed record CreateOAuthUserRequest(string Email, string? DisplayName, string? Provider, string? Role);
 internal sealed record UpdateRoleRequest(string Role);
-internal sealed record CreateApiKeyRequest(string Name, string? Key = null);
+internal sealed record UpdateUserRequest(string? DisplayName, string? Role);
+internal sealed record CreateOAuthDomainRequest(string? Domain, string? Provider, string? Role = "viewer");
+internal sealed record CreateApiKeyRequest(
+    string Name,
+    string? Key = null,
+    string? Description = null,
+    CoreLogLevel? MinimumLevel = null);
 

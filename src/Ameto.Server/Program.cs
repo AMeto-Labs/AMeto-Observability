@@ -72,14 +72,28 @@ builder.Services
     .AddAmetoIngestion()
     .AddAmetoQuery();
 
+// ── Optional signal subsystems (toggle via env for benchmarking / logs-only mode) ──
+//   Ameto__Metrics__Enabled / Ameto__Tracing__Enabled / Ameto__Alerts__Enabled
+bool enableTracing = builder.Configuration.GetValue("Ameto:Tracing:Enabled", true);
+bool enableMetrics = builder.Configuration.GetValue("Ameto:Metrics:Enabled", true);
+bool enableAlerts  = builder.Configuration.GetValue("Ameto:Alerts:Enabled",  true);
+
+// The alert evaluator consumes IMetricAggregator + ITraceStatsProvider, so it can
+// only run when both subsystems are present. Disable it otherwise to avoid a DI failure.
+if (enableAlerts && (!enableMetrics || !enableTracing))
+    enableAlerts = false;
+
 // Alert rules store + evaluator
-builder.Services.AddAmetoAlerts(serverOptions.DataDirectory);
+if (enableAlerts)
+    builder.Services.AddAmetoAlerts(serverOptions.DataDirectory);
 
 // Distributed tracing
-builder.Services.AddAmetoTracing(serverOptions.DataDirectory);
+if (enableTracing)
+    builder.Services.AddAmetoTracing(serverOptions.DataDirectory);
 
 // Metrics
-builder.Services.AddAmetoMetrics(serverOptions.DataDirectory);
+if (enableMetrics)
+    builder.Services.AddAmetoMetrics(serverOptions.DataDirectory);
 
 var repOpts = builder.Configuration.GetSection("Ameto:Replication").Get<ReplicationOptions>() ?? new ReplicationOptions();
 builder.Services.AddAmetoReplication(repOpts);
@@ -116,13 +130,16 @@ app.UseStaticFiles();
 // ── Endpoints ─────────────────────────────────────────────────────────────────
 app.MapAuthEndpoints();
 app.MapAmetoEndpoints();
-app.MapAlertEndpoints();
+if (enableAlerts)
+    app.MapAlertEndpoints();
 app.MapRetentionEndpoints();
 app.MapDiagnosticsEndpoints();
 app.MapReplicationEndpoints();
-app.MapOtlpEndpoints();
-app.MapMetricEndpoints();
-app.MapTraceEndpoints();
+app.MapOtlpEndpoints(enableTracing, enableMetrics);
+if (enableMetrics)
+    app.MapMetricEndpoints();
+if (enableTracing)
+    app.MapTraceEndpoints();
 
 // SPA fallback — Angular handles client-side routing
 app.MapFallbackToFile("index.html");

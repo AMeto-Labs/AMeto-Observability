@@ -42,5 +42,25 @@ export interface StatsDto {
   compressedBytes: number;
 }
 
+/** Per-service event counts bucketed over time (GET /api/events/counts). */
+export interface EventCountService {
+  service: string;
+  count: number;
+  /** One value per bucket, aligned with <see cref="EventCountsDto.buckets"/>. */
+  points: number[];
+}
+
+export interface EventCountsDto {
+  from: string;
+  to: string;
+  bucketSeconds: number;
+  total: number;
+  sampled: number;
+  truncated: boolean;
+  /** Bucket start timestamps (unix milliseconds). */
+  buckets: number[];
+  services: EventCountService[];
+}
+
 export const LEVELS = ['Verbose', 'Debug', 'Information', 'Warning', 'Error', 'Fatal'] as const;
 export type Level = (typeof LEVELS)[number];

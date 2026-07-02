@@ -104,6 +104,38 @@ public static class LogEventSerializer
 
     // ── Private helpers ──────────────────────────────────────────────────────
 
+    /// <summary>Known CLEF field discriminator — lets the parse loop match keys without allocating.</summary>
+    private enum ClefField : byte
+    {
+        Unknown = 0, Timestamp, MessageTemplate, Level, Message, Exception, TraceId, SpanId, ServiceName,
+    }
+
+    /// <summary>Classifies a CLEF key from its raw UTF-8 bytes — zero allocation (hot path).</summary>
+    private static ClefField ClassifyKey(ReadOnlySpan<byte> key) =>
+        key.SequenceEqual("@t"u8)            ? ClefField.Timestamp       :
+        key.SequenceEqual("@mt"u8)           ? ClefField.MessageTemplate :
+        key.SequenceEqual("@l"u8)            ? ClefField.Level           :
+        key.SequenceEqual("@m"u8)            ? ClefField.Message         :
+        key.SequenceEqual("@x"u8)            ? ClefField.Exception       :
+        key.SequenceEqual("@tr"u8)           ? ClefField.TraceId         :
+        key.SequenceEqual("@sp"u8)           ? ClefField.SpanId          :
+        key.SequenceEqual("service.name"u8)  ? ClefField.ServiceName     :
+        ClefField.Unknown;
+
+    /// <summary>Fallback classifier for the rare non-contiguous-key path.</summary>
+    private static ClefField ClassifyKey(string? key) => key switch
+    {
+        ClefFields.Timestamp       => ClefField.Timestamp,
+        ClefFields.MessageTemplate => ClefField.MessageTemplate,
+        ClefFields.Level           => ClefField.Level,
+        ClefFields.Message         => ClefField.Message,
+        ClefFields.Exception       => ClefField.Exception,
+        ClefFields.TraceId         => ClefField.TraceId,
+        ClefFields.SpanId          => ClefField.SpanId,
+        ClefFields.ServiceName     => ClefField.ServiceName,
+        _                          => ClefField.Unknown,
+    };
+
     private static LogEvent ReadEvent(ref MessagePackReader reader, EventId id)
     {
         // Capture the underlying sequence so we can slice raw msgpack bytes for
@@ -129,39 +161,46 @@ public static class LogEventSerializer
             // (key, value) pair as a single msgpack-encoded slice if it turns
             // out to be a user property.
             SequencePosition pairStart = reader.Position;
-            string key = reader.ReadString() ?? string.Empty;
 
-            switch (key)
+            // Match the field key as UTF-8 bytes without allocating a string.
+            // CLEF events carry ~8 fields each; the old `reader.ReadString()` per
+            // key allocated a throwaway string for every field of every event —
+            // the dominant managed-allocation source on the ingest hot path.
+            ClefField field = reader.TryReadStringSpan(out ReadOnlySpan<byte> keySpan)
+                ? ClassifyKey(keySpan)
+                : ClassifyKey(reader.ReadString()); // rare: non-contiguous key
+
+            switch (field)
             {
-                case ClefFields.Timestamp:
+                case ClefField.Timestamp:
                     timestamp = reader.ReadString();
                     break;
-                case ClefFields.MessageTemplate:
+                case ClefField.MessageTemplate:
                     messageTemplate = reader.ReadString();
                     break;
-                case ClefFields.Level:
+                case ClefField.Level:
                     levelStr = reader.ReadString();
                     break;
-                case ClefFields.Message:
+                case ClefField.Message:
                     // CLEF rendered-message — kept only as a fallback in case @mt is absent.
                     messageFallback = reader.ReadString();
                     break;
-                case ClefFields.Exception:
+                case ClefField.Exception:
                     exception = ExceptionInfo.Read(ref reader);
                     break;
-                case ClefFields.TraceId:
+                case ClefField.TraceId:
                 {
                     string? hex = reader.ReadString();
                     TraceIdHelper.TryParseTraceId(hex, out traceIdHi, out traceIdLo);
                     break;
                 }
-                case ClefFields.SpanId:
+                case ClefField.SpanId:
                 {
                     string? hex = reader.ReadString();
                     TraceIdHelper.TryParseSpanId(hex, out spanId);
                     break;
                 }
-                case ClefFields.ServiceName:
+                case ClefField.ServiceName:
                     serviceName = reader.ReadString();
                     break;
                 default:

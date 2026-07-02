@@ -214,7 +214,17 @@ internal static class MetricReader
     {
         var dict = labels.Pairs.ToDictionary(t => t.Key, t => t.Value, StringComparer.Ordinal);
         foreach (var (k, v) in matchers)
-            if (!dict.TryGetValue(k, out var actual) || actual != v) return false;
+        {
+            if (!dict.TryGetValue(k, out var actual)) return false;
+            // Exact, or '|'-delimited OR (e.g. service.name=A|B|C) for multi-select.
+            if (v.IndexOf('|') < 0) { if (actual != v) return false; }
+            else
+            {
+                bool any = false;
+                foreach (var opt in v.Split('|')) if (actual == opt) { any = true; break; }
+                if (!any) return false;
+            }
+        }
         return true;
     }
 

@@ -1,16 +1,16 @@
 {
   "/api": {
-    "target": "https://ameto.rusilan5.space",
+    "target": "http://localhost:8555",
     "secure": false,
     "changeOrigin": true
   },
   "/auth": {
-    "target": "https://ameto.rusilan5.space",
+    "target": "http://localhost:8555",
     "secure": false,
     "changeOrigin": true
   },
   "/health": {
-    "target": "https://ameto.rusilan5.space",
+    "target": "http://localhost:8555",
     "secure": false,
     "changeOrigin": true
   }

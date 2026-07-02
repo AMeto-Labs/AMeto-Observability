@@ -8,30 +8,27 @@ namespace Ameto.Ingestion;
 /// <summary>
 /// MPMC (Multi-Producer Multi-Consumer) bounded ring buffer backed by NativeMemory.
 ///
-/// Each slot stores a variable-length byte payload (serialised log event properties).
-/// The ring stores fixed-size <see cref="Slot"/> descriptors; payloads live in a
-/// separate heap-allocated byte array per slot (minimises unsafe surface while keeping
-/// the hot-path descriptor array off-heap for cache efficiency).
+/// The ring stores fixed-size <see cref="Slot"/> descriptors and sequences events with a
+/// classic sequence-number algorithm (Dmitry Vyukov's MPMC queue).
 ///
-/// Capacity must be a power of two. The implementation uses a classic sequence-number
-/// algorithm (Dmitry Vyukov's MPMC queue) with Interlocked operations on slot sequences.
+/// Payloads do NOT live one-per-slot. Instead they are stored in a single shared,
+/// bounded <em>slab pool</em> (<see cref="_payloadArena"/>) and handed out via a
+/// lock-free free-list (an ABA-safe Treiber stack over slab indices). This decouples
+/// payload memory from <see cref="Capacity"/>: instead of <c>capacity × maxPayload</c>
+/// (e.g. 16384 × 64 KB = 1 GB) reserved up front, only <see cref="_slabCount"/> slabs
+/// exist, and pages become resident on demand — when the drainer keeps up, only a
+/// handful of slabs are ever touched, so RSS stays at a few MB regardless of capacity.
+/// When the pool is exhausted, enqueue applies back-pressure (returns false), exactly
+/// like a full ring.
 ///
 /// Thread safety: fully concurrent producers and consumers with no locks.
 /// </summary>
 public sealed unsafe class IngestionRingBuffer : IDisposable
 {
+    /// <summary>Total bytes the shared payload pool may commit at most (back-pressure ceiling).</summary>
+    private const long PayloadPoolBytes = 128L * 1024 * 1024; // 128 MB worst case; demand-driven in practice
+
     // ── Slot layout (64 bytes = one cache line) ────────────────────────────────
-    // sequence : long  (8)
-    // timestamp: long  (8)
-    // level    : byte  (1)
-    // _pad1    : byte  (1)
-    // _pad2    : ushort(2)
-    // payloadLen: int  (4)
-    // templateIdx: int (4)
-    // _pad3    : int   (4)
-    // payload  : IntPtr(8) — pointer to GC-heap byte[] pinned per slot
-    // _pad     : 24 bytes
-    // Total    : 64 bytes
     [StructLayout(LayoutKind.Explicit, Size = 64)]
     private struct Slot
     {
@@ -43,7 +40,7 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
         [FieldOffset(20)] public int     PayloadLen;
         [FieldOffset(24)] public int     TemplateIdx;
         [FieldOffset(28)] public int     ServiceNameIdx;   // intern-pool index (-1 if absent)
-        [FieldOffset(32)] public IntPtr  PayloadPtr;       // byte* into PayloadBuf
+        [FieldOffset(32)] public int     PayloadSlab;      // index into the shared slab pool (-1 = none)
         [FieldOffset(40)] public ulong   TraceIdHi;        // hi 64 bits of 128-bit TraceId
         [FieldOffset(48)] public ulong   TraceIdLo;        // lo 64 bits of 128-bit TraceId
         [FieldOffset(56)] public ulong   SpanId;           // 64-bit SpanId
@@ -54,21 +51,19 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
     private readonly Slot*  _slots;      // NativeMemory array
     private readonly nuint  _slotsBytes;
 
-    // Per-slot payload buffers — avoid GC pinning by allocating per-slot on NativeMemory too
-    // _slotPayloads[i] points to a NativeMemory block of _maxPayloadBytes
-    private readonly byte** _payloadBufs;
-    private readonly int    _maxPayloadBytes;
+    // ── Shared payload slab pool ────────────────────────────────────────────────
+    // One contiguous arena of _slabCount × _slabBytes. Slabs are handed out by index
+    // through a lock-free free-list; the arena is sized to PayloadPoolBytes, NOT to
+    // capacity, so payload memory no longer scales with the ring size.
+    private readonly byte*       _payloadArena;
+    private readonly nuint       _payloadArenaBytes;
+    private readonly int         _slabBytes;     // max payload bytes per event
+    private readonly int         _slabCount;
+    private readonly int*        _slabNext;      // free-list chain: _slabNext[i] = next free slab, or -1
+    private          PaddedLong* _freeHead;      // packed (version:hi32 | index:lo32); index -1 ⇒ empty
 
-    // Per-slot message-template strings (managed). Parallel to the native slot
-    // array. Lets the drainer hand the original template to StorageEngine even
-    // when the StringInternPool entry is missing or has been evicted — so cold
-    // segments preserve the template text instead of silently writing empty.
-    private readonly string?[] _slotTemplates;
-
-    // Per-slot structured exception payloads (managed, parallel to _slotTemplates).
-    // Stored separately from the msgpack properties payload so the drainer can
-    // hand the typed object straight to the storage engine and indexer without
-    // re-deserialising.
+    // Per-slot message-template strings + structured exceptions (managed, parallel to slots).
+    private readonly string?[]        _slotTemplates;
     private readonly ExceptionInfo?[] _slotExceptions;
 
     // Cursors — each on its own cache line to avoid false sharing
@@ -82,31 +77,38 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
 
     // ── Construction ─────────────────────────────────────────────────────────
 
-    /// <param name="capacity">Must be a power of two. Recommended: 1 << 14 = 16384.</param>
-    /// <param name="maxPayloadBytesPerSlot">Max msgpack bytes per event. Default 64 KB.</param>
+    /// <param name="capacity">Ring sequencing slots. Must be a power of two. Recommended: 1 << 14 = 16384.</param>
+    /// <param name="maxPayloadBytesPerSlot">Max msgpack bytes per event (slab size). Default 64 KB.</param>
     public IngestionRingBuffer(int capacity = 1 << 14, int maxPayloadBytesPerSlot = 64 * 1024)
     {
         if (capacity <= 0 || (capacity & (capacity - 1)) != 0)
             throw new ArgumentException("capacity must be a positive power of two", nameof(capacity));
 
-        _capacity        = capacity;
-        _mask            = capacity - 1L;
-        _maxPayloadBytes = maxPayloadBytesPerSlot;
+        _capacity = capacity;
+        _mask     = capacity - 1L;
 
         // Allocate slot array
         _slotsBytes = (nuint)(capacity * sizeof(Slot));
         _slots      = (Slot*)NativeMemory.AllocZeroed(_slotsBytes);
-
-        // Initialise sequences
         for (int i = 0; i < capacity; i++)
             _slots[i].Sequence = i;
 
-        // Allocate per-slot payload buffers
-        _payloadBufs = (byte**)NativeMemory.AllocZeroed((nuint)(capacity * sizeof(IntPtr)));
-        for (int i = 0; i < capacity; i++)
-            _payloadBufs[i] = (byte*)NativeMemory.Alloc((nuint)maxPayloadBytesPerSlot);
+        // ── Shared payload slab pool ────────────────────────────────────────────
+        // Cap the pool at PayloadPoolBytes (and never more slabs than ring slots).
+        _slabBytes = maxPayloadBytesPerSlot;
+        _slabCount = (int)Math.Min(capacity, Math.Max(1, PayloadPoolBytes / _slabBytes));
 
-        _slotTemplates = new string?[capacity];
+        _payloadArenaBytes = (nuint)((long)_slabCount * _slabBytes);
+        _payloadArena      = (byte*)NativeMemory.Alloc(_payloadArenaBytes); // reserve only; pages fault in on demand
+
+        // Free-list: chain every slab, head = slab 0 (version 0).
+        _slabNext = (int*)NativeMemory.Alloc((nuint)(_slabCount * sizeof(int)));
+        for (int i = 0; i < _slabCount - 1; i++) _slabNext[i] = i + 1;
+        _slabNext[_slabCount - 1] = -1;
+
+        _freeHead = (PaddedLong*)NativeMemory.AllocZeroed((nuint)sizeof(PaddedLong)); // value 0 ⇒ idx 0, ver 0
+
+        _slotTemplates  = new string?[capacity];
         _slotExceptions = new ExceptionInfo?[capacity];
 
         // Allocate cursors
@@ -130,11 +132,43 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
         }
     }
 
+    // ── Slab pool (lock-free Treiber stack, ABA-safe via versioned head) ────────
+
+    /// <summary>Pops a free slab index, or -1 when the payload pool is exhausted.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private int AcquireSlab()
+    {
+        while (true)
+        {
+            long head = Volatile.Read(ref _freeHead->Value);
+            int  idx  = unchecked((int)head);          // low 32 bits; -1 ⇒ empty
+            if (idx < 0) return -1;
+            int  next = _slabNext[idx];
+            long newHead = unchecked((((head >> 32) + 1) << 32) | (uint)next); // bump version, swing to next
+            if (Interlocked.CompareExchange(ref _freeHead->Value, newHead, head) == head)
+                return idx;
+        }
+    }
+
+    /// <summary>Returns a slab index to the free-list.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void ReleaseSlab(int idx)
+    {
+        while (true)
+        {
+            long head = Volatile.Read(ref _freeHead->Value);
+            _slabNext[idx] = unchecked((int)head);     // our slab points at the old head
+            long newHead = unchecked((((head >> 32) + 1) << 32) | (uint)idx);
+            if (Interlocked.CompareExchange(ref _freeHead->Value, newHead, head) == head)
+                return;
+        }
+    }
+
     // ── Enqueue ───────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Non-blocking enqueue. Returns false if the buffer is full (back-pressure).
-    /// Copies <paramref name="payload"/> into the slot's NativeMemory buffer.
+    /// Non-blocking enqueue. Returns false if the ring is full OR the shared payload
+    /// pool is exhausted (back-pressure). Copies <paramref name="payload"/> into a slab.
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool TryEnqueue(
@@ -149,8 +183,13 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
         ulong   spanId         = 0,
         int     serviceNameIdx = -1)
     {
-        if (payload.Length > _maxPayloadBytes)
+        if (payload.Length > _slabBytes)
             return false; // drop oversized event
+
+        // Reserve payload storage first: if the pool is full we apply back-pressure
+        // without ever claiming a ring slot we couldn't fill.
+        int slab = AcquireSlab();
+        if (slab < 0) return false;
 
         long pos;
         Slot* slot;
@@ -159,40 +198,40 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
         {
             pos  = Volatile.Read(ref _enqueuePos->Value);
             slot = _slots + (pos & _mask);
-            long seq = Volatile.Read(ref slot->Sequence);
+            long seq  = Volatile.Read(ref slot->Sequence);
             long diff = seq - pos;
 
             if (diff == 0)
             {
-                // Slot is available — try to claim it
                 if (Interlocked.CompareExchange(ref _enqueuePos->Value, pos + 1, pos) == pos)
                     break;
             }
             else if (diff < 0)
             {
-                // Buffer full
+                ReleaseSlab(slab); // ring full — give the slab back
                 return false;
             }
             // diff > 0: another producer just published here, spin
         }
 
-        // We own the slot — write payload
-        byte* buf = _payloadBufs[pos & _mask];
+        // We own the slot and a private slab — write payload.
+        byte* buf = _payloadArena + (long)slab * _slabBytes;
         if (payload.Length > 0)
             payload.CopyTo(new Span<byte>(buf, payload.Length));
 
-        _slotTemplates [pos & _mask] = template;
-        _slotExceptions[pos & _mask] = exception;
+        int slotIdx = (int)(pos & _mask);
+        _slotTemplates [slotIdx] = template;
+        _slotExceptions[slotIdx] = exception;
 
-        slot->TimestampTicks  = timestampTicks;
-        slot->Level            = level;
-        slot->TemplateIdx      = templateIdx;
-        slot->PayloadLen       = payload.Length;
-        slot->PayloadPtr       = (IntPtr)buf;
-        slot->TraceIdHi        = traceIdHi;
-        slot->TraceIdLo        = traceIdLo;
-        slot->SpanId           = spanId;
-        slot->ServiceNameIdx   = serviceNameIdx;
+        slot->TimestampTicks = timestampTicks;
+        slot->Level          = level;
+        slot->TemplateIdx    = templateIdx;
+        slot->PayloadLen     = payload.Length;
+        slot->PayloadSlab    = slab;
+        slot->TraceIdHi      = traceIdHi;
+        slot->TraceIdLo      = traceIdLo;
+        slot->SpanId         = spanId;
+        slot->ServiceNameIdx = serviceNameIdx;
 
         // Publish: advance sequence to pos+1
         Volatile.Write(ref slot->Sequence, pos + 1);
@@ -242,23 +281,22 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
 
             if (diff == 0)
             {
-                // Slot is ready — try to claim it
                 if (Interlocked.CompareExchange(ref _dequeuePos->Value, pos + 1, pos) == pos)
                     break;
             }
             else if (diff < 0)
             {
-                // Buffer empty
-                return false;
+                return false; // empty
             }
             // diff > 0: slot is ahead (wrap-around in progress), spin
         }
 
-        // Read payload
-        int len = slot->PayloadLen;
-        if (len > 0 && payloadBuffer.Length >= len)
+        // Read payload out of its slab, then free the slab back to the pool.
+        int len  = slot->PayloadLen;
+        int slab = slot->PayloadSlab;
+        if (len > 0 && slab >= 0 && payloadBuffer.Length >= len)
         {
-            byte* src = (byte*)slot->PayloadPtr;
+            byte* src = _payloadArena + (long)slab * _slabBytes;
             new ReadOnlySpan<byte>(src, len).CopyTo(payloadBuffer);
         }
 
@@ -271,13 +309,19 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
         spanId         = slot->SpanId;
         serviceNameIdx = slot->ServiceNameIdx;
 
-        // Hand off the template / exception refs and clear the slot so the GC can
-        // collect them when no longer referenced.
         int slotIdx = (int)(pos & _mask);
         template                 = _slotTemplates [slotIdx];
         exception                = _slotExceptions[slotIdx];
         _slotTemplates [slotIdx] = null;
         _slotExceptions[slotIdx] = null;
+
+        // Return the slab once its bytes have been copied out. The consumer already
+        // holds the data, so a producer may safely reuse this slab immediately.
+        if (slab >= 0)
+        {
+            slot->PayloadSlab = -1;
+            ReleaseSlab(slab);
+        }
 
         // Release slot: advance sequence by capacity so the next wrap-around can reuse it
         Volatile.Write(ref slot->Sequence, pos + _capacity);
@@ -291,10 +335,9 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
         if (_disposed) return;
         _disposed = true;
 
-        for (int i = 0; i < _capacity; i++)
-            NativeMemory.Free(_payloadBufs[i]);
-
-        NativeMemory.Free(_payloadBufs);
+        NativeMemory.Free(_payloadArena);
+        NativeMemory.Free(_slabNext);
+        NativeMemory.Free(_freeHead);
         NativeMemory.Free(_slots);
         NativeMemory.Free(_enqueuePos);
         NativeMemory.Free(_dequeuePos);

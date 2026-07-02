@@ -1,0 +1,56 @@
+<app-section title="Retention policy">
+  <span class="sublabel">
+    How long events are kept per log level. The retention worker runs every hour.
+    Changes take effect on the next run.
+  </span>
+
+  @if (loading()) {
+    <span class="sublabel">Loading…</span>
+  } @else {
+    <div class="retention-grid">
+      @for (f of fields; track f.key) {
+        <div class="level-label">
+          @if (f.dotClass) {
+            <div class="dot" [class]="f.dotClass"></div>
+          } @else if (f.icon) {
+            <lucide-icon [name]="f.icon" [size]="12" style="margin-right:4px" />
+          }
+          {{ f.label }}
+        </div>
+        <div class="days-control">
+          <input
+            class="days-input"
+            type="number"
+            min="1"
+            [ngModel]="signals[f.key]()"
+            (ngModelChange)="signals[f.key].set(+$event)"
+            [title]="f.label + ' retention days'"
+          />
+          <span class="days-unit">days</span>
+        </div>
+      }
+    </div>
+
+    <div class="retention-footer">
+      @if (runResult(); as r) {
+        <span class="run-result ok">
+          Logs: {{ r.deletedSegments }} seg · {{ (r.freedBytes / 1048576).toFixed(1) }} MB freed
+          @if (r.deletedMetricFiles > 0) { &nbsp;· Metrics: {{ r.deletedMetricFiles }} file(s) }
+          @if (r.deletedTraceFiles > 0) { &nbsp;· Traces: {{ r.deletedTraceFiles }} file(s) }
+        </span>
+      } @else {
+        <span></span>
+      }
+      <div class="btn-group">
+        <button class="btn" [disabled]="running() || saving()" (click)="run()">
+          <lucide-icon [name]="running() ? 'loader-circle' : 'play'" [size]="13" />
+          {{ running() ? 'Running…' : 'Run now' }}
+        </button>
+        <button class="btn primary" [disabled]="saving() || running()" (click)="save()">
+          <lucide-icon [name]="saving() ? 'loader-circle' : 'save'" [size]="13" />
+          {{ saving() ? 'Saving…' : 'Save' }}
+        </button>
+      </div>
+    </div>
+  }
+</app-section>

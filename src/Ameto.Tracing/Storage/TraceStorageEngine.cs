@@ -28,6 +28,8 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
 
     private const int HotFlushThreshold    = 50_000;  // spans before flush
     private const int CompactionThreshold  = 10_000;  // merge cold segments smaller than this
+    private const int MaxSegmentsPerPass   = 20;       // merge at most N oldest small segments per run
+    private const int MaxSpansPerPass      = 200_000;  // hard cap on spans loaded into memory per run
 
     public TraceStorageEngine(string dataDir, ILogger<TraceStorageEngine> logger)
     {
@@ -247,25 +249,40 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
 
     internal void CompactSmallSegments()
     {
-        var small = _coldSegments.Where(s => s.SpanCount < CompactionThreshold).ToList();
+        // Bounded pass: take only the oldest small segments and cap the spans loaded
+        // into memory. Compaction used to merge ALL small segments at once, which on a
+        // memory-limited container exhausted the heap (tiny allocations threw OOM) and
+        // left the segments un-compacted — so they piled up and every pass failed worse.
+        // A bounded pass drains the backlog incrementally (one merge per hourly run).
+        var small = _coldSegments
+            .Where(s => s.SpanCount < CompactionThreshold)
+            .OrderBy(s => s.MinStartNano)   // oldest first
+            .Take(MaxSegmentsPerPass)
+            .ToList();
         if (small.Count < 2) return;
 
-        var allSpans = new List<SpanRecord>();
+        var allSpans  = new List<SpanRecord>();
+        var processed = new List<SpanSegmentInfo>(small.Count);
         foreach (var seg in small)
         {
-            try   { allSpans.AddRange(SpanReader.ReadAll(seg.FilePath)); }
+            if (allSpans.Count >= MaxSpansPerPass) break;   // memory cap reached — stop taking more
+            try
+            {
+                allSpans.AddRange(SpanReader.ReadAll(seg.FilePath));
+                processed.Add(seg);
+            }
             catch (Exception ex) { _logger.LogWarning(ex, "Compaction: failed to read {File}", seg.FilePath); }
         }
 
-        if (allSpans.Count == 0) return;
+        if (processed.Count < 2 || allSpans.Count == 0) return;
 
         try
         {
             var merged = SpanWriter.Write(_dataDir, allSpans);
             _logger.LogInformation("Compacted {Count} small segments → {File} ({Spans} spans)",
-                small.Count, Path.GetFileName(merged.FilePath), allSpans.Count);
+                processed.Count, Path.GetFileName(merged.FilePath), allSpans.Count);
 
-            foreach (var seg in small)
+            foreach (var seg in processed)   // delete only the segments we actually merged
             {
                 _coldSegments.Remove(seg);
                 try   { File.Delete(seg.FilePath); }

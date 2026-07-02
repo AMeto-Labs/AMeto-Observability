@@ -1,5 +1,6 @@
 import { Routes } from '@angular/router';
 import { authGuard } from './core/guards/auth.guard';
+import { settingsDeactivateGuard } from './core/guards/settings-deactivate.guard';
 
 export const routes: Routes = [
   {
@@ -35,7 +36,17 @@ export const routes: Routes = [
       },
       {
         path: 'settings',
-        loadComponent: () => import('./pages/settings/settings').then(m => m.SettingsComponent),
+        children: [
+          {
+            path: '',
+            canDeactivate: [settingsDeactivateGuard],
+            loadComponent: () => import('./pages/settings/settings').then(m => m.SettingsComponent),
+          },
+          {
+            path: 'users/:id',
+            loadComponent: () => import('./pages/settings/user-detail/user-detail').then(m => m.UserDetailComponent),
+          },
+        ],
       },
       {
         path: 'diagnostics',

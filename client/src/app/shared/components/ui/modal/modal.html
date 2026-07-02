@@ -1,0 +1,17 @@
+@if (open()) {
+  <div class="modal-backdrop" (click)="onBackdrop()">
+    <div class="modal" role="dialog" aria-modal="true" (click)="$event.stopPropagation()">
+      <header class="modal__header">
+        <h3 class="modal__title">{{ title() }}</h3>
+        @if (dismissable()) {
+          <button class="btn-icon" type="button" title="Close" (click)="close.emit()">
+            <lucide-icon name="x" [size]="16" />
+          </button>
+        }
+      </header>
+      <div class="modal__body">
+        <ng-content />
+      </div>
+    </div>
+  </div>
+}

@@ -198,7 +198,9 @@ internal static class AuthServiceExtensions
             return Task.CompletedTask;
         }
 
-        var user = store.FindOAuthUser(email, provider);
+        var displayName = ctx.Principal?.FindFirst(System.Security.Claims.ClaimTypes.Name)?.Value ?? email;
+        // Per-email allowlist first, then domain allowlist (auto-provisions on first match).
+        var user = store.FindOrCreateOAuthUser(email, displayName, provider);
         if (user is null)
         {
             ctx.Response.Redirect($"/login?error=access_denied&email={Uri.EscapeDataString(email)}");
@@ -206,7 +208,6 @@ internal static class AuthServiceExtensions
             return Task.CompletedTask;
         }
 
-        var displayName = ctx.Principal?.FindFirst(System.Security.Claims.ClaimTypes.Name)?.Value ?? email;
         var token = issuer.Issue(user.Username, user.Role, email, displayName);
 
         ctx.Response.Redirect(

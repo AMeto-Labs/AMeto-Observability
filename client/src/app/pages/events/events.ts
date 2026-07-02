@@ -671,12 +671,14 @@ export class EventsComponent implements OnInit, OnDestroy {
   }
 
   scrollToOlderLogs(): void {
-    this.virtualizer.scrollToOffset(0, { behavior: 'smooth' });
+    // Events are newest-first, so the oldest loaded event is at the bottom.
+    const last = this.displayedEvents().length - 1;
+    if (last >= 0) this.virtualizer.scrollToIndex(last, { behavior: 'smooth' });
   }
 
   scrollToNewerLogs(): void {
-    const last = this.displayedEvents().length - 1;
-    if (last >= 0) this.virtualizer.scrollToIndex(last, { behavior: 'smooth' });
+    // Newest events sit at the top of the list.
+    this.virtualizer.scrollToOffset(0, { behavior: 'smooth' });
   }
 
   /** TrackBy for *cdkVirtualFor over event rows. */

@@ -7,6 +7,22 @@
       <span class="page-subtitle">Rates, errors, latency &amp; resources</span>
     </div>
     <div class="hdr-actions">
+      @if (services().length) {
+        <div class="svc-multi">
+          @for (s of selectedServices(); track s) {
+            <span class="svc-chip">{{ s }}<button class="svc-chip-x" title="Remove" (click)="removeService(s)">×</button></span>
+          }
+          <select class="svc-select" [value]="''" (change)="onAddService($event)">
+            <option value="">{{ selectedServices().length ? '+ add service' : 'All services' }}</option>
+            @for (s of services(); track s) {
+              @if (!selectedServices().includes(s)) { <option [value]="s">{{ s }}</option> }
+            }
+          </select>
+          @if (selectedServices().length) {
+            <button class="svc-clear" title="Clear all" (click)="clearServices()">clear</button>
+          }
+        </div>
+      }
       <div class="preset-group">
         @for (p of ['15m','30m','1h','3h','6h','12h','24h']; track p) {
           <button class="preset-btn" [class.active]="preset() === p" (click)="onPreset(p)">{{ p }}</button>
@@ -57,10 +73,36 @@
         }
       </div>
 
+      <!-- Per-service breakdown -->
+      @if (serviceRows().length) {
+        <div class="panel">
+          <div class="panel-hdr">Services
+            <span class="panel-sub">RPS · error% · latency · click to focus</span>
+          </div>
+          <div class="svc-table">
+            <div class="svc-row svc-head">
+              <span>Service</span><span>RPS</span><span>Err%</span><span>p50</span><span>p95</span><span>p99</span>
+            </div>
+            @for (s of serviceRows(); track s.service) {
+              <div class="svc-row" [class.active]="selectedServices().includes(s.service)" (click)="selectService(s.service)">
+                <span class="svc-name" [title]="s.service">{{ s.service }}</span>
+                <span>{{ fmtCardinality(s.rps) }}</span>
+                <span [class.svc-err]="s.errPct > 1">{{ s.errPct.toFixed(1) }}%</span>
+                <span>{{ fmtCardinality(s.p50) }}<i>ms</i></span>
+                <span>{{ fmtCardinality(s.p95) }}<i>ms</i></span>
+                <span>{{ fmtCardinality(s.p99) }}<i>ms</i></span>
+              </div>
+            }
+          </div>
+        </div>
+      }
+
       <!-- Charts row -->
       <div class="grid-2">
         <div class="panel">
-          <div class="panel-hdr">Request rate <span class="panel-sub">rps</span></div>
+          <div class="panel-hdr">Request rate <span class="panel-sub">rps</span>
+            @if (selectedServices().length) { <span class="panel-sub">· {{ selectedServices().length === 1 ? selectedServices()[0] : selectedServices().length + ' services' }}</span> }
+          </div>
           <div class="chart-wrap"><canvas #rateCanvas></canvas></div>
         </div>
         <div class="panel">

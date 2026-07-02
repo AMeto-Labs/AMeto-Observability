@@ -527,8 +527,24 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         if (matchers is null || matchers.Count == 0) return true;
         var pairs = labels.Pairs.ToDictionary(t => t.Key, t => t.Value, StringComparer.Ordinal);
         foreach (var (k, v) in matchers)
-            if (!pairs.TryGetValue(k, out var actual) || actual != v) return false;
+        {
+            if (!pairs.TryGetValue(k, out var actual)) return false;
+            if (!LabelValueMatches(actual, v)) return false;
+        }
         return true;
+    }
+
+    /// <summary>
+    /// Exact match, or OR-match when the matcher value is '|'-delimited
+    /// (e.g. <c>service.name=A|B|C</c>) — lets the multi-service filter merge
+    /// several series server-side so quantiles aggregate over the union.
+    /// </summary>
+    private static bool LabelValueMatches(string actual, string matcher)
+    {
+        if (matcher.IndexOf('|') < 0) return actual == matcher;
+        foreach (var opt in matcher.Split('|'))
+            if (actual == opt) return true;
+        return false;
     }
 
     /// <summary>

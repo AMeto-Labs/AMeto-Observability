@@ -35,9 +35,10 @@ public static class OtlpEndpointMapper
         AllowTrailingCommas  = true,
     };
 
-    public static void MapOtlpEndpoints(this WebApplication app)
+    public static void MapOtlpEndpoints(this WebApplication app, bool enableTraces = true, bool enableMetrics = true)
     {
         // ── Traces ────────────────────────────────────────────────────────────
+        if (enableTraces)
         app.MapPost("/otlp/v1/traces", async (HttpContext ctx, ISpanIngester ingester, ILoggerFactory logFactory) =>
         {
             var logger = logFactory.CreateLogger("Ameto.Otel.Traces");
@@ -80,6 +81,7 @@ public static class OtlpEndpointMapper
         });
 
         // ── Metrics ───────────────────────────────────────────────────────────
+        if (enableMetrics)
         app.MapPost("/otlp/v1/metrics", async (HttpContext ctx) =>
         {
             var ingester = ctx.RequestServices.GetRequiredService<IMetricIngester>();

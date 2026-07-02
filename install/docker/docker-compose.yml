@@ -1,42 +1,54 @@
+# Local build + run.
+# To consume Ameto as a pre-built image from another project's compose,
+# see docker-compose.pull.yml (image-only, no build context).
 services:
 
-  Ameto:
+  ameto:
     build:
       context: ../..          # repo root (so COPY can reach src/ and client/)
       dockerfile: install/docker/Dockerfile
-    image: Ameto:latest
-    container_name: Ameto
+    image: ameto/server:latest   # image names must be lowercase
+    container_name: ameto
     restart: unless-stopped
+    # Memory limit: .NET sizes its GC heap to the cgroup limit and
+    # RamPressureService measures RamTargetPercent against THIS, not the host's
+    # total RAM. Without it the hot tier never auto-flushes on a large host.
+    mem_limit: 1g
     ports:
       - "5341:5341"
     volumes:
-      # Persist log data across restarts
-      - Ameto-data:/data
-      # Optional: mount your own config.yml (uncomment to use)
+      # Persist data (log/metric/trace segments + Ameto.db) across restarts.
+      - ameto-data:/data
+      # Optional: mount your own config.yml (env vars below override it anyway).
       # - ./config.yml:/app/config.yml:ro
     environment:
-      # Override individual config values via env vars if needed.
-      # Ameto uses YAML config; environment overrides are not yet supported.
-      # Use a mounted config.yml for production tuning.
-      DOTNET_RUNNING_IN_CONTAINER: "true"
+      # ── Config via env vars ───────────────────────────────────────────────
+      # Program.cs reads env vars after config.yml, so these override the baked
+      # YAML. Use the .NET double-underscore convention for nested keys:
+      #   Ameto:HttpPort  ->  Ameto__HttpPort
+      Ameto__DataDirectory: /data         # keep data on the volume
+      Ameto__HttpPort: "5341"
+      Ameto__RamTargetPercent: "75"
+      # Hot-tier flush tuning
+      Ameto__HotTier__MaxSizeBytes: "67108864"   # 64 MB
+      Ameto__HotTier__MaxAge: "00:05:00"
+      # First-run retention defaults (days); afterwards live in SQLite
+      Ameto__Retention__InformationDays: "90"
+      Ameto__Retention__ErrorDays: "90"
+      Ameto__Retention__MetricsDays: "30"
+      Ameto__Retention__TracesDays: "14"
+      # Replication (single node: leave disabled)
+      Ameto__Replication__Enabled: "false"
+      # ── TLS (optional) ────────────────────────────────────────────────────
+      # Mount a .pfx and point these at it to serve HTTPS instead of HTTP:
+      # Ameto__SslCertPath: /certs/ameto.pfx
+      # Ameto__SslCertPassword: changeit
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:5341/api/health"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:5341/health"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 10s
 
-  # ── Optional: second node for replication testing ─────────────────────────
-  # Ameto-node1:
-  #   image: Ameto:latest
-  #   container_name: Ameto-node1
-  #   restart: unless-stopped
-  #   ports:
-  #     - "5342:5341"
-  #   volumes:
-  #     - Ameto-node1-data:/data
-  #     - ./config-node1.yml:/app/config.yml:ro
-
 volumes:
-  Ameto-data:
-  # Ameto-node1-data:
+  ameto-data:

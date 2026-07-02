@@ -1,0 +1,83 @@
+.sublabel {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.retention-grid {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px 16px;
+  align-items: center;
+}
+
+.level-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.dot-v { background: var(--lvl-v); }
+.dot-d { background: var(--lvl-d); }
+.dot-i { background: var(--lvl-i); }
+.dot-w { background: var(--lvl-w); }
+.dot-e { background: var(--lvl-e); }
+.dot-f { background: var(--lvl-f); }
+
+.days-control {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.days-input {
+  width: 72px;
+  padding: 4px 8px;
+  background: var(--bg-main);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 12px;
+  text-align: right;
+  outline: none;
+
+  &:focus {
+    border-color: var(--primary);
+  }
+}
+
+.days-unit {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.retention-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 4px;
+  gap: 8px;
+}
+
+.run-result {
+  font-size: 11px;
+  color: var(--text-secondary);
+
+  &.ok {
+    color: var(--success);
+  }
+}
+
+.btn-group {
+  display: flex;
+  gap: 6px;
+}

@@ -1,6 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using Microsoft.Data.Sqlite;
+using CoreLogLevel = Ameto.Core.LogLevel;
 
 namespace Ameto.Server.Auth;
 
@@ -18,6 +19,8 @@ internal sealed record UserRecord(
 internal sealed record ApiKeyRecord(
     string Id,
     string Name,
+    string Description,
+    CoreLogLevel MinimumLevel,
     string KeyHash,
     string CreatedBy,
     DateTimeOffset CreatedAt)
@@ -25,6 +28,14 @@ internal sealed record ApiKeyRecord(
     // Full key — only populated immediately after creation; never persisted.
     public string? Key { get; init; }
 }
+
+/// <summary>An OAuth domain allowlist rule: any email @Domain via Provider may sign in.</summary>
+internal sealed record OAuthDomainRecord(
+    string Id,
+    string Provider,
+    string Domain,
+    string Role,
+    DateTimeOffset CreatedAt);
 
 // ── Store ──────────────────────────────────────────────────────────────────────
 
@@ -61,8 +72,8 @@ internal sealed class AuthStore
     // ── OAuth auth ────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Finds or refuses an OAuth user by email + provider.
-    /// Returns null when the email is not in the allowlist (user must be pre-created by admin).
+    /// Finds an OAuth user by exact email + provider. Returns null when the email
+    /// is not in the per-email allowlist.
     /// </summary>
     public UserRecord? FindOAuthUser(string email, string provider)
     {
@@ -78,6 +89,48 @@ internal sealed class AuthStore
         using var r = cmd.ExecuteReader();
         if (!r.Read()) return null;
         return MapUser(r);
+    }
+
+    /// <summary>
+    /// Resolves an OAuth sign-in: exact per-email allowlist first, then the
+    /// domain allowlist. When only a domain rule matches, the user is
+    /// auto-provisioned (so subsequent sign-ins and admin management use the
+    /// per-email path). Returns null when neither matches (sign-in refused).
+    /// </summary>
+    public UserRecord? FindOrCreateOAuthUser(string email, string displayName, string provider)
+    {
+        var existing = FindOAuthUser(email, provider);
+        if (existing is not null) return existing;
+
+        // Extract the host part (after the last '@') without allocating when empty.
+        var at = email.LastIndexOf('@');
+        if (at <= 0 || at >= email.Length - 1) return null;
+        var domain = email[(at + 1)..].ToLowerInvariant();
+
+        var rule = FindOAuthDomain(provider, domain);
+        if (rule is null) return null;
+
+        // Auto-provision so the user appears in the users list and can be managed.
+        return CreateOAuthUser(email, displayName, provider, rule.Role);
+    }
+
+    /// <summary>Looks up a domain allowlist rule for a provider + domain (case-insensitive).</summary>
+    private OAuthDomainRecord? FindOAuthDomain(string provider, string domain)
+    {
+        using var conn = _db.Open();
+        using var cmd  = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT id, provider, domain, role, created_at
+            FROM oauth_domains
+            WHERE provider = @p AND domain = @d COLLATE NOCASE
+            """;
+        cmd.Parameters.AddWithValue("@p", provider);
+        cmd.Parameters.AddWithValue("@d", domain);
+        using var r = cmd.ExecuteReader();
+        if (!r.Read()) return null;
+        return new OAuthDomainRecord(
+            r.GetString(0), r.GetString(1), r.GetString(2),
+            r.GetString(3), DateTimeOffset.Parse(r.GetString(4)));
     }
 
     // ── Users: list / create / delete ─────────────────────────────────────────
@@ -116,6 +169,20 @@ internal sealed class AuthStore
         var result = new List<UserRecord>();
         while (r.Read()) result.Add(MapUser(r));
         return result;
+    }
+
+    public UserRecord? GetUser(string id)
+    {
+        using var conn = _db.Open();
+        using var cmd  = conn.CreateCommand();
+        cmd.CommandText = """
+            SELECT id, username, display_name, email, provider, role, created_at
+            FROM users WHERE id = @id
+            """;
+        cmd.Parameters.AddWithValue("@id", id);
+        using var r = cmd.ExecuteReader();
+        if (!r.Read()) return null;
+        return MapUser(r);
     }
 
     public UserRecord CreateUser(string username, string password, string role)
@@ -187,6 +254,18 @@ internal sealed class AuthStore
         return cmd.ExecuteNonQuery() > 0;
     }
 
+    /// <summary>Updates display name and role for a user.</summary>
+    public bool UpdateUser(string id, string displayName, string role)
+    {
+        using var conn = _db.Open();
+        using var cmd  = conn.CreateCommand();
+        cmd.CommandText = "UPDATE users SET display_name = @dn, role = @r WHERE id = @id";
+        cmd.Parameters.AddWithValue("@dn", displayName);
+        cmd.Parameters.AddWithValue("@r",  NormaliseRole(role));
+        cmd.Parameters.AddWithValue("@id", id);
+        return cmd.ExecuteNonQuery() > 0;
+    }
+
     public string? GetRole(string username)
     {
         using var conn = _db.Open();
@@ -194,6 +273,51 @@ internal sealed class AuthStore
         cmd.CommandText = "SELECT role FROM users WHERE username = @u COLLATE NOCASE";
         cmd.Parameters.AddWithValue("@u", username);
         return cmd.ExecuteScalar() as string;
+    }
+
+    // ── OAuth domain allowlist ────────────────────────────────────────────────
+
+    public IReadOnlyList<OAuthDomainRecord> ListOAuthDomains()
+    {
+        using var conn = _db.Open();
+        using var cmd  = conn.CreateCommand();
+        cmd.CommandText = "SELECT id, provider, domain, role, created_at FROM oauth_domains ORDER BY provider, domain";
+        using var r    = cmd.ExecuteReader();
+        var result = new List<OAuthDomainRecord>();
+        while (r.Read())
+            result.Add(new(r.GetString(0), r.GetString(1), r.GetString(2),
+                           r.GetString(3), DateTimeOffset.Parse(r.GetString(4))));
+        return result;
+    }
+
+    public OAuthDomainRecord CreateOAuthDomain(string provider, string domain, string role)
+    {
+        var rec = new OAuthDomainRecord(
+            Guid.NewGuid().ToString("N"), provider, domain.ToLowerInvariant(),
+            NormaliseRole(role), DateTimeOffset.UtcNow);
+
+        using var conn = _db.Open();
+        using var cmd  = conn.CreateCommand();
+        cmd.CommandText = """
+            INSERT INTO oauth_domains (id, provider, domain, role, created_at)
+            VALUES (@id, @p, @d, @r, @ca)
+            """;
+        cmd.Parameters.AddWithValue("@id", rec.Id);
+        cmd.Parameters.AddWithValue("@p",  rec.Provider);
+        cmd.Parameters.AddWithValue("@d",  rec.Domain);
+        cmd.Parameters.AddWithValue("@r",  rec.Role);
+        cmd.Parameters.AddWithValue("@ca", rec.CreatedAt.ToString("O"));
+        cmd.ExecuteNonQuery();
+        return rec;
+    }
+
+    public bool DeleteOAuthDomain(string id)
+    {
+        using var conn = _db.Open();
+        using var cmd  = conn.CreateCommand();
+        cmd.CommandText = "DELETE FROM oauth_domains WHERE id = @id";
+        cmd.Parameters.AddWithValue("@id", id);
+        return cmd.ExecuteNonQuery() > 0;
     }
 
     // ── API keys ──────────────────────────────────────────────────────────────
@@ -216,16 +340,18 @@ internal sealed class AuthStore
     {
         using var conn = _db.Open();
         using var cmd  = conn.CreateCommand();
-        cmd.CommandText = "SELECT id, name, key_hash, created_by, created_at FROM api_keys ORDER BY created_at";
+        cmd.CommandText = "SELECT id, name, description, minimum_level, key_hash, created_by, created_at FROM api_keys ORDER BY created_at";
         using var r    = cmd.ExecuteReader();
         var result = new List<ApiKeyRecord>();
         while (r.Read())
             result.Add(new(r.GetString(0), r.GetString(1), r.GetString(2),
-                           r.GetString(3), DateTimeOffset.Parse(r.GetString(4))));
+                           (CoreLogLevel)r.GetInt32(3), r.GetString(4), r.GetString(5),
+                           DateTimeOffset.Parse(r.GetString(6))));
         return result;
     }
 
-    public ApiKeyRecord CreateApiKey(string name, string createdBy, string? manualKey = null)
+    public ApiKeyRecord CreateApiKey(
+        string name, string description, CoreLogLevel minimumLevel, string createdBy, string? manualKey = null)
     {
         var key = manualKey?.Trim() is { Length: > 0 } mk
             ? mk
@@ -234,7 +360,8 @@ internal sealed class AuthStore
 
         var hash = KeyHash(key);
         var rec  = new ApiKeyRecord(
-            Guid.NewGuid().ToString("N"), name, hash, createdBy, DateTimeOffset.UtcNow)
+            Guid.NewGuid().ToString("N"), name, description, minimumLevel, hash,
+            createdBy, DateTimeOffset.UtcNow)
         {
             Key = key,
         };
@@ -242,14 +369,16 @@ internal sealed class AuthStore
         using var conn = _db.Open();
         using var cmd  = conn.CreateCommand();
         cmd.CommandText = """
-            INSERT INTO api_keys (id, name, key_hash, created_by, created_at)
-            VALUES (@id, @n, @h, @cb, @ca)
+            INSERT INTO api_keys (id, name, description, minimum_level, key_hash, created_by, created_at)
+            VALUES (@id, @n, @desc, @ml, @h, @cb, @ca)
             """;
-        cmd.Parameters.AddWithValue("@id", rec.Id);
-        cmd.Parameters.AddWithValue("@n",  rec.Name);
-        cmd.Parameters.AddWithValue("@h",  hash);
-        cmd.Parameters.AddWithValue("@cb", rec.CreatedBy);
-        cmd.Parameters.AddWithValue("@ca", rec.CreatedAt.ToString("O"));
+        cmd.Parameters.AddWithValue("@id",   rec.Id);
+        cmd.Parameters.AddWithValue("@n",    rec.Name);
+        cmd.Parameters.AddWithValue("@desc", rec.Description);
+        cmd.Parameters.AddWithValue("@ml",   (int)rec.MinimumLevel);
+        cmd.Parameters.AddWithValue("@h",    hash);
+        cmd.Parameters.AddWithValue("@cb",   rec.CreatedBy);
+        cmd.Parameters.AddWithValue("@ca",   rec.CreatedAt.ToString("O"));
         cmd.ExecuteNonQuery();
         return rec;
     }

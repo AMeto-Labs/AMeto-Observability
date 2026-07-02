@@ -1,0 +1,21 @@
+.row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.field {
+  flex: 1;
+  min-width: 320px;
+}
+
+.label {
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+.sublabel {
+  font-size: 11px;
+  color: var(--text-secondary);
+}

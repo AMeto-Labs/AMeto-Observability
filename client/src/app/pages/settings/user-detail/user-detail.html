@@ -1,0 +1,84 @@
+<div class="page">
+  <a class="back-link" (click)="back()">
+    <lucide-icon name="arrow-left" [size]="14" />
+    Back to Users
+  </a>
+
+  @if (loading()) {
+    <span class="muted">Loading…</span>
+  } @else if (error(); as err) {
+    <span class="form-error">{{ err }}</span>
+  } @else if (user(); as u) {
+    <app-page-header icon="user" [title]="u.displayName || u.username" [subtitle]="u.email || u.username" />
+
+    <app-section title="Profile">
+      <div class="info-grid">
+        <div class="info-label">Username</div>
+        <div class="info-value mono-sm">{{ u.username }}</div>
+
+        <div class="info-label">Email</div>
+        <div class="info-value mono-sm">{{ u.email || '—' }}</div>
+
+        <div class="info-label">Provider</div>
+        <div class="info-value">
+          <span class="provider-badge" [attr.data-provider]="u.provider">{{ u.provider }}</span>
+        </div>
+
+        <div class="info-label">Role</div>
+        <div class="info-value">
+          <span class="role-badge" [class.admin]="u.role === 'admin'">{{ u.role }}</span>
+        </div>
+
+        <div class="info-label">Created</div>
+        <div class="info-value muted">{{ u.createdAt | date: 'yyyy-MM-dd HH:mm' }}</div>
+
+        <div class="info-label">User ID</div>
+        <div class="info-value mono-sm muted">{{ u.id }}</div>
+      </div>
+    </app-section>
+
+    <app-section title="Edit user">
+      @if (!editing()) {
+        <div class="row">
+          <span class="sublabel">Change display name or role.</span>
+          <button class="btn primary" (click)="startEdit()">
+            <lucide-icon name="pencil" [size]="13" />
+            Edit
+          </button>
+        </div>
+      } @else {
+        <div class="edit-form">
+          <label class="field">
+            <span class="label">Display name</span>
+            <input class="field-input" [ngModel]="editDisplayName()" (ngModelChange)="editDisplayName.set($event)" />
+          </label>
+          <label class="field">
+            <span class="label">Role</span>
+            <select class="field-select" [ngModel]="editRole()" (ngModelChange)="editRole.set($event)">
+              <option value="viewer">viewer</option>
+              <option value="manager">manager</option>
+              <option value="admin">admin</option>
+            </select>
+          </label>
+          <div class="btn-group">
+            <button class="btn" (click)="cancelEdit()" [disabled]="saving()">Cancel</button>
+            <button class="btn primary" (click)="save()" [disabled]="saving()">
+              <lucide-icon [name]="saving() ? 'loader-circle' : 'save'" [size]="13" />
+              {{ saving() ? 'Saving…' : 'Save' }}
+            </button>
+          </div>
+        </div>
+      }
+    </app-section>
+
+    <app-section title="Danger zone">
+      <div class="row">
+        <span class="sublabel">Permanently delete this user. OAuth allowlist entries can be re-added later.</span>
+        <button class="btn danger" (click)="remove()" [disabled]="deleting()">
+          <lucide-icon [name]="deleting() ? 'loader-circle' : 'trash-2'" [size]="13" />
+          {{ deleting() ? 'Deleting…' : 'Delete user' }}
+        </button>
+      </div>
+    </app-section>
+  }
+</div>

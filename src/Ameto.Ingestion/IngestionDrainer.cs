@@ -118,9 +118,11 @@ public sealed class IngestionDrainer : IAsyncDisposable
             }
             else if (drained == 0)
             {
-                // Nothing in the ring — block until a producer signals or 50 ms elapse.
-                // This replaces the old 1–3 ms busy-poll that kept CPU at 3-5% when idle.
-                await _signal.WaitAsync(50, ct).ConfigureAwait(false);
+                // Nothing in the ring — block until a producer signals. The 1 s timeout
+                // is only a missed-signal safety net: NotifyEnqueued releases the semaphore
+                // on every enqueue into an empty ring, so real wake-up latency stays ~0.
+                // A short timeout here (was 50 ms) cost ~20 idle wake-ups/sec for nothing.
+                await _signal.WaitAsync(1000, ct).ConfigureAwait(false);
             }
             }
             catch (ObjectDisposedException) { return; } // ring buffer disposed during shutdown

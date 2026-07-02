@@ -61,6 +61,18 @@ internal sealed class AuthDatabase
             );
             CREATE UNIQUE INDEX IF NOT EXISTS ux_api_keys_hash
                 ON api_keys(key_hash);
+
+            -- OAuth domain allowlist: any user whose email ends with @domain
+            -- for the given provider may sign in (auto-provisioned on first login).
+            CREATE TABLE IF NOT EXISTS oauth_domains (
+                id         TEXT PRIMARY KEY,
+                provider   TEXT NOT NULL,
+                domain     TEXT NOT NULL,
+                role       TEXT NOT NULL DEFAULT 'viewer',
+                created_at TEXT NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_oauth_domains_provider_domain
+                ON oauth_domains(provider, domain COLLATE NOCASE);
             """);
     }
 
@@ -95,6 +107,16 @@ internal sealed class AuthDatabase
 
         // Migrate roles that are outside the allowed set
         Exec(conn, "UPDATE users SET role = 'viewer' WHERE role NOT IN ('admin','manager','viewer')");
+
+        // api_keys: description + minimum_level (LogLevel byte). Safe to run multiple times.
+        foreach (var ddl in new[]
+        {
+            "ALTER TABLE api_keys ADD COLUMN description   TEXT    NOT NULL DEFAULT ''",
+            "ALTER TABLE api_keys ADD COLUMN minimum_level INTEGER NOT NULL DEFAULT 0",
+        })
+        {
+            try { Exec(conn, ddl); } catch { /* column already exists */ }
+        }
     }
 
     private static void Exec(SqliteConnection conn, string sql)

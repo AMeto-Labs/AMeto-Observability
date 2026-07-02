@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Ameto.Core;
@@ -20,8 +21,7 @@ public static class EndpointMapper
     };
 
     public static void MapAmetoEndpoints(this WebApplication app)
-    {
-        // ── Health ────────────────────────────────────────────────────────────
+    {        // ── Health ────────────────────────────────────────────────────────────
         app.MapGet("/health", () => Results.Ok(new { status = "ok", utc = DateTimeOffset.UtcNow }));
 
         // ── Stats ─────────────────────────────────────────────────────────────
@@ -168,6 +168,115 @@ public static class EndpointMapper
             return Results.Ok(services.ToArray());
         }).RequireAuthorization();
 
+        // ── Event counts by service over time: GET /api/events/counts ────────
+        // Powers the Dashboard "Log events" chart. Streams up to `limit` events
+        // (newest first) within [from, to] and aggregates per-service counts into
+        // fixed-width time buckets, returned as dense, chart-ready arrays.
+        //   from    — ISO-8601 lower bound (default: now - 24h)
+        //   to      — ISO-8601 upper bound (default: now)
+        //   bucket  — bucket size in seconds (default: auto from the range)
+        //   limit   — max events to scan (default 50 000, capped at 1 000 000)
+        //   service — restrict to a single service (case-insensitive)
+        app.MapGet("/api/events/counts", async (
+            HttpContext      ctx,
+            IQueryExecutor   executor,
+            string?          from    = null,
+            string?          to      = null,
+            int?             bucket  = null,
+            int              limit   = 50_000,
+            string?          service = null) =>
+        {
+            var now   = DateTimeOffset.UtcNow;
+            var toUtc = to is null ? now
+                                   : DateTimeOffset.Parse(to, null, DateTimeStyles.RoundtripKind).ToUniversalTime();
+            var fromUtc = from is null ? toUtc.AddDays(-1)
+                                       : DateTimeOffset.Parse(from, null, DateTimeStyles.RoundtripKind).ToUniversalTime();
+            if (fromUtc > toUtc) (fromUtc, toUtc) = (toUtc, fromUtc);
+
+            double rangeSec = Math.Max(1, (toUtc - fromUtc).TotalSeconds);
+            int bucketSeconds = bucket is > 0 ? bucket.Value : AutoBucketSeconds(rangeSec);
+
+            // Keep the bucket axis manageable; widen the bucket if the requested
+            // size would produce more than 2 000 columns.
+            long minB = fromUtc.ToUnixTimeSeconds() / bucketSeconds;
+            long maxB = toUtc.ToUnixTimeSeconds()   / bucketSeconds;
+            if (maxB - minB + 1 > 2_000)
+            {
+                bucketSeconds = AutoBucketSeconds(rangeSec);
+                minB = fromUtc.ToUnixTimeSeconds() / bucketSeconds;
+                maxB = toUtc.ToUnixTimeSeconds()   / bucketSeconds;
+            }
+            int nBuckets = (int)(maxB - minB + 1);
+
+            var request = new QueryRequest
+            {
+                FromUtc   = fromUtc,
+                ToUtc     = toUtc,
+                Count     = Math.Clamp(limit, 1, 1_000_000),
+                Direction = QueryDirection.Backward,
+            };
+
+            // (service, bucketIndex) -> count, plus per-service totals.
+            var sparse    = new Dictionary<(string Service, long Bucket), long>();
+            var svcTotals = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+            long total = 0, sampled = 0;
+
+            await foreach (var ev in executor.ExecuteAsync(request, ctx.RequestAborted))
+            {
+                sampled++;
+                var svc = ev.ServiceName
+                    ?? (ev.Properties?.TryGetValue("ApplicationContext", out var v) == true ? v?.ToString() : null)
+                    ?? "(unknown)";
+                if (service is not null && !svc.Equals(service, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                long b = ev.Timestamp.ToUnixTimeSeconds() / bucketSeconds;
+                var key = (svc, b);
+                sparse[key] = sparse.TryGetValue(key, out var c) ? c + 1 : 1;
+                svcTotals[svc] = svcTotals.TryGetValue(svc, out var t) ? t + 1 : 1;
+                total++;
+            }
+
+            bool truncated = sampled >= request.Count;
+
+            // Top services by count (cap to 25 to bound payload / chart noise).
+            var ordered = svcTotals.OrderByDescending(kv => kv.Value).ToList();
+            int maxServices = 25;
+            var chosen = ordered.Count <= maxServices ? ordered : ordered.Take(maxServices).ToList();
+            var pointsBySvc = chosen.ToDictionary(
+                kv => kv.Key, kv => new long[nBuckets], StringComparer.OrdinalIgnoreCase);
+
+            foreach (var (k, v) in sparse)
+            {
+                if (!pointsBySvc.TryGetValue(k.Service, out var arr)) continue;
+                int off = (int)(k.Bucket - minB);
+                if ((uint)off < (uint)nBuckets) arr[off] += v;
+            }
+
+            var buckets = new long[nBuckets];
+            for (int i = 0; i < nBuckets; i++)
+                buckets[i] = (minB + i) * bucketSeconds * 1000L; // bucket start, unix ms
+
+            var servicesOut = chosen.Select(kv => (object)new
+            {
+                service = kv.Key,
+                count   = kv.Value,
+                points  = pointsBySvc[kv.Key],
+            }).ToList();
+
+            return Results.Ok(new
+            {
+                from          = fromUtc.ToString("O"),
+                to            = toUtc.ToString("O"),
+                bucketSeconds,
+                total,
+                sampled,
+                truncated,
+                buckets,
+                services      = servicesOut,
+            });
+        }).RequireAuthorization();
+
         // ── Live tail: GET /api/events/live  (SSE) ────────────────────────────
         // Streams new events as Server-Sent Events in CLEF JSON format.
         // Parameters: filter, from (default = now), count = 0 means unlimited.
@@ -312,6 +421,22 @@ public static class EndpointMapper
     }
 
     // ── API-key extraction (ingest path only) ─────────────────────────────────
+
+    /// <summary>
+    /// Picks a "nice" time-bucket size (in seconds) for a given range so the
+    /// resulting chart has ~120 columns. Used by GET /api/events/counts when no
+    /// explicit <c>bucket</c> is supplied.
+    /// </summary>
+    private static int AutoBucketSeconds(double rangeSeconds)
+    {
+        const int target = 120;
+        double raw = rangeSeconds / target;
+        int[] steps = { 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 14_400, 21_600, 43_200, 86_400, 172_800, 604_800 };
+        foreach (var s in steps)
+            if (s >= raw) return s;
+        return (int)Math.Ceiling(raw / 604_800.0) * 604_800;
+    }
+
     private static string? ExtractApiKey(HttpRequest req)
     {
         if (req.Headers.TryGetValue("X-Seq-ApiKey", out var v) && v.Count > 0)

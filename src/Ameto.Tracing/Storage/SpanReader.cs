@@ -151,7 +151,63 @@ internal static class SpanReader
 
     // ── ReadAll (compaction) ───────────────────────────────────────────────────
 
-    internal static List<SpanRecord> ReadAll(string filePath) => ReadSpansFromFile(filePath);
+    internal static List<SpanRecord> ReadAll(string filePath)
+    {
+        const long MaxTotalBytes = 500_000_000; // 500MB limit for safety
+        var totalBytesRead = 0L;
+        using var fs = OpenRead(filePath);
+        using var br = new BinaryReader(fs);
+
+        br.ReadUInt32(); // magic
+        br.ReadUInt16(); // version
+        int spanCount = (int)br.ReadUInt32();
+        br.ReadInt64();  // minNano
+        br.ReadInt64();  // maxNano
+        br.ReadByte();   // flags
+
+        var (traceIdxOffset, _) = ReadFooter(fs, br);
+        fs.Seek(27, SeekOrigin.Begin);
+
+        var result = new List<SpanRecord>(Math.Min(spanCount, 100_000));
+        uint blockIdx = 0;
+
+        while (fs.Position < traceIdxOffset && totalBytesRead < MaxTotalBytes)
+        {
+            uint uncompSize = br.ReadUInt32();
+            uint compSize = br.ReadUInt32();
+
+            if (uncompSize > 10_000_000 || compSize > 10_000_000) // 10MB per block limit
+                throw new InvalidDataException($"Block {blockIdx} size too large: uncompressed={uncompSize}, compressed={compSize}");
+
+            if (totalBytesRead + compSize > MaxTotalBytes)
+                throw new InvalidDataException($"Total data exceeds {MaxTotalBytes} bytes limit");
+
+            var compBytes = br.ReadBytes((int)compSize);
+            totalBytesRead += compSize;
+
+            try
+            {
+                var raw = LZ4Pickler.Unpickle(compBytes);
+                var reader = new MessagePackReader(raw);
+                int cnt = reader.ReadArrayHeader();
+                if (cnt > 50_000) // Safety limit for spans per block
+                    throw new InvalidDataException($"Block {blockIdx} contains too many spans: {cnt}");
+
+                for (int i = 0; i < cnt; i++)
+                {
+                    if (result.Count >= 1_000_000) // Total span limit
+                        throw new InvalidDataException($"Total span count exceeds 1,000,000");
+                    result.Add(DeserializeSpan(ref reader));
+                }
+            }
+            catch (OutOfMemoryException ex)
+            {
+                throw new InvalidDataException($"Out of memory while processing block {blockIdx} (size: {compSize} bytes)", ex);
+            }
+            blockIdx++;
+        }
+        return result;
+    }
 
     // ── Core block reader ──────────────────────────────────────────────────────
 
@@ -352,7 +408,15 @@ internal static class SpanReader
     {
         var seq = r.ReadBytes();
         if (seq is null) return new byte[expectedLen];
-        var arr = new byte[seq.Value.Length];
+
+        long totalLen = 0;
+        foreach (var seg in seq.Value)
+            totalLen += seg.Length;
+
+        if (totalLen > 1024) // 1KB limit for trace/span IDs
+            throw new InvalidDataException($"Byte array too large: {totalLen} bytes (expected {expectedLen})");
+
+        var arr = new byte[(int)totalLen];
         long pos = 0;
         foreach (var seg in seq.Value)
         {

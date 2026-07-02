@@ -1,0 +1,20 @@
+<app-section title="Events">
+  <div class="row">
+    <div class="field">
+      <span class="label">Overview custom props</span>
+      <span class="sublabel">Comma-separated keys from event props shown in Event expanded → Overview left panel.</span>
+      <input
+        class="field-input"
+        type="text"
+        placeholder="orderId, tenant, userId"
+        [ngModel]="overviewCustomPropsCsv()"
+        (ngModelChange)="overviewCustomPropsCsv.set($event)"
+        style="margin-top:8px; width:100%;"
+      />
+    </div>
+    <button class="btn primary" (click)="saveOverviewPrefs()">
+      <lucide-icon name="save" [size]="13" />
+      Save
+    </button>
+  </div>
+</app-section>

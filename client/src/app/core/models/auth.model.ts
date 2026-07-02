@@ -14,6 +14,8 @@ export interface UserDto {
 export interface ApiKeyDto {
   id: string;
   name: string;
+  description: string;
+  minimumLevel: number;
   keyPreview: string;
   createdBy: string;
   createdAt: string;
@@ -22,8 +24,18 @@ export interface ApiKeyDto {
 export interface CreatedApiKeyDto {
   id: string;
   name: string;
+  description: string;
+  minimumLevel: number;
   key: string;
   createdBy: string;
+  createdAt: string;
+}
+
+export interface OAuthDomainDto {
+  id: string;
+  provider: 'google' | 'microsoft';
+  domain: string;
+  role: UserRole;
   createdAt: string;
 }
 
