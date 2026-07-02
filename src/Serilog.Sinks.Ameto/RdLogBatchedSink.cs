@@ -95,8 +95,9 @@ internal sealed class AmetoBatchedSink : IBatchedLogEventSink, IDisposable
         var writer = new MessagePackWriter(_bufWriter);
 
         writer.WriteArrayHeader(events.Count);
-        foreach (var evt in events)
-            AmetoClefFormatter.Write(ref writer, evt, _serviceNameUtf8);
+        // Index loop over the IList avoids the boxed IEnumerator the interface foreach allocates.
+        for (int i = 0; i < events.Count; i++)
+            AmetoClefFormatter.Write(ref writer, events[i], _serviceNameUtf8);
         writer.Flush();
 
         return _bufWriter.WrittenMemory;

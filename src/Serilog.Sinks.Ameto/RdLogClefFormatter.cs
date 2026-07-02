@@ -68,10 +68,24 @@ internal static class AmetoClefFormatter
     }
     if (hasService) { writer.WriteString("service.name"u8); writer.WriteString(serviceNameUtf8.Span); }
 
-    foreach (var kv in evt.Properties)
+    // Serilog's LogEvent.Properties is a Dictionary<> behind the IReadOnlyDictionary<>
+    // interface. Iterating the concrete type uses its struct enumerator instead of a
+    // boxed IEnumerator — one fewer heap allocation per event on the logging hot path.
+    if (evt.Properties is Dictionary<string, LogEventPropertyValue> propDict)
     {
-      writer.Write(kv.Key);
-      WriteValue(ref writer, kv.Value);
+      foreach (var kv in propDict)
+      {
+        writer.Write(kv.Key);
+        WriteValue(ref writer, kv.Value);
+      }
+    }
+    else
+    {
+      foreach (var kv in evt.Properties)
+      {
+        writer.Write(kv.Key);
+        WriteValue(ref writer, kv.Value);
+      }
     }
   }
 
@@ -144,7 +158,10 @@ internal static class AmetoClefFormatter
       case ulong ul: writer.Write(ul); break;
       case float f: writer.Write(f); break;
       case double d: writer.Write(d); break;
-      case decimal dec: writer.Write(dec.ToString(CultureInfo.InvariantCulture)); break;
+      case decimal dec:
+        dec.TryFormat(charBuf, out len, default, CultureInfo.InvariantCulture);
+        WriteAsciiString(ref writer, charBuf[..len]);
+        break;
       case DateTime dt:
         dt.TryFormat(charBuf, out len, "o", CultureInfo.InvariantCulture);
         WriteAsciiString(ref writer, charBuf[..len]);

@@ -14,7 +14,15 @@
     <Authors>Ameto</Authors>
     <Description>Serilog sink that ships events to an Ameto server (Seq-compatible CLEF over MessagePack).</Description>
     <PackageTags>serilog;sink;logging;ameto;seq;clef</PackageTags>
+    <PackageIcon>logo.png</PackageIcon>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
   </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Packaged (not compiled) assets: NuGet gallery icon + package README. -->
+    <None Include="logo.png"  Pack="true" PackagePath="\" />
+    <None Include="README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
 
   <ItemGroup>
     <PackageReference Include="MessagePack" Version="3.1.7" />
