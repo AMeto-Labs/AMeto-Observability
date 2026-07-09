@@ -72,237 +72,30 @@
   <div class="filter-bar-inner">
 
     <!-- Date range -->
-    <div #dateFbGroup class="fb-group" (click)="$event.stopPropagation()">
-      <button class="fb-btn" [class.open]="dateDropdownOpen()" (click)="openDateDropdown()">
+    <div class="fb-group" (click)="$event.stopPropagation()">
+      <button #dateBtn class="fb-btn" [class.open]="dateDropdownOpen()" (click)="openDate(dateBtn)">
         <lucide-icon name="calendar" [size]="13" />
         <span>{{ dateRangeLabel() }}</span>
         <lucide-icon name="chevron-down" [size]="11" class="fb-caret" [class.rotated]="dateDropdownOpen()" />
       </button>
-      @if (dateDropdownOpen()) {
-        <div class="fb-dropdown date-dd" [style.top.px]="ddPos().top" [style.left.px]="ddPos().left">
-          <!-- Header -->
-          <div class="dd-panel-header">
-            <span class="dd-panel-title">Date range</span>
-            <button class="dd-close-btn" title="Close" (click)="dateDropdownOpen.set(false)">
-              <lucide-icon name="x" [size]="13" />
-            </button>
-          </div>
-          <!-- Body: two columns -->
-          <div class="date-dd-body">
-          <!-- Left: preset list -->
-          <div class="date-preset-list">
-            @for (p of datePresets; track p.value) {
-              <button
-                class="date-preset-item"
-                [class.active]="timePreset() === p.value"
-                [class.is-custom]="p.value === 'custom'"
-                (click)="setTimePreset(p.value)">
-                {{ p.label }}
-              </button>
-            }
-          </div>
-          <!-- Right: calendar + inputs -->
-          <div class="date-cal-panel">
-            <div class="cal-header">
-              <button class="cal-nav-btn" title="Previous month" (click)="prevCalendarMonth()">
-                <lucide-icon name="chevron-left" [size]="13" />
-              </button>
-              <span class="cal-month-label">{{ calendarMonthLabel() }}</span>
-              <button class="cal-nav-btn" title="Next month" (click)="nextCalendarMonth()">
-                <lucide-icon name="chevron-right" [size]="13" />
-              </button>
-            </div>
-            <div class="cal-pick-hint" [class.picking-end]="calPickingEnd()">
-              {{ calPickingEnd() ? 'Click to set end date' : 'Click to set start date' }}
-            </div>
-            <div class="cal-grid">
-              @for (d of calendarWeekDays; track d) {
-                <div class="cal-dow">{{ d }}</div>
-              }
-              @for (day of calendarDays(); track day.year + '-' + day.month + '-' + day.day) {
-                <button
-                  class="cal-day"
-                  [class.other-month]="!day.isCurrentMonth"
-                  [class.today]="day.isToday"
-                  [class.cal-from]="day.isFrom"
-                  [class.cal-to]="day.isTo"
-                  [class.cal-in-range]="day.inRange"
-                  (click)="selectCalendarDay(day)">
-                  {{ day.day }}
-                </button>
-              }
-            </div>
-            <!-- Date inputs -->
-            <div class="cal-inputs">
-              <div class="cal-input-row">
-                <span class="cal-input-lbl">Start</span>
-                <div class="cal-input-field-wrap">
-                  <div class="cal-field-wrap is-datetime" [class.invalid]="customFrom() && !customFromValid()">
-                    <input
-                      type="text"
-                      class="cal-field-input"
-                      placeholder="yyyy-mm-dd HH:mm"
-                      [value]="customFrom()"
-                      dateMask dateMaskType="datetime" dateMaskMode="start"
-                      (valueChange)="setFrom($event)"
-                      (suggestionChange)="customFromSuggestion.set($event)"
-                      (blur)="customFromSuggestion.set('')"
-                      (keydown.enter)="onDateKeydown($event)"
-                      spellcheck="false"
-                      autocomplete="off" />
-                    <lucide-icon name="calendar" [size]="12" class="cal-field-icon" />
-                  </div>
-                  @if (customFromSuggestion()) {
-                    <button
-                      class="cal-time-tip"
-                      tabindex="-1"
-                      (mousedown)="$event.preventDefault(); acceptFromSuggestion()">
-                      {{ suggestionLabel(customFromSuggestion()) }}
-                      <span class="cal-time-tip-kbd">Tab ↵</span>
-                    </button>
-                  }
-                </div>
-              </div>
-              <div class="cal-input-row">
-                <span class="cal-input-lbl">End</span>
-                <div class="cal-input-field-wrap">
-                  <div class="cal-field-wrap is-datetime" [class.invalid]="customTo() && !customToValid()">
-                    <input
-                      type="text"
-                      class="cal-field-input"
-                      [placeholder]="customTo() ? 'yyyy-mm-dd HH:mm' : 'Now (open range)'"
-                      [value]="customTo()"
-                      dateMask dateMaskType="datetime" dateMaskMode="end"
-                      (valueChange)="setTo($event)"
-                      (suggestionChange)="customToSuggestion.set($event)"
-                      (blur)="customToSuggestion.set('')"
-                      (keydown.enter)="onDateKeydown($event)"
-                      spellcheck="false"
-                      autocomplete="off" />
-                    <lucide-icon name="calendar" [size]="12" class="cal-field-icon" />
-                  </div>
-                  @if (customToSuggestion()) {
-                    <button
-                      class="cal-time-tip"
-                      tabindex="-1"
-                      (mousedown)="$event.preventDefault(); acceptToSuggestion()">
-                      {{ suggestionLabel(customToSuggestion()) }}
-                      <span class="cal-time-tip-kbd">Tab ↵</span>
-                    </button>
-                  }
-                </div>
-              </div>
-            </div>
-            <div class="dd-footer-actions">
-              <button class="dd-cancel-btn" (click)="dateDropdownOpen.set(false)">Cancel</button>
-              <button class="dd-apply-btn" [disabled]="!canSearch()" (click)="search(); dateDropdownOpen.set(false)">Apply</button>
-            </div>
-          </div>
-          </div>
-        </div>
-      }
     </div>
 
     <!-- All levels -->
-    <div #levelsFbGroup class="fb-group" (click)="$event.stopPropagation()">
-      <button class="fb-btn" [class.open]="levelsDropdownOpen()" [class.filtered]="!allLevelsActive()" (click)="openLevelsDropdown()">
+    <div class="fb-group" (click)="$event.stopPropagation()">
+      <button #levelsBtn class="fb-btn" [class.open]="levelsDropdownOpen()" [class.filtered]="!allLevelsActive()" (click)="openLevels(levelsBtn)">
         <lucide-icon name="sparkles" [size]="13" />
         <span>{{ levelsLabel() }}</span>
         <lucide-icon name="chevron-down" [size]="11" class="fb-caret" [class.rotated]="levelsDropdownOpen()" />
       </button>
-      @if (levelsDropdownOpen()) {
-        <div class="fb-dropdown lvl-dd" [style.top.px]="ddPos().top" [style.left.px]="ddPos().left">
-          <div class="dd-panel-header">
-            <span class="dd-panel-title">Levels</span>
-            <button class="dd-close-btn" title="Close" (click)="levelsDropdownOpen.set(false)">
-              <lucide-icon name="x" [size]="13" />
-            </button>
-          </div>
-          <label class="dd-select-all-row">
-            <input
-              type="checkbox"
-              [checked]="allPendingLevelsActive()"
-              [indeterminate]="!allPendingLevelsActive() && pendingLevels().size > 0"
-              (change)="toggleAllPendingLevels()" />
-            <span class="dd-select-all-lbl">Select all</span>
-            <span class="dd-total-count">{{ fmtCount(totalCount()) }}</span>
-          </label>
-          <div class="dd-scroll">
-            @for (lvl of levelItems; track lvl.key) {
-              <label class="lvl-dd-row" [attr.data-level]="lvl.key.toLowerCase()">
-                <input type="checkbox" [checked]="isPendingLevelActive(lvl.key)" (change)="togglePendingLevel(lvl.key)" />
-                <span class="lvl-dot"></span>
-                <span class="lvl-name">{{ lvl.key }}</span>
-                <span class="lvl-count">{{ fmtCount(levelCounts()[lvl.key] || 0) }}</span>
-              </label>
-            }
-          </div>
-          <div class="dd-footer-actions">
-            <button class="dd-reset-btn" (click)="resetLevels()">Reset</button>
-            <button class="dd-apply-btn" (click)="applyLevels()">Apply</button>
-          </div>
-        </div>
-      }
     </div>
 
     <!-- All services -->
-    <div #svcFbGroup class="fb-group" (click)="$event.stopPropagation()">
-      <button class="fb-btn" [class.open]="serviceDropdownOpen()" [class.filtered]="selectedServices().size > 0" (click)="openServicesDropdown()">
+    <div class="fb-group" (click)="$event.stopPropagation()">
+      <button #svcBtn class="fb-btn" [class.open]="serviceDropdownOpen()" [class.filtered]="selectedServices().size > 0" (click)="openServices(svcBtn)">
         <lucide-icon name="boxes" [size]="13" />
         <span>{{ serviceLabel() }}</span>
         <lucide-icon name="chevron-down" [size]="11" class="fb-caret" [class.rotated]="serviceDropdownOpen()" />
       </button>
-      @if (serviceDropdownOpen()) {
-        <div class="fb-dropdown svc-dd" [style.top.px]="ddPos().top" [style.left.px]="ddPos().left">
-          <div class="dd-panel-header">
-            <span class="dd-panel-title">Services</span>
-            <button class="dd-close-btn" title="Close" (click)="serviceDropdownOpen.set(false)">
-              <lucide-icon name="x" [size]="13" />
-            </button>
-          </div>
-          <div class="svc-search-wrap">
-            <lucide-icon name="search" [size]="12" class="svc-search-icon" />
-            <input
-              type="text"
-              class="svc-search-input"
-              placeholder="Search services"
-              [value]="serviceSearch()"
-              (input)="serviceSearch.set($any($event.target).value)" />
-          </div>
-          <label class="dd-select-all-row">
-            <input
-              type="checkbox"
-              [checked]="allPendingServicesActive()"
-              [indeterminate]="!allPendingServicesActive() && pendingServices().size < filteredServices().length"
-              (change)="resetServices()" />
-            <span class="dd-select-all-lbl">Select all</span>
-            <span class="dd-total-count">{{ availableServices().length }}</span>
-          </label>
-          <div class="dd-scroll">
-            @for (svc of (showMoreServices() ? filteredServices() : filteredServices().slice(0, 8)); track svc) {
-              <label class="svc-dd-row">
-                <input type="checkbox" [checked]="isPendingServiceActive(svc)" (change)="togglePendingService(svc)" />
-                <span class="svc-color-dot" [style.background]="serviceColor(svc)"></span>
-                <span class="svc-name">{{ svc }}</span>
-                <span class="svc-count">{{ fmtCount(serviceCounts()[svc] || 0) }}</span>
-                <span class="svc-pct">{{ servicePercent(svc) }}</span>
-              </label>
-            }
-            @if (!showMoreServices() && filteredServices().length > 8) {
-              <button class="svc-show-more" (click)="showMoreServices.set(true)">
-                Show {{ filteredServices().length - 8 }} more
-              </button>
-            }
-            @if (!filteredServices().length) {
-              <div class="svc-empty">No services found</div>
-            }
-          </div>
-          <div class="dd-footer-actions">
-            <button class="dd-reset-btn" (click)="resetServices()">Reset</button>
-            <button class="dd-apply-btn" (click)="applyServices()">Apply</button>
-          </div>
-        </div>
-      }
     </div>
 
     <!-- Level count chips -->
@@ -379,6 +172,7 @@
                 (expandRequested)="onExpandRequested($event)"
                 (filterSelected)="applyFilter($event)"
                 (seekRequested)="seek($event.from, $event.to)"
+                (timeRangeBound)="onTimeRangeBound($event)"
               />
             </div>
           }

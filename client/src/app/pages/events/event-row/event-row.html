@@ -70,27 +70,102 @@
             <section class="ev-card ev-card--left">
               <table class="meta-table">
                 <tr>
+                  <td class="row-act"></td>
                   <td class="pk">Service</td>
-                  <td class="pv">{{ service() || 'n/a' }}</td>
+                  <td class="pv">
+                    <div class="meta-val-row">
+                      <span class="meta-val">{{ service() || 'n/a' }}</span>
+                      @if (service()) {
+                        <span class="row-acts">
+                          <button class="row-act-btn" (click)="filterService()" title="Show only this service">
+                            <lucide-icon name="filter" [size]="11" />Include service
+                          </button>
+                          <button class="row-act-btn" (click)="excludeService()" title="Exclude this service">
+                            <lucide-icon name="filter-x" [size]="11" />Exclude service
+                          </button>
+                          <button class="row-act-btn row-act-icon" [class.done]="copiedKey() === 'service'" (click)="copyService()" title="Copy service name">
+                            <lucide-icon [name]="copiedKey() === 'service' ? 'check' : 'copy'" [size]="11" />
+                          </button>
+                        </span>
+                      }
+                    </div>
+                  </td>
                 </tr>
                 <tr>
+                  <td class="row-act">
+                    <button class="row-menu-btn" (click)="openRowMenu($event, 'timestamp')" title="Seek / range around this time">
+                      <lucide-icon name="clock" [size]="12" />
+                    </button>
+                  </td>
                   <td class="pk">Timestamp</td>
                   <td class="pv">{{ event()['@t'] | date: 'yyyy-MM-dd HH:mm:ss.SSS' }}</td>
                 </tr>
                 <tr>
+                  <td class="row-act"></td>
                   <td class="pk">Level</td>
-                  <td class="pv"><span class="ev-log-badge" [attr.data-level]="levelKey()">{{ event()['@l'] }}</span></td>
+                  <td class="pv">
+                    <div class="meta-val-row">
+                      <span class="ev-log-badge" [attr.data-level]="levelKey()">{{ event()['@l'] }}</span>
+                      <span class="row-acts">
+                        <button class="row-act-btn" (click)="filterLevel()" title="Show only this log level">
+                          <lucide-icon name="filter" [size]="11" />Just this level
+                        </button>
+                        <button class="row-act-btn" (click)="excludeLevel()" title="Exclude this log level">
+                          <lucide-icon name="filter-x" [size]="11" />Exclude
+                        </button>
+                      </span>
+                    </div>
+                  </td>
                 </tr>
                 <tr>
+                  <td class="row-act"></td>
                   <td class="pk">TraceId</td>
-                  <td class="pv ev-trace-id">{{ traceId() || '—' }}</td>
+                  <td class="pv ev-trace-id">
+                    <div class="meta-val-row">
+                      <span class="meta-val">{{ traceId() || '—' }}</span>
+                      @if (traceId()) {
+                        <span class="row-acts">
+                          <button class="row-act-btn" (click)="filterAttr('@tr', traceId())" title="Filter events by this TraceId">
+                            <lucide-icon name="filter" [size]="11" />Find TraceId
+                          </button>
+                          <button class="row-act-btn" (click)="openTraceExternal()" title="Open this trace in the Traces page">
+                            <lucide-icon name="external-link" [size]="11" />View in Traces
+                          </button>
+                          <button class="row-act-btn row-act-icon" [class.done]="copiedKey() === 'traceId'" (click)="copyTraceId()" title="Copy TraceId">
+                            <lucide-icon [name]="copiedKey() === 'traceId' ? 'check' : 'copy'" [size]="11" />
+                          </button>
+                        </span>
+                      }
+                    </div>
+                  </td>
                 </tr>
                 <tr>
+                  <td class="row-act"></td>
                   <td class="pk">SpanId</td>
-                  <td class="pv ev-span-id">{{ spanId() || '—' }}</td>
+                  <td class="pv ev-span-id">
+                    <div class="meta-val-row">
+                      <span class="meta-val">{{ spanId() || '—' }}</span>
+                      @if (spanId()) {
+                        <span class="row-acts">
+                          <button class="row-act-btn" (click)="filterAttr('@sp', spanId())" title="Filter events by this SpanId">
+                            <lucide-icon name="filter" [size]="11" />Find SpanId
+                          </button>
+                          @if (traceId()) {
+                            <button class="row-act-btn" (click)="openTraceExternal()" title="Open the parent trace in the Traces page">
+                              <lucide-icon name="external-link" [size]="11" />View in Traces
+                            </button>
+                          }
+                          <button class="row-act-btn row-act-icon" [class.done]="copiedKey() === 'spanId'" (click)="copySpanId()" title="Copy SpanId">
+                            <lucide-icon [name]="copiedKey() === 'spanId' ? 'check' : 'copy'" [size]="11" />
+                          </button>
+                        </span>
+                      }
+                    </div>
+                  </td>
                 </tr>
                 @for (it of overviewCustomItems(); track it.key) {
                   <tr>
+                    <td class="row-act"></td>
                     <td class="pk">{{ it.key }}</td>
                     <td class="pv">{{ it.value }}</td>
                   </tr>
@@ -444,18 +519,27 @@
       <button (click)="seek(60)"><lucide-icon name="clock" [size]="13" />± 1 minute</button>
       <button (click)="seek(300)"><lucide-icon name="clock" [size]="13" />± 5 minutes</button>
     }
-    @if (menuType() === 'level') {
-      <div class="ctx-label">Level: {{ event()['@l'] }}</div>
-      <button (click)="filterLevel()">
-        <lucide-icon name="filter" [size]="13" />Show only {{ event()['@l'] }}
-      </button>
-      <button (click)="excludeLevel()">
-        <lucide-icon name="filter-x" [size]="13" />Exclude {{ event()['@l'] }}
-      </button>
-    }
     @if (menuType() === 'export') {
       <button (click)="copyRaw()"><lucide-icon name="file-json" [size]="13" />Copy raw JSON</button>
       <button (click)="copyLink()"><lucide-icon name="link" [size]="13" />Copy event link</button>
+    }
+    @if (menuType() === 'timestamp') {
+      <div class="ctx-label">{{ event()['@t'] | date: 'yyyy-MM-dd HH:mm:ss.SSS' }}</div>
+      <div class="ctx-label">Seek window (±)</div>
+      <button (click)="seek(5)"><lucide-icon name="clock" [size]="13" />± 5 seconds</button>
+      <button (click)="seek(30)"><lucide-icon name="clock" [size]="13" />± 30 seconds</button>
+      <button (click)="seek(60)"><lucide-icon name="clock" [size]="13" />± 1 minute</button>
+      <button (click)="seek(300)"><lucide-icon name="clock" [size]="13" />± 5 minutes</button>
+      <button (click)="seek(900)"><lucide-icon name="clock" [size]="13" />± 15 minutes</button>
+      <button (click)="seek(1800)"><lucide-icon name="clock" [size]="13" />± 30 minutes</button>
+      <hr />
+      <button (click)="findEventsAfter()"><lucide-icon name="arrow-right" [size]="13" />Events after this</button>
+      <button (click)="findEventsBefore()"><lucide-icon name="arrow-left" [size]="13" />Events before this</button>
+      <hr />
+      <button (click)="setRangeStart()"><lucide-icon name="chevrons-right" [size]="13" />Set as range start</button>
+      <button (click)="setRangeEnd()"><lucide-icon name="chevrons-left" [size]="13" />Set as range end</button>
+      <hr />
+      <button (click)="copyTimestampIso()"><lucide-icon name="copy" [size]="13" />Copy ISO timestamp</button>
     }
     @if (menuType() === 'jv') {
       @if (jvMenu(); as m) {

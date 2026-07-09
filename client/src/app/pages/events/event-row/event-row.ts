@@ -8,8 +8,6 @@ import { forkJoin, of } from 'rxjs';
 import { switchMap, catchError, map } from 'rxjs/operators';
 import { DomSanitizer } from '@angular/platform-browser';
 import { NgTemplateOutlet, DatePipe } from '@angular/common';
-import { Overlay, OverlayRef } from '@angular/cdk/overlay';
-import { TemplatePortal } from '@angular/cdk/portal';
 import { LucideAngularModule } from 'lucide-angular';
 
 import { EventDto } from '../../../core/models/event.model';
@@ -23,6 +21,7 @@ import { MetricSparkComponent } from '../../../shared/components/metric-spark/me
 import {
   JsonViewerActions, JvMenuRequest, jvLiteral, jvWildcard,
 } from '../../../shared/components/json-viewer/json-viewer.actions';
+import { ContextMenuService, OverlayPanelRef } from '../../../shared/services/overlay';
 
 const LEVEL_SHORT: Record<string, string> = {
   verbose: 'VRB', debug: 'DBG', information: 'INF',
@@ -126,6 +125,8 @@ export class EventRowComponent {
   filterSelected = output<string>();
   seekRequested  = output<{ from: Date; to: Date }>();
   expandRequested = output<string>();
+  /** Bind a timestamp to one side of the parent time-range inputs without loading. */
+  timeRangeBound = output<{ side: 'from' | 'to'; date: Date; load?: boolean }>();
 
   private api = inject(ApiService);
 
@@ -134,7 +135,7 @@ export class EventRowComponent {
   messageExpanded = signal(false);
   detailTab  = signal<'overview' | 'message' | 'json' | 'exception' | 'trace' | 'metrics'>('overview');
   jsonSearch = signal('');
-  menuType  = signal<'message' | 'level' | 'export' | 'jv' | null>(null);
+  menuType  = signal<'message' | 'level' | 'export' | 'jv' | 'service' | 'traceId' | 'spanId' | 'timestamp' | null>(null);
   menuPos   = signal({ x: 0, y: 0 });
   /** Active JSON-viewer node context (path/value/kind) when {@link menuType} is 'jv'. */
   jvMenu = signal<JvMenuRequest | null>(null);
@@ -150,6 +151,7 @@ export class EventRowComponent {
   /** Key of the copy button showing the "copied" confirmation, null otherwise. */
   copiedKey = signal<string | null>(null);
   private copiedTimer?: ReturnType<typeof setTimeout>;
+  private hoverCloseTimer?: ReturnType<typeof setTimeout>;
 
   // ── Correlated metrics state ──────────────────────────────────────────
   readonly metricSeries      = signal<{ name: string; series: MetricSeriesDto[] }[]>([]);
@@ -161,10 +163,10 @@ export class EventRowComponent {
   private sanitizer = inject(DomSanitizer);
   private datePipe  = inject(DatePipe);
   private prefs = inject(UserPreferencesService);
-  private overlay = inject(Overlay);
   private vcr = inject(ViewContainerRef);
   private jvActions = inject(JsonViewerActions);
-  private overlayRef: OverlayRef | null = null;
+  private contextMenu = inject(ContextMenuService);
+  private menuRef?: OverlayPanelRef;
   ctxMenuTpl = viewChild<TemplateRef<unknown>>('ctxMenuTpl');
 
   constructor() {
@@ -267,50 +269,41 @@ export class EventRowComponent {
       });
     });
 
-    // Render the context menu through a CDK overlay so it escapes the
-    // transformed virtual-scroll container (where `position: fixed` would
-    // otherwise be positioned relative to the transformed ancestor).
+    // Render the context menu through the ContextMenuService (CDK overlay) so it
+    // escapes the transformed virtual-scroll container (where `position: fixed`
+    // would otherwise anchor to the transformed ancestor). menuType/menuPos stay
+    // the single source of truth; document click/keydown drive close via
+    // onCloseMenu, so the service's own auto-close is left off.
     effect(() => {
       const type = this.menuType();
       const pos  = this.menuPos();
       const tpl  = this.ctxMenuTpl();
-      untracked(() => this.syncOverlay(type, pos, tpl));
-    });
-  }
-
-  private syncOverlay(
-    type: 'message' | 'level' | 'export' | 'jv' | null,
-    pos: { x: number; y: number },
-    tpl: TemplateRef<unknown> | undefined,
-  ): void {
-    if (!type || !tpl) {
-      this.overlayRef?.detach();
-      return;
-    }
-    const positionStrategy = this.overlay.position()
-      .global()
-      .left(`${pos.x}px`)
-      .top(`${pos.y}px`);
-    if (!this.overlayRef) {
-      this.overlayRef = this.overlay.create({
-        positionStrategy,
-        scrollStrategy: this.overlay.scrollStrategies.reposition(),
-        panelClass: 'ctx-menu-overlay',
+      untracked(() => {
+        if (type && tpl) {
+          this.menuRef = this.contextMenu.open({
+            template: tpl,
+            viewContainerRef: this.vcr,
+            x: pos.x,
+            y: pos.y,
+            panelClass: 'ctx-menu-overlay',
+            closeOnOutside: false,
+            closeOnEscape: false,
+          });
+        } else {
+          this.menuRef?.close();
+          this.menuRef = undefined;
+        }
       });
-    } else {
-      this.overlayRef.updatePositionStrategy(positionStrategy);
-    }
-    if (!this.overlayRef.hasAttached()) {
-      this.overlayRef.attach(new TemplatePortal(tpl, this.vcr));
-    }
+    });
   }
 
   ngOnDestroy(): void {
     clearTimeout(this.copiedTimer);
+    clearTimeout(this.hoverCloseTimer);
     this.traceSubRef?.unsubscribe();
     this.metricsSubRef?.unsubscribe();
-    this.overlayRef?.dispose();
-    this.overlayRef = null;
+    this.menuRef?.close();
+    this.menuRef = undefined;
   }
 
   eventTsMs = computed(() =>
@@ -636,10 +629,46 @@ export class EventRowComponent {
     this.menuPos.set({ x, y });
   }
 
+  /**
+   * Opens the property filter/copy menu *anchored to a row element* — used by
+   * the leading action button on property / meta-table rows so the menu pops
+   * just right of the key text rather than at an arbitrary click point.
+   */
+  openRowMenu(e: MouseEvent, type: 'service' | 'traceId' | 'spanId' | 'timestamp'): void {
+    e.preventDefault();
+    e.stopPropagation();
+    const target = e.currentTarget as HTMLElement;
+    const r = target.getBoundingClientRect();
+    let x = r.right + 4;
+    let y = r.top;
+    const w = type === 'timestamp' ? 220 : 220;
+    const h = type === 'timestamp' ? 360 : 240;
+    if (x + w > window.innerWidth)  x = r.left - w - 4;
+    if (x < 4)                        x = r.right + 4;
+    if (y + h > window.innerHeight)   y = Math.max(4, window.innerHeight - h);
+    this.menuType.set(type);
+    this.menuPos.set({ x, y });
+  }
+
   @HostListener('document:click')
   @HostListener('document:keydown')
   onCloseMenu(): void {
     if (this.menuType()) this.menuType.set(null);
+  }
+
+  /**
+   * Opens the property filter/copy menu (the same node menu the JSON viewer uses)
+   * for a Properties-table row, anchored to the clicked 3-lines button.
+   */
+  openPropMenu(e: MouseEvent, path: string, raw: unknown, isStructured: boolean): void {
+    e.stopPropagation();
+    e.preventDefault();
+    this.jvMenu.set({ path, rawValue: raw, isContainer: isStructured, x: e.clientX, y: e.clientY });
+    let x = e.clientX, y = e.clientY + 6;
+    if (x + 240 > window.innerWidth)  x = e.clientX - 240;
+    if (y + 200 > window.innerHeight) y = e.clientY - 200;
+    this.menuPos.set({ x, y });
+    this.menuType.set('jv');
   }
 
   // ── Context menu actions ──────────────────────────────────────────────
@@ -667,6 +696,157 @@ export class EventRowComponent {
     });
     this.menuType.set(null);
   }
+
+  // ── Service row actions ──────────────────────────────────────────────
+  async copyService(): Promise<void> {
+    await navigator.clipboard.writeText(this.service());
+    this.menuType.set(null);
+    this.flashCopied('service');
+  }
+
+  filterService(): void {
+    const svc = this.service();
+    if (!svc) return;
+    this.filterSelected.emit(`['service.name'] = ${jvLiteral(svc)}`);
+    this.menuType.set(null);
+  }
+
+  excludeService(): void {
+    const svc = this.service();
+    if (!svc) return;
+    this.filterSelected.emit(`['service.name'] <> ${jvLiteral(svc)}`);
+    this.menuType.set(null);
+  }
+
+  // ── TraceId / SpanId row actions ──────────────────────────────────────
+  async copyTraceId(): Promise<void> {
+    await this.copyText(this.traceId(), 'traceId');
+    this.menuType.set(null);
+  }
+
+  async copySpanId(): Promise<void> {
+    await this.copyText(this.spanId(), 'spanId');
+    this.menuType.set(null);
+  }
+
+  openTraceView(): void {
+    const tid = this.traceId();
+    if (!tid) return;
+    this.detailTab.set('trace');
+    this.menuType.set(null);
+  }
+
+  openTraceExternal(): void {
+    const tid = this.traceId();
+    if (!tid) return;
+    window.open(`/traces?trace=${encodeURIComponent(tid)}`, '_blank');
+    this.menuType.set(null);
+  }
+
+  // ── Timestamp row actions ───────────────────────────────────────────
+  timestampIso(): string {
+    return new Date(this.event()['@t']).toISOString();
+  }
+
+  timestampLocalLabel(): string {
+    const d = new Date(this.event()['@t']);
+    return d.toLocaleString();
+  }
+
+  async copyTimestampIso(): Promise<void> {
+    await navigator.clipboard.writeText(this.timestampIso());
+    this.menuType.set(null);
+    this.flashCopied('ts-iso');
+  }
+
+  async copyTimestampHuman(): Promise<void> {
+    await navigator.clipboard.writeText(this.timestampIso() + '   (' + this.timestampLocalLabel() + ')');
+    this.menuType.set(null);
+    this.flashCopied('ts-human');
+  }
+
+  setRangeStart(): void {
+    this.timeRangeBound.emit({ side: 'from', date: new Date(this.event()['@t']) });
+    this.menuType.set(null);
+  }
+
+  setRangeEnd(): void {
+    this.timeRangeBound.emit({ side: 'to', date: new Date(this.event()['@t']) });
+    this.menuType.set(null);
+  }
+
+  /** Find events in a ±1 second window around this event's timestamp. */
+  findNear(): void {
+    this.seek(1);
+  }
+
+  /** Show all events after this timestamp (to now) — same as message findFrom. */
+  findEventsAfter(): void {
+    this.findFrom();
+  }
+
+  /** Show all events up to this timestamp (from epoch) — same as message findTo. */
+  findEventsBefore(): void {
+    this.findTo();
+  }
+
+  /**
+   * Jump-to-date: emit a seek over a small symmetrical window around a date the
+   * user enters into the overlay input bound to {@link jumpDateInput}. Closing
+   * the menu resets the value.
+   */
+  jumpDateInput = signal('');
+
+  jumptoDateConfirm(): void {
+    const v = this.jumpDateInput()?.trim();
+    if (!v) return;
+    const target = new Date(v);
+    if (isNaN(target.getTime())) return;
+    const windowMs = (this.jumpPresetWindow() || 5) * 1000;
+    this.seekRequested.emit({
+      from: new Date(target.getTime() - windowMs),
+      to:   new Date(target.getTime() + windowMs),
+    });
+    this.jumpDateInput.set('');
+    this.menuType.set(null);
+  }
+
+  jumpPresetWindow = signal<5 | 30 | 60 | 300 | 900 | 1800>(5);
+
+  // ── Hover-driven menu helpers (timestamp row) ────────────────────────
+  /**
+   * The timestamp row reveals its menu on hover (no button — the date text
+   * itself is the trigger). When the pointer leaves the row *or* the overlay
+   * panel, we schedule a short close so the user can move from the row into
+   * the menu without it snapping shut. Any subsequent enter cancels it.
+   */
+  onTimestampHoverEnter(e: MouseEvent): void {
+    if (this.menuType() === 'timestamp') { this.cancelHoverClose(); return; }
+    if (this.menuType() !== null) return;            // another menu is open — don't hijack
+    this.openRowMenu(e, 'timestamp');
+  }
+
+  onTimestampHoverLeave(): void {
+    if (this.menuType() === 'timestamp') this.scheduleHoverClose();
+  }
+
+  onCtxMenuEnter(): void {
+    if (this.menuType() === 'timestamp') this.cancelHoverClose();
+  }
+
+  onCtxMenuLeave(): void {
+    if (this.menuType() === 'timestamp') this.scheduleHoverClose();
+  }
+
+  private scheduleHoverClose(): void {
+    clearTimeout(this.hoverCloseTimer);
+    this.hoverCloseTimer = setTimeout(() => {
+      if (this.menuType() === 'timestamp') this.menuType.set(null);
+    }, 250);
+  }
+
+  private cancelHoverClose(): void { clearTimeout(this.hoverCloseTimer); }
+
 
   filterLevel(): void {
     this.filterSelected.emit(`@l = '${this.event()['@l']}'`);

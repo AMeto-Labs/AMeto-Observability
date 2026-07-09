@@ -1,0 +1,499 @@
+/* ═══════════════════════════════════════════════════════════════════
+   Overlay panels (CDK Overlay) — dropdowns rendered via DropdownService.
+   These live globally because overlays attach at the document root, outside
+   any component's view-encapsulation scope.
+   ═══════════════════════════════════════════════════════════════════ */
+
+/* ── Panel box ──────────────────────────────────────────────────── */
+.dd-panel {
+  display: flex;
+  flex-direction: column;
+  background: var(--surface-up);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+/* ── Shared panel atoms ─────────────────────────────────────────── */
+.dd-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px 6px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.dd-panel-title {
+  font-size: 12px;
+  font-weight: 600;
+  font-family: var(--ui);
+  color: var(--txt);
+  letter-spacing: .3px;
+}
+.dd-close-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 4px;
+  background: none;
+  border: none;
+  color: var(--txt-dim);
+  cursor: pointer;
+  transition: background .1s, color .1s;
+}
+.dd-close-btn:hover { background: var(--surface-hover); color: var(--txt); }
+
+/* select-all row shared by levels + services */
+.dd-select-all-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  font-family: var(--ui);
+  font-size: 12px;
+  color: var(--txt-muted);
+  transition: background .1s;
+
+  input[type="checkbox"] {
+    width: 13px;
+    height: 13px;
+    accent-color: var(--accent);
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+}
+.dd-select-all-row:hover { background: var(--surface-hover); }
+.dd-select-all-lbl { flex: 1; color: var(--txt); font-weight: 500; }
+.dd-total-count { color: var(--txt-dim); font-size: 11px; }
+
+/* footer actions (Reset + Apply) */
+.dd-footer-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  padding: 8px 10px;
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.dd-reset-btn {
+  height: 26px;
+  padding: 0 12px;
+  border-radius: var(--radius-sm);
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--txt-muted);
+  font-size: 11.5px;
+  font-family: var(--ui);
+  cursor: pointer;
+  transition: all .12s;
+}
+.dd-reset-btn:hover { border-color: var(--txt-muted); color: var(--txt); }
+
+.dd-apply-btn {
+  height: 26px;
+  padding: 0 14px;
+  border-radius: var(--radius-sm);
+  background: var(--accent);
+  border: none;
+  color: #fff;
+  font-size: 11.5px;
+  font-family: var(--ui);
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity .12s;
+}
+.dd-apply-btn:hover { opacity: .88; }
+.dd-apply-btn:disabled { opacity: .35; cursor: default; }
+
+.dd-cancel-btn {
+  height: 26px;
+  padding: 0 12px;
+  border-radius: var(--radius-sm);
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--txt-muted);
+  font-size: 11.5px;
+  font-family: var(--ui);
+  cursor: pointer;
+  transition: all .12s;
+}
+.dd-cancel-btn:hover { border-color: var(--txt-muted); color: var(--txt); }
+
+/* Scrollable middle sections for large lists */
+.dd-scroll {
+  flex: 1;
+  overflow-y: auto;
+  min-height: 0;
+}
+
+/* ── Levels dropdown ────────────────────────────────────────────── */
+.lvl-dd {
+  min-width: 230px;
+  max-height: 420px;
+}
+
+.lvl-dd-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  cursor: pointer;
+  font-size: 12px;
+  font-family: var(--ui);
+  color: var(--txt-muted);
+  transition: background .1s;
+
+  input[type="checkbox"] {
+    width: 13px;
+    height: 13px;
+    accent-color: var(--accent);
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+}
+.lvl-dd-row:hover { background: var(--surface-hover); }
+.lvl-name { flex: 1; color: var(--txt); }
+.lvl-count {
+  color: var(--txt-dim);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  min-width: 42px;
+  text-align: right;
+}
+
+.lvl-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 1.5px solid currentColor;
+  flex-shrink: 0;
+}
+
+.lvl-dd-row[data-level="verbose"]     { .lvl-dot { background: var(--lvl-v); border-color: var(--lvl-v); } }
+.lvl-dd-row[data-level="debug"]       { .lvl-dot { background: var(--lvl-d); border-color: var(--lvl-d); } }
+.lvl-dd-row[data-level="information"] { .lvl-dot { background: var(--lvl-i); border-color: var(--lvl-i); } }
+.lvl-dd-row[data-level="warning"]     { .lvl-dot { background: var(--lvl-w); border-color: var(--lvl-w); } }
+.lvl-dd-row[data-level="error"]       { .lvl-dot { background: var(--lvl-e); border-color: var(--lvl-e); } }
+.lvl-dd-row[data-level="fatal"]       { .lvl-dot { background: var(--lvl-f); border-color: var(--lvl-f); } }
+
+/* ── Services dropdown ──────────────────────────────────────────── */
+.svc-dd {
+  min-width: 280px;
+  max-width: 340px;
+  max-height: 480px;
+}
+
+.svc-search-wrap {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 7px 10px 4px;
+  height: 28px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0 8px;
+  transition: border-color .12s;
+  flex-shrink: 0;
+}
+.svc-search-wrap:focus-within { border-color: var(--accent); }
+.svc-search-icon { color: var(--txt-dim); flex-shrink: 0; }
+.svc-search-input {
+  flex: 1;
+  background: none;
+  border: none;
+  outline: none;
+  color: var(--txt);
+  font-size: 12px;
+  font-family: var(--ui);
+  caret-color: var(--accent);
+  min-width: 0;
+}
+.svc-search-input::placeholder { color: var(--txt-dim); }
+
+.svc-dd-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 12px;
+  cursor: pointer;
+  font-size: 12px;
+  font-family: var(--ui);
+  color: var(--txt-muted);
+  transition: background .1s;
+  flex-shrink: 0;
+
+  input[type="checkbox"] {
+    width: 13px;
+    height: 13px;
+    accent-color: var(--accent);
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+}
+.svc-dd-row:hover { background: var(--surface-hover); }
+.svc-color-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+.svc-name { flex: 1; color: var(--txt); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.svc-count {
+  color: var(--txt-dim);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
+.svc-pct {
+  color: var(--txt-dim);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+  min-width: 36px;
+  text-align: right;
+}
+.svc-show-more {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 5px 12px;
+  background: none;
+  border: none;
+  border-top: 1px solid var(--border);
+  color: var(--accent);
+  font-size: 11.5px;
+  font-family: var(--ui);
+  cursor: pointer;
+  transition: background .1s;
+  flex-shrink: 0;
+}
+.svc-show-more:hover { background: var(--surface-hover); }
+.svc-empty {
+  padding: 10px 12px;
+  font-size: 12px;
+  color: var(--txt-dim);
+  font-family: var(--ui);
+  font-style: italic;
+}
+
+/* ── Date-range dropdown — two-panel ────────────────────────────── */
+.date-dd {
+  min-width: 540px;
+}
+.date-dd-body {
+  display: flex;
+  flex-direction: row;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+.date-preset-list {
+  display: flex;
+  flex-direction: column;
+  width: 164px;
+  flex-shrink: 0;
+  border-right: 1px solid var(--border);
+  padding: 6px 0;
+  overflow-y: auto;
+}
+.date-preset-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 6px 14px;
+  background: none;
+  border: none;
+  color: var(--txt-muted);
+  font-size: 12px;
+  font-family: var(--ui);
+  cursor: pointer;
+  transition: background .1s, color .1s;
+  white-space: nowrap;
+}
+.date-preset-item:hover { background: var(--surface-hover); color: var(--txt); }
+.date-preset-item.active { color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.date-preset-item.is-custom {
+  margin-top: 6px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  color: var(--accent);
+  font-weight: 500;
+}
+.date-preset-item.is-custom:not(.active) { opacity: .75; }
+
+.date-cal-panel {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  padding: 0;
+}
+.cal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 8px 2px;
+  flex-shrink: 0;
+}
+.cal-pick-hint {
+  text-align: center;
+  font-size: 10px;
+  color: var(--txt-dim);
+  padding: 0 8px 3px;
+  flex-shrink: 0;
+  opacity: .7;
+}
+.cal-pick-hint.picking-end { color: var(--accent); opacity: 1; }
+.cal-nav-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 4px;
+  background: none;
+  border: none;
+  color: var(--txt-muted);
+  cursor: pointer;
+  transition: background .1s, color .1s;
+}
+.cal-nav-btn:hover { background: var(--surface-hover); color: var(--txt); }
+.cal-month-label {
+  font-size: 12px;
+  font-weight: 600;
+  font-family: var(--ui);
+  color: var(--txt);
+}
+.cal-grid {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 1px;
+  padding: 0 6px;
+  flex-shrink: 0;
+}
+.cal-dow {
+  font-size: 9.5px;
+  font-family: var(--ui);
+  font-weight: 600;
+  color: var(--txt-dim);
+  text-align: center;
+  padding: 2px 0;
+  letter-spacing: .4px;
+}
+.cal-day {
+  aspect-ratio: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 3px;
+  background: none;
+  border: none;
+  color: var(--txt-muted);
+  font-size: 11px;
+  font-family: var(--ui);
+  cursor: pointer;
+  transition: background .1s, color .1s;
+  min-height: 22px;
+}
+.cal-day:hover { background: var(--surface-hover); color: var(--txt); }
+.cal-day.other-month { color: var(--txt-dim); opacity: .4; }
+.cal-day.today { color: var(--accent); font-weight: 700; }
+.cal-day.cal-from,
+.cal-day.cal-to {
+  background: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+.cal-day.cal-in-range {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  color: var(--accent);
+  border-radius: 0;
+}
+.cal-inputs {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 8px 10px 6px;
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.cal-input-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.cal-input-lbl {
+  font-size: 11px;
+  color: var(--txt-dim);
+  font-family: var(--ui);
+  width: 36px;
+  flex-shrink: 0;
+}
+.cal-input-field-wrap {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  position: relative;
+}
+.cal-field-wrap {
+  display: flex;
+  align-items: center;
+  flex: 1;
+  height: 26px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0 6px 0 8px;
+  gap: 4px;
+  transition: border-color .12s;
+}
+.cal-field-wrap.is-datetime { width: 100%; }
+.cal-field-wrap:focus-within { border-color: var(--accent); }
+.cal-field-wrap.invalid { border-color: var(--lvl-e); }
+.cal-field-input {
+  flex: 1;
+  background: none;
+  border: none;
+  outline: none;
+  color: var(--txt);
+  font-size: 11.5px;
+  font-family: var(--ui);
+  font-variant-numeric: tabular-nums;
+  caret-color: var(--accent);
+  min-width: 0;
+}
+.cal-field-input::placeholder { color: var(--txt-dim); }
+.cal-field-icon { color: var(--txt-dim); flex-shrink: 0; }
+.cal-time-tip {
+  position: absolute;
+  top: calc(100% + 2px);
+  left: 0;
+  background: var(--surface);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  color: var(--accent);
+  font-size: 10px;
+  font-family: var(--ui);
+  font-variant-numeric: tabular-nums;
+  padding: 2px 8px;
+  cursor: pointer;
+  white-space: nowrap;
+  z-index: 20;
+  opacity: .9;
+  transition: opacity .1s;
+}
+.cal-time-tip:hover { opacity: 1; background: color-mix(in srgb, var(--accent) 10%, var(--surface)); }
+.cal-time-tip-kbd {
+  margin-left: 5px;
+  opacity: .55;
+  font-size: 9px;
+  letter-spacing: .02em;
+}

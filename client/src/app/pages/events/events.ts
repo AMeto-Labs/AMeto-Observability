@@ -14,11 +14,18 @@ import { ApiService } from '../../core/services/api.service';
 import { EventDto, LEVELS } from '../../core/models/event.model';
 import { EventRowComponent } from './event-row/event-row';
 import { SignalsPanelComponent } from './signals-panel/signals-panel';
-import { DateMaskDirective } from '../../shared/directives/date-mask.directive';
 import { highlightFilterExpression } from '../../shared/utils/filter-highlight';
 import { injectVirtualizer } from '@tanstack/angular-virtual';
 import { VmeasureDirective } from '../../shared/directives/virtual-measure.directive';
 import { EmptyStateComponent } from '../../shared/components/ui';
+import { DropdownService, OverlayPanelRef } from '../../shared/services/overlay';
+import {
+  LevelsDropdownComponent, LevelsDropdownData, LevelsDropdownResult,
+} from './dropdowns/levels-dropdown';
+import {
+  ServicesDropdownComponent, ServicesDropdownData, ServicesDropdownResult,
+} from './dropdowns/services-dropdown';
+import { DateRangeDropdownComponent, DateDropdownController } from './dropdowns/date-range-dropdown';
 
 type TimePreset = '5m' | '15m' | '30m' | '1d' | '7d' | '2w' | '1mo' | 'custom';
 
@@ -137,7 +144,7 @@ function msToDotNetUtcTicks(ms: number): number {
 
 @Component({
   selector: 'app-events',
-  imports: [FormsModule, LucideAngularModule, EventRowComponent, SignalsPanelComponent, EmptyStateComponent, DateMaskDirective, VmeasureDirective],
+  imports: [FormsModule, LucideAngularModule, EventRowComponent, SignalsPanelComponent, EmptyStateComponent, VmeasureDirective],
   templateUrl: './events.html',
   styleUrl: './events.scss',
   changeDetection: ChangeDetectionStrategy.OnPush,
@@ -148,6 +155,12 @@ export class EventsComponent implements OnInit, OnDestroy {
   private sanitizer = inject(DomSanitizer);
   private route     = inject(ActivatedRoute);
   private router    = inject(Router);
+  private dropdown  = inject(DropdownService);
+
+  /** Handles to the open filter-bar dropdown overlays, if any. */
+  private levelsRef?: OverlayPanelRef<LevelsDropdownResult, LevelsDropdownData>;
+  private servicesRef?: OverlayPanelRef<ServicesDropdownResult, ServicesDropdownData>;
+  private dateRef?: OverlayPanelRef<void, DateDropdownController>;
 
   // ── State ──────────────────────────────────────────────────────────────
   filterInput   = signal('');
@@ -174,14 +187,8 @@ export class EventsComponent implements OnInit, OnDestroy {
   levelsDropdownOpen  = signal(false);
   serviceDropdownOpen = signal(false);
   dateDropdownOpen    = signal(false);
-  // Pending state for dropdowns (edits before Apply)
-  pendingServices     = signal<Set<string>>(new Set());
-  serviceSearch       = signal('');
-  showMoreServices    = signal(false);
   // Services loaded from backend (independent of loaded events)
   backendServices     = signal<string[]>([]);
-  // Pending levels for dropdown
-  pendingLevels       = signal<Set<string>>(new Set(LEVELS as unknown as string[]));
   // Calendar for date picker
   calendarNav         = signal<{ year: number; month: number }>({
     year: new Date().getFullYear(), month: new Date().getMonth(),
@@ -235,19 +242,18 @@ export class EventsComponent implements OnInit, OnDestroy {
   ];
 
   readonly calendarWeekDays = ['Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa', 'Su'];
-  readonly maskPattern = 'yyyy-mm-dd HH:mm';
 
   /** Allowed page sizes shown in the dropdown next to the event counter. */
   readonly pageSizeOptions = [50, 100, 150, 300, 500];
   /** Active page size — applied to every events query (initial load + paging). */
   pageSize = signal<number>(50);
 
-  maskRemaining(value: string): string {
-    return this.maskPattern.slice(value.length);
-  }
-
   onExpandRequested(eventId: string): void {
     if (!eventId) return;
+    // Expanding a row is a click inside the events list that stops propagation
+    // (event-row.toggleExpand), so the document click-away never fires — dismiss
+    // any open filter dropdown here instead.
+    this.closeAllDropdowns();
     this.expandedEventIds.update(prev => {
       const next = new Set(prev);
       if (next.has(eventId)) next.delete(eventId);
@@ -347,13 +353,6 @@ export class EventsComponent implements OnInit, OnDestroy {
     return counts;
   });
 
-  filteredServices = computed(() => {
-    const q = this.serviceSearch().toLowerCase();
-    return q ? this.availableServices().filter(s => s.toLowerCase().includes(q)) : this.availableServices();
-  });
-
-  allPendingLevelsActive   = computed(() => this.pendingLevels().size === LEVELS.length);
-  allPendingServicesActive = computed(() => this.pendingServices().size === 0);
 
   /** Syntax-highlighted HTML for the filter overlay div. */
   filterHighlight = computed<SafeHtml>(() =>
@@ -366,12 +365,6 @@ export class EventsComponent implements OnInit, OnDestroy {
   // ── View refs / sync ──────────────────────────────────────────────────
   private filterRef    = viewChild<ElementRef<HTMLTextAreaElement>>('filterEl');
   private eventsScroll = viewChild<ElementRef<HTMLElement>>('eventsScroll');
-  private dateFbGroup  = viewChild<ElementRef<HTMLElement>>('dateFbGroup');
-  private levelsFbGroup = viewChild<ElementRef<HTMLElement>>('levelsFbGroup');
-  private svcFbGroup    = viewChild<ElementRef<HTMLElement>>('svcFbGroup');
-
-  /** Position (fixed) for the currently-open dropdown. */
-  ddPos = signal<{ top: number; left: number }>({ top: 0, left: 0 });
 
   // ── TanStack Virtual ──────────────────────────────────────────────────
   readonly virtualizer = injectVirtualizer(() => ({
@@ -384,13 +377,6 @@ export class EventsComponent implements OnInit, OnDestroy {
 
   /** Stable ref to measureElement — avoids creating a new closure every CD cycle. */
   readonly measureRow = (el: Element) => this.virtualizer.measureElement(el);
-
-  private computeDdPos(el: HTMLElement | undefined): void {
-    if (!el) return;
-    const r = el.getBoundingClientRect();
-    const left = Math.min(r.left, window.innerWidth - (el.closest('.date-dd') ? 544 : 300));
-    this.ddPos.set({ top: Math.round(r.bottom + 4), left: Math.max(0, Math.round(left)) });
-  }
 
   // ── RxJS plumbing ─────────────────────────────────────────────────────
   private subs: Subscription[] = [];
@@ -699,6 +685,14 @@ export class EventsComponent implements OnInit, OnDestroy {
     this.loadEvents();
   }
 
+  /** A row's timestamp was chosen as the start/end of the active time range. */
+  onTimeRangeBound(e: { side: 'from' | 'to'; date: Date }): void {
+    if (e.side === 'from') this.customFrom.set(this.fmtDateInput(e.date));
+    else                   this.customTo.set(this.fmtDateInput(e.date));
+    this.timePreset.set('custom');
+    this.loadEvents();
+  }
+
   /**
    * Filter textarea key handler.
    *   Enter                  → submit (or accept suggestion when popup is open)
@@ -941,15 +935,56 @@ export class EventsComponent implements OnInit, OnDestroy {
   /** Tracks two-click calendar range selection: false = picking start, true = picking end. */
   calPickingEnd = signal<boolean>(false);
 
-  // ── Date dropdown ─────────────────────────────────────────────────────
-  openDateDropdown(): void {
-    this.levelsDropdownOpen.set(false);
-    this.serviceDropdownOpen.set(false);
-    this.computeDdPos(this.dateFbGroup()?.nativeElement);
+  // ── Date dropdown (CDK overlay via DropdownService) ───────────────────
+  async openDate(origin: HTMLElement): Promise<void> {
+    if (this.dateDropdownOpen()) { this.dateRef?.close(); return; }
+    this.closeAllDropdowns();
     this.calPickingEnd.set(false);
     const d = this.parseCustomDate(this.customFrom()) ?? new Date();
     this.calendarNav.set({ year: d.getFullYear(), month: d.getMonth() });
     this.dateDropdownOpen.set(true);
+    this.dateRef = this.dropdown.open<DateRangeDropdownComponent, void, DateDropdownController>(
+      DateRangeDropdownComponent,
+      { origin, data: this.buildDateController() },
+    );
+    await this.dateRef.closed;
+    this.dateDropdownOpen.set(false);
+    this.dateRef = undefined;
+  }
+
+  /**
+   * The date range shares state with the toolbar/URL/row-binding, so it stays
+   * owned here — the dropdown is a pure view over these signals + actions.
+   */
+  private buildDateController(): DateDropdownController {
+    return {
+      presets: this.datePresets,
+      weekDays: this.calendarWeekDays,
+      timePreset: this.timePreset,
+      customFrom: this.customFrom,
+      customTo: this.customTo,
+      fromSuggestion: this.customFromSuggestion,
+      toSuggestion: this.customToSuggestion,
+      calPickingEnd: this.calPickingEnd,
+      monthLabel: this.calendarMonthLabel,
+      days: this.calendarDays,
+      customFromValid: this.customFromValid,
+      customToValid: this.customToValid,
+      canSearch: this.canSearch,
+      setPreset: (p) => this.setTimePreset(p),
+      prevMonth: () => this.prevCalendarMonth(),
+      nextMonth: () => this.nextCalendarMonth(),
+      selectDay: (day) => this.selectCalendarDay(day),
+      setFrom: (v) => this.setFrom(v),
+      setTo: (v) => this.setTo(v),
+      setFromSuggestion: (v) => this.customFromSuggestion.set(v),
+      setToSuggestion: (v) => this.customToSuggestion.set(v),
+      acceptFromSuggestion: () => this.acceptFromSuggestion(),
+      acceptToSuggestion: () => this.acceptToSuggestion(),
+      suggestionLabel: (s) => this.suggestionLabel(s),
+      onDateKeydown: (e) => this.onDateKeydown(e),
+      apply: () => this.search(),
+    };
   }
 
   prevCalendarMonth(): void {
@@ -994,38 +1029,24 @@ export class EventsComponent implements OnInit, OnDestroy {
     }
   }
 
-  // ── Levels dropdown (pending/apply) ───────────────────────────────────
-  openLevelsDropdown(): void {
-    // Close all other dropdowns first (fixes: old dropdown stays open)
-    this.serviceDropdownOpen.set(false);
-    this.dateDropdownOpen.set(false);
-    this.computeDdPos(this.levelsFbGroup()?.nativeElement);
-    this.pendingLevels.set(new Set(this.activeLevels()));
+  // ── Levels dropdown (CDK overlay via DropdownService) ─────────────────
+  async openLevels(origin: HTMLElement): Promise<void> {
+    // Re-click the trigger while open → toggle closed.
+    if (this.levelsDropdownOpen()) { this.levelsRef?.close(); return; }
+    this.closeAllDropdowns();
     this.levelsDropdownOpen.set(true);
-  }
-
-  togglePendingLevel(level: string): void {
-    this.pendingLevels.update(set => {
-      const next = new Set(set);
-      if (next.has(level)) next.delete(level); else next.add(level);
-      return next;
-    });
-  }
-
-  toggleAllPendingLevels(): void {
-    this.allPendingLevelsActive()
-      ? this.pendingLevels.set(new Set())
-      : this.pendingLevels.set(new Set(LEVELS as unknown as string[]));
-  }
-
-  isPendingLevelActive(level: string): boolean {
-    return this.pendingLevels().has(level);
-  }
-
-  applyLevels(): void {
-    const levels = new Set(this.pendingLevels());
+    this.levelsRef = this.dropdown.open<LevelsDropdownComponent, LevelsDropdownResult, LevelsDropdownData>(
+      LevelsDropdownComponent,
+      { origin, data: { active: this.activeLevels(), counts: this.levelCounts(), total: this.totalCount() } },
+    );
+    const result = await this.levelsRef.closed;
     this.levelsDropdownOpen.set(false);
-    // Write @l clause into filter as single source of truth
+    this.levelsRef = undefined;
+    if (result) { this.writeLevelsClause(result); this.loadEvents(); }
+  }
+
+  /** Splices the chosen levels into the filter's `@l` clause (single source of truth). */
+  private writeLevelsClause(levels: Set<string>): void {
     const allActive = levels.size === LEVELS.length;
     this.filterInput.update(q => {
       const stripped = stripFilterClause(q, /@l\s*(=|in|!=)[^)\n]+(\))?/g);
@@ -1036,52 +1057,47 @@ export class EventsComponent implements OnInit, OnDestroy {
       return stripped.trim() ? `${clause} and ${stripped.trim()}` : clause;
     });
     this.filter.set(this.filterInput());
-    this.loadEvents();
   }
 
-  resetLevels(): void {
-    this.pendingLevels.set(new Set(LEVELS as unknown as string[]));
-  }
+  // ── Services dropdown (CDK overlay via DropdownService) ───────────────
+  async openServices(origin: HTMLElement): Promise<void> {
+    if (this.serviceDropdownOpen()) { this.servicesRef?.close(); return; }
+    this.closeAllDropdowns();
 
-  pendingLevelsTotal = () =>
-    Object.entries(this.levelCounts()).reduce((sum, [, n]) => sum + n, 0);
-
-  // ── Services dropdown (pending/apply) ─────────────────────────────────
-  openServicesDropdown(): void {
-    // Close all other dropdowns first (fixes: old dropdown stays open)
-    this.levelsDropdownOpen.set(false);
-    this.dateDropdownOpen.set(false);
-    // Lazy-load backend services if not yet loaded
+    // Lazy-load backend service names on first open so the list is complete
+    // (some services may not appear in the currently loaded events).
     if (this.backendServices().length === 0) {
-      this.api.getServiceNames().subscribe({
-        next: s => { this.backendServices.set(s); this.cdr.markForCheck(); },
-        error: () => {},
+      await new Promise<void>(resolve => {
+        this.api.getServiceNames().subscribe({
+          next: s => { this.backendServices.set(s); resolve(); },
+          error: () => resolve(),
+        });
       });
     }
-    this.computeDdPos(this.svcFbGroup()?.nativeElement);
-    this.pendingServices.set(new Set(this.selectedServices()));
-    this.serviceSearch.set('');
-    this.showMoreServices.set(false);
+
     this.serviceDropdownOpen.set(true);
+    this.servicesRef = this.dropdown.open<ServicesDropdownComponent, ServicesDropdownResult, ServicesDropdownData>(
+      ServicesDropdownComponent,
+      { origin, data: {
+        selected: this.selectedServices(),
+        services: this.availableServices(),
+        counts: this.serviceCounts(),
+        total: this.totalCount(),
+      } },
+    );
+    const result = await this.servicesRef.closed;
+    this.serviceDropdownOpen.set(false);
+    this.servicesRef = undefined;
+    if (result) { this.writeServicesClause(result); this.loadEvents(); }
   }
 
-  togglePendingService(svc: string): void {
-    this.pendingServices.update(set => {
-      const next = new Set(set);
-      if (next.has(svc)) next.delete(svc); else next.add(svc);
-      return next;
-    });
-  }
-
-  isPendingServiceActive(svc: string): boolean {
-    return this.pendingServices().has(svc);
-  }
-
-  applyServices(): void {
-    const svcs = new Set(this.pendingServices());
-    // selectedServices is computed from filterInput, so just patch the filter\n    this.serviceDropdownOpen.set(false);
-    // Use bracket notation ['service.name'] so the parser treats it as a single
-    // segment — matches the ev.ServiceName dedicated field fast-path on the backend.
+  /**
+   * Splices the chosen services into the filter's `['service.name']` clause.
+   * Bracket notation keeps the parser treating it as one segment — matching the
+   * dedicated ServiceName field fast-path on the backend. Placed after any `@l`
+   * clause, before the rest of the user's expression.
+   */
+  private writeServicesClause(svcs: Set<string>): void {
     this.filterInput.update(q => {
       const stripped = stripFilterClause(
         q, /\['service\.name'\]\s*=\s*'[^']*'|\['service\.name'\]\s*in\s*\[[^\]]*\]|\(service\.name\s*=\s*'[^']*'\s*or\s*ApplicationContext\s*=\s*'[^']*'\)/g
@@ -1090,7 +1106,6 @@ export class EventsComponent implements OnInit, OnDestroy {
       const clause = svcs.size === 1
         ? `['service.name'] = '${[...svcs][0]}'`
         : `['service.name'] in [${[...svcs].map(s => `'${s}'`).join(', ')}]`;
-      // Place AFTER @l clause if present, before everything else
       const lvlMatch = stripped.match(/^(@l\s*(?:=|in)\s*\[[^\]]+\]|@l\s*=\s*'[^']*')(\s+and\s+|$)/i);
       if (lvlMatch) {
         const rest = stripped.slice(lvlMatch[0].length).trim();
@@ -1099,36 +1114,22 @@ export class EventsComponent implements OnInit, OnDestroy {
       return stripped.trim() ? `${clause} and ${stripped.trim()}` : clause;
     });
     this.filter.set(this.filterInput());
-    this.loadEvents();
   }
 
-  resetServices(): void {
-    this.pendingServices.set(new Set());
+  /** Escape closes any open filter dropdown (date / levels / services). */
+  @HostListener('document:keydown.escape')
+  closeDropdownsOnEscape(): void {
+    this.closeAllDropdowns();
   }
 
-  servicePercent(svc: string): string {
-    const total = this.totalCount();
-    if (!total) return '0%';
-    return `${Math.round(((this.serviceCounts()[svc] ?? 0) / total) * 100)}%`;
-  }
-
-  private readonly SERVICE_COLORS = [
-    '#4DA3FF', '#38BDF8', '#34D399', '#A78BFA',
-    '#FB923C', '#F472B6', '#22D3EE', '#818CF8',
-    '#E879F9', '#4ADE80', '#FACC15', '#F87171',
-  ];
-
-  serviceColor(name: string): string {
-    let h = 0;
-    for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
-    return this.SERVICE_COLORS[h % this.SERVICE_COLORS.length];
-  }
-
-  @HostListener('document:click', ['$event'])
-  closeDropdowns(e: MouseEvent): void {
-    if ((e.target as HTMLElement).closest('.fb-group')) return;
-    this.levelsDropdownOpen.set(false);
-    this.serviceDropdownOpen.set(false);
-    this.dateDropdownOpen.set(false);
+  /**
+   * Force-closes every filter-bar dropdown. Each is a CDK overlay that also
+   * self-dismisses on outside-click via {@link DropdownService}; this is used
+   * when opening another dropdown, on Escape, and when a row is expanded.
+   */
+  private closeAllDropdowns(): void {
+    this.levelsRef?.close();
+    this.servicesRef?.close();
+    this.dateRef?.close();
   }
 }

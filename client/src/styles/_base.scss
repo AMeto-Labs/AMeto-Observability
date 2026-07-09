@@ -42,7 +42,7 @@ lucide-icon {
 }
 
 ::selection {
-  background: var(--primary-soft);
+  background: color-mix(in srgb, var(--info) 45%, transparent);
   color: inherit;
 }
 

@@ -445,6 +445,73 @@
   padding-left: 2px;
 }
 
+/* Leading action cell (before the key) in both meta-table and props-table.
+   Holds a single menu/clock button, revealed on row hover. */
+.row-act {
+  width: 18px;
+  padding: 0 2px 0 0;
+  vertical-align: top;
+  text-align: center;
+  white-space: nowrap;
+}
+.row-menu-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--txt-muted);
+  padding: 2px 3px;
+  border-radius: 4px;
+  transition: opacity .12s, color .12s, background .12s;
+}
+.row-menu-btn:hover { color: var(--txt-primary); background: var(--surface-hover); }
+tr:hover > .row-act > .row-menu-btn,
+.row-menu-btn:focus-visible { opacity: 1; }
+
+/* Always-visible inline row actions (Service / Level / TraceId / SpanId) */
+.meta-val-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.meta-val { min-width: 0; word-break: break-all; }
+.row-acts {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.row-act-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  height: 20px;
+  padding: 0 7px;
+  border: 1px solid var(--border-sub);
+  background: var(--surface-up);
+  color: var(--txt-muted);
+  font-size: 10.5px;
+  font-family: var(--font-ui);
+  white-space: nowrap;
+  border-radius: 5px;
+  cursor: pointer;
+  transition: color .12s, border-color .12s, background .12s;
+}
+.row-act-btn:hover { color: var(--txt); border-color: var(--accent-soft); background: var(--surface-hover); }
+.row-act-btn.row-act-icon { padding: 0 5px; }
+.row-act-btn.done { color: var(--lvl-i); border-color: var(--lvl-i); }
+
+/* Remove the json-viewer's own top-level filter button inside the Properties
+   card — the leading row button already covers it (avoids two buttons per row).
+   Nested nodes keep their buttons for deep-path filtering. */
+.ev-card--props .pv > app-json-viewer > .jv-leaf > .jv-menu-btn,
+.ev-card--props .pv > app-json-viewer > .jv-node > .jv-head > .jv-menu-btn {
+  display: none;
+}
+
 .ev-no-exception {
   color: var(--txt-muted);
   font-size: 12px;
