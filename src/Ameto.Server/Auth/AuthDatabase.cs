@@ -108,11 +108,15 @@ internal sealed class AuthDatabase
         // Migrate roles that are outside the allowed set
         Exec(conn, "UPDATE users SET role = 'viewer' WHERE role NOT IN ('admin','manager','viewer')");
 
-        // api_keys: description + minimum_level (LogLevel byte). Safe to run multiple times.
+        // api_keys columns added after initial release. Safe to run multiple times.
+        // permissions defaults to 7 (All: Logs|Traces|Metrics) so keys created before
+        // per-permission scoping keep ingesting everything. minimum_level is legacy
+        // (no longer read); left in place so old DBs need no destructive rebuild.
         foreach (var ddl in new[]
         {
             "ALTER TABLE api_keys ADD COLUMN description   TEXT    NOT NULL DEFAULT ''",
             "ALTER TABLE api_keys ADD COLUMN minimum_level INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE api_keys ADD COLUMN permissions   INTEGER NOT NULL DEFAULT 7",
         })
         {
             try { Exec(conn, ddl); } catch { /* column already exists */ }

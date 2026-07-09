@@ -41,6 +41,7 @@ public static class OtlpEndpointMapper
         if (enableTraces)
         app.MapPost("/otlp/v1/traces", async (HttpContext ctx, ISpanIngester ingester, ILoggerFactory logFactory) =>
         {
+            if (!Authorized(ctx, ApiKeyPermissions.Traces)) return;
             var logger = logFactory.CreateLogger("Ameto.Otel.Traces");
 
             var (body, bodyLen) = await ReadBodyAsync(ctx);
@@ -84,6 +85,7 @@ public static class OtlpEndpointMapper
         if (enableMetrics)
         app.MapPost("/otlp/v1/metrics", async (HttpContext ctx) =>
         {
+            if (!Authorized(ctx, ApiKeyPermissions.Metrics)) return;
             var ingester = ctx.RequestServices.GetRequiredService<IMetricIngester>();
 
             var (body, bodyLen) = await ReadBodyAsync(ctx);
@@ -110,6 +112,7 @@ public static class OtlpEndpointMapper
         // ── Logs ──────────────────────────────────────────────────────────────
         app.MapPost("/otlp/v1/logs", async (HttpContext ctx) =>
         {
+            if (!Authorized(ctx, ApiKeyPermissions.Logs)) return;
             var endpoint = ctx.RequestServices.GetRequiredService<IngestionEndpoint>();
 
             var (body, bodyLen) = await ReadBodyAsync(ctx);
@@ -136,6 +139,21 @@ public static class OtlpEndpointMapper
 
         // Metric query endpoints live in Ameto.Metrics.MetricQueryEndpointMapper
         // (mapped via app.MapMetricEndpoints()).
+    }
+
+    // ── API-key authorization ───────────────────────────────────────────────────
+
+    /// <summary>
+    /// Enforces the ingest API key (cache-backed, no DB hit) for the given permission.
+    /// Writes 401 and returns false when the key is missing or lacks the permission.
+    /// </summary>
+    private static bool Authorized(HttpContext ctx, ApiKeyPermissions required)
+    {
+        var validator = ctx.RequestServices.GetRequiredService<IApiKeyValidator>();
+        var key = ApiKeyHeader.Extract(ctx.Request);
+        if (key is not null && validator.Validate(key.AsSpan(), required)) return true;
+        ctx.Response.StatusCode = StatusCodes.Status401Unauthorized;
+        return false;
     }
 
     // ── DTO mappers ───────────────────────────────────────────────────────────

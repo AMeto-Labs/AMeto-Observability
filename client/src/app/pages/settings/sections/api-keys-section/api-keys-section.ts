@@ -12,9 +12,11 @@ import { DatePipe } from '@angular/common';
 import { LucideAngularModule } from 'lucide-angular';
 import { SectionComponent, ModalComponent } from '../../../../shared/components/ui';
 import { ApiService } from '../../../../core/services/api.service';
-import { ApiKeyDto, CreatedApiKeyDto } from '../../../../core/models/auth.model';
-import { LEVELS } from '../../../../core/models/event.model';
+import { ApiKeyDto, CreatedApiKeyDto, ApiKeyPermission } from '../../../../core/models/auth.model';
 import { SettingsDirtyService } from '../../settings-dirty.service';
+
+/** Bit set covering both trace + metric ingest, presented as one choice in the UI. */
+const TRACES_METRICS = ApiKeyPermission.Traces | ApiKeyPermission.Metrics;
 
 @Component({
   selector: 'app-api-keys-section',
@@ -38,10 +40,16 @@ export class ApiKeysSectionComponent implements OnInit {
   readonly creating = signal(false);
   readonly newName = signal('');
   readonly newDescription = signal('');
-  readonly newMinimumLevel = signal(0); // index into LEVELS
   readonly newKeyManual = signal('');
 
-  readonly levels = LEVELS;
+  /** Ingest scopes granted to the new key (both on by default). */
+  readonly permLogs = signal(true);
+  readonly permTracesMetrics = signal(true);
+
+  /** Combined permission bit-set sent to the server; ≥ 1 scope required. */
+  readonly newPermissions = computed(
+    () => (this.permLogs() ? ApiKeyPermission.Logs : 0) | (this.permTracesMetrics() ? TRACES_METRICS : 0),
+  );
 
   /** Dirty while the create form has input. */
   readonly dirty = computed(
@@ -86,12 +94,16 @@ export class ApiKeysSectionComponent implements OnInit {
       this.keyError.set('Name is required.');
       return;
     }
+    if (this.newPermissions() === 0) {
+      this.keyError.set('Select at least one permission.');
+      return;
+    }
     this.keyError.set(null);
     this.creating.set(true);
     this.api.createApiKey(
       name,
       this.newDescription().trim(),
-      this.newMinimumLevel(),
+      this.newPermissions(),
       this.newKeyManual().trim() || undefined,
     ).subscribe({
       next: ck => {
@@ -102,7 +114,7 @@ export class ApiKeysSectionComponent implements OnInit {
             id: ck.id,
             name: ck.name,
             description: ck.description,
-            minimumLevel: ck.minimumLevel,
+            permissions: ck.permissions,
             keyPreview: ck.key.slice(0, 12) + '…',
             createdBy: ck.createdBy,
             createdAt: ck.createdAt,
@@ -135,14 +147,20 @@ export class ApiKeysSectionComponent implements OnInit {
     });
   }
 
-  levelLabel(index: number): string {
-    return LEVELS[index] ?? 'Verbose';
+  /** Human label for a key's permission bit-set (table column). */
+  permLabel(perms: number): string {
+    if ((perms & (ApiKeyPermission.Logs | TRACES_METRICS)) === (ApiKeyPermission.Logs | TRACES_METRICS)) return 'All';
+    const parts: string[] = [];
+    if (perms & ApiKeyPermission.Logs) parts.push('Logs');
+    if (perms & TRACES_METRICS) parts.push('Traces & Metrics');
+    return parts.length ? parts.join(', ') : 'None';
   }
 
   private resetForm(): void {
     this.newName.set('');
     this.newDescription.set('');
-    this.newMinimumLevel.set(0);
     this.newKeyManual.set('');
+    this.permLogs.set(true);
+    this.permTracesMetrics.set(true);
   }
 }

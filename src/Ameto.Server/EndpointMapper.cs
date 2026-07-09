@@ -40,12 +40,12 @@ public static class EndpointMapper
         // Hot path: validated via in-memory ApiKeyCache (no JWT, no DB hit).
         app.MapPost("/api/events", async (HttpContext ctx, IngestionEndpoint ingestion, ApiKeyCache cache) =>
         {
-            var key = ExtractApiKey(ctx.Request);
-            if (key is null || !cache.Validate(key.AsSpan()))
+            var key = Ameto.Ingestion.ApiKeyHeader.Extract(ctx.Request);
+            if (key is null || !cache.Validate(key.AsSpan(), Ameto.Ingestion.ApiKeyPermissions.Logs))
             {
                 ctx.Response.StatusCode  = StatusCodes.Status401Unauthorized;
                 ctx.Response.ContentType = "application/json";
-                await ctx.Response.WriteAsync("{\"error\":\"Valid API key required.\"}" );
+                await ctx.Response.WriteAsync("{\"error\":\"Valid API key with Logs permission required.\"}" );
                 return;
             }
             await ingestion.HandleAsync(ctx);
@@ -437,20 +437,6 @@ public static class EndpointMapper
         return (int)Math.Ceiling(raw / 604_800.0) * 604_800;
     }
 
-    private static string? ExtractApiKey(HttpRequest req)
-    {
-        if (req.Headers.TryGetValue("X-Seq-ApiKey", out var v) && v.Count > 0)
-            return v[0];
-
-        var header = req.Headers.Authorization.ToString();
-        if (header.StartsWith("apikey ", StringComparison.OrdinalIgnoreCase))
-            return header["apikey ".Length..].Trim();
-
-        if (req.Query.TryGetValue("apiKey", out var qs) && qs.Count > 0)
-            return qs[0];
-
-        return null;
-    }
 }
 
 // ── Dynamic object converter ──────────────────────────────────────────────────

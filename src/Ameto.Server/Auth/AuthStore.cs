@@ -1,7 +1,7 @@
 using System.Security.Cryptography;
 using System.Text;
 using Microsoft.Data.Sqlite;
-using CoreLogLevel = Ameto.Core.LogLevel;
+using Ameto.Ingestion;
 
 namespace Ameto.Server.Auth;
 
@@ -20,7 +20,7 @@ internal sealed record ApiKeyRecord(
     string Id,
     string Name,
     string Description,
-    CoreLogLevel MinimumLevel,
+    ApiKeyPermissions Permissions,
     string KeyHash,
     string CreatedBy,
     DateTimeOffset CreatedAt)
@@ -340,27 +340,28 @@ internal sealed class AuthStore
     {
         using var conn = _db.Open();
         using var cmd  = conn.CreateCommand();
-        cmd.CommandText = "SELECT id, name, description, minimum_level, key_hash, created_by, created_at FROM api_keys ORDER BY created_at";
+        cmd.CommandText = "SELECT id, name, description, permissions, key_hash, created_by, created_at FROM api_keys ORDER BY created_at";
         using var r    = cmd.ExecuteReader();
         var result = new List<ApiKeyRecord>();
         while (r.Read())
             result.Add(new(r.GetString(0), r.GetString(1), r.GetString(2),
-                           (CoreLogLevel)r.GetInt32(3), r.GetString(4), r.GetString(5),
+                           (ApiKeyPermissions)r.GetInt32(3), r.GetString(4), r.GetString(5),
                            DateTimeOffset.Parse(r.GetString(6))));
         return result;
     }
 
     public ApiKeyRecord CreateApiKey(
-        string name, string description, CoreLogLevel minimumLevel, string createdBy, string? manualKey = null)
+        string name, string description, ApiKeyPermissions permissions, string createdBy, string? manualKey = null)
     {
+        // Auto-generated keys are a plain 48-char lowercase-hex token (no prefix);
+        // a manual key is used verbatim.
         var key = manualKey?.Trim() is { Length: > 0 } mk
             ? mk
-            : "rdl_" + Convert.ToBase64String(
-                  SHA256.HashData(RandomNumberGenerator.GetBytes(32)));
+            : Convert.ToHexString(RandomNumberGenerator.GetBytes(24)).ToLowerInvariant();
 
         var hash = KeyHash(key);
         var rec  = new ApiKeyRecord(
-            Guid.NewGuid().ToString("N"), name, description, minimumLevel, hash,
+            Guid.NewGuid().ToString("N"), name, description, permissions, hash,
             createdBy, DateTimeOffset.UtcNow)
         {
             Key = key,
@@ -369,13 +370,13 @@ internal sealed class AuthStore
         using var conn = _db.Open();
         using var cmd  = conn.CreateCommand();
         cmd.CommandText = """
-            INSERT INTO api_keys (id, name, description, minimum_level, key_hash, created_by, created_at)
-            VALUES (@id, @n, @desc, @ml, @h, @cb, @ca)
+            INSERT INTO api_keys (id, name, description, permissions, key_hash, created_by, created_at)
+            VALUES (@id, @n, @desc, @perm, @h, @cb, @ca)
             """;
         cmd.Parameters.AddWithValue("@id",   rec.Id);
         cmd.Parameters.AddWithValue("@n",    rec.Name);
         cmd.Parameters.AddWithValue("@desc", rec.Description);
-        cmd.Parameters.AddWithValue("@ml",   (int)rec.MinimumLevel);
+        cmd.Parameters.AddWithValue("@perm", (int)rec.Permissions);
         cmd.Parameters.AddWithValue("@h",    hash);
         cmd.Parameters.AddWithValue("@cb",   rec.CreatedBy);
         cmd.Parameters.AddWithValue("@ca",   rec.CreatedAt.ToString("O"));

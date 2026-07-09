@@ -1,0 +1,164 @@
+/* Fixed-height (29px) collapsed log row — extracted from the old EventRow
+   `.ev-main`. Height is pinned and overflow clipped so rows stay uniform for
+   virtual scrolling; the detail panel lives in a separate drawer. */
+:host {
+  display: block;
+  position: relative;
+  height: 29px;
+  box-sizing: border-box;
+  overflow: hidden;
+  border-bottom: 1px solid rgba(255, 255, 255, .03);
+  --lc: var(--lvl-i);
+  font-family: var(--font-mono);
+  font-size: var(--log-font-size);
+  line-height: var(--log-line-height);
+  letter-spacing: var(--log-letter-spacing);
+  font-variant-ligatures: none;
+  font-feature-settings: normal;
+  text-rendering: optimizeLegibility;
+  transition: background 120ms ease;
+}
+
+/* Level-specific stripe colour + badge background */
+:host.ev-verbose     { --lc: var(--lvl-v); --lc-bg: var(--lvl-v-bg); }
+:host.ev-debug       { --lc: var(--lvl-d); --lc-bg: var(--lvl-d-bg); }
+:host.ev-information { --lc: var(--lvl-i); --lc-bg: var(--lvl-i-bg); }
+:host.ev-warning     { --lc: var(--lvl-w); --lc-bg: var(--lvl-w-bg); }
+:host.ev-error       { --lc: var(--lvl-e); --lc-bg: var(--lvl-e-bg); }
+:host.ev-fatal       { --lc: var(--lvl-f); --lc-bg: var(--lvl-f-bg); }
+
+:host:hover .ev-main { background: rgba(255, 255, 255, .03); }
+
+/* Subtle row tint by severity — only for warning/error/fatal */
+:host.ev-warning  .ev-main { background: color-mix(in srgb, var(--lvl-w-bg) 30%, transparent); }
+:host.ev-error    .ev-main { background: color-mix(in srgb, var(--lvl-e-bg) 30%, transparent); }
+:host.ev-fatal    .ev-main { background: color-mix(in srgb, var(--lvl-f-bg) 30%, transparent); }
+:host.ev-warning:hover .ev-main { background: color-mix(in srgb, var(--lvl-w-bg) 50%, transparent); }
+:host.ev-error:hover   .ev-main { background: color-mix(in srgb, var(--lvl-e-bg) 50%, transparent); }
+:host.ev-fatal:hover   .ev-main { background: color-mix(in srgb, var(--lvl-f-bg) 50%, transparent); }
+
+/* Selected — this row is the one open in the detail drawer. Declared after the
+   severity/hover tints so it wins at equal specificity. */
+:host.selected .ev-main {
+  background: color-mix(in srgb, var(--accent) 20%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+/* Live tail — a just-arrived event flashes accent for ~1s, then fades out.
+   The `.is-new` class is dropped by the store after 1s, matching the animation. */
+:host.is-new .ev-main {
+  animation: ev-row-flash 1s ease-out;
+}
+@keyframes ev-row-flash {
+  0%   { background: color-mix(in srgb, var(--accent) 45%, transparent); }
+  55%  { background: color-mix(in srgb, var(--accent) 25%, transparent); }
+  100% { background: transparent; }
+}
+:host.selected:hover .ev-main {
+  background: color-mix(in srgb, var(--accent) 26%, transparent);
+}
+
+/* ── Main row ─────────────────────────────────────────────────────── */
+.ev-main {
+  display: flex;
+  align-items: center;
+  height: 100%;
+  cursor: pointer;
+  gap: 0;
+  padding-right: 8px;
+  transition: background 120ms ease;
+}
+
+.ev-stripe {
+  width: 3px;
+  min-width: 3px;
+  align-self: stretch;
+  background: var(--lc);
+  flex-shrink: 0;
+  margin-right: 8px;
+  opacity: .9;
+}
+
+.ev-ts {
+  flex-shrink: 0;
+  width: 160px;
+  color: var(--txt);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  cursor: default;
+  padding-right: 6px;
+}
+
+.ev-level {
+  flex-shrink: 0;
+  width: 45px;
+  display: flex;
+  align-items: center;
+  padding-right: 6px;
+}
+.ev-lvl-badge {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: .3px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--lc-bg, rgba(255, 255, 255, .06));
+  color: var(--lc);
+  white-space: nowrap;
+}
+
+.ev-svc {
+  flex-shrink: 0;
+  max-width: 200px;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  overflow: hidden;
+  padding-right: 12px;
+  color: var(--txt-muted);
+}
+.ev-svc-icon {
+  flex-shrink: 0;
+  opacity: .65;
+  color: var(--svc-color, #A78BFA);
+}
+.ev-svc-name {
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--svc-color, #A78BFA);
+  opacity: .85;
+}
+
+.ev-msg {
+  flex: 1;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: var(--log-font-size);
+  cursor: pointer;
+  min-width: 0;
+}
+.ev-msg:hover { color: var(--txt); }
+
+/* Wrap mode: let the message wrap instead of truncating. The row height stays
+   fixed (host clips overflow) — the full message lives in the drawer. */
+:host.ev-wrap-mode .ev-main { align-items: flex-start; padding-top: 6px; }
+:host.ev-wrap-mode .ev-msg  { white-space: pre-wrap; overflow: hidden; text-overflow: clip; word-break: break-word; }
+
+.ev-props-hint {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  padding: 0 8px;
+  max-width: 320px;
+  overflow: hidden;
+}
+.ev-kv { display: flex; gap: 0; overflow: hidden; max-width: 120px; }
+.ev-pk { color: #718096; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 11px; }
+.ev-pv { color: var(--c-str); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 11px; max-width: 60px; }
+.ev-sep { color: #4A5568; }
+.ev-more-props { color: #4A5568; font-size: 10px; flex-shrink: 0; }

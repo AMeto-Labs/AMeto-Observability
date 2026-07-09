@@ -1,0 +1,221 @@
+/* ── Main toolbar ────────────────────────────────────────────────── */
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: var(--toolbar-h);
+  padding: 8px 10px;
+  background: rgba(11,16,32,.80);
+  backdrop-filter: blur(12px);
+  border-bottom: 1px solid #24304F;
+  flex-shrink: 0;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+.filter-wrap {
+  flex: 1;
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  background: #111827;
+  border: 1px solid #24304F;
+  border-radius: 12px;
+  padding: 4px 8px;
+  min-height: 28px;
+  backdrop-filter: blur(12px);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.03), 0 8px 24px rgba(0,0,0,.25);
+  transition: border-color .12s;
+}
+.filter-wrap:focus-within { border-color: var(--accent); }
+.filter-icon { color: var(--txt-dim); flex-shrink: 0; margin-top: 2px; }
+
+/* ── Filter highlight overlay ────────────────────────────────────── */
+.filter-hl-wrap {
+  flex: 1;
+  position: relative;
+  min-width: 0;
+  display: block;
+  font-family: var(--font-mono);
+  font-size: var(--log-font-size);
+  line-height: var(--log-line-height);
+  letter-spacing: var(--log-letter-spacing);
+  font-variant-ligatures: none;
+  font-feature-settings: normal;
+  text-rendering: optimizeLegibility;
+}
+.filter-hl {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow: hidden;
+  padding: 0;
+  margin: 0;
+  font-size: inherit;
+  font-family: inherit;
+  font-weight: inherit;
+  letter-spacing: inherit;
+  line-height: 1.4;
+}
+
+/* Token colours */
+.filter-hl ::ng-deep .fh-str   { color: var(--lvl-i);      }
+.filter-hl ::ng-deep .fh-kw    { color: var(--accent);      }
+.filter-hl ::ng-deep .fh-op    { color: var(--txt-dim);     }
+.filter-hl ::ng-deep .fh-num   { color: var(--lvl-w);       }
+.filter-hl ::ng-deep .fh-paren { color: var(--txt-muted);   }
+.filter-hl ::ng-deep .fh-ident { color: var(--txt); font-weight: 500; }
+
+.filter-input {
+  position: relative;
+  display: block;
+  width: 100%;
+  background: none;
+  border: none;
+  outline: none;
+  padding: 0;
+  margin: 0;
+  resize: none;
+  overflow: hidden;
+  font: inherit;
+  line-height: 1.4;
+  color: transparent;
+  caret-color: var(--accent);
+  min-width: 0;
+}
+.filter-input::placeholder { color: var(--txt-dim); }
+
+/* ── Filter autocomplete popup ──────────────────────────────────── */
+.suggest-pop {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  min-width: 220px;
+  max-width: 420px;
+  max-height: 260px;
+  overflow-y: auto;
+  background: var(--surface-up);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow);
+  list-style: none;
+  margin: 0;
+  padding: 4px 0;
+  z-index: 50;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.suggest-item {
+  padding: 3px 10px;
+  color: var(--txt);
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.suggest-item.active,
+.suggest-item:hover { background: var(--accent-bg); }
+
+.filter-clear {
+  background: none; border: none;
+  color: var(--txt-dim); padding: 2px;
+  display: flex; align-items: center;
+  border-radius: 2px;
+  margin-top: 1px;
+}
+.filter-clear:hover { color: var(--txt); }
+
+.kbd-hint {
+  flex-shrink: 0;
+  font-size: 10px;
+  color: var(--txt-dim);
+  background: var(--surface-hover);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 5px;
+  margin-top: 2px;
+  letter-spacing: 0;
+  font-family: var(--ui);
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+/* ── Toolbar right section ──────────────────────────────────────── */
+.toolbar-right {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.sep-v {
+  width: 1px;
+  height: 18px;
+  background: var(--border);
+  flex-shrink: 0;
+  margin: 0 2px;
+}
+
+.tb-live-btn {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  border-radius: var(--radius-sm);
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--txt-muted);
+  font-size: 11px;
+  font-family: var(--ui);
+  transition: all .12s;
+}
+.tb-live-btn:hover { color: var(--txt); border-color: var(--txt-muted); }
+.tb-live-btn.live-on { color: var(--lvl-e); border-color: var(--lvl-e); background: var(--lvl-e-bg); }
+
+.live-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--txt-dim);
+  flex-shrink: 0;
+  transition: background .15s;
+}
+.live-dot.on {
+  background: var(--lvl-e);
+  box-shadow: 0 0 6px var(--lvl-e);
+  animation: pulse-dot 1.2s ease-in-out infinite;
+}
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .5; }
+}
+
+.tb-icon-btn {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  width: 28px;
+  height: 28px;
+  justify-content: center;
+  border-radius: var(--radius-sm);
+  background: none;
+  border: none;
+  color: var(--txt-dim);
+  padding: 0;
+  transition: color .1s, background .1s;
+}
+.tb-icon-btn:hover { color: var(--txt); background: var(--surface-hover); }
+.tb-icon-btn--on { color: var(--accent); background: var(--accent-dim); }
+.tb-icon-btn--on:hover { color: var(--accent); background: var(--accent-dim); }
+
+/* Apply button accent (shared class name with the old action bar) */
+.fb-apply-btn {
+  color: var(--accent) !important;
+  border-color: var(--accent) !important;
+  background: var(--accent-dim) !important;
+}
+.fb-apply-btn:hover { opacity: .85; }
+.fb-apply-btn:disabled { opacity: .35; cursor: default; }

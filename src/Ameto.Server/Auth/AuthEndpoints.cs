@@ -2,7 +2,7 @@ using System.Security.Claims;
 using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Google;
 using Microsoft.AspNetCore.Authentication.MicrosoftAccount;
-using CoreLogLevel = Ameto.Core.LogLevel;
+using Ameto.Ingestion;
 
 namespace Ameto.Server.Auth;
 
@@ -226,7 +226,7 @@ internal static class AuthEndpoints
             Results.Ok(store.ListApiKeys().Select(k => new
             {
                 k.Id, k.Name, k.Description,
-                MinimumLevel = (int)k.MinimumLevel,
+                Permissions = (int)k.Permissions,
                 k.CreatedBy,
                 KeyPreview = k.KeyHash[..8] + "…",
                 CreatedAt  = k.CreatedAt.ToString("O"),
@@ -241,16 +241,17 @@ internal static class AuthEndpoints
                 return Results.BadRequest(new { error = "Name is required." });
 
             var createdBy = ctx.User.FindFirst(ClaimTypes.Name)?.Value ?? "unknown";
-            var minLevel = req.MinimumLevel is { } ml && ml >= CoreLogLevel.Verbose && ml <= CoreLogLevel.Fatal
-                ? ml : CoreLogLevel.Verbose;
+            // Mask to known bits; empty/None grants everything (a key with no scope is useless).
+            var permissions = (ApiKeyPermissions)(req.Permissions ?? 0) & ApiKeyPermissions.All;
+            if (permissions == ApiKeyPermissions.None) permissions = ApiKeyPermissions.All;
             var rec = store.CreateApiKey(
                 req.Name.Trim(), req.Description?.Trim() ?? string.Empty,
-                minLevel, createdBy, req.Key?.Trim());
+                permissions, createdBy, req.Key?.Trim());
             cache.Invalidate();
             return Results.Ok(new
             {
                 rec.Id, rec.Name, rec.Description,
-                MinimumLevel = (int)rec.MinimumLevel,
+                Permissions = (int)rec.Permissions,
                 rec.Key, rec.CreatedBy,
                 CreatedAt = rec.CreatedAt.ToString("O"),
             });
@@ -279,5 +280,5 @@ internal sealed record CreateApiKeyRequest(
     string Name,
     string? Key = null,
     string? Description = null,
-    CoreLogLevel? MinimumLevel = null);
+    int? Permissions = null);
 

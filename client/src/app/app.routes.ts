@@ -23,10 +23,6 @@ export const routes: Routes = [
         loadComponent: () => import('./pages/events/events').then(m => m.EventsComponent),
       },
       {
-        path: 'live',
-        loadComponent: () => import('./pages/live/live').then(m => m.LiveComponent),
-      },
-      {
         path: 'signals',
         loadComponent: () => import('./pages/signals/signals').then(m => m.SignalsPageComponent),
       },

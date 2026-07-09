@@ -1,193 +1,66 @@
 <div class="events-page">
 
-  <!-- ── Row 1: Main filter bar ──────────────────────────────────────── -->
-  <div class="toolbar">
-    <div class="filter-wrap">
-      <lucide-icon name="search" [size]="13" class="filter-icon" />
-      <div class="filter-hl-wrap">
-        <div class="filter-hl" [innerHTML]="filterHighlight()" aria-hidden="true"></div>
-        <textarea
-          #filterEl
-          class="filter-input"
-          placeholder="Filter expression… (Enter = run, Ctrl+Enter = newline, Ctrl+Space = suggest)"
-          [rows]="filterRows()"
-          (input)="onFilterInput($any($event.target).value)"
-          (keydown)="onFilterKeydown($event)"
-          (blur)="closeSuggest()"
-          spellcheck="false"
-          autocomplete="off"
-          wrap="soft"></textarea>
-        @if (suggestOpen() && suggestItems().length) {
-          <div class="suggest-pop" role="listbox" aria-label="Filter suggestions" (mousedown)="$event.preventDefault()">
-            @for (item of suggestItems(); track item; let i = $index) {
-              <div
-                class="suggest-item"
-                role="option"
-                [class.active]="i === suggestIndex()"
-                (mouseenter)="suggestIndex.set(i)"
-                (click)="selectSuggestion(item)">{{ item }}</div>
-            }
-          </div>
-        }
-      </div>
-      @if (filterInput()) {
-        <button class="filter-clear" (click)="applyFilter('')" title="Clear filter">
-          <lucide-icon name="x" [size]="12" />
-        </button>
-      }
-      <span class="kbd-hint">Ctrl+Space</span>
-    </div>
-
-    <div class="toolbar-right">
-      <div class="sep-v"></div>
-      <button class="tb-live-btn fb-apply-btn" [disabled]="!canSearch()" (click)="search()">
-        <lucide-icon name="play" [size]="12" />
-        Apply
-      </button>
-      <button class="tb-live-btn" (click)="resetAll()">
-        <lucide-icon name="x" [size]="12" />
-        Clear
-      </button>
-      <div class="sep-v"></div>
-      <button
-        class="tb-live-btn"
-        [class.live-on]="liveActive()"
-        (click)="toggleLive()"
-        title="Live tail">
-        <span class="live-dot" [class.on]="liveActive()"></span>
-        <span>Live</span>
-      </button>
-      <button
-        class="tb-icon-btn"
-        [class.tb-icon-btn--on]="signalsPanelOpen()"
-        (click)="signalsPanelOpen.update(v => !v)"
-        title="Signals / Alerts">
-        <lucide-icon name="bell" [size]="16" [strokeWidth]="1.5" />
-      </button>
-    </div>
-  </div>
-
-  <!-- ── Row 2: Filter options bar ───────────────────────────────────── -->
-  <div class="filter-bar">
-  <div class="filter-bar-inner">
-
-    <!-- Date range -->
-    <div class="fb-group" (click)="$event.stopPropagation()">
-      <button #dateBtn class="fb-btn" [class.open]="dateDropdownOpen()" (click)="openDate(dateBtn)">
-        <lucide-icon name="calendar" [size]="13" />
-        <span>{{ dateRangeLabel() }}</span>
-        <lucide-icon name="chevron-down" [size]="11" class="fb-caret" [class.rotated]="dateDropdownOpen()" />
-      </button>
-    </div>
-
-    <!-- All levels -->
-    <div class="fb-group" (click)="$event.stopPropagation()">
-      <button #levelsBtn class="fb-btn" [class.open]="levelsDropdownOpen()" [class.filtered]="!allLevelsActive()" (click)="openLevels(levelsBtn)">
-        <lucide-icon name="sparkles" [size]="13" />
-        <span>{{ levelsLabel() }}</span>
-        <lucide-icon name="chevron-down" [size]="11" class="fb-caret" [class.rotated]="levelsDropdownOpen()" />
-      </button>
-    </div>
-
-    <!-- All services -->
-    <div class="fb-group" (click)="$event.stopPropagation()">
-      <button #svcBtn class="fb-btn" [class.open]="serviceDropdownOpen()" [class.filtered]="selectedServices().size > 0" (click)="openServices(svcBtn)">
-        <lucide-icon name="boxes" [size]="13" />
-        <span>{{ serviceLabel() }}</span>
-        <lucide-icon name="chevron-down" [size]="11" class="fb-caret" [class.rotated]="serviceDropdownOpen()" />
-      </button>
-    </div>
-
-    <!-- Level count chips -->
-    <div class="sep-v"></div>
-    <div class="lc-chips">
-      <button class="lc-chip lc-all" [class.active]="allLevelsActive()" (click)="toggleAllLevels()">
-        ALL <span class="lc-num">{{ fmtCount(totalCount()) }}</span>
-      </button>
-      @for (lvl of levelItems; track lvl.key) {
-        <button
-          class="lc-chip"
-          [class.active]="isLevelActive(lvl.key)"
-          [attr.data-level]="lvl.key.toLowerCase()"
-          (click)="toggleLevel(lvl.key)">
-          {{ lvl.short }} <span class="lc-num">{{ fmtCount(levelCounts()[lvl.key.toLowerCase()]) }}</span>
-        </button>
-      }
-    </div>
-    <div class="sep-v"></div>
-
-    <!-- Page size (right-aligned) -->
-    <select
-      class="page-size-select"
-      (change)="onPageSizeChange($any($event.target).value)"
-      title="Events per request">
-      @for (n of pageSizeOptions; track n) {
-        <option [value]="n" [selected]="n === pageSize()">{{ n }}</option>
-      }
-    </select>
-  </div>
-  </div>
+  <app-events-toolbar />
+  <app-events-filter-bar />
 
   <!-- ── Main body ────────────────────────────────────────────────────── -->
   <div class="events-body">
     <div class="events-list-wrap">
       <!-- Column headers -->
       <div class="events-header">
-        <span class="ev-h-expand"></span>
         <span class="ev-h-stripe"></span>
         <span class="ev-h-col ev-h-ts">TIME <lucide-icon name="arrow-up" [size]="10" /></span>
         <span class="ev-h-col ev-h-lvl">LEVEL</span>
         <span class="ev-h-col ev-h-svc">SERVICE</span>
         <span class="ev-h-col ev-h-msg">
           MESSAGE
-          <button class="ev-h-wrap-btn tb-icon-btn" [class.tb-icon-btn--on]="wrapMessages()" (click)="wrapMessages.update(v => !v)" title="Wrap messages">
+          <button class="ev-h-wrap-btn tb-icon-btn" [class.tb-icon-btn--on]="store.wrapMessages()" (click)="store.toggleWrap()" title="Wrap messages">
             <lucide-icon name="text-wrap" [size]="13" [strokeWidth]="1.5" />
           </button>
         </span>
       </div>
 
-      @if (loading()) {
+      @if (store.loading()) {
         <div class="loading-bar"></div>
       }
-      @if (error()) {
+      @if (store.error()) {
         <div class="error-banner">
           <lucide-icon name="circle-alert" [size]="14" />
-          {{ error() }}
-          <button class="err-retry" (click)="loadEvents()">Retry</button>
+          {{ store.error() }}
+          <button class="err-retry" (click)="store.loadEvents()">Retry</button>
         </div>
       }
-      <!-- Single virtual-scroll container — TanStack handles fixed + expanded rows -->
+
+      <!-- Fixed-height virtual list -->
       <div #eventsScroll class="events-list" (scroll)="onEventsScroll($event)">
         <div [style.height.px]="virtualizer.getTotalSize()" style="position:relative">
           @for (vRow of virtualizer.getVirtualItems(); track vRow.key) {
-            <div
-              class="ev-vrow"
-              [attr.data-index]="vRow.index"
-              [style.transform]="'translateY(' + vRow.start + 'px)'"
-              [vmeasure]="measureRow">
-              <app-event-row
-                [event]="displayedEvents()[vRow.index]"
-                [wrap]="wrapMessages()"
-                [expandedEventIds]="expandedEventIds()"
-                (expandRequested)="onExpandRequested($event)"
-                (filterSelected)="applyFilter($event)"
-                (seekRequested)="seek($event.from, $event.to)"
-                (timeRangeBound)="onTimeRangeBound($event)"
-              />
+            @let ev = store.displayedEvents()[vRow.index];
+            <div class="ev-vrow" [style.transform]="'translateY(' + vRow.start + 'px)'">
+              @if (ev) {
+                <app-event-list-row
+                  [event]="ev"
+                  [selected]="ev.id === store.selectedId()"
+                  [wrap]="store.wrapMessages()"
+                  [isNew]="store.newEventIds().has(ev.id)"
+                  (selectRequested)="store.selectEvent(ev.id)"
+                  (filterSelected)="store.applyFilter($event)"
+                />
+              }
             </div>
           }
         </div>
-        @if (loadingMore()) {
+        @if (store.loadingMore()) {
           <div class="load-more"><span class="load-more-spin"></span></div>
         }
-        @if (!loading() && !error() && displayedEvents().length === 0) {
+        @if (!store.loading() && !store.error() && store.displayedEvents().length === 0) {
           <app-empty-state icon="inbox" text="No events match the current filter"></app-empty-state>
         }
       </div>
 
       <!-- Footer -->
       <div class="events-footer">
-        <span class="ev-footer-count">Showing {{ displayedEvents().length }} of {{ fmtCount(totalCount()) }} events</span>
+        <span class="ev-footer-count">Showing {{ store.displayedEvents().length }} of {{ fmtCount(store.totalCount()) }} events</span>
         <div class="ev-footer-nav">
           <button class="ev-footer-btn" (click)="scrollToOlderLogs()">
             <lucide-icon name="arrow-down" [size]="12" /> Older logs
@@ -196,20 +69,32 @@
             <lucide-icon name="arrow-up" [size]="12" /> Newer logs
           </button>
         </div>
-        <button class="ev-footer-live" (click)="toggleLive()">
+        <button class="ev-footer-live" (click)="store.toggleLive()">
           Jump to live <lucide-icon name="arrow-right" [size]="12" />
         </button>
       </div>
     </div>
 
-    @if (signalsPanelOpen()) {
+    <!-- Detail drawer -->
+    @if (store.selectedEvent(); as ev) {
+      <div class="event-drawer">
+        <app-event-detail
+          [event]="ev"
+          (closed)="store.selectEvent(null)"
+          (filterSelected)="store.applyFilter($event)"
+          (seekRequested)="store.seek($event.from, $event.to)"
+          (timeRangeBound)="store.onTimeRangeBound($event)"
+        />
+      </div>
+    }
+
+    @if (store.signalsPanelOpen()) {
       <app-signals-panel
-        [currentFilter]="filter()"
-        (filterSelected)="applyFilter($event)"
-        (closed)="signalsPanelOpen.set(false)"
+        [currentFilter]="store.filter()"
+        (filterSelected)="store.applyFilter($event)"
+        (closed)="store.toggleSignalsPanel()"
       />
     }
   </div>
 
 </div>
-

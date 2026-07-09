@@ -11,11 +11,18 @@ export interface UserDto {
   createdAt: string;
 }
 
+/** API-key ingest permission bit flags (mirror of the server's ApiKeyPermissions). */
+export const enum ApiKeyPermission {
+  Logs    = 1,
+  Traces  = 2,
+  Metrics = 4,
+}
+
 export interface ApiKeyDto {
   id: string;
   name: string;
   description: string;
-  minimumLevel: number;
+  permissions: number;
   keyPreview: string;
   createdBy: string;
   createdAt: string;
@@ -25,7 +32,7 @@ export interface CreatedApiKeyDto {
   id: string;
   name: string;
   description: string;
-  minimumLevel: number;
+  permissions: number;
   key: string;
   createdBy: string;
   createdAt: string;

@@ -70,6 +70,8 @@ internal static class AuthServiceExtensions
         services.AddSingleton<AuthStore>();
         services.AddSingleton(issuer);
         services.AddSingleton<ApiKeyCache>();
+        // Expose the cache as the ingest-path validator (used by OTLP endpoints in Ameto.Otel).
+        services.AddSingleton<Ameto.Ingestion.IApiKeyValidator>(sp => sp.GetRequiredService<ApiKeyCache>());
         services.AddSingleton(authOptions);
 
         // ── Authentication ─────────────────────────────────────────────────────

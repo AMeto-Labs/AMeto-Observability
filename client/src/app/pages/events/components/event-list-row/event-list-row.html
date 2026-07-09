@@ -1,0 +1,42 @@
+@if (event(); as ev) {
+  <div class="ev-main" (click)="onRowClick()">
+    <span class="ev-stripe"></span>
+    <span class="ev-ts" [title]="ev['@t']">{{ ev['@t'] | date: 'yyyy-MM-dd HH:mm:ss.SSS' }}</span>
+    <span class="ev-level">
+      <span class="ev-lvl-badge">{{ levelShort() }}</span>
+    </span>
+    @if (service()) {
+      <span class="ev-svc">
+        <lucide-icon name="box" [size]="12" class="ev-svc-icon" />
+        <span class="ev-svc-name">{{ service() }}</span>
+      </span>
+    }
+    <span class="ev-msg" [innerHTML]="renderedHtml()" (contextmenu)="openMessageMenu($event)"></span>
+    @if (propsCount() > 0) {
+      <span class="ev-props-hint">
+        @for (kv of topProps(); track kv.k) {
+          <span class="ev-kv">
+            <span class="ev-pk">{{ kv.k }}</span
+            ><span class="ev-sep"> = </span><span class="ev-pv">{{ kv.v }}</span>
+          </span>
+        }
+        @if (propsCount() > 3) {
+          <span class="ev-more-props">+{{ propsCount() - 3 }}</span>
+        }
+      </span>
+    }
+  </div>
+}
+
+<!-- Lightweight message quick-filter menu (rendered into a CDK overlay) -->
+<ng-template #ctxMenuTpl>
+  <div class="ctx-menu">
+    <div class="ctx-label">Message</div>
+    <button (click)="findSimilar()">
+      <lucide-icon name="list-filter" [size]="13" />Find all like this
+    </button>
+    <button (click)="excludeSimilar()">
+      <lucide-icon name="ban" [size]="13" />Exclude these
+    </button>
+  </div>
+</ng-template>

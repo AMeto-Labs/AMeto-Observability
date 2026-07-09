@@ -15,7 +15,7 @@
         <tr>
           <th>Name</th>
           <th>Description</th>
-          <th>Min level</th>
+          <th>Permissions</th>
           <th>Key</th>
           <th>Created by</th>
           <th>Created</th>
@@ -27,7 +27,7 @@
           <tr>
             <td>{{ k.name }}</td>
             <td class="muted">{{ k.description || '—' }}</td>
-            <td><span class="level-pill">{{ levelLabel(k.minimumLevel) }}</span></td>
+            <td><span class="level-pill">{{ permLabel(k.permissions) }}</span></td>
             <td class="mono muted">{{ k.keyPreview }}</td>
             <td class="muted">{{ k.createdBy }}</td>
             <td class="muted">{{ k.createdAt | date: 'yyyy-MM-dd' }}</td>
@@ -65,15 +65,20 @@
       <span class="label">Description</span>
       <input class="field-input" placeholder="What is this key used for?" [ngModel]="newDescription()" (ngModelChange)="newDescription.set($event)" />
     </label>
-    <label class="field">
-      <span class="label">Minimum level</span>
-      <select class="field-select" [ngModel]="newMinimumLevel()" (ngModelChange)="newMinimumLevel.set(+$event)">
-        @for (lvl of levels; track lvl; let i = $index) {
-          <option [value]="i">{{ lvl }}+</option>
-        }
-      </select>
-      <span class="hint">Events below this level will be rejected by this key (business logic applied later).</span>
-    </label>
+    <div class="field">
+      <span class="label">Permissions</span>
+      <label class="perm-row">
+        <input type="checkbox" [checked]="permLogs()" (change)="permLogs.set($any($event.target).checked)" />
+        <span class="perm-name">Logs</span>
+        <span class="perm-hint">POST /api/events · /otlp/v1/logs</span>
+      </label>
+      <label class="perm-row">
+        <input type="checkbox" [checked]="permTracesMetrics()" (change)="permTracesMetrics.set($any($event.target).checked)" />
+        <span class="perm-name">Traces &amp; Metrics</span>
+        <span class="perm-hint">/otlp/v1/traces · /otlp/v1/metrics</span>
+      </label>
+      <span class="hint">Which ingest endpoints this key may write to.</span>
+    </div>
     <label class="field">
       <span class="label">Manual key (optional)</span>
       <input class="field-input" placeholder="Leave empty to auto-generate" [ngModel]="newKeyManual()" (ngModelChange)="newKeyManual.set($event)" />

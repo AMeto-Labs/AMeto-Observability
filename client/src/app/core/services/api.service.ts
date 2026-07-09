@@ -171,9 +171,9 @@ export class ApiService {
 
   // ── API Keys ───────────────────────────────────────────────────────────────
   getApiKeys(): Observable<ApiKeyDto[]>       { return this.http.get<ApiKeyDto[]>('/api/auth/keys'); }
-  createApiKey(name: string, description: string, minimumLevel: number, key?: string): Observable<CreatedApiKeyDto> {
+  createApiKey(name: string, description: string, permissions: number, key?: string): Observable<CreatedApiKeyDto> {
     return this.http.post<CreatedApiKeyDto>('/api/auth/keys', {
-      name, description, minimumLevel, key: key || null,
+      name, description, permissions, key: key || null,
     });
   }
   deleteApiKey(id: string): Observable<void>  { return this.http.delete<void>(`/api/auth/keys/${id}`); }

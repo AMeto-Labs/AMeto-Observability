@@ -1,0 +1,522 @@
+@let ev = event();
+
+<div class="ev-detail" [attr.data-level]="levelKey()">
+
+  <!-- ── Header: severity + timestamp + service + close ─────────────── -->
+  <header class="d-head">
+    <span class="ev-log-badge" [attr.data-level]="levelKey()">{{ ev['@l'] }}</span>
+    <div class="d-head-meta">
+      <span class="d-head-ts">{{ ev['@t'] | date: 'yyyy-MM-dd HH:mm:ss.SSS' }}</span>
+      @if (service()) {
+        <span class="d-head-svc" title="Service">
+          <lucide-icon name="box" [size]="11" />{{ service() }}
+        </span>
+      }
+    </div>
+    <button class="d-close" (click)="closed.emit()" title="Close" aria-label="Close detail">
+      <lucide-icon name="x" [size]="16" />
+    </button>
+  </header>
+
+  <!-- ── Message hero — always visible ──────────────────────────────── -->
+  <div class="d-message">
+    <div class="d-message-text" [innerHTML]="renderedHtml()"></div>
+    <button
+      class="d-msg-copy"
+      [class.done]="copiedKey() === 'message'"
+      (click)="copyMessage()"
+      title="Copy message">
+      <lucide-icon [name]="copiedKey() === 'message' ? 'check' : 'copy'" [size]="12" />
+    </button>
+  </div>
+
+  <!-- ── Tabs ───────────────────────────────────────────────────────── -->
+  <nav class="ev-tabs">
+    @if (hasException()) {
+      <button class="tab-exc" [class.active]="detailTab() === 'exception'" (click)="detailTab.set('exception')">
+        <lucide-icon name="circle-alert" [size]="12" /> Exception
+      </button>
+    }
+    <button [class.active]="detailTab() === 'overview'" (click)="detailTab.set('overview')">Overview</button>
+    <button [class.active]="detailTab() === 'json'" (click)="detailTab.set('json')">JSON</button>
+    <button [class.active]="detailTab() === 'trace'" (click)="detailTab.set('trace')">Trace</button>
+    <button [class.active]="detailTab() === 'metrics'" (click)="detailTab.set('metrics')">Metrics</button>
+  </nav>
+
+  <!-- ── Body ───────────────────────────────────────────────────────── -->
+  <div class="ev-detail-body">
+
+    @if (detailTab() === 'overview') {
+      <!-- HTTP / duration summary -->
+      @if (httpInfo().method || httpInfo().status || httpInfo().url || traceDuration() !== null) {
+        <div class="d-http">
+          @if (httpInfo().method) { <span class="d-http-method">{{ httpInfo().method }}</span> }
+          @if (httpInfo().status; as st) {
+            <span class="d-http-status" [class.ok]="st[0] === '2'" [class.err]="st[0] === '4' || st[0] === '5'">{{ st }}</span>
+          }
+          @if (httpInfo().url) { <span class="d-http-url">{{ httpInfo().url }}</span> }
+          @if (traceDuration() !== null) {
+            <span class="d-http-dur"><lucide-icon name="clock" [size]="11" />{{ traceDurationLabel() }}</span>
+          }
+        </div>
+      }
+
+      <!-- Facts -->
+      <div class="d-facts">
+        <div class="d-fact">
+          <span class="d-fact-k">Service</span>
+          <div class="d-fact-v">
+            <span class="d-fact-val">{{ service() || 'n/a' }}</span>
+            @if (service()) {
+              <span class="d-acts">
+                <button class="d-act" (click)="filterService()" title="Show only this service">
+                  <lucide-icon name="list-filter" [size]="11" />Only
+                </button>
+                <button class="d-act" (click)="excludeService()" title="Exclude this service">
+                  <lucide-icon name="ban" [size]="11" />Exclude
+                </button>
+                <button class="d-act d-act-icon" [class.done]="copiedKey() === 'service'" (click)="copyService()" title="Copy service name">
+                  <lucide-icon [name]="copiedKey() === 'service' ? 'check' : 'copy'" [size]="11" />
+                </button>
+              </span>
+            }
+          </div>
+        </div>
+
+        <div class="d-fact">
+          <span class="d-fact-k">Level</span>
+          <div class="d-fact-v">
+            <span class="ev-log-badge" [attr.data-level]="levelKey()">{{ ev['@l'] }}</span>
+            <span class="d-acts">
+              <button class="d-act" (click)="filterLevel()" title="Show only this log level">
+                <lucide-icon name="list-filter" [size]="11" />Only
+              </button>
+              <button class="d-act" (click)="excludeLevel()" title="Exclude this log level">
+                <lucide-icon name="ban" [size]="11" />Exclude
+              </button>
+            </span>
+          </div>
+        </div>
+
+        <div class="d-fact">
+          <span class="d-fact-k">Timestamp</span>
+          <div class="d-fact-v">
+            <span class="d-fact-val d-mono">{{ ev['@t'] | date: 'yyyy-MM-dd HH:mm:ss.SSS' }}</span>
+            <span class="d-acts">
+              <button class="d-act" (click)="openRowMenu($event, 'timestamp')" title="Seek / range around this time">
+                <lucide-icon name="clock" [size]="11" />Seek…
+              </button>
+            </span>
+          </div>
+        </div>
+
+        @if (traceId()) {
+          <div class="d-fact">
+            <span class="d-fact-k">TraceId</span>
+            <div class="d-fact-v">
+              <span class="d-fact-val d-mono d-id">{{ traceId() }}</span>
+              <span class="d-acts">
+                <button class="d-act" (click)="filterAttr('@tr', traceId())" title="Filter events by this TraceId">
+                  <lucide-icon name="list-filter" [size]="11" />Find
+                </button>
+                <button class="d-act" (click)="openTraceExternal()" title="Open this trace in the Traces page">
+                  <lucide-icon name="external-link" [size]="11" />Traces
+                </button>
+                <button class="d-act d-act-icon" [class.done]="copiedKey() === 'traceId'" (click)="copyTraceId()" title="Copy TraceId">
+                  <lucide-icon [name]="copiedKey() === 'traceId' ? 'check' : 'copy'" [size]="11" />
+                </button>
+              </span>
+            </div>
+          </div>
+        }
+
+        @if (spanId()) {
+          <div class="d-fact">
+            <span class="d-fact-k">SpanId</span>
+            <div class="d-fact-v">
+              <span class="d-fact-val d-mono d-id">{{ spanId() }}</span>
+              <span class="d-acts">
+                <button class="d-act" (click)="filterAttr('@sp', spanId())" title="Filter events by this SpanId">
+                  <lucide-icon name="list-filter" [size]="11" />Find
+                </button>
+                @if (traceId()) {
+                  <button class="d-act" (click)="openTraceExternal()" title="Open the parent trace in the Traces page">
+                    <lucide-icon name="external-link" [size]="11" />Traces
+                  </button>
+                }
+                <button class="d-act d-act-icon" [class.done]="copiedKey() === 'spanId'" (click)="copySpanId()" title="Copy SpanId">
+                  <lucide-icon [name]="copiedKey() === 'spanId' ? 'check' : 'copy'" [size]="11" />
+                </button>
+              </span>
+            </div>
+          </div>
+        }
+
+        @for (it of overviewCustomItems(); track it.key) {
+          <div class="d-fact">
+            <span class="d-fact-k">{{ it.key }}</span>
+            <div class="d-fact-v"><span class="d-fact-val">{{ it.value }}</span></div>
+          </div>
+        }
+      </div>
+
+      <!-- Properties -->
+      @if (allProps().length) {
+        <div class="d-section-label">Properties <span class="d-count">{{ allProps().length }}</span></div>
+        <div class="d-props">
+          @for (kv of allProps(); track kv.path) {
+            <div class="d-prop" [class.structured]="kv.isStructured">
+              <span class="d-prop-k">{{ kv.path }}</span>
+              <div class="d-prop-v"><app-json-viewer [value]="kv.raw" [path]="kv.path" /></div>
+            </div>
+          }
+        </div>
+      } @else {
+        <div class="d-empty">No properties on this event.</div>
+      }
+    }
+
+    @if (detailTab() === 'json') {
+      <section class="ev-card ev-card--single ev-card--json">
+        <div class="ev-json-toolbar">
+          <lucide-icon name="search" [size]="12" class="ev-json-search-icon" />
+          <input
+            class="ev-json-search-input"
+            type="text"
+            placeholder="Search keys or values…"
+            [value]="jsonSearch()"
+            (input)="jsonSearch.set($any($event.target).value)"
+            autocomplete="off"
+            spellcheck="false" />
+          @if (jsonSearch()) {
+            <button class="ev-json-search-clear" (click)="jsonSearch.set('')" title="Clear">
+              <lucide-icon name="x" [size]="11" />
+            </button>
+          }
+        </div>
+        <div class="ev-json-body">
+          <app-json-viewer
+            [value]="clefView()"
+            [initialExpanded]="true"
+            [searchTerm]="jsonSearch()" />
+        </div>
+      </section>
+    }
+
+    @if (detailTab() === 'exception') {
+      @if (ev['@x']; as exc) {
+        <div class="ev-exception">
+          <ng-container *ngTemplateOutlet="excBlock; context: { $implicit: exc, depth: 0 }" />
+        </div>
+      } @else {
+        <div class="d-empty">No exception on this event.</div>
+      }
+    }
+
+    @if (detailTab() === 'trace') {
+      <section class="ev-card ev-card--single ev-card--trace">
+        @if (!traceId() && !spanId()) {
+          <div class="tr-empty">No trace context in this event.</div>
+        } @else {
+
+          <!-- ── Trace waterfall ──────────────────────────────────── -->
+          @if (traceId()) {
+            <div class="tr-block tr-block--wf">
+              <div class="tr-block-label">
+                Trace waterfall
+                @if (traceSpansLoading()) {
+                  <span class="tr-wf-loading">loading…</span>
+                }
+              </div>
+
+              @if (traceSpansLoading() && traceSpans().length === 0) {
+                <div class="tr-wf-skeletons">
+                  <div class="tr-wf-sk"></div>
+                  <div class="tr-wf-sk tr-wf-sk--2"></div>
+                  <div class="tr-wf-sk tr-wf-sk--3"></div>
+                </div>
+              }
+
+              @if (!traceSpansLoading() && traceSpans().length === 0 && lastFetchedTid()) {
+                <div class="tr-empty">No spans found for this trace.</div>
+              }
+
+              @if (traceSpans().length > 0) {
+                <div class="ev-waterfall">
+                  <div class="ev-wf-axis">
+                    <div class="ev-wf-label-col">Service / Operation</div>
+                    <div class="ev-wf-bar-col">
+                      @for (tick of wfTicks(); track tick.pct) {
+                        <span class="ev-wf-tick" [style.left.%]="tick.pct">{{ tick.label }}</span>
+                      }
+                    </div>
+                    <div class="ev-wf-dur-col">Duration</div>
+                  </div>
+                  @for (span of traceSpans(); track span.spanId) {
+                    <div class="ev-wf-row"
+                         [class.ev-wf-row--current]="span.spanId === spanId()"
+                         [class.ev-wf-row--error]="span.status === 'Error'"
+                         [class.ev-wf-row--selected]="selectedWfSpan()?.spanId === span.spanId"
+                         (click)="selectWfSpan(span)">
+                      <div class="ev-wf-label-col" [style.padding-left.px]="wfDepth(span) * 14 + 6">
+                        <span class="ev-wf-dot" [style.background]="wfSvcColor(span.serviceName)"></span>
+                        <div class="ev-wf-names">
+                          <span class="ev-wf-svc">{{ span.serviceName }}</span>
+                          <span class="ev-wf-op" [class.ev-wf-op--error]="span.status === 'Error'">{{ span.name }}</span>
+                        </div>
+                      </div>
+                      <div class="ev-wf-bar-col">
+                        <div class="ev-wf-bar"
+                             [class.ev-wf-bar--error]="span.status === 'Error'"
+                             [style.left.%]="wfLeft(span)"
+                             [style.width.%]="wfWidth(span)"
+                             [style.background]="span.status === 'Error' ? '' : wfSvcColor(span.serviceName)">
+                        </div>
+                      </div>
+                      <div class="ev-wf-dur-col">{{ wfFmt(span.durationNanos) }}</div>
+                    </div>
+                    @if (selectedWfSpan()?.spanId === span.spanId && selectedWfSpanTags().length > 0) {
+                      <div class="ev-wf-detail">
+                        @for (tag of selectedWfSpanTags(); track tag.k) {
+                          <div class="ev-wf-tag-row">
+                            <span class="ev-wf-tag-k">{{ tag.k }}</span>
+                            <span class="ev-wf-tag-v">{{ tag.v }}</span>
+                            <button class="tr-filter-btn ev-wf-tag-filter" (click)="filterAttr(tag.k, tag.v); $event.stopPropagation()" title="Filter">
+                              <lucide-icon name="list-filter" [size]="11" />
+                            </button>
+                          </div>
+                        }
+                      </div>
+                    }
+                  }
+                </div>
+              }
+            </div>
+          }
+
+          <!-- ── Span identity ──────────────────────────────────── -->
+          <div class="tr-block">
+            <div class="tr-block-label">Span identity</div>
+            <div class="tr-tags">
+              @if (service()) {
+                <span class="tr-badge tr-badge--svc">
+                  <lucide-icon name="box" [size]="11" />{{ service() }}
+                </span>
+              }
+              @if (httpInfo().method) {
+                <span class="tr-badge tr-badge--http">{{ httpInfo().method }}</span>
+              }
+              @if (httpInfo().status; as st) {
+                <span class="tr-badge" [class.tr-badge--ok]="st[0] === '2'" [class.tr-badge--err]="st[0] === '4' || st[0] === '5'">
+                  {{ st }}
+                </span>
+              }
+            </div>
+            <div class="tr-ids">
+              <div class="tr-id-row">
+                <span class="tr-id-key">TraceId</span>
+                <span class="tr-id-val">{{ traceId() || '—' }}</span>
+                @if (traceId()) {
+                  <button class="tr-copy-btn" [class.tr-copy-btn--done]="copiedKey() === 'traceId'" (click)="copyText(traceId(), 'traceId')" title="Copy TraceId">
+                    <lucide-icon [name]="copiedKey() === 'traceId' ? 'check' : 'copy'" [size]="11" />
+                  </button>
+                }
+              </div>
+              <div class="tr-id-row">
+                <span class="tr-id-key">SpanId</span>
+                <span class="tr-id-val">{{ spanId() || '—' }}</span>
+                @if (spanId()) {
+                  <button class="tr-copy-btn" [class.tr-copy-btn--done]="copiedKey() === 'spanId'" (click)="copyText(spanId(), 'spanId')" title="Copy SpanId">
+                    <lucide-icon [name]="copiedKey() === 'spanId' ? 'check' : 'copy'" [size]="11" />
+                  </button>
+                }
+              </div>
+              @if (parentSpanId()) {
+                <div class="tr-id-row">
+                  <span class="tr-id-key">ParentSpan</span>
+                  <span class="tr-id-val tr-id-val--muted">{{ parentSpanId() }}</span>
+                  <button class="tr-copy-btn" [class.tr-copy-btn--done]="copiedKey() === 'parentSpan'" (click)="copyText(parentSpanId(), 'parentSpan')" title="Copy ParentSpanId">
+                    <lucide-icon [name]="copiedKey() === 'parentSpan' ? 'check' : 'copy'" [size]="11" />
+                  </button>
+                </div>
+              }
+              @if (traceparent()) {
+                <div class="tr-id-row tr-id-row--tp">
+                  <span class="tr-id-key">traceparent</span>
+                  <span class="tr-id-val tr-id-val--tp">{{ traceparent() }}</span>
+                  <button class="tr-copy-btn" [class.tr-copy-btn--done]="copiedKey() === 'traceparent'" (click)="copyText(traceparent(), 'traceparent')" title="Copy W3C traceparent">
+                    <lucide-icon [name]="copiedKey() === 'traceparent' ? 'check' : 'copy'" [size]="11" />
+                  </button>
+                </div>
+              }
+            </div>
+          </div>
+
+          <!-- ── Duration timeline ─────────────────────────────── -->
+          @if (traceDuration() !== null) {
+            <div class="tr-block">
+              <div class="tr-block-label">Duration timeline</div>
+              <div class="tr-timeline">
+                <div class="tr-tl-axis">
+                  <span>{{ ev['@t'] | date:'HH:mm:ss.SSS' }}</span>
+                  <span class="tr-tl-dur-label">{{ traceDurationLabel() }}</span>
+                  <span>+{{ traceDurationLabel() }}</span>
+                </div>
+                <div class="tr-tl-track">
+                  <div class="tr-tl-bar">
+                    <span class="tr-tl-bar-text">{{ traceDurationLabel() }}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          }
+
+          <!-- ── OTel attributes ───────────────────────────────── -->
+          @if (otelAttrs().length > 0) {
+            <div class="tr-block">
+              <div class="tr-block-label">OTel attributes</div>
+              <table class="tr-attrs-table">
+                @for (kv of otelAttrs(); track kv.key) {
+                  <tr class="tr-attr-row">
+                    <td class="tr-attr-key">{{ kv.key }}</td>
+                    <td class="tr-attr-val">{{ kv.value }}</td>
+                    <td class="tr-attr-action">
+                      <button class="tr-filter-btn" (click)="filterAttr(kv.key, kv.raw)" title="Filter">
+                        <lucide-icon name="list-filter" [size]="11" />
+                      </button>
+                    </td>
+                  </tr>
+                }
+              </table>
+            </div>
+          }
+
+        }
+      </section>
+    }
+
+    @if (detailTab() === 'metrics') {
+      <section class="ev-card ev-card--single ev-card--metrics">
+        @if (metricItems().length === 0) {
+          <div class="d-empty">No numeric props in this event.</div>
+
+        } @else if (metricsLoading()) {
+          <div class="ev-met-loading">
+            <lucide-icon name="loader-circle" [size]="13" class="ev-met-spinner" />
+            Looking up correlated metrics…
+          </div>
+
+        } @else if (metricSeries().length > 0) {
+          <div class="ev-met-header">Metrics ±10 min around this event</div>
+          <div class="ev-met-grid">
+            @for (entry of metricSeries(); track entry.name) {
+              @if (entry.series[0]; as s) {
+                <div class="ev-met-card">
+                  <div class="ev-met-card-top">
+                    <span class="ev-met-name">{{ entry.name }}</span>
+                    <span class="ev-met-kind">{{ s.kind }}</span>
+                    @if (s.unit) { <span class="ev-met-unit">{{ s.unit }}</span> }
+                  </div>
+                  <app-metric-spark [series]="s" [eventTsMs]="eventTsMs()" />
+                </div>
+              }
+            }
+          </div>
+          <div class="ev-met-props-label">Prop values at this moment</div>
+          <div class="ev-met-chips">
+            @for (m of metricItems(); track m.key) {
+              <span class="ev-met-chip">
+                <span class="ev-met-chip-k">{{ m.key }}</span>
+                <span class="ev-met-chip-v">{{ m.value }}</span>
+              </span>
+            }
+          </div>
+
+        } @else {
+          <div class="ev-met-header ev-met-header--muted">
+            No matching metrics found in the store — showing raw numeric props.
+          </div>
+          <div class="ev-met-chips">
+            @for (m of metricItems(); track m.key) {
+              <span class="ev-met-chip">
+                <span class="ev-met-chip-k">{{ m.key }}</span>
+                <span class="ev-met-chip-v">{{ m.value }}</span>
+              </span>
+            }
+          </div>
+        }
+
+      </section>
+    }
+  </div>
+</div>
+
+<ng-template #excBlock let-exc let-depth="depth">
+  <div class="exc-frame" [style.margin-left.px]="depth * 12">
+    <div class="exc-head">
+      <span class="exc-type">{{ exc.type }}</span>
+      @if (exc.message) {
+        <span class="exc-msg">: {{ exc.message }}</span>
+      }
+    </div>
+    @if (exc.stack) {
+      <pre class="exc-stack">{{ exc.stack }}</pre>
+    }
+    @if (exc.inner; as inner) {
+      <div class="exc-inner-label">Caused by →</div>
+      <ng-container *ngTemplateOutlet="excBlock; context: { $implicit: inner, depth: depth + 1 }" />
+    }
+  </div>
+</ng-template>
+
+<!-- Context menus (rendered into a CDK overlay attached to body) -->
+<ng-template #ctxMenuTpl>
+  <div class="ctx-menu">
+    @if (menuType() === 'timestamp') {
+      <div class="ctx-label">{{ event()['@t'] | date: 'yyyy-MM-dd HH:mm:ss.SSS' }}</div>
+      <div class="ctx-label">Seek window (±)</div>
+      <button (click)="seek(5)"><lucide-icon name="clock" [size]="13" />± 5 seconds</button>
+      <button (click)="seek(30)"><lucide-icon name="clock" [size]="13" />± 30 seconds</button>
+      <button (click)="seek(60)"><lucide-icon name="clock" [size]="13" />± 1 minute</button>
+      <button (click)="seek(300)"><lucide-icon name="clock" [size]="13" />± 5 minutes</button>
+      <button (click)="seek(900)"><lucide-icon name="clock" [size]="13" />± 15 minutes</button>
+      <button (click)="seek(1800)"><lucide-icon name="clock" [size]="13" />± 30 minutes</button>
+      <hr />
+      <button (click)="findEventsAfter()"><lucide-icon name="arrow-right" [size]="13" />Events after this</button>
+      <button (click)="findEventsBefore()"><lucide-icon name="arrow-left" [size]="13" />Events before this</button>
+      <hr />
+      <button (click)="setRangeStart()"><lucide-icon name="chevrons-right" [size]="13" />Set as range start</button>
+      <button (click)="setRangeEnd()"><lucide-icon name="chevrons-left" [size]="13" />Set as range end</button>
+      <hr />
+      <button (click)="copyTimestampIso()"><lucide-icon name="copy" [size]="13" />Copy ISO timestamp</button>
+    }
+    @if (menuType() === 'jv') {
+      @if (jvMenu(); as m) {
+        <div class="ctx-label">{{ m.path }}</div>
+        @if (m.isContainer) {
+          <button (click)="jvFind()">
+            <lucide-icon name="search" [size]="13" />Find <code>has({{ m.path }})</code>
+          </button>
+          <button (click)="jvExclude()">
+            <lucide-icon name="ban" [size]="13" />Exclude <code>not has(…)</code>
+          </button>
+        } @else {
+          <button (click)="jvFind()">
+            <lucide-icon name="search" [size]="13" />Find <code>{{ jvEqExpr() }}</code>
+          </button>
+          <button (click)="jvExclude()">
+            <lucide-icon name="ban" [size]="13" />Exclude <code>{{ jvNeExpr() }}</code>
+          </button>
+          @if (jvAnyExpr(); as anyExpr) {
+            <hr />
+            <button (click)="jvFindAny()">
+              <lucide-icon name="asterisk" [size]="13" />Any element <code>{{ anyExpr }}</code>
+            </button>
+          }
+        }
+        <hr />
+        <button (click)="jvCopy()"><lucide-icon name="copy" [size]="13" />Copy</button>
+      }
+    }
+  </div>
+</ng-template>

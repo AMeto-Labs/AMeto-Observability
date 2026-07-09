@@ -7,6 +7,7 @@ import { AuthProvidersDto, LoginResponseDto, UserRole } from '../models/auth.mod
 const TOKEN_KEY   = 'rd_token';
 const EXPIRES_KEY = 'rd_token_exp';
 const ROLE_KEY    = 'rd_role';
+const RETURN_KEY  = 'rd_return_url';
 
 @Injectable({ providedIn: 'root' })
 export class AuthService {
@@ -35,14 +36,19 @@ export class AuthService {
   }
 
   /** Redirects browser to OAuth provider (full page redirect, not XHR). */
-  loginWithOAuth(provider: 'google' | 'microsoft'): void {
+  loginWithOAuth(provider: 'google' | 'microsoft', returnUrl?: string): void {
+    // Full-page redirect drops component state, so persist the return target.
+    if (returnUrl) sessionStorage.setItem(RETURN_KEY, returnUrl);
+    else sessionStorage.removeItem(RETURN_KEY);
     window.location.href = `/api/auth/oauth/${provider}`;
   }
 
   /** Called by the OAuth callback route — stores the token from the URL fragment. */
   handleOAuthCallback(token: string, expiresIn: number, role: string): void {
     this.storeToken({ token, expiresIn, role: role as UserRole });
-    this.router.navigate(['/events']);
+    const returnUrl = sessionStorage.getItem(RETURN_KEY);
+    sessionStorage.removeItem(RETURN_KEY);
+    this.router.navigateByUrl(returnUrl || '/events');
   }
 
   getProviders() {

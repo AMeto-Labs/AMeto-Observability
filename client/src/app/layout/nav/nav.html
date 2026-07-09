@@ -27,12 +27,9 @@
       <span class="nav-label">{{ settingsItem.label }}</span>
     </a>
 
-
-
-    <div class="nav-user" (click)="auth.logout()" title="Sign out">
-      <div class="user-avatar">{{ userInitials }}</div>
-      <span class="user-name">{{ userLabel }}</span>
-      <lucide-icon name="chevron-down" [size]="10" class="user-caret" />
-    </div>
+    <button class="nav-item" type="button" (click)="auth.logout()" title="Sign out">
+      <lucide-icon name="log-out" [size]="18" [strokeWidth]="1.5" />
+      <span class="nav-label">Sign out</span>
+    </button>
   </div>
 </nav>

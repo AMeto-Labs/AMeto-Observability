@@ -1,0 +1,59 @@
+<div class="filter-bar">
+<div class="filter-bar-inner">
+
+  <!-- Date range -->
+  <div class="fb-group" (click)="$event.stopPropagation()">
+    <button #dateBtn class="fb-btn" [class.open]="dateDropdownOpen()" (click)="openDate(dateBtn)">
+      <lucide-icon name="calendar" [size]="13" />
+      <span>{{ store.dateRangeLabel() }}</span>
+      <lucide-icon name="chevron-down" [size]="11" class="fb-caret" [class.rotated]="dateDropdownOpen()" />
+    </button>
+  </div>
+
+  <!-- All levels -->
+  <div class="fb-group" (click)="$event.stopPropagation()">
+    <button #levelsBtn class="fb-btn" [class.open]="levelsDropdownOpen()" [class.filtered]="!store.allLevelsActive()" (click)="openLevels(levelsBtn)">
+      <lucide-icon name="sparkles" [size]="13" />
+      <span>{{ store.levelsLabel() }}</span>
+      <lucide-icon name="chevron-down" [size]="11" class="fb-caret" [class.rotated]="levelsDropdownOpen()" />
+    </button>
+  </div>
+
+  <!-- All services -->
+  <div class="fb-group" (click)="$event.stopPropagation()">
+    <button #svcBtn class="fb-btn" [class.open]="serviceDropdownOpen()" [class.filtered]="store.selectedServices().size > 0" (click)="openServices(svcBtn)">
+      <lucide-icon name="boxes" [size]="13" />
+      <span>{{ store.serviceLabel() }}</span>
+      <lucide-icon name="chevron-down" [size]="11" class="fb-caret" [class.rotated]="serviceDropdownOpen()" />
+    </button>
+  </div>
+
+  <!-- Level count chips -->
+  <div class="sep-v"></div>
+  <div class="lc-chips">
+    <button class="lc-chip lc-all" [class.active]="store.allLevelsActive()" (click)="store.toggleAllLevels()">
+      ALL <span class="lc-num">{{ fmtCount(store.totalCount()) }}</span>
+    </button>
+    @for (lvl of levelItems; track lvl.key) {
+      <button
+        class="lc-chip"
+        [class.active]="isLevelActive(lvl.key)"
+        [attr.data-level]="lvl.key.toLowerCase()"
+        (click)="store.toggleLevel(lvl.key)">
+        {{ lvl.short }} <span class="lc-num">{{ fmtCount(store.levelCounts()[lvl.key.toLowerCase()]) }}</span>
+      </button>
+    }
+  </div>
+  <div class="sep-v"></div>
+
+  <!-- Page size (right-aligned) -->
+  <select
+    class="page-size-select"
+    (change)="store.setPageSize(+$any($event.target).value)"
+    title="Events per request">
+    @for (n of pageSizeOptions; track n) {
+      <option [value]="n" [selected]="n === store.pageSize()">{{ n }}</option>
+    }
+  </select>
+</div>
+</div>

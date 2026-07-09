@@ -10,23 +10,18 @@ import { DomSanitizer } from '@angular/platform-browser';
 import { NgTemplateOutlet, DatePipe } from '@angular/common';
 import { LucideAngularModule } from 'lucide-angular';
 
-import { EventDto } from '../../../core/models/event.model';
-import { SpanDto } from '../../../core/models/span.model';
-import { MetricSeriesDto } from '../../../core/models/metric.model';
-import { UserPreferencesService } from '../../../core/services/user-preferences.service';
-import { ApiService } from '../../../core/services/api.service';
-import { renderMessageHtml, escapeHtmlExport } from '../../../shared/utils/clef-renderer';
-import { JsonViewerComponent } from '../../../shared/components/json-viewer/json-viewer';
-import { MetricSparkComponent } from '../../../shared/components/metric-spark/metric-spark';
+import { EventDto } from '../../../../core/models/event.model';
+import { SpanDto } from '../../../../core/models/span.model';
+import { MetricSeriesDto } from '../../../../core/models/metric.model';
+import { UserPreferencesService } from '../../../../core/services/user-preferences.service';
+import { ApiService } from '../../../../core/services/api.service';
+import { renderMessageHtml } from '../../../../shared/utils/clef-renderer';
+import { JsonViewerComponent } from '../../../../shared/components/json-viewer/json-viewer';
+import { MetricSparkComponent } from '../../../../shared/components/metric-spark/metric-spark';
 import {
   JsonViewerActions, JvMenuRequest, jvLiteral, jvWildcard,
-} from '../../../shared/components/json-viewer/json-viewer.actions';
-import { ContextMenuService, OverlayPanelRef } from '../../../shared/services/overlay';
-
-const LEVEL_SHORT: Record<string, string> = {
-  verbose: 'VRB', debug: 'DBG', information: 'INF',
-  warning: 'WRN', error: 'ERR', fatal: 'FTL',
-};
+} from '../../../../shared/components/json-viewer/json-viewer.actions';
+import { ContextMenuService, OverlayPanelRef } from '../../../../shared/services/overlay';
 
 export interface PropEntry {
   /** Full dot-path usable in filter expressions, e.g. "Payload.Customer.Id" */
@@ -99,43 +94,37 @@ function wfFmtMs(ms: number): string {
   return `${(ms / 1_000).toFixed(3)}s`;
 }
 
+/**
+ * Side-drawer detail view for a single selected event. Renders the tabbed panel
+ * (Overview / Rendered Message / JSON / Trace waterfall / Metrics), the exception
+ * block and the shared property/timestamp context menu. The collapsed log row is
+ * a separate component; this one takes the already-selected event as a required
+ * input and shows one event at a time.
+ */
 @Component({
-  selector: 'app-event-row',
+  selector: 'app-event-detail',
   imports: [LucideAngularModule, NgTemplateOutlet, DatePipe, JsonViewerComponent, MetricSparkComponent],
-  providers: [DatePipe, JsonViewerActions],
-  templateUrl: './event-row.html',
-  styleUrl: './event-row.scss',
+  providers: [JsonViewerActions],
+  templateUrl: './event-detail.html',
+  styleUrl: './event-detail.scss',
   changeDetection: ChangeDetectionStrategy.OnPush,
-  host: {
-    '[class.ev-verbose]':     'levelKey() === "verbose"',
-    '[class.ev-debug]':       'levelKey() === "debug"',
-    '[class.ev-information]': 'levelKey() === "information"',
-    '[class.ev-warning]':     'levelKey() === "warning"',
-    '[class.ev-error]':       'levelKey() === "error"',
-    '[class.ev-fatal]':       'levelKey() === "fatal"',
-    '[class.ev-expanded]':    'expanded()',
-    '[class.ev-wrap-mode]':   'wrap()',
-  },
 })
-export class EventRowComponent {
+export class EventDetailComponent {
   // ── Inputs / outputs ──────────────────────────────────────────────────
   event = input.required<EventDto>();
-  wrap  = input<boolean>(false);
-  expandedEventIds = input<ReadonlySet<string>>(new Set());
   filterSelected = output<string>();
   seekRequested  = output<{ from: Date; to: Date }>();
-  expandRequested = output<string>();
-  /** Bind a timestamp to one side of the parent time-range inputs without loading. */
-  timeRangeBound = output<{ side: 'from' | 'to'; date: Date; load?: boolean }>();
+  /** Bind a timestamp to one side of the parent time-range inputs. */
+  timeRangeBound = output<{ side: 'from' | 'to'; date: Date }>();
+  /** Header close button — the parent hides the drawer. */
+  closed = output<void>();
 
   private api = inject(ApiService);
 
   // ── Local state ───────────────────────────────────────────────────────
-  expanded  = computed(() => this.expandedEventIds().has(this.event().id));
-  messageExpanded = signal(false);
   detailTab  = signal<'overview' | 'message' | 'json' | 'exception' | 'trace' | 'metrics'>('overview');
   jsonSearch = signal('');
-  menuType  = signal<'message' | 'level' | 'export' | 'jv' | 'service' | 'traceId' | 'spanId' | 'timestamp' | null>(null);
+  menuType  = signal<'timestamp' | 'jv' | null>(null);
   menuPos   = signal({ x: 0, y: 0 });
   /** Active JSON-viewer node context (path/value/kind) when {@link menuType} is 'jv'. */
   jvMenu = signal<JvMenuRequest | null>(null);
@@ -151,7 +140,6 @@ export class EventRowComponent {
   /** Key of the copy button showing the "copied" confirmation, null otherwise. */
   copiedKey = signal<string | null>(null);
   private copiedTimer?: ReturnType<typeof setTimeout>;
-  private hoverCloseTimer?: ReturnType<typeof setTimeout>;
 
   // ── Correlated metrics state ──────────────────────────────────────────
   readonly metricSeries      = signal<{ name: string; series: MetricSeriesDto[] }[]>([]);
@@ -161,7 +149,6 @@ export class EventRowComponent {
   private metricsSubRef?: any;
 
   private sanitizer = inject(DomSanitizer);
-  private datePipe  = inject(DatePipe);
   private prefs = inject(UserPreferencesService);
   private vcr = inject(ViewContainerRef);
   private jvActions = inject(JsonViewerActions);
@@ -182,16 +169,18 @@ export class EventRowComponent {
       this.menuType.set('jv');
     });
 
-    // CDK virtual scroll recycles row instances across different events.
-    // Reset local UI state whenever the bound event changes so an expanded /
-    // menu-open state from a previous row does not leak onto a new one.
+    // The detail now shows one event at a time via a required input. Reset all
+    // local UI state (tab, open menu, fetched-trace/metric caches) whenever the
+    // bound event changes so state from a previous selection does not leak.
     effect(() => {
       this.event(); // track input identity
       untracked(() => {
+        this.traceSubRef?.unsubscribe();
+        this.metricsSubRef?.unsubscribe();
         this.menuType.set(null);
         this.jvMenu.set(null);
-        this.messageExpanded.set(false);
-        this.detailTab.set('overview');
+        this.jsonSearch.set('');
+        this.detailTab.set(this.hasException() ? 'exception' : 'overview');
         this.lastFetchedTid.set('');
         this.traceSpans.set([]);
         this.traceSpansLoading.set(false);
@@ -270,10 +259,10 @@ export class EventRowComponent {
     });
 
     // Render the context menu through the ContextMenuService (CDK overlay) so it
-    // escapes the transformed virtual-scroll container (where `position: fixed`
-    // would otherwise anchor to the transformed ancestor). menuType/menuPos stay
-    // the single source of truth; document click/keydown drive close via
-    // onCloseMenu, so the service's own auto-close is left off.
+    // escapes any transformed ancestor (where `position: fixed` would otherwise
+    // anchor to the transformed container). menuType/menuPos stay the single
+    // source of truth; document click/keydown drive close via onCloseMenu, so the
+    // service's own auto-close is left off.
     effect(() => {
       const type = this.menuType();
       const pos  = this.menuPos();
@@ -299,7 +288,6 @@ export class EventRowComponent {
 
   ngOnDestroy(): void {
     clearTimeout(this.copiedTimer);
-    clearTimeout(this.hoverCloseTimer);
     this.traceSubRef?.unsubscribe();
     this.metricsSubRef?.unsubscribe();
     this.menuRef?.close();
@@ -312,8 +300,6 @@ export class EventRowComponent {
 
   // ── Derived ───────────────────────────────────────────────────────────
   levelKey = computed(() => (this.event()['@l'] ?? 'information').toLowerCase());
-
-  levelShort = computed(() => LEVEL_SHORT[this.levelKey()] ?? this.levelKey().slice(0, 3).toUpperCase());
 
   service = computed(() =>
     (this.event()['service.name'] as string | undefined) ?? ''
@@ -331,24 +317,11 @@ export class EventRowComponent {
     ''
   );
 
-  // timestamp = computed(() => {
-  //   const raw = this.event()['@t'];
-  //   try {
-  //     const d = new Date(raw);
-  //     const datePart = this.datePipe.transform(d, 'MM-dd HH:mm:ss') ?? raw;
-  //     const fracMatch = raw.match(/\.(\d+)/);
-  //     const ms = fracMatch ? fracMatch[1].slice(0, 3).padEnd(3, '0') : '000';
-  //     return `${datePart}.${ms}`;
-  //   } catch { return raw; }
-  // });
-
   renderedHtml = computed(() =>
     this.sanitizer.bypassSecurityTrustHtml(
       renderMessageHtml(this.event()['@mt'], this.event().props)
     )
   );
-
-  rawJson = computed(() => JSON.stringify(this.event(), null, 2));
 
   /**
    * CLEF-style flat view of the event: system fields + user props at the same
@@ -370,12 +343,6 @@ export class EventRowComponent {
     return view;
   });
 
-  topProps = computed(() =>
-    Object.entries(this.event().props ?? {})
-      .slice(0, 3)
-      .map(([k, v]) => ({ k, v: formatInline(v) }))
-  );
-
   /**
    * Flat top-level property list:
    *  - Scalar values  → text row { path:'A', label:'A', value:'42', isStructured:false }
@@ -384,7 +351,6 @@ export class EventRowComponent {
    */
   allProps = computed(() => buildProps(this.event().props ?? {}));
 
-  propsCount   = computed(() => Object.keys(this.event().props ?? {}).length);
   hasException  = computed(() => !!this.event()['@x']);
 
   overviewCustomItems = computed(() => {
@@ -398,16 +364,6 @@ export class EventRowComponent {
   metricItems = computed(() => Object.entries(this.event().props ?? {})
     .filter(([, v]) => typeof v === 'number')
     .map(([k, v]) => ({ key: k, value: Number(v).toLocaleString() }))
-  );
-
-  traceAttrs = computed(() => Object.entries(this.event().props ?? {})
-    .filter(([k]) =>
-      k.startsWith('trace.') ||
-      k.startsWith('span.') ||
-      k.startsWith('otel.') ||
-      k === 'trace_id' ||
-      k === 'span_id')
-    .map(([k, v]) => ({ key: k, value: formatInline(v) }))
   );
 
   parentSpanId = computed(() => {
@@ -532,41 +488,6 @@ export class EventRowComponent {
     this.selectedWfSpan.update(s => s?.spanId === span.spanId ? null : span);
   }
 
-  labelChips = computed(() => {
-    const p = this.event().props ?? {};
-    const chips: Array<{ k: string; v: string }> = [];
-    const keys = ['version', 'instance', 'region', 'host', 'environment', 'env'];
-    for (const k of keys) {
-      const v = p[k];
-      if (v !== null && v !== undefined && String(v).length > 0) {
-        chips.push({ k, v: String(v) });
-      }
-    }
-    return chips;
-  });
-
-  durationLabel = computed(() => {
-    const p = this.event().props ?? {};
-    const candidates = ['durationMs', 'duration', 'elapsedMs', 'Elapsed', 'elapsed'];
-    for (const k of candidates) {
-      const v = p[k];
-      if (typeof v === 'number' && Number.isFinite(v)) return `${v}ms`;
-      if (typeof v === 'string' && v.trim().length > 0) return v;
-    }
-    return 'n/a';
-  });
-
-  // ── Interaction ───────────────────────────────────────────────────────
-  toggleExpand(e: Event): void {
-    e.stopPropagation();
-    if (this.menuType()) { this.menuType.set(null); return; }
-    const opening = !this.expanded();
-    this.expandRequested.emit(this.event().id);
-    if (opening && this.hasException()) this.detailTab.set('exception');
-    else if (opening)                   this.detailTab.set('overview');
-    if (opening) this.jsonSearch.set('');
-  }
-
   // ── JSON-viewer context menu ──────────────────────────────────────────
   /** `path = value` (leaf) — exact match. */
   jvEqExpr = computed(() => {
@@ -618,31 +539,20 @@ export class EventRowComponent {
     this.menuType.set(null);
   }
 
-  openMenu(e: MouseEvent, type: 'message' | 'level' | 'export'): void {
-    e.stopPropagation();
-    e.preventDefault();
-    let x = e.clientX;
-    let y = e.clientY + 6;
-    if (x + 210 > window.innerWidth)  x = e.clientX - 210;
-    if (y + 260 > window.innerHeight) y = e.clientY - 260;
-    this.menuType.set(type);
-    this.menuPos.set({ x, y });
-  }
-
   /**
-   * Opens the property filter/copy menu *anchored to a row element* — used by
-   * the leading action button on property / meta-table rows so the menu pops
-   * just right of the key text rather than at an arbitrary click point.
+   * Opens the timestamp seek/range menu *anchored to a row element* — used by
+   * the leading clock button on the Timestamp meta-table row so the menu pops
+   * just right of the button rather than at an arbitrary click point.
    */
-  openRowMenu(e: MouseEvent, type: 'service' | 'traceId' | 'spanId' | 'timestamp'): void {
+  openRowMenu(e: MouseEvent, type: 'timestamp'): void {
     e.preventDefault();
     e.stopPropagation();
     const target = e.currentTarget as HTMLElement;
     const r = target.getBoundingClientRect();
     let x = r.right + 4;
     let y = r.top;
-    const w = type === 'timestamp' ? 220 : 220;
-    const h = type === 'timestamp' ? 360 : 240;
+    const w = 220;
+    const h = 360;
     if (x + w > window.innerWidth)  x = r.left - w - 4;
     if (x < 4)                        x = r.right + 4;
     if (y + h > window.innerHeight)   y = Math.max(4, window.innerHeight - h);
@@ -656,28 +566,7 @@ export class EventRowComponent {
     if (this.menuType()) this.menuType.set(null);
   }
 
-  /**
-   * Opens the property filter/copy menu (the same node menu the JSON viewer uses)
-   * for a Properties-table row, anchored to the clicked 3-lines button.
-   */
-  openPropMenu(e: MouseEvent, path: string, raw: unknown, isStructured: boolean): void {
-    e.stopPropagation();
-    e.preventDefault();
-    this.jvMenu.set({ path, rawValue: raw, isContainer: isStructured, x: e.clientX, y: e.clientY });
-    let x = e.clientX, y = e.clientY + 6;
-    if (x + 240 > window.innerWidth)  x = e.clientX - 240;
-    if (y + 200 > window.innerHeight) y = e.clientY - 200;
-    this.menuPos.set({ x, y });
-    this.menuType.set('jv');
-  }
-
   // ── Context menu actions ──────────────────────────────────────────────
-  findSimilar(): void {
-    const tmpl = this.event()['@mt'] ?? '';
-    this.filterSelected.emit(`@mt = '${tmpl.replace(/'/g, "''")}'`);
-    this.menuType.set(null);
-  }
-
   findFrom(): void {
     this.seekRequested.emit({ from: new Date(this.event()['@t']), to: new Date() });
     this.menuType.set(null);
@@ -729,13 +618,6 @@ export class EventRowComponent {
     this.menuType.set(null);
   }
 
-  openTraceView(): void {
-    const tid = this.traceId();
-    if (!tid) return;
-    this.detailTab.set('trace');
-    this.menuType.set(null);
-  }
-
   openTraceExternal(): void {
     const tid = this.traceId();
     if (!tid) return;
@@ -748,21 +630,10 @@ export class EventRowComponent {
     return new Date(this.event()['@t']).toISOString();
   }
 
-  timestampLocalLabel(): string {
-    const d = new Date(this.event()['@t']);
-    return d.toLocaleString();
-  }
-
   async copyTimestampIso(): Promise<void> {
     await navigator.clipboard.writeText(this.timestampIso());
     this.menuType.set(null);
     this.flashCopied('ts-iso');
-  }
-
-  async copyTimestampHuman(): Promise<void> {
-    await navigator.clipboard.writeText(this.timestampIso() + '   (' + this.timestampLocalLabel() + ')');
-    this.menuType.set(null);
-    this.flashCopied('ts-human');
   }
 
   setRangeStart(): void {
@@ -775,78 +646,15 @@ export class EventRowComponent {
     this.menuType.set(null);
   }
 
-  /** Find events in a ±1 second window around this event's timestamp. */
-  findNear(): void {
-    this.seek(1);
-  }
-
-  /** Show all events after this timestamp (to now) — same as message findFrom. */
+  /** Show all events after this timestamp (to now). */
   findEventsAfter(): void {
     this.findFrom();
   }
 
-  /** Show all events up to this timestamp (from epoch) — same as message findTo. */
+  /** Show all events up to this timestamp (from epoch). */
   findEventsBefore(): void {
     this.findTo();
   }
-
-  /**
-   * Jump-to-date: emit a seek over a small symmetrical window around a date the
-   * user enters into the overlay input bound to {@link jumpDateInput}. Closing
-   * the menu resets the value.
-   */
-  jumpDateInput = signal('');
-
-  jumptoDateConfirm(): void {
-    const v = this.jumpDateInput()?.trim();
-    if (!v) return;
-    const target = new Date(v);
-    if (isNaN(target.getTime())) return;
-    const windowMs = (this.jumpPresetWindow() || 5) * 1000;
-    this.seekRequested.emit({
-      from: new Date(target.getTime() - windowMs),
-      to:   new Date(target.getTime() + windowMs),
-    });
-    this.jumpDateInput.set('');
-    this.menuType.set(null);
-  }
-
-  jumpPresetWindow = signal<5 | 30 | 60 | 300 | 900 | 1800>(5);
-
-  // ── Hover-driven menu helpers (timestamp row) ────────────────────────
-  /**
-   * The timestamp row reveals its menu on hover (no button — the date text
-   * itself is the trigger). When the pointer leaves the row *or* the overlay
-   * panel, we schedule a short close so the user can move from the row into
-   * the menu without it snapping shut. Any subsequent enter cancels it.
-   */
-  onTimestampHoverEnter(e: MouseEvent): void {
-    if (this.menuType() === 'timestamp') { this.cancelHoverClose(); return; }
-    if (this.menuType() !== null) return;            // another menu is open — don't hijack
-    this.openRowMenu(e, 'timestamp');
-  }
-
-  onTimestampHoverLeave(): void {
-    if (this.menuType() === 'timestamp') this.scheduleHoverClose();
-  }
-
-  onCtxMenuEnter(): void {
-    if (this.menuType() === 'timestamp') this.cancelHoverClose();
-  }
-
-  onCtxMenuLeave(): void {
-    if (this.menuType() === 'timestamp') this.scheduleHoverClose();
-  }
-
-  private scheduleHoverClose(): void {
-    clearTimeout(this.hoverCloseTimer);
-    this.hoverCloseTimer = setTimeout(() => {
-      if (this.menuType() === 'timestamp') this.menuType.set(null);
-    }, 250);
-  }
-
-  private cancelHoverClose(): void { clearTimeout(this.hoverCloseTimer); }
-
 
   filterLevel(): void {
     this.filterSelected.emit(`@l = '${this.event()['@l']}'`);
@@ -880,17 +688,4 @@ export class EventRowComponent {
   filterAttr(key: string, raw: unknown): void {
     this.filterSelected.emit(`${key} = ${jvLiteral(raw)}`);
   }
-
-  async copyRaw(): Promise<void> {
-    await navigator.clipboard.writeText(JSON.stringify(this.event()));
-    this.menuType.set(null);
-  }
-
-  copyLink(): void {
-    const url = `${window.location.origin}/events?id=${encodeURIComponent(this.event().id ?? '')}`;
-    navigator.clipboard.writeText(url);
-    this.menuType.set(null);
-  }
-
-  protected readonly escapeHtmlExport = escapeHtmlExport;
 }

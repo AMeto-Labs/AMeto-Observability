@@ -26,11 +26,4 @@ export class NavComponent {
   ];
 
   readonly settingsItem: NavItem = { path: '/settings', icon: 'settings', label: 'Settings' };
-
-  readonly userLabel: string = (() => {
-    const r = this.auth.role;
-    return r.charAt(0).toUpperCase() + r.slice(1);
-  })();
-
-  readonly userInitials: string = this.userLabel.slice(0, 2).toUpperCase();
 }

@@ -25,7 +25,11 @@ export class LoginComponent implements OnInit {
   error    = signal<string | null>(null);
   providers = signal<AuthProvidersDto>({ local: true, google: false, microsoft: false });
 
+  private returnUrl = '/';
+
   ngOnInit(): void {
+    this.returnUrl = this.route.snapshot.queryParamMap.get('returnUrl') || '/';
+
     // Show error from OAuth redirect
     this.route.queryParamMap.subscribe(params => {
       const err = params.get('error');
@@ -54,11 +58,11 @@ export class LoginComponent implements OnInit {
     this.loading.set(true);
     this.error.set(null);
     this.auth.login(this.username, this.password).subscribe({
-      next: () => this.router.navigate(['/']),
+      next: () => this.router.navigateByUrl(this.returnUrl),
       error: () => { this.loading.set(false); this.error.set('Invalid credentials.'); },
     });
   }
 
-  loginGoogle(): void     { this.auth.loginWithOAuth('google'); }
-  loginMicrosoft(): void  { this.auth.loginWithOAuth('microsoft'); }
+  loginGoogle(): void     { this.auth.loginWithOAuth('google', this.returnUrl); }
+  loginMicrosoft(): void  { this.auth.loginWithOAuth('microsoft', this.returnUrl); }
 }

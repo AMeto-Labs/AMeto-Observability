@@ -53,6 +53,29 @@
   outline: none;
 }
 
+.perm-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+  cursor: pointer;
+
+  input[type="checkbox"] {
+    width: 14px;
+    height: 14px;
+    accent-color: var(--primary);
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+}
+.perm-name { font-size: 12px; color: var(--text-primary); }
+.perm-hint {
+  font-size: 10.5px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  margin-left: auto;
+}
+
 .modal-actions {
   display: flex;
   justify-content: flex-end;

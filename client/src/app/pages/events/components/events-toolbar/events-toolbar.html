@@ -1,0 +1,65 @@
+<div class="toolbar">
+  <div class="filter-wrap">
+    <lucide-icon name="search" [size]="13" class="filter-icon" />
+    <div class="filter-hl-wrap">
+      <div class="filter-hl" [innerHTML]="filterHighlight()" aria-hidden="true"></div>
+      <textarea
+        #filterEl
+        class="filter-input"
+        placeholder="Filter expression… (Enter = run, Ctrl+Enter = newline, Ctrl+Space = suggest)"
+        [rows]="filterRows()"
+        (input)="onFilterInput($any($event.target).value)"
+        (keydown)="onFilterKeydown($event)"
+        (blur)="closeSuggest()"
+        spellcheck="false"
+        autocomplete="off"
+        wrap="soft"></textarea>
+      @if (suggestOpen() && suggestItems().length) {
+        <div class="suggest-pop" role="listbox" aria-label="Filter suggestions" (mousedown)="$event.preventDefault()">
+          @for (item of suggestItems(); track item; let i = $index) {
+            <div
+              class="suggest-item"
+              role="option"
+              [class.active]="i === suggestIndex()"
+              (mouseenter)="suggestIndex.set(i)"
+              (click)="selectSuggestion(item)">{{ item }}</div>
+          }
+        </div>
+      }
+    </div>
+    @if (store.filterInput()) {
+      <button class="filter-clear" (click)="store.applyFilter('')" title="Clear filter">
+        <lucide-icon name="x" [size]="12" />
+      </button>
+    }
+    <span class="kbd-hint">Ctrl+Space</span>
+  </div>
+
+  <div class="toolbar-right">
+    <div class="sep-v"></div>
+    <button class="tb-live-btn fb-apply-btn" [disabled]="!store.canSearch()" (click)="store.search()">
+      <lucide-icon name="play" [size]="12" />
+      Apply
+    </button>
+    <button class="tb-live-btn" (click)="store.resetAll()">
+      <lucide-icon name="x" [size]="12" />
+      Clear
+    </button>
+    <div class="sep-v"></div>
+    <button
+      class="tb-live-btn"
+      [class.live-on]="store.live()"
+      (click)="store.toggleLive()"
+      title="Live tail">
+      <span class="live-dot" [class.on]="store.live()"></span>
+      <span>Live</span>
+    </button>
+    <button
+      class="tb-icon-btn"
+      [class.tb-icon-btn--on]="store.signalsPanelOpen()"
+      (click)="store.toggleSignalsPanel()"
+      title="Signals / Alerts">
+      <lucide-icon name="bell" [size]="16" [strokeWidth]="1.5" />
+    </button>
+  </div>
+</div>
