@@ -2,6 +2,7 @@ import { ChangeDetectionStrategy, Component, computed, inject, signal } from '@a
 import { LucideAngularModule } from 'lucide-angular';
 
 import { OverlayPanelRef } from '../../../shared/services/overlay';
+import { serviceColor } from '../../../shared/utils/service-color';
 
 /** Input handed to the services dropdown via {@link OverlayPanelRef.data}. */
 export interface ServicesDropdownData {
@@ -17,12 +18,6 @@ export interface ServicesDropdownData {
 
 /** Resolved via {@link OverlayPanelRef.close} on Apply; `undefined` when dismissed. */
 export type ServicesDropdownResult = Set<string>;
-
-const SERVICE_COLORS = [
-  '#4DA3FF', '#38BDF8', '#34D399', '#A78BFA',
-  '#FB923C', '#F472B6', '#22D3EE', '#818CF8',
-  '#E879F9', '#4ADE80', '#FACC15', '#F87171',
-];
 
 @Component({
   selector: 'app-services-dropdown',
@@ -127,11 +122,8 @@ export class ServicesDropdownComponent {
     return `${Math.round(((this.ref.data.counts[svc] ?? 0) / total) * 100)}%`;
   }
 
-  serviceColor(name: string): string {
-    let h = 0;
-    for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
-    return SERVICE_COLORS[h % SERVICE_COLORS.length];
-  }
+  /** Shared per-service colour (same palette everywhere). */
+  readonly serviceColor = serviceColor;
 
   fmtCount(n: number | undefined): string {
     if (!n) return '0';

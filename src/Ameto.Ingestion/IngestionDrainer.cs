@@ -26,8 +26,11 @@ public sealed class IngestionDrainer : IAsyncDisposable
     private readonly Task                    _loop;
     private int _disposed;
 
-    // Reusable payload buffer per drain call (max 64 KB per event)
-    private readonly byte[] _payloadBuf = new byte[64 * 1024];
+    // Reusable payload buffer per drain call. MUST be at least the ring's slab size
+    // (ServerOptions.Ingestion.MaxEventPayloadBytes) — dequeued payloads are copied into
+    // it, and the ring drops anything larger, so sizing them from the same config value
+    // keeps them in lock-step. Sized in the constructor.
+    private readonly byte[] _payloadBuf;
 
     // Signal: producers release once when enqueueing into an empty buffer.
     // Drainer blocks here instead of polling, eliminating idle CPU usage.
@@ -36,12 +39,14 @@ public sealed class IngestionDrainer : IAsyncDisposable
     public IngestionDrainer(
         IngestionRingBuffer ring,
         StorageEngine storage,
+        ServerOptions options,
         ILogger<IngestionDrainer> logger)
     {
-        _ring    = ring;
-        _storage = storage;
-        _logger  = logger;
-        _loop    = Task.Run(() => DrainLoopAsync(_cts.Token));
+        _ring       = ring;
+        _storage    = storage;
+        _logger     = logger;
+        _payloadBuf = new byte[options.Ingestion.MaxEventPayloadBytes];
+        _loop       = Task.Run(() => DrainLoopAsync(_cts.Token));
     }
 
     /// <summary>

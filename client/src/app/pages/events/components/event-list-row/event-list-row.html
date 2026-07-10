@@ -6,7 +6,7 @@
       <span class="ev-lvl-badge">{{ levelShort() }}</span>
     </span>
     @if (service()) {
-      <span class="ev-svc">
+      <span class="ev-svc" [style.--svc-color]="svcColor()">
         <lucide-icon name="box" [size]="12" class="ev-svc-icon" />
         <span class="ev-svc-name">{{ service() }}</span>
       </span>

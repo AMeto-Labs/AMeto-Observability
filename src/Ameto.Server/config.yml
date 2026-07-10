@@ -17,6 +17,12 @@ Ameto:
   Indexing:
     MaxPropertyFlattenDepth: 5
 
+  # Ingestion size limits (bytes)
+  Ingestion:
+    MaxBatchBytes: 4194304        # 4 MB  — max POST /api/events body (larger → 413)
+    MaxEventPayloadBytes: 65536   # 64 KB — max properties per event (larger events dropped + logged)
+    MaxOtlpBatchBytes: 8388608    # 8 MB  — max OTLP /otlp/v1/* body (larger → 413)
+
   # Per-level default retention (days).
   # These are only used the very first time — after that the values live in SQLite.
   Retention:

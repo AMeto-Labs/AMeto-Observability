@@ -143,6 +143,13 @@ public sealed class CompiledFilter
                     if (p.Length >= 3) out_.Add((like.Property, p));
                 break;
 
+            case FreeTextNode ft:
+                // Each 3+ char term narrows candidate blocks via the trigram index
+                // (property is ignored by LookupTrigram — the index is global text).
+                foreach (var term in ft.Terms)
+                    if (term.Length >= 3) out_.Add((string.Empty, term));
+                break;
+
             case AndNode and:
                 CollectTrigram(and.Left,  out_);
                 CollectTrigram(and.Right, out_);

@@ -16,8 +16,10 @@ import { MetricSeriesDto } from '../../../../core/models/metric.model';
 import { UserPreferencesService } from '../../../../core/services/user-preferences.service';
 import { ApiService } from '../../../../core/services/api.service';
 import { renderMessageHtml } from '../../../../shared/utils/clef-renderer';
+import { serviceColor } from '../../../../shared/utils/service-color';
 import { JsonViewerComponent } from '../../../../shared/components/json-viewer/json-viewer';
 import { MetricSparkComponent } from '../../../../shared/components/metric-spark/metric-spark';
+import { ModalComponent } from '../../../../shared/components/ui';
 import {
   JsonViewerActions, JvMenuRequest, jvLiteral, jvWildcard,
 } from '../../../../shared/components/json-viewer/json-viewer.actions';
@@ -103,7 +105,7 @@ function wfFmtMs(ms: number): string {
  */
 @Component({
   selector: 'app-event-detail',
-  imports: [LucideAngularModule, NgTemplateOutlet, DatePipe, JsonViewerComponent, MetricSparkComponent],
+  imports: [LucideAngularModule, NgTemplateOutlet, DatePipe, JsonViewerComponent, MetricSparkComponent, ModalComponent],
   providers: [JsonViewerActions],
   templateUrl: './event-detail.html',
   styleUrl: './event-detail.scss',
@@ -124,7 +126,9 @@ export class EventDetailComponent {
   // ── Local state ───────────────────────────────────────────────────────
   detailTab  = signal<'overview' | 'message' | 'json' | 'exception' | 'trace' | 'metrics'>('overview');
   jsonSearch = signal('');
-  menuType  = signal<'timestamp' | 'jv' | null>(null);
+  /** Full rendered-message modal (the hero clamps to 2 lines). */
+  messageModalOpen = signal(false);
+  menuType  = signal<'timestamp' | 'jv' | 'service' | 'level' | 'traceId' | 'spanId' | null>(null);
   menuPos   = signal({ x: 0, y: 0 });
   /** Active JSON-viewer node context (path/value/kind) when {@link menuType} is 'jv'. */
   jvMenu = signal<JvMenuRequest | null>(null);
@@ -180,6 +184,7 @@ export class EventDetailComponent {
         this.menuType.set(null);
         this.jvMenu.set(null);
         this.jsonSearch.set('');
+        this.messageModalOpen.set(false);
         this.detailTab.set(this.hasException() ? 'exception' : 'overview');
         this.lastFetchedTid.set('');
         this.traceSpans.set([]);
@@ -304,6 +309,9 @@ export class EventDetailComponent {
   service = computed(() =>
     (this.event()['service.name'] as string | undefined) ?? ''
   );
+
+  /** Stable per-service colour, shared with the list rows / dropdown / waterfall. */
+  svcColor = computed(() => serviceColor(this.service()));
 
   traceId = computed(() =>
     (this.event()['@tr'] as string | undefined) ??
@@ -476,10 +484,7 @@ export class EventDetailComponent {
   }
 
   wfSvcColor(name: string): string {
-    const PALETTE = ['#38BDF8', '#F59E0B', '#22C55E', '#a78bfa', '#f97316', '#ec4899', '#06b6d4', '#84cc16'];
-    let h = 0;
-    for (const c of name) h = (h * 31 + c.charCodeAt(0)) & 0x7fff_ffff;
-    return PALETTE[h % PALETTE.length];
+    return serviceColor(name);
   }
 
   wfFmt(nanos: number): string { return wfFmtMs(nanos / 1_000_000); }
@@ -540,23 +545,36 @@ export class EventDetailComponent {
   }
 
   /**
-   * Opens the timestamp seek/range menu *anchored to a row element* — used by
-   * the leading clock button on the Timestamp meta-table row so the menu pops
-   * just right of the button rather than at an arbitrary click point.
+   * Opens a fact's action menu (service / level / timestamp / trace / span),
+   * anchored below the leading ⋮ button that triggered it.
    */
-  openRowMenu(e: MouseEvent, type: 'timestamp'): void {
+  openMenu(e: MouseEvent, type: 'timestamp' | 'service' | 'level' | 'traceId' | 'spanId'): void {
     e.preventDefault();
     e.stopPropagation();
-    const target = e.currentTarget as HTMLElement;
-    const r = target.getBoundingClientRect();
-    let x = r.right + 4;
-    let y = r.top;
-    const w = 220;
-    const h = 360;
-    if (x + w > window.innerWidth)  x = r.left - w - 4;
-    if (x < 4)                        x = r.right + 4;
-    if (y + h > window.innerHeight)   y = Math.max(4, window.innerHeight - h);
+    this.positionMenu(e.currentTarget as HTMLElement);
     this.menuType.set(type);
+  }
+
+  /**
+   * Opens the filter/copy menu for a top-level property, reusing the JSON-viewer
+   * 'jv' menu, anchored below its leading ⋮ button.
+   */
+  openPropMenu(e: MouseEvent, kv: PropEntry): void {
+    e.preventDefault();
+    e.stopPropagation();
+    this.jvMenu.set({ path: kv.path, rawValue: kv.raw, isContainer: kv.isStructured, x: 0, y: 0 });
+    this.positionMenu(e.currentTarget as HTMLElement);
+    this.menuType.set('jv');
+  }
+
+  /** Positions the context menu just below the triggering button, flipping up / clamping to the viewport. */
+  private positionMenu(el: HTMLElement): void {
+    const r = el.getBoundingClientRect();
+    const w = 240, h = 340;
+    let x = r.left;
+    let y = r.bottom + 4;
+    if (x + w > window.innerWidth)  x = Math.max(4, window.innerWidth - w - 4);
+    if (y + h > window.innerHeight) y = Math.max(4, r.top - h - 4);
     this.menuPos.set({ x, y });
   }
 

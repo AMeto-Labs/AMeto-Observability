@@ -14,8 +14,12 @@ public static class IngestionServiceExtensions
     /// </summary>
     public static IServiceCollection AddAmetoIngestion(this IServiceCollection services)
     {
-        // Ring buffer — singleton shared between endpoint (producers) and drainer (consumer)
-        services.AddSingleton<IngestionRingBuffer>();
+        // Ring buffer — singleton shared between endpoint (producers) and drainer (consumer).
+        // Slab size (max properties bytes per event) is taken from config; a static lambda
+        // keeps this closure allocation-free.
+        services.AddSingleton<IngestionRingBuffer>(static sp =>
+            new IngestionRingBuffer(
+                maxPayloadBytesPerSlot: sp.GetRequiredService<ServerOptions>().Ingestion.MaxEventPayloadBytes));
 
         // Endpoint — singleton, mapped as a route handler in Program.cs
         services.AddSingleton<IngestionEndpoint>();

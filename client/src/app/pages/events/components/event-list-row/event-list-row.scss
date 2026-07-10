@@ -143,10 +143,31 @@
 }
 .ev-msg:hover { color: var(--txt); }
 
-/* Wrap mode: let the message wrap instead of truncating. The row height stays
-   fixed (host clips overflow) — the full message lives in the drawer. */
-:host.ev-wrap-mode .ev-main { align-items: flex-start; padding-top: 6px; }
-:host.ev-wrap-mode .ev-msg  { white-space: pre-wrap; overflow: hidden; text-overflow: clip; word-break: break-word; }
+/* Wrap mode: the row grows to show the full message across multiple lines.
+   (The parent renders wrapped rows non-virtualized, so variable heights are fine.) */
+:host.ev-wrap-mode {
+  height: auto;
+  min-height: 29px;
+  overflow: visible;
+}
+:host.ev-wrap-mode .ev-main {
+  height: auto;
+  min-height: 29px;
+  align-items: flex-start;
+  padding-top: 6px;
+  padding-bottom: 6px;
+}
+:host.ev-wrap-mode .ev-ts,
+:host.ev-wrap-mode .ev-level,
+:host.ev-wrap-mode .ev-svc { padding-top: 1px; }
+:host.ev-wrap-mode .ev-msg {
+  white-space: pre-wrap;
+  overflow: visible;
+  text-overflow: clip;
+  word-break: break-word;
+  padding-right: 8px;
+}
+:host.ev-wrap-mode .ev-props-hint { display: none; }
 
 .ev-props-hint {
   display: flex;

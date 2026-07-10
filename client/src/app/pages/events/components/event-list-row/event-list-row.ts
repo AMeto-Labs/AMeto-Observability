@@ -8,6 +8,7 @@ import { LucideAngularModule } from 'lucide-angular';
 
 import { EventDto } from '../../../../core/models/event.model';
 import { renderMessageHtml } from '../../../../shared/utils/clef-renderer';
+import { serviceColor } from '../../../../shared/utils/service-color';
 import { ContextMenuService, OverlayPanelRef } from '../../../../shared/services/overlay';
 
 const LEVEL_SHORT: Record<string, string> = {
@@ -31,9 +32,10 @@ function formatInline(v: unknown): string {
  * lightweight "find similar" filter ({@link filterSelected}). All inline detail,
  * trace/metrics/JSON tabs and heavyweight menus live in the drawer, not here.
  *
- * The host renders at a fixed 29px and clips overflow so heights stay uniform
- * for virtual scrolling — {@link wrap} toggles message wrapping vs truncation
- * within that fixed box, it never grows the row.
+ * By default the host renders at a fixed 29px and clips overflow so heights stay
+ * uniform for virtual scrolling. In {@link wrap} mode the host grows to fit the
+ * full message across multiple lines (the parent renders wrapped rows
+ * non-virtualized, since variable heights can't be virtualized at fixed size).
  */
 @Component({
   selector: 'app-event-list-row',
@@ -58,7 +60,7 @@ export class EventListRowComponent {
   readonly event = input.required<EventDto>();
   /** Highlight when this row is the one currently open in the detail drawer. */
   readonly selected = input<boolean>(false);
-  /** Wrap the message text instead of truncating it (row height stays fixed). */
+  /** Wrap the message across multiple lines (the row grows to fit) instead of truncating. */
   readonly wrap = input<boolean>(false);
   /** True for ~1s after the event arrives on the live tail — plays a highlight flash. */
   readonly isNew = input<boolean>(false);
@@ -97,6 +99,9 @@ export class EventListRowComponent {
 
   readonly service = computed(() =>
     (this.event()['service.name'] as string | undefined) ?? '');
+
+  /** Stable per-service colour (shared across the app). */
+  readonly svcColor = computed(() => serviceColor(this.service()));
 
   readonly renderedHtml = computed(() =>
     this.sanitizer.bypassSecurityTrustHtml(

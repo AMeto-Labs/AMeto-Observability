@@ -2,32 +2,24 @@
 
 <div class="ev-detail" [attr.data-level]="levelKey()">
 
-  <!-- ── Header: severity + timestamp + service + close ─────────────── -->
-  <header class="d-head">
-    <span class="ev-log-badge" [attr.data-level]="levelKey()">{{ ev['@l'] }}</span>
-    <div class="d-head-meta">
-      <span class="d-head-ts">{{ ev['@t'] | date: 'yyyy-MM-dd HH:mm:ss.SSS' }}</span>
-      @if (service()) {
-        <span class="d-head-svc" title="Service">
-          <lucide-icon name="box" [size]="11" />{{ service() }}
-        </span>
-      }
-    </div>
-    <button class="d-close" (click)="closed.emit()" title="Close" aria-label="Close detail">
-      <lucide-icon name="x" [size]="16" />
-    </button>
-  </header>
-
-  <!-- ── Message hero — always visible ──────────────────────────────── -->
+  <!-- ── Message hero (top element) — clamped to 2 lines; expand for full ─ -->
   <div class="d-message">
-    <div class="d-message-text" [innerHTML]="renderedHtml()"></div>
-    <button
-      class="d-msg-copy"
-      [class.done]="copiedKey() === 'message'"
-      (click)="copyMessage()"
-      title="Copy message">
-      <lucide-icon [name]="copiedKey() === 'message' ? 'check' : 'copy'" [size]="12" />
-    </button>
+    <div class="d-message-text d-clamp" [innerHTML]="renderedHtml()"></div>
+    <div class="d-msg-actions">
+      <button class="d-msg-btn" (click)="messageModalOpen.set(true)" title="View full message">
+        <lucide-icon name="maximize-2" [size]="12" />
+      </button>
+      <button
+        class="d-msg-btn"
+        [class.done]="copiedKey() === 'message'"
+        (click)="copyMessage()"
+        title="Copy message">
+        <lucide-icon [name]="copiedKey() === 'message' ? 'check' : 'copy'" [size]="12" />
+      </button>
+      <button class="d-msg-btn d-msg-close" (click)="closed.emit()" title="Close" aria-label="Close detail">
+        <lucide-icon name="x" [size]="13" />
+      </button>
+    </div>
   </div>
 
   <!-- ── Tabs ───────────────────────────────────────────────────────── -->
@@ -47,113 +39,72 @@
   <div class="ev-detail-body">
 
     @if (detailTab() === 'overview') {
-      <!-- HTTP / duration summary -->
-      @if (httpInfo().method || httpInfo().status || httpInfo().url || traceDuration() !== null) {
-        <div class="d-http">
-          @if (httpInfo().method) { <span class="d-http-method">{{ httpInfo().method }}</span> }
-          @if (httpInfo().status; as st) {
-            <span class="d-http-status" [class.ok]="st[0] === '2'" [class.err]="st[0] === '4' || st[0] === '5'">{{ st }}</span>
-          }
-          @if (httpInfo().url) { <span class="d-http-url">{{ httpInfo().url }}</span> }
-          @if (traceDuration() !== null) {
-            <span class="d-http-dur"><lucide-icon name="clock" [size]="11" />{{ traceDurationLabel() }}</span>
-          }
-        </div>
-      }
-
-      <!-- Facts -->
+      <!-- Facts — menu | key | value -->
       <div class="d-facts">
         <div class="d-fact">
+          @if (service()) {
+            <button class="d-menu-btn" (click)="openMenu($event, 'service')" title="Service actions">
+              <lucide-icon name="list-filter" [size]="12" />
+            </button>
+          } @else {
+            <span class="d-menu-spacer"></span>
+          }
           <span class="d-fact-k">Service</span>
           <div class="d-fact-v">
-            <span class="d-fact-val">{{ service() || 'n/a' }}</span>
-            @if (service()) {
-              <span class="d-acts">
-                <button class="d-act" (click)="filterService()" title="Show only this service">
-                  <lucide-icon name="list-filter" [size]="11" />Only
-                </button>
-                <button class="d-act" (click)="excludeService()" title="Exclude this service">
-                  <lucide-icon name="ban" [size]="11" />Exclude
-                </button>
-                <button class="d-act d-act-icon" [class.done]="copiedKey() === 'service'" (click)="copyService()" title="Copy service name">
-                  <lucide-icon [name]="copiedKey() === 'service' ? 'check' : 'copy'" [size]="11" />
-                </button>
-              </span>
-            }
-          </div>
-        </div>
-
-        <div class="d-fact">
-          <span class="d-fact-k">Level</span>
-          <div class="d-fact-v">
-            <span class="ev-log-badge" [attr.data-level]="levelKey()">{{ ev['@l'] }}</span>
-            <span class="d-acts">
-              <button class="d-act" (click)="filterLevel()" title="Show only this log level">
-                <lucide-icon name="list-filter" [size]="11" />Only
-              </button>
-              <button class="d-act" (click)="excludeLevel()" title="Exclude this log level">
-                <lucide-icon name="ban" [size]="11" />Exclude
-              </button>
+            <span class="d-svc" [style.--svc-color]="svcColor()">
+              <span class="d-svc-dot"></span>
+              <span class="d-fact-val d-svc-name">{{ service() || 'n/a' }}</span>
             </span>
           </div>
         </div>
 
         <div class="d-fact">
+          <button class="d-menu-btn" (click)="openMenu($event, 'timestamp')" title="Seek / range around this time">
+            <lucide-icon name="list-filter" [size]="12" />
+          </button>
           <span class="d-fact-k">Timestamp</span>
           <div class="d-fact-v">
             <span class="d-fact-val d-mono">{{ ev['@t'] | date: 'yyyy-MM-dd HH:mm:ss.SSS' }}</span>
-            <span class="d-acts">
-              <button class="d-act" (click)="openRowMenu($event, 'timestamp')" title="Seek / range around this time">
-                <lucide-icon name="clock" [size]="11" />Seek…
-              </button>
-            </span>
+          </div>
+        </div>
+
+        <div class="d-fact">
+          <button class="d-menu-btn" (click)="openMenu($event, 'level')" title="Level actions">
+            <lucide-icon name="list-filter" [size]="12" />
+          </button>
+          <span class="d-fact-k">Level</span>
+          <div class="d-fact-v">
+            <span class="ev-log-badge" [attr.data-level]="levelKey()">{{ ev['@l'] }}</span>
           </div>
         </div>
 
         @if (traceId()) {
           <div class="d-fact">
+            <button class="d-menu-btn" (click)="openMenu($event, 'traceId')" title="TraceId actions">
+              <lucide-icon name="list-filter" [size]="12" />
+            </button>
             <span class="d-fact-k">TraceId</span>
             <div class="d-fact-v">
               <span class="d-fact-val d-mono d-id">{{ traceId() }}</span>
-              <span class="d-acts">
-                <button class="d-act" (click)="filterAttr('@tr', traceId())" title="Filter events by this TraceId">
-                  <lucide-icon name="list-filter" [size]="11" />Find
-                </button>
-                <button class="d-act" (click)="openTraceExternal()" title="Open this trace in the Traces page">
-                  <lucide-icon name="external-link" [size]="11" />Traces
-                </button>
-                <button class="d-act d-act-icon" [class.done]="copiedKey() === 'traceId'" (click)="copyTraceId()" title="Copy TraceId">
-                  <lucide-icon [name]="copiedKey() === 'traceId' ? 'check' : 'copy'" [size]="11" />
-                </button>
-              </span>
             </div>
           </div>
         }
 
         @if (spanId()) {
           <div class="d-fact">
+            <button class="d-menu-btn" (click)="openMenu($event, 'spanId')" title="SpanId actions">
+              <lucide-icon name="list-filter" [size]="12" />
+            </button>
             <span class="d-fact-k">SpanId</span>
             <div class="d-fact-v">
               <span class="d-fact-val d-mono d-id">{{ spanId() }}</span>
-              <span class="d-acts">
-                <button class="d-act" (click)="filterAttr('@sp', spanId())" title="Filter events by this SpanId">
-                  <lucide-icon name="list-filter" [size]="11" />Find
-                </button>
-                @if (traceId()) {
-                  <button class="d-act" (click)="openTraceExternal()" title="Open the parent trace in the Traces page">
-                    <lucide-icon name="external-link" [size]="11" />Traces
-                  </button>
-                }
-                <button class="d-act d-act-icon" [class.done]="copiedKey() === 'spanId'" (click)="copySpanId()" title="Copy SpanId">
-                  <lucide-icon [name]="copiedKey() === 'spanId' ? 'check' : 'copy'" [size]="11" />
-                </button>
-              </span>
             </div>
           </div>
         }
 
         @for (it of overviewCustomItems(); track it.key) {
           <div class="d-fact">
+            <span class="d-menu-spacer"></span>
             <span class="d-fact-k">{{ it.key }}</span>
             <div class="d-fact-v"><span class="d-fact-val">{{ it.value }}</span></div>
           </div>
@@ -166,6 +117,9 @@
         <div class="d-props">
           @for (kv of allProps(); track kv.path) {
             <div class="d-prop" [class.structured]="kv.isStructured">
+              <button class="d-menu-btn" (click)="openPropMenu($event, kv)" title="Filter / copy">
+                <lucide-icon name="list-filter" [size]="12" />
+              </button>
               <span class="d-prop-k">{{ kv.path }}</span>
               <div class="d-prop-v"><app-json-viewer [value]="kv.raw" [path]="kv.path" /></div>
             </div>
@@ -299,7 +253,7 @@
             <div class="tr-block-label">Span identity</div>
             <div class="tr-tags">
               @if (service()) {
-                <span class="tr-badge tr-badge--svc">
+                <span class="tr-badge tr-badge--svc" [style.--svc-color]="svcColor()">
                   <lucide-icon name="box" [size]="11" />{{ service() }}
                 </span>
               }
@@ -451,6 +405,17 @@
   </div>
 </div>
 
+<!-- Full rendered-message modal (opened from the clamped hero) -->
+<app-modal [open]="messageModalOpen()" title="Rendered message" (close)="messageModalOpen.set(false)">
+  <div class="d-modal-msg" [innerHTML]="renderedHtml()"></div>
+  <div class="d-modal-actions">
+    <button class="d-modal-copy" [class.done]="copiedKey() === 'message'" (click)="copyMessage()">
+      <lucide-icon [name]="copiedKey() === 'message' ? 'check' : 'copy'" [size]="13" />
+      {{ copiedKey() === 'message' ? 'Copied!' : 'Copy' }}
+    </button>
+  </div>
+</app-modal>
+
 <ng-template #excBlock let-exc let-depth="depth">
   <div class="exc-frame" [style.margin-left.px]="depth * 12">
     <div class="exc-head">
@@ -472,6 +437,34 @@
 <!-- Context menus (rendered into a CDK overlay attached to body) -->
 <ng-template #ctxMenuTpl>
   <div class="ctx-menu">
+    @if (menuType() === 'service') {
+      <div class="ctx-label">{{ service() }}</div>
+      <button (click)="filterService()"><lucide-icon name="list-filter" [size]="13" />Only this service</button>
+      <button (click)="excludeService()"><lucide-icon name="ban" [size]="13" />Exclude this service</button>
+      <hr />
+      <button (click)="copyService()"><lucide-icon name="copy" [size]="13" />Copy name</button>
+    }
+    @if (menuType() === 'level') {
+      <div class="ctx-label">{{ event()['@l'] }}</div>
+      <button (click)="filterLevel()"><lucide-icon name="list-filter" [size]="13" />Only this level</button>
+      <button (click)="excludeLevel()"><lucide-icon name="ban" [size]="13" />Exclude this level</button>
+    }
+    @if (menuType() === 'traceId') {
+      <div class="ctx-label">TraceId</div>
+      <button (click)="filterAttr('@tr', traceId())"><lucide-icon name="list-filter" [size]="13" />Find this TraceId</button>
+      <button (click)="openTraceExternal()"><lucide-icon name="external-link" [size]="13" />Open in Traces page</button>
+      <hr />
+      <button (click)="copyTraceId()"><lucide-icon name="copy" [size]="13" />Copy TraceId</button>
+    }
+    @if (menuType() === 'spanId') {
+      <div class="ctx-label">SpanId</div>
+      <button (click)="filterAttr('@sp', spanId())"><lucide-icon name="list-filter" [size]="13" />Find this SpanId</button>
+      @if (traceId()) {
+        <button (click)="openTraceExternal()"><lucide-icon name="external-link" [size]="13" />Open parent trace</button>
+      }
+      <hr />
+      <button (click)="copySpanId()"><lucide-icon name="copy" [size]="13" />Copy SpanId</button>
+    }
     @if (menuType() === 'timestamp') {
       <div class="ctx-label">{{ event()['@t'] | date: 'yyyy-MM-dd HH:mm:ss.SSS' }}</div>
       <div class="ctx-label">Seek window (±)</div>

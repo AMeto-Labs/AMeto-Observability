@@ -20,6 +20,8 @@
   height: 100%;
   min-height: 0;
   background: var(--surface);
+  /* Severity accent strip along the top edge of the panel. */
+  box-shadow: inset 0 2px 0 var(--sev, var(--accent));
 }
 
 /* Severity accent, resolved from the panel's data-level. */
@@ -30,84 +32,39 @@
 .ev-detail[data-level="error"]       { --sev: var(--lvl-e); }
 .ev-detail[data-level="fatal"]       { --sev: var(--lvl-f); }
 
-/* ── Header ──────────────────────────────────────────────────────── */
-.d-head {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 10px 12px;
-  flex-shrink: 0;
-  border-bottom: 1px solid var(--border-sub);
-  background: var(--surface);
-  box-shadow: inset 0 2px 0 var(--sev, var(--accent));
-}
-.d-head-meta {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-  min-width: 0;
-  flex: 1;
-}
-.d-head-ts {
-  font-size: 12.5px;
-  color: var(--txt);
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-}
-.d-head-svc {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  min-width: 0;
-  font-size: 11px;
-  color: var(--txt-muted);
-
-  lucide-icon { flex-shrink: 0; opacity: .7; }
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.d-close {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 26px;
-  height: 26px;
-  flex-shrink: 0;
-  border-radius: var(--radius-sm, 6px);
-  background: none;
-  border: 1px solid transparent;
-  color: var(--txt-muted);
-  cursor: pointer;
-  transition: color .12s, background .12s, border-color .12s;
-
-  &:hover { color: var(--txt); background: var(--surface-up); border-color: var(--border); }
-}
-
-/* ── Message hero (always visible) ───────────────────────────────── */
+/* ── Message hero (top element) — clamped to 2 lines; full text in modal ─ */
 .d-message {
   position: relative;
   flex-shrink: 0;
-  margin: 10px 12px 2px;
-  padding: 9px 34px 9px 12px;
+  margin: 12px 12px 2px;
+  padding: 9px 84px 9px 12px; /* right room for expand + copy + close */
   background: var(--bg);
   border: 1px solid var(--border-sub);
   border-left: 3px solid var(--sev, var(--accent));
   border-radius: 7px;
-  max-height: 32vh;
-  overflow: auto;
+  overflow: hidden;
 }
 .d-message-text {
   color: var(--txt);
   line-height: 1.55;
-  white-space: pre-wrap;
   word-break: break-word;
   font-size: var(--log-font-size);
 }
-.d-msg-copy {
+.d-message-text.d-clamp {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  white-space: normal;
+}
+.d-msg-actions {
   position: absolute;
   top: 6px;
   right: 6px;
+  display: inline-flex;
+  gap: 4px;
+}
+.d-msg-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -117,6 +74,64 @@
   background: var(--surface);
   border: 1px solid var(--border-sub);
   color: var(--txt-dim);
+  cursor: pointer;
+  transition: color .12s, border-color .12s, background .12s;
+
+  &:hover { color: var(--txt); border-color: var(--accent-soft); }
+  &.done { color: #34D399; border-color: rgba(52,211,153,.35); background: rgba(52,211,153,.08); }
+}
+
+.d-msg-close:hover { color: var(--lvl-e); border-color: rgba(239,68,68,.35); }
+
+/* ── Service identity (coloured, stable per service) ─────────────── */
+.d-svc {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.d-svc-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--svc-color, var(--txt-muted));
+  flex-shrink: 0;
+}
+.d-fact-val.d-svc-name {
+  color: var(--svc-color, var(--txt));
+  font-weight: 500;
+}
+
+/* ── Full-message modal ──────────────────────────────────────────── */
+.d-modal-msg {
+  font-family: var(--font-mono);
+  font-size: var(--log-font-size);
+  line-height: 1.6;
+  color: var(--txt);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 60vh;
+  overflow: auto;
+  padding: 10px 12px;
+  background: var(--bg);
+  border: 1px solid var(--border-sub);
+  border-radius: 6px;
+}
+.d-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 10px;
+}
+.d-modal-copy {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 12px;
+  font-size: 12px;
+  color: var(--txt-muted);
+  background: var(--surface-up);
+  border: 1px solid var(--border);
+  border-radius: 6px;
   cursor: pointer;
   transition: color .12s, border-color .12s, background .12s;
 
@@ -161,59 +176,6 @@
   padding: 12px;
 }
 
-/* ── HTTP / duration summary ─────────────────────────────────────── */
-.d-http {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
-  margin-bottom: 12px;
-}
-.d-http-method {
-  font-family: var(--font-ui);
-  font-size: 11px;
-  font-weight: 700;
-  color: #60A5FA;
-  background: rgba(96,165,250,.12);
-  border: 1px solid rgba(96,165,250,.22);
-  border-radius: 5px;
-  padding: 1px 7px;
-}
-.d-http-status {
-  font-family: var(--font-ui);
-  font-size: 11px;
-  font-weight: 700;
-  color: var(--txt-muted);
-  background: var(--surface-up);
-  border: 1px solid var(--border-sub);
-  border-radius: 5px;
-  padding: 1px 7px;
-  font-variant-numeric: tabular-nums;
-
-  &.ok  { color: #34D399; background: rgba(52,211,153,.1); border-color: rgba(52,211,153,.22); }
-  &.err { color: var(--lvl-e); background: var(--lvl-e-bg); border-color: rgba(239,68,68,.22); }
-}
-.d-http-url {
-  flex: 1 1 100%;
-  min-width: 0;
-  color: var(--txt-dim);
-  font-size: 11px;
-  word-break: break-all;
-}
-.d-http-dur {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  font-family: var(--font-ui);
-  font-size: 11px;
-  color: var(--accent);
-  background: var(--accent-dim);
-  border: 1px solid color-mix(in srgb, var(--accent) 25%, transparent);
-  border-radius: 5px;
-  padding: 1px 7px;
-  font-variant-numeric: tabular-nums;
-}
-
 /* ── Facts (definition grid) ─────────────────────────────────────── */
 .d-facts {
   display: flex;
@@ -221,22 +183,21 @@
   margin-bottom: 6px;
 }
 .d-fact {
-  display: flex;
-  align-items: flex-start;
-  gap: 12px;
+  display: grid;
+  grid-template-columns: 22px 78px minmax(0, 1fr);   /* menu | key | value */
+  align-items: center;
+  column-gap: 8px;
   padding: 6px 2px;
   border-bottom: 1px solid var(--border-sub);
 }
 .d-fact:last-child { border-bottom: none; }
 .d-fact-k {
-  flex: 0 0 84px;
   color: var(--txt-muted);
   font-size: 11px;
   font-family: var(--font-ui);
-  padding-top: 3px;
+  word-break: break-word;
 }
 .d-fact-v {
-  flex: 1;
   min-width: 0;
   display: flex;
   align-items: center;
@@ -251,33 +212,25 @@
 .d-fact-val.d-mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
 .d-fact-val.d-id   { color: var(--info, #60A5FA); font-size: 11.5px; letter-spacing: .02em; }
 
-.d-acts {
-  display: inline-flex;
+/* Leading ⋮ button — opens a row's context menu (replaces the old right-side buttons). */
+.d-menu-btn {
+  display: flex;
   align-items: center;
-  gap: 4px;
-  margin-left: auto;
-  flex-shrink: 0;
-}
-.d-act {
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
+  justify-content: center;
+  width: 22px;
   height: 22px;
-  padding: 0 8px;
-  border: 1px solid var(--border-sub);
-  background: var(--surface-up);
-  color: var(--txt-muted);
-  font-size: 10.5px;
-  font-family: var(--font-ui);
-  white-space: nowrap;
+  padding: 0;
+  background: none;
+  border: 1px solid transparent;
   border-radius: 5px;
+  color: var(--txt-dim);
   cursor: pointer;
-  transition: color .12s, border-color .12s, background .12s;
-
-  &:hover { color: var(--txt); border-color: var(--accent-soft); background: var(--surface-hover); }
-  &.d-act-icon { padding: 0 6px; }
-  &.done { color: #34D399; border-color: rgba(52,211,153,.35); background: rgba(52,211,153,.08); }
+  transition: color .12s, background .12s, border-color .12s;
 }
+.d-menu-btn:hover  { color: var(--txt); background: var(--surface-hover); border-color: var(--border-sub); }
+.d-menu-btn:active { background: var(--surface-up); }
+/* Keeps the value column aligned on rows that have no menu. */
+.d-menu-spacer { width: 22px; }
 
 /* ── Section label ───────────────────────────────────────────────── */
 .d-section-label {
@@ -309,9 +262,10 @@
   flex-direction: column;
 }
 .d-prop {
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
+  display: grid;
+  grid-template-columns: 22px 128px minmax(0, 1fr);   /* menu | key | value — fixed key col aligns all values */
+  align-items: start;
+  column-gap: 8px;
   padding: 3px 2px;
   border-bottom: 1px solid color-mix(in srgb, var(--border-sub) 55%, transparent);
 
@@ -319,18 +273,17 @@
   &:hover { background: var(--surface-hover); }
 }
 .d-prop-k {
-  flex: 0 0 auto;
-  max-width: 42%;
   color: var(--txt-muted);
   font-size: 11.5px;
   word-break: break-all;
-  padding-top: 1px;
+  padding-top: 3px;
 }
+.d-prop .d-menu-btn { margin-top: 1px; }
 .d-prop-v {
-  flex: 1;
   min-width: 0;
   color: var(--txt);
   word-break: break-all;
+  padding-top: 2px;
 }
 
 .d-empty {

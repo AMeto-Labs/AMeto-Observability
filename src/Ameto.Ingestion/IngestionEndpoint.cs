@@ -23,34 +23,42 @@ namespace Ameto.Ingestion;
 /// Returns:
 ///   200 OK + JSON { "ingested": N, "dropped": M }
 ///   400 Bad Request if body is not a valid MessagePack array
-///   413 Payload Too Large if body exceeds 4 MB
+///   413 Payload Too Large if body exceeds the configured batch limit
+///          (<see cref="IngestionOptions.MaxBatchBytes"/>)
 /// </summary>
 public sealed class IngestionEndpoint
 {
-    private const int MaxBodyBytes = 4 * 1024 * 1024; // 4 MB
-
     private readonly IngestionRingBuffer     _ring;
     private readonly StringInternPool        _pool;
     private readonly IngestionDrainer        _drainer;
     private readonly ILogger<IngestionEndpoint> _logger;
 
+    /// <summary>Max HTTP body bytes for one CLEF batch — 413 above this. From config.</summary>
+    private readonly int _maxBatchBytes;
+
+    /// <summary>Max properties bytes per event — matches the ring slab size. From config.</summary>
+    private readonly int _maxEventPayloadBytes;
+
     public IngestionEndpoint(
         IngestionRingBuffer ring,
         StringInternPool pool,
         IngestionDrainer drainer,
+        ServerOptions options,
         ILogger<IngestionEndpoint> logger)
     {
         _ring    = ring;
         _pool    = pool;
         _drainer = drainer;
         _logger  = logger;
+        _maxBatchBytes        = options.Ingestion.MaxBatchBytes;
+        _maxEventPayloadBytes = options.Ingestion.MaxEventPayloadBytes;
     }
 
     public async Task HandleAsync(HttpContext ctx)
     {
         // ── 1. Read body into a pooled buffer ─────────────────────────────────
         long? contentLength = ctx.Request.ContentLength;
-        if (contentLength > MaxBodyBytes)
+        if (contentLength > _maxBatchBytes)
         {
             ctx.Response.StatusCode = StatusCodes.Status413PayloadTooLarge;
             return;
@@ -84,7 +92,7 @@ public sealed class IngestionEndpoint
                 if (n == 0) break;
                 bodyLen += n;
 
-                if (bodyLen > MaxBodyBytes)
+                if (bodyLen > _maxBatchBytes)
                 {
                     ArrayPool<byte>.Shared.Return(bodyBuf);
                     ctx.Response.StatusCode = StatusCodes.Status413PayloadTooLarge;
@@ -125,25 +133,7 @@ public sealed class IngestionEndpoint
             int ingested = 0, dropped = 0;
 
             foreach (var ev in events)
-            {
-                int tmplIdx = string.IsNullOrEmpty(ev.MessageTemplate)
-                    ? -1
-                    : _pool.Intern(ev.MessageTemplate);
-
-                int svcIdx = ev.ServiceName is not null ? _pool.Intern(ev.ServiceName) : -1;
-
-                bool ok = _ring.TryEnqueue(
-                    ev.Timestamp.UtcTicks,
-                    (byte)ev.Level,
-                    tmplIdx,
-                    ev.MessageTemplate,
-                    ev.Exception,
-                    ev.RawProperties.Span,
-                    ev.TraceIdHi, ev.TraceIdLo, ev.SpanId, svcIdx);
-
-                if (ok) ingested++;
-                else    dropped++;
-            }
+                TryIngest(ev, ref ingested, ref dropped);
 
             if (ingested > 0)
                 _drainer.NotifyEnqueued();
@@ -169,30 +159,51 @@ public sealed class IngestionEndpoint
     public (int Ingested, int Dropped) IngestEvents(IReadOnlyList<LogEvent> events)
     {
         int ingested = 0, dropped = 0;
-        foreach (var ev in events)
-        {
-            int tmplIdx = string.IsNullOrEmpty(ev.MessageTemplate)
-                ? -1
-                : _pool.Intern(ev.MessageTemplate);
-
-            int svcIdx = ev.ServiceName is not null ? _pool.Intern(ev.ServiceName) : -1;
-
-            bool ok = _ring.TryEnqueue(
-                ev.Timestamp.UtcTicks,
-                (byte)ev.Level,
-                tmplIdx,
-                ev.MessageTemplate,
-                ev.Exception,
-                ev.RawProperties.Span,
-                ev.TraceIdHi, ev.TraceIdLo, ev.SpanId, svcIdx);
-
-            if (ok) ingested++;
-            else    dropped++;
-        }
+        for (int i = 0; i < events.Count; i++)
+            TryIngest(events[i], ref ingested, ref dropped);
 
         if (ingested > 0)
             _drainer.NotifyEnqueued();
 
         return (ingested, dropped);
     }
+
+    /// <summary>
+    /// Interns strings and pushes one event onto the ring, tallying ingested/dropped.
+    /// An event whose properties blob exceeds <see cref="_maxEventPayloadBytes"/> is
+    /// rejected up-front WITH a warning (size + reason) — the ring would otherwise drop
+    /// it silently. Ring-full / pool-exhausted back-pressure is still counted as dropped
+    /// but not logged per event, since that path is high-volume under overload.
+    /// </summary>
+    private void TryIngest(LogEvent ev, ref int ingested, ref int dropped)
+    {
+        int payloadLen = ev.RawProperties.Length;
+        if (payloadLen > _maxEventPayloadBytes)
+        {
+            dropped++;
+            _logger.LogWarning(
+                "Dropped oversized log event: properties {PayloadBytes} B exceed limit {LimitBytes} B (service={Service}, template=\"{Template}\")",
+                payloadLen, _maxEventPayloadBytes, ev.ServiceName ?? "(none)", Truncate(ev.MessageTemplate, 120));
+            return;
+        }
+
+        int tmplIdx = string.IsNullOrEmpty(ev.MessageTemplate) ? -1 : _pool.Intern(ev.MessageTemplate);
+        int svcIdx  = ev.ServiceName is not null ? _pool.Intern(ev.ServiceName) : -1;
+
+        bool ok = _ring.TryEnqueue(
+            ev.Timestamp.UtcTicks,
+            (byte)ev.Level,
+            tmplIdx,
+            ev.MessageTemplate,
+            ev.Exception,
+            ev.RawProperties.Span,
+            ev.TraceIdHi, ev.TraceIdLo, ev.SpanId, svcIdx);
+
+        if (ok) ingested++;
+        else    dropped++;
+    }
+
+    /// <summary>Clamps a template for safe logging (cold path only — the substring alloc is fine).</summary>
+    private static string Truncate(string? s, int max) =>
+        string.IsNullOrEmpty(s) ? "(none)" : s.Length <= max ? s : string.Concat(s.AsSpan(0, max), "…");
 }

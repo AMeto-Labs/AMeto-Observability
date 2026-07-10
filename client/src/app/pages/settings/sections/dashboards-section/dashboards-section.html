@@ -1,12 +1,128 @@
-<app-section title="Dashboards">
-  <div class="row">
-    <div>
-      <span class="label">Dashboards</span>
-      <span class="sublabel">View metrics, diagnostics and system dashboards.</span>
-    </div>
-    <a class="toggle" routerLink="/diagnostics">
-      <lucide-icon name="layout-dashboard" [size]="14" />
-      Open Dashboards
-    </a>
+<div class="dash-hdr">
+  <div>
+    <span class="label">System dashboard</span>
+    <span class="sublabel">Disk, memory, storage and process vital signs.</span>
   </div>
-</app-section>
+  <div class="dash-hdr-actions">
+    @if (refreshedAt()) { <span class="refreshed-at">Updated {{ refreshedAt() }}</span> }
+    <button class="dash-refresh" (click)="load()" [disabled]="loading()">
+      <lucide-icon name="refresh-cw" [size]="13" [strokeWidth]="1.5" /> Refresh
+    </button>
+  </div>
+</div>
+
+@if (loading() && !data()) {
+  <app-section title="Disk">
+    @for (i of [1, 2]; track i) {
+      <div class="metric">
+        <div class="skeleton skeleton-name"></div>
+        <div class="metric-right">
+          <div class="skeleton skeleton-value"></div>
+          <div class="skeleton skeleton-desc"></div>
+        </div>
+      </div>
+    }
+  </app-section>
+}
+
+@if (data(); as d) {
+  <!-- ── Disk ───────────────────────────────────────────── -->
+  <app-section title="Disk">
+    <div class="metric">
+      <div class="metric-name">Free disk space</div>
+      <div class="metric-right">
+        <div class="metric-value">{{ fmtBytes(d.diskFreeBytes) }}</div>
+        <div class="metric-desc">
+          {{ fmtBytes(d.diskTotalBytes - d.diskFreeBytes) }} used of {{ fmtBytes(d.diskTotalBytes) }}
+          ({{ diskPercent(d.diskFreeBytes, d.diskTotalBytes) }}% used).
+          The event store is persisted on the same drive as the data directory.
+        </div>
+      </div>
+    </div>
+
+    <div class="metric">
+      <div class="metric-name">Storage size</div>
+      <div class="metric-right">
+        <div class="metric-value">{{ fmtBytes(d.totalCompressedBytes) }}</div>
+        <div class="metric-desc">Total compressed size of all cold-tier segments on disk.</div>
+      </div>
+    </div>
+  </app-section>
+
+  <!-- ── Memory ─────────────────────────────────────────── -->
+  <app-section title="Memory">
+    <div class="metric">
+      <div class="metric-name">System RAM usage</div>
+      <div class="metric-right">
+        <div class="metric-value" [class.accent]="d.systemRamPercent >= d.ramTargetPercent">
+          {{ d.systemRamPercent }} %
+        </div>
+        <div class="ram-bar-track">
+          <div class="ram-bar-fill {{ ramClass(d.systemRamPercent, d.ramTargetPercent) }}"
+               [style.width.%]="d.systemRamPercent"></div>
+        </div>
+        <div class="metric-desc">
+          Overall system physical memory utilisation across all processes.
+          Target threshold: <strong>{{ d.ramTargetPercent }} %</strong>.
+          When exceeded, the server flushes the hot tier to release in-memory buffers.
+          Configure via <code>Ameto:RamTargetPercent</code>.
+        </div>
+      </div>
+    </div>
+
+    <div class="metric">
+      <div class="metric-name">Process working set</div>
+      <div class="metric-right">
+        <div class="metric-value">{{ fmtBytes(d.processWorkingSetBytes) }}</div>
+        <div class="metric-desc">Physical memory committed to this server process.</div>
+      </div>
+    </div>
+  </app-section>
+
+  <!-- ── Storage ────────────────────────────────────────── -->
+  <app-section title="Storage">
+    <div class="metric">
+      <div class="metric-name">Segments</div>
+      <div class="metric-right">
+        <div class="metric-value">{{ fmtNum(d.segmentCount) }}</div>
+        <div class="metric-desc">
+          Number of cold-tier segments currently on disk.
+          Each segment holds a time-bounded batch of events.
+        </div>
+      </div>
+    </div>
+
+    <div class="metric">
+      <div class="metric-name">Total events</div>
+      <div class="metric-right">
+        <div class="metric-value">{{ fmtNum(d.totalEventCount) }}</div>
+        <div class="metric-desc">
+          Sum of all events across all cold-tier segments.
+          Does not include events still in the hot tier (not yet flushed).
+        </div>
+      </div>
+    </div>
+  </app-section>
+
+  <!-- ── Process ────────────────────────────────────────── -->
+  <app-section title="Process">
+    <div class="metric">
+      <div class="metric-name">Process uptime</div>
+      <div class="metric-right">
+        <div class="metric-value">{{ fmtUptime(d.processStartedAt) }}</div>
+        <div class="metric-desc">Time since the server process started ({{ fmtStartedAt(d.processStartedAt) }} UTC).</div>
+      </div>
+    </div>
+
+    <div class="metric">
+      <div class="metric-name">Process threads</div>
+      <div class="metric-right">
+        <div class="metric-value">{{ d.processThreads }}</div>
+        <div class="metric-desc">
+          Number of active threads in the server process.
+          A high thread count may indicate contention or slow I/O.
+        </div>
+      </div>
+    </div>
+  </app-section>
+}

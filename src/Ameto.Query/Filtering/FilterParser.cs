@@ -708,17 +708,67 @@ public sealed class FilterParser
             return new CompareNode(lhv?.ToString() ?? "", FlipOp(op), rhv);
         }
 
-        // Bare level keyword: Error, Fatal, etc.
+        // Bare level keyword: Error, Fatal, etc. → level filter (single word only).
         if (lhProp is not null &&
             LogLevelExtensions.TryParse(lhProp.AsSpan(), out var level))
             return new LevelNode(level);
 
-        // Bare property existence (not ideal but tolerated)
-        if (lhProp is not null)
-            return new HasNode(lhProp);
+        // Bare word / quoted string / number with no operator → free-text search.
+        // Greedily collects a run of adjacent bare terms (implicit AND) so `user balance`
+        // searches for events containing both words. Structured clauses are unaffected:
+        // the run stops at any keyword/operator, so `foo and @l = 'Error'` still parses
+        // as And(FreeText 'foo', @l = 'Error'). (Replaces the old bare-property HasNode
+        // fallback — an explicit has()/isDefined() is still available for existence.)
+        if (lhProp is not null || lhv is string || lhv is long || lhv is double)
+        {
+            string first = lhProp is not null
+                ? lhProp.Replace(ClefFields.PropertyPathSeparator, '.')
+                : System.Convert.ToString(lhv, System.Globalization.CultureInfo.InvariantCulture) ?? string.Empty;
+            var terms = new List<string>(2) { first };
+            CollectFreeTextRun(terms);
+            return new FreeTextNode(terms.ToArray());
+        }
 
         return new MatchAllNode();
     }
+
+    // ── Free-text run ─────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// After an initial bare term, greedily consumes following bare terms
+    /// (identifiers, quoted strings, numbers) as additional free-text search terms.
+    /// Stops at anything that begins a structured clause — a comparison operator,
+    /// <c>in</c>/<c>like</c>, a parenthesis/bracket, or a term immediately followed by
+    /// an operator (the LHS of a comparison) — so mixing free text with explicit
+    /// clauses (<c>foo and @l = 'Error'</c>) still parses correctly.
+    /// </summary>
+    private void CollectFreeTextRun(List<string> terms)
+    {
+        while (true)
+        {
+            var k = PeekKind();
+            // A quoted string is always taken as a free-text term.
+            if (k == TokenKind.String)
+            {
+                terms.Add(Peek().Raw);
+                _pos++;
+                continue;
+            }
+            // A bare word/number is a term unless it starts a structured clause (`bar = 1`, `bar.x`).
+            if ((k == TokenKind.Ident || k == TokenKind.Number) && !StartsStructuredClause(PeekKind(1)))
+            {
+                terms.Add(Peek().Raw);
+                _pos++;
+                continue;
+            }
+            return;
+        }
+    }
+
+    /// <summary>True when <paramref name="k"/> begins a comparison / path / list clause.</summary>
+    private static bool StartsStructuredClause(TokenKind k) => k is
+        TokenKind.Eq or TokenKind.Ne or TokenKind.Lt or TokenKind.Le or TokenKind.Gt or TokenKind.Ge
+        or TokenKind.In or TokenKind.Like or TokenKind.LParen or TokenKind.Dot or TokenKind.LBracket;
 
     // ── Value reading ─────────────────────────────────────────────────────────
 
@@ -965,6 +1015,10 @@ public sealed class FilterParser
         _pos < _tokens.Count ? _tokens[_pos] : new Token(TokenKind.Eof, "", -1);
 
     private TokenKind PeekKind() => Peek().Kind;
+
+    /// <summary>Look-ahead: kind of the token <paramref name="ahead"/> positions past the cursor.</summary>
+    private TokenKind PeekKind(int ahead) =>
+        _pos + ahead < _tokens.Count ? _tokens[_pos + ahead].Kind : TokenKind.Eof;
 
     private void Consume(TokenKind kind)
     {

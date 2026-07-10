@@ -23,6 +23,10 @@ export const routes: Routes = [
         loadComponent: () => import('./pages/events/events').then(m => m.EventsComponent),
       },
       {
+        path: 'stats',
+        loadComponent: () => import('./pages/stats/stats').then(m => m.StatsComponent),
+      },
+      {
         path: 'signals',
         loadComponent: () => import('./pages/signals/signals').then(m => m.SignalsPageComponent),
       },
@@ -43,10 +47,6 @@ export const routes: Routes = [
             loadComponent: () => import('./pages/settings/user-detail/user-detail').then(m => m.UserDetailComponent),
           },
         ],
-      },
-      {
-        path: 'diagnostics',
-        loadComponent: () => import('./pages/diagnostics/diagnostics').then(m => m.DiagnosticsComponent),
       },
       {
         path: 'traces',

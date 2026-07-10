@@ -25,7 +25,6 @@ namespace Ameto.Otel;
 /// </summary>
 public static class OtlpEndpointMapper
 {
-    private const int    MaxBodyBytes        = 8 * 1024 * 1024; // 8 MB
     private const string JsonContentType     = "application/json";
     private const string ProtobufContentType = "application/x-protobuf";
 
@@ -180,8 +179,10 @@ public static class OtlpEndpointMapper
     /// </summary>
     private static async ValueTask<(byte[]? Buffer, int Length)> ReadBodyAsync(HttpContext ctx)
     {
+        int maxBytes = ctx.RequestServices.GetRequiredService<Ameto.Core.ServerOptions>().Ingestion.MaxOtlpBatchBytes;
+
         long? declared = ctx.Request.ContentLength;
-        if (declared > MaxBodyBytes)
+        if (declared > maxBytes)
         {
             ctx.Response.StatusCode = StatusCodes.Status413PayloadTooLarge;
             return (null, 0);
@@ -208,7 +209,7 @@ public static class OtlpEndpointMapper
                 if (read == 0) break;
                 totalRead += read;
 
-                if (totalRead > MaxBodyBytes)
+                if (totalRead > maxBytes)
                 {
                     ctx.Response.StatusCode = StatusCodes.Status413PayloadTooLarge;
                     ArrayPool<byte>.Shared.Return(buf);

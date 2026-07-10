@@ -1,0 +1,60 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Docker build CONTEXT excludes.
+#
+# The Dockerfile (install/docker/Dockerfile) builds everything INSIDE the image
+# (`npm ci`, `dotnet restore/publish`), so the context only needs:
+#   client/ (minus node_modules/.angular/dist), src/ (minus bin/obj), Ameto.slnx
+#
+# IMPORTANT: Docker reads .dockerignore from the CONTEXT ROOT (this file), not the
+# copy at install/docker/.dockerignore — that one sits next to the Dockerfile and
+# is NOT applied for `docker build -f install/docker/Dockerfile .`.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Git
+.git
+.gitignore
+.gitattributes
+.github
+
+# Agent / tool worktrees — each is a FULL repo checkout (huge)
+.claude
+.kilo
+
+# IDE / editor
+.vs
+.vscode
+*.user
+*.suo
+
+# .NET build output (rebuilt inside the image)
+**/bin/
+**/obj/
+
+# Node / Angular — `npm ci` runs inside; caches & prior outputs are not needed
+**/node_modules/
+client/.angular/
+client/dist/
+
+# Prebuilt SPA — the Dockerfile rebuilds it and copies it into wwwroot
+src/Ameto.Server/wwwroot/
+
+# Publish artifacts
+publish/
+artifacts/
+
+# Test & tooling projects (the server image doesn't need them)
+tests/
+tools/
+
+# Install scripts & docs
+install/
+docs/
+*.md
+
+# Runtime data — NEVER bake the local store (segments + SQLite) into the context
+data/
+
+# Misc
+*.ps1
+*.sh
+*.nupkg

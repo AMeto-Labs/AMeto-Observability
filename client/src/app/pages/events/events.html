@@ -31,25 +31,40 @@
         </div>
       }
 
-      <!-- Fixed-height virtual list -->
+      <!-- List: fixed-height virtual (default) or natural-height wrapped rows -->
       <div #eventsScroll class="events-list" (scroll)="onEventsScroll($event)">
-        <div [style.height.px]="virtualizer.getTotalSize()" style="position:relative">
-          @for (vRow of virtualizer.getVirtualItems(); track vRow.key) {
-            @let ev = store.displayedEvents()[vRow.index];
-            <div class="ev-vrow" [style.transform]="'translateY(' + vRow.start + 'px)'">
-              @if (ev) {
-                <app-event-list-row
-                  [event]="ev"
-                  [selected]="ev.id === store.selectedId()"
-                  [wrap]="store.wrapMessages()"
-                  [isNew]="store.newEventIds().has(ev.id)"
-                  (selectRequested)="store.selectEvent(ev.id)"
-                  (filterSelected)="store.applyFilter($event)"
-                />
-              }
-            </div>
+        @if (store.wrapMessages()) {
+          <!-- Wrap mode: rows grow to show the full message, so they are rendered
+               naturally — fixed-height virtualization can't hold variable heights. -->
+          @for (ev of store.displayedEvents(); track ev.id) {
+            <app-event-list-row
+              [event]="ev"
+              [selected]="ev.id === store.selectedId()"
+              [wrap]="true"
+              [isNew]="store.newEventIds().has(ev.id)"
+              (selectRequested)="store.selectEvent(ev.id)"
+              (filterSelected)="store.applyFilter($event)"
+            />
           }
-        </div>
+        } @else {
+          <div [style.height.px]="virtualizer.getTotalSize()" style="position:relative">
+            @for (vRow of virtualizer.getVirtualItems(); track vRow.key) {
+              @let ev = store.displayedEvents()[vRow.index];
+              <div class="ev-vrow" [style.transform]="'translateY(' + vRow.start + 'px)'">
+                @if (ev) {
+                  <app-event-list-row
+                    [event]="ev"
+                    [selected]="ev.id === store.selectedId()"
+                    [wrap]="false"
+                    [isNew]="store.newEventIds().has(ev.id)"
+                    (selectRequested)="store.selectEvent(ev.id)"
+                    (filterSelected)="store.applyFilter($event)"
+                  />
+                }
+              </div>
+            }
+          </div>
+        }
         @if (store.loadingMore()) {
           <div class="load-more"><span class="load-more-spin"></span></div>
         }
@@ -75,9 +90,10 @@
       </div>
     </div>
 
-    <!-- Detail drawer -->
+    <!-- Detail drawer — resizable; width persisted in localStorage -->
     @if (store.selectedEvent(); as ev) {
-      <div class="event-drawer">
+      <div class="event-drawer" #drawerEl [style.width.px]="prefs.drawerWidth()">
+        <div class="drawer-resizer" (mousedown)="startResize($event)" title="Drag to resize"></div>
         <app-event-detail
           [event]="ev"
           (closed)="store.selectEvent(null)"

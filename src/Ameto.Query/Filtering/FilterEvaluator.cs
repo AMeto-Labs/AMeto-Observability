@@ -72,9 +72,89 @@ public static class FilterEvaluator
             RegexMatchNode rxm            => EvalRegexMatch(rxm, ev),
             RegexExtractCompareNode rxe   => EvalRegexExtract(rxe, ev),
             InNode inNode                 => EvalIn(inNode, ev),
+            FreeTextNode ft               => EvalFreeText(ft, ev),
             _                             => false,
         };
     }
+
+    // ── Free-text search ────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Maximum property-nesting depth searched by free-text — MUST stay equal to
+    /// <c>ServerOptions.MaxPropertyFlattenDepth</c> (default 5), the depth to which
+    /// <c>SegmentIndexBuilder</c> flattens string values into the trigram index. A value
+    /// nested deeper than this is not indexed, so it must not be matched here either, or
+    /// cold-tier (index-skipped) and hot-tier (full-scan) queries would diverge.
+    /// </summary>
+    private const int MaxFlattenDepth = 5;
+
+    /// <summary>
+    /// Bare free-text: every term must appear (case-insensitive substring) in one of
+    /// the trigram-indexed text fields — message template, exception type/message, or
+    /// any flattened string property value. The field set is kept in lock-step with
+    /// <c>SegmentIndexBuilder</c>'s trigram coverage so hot-tier scans and cold-tier
+    /// index skips return the same events.
+    /// </summary>
+    private static bool EvalFreeText(FreeTextNode ft, LogEvent ev)
+    {
+        foreach (var term in ft.Terms)
+            if (!EventContainsTerm(ev, term))
+                return false;
+        return true;
+    }
+
+    private static bool EventContainsTerm(LogEvent ev, string term)
+    {
+        if (Ci(ev.MessageTemplate, term)) return true;
+
+        if (ev.Exception is { } ex)
+        {
+            if (Ci(ex.Type, term))    return true;
+            if (Ci(ex.Message, term)) return true;
+        }
+
+        return ev.Properties is { } props && PropsContainTerm(props, term, depth: 0);
+    }
+
+    /// <summary>
+    /// Recursively scans property values for <paramref name="term"/>, mirroring
+    /// <c>SegmentIndexBuilder.FlattenValue</c>: nested maps are walked, arrays/lists are
+    /// expanded, and only STRING scalars are matched — numbers and bools are not
+    /// trigram-indexed, so matching them would desync the cold-tier index fast-path.
+    /// The <paramref name="depth"/> guard mirrors the index's flatten-depth limit so a
+    /// value nested deeper than <see cref="MaxFlattenDepth"/> (which the index never
+    /// trigrammed) is not matched here either.
+    /// </summary>
+    private static bool PropsContainTerm(Dictionary<string, object?> dict, string term, int depth)
+    {
+        // Mirrors SegmentIndexBuilder.FlattenProperties' `if (depth > _maxFlattenDepth) return;`.
+        if (depth > MaxFlattenDepth) return false;
+
+        foreach (var v in dict.Values)
+            if (ValueContainsTerm(v, term, depth))
+                return true;
+        return false;
+    }
+
+    private static bool ValueContainsTerm(object? v, string term, int depth)
+    {
+        switch (v)
+        {
+            case string s:
+                return Ci(s, term);
+            case Dictionary<string, object?> nested:
+                return PropsContainTerm(nested, term, depth + 1); // nested map → +1 (arrays don't add depth)
+            case IEnumerable seq: // arrays / lists — string is already handled above
+                foreach (var item in seq)
+                    if (ValueContainsTerm(item, term, depth)) return true;
+                return false;
+            default:
+                return false; // numbers, bools, null — not trigram-indexed
+        }
+    }
+
+    private static bool Ci(string? haystack, string term) =>
+        haystack is not null && haystack.Contains(term, StringComparison.OrdinalIgnoreCase);
 
     // ── Property access ───────────────────────────────────────────────────────
 

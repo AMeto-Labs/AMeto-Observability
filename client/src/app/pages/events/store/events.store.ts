@@ -552,6 +552,21 @@ export const EventsStore = signalStore(
       });
     }
 
+    /**
+     * Zooms the active query window to an explicit [from, to] range and reloads.
+     * Drives the log-volume histogram's click-to-zoom. Reuses the normal reload
+     * path (loadEvents) and only rewrites the time bounds — the filter string is
+     * left untouched.
+     */
+    function setTimeRange(fromIso: string, toIso: string): void {
+      patchState(store, {
+        customFrom: fmtDateInput(new Date(fromIso)),
+        customTo: fmtDateInput(new Date(toIso)),
+        timePreset: 'custom',
+      });
+      loadEvents();
+    }
+
     /** A row's timestamp was chosen as the start/end of the active time range. */
     function onTimeRangeBound(e: { side: 'from' | 'to'; date: Date }): void {
       if (e.side === 'from') patchState(store, { customFrom: fmtDateInput(e.date), timePreset: 'custom' });
@@ -709,6 +724,7 @@ export const EventsStore = signalStore(
       setPageSize,
       toggleLive,
       seek,
+      setTimeRange,
       onTimeRangeBound,
       selectEvent,
       toggleWrap,

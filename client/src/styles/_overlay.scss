@@ -283,9 +283,9 @@
   font-style: italic;
 }
 
-/* ── Date-range dropdown — two-panel ────────────────────────────── */
+/* ── Date-range dropdown ─────────────────────────────────────────── */
 .date-dd {
-  min-width: 540px;
+  width: 452px;
 }
 .date-dd-body {
   display: flex;
@@ -294,22 +294,50 @@
   min-height: 0;
   overflow: hidden;
 }
-.date-preset-list {
+
+/* Small uppercase section header shared by both columns */
+.date-sec-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .07em;
+  text-transform: uppercase;
+  color: var(--txt-dim);
+  padding: 10px 12px 6px;
+}
+.date-sec-badge {
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border-radius: 999px;
+  padding: 1px 6px;
+}
+
+/* Left column: quick ranges (one click applies + closes) */
+.date-quick {
   display: flex;
   flex-direction: column;
-  width: 164px;
+  width: 140px;
   flex-shrink: 0;
   border-right: 1px solid var(--border);
-  padding: 6px 0;
+  padding-bottom: 6px;
   overflow-y: auto;
 }
-.date-preset-item {
-  display: block;
-  width: 100%;
+.date-quick-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  margin: 1px 6px;
+  padding: 6px 9px;
   text-align: left;
-  padding: 6px 14px;
   background: none;
   border: none;
+  border-radius: var(--radius-sm);
   color: var(--txt-muted);
   font-size: 12px;
   font-family: var(--ui);
@@ -317,47 +345,105 @@
   transition: background .1s, color .1s;
   white-space: nowrap;
 }
-.date-preset-item:hover { background: var(--surface-hover); color: var(--txt); }
-.date-preset-item.active { color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
-.date-preset-item.is-custom {
-  margin-top: 6px;
-  padding-top: 10px;
-  border-top: 1px solid var(--border);
+.date-quick-item:hover { background: var(--surface-hover); color: var(--txt); }
+.date-quick-item.active {
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
   color: var(--accent);
-  font-weight: 500;
+  font-weight: 600;
 }
-.date-preset-item.is-custom:not(.active) { opacity: .75; }
+.date-quick-check { flex-shrink: 0; }
 
-.date-cal-panel {
+/* Right column: absolute range (From/To + calendar, always available) */
+.date-abs {
   display: flex;
   flex-direction: column;
   flex: 1;
   min-width: 0;
-  padding: 0;
 }
+.date-abs-fields {
+  display: flex;
+  gap: 8px;
+  padding: 0 12px 2px;
+}
+.date-field {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  position: relative;
+}
+.date-field-lbl {
+  font-size: 10px;
+  color: var(--txt-dim);
+  font-family: var(--ui);
+  padding-left: 2px;
+}
+.date-field-box {
+  display: flex;
+  align-items: center;
+  height: 28px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0 7px 0 9px;
+  transition: border-color .12s, box-shadow .12s;
+}
+/* The field being picked (start vs end) is highlighted — replaces the old hint row. */
+.date-field.picking .date-field-box {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 22%, transparent);
+}
+.date-field.invalid .date-field-box { border-color: var(--lvl-e); }
+.date-field-input {
+  flex: 1;
+  min-width: 0;
+  background: none;
+  border: none;
+  outline: none;
+  color: var(--txt);
+  font-size: 11.5px;
+  font-family: var(--ui);
+  font-variant-numeric: tabular-nums;
+  caret-color: var(--accent);
+}
+.date-field-input::placeholder { color: var(--txt-dim); }
+.date-field-tip {
+  position: absolute;
+  top: calc(100% + 3px);
+  left: 0;
+  z-index: 20;
+  background: var(--surface);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  color: var(--accent);
+  font-size: 10px;
+  font-family: var(--ui);
+  font-variant-numeric: tabular-nums;
+  padding: 2px 8px;
+  cursor: pointer;
+  white-space: nowrap;
+  opacity: .95;
+  transition: opacity .1s;
+}
+.date-field-tip:hover { opacity: 1; background: color-mix(in srgb, var(--accent) 10%, var(--surface)); }
+.date-field-tip-kbd { margin-left: 5px; opacity: .55; font-size: 9px; letter-spacing: .02em; }
+
+/* Calendar */
+.date-cal { padding: 8px 12px 6px; }
 .cal-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 6px 8px 2px;
-  flex-shrink: 0;
+  padding: 0 0 5px;
 }
-.cal-pick-hint {
-  text-align: center;
-  font-size: 10px;
-  color: var(--txt-dim);
-  padding: 0 8px 3px;
-  flex-shrink: 0;
-  opacity: .7;
-}
-.cal-pick-hint.picking-end { color: var(--accent); opacity: 1; }
 .cal-nav-btn {
   display: flex;
   align-items: center;
   justify-content: center;
   width: 24px;
   height: 24px;
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   background: none;
   border: none;
   color: var(--txt-muted);
@@ -374,126 +460,52 @@
 .cal-grid {
   display: grid;
   grid-template-columns: repeat(7, 1fr);
-  gap: 1px;
-  padding: 0 6px;
-  flex-shrink: 0;
 }
 .cal-dow {
-  font-size: 9.5px;
+  font-size: 9px;
   font-family: var(--ui);
-  font-weight: 600;
+  font-weight: 700;
   color: var(--txt-dim);
   text-align: center;
-  padding: 2px 0;
-  letter-spacing: .4px;
+  padding: 2px 0 5px;
+  letter-spacing: .3px;
+  text-transform: uppercase;
 }
+/* Flush cells (no grid gap) so the selected range reads as one continuous band. */
 .cal-day {
-  aspect-ratio: 1;
+  height: 26px;
   display: flex;
   align-items: center;
   justify-content: center;
-  border-radius: 3px;
   background: none;
   border: none;
+  border-radius: var(--radius-sm);
   color: var(--txt-muted);
-  font-size: 11px;
+  font-size: 11.5px;
   font-family: var(--ui);
+  font-variant-numeric: tabular-nums;
   cursor: pointer;
   transition: background .1s, color .1s;
-  min-height: 22px;
 }
 .cal-day:hover { background: var(--surface-hover); color: var(--txt); }
-.cal-day.other-month { color: var(--txt-dim); opacity: .4; }
-.cal-day.today { color: var(--accent); font-weight: 700; }
+.cal-day.other-month { color: var(--txt-dim); opacity: .38; }
+.cal-day.today {
+  color: var(--accent);
+  font-weight: 700;
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent);
+}
+.cal-day.cal-in-range {
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
+  color: var(--accent);
+  border-radius: 0;
+}
 .cal-day.cal-from,
 .cal-day.cal-to {
   background: var(--accent);
   color: #fff;
   font-weight: 600;
 }
-.cal-day.cal-in-range {
-  background: color-mix(in srgb, var(--accent) 14%, transparent);
-  color: var(--accent);
-  border-radius: 0;
-}
-.cal-inputs {
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-  padding: 8px 10px 6px;
-  border-top: 1px solid var(--border);
-  flex-shrink: 0;
-}
-.cal-input-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-.cal-input-lbl {
-  font-size: 11px;
-  color: var(--txt-dim);
-  font-family: var(--ui);
-  width: 36px;
-  flex-shrink: 0;
-}
-.cal-input-field-wrap {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  position: relative;
-}
-.cal-field-wrap {
-  display: flex;
-  align-items: center;
-  flex: 1;
-  height: 26px;
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  padding: 0 6px 0 8px;
-  gap: 4px;
-  transition: border-color .12s;
-}
-.cal-field-wrap.is-datetime { width: 100%; }
-.cal-field-wrap:focus-within { border-color: var(--accent); }
-.cal-field-wrap.invalid { border-color: var(--lvl-e); }
-.cal-field-input {
-  flex: 1;
-  background: none;
-  border: none;
-  outline: none;
-  color: var(--txt);
-  font-size: 11.5px;
-  font-family: var(--ui);
-  font-variant-numeric: tabular-nums;
-  caret-color: var(--accent);
-  min-width: 0;
-}
-.cal-field-input::placeholder { color: var(--txt-dim); }
-.cal-field-icon { color: var(--txt-dim); flex-shrink: 0; }
-.cal-time-tip {
-  position: absolute;
-  top: calc(100% + 2px);
-  left: 0;
-  background: var(--surface);
-  border: 1px solid var(--accent);
-  border-radius: var(--radius-sm);
-  color: var(--accent);
-  font-size: 10px;
-  font-family: var(--ui);
-  font-variant-numeric: tabular-nums;
-  padding: 2px 8px;
-  cursor: pointer;
-  white-space: nowrap;
-  z-index: 20;
-  opacity: .9;
-  transition: opacity .1s;
-}
-.cal-time-tip:hover { opacity: 1; background: color-mix(in srgb, var(--accent) 10%, var(--surface)); }
-.cal-time-tip-kbd {
-  margin-left: 5px;
-  opacity: .55;
-  font-size: 9px;
-  letter-spacing: .02em;
-}
+/* Range pill: round only the outer ends, flat band between. */
+.cal-day.cal-from        { border-radius: var(--radius-sm) 0 0 var(--radius-sm); }
+.cal-day.cal-to          { border-radius: 0 var(--radius-sm) var(--radius-sm) 0; }
+.cal-day.cal-from.cal-to { border-radius: var(--radius-sm); }

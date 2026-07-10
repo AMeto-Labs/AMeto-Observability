@@ -218,16 +218,37 @@
 
 /* ── Detail drawer (right side panel) ─────────────────────────────── */
 .event-drawer {
+  position: relative;                 /* anchor for the drag handle */
   flex-shrink: 0;
-  width: 44%;
-  min-width: 440px;
-  max-width: 780px;
+  /* width is set inline from the persisted preference; JS clamps the bounds */
   display: flex;
   flex-direction: column;
   overflow: hidden;
   border-left: 1px solid var(--border);
   background: var(--surface);
 }
+/* Drag handle on the drawer's left edge — resizes the whole drawer. */
+.drawer-resizer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 6px;
+  height: 100%;
+  cursor: col-resize;
+  z-index: 5;
+}
+.drawer-resizer::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 2px;
+  background: transparent;
+  transition: background .12s;
+}
+.drawer-resizer:hover::before,
+.drawer-resizer:active::before { background: var(--accent); }
 .event-drawer app-event-detail {
   flex: 1;
   min-height: 0;

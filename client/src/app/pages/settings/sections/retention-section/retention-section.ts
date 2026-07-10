@@ -56,7 +56,7 @@ export class RetentionSectionComponent implements OnInit {
     { key: 'warningDays',     label: 'Warning',     dotClass: 'dot-w' },
     { key: 'errorDays',       label: 'Error',       dotClass: 'dot-e' },
     { key: 'fatalDays',       label: 'Fatal',       dotClass: 'dot-f' },
-    { key: 'metricsDays',     label: 'Metrics',     icon: 'bar-chart-2' },
+    { key: 'metricsDays',     label: 'Metrics',     icon: 'chart-bar' },
     { key: 'tracesDays',      label: 'Traces',      icon: 'git-branch' },
   ];
 

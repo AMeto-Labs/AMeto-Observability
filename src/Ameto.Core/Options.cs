@@ -52,6 +52,31 @@ public sealed class IndexingOptions
 }
 
 /// <summary>
+/// Ingestion request/size limits. All values are byte counts.
+/// </summary>
+public sealed class IngestionOptions
+{
+    /// <summary>
+    /// Max HTTP body for <c>POST /api/events</c> (CLEF msgpack batch). A request whose
+    /// body exceeds this is rejected with 413 before parsing. Default: 4 MB.
+    /// </summary>
+    public int MaxBatchBytes { get; init; } = 4 * 1024 * 1024;
+
+    /// <summary>
+    /// Max msgpack properties bytes for a single event — also the ring-buffer slab size.
+    /// An event whose serialised properties exceed this is dropped (logged with its size),
+    /// while the rest of the batch still ingests. Default: 64 KB.
+    /// </summary>
+    public int MaxEventPayloadBytes { get; init; } = 64 * 1024;
+
+    /// <summary>
+    /// Max HTTP body for the OTLP ingest endpoints (<c>/otlp/v1/*</c>). Larger → 413.
+    /// Default: 8 MB.
+    /// </summary>
+    public int MaxOtlpBatchBytes { get; init; } = 8 * 1024 * 1024;
+}
+
+/// <summary>
 /// Initial per-level retention defaults (days). Used only on first run;
 /// after that the values live in SQLite and these are ignored.
 /// </summary>
@@ -76,6 +101,7 @@ public sealed class ServerOptions
     public string           DataDirectory    { get; init; } = "data";
     public HotTierOptions   HotTier          { get; init; } = new();
     public IndexingOptions  Indexing         { get; init; } = new();
+    public IngestionOptions Ingestion        { get; init; } = new();
     public RetentionConfig  Retention        { get; init; } = new();
     public int              HttpPort         { get; init; } = 5341;
     public string           SslCertPath      { get; init; } = "";

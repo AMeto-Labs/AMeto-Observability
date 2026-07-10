@@ -646,6 +646,30 @@ public sealed class InNode : FilterNode
 /// <summary>Match-all — returned when filter string is null/empty.</summary>
 public sealed class MatchAllNode : FilterNode { }
 
+// ── Free-text search ──────────────────────────────────────────────────────────
+
+/// <summary>
+/// Bare free-text search — produced by the parser when the user types plain words
+/// into the filter box (e.g. <c>balance</c> or <c>user balance</c>) rather than a
+/// structured expression. Matches when EVERY term is found, case-insensitively and
+/// as a substring, in one of the event's trigram-indexed text fields: the message
+/// template, the exception type/message, or any (recursively flattened) string
+/// property value.
+///
+/// Terms of 3+ characters are surfaced as trigram hints
+/// (<see cref="CompiledFilter.GetTrigramHints"/>), so cold-tier segments are skipped
+/// via the index instead of decompressed and scanned — that is what keeps the search
+/// fast. The matched field set is deliberately kept identical to what
+/// <c>SegmentIndexBuilder</c> feeds the trigram index, so index-accelerated
+/// (cold-tier) and full-scan (hot-tier) queries always return the same events.
+/// </summary>
+public sealed class FreeTextNode : FilterNode
+{
+    /// <summary>Search terms — AND semantics, all must match. Original case preserved.</summary>
+    public string[] Terms { get; }
+    public FreeTextNode(string[] terms) => Terms = terms;
+}
+
 // ── New scalar nodes ──────────────────────────────────────────────────────────
 
 /// <summary>fromXml(Prop, 'xpath') op value — extract value via XPath from XML string property.</summary>
