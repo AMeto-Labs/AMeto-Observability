@@ -104,6 +104,26 @@
           }
         </div>
       </div>
+
+      <!-- Per-level breakdown + error rate -->
+      @if (levelRows().length) {
+        <div class="panel level-panel">
+          <div class="panel-hdr">
+            Levels <span class="panel-sub">severity breakdown</span>
+            <span class="err-rate" [class.hot]="+errorRatePct() >= 5">{{ errorRatePct() }}% error rate</span>
+          </div>
+          <div class="svc-list">
+            @for (l of levelRows(); track l.level) {
+              <div class="svc-row">
+                <span class="svc-dot" [style.background]="l.color"></span>
+                <span class="svc-name">{{ l.level }}</span>
+                <div class="svc-bar-wrap"><div class="svc-bar" [style.width.%]="l.pct" [style.background]="l.color"></div></div>
+                <span class="svc-val">{{ fmtNum(l.count) }}</span>
+              </div>
+            }
+          </div>
+        </div>
+      }
     }
   }
 

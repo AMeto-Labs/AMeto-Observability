@@ -72,6 +72,9 @@ builder.Services
     .AddAmetoIngestion()
     .AddAmetoQuery();
 
+// Short-TTL cache for GET /api/events/counts header-scan responses.
+builder.Services.AddSingleton<LogVolumeCountsCache>();
+
 // ── Optional signal subsystems (toggle via env for benchmarking / logs-only mode) ──
 //   Ameto__Metrics__Enabled / Ameto__Tracing__Enabled / Ameto__Alerts__Enabled
 bool enableTracing = builder.Configuration.GetValue("Ameto:Tracing:Enabled", true);
