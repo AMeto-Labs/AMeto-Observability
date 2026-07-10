@@ -137,6 +137,100 @@ public sealed class SegmentReader : ISegmentReader
         await Task.CompletedTask;
     }
 
+    // ── Header-only aggregation ─────────────────────────────────────────────────
+
+    /// <summary>
+    /// Counts events into <paramref name="agg"/> by decoding only the timestamp (@t), level (@l)
+    /// and service (service.name) columns of each block. The message-template, exception and
+    /// properties columns are skipped entirely — no UTF-8 template decode, no MessagePack
+    /// deserialisation, no <see cref="LogEvent"/> allocation. The block still has to be
+    /// LZ4-decompressed (all columns share one compressed frame in the v4 format), but that is a
+    /// fraction of the cost of full materialisation.
+    /// </summary>
+    public void AggregateHeaders(LogVolumeAggregator agg, long fromTicks, long toTicks)
+    {
+        // Whole-segment fast reject on the file header's min/max timestamps.
+        if (Info.MaxTimestampTicks < fromTicks || Info.MinTimestampTicks > toTicks) return;
+
+        foreach (var (blockOffset, _) in _blocks)
+            AggregateBlockHeaders(blockOffset, agg, fromTicks, toTicks);
+    }
+
+    private void AggregateBlockHeaders(long blockOffset, LogVolumeAggregator agg, long fromTicks, long toTicks)
+    {
+        int uncompressedSize = ReadInt32At(blockOffset);
+        int compressedSize   = ReadInt32At(blockOffset + 4);
+
+        byte[]? rentedComp   = null;
+        byte[]? rentedUncomp = null;
+        try
+        {
+            rentedComp   = ArrayPool<byte>.Shared.Rent(compressedSize);
+            rentedUncomp = ArrayPool<byte>.Shared.Rent(uncompressedSize);
+
+            _view.ReadArray(blockOffset + 8, rentedComp, 0, compressedSize);
+
+            int decoded = LZ4Codec.Decode(rentedComp, 0, compressedSize, rentedUncomp, 0, uncompressedSize);
+            if (decoded != uncompressedSize) return;
+
+            ScanBlockHeaders(rentedUncomp.AsSpan(0, decoded), agg, fromTicks, toTicks);
+        }
+        finally
+        {
+            if (rentedComp   is not null) ArrayPool<byte>.Shared.Return(rentedComp);
+            if (rentedUncomp is not null) ArrayPool<byte>.Shared.Return(rentedUncomp);
+        }
+    }
+
+    /// <summary>Parses a decompressed columnar block, extracting only @t / @l / service.name.</summary>
+    private static void ScanBlockHeaders(ReadOnlySpan<byte> span, LogVolumeAggregator agg, long fromTicks, long toTicks)
+    {
+        int   pos        = 0;
+        int   eventCount = (int)BinaryPrimitives.ReadUInt32LittleEndian(span.Slice(pos, 4)); pos += 4;
+        long  blockMinTs = BinaryPrimitives.ReadInt64LittleEndian (span.Slice(pos, 8));      pos += 8;
+        pos += 8; // skip blockMinId — @i is not needed for counting
+        byte  colCount   = span[pos]; pos += 1;
+
+        ReadOnlySpan<byte> colT = default, colL = default, colSvc = default;
+        for (int c = 0; c < colCount; c++)
+        {
+            byte id      = span[pos]; pos += 1;
+            int  byteLen = (int)BinaryPrimitives.ReadUInt32LittleEndian(span.Slice(pos, 4)); pos += 4;
+            var  data    = span.Slice(pos, byteLen); pos += byteLen;
+            switch (id)
+            {
+                case 1: colT   = data; break;   // @t  int64 deltas
+                case 2: colL   = data; break;   // @l  byte levels
+                case 9: colSvc = data; break;   // service.name string column
+                default: break;                 // @i/@mt/@x/props/@tr/@sp: skipped, never decoded
+            }
+        }
+
+        // service.name is a string column: (eventCount+1) uint32 offsets, then the UTF-8 payload.
+        int  offsetsBytes = (eventCount + 1) * 4;
+        bool hasSvc       = colSvc.Length >= offsetsBytes;
+        var  svcOffsets   = hasSvc ? colSvc.Slice(0, offsetsBytes) : default;
+        var  svcPayload   = hasSvc ? colSvc.Slice(offsetsBytes)    : default;
+
+        for (int i = 0; i < eventCount; i++)
+        {
+            long ts = blockMinTs + BinaryPrimitives.ReadInt64LittleEndian(colT.Slice(i * 8, 8));
+            if (ts < fromTicks || ts > toTicks) continue;
+
+            var level = (LogLevel)colL[i];
+
+            ReadOnlySpan<byte> svc = default;
+            if (hasSvc)
+            {
+                uint s = BinaryPrimitives.ReadUInt32LittleEndian(svcOffsets.Slice(i * 4, 4));
+                uint e = BinaryPrimitives.ReadUInt32LittleEndian(svcOffsets.Slice((i + 1) * 4, 4));
+                if (e > s) svc = svcPayload.Slice((int)s, (int)(e - s));
+            }
+
+            agg.AddByServiceUtf8(ts, level, svc);
+        }
+    }
+
     // ── Block reading ─────────────────────────────────────────────────────────
 
     private IEnumerable<LogEvent> ReadBlock(long blockOffset, bool reversed)

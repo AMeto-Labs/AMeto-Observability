@@ -137,6 +137,15 @@
 .svc-bar { height: 100%; border-radius: 4px; transition: width .2s; }
 .svc-val { flex: 0 0 auto; font-size: 11px; color: var(--text-muted); font-family: var(--font-ui); min-width: 48px; text-align: right; }
 
+// ── Per-level breakdown ─────────────────────────────────────────────────────
+// Level rows are informational, not clickable — drop the service-row affordances.
+.level-panel .svc-row { cursor: default; &:hover { background: transparent; } }
+.err-rate {
+  margin-left: auto; font-size: 11px; font-weight: 500; font-family: var(--font-ui);
+  color: var(--text-muted);
+  &.hot { color: var(--error); }
+}
+
 // ── Diagnostics (vital signs) metrics ───────────────────────────────────────
 .metric {
   display: grid;

@@ -137,6 +137,19 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
     public IHotTierReader OpenHotTierReader()
     {
+        var (current, frozen, covered) = SnapshotTiers();
+        return new HotTierReaderSnapshot(current, frozen, covered, TemplatePool, this);
+    }
+
+    /// <summary>
+    /// Captures the current hot tier plus any frozen-but-not-yet-released tiers, along with the
+    /// set of cold segment ids those frozen tiers still cover (to avoid double counting during a
+    /// flush overlap). Increments the active-reader count so a concurrent flush cannot free a
+    /// captured tier's native memory while it is being scanned — callers <b>must</b> pair this
+    /// with exactly one <see cref="OnReaderDisposed"/> when finished.
+    /// </summary>
+    private (HotTierSegment Current, HotTierSegment[] Frozen, HashSet<ulong> Covered) SnapshotTiers()
+    {
         HotTierSegment    current;
         HotTierSegment[]  frozen;
         HashSet<ulong>    covered;
@@ -160,7 +173,70 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             }
             Interlocked.Increment(ref _activeReaders);
         }
-        return new HotTierReaderSnapshot(current, frozen, covered, TemplatePool, this);
+        return (current, frozen, covered);
+    }
+
+    /// <summary>
+    /// Near-zero-allocation log-volume aggregation: buckets <c>(bucket, service, level)</c> event
+    /// counts by scanning event <b>headers</b> across the hot tier and cold-tier segments in
+    /// <c>[fromUtc, toUtc]</c>, never materialising a <see cref="LogEvent"/>. Backs
+    /// <c>GET /api/events/counts</c>. Bucketing parameters are supplied by the caller so the axis
+    /// matches the endpoint's column-cap logic.
+    /// </summary>
+    public async ValueTask<LogVolumeCounts> AggregateLogVolumeAsync(
+        DateTimeOffset fromUtc, DateTimeOffset toUtc,
+        long minBucket, int bucketSeconds, int nBuckets,
+        string? serviceFilter, CancellationToken ct = default)
+    {
+        long fromTicks = fromUtc.UtcTicks;
+        long toTicks   = toUtc.UtcTicks;
+
+        var agg = new LogVolumeAggregator(
+            fromTicks, toTicks, minBucket, bucketSeconds, nBuckets, serviceFilter, TemplatePool);
+
+        // Hold a reader snapshot for the whole scan so frozen tiers stay mapped.
+        var (current, frozen, covered) = SnapshotTiers();
+        try
+        {
+            // Hot tier: direct header walk (frozen tiers hold the older events, current the newest).
+            for (int i = 0; i < frozen.Length; i++)
+                frozen[i].AggregateInto(agg, fromTicks, toTicks);
+            current.AggregateInto(agg, fromTicks, toTicks);
+
+            // Cold tier: segments overlapping the window, minus those still covered by frozen hot
+            // tiers. Offloaded to the thread pool — it is CPU-bound (mmap reads + LZ4 decode) and we
+            // do not want to occupy the request thread. Single-threaded feed keeps the aggregator
+            // lock-free; the short-TTL response cache absorbs repeated range toggles.
+            var segInfos = GetSegments(fromUtc, toUtc);
+            if (segInfos.Count > 0)
+            {
+                await Task.Run(() =>
+                {
+                    foreach (var info in segInfos)
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        if (covered.Contains(info.Id.Value)) continue;
+                        if (info.MaxTimestampTicks < fromTicks || info.MinTimestampTicks > toTicks) continue;
+                        try
+                        {
+                            using var reader = SegmentReader.Open(info.FilePath);
+                            reader.AggregateHeaders(agg, fromTicks, toTicks);
+                        }
+                        catch (Exception ex)
+                        {
+                            // Never lose the whole aggregate over one bad/racing segment file.
+                            _logger.LogDebug(ex, "Header aggregation skipped segment {Id}", info.Id);
+                        }
+                    }
+                }, ct).ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            OnReaderDisposed();
+        }
+
+        return agg.Build();
     }
 
     private void OnReaderDisposed()

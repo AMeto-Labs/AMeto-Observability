@@ -55,6 +55,10 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
     // Lazily allocated per chunk on first event that carries an exception.
     private readonly ExceptionInfo?[]?[] _chunkExceptions;
     private          int        _chunksAllocated;
+    /// <summary>Running sum of <see cref="_chunkPayloadTails"/> — total payload bytes
+    /// actually written across all chunks. Kept incrementally so the hot-path
+    /// <see cref="IsFull"/> check is O(1) instead of re-summing the tails array.</summary>
+    private          long       _payloadBytes;
 
     // ── Limits ────────────────────────────────────────────────────────────────
 
@@ -86,7 +90,7 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
     /// </summary>
     public bool IsFull =>
         _count >= _maxEvents ||
-        (long)_chunksAllocated * ChunkPayloadBytes >= _maxPayloadBytes;
+        _payloadBytes >= _maxPayloadBytes;
 
     // ── Construction ─────────────────────────────────────────────────────────
 
@@ -131,8 +135,9 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
         // Allocate the chunk lazily on first use.
         if (_chunkArenas[ci] == 0)
         {
-            // Would allocating exceed the payload budget?
-            if ((long)_chunksAllocated * ChunkPayloadBytes >= _maxPayloadBytes)
+            // Would allocating exceed the payload budget? Measured against bytes
+            // actually written, not reserved chunk capacity.
+            if (_payloadBytes >= _maxPayloadBytes)
                 return false;
             if (ci >= _maxChunks)
                 return false;
@@ -169,6 +174,7 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
         }
 
         _chunkPayloadTails[ci] += payloadLen;
+        _payloadBytes          += payloadLen;
 
         // Publish: Interlocked.Increment acts as full memory barrier —
         // header + payload writes are visible to readers before _count increases.
@@ -213,6 +219,25 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
         int snapshot = _count;
         for (int i = 0; i < snapshot; i++)
             yield return MaterialiseEvent(i, pool);
+    }
+
+    // ── Header-only aggregation ─────────────────────────────────────────────────
+
+    /// <summary>
+    /// Feeds every in-window event's <b>header</b> (timestamp, level, service pool index) into
+    /// <paramref name="agg"/> without touching the payload arena — no properties decode, no
+    /// message-template or exception materialisation. Powers the near-zero-allocation counts path.
+    /// </summary>
+    public void AggregateInto(LogVolumeAggregator agg, long fromTicks, long toTicks)
+    {
+        int snapshot = _count;                       // volatile read: publishes prior writes
+        for (int i = 0; i < snapshot; i++)
+        {
+            ref var h = ref GetHeader(i);
+            long ts = h.TimestampUtcTicks;
+            if (ts < fromTicks || ts > toTicks) continue;
+            agg.AddByPoolIndex(ts, h.Level, h.ServiceNamePoolIndex);
+        }
     }
 
     // ── Flush helpers ─────────────────────────────────────────────────────────

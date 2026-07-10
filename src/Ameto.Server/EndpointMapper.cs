@@ -168,24 +168,29 @@ public static class EndpointMapper
             return Results.Ok(services.ToArray());
         }).RequireAuthorization();
 
-        // ── Event counts by service over time: GET /api/events/counts ────────
-        // Powers the Dashboard "Log events" chart. Streams up to `limit` events
-        // (newest first) within [from, to] and aggregates per-service counts into
-        // fixed-width time buckets, returned as dense, chart-ready arrays.
+        // ── Event counts by service + level over time: GET /api/events/counts ─
+        // Powers the "Log events" chart / stats. Buckets per-service AND per-level
+        // event counts over [from, to] by scanning event HEADERS only — no LogEvent,
+        // Properties, message or exception is ever materialised (see
+        // StorageEngine.AggregateLogVolumeAsync). Results are dense, chart-ready arrays.
         //   from    — ISO-8601 lower bound (default: now - 24h)
         //   to      — ISO-8601 upper bound (default: now)
         //   bucket  — bucket size in seconds (default: auto from the range)
-        //   limit   — max events to scan (default 50 000, capped at 1 000 000)
+        //   limit   — accepted for backward compatibility; the header scan is cheap
+        //             enough to always cover the full window, so it no longer bounds it.
         //   service — restrict to a single service (case-insensitive)
         app.MapGet("/api/events/counts", async (
-            HttpContext      ctx,
-            IQueryExecutor   executor,
-            string?          from    = null,
-            string?          to      = null,
-            int?             bucket  = null,
-            int              limit   = 50_000,
-            string?          service = null) =>
+            HttpContext           ctx,
+            StorageEngine         storage,
+            LogVolumeCountsCache  cache,
+            string?               from    = null,
+            string?               to      = null,
+            int?                  bucket  = null,
+            int                   limit   = 50_000,
+            string?               service = null) =>
         {
+            _ = limit; // retained for API compatibility; no longer caps the scan.
+
             var now   = DateTimeOffset.UtcNow;
             var toUtc = to is null ? now
                                    : DateTimeOffset.Parse(to, null, DateTimeStyles.RoundtripKind).ToUniversalTime();
@@ -208,73 +213,53 @@ public static class EndpointMapper
             }
             int nBuckets = (int)(maxB - minB + 1);
 
-            var request = new QueryRequest
-            {
-                FromUtc   = fromUtc,
-                ToUtc     = toUtc,
-                Count     = Math.Clamp(limit, 1, 1_000_000),
-                Direction = QueryDirection.Backward,
-            };
+            var svcFilter = string.IsNullOrEmpty(service) ? null : service;
 
-            // (service, bucketIndex) -> count, plus per-service totals.
-            var sparse    = new Dictionary<(string Service, long Bucket), long>();
-            var svcTotals = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
-            long total = 0, sampled = 0;
+            // Cache keyed on the bucket grid so drifting "now" bounds still hit within a TTL.
+            var cacheKey = new CountsCacheKey(minB, maxB, bucketSeconds, svcFilter);
+            if (cache.TryGet(cacheKey, out var cached))
+                return Results.Json(cached, EventCountsJsonContext.Default.EventCountsResponse);
 
-            await foreach (var ev in executor.ExecuteAsync(request, ctx.RequestAborted))
-            {
-                sampled++;
-                var svc = ev.ServiceName
-                    ?? (ev.Properties?.TryGetValue("ApplicationContext", out var v) == true ? v?.ToString() : null)
-                    ?? "(unknown)";
-                if (service is not null && !svc.Equals(service, StringComparison.OrdinalIgnoreCase))
-                    continue;
-
-                long b = ev.Timestamp.ToUnixTimeSeconds() / bucketSeconds;
-                var key = (svc, b);
-                sparse[key] = sparse.TryGetValue(key, out var c) ? c + 1 : 1;
-                svcTotals[svc] = svcTotals.TryGetValue(svc, out var t) ? t + 1 : 1;
-                total++;
-            }
-
-            bool truncated = sampled >= request.Count;
-
-            // Top services by count (cap to 25 to bound payload / chart noise).
-            var ordered = svcTotals.OrderByDescending(kv => kv.Value).ToList();
-            int maxServices = 25;
-            var chosen = ordered.Count <= maxServices ? ordered : ordered.Take(maxServices).ToList();
-            var pointsBySvc = chosen.ToDictionary(
-                kv => kv.Key, kv => new long[nBuckets], StringComparer.OrdinalIgnoreCase);
-
-            foreach (var (k, v) in sparse)
-            {
-                if (!pointsBySvc.TryGetValue(k.Service, out var arr)) continue;
-                int off = (int)(k.Bucket - minB);
-                if ((uint)off < (uint)nBuckets) arr[off] += v;
-            }
+            var result = await storage.AggregateLogVolumeAsync(
+                fromUtc, toUtc, minB, bucketSeconds, nBuckets, svcFilter, ctx.RequestAborted);
 
             var buckets = new long[nBuckets];
             for (int i = 0; i < nBuckets; i++)
                 buckets[i] = (minB + i) * bucketSeconds * 1000L; // bucket start, unix ms
 
-            var servicesOut = chosen.Select(kv => (object)new
+            // Top services by count (cap to 25 to bound payload / chart noise). Services
+            // are already sorted descending by the aggregator.
+            const int maxServices = 25;
+            int svcTake = Math.Min(maxServices, result.Services.Count);
+            var servicesOut = new CountSeriesDto[svcTake];
+            for (int i = 0; i < svcTake; i++)
             {
-                service = kv.Key,
-                count   = kv.Value,
-                points  = pointsBySvc[kv.Key],
-            }).ToList();
+                var s = result.Services[i];
+                servicesOut[i] = new CountSeriesDto { Service = s.Name, Count = s.Count, Points = s.Points };
+            }
 
-            return Results.Ok(new
+            var levelsOut = new CountSeriesDto[result.Levels.Count];
+            for (int i = 0; i < result.Levels.Count; i++)
             {
-                from          = fromUtc.ToString("O"),
-                to            = toUtc.ToString("O"),
-                bucketSeconds,
-                total,
-                sampled,
-                truncated,
-                buckets,
-                services      = servicesOut,
-            });
+                var l = result.Levels[i];
+                levelsOut[i] = new CountSeriesDto { Level = l.Name, Count = l.Count, Points = l.Points };
+            }
+
+            var response = new EventCountsResponse
+            {
+                From          = fromUtc.ToString("O"),
+                To            = toUtc.ToString("O"),
+                BucketSeconds = bucketSeconds,
+                Total         = result.Total,
+                Sampled       = result.Scanned,
+                Truncated     = false, // full-window header scan — never sampled/truncated
+                Buckets       = buckets,
+                Services      = servicesOut,
+                Levels        = levelsOut,
+            };
+
+            cache.Set(cacheKey, response);
+            return Results.Json(response, EventCountsJsonContext.Default.EventCountsResponse);
         }).RequireAuthorization();
 
         // ── Live tail: GET /api/events/live  (SSE) ────────────────────────────

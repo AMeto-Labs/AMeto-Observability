@@ -50,6 +50,14 @@ export interface EventCountService {
   points: number[];
 }
 
+/** Per-level event counts bucketed over time (GET /api/events/counts). */
+export interface EventCountLevel {
+  level: string;
+  count: number;
+  /** One value per bucket, aligned with <see cref="EventCountsDto.buckets"/>. */
+  points: number[];
+}
+
 export interface EventCountsDto {
   from: string;
   to: string;
@@ -60,6 +68,11 @@ export interface EventCountsDto {
   /** Bucket start timestamps (unix milliseconds). */
   buckets: number[];
   services: EventCountService[];
+  /**
+   * Per-level breakdown. Optional for backward compatibility; the header-scan
+   * backend always populates it (only levels that actually occurred are present).
+   */
+  levels?: EventCountLevel[];
 }
 
 export const LEVELS = ['Verbose', 'Debug', 'Information', 'Warning', 'Error', 'Fatal'] as const;

@@ -61,13 +61,16 @@ export class ApiService {
     return this.http.get<string[]>(`/api/events/services?days=${days}`);
   }
 
-  /** Per-service event counts bucketed over time (Dashboard "Log events" chart). */
-  getEventCounts(params: { from?: string; to?: string; bucket?: number; limit?: number; service?: string } = {}): Observable<EventCountsDto> {
+  /**
+   * Per-service and per-level event counts bucketed over time (Dashboard "Log events" chart).
+   * The backend counts from event headers only, so the whole window is scanned cheaply — there
+   * is no longer a `limit` to tune.
+   */
+  getEventCounts(params: { from?: string; to?: string; bucket?: number; service?: string } = {}): Observable<EventCountsDto> {
     const p = new URLSearchParams();
     if (params.from)    p.set('from',    params.from);
     if (params.to)      p.set('to',      params.to);
     if (params.bucket)  p.set('bucket',  String(params.bucket));
-    if (params.limit)   p.set('limit',   String(params.limit));
     if (params.service) p.set('service', params.service);
     return this.http.get<EventCountsDto>(`/api/events/counts?${p.toString()}`);
   }

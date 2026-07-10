@@ -18,9 +18,15 @@ Chart.register(...registerables, zoomPlugin);
 type Tab = 'log-events' | 'diagnostics';
 
 interface SvcRow { service: string; count: number; pct: number; }
+interface LevelRow { level: string; count: number; pct: number; color: string; }
 
 const PALETTE = ['#38BDF8', '#F59E0B', '#22C55E', '#a78bfa', '#f97316',
                  '#ec4899', '#06b6d4', '#84cc16', '#eab308', '#8b5cf6'];
+/** Severity → colour for the per-level breakdown (ascending severity). */
+const LEVEL_COLORS: Record<string, string> = {
+  Verbose: '#64748b', Debug: '#38BDF8', Information: '#22C55E',
+  Warning: '#F59E0B', Error: '#EF4444', Fatal: '#B91C1C',
+};
 const PRESETS = ['1h', '3h', '6h', '12h', '24h', '7d'];
 
 @Component({
@@ -70,6 +76,28 @@ export class DiagnosticsComponent implements OnInit, OnDestroy {
   });
 
   totalDisplayed = computed(() => this.displayedServices().reduce((a, s) => a + s.count, 0));
+
+  /** Per-level breakdown from the header-scan `levels` series (ascending severity). */
+  levelRows = computed<LevelRow[]>(() => {
+    const levels = this.counts()?.levels ?? [];
+    if (!levels.length) return [];
+    const max = levels.reduce((m, l) => Math.max(m, l.count), 1);
+    return levels.map(l => ({
+      level: l.level,
+      count: l.count,
+      pct: (l.count / max) * 100,
+      color: LEVEL_COLORS[l.level] ?? '#64748b',
+    }));
+  });
+
+  /** Error+Fatal share of counted events, as a percentage string. */
+  errorRatePct = computed(() => {
+    const c = this.counts();
+    if (!c?.levels?.length || c.total === 0) return '0.0';
+    const errs = c.levels.reduce(
+      (a, l) => a + (l.level === 'Error' || l.level === 'Fatal' ? l.count : 0), 0);
+    return ((errs / c.total) * 100).toFixed(1);
+  });
 
   /** Stable palette index for a service based on its rank in the full result. */
   private svcIndex(svc: string): number {
@@ -144,7 +172,7 @@ export class DiagnosticsComponent implements OnInit, OnDestroy {
   loadCounts(): void {
     this.countsLoading.set(true);
     this.countsError.set(null);
-    this.api.getEventCounts({ from: this.fromIso(), limit: 50_000 }).subscribe({
+    this.api.getEventCounts({ from: this.fromIso() }).subscribe({
       next: d => {
         this.counts.set(d);
         this.countsLoading.set(false);
