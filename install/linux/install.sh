@@ -154,8 +154,9 @@ Ameto:
   RamTargetPercent: 99
 
   HotTier:
-    MaxSizeBytes: 268435456  # 256 MB
+    MaxSizeBytes: 67108864   # 64 MB
     MaxAge: "00:05:00"
+    FlushConcurrency: 0      # 0 = auto (cores/2, 2-8). Lower = less RAM, higher = more throughput
 
   Indexing:
     MaxPropertyFlattenDepth: 5

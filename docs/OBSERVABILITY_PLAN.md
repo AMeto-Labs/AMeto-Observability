@@ -1,4 +1,10 @@
-# Observability Platform — Plan (Logs + Traces + Metrics)
+# Observability Platform — Design (Logs + Traces + Metrics)
+
+> **Status: IMPLEMENTED.** This started as a plan; all phases below now ship. It is kept as
+> the architecture overview. A few names/paths drifted during implementation — the real ones:
+> traces live in **`Ameto.Tracing`** (not `Ameto.Traces`); OTLP is at **`/otlp/v1/{logs,traces,metrics}`**
+> (not `/v1/...`); the services list is **`GET /api/events/services`**; metric time-series is
+> **`GET /api/metrics/query`**. See [API.md](API.md) for the current endpoint reference.
 
 ## Принципы
 
@@ -123,10 +129,8 @@ GET /metrics                    ← Prometheus scrape (text/plain)
 | Страница | Статус |
 |---|---|
 | Logs | ✅ есть |
-| Traces | 🆕 список трейсов + waterfall view |
-| Metrics | 🆕 time-series графики |
-
-Waterfall view для трейсов — отдельный сложный Angular-компонент.
+| Traces | ✅ список трейсов, waterfall, flamegraph, service-graph, latency |
+| Metrics | ✅ time-series графики, heatmap, exemplars |
 
 ---
 
@@ -134,15 +138,15 @@ Waterfall view для трейсов — отдельный сложный Angul
 
 ```
 src/
-  Ameto.Core/         ← добавить SpanEvent, MetricPoint, MetricSeries
-  Ameto.Otel/         ← NEW: OTLP HTTP endpoints + конвертеры
-  Ameto.Traces/       ← NEW: SpanIngester, TracesStorage, TracesQuery
-  Ameto.Metrics/      ← NEW: MetricIngester, MetricStorage, MetricQuery
-  Ameto.Ingestion/    ← без изменений (logs only)
+  Ameto.Core/         ← SpanEvent, MetricPoint, MetricSeries
+  Ameto.Otel/         ← OTLP HTTP endpoints + конвертеры (+ zero-alloc streaming log parser)
+  Ameto.Tracing/      ← SpanIngester, trace storage (.trc), trace query
+  Ameto.Metrics/      ← MetricIngester, metric storage, metric query
+  Ameto.Ingestion/    ← logs ingest (ring buffer, drainer)
   Ameto.Storage/      ← переиспользуется traces/metrics
-  Ameto.Indexing/     ← переиспользуется для .trc/.met
-  Ameto.Query/        ← минимальные расширения для traces
-  Ameto.Server/       ← добавить новые endpoints
+  Ameto.Indexing/     ← переиспользуется для .trc/.met (posting-list codec)
+  Ameto.Query/        ← Seq filter parser/evaluator + query executor
+  Ameto.Server/       ← Kestrel host, все endpoints
 ```
 
 ---

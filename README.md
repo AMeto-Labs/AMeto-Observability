@@ -94,25 +94,34 @@ npm install
 npm start   # proxies /api/* to http://localhost:5341
 ```
 
-### 5. Publish (production)
+### 5. Deploy (production)
 
-```powershell
-.\publish.ps1            # build Angular + dotnet publish (self-contained), interactive prompt
-.\publish.ps1 -NoRestart # build only
-.\publish.ps1 -Restart   # build + restart running server
+Ameto runs as a **Windows service**, a **Linux systemd service**, or in **Docker** — see
+[**install/README.md**](install/README.md) for step-by-step instructions and requirements per OS.
+
+To build a self-contained binary yourself (UI baked in):
+
+```bash
+# build the Angular UI into wwwroot, then publish a single self-contained binary
+cd client && npm ci && npx ng build --configuration production --output-path dist
+# copy dist/browser/* → src/Ameto.Server/wwwroot, then:
+cd .. && dotnet publish src/Ameto.Server -c Release -r <win-x64|linux-x64> \
+    --self-contained true -p:PublishSingleFile=true -o publish
 ```
 
-See also [build-release.ps1](build-release.ps1) (release artifacts) and [publish-nuget.ps1](publish-nuget.ps1) (push the Serilog sink to NuGet). Manual install steps are in [INSTALL.md](INSTALL.md).
+Docker builds the UI + server in one step — no local .NET/Node needed:
+`docker compose -f install/docker/docker-compose.example.yml up -d --build`.
 
 ### 6. Run tests
 
 ```bash
 dotnet test tests/Ameto.Core.Tests
-dotnet test tests/Ameto.Query.Tests
 dotnet test tests/Ameto.Storage.Tests
+dotnet test tests/Ameto.Indexing.Tests
+dotnet test tests/Ameto.Query.Tests
 dotnet test tests/Ameto.Integration.Tests
 
-# BenchmarkDotNet perf suite
+# BenchmarkDotNet perf suite + allocation/parity probes
 cd tests/Ameto.Perf
 dotnet run -c Release
 ```
@@ -129,7 +138,7 @@ Ameto:
   DataDirectory: data
   HttpPort: 5341
   HotTier:
-    MaxSizeBytes: 268435456
+    MaxSizeBytes: 67108864   # 64 MB
     MaxAge: "00:05:00"
 ```
 
@@ -149,7 +158,7 @@ See [docs/API.md](docs/API.md) for the full reference and [docs/FILTER_EXPRESSIO
 
 ## Architecture
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the detailed module breakdown and [docs/OBSERVABILITY_PLAN.md](docs/OBSERVABILITY_PLAN.md) for the logs/traces/metrics design.
+See [docs/OBSERVABILITY_PLAN.md](docs/OBSERVABILITY_PLAN.md) for the logs/traces/metrics design overview, and the module breakdown below.
 
 ## Project layout
 
@@ -172,9 +181,10 @@ Ameto.slnx
 └── tests/
     ├── Ameto.Core.Tests/
     ├── Ameto.Storage.Tests/
+    ├── Ameto.Indexing.Tests/ — posting-list codec, segment format, zero-alloc gates
     ├── Ameto.Query.Tests/
     ├── Ameto.Integration.Tests/
-    └── Ameto.Perf/          — BenchmarkDotNet benchmarks
+    └── Ameto.Perf/           — BenchmarkDotNet benchmarks + allocation/parity probes
 ```
 
 ## License

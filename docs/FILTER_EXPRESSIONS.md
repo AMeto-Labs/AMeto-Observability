@@ -2,6 +2,20 @@
 
 Ameto implements the [Seq Filter Expression](https://docs.datalust.co/docs/filter-expressions) syntax.
 
+## Free-text search
+
+Anything that isn't a valid expression is treated as **free text**: every
+whitespace-separated term must appear (case-insensitive substring) in the rendered
+message or a property value.
+
+```
+timeout                 # events whose text contains "timeout"
+payment failed          # contains BOTH "payment" AND "failed"
+```
+
+Free text can't be mixed into an expression, but the expression language covers the
+same intent (`ci_contains(@mt, 'timeout')`).
+
 ## Comparison operators
 
 ```

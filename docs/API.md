@@ -147,6 +147,17 @@ Ingest a batch of log events.
 **Response `413 Payload Too Large`:** body > 4 MB.  
 **Response `400 Bad Request`:** invalid MessagePack.
 
+### `POST /otlp/v1/logs`, `POST /otlp/v1/traces`, `POST /otlp/v1/metrics`
+
+Native OpenTelemetry ingestion — point any OTLP exporter here (no collector required).
+
+**Auth:** API key (same as `/api/events`).  
+**Content-Type:** `application/json` (OTLP/JSON) or `application/x-protobuf` (OTLP/Protobuf).  
+**Body:** the corresponding OTLP `Export…ServiceRequest` (`resourceLogs` / `resourceSpans` / `resourceMetrics`). Max body: 8 MB (`Ingestion.MaxOtlpBatchBytes`).
+
+**Response `200 OK`:** `{ "ingested": N, "dropped": M }`.  
+`resource.attributes["service.name"]` becomes the event's service; `traceId` / `spanId` are indexed for log↔trace correlation.
+
 ---
 
 ## Query
@@ -197,6 +208,38 @@ Returns a sorted array of distinct property names seen in the last 24 h (up to 5
 
 **Auth:** JWT Bearer.
 
+### `GET /api/events/services`
+
+Returns the distinct `service.name` values seen, for the services dropdown/filter.
+
+**Auth:** JWT Bearer.
+
+### `GET /api/events/counts`
+
+Header-only log-volume aggregation: bucketed `(time, level[, service])` counts over a time range, without materialising events (powers the volume histogram). Params: `from`, `to`, `filter`, `gb` (group-by), bucketing hints.
+
+**Auth:** JWT Bearer. **Response:** JSON `{ buckets, series, … }`.
+
+---
+
+## Search history
+
+Per-user recent + pinned filter queries (shown in the events Signals panel).
+
+### `GET /api/search-history`
+Returns `{ pinned: string[], recent: string[] }` for the caller.
+
+### `POST /api/search-history`
+Record a query — body `{ "query": "@l='Error'" }`. → `204`.
+
+### `PUT /api/search-history/pin`
+Pin/unpin — body `{ "query": "…", "pinned": true }`. → `204`.
+
+### `DELETE /api/search-history?query=…`
+Remove one entry. → `204`.
+
+All require JWT Bearer.
+
 ---
 
 ## Statistics
@@ -230,7 +273,7 @@ Server health snapshot.
   "diskFreeBytes": 10737418240,
   "diskTotalBytes": 107374182400,
   "systemRamPercent": 42,
-  "ramTargetPercent": 99,
+  "ramTargetPercent": 85,
   "processWorkingSetBytes": 134217728,
   "processThreads": 18,
   "processStartedAt": "2026-05-20T09:00:00Z",
@@ -259,12 +302,14 @@ Updates and persists retention settings to SQLite.
 **Body:**
 ```json
 {
-  "verboseDays": 3,
+  "verboseDays": 90,
   "debugDays": 3,
   "informationDays": 90,
   "warningDays": 90,
   "errorDays": 90,
-  "fatalDays": 90
+  "fatalDays": 90,
+  "metricsDays": 30,
+  "tracesDays": 14
 }
 ```
 
@@ -330,6 +375,60 @@ Update a saved query. Only the owner or an `admin` may update.
 Delete a saved query. Only the owner or an `admin` may delete.
 
 **Response `204 No Content`** on success, **`403`** if not owner/admin, **`404`** if not found.
+
+---
+
+## Traces
+
+Distributed-tracing query surface (spans ingested via OTLP). All require JWT Bearer.
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /api/traces` | List/search traces (root spans) by service, name, tag filter, duration, time range. |
+| `GET /api/traces/query` | Same, richer query params (tag expressions like `{ db.system = 'mssql' && duration > 200ms }`). |
+| `GET /api/traces/stats` | Aggregate trace stats (counts, error rate, latency) over a window. |
+| `GET /api/traces/latency` | Latency distribution / percentiles by service or operation. |
+| `GET /api/traces/service-graph` | Service dependency graph (edges + call counts) inferred from spans. |
+| `GET /api/traces/compare` | Compare two traces / time windows. |
+| `GET /api/traces/{traceId}` | Full span tree for one trace. |
+| `GET /api/traces/{traceId}/flamegraph` | Flamegraph layout for the trace. |
+| `GET /api/traces/{traceId}/logs` | Logs correlated to the trace (via `@tr`). |
+| `GET /api/spans/{spanId}/logs` | Logs correlated to a single span (via `@sp`). |
+
+---
+
+## Metrics
+
+Metric query surface (points ingested via OTLP). All require JWT Bearer.
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /api/metrics/names` | Distinct metric names. |
+| `GET /api/metrics/catalog` | Metric catalog (name, type, unit, label keys). |
+| `GET /api/metrics/query` | Time-series query: `metric`, `agg` (avg/sum/min/max/count), `gb` (group-by label), `filters`, time range. |
+| `GET /api/metrics/expr` | Evaluate a metric expression (arithmetic over series). |
+| `GET /api/metrics/{name}` | Series for one metric. |
+| `GET /api/metrics/{name}/labels` | Label keys for a metric; `…/labels/{key}/values` for a key's values. |
+| `GET /api/metrics/{name}/heatmap` | Heatmap buckets for a histogram/gauge metric. |
+| `GET /api/metrics/{name}/exemplars` | Exemplars (trace-linked sample points) for a metric. |
+
+---
+
+## Alerts
+
+Threshold rules over logs/metrics with webhook/SMTP dispatch and silences. Mapped under the alerts group; all require JWT Bearer (rule CRUD is admin/manager). Key endpoints: rule CRUD (`GET/POST/PUT/DELETE`), `GET …/state` (firing state), `POST …/{id}/ack`, `POST …/test`, `POST …/preview`, `…/silences`, `…/maintenance`, `…/history`.
+
+---
+
+## Auth providers (OAuth)
+
+| Endpoint | Purpose |
+|----------|---------|
+| `GET /api/auth/providers` | Configured OAuth providers (for the login screen). |
+| `GET /api/auth/oauth/{provider}` | Begin the OAuth flow for a provider. |
+| `GET/POST/DELETE /api/users/oauth-domains` | Admin: manage the OAuth email-domain allowlist / auto-provisioning. |
+
+Per-user **view permissions** (Logs / Metrics / Traces / Stats) are set on the user object (`POST/PUT /api/users`) and enforced server-side per request.
 
 ---
 

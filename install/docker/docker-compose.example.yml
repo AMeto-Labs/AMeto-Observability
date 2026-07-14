@@ -1,0 +1,94 @@
+# Ameto — example Docker Compose.
+#
+# Copy this file to `docker-compose.yml` and adjust. Two ways to get the image:
+#
+#   A) Build from source (this repo)  — uncomment the `build:` block below.
+#   B) Pull a pre-built image         — set `image:` to your registry tag and
+#                                        remove the `build:` block.
+#
+# Run (from the repo root, or wherever this file lives):
+#   docker compose -f install/docker/docker-compose.example.yml up -d --build
+#
+# All configuration is passed as environment variables using the .NET
+# double-underscore convention:  Ameto:HttpPort  ->  Ameto__HttpPort
+# Order of precedence: baked config.yml  <  env vars  <  CLI args.
+# Every option below shows its DEFAULT; uncomment to override.
+
+services:
+  ameto:
+    # A) Build from source:
+    build:
+      context: ../..                       # repo root, so COPY reaches src/ and client/
+      dockerfile: install/docker/Dockerfile
+    image: ameto/server:latest             # image names must be lowercase
+    # B) Or pull a pre-built image instead of building:
+    # image: ghcr.io/ameto-observability/ameto:latest
+    # pull_policy: always
+
+    container_name: ameto
+    restart: unless-stopped
+
+    # .NET sizes its GC heap to this cgroup limit, and RamTargetPercent is measured
+    # against THIS, not the host's total RAM. Without a limit the hot tier never
+    # auto-flushes on a large host. Raise for higher sustained ingestion.
+    mem_limit: 1g
+
+    ports:
+      - "5341:5341"                        # host:container — change the host side to relocate
+
+    volumes:
+      # Persist all data (log/metric/trace segments + Ameto.db auth/retention) across restarts.
+      - ameto-data:/data
+      # Optional: mount your own config.yml (env vars below still override it).
+      # - ./config.yml:/app/config.yml:ro
+      # Optional: mount a TLS certificate directory (see SslCertPath below).
+      # - ./certs:/certs:ro
+
+    environment:
+      # ── Core ──────────────────────────────────────────────────────────────
+      Ameto__DataDirectory: /data          # keep data on the mounted volume
+      Ameto__HttpPort: "5341"
+      Ameto__NodeId: "0"                    # unique per node when replicating
+      Ameto__RamTargetPercent: "75"         # default 85; flush the hot tier when host RAM load exceeds this
+
+      # ── TLS (optional — serves HTTPS instead of HTTP when set) ────────────
+      # Ameto__SslCertPath: /certs/ameto.pfx
+      # Ameto__SslCertPassword: changeit
+
+      # ── Hot tier (write buffer → flush tuning) ───────────────────────────
+      Ameto__HotTier__MaxSizeBytes: "67108864"   # default 64 MB — flush when the in-RAM tier reaches this
+      Ameto__HotTier__MaxAge: "00:05:00"          # default 5 min — flush a tier at least this often
+      Ameto__HotTier__FlushConcurrency: "0"       # default 0 = auto (cores/2, 2–8). Lower = less RAM, higher = more throughput
+
+      # ── Indexing ──────────────────────────────────────────────────────────
+      # Ameto__Indexing__MaxPropertyFlattenDepth: "5"   # nested-property flatten depth (0 = top-level keys only)
+
+      # ── Ingestion limits (bytes) ──────────────────────────────────────────
+      # Ameto__Ingestion__MaxBatchBytes: "4194304"        # default 4 MB — max CLEF body (POST /api/events)
+      # Ameto__Ingestion__MaxEventPayloadBytes: "65536"   # default 64 KB — max properties per event (ring slab)
+      # Ameto__Ingestion__MaxOtlpBatchBytes: "8388608"    # default 8 MB — max OTLP body (POST /otlp/v1/*)
+
+      # ── Retention (first-run defaults, days; afterwards managed in the UI / SQLite) ──
+      Ameto__Retention__VerboseDays: "90"
+      Ameto__Retention__DebugDays: "3"
+      Ameto__Retention__InformationDays: "90"
+      Ameto__Retention__WarningDays: "90"
+      Ameto__Retention__ErrorDays: "90"
+      Ameto__Retention__FatalDays: "90"
+      Ameto__Retention__MetricsDays: "30"
+      Ameto__Retention__TracesDays: "14"
+
+      # ── Replication (multi-node cluster; single node: keep disabled) ──────
+      Ameto__Replication__Enabled: "false"
+      # Ameto__Replication__SeedNodes__0: "http://ameto-2:5341"
+      # Ameto__Replication__SeedNodes__1: "http://ameto-3:5341"
+
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:5341/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  ameto-data:
