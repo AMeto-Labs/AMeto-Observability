@@ -22,7 +22,7 @@ services:
       dockerfile: install/docker/Dockerfile
     image: ameto/server:latest             # image names must be lowercase
     # B) Or pull a pre-built image instead of building:
-    # image: ghcr.io/ameto-observability/ameto:latest
+    # image: ghcr.io/ameto-labs/ameto:latest
     # pull_policy: always
 
     container_name: ameto
