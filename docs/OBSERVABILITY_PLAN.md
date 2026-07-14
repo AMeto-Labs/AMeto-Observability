@@ -6,36 +6,36 @@
 > (not `/v1/...`); the services list is **`GET /api/events/services`**; metric time-series is
 > **`GET /api/metrics/query`**. See [API.md](API.md) for the current endpoint reference.
 
-## Принципы
+## Principles
 
-- **OTLP** как единый протокол приёма (OpenTelemetry Protocol) — стандарт де-факто
-- Каждый сигнал хранится отдельно, но с общими примитивами (сегменты, индексы)
-- Максимальное переиспользование существующего кода (Storage, Indexing, Query)
+- **OTLP** as the single ingestion protocol (OpenTelemetry Protocol) — the de facto standard
+- Each signal is stored separately, but on shared primitives (segments, indexes)
+- Maximum reuse of existing code (Storage, Indexing, Query)
 
 ---
 
-## Phase 1 — OTLP-приём
+## Phase 1 — OTLP ingestion
 
-**Новый проект `Ameto.Otel`**
+**New project `Ameto.Otel`**
 
 ```
 POST /v1/traces   → ExportTraceServiceRequest   (protobuf)
 POST /v1/metrics  → ExportMetricsServiceRequest  (protobuf)
-POST /v1/logs     → ExportLogsServiceRequest     (protobuf)  ← OTLP-альтернатива /api/events
+POST /v1/logs     → ExportLogsServiceRequest     (protobuf)  ← OTLP alternative to /api/events
 ```
 
-- Подключить `OpenTelemetry.Proto` NuGet (только контракты, без SDK)
-- Конвертеры: `OtlpSpan` → `SpanEvent`, `OtlpMetric` → `MetricPoint`
-- Отдельные `ISpanIngester`, `IMetricIngester` (аналог текущего ring buffer)
-- Текущий `POST /api/events` остаётся — обратная совместимость с Serilog sink
+- Add the `OpenTelemetry.Proto` NuGet package (contracts only, no SDK)
+- Converters: `OtlpSpan` → `SpanEvent`, `OtlpMetric` → `MetricPoint`
+- Separate `ISpanIngester`, `IMetricIngester` (mirroring the current ring buffer)
+- The current `POST /api/events` stays — backward compatible with the Serilog sink
 
 ---
 
 ## Phase 2 — Traces
 
-**Новый проект `Ameto.Traces`**
+**New project `Ameto.Traces`**
 
-### Модель данных
+### Data model
 
 ```csharp
 public readonly struct SpanEvent
@@ -52,35 +52,35 @@ public readonly struct SpanEvent
 }
 ```
 
-### Хранение — `.trc` сегменты (аналог `.seg`)
+### Storage — `.trc` segments (analogous to `.seg`)
 
-- Те же 6-колоночных блоков: `@l` → `StatusCode`, `@mt` → span name, etc.
-- TraceId → inverted index → быстрый lookup `traceId = 'abc...'`
-- Trigram index на span name → `contains(name, 'payment')`
-- Индекс по duration → медленные спаны `duration > 500`
+- The same 6-column blocks: `@l` → `StatusCode`, `@mt` → span name, etc.
+- TraceId → inverted index → fast lookup `traceId = 'abc...'`
+- Trigram index on span name → `contains(name, 'payment')`
+- Index on duration → slow spans `duration > 500`
 
 ### API
 
 ```
 GET /api/traces?filter=...&from=...&to=...
-GET /api/traces/{traceId}   ← все спаны трейса (waterfall)
-GET /api/services           ← список сервисов
+GET /api/traces/{traceId}   ← all spans of a trace (waterfall)
+GET /api/services           ← list of services
 ```
 
 ---
 
 ## Phase 3 — Metrics
 
-**Новый проект `Ameto.Metrics`**
+**New project `Ameto.Metrics`**
 
-### Модель данных
+### Data model
 
 ```csharp
 public readonly struct MetricPoint
 {
     public long   TimestampTicks;
     public double Value;
-    // для histogram: count + sum + buckets хранятся в attributes
+    // for histograms: count + sum + buckets are stored in attributes
 }
 
 public sealed class MetricSeries
@@ -92,70 +92,70 @@ public sealed class MetricSeries
 }
 ```
 
-### Хранение — `.met` сегменты
+### Storage — `.met` segments
 
-- Time-series ориентированные — дельта-кодирование по времени
-- Отдельный файл-каталог серий `series.idx` (name + labels → seriesId)
+- Time-series oriented — delta encoding over time
+- A separate series catalog file `series.idx` (name + labels → seriesId)
 - Downsampling: raw 15s → 1min → 5min → 1h (background job)
 
 ### API
 
 ```
 GET /api/metrics?name=http.server.duration&from=...&to=...&step=60s
-GET /api/metrics/names          ← список всех метрик
-GET /api/metrics/labels?name=.. ← доступные label values
+GET /api/metrics/names          ← list of all metrics
+GET /api/metrics/labels?name=.. ← available label values
 GET /metrics                    ← Prometheus scrape (text/plain)
 ```
 
 ---
 
-## Phase 4 — Корреляция
+## Phase 4 — Correlation
 
-Самая ценная часть — связать три сигнала:
+The most valuable part — linking the three signals together:
 
-| Связь | Механизм |
+| Link | Mechanism |
 |---|---|
-| Log → Trace | `traceId` / `spanId` в properties лога (пишет OpenTelemetry SDK автоматически) |
-| Trace → Logs | `GET /api/events?filter=TraceId='abc'` — работает уже сейчас |
-| Trace → Metrics | по `service.name` + временному окну |
-| Metrics → Logs | клик на аномалию → открывает логи того же сервиса в то же время |
+| Log → Trace | `traceId` / `spanId` in the log's properties (written automatically by the OpenTelemetry SDK) |
+| Trace → Logs | `GET /api/events?filter=TraceId='abc'` — already works today |
+| Trace → Metrics | by `service.name` + time window |
+| Metrics → Logs | click an anomaly → opens logs for the same service at the same time |
 
-`FilterEvaluator` уже понимает `TraceId = '...'` через properties — изменений не требует.
+`FilterEvaluator` already understands `TraceId = '...'` via properties — no changes needed.
 
 ---
 
 ## Phase 5 — UI
 
-| Страница | Статус |
+| Page | Status |
 |---|---|
-| Logs | ✅ есть |
-| Traces | ✅ список трейсов, waterfall, flamegraph, service-graph, latency |
-| Metrics | ✅ time-series графики, heatmap, exemplars |
+| Logs | ✅ done |
+| Traces | ✅ trace list, waterfall, flamegraph, service graph, latency |
+| Metrics | ✅ time-series charts, heatmap, exemplars |
 
 ---
 
-## Итоговая структура проектов
+## Final project structure
 
 ```
 src/
   Ameto.Core/         ← SpanEvent, MetricPoint, MetricSeries
-  Ameto.Otel/         ← OTLP HTTP endpoints + конвертеры (+ zero-alloc streaming log parser)
+  Ameto.Otel/         ← OTLP HTTP endpoints + converters (+ zero-alloc streaming log parser)
   Ameto.Tracing/      ← SpanIngester, trace storage (.trc), trace query
   Ameto.Metrics/      ← MetricIngester, metric storage, metric query
   Ameto.Ingestion/    ← logs ingest (ring buffer, drainer)
-  Ameto.Storage/      ← переиспользуется traces/metrics
-  Ameto.Indexing/     ← переиспользуется для .trc/.met (posting-list codec)
+  Ameto.Storage/      ← reused for traces/metrics
+  Ameto.Indexing/     ← reused for .trc/.met (posting-list codec)
   Ameto.Query/        ← Seq filter parser/evaluator + query executor
-  Ameto.Server/       ← Kestrel host, все endpoints
+  Ameto.Server/       ← Kestrel host, all endpoints
 ```
 
 ---
 
-## Приоритеты
+## Priorities
 
-| Приоритет | Фаза | Ценность |
+| Priority | Phase | Value |
 |---|---|---|
-| 1 | Traces | Distributed tracing, waterfall, поиск по traceId |
-| 2 | OTLP ingestion | Любой OpenTelemetry SDK начинает слать данные без доп. кода |
-| 3 | Корреляция Log↔Trace | Почти бесплатна — traceId уже в properties |
-| 4 | Metrics | Самое сложное (TSDB, downsampling); менее приоритетно при наличии Prometheus |
+| 1 | Traces | Distributed tracing, waterfall, search by traceId |
+| 2 | OTLP ingestion | Any OpenTelemetry SDK can start sending data with no extra code |
+| 3 | Log↔Trace correlation | Almost free — traceId is already in properties |
+| 4 | Metrics | The hardest (TSDB, downsampling); lower priority when Prometheus is available |
