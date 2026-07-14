@@ -2,12 +2,10 @@ import {
   Component, input, output, computed, effect, viewChild, ElementRef,
   ChangeDetectionStrategy, OnDestroy,
 } from '@angular/core';
-import { Chart, LinearScale, Tooltip } from 'chart.js';
-import { MatrixController, MatrixElement } from 'chartjs-chart-matrix';
+import type { Chart as ChartJs } from 'chart.js';
+import { loadChart } from '../../../shared/utils/chart-lazy';
 import { format } from 'date-fns';
 import { HeatmapDto } from '../../../core/models/metric.model';
-
-Chart.register(MatrixController, MatrixElement, LinearScale, Tooltip);
 
 interface Cell { x: number; y: number; v: number; }
 
@@ -40,7 +38,9 @@ export class HeatmapComponent implements OnDestroy {
   readonly cellClick = output<{ tsMs: number; loMs: number; hiMs: number; count: number }>();
 
   private cv = viewChild<ElementRef<HTMLCanvasElement>>('cv');
-  private chart?: Chart;
+  private chart?: ChartJs;
+  /** Monotonic guard: only the newest async render may create a chart. */
+  private renderSeq = 0;
 
   hasData = computed(() => {
     const d = this.data();
@@ -53,14 +53,15 @@ export class HeatmapComponent implements OnDestroy {
       const scale = this.scale();
       const canvas = this.cv()?.nativeElement;
       if (!canvas || !d || !this.hasData()) { this.destroy(); return; }
-      this.render(canvas, d, scale);
+      void this.render(canvas, d, scale);
     });
   }
 
   ngOnDestroy() { this.destroy(); }
   private destroy() { this.chart?.destroy(); this.chart = undefined; }
 
-  private render(canvas: HTMLCanvasElement, d: HeatmapDto, scale: number) {
+  private async render(canvas: HTMLCanvasElement, d: HeatmapDto, scale: number) {
+    const seq = ++this.renderSeq;
     this.destroy();
 
     const nBuckets = d.bounds.length + 1;
@@ -91,7 +92,9 @@ export class HeatmapComponent implements OnDestroy {
       return hi === Infinity ? `> ${fmtNum(lo)}` : `${fmtNum(lo)}–${fmtNum(hi)}`;
     };
 
-    this.chart = new Chart(canvas, {
+    const ChartCtor = await loadChart();
+    if (seq !== this.renderSeq) return; // superseded by a newer render while loading
+    this.chart = new ChartCtor(canvas, {
       type: 'matrix',
       data: {
         datasets: [{
@@ -150,6 +153,10 @@ export class HeatmapComponent implements OnDestroy {
         },
       },
     });
+
+    // When swapped into view, the container may have had zero width during the Angular
+    // transition; force a resize once layout settles so Chart.js re-measures (avoids a 0×0 canvas).
+    requestAnimationFrame(() => this.chart?.resize());
   }
 }
 

@@ -7,6 +7,7 @@ import {
 } from '@ngrx/signals';
 
 import { ApiService } from '../../../core/services/api.service';
+import { SearchHistoryService } from '../../../core/services/search-history.service';
 import { EventDto, LEVELS } from '../../../core/models/event.model';
 import {
   TimePreset,
@@ -226,6 +227,7 @@ export const EventsStore = signalStore(
     api = inject(ApiService),
     router = inject(Router),
     route = inject(ActivatedRoute),
+    history = inject(SearchHistoryService),
   ) => {
     // Streaming subscriptions live in the closure: the previous is torn down before a
     // new one starts, and both are disposed on destroy (via _disposeStreams).
@@ -384,11 +386,13 @@ export const EventsStore = signalStore(
     function search(): void {
       if (!store.canSearch()) return;
       patchState(store, { filter: store.filterInput() });
+      history.record(store.filterInput());
       loadEvents();
     }
 
     function applyFilter(filter: string): void {
       patchState(store, { filterInput: filter, filter });
+      history.record(filter);
       loadEvents();
     }
 

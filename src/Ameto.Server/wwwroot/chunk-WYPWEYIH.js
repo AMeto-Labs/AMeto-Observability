@@ -1,0 +1,1 @@
+var e=["#4DA3FF","#38BDF8","#34D399","#A78BFA","#FB923C","#F472B6","#22D3EE","#818CF8","#E879F9","#4ADE80","#FACC15","#F87171"],E="var(--txt-muted)";function F(t){if(!t)return E;let n=0;for(let r=0;r<t.length;r++)n=n*31+t.charCodeAt(r)>>>0;return e[n%e.length]}export{F as a};

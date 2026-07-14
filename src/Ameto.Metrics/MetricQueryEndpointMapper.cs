@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
 using System.Globalization;
+using Ameto.Core;
 
 namespace Ameto.Metrics;
 
@@ -12,7 +13,7 @@ public static class MetricQueryEndpointMapper
         // GET /api/metrics/names?prefix=
         app.MapGet("/api/metrics/names", (IMetricQuery query, string? prefix) =>
             Results.Json(query.GetMetricNames(string.IsNullOrEmpty(prefix) ? null : prefix).ToList())
-        ).RequireAuthorization();
+        ).RequireAuthorization(ViewPolicies.Metrics);
 
         // GET /api/metrics/catalog?search=
         app.MapGet("/api/metrics/catalog", (IMetricCatalog catalog, string? search) =>
@@ -29,17 +30,17 @@ public static class MetricQueryEndpointMapper
                 })
                 .ToList();
             return Results.Json(entries);
-        }).RequireAuthorization();
+        }).RequireAuthorization(ViewPolicies.Metrics);
 
         // GET /api/metrics/{name}/labels
         app.MapGet("/api/metrics/{name}/labels", (IMetricCatalog catalog, string name) =>
             Results.Json(catalog.GetLabelKeys(name))
-        ).RequireAuthorization();
+        ).RequireAuthorization(ViewPolicies.Metrics);
 
         // GET /api/metrics/{name}/labels/{key}/values
         app.MapGet("/api/metrics/{name}/labels/{key}/values", (IMetricCatalog catalog, string name, string key) =>
             Results.Json(catalog.GetLabelValues(name, key))
-        ).RequireAuthorization();
+        ).RequireAuthorization(ViewPolicies.Metrics);
 
         // POST /api/metrics/query  — server-side typed aggregation
         app.MapPost("/api/metrics/query", async (HttpContext ctx, IMetricAggregator agg) =>
@@ -53,7 +54,7 @@ public static class MetricQueryEndpointMapper
 
             var series = await agg.QueryAsync(ToRequest(dto), ctx.RequestAborted);
             return Results.Json(series.Select(ToDto).ToList());
-        }).RequireAuthorization();
+        }).RequireAuthorization(ViewPolicies.Metrics);
 
         // POST /api/metrics/expr  — binary metric expression (A op B)
         app.MapPost("/api/metrics/expr", async (HttpContext ctx, IMetricAggregator agg) =>
@@ -73,7 +74,7 @@ public static class MetricQueryEndpointMapper
             };
             var series = await agg.EvalExprAsync(req, ctx.RequestAborted);
             return Results.Json(ToDto(series));
-        }).RequireAuthorization();
+        }).RequireAuthorization(ViewPolicies.Metrics);
 
         // GET /api/metrics/{name}/heatmap?from=&to=&step=&filters=k:v,k2:v2
         app.MapGet("/api/metrics/{name}/heatmap", async (HttpContext ctx, IMetricAggregator agg, string name) =>
@@ -90,7 +91,7 @@ public static class MetricQueryEndpointMapper
                 Unit    = hm.Unit,
                 Columns = hm.Columns.Select(c => new HeatmapColumnDto { Ts = c.Ts, Counts = c.Counts }).ToArray(),
             });
-        }).RequireAuthorization();
+        }).RequireAuthorization(ViewPolicies.Metrics);
 
         // GET /api/metrics/{name}/exemplars?from=&to=&filters=k:v&limit=
         app.MapGet("/api/metrics/{name}/exemplars", (HttpContext ctx, IMetricExemplars store, string name) =>
@@ -111,7 +112,7 @@ public static class MetricQueryEndpointMapper
                 })
                 .ToList();
             return Results.Json(result);
-        }).RequireAuthorization();
+        }).RequireAuthorization(ViewPolicies.Metrics);
 
         // GET /api/metrics/{name}?from=&to=&step=  — raw series (no aggregation)
         app.MapGet("/api/metrics/{name}", async (HttpContext ctx, IMetricQuery query, string name) =>
@@ -125,7 +126,7 @@ public static class MetricQueryEndpointMapper
                 result.Add(ToDto(s));
 
             return Results.Json(result);
-        }).RequireAuthorization();
+        }).RequireAuthorization(ViewPolicies.Metrics);
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

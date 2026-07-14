@@ -68,6 +68,24 @@
   outline: none;
 }
 
+.perm-checks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  padding: 4px 0;
+}
+
+.perm-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-primary);
+  cursor: pointer;
+
+  input { cursor: pointer; accent-color: var(--accent, #F59E0B); }
+}
+
 .btn-group {
   display: flex;
   gap: 6px;

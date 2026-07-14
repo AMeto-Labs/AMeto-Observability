@@ -28,10 +28,22 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
 {
     // ── Chunk geometry (fixed constants) ──────────────────────────────────────
 
-    /// <summary>Events per chunk. Power-of-2 for fast modulo/division by JIT.</summary>
-    private const int  ChunkEventCapacity = 65_536;
+    // GEOMETRY INVARIANT — read before tuning either constant:
+    //   A chunk holds exactly ChunkEventCapacity header slots, addressed by index
+    //   division (ci = idx / ChunkEventCapacity). The writer only advances to the next
+    //   chunk when the *slot* count rolls over. Therefore the payload area MUST be able
+    //   to hold ChunkEventCapacity events' worth of payload — otherwise the payload area
+    //   fills first, TryWrite returns false, the slot counter never reaches the roll-over
+    //   point, and the segment is permanently wedged below capacity. StorageEngine reacts
+    //   to that false by flushing, so an undersized payload area turns into a flush storm
+    //   (tiny cold segments), which is the ingest-drop root cause.
+    //   Keep: ChunkEventCapacity * avgPayloadBytes  <=  ChunkPayloadBytes.
+    //   At 16384 * 512B = 8 MB this covers structured logs up to ~512 B average.
 
-    /// <summary>Payload bytes per chunk. 8 MB gives ~100-byte average events comfortable headroom.</summary>
+    /// <summary>Events per chunk. Power-of-2 for fast modulo/division by JIT.</summary>
+    private const int  ChunkEventCapacity = 16_384;
+
+    /// <summary>Payload bytes per chunk. 8 MB / 16384 slots = 512 B/event headroom (see invariant above).</summary>
     private const long ChunkPayloadBytes  = 8 * 1024 * 1024; // 8 MB
 
     /// <summary>Bytes occupied by the header array at the start of every chunk.</summary>
@@ -273,7 +285,13 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
 
     private void AllocChunk(int ci)
     {
-        _chunkArenas[ci]       = (nuint)NativeMemory.AllocZeroed((nuint)ChunkTotalBytes);
+        // Alloc (not AllocZeroed): zeroing touches every page of the chunk, making the
+        // whole 8 MB payload area resident even when small events fill only a fraction of
+        // it — a ~3× RSS blow-up per hot tier. Uninitialised memory is safe here because
+        // a header/payload slot is fully written before Interlocked.Increment(_count)
+        // publishes it, and readers never touch a slot at index >= _count. Only pages we
+        // actually write become resident.
+        _chunkArenas[ci]       = (nuint)NativeMemory.Alloc((nuint)ChunkTotalBytes);
         _chunkPayloadTails[ci] = 0;
         _chunksAllocated++;
     }

@@ -40,6 +40,13 @@ internal static class AuthServiceExtensions
     public const string PolicyManager = "RequireManager";
     public const string PolicyViewer  = "RequireViewer";
 
+    // Per-view read scopes (admin bypasses; see ClaimsPrincipalExtensions.HasView).
+    // Names live in Ameto.Core so cross-assembly mappers gate on the same strings.
+    public const string PolicyViewLogs    = Ameto.Core.ViewPolicies.Logs;
+    public const string PolicyViewMetrics = Ameto.Core.ViewPolicies.Metrics;
+    public const string PolicyViewTraces  = Ameto.Core.ViewPolicies.Traces;
+    public const string PolicyViewStats   = Ameto.Core.ViewPolicies.Stats;
+
     /// <summary>
     /// Registers JWT Bearer authentication, OAuth providers (optional),
     /// authorization policies and all auth-related services into DI.
@@ -68,6 +75,7 @@ internal static class AuthServiceExtensions
         var issuer = new JwtIssuer(secret);
         services.AddSingleton(new AuthDatabase(dataDirectory));
         services.AddSingleton<AuthStore>();
+        services.AddSingleton<SearchHistoryStore>();
         services.AddSingleton(issuer);
         services.AddSingleton<ApiKeyCache>();
         // Expose the cache as the ingest-path validator (used by OTLP endpoints in Ameto.Otel).
@@ -167,6 +175,16 @@ internal static class AuthServiceExtensions
             o.AddPolicy(PolicyViewer, p =>
                 p.RequireAuthenticatedUser().RequireRole("admin", "manager", "viewer"));
 
+            // Per-view read scopes — admin bypasses, otherwise the JWT 'perm' bit is required.
+            o.AddPolicy(PolicyViewLogs, p => p.RequireAuthenticatedUser()
+                .RequireAssertion(static c => c.User.HasView(ViewPermissions.Logs)));
+            o.AddPolicy(PolicyViewMetrics, p => p.RequireAuthenticatedUser()
+                .RequireAssertion(static c => c.User.HasView(ViewPermissions.Metrics)));
+            o.AddPolicy(PolicyViewTraces, p => p.RequireAuthenticatedUser()
+                .RequireAssertion(static c => c.User.HasView(ViewPermissions.Traces)));
+            o.AddPolicy(PolicyViewStats, p => p.RequireAuthenticatedUser()
+                .RequireAssertion(static c => c.User.HasView(ViewPermissions.Stats)));
+
             // Default policy requires at least viewer
             o.DefaultPolicy = o.GetPolicy(PolicyViewer)!;
         });
@@ -210,7 +228,7 @@ internal static class AuthServiceExtensions
             return Task.CompletedTask;
         }
 
-        var token = issuer.Issue(user.Username, user.Role, email, displayName);
+        var token = issuer.Issue(user.Username, user.Role, email, displayName, user.Permissions);
 
         ctx.Response.Redirect(
             $"/oauth-callback?token={Uri.EscapeDataString(token)}&expiresIn={JwtIssuer.ExpiresInSeconds}&role={user.Role}");

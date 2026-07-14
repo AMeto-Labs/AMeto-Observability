@@ -17,4 +17,8 @@
     <ProjectReference Include="..\Ameto.Core\Ameto.Core.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="Ameto.Integration.Tests" />
+  </ItemGroup>
+
 </Project>

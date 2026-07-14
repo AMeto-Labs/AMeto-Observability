@@ -7,6 +7,7 @@ import { FormsModule } from '@angular/forms';
 import { LucideAngularModule } from 'lucide-angular';
 import { format } from 'date-fns';
 import { ApiService } from '../../core/services/api.service';
+import { serviceColor } from '../../shared/utils/service-color';
 import { EventDto } from '../../core/models/event.model';
 import { SpanDto, TraceRowDto, TraceStatsDto } from '../../core/models/span.model';
 import { subHours, formatISO } from 'date-fns';
@@ -75,6 +76,16 @@ export class TracesComponent implements OnInit, OnDestroy {
   filterMaxDurationMs: number | null = null;
   filterHttpStatus   = '';
   preset             = '1h';
+  /** Custom [from,to] as datetime-local strings — used when preset === 'custom'. */
+  customFrom         = '';
+  customTo           = '';
+
+  /** Stable query window driving the Graph / Latency panels. Set on user action only, so the
+   *  15 s live poll never changes it → those panels don't re-fetch/re-layout (no jumping). */
+  readonly winFrom     = signal<string>('');
+  readonly winTo       = signal<string | undefined>(undefined);
+  /** Full service list from the backend (not just services present in loaded traces). */
+  readonly allServices = signal<string[]>([]);
 
   // TraceQL
   traceqlInput   = '';
@@ -82,6 +93,8 @@ export class TracesComponent implements OnInit, OnDestroy {
   traceqlError   = signal('');
 
   private _poll: ReturnType<typeof setInterval> | null = null;
+  /** Refresh immediately when the tab is re-shown after being hidden. */
+  private _onVisibility = () => { if (!document.hidden) this.poll(); };
 
   // ── Computed ──────────────────────────────────────────────────────────────
   services = computed(() => {
@@ -90,6 +103,13 @@ export class TracesComponent implements OnInit, OnDestroy {
   });
 
   filteredTraces = computed(() => this.traces());
+
+  /** Services offered in the filter — backend list ∪ services seen in loaded traces. */
+  serviceOptions = computed(() => {
+    const set = new Set<string>(this.allServices());
+    for (const s of this.services()) set.add(s);
+    return [...set].sort();
+  });
 
   // ── Waterfall computed helpers ────────────────────────────────────────────
   private traceRange = computed<{ minNs: number; totalNs: number }>(() => {
@@ -134,8 +154,28 @@ export class TracesComponent implements OnInit, OnDestroy {
   // ── Lifecycle ─────────────────────────────────────────────────────────────
   ngOnInit() {
     this.restoreFromUrl();
+    this.setWindow();
+    this.loadAllServices();
     this.loadAll();
-    this._poll = setInterval(() => this.loadAll(), 15_000);
+    this._poll = setInterval(() => this.poll(), 15_000);
+    document.addEventListener('visibilitychange', this._onVisibility);
+  }
+
+  /** Periodic live refresh. Skips work when the tab is hidden, and only refetches the
+   *  (heavier) trace list while the Traces tab is actually on screen. */
+  private poll() {
+    if (document.hidden) return;
+    const from = this.fromIso();
+    const to   = this.toIso();
+    this.loadStats(from, to);
+    if (this.activeMainTab === 'traces') this.loadTraces(from, to);
+  }
+
+  private loadAllServices() {
+    this.api.getServiceNames(30).subscribe({
+      next: s => { this.allServices.set(s); this.cdr.markForCheck(); },
+      error: () => { /* keep empty — falls back to services seen in loaded traces */ },
+    });
   }
 
   // ── URL state sync (survives F5 / deep-link) ──────────────────────────────
@@ -148,6 +188,10 @@ export class TracesComponent implements OnInit, OnDestroy {
 
     const range = q.get('range');
     if (range) this.preset = range;
+    if (this.preset === 'custom') {
+      this.customFrom = q.get('cfrom') ?? '';
+      this.customTo   = q.get('cto')   ?? '';
+    }
 
     const dtab = q.get('dtab');
     if (dtab === 'flamegraph' || dtab === 'details' || dtab === 'timeline')
@@ -174,6 +218,8 @@ export class TracesComponent implements OnInit, OnDestroy {
       trace:  this.selectedTraceId() ?? null,
       dtab:   this.activeTraceTab === 'timeline' ? null : this.activeTraceTab,
       range:  this.preset === '1h'               ? null : this.preset,
+      cfrom:  this.preset === 'custom' && this.customFrom ? this.customFrom : null,
+      cto:    this.preset === 'custom' && this.customTo   ? this.customTo   : null,
       svc:    this.filterService    || null,
       name:   this.filterName       || null,
       status: this.filterStatus     || null,
@@ -194,6 +240,8 @@ export class TracesComponent implements OnInit, OnDestroy {
   setMainTab(tab: 'traces' | 'graph' | 'latency' | 'compare') {
     this.activeMainTab = tab;
     this.syncUrl();
+    // Returning to the list refreshes it (polling leaves it alone while off-screen).
+    if (tab === 'traces') this.loadTraces(this.fromIso(), this.toIso());
   }
 
   setTraceTab(tab: 'timeline' | 'flamegraph' | 'details') {
@@ -204,6 +252,15 @@ export class TracesComponent implements OnInit, OnDestroy {
   setPreset(p: string) {
     this.preset = p;
     this.syncUrl();
+    // 'custom' just reveals the date inputs; the query runs on Apply.
+    if (p !== 'custom') { this.setWindow(); this.loadAll(); }
+  }
+
+  /** Apply a custom range. `from` is required; `to` optional (empty → open-ended / now). */
+  applyCustom() {
+    if (!this.customFrom) return;
+    this.syncUrl();
+    this.setWindow();
     this.loadAll();
   }
 
@@ -215,24 +272,26 @@ export class TracesComponent implements OnInit, OnDestroy {
 
   ngOnDestroy() {
     if (this._poll) clearInterval(this._poll);
+    document.removeEventListener('visibilitychange', this._onVisibility);
   }
 
   // ── Data loading ──────────────────────────────────────────────────────────
   loadAll() {
     const from = this.fromIso();
-    this.loadStats(from);
-    this.loadTraces(from);
+    const to   = this.toIso();
+    this.loadStats(from, to);
+    this.loadTraces(from, to);
   }
 
-  loadStats(from: string) {
+  loadStats(from: string, to?: string) {
     this.statsLoading.set(true);
-    this.api.getTraceStats(from).subscribe({
+    this.api.getTraceStats(from, to).subscribe({
       next: s  => { this.stats.set(s); this.statsLoading.set(false); this.cdr.markForCheck(); },
       error: () => { this.statsLoading.set(false); this.cdr.markForCheck(); },
     });
   }
 
-  loadTraces(from: string) {
+  loadTraces(from: string, to?: string) {
     if (this.traceqlMode() && this.traceqlInput.trim()) {
       this.runTraceQL();
       return;
@@ -240,6 +299,7 @@ export class TracesComponent implements OnInit, OnDestroy {
     this.loading.set(true);
     this.api.searchTraces({
       from,
+      to,
       service:        this.filterService        || undefined,
       spanName:       this.filterName           || undefined,
       status:         this.filterStatus         || undefined,
@@ -360,13 +420,25 @@ export class TracesComponent implements OnInit, OnDestroy {
     return !!sp && log['@sp'] === sp;
   }
 
-  fromIsoPublic(): string { return this.fromIso(); }
+  private readonly presetHours: Record<string, number> = {
+    '15m': 0.25, '30m': 0.5, '1h': 1, '3h': 3, '6h': 6, '12h': 12, '24h': 24,
+  };
 
+  /** Query lower bound — custom value, or "now − preset" (fresh each call → live list). */
   private fromIso(): string {
-    const map: Record<string, number> = {
-      '15m': 0.25, '30m': 0.5, '1h': 1, '3h': 3, '6h': 6, '12h': 12, '24h': 24,
-    };
-    return formatISO(subHours(new Date(), map[this.preset] ?? 1));
+    if (this.preset === 'custom') return localToIso(this.customFrom);
+    return formatISO(subHours(new Date(), this.presetHours[this.preset] ?? 1));
+  }
+
+  /** Query upper bound — only in custom mode; presets stay open-ended (server "now"). */
+  private toIso(): string | undefined {
+    return this.preset === 'custom' ? (localToIso(this.customTo) || undefined) : undefined;
+  }
+
+  /** Freezes the current window into winFrom/winTo (drives Graph/Latency). User action only. */
+  private setWindow(): void {
+    this.winFrom.set(this.fromIso());
+    this.winTo.set(this.toIso());
   }
 
   // ── Waterfall helpers ─────────────────────────────────────────────────────
@@ -426,11 +498,9 @@ export class TracesComponent implements OnInit, OnDestroy {
     return 'badge-ok';
   }
 
+  /** Stable per-service colour (shared hash palette — consistent with Logs / Stats). */
   svcColor(name: string): string {
-    const PALETTE = ['#38BDF8', '#F59E0B', '#22C55E', '#a78bfa', '#f97316', '#ec4899', '#06b6d4', '#84cc16'];
-    let h = 0;
-    for (const c of name) h = (h * 31 + c.charCodeAt(0)) & 0x7fff_ffff;
-    return PALETTE[h % PALETTE.length];
+    return serviceColor(name);
   }
 
   sparkline(data: number[]): string {
@@ -482,6 +552,13 @@ export class TracesComponent implements OnInit, OnDestroy {
 
 function isZeroId(id: string): boolean {
   return !id || /^0+$/.test(id);
+}
+
+/** datetime-local ("yyyy-MM-ddTHH:mm") → ISO-8601, or '' when empty/invalid. */
+function localToIso(local: string): string {
+  if (!local) return '';
+  const d = new Date(local);
+  return isNaN(d.getTime()) ? '' : d.toISOString();
 }
 
 function fmtMs(ms: number): string {

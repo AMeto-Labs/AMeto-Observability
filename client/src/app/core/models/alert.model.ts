@@ -2,6 +2,17 @@ export type AlertSource     = 'Log' | 'Metric' | 'Trace';
 export type AlertSeverity   = 'Info' | 'Warning' | 'Critical';
 export type AlertComparator = 'GreaterThan' | 'GreaterOrEqual' | 'LessThan' | 'LessOrEqual';
 export type AlertState      = 'Ok' | 'Pending' | 'Firing' | 'NoData';
+
+/** A scheduled recurring silence window. */
+export interface MaintenanceWindow {
+  id: string;
+  name: string;
+  enabled: boolean;
+  daysOfWeek: number;       // bit 0 = Sunday … bit 6 = Saturday
+  startMinuteUtc: number;   // minutes from midnight UTC
+  durationMinutes: number;
+  maxSeverity?: AlertSeverity | null;  // null = all severities
+}
 export type TraceMetricKind = 'ErrorRatePct' | 'P50Ms' | 'P95Ms' | 'P99Ms' | 'AvgDurationMs' | 'SpanCount';
 
 // ── Channels ────────────────────────────────────────────────────────────────
@@ -22,6 +33,8 @@ export interface AlertRule {
   window:      string;   // TimeSpan serialized
   for:         string;
   cooldown:    string;
+  repeatInterval?: string;
+  escalateAfter?: string;
   filter?:     string;
   noData:      boolean;
   metric?:     string;
@@ -47,6 +60,8 @@ export interface AlertRuleUpsertRequest {
   windowSeconds: number;
   forSeconds:    number;
   cooldownSeconds: number;
+  repeatSeconds?: number;
+  escalateSeconds?: number;
   filter?:       string;
   noData?:       boolean;
   metric?:       string;
@@ -68,6 +83,8 @@ export interface AlertStateSnapshot {
   pendingSince?: string;
   lastFiredAt?: string;
   evaluatedAt:  string;
+  ackedAt?:     string;
+  ackedBy?:     string;
 }
 
 export interface AlertHistoryEntry {

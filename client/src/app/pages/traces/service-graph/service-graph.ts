@@ -228,7 +228,9 @@ export class ServiceGraphComponent implements OnChanges {
   }
 
   load() {
-    this.loading.set(true);
+    // Only show the full-screen spinner on the first load — a refresh keeps the
+    // existing graph on screen (no blank flash).
+    if (this.nodes().length === 0) this.loading.set(true);
     this.error.set('');
     this.api.getServiceGraph(this.from(), this.to()).subscribe({
       next: data => {
@@ -264,19 +266,25 @@ export class ServiceGraphComponent implements OnChanges {
     const count = rawNodes.length;
     const r = Math.min(cx, cy) * 0.7;
 
+    // Reuse the position of any node that already exists so a data refresh does
+    // NOT relayout the whole graph (that was the "jumping"). Only brand-new nodes
+    // get a fresh position, and the force simulation runs only on the first layout.
+    const prev = new Map(this.nodes().map(n => [n.id, n]));
     const nodeById = new Map<string, LayoutNode>();
 
     const ns: LayoutNode[] = rawNodes.map((n, i) => {
       const a = (2 * Math.PI * i) / count - Math.PI / 2;
       const calls = n.callCount ?? n.requestCount ?? 0;
       const errs  = n.errorCount ?? 0;
+      const id    = n.id ?? n.serviceName ?? n.name ?? String(i);
+      const old   = prev.get(id);
       const ln: LayoutNode = {
-        id:        n.id ?? n.serviceName ?? n.name ?? String(i),
+        id,
         label:     n.label ?? n.serviceName ?? n.name ?? String(i),
         errorRate: calls > 0 ? errs / calls : 0,
         callCount: calls,
-        x:  count === 1 ? cx : cx + r * Math.cos(a),
-        y:  count === 1 ? cy : cy + r * Math.sin(a),
+        x:  old ? old.x : (count === 1 ? cx : cx + r * Math.cos(a)),
+        y:  old ? old.y : (count === 1 ? cy : cy + r * Math.sin(a)),
         r: Math.max(30, Math.min(52, 28 + Math.log10(Math.max(calls, 1)) * 6)),
         vx: 0, vy: 0,
       };
@@ -294,47 +302,62 @@ export class ServiceGraphComponent implements OnChanges {
 
     this.nodes.set(ns);
     this.edges.set(es);
-    this.runForceSimulation(ns, es);
+    // First layout → position from scratch. Refresh → keep existing positions (no jump).
+    if (prev.size === 0) this.runForceSimulation(ns, es);
+    else this.cdr.markForCheck();
   }
 
-  /** Minimal force-directed layout — ~60 iterations on the main thread. */
+  /**
+   * Fruchterman–Reingold force-directed layout. Forces (vx/vy) are recomputed
+   * fresh every iteration and applied as a displacement capped by a temperature
+   * that cools over time — so the layout converges to a spread instead of the
+   * runaway that piled every node into the corners.
+   */
   private runForceSimulation(ns: LayoutNode[], es: LayoutEdge[]) {
     const W = 900, H = 500;
-    const IDEAL = 160, REPEL = 6000, LINK_STRENGTH = 0.4, DAMP = 0.7;
-    const ITER  = 80;
+    const cx = W / 2, cy = H / 2;
+    const IDEAL = 150, REPEL = 14000, LINK = 0.05, GRAVITY = 0.02;
+    const ITER  = 320;
+    let   temp  = 42;                 // max displacement per node per iteration
 
     for (let t = 0; t < ITER; t++) {
-      // Repulsion between all pairs
+      for (const n of ns) { n.vx = 0; n.vy = 0; }   // fresh force accumulation
+
+      // Repulsion between every pair (~1/d²).
       for (let i = 0; i < ns.length; i++) {
         for (let j = i + 1; j < ns.length; j++) {
-          const dx = ns[i].x - ns[j].x || 0.01;
-          const dy = ns[i].y - ns[j].y || 0.01;
-          const d2 = dx * dx + dy * dy;
-          const f  = REPEL / d2;
-          ns[i].vx += f * dx; ns[i].vy += f * dy;
-          ns[j].vx -= f * dx; ns[j].vy -= f * dy;
+          let dx = ns[i].x - ns[j].x;
+          let dy = ns[i].y - ns[j].y;
+          let d2 = dx * dx + dy * dy;
+          if (d2 < 0.01) { dx = Math.random() - 0.5; dy = Math.random() - 0.5; d2 = 0.01; }
+          const d = Math.sqrt(d2);
+          const f = REPEL / d2;
+          ns[i].vx += (dx / d) * f; ns[i].vy += (dy / d) * f;
+          ns[j].vx -= (dx / d) * f; ns[j].vy -= (dy / d) * f;
         }
       }
-      // Attraction along edges
+      // Spring attraction along edges toward the ideal length.
       for (const e of es) {
         const dx = e.toNode.x - e.fromNode.x;
         const dy = e.toNode.y - e.fromNode.y;
         const d  = Math.sqrt(dx * dx + dy * dy) || 1;
-        const f  = LINK_STRENGTH * (d - IDEAL) / d;
-        e.fromNode.vx += f * dx; e.fromNode.vy += f * dy;
-        e.toNode.vx   -= f * dx; e.toNode.vy   -= f * dy;
+        const f  = LINK * (d - IDEAL);
+        e.fromNode.vx += (dx / d) * f; e.fromNode.vy += (dy / d) * f;
+        e.toNode.vx   -= (dx / d) * f; e.toNode.vy   -= (dy / d) * f;
       }
-      // Center gravity
+      // Gentle gravity toward the centre so disconnected nodes don't drift off.
       for (const n of ns) {
-        n.vx += (W / 2 - n.x) * 0.01;
-        n.vy += (H / 2 - n.y) * 0.01;
+        n.vx += (cx - n.x) * GRAVITY;
+        n.vy += (cy - n.y) * GRAVITY;
       }
-      // Integrate + damp + clamp
+      // Integrate: move by the force direction, capped at the current temperature.
       for (const n of ns) {
-        n.vx *= DAMP; n.vy *= DAMP;
-        n.x = Math.max(n.r + 10, Math.min(W - n.r - 10, n.x + n.vx));
-        n.y = Math.max(n.r + 10, Math.min(H - n.r - 10, n.y + n.vy));
+        const disp = Math.sqrt(n.vx * n.vx + n.vy * n.vy) || 1;
+        const step = Math.min(disp, temp);
+        n.x = Math.max(n.r + 10, Math.min(W - n.r - 10, n.x + (n.vx / disp) * step));
+        n.y = Math.max(n.r + 10, Math.min(H - n.r - 10, n.y + (n.vy / disp) * step));
       }
+      temp = Math.max(2, temp * 0.985);   // cool down
     }
 
     this.nodes.set([...ns]);

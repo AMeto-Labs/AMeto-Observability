@@ -128,7 +128,25 @@ New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
 # Copy everything from the binary's directory (runtime, assets, config.yml, etc.)
 $sourceDir = Split-Path $BinaryPath -Parent
 Write-Ok "Copying from $sourceDir ..."
+
+# Preserve an existing config.yml across the copy. The release bundle ships a
+# default config.yml; a plain -Force copy would clobber a customised one (e.g. a
+# changed HttpPort or retention). Stash it first, restore it after — mirrors the
+# Linux install.sh behaviour so upgrades never reset the user's configuration.
+$preservedConfig = $null
+$existingConfig  = Join-Path $InstallDir "config.yml"
+if (Test-Path $existingConfig) {
+    $preservedConfig = New-TemporaryFile
+    Copy-Item $existingConfig $preservedConfig.FullName -Force
+}
+
 Copy-Item "$sourceDir\*" -Destination $InstallDir -Recurse -Force
+
+if ($preservedConfig) {
+    Copy-Item $preservedConfig.FullName $existingConfig -Force
+    Remove-Item $preservedConfig.FullName -Force
+    Write-Warn "Preserved existing config.yml — your settings (e.g. HttpPort) are kept."
+}
 
 # ── Create / ensure data directory ────────────────────────────────────────────
 Write-Step "Creating data directory: $DataDirectory"

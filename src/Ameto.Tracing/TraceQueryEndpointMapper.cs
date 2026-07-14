@@ -1,6 +1,8 @@
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.DependencyInjection;
+using Ameto.Core;
 using Ameto.Tracing.Storage;
 using Ameto.Tracing.TraceQL;
 using HistogramBuckets = Ameto.Tracing.Storage.HistogramBuckets;
@@ -11,74 +13,49 @@ public static class TraceQueryEndpointMapper
 {
     public static void MapTraceEndpoints(this WebApplication app)
     {
+        // All trace read endpoints require the Traces view scope (admin bypasses).
+        var group = app.MapGroup("").RequireAuthorization(ViewPolicies.Traces);
+
         // GET /api/traces/stats?from=&to=
-        // Uses .stats sidecar files — no span deserialization, sub-millisecond for large datasets.
-        app.MapGet("/api/traces/stats", async (HttpContext ctx) =>
+        // Fully sidecar-based: percentiles from .stats, volume/sparkline from the .tracesum
+        // volume headers. No span deserialization — sub-millisecond for any dataset/window.
+        group.MapGet("/api/traces/stats", async (HttpContext ctx) =>
         {
-            var statsProvider = ctx.RequestServices.GetRequiredService<ITraceStatsProvider>();
-            var (from, to)    = ParseFromTo(ctx);
+            var statsProvider   = ctx.RequestServices.GetRequiredService<ITraceStatsProvider>();
+            var summaryProvider = ctx.RequestServices.GetRequiredService<ITraceSummaryProvider>();
+            var (from, to)      = ParseFromTo(ctx);
 
-            var perService = await statsProvider.GetAggregateStatsAsync(from, to, ctx.RequestAborted);
-
-            uint   totalSpans  = 0;
-            uint   errorSpans  = 0;
-            var    mergedBuckets = new uint[HistogramBuckets.Count];
-
+            var perService    = await statsProvider.GetAggregateStatsAsync(from, to, ctx.RequestAborted);
+            var mergedBuckets = new uint[HistogramBuckets.Count];
             foreach (var svc in perService)
-            {
-                totalSpans += svc.SpanCount;
-                errorSpans += svc.ErrorCount;
                 for (int i = 0; i < HistogramBuckets.Count; i++)
                     mergedBuckets[i] += svc.Buckets[i];
-            }
+
+            const int Buckets = 20;
+            var volume = await summaryProvider.GetTraceVolumeAsync(from, to, Buckets, ctx.RequestAborted);
 
             double windowSeconds = Math.Max(1, (to - from).TotalSeconds);
 
-            // Sparklines: we still need a quick scan for time-bucketed data.
-            // Use the trace search but with a coarser limit.
-            var provider       = ctx.RequestServices.GetRequiredService<ITraceProvider>();
-            var allSpans       = new List<SpanRecord>();
-            await foreach (var s in provider.SearchSpansAsync(from, to, limit: 10_000, ct: ctx.RequestAborted))
-                allSpans.Add(s);
-
-            var groups = allSpans.GroupBy(s => s.TraceId).ToList();
-
-            const int BUCKETS  = 20;
-            long fromNano      = from.ToUnixTimeMilliseconds() * 1_000_000L;
-            long rangeNano     = Math.Max(1L, to.ToUnixTimeMilliseconds() * 1_000_000L - fromNano);
-            var totalSparkline = new double[BUCKETS];
-            var errorSparkline = new double[BUCKETS];
-
-            foreach (var g in groups)
-            {
-                var root   = GetRootSpan(g) ?? g.OrderBy(s => s.StartTimeUnixNano).First();
-                int bucket = (int)Math.Clamp((root.StartTimeUnixNano - fromNano) * (double)BUCKETS / rangeNano, 0, BUCKETS - 1);
-                totalSparkline[bucket]++;
-                if (g.Any(s => s.Status == SpanStatusCode.Error)) errorSparkline[bucket]++;
-            }
-
-            int totalTraces = groups.Count;
-            int errorTraces = groups.Count(g => g.Any(s => s.Status == SpanStatusCode.Error));
-
             var stats = new TraceStatsDto
             {
-                TotalTraces    = totalTraces,
-                ErrorRate      = totalTraces > 0 ? (double)errorTraces / totalTraces * 100.0 : 0,
+                TotalTraces    = volume.TotalTraces,
+                ErrorRate      = volume.TotalTraces > 0 ? (double)volume.ErrorTraces / volume.TotalTraces * 100.0 : 0,
                 P50LatencyMs   = HistogramBuckets.Percentile(mergedBuckets, 0.50),
                 P95LatencyMs   = HistogramBuckets.Percentile(mergedBuckets, 0.95),
                 P99LatencyMs   = HistogramBuckets.Percentile(mergedBuckets, 0.99),
-                ThroughputRps  = totalTraces / windowSeconds,
-                TotalSparkline = totalSparkline,
-                ErrorSparkline = errorSparkline,
+                ThroughputRps  = volume.TotalTraces / windowSeconds,
+                TotalSparkline = volume.TotalSparkline,
+                ErrorSparkline = volume.ErrorSparkline,
             };
 
             await ctx.Response.WriteAsJsonAsync(stats);
         });
 
         // GET /api/traces?from=&to=&service=&name=&status=&limit=&minDurationMs=&maxDurationMs=&httpStatus=
-        app.MapGet("/api/traces", async (HttpContext ctx) =>
+        // Served from .tracesum bodies (pre-aggregated per-trace rows) — no span deserialization.
+        group.MapGet("/api/traces", async (HttpContext ctx) =>
         {
-            var provider  = ctx.RequestServices.GetRequiredService<ITraceProvider>();
+            var summaryProvider = ctx.RequestServices.GetRequiredService<ITraceSummaryProvider>();
             var (from, to) = ParseFromTo(ctx);
 
             var service = NullIfEmpty(ctx.Request.Query["service"]);
@@ -93,47 +70,42 @@ public static class TraceQueryEndpointMapper
             long?  maxDurNanos   = ParseLong(ctx.Request.Query["maxDurationMs"]) is long maxMs ? maxMs * 1_000_000L : null;
             string httpStatusRaw = ctx.Request.Query["httpStatus"].ToString();
 
-            var allSpans = new List<SpanRecord>();
-            await foreach (var s in provider.SearchSpansAsync(from, to, service, name, status,
-                               minDurNanos, maxDurNanos, limit: limit * 5, ct: ctx.RequestAborted))
-                allSpans.Add(s);
+            // Over-fetch when a post-filter (httpStatus) is active so the page still fills.
+            int fetch = string.IsNullOrEmpty(httpStatusRaw) ? limit : Math.Min(1000, limit * 3);
 
-            var traces = allSpans
-                .GroupBy(s => s.TraceId)
-                .Select(g =>
+            var summaries = await summaryProvider.GetTraceListAsync(
+                from, to, service, name, status, minDurNanos, maxDurNanos, fetch, ctx.RequestAborted);
+
+            var traces = new List<TraceRowDto>(Math.Min(summaries.Count, limit));
+            foreach (var s in summaries)
+            {
+                int? httpSc = s.HttpStatusCode != 0 ? s.HttpStatusCode : null;
+                if (!MatchHttpStatus(httpSc, httpStatusRaw)) continue;
+
+                traces.Add(new TraceRowDto
                 {
-                    var spans   = g.ToList();
-                    var root    = GetRootSpan(g) ?? spans.OrderBy(s => s.StartTimeUnixNano).First();
-                    bool hasErr = spans.Any(s => s.Status == SpanStatusCode.Error);
-                    // Collect all unique service names across spans in this trace
-                    var services = spans.Select(s => s.ServiceName).Distinct().ToArray();
-                    return new TraceRowDto
-                    {
-                        TraceId           = root.TraceId.ToString(),
-                        SpanId            = root.SpanId.ToString(),
-                        Name              = root.Name,
-                        ServiceName       = root.ServiceName,
-                        Services          = services,
-                        Status            = hasErr ? "Error" : root.Status.ToString(),
-                        HttpMethod        = GetAttr(root.Attributes, "http.request.method", "http.method"),
-                        HttpPath          = GetAttr(root.Attributes, "url.path", "http.target", "http.route", "url.full", "http.url"),
-                        HttpStatusCode    = root.HttpStatusCode != 0 ? root.HttpStatusCode : null,
-                        StartTimeUnixNano = root.StartTimeUnixNano,
-                        DurationNanos     = root.DurationNanos,
-                        SpanCount         = spans.Count,
-                    };
-                })
-                .Where(t => MatchHttpStatus(t.HttpStatusCode, httpStatusRaw))
-                .OrderByDescending(t => t.StartTimeUnixNano)
-                .Take(limit)
-                .ToList();
+                    TraceId           = s.TraceId.ToString(),
+                    SpanId            = s.RootSpanId.ToString(),
+                    Name              = s.Name,
+                    ServiceName       = s.ServiceName,
+                    Services          = s.Services,
+                    Status            = (s.HasError ? SpanStatusCode.Error : s.RootStatus).ToString(),
+                    HttpMethod        = s.HttpMethod,
+                    HttpPath          = s.HttpPath,
+                    HttpStatusCode    = httpSc,
+                    StartTimeUnixNano = s.RootStartNano,
+                    DurationNanos     = s.DurationNanos,
+                    SpanCount         = (int)s.SpanCount,
+                });
+                if (traces.Count >= limit) break;
+            }
 
             await ctx.Response.WriteAsJsonAsync(traces);
         });
 
         // GET /api/traces/latency?from=&to=&service=
         // Returns per-service duration histograms + p50/p95/p99/p999 from .stats sidecars.
-        app.MapGet("/api/traces/latency", async (HttpContext ctx) =>
+        group.MapGet("/api/traces/latency", async (HttpContext ctx) =>
         {
             var statsProvider = ctx.RequestServices.GetRequiredService<ITraceStatsProvider>();
             var (from, to)    = ParseFromTo(ctx);
@@ -166,7 +138,7 @@ public static class TraceQueryEndpointMapper
         });
 
         // GET /api/traces/compare?a={traceId}&b={traceId}
-        app.MapGet("/api/traces/compare", async (HttpContext ctx) =>
+        group.MapGet("/api/traces/compare", async (HttpContext ctx) =>
         {
             var provider = ctx.RequestServices.GetRequiredService<ITraceProvider>();
             string? aHex = ctx.Request.Query["a"];
@@ -187,7 +159,7 @@ public static class TraceQueryEndpointMapper
         });
 
         // GET /api/traces/service-graph?from=&to=
-        app.MapGet("/api/traces/service-graph", async (HttpContext ctx) =>
+        group.MapGet("/api/traces/service-graph", async (HttpContext ctx) =>
         {
             var graphProvider = ctx.RequestServices.GetRequiredService<IServiceGraphProvider>();
             var (from, to)    = ParseFromTo(ctx);
@@ -197,7 +169,7 @@ public static class TraceQueryEndpointMapper
 
         // POST /api/traces/query  — TraceQL
         // Body: { "query": "{ .http.status_code = 500 }", "from": "...", "to": "...", "limit": 100 }
-        app.MapPost("/api/traces/query", async (HttpContext ctx) =>
+        group.MapPost("/api/traces/query", async (HttpContext ctx) =>
         {
             TraceQueryRequest? req = null;
             try { req = await ctx.Request.ReadFromJsonAsync<TraceQueryRequest>(ctx.RequestAborted); }
@@ -229,7 +201,7 @@ public static class TraceQueryEndpointMapper
         });
 
         // GET /api/traces/{traceId}/flamegraph
-        app.MapGet("/api/traces/{traceId}/flamegraph", async (HttpContext ctx, string traceId) =>
+        group.MapGet("/api/traces/{traceId}/flamegraph", async (HttpContext ctx, string traceId) =>
         {
             if (!TraceId.TryParseHex(traceId, out var tid))
             {
@@ -246,7 +218,7 @@ public static class TraceQueryEndpointMapper
         });
 
         // GET /api/traces/{traceId}
-        app.MapGet("/api/traces/{traceId}", async (HttpContext ctx, string traceId) =>
+        group.MapGet("/api/traces/{traceId}", async (HttpContext ctx, string traceId) =>
         {
             if (!TraceId.TryParseHex(traceId, out var tid))
             {
@@ -375,21 +347,6 @@ public static class TraceQueryEndpointMapper
         return int.TryParse(filter, out var exact) && code == exact;
     }
 
-    private static SpanRecord? GetRootSpan(IEnumerable<SpanRecord> spans)
-    {
-        foreach (var s in spans)
-            if (s.ParentSpanId.IsEmpty) return s;
-        return null;
-    }
-
-    private static string GetAttr(IReadOnlyDictionary<string, object?>? attrs, params string[] keys)
-    {
-        if (attrs is null) return string.Empty;
-        foreach (var k in keys)
-            if (attrs.TryGetValue(k, out var v) && v is not null)
-                return v.ToString() ?? string.Empty;
-        return string.Empty;
-    }
 }
 
 /// <summary>One row per trace (root span) for the trace list view.</summary>

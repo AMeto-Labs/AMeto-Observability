@@ -91,3 +91,6 @@ desktop.ini
 *~
 
 .claude/launch.json
+
+# Installer build outputs (large binaries)
+install/windows/Output/

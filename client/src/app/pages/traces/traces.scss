@@ -71,6 +71,27 @@
   &.active { background: var(--accent); color: #000; font-weight: 600; }
 }
 
+/* Custom date-range inputs (shown when the Custom preset is active). */
+.custom-range {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.custom-dt {
+  height: 28px;
+  padding: 0 8px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-primary);
+  font-size: 12px;
+  color-scheme: dark;
+  outline: none;
+
+  &:focus { border-color: var(--accent); }
+}
+.custom-sep { color: var(--text-muted); font-size: 12px; }
+
 .live-badge {
   display: flex;
   align-items: center;

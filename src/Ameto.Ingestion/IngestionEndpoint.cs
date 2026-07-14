@@ -9,6 +9,23 @@ using Ameto.Storage;
 namespace Ameto.Ingestion;
 
 /// <summary>
+/// Sink for the zero-alloc OTLP streaming parser: one already-msgpack-encoded record at a
+/// time, straight into the ring. Implemented by <see cref="IngestionEndpoint"/>; abstracted
+/// so the parser can be unit-tested against a capturing fake.
+/// </summary>
+public interface IOtlpLogSink
+{
+    bool TryIngestRaw(
+        long tsTicks, byte level,
+        ReadOnlySpan<byte> templateUtf8,
+        ReadOnlySpan<byte> msgpackProps,
+        ulong traceHi, ulong traceLo, ulong spanId,
+        ReadOnlySpan<byte> serviceUtf8);
+
+    void NotifyBatchEnqueued();
+}
+
+/// <summary>
 /// Handles POST /api/events
 ///
 /// Wire format: MessagePack array of CLEF maps.
@@ -26,7 +43,7 @@ namespace Ameto.Ingestion;
 ///   413 Payload Too Large if body exceeds the configured batch limit
 ///          (<see cref="IngestionOptions.MaxBatchBytes"/>)
 /// </summary>
-public sealed class IngestionEndpoint
+public sealed class IngestionEndpoint : IOtlpLogSink
 {
     private readonly IngestionRingBuffer     _ring;
     private readonly StringInternPool        _pool;
@@ -167,6 +184,35 @@ public sealed class IngestionEndpoint
 
         return (ingested, dropped);
     }
+
+    /// <summary>
+    /// Zero-alloc streaming ingest of one already-msgpack-encoded log record straight into
+    /// the ring — no <see cref="LogEvent"/> object. Interns template/service directly from
+    /// UTF-8 spans (no string allocation on a cache hit). Drives the OTLP JSON streaming
+    /// parser. Returns true if ingested, false if dropped (oversized or back-pressure).
+    /// Call <see cref="NotifyBatchEnqueued"/> once after a batch.
+    /// </summary>
+    public bool TryIngestRaw(
+        long tsTicks, byte level,
+        ReadOnlySpan<byte> templateUtf8,
+        ReadOnlySpan<byte> msgpackProps,
+        ulong traceHi, ulong traceLo, ulong spanId,
+        ReadOnlySpan<byte> serviceUtf8)
+    {
+        if (msgpackProps.Length > _maxEventPayloadBytes)
+            return false; // oversized — drop (hot path: no per-event log, unlike TryIngest)
+
+        int    tmplIdx = _pool.Intern(templateUtf8);           // -1 when empty
+        string tmpl    = tmplIdx >= 0 ? _pool.Get(tmplIdx) : string.Empty;
+        int    svcIdx  = _pool.Intern(serviceUtf8);            // -1 when empty
+
+        return _ring.TryEnqueue(
+            tsTicks, level, tmplIdx, tmpl, exception: null,
+            msgpackProps, traceHi, traceLo, spanId, svcIdx);
+    }
+
+    /// <summary>Wakes the drainer once after a streaming batch (see <see cref="TryIngestRaw"/>).</summary>
+    public void NotifyBatchEnqueued() => _drainer.NotifyEnqueued();
 
     /// <summary>
     /// Interns strings and pushes one event onto the ring, tallying ingested/dropped.

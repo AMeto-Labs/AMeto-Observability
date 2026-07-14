@@ -73,18 +73,21 @@ public sealed class RamPressureService : BackgroundService
 
                         await _storage.FlushHotTierAsync(stoppingToken);
 
-                        // Ask the GC to reclaim any freed managed memory.
+                        // Ask the GC to reclaim any freed managed memory, then
+                        // release the freed resident pages back to the OS
+                        // (Windows working set + Linux arenas).
                         GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+                        WorkingSetTrimmer.TryTrim();
 
                         lastFlush = DateTimeOffset.UtcNow;
                     }
                 }
 
-                // Return freed native memory to the OS every cycle, not only
-                // under RAM pressure. glibc retains free()'d hot-tier blocks in
-                // its arenas, so without a regular malloc_trim the RSS drifts
-                // upward between flushes. The call is cheap and idempotent.
-                WorkingSetTrimmer.TryTrim();
+                // Per-cycle upkeep: return free()'d allocator arenas to the OS so
+                // the RSS doesn't drift upward between flushes. Linux-only —
+                // Windows manages its own working set and is trimmed only under
+                // real pressure above (emptying it every 30 s just churns pages).
+                WorkingSetTrimmer.TrimAllocator();
             }
             catch (OperationCanceledException) { break; }
             catch (Exception ex)

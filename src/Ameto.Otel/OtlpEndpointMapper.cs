@@ -117,22 +117,28 @@ public static class OtlpEndpointMapper
             var (body, bodyLen) = await ReadBodyAsync(ctx);
             if (body is null) return;
 
-            ExportLogsServiceRequest? request;
+            int ingested = 0, dropped = 0;
             try
             {
                 bool isProto = ctx.Request.ContentType?.StartsWith(ProtobufContentType, StringComparison.OrdinalIgnoreCase) ?? false;
-                request = isProto
-                    ? OtlpProtoDecoder.DecodeLogs(body, bodyLen)
-                    : JsonSerializer.Deserialize<ExportLogsServiceRequest>(body.AsSpan(0, bodyLen), _jsonOptions);
+                if (isProto)
+                {
+                    // Protobuf still decodes into the object model, then maps to events.
+                    var request = OtlpProtoDecoder.DecodeLogs(body, bodyLen);
+                    if (request is null) { ctx.Response.StatusCode = 400; return; }
+                    var events = OtlpLogMapper.Map(request, Ameto.Core.NodeId.Local.Value);
+                    (ingested, dropped) = endpoint.IngestEvents(events);
+                }
+                else
+                {
+                    // JSON: zero-alloc streaming parse straight into the ring — no object
+                    // graph, no per-record LogEvent, no per-attribute strings.
+                    (ingested, dropped) = OtlpLogStreamParser.Parse(body.AsSpan(0, bodyLen), endpoint);
+                }
             }
             catch { ctx.Response.StatusCode = 400; return; }
             finally { ArrayPool<byte>.Shared.Return(body); }
 
-            if (request is null) { ctx.Response.StatusCode = 400; return; }
-
-            // NodeId.Local is the same used by the existing ingestion path
-            var events = OtlpLogMapper.Map(request, Ameto.Core.NodeId.Local.Value);
-            var (ingested, dropped) = endpoint.IngestEvents(events);
             await WriteJsonOk(ctx, ingested, dropped);
         });
 

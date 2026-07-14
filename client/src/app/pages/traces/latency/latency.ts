@@ -6,6 +6,7 @@ import { FormsModule } from '@angular/forms';
 import { LucideAngularModule } from 'lucide-angular';
 import { ApiService } from '../../../core/services/api.service';
 import { LatencyServiceDto, LatencyBucketDto } from '../../../core/models/span.model';
+import { serviceColor } from '../../../shared/utils/service-color';
 
 @Component({
   selector: 'app-latency',
@@ -385,14 +386,8 @@ export class LatencyComponent implements OnChanges {
     return String(n);
   }
 
-  private readonly PALETTE = [
-    '#38bdf8','#f59e0b','#22c55e','#a78bfa',
-    '#f97316','#ec4899','#06b6d4','#84cc16',
-  ];
-
+  /** Stable per-service colour (shared hash palette — consistent with Logs / Stats). */
   svcColor(name: string): string {
-    let h = 0;
-    for (const c of name) h = (h * 31 + c.charCodeAt(0)) & 0x7fff_ffff;
-    return this.PALETTE[h % this.PALETTE.length];
+    return serviceColor(name);
   }
 }

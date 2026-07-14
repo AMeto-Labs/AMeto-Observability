@@ -14,6 +14,7 @@ internal sealed record UserRecord(
     string Email,
     string Provider,
     string Role,
+    ViewPermissions Permissions,
     DateTimeOffset CreatedAt);
 
 internal sealed record ApiKeyRecord(
@@ -80,7 +81,7 @@ internal sealed class AuthStore
         using var conn = _db.Open();
         using var cmd  = conn.CreateCommand();
         cmd.CommandText = """
-            SELECT id, username, display_name, email, provider, role, created_at
+            SELECT id, username, display_name, email, provider, role, created_at, permissions
             FROM users
             WHERE email = @e COLLATE NOCASE AND provider = @p
             """;
@@ -144,7 +145,7 @@ internal sealed class AuthStore
         using var conn = _db.Open();
         using var cmd  = conn.CreateCommand();
         cmd.CommandText = """
-            SELECT id, username, display_name, email, provider, role, created_at
+            SELECT id, username, display_name, email, provider, role, created_at, permissions
             FROM users
             WHERE username = @u COLLATE NOCASE
                OR (email != '' AND email = @e COLLATE NOCASE)
@@ -162,7 +163,7 @@ internal sealed class AuthStore
         using var conn = _db.Open();
         using var cmd  = conn.CreateCommand();
         cmd.CommandText = """
-            SELECT id, username, display_name, email, provider, role, created_at
+            SELECT id, username, display_name, email, provider, role, created_at, permissions
             FROM users ORDER BY created_at
             """;
         using var r    = cmd.ExecuteReader();
@@ -176,7 +177,7 @@ internal sealed class AuthStore
         using var conn = _db.Open();
         using var cmd  = conn.CreateCommand();
         cmd.CommandText = """
-            SELECT id, username, display_name, email, provider, role, created_at
+            SELECT id, username, display_name, email, provider, role, created_at, permissions
             FROM users WHERE id = @id
             """;
         cmd.Parameters.AddWithValue("@id", id);
@@ -185,19 +186,20 @@ internal sealed class AuthStore
         return MapUser(r);
     }
 
-    public UserRecord CreateUser(string username, string password, string role)
+    public UserRecord CreateUser(string username, string password, string role,
+        ViewPermissions permissions = ViewPermissions.All)
     {
         var salt = RandomNumberGenerator.GetBytes(16);
         var hash = HashPassword(password, salt);
         var rec  = new UserRecord(
             Guid.NewGuid().ToString("N"), username, username, "", "local",
-            NormaliseRole(role), DateTimeOffset.UtcNow);
+            NormaliseRole(role), permissions, DateTimeOffset.UtcNow);
 
         using var conn = _db.Open();
         using var cmd  = conn.CreateCommand();
         cmd.CommandText = """
-            INSERT INTO users (id, username, display_name, email, provider, password_hash, salt, role, created_at)
-            VALUES (@id, @u, @dn, '', 'local', @h, @s, @r, @ca)
+            INSERT INTO users (id, username, display_name, email, provider, password_hash, salt, role, permissions, created_at)
+            VALUES (@id, @u, @dn, '', 'local', @h, @s, @r, @perm, @ca)
             """;
         cmd.Parameters.AddWithValue("@id", rec.Id);
         cmd.Parameters.AddWithValue("@u",  rec.Username);
@@ -205,6 +207,7 @@ internal sealed class AuthStore
         cmd.Parameters.AddWithValue("@h",  hash);
         cmd.Parameters.AddWithValue("@s",  Convert.ToBase64String(salt));
         cmd.Parameters.AddWithValue("@r",  rec.Role);
+        cmd.Parameters.AddWithValue("@perm", (int)rec.Permissions);
         cmd.Parameters.AddWithValue("@ca", rec.CreatedAt.ToString("O"));
         cmd.ExecuteNonQuery();
         return rec;
@@ -216,13 +219,13 @@ internal sealed class AuthStore
         var username = $"{provider}:{email.ToLowerInvariant()}";
         var rec = new UserRecord(
             Guid.NewGuid().ToString("N"), username, displayName, email.ToLowerInvariant(),
-            provider, NormaliseRole(role), DateTimeOffset.UtcNow);
+            provider, NormaliseRole(role), ViewPermissions.All, DateTimeOffset.UtcNow);
 
         using var conn = _db.Open();
         using var cmd  = conn.CreateCommand();
         cmd.CommandText = """
-            INSERT INTO users (id, username, display_name, email, provider, password_hash, salt, role, created_at)
-            VALUES (@id, @u, @dn, @e, @p, '', '', @r, @ca)
+            INSERT INTO users (id, username, display_name, email, provider, password_hash, salt, role, permissions, created_at)
+            VALUES (@id, @u, @dn, @e, @p, '', '', @r, @perm, @ca)
             """;
         cmd.Parameters.AddWithValue("@id", rec.Id);
         cmd.Parameters.AddWithValue("@u",  rec.Username);
@@ -230,6 +233,7 @@ internal sealed class AuthStore
         cmd.Parameters.AddWithValue("@e",  rec.Email);
         cmd.Parameters.AddWithValue("@p",  rec.Provider);
         cmd.Parameters.AddWithValue("@r",  rec.Role);
+        cmd.Parameters.AddWithValue("@perm", (int)rec.Permissions);
         cmd.Parameters.AddWithValue("@ca", rec.CreatedAt.ToString("O"));
         cmd.ExecuteNonQuery();
         return rec;
@@ -254,14 +258,15 @@ internal sealed class AuthStore
         return cmd.ExecuteNonQuery() > 0;
     }
 
-    /// <summary>Updates display name and role for a user.</summary>
-    public bool UpdateUser(string id, string displayName, string role)
+    /// <summary>Updates display name, role and view permissions for a user.</summary>
+    public bool UpdateUser(string id, string displayName, string role, ViewPermissions permissions)
     {
         using var conn = _db.Open();
         using var cmd  = conn.CreateCommand();
-        cmd.CommandText = "UPDATE users SET display_name = @dn, role = @r WHERE id = @id";
+        cmd.CommandText = "UPDATE users SET display_name = @dn, role = @r, permissions = @perm WHERE id = @id";
         cmd.Parameters.AddWithValue("@dn", displayName);
         cmd.Parameters.AddWithValue("@r",  NormaliseRole(role));
+        cmd.Parameters.AddWithValue("@perm", (int)permissions);
         cmd.Parameters.AddWithValue("@id", id);
         return cmd.ExecuteNonQuery() > 0;
     }
@@ -398,6 +403,7 @@ internal sealed class AuthStore
     private static UserRecord MapUser(SqliteDataReader r) => new(
         r.GetString(0), r.GetString(1), r.GetString(2),
         r.GetString(3), r.GetString(4), r.GetString(5),
+        (ViewPermissions)r.GetInt32(7),
         DateTimeOffset.Parse(r.GetString(6)));
 
     private static string HashPassword(string password, byte[] salt)

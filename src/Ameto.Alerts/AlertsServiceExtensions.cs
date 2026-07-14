@@ -29,7 +29,10 @@ public static class AlertsServiceExtensions
         string dataDirectory)
     {
         services.AddSingleton<AlertRuleStore>(sp =>
-            new AlertRuleStore(dataDirectory, sp.GetRequiredService<ILogger<AlertRuleStore>>()));
+            new AlertRuleStore(
+                dataDirectory,
+                sp.GetRequiredService<Ameto.Core.ISecretProtector>(),
+                sp.GetRequiredService<ILogger<AlertRuleStore>>()));
 
         services.AddSingleton<AlertPersistence>(sp =>
             new AlertPersistence(dataDirectory, sp.GetRequiredService<ILogger<AlertPersistence>>()));

@@ -123,6 +123,35 @@ public sealed class HotTierSegmentTests : IDisposable
         Assert.Equal(LogLevel.Warning, events[1].Level);
     }
 
+    // ── Chunk geometry (regression: payload area must not wedge the segment) ────
+
+    /// <summary>
+    /// Guards the chunk-geometry invariant: with realistic (&gt;128 B) payloads a segment
+    /// must fill to its configured event capacity, spanning multiple chunks, instead of
+    /// wedging when the first chunk's payload area fills. A regression here re-introduces
+    /// the "flush storm" (tiny cold segments → ingest drops under load).
+    /// </summary>
+    [Fact]
+    public void TryWrite_RealisticPayloads_ReachesEventCapacityAcrossChunks()
+    {
+        const int count   = 50_000;                 // > ChunkEventCapacity ⇒ multiple chunks
+        var       payload = new byte[300];          // > 128 B (the old geometry's per-slot budget)
+        new Random(7).NextBytes(payload);
+
+        using var seg = new HotTierSegment(count, (long)count * payload.Length + 1024 * 1024);
+        int accepted = 0;
+        for (int i = 0; i < count; i++)
+            if (seg.TryWrite(MakeHeader(LogLevel.Information, i), payload)) accepted++;
+
+        Assert.Equal(count, accepted);
+        Assert.Equal(count, seg.Count);
+
+        // Payload of an event well past the first chunk boundary must round-trip intact.
+        var read = seg.GetPropertiesPayload(count - 1);
+        Assert.Equal(payload.Length, read.Length);
+        Assert.True(read.SequenceEqual(payload));
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private static LogEventHeader MakeHeader(

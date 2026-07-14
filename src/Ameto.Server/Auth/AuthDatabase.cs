@@ -73,6 +73,18 @@ internal sealed class AuthDatabase
             );
             CREATE UNIQUE INDEX IF NOT EXISTS ux_oauth_domains_provider_domain
                 ON oauth_domains(provider, domain COLLATE NOCASE);
+
+            -- Per-user saved search / filter history. `pinned` rows survive the
+            -- recent-history prune; the UI shows top pinned then recent.
+            CREATE TABLE IF NOT EXISTS search_history (
+                username   TEXT    NOT NULL,
+                query      TEXT    NOT NULL,
+                pinned     INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT    NOT NULL,
+                PRIMARY KEY (username, query)
+            );
+            CREATE INDEX IF NOT EXISTS ix_search_history_user
+                ON search_history(username, pinned, updated_at DESC);
             """);
     }
 
@@ -104,6 +116,11 @@ internal sealed class AuthDatabase
                 """);
         }
         catch { /* index already exists */ }
+
+        // Per-user view scopes (Logs|Metrics|Traces|Stats). Defaults to 15 (All) so
+        // users created before per-view scoping keep full read access. Admins ignore it.
+        try { Exec(conn, "ALTER TABLE users ADD COLUMN permissions INTEGER NOT NULL DEFAULT 15"); }
+        catch { /* column already exists */ }
 
         // Migrate roles that are outside the allowed set
         Exec(conn, "UPDATE users SET role = 'viewer' WHERE role NOT IN ('admin','manager','viewer')");

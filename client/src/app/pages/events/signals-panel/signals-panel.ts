@@ -2,14 +2,28 @@ import {
   Component, input, output, signal, inject, OnInit,
   ChangeDetectionStrategy, ChangeDetectorRef,
 } from '@angular/core';
-import { FormsModule } from '@angular/forms';
 import { LucideAngularModule } from 'lucide-angular';
+import { forkJoin } from 'rxjs';
 import { ApiService } from '../../../core/services/api.service';
-import { AlertRule } from '../../../core/models/alert.model';
+import { SearchHistoryService } from '../../../core/services/search-history.service';
+import { AlertSeverity } from '../../../core/models/alert.model';
 
+interface FiringAlert {
+  id: string;
+  name: string;
+  severity: AlertSeverity;
+  filter?: string;
+}
+
+/**
+ * Right-hand quick-access panel on the events page:
+ *   1. Log-source alert rules that are currently **firing** (top).
+ *   2. The user's **search history** — pinned first, then recent.
+ * Clicking any entry applies its filter to the events query.
+ */
 @Component({
   selector: 'app-signals-panel',
-  imports: [FormsModule, LucideAngularModule],
+  imports: [LucideAngularModule],
   templateUrl: './signals-panel.html',
   styleUrl: './signals-panel.scss',
   changeDetection: ChangeDetectionStrategy.OnPush,
@@ -17,71 +31,47 @@ import { AlertRule } from '../../../core/models/alert.model';
 export class SignalsPanelComponent implements OnInit {
   private api = inject(ApiService);
   private cdr = inject(ChangeDetectorRef);
+  readonly history = inject(SearchHistoryService);
 
+  /** Current filter — kept for wiring compatibility with the events page. */
   readonly currentFilter = input<string>('');
   readonly filterSelected = output<string>();
   readonly closed = output<void>();
 
-  signals  = signal<AlertRule[]>([]);
-  loading  = signal(true);
-  creating = signal(false);
-  saving   = signal(false);
-  draftName = '';
+  readonly firing = signal<FiringAlert[]>([]);
 
-  ngOnInit(): void { this.load(); }
+  ngOnInit(): void {
+    this.history.load();
+    this.loadFiring();
+  }
 
-  load(): void {
-    this.loading.set(true);
-    this.api.getAlerts().subscribe({
-      next: (list: AlertRule[]) => { this.signals.set(list); this.loading.set(false); this.cdr.markForCheck(); },
-      error: ()   => { this.loading.set(false); this.cdr.markForCheck(); },
+  /** Log-source rules whose live state is Firing. */
+  private loadFiring(): void {
+    forkJoin({ rules: this.api.getAlerts(), states: this.api.getAlertState() }).subscribe({
+      next: ({ rules, states }) => {
+        const firingIds = new Set(states.filter(s => s.state === 'Firing').map(s => s.ruleId));
+        this.firing.set(
+          rules
+            .filter(r => r.source === 'Log' && firingIds.has(r.id))
+            .map(r => ({ id: r.id, name: r.name, severity: r.severity, filter: r.filter })),
+        );
+        this.cdr.markForCheck();
+      },
+      error: () => this.cdr.markForCheck(),
     });
   }
 
-  startCreate(): void {
-    this.draftName = '';
-    this.creating.set(true);
-  }
-
-  cancelCreate(): void { this.creating.set(false); }
-
-  saveNew(): void {
-    if (!this.draftName.trim()) return;
-    this.saving.set(true);
-    this.api.createAlert({
-      name: this.draftName.trim(),
-      enabled: true,
-      severity: 'Warning',
-      source: 'Log',
-      comparator: 'GreaterOrEqual',
-      threshold: 1,
-      windowSeconds: 300,
-      forSeconds: 0,
-      cooldownSeconds: 900,
-      filter: this.currentFilter() || undefined,
-    }).subscribe({
-        next: () => { this.saving.set(false); this.creating.set(false); this.load(); },
-        error: () => { this.saving.set(false); this.cdr.markForCheck(); },
-      });
-  }
-
-  applyFilter(filter: string | undefined): void {
+  apply(filter: string | undefined): void {
     if (filter) this.filterSelected.emit(filter);
   }
 
-  toggle(s: AlertRule, event: MouseEvent): void {
-    event.stopPropagation();
-    this.api.updateAlert(s.id, {
-      name: s.name, enabled: !s.enabled, severity: s.severity, source: s.source,
-      comparator: s.comparator, threshold: s.threshold,
-      windowSeconds: 300, forSeconds: 0, cooldownSeconds: 900,
-      filter: s.filter, metric: s.metric, aggregation: s.aggregation, quantile: s.quantile,
-      service: s.service, traceMetric: s.traceMetric, channels: s.channels, template: s.template,
-    }).subscribe(() => this.load());
+  pin(query: string, pinned: boolean, e: MouseEvent): void {
+    e.stopPropagation();
+    this.history.setPinned(query, pinned);
   }
 
-  delete(id: string, event: MouseEvent): void {
-    event.stopPropagation();
-    this.api.deleteAlert(id).subscribe(() => this.load());
+  remove(query: string, e: MouseEvent): void {
+    e.stopPropagation();
+    this.history.remove(query);
   }
 }

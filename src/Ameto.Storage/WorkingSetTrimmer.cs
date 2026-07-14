@@ -17,6 +17,12 @@ namespace Ameto.Storage;
 /// </summary>
 internal static class WorkingSetTrimmer
 {
+    /// <summary>
+    /// Full release of resident memory back to the OS — used only after a
+    /// pressure-triggered flush + GC. On Windows this empties the working set
+    /// (<c>SetProcessWorkingSetSizeEx(-1,-1)</c>); on Linux it also returns freed
+    /// allocator arenas (<c>malloc_trim</c>).
+    /// </summary>
     public static void TryTrim()
     {
         try
@@ -27,6 +33,27 @@ internal static class WorkingSetTrimmer
         catch
         {
             // best-effort — never break the flush pipeline on a failed trim
+        }
+    }
+
+    /// <summary>
+    /// Cheap per-cycle upkeep: returns free()'d allocator arenas to the OS.
+    /// Linux/glibc retains freed hot-tier chunks, so the RSS drifts upward
+    /// without a regular <c>malloc_trim</c>. <b>No-op on Windows</b> — emptying the
+    /// working set every cycle just evicts pages that get soft-faulted straight
+    /// back in (visible as a sawtooth in Task Manager) for no real benefit; the
+    /// Windows working set is only trimmed under real RAM pressure via
+    /// <see cref="TryTrim"/>.
+    /// </summary>
+    public static void TrimAllocator()
+    {
+        try
+        {
+            if (OperatingSystem.IsLinux()) TrimLinux();
+        }
+        catch
+        {
+            // best-effort
         }
     }
 

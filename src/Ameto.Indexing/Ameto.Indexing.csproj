@@ -18,4 +18,8 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="Ameto.Indexing.Tests" />
+  </ItemGroup>
+
 </Project>

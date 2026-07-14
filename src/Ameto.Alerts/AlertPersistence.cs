@@ -145,6 +145,69 @@ public sealed class AlertPersistence
         return list;
     }
 
+    // ── Maintenance windows ─────────────────────────────────────────────────────
+
+    public void UpsertMaintenance(MaintenanceWindow w)
+    {
+        lock (_lock)
+        try
+        {
+            using var conn = Open();
+            using var cmd  = conn.CreateCommand();
+            cmd.CommandText = """
+                INSERT INTO maintenance_windows (id, name, enabled, days_of_week, start_minute, duration_minutes, max_severity)
+                VALUES (@id, @name, @en, @dow, @start, @dur, @sev)
+                ON CONFLICT(id) DO UPDATE SET name=excluded.name, enabled=excluded.enabled,
+                    days_of_week=excluded.days_of_week, start_minute=excluded.start_minute,
+                    duration_minutes=excluded.duration_minutes, max_severity=excluded.max_severity
+                """;
+            cmd.Parameters.AddWithValue("@id",    w.Id);
+            cmd.Parameters.AddWithValue("@name",  w.Name);
+            cmd.Parameters.AddWithValue("@en",    w.Enabled ? 1 : 0);
+            cmd.Parameters.AddWithValue("@dow",   w.DaysOfWeek);
+            cmd.Parameters.AddWithValue("@start", w.StartMinuteUtc);
+            cmd.Parameters.AddWithValue("@dur",   w.DurationMinutes);
+            cmd.Parameters.AddWithValue("@sev",   (object?)(w.MaxSeverity is { } s ? (int)s : (int?)null) ?? DBNull.Value);
+            cmd.ExecuteNonQuery();
+        }
+        catch (Exception ex) { _logger.LogError(ex, "Failed to persist maintenance window"); }
+    }
+
+    public void DeleteMaintenance(string id)
+    {
+        lock (_lock)
+        try
+        {
+            using var conn = Open();
+            using var cmd  = conn.CreateCommand();
+            cmd.CommandText = "DELETE FROM maintenance_windows WHERE id = @id";
+            cmd.Parameters.AddWithValue("@id", id);
+            cmd.ExecuteNonQuery();
+        }
+        catch (Exception ex) { _logger.LogError(ex, "Failed to delete maintenance window"); }
+    }
+
+    public IReadOnlyList<MaintenanceWindow> LoadMaintenance()
+    {
+        var list = new List<MaintenanceWindow>();
+        try
+        {
+            using var conn = Open();
+            using var cmd  = conn.CreateCommand();
+            cmd.CommandText = "SELECT id, name, enabled, days_of_week, start_minute, duration_minutes, max_severity FROM maintenance_windows";
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                list.Add(new MaintenanceWindow
+                {
+                    Id = r.GetString(0), Name = r.GetString(1), Enabled = r.GetInt32(2) != 0,
+                    DaysOfWeek = r.GetInt32(3), StartMinuteUtc = r.GetInt32(4), DurationMinutes = r.GetInt32(5),
+                    MaxSeverity = r.IsDBNull(6) ? null : (AlertSeverity)r.GetInt32(6),
+                });
+        }
+        catch (Exception ex) { _logger.LogError(ex, "Failed to load maintenance windows"); }
+        return list;
+    }
+
     // ── Per-rule state (cooldown / state continuity across restart) ─────────────
 
     public void SaveState(string ruleId, AlertState state, double lastValue,
@@ -209,6 +272,10 @@ public sealed class AlertPersistence
             CREATE TABLE IF NOT EXISTS alert_state (
                 rule_id TEXT PRIMARY KEY, state INTEGER NOT NULL, last_value REAL NOT NULL,
                 pending_ticks INTEGER, fired_ticks INTEGER);
+            CREATE TABLE IF NOT EXISTS maintenance_windows (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, enabled INTEGER NOT NULL,
+                days_of_week INTEGER NOT NULL, start_minute INTEGER NOT NULL,
+                duration_minutes INTEGER NOT NULL, max_severity INTEGER);
             """;
         cmd.ExecuteNonQuery();
         PruneHistory();

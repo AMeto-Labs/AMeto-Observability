@@ -41,6 +41,9 @@
                 <lucide-icon [name]="sourceIcon(r.source)" [size]="13" class="src-icon" [title]="r.source" />
                 <span class="rule-name">{{ r.name }}</span>
                 <span class="state-text" [class]="stateCls(r.id)">{{ stateLabel(r.id) }}</span>
+                @if (isAcked(r.id)) {
+                  <span class="ack-badge" [title]="'acknowledged by ' + ackedBy(r.id)">✓ ack{{ ackedBy(r.id) ? ' · ' + ackedBy(r.id) : '' }}</span>
+                }
               </div>
               <div class="rule-cond">
                 @if (r.source === 'Log') { <code>count({{ r.filter || '*' }})</code> }
@@ -57,6 +60,13 @@
             </div>
 
             <div class="rule-actions">
+              @if (isFiring(r.id)) {
+                @if (isAcked(r.id)) {
+                  <button class="ic" (click)="unack(r.id, $event)" title="Un-acknowledge (resume re-notify)"><lucide-icon name="bell-ring" [size]="14" /></button>
+                } @else {
+                  <button class="ic ack" (click)="ack(r.id, $event)" title="Acknowledge (mute re-notify until resolved)"><lucide-icon name="check-check" [size]="14" /></button>
+                }
+              }
               <button class="ic" (click)="toggleEnabled(r)" [title]="r.enabled ? 'Disable' : 'Enable'">
                 <lucide-icon [name]="r.enabled ? 'toggle-right' : 'toggle-left'" [size]="16" />
               </button>
@@ -92,10 +102,11 @@
     }
   }
 
-  <!-- ══ SILENCES ══════════════════════════════════════════════════════════ -->
+  <!-- ══ SILENCES & MAINTENANCE ════════════════════════════════════════════ -->
   @if (tab() === 'silences') {
+    <div class="sub-hdr">Active silences</div>
     @if (!silences().length) {
-      <div class="panel-empty">No active silences.</div>
+      <div class="panel-empty sm">No active silences.</div>
     } @else {
       <div class="silences">
         @for (s of silences(); track s.id) {
@@ -109,12 +120,46 @@
         }
       </div>
     }
+
+    <div class="sub-hdr maint-top">Maintenance windows</div>
+    <div class="maint-add">
+      <input class="maint-name" [(ngModel)]="maintDraft.name" placeholder="Name (e.g. Nightly deploy)" spellcheck="false" />
+      <div class="maint-days">
+        @for (d of dayLabels; track $index) {
+          <button class="day-btn" [class.on]="maintDraft.days[$index]" (click)="toggleMaintDay($index)">{{ d }}</button>
+        }
+      </div>
+      <input type="time" [(ngModel)]="maintDraft.startTime" title="Start (UTC)" />
+      <input type="number" min="1" [(ngModel)]="maintDraft.durationMinutes" style="width:70px" title="Duration (minutes)" />
+      <select [(ngModel)]="maintDraft.maxSeverity" title="Which severities to mute">
+        <option value="">all severities</option>
+        <option value="Info">≤ Info</option>
+        <option value="Warning">≤ Warning</option>
+        <option value="Critical">≤ Critical</option>
+      </select>
+      <button class="btn-secondary" (click)="addMaintenance()" [disabled]="!maintDraft.name.trim()">+ Add</button>
+    </div>
+    <p class="maint-hint">Times are UTC. While a window is active, matching rules' notifications are muted.</p>
+
+    @if (maintenance().length) {
+      <div class="silences">
+        @for (w of maintenance(); track w.id) {
+          <div class="sil-row">
+            <lucide-icon name="calendar-clock" [size]="14" class="sil-icon" />
+            <span class="sil-name">{{ w.name }}</span>
+            @if (maintActive(w)) { <span class="maint-active">● active now</span> }
+            <span class="sil-reason">{{ maintSchedule(w) }} · {{ maintSevLabel(w) }}</span>
+            <button class="ic danger" (click)="removeMaintenance(w.id)" title="Remove"><lucide-icon name="x" [size]="14" /></button>
+          </div>
+        }
+      </div>
+    }
   }
 
-  <!-- ══ EDITOR (slide-over) ═══════════════════════════════════════════════ -->
+  <!-- ══ EDITOR (modal) ════════════════════════════════════════════════════ -->
   @if (editing(); as d) {
     <div class="ed-backdrop" (click)="cancel()"></div>
-    <aside class="ed-drawer">
+    <aside class="ed-modal">
       <div class="ed-hdr">
         <span class="ed-title">{{ d.id ? 'Edit rule' : 'New rule' }}</span>
         <button class="ic" (click)="cancel()"><lucide-icon name="x" [size]="16" /></button>
@@ -177,6 +222,8 @@
           <label class="fld"><span>Window (s)</span><input type="number" [(ngModel)]="d.windowSeconds" /></label>
           <label class="fld"><span>For (s)</span><input type="number" [(ngModel)]="d.forSeconds" /></label>
           <label class="fld"><span>Cooldown (s)</span><input type="number" [(ngModel)]="d.cooldownSeconds" /></label>
+          <label class="fld"><span>Re-notify (s)</span><input type="number" min="0" [(ngModel)]="d.repeatSeconds" title="Re-send while firing every N seconds. 0 = once until resolved." /></label>
+          <label class="fld"><span>Escalate after (s)</span><input type="number" min="0" [(ngModel)]="d.escalateSeconds" title="If unacknowledged this long, notify escalation-only channels. 0 = never." /></label>
         </div>
 
         <div class="preview-bar">
@@ -195,10 +242,16 @@
           <span>Channels</span>
           <div class="ch-add">
             <button (click)="addChannel('telegram')">+ Telegram</button>
+            <button (click)="addChannel('slack')">+ Slack</button>
+            <button (click)="addChannel('discord')">+ Discord</button>
+            <button (click)="addChannel('teams')">+ Teams</button>
+            <button (click)="addChannel('pagerduty')">+ PagerDuty</button>
+            <button (click)="addChannel('httpflow')">+ HTTP flow</button>
             <button (click)="addChannel('webhook')">+ Webhook</button>
             <button (click)="addChannel('smtp')">+ Email</button>
           </div>
         </div>
+        <p class="ch-secret-hint">🔒 Secrets are encrypted at rest and never sent back. A masked field stays unchanged unless you type a new value.</p>
         @for (c of d.channels; track $index) {
           <div class="ch-card">
             <div class="ch-card-hdr">
@@ -206,10 +259,88 @@
               <button class="ic danger" (click)="removeChannel($index)"><lucide-icon name="x" [size]="13" /></button>
             </div>
             @if (c.type === 'telegram') {
-              <input [(ngModel)]="c.botToken" placeholder="Bot token" spellcheck="false" />
+              <input [(ngModel)]="c.botToken" type="password" placeholder="Bot token" spellcheck="false" autocomplete="off" />
               <input [(ngModel)]="c.chatId" placeholder="Chat ID" spellcheck="false" />
             } @else if (c.type === 'webhook') {
               <input [(ngModel)]="c.url" placeholder="https://hooks.example.com/..." spellcheck="false" />
+            } @else if (c.type === 'slack') {
+              <input [(ngModel)]="c.webhookUrl" type="password" placeholder="Slack incoming webhook URL" spellcheck="false" autocomplete="off" />
+            } @else if (c.type === 'discord') {
+              <input [(ngModel)]="c.webhookUrl" type="password" placeholder="Discord webhook URL" spellcheck="false" autocomplete="off" />
+            } @else if (c.type === 'teams') {
+              <input [(ngModel)]="c.webhookUrl" type="password" placeholder="Teams incoming webhook URL" spellcheck="false" autocomplete="off" />
+            } @else if (c.type === 'pagerduty') {
+              <input [(ngModel)]="c.routingKey" type="password" placeholder="PagerDuty routing key (integration key)" spellcheck="false" autocomplete="off" />
+            } @else if (c.type === 'httpflow') {
+              <div class="hf">
+                <div class="hf-block">
+                  <span class="hf-lbl">Secret variables</span>
+                  @for (sv of c.secrets; track $index) {
+                    <div class="hf-row">
+                      <input class="hf-k" [(ngModel)]="sv.name" placeholder="name" spellcheck="false" />
+                      <input class="hf-v" [(ngModel)]="sv.value" type="password" placeholder="value" spellcheck="false" autocomplete="off" />
+                      <button class="ic danger" (click)="removeSecret(c, $index)"><lucide-icon name="x" [size]="12" /></button>
+                    </div>
+                  }
+                  <button class="hf-add" (click)="addSecret(c)">+ secret</button>
+                </div>
+
+                @for (s of c.steps; track $index) {
+                  <div class="hf-step">
+                    <div class="hf-step-hdr">
+                      <span class="hf-step-n">Step {{ $index + 1 }}</span>
+                      <input class="hf-name" [(ngModel)]="s.name" placeholder="label (optional)" spellcheck="false" />
+                      <button class="ic danger" (click)="removeStep(c, $index)"><lucide-icon name="x" [size]="12" /></button>
+                    </div>
+                    <div class="hf-req">
+                      <select class="hf-method" [(ngModel)]="s.method">
+                        <option>GET</option><option>POST</option><option>PUT</option><option>PATCH</option><option>DELETE</option>
+                      </select>
+                      <input class="hf-url" [(ngModel)]="s.url" placeholder="https://host/path" spellcheck="false" />
+                    </div>
+
+                    <div class="hf-block">
+                      <span class="hf-lbl">Headers</span>
+                      @for (h of s.headers; track $index) {
+                        <div class="hf-row">
+                          <input class="hf-k" [(ngModel)]="h.key" placeholder="key" spellcheck="false" />
+                          <input class="hf-v" [(ngModel)]="h.value" placeholder="value" spellcheck="false" />
+                          <button class="ic danger" (click)="removeHeader(s, $index)"><lucide-icon name="x" [size]="12" /></button>
+                        </div>
+                      }
+                      <button class="hf-add" (click)="addHeader(s)">+ header</button>
+                    </div>
+
+                    <div class="hf-block">
+                      <span class="hf-lbl">Body
+                        <select class="hf-inline" [(ngModel)]="s.bodyType">
+                          <option value="none">none</option><option value="json">json</option><option value="text">text</option><option value="form">form</option><option value="xml">xml</option>
+                        </select>
+                      </span>
+                      @if (s.bodyType !== 'none') {
+                        <textarea class="hf-body" [(ngModel)]="s.body" rows="2" spellcheck="false" placeholder="request body"></textarea>
+                      }
+                    </div>
+
+                    <div class="hf-block">
+                      <span class="hf-lbl">Save response to variable</span>
+                      @for (e of s.extracts; track $index) {
+                        <div class="hf-row">
+                          <input class="hf-var" [(ngModel)]="e.var" placeholder="var" spellcheck="false" />
+                          <select class="hf-src" [(ngModel)]="e.source">
+                            <option value="json">JSONPath</option><option value="xml">XPath</option><option value="header">header</option><option value="regex">regex</option><option value="status">status</option>
+                          </select>
+                          <input class="hf-expr" [(ngModel)]="e.expr" placeholder="$.access_token" spellcheck="false" />
+                          <button class="ic danger" (click)="removeExtract(s, $index)"><lucide-icon name="x" [size]="12" /></button>
+                        </div>
+                      }
+                      <button class="hf-add" (click)="addExtract(s)">+ extract</button>
+                    </div>
+                  </div>
+                }
+                <button class="hf-addstep" (click)="addStep(c)"><lucide-icon name="plus" [size]="12" /> Add step</button>
+                <p class="hf-vars">{{ hfVarsHint }}</p>
+              </div>
             } @else {
               <div class="fld-row">
                 <input [(ngModel)]="c.host" placeholder="smtp.host" />
@@ -224,6 +355,19 @@
                 <input [(ngModel)]="c.password" type="password" placeholder="password" />
               </div>
             }
+            <div class="ch-routing">
+              <label class="ch-fld"><span>fires when</span>
+                <select [(ngModel)]="c.minSeverity" title="Only fire this channel when the rule's severity is at least this">
+                  <option value="">any severity</option>
+                  <option value="Info">≥ Info</option>
+                  <option value="Warning">≥ Warning</option>
+                  <option value="Critical">≥ Critical</option>
+                </select>
+              </label>
+              <label class="ch-esc" title="Only notify this channel when the alert escalates (unacknowledged past the escalate-after time)">
+                <input type="checkbox" [(ngModel)]="c.escalationOnly"> escalation only
+              </label>
+            </div>
           </div>
         }
 
@@ -231,8 +375,13 @@
           <textarea [(ngModel)]="d.template" rows="2" spellcheck="false"></textarea></label>
       </div>
 
+      @if (testStatus()) { <p class="test-status">{{ testStatus() }}</p> }
       <div class="ed-footer">
         <button class="btn-secondary" (click)="cancel()">Cancel</button>
+        <button class="btn-secondary" (click)="sendTest()" [disabled]="!d.channels.length"
+                title="Send a test notification through this rule's channels">
+          <lucide-icon name="send" [size]="12" /> Send test
+        </button>
         <button class="btn-primary" (click)="save()" [disabled]="!d.name.trim()">
           {{ d.id ? 'Save' : 'Create' }}
         </button>

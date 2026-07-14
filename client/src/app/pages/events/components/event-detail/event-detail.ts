@@ -45,6 +45,15 @@ function formatInline(v: unknown): string {
   return String(v);
 }
 
+/** Full, human-readable value for the "view full value" modal — raw string for
+ *  scalars, pretty-printed JSON for objects/arrays. */
+function formatFullValue(v: unknown): string {
+  if (v === null || v === undefined) return 'null';
+  if (typeof v === 'string')  return v;
+  if (typeof v === 'object')  { try { return JSON.stringify(v, null, 2); } catch { return String(v); } }
+  return String(v);
+}
+
 /** Safe identifier as accepted by the server-side lexer (letter/digit/_/@). */
 const IDENT_RE = /^[A-Za-z_@][A-Za-z0-9_@]*$/;
 
@@ -128,6 +137,9 @@ export class EventDetailComponent {
   jsonSearch = signal('');
   /** Full rendered-message modal (the hero clamps to 2 lines). */
   messageModalOpen = signal(false);
+  /** Full property-value modal (opened from the 'jv' menu — for one-line-clamped props). */
+  valueModalOpen = signal(false);
+  valueModal = signal<{ path: string; text: string } | null>(null);
   menuType  = signal<'timestamp' | 'jv' | 'service' | 'level' | 'traceId' | 'spanId' | null>(null);
   menuPos   = signal({ x: 0, y: 0 });
   /** Active JSON-viewer node context (path/value/kind) when {@link menuType} is 'jv'. */
@@ -185,6 +197,8 @@ export class EventDetailComponent {
         this.jvMenu.set(null);
         this.jsonSearch.set('');
         this.messageModalOpen.set(false);
+        this.valueModalOpen.set(false);
+        this.valueModal.set(null);
         this.detailTab.set(this.hasException() ? 'exception' : 'overview');
         this.lastFetchedTid.set('');
         this.traceSpans.set([]);
@@ -542,6 +556,22 @@ export class EventDetailComponent {
     const text = m.isContainer ? m.path : jvLiteral(m.rawValue);
     await navigator.clipboard.writeText(text);
     this.menuType.set(null);
+  }
+
+  /** Opens the full-value modal for the active 'jv' node (scalar text or pretty JSON). */
+  jvViewValue(): void {
+    const m = this.jvMenu();
+    if (!m) return;
+    this.valueModal.set({ path: m.path, text: formatFullValue(m.rawValue) });
+    this.valueModalOpen.set(true);
+    this.menuType.set(null);
+  }
+
+  async copyValueModal(): Promise<void> {
+    const v = this.valueModal();
+    if (!v) return;
+    await navigator.clipboard.writeText(v.text);
+    this.flashCopied('jv-value');
   }
 
   /**

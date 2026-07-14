@@ -92,3 +92,51 @@ jobs:
             ameto-${{ env.VERSION }}-linux-x64.tar.gz
             ameto-${{ env.VERSION }}-win-x64.zip
             SHA256SUMS.txt
+
+  # ── Native Windows installers (Inno Setup) ─────────────────────────────────
+  # Inno Setup's ISCC compiler is Windows-only, so the setup.exe artifacts are
+  # built on a Windows runner and appended to the release created above.
+  windows-installer:
+    name: Build Windows installers ${{ inputs.version || github.ref_name }}
+    needs: release
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: client/package-lock.json
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.x'
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      # Publishes win-x64 + win-x86 and compiles both setup.exe files.
+      - name: Build installers
+        shell: pwsh
+        run: install/windows/build-installer.ps1 -Version "${{ env.VERSION }}" -Arch both
+
+      - name: Checksums
+        shell: pwsh
+        run: |
+          Get-FileHash install/windows/Output/*.exe -Algorithm SHA256 |
+            ForEach-Object { "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf) } |
+            Set-Content install/windows/Output/SHA256SUMS-win-installer.txt
+
+      - name: Append installers to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.VERSION }}
+          files: |
+            install/windows/Output/ameto-${{ env.VERSION }}-setup-x64.exe
+            install/windows/Output/ameto-${{ env.VERSION }}-setup-x86.exe
+            install/windows/Output/SHA256SUMS-win-installer.txt

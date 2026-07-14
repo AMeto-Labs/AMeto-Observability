@@ -26,6 +26,8 @@
     <ProjectReference Include="..\..\src\Ameto.Core\Ameto.Core.csproj" />
     <ProjectReference Include="..\..\src\Ameto.Storage\Ameto.Storage.csproj" />
     <ProjectReference Include="..\..\src\Ameto.Ingestion\Ameto.Ingestion.csproj" />
+    <ProjectReference Include="..\..\src\Ameto.Indexing\Ameto.Indexing.csproj" />
+    <ProjectReference Include="..\..\src\Ameto.Otel\Ameto.Otel.csproj" />
     <ProjectReference Include="..\..\src\Ameto.Query\Ameto.Query.csproj" />
   </ItemGroup>
 

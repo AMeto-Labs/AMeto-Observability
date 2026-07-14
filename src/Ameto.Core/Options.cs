@@ -31,11 +31,24 @@ public sealed class RetentionPolicy
 /// </summary>
 public sealed class HotTierOptions
 {
-    /// <summary>Maximum size of the hot-tier in bytes before a flush is triggered.</summary>
-    public long MaxSizeBytes { get; init; } = 256 * 1024 * 1024; // 256 MB
+    /// <summary>
+    /// Maximum size of the hot-tier in bytes before a flush is triggered. Smaller tiers
+    /// mean smaller frozen tiers held in RAM while their cold segment is being written,
+    /// so the parallel-flush backlog (see StorageEngine) can be deeper for the same memory
+    /// ceiling — smoother back-pressure with fewer drops under bursty ingest.
+    /// </summary>
+    public long MaxSizeBytes { get; init; } = 64 * 1024 * 1024; // 64 MB
 
     /// <summary>Maximum age of events in the hot-tier before a flush is triggered.</summary>
     public TimeSpan MaxAge   { get; init; } = TimeSpan.FromMinutes(5);
+
+    /// <summary>
+    /// Number of cold-segment flushes (index build + compress + write) allowed to run in
+    /// parallel. Higher = more flush throughput (fewer ingest drops under burst) but more
+    /// peak RAM (concurrent index builds). 0 = auto (≈ processor count / 2, capped 2–8).
+    /// Tune down on memory-constrained hosts, up on many-core hosts chasing throughput.
+    /// </summary>
+    public int FlushConcurrency { get; init; } = 0;
 }
 
 /// <summary>

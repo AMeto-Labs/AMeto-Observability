@@ -41,6 +41,37 @@ public sealed class StringInternPool
         return _stringToIndex[template];
     }
 
+    /// <summary>
+    /// Interns a UTF-8 template/name without allocating a <see cref="string"/> on a cache
+    /// hit (the common case — templates/service names are low-cardinality and repeat). A
+    /// string is materialised only the first time a value is seen. Powers the zero-alloc
+    /// OTLP streaming ingest path. Returns -1 for empty input or when the pool is full.
+    /// </summary>
+    public int Intern(ReadOnlySpan<byte> utf8)
+    {
+        if (utf8.IsEmpty) return -1;
+
+        // Decode UTF-8 → chars for the ordinal lookup. Short by nature ⇒ stack; pool the rare long one.
+        int charCount = System.Text.Encoding.UTF8.GetCharCount(utf8);
+        char[]? rented = charCount > 512 ? System.Buffers.ArrayPool<char>.Shared.Rent(charCount) : null;
+        Span<char> chars = rented ?? stackalloc char[charCount];
+        System.Text.Encoding.UTF8.GetChars(utf8, chars);
+        var key = chars[..charCount];
+        try
+        {
+            // Alternate lookup matches an existing key by span — no string allocation on hit.
+            var lookup = _stringToIndex.GetAlternateLookup<ReadOnlySpan<char>>();
+            if (lookup.TryGetValue(key, out int idx))
+                return idx;
+
+            return Intern(new string(key)); // miss: materialise once, intern via the string path
+        }
+        finally
+        {
+            if (rented is not null) System.Buffers.ArrayPool<char>.Shared.Return(rented);
+        }
+    }
+
     public string Get(int index)
     {
         if (index < 0) return string.Empty;

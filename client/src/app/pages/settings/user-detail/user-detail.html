@@ -29,6 +29,9 @@
           <span class="role-badge" [class.admin]="u.role === 'admin'">{{ u.role }}</span>
         </div>
 
+        <div class="info-label">Permissions</div>
+        <div class="info-value">{{ permsLabel(u.role, u.permissions) }}</div>
+
         <div class="info-label">Created</div>
         <div class="info-value muted">{{ u.createdAt | date: 'yyyy-MM-dd HH:mm' }}</div>
 
@@ -40,7 +43,7 @@
     <app-section title="Edit user">
       @if (!editing()) {
         <div class="row">
-          <span class="sublabel">Change display name or role.</span>
+          <span class="sublabel">Change display name, role or view permissions.</span>
           <button class="btn primary" (click)="startEdit()">
             <lucide-icon name="pencil" [size]="13" />
             Edit
@@ -60,6 +63,21 @@
               <option value="admin">admin</option>
             </select>
           </label>
+          <div class="field">
+            <span class="label">View permissions</span>
+            @if (editRole() === 'admin') {
+              <span class="sublabel">Admins have full access to every page.</span>
+            } @else {
+              <div class="perm-checks">
+                @for (s of permScopes; track s.bit) {
+                  <label class="perm-check">
+                    <input type="checkbox" [checked]="hasPerm(s.bit)" (change)="togglePerm(s.bit)" />
+                    <span>{{ s.label }}</span>
+                  </label>
+                }
+              </div>
+            }
+          </div>
           <div class="btn-group">
             <button class="btn" (click)="cancelEdit()" [disabled]="saving()">Cancel</button>
             <button class="btn primary" (click)="save()" [disabled]="saving()">

@@ -3,63 +3,69 @@
     <lucide-icon name="bell" [size]="13" [strokeWidth]="1.8" />
     Signals
   </span>
-  <div class="sig-header-actions">
-    <button class="sig-icon-btn" (click)="startCreate()" title="Create signal from current filter">
-      <lucide-icon name="plus" [size]="14" [strokeWidth]="1.8" />
-    </button>
-    <button class="sig-icon-btn" (click)="closed.emit()" title="Close">
-      <lucide-icon name="x" [size]="14" [strokeWidth]="1.8" />
-    </button>
-  </div>
+  <button class="sig-icon-btn" (click)="closed.emit()" title="Close">
+    <lucide-icon name="x" [size]="14" [strokeWidth]="1.8" />
+  </button>
 </div>
 
-@if (creating()) {
-  <div class="sig-create">
-    @if (currentFilter()) {
-      <div class="sig-create-filter">{{ currentFilter() }}</div>
-    }
-    <input
-      class="sig-name-input"
-      type="text"
-      placeholder="Signal name…"
-      [(ngModel)]="draftName"
-      (keydown.enter)="saveNew()"
-      (keydown.escape)="cancelCreate()"
-      autofocus />
-    <div class="sig-create-btns">
-      <button class="sig-cancel-btn" (click)="cancelCreate()">Cancel</button>
-      <button class="sig-save-btn" (click)="saveNew()" [disabled]="!draftName.trim() || saving()">Save</button>
-    </div>
-  </div>
-}
-
 <div class="sig-list">
-  @if (loading()) {
-    <div class="sig-loading">
-      <lucide-icon name="loader" [size]="16" [strokeWidth]="1.5" />
+
+  <!-- ── Firing (log-source) alerts ──────────────────────────────────────── -->
+  @if (firing().length) {
+    <div class="sig-section-label">
+      <lucide-icon name="flame" [size]="12" [strokeWidth]="1.9" />
+      Firing
     </div>
-  } @else if (signals().length === 0) {
-    <div class="sig-empty">
-      <lucide-icon name="bell-off" [size]="20" [strokeWidth]="1.5" />
-      <span>No signals yet</span>
-      <span class="sig-hint">Click + to create one from the current filter</span>
-    </div>
-  } @else {
-    @for (s of signals(); track s.id) {
-      <div class="sig-item" [class.sig-item--off]="!s.enabled" (click)="applyFilter(s.filter)">
-        <div class="sig-dot" [class.sig-dot--off]="!s.enabled"></div>
+    @for (a of firing(); track a.id) {
+      <div class="sig-item sig-item--firing" (click)="apply(a.filter)" [title]="a.filter || a.name">
+        <div class="sig-dot" [attr.data-sev]="a.severity"></div>
         <div class="sig-info">
-          <span class="sig-name">{{ s.name }}</span>
-          @if (s.filter) {
-            <span class="sig-filter">{{ s.filter }}</span>
+          <span class="sig-name">{{ a.name }}</span>
+          @if (a.filter) {
+            <span class="sig-filter">{{ a.filter }}</span>
           }
         </div>
+      </div>
+    }
+  }
+
+  <!-- ── Search history ──────────────────────────────────────────────────── -->
+  <div class="sig-section-label">
+    <lucide-icon name="history" [size]="12" [strokeWidth]="1.9" />
+    Search history
+  </div>
+
+  @if (history.pinned().length === 0 && history.recent().length === 0) {
+    <div class="sig-empty">
+      <lucide-icon name="search" [size]="20" [strokeWidth]="1.5" />
+      <span>No searches yet</span>
+      <span class="sig-hint">Run a filter to see it here</span>
+    </div>
+  } @else {
+    @for (q of history.pinned(); track q) {
+      <div class="sig-item sig-hist" (click)="apply(q)" [title]="q">
+        <lucide-icon name="pin" [size]="12" [strokeWidth]="1.8" class="sig-lead sig-lead--pinned" />
+        <span class="sig-query">{{ q }}</span>
         <div class="sig-item-actions">
-          <button class="sig-icon-btn" (click)="toggle(s, $event)" [title]="s.enabled ? 'Disable' : 'Enable'">
-            <lucide-icon [name]="s.enabled ? 'pause' : 'play'" [size]="12" [strokeWidth]="1.8" />
+          <button class="sig-icon-btn" (click)="pin(q, false, $event)" title="Unpin">
+            <lucide-icon name="pin-off" [size]="12" [strokeWidth]="1.8" />
           </button>
-          <button class="sig-icon-btn danger" (click)="delete(s.id, $event)" title="Delete">
-            <lucide-icon name="trash-2" [size]="12" [strokeWidth]="1.8" />
+          <button class="sig-icon-btn danger" (click)="remove(q, $event)" title="Remove">
+            <lucide-icon name="x" [size]="12" [strokeWidth]="1.8" />
+          </button>
+        </div>
+      </div>
+    }
+    @for (q of history.recent(); track q) {
+      <div class="sig-item sig-hist" (click)="apply(q)" [title]="q">
+        <lucide-icon name="clock" [size]="12" [strokeWidth]="1.8" class="sig-lead" />
+        <span class="sig-query">{{ q }}</span>
+        <div class="sig-item-actions">
+          <button class="sig-icon-btn" (click)="pin(q, true, $event)" title="Pin">
+            <lucide-icon name="pin" [size]="12" [strokeWidth]="1.8" />
+          </button>
+          <button class="sig-icon-btn danger" (click)="remove(q, $event)" title="Remove">
+            <lucide-icon name="x" [size]="12" [strokeWidth]="1.8" />
           </button>
         </div>
       </div>

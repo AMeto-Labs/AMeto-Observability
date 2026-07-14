@@ -60,6 +60,45 @@
 
 .jv-leaf { display: inline; }
 
+/* ── One-line mode (opt-in, e.g. the Properties list) ───────────────
+   Keep the toggle + preview (or a plain leaf) on a single row and clip the
+   overflow with an ellipsis instead of wrapping. Only the collapsed head and
+   the leaf are clamped — expanding a container still reveals the full tree. */
+:host(.jv--one-line) { display: block; min-width: 0; }
+
+:host(.jv--one-line) > .jv-node:not(.jv-open) {
+  display: block;
+  min-width: 0;
+}
+:host(.jv--one-line) > .jv-node:not(.jv-open) > .jv-head,
+:host(.jv--one-line) > .jv-leaf {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+:host(.jv--one-line) > .jv-node:not(.jv-open) > .jv-head > .jv-preview,
+:host(.jv--one-line) > .jv-leaf > span:first-child {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Toggle and filter buttons never shrink — only the text does. */
+:host(.jv--one-line) > .jv-node:not(.jv-open) > .jv-head > .jv-toggle,
+:host(.jv--one-line) > .jv-node:not(.jv-open) > .jv-head > .jv-menu-btn,
+:host(.jv--one-line) > .jv-leaf > .jv-menu-btn { flex: none; }
+
+/* When an expanded one-line container reveals its children, let the node fill the
+   (narrow) column and truncate each child row to a single line with an ellipsis —
+   no horizontal scroll, no ragged wrapping of the wide non-breaking previews. */
+:host(.jv--one-line) > .jv-node.jv-open { display: block; min-width: 0; }
+:host(.jv--one-line) .jv-row {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 /* Filter affordance — hidden until its row/header is hovered. */
 .jv-menu-btn {
   display: inline-flex;

@@ -121,7 +121,7 @@
                 <lucide-icon name="list-filter" [size]="12" />
               </button>
               <span class="d-prop-k">{{ kv.path }}</span>
-              <div class="d-prop-v"><app-json-viewer [value]="kv.raw" [path]="kv.path" /></div>
+              <div class="d-prop-v"><app-json-viewer [value]="kv.raw" [path]="kv.path" [oneLine]="true" [rootMenu]="false" /></div>
             </div>
           }
         </div>
@@ -416,6 +416,17 @@
   </div>
 </app-modal>
 
+<!-- Full property-value modal (opened from the 'jv' context menu) -->
+<app-modal [open]="valueModalOpen()" [title]="valueModal()?.path || 'Value'" (close)="valueModalOpen.set(false)">
+  <pre class="d-modal-value">{{ valueModal()?.text }}</pre>
+  <div class="d-modal-actions">
+    <button class="d-modal-copy" [class.done]="copiedKey() === 'jv-value'" (click)="copyValueModal()">
+      <lucide-icon [name]="copiedKey() === 'jv-value' ? 'check' : 'copy'" [size]="13" />
+      {{ copiedKey() === 'jv-value' ? 'Copied!' : 'Copy' }}
+    </button>
+  </div>
+</app-modal>
+
 <ng-template #excBlock let-exc let-depth="depth">
   <div class="exc-frame" [style.margin-left.px]="depth * 12">
     <div class="exc-head">
@@ -508,6 +519,7 @@
           }
         }
         <hr />
+        <button (click)="jvViewValue()"><lucide-icon name="maximize-2" [size]="13" />View full value</button>
         <button (click)="jvCopy()"><lucide-icon name="copy" [size]="13" />Copy</button>
       }
     }

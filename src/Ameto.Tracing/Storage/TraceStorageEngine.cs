@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Runtime.InteropServices;
 using MessagePack;
 using Microsoft.Extensions.Logging;
 using Ameto.Core;
@@ -14,12 +15,17 @@ namespace Ameto.Tracing.Storage;
 /// Cold tier: flushed as <c>.trc</c> files by <see cref="SpanWriter"/>
 /// when the hot segment reaches its size/time threshold.
 /// </summary>
-public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IServiceGraphProvider, IRetentionTarget, IDisposable
+public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IServiceGraphProvider, ITraceSummaryProvider, IRetentionTarget, IDisposable
 {
     // ── Hot tier ─────────────────────────────────────────────────────────────
     private readonly List<SpanRecord>                          _hotSpans  = new();
     private readonly Dictionary<TraceId, List<int>>            _traceIdx  = new();
     private readonly ReaderWriterLockSlim                      _lock      = new();
+
+    // 0 = live, 1 = disposed. Guards against multiple Dispose calls: the engine
+    // is registered as several singleton interfaces, so the DI container captures
+    // and disposes the same instance more than once at shutdown.
+    private int _disposed;
 
     // ── Cold tier ─────────────────────────────────────────────────────────────
     private readonly string                                    _dataDir;
@@ -239,8 +245,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             {
                 // v1 files (12-byte footer) will fail with wrong footer magic — delete them.
                 _logger.LogWarning(ex, "Unreadable segment {File} — deleting (likely format v1)", file);
-                try { File.Delete(file); } catch { /* best effort */ }
-                try { File.Delete(Path.ChangeExtension(file, ".stats")); } catch { /* best effort */ }
+                DeleteSegmentFiles(file);
             }
         }
         _logger.LogInformation("Loaded {Count} cold span segments", _coldSegments.Count);
@@ -285,8 +290,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             foreach (var seg in processed)   // delete only the segments we actually merged
             {
                 _coldSegments.Remove(seg);
-                try   { File.Delete(seg.FilePath); }
-                catch (Exception ex) { _logger.LogWarning(ex, "Compaction: failed to delete {File}", seg.FilePath); }
+                DeleteSegmentFiles(seg.FilePath);   // .trc + all companion sidecars
             }
             _coldSegments.Add(merged);
         }
@@ -481,6 +485,297 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         });
     }
 
+    // ── ITraceSummaryProvider ──────────────────────────────────────────────────
+
+    private static readonly string[] MethodKeys = { "http.request.method", "http.method" };
+    private static readonly string[] PathKeys   = { "url.path", "http.target", "http.route", "url.full", "http.url" };
+
+    /// <summary>
+    /// Trace volume + sparkline over [from,to]. Cold tiers are served purely from the
+    /// tiny <c>.tracesum</c> volume headers (no span deserialisation); the hot tier is
+    /// grouped live. Bounded by (segments × grid-cells) — cheap for any window width.
+    /// </summary>
+    public async Task<TraceVolume> GetTraceVolumeAsync(
+        DateTimeOffset from, DateTimeOffset to, int buckets, CancellationToken ct = default)
+    {
+        long fromNano  = from.ToUnixTimeMilliseconds() * 1_000_000L;
+        long toNano    = to.ToUnixTimeMilliseconds()   * 1_000_000L;
+        long rangeNano = Math.Max(1L, toNano - fromNano);
+        if (buckets < 1) buckets = 1;
+
+        var total = new double[buckets];
+        var error = new double[buckets];
+        int totalTraces = 0, errorTraces = 0;
+
+        void Add(long startNano, uint traces, uint errors)
+        {
+            if (startNano < fromNano || startNano > toNano) return;
+            int b = (int)Math.Clamp((startNano - fromNano) * (long)buckets / rangeNano, 0, buckets - 1);
+            total[b]    += traces;
+            error[b]    += errors;
+            totalTraces += (int)traces;
+            errorTraces += (int)errors;
+        }
+
+        // Snapshot cold segments + aggregate hot tier under one short read-lock.
+        SpanSegmentInfo[] segs;
+        _lock.EnterReadLock();
+        try
+        {
+            segs = _coldSegments.ToArray();
+
+            if (_hotSpans.Count > 0)
+            {
+                var hot = new Dictionary<TraceId, HotVolAcc>(_traceIdx.Count);
+                foreach (var s in _hotSpans) AccumulateVolume(hot, s);
+                foreach (var a in hot.Values) Add(a.HasRoot ? a.RootStart : a.Earliest, 1, a.Err ? 1u : 0u);
+            }
+        }
+        finally { _lock.ExitReadLock(); }
+
+        long half = TraceSummarySidecar.GridNanos / 2;
+        foreach (var seg in segs)
+        {
+            if (seg.MaxStartNano < fromNano || seg.MinStartNano > toNano) continue;
+            ct.ThrowIfCancellationRequested();
+
+            var vs = TraceSummarySidecar.ReadVolume(seg.FilePath);
+            if (vs is not null)
+            {
+                foreach (var e in vs.Buckets)
+                    Add(e.GridIndex * TraceSummarySidecar.GridNanos + half, e.TraceCount, e.ErrorCount);
+            }
+            else
+            {
+                // Legacy segment written before .tracesum existed — derive volume from spans
+                // (bounded per segment). Such segments vanish as retention/compaction ages them out.
+                var legacy = new Dictionary<TraceId, HotVolAcc>();
+                await foreach (var s in SpanReader.SearchAsync(
+                    seg.FilePath, fromNano, toNano, null, null, null, null, null, null, ct))
+                    AccumulateVolume(legacy, s);
+                foreach (var a in legacy.Values) Add(a.HasRoot ? a.RootStart : a.Earliest, 1, a.Err ? 1u : 0u);
+            }
+        }
+
+        return new TraceVolume
+        {
+            TotalTraces    = totalTraces,
+            ErrorTraces    = errorTraces,
+            TotalSparkline = total,
+            ErrorSparkline = error,
+        };
+    }
+
+    private static void AccumulateVolume(Dictionary<TraceId, HotVolAcc> acc, SpanRecord s)
+    {
+        ref var a = ref CollectionsMarshal.GetValueRefOrAddDefault(acc, s.TraceId, out _);
+        if (!a.Init) { a.Init = true; a.Earliest = long.MaxValue; }
+        if (s.Status == SpanStatusCode.Error) a.Err = true;
+        if (s.StartTimeUnixNano < a.Earliest) a.Earliest = s.StartTimeUnixNano;
+        if (s.ParentSpanId.IsEmpty && !a.HasRoot) { a.HasRoot = true; a.RootStart = s.StartTimeUnixNano; }
+    }
+
+    /// <summary>
+    /// Newest-first, filtered trace rows. Cold tiers are served from <c>.tracesum</c> bodies
+    /// (no span deserialisation); the hot tier is grouped live. Traces are merged by id across
+    /// tiers, then the cheap filters are applied and the newest <paramref name="limit"/> kept.
+    /// </summary>
+    public async Task<IReadOnlyList<TraceSummary>> GetTraceListAsync(
+        DateTimeOffset   from,
+        DateTimeOffset   to,
+        string?          serviceName,
+        string?          spanName,
+        SpanStatusCode?  status,
+        long?            minDurationNanos,
+        long?            maxDurationNanos,
+        int              limit,
+        CancellationToken ct = default)
+    {
+        long fromNano = from.ToUnixTimeMilliseconds() * 1_000_000L;
+        long toNano   = to.ToUnixTimeMilliseconds()   * 1_000_000L;
+        int  scanCap  = Math.Max(limit * 5, 500);
+
+        var merged = new Dictionary<TraceId, MergedTrace>(scanCap);
+
+        // Hot tier — group live spans (newest data) under read-lock. Snapshot cold too.
+        SpanSegmentInfo[] segs;
+        _lock.EnterReadLock();
+        try
+        {
+            segs = _coldSegments.ToArray();
+            foreach (var s in _hotSpans)
+            {
+                if (s.StartTimeUnixNano < fromNano || s.StartTimeUnixNano > toNano) continue;
+                MergeSpanInto(merged, s);
+            }
+        }
+        finally { _lock.ExitReadLock(); }
+
+        // Cold — newest-first. .tracesum bodies where present, else legacy span read.
+        Array.Sort(segs, static (a, b) => b.MaxStartNano.CompareTo(a.MaxStartNano));
+        foreach (var seg in segs)
+        {
+            if (merged.Count >= scanCap) break;
+            if (seg.MaxStartNano < fromNano || seg.MinStartNano > toNano) continue;
+            if (serviceName is not null && seg.Services.Length > 0 &&
+                !Array.Exists(seg.Services, x => x.Equals(serviceName, StringComparison.OrdinalIgnoreCase)))
+                continue;
+
+            ct.ThrowIfCancellationRequested();
+
+            if (TraceSummarySidecar.Exists(seg.FilePath))
+            {
+                foreach (var r in TraceSummarySidecar.ReadSummaries(seg.FilePath))
+                {
+                    if (r.RootStartNano < fromNano || r.RootStartNano > toNano) continue;
+                    MergeSummaryInto(merged, r);
+                }
+            }
+            else
+            {
+                // Legacy segment — fall back to the span read (bounded by segment + filters).
+                await foreach (var s in SpanReader.SearchAsync(
+                    seg.FilePath, fromNano, toNano, serviceName, spanName, status, null,
+                    minDurationNanos, maxDurationNanos, ct))
+                    MergeSpanInto(merged, s);
+            }
+        }
+
+        // Filter + sort newest-first + take limit.
+        var list = new List<TraceSummary>(merged.Count);
+        foreach (var m in merged.Values)
+        {
+            var rowStatus = m.HasError ? SpanStatusCode.Error : m.RootStatus;
+            if (status is not null && rowStatus != status.Value) continue;
+            if (serviceName is not null && !ServiceMatch(m, serviceName)) continue;
+            if (spanName is not null && !m.Name.Contains(spanName, StringComparison.OrdinalIgnoreCase)) continue;
+            if (minDurationNanos is not null && m.DurationNanos < minDurationNanos.Value) continue;
+            if (maxDurationNanos is not null && m.DurationNanos > maxDurationNanos.Value) continue;
+            list.Add(m.ToSummary());
+        }
+
+        list.Sort(static (a, b) => b.RootStartNano.CompareTo(a.RootStartNano));
+        if (list.Count > limit) list.RemoveRange(limit, list.Count - limit);
+
+        return list;
+    }
+
+    private static MergedTrace GetOrAdd(Dictionary<TraceId, MergedTrace> merged, TraceId id)
+    {
+        if (!merged.TryGetValue(id, out var m)) { m = new MergedTrace { TraceId = id }; merged[id] = m; }
+        return m;
+    }
+
+    private static void MergeSpanInto(Dictionary<TraceId, MergedTrace> merged, SpanRecord s)
+    {
+        var m = GetOrAdd(merged, s.TraceId);
+        m.SpanCount++;
+        if (s.Status == SpanStatusCode.Error) m.HasError = true;
+        m.Services.Add(s.ServiceName);
+        if (s.StartTimeUnixNano < m.EarliestNano) { m.EarliestNano = s.StartTimeUnixNano; m.EarliestService = s.ServiceName; }
+        if (s.ParentSpanId.IsEmpty && !m.HasRoot)
+        {
+            m.HasRoot        = true;
+            m.RootSpanId     = s.SpanId;
+            m.RootStartNano  = s.StartTimeUnixNano;
+            m.DurationNanos  = s.DurationNanos;
+            m.RootStatus     = s.Status;
+            m.HttpStatusCode = s.HttpStatusCode;
+            m.Name           = s.Name;
+            m.ServiceName    = s.ServiceName;
+            m.HttpMethod     = GetAttr(s.Attributes, MethodKeys);
+            m.HttpPath       = GetAttr(s.Attributes, PathKeys);
+        }
+    }
+
+    private static void MergeSummaryInto(Dictionary<TraceId, MergedTrace> merged, TraceSummary r)
+    {
+        var m = GetOrAdd(merged, r.TraceId);
+        m.SpanCount += r.SpanCount;
+        if (r.HasError) m.HasError = true;
+        foreach (var sv in r.Services) m.Services.Add(sv);
+        if (r.RootStartNano < m.EarliestNano) { m.EarliestNano = r.RootStartNano; m.EarliestService = r.ServiceName; }
+        if (r.HasRoot && !m.HasRoot)
+        {
+            m.HasRoot        = true;
+            m.RootSpanId     = r.RootSpanId;
+            m.RootStartNano  = r.RootStartNano;
+            m.DurationNanos  = r.DurationNanos;
+            m.RootStatus     = r.RootStatus;
+            m.HttpStatusCode = r.HttpStatusCode;
+            m.Name           = r.Name;
+            m.ServiceName    = r.ServiceName;
+            m.HttpMethod     = r.HttpMethod;
+            m.HttpPath       = r.HttpPath;
+        }
+    }
+
+    private static bool ServiceMatch(MergedTrace m, string service)
+    {
+        if (m.ServiceName.Equals(service, StringComparison.OrdinalIgnoreCase)) return true;
+        foreach (var sv in m.Services)
+            if (sv.Equals(service, StringComparison.OrdinalIgnoreCase)) return true;
+        return false;
+    }
+
+    private static string GetAttr(IReadOnlyDictionary<string, object?>? attrs, string[] keys)
+    {
+        if (attrs is null) return string.Empty;
+        foreach (var k in keys)
+            if (attrs.TryGetValue(k, out var v) && v is not null)
+                return v.ToString() ?? string.Empty;
+        return string.Empty;
+    }
+
+    private struct HotVolAcc
+    {
+        public bool Init;
+        public long Earliest;
+        public bool HasRoot;
+        public long RootStart;
+        public bool Err;
+    }
+
+    private sealed class MergedTrace
+    {
+        public TraceId         TraceId;
+        public uint            SpanCount;
+        public bool            HasError;
+        public long            EarliestNano = long.MaxValue;
+        public string          EarliestService = string.Empty;
+
+        public bool            HasRoot;
+        public SpanId          RootSpanId;
+        public long            RootStartNano;
+        public long            DurationNanos;
+        public SpanStatusCode  RootStatus;
+        public short           HttpStatusCode;
+        public string          Name        = string.Empty;
+        public string          ServiceName = string.Empty;
+        public string          HttpMethod  = string.Empty;
+        public string          HttpPath    = string.Empty;
+
+        public readonly HashSet<string> Services = new(2, StringComparer.Ordinal);
+
+        public TraceSummary ToSummary() => new()
+        {
+            TraceId        = TraceId,
+            RootSpanId     = RootSpanId,
+            RootStartNano  = HasRoot ? RootStartNano : EarliestNano,
+            DurationNanos  = DurationNanos,
+            SpanCount      = SpanCount,
+            HasRoot        = HasRoot,
+            HasError       = HasError,
+            RootStatus     = RootStatus,
+            HttpStatusCode = HttpStatusCode,
+            Name           = Name,
+            ServiceName    = HasRoot ? ServiceName : EarliestService,
+            HttpMethod     = HttpMethod,
+            HttpPath       = HttpPath,
+            Services       = [.. Services],
+        };
+    }
+
     private static uint[] BucketOf(long durationNanos)
     {
         var b = new uint[HistogramBuckets.Count];
@@ -490,6 +785,8 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
 
     public void Dispose()
     {
+        if (System.Threading.Interlocked.Exchange(ref _disposed, 1) != 0) return;
+
         _lock.EnterWriteLock();
         try { FlushHotTierLocked(); }
         finally { _lock.ExitWriteLock(); }
@@ -515,13 +812,28 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         finally { _lock.ExitWriteLock(); }
 
         foreach (var s in toDelete)
-            try { File.Delete(s.FilePath); } catch { /* best effort */ }
+            DeleteSegmentFiles(s.FilePath);
 
         if (toDelete.Count > 0)
             _logger.LogInformation("Retention pruned {Count} trace file(s) older than {Days} days",
                 toDelete.Count, (int)ttl.TotalDays);
 
         return Task.FromResult(toDelete.Count);
+    }
+
+    /// <summary>Deletes a cold segment's <c>.trc</c> plus every companion sidecar. Best-effort.</summary>
+    private static void DeleteSegmentFiles(string trcPath)
+    {
+        TryDelete(trcPath);
+        TryDelete(Path.ChangeExtension(trcPath, ".stats"));
+        TryDelete(Path.ChangeExtension(trcPath, ".svcgraph"));
+        TryDelete(Path.ChangeExtension(trcPath, ".tracesum"));
+
+        static void TryDelete(string path)
+        {
+            try { if (File.Exists(path)) File.Delete(path); }
+            catch { /* best effort */ }
+        }
     }
 }
 

@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.Extensions.Logging;
+using Ameto.Core;
 
 namespace Ameto.Alerts;
 
@@ -14,6 +15,7 @@ namespace Ameto.Alerts;
 public sealed class AlertRuleStore : IDisposable
 {
     private readonly string                    _filePath;
+    private readonly ISecretProtector          _protector;
     private readonly ILogger<AlertRuleStore>   _logger;
     private readonly FileSystemWatcher         _watcher;
     private readonly object                    _lock = new();
@@ -31,10 +33,11 @@ public sealed class AlertRuleStore : IDisposable
         Converters                  = { new AlertChannelConverter() },
     };
 
-    public AlertRuleStore(string dataDirectory, ILogger<AlertRuleStore> logger)
+    public AlertRuleStore(string dataDirectory, ISecretProtector protector, ILogger<AlertRuleStore> logger)
     {
-        _logger   = logger;
-        _filePath = Path.Combine(dataDirectory, "alerts.json");
+        _protector = protector;
+        _logger    = logger;
+        _filePath  = Path.Combine(dataDirectory, "alerts.json");
 
         Directory.CreateDirectory(dataDirectory);
 
@@ -103,6 +106,13 @@ public sealed class AlertRuleStore : IDisposable
             var dtos  = JsonSerializer.Deserialize<List<AlertRuleDto>>(json, _jsonOpts) ?? [];
             _rules    = dtos.Select(FromDto).ToList().AsReadOnly();
             _logger.LogInformation("Loaded {Count} alert rules from {File}", _rules.Count, _filePath);
+
+            // One-time migration: any legacy plaintext channel secret on disk gets encrypted at rest.
+            if (dtos.Any(d => (d.Channels ?? []).Any(HasPlaintextSecret)))
+            {
+                SaveToDisk(_rules);
+                _logger.LogInformation("Encrypted plaintext channel secret(s) at rest in {File}", _filePath);
+            }
         }
         catch (Exception ex)
         {
@@ -141,7 +151,7 @@ public sealed class AlertRuleStore : IDisposable
 
     // ── DTO mapping ───────────────────────────────────────────────────────────
 
-    private static AlertRule FromDto(AlertRuleDto d) => new()
+    private AlertRule FromDto(AlertRuleDto d) => new()
     {
         Id          = d.Id   ?? Guid.NewGuid().ToString("N")[..8],
         Name        = d.Name ?? "Unnamed",
@@ -153,6 +163,8 @@ public sealed class AlertRuleStore : IDisposable
         Window      = TimeSpan.FromSeconds(d.WindowSeconds   > 0 ? d.WindowSeconds   : 300),
         For         = TimeSpan.FromSeconds(d.ForSeconds      > 0 ? d.ForSeconds      : 0),
         Cooldown    = TimeSpan.FromSeconds(d.CooldownSeconds > 0 ? d.CooldownSeconds : 900),
+        RepeatInterval = TimeSpan.FromSeconds(d.RepeatSeconds > 0 ? d.RepeatSeconds : 0),
+        EscalateAfter  = TimeSpan.FromSeconds(d.EscalateSeconds > 0 ? d.EscalateSeconds : 0),
         Filter      = d.Filter,
         NoData      = d.NoData,
         Metric      = d.Metric,
@@ -162,11 +174,11 @@ public sealed class AlertRuleStore : IDisposable
         Labels      = d.Labels,
         Service     = d.Service,
         TraceMetric = ParseEnum(d.TraceMetric, TraceMetricKind.ErrorRatePct),
-        Channels    = d.Channels ?? [],
+        Channels    = (d.Channels ?? []).Select(UnprotectChannel).ToList(),
         Template    = d.Template,
     };
 
-    private static AlertRuleDto ToDto(AlertRule r) => new()
+    private AlertRuleDto ToDto(AlertRule r) => new()
     {
         Id              = r.Id,
         Name            = r.Name,
@@ -178,6 +190,8 @@ public sealed class AlertRuleStore : IDisposable
         WindowSeconds   = (int)r.Window.TotalSeconds,
         ForSeconds      = (int)r.For.TotalSeconds,
         CooldownSeconds = (int)r.Cooldown.TotalSeconds,
+        RepeatSeconds   = (int)r.RepeatInterval.TotalSeconds,
+        EscalateSeconds = (int)r.EscalateAfter.TotalSeconds,
         Filter          = r.Filter,
         NoData          = r.NoData,
         Metric          = r.Metric,
@@ -187,12 +201,64 @@ public sealed class AlertRuleStore : IDisposable
         Labels          = r.Labels,
         Service         = r.Service,
         TraceMetric     = r.TraceMetric.ToString(),
-        Channels        = r.Channels.ToList(),
+        Channels        = r.Channels.Select(ProtectChannel).ToList(),
         Template        = r.Template,
     };
 
     private static T ParseEnum<T>(string? s, T fallback) where T : struct, Enum =>
         Enum.TryParse<T>(s, ignoreCase: true, out var v) ? v : fallback;
+
+    // ── Channel secret encryption (at rest) ──────────────────────────────────────
+    // Channel objects are init-only, so protecting/unprotecting produces a fresh copy.
+
+    private AlertChannel ProtectChannel(AlertChannel ch) => Transform(ch, _protector.Protect);
+    private AlertChannel UnprotectChannel(AlertChannel ch) => Transform(ch, _protector.Unprotect);
+
+    private static AlertChannel Transform(AlertChannel ch, Func<string?, string> f)
+    {
+        AlertChannel result = ch switch
+        {
+            TelegramChannel t => new TelegramChannel { ChatId = t.ChatId, BotToken = f(t.BotToken) },
+            SmtpChannel s     => new SmtpChannel
+            {
+                Host = s.Host, Port = s.Port, UseSsl = s.UseSsl, Username = s.Username,
+                Password = string.IsNullOrEmpty(s.Password) ? s.Password : f(s.Password),
+                From = s.From, To = s.To,
+            },
+            WebhookChannel w  => new WebhookChannel
+            {
+                Url = w.Url,
+                Headers = w.Headers?.ToDictionary(kv => kv.Key, kv => f(kv.Value)),
+            },
+            SlackChannel s     => new SlackChannel     { WebhookUrl = f(s.WebhookUrl) },
+            DiscordChannel d   => new DiscordChannel   { WebhookUrl = f(d.WebhookUrl) },
+            TeamsChannel tm    => new TeamsChannel     { WebhookUrl = f(tm.WebhookUrl) },
+            PagerDutyChannel p => new PagerDutyChannel { RoutingKey = f(p.RoutingKey) },
+            HttpFlowChannel hf => new HttpFlowChannel
+            {
+                Steps   = hf.Steps,   // non-secret (reference the {{secret.*}} placeholders, not the values)
+                Secrets = hf.Secrets.ToDictionary(kv => kv.Key, kv => f(kv.Value)),
+            },
+            _ => ch,
+        };
+        result.EscalationOnly = ch.EscalationOnly;   // preserve the (non-secret) routing flags across the copy
+        result.MinSeverity    = ch.MinSeverity;
+        return result;
+    }
+
+    private bool HasPlaintextSecret(AlertChannel ch) => ch switch
+    {
+        TelegramChannel t  => IsPlaintext(t.BotToken),
+        SmtpChannel s      => IsPlaintext(s.Password),
+        WebhookChannel w   => w.Headers is not null && w.Headers.Values.Any(IsPlaintext),
+        SlackChannel s     => IsPlaintext(s.WebhookUrl),
+        DiscordChannel d   => IsPlaintext(d.WebhookUrl),
+        TeamsChannel tm    => IsPlaintext(tm.WebhookUrl),
+        PagerDutyChannel p => IsPlaintext(p.RoutingKey),
+        HttpFlowChannel hf => hf.Secrets.Values.Any(IsPlaintext),
+        _ => false,
+    };
+    private bool IsPlaintext(string? v) => !string.IsNullOrEmpty(v) && !_protector.IsProtected(v);
 }
 
 // ── DTO types for JSON serialisation ─────────────────────────────────────────
@@ -209,6 +275,8 @@ internal sealed class AlertRuleDto
     public int                  WindowSeconds   { get; set; } = 300;
     public int                  ForSeconds      { get; set; }
     public int                  CooldownSeconds { get; set; } = 900;
+    public int                  RepeatSeconds   { get; set; }
+    public int                  EscalateSeconds { get; set; }
     public string?              Filter          { get; set; }
     public bool                 NoData          { get; set; }
     public string?              Metric          { get; set; }
@@ -235,10 +303,15 @@ internal sealed class AlertChannelConverter : JsonConverter<AlertChannel>
 
         return (type?.ToLowerInvariant()) switch
         {
-            "smtp"     => JsonSerializer.Deserialize<SmtpChannel>(root.GetRawText(), options),
-            "telegram" => JsonSerializer.Deserialize<TelegramChannel>(root.GetRawText(), options),
-            "webhook"  => JsonSerializer.Deserialize<WebhookChannel>(root.GetRawText(), options),
-            _          => JsonSerializer.Deserialize<WebhookChannel>(root.GetRawText(), options),
+            "smtp"      => JsonSerializer.Deserialize<SmtpChannel>(root.GetRawText(), options),
+            "telegram"  => JsonSerializer.Deserialize<TelegramChannel>(root.GetRawText(), options),
+            "webhook"   => JsonSerializer.Deserialize<WebhookChannel>(root.GetRawText(), options),
+            "slack"     => JsonSerializer.Deserialize<SlackChannel>(root.GetRawText(), options),
+            "discord"   => JsonSerializer.Deserialize<DiscordChannel>(root.GetRawText(), options),
+            "teams"     => JsonSerializer.Deserialize<TeamsChannel>(root.GetRawText(), options),
+            "pagerduty" => JsonSerializer.Deserialize<PagerDutyChannel>(root.GetRawText(), options),
+            "httpflow"  => JsonSerializer.Deserialize<HttpFlowChannel>(root.GetRawText(), options),
+            _           => JsonSerializer.Deserialize<WebhookChannel>(root.GetRawText(), options),
         };
     }
 
@@ -247,9 +320,14 @@ internal sealed class AlertChannelConverter : JsonConverter<AlertChannel>
     {
         switch (value)
         {
-            case WebhookChannel  wh: JsonSerializer.Serialize(writer, wh, options); break;
-            case SmtpChannel     sm: JsonSerializer.Serialize(writer, sm, options); break;
-            case TelegramChannel tg: JsonSerializer.Serialize(writer, tg, options); break;
+            case WebhookChannel   wh: JsonSerializer.Serialize(writer, wh, options); break;
+            case SmtpChannel      sm: JsonSerializer.Serialize(writer, sm, options); break;
+            case TelegramChannel  tg: JsonSerializer.Serialize(writer, tg, options); break;
+            case SlackChannel     sl: JsonSerializer.Serialize(writer, sl, options); break;
+            case DiscordChannel   dc: JsonSerializer.Serialize(writer, dc, options); break;
+            case TeamsChannel     tm: JsonSerializer.Serialize(writer, tm, options); break;
+            case PagerDutyChannel pd: JsonSerializer.Serialize(writer, pd, options); break;
+            case HttpFlowChannel  hf: JsonSerializer.Serialize(writer, hf, options); break;
             default: JsonSerializer.Serialize(writer, value, options); break;
         }
     }

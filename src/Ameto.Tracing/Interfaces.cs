@@ -86,6 +86,45 @@ public interface ITraceStatsProvider
 }
 
 /// <summary>
+/// Pre-aggregated trace-level views built from <c>.tracesum</c> sidecars — the list rows
+/// and the volume sparkline are served without deserialising any spans.
+/// </summary>
+public interface ITraceSummaryProvider
+{
+    /// <summary>
+    /// Newest-first, filtered trace summaries for the list view. Merges the hot tier with
+    /// cold <c>.tracesum</c> bodies (deduped by trace id), applies the cheap filters, and
+    /// returns at most <paramref name="limit"/> rows.
+    /// </summary>
+    Task<IReadOnlyList<Ameto.Tracing.Storage.TraceSummary>> GetTraceListAsync(
+        DateTimeOffset   from,
+        DateTimeOffset   to,
+        string?          serviceName,
+        string?          spanName,
+        SpanStatusCode?  status,
+        long?            minDurationNanos,
+        long?            maxDurationNanos,
+        int              limit,
+        CancellationToken ct = default);
+
+    /// <summary>
+    /// Trace volume (total/error counts + time-bucketed sparkline) over [from, to],
+    /// read from the tiny <c>.tracesum</c> volume headers + hot tier.
+    /// </summary>
+    Task<TraceVolume> GetTraceVolumeAsync(
+        DateTimeOffset from, DateTimeOffset to, int buckets, CancellationToken ct = default);
+}
+
+/// <summary>Trace-volume result: totals + per-bucket sparklines.</summary>
+public sealed class TraceVolume
+{
+    public int      TotalTraces    { get; init; }
+    public int      ErrorTraces    { get; init; }
+    public double[] TotalSparkline { get; init; } = [];
+    public double[] ErrorSparkline { get; init; } = [];
+}
+
+/// <summary>
 /// Provides access to stored trace/span data.
 /// </summary>
 public interface ITraceProvider

@@ -34,7 +34,7 @@ public static class EndpointMapper
                 totalEvents     = segs.Sum(s => (long)s.EventCount),
                 compressedBytes = segs.Sum(s => s.CompressedBytes),
             });
-        }).RequireAuthorization();
+        }).RequireAuthorization(AuthServiceExtensions.PolicyViewStats);
 
         // ── Ingest: POST /api/events  (CLEF msgpack batch) ───────────────────
         // Hot path: validated via in-memory ApiKeyCache (no JWT, no DB hit).
@@ -121,7 +121,7 @@ public static class EndpointMapper
                 await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
             }
             catch (OperationCanceledException) { /* client disconnected */ }
-        }).RequireAuthorization();
+        }).RequireAuthorization(AuthServiceExtensions.PolicyViewLogs);
 
         // ── Distinct property names: GET /api/events/props ───────────────────
         // Returns sorted unique property keys from the last 24 h (up to 5 000 events sampled).
@@ -141,7 +141,7 @@ public static class EndpointMapper
                     props.Add(key);
             }
             return Results.Ok(props.ToArray());
-        }).RequireAuthorization();
+        }).RequireAuthorization(AuthServiceExtensions.PolicyViewLogs);
 
         // ── Distinct services: GET /api/events/services ───────────────────────
         // Returns sorted unique values of ApplicationContext / service.name properties
@@ -166,7 +166,7 @@ public static class EndpointMapper
                     services.Add(svc);
             }
             return Results.Ok(services.ToArray());
-        }).RequireAuthorization();
+        }).RequireAuthorization(AuthServiceExtensions.PolicyViewLogs);
 
         // ── Event counts by service + level over time: GET /api/events/counts ─
         // Powers the "Log events" chart / stats. Buckets per-service AND per-level
@@ -260,7 +260,7 @@ public static class EndpointMapper
 
             cache.Set(cacheKey, response);
             return Results.Json(response, EventCountsJsonContext.Default.EventCountsResponse);
-        }).RequireAuthorization();
+        }).RequireAuthorization(AuthServiceExtensions.PolicyViewLogs);
 
         // ── Live tail: GET /api/events/live  (SSE) ────────────────────────────
         // Streams new events as Server-Sent Events in CLEF JSON format.
@@ -317,7 +317,7 @@ public static class EndpointMapper
                     try { await Task.Delay(250, ctx.RequestAborted); } catch (OperationCanceledException) { break; }
                 }
             }
-        }).RequireAuthorization();
+        }).RequireAuthorization(AuthServiceExtensions.PolicyViewLogs);
 
         // ── Span logs: GET /api/spans/{spanId}/logs ───────────────────────────
         // Returns up to 500 log events that were emitted within the given span.
@@ -358,7 +358,7 @@ public static class EndpointMapper
                 results.Add(LogEventDto.From(ev));
 
             await ctx.Response.WriteAsJsonAsync(results, _json, ctx.RequestAborted);
-        }).RequireAuthorization();
+        }).RequireAuthorization(AuthServiceExtensions.PolicyViewLogs);
 
         // ── Trace logs: GET /api/traces/{traceId}/logs ────────────────────────
         // Returns every log event correlated to the trace (filtered on @tr). This is
@@ -402,7 +402,7 @@ public static class EndpointMapper
                 results.Add(LogEventDto.From(ev));
 
             await ctx.Response.WriteAsJsonAsync(results, _json, ctx.RequestAborted);
-        }).RequireAuthorization();
+        }).RequireAuthorization(AuthServiceExtensions.PolicyViewLogs);
     }
 
     // ── API-key extraction (ingest path only) ─────────────────────────────────

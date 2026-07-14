@@ -1,11 +1,17 @@
+# syntax=docker/dockerfile:1
+# BuildKit is required (default in modern Docker) for the --mount=type=cache
+# package caches and COPY --chmod below.
+
 # ── Stage 1: Build Angular SPA ────────────────────────────────────────────────
 FROM node:22-alpine AS client-build
 
 WORKDIR /build/client
 
-# Install dependencies (cached layer)
+# Install dependencies (cached layer). The npm cache is a BuildKit cache mount,
+# so a changed lockfile re-links from cache instead of re-downloading the world.
 COPY client/package*.json ./
-RUN npm ci --prefer-offline --no-audit --no-fund
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --prefer-offline --no-audit --no-fund
 
 # Build production bundle
 COPY client/ ./
@@ -20,21 +26,47 @@ RUN if [ -d /build/wwwroot/browser ]; then \
 # ── Stage 2: Build .NET Server ────────────────────────────────────────────────
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS server-build
 
+ENV DOTNET_NOLOGO=1 \
+    DOTNET_CLI_TELEMETRY_OPTOUT=1
+
 WORKDIR /build
 
-# Restore NuGet packages first (cached layer — only re-runs when csproj files change)
+# Restore first, from the project graph ONLY. Copying just the .slnx + every
+# .csproj reachable from Ameto.Server (before any .cs) means the expensive
+# `dotnet restore` layer is cached and only re-runs when a project file changes —
+# editing source no longer re-downloads NuGet. Keep this list in sync with the
+# Ameto.Server project reference graph.
 COPY Ameto.slnx ./
-COPY src/ ./src/
+COPY src/Ameto.Core/Ameto.Core.csproj             src/Ameto.Core/
+COPY src/Ameto.Storage/Ameto.Storage.csproj       src/Ameto.Storage/
+COPY src/Ameto.Indexing/Ameto.Indexing.csproj     src/Ameto.Indexing/
+COPY src/Ameto.Query/Ameto.Query.csproj           src/Ameto.Query/
+COPY src/Ameto.Ingestion/Ameto.Ingestion.csproj   src/Ameto.Ingestion/
+COPY src/Ameto.Metrics/Ameto.Metrics.csproj       src/Ameto.Metrics/
+COPY src/Ameto.Tracing/Ameto.Tracing.csproj       src/Ameto.Tracing/
+COPY src/Ameto.Otel/Ameto.Otel.csproj             src/Ameto.Otel/
+COPY src/Ameto.Alerts/Ameto.Alerts.csproj         src/Ameto.Alerts/
+COPY src/Ameto.Replication/Ameto.Replication.csproj src/Ameto.Replication/
+COPY src/Ameto.Server/Ameto.Server.csproj         src/Ameto.Server/
 
-RUN dotnet restore src/Ameto.Server/Ameto.Server.csproj \
+# The NuGet global-packages folder is a BuildKit cache mount — persisted across
+# builds, so restore is near-instant once warm. It must be declared on BOTH the
+# restore and the publish RUN (publish --no-restore reads packages from it).
+RUN --mount=type=cache,target=/root/.nuget/packages \
+    dotnet restore src/Ameto.Server/Ameto.Server.csproj \
         --runtime linux-musl-x64
 
-# Copy Angular output into wwwroot before publish
+# Now bring in the actual sources + the built SPA (these layers change often, but
+# they sit AFTER the cached restore).
+COPY src/ ./src/
 COPY --from=client-build /build/wwwroot ./src/Ameto.Server/wwwroot/
 
 # linux-musl-x64        → Alpine runtime base (tiny vs Debian)
 # InvariantGlobalization → drop the ~28 MB ICU dependency (app parses invariantly)
-RUN dotnet publish src/Ameto.Server/Ameto.Server.csproj \
+# The residual .pdb/.xml/web.config/locale strip runs in the same layer so it
+# never lands in an intermediate layer.
+RUN --mount=type=cache,target=/root/.nuget/packages \
+    dotnet publish src/Ameto.Server/Ameto.Server.csproj \
         --configuration Release \
         --output /publish \
         --runtime linux-musl-x64 \
@@ -43,14 +75,12 @@ RUN dotnet publish src/Ameto.Server/Ameto.Server.csproj \
         /p:DebugSymbols=false \
         /p:GenerateDocumentationFile=false \
         /p:InvariantGlobalization=true \
-        --no-restore
-
-# Strip residual debug / doc files
-RUN find /publish -name '*.pdb' -delete && \
-    find /publish -name '*.xml' -delete && \
-    find /publish -name 'web.config' -delete && \
-    find /publish -maxdepth 1 -type d -regextype posix-extended \
-         -regex '.*/[a-z]{2}(-[A-Z]{2})?$' -exec rm -rf {} + 2>/dev/null || true
+        --no-restore \
+ && find /publish -name '*.pdb' -delete \
+ && find /publish -name '*.xml' -delete \
+ && find /publish -name 'web.config' -delete \
+ && find /publish -maxdepth 1 -type d -regextype posix-extended \
+        -regex '.*/[a-z]{2}(-[A-Z]{2})?$' -exec rm -rf {} + 2>/dev/null || true
 
 # ── Stage 3: Runtime image ────────────────────────────────────────────────────
 # Alpine runtime-deps: musl libc + only the native libs a self-contained .NET
@@ -62,25 +92,27 @@ LABEL org.opencontainers.image.title="Ameto Server" \
       org.opencontainers.image.description="High-performance self-hosted structured log server" \
       org.opencontainers.image.licenses="MIT"
 
-# jemalloc — replaces musl's allocator to keep ingestion-path RSS in check.
-# wget for the HEALTHCHECK is already provided by BusyBox (no install needed).
-RUN apk add --no-cache jemalloc
-
-# Dedicated non-root user — pin uid 999 to match data volumes created by the prior
-# (Debian/Ubuntu) image, whose system user was uid 999. The /data files are owner-
-# writable (-rw-r--r--), so matching the OWNER uid is what matters; gid 999 is already
-# taken by 'ping' on Alpine, so the group keeps an auto-assigned id. Without the pin,
-# BusyBox picks uid 100 and the process can't write existing files → SQLite
-# "attempt to write a readonly database".
-RUN addgroup ameto \
- && adduser -D -H -u 999 -G ameto ameto
+# One layer for all image prep:
+#   jemalloc  — replaces musl's allocator to keep ingestion-path RSS in check
+#               (high-churn small allocations; purges aggressively). wget for the
+#               HEALTHCHECK is already provided by BusyBox.
+#   ameto user — dedicated non-root identity, uid pinned to 999 to match data
+#               volumes created by the prior (Debian/Ubuntu) image whose system
+#               user was uid 999. The /data files are owner-writable, so matching
+#               the OWNER uid is what matters; gid 999 is already taken by 'ping'
+#               on Alpine so the group keeps an auto-assigned id. Without the pin,
+#               BusyBox picks uid 100 and the process can't write existing files
+#               → SQLite "attempt to write a readonly database".
+#   /data     — persisted volume for log/metric/trace segments + SQLite (Ameto.db).
+RUN apk add --no-cache jemalloc \
+ && addgroup ameto \
+ && adduser -D -H -u 999 -G ameto ameto \
+ && mkdir -p /data && chown ameto:ameto /data
 
 WORKDIR /app
-COPY --from=server-build /publish ./
-RUN chmod +x ./Ameto.Server
+# --chmod makes Ameto.Server executable at copy time (no extra chmod layer).
+COPY --from=server-build --chmod=755 /publish ./
 
-# Data volume — persists log/metric/trace segments + SQLite (Ameto.db) across restarts.
-RUN mkdir -p /data && chown ameto:ameto /data
 VOLUME ["/data"]
 
 # ── Configuration via environment variables ───────────────────────────────────

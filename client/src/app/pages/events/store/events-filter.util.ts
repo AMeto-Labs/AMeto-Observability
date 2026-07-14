@@ -9,8 +9,9 @@ const IDENT_RE = /^[A-Za-z_@][A-Za-z0-9_@]*$/;
 /** Matches the trailing token under the caret that the autocomplete popup completes. */
 export const PREFIX_RE = /[@A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$/;
 
-/** Matches an `@l = …` / `@l in […]` clause for splicing. */
-const LEVEL_CLAUSE_RE = /@l\s*(=|in|!=)[^)\n]+(\))?/g;
+/** Matches an `@l = …` / `@l <> …` / `@l in […]` / `@l not in […]` clause for splicing. */
+const LEVEL_CLAUSE_RE =
+  /@l\s+not\s+in\s*\[[^\]]*\]|@l\s+in\s*\[[^\]]*\]|@l\s*(?:<>|!=|=)\s*'[^']*'/gi;
 
 /** Matches a `['service.name']` clause (and the legacy OR-form) for splicing. */
 const SERVICE_CLAUSE_RE =
@@ -86,11 +87,25 @@ export function stripFilterClause(expr: string, pattern: RegExp): string {
 
 /** Active log levels in a filter expression. Full set when there's no `@l` clause. */
 export function parseLevelsFromFilter(expr: string): Set<string> {
+  // `@l not in ['A', 'B']` ⇒ every level except the listed ones.
+  const notInMatch = expr.match(/@l\s+not\s+in\s*\[([^\]]+)\]/i);
+  if (notInMatch) {
+    const levels = ALL_LEVELS();
+    for (const m of notInMatch[1].matchAll(/'([^']+)'/g)) levels.delete(m[1]);
+    return levels;
+  }
   const inMatch = expr.match(/@l\s+in\s*\[([^\]]+)\]/i);
   if (inMatch) {
     const levels = new Set<string>();
     for (const m of inMatch[1].matchAll(/'([^']+)'/g)) levels.add(m[1]);
     return levels.size > 0 ? levels : ALL_LEVELS();
+  }
+  // `@l <> 'A'` / `@l != 'A'` ⇒ every level except A.
+  const neqMatch = expr.match(/@l\s*(?:<>|!=)\s*'([^']+)'/i);
+  if (neqMatch) {
+    const levels = ALL_LEVELS();
+    levels.delete(neqMatch[1]);
+    return levels;
   }
   const eqMatch = expr.match(/@l\s*=\s*'([^']+)'/i);
   if (eqMatch) return new Set([eqMatch[1]]);
@@ -114,9 +129,15 @@ export function parseServicesFromFilter(expr: string): Set<string> {
 export function setLevelsClause(expr: string, levels: Set<string>): string {
   const stripped = stripFilterClause(expr, LEVEL_CLAUSE_RE);
   if (levels.size === LEVELS.length) return stripped;
-  const clause = levels.size === 1
-    ? `@l = '${[...levels][0]}'`
-    : `@l in [${[...levels].map(l => `'${l}'`).join(', ')}]`;
+  let clause: string;
+  if (levels.size === 1) {
+    clause = `@l = '${[...levels][0]}'`;
+  } else if (levels.size === LEVELS.length - 1) {
+    const excluded = (LEVELS as readonly string[]).find((l) => !levels.has(l))!;
+    clause = `@l <> '${excluded}'`;
+  } else {
+    clause = `@l in [${[...levels].map((l) => `'${l}'`).join(', ')}]`;
+  }
   return stripped.trim() ? `${clause} and ${stripped.trim()}` : clause;
 }
 
@@ -131,7 +152,7 @@ export function setServicesClause(expr: string, svcs: Set<string>): string {
   const clause = svcs.size === 1
     ? `['service.name'] = '${[...svcs][0]}'`
     : `['service.name'] in [${[...svcs].map(s => `'${s}'`).join(', ')}]`;
-  const lvlMatch = stripped.match(/^(@l\s*(?:=|in)\s*\[[^\]]+\]|@l\s*=\s*'[^']*')(\s+and\s+|$)/i);
+  const lvlMatch = stripped.match(/^(@l\s+(?:not\s+in|in)\s*\[[^\]]+\]|@l\s*(?:<>|!=|=)\s*'[^']*')(\s+and\s+|$)/i);
   if (lvlMatch) {
     const rest = stripped.slice(lvlMatch[0].length).trim();
     return rest ? `${lvlMatch[1]} and ${clause} and ${rest}` : `${lvlMatch[1]} and ${clause}`;

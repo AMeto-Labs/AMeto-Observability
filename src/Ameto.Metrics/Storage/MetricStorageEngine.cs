@@ -59,6 +59,10 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     private readonly Task                    _flushTask;
     private readonly Task                    _rollupTask;
 
+    // 0 = live, 1 = disposed. Guards against the multiple DisposeAsync calls
+    // that occur at host shutdown (see DisposeAsync).
+    private int _disposed;
+
     public MetricStorageEngine(string dataDir, ILogger<MetricStorageEngine> logger)
     {
         _dataDir = dataDir;
@@ -647,6 +651,13 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
     public async ValueTask DisposeAsync()
     {
+        // Idempotent: this engine is disposed more than once at host shutdown —
+        // the DI container disposes the singleton IAsyncDisposable, and
+        // MetricStorageHostedService additionally calls DisposeAsync from both
+        // StopAsync and its own DisposeAsync. Cancelling/disposing the CTS twice
+        // throws ObjectDisposedException, so bail out after the first pass.
+        if (System.Threading.Interlocked.Exchange(ref _disposed, 1) != 0) return;
+
         _cts.Cancel();
         try { await Task.WhenAll(_flushTask, _rollupTask); }
         catch (OperationCanceledException) { }

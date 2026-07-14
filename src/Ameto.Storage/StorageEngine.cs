@@ -48,7 +48,21 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     // Hot tier
     private          HotTierSegment                       _hot;
     private          WriteAheadLog?                       _wal;
+    // Serialises only the fast hot-tier/WAL *swap* — NOT the heavy cold-segment write.
+    // WaitAsync(0) drops a redundant trigger: whoever holds it swaps the whole tier.
     private readonly SemaphoreSlim                        _flushLock  = new(1, 1);
+    // Bounds how many cold-segment builds (index + compress + write) run concurrently.
+    // The swap hands off to this so multiple segments persist in parallel on idle cores
+    // instead of serialising behind one flush (the 50k/s ingest-drop bottleneck).
+    private readonly SemaphoreSlim                        _flushConcurrency;
+    // Back-pressure gate: caps how many frozen-but-not-yet-persisted hot tiers may be
+    // in flight, bounding RAM (≈ slots × HotTier.MaxSizeBytes). When exhausted the swap
+    // is skipped, so the full hot tier back-pressures the drainer instead of buffering
+    // unbounded tiers in memory. Acquired non-blocking at swap, released after persist.
+    private readonly SemaphoreSlim                        _flushSlots;
+    // In-flight parallel cold-flush tasks, so DisposeAsync can await them before the
+    // tiers they read are freed. Self-pruning via ContinueWith on completion.
+    private readonly ConcurrentDictionary<Task, byte>    _inFlightFlushes = new();
     private readonly CancellationTokenSource               _cts        = new();
     private readonly Task                                  _flushLoop;
 
@@ -62,13 +76,16 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     private readonly List<(HotTierSegment Tier, ulong SegId)> _frozenHot = new();
     private readonly object                                   _frozenLock = new();
 
-    // Previously-frozen hot tier awaiting disposal. Disposed on the next flush
-    // cycle so any in-flight query that captured the reference has time to drain.
-    private HotTierSegment?                                   _retiredHot;
+    // Frozen hot tiers whose cold segment has been written and which are no longer in
+    // _frozenHot, but which an in-flight query may still hold a reference to. Disposed
+    // once _activeReaders hits zero (see RetireHotTier / DrainRetired). A list (not a
+    // single slot) because parallel flushes can retire several tiers concurrently.
+    private readonly List<HotTierSegment>                     _retired    = new();
+    private readonly object                                   _retireLock = new();
 
     // Number of HotTierReaderSnapshot instances currently in-flight. Incremented
     // by OpenHotTierReader, decremented by snapshot.Dispose(). Used to eagerly
-    // release the retired hot tier when no query could possibly observe it.
+    // release retired hot tiers when no query could possibly observe them.
     private int _activeReaders;
 
     // Monotonic segment counter
@@ -86,6 +103,20 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         _options        = options.Value;
         _retentionStore = retentionStore;
         _logger         = logger;
+        // Parallel cold-flush width: concurrent index+compress+write jobs saturate idle
+        // cores so flush throughput exceeds ingest and the backlog drains. Configurable
+        // (HotTier.FlushConcurrency); 0 = auto ≈ processor count / 2, capped 2–8.
+        int flushWidth = _options.HotTier.FlushConcurrency > 0
+            ? Math.Min(_options.HotTier.FlushConcurrency, 64)
+            : Math.Clamp(Environment.ProcessorCount / 2, 1, 8);
+        _flushConcurrency = new SemaphoreSlim(flushWidth);
+        // In-flight tier cap: bound the frozen-tier backlog to ~1 GB of RSS. A frozen tier
+        // costs roughly 1.4 × MaxSizeBytes resident (payload + headers + partial last chunk),
+        // so budget against that, floored at the flush width so every concurrent flush can
+        // hold a slot. Smaller tiers ⇒ a deeper backlog for the same ceiling (smoother).
+        long tierFootprint = (long)(Math.Max(1, _options.HotTier.MaxSizeBytes) * 1.4);
+        int  flushSlots    = Math.Clamp((int)(1_073_741_824L / tierFootprint), flushWidth, 64);
+        _flushSlots = new SemaphoreSlim(flushSlots, flushSlots);
         _idGen    = new EventIdGenerator(_options.NodeId);
         _dataDir  = _options.DataDirectory;
         _walDir   = Path.Combine(_dataDir, "wal");
@@ -241,7 +272,8 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
     private void OnReaderDisposed()
     {
-        Interlocked.Decrement(ref _activeReaders);
+        if (Interlocked.Decrement(ref _activeReaders) == 0)
+            DrainRetired();
     }
 
     /// <summary>
@@ -302,7 +334,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         if (!_hot.TryWrite(h, propertiesPayload, template, exception))
         {
             // Hot tier full — schedule async flush and signal back-pressure
-            _ = Task.Run(() => TryFlushAsync());
+            ScheduleFlush();
             return false;
         }
 
@@ -320,7 +352,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
         // Check size threshold
         if (_hot.IsFull)
-            _ = Task.Run(() => TryFlushAsync());
+            ScheduleFlush();
 
         return true;
     }
@@ -357,106 +389,140 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
     // ── Flush ─────────────────────────────────────────────────────────────────
 
+    /// <summary>Fire-and-forget a parallel flush, tracked so shutdown can await it.</summary>
+    private void ScheduleFlush()
+    {
+        var t = Task.Run(() => TryFlushAsync());
+        _inFlightFlushes[t] = 0;
+        _ = t.ContinueWith(
+            static (x, s) => ((ConcurrentDictionary<Task, byte>)s!).TryRemove(x, out _),
+            _inFlightFlushes, CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+    }
+
     private async Task TryFlushAsync(CancellationToken ct = default)
     {
-        if (!await _flushLock.WaitAsync(0, ct)) return; // another flush in progress
-
+        // ── SWAP PHASE — serialised (via _flushLock) and fast. Freezes the current
+        //    hot tier, publishes it to the frozen list, installs a fresh hot tier and
+        //    rotates the WAL, then releases the lock so the NEXT full tier can be
+        //    swapped while this one is still being persisted by the heavy phase.
         HotTierSegment? oldHot     = null;
         WriteAheadLog?  oldWal     = null;
         string?         oldWalPath = null;
-        bool            addedToFrozen = false;
         ulong           reservedSegId = 0;
+
+        if (!await _flushLock.WaitAsync(0, ct)) return; // a swap is already in progress
         try
         {
-            if (_hot.Count == 0)
-                return;
+            if (_hot.Count == 0) return;
 
-            // Atomically swap hot tier
+            // Back-pressure gate: if the in-flight tier budget is exhausted, skip the swap.
+            // The hot tier stays full → TryWrite returns false → the drainer parks (ring
+            // back-pressure) rather than letting frozen tiers pile up unbounded in RAM.
+            if (!_flushSlots.Wait(0)) return;
+
             oldHot     = _hot;
             oldWal     = _wal;
             oldWalPath = oldWal?.FilePath;
             oldHot.Freeze();
 
-            // Reserve the next segment id and publish oldHot to the frozen-tier
-            // list under the same lock that queries use to snapshot. Queries
-            // opened from this point on will see oldHot's events AND skip the
-            // reserved cold segment id (which will exist briefly during the
-            // overlap between segment registration and frozen-list removal).
+            // Publish oldHot + reserve its segment id under the lock queries snapshot
+            // from, so a concurrent query sees oldHot's events AND skips the reserved
+            // cold segment id (no duplicates during the register/remove overlap).
             reservedSegId = _nextSegmentId;
-            lock (_frozenLock)
-            {
-                _frozenHot.Add((oldHot, reservedSegId));
-                addedToFrozen = true;
-            }
+            lock (_frozenLock) { _frozenHot.Add((oldHot, reservedSegId)); }
 
             _hot = CreateHotTier();
 
-            // Advance segment counter and open new WAL *before* releasing old WAL,
-            // so the drain loop never writes to a disposed WAL.
-            // Bump _nextSegmentId first so OpenWal uses the *next* id, not the same one.
+            // Rotate the WAL: bump the counter first so the new WAL uses the *next* id,
+            // then swap it in before releasing the old file so the drain loop never
+            // writes to a disposed WAL.
             _nextSegmentId++;
-            _wal = null;          // guard: if OpenWal throws, drain loop stops writing
-            oldWal?.Dispose();    // release file lock before opening new file
-            oldWal = null;
+            _wal = null;
+            oldWal?.Dispose();
             OpenWal();
-
-            // Flush old hot tier to cold segment (no index yet — Indexing layer adds them)
-            var segId   = new SegmentId(reservedSegId);
-            var segPath = BuildSegmentPath(segId, oldHot);
-            var info    = await FlushToColdAsync(oldHot, segId, segPath, ct);
-
-            // Atomically: register the cold segment AND drop oldHot from the
-            // frozen list. The reader's CoveredSegmentIds still includes the
-            // segment id (snapshot was taken earlier), so the cold scan will
-            // skip it and we avoid duplicates.
-            lock (_frozenLock)
-            {
-                _segments[segId.Value] = info;
-                _frozenHot.RemoveAll(f => ReferenceEquals(f.Tier, oldHot));
-                addedToFrozen = false;
-            }
-            _logger.LogInformation("Flushed segment {Id}: {Count} events → {Path}", segId, info.EventCount, segPath);
-
-            // Notify cluster replicator
-            SegmentFlushed?.Invoke(info);
-
-            // Delete WAL and companion pool file after successful flush
-            if (oldWalPath is not null)
-            {
-                try { File.Delete(oldWalPath); }
-                catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete WAL {Path}", oldWalPath); }
-                try { File.Delete(oldWalPath + ".pool"); } catch { /* best-effort */ }
-            }
         }
-        catch (Exception ex)
+        finally { _flushLock.Release(); }
+
+        if (oldHot is null) return; // hot tier was empty — nothing swapped (no slot taken)
+
+        // ── HEAVY PHASE — parallel, bounded by _flushConcurrency. Builds the inverted/
+        //    trigram/bloom indexes, compresses and writes the cold segment. Runs off the
+        //    swap lock so several segments persist at once on otherwise idle cores. The
+        //    back-pressure slot (taken at swap) is held until the tier is fully persisted.
+        try
         {
-            _logger.LogError(ex, "Segment flush failed");
-            // On failure, leave oldHot in _frozenHot so its events remain
-            // visible to queries; the WAL on disk lets recovery replay them on
-            // restart. Skip the retirement step below — oldHot is still in use.
-            if (addedToFrozen) oldHot = null;
+            await _flushConcurrency.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                var segId   = new SegmentId(reservedSegId);
+                var segPath = BuildSegmentPath(segId, oldHot);
+
+                SegmentInfo info;
+                try
+                {
+                    info = await FlushToColdAsync(oldHot, segId, segPath, ct);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex, "Segment flush failed");
+                    // Leave oldHot in _frozenHot so its events stay queryable; the WAL on
+                    // disk replays them on restart. Do not retire — still referenced.
+                    return;
+                }
+
+                // Register the cold segment AND drop oldHot from the frozen list atomically.
+                lock (_frozenLock)
+                {
+                    _segments[segId.Value] = info;
+                    _frozenHot.RemoveAll(f => ReferenceEquals(f.Tier, oldHot));
+                }
+                _logger.LogInformation("Flushed segment {Id}: {Count} events → {Path}", segId, info.EventCount, segPath);
+
+                SegmentFlushed?.Invoke(info);
+
+                if (oldWalPath is not null)
+                {
+                    try { File.Delete(oldWalPath); }
+                    catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete WAL {Path}", oldWalPath); }
+                    try { File.Delete(oldWalPath + ".pool"); } catch { /* best-effort */ }
+                }
+
+                RetireHotTier(oldHot);
+            }
+            finally { _flushConcurrency.Release(); }
         }
-        finally
+        finally { _flushSlots.Release(); }
+    }
+
+    /// <summary>
+    /// Frees a flushed hot tier once no query can still be reading it. Any query holding
+    /// a reference snapshotted it (and incremented <see cref="_activeReaders"/>) under
+    /// <see cref="_frozenLock"/> before it was removed from <see cref="_frozenHot"/>, so
+    /// <c>_activeReaders == 0</c> proves no reader holds this — or any earlier-retired —
+    /// tier. A list (not one slot) because parallel flushes retire tiers concurrently.
+    /// </summary>
+    private void RetireHotTier(HotTierSegment tier)
+    {
+        lock (_retireLock)
         {
-            // Retirement: if no readers are active, dispose oldHot immediately;
-            // otherwise rotate it through _retiredHot so any in-flight query
-            // that captured the reference before we removed it from _frozenHot
-            // has time to drain (released on the next flush cycle).
-            HotTierSegment? toDispose;
+            _retired.Add(tier);
             if (Volatile.Read(ref _activeReaders) == 0)
             {
-                toDispose   = _retiredHot;
-                _retiredHot = null;
-                oldHot?.Dispose();
+                foreach (var t in _retired) t.Dispose();
+                _retired.Clear();
             }
-            else
-            {
-                toDispose   = _retiredHot;
-                _retiredHot = oldHot;
-            }
-            toDispose?.Dispose();
-            oldWal?.Dispose();
-            _flushLock.Release();
+        }
+    }
+
+    /// <summary>Disposes retired tiers once the last concurrent reader finishes.</summary>
+    private void DrainRetired()
+    {
+        lock (_retireLock)
+        {
+            if (_retired.Count == 0 || Volatile.Read(ref _activeReaders) != 0) return;
+            foreach (var t in _retired) t.Dispose();
+            _retired.Clear();
         }
     }
 
@@ -719,20 +785,33 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         catch (OperationCanceledException) { }
         catch (ObjectDisposedException) { }
 
+        // Await all in-flight parallel flushes before freeing the frozen tiers they
+        // read — disposing their native memory mid-flush faults (AccessViolation).
+        // No new flush can start: the age loop is stopped and no writes remain.
+        try { await Task.WhenAll(_inFlightFlushes.Keys.ToArray()); } catch { /* best-effort */ }
+
         if (_hot.Count > 0)
         {
-            try { await TryFlushAsync(); }
-            catch { /* best-effort final flush */ }
+            try { await TryFlushAsync(); } catch { /* best-effort final flush */ }
+            // TryFlushAsync's heavy phase runs to completion inline here (we awaited it),
+            // but a concurrent trigger may have scheduled another — drain those too.
+            try { await Task.WhenAll(_inFlightFlushes.Keys.ToArray()); } catch { }
         }
 
         _hot.Dispose();
-        _retiredHot?.Dispose();
+        lock (_retireLock)
+        {
+            foreach (var t in _retired) t.Dispose();
+            _retired.Clear();
+        }
         lock (_frozenLock)
         {
             foreach (var (tier, _) in _frozenHot) tier.Dispose();
             _frozenHot.Clear();
         }
         _wal?.Dispose();
+        _flushConcurrency.Dispose();
+        _flushSlots.Dispose();
         _flushLock.Dispose();
         _cts.Dispose();
     }

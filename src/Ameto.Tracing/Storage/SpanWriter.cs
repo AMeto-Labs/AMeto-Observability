@@ -127,6 +127,9 @@ internal static class SpanWriter
         // ── .svcgraph sidecar ──────────────────────────────────────────────────
         ServiceGraphSidecar.Write(trcPath, spans);
 
+        // ── .tracesum sidecar (volume header + per-trace rows) ──────────────────
+        TraceSummarySidecar.Write(trcPath, spans);
+
         var services = new string[svcBlockMap.Count];
         svcBlockMap.Keys.CopyTo(services, 0);
 

@@ -25,6 +25,10 @@ internal sealed class SpanDrainer : IAsyncDisposable
     private readonly Task                 _drainTask;
     private readonly CancellationTokenSource _cts = new();
 
+    // 0 = live, 1 = disposed. Guards against the multiple DisposeAsync calls at
+    // host shutdown (see DisposeAsync).
+    private int _disposed;
+
     private DateTime _lastFlush = DateTime.UtcNow;
 
     private readonly SpanIngestItem?[] _batch = new SpanIngestItem?[BatchSize];
@@ -96,6 +100,11 @@ internal sealed class SpanDrainer : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        // Idempotent: SpanDrainerService disposes this from both StopAsync and its
+        // own DisposeAsync, and the DI container disposes the singleton as well.
+        // Cancelling/disposing the CTS twice throws ObjectDisposedException.
+        if (System.Threading.Interlocked.Exchange(ref _disposed, 1) != 0) return;
+
         _cts.Cancel();
         try { await _drainTask.ConfigureAwait(false); }
         catch (OperationCanceledException) { }

@@ -18,6 +18,17 @@ var builder = WebApplication.CreateBuilder(new WebApplicationOptions
     // of the working directory the process is started from.
     ContentRootPath = AppContext.BaseDirectory,
 });
+
+// ── Windows Service hosting ───────────────────────────────────────────────────
+// No-op unless the process is actually launched by the Windows SCM
+// (WindowsServiceHelpers.IsWindowsService() returns true). On Linux, in the
+// Docker image, and when run from a console this does nothing, so the container
+// and systemd paths are unaffected. Without it, a service registered by the
+// Windows installer never signals SERVICE_RUNNING and the SCM aborts it with
+// "Error 1053: the service did not respond to the start request in a timely
+// fashion". It also routes host logs to the Windows Event Log when running as a
+// service (no console is attached).
+builder.Services.AddWindowsService(static options => options.ServiceName = "Ameto");
 // ── Configuration sources ────────────────────────────────────────────────────
 // We use a single, app-specific config file instead of appsettings*.json.
 builder.Configuration.Sources.Clear();
@@ -88,7 +99,21 @@ if (enableAlerts && (!enableMetrics || !enableTracing))
 
 // Alert rules store + evaluator
 if (enableAlerts)
+{
+    // Serialise alert channels by runtime type so their (masked) fields reach the client.
+    builder.Services.ConfigureHttpJsonOptions(o =>
+        o.SerializerOptions.Converters.Add(new Ameto.Server.AlertChannelResponseConverter()));
+
+    // Reversible encryption for channel secrets (bot tokens, SMTP passwords, webhook auth headers).
+    builder.Services.AddSingleton<Ameto.Core.ISecretProtector>(sp =>
+        Ameto.Core.SecretProtectorFactory.Create(
+            serverOptions.DataDirectory,
+            builder.Configuration["Ameto:MasterKey"],
+            path => sp.GetRequiredService<ILogger<Ameto.Core.AesGcmSecretProtector>>().LogWarning(
+                "Secret protector: generated a new master key at {Path}. For production set AMETO__MasterKey and keep it off the data volume.",
+                path)));
     builder.Services.AddAmetoAlerts(serverOptions.DataDirectory);
+}
 
 // Distributed tracing
 if (enableTracing)
@@ -132,6 +157,7 @@ app.UseStaticFiles();
 
 // ── Endpoints ─────────────────────────────────────────────────────────────────
 app.MapAuthEndpoints();
+app.MapSearchHistoryEndpoints();
 app.MapAmetoEndpoints();
 if (enableAlerts)
     app.MapAlertEndpoints();

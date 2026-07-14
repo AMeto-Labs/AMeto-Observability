@@ -117,6 +117,22 @@
   border: 1px solid var(--border-sub);
   border-radius: 6px;
 }
+.d-modal-value {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--log-font-size);
+  line-height: 1.6;
+  color: var(--txt);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 60vh;
+  overflow: auto;
+  padding: 10px 12px;
+  background: var(--bg);
+  border: 1px solid var(--border-sub);
+  border-radius: 6px;
+}
+
 .d-modal-actions {
   display: flex;
   justify-content: flex-end;
@@ -284,6 +300,11 @@
   color: var(--txt);
   word-break: break-all;
   padding-top: 2px;
+  /* Expanded structured values (arrays/objects of long JSON) render a tree wider
+     than this fixed column; each row truncates itself with an ellipsis (see
+     json-viewer one-line mode), so clip here without a scrollbar — the tree never
+     spills into the neighbouring rows/columns. */
+  overflow: hidden;
 }
 
 .d-empty {

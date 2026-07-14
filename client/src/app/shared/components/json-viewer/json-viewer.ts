@@ -84,7 +84,7 @@ function highlightJsonLine(json: string): string {
   standalone: true,
   imports: [LucideAngularModule],
   changeDetection: ChangeDetectionStrategy.OnPush,
-  host: { class: 'jv' },
+  host: { class: 'jv', '[class.jv--one-line]': 'oneLine()' },
   template: `
     @if (isContainer()) {
       <span class="jv-node" [class.jv-open]="expanded()">
@@ -105,7 +105,7 @@ function highlightJsonLine(json: string): string {
             <span class="jv-bracket">{{ isArray() ? '[' : '{' }}</span>
           }
 
-          @if (actions) {
+          @if (actions && rootMenu()) {
             <button class="jv-menu-btn" type="button" title="Filter…"
                     (click)="openMenu($event, path(), value(), true)">
               <lucide-icon name="list-filter" [size]="11" />
@@ -129,7 +129,8 @@ function highlightJsonLine(json: string): string {
                     </button>
                   }
                 } @else {
-                  <app-json-viewer [value]="entry.value" [path]="childPath(entry)" [searchTerm]="searchTerm()" />
+                  <app-json-viewer [value]="entry.value" [path]="childPath(entry)"
+                                   [searchTerm]="searchTerm()" [initialExpanded]="initialExpanded()" />
                 }
               </span>
             }
@@ -140,7 +141,7 @@ function highlightJsonLine(json: string): string {
     } @else {
       <span class="jv-leaf">
         <span [class]="leafClass(value())" [innerHTML]="hl(leafText(value()))"></span>
-        @if (actions) {
+        @if (actions && rootMenu()) {
           <button class="jv-menu-btn" type="button" title="Filter…"
                   (click)="openMenu($event, path(), value(), false)">
             <lucide-icon name="list-filter" [size]="11" />
@@ -159,6 +160,14 @@ export class JsonViewerComponent {
   readonly initialExpanded = input<boolean>(false);
   /** Search term — highlighted in keys and leaf values throughout the tree. */
   readonly searchTerm = input<string>('');
+  /** Clamp the collapsed preview / leaf to a single line, truncating with an
+   *  ellipsis instead of wrapping. Opt-in (Properties list); nested viewers stay
+   *  inline. Expanding a container still reveals the full multi-line tree. */
+  readonly oneLine = input<boolean>(false);
+  /** Show the filter menu button on THIS (root) node. Off in the Properties list,
+   *  where the row already has its own leading menu button — nested nodes still
+   *  show theirs, so per-path filtering stays available when expanded. */
+  readonly rootMenu = input<boolean>(true);
 
   /** Optional — present only when a host (e.g. event-row) provides the channel. */
   protected readonly actions = inject(JsonViewerActions, { optional: true });

@@ -61,7 +61,21 @@ public sealed unsafe class SegmentBloomFilter : IDisposable
         SetBit(block, h2 % BlockBits);
     }
 
-    public void Add(string value) => Add(System.Text.Encoding.UTF8.GetBytes(value));
+    public void Add(string value) => Add((ReadOnlySpan<char>)value);
+
+    /// <summary>
+    /// Encodes into stack/pooled scratch instead of allocating a byte[] per add — the hashed
+    /// bytes are identical to <see cref="Add(string)"/>, so the filter output is unchanged.
+    /// </summary>
+    public void Add(ReadOnlySpan<char> value)
+    {
+        int max = System.Text.Encoding.UTF8.GetMaxByteCount(value.Length);
+        byte[]? rented = max > 512 ? System.Buffers.ArrayPool<byte>.Shared.Rent(max) : null;
+        Span<byte> buf = rented ?? stackalloc byte[max];
+        int n = System.Text.Encoding.UTF8.GetBytes(value, buf);
+        Add(buf[..n]);
+        if (rented is not null) System.Buffers.ArrayPool<byte>.Shared.Return(rented);
+    }
 
     // ── Query ─────────────────────────────────────────────────────────────────
 

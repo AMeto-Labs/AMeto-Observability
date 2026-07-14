@@ -31,12 +31,17 @@ public sealed class AlertEvaluator : IAsyncDisposable
 
     private readonly ConcurrentDictionary<string, MutableState> _states = new();
     private readonly ConcurrentDictionary<string, AlertSilence> _silences = new();
+    private readonly ConcurrentDictionary<string, MaintenanceWindow> _maintenance = new();
     private readonly AlertHistoryEntry[]   _history = new AlertHistoryEntry[HistoryCapacity];
     private readonly object                _histLock = new();
     private int _histCount, _histHead;
 
     private readonly CancellationTokenSource _cts = new();
     private readonly Task _loop;
+
+    // 0 = live, 1 = disposed. Guards against the multiple DisposeAsync calls at
+    // host shutdown (see DisposeAsync).
+    private int _disposed;
 
     public AlertEvaluator(
         AlertRuleStore store, AlertDispatcher dispatcher, AlertPersistence persist,
@@ -55,6 +60,9 @@ public sealed class AlertEvaluator : IAsyncDisposable
     {
         foreach (var s in _persist.LoadSilences())
             if (s.Until > DateTimeOffset.UtcNow) _silences[s.Id] = s;
+
+        foreach (var m in _persist.LoadMaintenance())
+            _maintenance[m.Id] = m;
 
         foreach (var (ruleId, state, lastValue, pending, fired) in _persist.LoadStates())
             _states[ruleId] = new MutableState
@@ -90,6 +98,8 @@ public sealed class AlertEvaluator : IAsyncDisposable
                 PendingSince = s?.PendingSince,
                 LastFiredAt = s?.LastFiredAt,
                 EvaluatedAt = s?.EvaluatedAt ?? DateTimeOffset.MinValue,
+                AckedAt = s?.AckedAt,
+                AckedBy = s?.AckedBy,
             });
         }
         return list;
@@ -113,6 +123,24 @@ public sealed class AlertEvaluator : IAsyncDisposable
         return _silences.Values.OrderByDescending(s => s.Until).ToList();
     }
 
+    /// <summary>Acknowledge a currently-firing rule: mutes re-notify until it resolves. No-op if not firing.</summary>
+    public bool Acknowledge(string ruleId, string? by)
+    {
+        if (!_states.TryGetValue(ruleId, out var st) || st.State != AlertState.Firing) return false;
+        st.AckedAt = DateTimeOffset.UtcNow;
+        st.AckedBy = by;
+        return true;
+    }
+
+    /// <summary>Clear an acknowledgement (re-notify resumes on the next repeat interval).</summary>
+    public bool Unacknowledge(string ruleId)
+    {
+        if (!_states.TryGetValue(ruleId, out var st) || st.AckedAt is null) return false;
+        st.AckedAt = null;
+        st.AckedBy = null;
+        return true;
+    }
+
     public AlertSilence AddSilence(AlertSilence s) { _silences[s.Id] = s; _persist.UpsertSilence(s); return s; }
     public bool RemoveSilence(string id)
     {
@@ -121,9 +149,48 @@ public sealed class AlertEvaluator : IAsyncDisposable
         return ok;
     }
 
+    // ── Maintenance windows ─────────────────────────────────────────────────────
+
+    public IReadOnlyList<MaintenanceWindow> GetMaintenance() => _maintenance.Values.OrderBy(m => m.Name).ToList();
+
+    public MaintenanceWindow UpsertMaintenance(MaintenanceWindow w)
+    {
+        _maintenance[w.Id] = w;
+        _persist.UpsertMaintenance(w);
+        return w;
+    }
+
+    public bool RemoveMaintenance(string id)
+    {
+        bool ok = _maintenance.TryRemove(id, out _);
+        if (ok) _persist.DeleteMaintenance(id);
+        return ok;
+    }
+
+    private bool IsInMaintenance(AlertRule rule, DateTimeOffset now)
+    {
+        foreach (var w in _maintenance.Values)
+            if (w.IsActiveAt(now) && w.Matches(rule.Severity)) return true;
+        return false;
+    }
+
     /// <summary>Evaluate a rule's value right now without affecting state (for the editor preview).</summary>
     public async Task<double> PreviewAsync(AlertRule rule, CancellationToken ct = default)
         => await ComputeValueAsync(rule, DateTimeOffset.UtcNow, ct);
+
+    /// <summary>
+    /// Dispatches a one-off TEST notification through the rule's channels — bypasses the
+    /// state machine, cooldown and silences so the user can verify channel delivery.
+    /// </summary>
+    public Task SendTestAsync(AlertRule rule, CancellationToken ct = default)
+    {
+        var fired = new AlertFiredEvent
+        {
+            Rule = rule, State = AlertState.Firing, Value = rule.Threshold,
+            At = DateTimeOffset.UtcNow, IsTest = true,
+        };
+        return _dispatcher.DispatchAsync(fired);
+    }
 
     // ── Eval loop ───────────────────────────────────────────────────────────────
 
@@ -176,6 +243,10 @@ public sealed class AlertEvaluator : IAsyncDisposable
             {
                 st.State = AlertState.Ok;
                 st.PendingSince = null;
+                st.AckedAt = null;   // clear ack — the incident is over
+                st.AckedBy = null;
+                st.FiringSince = null;
+                st.Escalated = false;
                 Record(rule, AlertState.Ok, value, now);
                 Dispatch(rule, AlertState.Ok, value, now);
             }
@@ -200,7 +271,9 @@ public sealed class AlertEvaluator : IAsyncDisposable
 
         if (st.State == AlertState.Firing)
         {
-            // Cooldown gate on repeated firing notifications
+            st.FiringSince ??= now;   // mark the start of this firing incident
+
+            // Cooldown gate on the first firing notification.
             bool cooled = st.LastFiredAt is null || now - st.LastFiredAt >= rule.Cooldown;
             if (cooled && !st.Notified)
             {
@@ -209,9 +282,24 @@ public sealed class AlertEvaluator : IAsyncDisposable
                 Record(rule, AlertState.Firing, value, now);
                 Dispatch(rule, AlertState.Firing, value, now);
             }
+            // Re-notify: while still firing (and not acknowledged), re-send every RepeatInterval.
+            else if (st.Notified && st.AckedAt is null && rule.RepeatInterval > TimeSpan.Zero
+                     && st.LastFiredAt is { } last && now - last >= rule.RepeatInterval)
+            {
+                st.LastFiredAt = now;
+                Dispatch(rule, AlertState.Firing, value, now);
+            }
+
+            // Escalation: unacknowledged past EscalateAfter → notify the escalation-only channels once.
+            if (rule.EscalateAfter > TimeSpan.Zero && !st.Escalated && st.AckedAt is null
+                && st.FiringSince is { } fs && now - fs >= rule.EscalateAfter)
+            {
+                st.Escalated = true;
+                Dispatch(rule, AlertState.Firing, value, now, escalation: true);
+            }
         }
 
-        if (st.State != AlertState.Firing) st.Notified = false;
+        if (st.State != AlertState.Firing) { st.Notified = false; st.FiringSince = null; st.Escalated = false; }
 
         if (st.State != prevState) PersistState(rule.Id, st);
     }
@@ -219,10 +307,11 @@ public sealed class AlertEvaluator : IAsyncDisposable
     private void PersistState(string ruleId, MutableState st) =>
         _persist.SaveState(ruleId, st.State, st.LastValue, st.PendingSince, st.LastFiredAt);
 
-    private void Dispatch(AlertRule rule, AlertState state, double value, DateTimeOffset now)
+    private void Dispatch(AlertRule rule, AlertState state, double value, DateTimeOffset now, bool escalation = false)
     {
         if (IsSilenced(rule.Id)) return;
-        var fired = new AlertFiredEvent { Rule = rule, State = state, Value = value, At = now };
+        if (IsInMaintenance(rule, now)) return;
+        var fired = new AlertFiredEvent { Rule = rule, State = state, Value = value, At = now, IsEscalation = escalation };
         _ = Task.Run(() => _dispatcher.DispatchAsync(fired));
     }
 
@@ -343,6 +432,11 @@ public sealed class AlertEvaluator : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
+        // Idempotent: AlertsHostedService disposes this from both StopAsync and
+        // its own DisposeAsync, and the DI container disposes the singleton too.
+        // Cancelling/disposing the CTS twice throws ObjectDisposedException.
+        if (System.Threading.Interlocked.Exchange(ref _disposed, 1) != 0) return;
+
         _cts.Cancel();
         try { await _loop; } catch (OperationCanceledException) { }
         _cts.Dispose();
@@ -356,5 +450,9 @@ public sealed class AlertEvaluator : IAsyncDisposable
         public DateTimeOffset? LastFiredAt;
         public DateTimeOffset  EvaluatedAt;
         public bool            Notified;
+        public DateTimeOffset? AckedAt;
+        public string?         AckedBy;
+        public DateTimeOffset? FiringSince;
+        public bool            Escalated;
     }
 }

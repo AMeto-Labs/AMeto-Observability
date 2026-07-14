@@ -15,12 +15,17 @@ internal sealed class JwtIssuer
         _key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(secret));
     }
 
-    public string Issue(string username, string role, string email = "", string displayName = "")
+    public string Issue(string username, string role, string email = "", string displayName = "",
+        ViewPermissions permissions = ViewPermissions.All)
     {
+        // Admins always carry the full scope regardless of the stored bitmask.
+        var effective = role == "admin" ? ViewPermissions.All : permissions;
+
         var claims = new List<Claim>
         {
             new(ClaimTypes.Name, username),
             new(ClaimTypes.Role, role),
+            new(ClaimsPrincipalExtensions.PermClaim, ((int)effective).ToString()),
         };
         if (!string.IsNullOrEmpty(email))
             claims.Add(new Claim(ClaimTypes.Email, email));

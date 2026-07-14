@@ -1,6 +1,8 @@
 import { Routes } from '@angular/router';
 import { authGuard } from './core/guards/auth.guard';
+import { permGuard } from './core/guards/perm.guard';
 import { settingsDeactivateGuard } from './core/guards/settings-deactivate.guard';
+import { ViewPermission } from './core/models/auth.model';
 
 export const routes: Routes = [
   {
@@ -20,10 +22,12 @@ export const routes: Routes = [
       { path: '', redirectTo: 'events', pathMatch: 'full' },
       {
         path: 'events',
+        canActivate: [permGuard(ViewPermission.Logs)],
         loadComponent: () => import('./pages/events/events').then(m => m.EventsComponent),
       },
       {
         path: 'stats',
+        canActivate: [permGuard(ViewPermission.Stats)],
         loadComponent: () => import('./pages/stats/stats').then(m => m.StatsComponent),
       },
       {
@@ -50,11 +54,17 @@ export const routes: Routes = [
       },
       {
         path: 'traces',
+        canActivate: [permGuard(ViewPermission.Traces)],
         loadComponent: () => import('./pages/traces/traces').then(m => m.TracesComponent),
       },
       {
         path: 'metrics',
+        canActivate: [permGuard(ViewPermission.Metrics)],
         loadComponent: () => import('./pages/metrics/metrics').then(m => m.MetricsComponent),
+      },
+      {
+        path: 'reference',
+        loadComponent: () => import('./pages/reference/reference').then(m => m.ReferenceComponent),
       },
     ],
   },

@@ -13,7 +13,7 @@ namespace Ameto.Integration.Tests;
 // Shared helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-file static class TestHelpers
+internal static class TestHelpers
 {
     /// <summary>
     /// Serialises a batch of LogEvents into a msgpack array of CLEF maps.
@@ -63,10 +63,41 @@ file static class TestHelpers
     }
 
     /// <summary>
-    /// Polls GET /api/events until at least <paramref name="expectedCount"/> events are returned,
-    /// or throws <see cref="TimeoutException"/>.
+    /// Consumes the Server-Sent Events stream from GET /api/events and returns the
+    /// per-event JSON payloads (each <c>data:</c> line), stopping at the terminal
+    /// <c>event: done</c>. This is the real query contract — the endpoint streams
+    /// CLEF events rather than returning a JSON envelope.
     /// </summary>
-    public static async Task<JsonElement> WaitForEventsAsync(
+    public static async Task<List<JsonElement>> StreamEventsAsync(HttpClient client, string url)
+    {
+        using var request  = new HttpRequestMessage(HttpMethod.Get, url);
+        using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+        response.EnsureSuccessStatusCode();
+
+        var events = new List<JsonElement>();
+        await using var stream = await response.Content.ReadAsStreamAsync();
+        using var reader = new System.IO.StreamReader(stream);
+
+        string? line;
+        while ((line = await reader.ReadLineAsync()) is not null)
+        {
+            if (line.StartsWith("event: done", StringComparison.Ordinal)) break;
+            if (!line.StartsWith("data: ", StringComparison.Ordinal)) continue;
+
+            var payload = line["data: ".Length..];
+            if (payload.Length == 0 || payload == "{}") continue;
+
+            using var doc = JsonDocument.Parse(payload);
+            events.Add(doc.RootElement.Clone());
+        }
+        return events;
+    }
+
+    /// <summary>
+    /// Polls GET /api/events (SSE) until at least <paramref name="expectedCount"/> events
+    /// are streamed, or throws <see cref="TimeoutException"/>. Returns the streamed events.
+    /// </summary>
+    public static async Task<List<JsonElement>> WaitForEventsAsync(
         HttpClient client,
         int expectedCount,
         string? filter  = null,
@@ -78,15 +109,12 @@ file static class TestHelpers
 
         while (true)
         {
-            var resp = await client.GetAsync(url);
-            resp.EnsureSuccessStatusCode();
-            var json = await resp.Content.ReadFromJsonAsync<JsonElement>();
-            var arr  = json.GetProperty("events");
-            if (arr.GetArrayLength() >= expectedCount)
-                return json;
+            var events = await StreamEventsAsync(client, url);
+            if (events.Count >= expectedCount)
+                return events;
             if (DateTimeOffset.UtcNow >= deadline)
                 throw new TimeoutException(
-                    $"Drain timeout: only {arr.GetArrayLength()} of {expectedCount} events arrived.");
+                    $"Drain timeout: only {events.Count} of {expectedCount} events arrived.");
             await Task.Delay(20);
         }
     }
@@ -97,6 +125,7 @@ file static class TestHelpers
         string? filter   = null,
         string? dir      = null,
         string? afterId  = null,
+        long?   afterTs  = null,
         string? from     = null,
         string? to       = null)
     {
@@ -104,6 +133,7 @@ file static class TestHelpers
         if (filter  is not null) sb.Append("&filter=").Append(Uri.EscapeDataString(filter));
         if (dir     is not null) sb.Append("&dir=").Append(dir);
         if (afterId is not null) sb.Append("&afterId=").Append(afterId);
+        if (afterTs is not null) sb.Append("&afterTs=").Append(afterTs.Value);
         if (from    is not null) sb.Append("&from=").Append(Uri.EscapeDataString(from));
         if (to      is not null) sb.Append("&to=").Append(Uri.EscapeDataString(to));
         return sb.ToString();
@@ -322,11 +352,11 @@ public sealed class IngestionTests : IClassFixture<AmetoWebAppFactory>
         await TestHelpers.IngestAsync(_client, ev);
 
         // Wait for the drain loop to move the event from ring → hot tier.
-        var json = await TestHelpers.WaitForEventsAsync(
+        var events = await TestHelpers.WaitForEventsAsync(
             _client, expectedCount: 1, filter: $"Tag = '{tag}'");
 
-        Assert.True(json.GetProperty("count").GetInt32() >= 1);
-        var first = json.GetProperty("events").EnumerateArray().First();
+        Assert.True(events.Count >= 1);
+        var first = events[0];
         Assert.Equal($"Drain probe {tag}", first.GetProperty("@mt").GetString());
     }
 
@@ -416,25 +446,25 @@ public sealed class QueryTests : IClassFixture<QueryTestFixture>
         _seedTime = fixture.SeedTime;
     }
 
-    // ── Response shape ────────────────────────────────────────────────────────
+    // ── Stream shape ──────────────────────────────────────────────────────────
 
     [Fact]
-    public async Task Query_ResponseShape_HasEventsCountCursorKeys()
+    public async Task Query_Stream_YieldsEventsWithCursorFields()
     {
-        var json = await _client.GetFromJsonAsync<JsonElement>(
-            TestHelpers.EventsUrl(count: 1));
+        var events = await TestHelpers.StreamEventsAsync(_client, TestHelpers.EventsUrl(count: 1));
 
-        Assert.True(json.TryGetProperty("events", out _), "Missing 'events'");
-        Assert.True(json.TryGetProperty("count",  out _), "Missing 'count'");
-        Assert.True(json.TryGetProperty("cursor", out _), "Missing 'cursor'");
+        Assert.Single(events);                 // the streamed payload, honouring count
+        // The next-page cursor is derived from the last event's (id, @t).
+        var last = events[^1];
+        Assert.True(last.TryGetProperty("id", out _), "event missing 'id' (cursor key)");
+        Assert.True(last.TryGetProperty("@t", out _), "event missing '@t' (cursor timestamp)");
     }
 
     [Fact]
     public async Task Query_EventShape_HasClefFields()
     {
-        var json   = await _client.GetFromJsonAsync<JsonElement>(TestHelpers.EventsUrl(count: 1));
-        var events = json.GetProperty("events");
-        Assert.True(events.GetArrayLength() >= 1, "Expected at least one event");
+        var events = await TestHelpers.StreamEventsAsync(_client, TestHelpers.EventsUrl(count: 1));
+        Assert.True(events.Count >= 1, "Expected at least one event");
 
         var ev = events[0];
         Assert.True(ev.TryGetProperty("@t",  out _), "Missing '@t'");
@@ -448,11 +478,9 @@ public sealed class QueryTests : IClassFixture<QueryTestFixture>
     [Fact]
     public async Task Query_All_ReturnsAllTenSeededEvents()
     {
-        var json = await _client.GetFromJsonAsync<JsonElement>(
-            TestHelpers.EventsUrl(count: 100));
+        var events = await TestHelpers.StreamEventsAsync(_client, TestHelpers.EventsUrl(count: 100));
 
-        Assert.True(json.GetProperty("count").GetInt32() >= 10,
-            "Expected at least 10 seeded events");
+        Assert.True(events.Count >= 10, "Expected at least 10 seeded events");
     }
 
     // ── Level filters ─────────────────────────────────────────────────────────
@@ -460,46 +488,43 @@ public sealed class QueryTests : IClassFixture<QueryTestFixture>
     [Fact]
     public async Task Query_Filter_InformationLevel_Returns5()
     {
-        var json   = await _client.GetFromJsonAsync<JsonElement>(
+        var events = await TestHelpers.StreamEventsAsync(_client,
             TestHelpers.EventsUrl(count: 100, filter: "@l = 'Information'"));
-        var events = json.GetProperty("events");
 
-        Assert.True(events.GetArrayLength() >= 5);
-        foreach (var ev in events.EnumerateArray())
+        Assert.True(events.Count >= 5);
+        foreach (var ev in events)
             Assert.Equal("Information", ev.GetProperty("@l").GetString());
     }
 
     [Fact]
     public async Task Query_Filter_WarningLevel_Returns3()
     {
-        var json   = await _client.GetFromJsonAsync<JsonElement>(
+        var events = await TestHelpers.StreamEventsAsync(_client,
             TestHelpers.EventsUrl(count: 100, filter: "@l = 'Warning'"));
-        var events = json.GetProperty("events");
 
-        Assert.True(events.GetArrayLength() >= 3);
-        foreach (var ev in events.EnumerateArray())
+        Assert.True(events.Count >= 3);
+        foreach (var ev in events)
             Assert.Equal("Warning", ev.GetProperty("@l").GetString());
     }
 
     [Fact]
     public async Task Query_Filter_ErrorLevel_Returns2()
     {
-        var json   = await _client.GetFromJsonAsync<JsonElement>(
+        var events = await TestHelpers.StreamEventsAsync(_client,
             TestHelpers.EventsUrl(count: 100, filter: "@l = 'Error'"));
-        var events = json.GetProperty("events");
 
-        Assert.True(events.GetArrayLength() >= 2);
-        foreach (var ev in events.EnumerateArray())
+        Assert.True(events.Count >= 2);
+        foreach (var ev in events)
             Assert.Equal("Error", ev.GetProperty("@l").GetString());
     }
 
     [Fact]
     public async Task Query_Filter_NonExistentLevel_ReturnsEmpty()
     {
-        var json = await _client.GetFromJsonAsync<JsonElement>(
+        var events = await TestHelpers.StreamEventsAsync(_client,
             TestHelpers.EventsUrl(count: 100, filter: "@l = 'Fatal'"));
 
-        Assert.Equal(0, json.GetProperty("count").GetInt32());
+        Assert.Empty(events);
     }
 
     // ── Template filter ───────────────────────────────────────────────────────
@@ -507,24 +532,22 @@ public sealed class QueryTests : IClassFixture<QueryTestFixture>
     [Fact]
     public async Task Query_Filter_ByExactMessageTemplate_ReturnsMatch()
     {
-        var json   = await _client.GetFromJsonAsync<JsonElement>(
+        var events = await TestHelpers.StreamEventsAsync(_client,
             TestHelpers.EventsUrl(count: 100, filter: "@mt = 'Request failed {StatusCode}'"));
-        var events = json.GetProperty("events");
 
-        Assert.True(events.GetArrayLength() >= 2);
-        foreach (var ev in events.EnumerateArray())
+        Assert.True(events.Count >= 2);
+        foreach (var ev in events)
             Assert.Equal("Request failed {StatusCode}", ev.GetProperty("@mt").GetString());
     }
 
     [Fact]
     public async Task Query_Filter_ByMessageTemplateLike_ReturnsMatches()
     {
-        var json   = await _client.GetFromJsonAsync<JsonElement>(
+        var events = await TestHelpers.StreamEventsAsync(_client,
             TestHelpers.EventsUrl(count: 100, filter: "@mt like 'Slow%'"));
-        var events = json.GetProperty("events");
 
-        Assert.True(events.GetArrayLength() >= 3);
-        foreach (var ev in events.EnumerateArray())
+        Assert.True(events.Count >= 3);
+        foreach (var ev in events)
             Assert.StartsWith("Slow", ev.GetProperty("@mt").GetString());
     }
 
@@ -533,11 +556,10 @@ public sealed class QueryTests : IClassFixture<QueryTestFixture>
     [Fact]
     public async Task Query_Filter_ByProperty_StatusCode500_ReturnsOneEvent()
     {
-        var json   = await _client.GetFromJsonAsync<JsonElement>(
+        var events = await TestHelpers.StreamEventsAsync(_client,
             TestHelpers.EventsUrl(count: 100, filter: "StatusCode = 500"));
-        var events = json.GetProperty("events");
 
-        Assert.True(events.GetArrayLength() >= 1);
+        Assert.True(events.Count >= 1);
         var props = events[0].GetProperty("props");
         Assert.Equal(500L, props.GetProperty("StatusCode").GetInt64());
     }
@@ -545,11 +567,10 @@ public sealed class QueryTests : IClassFixture<QueryTestFixture>
     [Fact]
     public async Task Query_Filter_ByProperty_UserId3_ReturnsOneEvent()
     {
-        var json   = await _client.GetFromJsonAsync<JsonElement>(
+        var events = await TestHelpers.StreamEventsAsync(_client,
             TestHelpers.EventsUrl(count: 100, filter: "UserId = 3"));
-        var events = json.GetProperty("events");
 
-        Assert.True(events.GetArrayLength() >= 1);
+        Assert.True(events.Count >= 1);
         var props = events[0].GetProperty("props");
         Assert.Equal(3L, props.GetProperty("UserId").GetInt64());
     }
@@ -559,21 +580,17 @@ public sealed class QueryTests : IClassFixture<QueryTestFixture>
     [Fact]
     public async Task Query_Count_LimitsResults()
     {
-        var json = await _client.GetFromJsonAsync<JsonElement>(
-            TestHelpers.EventsUrl(count: 3));
+        var events = await TestHelpers.StreamEventsAsync(_client, TestHelpers.EventsUrl(count: 3));
 
-        var events = json.GetProperty("events");
-        Assert.Equal(3, events.GetArrayLength());
-        Assert.Equal(3, json.GetProperty("count").GetInt32());
+        Assert.Equal(3, events.Count);
     }
 
     [Fact]
     public async Task Query_Count1_ReturnsSingleEvent()
     {
-        var json = await _client.GetFromJsonAsync<JsonElement>(
-            TestHelpers.EventsUrl(count: 1));
+        var events = await TestHelpers.StreamEventsAsync(_client, TestHelpers.EventsUrl(count: 1));
 
-        Assert.Equal(1, json.GetProperty("events").GetArrayLength());
+        Assert.Single(events);
     }
 
     // ── Direction ─────────────────────────────────────────────────────────────
@@ -581,9 +598,8 @@ public sealed class QueryTests : IClassFixture<QueryTestFixture>
     [Fact]
     public async Task Query_Direction_Backward_IsNewestFirst()
     {
-        var json   = await _client.GetFromJsonAsync<JsonElement>(
+        var events = await TestHelpers.StreamEventsAsync(_client,
             TestHelpers.EventsUrl(count: 10, dir: "backward"));
-        var events = json.GetProperty("events").EnumerateArray().ToList();
 
         for (int i = 1; i < events.Count; i++)
         {
@@ -597,9 +613,8 @@ public sealed class QueryTests : IClassFixture<QueryTestFixture>
     [Fact]
     public async Task Query_Direction_Forward_IsOldestFirst()
     {
-        var json   = await _client.GetFromJsonAsync<JsonElement>(
+        var events = await TestHelpers.StreamEventsAsync(_client,
             TestHelpers.EventsUrl(count: 10, dir: "forward"));
-        var events = json.GetProperty("events").EnumerateArray().ToList();
 
         for (int i = 1; i < events.Count; i++)
         {
@@ -618,11 +633,10 @@ public sealed class QueryTests : IClassFixture<QueryTestFixture>
         var from = _seedTime.AddMinutes(-1).ToString("O");
         var to   = _seedTime.AddMinutes(+5).ToString("O");
 
-        var json = await _client.GetFromJsonAsync<JsonElement>(
+        var events = await TestHelpers.StreamEventsAsync(_client,
             TestHelpers.EventsUrl(count: 100, from: from, to: to));
 
-        Assert.True(json.GetProperty("count").GetInt32() >= 10,
-            "Time window should include all seeded events");
+        Assert.True(events.Count >= 10, "Time window should include all seeded events");
     }
 
     [Fact]
@@ -630,10 +644,10 @@ public sealed class QueryTests : IClassFixture<QueryTestFixture>
     {
         var from = _seedTime.AddHours(1).ToString("O");
 
-        var json = await _client.GetFromJsonAsync<JsonElement>(
+        var events = await TestHelpers.StreamEventsAsync(_client,
             TestHelpers.EventsUrl(count: 100, from: from));
 
-        Assert.Equal(0, json.GetProperty("count").GetInt32());
+        Assert.Empty(events);
     }
 
     [Fact]
@@ -641,10 +655,10 @@ public sealed class QueryTests : IClassFixture<QueryTestFixture>
     {
         var to = _seedTime.AddHours(-1).ToString("O");
 
-        var json = await _client.GetFromJsonAsync<JsonElement>(
+        var events = await TestHelpers.StreamEventsAsync(_client,
             TestHelpers.EventsUrl(count: 100, to: to));
 
-        Assert.Equal(0, json.GetProperty("count").GetInt32());
+        Assert.Empty(events);
     }
 
     // ── Cursor pagination ─────────────────────────────────────────────────────
@@ -653,37 +667,36 @@ public sealed class QueryTests : IClassFixture<QueryTestFixture>
     public async Task Query_Pagination_ForwardPages_CoverAllEvents()
     {
         // Page 1: forward, 3 events
-        var page1 = await _client.GetFromJsonAsync<JsonElement>(
+        var page1 = await TestHelpers.StreamEventsAsync(_client,
             TestHelpers.EventsUrl(count: 3, dir: "forward"));
-        var page1Events = page1.GetProperty("events").EnumerateArray().ToList();
-        Assert.Equal(3, page1Events.Count);
+        Assert.Equal(3, page1.Count);
 
-        // Cursor is the last event's id
-        var cursor = page1.GetProperty("cursor").GetString();
-        Assert.NotNull(cursor);
+        // The keyset cursor is the last event's (id, @t) — afterTs is the primary
+        // key, afterId the tiebreaker (see QueryExecutor.AfterCursor).
+        var last    = page1[^1];
+        var afterId = last.GetProperty("id").GetString();
+        var afterTs = DateTimeOffset.Parse(last.GetProperty("@t").GetString()!).UtcTicks;
 
-        // Page 2: continue from cursor
-        var page2 = await _client.GetFromJsonAsync<JsonElement>(
-            TestHelpers.EventsUrl(count: 3, dir: "forward", afterId: cursor));
-        var page2Events = page2.GetProperty("events").EnumerateArray().ToList();
+        // Page 2: continue from the cursor
+        var page2 = await TestHelpers.StreamEventsAsync(_client,
+            TestHelpers.EventsUrl(count: 3, dir: "forward", afterId: afterId, afterTs: afterTs));
 
         // No overlap between pages
-        var page1Ids = page1Events.Select(e => e.GetProperty("id").GetString()).ToHashSet();
-        var page2Ids = page2Events.Select(e => e.GetProperty("id").GetString()).ToHashSet();
+        var page1Ids = page1.Select(e => e.GetProperty("id").GetString()).ToHashSet();
+        var page2Ids = page2.Select(e => e.GetProperty("id").GetString()).ToHashSet();
         Assert.Empty(page1Ids.Intersect(page2Ids));
     }
 
     [Fact]
-    public async Task Query_Pagination_Cursor_IsPresentWhenEventsReturned()
+    public async Task Query_Pagination_LastEventProvidesCursor()
     {
-        var json = await _client.GetFromJsonAsync<JsonElement>(
-            TestHelpers.EventsUrl(count: 5));
-        var cursor = json.GetProperty("cursor");
+        var events = await TestHelpers.StreamEventsAsync(_client, TestHelpers.EventsUrl(count: 5));
 
-        // cursor should be a non-null string when events are returned
-        Assert.True(cursor.ValueKind == JsonValueKind.String ||
-                    cursor.ValueKind == JsonValueKind.Number,
-            "Cursor should be a string or number when events are present");
+        Assert.NotEmpty(events);
+        // The last streamed event carries the id used as the next-page cursor.
+        var id = events[^1].GetProperty("id").GetString();
+        Assert.False(string.IsNullOrEmpty(id),
+            "Last event should expose an id usable as the next-page cursor");
     }
 
     // ── Combined filter + time range ──────────────────────────────────────────
@@ -694,12 +707,11 @@ public sealed class QueryTests : IClassFixture<QueryTestFixture>
         var from = _seedTime.AddMinutes(-1).ToString("O");
         var to   = _seedTime.AddMinutes(+5).ToString("O");
 
-        var json   = await _client.GetFromJsonAsync<JsonElement>(
+        var events = await TestHelpers.StreamEventsAsync(_client,
             TestHelpers.EventsUrl(count: 100, filter: "@l = 'Error'", from: from, to: to));
-        var events = json.GetProperty("events");
 
-        Assert.True(events.GetArrayLength() >= 2);
-        foreach (var ev in events.EnumerateArray())
+        Assert.True(events.Count >= 2);
+        foreach (var ev in events)
             Assert.Equal("Error", ev.GetProperty("@l").GetString());
     }
 }
@@ -722,7 +734,7 @@ public sealed class SignalsCrudTests : IClassFixture<AmetoWebAppFactory>
     {
         var rule = MakeRule();
 
-        var resp = await _client.PostAsJsonAsync("/api/signals", rule);
+        var resp = await _client.PostAsJsonAsync("/api/alerts", rule);
 
         Assert.Equal(HttpStatusCode.Created, resp.StatusCode);
         Assert.NotNull(resp.Headers.Location);
@@ -733,7 +745,7 @@ public sealed class SignalsCrudTests : IClassFixture<AmetoWebAppFactory>
     {
         var rule = MakeRule(name: "IdCheck");
 
-        var resp = await _client.PostAsJsonAsync("/api/signals", rule);
+        var resp = await _client.PostAsJsonAsync("/api/alerts", rule);
         var body = await resp.Content.ReadFromJsonAsync<JsonElement>();
 
         Assert.True(body.TryGetProperty("id", out var idProp));
@@ -745,7 +757,7 @@ public sealed class SignalsCrudTests : IClassFixture<AmetoWebAppFactory>
     {
         var rule = MakeRule(name: "FieldCheck", filter: "@l = 'Error'", threshold: 7);
 
-        var resp = await _client.PostAsJsonAsync("/api/signals", rule);
+        var resp = await _client.PostAsJsonAsync("/api/alerts", rule);
         var body = await resp.Content.ReadFromJsonAsync<JsonElement>();
 
         Assert.Equal("FieldCheck",      body.GetProperty("name").GetString());
@@ -758,7 +770,7 @@ public sealed class SignalsCrudTests : IClassFixture<AmetoWebAppFactory>
     [Fact]
     public async Task Signals_Get_List_ReturnsArray()
     {
-        var resp = await _client.GetAsync("/api/signals");
+        var resp = await _client.GetAsync("/api/alerts");
 
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
         var json = await resp.Content.ReadFromJsonAsync<JsonElement>();
@@ -769,11 +781,11 @@ public sealed class SignalsCrudTests : IClassFixture<AmetoWebAppFactory>
     public async Task Signals_Post_AppearsInList()
     {
         var name = "ListTest_" + Guid.NewGuid().ToString("N")[..6];
-        var post  = await _client.PostAsJsonAsync("/api/signals", MakeRule(name: name));
+        var post  = await _client.PostAsJsonAsync("/api/alerts", MakeRule(name: name));
         var id    = (await post.Content.ReadFromJsonAsync<JsonElement>())
                         .GetProperty("id").GetString()!;
 
-        var list = await _client.GetFromJsonAsync<JsonElement[]>("/api/signals");
+        var list = await _client.GetFromJsonAsync<JsonElement[]>("/api/alerts");
         Assert.NotNull(list);
         Assert.Contains(list, r => r.GetProperty("id").GetString() == id);
     }
@@ -784,11 +796,11 @@ public sealed class SignalsCrudTests : IClassFixture<AmetoWebAppFactory>
     public async Task Signals_GetById_ReturnsCorrectRule()
     {
         var name = "GetByIdTest_" + Guid.NewGuid().ToString("N")[..6];
-        var post = await _client.PostAsJsonAsync("/api/signals", MakeRule(name: name));
+        var post = await _client.PostAsJsonAsync("/api/alerts", MakeRule(name: name));
         var id   = (await post.Content.ReadFromJsonAsync<JsonElement>())
                        .GetProperty("id").GetString()!;
 
-        var resp = await _client.GetAsync($"/api/signals/{id}");
+        var resp = await _client.GetAsync($"/api/alerts/{id}");
 
         Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
         var body = await resp.Content.ReadFromJsonAsync<JsonElement>();
@@ -799,7 +811,7 @@ public sealed class SignalsCrudTests : IClassFixture<AmetoWebAppFactory>
     [Fact]
     public async Task Signals_GetById_UnknownId_Returns404()
     {
-        var resp = await _client.GetAsync("/api/signals/does-not-exist-xyz");
+        var resp = await _client.GetAsync("/api/alerts/does-not-exist-xyz");
 
         Assert.Equal(HttpStatusCode.NotFound, resp.StatusCode);
     }
@@ -809,12 +821,12 @@ public sealed class SignalsCrudTests : IClassFixture<AmetoWebAppFactory>
     [Fact]
     public async Task Signals_Put_UpdatesNameAndFilter()
     {
-        var post = await _client.PostAsJsonAsync("/api/signals", MakeRule(name: "Original"));
+        var post = await _client.PostAsJsonAsync("/api/alerts", MakeRule(name: "Original"));
         var id   = (await post.Content.ReadFromJsonAsync<JsonElement>())
                        .GetProperty("id").GetString()!;
 
         var update = MakeRule(name: "Updated", filter: "@l = 'Fatal'", threshold: 1);
-        var putResp = await _client.PutAsJsonAsync($"/api/signals/{id}", update);
+        var putResp = await _client.PutAsJsonAsync($"/api/alerts/{id}", update);
 
         Assert.Equal(HttpStatusCode.OK, putResp.StatusCode);
         var body = await putResp.Content.ReadFromJsonAsync<JsonElement>();
@@ -825,7 +837,7 @@ public sealed class SignalsCrudTests : IClassFixture<AmetoWebAppFactory>
     [Fact]
     public async Task Signals_Put_UnknownId_Returns404()
     {
-        var resp = await _client.PutAsJsonAsync("/api/signals/no-such-rule",
+        var resp = await _client.PutAsJsonAsync("/api/alerts/no-such-rule",
             MakeRule(name: "Ghost"));
 
         Assert.Equal(HttpStatusCode.NotFound, resp.StatusCode);
@@ -836,11 +848,11 @@ public sealed class SignalsCrudTests : IClassFixture<AmetoWebAppFactory>
     [Fact]
     public async Task Signals_Delete_Returns204()
     {
-        var post = await _client.PostAsJsonAsync("/api/signals", MakeRule());
+        var post = await _client.PostAsJsonAsync("/api/alerts", MakeRule());
         var id   = (await post.Content.ReadFromJsonAsync<JsonElement>())
                        .GetProperty("id").GetString()!;
 
-        var del = await _client.DeleteAsync($"/api/signals/{id}");
+        var del = await _client.DeleteAsync($"/api/alerts/{id}");
 
         Assert.Equal(HttpStatusCode.NoContent, del.StatusCode);
     }
@@ -848,13 +860,13 @@ public sealed class SignalsCrudTests : IClassFixture<AmetoWebAppFactory>
     [Fact]
     public async Task Signals_Delete_RemovedFromList()
     {
-        var post = await _client.PostAsJsonAsync("/api/signals", MakeRule());
+        var post = await _client.PostAsJsonAsync("/api/alerts", MakeRule());
         var id   = (await post.Content.ReadFromJsonAsync<JsonElement>())
                        .GetProperty("id").GetString()!;
 
-        await _client.DeleteAsync($"/api/signals/{id}");
+        await _client.DeleteAsync($"/api/alerts/{id}");
 
-        var list = await _client.GetFromJsonAsync<JsonElement[]>("/api/signals");
+        var list = await _client.GetFromJsonAsync<JsonElement[]>("/api/alerts");
         Assert.NotNull(list);
         Assert.DoesNotContain(list, r => r.GetProperty("id").GetString() == id);
     }
@@ -862,7 +874,7 @@ public sealed class SignalsCrudTests : IClassFixture<AmetoWebAppFactory>
     [Fact]
     public async Task Signals_Delete_UnknownId_Returns404()
     {
-        var resp = await _client.DeleteAsync("/api/signals/does-not-exist-abc");
+        var resp = await _client.DeleteAsync("/api/alerts/does-not-exist-abc");
 
         Assert.Equal(HttpStatusCode.NotFound, resp.StatusCode);
     }
@@ -870,12 +882,12 @@ public sealed class SignalsCrudTests : IClassFixture<AmetoWebAppFactory>
     [Fact]
     public async Task Signals_Delete_ThenGetById_Returns404()
     {
-        var post = await _client.PostAsJsonAsync("/api/signals", MakeRule());
+        var post = await _client.PostAsJsonAsync("/api/alerts", MakeRule());
         var id   = (await post.Content.ReadFromJsonAsync<JsonElement>())
                        .GetProperty("id").GetString()!;
 
-        await _client.DeleteAsync($"/api/signals/{id}");
-        var getResp = await _client.GetAsync($"/api/signals/{id}");
+        await _client.DeleteAsync($"/api/alerts/{id}");
+        var getResp = await _client.GetAsync($"/api/alerts/{id}");
 
         Assert.Equal(HttpStatusCode.NotFound, getResp.StatusCode);
     }
@@ -886,18 +898,18 @@ public sealed class SignalsCrudTests : IClassFixture<AmetoWebAppFactory>
     public async Task Signals_FullLifecycle_CreateUpdateDelete()
     {
         // 1. Create
-        var post = await _client.PostAsJsonAsync("/api/signals",
+        var post = await _client.PostAsJsonAsync("/api/alerts",
             MakeRule(name: "Lifecycle", filter: "@l = 'Warning'", threshold: 3));
         Assert.Equal(HttpStatusCode.Created, post.StatusCode);
         var id = (await post.Content.ReadFromJsonAsync<JsonElement>())
                      .GetProperty("id").GetString()!;
 
         // 2. Verify in list
-        var list = await _client.GetFromJsonAsync<JsonElement[]>("/api/signals");
+        var list = await _client.GetFromJsonAsync<JsonElement[]>("/api/alerts");
         Assert.Contains(list!, r => r.GetProperty("id").GetString() == id);
 
         // 3. Update
-        var put = await _client.PutAsJsonAsync($"/api/signals/{id}",
+        var put = await _client.PutAsJsonAsync($"/api/alerts/{id}",
             MakeRule(name: "Lifecycle (updated)", filter: "@l = 'Error'", threshold: 10));
         Assert.Equal(HttpStatusCode.OK, put.StatusCode);
         var updated = await put.Content.ReadFromJsonAsync<JsonElement>();
@@ -905,15 +917,15 @@ public sealed class SignalsCrudTests : IClassFixture<AmetoWebAppFactory>
         Assert.Equal(10,                    updated.GetProperty("threshold").GetInt32());
 
         // 4. Get by id confirms update persisted
-        var get = await _client.GetFromJsonAsync<JsonElement>($"/api/signals/{id}");
+        var get = await _client.GetFromJsonAsync<JsonElement>($"/api/alerts/{id}");
         Assert.Equal("Lifecycle (updated)", get.GetProperty("name").GetString());
 
         // 5. Delete
-        var del = await _client.DeleteAsync($"/api/signals/{id}");
+        var del = await _client.DeleteAsync($"/api/alerts/{id}");
         Assert.Equal(HttpStatusCode.NoContent, del.StatusCode);
 
         // 6. No longer found
-        var missing = await _client.GetAsync($"/api/signals/{id}");
+        var missing = await _client.GetAsync($"/api/alerts/{id}");
         Assert.Equal(HttpStatusCode.NotFound, missing.StatusCode);
     }
 

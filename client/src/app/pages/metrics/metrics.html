@@ -1,305 +1,208 @@
-<div class="metrics-page">
-
-  <!-- Header -->
-  <div class="page-hdr">
-    <div class="page-title">
+<div class="metrics-explore">
+  <!-- ── Header ─────────────────────────────────────────────────────────── -->
+  <header class="mx-hdr">
+    <div class="mx-title">
       <h1>Metrics</h1>
-      <span class="page-subtitle">Rates, errors, latency &amp; resources</span>
-    </div>
-    <div class="hdr-actions">
-      @if (services().length) {
-        <div class="svc-multi">
-          @for (s of selectedServices(); track s) {
-            <span class="svc-chip">{{ s }}<button class="svc-chip-x" title="Remove" (click)="removeService(s)">×</button></span>
-          }
-          <select class="svc-select" [value]="''" (change)="onAddService($event)">
-            <option value="">{{ selectedServices().length ? '+ add service' : 'All services' }}</option>
-            @for (s of services(); track s) {
-              @if (!selectedServices().includes(s)) { <option [value]="s">{{ s }}</option> }
-            }
-          </select>
-          @if (selectedServices().length) {
-            <button class="svc-clear" title="Clear all" (click)="clearServices()">clear</button>
-          }
-        </div>
+      @if (mode() === 'expr') {
+        <span class="mx-sub">expression · step {{ stepStr() }}</span>
+      } @else if (selected()) {
+        <span class="mx-sub">{{ series().length }} series · step {{ stepStr() }}</span>
+      } @else {
+        <span class="mx-sub">explore any metric</span>
       }
+    </div>
+
+    <div class="mx-range">
       <div class="preset-group">
-        @for (p of ['15m','30m','1h','3h','6h','12h','24h']; track p) {
-          <button class="preset-btn" [class.active]="preset() === p" (click)="onPreset(p)">{{ p }}</button>
+        @for (p of presets; track p) {
+          <button class="preset-btn" [class.active]="preset() === p" (click)="setPreset(p)">{{ p }}</button>
         }
-      </div>
-    </div>
-  </div>
-
-  <!-- Tabs -->
-  <div class="main-tabs">
-    <button class="main-tab" [class.active]="tab() === 'overview'" (click)="setTab('overview')">
-      <lucide-icon name="activity" [size]="13" /> Overview
-    </button>
-    <button class="main-tab" [class.active]="tab() === 'runtime'" (click)="setTab('runtime')">
-      <lucide-icon name="cpu" [size]="13" /> Runtime
-    </button>
-    <button class="main-tab" [class.active]="tab() === 'explore'" (click)="setTab('explore')">
-      <lucide-icon name="search" [size]="13" /> Explore
-    </button>
-  </div>
-
-  <!-- ══ OVERVIEW ══════════════════════════════════════════════════════════ -->
-  @if (tab() === 'overview') {
-    @if (!reqMetric()) {
-      <div class="panel-empty">No <code>http.server.request.duration</code> histogram found yet. Send some traffic.</div>
-    } @else {
-      <!-- Stat cards -->
-      <div class="stats-row">
-        @for (c of statCards(); track c.label) {
-          <div class="stat-card" [style.border-top-color]="toneColor(c.tone)">
-            <div class="stat-info">
-              <span class="stat-label">{{ c.label }}</span>
-              <span class="stat-value">{{ c.value }}<span class="stat-unit">{{ c.unit }}</span></span>
-            </div>
-            @if (c.gaugePct !== undefined) {
-              <svg class="stat-gauge" viewBox="0 0 36 36">
-                <path class="g-bg" d="M18 4 a14 14 0 1 1 0 28 a14 14 0 1 1 0 -28" fill="none" stroke-width="3"/>
-                <path [attr.stroke]="toneColor(c.tone)" fill="none" stroke-width="3" stroke-linecap="round"
-                      [attr.stroke-dasharray]="(c.gaugePct/100*88) + ' 88'"
-                      d="M18 4 a14 14 0 1 1 0 28 a14 14 0 1 1 0 -28"/>
-              </svg>
-            } @else if (c.spark.length) {
-              <svg class="sparkline" viewBox="0 0 100 28" preserveAspectRatio="none">
-                <polyline [attr.points]="sparkPath(c.spark)" fill="none" [attr.stroke]="toneColor(c.tone)" stroke-width="1.5"/>
-              </svg>
-            }
-          </div>
-        }
+        <button class="preset-btn" [class.active]="preset() === 'custom'" (click)="setPreset('custom')">custom</button>
       </div>
 
-      <!-- Per-service breakdown -->
-      @if (serviceRows().length) {
-        <div class="panel">
-          <div class="panel-hdr">Services
-            <span class="panel-sub">RPS · error% · latency · click to focus</span>
-          </div>
-          <div class="svc-table">
-            <div class="svc-row svc-head">
-              <span>Service</span><span>RPS</span><span>Err%</span><span>p50</span><span>p95</span><span>p99</span>
-            </div>
-            @for (s of serviceRows(); track s.service) {
-              <div class="svc-row" [class.active]="selectedServices().includes(s.service)" (click)="selectService(s.service)">
-                <span class="svc-name" [title]="s.service">{{ s.service }}</span>
-                <span>{{ fmtCardinality(s.rps) }}</span>
-                <span [class.svc-err]="s.errPct > 1">{{ s.errPct.toFixed(1) }}%</span>
-                <span>{{ fmtCardinality(s.p50) }}<i>ms</i></span>
-                <span>{{ fmtCardinality(s.p95) }}<i>ms</i></span>
-                <span>{{ fmtCardinality(s.p99) }}<i>ms</i></span>
-              </div>
-            }
-          </div>
+      @if (preset() === 'custom') {
+        <div class="custom-range">
+          <input type="datetime-local" class="custom-dt" [(ngModel)]="customFrom">
+          <span class="custom-sep">→</span>
+          <input type="datetime-local" class="custom-dt" [(ngModel)]="customTo">
+          <button class="b-run" (click)="applyCustom()">Apply</button>
         </div>
       }
+    </div>
+  </header>
 
-      <!-- Charts row -->
-      <div class="grid-2">
-        <div class="panel">
-          <div class="panel-hdr">Request rate <span class="panel-sub">rps</span>
-            @if (selectedServices().length) { <span class="panel-sub">· {{ selectedServices().length === 1 ? selectedServices()[0] : selectedServices().length + ' services' }}</span> }
-          </div>
-          <div class="chart-wrap"><canvas #rateCanvas></canvas></div>
-        </div>
-        <div class="panel">
-          <div class="panel-hdr">Latency percentiles <span class="panel-sub">ms</span>
-            @if (exemplarCount()) {
-              <span class="panel-sub exemplar-hint">· <span class="ex-dot"></span>{{ exemplarCount() }} exemplars — click to open trace</span>
-            }
-          </div>
-          <div class="chart-wrap"><canvas #latCanvas></canvas></div>
-        </div>
+  <!-- ── Explore body ───────────────────────────────────────────────────── -->
+  <div class="explore">
+    <!-- Catalog -->
+    <aside class="catalog-panel">
+      <div class="catalog-search">
+        <lucide-icon name="search" class="cs-icon" [size]="14" />
+        <input class="cs-input" placeholder="Search metrics…"
+               [ngModel]="search()" (ngModelChange)="search.set($event)">
       </div>
-
-      <!-- Heatmap -->
-      <div class="panel">
-        <div class="panel-hdr">Latency distribution <span class="panel-sub">heatmap · click a cell to see traces</span></div>
-        <app-heatmap [data]="heatmap()" [scale]="latencyScale()" (cellClick)="onHeatmapCell($event)" />
-      </div>
-
-      <!-- Top-K + status -->
-      <div class="grid-2">
-        <div class="panel">
-          <div class="panel-hdr">Top routes <span class="panel-sub">by rate</span></div>
-          <div class="topk">
-            @for (r of topRows(); track r.label) {
-              <div class="topk-row">
-                <span class="topk-label" [title]="r.label">{{ r.label }}</span>
-                <div class="topk-bar-wrap"><div class="topk-bar" [style.width.%]="r.pct"></div></div>
-                <span class="topk-val">{{ fmtCardinality(r.value) }}</span>
-              </div>
-            } @empty { <div class="panel-empty sm">No route labels</div> }
-          </div>
-        </div>
-        <div class="panel">
-          <div class="panel-hdr">Status codes</div>
-          <div class="donut-wrap">
-            <svg viewBox="0 0 80 80" class="donut">
-              @for (seg of donutDash(); track seg.key) {
-                <circle cx="40" cy="40" r="30" fill="none" [attr.stroke]="seg.color" stroke-width="12"
-                        [attr.stroke-dasharray]="seg.dash + ' 999'"
-                        [attr.stroke-dashoffset]="seg.offset" transform="rotate(-90 40 40)"/>
-              }
-            </svg>
-            <div class="donut-legend">
-              @for (k of ['2xx','3xx','4xx','5xx']; track k) {
-                <span class="dl-item"><span class="dl-dot" [style.background]="statusColor(k)"></span>{{ k }}
-                  <b>{{ fmtCardinality(statusPcts()[k]) }}</b></span>
-              }
-            </div>
-          </div>
-        </div>
-      </div>
-    }
-  }
-
-  <!-- ══ RUNTIME ═══════════════════════════════════════════════════════════ -->
-  @if (tab() === 'runtime') {
-    @if (!runtimePanels().length) {
-      <div class="panel-empty">No runtime metrics found. Enable .NET runtime instrumentation.</div>
-    } @else {
-      <div class="grid-2">
-        @for (p of runtimePanels(); track p.canvasId) {
-          <div class="panel">
-            <div class="panel-hdr">{{ p.title }} @if (p.unit) { <span class="panel-sub">{{ p.unit }}</span> }</div>
-            <div class="chart-wrap sm"><canvas [id]="p.canvasId"></canvas></div>
-          </div>
+      <div class="catalog-list">
+        @for (m of filteredCatalog(); track m.name) {
+          <button class="cat-row" [class.active]="mode() === 'query' && selected()?.name === m.name" (click)="selectMetric(m)">
+            <span class="cat-type" [style.background]="typeColor(m.type) + '22'" [style.color]="typeColor(m.type)">
+              {{ typeShort(m.type) }}
+            </span>
+            <span class="cat-name">{{ m.name }}</span>
+            @if (m.unit) { <span class="cat-meta">{{ m.unit }}</span> }
+          </button>
+        } @empty {
+          <div class="panel-empty sm">No metrics ingested yet.</div>
         }
       </div>
-    }
-  }
+    </aside>
 
-  <!-- ══ EXPLORE ═══════════════════════════════════════════════════════════ -->
-  @if (tab() === 'explore') {
-    <div class="explore">
-      <!-- Catalog -->
-      <div class="catalog-panel">
-        <div class="catalog-search">
-          <lucide-icon name="search" [size]="13" class="cs-icon" />
-          <input class="cs-input" [ngModel]="catalogSearch()" (ngModelChange)="catalogSearch.set($event)"
-                 placeholder="Filter metrics…" />
-        </div>
-        <div class="catalog-list">
-          @for (m of filteredCatalog(); track m.name) {
-            <button class="cat-row" [class.active]="selectedMetric()?.name === m.name" (click)="selectMetric(m)">
-              <span class="cat-type" [style.background]="catalogTone(m.type) + '22'" [style.color]="catalogTone(m.type)">
-                {{ m.type[0] }}
-              </span>
-              <span class="cat-name" [title]="m.name">{{ m.name }}</span>
-              <span class="cat-meta">{{ fmtCardinality(m.cardinality) }} · {{ fmtLastSeen(m.lastSeenMs) }}</span>
-            </button>
-          } @empty { <div class="panel-empty sm">No metrics</div> }
-        </div>
-      </div>
-
-      <!-- Builder + chart -->
-      <div class="explore-main">
-        <!-- Mode toggle -->
-        <div class="ex-modebar">
-          <div class="ex-modes">
-            <button class="ex-mode" [class.active]="!exprMode()" (click)="exprMode.set(false)">Single metric</button>
-            <button class="ex-mode" [class.active]="exprMode()" (click)="exprMode.set(true)">Expression (A op B)</button>
-          </div>
-          @if (!exprMode()) {
-            <label class="ex-cmp"><input type="checkbox" [checked]="comparePrev()"
-              (change)="comparePrev.set(!comparePrev()); runExplore()" /> Compare prev period</label>
-          }
-          <button class="ex-reset" (click)="resetZoom()" title="Reset zoom"><lucide-icon name="zoom-out" [size]="13" /> Reset zoom</button>
-        </div>
-
-        @if (exprMode()) {
-          <!-- Expression builder -->
-          <div class="builder">
-            <div class="expr-row">
-              <div class="expr-side">
-                <input class="expr-metric" [(ngModel)]="exprLeft.metric" placeholder="metric A" spellcheck="false" />
-                <select [(ngModel)]="exprLeft.agg">
-                  <option value="rate">rate</option><option value="increase">increase</option>
-                  <option value="sum">sum</option><option value="avg">avg</option><option value="last">last</option>
-                </select>
-                <input class="expr-filters" [(ngModel)]="exprLeft.filters" placeholder="filters: status=500, method=GET" spellcheck="false" />
-              </div>
-              <select class="expr-op" [ngModel]="exprOp()" (ngModelChange)="exprOp.set($event)">
-                <option value="div">÷</option><option value="mul">×</option><option value="add">+</option><option value="sub">−</option>
-              </select>
-              <div class="expr-side">
-                <input class="expr-metric" [(ngModel)]="exprRight.metric" placeholder="metric B" spellcheck="false" />
-                <select [(ngModel)]="exprRight.agg">
-                  <option value="rate">rate</option><option value="increase">increase</option>
-                  <option value="sum">sum</option><option value="avg">avg</option><option value="last">last</option>
-                </select>
-                <input class="expr-filters" [(ngModel)]="exprRight.filters" placeholder="filters: (optional)" spellcheck="false" />
-              </div>
+    <!-- Main -->
+    <section class="explore-main">
+      @if (selected(); as m) {
+        <!-- Builder -->
+        <div class="builder">
+          <!-- mode + view switches -->
+          <div class="b-modebar">
+            <div class="seg">
+              <button [class.on]="mode() === 'query'" (click)="setMode('query')">Query</button>
+              <button [class.on]="mode() === 'expr'"  (click)="setMode('expr')">Expr A∘B</button>
             </div>
-            <div class="b-controls">
-              <label class="b-field"><span>× Scale</span>
-                <input type="number" [ngModel]="exprScale()" (ngModelChange)="exprScale.set(+$event)" style="width:90px" /></label>
-              <span class="expr-hint">e.g. rate(errors) ÷ rate(total) × 100 = error rate %</span>
-              <button class="b-run" (click)="runExpr()"><lucide-icon name="play" [size]="12" /> Run</button>
-            </div>
-          </div>
-          <div class="panel"><div class="chart-wrap"><canvas #exploreCanvas></canvas></div></div>
 
-        } @else if (!selectedMetric()) {
-          <div class="panel-empty">Select a metric to graph it</div>
-        } @else {
-          @let m = selectedMetric()!;
-          <div class="builder">
+            @if (mode() === 'query' && isHistogram()) {
+              <div class="seg">
+                <button [class.on]="viewMode() === 'lines'"   (click)="setViewMode('lines')">Lines</button>
+                <button [class.on]="viewMode() === 'heatmap'" (click)="setViewMode('heatmap')">Heatmap</button>
+              </div>
+              @if (viewMode() === 'lines') {
+                <label class="ex-toggle">
+                  <input type="checkbox" [checked]="showExemplars()" (change)="toggleExemplars()">
+                  exemplars
+                  @if (exemplarCount()) { <span class="ex-dot"></span> {{ exemplarCount() }} }
+                </label>
+              }
+            }
+          </div>
+
+          @if (mode() === 'query') {
             <div class="b-title">
-              <span class="cat-type" [style.background]="catalogTone(m.type) + '22'" [style.color]="catalogTone(m.type)">{{ m.type }}</span>
+              <span class="cat-type" [style.background]="typeColor(m.type) + '22'" [style.color]="typeColor(m.type)">
+                {{ m.type }}
+              </span>
               <span class="b-name">{{ m.name }}</span>
-              @if (m.unit) { <span class="b-unit">{{ m.unit }}</span> }
+              @if (m.unit) { <span class="b-unit">· {{ m.unit }}</span> }
+              <span class="b-unit">· {{ fmtNum(m.cardinality) }} series</span>
             </div>
+
             <div class="b-controls">
               <label class="b-field">
                 <span>Aggregation</span>
-                <select [ngModel]="exAggregation()" (ngModelChange)="exAggregation.set($event); runExplore()">
-                  @if (m.type === 'Histogram') { <option value="quantile">quantile</option> }
-                  @if (m.type === 'Counter') { <option value="rate">rate</option> <option value="increase">increase</option> }
-                  <option value="avg">avg</option><option value="min">min</option>
-                  <option value="max">max</option><option value="last">last</option><option value="sum">sum</option>
+                <select [ngModel]="aggregation()" (ngModelChange)="onAgg($event)">
+                  @for (a of aggs; track a) { <option [ngValue]="a">{{ a }}</option> }
                 </select>
               </label>
-              @if (exAggregation() === 'quantile') {
+
+              @if (aggregation() === 'quantile') {
                 <label class="b-field">
                   <span>Quantile</span>
-                  <select [ngModel]="exQuantile()" (ngModelChange)="exQuantile.set(+$event); runExplore()">
-                    <option [ngValue]="0.5">p50</option><option [ngValue]="0.9">p90</option>
-                    <option [ngValue]="0.95">p95</option><option [ngValue]="0.99">p99</option>
+                  <select [ngModel]="quantile()" (ngModelChange)="onQuantile($event)">
+                    <option [ngValue]="0.5">p50</option>
+                    <option [ngValue]="0.9">p90</option>
+                    <option [ngValue]="0.95">p95</option>
+                    <option [ngValue]="0.99">p99</option>
                   </select>
                 </label>
               }
-              <button class="b-run" (click)="runExplore()"><lucide-icon name="play" [size]="12" /> Run</button>
+
+              <label class="b-field">
+                <span>Top-K</span>
+                <select [ngModel]="topk()" (ngModelChange)="onTopk($event)">
+                  <option [ngValue]="5">5</option>
+                  <option [ngValue]="12">12</option>
+                  <option [ngValue]="20">20</option>
+                  <option [ngValue]="50">50</option>
+                </select>
+              </label>
+
+              <label class="b-field grow">
+                <span>Filters (key=value, …)</span>
+                <input class="b-input" placeholder="service.name=api, http.route=/orders"
+                       [ngModel]="filtersRaw()" (ngModelChange)="filtersRaw.set($event)"
+                       (keydown.enter)="runQuery()" (blur)="runQuery()">
+              </label>
+
+              <button class="b-run" (click)="runQuery()">
+                <lucide-icon name="play" [size]="13" /> Run
+              </button>
+              <button class="ex-reset" (click)="resetZoom()" title="Reset zoom">
+                <lucide-icon name="zoom-out" [size]="13" />
+              </button>
             </div>
+
             @if (m.labelKeys.length) {
               <div class="b-groupby">
-                <span class="gb-label">Group by:</span>
+                <span class="gb-label">group by</span>
                 @for (k of m.labelKeys; track k) {
-                  <button class="gb-chip" [class.on]="exGroupBy().includes(k)" (click)="toggleGroupBy(k); runExplore()">{{ k }}</button>
+                  <button class="gb-chip" [class.on]="groupBy().includes(k)" (click)="toggleGroupBy(k)">{{ k }}</button>
                 }
               </div>
             }
-          </div>
+          } @else {
+            <!-- Expression builder -->
+            <div class="expr">
+              <div class="expr-side">
+                <input class="b-input" list="metricList" placeholder="left metric" [(ngModel)]="exprLeft.metric">
+                <div class="expr-sub">
+                  <select [(ngModel)]="exprLeft.agg">@for (a of aggs; track a) { <option [ngValue]="a">{{ a }}</option> }</select>
+                  <input class="b-input" placeholder="filters" [(ngModel)]="exprLeft.filters">
+                </div>
+              </div>
 
-          <div class="panel">
-            <div class="chart-wrap"><canvas #exploreCanvas></canvas></div>
-          </div>
-          @if (exHeatmap()) {
-            <div class="panel">
-              <div class="panel-hdr">Distribution <span class="panel-sub">heatmap · click a cell to see traces</span></div>
-              <app-heatmap [data]="exHeatmap()" [scale]="m.unit === 's' ? 1000 : 1" (cellClick)="onHeatmapCell($event)" />
+              <select class="expr-op" [ngModel]="exprOp()" (ngModelChange)="exprOp.set($event)">
+                @for (o of ops; track o) { <option [ngValue]="o">{{ o === 'div' ? '÷' : o === 'mul' ? '×' : o === 'add' ? '+' : '−' }}</option> }
+              </select>
+
+              <div class="expr-side">
+                <input class="b-input" list="metricList" placeholder="right metric" [(ngModel)]="exprRight.metric">
+                <div class="expr-sub">
+                  <select [(ngModel)]="exprRight.agg">@for (a of aggs; track a) { <option [ngValue]="a">{{ a }}</option> }</select>
+                  <input class="b-input" placeholder="filters" [(ngModel)]="exprRight.filters">
+                </div>
+              </div>
+
+              <label class="b-field expr-scale">
+                <span>× scale</span>
+                <input class="b-input" type="number" [ngModel]="exprScale()" (ngModelChange)="exprScale.set(+$event)">
+              </label>
+
+              <button class="b-run" (click)="runExpr()"><lucide-icon name="play" [size]="13" /> Run</button>
+            </div>
+            <div class="expr-hint">e.g. error rate = rate(requests, filter <code>http.response.status_code=500</code>) ÷ rate(requests) × 100</div>
+            <datalist id="metricList">@for (n of metricNames(); track n) { <option [value]="n"></option> }</datalist>
+          }
+        </div>
+
+        <!-- Chart / Heatmap -->
+        <div class="chart-card">
+          @if (mode() === 'query' && isHistogram() && viewMode() === 'heatmap') {
+            <app-heatmap [data]="heatmap()" [scale]="scale()" (cellClick)="onHeatmapCell($event)" />
+          } @else {
+            <div class="chart-wrap">
+              <canvas #chartCanvas></canvas>
+              @if (loading()) {
+                <div class="chart-overlay"><lucide-icon name="loader" class="spin" [size]="18" /></div>
+              }
+              @if (!loading() && !series().length) {
+                <div class="chart-overlay muted">No data in this window</div>
+              }
             </div>
           }
-        }
-      </div>
-    </div>
-  }
+        </div>
+      } @else {
+        <div class="panel-empty">Select a metric from the catalog to start exploring.</div>
+      }
+    </section>
+  </div>
 
-  <!-- ══ Correlation drawer: metric → traces → logs ════════════════════════ -->
+  <!-- ── Correlation drawer (heatmap cell → traces) ─────────────────────── -->
   @if (corrOpen()) {
     <div class="corr-backdrop" (click)="closeCorr()"></div>
     <aside class="corr-drawer">
@@ -308,31 +211,29 @@
           <span class="corr-title">{{ corrTitle() }}</span>
           <span class="corr-sub">{{ corrSub() }}</span>
         </div>
-        <button class="corr-close" (click)="closeCorr()" aria-label="Close">
-          <lucide-icon name="x" [size]="16" />
-        </button>
+        <button class="corr-close" (click)="closeCorr()"><lucide-icon name="x" [size]="16" /></button>
       </div>
       <div class="corr-body">
         @if (corrLoading()) {
-          <div class="corr-empty"><lucide-icon name="loader" [size]="16" class="spin" /> Loading traces…</div>
+          <div class="corr-empty"><lucide-icon name="loader" class="spin" [size]="16" /> loading…</div>
         } @else if (!corrTraces().length) {
-          <div class="corr-empty">No traces in this window/latency range</div>
+          <div class="corr-empty">No matching traces</div>
         } @else {
           @for (t of corrTraces(); track t.traceId) {
             <button class="corr-row" (click)="openTrace(t.traceId)">
               <span class="corr-dot" [class.err]="t.status === 'Error'"></span>
-              <div class="corr-row-main">
-                <div class="corr-row-top">
+              <span class="corr-row-main">
+                <span class="corr-row-top">
                   @if (t.httpMethod) { <span class="corr-method">{{ t.httpMethod }}</span> }
                   <span class="corr-path">{{ t.httpPath || t.name }}</span>
-                </div>
-                <div class="corr-row-meta">
+                </span>
+                <span class="corr-row-meta">
                   <span class="corr-svc">{{ t.serviceName }}</span>
-                  <span class="corr-time">{{ corrFmtTime(t.startTimeUnixNano) }}</span>
-                </div>
-              </div>
-              <span class="corr-dur">{{ corrFmtDur(t.durationNanos) }}</span>
-              <lucide-icon name="arrow-right" [size]="13" class="corr-arrow" />
+                  <span>{{ corrTime(t.startTimeUnixNano) }}</span>
+                </span>
+              </span>
+              <span class="corr-dur">{{ corrDur(t.durationNanos) }}</span>
+              <lucide-icon name="arrow-right" class="corr-arrow" [size]="14" />
             </button>
           }
         }

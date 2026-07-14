@@ -145,7 +145,10 @@ if (-not $SkipClient) {
 Write-Step "2/3" "Publishing .NET server (self-contained)..."
 
 foreach ($t in $targets) {
-    $rid       = "$($t.OS)-$($t.Arch)"
+    # .NET RID uses 'win', not 'windows'. The OS field ("windows"/"linux") still
+    # names the output folder below; only the RID prefix differs.
+    $ridOs     = if ($t.OS -eq 'windows') { 'win' } else { $t.OS }
+    $rid       = "$ridOs-$($t.Arch)"
     $targetDir = Join-Path $root $OutDir $t.OS
 
     Write-Host ""
@@ -214,7 +217,8 @@ Write-Host ""
 
 foreach ($t in $targets) {
     $targetDir = Join-Path $root $OutDir $t.OS
-    $rid = "$($t.OS)-$($t.Arch)"
+    $ridOs = if ($t.OS -eq 'windows') { 'win' } else { $t.OS }
+    $rid = "$ridOs-$($t.Arch)"
     Write-Host "  $rid" -ForegroundColor Cyan
     Write-Host "    $targetDir" -ForegroundColor Gray
     if ($t.OS -eq "windows") {

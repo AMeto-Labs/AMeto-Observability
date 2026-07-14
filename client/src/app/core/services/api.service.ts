@@ -4,7 +4,7 @@ import { Observable } from 'rxjs';
 import { EventDto, EventQueryParams, StatsDto, EventCountsDto } from '../models/event.model';
 import {
   AlertRule, AlertRuleUpsertRequest, AlertStateSnapshot, AlertHistoryEntry,
-  AlertSilence, AlertPreviewResult,
+  AlertSilence, AlertPreviewResult, MaintenanceWindow,
 } from '../models/alert.model';
 import { NodeDto } from '../models/node.model';
 import { RetentionDto, RetentionRunResult } from '../models/retention.model';
@@ -12,6 +12,7 @@ import { DiagnosticsDto } from '../models/diagnostics.model';
 import { ApiKeyDto, CreatedApiKeyDto, OAuthDomainDto, UserDto } from '../models/auth.model';
 import { CompareTracesDto, LatencyServiceDto, SpanDto, SpanQueryParams, TraceQueryRequest, TraceRowDto, TraceStatsDto } from '../models/span.model';
 import { MetricSeriesDto, MetricCatalogDto, MetricQueryRequest, HeatmapDto, ExemplarDto, MetricExprRequest } from '../models/metric.model';
+import { SearchHistoryDto } from '../models/search-history.model';
 import { AuthService } from './auth.service';
 
 @Injectable({ providedIn: 'root' })
@@ -103,8 +104,40 @@ export class ApiService {
   deleteAlertSilence(id: string): Observable<void> {
     return this.http.delete<void>(`/api/alerts/silences/${id}`);
   }
+  getMaintenance(): Observable<MaintenanceWindow[]> {
+    return this.http.get<MaintenanceWindow[]>('/api/alerts/maintenance');
+  }
+  createMaintenance(w: MaintenanceWindow): Observable<MaintenanceWindow> {
+    return this.http.post<MaintenanceWindow>('/api/alerts/maintenance', w);
+  }
+  deleteMaintenance(id: string): Observable<void> {
+    return this.http.delete<void>(`/api/alerts/maintenance/${id}`);
+  }
   previewAlert(req: AlertRuleUpsertRequest): Observable<AlertPreviewResult> {
     return this.http.post<AlertPreviewResult>('/api/alerts/preview', req);
+  }
+  testAlert(req: AlertRuleUpsertRequest): Observable<{ sent: number }> {
+    return this.http.post<{ sent: number }>('/api/alerts/test', req);
+  }
+  ackAlert(id: string): Observable<void> {
+    return this.http.post<void>(`/api/alerts/${id}/ack`, {});
+  }
+  unackAlert(id: string): Observable<void> {
+    return this.http.delete<void>(`/api/alerts/${id}/ack`);
+  }
+
+  // ── Search history (per-user) ───────────────────────────────────────────────
+  getSearchHistory(): Observable<SearchHistoryDto> {
+    return this.http.get<SearchHistoryDto>('/api/search-history');
+  }
+  recordSearch(query: string): Observable<void> {
+    return this.http.post<void>('/api/search-history', { query });
+  }
+  pinSearch(query: string, pinned: boolean): Observable<void> {
+    return this.http.put<void>('/api/search-history/pin', { query, pinned });
+  }
+  deleteSearch(query: string): Observable<void> {
+    return this.http.delete<void>(`/api/search-history?query=${encodeURIComponent(query)}`);
   }
 
   getNodes(): Observable<NodeDto[]> {
@@ -156,8 +189,8 @@ export class ApiService {
   updateUserRole(id: string, role: string): Observable<void> {
     return this.http.patch<void>(`/api/users/${id}/role`, { role });
   }
-  updateUser(id: string, displayName: string, role: string): Observable<void> {
-    return this.http.patch<void>(`/api/users/${encodeURIComponent(id)}`, { displayName, role });
+  updateUser(id: string, displayName: string, role: string, permissions?: number): Observable<void> {
+    return this.http.patch<void>(`/api/users/${encodeURIComponent(id)}`, { displayName, role, permissions });
   }
   deleteUser(id: string): Observable<void>    { return this.http.delete<void>(`/api/users/${id}`); }
 

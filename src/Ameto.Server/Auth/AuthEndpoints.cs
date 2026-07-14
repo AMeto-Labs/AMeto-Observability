@@ -22,9 +22,15 @@ internal static class AuthEndpoints
             if (!store.ValidateUser(req.Username.Trim(), req.Password))
                 return Results.Unauthorized();
 
-            var role  = store.GetRole(req.Username.Trim()) ?? "viewer";
-            var token = issuer.Issue(req.Username.Trim(), role);
-            return Results.Ok(new { token, expiresIn = JwtIssuer.ExpiresInSeconds, role });
+            var user  = store.FindByUsernameOrEmail(req.Username.Trim(), "");
+            var role  = user?.Role ?? "viewer";
+            var perms = user?.Permissions ?? ViewPermissions.All;
+            var token = issuer.Issue(req.Username.Trim(), role, permissions: perms);
+            return Results.Ok(new
+            {
+                token, expiresIn = JwtIssuer.ExpiresInSeconds, role,
+                permissions = (int)(role == "admin" ? ViewPermissions.All : perms),
+            });
         });
 
         // ── OAuth: initiate ───────────────────────────────────────────────────
@@ -73,9 +79,13 @@ internal static class AuthEndpoints
             if (user is null)
                 return Results.Unauthorized();
 
-            // Use current role from DB (admin may have changed it since last login)
-            var token = issuer.Issue(user.Username, user.Role, user.Email);
-            return Results.Ok(new { token, expiresIn = JwtIssuer.ExpiresInSeconds, role = user.Role });
+            // Use current role + permissions from DB (admin may have changed them since last login)
+            var token = issuer.Issue(user.Username, user.Role, user.Email, permissions: user.Permissions);
+            return Results.Ok(new
+            {
+                token, expiresIn = JwtIssuer.ExpiresInSeconds, role = user.Role,
+                permissions = (int)(user.Role == "admin" ? ViewPermissions.All : user.Permissions),
+            });
         }).RequireAuthorization();
 
         // ── Users: list ───────────────────────────────────────────────────────
@@ -85,6 +95,7 @@ internal static class AuthEndpoints
             return Results.Ok(store.ListUsers().Select(u => new
             {
                 u.Id, u.Username, u.DisplayName, u.Email, u.Provider, u.Role,
+                Permissions = (int)u.Permissions,
                 CreatedAt = u.CreatedAt.ToString("O"),
             }));
         }).RequireAuthorization();
@@ -99,6 +110,7 @@ internal static class AuthEndpoints
                 : Results.Ok(new
                 {
                     u.Id, u.Username, u.DisplayName, u.Email, u.Provider, u.Role,
+                    Permissions = (int)u.Permissions,
                     CreatedAt = u.CreatedAt.ToString("O"),
                 });
         }).RequireAuthorization();
@@ -111,11 +123,13 @@ internal static class AuthEndpoints
                 return Results.BadRequest(new { error = "Username and password required." });
 
             var role = AuthStore.NormaliseRole(req.Role);
+            var perms = req.Permissions is int p ? (ViewPermissions)p & ViewPermissions.All : ViewPermissions.All;
             try
             {
-                var user = store.CreateUser(req.Username.Trim(), req.Password, role);
+                var user = store.CreateUser(req.Username.Trim(), req.Password, role, perms);
                 return Results.Ok(new { user.Id, user.Username, user.DisplayName,
                                         user.Email, user.Provider, user.Role,
+                                        Permissions = (int)user.Permissions,
                                         CreatedAt = user.CreatedAt.ToString("O") });
             }
             catch (Microsoft.Data.Sqlite.SqliteException ex) when (ex.SqliteErrorCode == 19)
@@ -139,6 +153,7 @@ internal static class AuthEndpoints
                 var user = store.CreateOAuthUser(req.Email.Trim(), req.DisplayName?.Trim() ?? req.Email.Trim(), provider, role);
                 return Results.Ok(new { user.Id, user.Username, user.DisplayName,
                                         user.Email, user.Provider, user.Role,
+                                        Permissions = (int)user.Permissions,
                                         CreatedAt = user.CreatedAt.ToString("O") });
             }
             catch (Microsoft.Data.Sqlite.SqliteException ex) when (ex.SqliteErrorCode == 19)
@@ -163,7 +178,11 @@ internal static class AuthEndpoints
             if (string.IsNullOrEmpty(name))
                 return Results.BadRequest(new { error = "Display name is required." });
             var role = AuthStore.NormaliseRole(req.Role ?? "viewer");
-            return store.UpdateUser(id, name, role) ? Results.NoContent() : Results.NotFound();
+            // Mask to known bits; when omitted, keep the user's current scopes.
+            var perms = req.Permissions is int p
+                ? (ViewPermissions)p & ViewPermissions.All
+                : (store.GetUser(id)?.Permissions ?? ViewPermissions.All);
+            return store.UpdateUser(id, name, role, perms) ? Results.NoContent() : Results.NotFound();
         }).RequireAuthorization();
 
         // ── OAuth domain allowlist: list / create / delete ────────────────────
@@ -271,10 +290,10 @@ internal static class AuthEndpoints
 }
 
 internal sealed record LoginRequest(string Username, string Password);
-internal sealed record CreateUserRequest(string Username, string Password, string Role = "viewer");
+internal sealed record CreateUserRequest(string Username, string Password, string Role = "viewer", int? Permissions = null);
 internal sealed record CreateOAuthUserRequest(string Email, string? DisplayName, string? Provider, string? Role);
 internal sealed record UpdateRoleRequest(string Role);
-internal sealed record UpdateUserRequest(string? DisplayName, string? Role);
+internal sealed record UpdateUserRequest(string? DisplayName, string? Role, int? Permissions = null);
 internal sealed record CreateOAuthDomainRequest(string? Domain, string? Provider, string? Role = "viewer");
 internal sealed record CreateApiKeyRequest(
     string Name,
