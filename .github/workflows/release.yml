@@ -85,11 +85,17 @@ jobs:
       - name: Checksums
         run: sha256sum ameto-*.tar.gz ameto-*.zip > SHA256SUMS.txt
 
+      # Fill the version into the install guide; action-gh-release appends the
+      # auto-generated changelog after this body (generate_release_notes below).
+      - name: Compose release notes (install guide)
+        run: sed "s|__VERSION__|${RELEASE_VERSION}|g" .github/release-body.md > RELEASE_BODY.md
+
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_VERSION }}
           name: ${{ env.RELEASE_VERSION }}
+          body_path: RELEASE_BODY.md
           generate_release_notes: true
           files: |
             ameto-${{ env.RELEASE_VERSION }}-linux-x64.tar.gz
