@@ -108,6 +108,9 @@
   white-space: nowrap;
 }
 
+/* Service name is a single fixed colour (cyan) — deliberately not the per-service
+   hash used elsewhere, and distinct from every level hue (gray/blue/green/amber/red/
+   purple) so it can never be confused with the level badge in this list. */
 .ev-svc {
   flex-shrink: 0;
   max-width: 200px;
@@ -117,18 +120,19 @@
   overflow: hidden;
   padding-right: 12px;
   color: var(--txt-muted);
+  --ev-svc-color: #22D3EE;
 }
 .ev-svc-icon {
   flex-shrink: 0;
   opacity: .65;
-  color: var(--svc-color, #A78BFA);
+  color: var(--ev-svc-color);
 }
 .ev-svc-name {
   font-size: 12px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  color: var(--svc-color, #A78BFA);
+  color: var(--ev-svc-color);
   opacity: .85;
 }
 
