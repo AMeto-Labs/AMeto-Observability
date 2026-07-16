@@ -8,7 +8,6 @@ import { LucideAngularModule } from 'lucide-angular';
 
 import { EventDto } from '../../../../core/models/event.model';
 import { renderMessageHtml } from '../../../../shared/utils/clef-renderer';
-import { serviceColor } from '../../../../shared/utils/service-color';
 import { ContextMenuService, OverlayPanelRef } from '../../../../shared/services/overlay';
 
 const LEVEL_SHORT: Record<string, string> = {
@@ -99,9 +98,6 @@ export class EventListRowComponent {
 
   readonly service = computed(() =>
     (this.event()['service.name'] as string | undefined) ?? '');
-
-  /** Stable per-service colour (shared across the app). */
-  readonly svcColor = computed(() => serviceColor(this.service()));
 
   readonly renderedHtml = computed(() =>
     this.sanitizer.bypassSecurityTrustHtml(
