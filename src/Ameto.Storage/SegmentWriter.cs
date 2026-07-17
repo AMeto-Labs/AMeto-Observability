@@ -207,6 +207,37 @@ public sealed class SegmentWriter : IDisposable
 
     // ── Columnar block writer ─────────────────────────────────────────────────
 
+    // ── Per-block scratch, reused across the ~1000 blocks of a segment flush ──
+    // One SegmentWriter serialises one segment on one thread, so plain instance
+    // fields suffice. Before this, every 64 KB block allocated ~10 arrays, five
+    // MemoryStreams, a ToArray of the whole block and four Stream.CopyTo buffers —
+    // hundreds of MB of (largely LOH) garbage per flushed tier, which slowed
+    // flushes into the back-pressure budget and showed up as ingest drops.
+    private byte[] _colT = [];
+    private byte[] _colL = [];
+    private byte[] _colI = [];
+    private byte[] _colTr = [];
+    private byte[] _colSp = [];
+    private uint[] _tmplOffsets = [];
+    private uint[] _excOffsets = [];
+    private uint[] _propsOffsets = [];
+    private uint[] _svcOffsets = [];
+    private readonly MemoryStream _tmplBytes  = new(1024);
+    private readonly MemoryStream _excBytes   = new(256);
+    private readonly MemoryStream _propsBytes = new(4096);
+    private readonly MemoryStream _svcBytes   = new(256);
+    private readonly MemoryStream _blk        = new(BlockSize + 4096);
+
+    private static void Ensure(ref byte[] buf, int size)
+    {
+        if (buf.Length < size) buf = new byte[Math.Max(size, buf.Length * 2)];
+    }
+
+    private static void Ensure(ref uint[] buf, int size)
+    {
+        if (buf.Length < size) buf = new uint[Math.Max(size, buf.Length * 2)];
+    }
+
     private void FlushColumnarBlock(HotTierSegment hot, StringInternPool templatePool, List<int> rowIndices)
     {
         int n = rowIndices.Count;
@@ -220,20 +251,28 @@ public sealed class SegmentWriter : IDisposable
             if (h.Id < blockMinId)               blockMinId = h.Id;
         }
 
-        var colT = new byte[n * 8];
-        var colL = new byte[n];
-        var colI = new byte[n * 8];
-        var colTr = new byte[n * 16];  // TraceId: Hi(8) + Lo(8) per event
-        var colSp = new byte[n * 8];   // SpanId: 8 bytes per event
-
-        var tmplOffsets  = new uint[n + 1];
-        var tmplBytes    = new MemoryStream(1024);
-        var excOffsets   = new uint[n + 1];
-        var excBytes     = new MemoryStream(256);
-        var propsOffsets = new uint[n + 1];
-        var propsBytes   = new MemoryStream(2048);
-        var svcOffsets   = new uint[n + 1];
-        var svcBytes     = new MemoryStream(256);
+        Ensure(ref _colT,  n * 8);
+        Ensure(ref _colL,  n);
+        Ensure(ref _colI,  n * 8);
+        Ensure(ref _colTr, n * 16);   // TraceId: Hi(8) + Lo(8) per event
+        Ensure(ref _colSp, n * 8);    // SpanId: 8 bytes per event
+        Ensure(ref _tmplOffsets,  n + 1);
+        Ensure(ref _excOffsets,   n + 1);
+        Ensure(ref _propsOffsets, n + 1);
+        Ensure(ref _svcOffsets,   n + 1);
+        var colT = _colT;
+        var colL = _colL;
+        var colI = _colI;
+        var colTr = _colTr;
+        var colSp = _colSp;
+        var tmplOffsets  = _tmplOffsets;
+        var excOffsets   = _excOffsets;
+        var propsOffsets = _propsOffsets;
+        var svcOffsets   = _svcOffsets;
+        var tmplBytes  = _tmplBytes;   tmplBytes.SetLength(0);
+        var excBytes   = _excBytes;    excBytes.SetLength(0);
+        var propsBytes = _propsBytes;  propsBytes.SetLength(0);
+        var svcBytes   = _svcBytes;    svcBytes.SetLength(0);
 
         ulong firstEventId = 0;
 
@@ -301,34 +340,37 @@ public sealed class SegmentWriter : IDisposable
         propsOffsets[n] = (uint)propsBytes.Length;
         svcOffsets[n]   = (uint)svcBytes.Length;
 
-        var blk = new MemoryStream(BlockSize);
+        var blk = _blk;
+        blk.SetLength(0);
         WriteUInt32(blk, (uint)n);
         WriteInt64(blk, blockMinTs);
         WriteUInt64(blk, blockMinId);
         blk.WriteByte(9);
 
-        WriteColumn(blk, 1, colT);
-        WriteColumn(blk, 2, colL);
-        WriteColumn(blk, 3, colI);
-        WriteStringColumn(blk, 4, tmplOffsets, tmplBytes);
-        WriteStringColumn(blk, 5, excOffsets,  excBytes);
-        WriteStringColumn(blk, 6, propsOffsets, propsBytes);
-        WriteColumn(blk, 7, colTr);
-        WriteColumn(blk, 8, colSp);
-        WriteStringColumn(blk, 9, svcOffsets, svcBytes);
+        WriteColumn(blk, 1, colT, n * 8);
+        WriteColumn(blk, 2, colL, n);
+        WriteColumn(blk, 3, colI, n * 8);
+        WriteStringColumn(blk, 4, tmplOffsets,  n + 1, tmplBytes);
+        WriteStringColumn(blk, 5, excOffsets,   n + 1, excBytes);
+        WriteStringColumn(blk, 6, propsOffsets, n + 1, propsBytes);
+        WriteColumn(blk, 7, colTr, n * 16);
+        WriteColumn(blk, 8, colSp, n * 8);
+        WriteStringColumn(blk, 9, svcOffsets, n + 1, svcBytes);
 
-        byte[] uncompressed = blk.ToArray();
-        int    maxOut       = LZ4Codec.MaximumOutputSize(uncompressed.Length);
-        byte[] compBuf      = ArrayPool<byte>.Shared.Rent(maxOut);
+        // Compress straight from the stream's internal buffer — no ToArray copy.
+        int    uncompressedLen = (int)blk.Length;
+        byte[] uncompressed    = blk.GetBuffer();
+        int    maxOut          = LZ4Codec.MaximumOutputSize(uncompressedLen);
+        byte[] compBuf         = ArrayPool<byte>.Shared.Rent(maxOut);
         try
         {
-            int compressedLen = LZ4Codec.Encode(uncompressed, 0, uncompressed.Length, compBuf, 0, maxOut, LZ4Level.L00_FAST);
+            int compressedLen = LZ4Codec.Encode(uncompressed, 0, uncompressedLen, compBuf, 0, maxOut, LZ4Level.L00_FAST);
 
             long blockOffset = _fs.Position;
             _blockIndex.Add((blockOffset, firstEventId, (uint)_eventsFlushed));
             _eventsFlushed += n;
 
-            _bw.Write((uint)uncompressed.Length);
+            _bw.Write((uint)uncompressedLen);
             _bw.Write((uint)compressedLen);
             _bw.Write(compBuf, 0, compressedLen);
         }
@@ -338,28 +380,29 @@ public sealed class SegmentWriter : IDisposable
         }
     }
 
-    private static void WriteColumn(MemoryStream dst, byte id, byte[] payload)
+    private static void WriteColumn(MemoryStream dst, byte id, byte[] payload, int length)
     {
         dst.WriteByte(id);
-        WriteUInt32(dst, (uint)payload.Length);
-        dst.Write(payload, 0, payload.Length);
+        WriteUInt32(dst, (uint)length);
+        dst.Write(payload, 0, length);
     }
 
-    private static void WriteStringColumn(MemoryStream dst, byte id, uint[] offsets, MemoryStream payload)
+    private static void WriteStringColumn(MemoryStream dst, byte id, uint[] offsets, int offsetCount, MemoryStream payload)
     {
-        int offsetsByteLen = offsets.Length * 4;
+        int offsetsByteLen = offsetCount * 4;
         int totalLen       = offsetsByteLen + (int)payload.Length;
         dst.WriteByte(id);
         WriteUInt32(dst, (uint)totalLen);
 
         Span<byte> tmp4 = stackalloc byte[4];
-        for (int i = 0; i < offsets.Length; i++)
+        for (int i = 0; i < offsetCount; i++)
         {
             BinaryPrimitives.WriteUInt32LittleEndian(tmp4, offsets[i]);
             dst.Write(tmp4);
         }
-        payload.Position = 0;
-        payload.CopyTo(dst);
+        // Write from the payload stream's internal buffer — Stream.CopyTo allocates
+        // an 80 KB transfer buffer per call (four calls per block before this).
+        dst.Write(payload.GetBuffer(), 0, (int)payload.Length);
     }
 
     private static void WriteUInt32(MemoryStream s, uint v)
