@@ -44,8 +44,9 @@
   border-radius: 7px;
   overflow: hidden;
 }
+/* Muted template + bright values, same relationship as the list row. */
 .d-message-text {
-  color: var(--txt);
+  color: var(--msg-tmpl);
   line-height: 1.55;
   word-break: break-word;
   font-size: var(--log-font-size);
@@ -90,15 +91,16 @@
   gap: 6px;
   min-width: 0;
 }
+/* Service is plain like every other fact — no per-service hue in the details. */
 .d-svc-dot {
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: var(--svc-color, var(--txt-muted));
+  background: var(--txt-muted);
   flex-shrink: 0;
 }
 .d-fact-val.d-svc-name {
-  color: var(--svc-color, var(--txt));
+  color: var(--txt);
   font-weight: 500;
 }
 
@@ -107,7 +109,7 @@
   font-family: var(--font-mono);
   font-size: var(--log-font-size);
   line-height: 1.6;
-  color: var(--txt);
+  color: var(--msg-tmpl);
   white-space: pre-wrap;
   word-break: break-word;
   max-height: 60vh;
@@ -289,7 +291,7 @@
   &:hover { background: var(--surface-hover); }
 }
 .d-prop-k {
-  color: var(--txt-muted);
+  color: var(--txt);
   font-size: 11.5px;
   word-break: break-all;
   padding-top: 3px;

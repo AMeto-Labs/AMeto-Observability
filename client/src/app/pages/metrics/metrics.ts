@@ -18,6 +18,7 @@ import {
 import { TraceRowDto } from '../../core/models/span.model';
 import { serviceColor } from '../../shared/utils/service-color';
 import { HeatmapComponent } from './heatmap/heatmap';
+import { SuggestInputDirective } from '../../shared/suggest/suggest-input.directive';
 
 const PRESETS: readonly [string, number][] = [
   ['15m', 0.25], ['30m', 0.5], ['1h', 1], ['3h', 3], ['6h', 6], ['12h', 12], ['24h', 24],
@@ -40,7 +41,7 @@ interface ExprSide { metric: string; agg: MetricAggregation; filters: string; }
  */
 @Component({
   selector: 'app-metrics',
-  imports: [FormsModule, LucideAngularModule, HeatmapComponent],
+  imports: [FormsModule, LucideAngularModule, HeatmapComponent, SuggestInputDirective],
   templateUrl: './metrics.html',
   styleUrl: './metrics.scss',
   changeDetection: ChangeDetectionStrategy.OnPush,
@@ -108,6 +109,8 @@ export class MetricsComponent implements OnInit, OnDestroy {
   });
   metricNames  = computed(() => this.catalog().map(m => m.name));
   isHistogram  = computed(() => this.selected()?.type === 'Histogram');
+  /** Label keys of the selected metric — offered by the filter's Ctrl+Space autocomplete. */
+  filterKeys   = computed(() => this.selected()?.labelKeys ?? []);
   scale        = computed(() => this.isHistogram() && this.selected()?.unit === 's' ? 1000 : 1);
 
   /** Auto step: aim for ~200 points across the window, snapped to a nice value. */

@@ -741,6 +741,28 @@
   max-height: 240px;
   border-top: 1px solid var(--border);
   background: var(--bg-elevated);
+  position: relative;
+}
+
+/* Close affordance for the span panel (re-clicking the span row also toggles it off). */
+.span-close {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  background: none;
+  border: none;
+  border-radius: var(--radius-sm);
+  color: var(--txt-muted);
+  cursor: pointer;
+
+  &:hover { color: var(--txt); background: var(--surface-up); }
 }
 
 .span-detail-left,
@@ -1263,6 +1285,9 @@
 
   &:last-child { border-bottom: none; }
   &:hover { background: var(--bg-card); }
+
+  // Rows open the full log-details modal.
+  &--clickable { cursor: pointer; }
 
   // Logs emitted under the currently selected span — highlighted within the
   // full trace-log list.

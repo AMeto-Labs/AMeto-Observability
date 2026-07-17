@@ -79,16 +79,19 @@
   opacity: .9;
 }
 
+/* The date repeats down the whole list, so it recedes; the time is what the eye
+   actually scans and carries the row. */
 .ev-ts {
   flex-shrink: 0;
   width: 160px;
-  color: var(--txt);
   font-size: 11px;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
   cursor: default;
   padding-right: 6px;
 }
+.ev-ts-date { color: var(--row-ts-date); }
+.ev-ts-time { color: var(--row-ts-time); }
 
 .ev-level {
   flex-shrink: 0;
@@ -108,9 +111,10 @@
   white-space: nowrap;
 }
 
-/* Service name is a single fixed colour (cyan) — deliberately not the per-service
-   hash used elsewhere, and distinct from every level hue (gray/blue/green/amber/red/
-   purple) so it can never be confused with the level badge in this list. */
+/* Service name is a single fixed, neutral colour — deliberately not the per-service
+   hash used elsewhere, and not a hue at all: the level badge is the only saturated
+   colour in the row, so nothing else can read as a severity at a glance. It shares
+   the timestamp's tone (--row-ts-time), keeping the row's metadata on one level. */
 .ev-svc {
   flex-shrink: 0;
   max-width: 200px;
@@ -120,7 +124,7 @@
   overflow: hidden;
   padding-right: 12px;
   color: var(--txt-muted);
-  --ev-svc-color: #22D3EE;
+  --ev-svc-color: var(--row-svc);
 }
 .ev-svc-icon {
   flex-shrink: 0;
@@ -136,6 +140,8 @@
   opacity: .85;
 }
 
+/* Literal template text recedes; the interpolated values (.msg-* spans) sit a
+   brightness step above it — that contrast, not colour, is what marks a value. */
 .ev-msg {
   flex: 1;
   overflow: hidden;
@@ -144,6 +150,7 @@
   font-size: var(--log-font-size);
   cursor: pointer;
   min-width: 0;
+  color: var(--msg-tmpl);
 }
 .ev-msg:hover { color: var(--txt); }
 
@@ -182,8 +189,10 @@
   max-width: 320px;
   overflow: hidden;
 }
+/* Props hint: neutral like the rest of the row. The value previously used --c-str,
+   which is exactly --lvl-i (Information green) — a plain value reading as a level. */
 .ev-kv { display: flex; gap: 0; overflow: hidden; max-width: 120px; }
-.ev-pk { color: #718096; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 11px; }
-.ev-pv { color: var(--c-str); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 11px; max-width: 60px; }
-.ev-sep { color: #4A5568; }
-.ev-more-props { color: #4A5568; font-size: 10px; flex-shrink: 0; }
+.ev-pk { color: var(--row-prop-key); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 11px; }
+.ev-pv { color: var(--row-prop-val); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 11px; max-width: 60px; }
+.ev-sep { color: var(--row-prop-sep); }
+.ev-more-props { color: var(--row-prop-sep); font-size: 10px; flex-shrink: 0; }

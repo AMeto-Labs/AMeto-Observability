@@ -1,5 +1,5 @@
 import {
-  Component, signal, computed, inject, OnInit, OnDestroy,
+  Component, signal, computed, inject, OnInit, OnDestroy, HostListener,
   ChangeDetectionStrategy, ChangeDetectorRef,
 } from '@angular/core';
 import { Router, ActivatedRoute } from '@angular/router';
@@ -15,10 +15,29 @@ import { ServiceGraphComponent } from './service-graph/service-graph';
 import { FlamegraphComponent } from './flame-graph/flame-graph';
 import { LatencyComponent } from './latency/latency';
 import { CompareTraceComponent } from './compare-trace/compare-trace';
+import { SuggestInputDirective } from '../../shared/suggest/suggest-input.directive';
+import { ModalComponent } from '../../shared/components/ui';
+import { EventDetailComponent } from '../events/components/event-detail/event-detail';
+
+/** TraceQL vocabulary offered by the Ctrl+Space autocomplete: intrinsics, common OTel span
+ *  attributes (dotted), status/kind enum values, and the comparison/boolean operators. */
+const TRACEQL_TOKENS: readonly string[] = [
+  // intrinsics
+  'status', 'duration', 'name', 'service', 'kind',
+  // common span / resource attributes
+  '.http.status_code', '.http.request.method', '.http.route', '.http.target', '.http.url',
+  '.http.response.status_code', '.rpc.method', '.rpc.service', '.db.system', '.db.statement',
+  '.db.name', '.net.peer.name', '.messaging.system', '.error',
+  // enum values
+  'error', 'ok', 'unset',
+  'server', 'client', 'producer', 'consumer', 'internal',
+  // operators / duration units
+  '&&', '||', '=', '!=', '>', '>=', '<', '<=', 'ms', 's',
+];
 
 @Component({
   selector: 'app-traces',
-  imports: [FormsModule, LucideAngularModule, ServiceGraphComponent, FlamegraphComponent, LatencyComponent, CompareTraceComponent],
+  imports: [FormsModule, LucideAngularModule, ServiceGraphComponent, FlamegraphComponent, LatencyComponent, CompareTraceComponent, SuggestInputDirective, ModalComponent, EventDetailComponent],
   templateUrl: './traces.html',
   styleUrl: './traces.scss',
   changeDetection: ChangeDetectionStrategy.OnPush,
@@ -50,6 +69,9 @@ export class TracesComponent implements OnInit, OnDestroy {
   traceLogsLoading = signal(false);
   traceLogsLoaded  = signal(false);
   onlyThisSpan     = signal(false);
+
+  /** Log opened in the full-detail modal (the same renderer the Events page uses); null = closed. */
+  logModalEvent    = signal<EventDto | null>(null);
 
   /** Logs shown in the Logs tab: all trace logs, or only those of the selected span. */
   visibleLogs = computed(() => {
@@ -91,6 +113,8 @@ export class TracesComponent implements OnInit, OnDestroy {
   traceqlInput   = '';
   traceqlMode    = signal(false);
   traceqlError   = signal('');
+  /** Candidates for the TraceQL Ctrl+Space autocomplete. */
+  readonly traceqlSuggestions = TRACEQL_TOKENS as string[];
 
   private _poll: ReturnType<typeof setInterval> | null = null;
   /** Refresh immediately when the tab is re-shown after being hidden. */
@@ -372,6 +396,22 @@ export class TracesComponent implements OnInit, OnDestroy {
     const same = this.selectedSpan()?.spanId === span.spanId;
     this.selectedSpan.set(same ? null : span);
     if (!same) this.activeSpanTab = 'tags';
+  }
+
+  /** Closes the span detail panel. */
+  closeSpan(): void {
+    this.selectedSpan.set(null);
+  }
+
+  /**
+   * Escape closes the innermost layer: the log modal (whose own EventDetail owns Escape
+   * and emits `closed` — this page listener is registered first, so it defers) → the
+   * span detail panel.
+   */
+  @HostListener('document:keydown.escape')
+  onEscape(): void {
+    if (this.logModalEvent()) return;
+    if (this.selectedSpan()) this.selectedSpan.set(null);
   }
 
   private resetLogs() {

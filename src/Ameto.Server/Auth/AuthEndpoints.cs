@@ -185,6 +185,23 @@ internal static class AuthEndpoints
             return store.UpdateUser(id, name, role, perms) ? Results.NoContent() : Results.NotFound();
         }).RequireAuthorization();
 
+        // ── Users: reset password (admin, local users only) ───────────────────
+        app.MapPatch("/api/users/{id}/password", (HttpContext ctx, string id, ChangePasswordRequest req, AuthStore store) =>
+        {
+            if (!IsAdmin(ctx)) return Results.Forbid();
+            // Passwords are not trimmed (leading/trailing spaces are significant);
+            // reject only all-whitespace/empty and anything under the minimum length.
+            if (string.IsNullOrWhiteSpace(req.Password) || req.Password.Length < 6)
+                return Results.BadRequest(new { error = "Password must be at least 6 characters." });
+
+            var user = store.GetUser(id);
+            if (user is null) return Results.NotFound();
+            if (user.Provider != "local")
+                return Results.BadRequest(new { error = "Only local users have a password." });
+
+            return store.SetPassword(id, req.Password) ? Results.NoContent() : Results.NotFound();
+        }).RequireAuthorization();
+
         // ── OAuth domain allowlist: list / create / delete ────────────────────
         app.MapGet("/api/users/oauth-domains", (HttpContext ctx, AuthStore store) =>
         {
@@ -294,6 +311,7 @@ internal sealed record CreateUserRequest(string Username, string Password, strin
 internal sealed record CreateOAuthUserRequest(string Email, string? DisplayName, string? Provider, string? Role);
 internal sealed record UpdateRoleRequest(string Role);
 internal sealed record UpdateUserRequest(string? DisplayName, string? Role, int? Permissions = null);
+internal sealed record ChangePasswordRequest(string Password);
 internal sealed record CreateOAuthDomainRequest(string? Domain, string? Provider, string? Role = "viewer");
 internal sealed record CreateApiKeyRequest(
     string Name,

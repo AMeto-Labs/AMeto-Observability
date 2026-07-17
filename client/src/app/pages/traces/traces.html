@@ -102,10 +102,11 @@
           <lucide-icon name="braces" [size]="13" class="tql-icon" />
           <input class="tql-input"
                  [(ngModel)]="traceqlInput"
+                 [appSuggestInput]="traceqlSuggestions"
+                 (suggestSubmit)="runTraceQL()"
                  placeholder='{ .http.status_code = 500 && duration > 500ms }'
                  spellcheck="false"
-                 autocomplete="off"
-                 (keyup.enter)="runTraceQL()" />
+                 autocomplete="off" />
           @if (traceqlInput) {
             <button class="tql-clear" (click)="traceqlInput = ''; traces.set([])" title="Clear">
               <lucide-icon name="x" [size]="11" />
@@ -124,7 +125,7 @@
         </div>
       }
       <div class="tql-hints">
-        <span class="tql-hint-label">Examples:</span>
+        <span class="tql-hint-label">Press <kbd>Ctrl</kbd>+<kbd>Space</kbd> for suggestions · Examples:</span>
         <button class="tql-hint-chip" (click)="traceqlInput = '{ status = error }'">&#123; status = error &#125;</button>
         <button class="tql-hint-chip" (click)="traceqlInput = '{ duration > 500ms }'">&#123; duration > 500ms &#125;</button>
         <button class="tql-hint-chip" (click)="traceqlInput = '{ .http.status_code = 500 }'">&#123; .http.status_code = 500 &#125;</button>
@@ -387,6 +388,10 @@
             @if (selectedSpan(); as span) {
               <div class="span-detail">
 
+                <button class="span-close" (click)="closeSpan()" title="Close span details (Esc)">
+                  <lucide-icon name="x" [size]="14" />
+                </button>
+
                 <div class="span-detail-left">
                   <div class="sd-field">
                     <span class="sd-key">Service</span>
@@ -487,7 +492,10 @@
                         </div>
                       } @else {
                         @for (log of visibleLogs(); track $index) {
-                          <div class="log-row" [class.log-row--match]="logMatchesSelectedSpan(log)">
+                          <div class="log-row log-row--clickable"
+                               [class.log-row--match]="logMatchesSelectedSpan(log)"
+                               (click)="logModalEvent.set(log)"
+                               title="Open full log details">
                             <span class="log-level" [class]="logLevelCls(log)">{{ logLevel(log) }}</span>
                             <span class="log-ts mono">{{ logTs(log) }}</span>
                             <span class="log-msg">{{ logMessage(log) }}</span>
@@ -543,3 +551,11 @@
 
   </div>
 </div>
+
+<!-- Full log details, rendered by the same component the Events page uses (overview /
+     JSON / trace / metrics tabs). Its own Escape handling emits `closed`. -->
+<app-modal [open]="!!logModalEvent()" title="Log details" (close)="logModalEvent.set(null)">
+  @if (logModalEvent(); as log) {
+    <app-event-detail [event]="log" (closed)="logModalEvent.set(null)" />
+  }
+</app-modal>

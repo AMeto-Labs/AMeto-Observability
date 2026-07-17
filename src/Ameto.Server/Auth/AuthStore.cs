@@ -271,6 +271,28 @@ internal sealed class AuthStore
         return cmd.ExecuteNonQuery() > 0;
     }
 
+    /// <summary>
+    /// Resets a local user's password: generates a fresh 16-byte salt and a new
+    /// PBKDF2 hash. Scoped to <c>provider = 'local'</c>, so an OAuth account's id
+    /// matches no rows and returns false (OAuth users have no password).
+    /// </summary>
+    public bool SetPassword(string id, string newPassword)
+    {
+        var salt = RandomNumberGenerator.GetBytes(16);
+        var hash = HashPassword(newPassword, salt);
+
+        using var conn = _db.Open();
+        using var cmd  = conn.CreateCommand();
+        cmd.CommandText = """
+            UPDATE users SET password_hash = @h, salt = @s
+            WHERE id = @id AND provider = 'local'
+            """;
+        cmd.Parameters.AddWithValue("@h",  hash);
+        cmd.Parameters.AddWithValue("@s",  Convert.ToBase64String(salt));
+        cmd.Parameters.AddWithValue("@id", id);
+        return cmd.ExecuteNonQuery() > 0;
+    }
+
     public string? GetRole(string username)
     {
         using var conn = _db.Open();

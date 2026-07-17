@@ -527,33 +527,26 @@ export const EventsStore = signalStore(
       if (store.live()) stopLive(); else startLive();
     }
 
-    /** One-off query over an explicit [from, to] window (e.g. a brushed time range). */
+    /**
+     * Applies a [from, to] window chosen from a timestamp context-menu action (± seek,
+     * "events after/before this"). Routes through the normal load path so the toolbar
+     * date filter reflects the window and it persists to the URL (loadEvents → syncRoute) —
+     * the same behaviour as the filter / bind-time context-menu actions. The filter string
+     * is left untouched (the seek only moves the time window).
+     *
+     * The date inputs are minute-precision, so floor `from` / ceil `to` to the minute to
+     * guarantee the picked event stays inside an otherwise sub-minute (± seconds) window.
+     */
     function seek(from: Date, to: Date): void {
       if (store.live()) stopLive();
-      patchState(store, { loading: true, error: null });
-
-      const acc: EventDto[] = [];
-      const size = store.pageSize();
-      querySub?.unsubscribe();
-      querySub = api.streamEvents({
-        filter: store.filter() || undefined,
-        from: from.toISOString(),
-        to: to.toISOString(),
-        count: size,
-        dir: 'backward',
-        levels: levelsParam(store.activeLevels()),
-      }).subscribe({
-        next: ev => {
-          acc.push(ev);
-          if (acc.length % 10 === 0) patchState(store, { events: [...acc] });
-        },
-        complete: () => {
-          patchState(store, { events: [...acc], loading: false, hasMore: acc.length >= size });
-        },
-        error: err => {
-          patchState(store, { error: (err as Error).message ?? 'Seek failed', loading: false });
-        },
+      const floorMin = (d: Date) => new Date(Math.floor(d.getTime() / 60_000) * 60_000);
+      const ceilMin  = (d: Date) => new Date(Math.ceil(d.getTime() / 60_000) * 60_000);
+      patchState(store, {
+        customFrom: fmtDateInput(floorMin(from)),
+        customTo: fmtDateInput(ceilMin(to)),
+        timePreset: 'custom',
       });
+      loadEvents();
     }
 
     /**
@@ -581,6 +574,11 @@ export const EventsStore = signalStore(
     /** Selects the event for the detail drawer; pass null to close it. */
     function selectEvent(id: string | null): void {
       patchState(store, { selectedId: id });
+    }
+
+    /** Row click: open the drawer for this event, or close it when it is already open. */
+    function toggleEvent(id: string): void {
+      patchState(store, { selectedId: store.selectedId() === id ? null : id });
     }
 
     function toggleWrap(): void {
@@ -731,6 +729,7 @@ export const EventsStore = signalStore(
       setTimeRange,
       onTimeRangeBound,
       selectEvent,
+      toggleEvent,
       toggleWrap,
       toggleSignalsPanel,
       prevCalendarMonth,

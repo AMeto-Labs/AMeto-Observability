@@ -50,11 +50,11 @@
    (scoped under .jv-preview, so it stays local to the viewer). */
 .jv-preview ::ng-deep {
   .jv-bracket { color: #E2E8F0; }
-  .jv-key     { color: #93C5FD; }
+  .jv-key     { color: var(--json-key); font-style: italic; }
   .jv-colon   { color: #64748B; }
-  .jv-str     { color: #86EFAC; }
-  .jv-num     { color: #FCD34D; }
-  .jv-bool    { color: #F9A8D4; }
+  .jv-str     { color: var(--txt); }
+  .jv-num     { color: var(--txt); }
+  .jv-bool    { color: var(--txt); }
   .jv-null    { color: #94A3B8; }
 }
 
@@ -91,8 +91,11 @@
 
 /* When an expanded one-line container reveals its children, let the node fill the
    (narrow) column and truncate each child row to a single line with an ellipsis —
-   no horizontal scroll, no ragged wrapping of the wide non-breaking previews. */
-:host(.jv--one-line) > .jv-node.jv-open { display: block; min-width: 0; }
+   no horizontal scroll, no ragged wrapping of the wide non-breaking previews.
+   Applies to EVERY expanded node in the subtree (descendant, not just `>` the root):
+   a nested container would otherwise stay `inline-block` and cascade its expanded
+   children far to the right of their key, off the (narrow) drawer — looking empty. */
+:host(.jv--one-line) .jv-node.jv-open { display: block; min-width: 0; }
 :host(.jv--one-line) .jv-row {
   white-space: nowrap;
   overflow: hidden;
@@ -137,14 +140,17 @@
   word-break: break-word;
 }
 
+/* Keys are one uniform sandy yellow (italic) in both the collapsed preview and the
+   expanded tree; values are the plain primary text colour — the old green/amber value
+   colours collided with the level palette. */
 .jv-bracket { color: #E2E8F0; }
-.jv-key     { color: #93C5FD; }   /* blue   — key names */
+.jv-key     { color: var(--json-key); font-style: italic; }
 .jv-colon   { color: #64748B; }
-.jv-str     { color: #86EFAC; }   /* green  — strings */
-.jv-num     { color: #FCD34D; }   /* amber  — numbers */
-.jv-bool    { color: #F9A8D4; }   /* pink   — booleans */
-.jv-null    { color: #94A3B8; }   /* muted  — null */
-.jv-empty   { color: #94A3B8; }   /* muted  — empty {}/[]  */
+.jv-str     { color: var(--txt); }
+.jv-num     { color: var(--txt); }
+.jv-bool    { color: var(--txt); }
+.jv-null    { color: #94A3B8; }   /* muted — null */
+.jv-empty   { color: #94A3B8; }   /* muted — empty {}/[]  */
 
 /* ── Search highlight ───────────────────────────────────────────── */
 mark.jv-hit {
