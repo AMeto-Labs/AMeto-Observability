@@ -16,6 +16,12 @@ namespace Ameto.Core.Serialization;
 /// </summary>
 public static class LogEventSerializer
 {
+    // CLEF ingest scratch, reused per thread (one request per thread at a time):
+    // raw property pair bytes and the msgpack map header. Contents are copied into
+    // each event's own array before the next event is parsed.
+    [ThreadStatic] private static ArrayBufferWriter<byte>? _tRawPairs;
+    [ThreadStatic] private static ArrayBufferWriter<byte>? _tHeader;
+
     private static readonly MessagePackSerializerOptions _options =
         MessagePackSerializerOptions.Standard
             .WithCompression(MessagePackCompression.None);
@@ -210,7 +216,14 @@ public static class LogEventSerializer
                     // and re-serialising them downstream in IngestionEndpoint.
                     reader.Skip();
                     SequencePosition pairEnd = reader.Position;
-                    rawPropsBuf ??= new ArrayBufferWriter<byte>(64);
+                    if (rawPropsBuf is null)
+                    {
+                        // Thread-reused scratch (one request per thread at a time); the
+                        // pair bytes are copied into the event's own array below, so
+                        // nothing escapes. Avoids an ArrayBufferWriter per event.
+                        rawPropsBuf = _tRawPairs ??= new ArrayBufferWriter<byte>(256);
+                        rawPropsBuf.Clear();
+                    }
                     foreach (var segment in sourceSequence.Slice(pairStart, pairEnd))
                         rawPropsBuf.Write(segment.Span);
                     rawPropsCount++;
@@ -231,10 +244,13 @@ public static class LogEventSerializer
         }
 
         // Materialise RawProperties as a single msgpack map: header(N) + raw pairs.
+        // The combined array is the event's own storage (it outlives the parse); only
+        // the header/pair scratch writers are thread-reused.
         ReadOnlyMemory<byte> rawProps = ReadOnlyMemory<byte>.Empty;
         if (rawPropsBuf is not null && rawPropsCount > 0)
         {
-            var headerBuf = new ArrayBufferWriter<byte>(8);
+            var headerBuf = _tHeader ??= new ArrayBufferWriter<byte>(8);
+            headerBuf.Clear();
             var headerWriter = new MessagePackWriter(headerBuf);
             headerWriter.WriteMapHeader(rawPropsCount);
             headerWriter.Flush();

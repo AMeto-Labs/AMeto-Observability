@@ -41,10 +41,10 @@ public sealed class IndexingWiring : Microsoft.Extensions.Hosting.IHostedService
     public Task StartAsync(CancellationToken cancellationToken)
     {
         int maxDepth = _opts.MaxPropertyFlattenDepth;
-        _storage.IndexBuilder = (hot, pool) =>
+        _storage.IndexBuilder = (hot, pool, order) =>
         {
             var builder = new SegmentIndexBuilder(hot.Count, maxDepth);
-            builder.Build(hot, pool);
+            builder.Build(hot, pool, order);
             return (builder.SerialisedInvertedIndex,
                     builder.SerialisedTrigramIndex,
                     builder.SerialisedBloomFilter);

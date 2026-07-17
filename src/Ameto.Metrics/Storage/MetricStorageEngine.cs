@@ -37,6 +37,10 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     // ── Hot tier ─────────────────────────────────────────────────────────────
     private readonly ConcurrentDictionary<SeriesKey, HotSeries> _hot = new();
     private          int _hotPointCount;
+    // 1 while a threshold-triggered flush is queued/running. Without this gate, every
+    // Ingest call past the threshold spawned ANOTHER Task.Run until the flush finally
+    // reset the counter — a stampede of concurrent flush tasks under load.
+    private          int _thresholdFlushScheduled;
 
     // ── Metadata catalog (maintained at ingestion, survives hot-tier drains) ───
     private readonly ConcurrentDictionary<string, MetricMeta> _meta =
@@ -111,8 +115,15 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
             }
 
             int total = System.Threading.Interlocked.Increment(ref _hotPointCount);
-            if (total >= HotFlushThreshold)
-                _ = Task.Run(FlushHotTierAsync);
+            if (total >= HotFlushThreshold
+                && System.Threading.Interlocked.CompareExchange(ref _thresholdFlushScheduled, 1, 0) == 0)
+            {
+                _ = Task.Run(async () =>
+                {
+                    try { await FlushHotTierAsync().ConfigureAwait(false); }
+                    finally { System.Threading.Interlocked.Exchange(ref _thresholdFlushScheduled, 0); }
+                });
+            }
         }
     }
 

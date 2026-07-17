@@ -13,8 +13,10 @@ namespace Ameto.Query;
 ///   1. Time-range filter on <see cref="SegmentInfo"/> (skip segments outside window).
 ///   2. Index fast-skip: load <see cref="SegmentIndexReader"/> and call
 ///      <see cref="ISegmentIndex.MightContain"/> — skip segments where index says no match.
-///   3. Trigram pre-filter: narrow to candidate block offsets via
-///      <see cref="ISegmentIndex.LookupTrigram"/>.
+///   3. Candidate narrowing: trigram (<see cref="ISegmentIndex.LookupTrigram"/>) and
+///      inverted (<see cref="ISegmentIndex.LookupIntersect"/>) posting lists yield
+///      candidate event ordinals (file order, v5 segments) — the reader skips blocks
+///      without candidates and materialises only candidate rows.
 ///   4. Block decode: LZ4 decompress via <see cref="SegmentReader"/>.
 ///   5. Per-event AST evaluation via <see cref="FilterEvaluator"/>.
 ///
@@ -55,23 +57,17 @@ public sealed class QueryExecutor : IQueryExecutor
         var  levels   = request.Levels;
 
         // ── Hot tier ──────────────────────────────────────────────────────────
+        // Window/cursor/level filtering and the (@t, id) sort happen at HEADER level
+        // inside the reader (HotTierScan) — events are materialised lazily in result
+        // order, so a page query allocates ~limit events, not the whole tier.
         using var hotReader = _segments.OpenHotTierReader();
         var covered = hotReader.CoveredSegmentIds;
-        var hotEvents = hotReader.ReadAll()
-            .Where(e => InWindow(e, from, to) && AfterCursor(e, afterTs, afterId, forward))
-            .Where(e => levels == null || levels.Contains(e.Level))
-            .Where(e => filter.Matches(e));
-
-        // Order strictly by event timestamp — EventId is time-derived but late-arriving
-        // events get borrowed-time sequence in their ID, so Id-ordering can disagree
-        // with @t-ordering. The user-visible contract is "sorted by @t".
-        hotEvents = forward
-            ? hotEvents.OrderBy(e => e.Timestamp).ThenBy(e => e.Id)
-            : hotEvents.OrderByDescending(e => e.Timestamp).ThenByDescending(e => e.Id);
-
-        foreach (var ev in hotEvents)
+        foreach (var ev in hotReader.ReadSorted(
+                     from?.UtcTicks ?? long.MinValue, to?.UtcTicks ?? long.MaxValue,
+                     afterTs, afterId?.RawValue, forward, levels))
         {
             if (ct.IsCancellationRequested || count >= limit) yield break;
+            if (!filter.Matches(ev)) continue;
             yield return ev;
             count++;
         }
@@ -105,6 +101,14 @@ public sealed class QueryExecutor : IQueryExecutor
     }
 
     // ── Cold-tier k-way merge ─────────────────────────────────────────────────
+
+    private static readonly Comparer<(long ts, ulong id)> MergeAsc =
+        Comparer<(long ts, ulong id)>.Create(static (a, b) =>
+            a.ts != b.ts ? a.ts.CompareTo(b.ts) : a.id.CompareTo(b.id));
+
+    private static readonly Comparer<(long ts, ulong id)> MergeDesc =
+        Comparer<(long ts, ulong id)>.Create(static (a, b) =>
+            a.ts != b.ts ? b.ts.CompareTo(a.ts) : b.id.CompareTo(a.id));
 
     /// <summary>
     /// Merges events from multiple cold-tier segments preserving a global
@@ -145,11 +149,7 @@ public sealed class QueryExecutor : IQueryExecutor
 
             // PriorityQueue ordered by (ts, id). For backward (newest-first) we invert
             // the comparer; .NET's PriorityQueue is a min-heap.
-            var comparer = forward
-                ? Comparer<(long ts, ulong id)>.Create((a, b) =>
-                    a.ts != b.ts ? a.ts.CompareTo(b.ts) : a.id.CompareTo(b.id))
-                : Comparer<(long ts, ulong id)>.Create((a, b) =>
-                    a.ts != b.ts ? b.ts.CompareTo(a.ts) : b.id.CompareTo(a.id));
+            var comparer = forward ? MergeAsc : MergeDesc;
 
             var heap = new PriorityQueue<IAsyncEnumerator<LogEvent>, (long ts, ulong id)>(comparer);
             foreach (var it in iterators)
@@ -240,8 +240,8 @@ public sealed class QueryExecutor : IQueryExecutor
                     if (hasIndexHint
                         && filter.TryGetIndexHint(out string hintProp, out object? hintVal))
                     {
-                        var bloomBytes = reader.ReadBloomFilterBytes();
-                        using var bloom = SegmentBloomFilter.Deserialise(bloomBytes);
+                        using var bloomSec = reader.RentBloomFilterBytes();
+                        using var bloom    = SegmentBloomFilter.Deserialise(bloomSec.Span);
                         string valStr = hintVal?.ToString() ?? string.Empty;
                         if (!bloom.MightContain(valStr))
                             return ValueTask.CompletedTask;
@@ -254,10 +254,12 @@ public sealed class QueryExecutor : IQueryExecutor
                     uint[]? candidates = null;
                     if (trigramHints.Count > 0 || hasIndexHint)
                     {
-                        var invertedBytes = reader.ReadInvertedIndexBytes();
-                        var trigramBytes  = reader.ReadTrigramIndexBytes();
-                        var bloomBytes2   = reader.ReadBloomFilterBytes();
-                        var idx           = _indexFactory.Create(invertedBytes, trigramBytes, bloomBytes2);
+                        // Pooled: sections are copied out inside the deserialisers, so the
+                        // rented buffers go back to the pool as soon as the index is built.
+                        using var invSec = reader.RentInvertedIndexBytes();
+                        using var triSec = reader.RentTrigramIndexBytes();
+                        using var bloSec = reader.RentBloomFilterBytes();
+                        var idx = _indexFactory.Create(invSec.Span, triSec.Span, bloSec.Span);
 
                         // Definitive inverted-index check (bloom can have false positives)
                         if (hasIndexHint
@@ -376,21 +378,7 @@ public sealed class QueryExecutor : IQueryExecutor
         return true;
     }
 
-    /// <summary>
-    /// (timestamp, eventId) cursor: lexicographic comparison against (afterTs, afterId).
-    /// For <paramref name="forward"/> direction, an event qualifies when its (ts, id) is
-    /// strictly GREATER than the cursor (delivers newer events than the last seen).
-    /// For backward direction, when (ts, id) is strictly LESS than the cursor (paginating
-    /// to older events). <c>afterTs</c> is the primary key; <c>afterId</c> is the
-    /// tiebreaker for events that share an exact @t.
-    /// </summary>
+    /// <summary>(timestamp, eventId) pagination cursor — see <see cref="QueryCursor.After"/>.</summary>
     private static bool AfterCursor(LogEvent ev, long? afterTs, Ameto.Core.EventId? afterId, bool forward)
-    {
-        if (!afterTs.HasValue && !afterId.HasValue) return true;
-        long evTs = ev.Timestamp.UtcTicks;
-        long ts   = afterTs ?? (forward ? long.MinValue : long.MaxValue);
-        if (evTs != ts) return forward ? evTs > ts : evTs < ts;
-        if (!afterId.HasValue) return true;
-        return forward ? ev.Id > afterId.Value : ev.Id < afterId.Value;
-    }
+        => QueryCursor.After(ev.Timestamp.UtcTicks, ev.Id.RawValue, afterTs, afterId?.RawValue, forward);
 }

@@ -302,6 +302,9 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private byte* ChunkPayloadPtr(int ci) => (byte*)_chunkArenas[ci] + ChunkHeaderBytes;
 
+    /// <summary>Materialises the event at <paramref name="index"/> (query-path sorted scan).</summary>
+    public LogEvent Materialise(int index, StringInternPool? pool) => MaterialiseEvent(index, pool);
+
     private LogEvent MaterialiseEvent(int index, StringInternPool? pool)
     {
         int ci    = index / ChunkEventCapacity;
@@ -329,7 +332,9 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
             MessageTemplate = template,
             Exception       = GetException(index),
             Properties      = props,
-            RawProperties   = payloadSpan.ToArray(),
+            // RawProperties deliberately left empty: nothing on the query path reads it
+            // (only ingest-side LogEvents carry it), and copying every payload made each
+            // hot-tier query re-allocate the entire tier's property bytes.
             TraceIdHi       = h.TraceIdHi,
             TraceIdLo       = h.TraceIdLo,
             SpanId          = h.SpanId,

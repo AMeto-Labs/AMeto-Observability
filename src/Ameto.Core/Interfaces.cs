@@ -26,12 +26,52 @@ public interface ISegmentProvider
 }
 
 /// <summary>
+/// (timestamp, eventId) pagination cursor shared by the hot-tier and cold-tier scans:
+/// an event qualifies when its (ts, id) is strictly past the cursor in the query
+/// direction. <c>afterTs</c> is the primary key; <c>afterId</c> breaks exact-@t ties.
+/// </summary>
+public static class QueryCursor
+{
+    public static bool After(long evTs, ulong evId, long? afterTs, ulong? afterId, bool forward)
+    {
+        if (!afterTs.HasValue && !afterId.HasValue) return true;
+        long ts = afterTs ?? (forward ? long.MinValue : long.MaxValue);
+        if (evTs != ts) return forward ? evTs > ts : evTs < ts;
+        if (!afterId.HasValue) return true;
+        return forward ? evId > afterId.Value : evId < afterId.Value;
+    }
+}
+
+/// <summary>
 /// Read-only view of hot-tier events. Must be disposed after use.
 /// </summary>
 public interface IHotTierReader : IDisposable
 {
     /// <summary>Iterates events in insertion order (oldest first).</summary>
     IEnumerable<LogEvent> ReadAll();
+
+    /// <summary>
+    /// Window/cursor/level-filtered events sorted by (@t, id) in the requested direction.
+    /// The default implementation materialises everything via <see cref="ReadAll"/> and
+    /// sorts — real hot-tier readers override it with a header-level scan that only
+    /// materialises events actually emitted (queries touch a page, not the whole tier).
+    /// </summary>
+    IEnumerable<LogEvent> ReadSorted(
+        long fromTicks, long toTicks,
+        long? afterTsTicks, ulong? afterIdRaw, bool forward,
+        IReadOnlySet<LogLevel>? levels)
+    {
+        var filtered = ReadAll().Where(e =>
+        {
+            long ts = e.Timestamp.UtcTicks;
+            if (ts < fromTicks || ts > toTicks) return false;
+            if (levels is not null && !levels.Contains(e.Level)) return false;
+            return QueryCursor.After(ts, e.Id.RawValue, afterTsTicks, afterIdRaw, forward);
+        });
+        return forward
+            ? filtered.OrderBy(e => e.Timestamp).ThenBy(e => e.Id)
+            : filtered.OrderByDescending(e => e.Timestamp).ThenByDescending(e => e.Id);
+    }
 
     /// <summary>
     /// IDs of cold-tier segments whose events are already returned by this hot reader.

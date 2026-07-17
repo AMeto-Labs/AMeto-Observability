@@ -16,7 +16,12 @@ public sealed class SegmentReader : ISegmentReader
 {
     private const uint   MagicHeader      = 0x52_44_4C_47;
     private const uint   MagicFooter      = 0x52_44_46_54;
-    private const ushort SupportedVersion = 4;
+    // v4: TraceId/SpanId/ServiceName columns; block-index entry = (offset, firstId).
+    // v5: block-index entry gains FirstOrdinal (file-order position of the block's first
+    //     event) and index posting lists store file ordinals — enables candidate-driven
+    //     block/row skipping. v4 segments remain readable (full scan, no skipping).
+    private const ushort MinSupportedVersion = 4;
+    private const ushort MaxSupportedVersion = 5;
 
     private readonly long _invertedIndexOffset;
     private readonly long _trigramIndexOffset;
@@ -24,6 +29,9 @@ public sealed class SegmentReader : ISegmentReader
     private readonly long _blockIndexOffset;
 
     private readonly (long FileOffset, ulong FirstEventId)[] _blocks;
+
+    /// <summary>Per-block file ordinal of its first event (v5+); null for v4 segments.</summary>
+    private readonly uint[]? _blockOrdinals;
 
     private readonly MemoryMappedFile         _mmf;
     private readonly MemoryMappedViewAccessor _view;
@@ -80,8 +88,8 @@ public sealed class SegmentReader : ISegmentReader
 
         if (magic != MagicHeader)
             throw new InvalidDataException($"Segment header magic mismatch in {filePath}");
-        if (version != SupportedVersion)
-            throw new InvalidDataException($"Unsupported segment version {version} in {filePath}; expected {SupportedVersion}. Delete the data directory and restart.");
+        if (version is < MinSupportedVersion or > MaxSupportedVersion)
+            throw new InvalidDataException($"Unsupported segment version {version} in {filePath}; expected {MinSupportedVersion}-{MaxSupportedVersion}. Delete the data directory and restart.");
 
         Info = new SegmentInfo
         {
@@ -97,14 +105,18 @@ public sealed class SegmentReader : ISegmentReader
         };
 
         int blockCount = ReadInt32At(_blockIndexOffset);
-        _blocks = new (long, ulong)[blockCount];
-        long pos = _blockIndexOffset + 4;
+        _blocks        = new (long, ulong)[blockCount];
+        _blockOrdinals = version >= 5 ? new uint[blockCount] : null;
+        long pos    = _blockIndexOffset + 4;
+        int  stride = version >= 5 ? 20 : 16;
         for (int i = 0; i < blockCount; i++)
         {
             long  offset  = ReadInt64At(pos);
             ulong firstId = (ulong)ReadInt64At(pos + 8);
-            _blocks[i]    = (offset, firstId);
-            pos += 16;
+            if (_blockOrdinals is not null)
+                _blockOrdinals[i] = (uint)ReadInt32At(pos + 16);
+            _blocks[i] = (offset, firstId);
+            pos += stride;
         }
     }
 
@@ -118,15 +130,36 @@ public sealed class SegmentReader : ISegmentReader
         long fromTicks = from?.UtcTicks ?? long.MinValue;
         long toTicks   = to?.UtcTicks   ?? long.MaxValue;
 
-        var blocks = reversed
-            ? _blocks.AsEnumerable().Reverse()
-            : _blocks.AsEnumerable();
-
-        foreach (var (blockOffset, _) in blocks)
+        // v5 + index candidates: posting-list offsets are file ordinals, so we can skip
+        // whole blocks with no candidate and, inside a touched block, materialise ONLY the
+        // candidate rows — the dominant query-path saving (no Dictionary/string per
+        // rejected event). Candidates may arrive unsorted (trigram set → array).
+        uint[]? cands = null;
+        if (candidateOffsets is { Length: > 0 } && _blockOrdinals is not null)
         {
+            cands = (uint[])candidateOffsets.Clone();
+            Array.Sort(cands);
+        }
+
+        int blockCount = _blocks.Length;
+        for (int bi = 0; bi < blockCount; bi++)
+        {
+            int idx = reversed ? blockCount - 1 - bi : bi;
             ct.ThrowIfCancellationRequested();
 
-            var events = ReadBlock(blockOffset, reversed);
+            int candStart = 0, candEnd = 0;
+            if (cands is not null)
+            {
+                uint first = _blockOrdinals![idx];
+                uint next  = idx + 1 < blockCount ? _blockOrdinals[idx + 1] : Info.EventCount;
+                candStart  = LowerBound(cands, first);
+                candEnd    = LowerBound(cands, next);
+                if (candStart == candEnd) continue;   // no candidate rows in this block
+            }
+
+            var events = cands is null
+                ? ReadBlock(_blocks[idx].FileOffset, reversed)
+                : ReadBlock(_blocks[idx].FileOffset, reversed, cands, candStart, candEnd, _blockOrdinals![idx]);
             foreach (var evt in events)
             {
                 long ts = evt.Timestamp.UtcTicks;
@@ -135,6 +168,18 @@ public sealed class SegmentReader : ISegmentReader
             }
         }
         await Task.CompletedTask;
+    }
+
+    /// <summary>First index in ascending <paramref name="a"/> whose value is ≥ <paramref name="key"/>.</summary>
+    private static int LowerBound(uint[] a, uint key)
+    {
+        int lo = 0, hi = a.Length;
+        while (lo < hi)
+        {
+            int mid = (lo + hi) >> 1;
+            if (a[mid] < key) lo = mid + 1; else hi = mid;
+        }
+        return lo;
     }
 
     // ── Header-only aggregation ─────────────────────────────────────────────────
@@ -233,7 +278,9 @@ public sealed class SegmentReader : ISegmentReader
 
     // ── Block reading ─────────────────────────────────────────────────────────
 
-    private IEnumerable<LogEvent> ReadBlock(long blockOffset, bool reversed)
+    private IEnumerable<LogEvent> ReadBlock(
+        long blockOffset, bool reversed,
+        uint[]? cands = null, int candStart = 0, int candEnd = 0, uint firstOrdinal = 0)
     {
         int uncompressedSize = ReadInt32At(blockOffset);
         int compressedSize   = ReadInt32At(blockOffset + 4);
@@ -252,7 +299,7 @@ public sealed class SegmentReader : ISegmentReader
             if (decoded != uncompressedSize)
                 yield break;
 
-            events = DecodeColumnarBlock(rentedUncomp.AsSpan(0, decoded));
+            events = DecodeColumnarBlock(rentedUncomp.AsSpan(0, decoded), cands, candStart, candEnd, firstOrdinal);
         }
         finally
         {
@@ -264,7 +311,15 @@ public sealed class SegmentReader : ISegmentReader
         foreach (var ev in events) yield return ev;
     }
 
-    private static List<LogEvent> DecodeColumnarBlock(ReadOnlySpan<byte> span)
+    /// <summary>
+    /// Decodes a columnar block into <see cref="LogEvent"/>s. When <paramref name="cands"/>
+    /// is non-null, only rows whose file ordinal (<paramref name="firstOrdinal"/> + row) is in
+    /// cands[candStart..candEnd) are materialised — rejected rows cost a couple of integer
+    /// comparisons, no Dictionary / string / ExceptionInfo allocation.
+    /// </summary>
+    private static List<LogEvent> DecodeColumnarBlock(
+        ReadOnlySpan<byte> span,
+        uint[]? cands = null, int candStart = 0, int candEnd = 0, uint firstOrdinal = 0)
     {
         int    pos        = 0;
         int    eventCount = (int)BinaryPrimitives.ReadUInt32LittleEndian(span.Slice(pos, 4));   pos += 4;
@@ -307,9 +362,18 @@ public sealed class SegmentReader : ISegmentReader
         var svcOffsets   = colSvc.Length >= offsetsBytes ? colSvc.Slice(0, offsetsBytes) : default;
         var svcPayload   = colSvc.Length >= offsetsBytes ? colSvc.Slice(offsetsBytes) : default;
 
-        var list = new List<LogEvent>(eventCount);
+        var list = new List<LogEvent>(cands is null ? eventCount : candEnd - candStart);
+        int cp = candStart;   // two-pointer walk: rows ascend, cands sorted ascending
         for (int i = 0; i < eventCount; i++)
         {
+            if (cands is not null)
+            {
+                uint ord = firstOrdinal + (uint)i;
+                while (cp < candEnd && cands[cp] < ord) cp++;
+                if (cp >= candEnd) break;             // no candidates left in this block
+                if (cands[cp] != ord) continue;       // this row is not a candidate
+            }
+
             long  tDelta = BinaryPrimitives.ReadInt64LittleEndian (colT.Slice(i * 8, 8));
             byte  lvl    = colL[i];
             ulong iDelta = BinaryPrimitives.ReadUInt64LittleEndian(colI.Slice(i * 8, 8));
@@ -373,6 +437,14 @@ public sealed class SegmentReader : ISegmentReader
     public byte[] ReadTrigramIndexBytes()   => ReadSection(_trigramIndexOffset);
     public byte[] ReadBloomFilterBytes()    => ReadSection(_bloomFilterOffset);
 
+    // Pooled variants for the query prefilter: index sections run to several MB per
+    // segment and are only needed transiently (every deserialiser copies out of the
+    // span), so renting kills what used to be gigabytes of short-lived arrays when
+    // prefiltering hundreds of segments in parallel.
+    public PooledSection RentInvertedIndexBytes() => RentSection(_invertedIndexOffset);
+    public PooledSection RentTrigramIndexBytes()  => RentSection(_trigramIndexOffset);
+    public PooledSection RentBloomFilterBytes()   => RentSection(_bloomFilterOffset);
+
     private byte[] ReadSection(long offset)
     {
         if (offset <= 0) return [];
@@ -380,6 +452,15 @@ public sealed class SegmentReader : ISegmentReader
         var  data = new byte[len];
         _view.ReadArray(offset + 4, data, 0, (int)len);
         return data;
+    }
+
+    private PooledSection RentSection(long offset)
+    {
+        if (offset <= 0) return default;
+        uint len  = (uint)ReadInt32At(offset);
+        var  data = ArrayPool<byte>.Shared.Rent((int)len);
+        _view.ReadArray(offset + 4, data, 0, (int)len);
+        return new PooledSection(data, (int)len);
     }
 
     private int   ReadInt32At(long offset)  { int   v = 0; _view.Read(offset, out v); return v; }
@@ -394,5 +475,29 @@ public sealed class SegmentReader : ISegmentReader
         _disposed = true;
         _view.Dispose();
         _mmf.Dispose();
+    }
+}
+
+/// <summary>
+/// A segment section backed by a pooled buffer. Dispose returns the buffer to
+/// <see cref="ArrayPool{T}.Shared"/> — consume the <see cref="Span"/> first (every
+/// index deserialiser copies out of it, so disposal right after deserialise is safe).
+/// </summary>
+public readonly struct PooledSection : IDisposable
+{
+    private readonly byte[]? _rented;
+    private readonly int     _length;
+
+    internal PooledSection(byte[]? rented, int length)
+    {
+        _rented = rented;
+        _length = length;
+    }
+
+    public ReadOnlySpan<byte> Span => _rented is null ? default : _rented.AsSpan(0, _length);
+
+    public void Dispose()
+    {
+        if (_rented is not null) ArrayPool<byte>.Shared.Return(_rented);
     }
 }

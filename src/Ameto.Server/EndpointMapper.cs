@@ -111,14 +111,10 @@ public static class EndpointMapper
 
             try
             {
+                using var sse = new SseJsonWriter(ctx.Response);
                 await foreach (var ev in executor.ExecuteAsync(request, ctx.RequestAborted))
-                {
-                    var json = JsonSerializer.Serialize(LogEventDto.From(ev), _json);
-                    await ctx.Response.WriteAsync($"data: {json}\n\n", ctx.RequestAborted);
-                    await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
-                }
-                await ctx.Response.WriteAsync("event: done\ndata: {}\n\n", ctx.RequestAborted);
-                await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+                    await sse.WriteEventAsync(LogEventDto.From(ev), _json, ctx.RequestAborted);
+                await sse.WriteDoneAsync(ctx.RequestAborted);
             }
             catch (OperationCanceledException) { /* client disconnected */ }
         }).RequireAuthorization(AuthServiceExtensions.PolicyViewLogs);
@@ -284,6 +280,7 @@ public static class EndpointMapper
             Ameto.Core.EventId? cursor = null;
             long?                cursorTs = null;
 
+            using var sse = new SseJsonWriter(ctx.Response);
             while (!ctx.RequestAborted.IsCancellationRequested)
             {
                 var request = new QueryRequest
@@ -299,11 +296,7 @@ public static class EndpointMapper
                 int newCount = 0;
                 await foreach (var ev in executor.ExecuteAsync(request, ctx.RequestAborted))
                 {
-                    var dto   = LogEventDto.From(ev);
-                    var json  = JsonSerializer.Serialize(dto, _json);
-                    var line  = $"data: {json}\n\n";
-                    await ctx.Response.WriteAsync(line, ctx.RequestAborted);
-                    await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+                    await sse.WriteEventAsync(LogEventDto.From(ev), _json, ctx.RequestAborted);
                     cursor   = (Ameto.Core.EventId?)ev.Id;
                     cursorTs = ev.Timestamp.UtcTicks;
                     newCount++;
@@ -312,8 +305,7 @@ public static class EndpointMapper
                 if (newCount == 0)
                 {
                     // Send keepalive comment and wait before next poll
-                    await ctx.Response.WriteAsync(": keepalive\n\n", ctx.RequestAborted);
-                    await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+                    await sse.WriteKeepaliveAsync(ctx.RequestAborted);
                     try { await Task.Delay(250, ctx.RequestAborted); } catch (OperationCanceledException) { break; }
                 }
             }

@@ -16,7 +16,7 @@ function escapeHtml(s: string): string {
  * The palette is pastel and deliberately outside the level hues (--lvl-*): the level
  * badge owns saturated colour, so a value can never read as a severity at a glance.
  */
-const PROP_PALETTE = ['#6cd0dd', '#ef9fbb', '#cf9be6', '#5fcaca', '#8bb6de', '#d3bd93'] as const;
+const PROP_PALETTE = ['#6cd0dd', '#ef9fbb', '#cf9be6', '#5fcaca', '#8bb6de', '#f0abfc'] as const;
 
 /** djb2-xor hash → stable palette slot for a property name. */
 function propColor(name: string): string {
