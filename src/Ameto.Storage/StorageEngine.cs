@@ -307,6 +307,16 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 yield return ev;
         }
 
+        /// <summary>
+        /// Header-level filtered + sorted scan (see <see cref="HotTierScan"/>): only the
+        /// events actually yielded are materialised, instead of the whole tier per query.
+        /// </summary>
+        public IEnumerable<LogEvent> ReadSorted(
+            long fromTicks, long toTicks,
+            long? afterTsTicks, ulong? afterIdRaw, bool forward,
+            IReadOnlySet<Ameto.Core.LogLevel>? levels)
+            => HotTierScan.ReadSorted(current, frozen, pool, fromTicks, toTicks, afterTsTicks, afterIdRaw, forward, levels);
+
         public IReadOnlySet<ulong> CoveredSegmentIds => covered;
 
         public void Dispose()

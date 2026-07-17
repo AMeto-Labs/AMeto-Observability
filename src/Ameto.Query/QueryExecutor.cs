@@ -57,23 +57,17 @@ public sealed class QueryExecutor : IQueryExecutor
         var  levels   = request.Levels;
 
         // ── Hot tier ──────────────────────────────────────────────────────────
+        // Window/cursor/level filtering and the (@t, id) sort happen at HEADER level
+        // inside the reader (HotTierScan) — events are materialised lazily in result
+        // order, so a page query allocates ~limit events, not the whole tier.
         using var hotReader = _segments.OpenHotTierReader();
         var covered = hotReader.CoveredSegmentIds;
-        var hotEvents = hotReader.ReadAll()
-            .Where(e => InWindow(e, from, to) && AfterCursor(e, afterTs, afterId, forward))
-            .Where(e => levels == null || levels.Contains(e.Level))
-            .Where(e => filter.Matches(e));
-
-        // Order strictly by event timestamp — EventId is time-derived but late-arriving
-        // events get borrowed-time sequence in their ID, so Id-ordering can disagree
-        // with @t-ordering. The user-visible contract is "sorted by @t".
-        hotEvents = forward
-            ? hotEvents.OrderBy(e => e.Timestamp).ThenBy(e => e.Id)
-            : hotEvents.OrderByDescending(e => e.Timestamp).ThenByDescending(e => e.Id);
-
-        foreach (var ev in hotEvents)
+        foreach (var ev in hotReader.ReadSorted(
+                     from?.UtcTicks ?? long.MinValue, to?.UtcTicks ?? long.MaxValue,
+                     afterTs, afterId?.RawValue, forward, levels))
         {
             if (ct.IsCancellationRequested || count >= limit) yield break;
+            if (!filter.Matches(ev)) continue;
             yield return ev;
             count++;
         }
@@ -378,21 +372,7 @@ public sealed class QueryExecutor : IQueryExecutor
         return true;
     }
 
-    /// <summary>
-    /// (timestamp, eventId) cursor: lexicographic comparison against (afterTs, afterId).
-    /// For <paramref name="forward"/> direction, an event qualifies when its (ts, id) is
-    /// strictly GREATER than the cursor (delivers newer events than the last seen).
-    /// For backward direction, when (ts, id) is strictly LESS than the cursor (paginating
-    /// to older events). <c>afterTs</c> is the primary key; <c>afterId</c> is the
-    /// tiebreaker for events that share an exact @t.
-    /// </summary>
+    /// <summary>(timestamp, eventId) pagination cursor — see <see cref="QueryCursor.After"/>.</summary>
     private static bool AfterCursor(LogEvent ev, long? afterTs, Ameto.Core.EventId? afterId, bool forward)
-    {
-        if (!afterTs.HasValue && !afterId.HasValue) return true;
-        long evTs = ev.Timestamp.UtcTicks;
-        long ts   = afterTs ?? (forward ? long.MinValue : long.MaxValue);
-        if (evTs != ts) return forward ? evTs > ts : evTs < ts;
-        if (!afterId.HasValue) return true;
-        return forward ? ev.Id > afterId.Value : ev.Id < afterId.Value;
-    }
+        => QueryCursor.After(ev.Timestamp.UtcTicks, ev.Id.RawValue, afterTs, afterId?.RawValue, forward);
 }
