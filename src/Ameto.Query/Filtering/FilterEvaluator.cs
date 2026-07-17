@@ -271,6 +271,60 @@ public static class FilterEvaluator
         return predicate(value);
     }
 
+    /// <summary>
+    /// Deep structural equality for the values MessagePack deserialisation produces
+    /// (null / string / bool / numbers / byte[] / List / Dictionary). Mirrors the old
+    /// JSON-string equality: dictionary entries compare in enumeration order, and
+    /// numbers compare across types (1L == 1.0, as both serialised to "1").
+    /// </summary>
+    private static bool StructuralEquals(object? a, object? b)
+    {
+        if (ReferenceEquals(a, b)) return true;
+        if (a is null || b is null) return false;
+
+        // byte[] first — it is an IList and must not fall into the list branch.
+        if (a is byte[] ab) return b is byte[] bb && ab.AsSpan().SequenceEqual(bb);
+        if (b is byte[]) return false;
+
+        if (a is string sa) return b is string sb && string.Equals(sa, sb, StringComparison.Ordinal);
+        if (b is string) return false;
+
+        if (a is bool ba) return b is bool bb2 && ba == bb2;
+        if (b is bool) return false;
+
+        bool aNum = IsNumeric(a), bNum = IsNumeric(b);
+        if (aNum || bNum) return aNum && bNum && ToDouble(a) == ToDouble(b);
+
+        if (a is IDictionary da)
+        {
+            if (b is not IDictionary db || da.Count != db.Count) return false;
+            var ea = da.GetEnumerator();
+            var eb = db.GetEnumerator();
+            while (ea.MoveNext())
+            {
+                if (!eb.MoveNext()) return false;
+                if (!StructuralEquals(ea.Key, eb.Key)) return false;
+                if (!StructuralEquals(ea.Value, eb.Value)) return false;
+            }
+            return !eb.MoveNext();
+        }
+        if (b is IDictionary) return false;
+
+        if (a is IList la)
+        {
+            if (b is not IList lb || la.Count != lb.Count) return false;
+            for (int i = 0; i < la.Count; i++)
+                if (!StructuralEquals(la[i], lb[i])) return false;
+            return true;
+        }
+        if (b is IList) return false;
+
+        return a.Equals(b);
+    }
+
+    private static bool IsNumeric(object o) =>
+        o is byte or sbyte or short or ushort or int or uint or long or ulong or float or double or decimal;
+
     private static bool Compare(object? left, object? right, CompareOp op)
     {
         if (left is null && right is null) return op is CompareOp.Eq;
@@ -281,9 +335,10 @@ public static class FilterEvaluator
             (right is IList && right is not byte[] && right is not string))
         {
             if (op is not (CompareOp.Eq or CompareOp.Ne)) return false;
-            string l = JsonSerializer.Serialize(left);
-            string r = JsonSerializer.Serialize(right);
-            bool eq = string.Equals(l, r, StringComparison.Ordinal);
+            // Structural comparison — same semantics as the old serialise-both-sides-to-JSON
+            // equality (ordered dictionary entries, cross-type numeric equality), without
+            // allocating two JSON strings per compared event.
+            bool eq = StructuralEquals(left, right);
             return op == CompareOp.Eq ? eq : !eq;
         }
 
