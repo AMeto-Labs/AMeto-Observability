@@ -91,8 +91,11 @@
 
 /* When an expanded one-line container reveals its children, let the node fill the
    (narrow) column and truncate each child row to a single line with an ellipsis —
-   no horizontal scroll, no ragged wrapping of the wide non-breaking previews. */
-:host(.jv--one-line) > .jv-node.jv-open { display: block; min-width: 0; }
+   no horizontal scroll, no ragged wrapping of the wide non-breaking previews.
+   Applies to EVERY expanded node in the subtree (descendant, not just `>` the root):
+   a nested container would otherwise stay `inline-block` and cascade its expanded
+   children far to the right of their key, off the (narrow) drawer — looking empty. */
+:host(.jv--one-line) .jv-node.jv-open { display: block; min-width: 0; }
 :host(.jv--one-line) .jv-row {
   white-space: nowrap;
   overflow: hidden;
