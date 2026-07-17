@@ -437,6 +437,14 @@ public sealed class SegmentReader : ISegmentReader
     public byte[] ReadTrigramIndexBytes()   => ReadSection(_trigramIndexOffset);
     public byte[] ReadBloomFilterBytes()    => ReadSection(_bloomFilterOffset);
 
+    // Pooled variants for the query prefilter: index sections run to several MB per
+    // segment and are only needed transiently (every deserialiser copies out of the
+    // span), so renting kills what used to be gigabytes of short-lived arrays when
+    // prefiltering hundreds of segments in parallel.
+    public PooledSection RentInvertedIndexBytes() => RentSection(_invertedIndexOffset);
+    public PooledSection RentTrigramIndexBytes()  => RentSection(_trigramIndexOffset);
+    public PooledSection RentBloomFilterBytes()   => RentSection(_bloomFilterOffset);
+
     private byte[] ReadSection(long offset)
     {
         if (offset <= 0) return [];
@@ -444,6 +452,15 @@ public sealed class SegmentReader : ISegmentReader
         var  data = new byte[len];
         _view.ReadArray(offset + 4, data, 0, (int)len);
         return data;
+    }
+
+    private PooledSection RentSection(long offset)
+    {
+        if (offset <= 0) return default;
+        uint len  = (uint)ReadInt32At(offset);
+        var  data = ArrayPool<byte>.Shared.Rent((int)len);
+        _view.ReadArray(offset + 4, data, 0, (int)len);
+        return new PooledSection(data, (int)len);
     }
 
     private int   ReadInt32At(long offset)  { int   v = 0; _view.Read(offset, out v); return v; }
@@ -458,5 +475,29 @@ public sealed class SegmentReader : ISegmentReader
         _disposed = true;
         _view.Dispose();
         _mmf.Dispose();
+    }
+}
+
+/// <summary>
+/// A segment section backed by a pooled buffer. Dispose returns the buffer to
+/// <see cref="ArrayPool{T}.Shared"/> — consume the <see cref="Span"/> first (every
+/// index deserialiser copies out of it, so disposal right after deserialise is safe).
+/// </summary>
+public readonly struct PooledSection : IDisposable
+{
+    private readonly byte[]? _rented;
+    private readonly int     _length;
+
+    internal PooledSection(byte[]? rented, int length)
+    {
+        _rented = rented;
+        _length = length;
+    }
+
+    public ReadOnlySpan<byte> Span => _rented is null ? default : _rented.AsSpan(0, _length);
+
+    public void Dispose()
+    {
+        if (_rented is not null) ArrayPool<byte>.Shared.Return(_rented);
     }
 }
