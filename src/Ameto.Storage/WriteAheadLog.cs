@@ -27,7 +27,12 @@ public sealed unsafe class WriteAheadLog : IDisposable
 {
     // ── WAL file header ──────────────────────────────────────────────────────
     private const uint   MagicNumber    = 0x52_44_57_41; // "RDWA"
-    private const ushort WalVersion     = 2;
+    // v3: WalEntryHeader is Pack=1 so the header truly occupies EntryHeaderSize bytes.
+    // v2 files had ExceptionLength laid out PAST the 20-byte header (alignment padding
+    // before TimestampTicks) where the payload copy immediately overwrote it — recovery
+    // read garbage lengths and always bailed with zero entries. v2 files are therefore
+    // unrecoverable by construction and are reset on open.
+    private const ushort WalVersion     = 3;
     private const int    FileHeaderSize = 32;
     private const int    EntryHeaderSize = 20;
 
@@ -42,7 +47,11 @@ public sealed unsafe class WriteAheadLog : IDisposable
         private short _pad;
     }
 
-    [StructLayout(LayoutKind.Sequential, Size = EntryHeaderSize)]
+    // Pack = 1 is essential: without it TimestampTicks aligns to 8, pushing
+    // ExceptionLength to offset 20 — outside the EntryHeaderSize stride and straight
+    // into the payload area (the v2 corruption described at WalVersion). Packed, the
+    // fields occupy exactly 4+8+1+1+2+4 = 20 bytes.
+    [StructLayout(LayoutKind.Sequential, Pack = 1, Size = EntryHeaderSize)]
     private struct WalEntryHeader
     {
         public uint   PayloadLength;
@@ -109,10 +118,24 @@ public sealed unsafe class WriteAheadLog : IDisposable
         }
         else
         {
-            // Recover write position from header
-            ref var hdr  = ref Unsafe.AsRef<WalFileHeader>(_ptr);
-            _writeOffset = hdr.WriteOffset - FileHeaderSize;
-            if (_writeOffset < 0) _writeOffset = 0;
+            ref var hdr = ref Unsafe.AsRef<WalFileHeader>(_ptr);
+            if (hdr.Magic != MagicNumber || hdr.Version != WalVersion)
+            {
+                // Unknown or pre-v3 file: entries used the corrupted v2 layout (see
+                // WalVersion) and cannot be replayed — reinitialise in place.
+                hdr.Magic       = MagicNumber;
+                hdr.Version     = WalVersion;
+                hdr.NodeId      = nodeId.Value;
+                hdr.SegmentId   = segmentId.Value;
+                hdr.WriteOffset = FileHeaderSize;
+                _writeOffset    = 0;
+            }
+            else
+            {
+                // Recover write position from header
+                _writeOffset = hdr.WriteOffset - FileHeaderSize;
+                if (_writeOffset < 0) _writeOffset = 0;
+            }
         }
 
         // Open companion pool file (template index → string) for crash recovery
@@ -127,12 +150,25 @@ public sealed unsafe class WriteAheadLog : IDisposable
     /// Appends a single event payload to the WAL. Thread-safe via lock.
     /// Fast path: a single Span copy into the mmap region.
     /// </summary>
+    // Reused per thread: exception msgpack scratch — the bytes are copied into the mmap
+    // below, so nothing outlives the call. Avoids a byte[] per exception-carrying event.
+    [ThreadStatic] private static System.Buffers.ArrayBufferWriter<byte>? _tExc;
+
     public unsafe void Append(long timestampTicks, LogLevel level, ushort templateIndex, string template, ReadOnlySpan<byte> payload, ExceptionInfo? exception = null)
     {
         EnsureTemplateInPool(templateIndex, template);
 
-        byte[] excBytes = exception is null ? Array.Empty<byte>() : exception.ToBytes();
-        int entrySize   = EntryHeaderSize + payload.Length + excBytes.Length;
+        ReadOnlySpan<byte> excBytes = default;
+        if (exception is not null)
+        {
+            var buf = _tExc ??= new System.Buffers.ArrayBufferWriter<byte>(256);
+            buf.Clear();
+            var w = new MessagePack.MessagePackWriter(buf);
+            exception.Write(ref w);
+            w.Flush();
+            excBytes = buf.WrittenSpan;
+        }
+        int entrySize = EntryHeaderSize + payload.Length + excBytes.Length;
 
         lock (_writeLock)
         {
@@ -322,6 +358,8 @@ public sealed unsafe class WriteAheadLog : IDisposable
         {
             ref var fh = ref Unsafe.AsRef<WalFileHeader>(ptr);
             if (fh.Magic != MagicNumber) return (0, []);
+            // Pre-v3 entries are laid out with the corrupted header stride — unreplayable.
+            if (fh.Version != WalVersion) return (fh.SegmentId, []);
             ulong segId       = fh.SegmentId;
             long  writeOffset = fh.WriteOffset - FileHeaderSize;
             if (writeOffset <= 0) return (segId, []);
