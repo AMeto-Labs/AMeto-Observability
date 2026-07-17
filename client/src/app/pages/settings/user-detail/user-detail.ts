@@ -41,6 +41,17 @@ export class UserDetailComponent implements OnInit {
   readonly saving = signal(false);
   readonly deleting = signal(false);
 
+  // ── Password reset (local users only) ─────────────────────────────────────
+  readonly changingPassword = signal(false);
+  readonly newPassword = signal('');
+  readonly confirmPassword = signal('');
+  readonly pwSaving = signal(false);
+  readonly pwError = signal<string | null>(null);
+  readonly pwSuccess = signal(false);
+
+  /** Only local-provider accounts have a password to reset. */
+  readonly isLocal = computed(() => this.user()?.provider === 'local');
+
   readonly userId = signal('');
 
   /** View scopes offered in the editor (admins are always granted all). */
@@ -113,6 +124,48 @@ export class UserDetailComponent implements OnInit {
         this.saving.set(false);
       },
       error: () => { this.saving.set(false); },
+    });
+  }
+
+  // ── Password reset ────────────────────────────────────────────────────────
+  startPasswordChange(): void {
+    this.newPassword.set('');
+    this.confirmPassword.set('');
+    this.pwError.set(null);
+    this.pwSuccess.set(false);
+    this.changingPassword.set(true);
+  }
+
+  cancelPasswordChange(): void {
+    this.changingPassword.set(false);
+    this.pwError.set(null);
+  }
+
+  savePassword(): void {
+    const pw = this.newPassword();
+    this.pwSuccess.set(false);
+    if (pw.length < 6) {
+      this.pwError.set('Password must be at least 6 characters.');
+      return;
+    }
+    if (pw !== this.confirmPassword()) {
+      this.pwError.set('Passwords do not match.');
+      return;
+    }
+    this.pwError.set(null);
+    this.pwSaving.set(true);
+    this.api.changeUserPassword(this.userId(), pw).subscribe({
+      next: () => {
+        this.pwSaving.set(false);
+        this.changingPassword.set(false);
+        this.newPassword.set('');
+        this.confirmPassword.set('');
+        this.pwSuccess.set(true);
+      },
+      error: (e) => {
+        this.pwSaving.set(false);
+        this.pwError.set(e?.error?.error ?? 'Failed to change password.');
+      },
     });
   }
 

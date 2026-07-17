@@ -192,6 +192,9 @@ export class ApiService {
   updateUser(id: string, displayName: string, role: string, permissions?: number): Observable<void> {
     return this.http.patch<void>(`/api/users/${encodeURIComponent(id)}`, { displayName, role, permissions });
   }
+  changeUserPassword(id: string, password: string): Observable<void> {
+    return this.http.patch<void>(`/api/users/${encodeURIComponent(id)}/password`, { password });
+  }
   deleteUser(id: string): Observable<void>    { return this.http.delete<void>(`/api/users/${id}`); }
 
   // ── OAuth domain allowlist ──────────────────────────────────────────────────

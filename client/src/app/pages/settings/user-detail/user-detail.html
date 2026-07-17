@@ -89,6 +89,52 @@
       }
     </app-section>
 
+    @if (isLocal()) {
+      <app-section title="Password">
+        @if (!changingPassword()) {
+          <div class="row">
+            <span class="sublabel">
+              @if (pwSuccess()) {
+                <span class="form-success">
+                  <lucide-icon name="check" [size]="12" /> Password updated.
+                </span>
+              } @else {
+                Set a new password for this user. They will use it at the next sign-in.
+              }
+            </span>
+            <button class="btn primary" (click)="startPasswordChange()">
+              <lucide-icon name="key" [size]="13" />
+              Change password
+            </button>
+          </div>
+        } @else {
+          <div class="edit-form">
+            <label class="field">
+              <span class="label">New password</span>
+              <input class="field-input" type="password" autocomplete="new-password"
+                     [ngModel]="newPassword()" (ngModelChange)="newPassword.set($event)" />
+            </label>
+            <label class="field">
+              <span class="label">Confirm password</span>
+              <input class="field-input" type="password" autocomplete="new-password"
+                     [ngModel]="confirmPassword()" (ngModelChange)="confirmPassword.set($event)"
+                     (keyup.enter)="savePassword()" />
+            </label>
+            @if (pwError(); as err) {
+              <span class="form-error">{{ err }}</span>
+            }
+            <div class="btn-group">
+              <button class="btn" (click)="cancelPasswordChange()" [disabled]="pwSaving()">Cancel</button>
+              <button class="btn primary" (click)="savePassword()" [disabled]="pwSaving()">
+                <lucide-icon [name]="pwSaving() ? 'loader-circle' : 'save'" [size]="13" />
+                {{ pwSaving() ? 'Saving…' : 'Set password' }}
+              </button>
+            </div>
+          </div>
+        }
+      </app-section>
+    }
+
     <app-section title="Danger zone">
       <div class="row">
         <span class="sublabel">Permanently delete this user. OAuth allowlist entries can be re-added later.</span>
