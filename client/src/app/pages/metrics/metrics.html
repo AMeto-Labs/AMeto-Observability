@@ -123,10 +123,11 @@
               </label>
 
               <label class="b-field grow">
-                <span>Filters (key=value, …)</span>
+                <span>Filters (key=value, …) · Ctrl+Space</span>
                 <input class="b-input" placeholder="service.name=api, http.route=/orders"
+                       [appSuggestInput]="filterKeys()"
                        [ngModel]="filtersRaw()" (ngModelChange)="filtersRaw.set($event)"
-                       (keydown.enter)="runQuery()" (blur)="runQuery()">
+                       (suggestSubmit)="runQuery()" (blur)="runQuery()">
               </label>
 
               <button class="b-run" (click)="runQuery()">

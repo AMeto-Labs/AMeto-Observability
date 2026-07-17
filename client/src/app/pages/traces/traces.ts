@@ -15,10 +15,27 @@ import { ServiceGraphComponent } from './service-graph/service-graph';
 import { FlamegraphComponent } from './flame-graph/flame-graph';
 import { LatencyComponent } from './latency/latency';
 import { CompareTraceComponent } from './compare-trace/compare-trace';
+import { SuggestInputDirective } from '../../shared/suggest/suggest-input.directive';
+
+/** TraceQL vocabulary offered by the Ctrl+Space autocomplete: intrinsics, common OTel span
+ *  attributes (dotted), status/kind enum values, and the comparison/boolean operators. */
+const TRACEQL_TOKENS: readonly string[] = [
+  // intrinsics
+  'status', 'duration', 'name', 'service', 'kind',
+  // common span / resource attributes
+  '.http.status_code', '.http.request.method', '.http.route', '.http.target', '.http.url',
+  '.http.response.status_code', '.rpc.method', '.rpc.service', '.db.system', '.db.statement',
+  '.db.name', '.net.peer.name', '.messaging.system', '.error',
+  // enum values
+  'error', 'ok', 'unset',
+  'server', 'client', 'producer', 'consumer', 'internal',
+  // operators / duration units
+  '&&', '||', '=', '!=', '>', '>=', '<', '<=', 'ms', 's',
+];
 
 @Component({
   selector: 'app-traces',
-  imports: [FormsModule, LucideAngularModule, ServiceGraphComponent, FlamegraphComponent, LatencyComponent, CompareTraceComponent],
+  imports: [FormsModule, LucideAngularModule, ServiceGraphComponent, FlamegraphComponent, LatencyComponent, CompareTraceComponent, SuggestInputDirective],
   templateUrl: './traces.html',
   styleUrl: './traces.scss',
   changeDetection: ChangeDetectionStrategy.OnPush,
@@ -91,6 +108,8 @@ export class TracesComponent implements OnInit, OnDestroy {
   traceqlInput   = '';
   traceqlMode    = signal(false);
   traceqlError   = signal('');
+  /** Candidates for the TraceQL Ctrl+Space autocomplete. */
+  readonly traceqlSuggestions = TRACEQL_TOKENS as string[];
 
   private _poll: ReturnType<typeof setInterval> | null = null;
   /** Refresh immediately when the tab is re-shown after being hidden. */

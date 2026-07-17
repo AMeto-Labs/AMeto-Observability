@@ -102,10 +102,11 @@
           <lucide-icon name="braces" [size]="13" class="tql-icon" />
           <input class="tql-input"
                  [(ngModel)]="traceqlInput"
+                 [appSuggestInput]="traceqlSuggestions"
+                 (suggestSubmit)="runTraceQL()"
                  placeholder='{ .http.status_code = 500 && duration > 500ms }'
                  spellcheck="false"
-                 autocomplete="off"
-                 (keyup.enter)="runTraceQL()" />
+                 autocomplete="off" />
           @if (traceqlInput) {
             <button class="tql-clear" (click)="traceqlInput = ''; traces.set([])" title="Clear">
               <lucide-icon name="x" [size]="11" />
@@ -124,7 +125,7 @@
         </div>
       }
       <div class="tql-hints">
-        <span class="tql-hint-label">Examples:</span>
+        <span class="tql-hint-label">Press <kbd>Ctrl</kbd>+<kbd>Space</kbd> for suggestions · Examples:</span>
         <button class="tql-hint-chip" (click)="traceqlInput = '{ status = error }'">&#123; status = error &#125;</button>
         <button class="tql-hint-chip" (click)="traceqlInput = '{ duration > 500ms }'">&#123; duration > 500ms &#125;</button>
         <button class="tql-hint-chip" (click)="traceqlInput = '{ .http.status_code = 500 }'">&#123; .http.status_code = 500 &#125;</button>
