@@ -46,13 +46,23 @@ public static class OtlpEndpointMapper
             var (body, bodyLen) = await ReadBodyAsync(ctx);
             if (body is null) return;
 
-            ExportTraceServiceRequest? request;
+            List<Ameto.Tracing.SpanIngestItem> spans;
             try
             {
                 bool isProto = ctx.Request.ContentType?.StartsWith(ProtobufContentType, StringComparison.OrdinalIgnoreCase) ?? false;
-                request = isProto
-                    ? OtlpProtoDecoder.DecodeTraces(body, bodyLen)
-                    : JsonSerializer.Deserialize<ExportTraceServiceRequest>(body.AsSpan(0, bodyLen), _jsonOptions);
+                if (isProto)
+                {
+                    // Protobuf still decodes into the object model, then maps to items.
+                    var request = OtlpProtoDecoder.DecodeTraces(body, bodyLen);
+                    if (request is null) { ctx.Response.StatusCode = 400; return; }
+                    spans = OtlpTraceMapper.Map(request);
+                }
+                else
+                {
+                    // JSON: streaming parse straight to SpanIngestItems — no OTLP object
+                    // graph, no per-field hex/nano strings (see OtlpTraceStreamParser).
+                    spans = OtlpTraceStreamParser.Parse(body.AsSpan(0, bodyLen));
+                }
             }
             catch (Exception ex)
             {
@@ -63,11 +73,7 @@ public static class OtlpEndpointMapper
             }
             finally { ArrayPool<byte>.Shared.Return(body); }
 
-            if (request is null) { ctx.Response.StatusCode = 400; return; }
-
-            var spans = OtlpTraceMapper.Map(request);
-            logger.LogDebug("OTLP /v1/traces: decoded {SpanCount} spans from {ResourceSpanCount} resource spans",
-                spans.Count, request.ResourceSpans?.Count ?? 0);
+            logger.LogDebug("OTLP /v1/traces: decoded {SpanCount} spans", spans.Count);
 
             if (spans.Count > 0)
             {
