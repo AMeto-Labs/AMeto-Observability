@@ -576,6 +576,11 @@ export const EventsStore = signalStore(
       patchState(store, { selectedId: id });
     }
 
+    /** Row click: open the drawer for this event, or close it when it is already open. */
+    function toggleEvent(id: string): void {
+      patchState(store, { selectedId: store.selectedId() === id ? null : id });
+    }
+
     function toggleWrap(): void {
       patchState(store, { wrapMessages: !store.wrapMessages() });
     }
@@ -724,6 +729,7 @@ export const EventsStore = signalStore(
       setTimeRange,
       onTimeRangeBound,
       selectEvent,
+      toggleEvent,
       toggleWrap,
       toggleSignalsPanel,
       prevCalendarMonth,

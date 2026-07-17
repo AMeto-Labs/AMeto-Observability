@@ -609,9 +609,25 @@ export class EventDetailComponent {
   }
 
   @HostListener('document:click')
-  @HostListener('document:keydown')
-  onCloseMenu(): void {
+  @HostListener('document:keydown', ['$event'])
+  onCloseMenu(e?: Event): void {
+    // Escape is owned by onEscape below (it also closes the modals / the drawer).
+    if ((e as KeyboardEvent | undefined)?.key === 'Escape') return;
     if (this.menuType()) this.menuType.set(null);
+  }
+
+  /**
+   * Escape closes the innermost open layer: context menu → modal → the drawer itself.
+   * Ignores an already-consumed key (e.g. the filter autocomplete calls preventDefault
+   * on Escape) so one press never collapses two layers at once.
+   */
+  @HostListener('document:keydown.escape', ['$event'])
+  onEscape(e: Event): void {
+    if (e.defaultPrevented) return;
+    if (this.menuType())          { this.menuType.set(null);          return; }
+    if (this.valueModalOpen())    { this.valueModalOpen.set(false);   return; }
+    if (this.messageModalOpen())  { this.messageModalOpen.set(false); return; }
+    this.closed.emit();
   }
 
   // ── Context menu actions ──────────────────────────────────────────────

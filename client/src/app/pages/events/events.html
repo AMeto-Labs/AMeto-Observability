@@ -42,7 +42,7 @@
               [selected]="ev.id === store.selectedId()"
               [wrap]="true"
               [isNew]="store.newEventIds().has(ev.id)"
-              (selectRequested)="store.selectEvent(ev.id)"
+              (selectRequested)="store.toggleEvent(ev.id)"
               (filterSelected)="store.applyFilter($event)"
             />
           }
@@ -57,7 +57,7 @@
                     [selected]="ev.id === store.selectedId()"
                     [wrap]="false"
                     [isNew]="store.newEventIds().has(ev.id)"
-                    (selectRequested)="store.selectEvent(ev.id)"
+                    (selectRequested)="store.toggleEvent(ev.id)"
                     (filterSelected)="store.applyFilter($event)"
                   />
                 }
