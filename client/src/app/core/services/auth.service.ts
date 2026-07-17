@@ -81,6 +81,20 @@ export class AuthService {
     this.router.navigate(['/login']);
   }
 
+  /**
+   * Re-validates the session after a channel that bypasses the HTTP interceptor fails.
+   * `EventSource` can neither send the `Authorization` header nor expose the response
+   * status, so an SSE 401 (stale/expired token, e.g. after the API target changed) never
+   * reaches {@link authInterceptor}. This routes the check back through `HttpClient`:
+   * a missing/expired token logs out immediately; otherwise `/api/auth/refresh` decides —
+   * a 401 there triggers the interceptor's logout + redirect, while a transient/network
+   * error returns no 401 and leaves the session intact (no false logout on a blip).
+   */
+  verifySession(): void {
+    if (!this.isAuthenticated()) { this.logout(); return; }
+    this.refresh().subscribe({ error: () => { /* 401 → interceptor logs out; else ignore */ } });
+  }
+
   private storeToken(r: LoginResponseDto): void {
     // Prefer role from response body; fall back to JWT payload decode
     let role: UserRole = r.role ?? 'viewer';
