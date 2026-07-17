@@ -1,7 +1,10 @@
 @if (event(); as ev) {
   <div class="ev-main" (click)="onRowClick()">
     <span class="ev-stripe"></span>
-    <span class="ev-ts" [title]="ev['@t']">{{ ev['@t'] | date: 'yyyy-MM-dd HH:mm:ss.SSS' }}</span>
+    <span class="ev-ts" [title]="ev['@t']"
+      ><span class="ev-ts-date">{{ ev['@t'] | date: 'yyyy-MM-dd' }} </span
+      ><span class="ev-ts-time">{{ ev['@t'] | date: 'HH:mm:ss.SSS' }}</span
+    ></span>
     <span class="ev-level">
       <span class="ev-lvl-badge">{{ levelShort() }}</span>
     </span>

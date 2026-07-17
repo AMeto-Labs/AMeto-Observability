@@ -22,6 +22,29 @@
   --param-bool: #38BDF8;
   --param-null: #6B7280;
 
+  /* ── Log-row palette ("1b" design spec, flat variant) ───────────────────
+     The level badge/stripe (--lvl-*) owns saturated colour. Message properties are
+     coloured by a stable hash of the property NAME (see clef-renderer: --prop inline,
+     flat foreground, no chip background) from a pastel palette in the free zone
+     (teal / rose / orchid) outside every level hue, so a value never reads as a
+     severity at a glance. The --param-* set above must not be used here — it matches
+     the level palette exactly (string == --lvl-i green, integer == --lvl-w amber). */
+  --msg-tmpl:  #C7CED9;  /* literal template text                    */
+  --msg-val:   #8C98A8;  /* JSON value — dimmed below the template   */
+  --msg-punct: #566073;  /* JSON structure — recedes                 */
+  --msg-null:  #6B7488;  /* absent value — dim + italic              */
+
+  /* Details JSON viewer (Overview properties + JSON tab): keys are one uniform
+     dimmed tone (the design's "dim key") — quiet landmarks, values stay bright. */
+  --json-key:  #7A8496;
+
+  --row-ts-date: #5C6879;  /* date recedes …                       */
+  --row-ts-time: #AEB8C5;  /* … time carries the row               */
+  --row-svc:     #AEB8C5;  /* service name — same tone as the time */
+  --row-prop-key: #64748B;
+  --row-prop-sep: #475569;
+  --row-prop-val: #CBD5E1;
+
   --border: #263244;
   --border-soft: #1E293B;
 

@@ -65,23 +65,36 @@ lucide-icon {
   background: var(--text-muted);
 }
 
+/* Rendered-message properties ("1b", flat variant): the renderer sets --prop inline —
+   a stable hash of the property NAME — so one field is always one colour, applied as
+   plain foreground (no chip background). The palette is pastel and outside the level
+   hues, so a value never reads as a severity (the old --param-* matched --lvl-i /
+   --lvl-w exactly). */
+.msg-prop {
+  color: var(--prop);
+  font-family: var(--font-mono);
+}
+
+/* JSON keys: the only highlighted part of an embedded JSON blob — property colour +
+   italic. Values are dimmed below the template text so the keys stay the landmarks. */
+.msg-key {
+  color: var(--prop);
+  font-family: var(--font-mono);
+  font-style: italic;
+}
+
 .msg-val {
-  color: var(--param-string);
+  color: var(--msg-val);
   font-family: var(--font-mono);
 }
 
-.msg-num {
-  color: var(--param-integer);
-  font-family: var(--font-mono);
-}
-
-.msg-obj {
-  color: var(--param-bool);
+.msg-punct {
+  color: var(--msg-punct);
   font-family: var(--font-mono);
 }
 
 .msg-null {
-  color: var(--param-null);
+  color: var(--msg-null);
   font-family: var(--font-mono);
   font-style: italic;
 }
