@@ -13,8 +13,10 @@ namespace Ameto.Query;
 ///   1. Time-range filter on <see cref="SegmentInfo"/> (skip segments outside window).
 ///   2. Index fast-skip: load <see cref="SegmentIndexReader"/> and call
 ///      <see cref="ISegmentIndex.MightContain"/> — skip segments where index says no match.
-///   3. Trigram pre-filter: narrow to candidate block offsets via
-///      <see cref="ISegmentIndex.LookupTrigram"/>.
+///   3. Candidate narrowing: trigram (<see cref="ISegmentIndex.LookupTrigram"/>) and
+///      inverted (<see cref="ISegmentIndex.LookupIntersect"/>) posting lists yield
+///      candidate event ordinals (file order, v5 segments) — the reader skips blocks
+///      without candidates and materialises only candidate rows.
 ///   4. Block decode: LZ4 decompress via <see cref="SegmentReader"/>.
 ///   5. Per-event AST evaluation via <see cref="FilterEvaluator"/>.
 ///

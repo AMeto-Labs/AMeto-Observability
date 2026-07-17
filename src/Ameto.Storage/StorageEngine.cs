@@ -22,7 +22,12 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// Injected by the Indexing layer at startup to avoid a circular project reference.
     /// Returns (invertedIndexBytes, trigramIndexBytes, bloomFilterBytes).
     /// </summary>
-    public Func<HotTierSegment, StringInternPool, (byte[], byte[], byte[])>? IndexBuilder { get; set; }
+    /// <summary>
+    /// Builds (inverted, trigram, bloom) index bytes for a frozen tier. The third argument
+    /// is the file write order (<see cref="SegmentWriter.ComputeSortOrder"/>) — the builder
+    /// must emit posting-list offsets in that order so they equal .seg file ordinals.
+    /// </summary>
+    public Func<HotTierSegment, StringInternPool, int[], (byte[], byte[], byte[])>? IndexBuilder { get; set; }
 
     /// <summary>
     /// Optional hook called on the write path after each event is accepted into the hot tier.
@@ -536,9 +541,13 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             byte[] trigramBytes  = Array.Empty<byte>();
             byte[] bloomBytes    = Array.Empty<byte>();
 
+            // One sort order shared by the index build and the block writer: posting-list
+            // offsets become file ordinals, which the reader maps back to blocks/rows.
+            int[] order = SegmentWriter.ComputeSortOrder(hot);
+
             if (indexBuilder is not null)
             {
-                (invertedBytes, trigramBytes, bloomBytes) = indexBuilder(hot, TemplatePool);
+                (invertedBytes, trigramBytes, bloomBytes) = indexBuilder(hot, TemplatePool, order);
             }
 
             // Write to a temp file first; rename to final path only after Finalise()
@@ -549,7 +558,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 SegmentInfo info;
                 using (var writer = new SegmentWriter(tmpPath))
                 {
-                    writer.WriteEvents(hot, TemplatePool);
+                    writer.WriteEvents(hot, TemplatePool, order);
                     writer.WriteInvertedIndex(invertedBytes);
                     writer.WriteTrigramIndex(trigramBytes);
                     writer.WriteBloomFilter(bloomBytes);

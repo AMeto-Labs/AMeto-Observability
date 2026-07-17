@@ -36,12 +36,21 @@ public sealed class SegmentIndexBuilder
 
     // ── Build ─────────────────────────────────────────────────────────────────
 
-    /// <summary>Streaming (zero-alloc) build. Must be called while <paramref name="hot"/> is frozen.</summary>
-    public void Build(HotTierSegment hot, StringInternPool pool)
+    /// <summary>
+    /// Streaming (zero-alloc) build. Must be called while <paramref name="hot"/> is frozen.
+    ///
+    /// <paramref name="order"/> is the file write order produced by
+    /// <c>SegmentWriter.ComputeSortOrder</c>: posting-list offsets are the event's ordinal
+    /// IN THE .SEG FILE (sorted by @t, id), so the reader can map candidate offsets straight
+    /// to blocks/rows. Null = identity (hot insertion order) — only for segments written
+    /// without sorting (tests).
+    /// </summary>
+    public void Build(HotTierSegment hot, StringInternPool pool, int[]? order = null)
     {
-        for (int i = 0; i < hot.Count; i++)
+        for (int pos = 0; pos < hot.Count; pos++)
         {
-            uint offset = (uint)i;
+            int  i      = order?[pos] ?? pos;
+            uint offset = (uint)pos;
             ref readonly var header = ref hot.GetHeader(i);
             IndexHeaderFields(in header, i, offset, hot, pool);
             IndexPropertiesStreaming(hot.GetPropertiesPayload(i), offset);
@@ -52,11 +61,12 @@ public sealed class SegmentIndexBuilder
     /// Reference build via the old per-event <c>Dictionary</c> path. Kept only as the
     /// correctness oracle for the streaming-parity test; not used in production.
     /// </summary>
-    public void BuildReference(HotTierSegment hot, StringInternPool pool)
+    public void BuildReference(HotTierSegment hot, StringInternPool pool, int[]? order = null)
     {
-        for (int i = 0; i < hot.Count; i++)
+        for (int pos = 0; pos < hot.Count; pos++)
         {
-            uint offset = (uint)i;
+            int  i      = order?[pos] ?? pos;
+            uint offset = (uint)pos;
             ref readonly var header = ref hot.GetHeader(i);
             IndexHeaderFields(in header, i, offset, hot, pool);
 

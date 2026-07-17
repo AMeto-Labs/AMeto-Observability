@@ -33,7 +33,7 @@ public sealed class SegmentWriter : IDisposable
 {
     private const uint   MagicHeader = 0x52_44_4C_47; // "RDLG"
     private const uint   MagicFooter = 0x52_44_46_54; // "RDFT"
-    private const ushort SegVersion  = 4;             // v4: + TraceId/SpanId/ServiceName columns
+    private const ushort SegVersion  = 5;             // v5: block index carries FirstOrdinal (v4: + TraceId/SpanId/ServiceName columns)
     private const int    BlockSize   = 64 * 1024;      // 64 KB target uncompressed block size
 
     public  const byte   FlagCompressed = 0x01;
@@ -42,7 +42,11 @@ public sealed class SegmentWriter : IDisposable
     private readonly FileStream   _fs;
     private readonly BinaryWriter _bw;
 
-    private readonly List<(long Offset, ulong FirstEventId)> _blockIndex = new();
+    // v5 block-index entry: byte offset of the block, first EventId, and the ordinal
+    // (file-order position, 0-based) of the block's first event. Index posting lists
+    // store these same ordinals, so the reader can map candidates → block → row.
+    private readonly List<(long Offset, ulong FirstEventId, uint FirstOrdinal)> _blockIndex = new();
+    private int _eventsFlushed;
 
     private long _invertedIndexOffset;
     private long _trigramIndexOffset;
@@ -63,14 +67,14 @@ public sealed class SegmentWriter : IDisposable
 
     // ── Public API ────────────────────────────────────────────────────────────
 
-    public void WriteEvents(HotTierSegment hot, StringInternPool templatePool)
+    /// <summary>
+    /// File write order: event indices sorted ascending by (TimestampUtcTicks, EventId).
+    /// The SAME array must be passed to <see cref="WriteEvents(HotTierSegment, StringInternPool, int[])"/>
+    /// and <c>SegmentIndexBuilder.Build</c> so index posting-list offsets equal file ordinals.
+    /// </summary>
+    public static int[] ComputeSortOrder(HotTierSegment hot)
     {
-        _fs.Seek(SegmentFileHeader.Size, SeekOrigin.Begin);
-
         int count = hot.Count;
-        if (count == 0) return;
-
-        // Sort ascending by (TimestampUtcTicks, EventId)
         var order = new int[count];
         for (int i = 0; i < count; i++) order[i] = i;
         Array.Sort(order, (a, b) =>
@@ -80,6 +84,18 @@ public sealed class SegmentWriter : IDisposable
             int c = ha.TimestampUtcTicks.CompareTo(hb.TimestampUtcTicks);
             return c != 0 ? c : ha.Id.CompareTo(hb.Id);
         });
+        return order;
+    }
+
+    public void WriteEvents(HotTierSegment hot, StringInternPool templatePool)
+        => WriteEvents(hot, templatePool, ComputeSortOrder(hot));
+
+    public void WriteEvents(HotTierSegment hot, StringInternPool templatePool, int[] order)
+    {
+        _fs.Seek(SegmentFileHeader.Size, SeekOrigin.Begin);
+
+        int count = hot.Count;
+        if (count == 0) return;
 
         var batch = new List<int>(1024);
         int approxBytes = 0;
@@ -141,10 +157,11 @@ public sealed class SegmentWriter : IDisposable
     {
         _blockIndexOffset = _fs.Position;
         _bw.Write((uint)_blockIndex.Count);
-        foreach (var (offset, firstId) in _blockIndex)
+        foreach (var (offset, firstId, firstOrdinal) in _blockIndex)
         {
             _bw.Write(offset);
             _bw.Write(firstId);
+            _bw.Write(firstOrdinal);   // v5: maps index posting-list offsets → block
         }
 
         long footerOffset = _fs.Position;
@@ -308,7 +325,8 @@ public sealed class SegmentWriter : IDisposable
             int compressedLen = LZ4Codec.Encode(uncompressed, 0, uncompressed.Length, compBuf, 0, maxOut, LZ4Level.L00_FAST);
 
             long blockOffset = _fs.Position;
-            _blockIndex.Add((blockOffset, firstEventId));
+            _blockIndex.Add((blockOffset, firstEventId, (uint)_eventsFlushed));
+            _eventsFlushed += n;
 
             _bw.Write((uint)uncompressed.Length);
             _bw.Write((uint)compressedLen);
