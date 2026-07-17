@@ -87,6 +87,24 @@ public sealed class IngestionOptions
     /// Default: 8 MB.
     /// </summary>
     public int MaxOtlpBatchBytes { get; init; } = 8 * 1024 * 1024;
+
+    /// <summary>
+    /// Ring-buffer sequencing slots between the HTTP ingest endpoints and the storage
+    /// drainer. Rounded up to a power of two. This is the absorption window for hot-tier
+    /// flush stalls: at 100k events/s, 65536 slots ≈ 650 ms of headroom before events
+    /// drop. Slot memory is ~64 B each (payload slabs are pooled separately and do NOT
+    /// scale with this), so the default costs ~4 MB. Default: 65536.
+    /// </summary>
+    public int RingCapacity { get; init; } = 64 * 1024;
+
+    /// <summary>
+    /// Payload slab arena budget for the ring: slabCount = min(RingCapacity, this /
+    /// MaxEventPayloadBytes). Slabs — not ring slots — are the true drop threshold when
+    /// the drainer stalls. The arena is reserved virtual memory: resident pages track the
+    /// bytes actually written (typical events touch one 4 KB page per slab), not the
+    /// budget, so a generous value is cheap. Default: 512 MB (= 8192 slabs of 64 KB).
+    /// </summary>
+    public long PayloadPoolBytes { get; init; } = 512L * 1024 * 1024;
 }
 
 /// <summary>

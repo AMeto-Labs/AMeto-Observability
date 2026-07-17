@@ -54,6 +54,8 @@ Request/size limits, in bytes. Oversized requests are rejected with `413` before
 | `MaxBatchBytes` | int | `4194304` (4 MB) | Max body for a CLEF batch (`POST /api/events`). |
 | `MaxEventPayloadBytes` | int | `65536` (64 KB) | Max serialised properties for a single event (also the ring-buffer slab size). An oversized event is dropped (and logged) while the rest of the batch ingests. |
 | `MaxOtlpBatchBytes` | int | `8388608` (8 MB) | Max body for the OTLP endpoints (`POST /otlp/v1/*`). |
+| `RingCapacity` | int | `65536` | Ring-buffer slots between the HTTP ingest endpoints and the storage drainer (rounded up to a power of two, ~64 B each). Together with `PayloadPoolBytes` this is the absorption window for flush stalls before events drop. |
+| `PayloadPoolBytes` | long | `536870912` (512 MB) | Payload slab arena budget: slab count = min(`RingCapacity`, this / `MaxEventPayloadBytes`). Reserved virtual memory — resident pages track the payload bytes actually written, not the budget. Slabs, not ring slots, are the true drop threshold under stall. |
 
 ---
 

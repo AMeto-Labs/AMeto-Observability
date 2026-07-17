@@ -449,17 +449,22 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
             _hot = CreateHotTier();
 
-            // Rotate the WAL: bump the counter first so the new WAL uses the *next* id,
-            // then swap it in before releasing the old file so the drain loop never
-            // writes to a disposed WAL.
+            // Rotate the WAL: bump the counter first so the new WAL uses the *next* id.
+            // The OLD WAL is disposed in the heavy phase, off the swap lock — disposing
+            // flushes up to 64 MB of dirty mmap pages to disk, and doing that here
+            // stalled every writer (hot tier stays full for the whole swap) long enough
+            // to overflow the ingest ring under sustained 100k/s load.
             _nextSegmentId++;
             _wal = null;
-            oldWal?.Dispose();
             OpenWal();
         }
         finally { _flushLock.Release(); }
 
         if (oldHot is null) return; // hot tier was empty — nothing swapped (no slot taken)
+
+        // Nobody writes to the old WAL any more (writers see the new _wal) — close its
+        // handles before the flush so File.Delete below succeeds afterwards.
+        oldWal?.Dispose();
 
         // ── HEAVY PHASE — parallel, bounded by _flushConcurrency. Builds the inverted/
         //    trigram/bloom indexes, compresses and writes the cold segment. Runs off the

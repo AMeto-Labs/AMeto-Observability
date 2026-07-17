@@ -47,3 +47,20 @@ Server side during the run:
 For context: v1.0.8's durable ceiling on the same box was ~76k/s — the v1.0.9
 performance work (candidate-driven segment reads, header-level hot-tier scan,
 pooled index sections, streaming OTLP parsers, WAL fixes) moved it.
+
+## Measured: post-1.0.9 dev (drop hunt), 2026-07-18
+
+Same box and methodology, chasing the remaining 1.46 % — each fix measured with
+a full 100k/s × 60 s run:
+
+| Build | Dropped |
+|---|---|
+| v1.0.9 baseline | 87 882 (1.46 %) |
+| + SegmentWriter per-block scratch reuse (42 MB → 483 KB alloc per flushed tier) | 60 532 (1.01 %) |
+| + WAL dispose moved off the swap lock, ring 16k → 64k slots | 42 486 (0.71 %) |
+| + payload slab pool 128 MB → 512 MB (the root cause: 2048 slabs ≈ 20 ms of absorption) | **0 (0.00 %)** |
+
+Final run: **6 001 000 / 6 001 000 ingested (99 947/s), zero drops**, batch
+p95 5.2 ms, max 74 ms, RSS steady ~1 GB. The drop threshold was never the ring
+slot count but the payload slab pool — see `Ingestion.RingCapacity` /
+`Ingestion.PayloadPoolBytes` in [CONFIGURATION.md](../../docs/CONFIGURATION.md).

@@ -26,7 +26,7 @@ namespace Ameto.Ingestion;
 public sealed unsafe class IngestionRingBuffer : IDisposable
 {
     /// <summary>Total bytes the shared payload pool may commit at most (back-pressure ceiling).</summary>
-    private const long PayloadPoolBytes = 128L * 1024 * 1024; // 128 MB worst case; demand-driven in practice
+    private const long DefaultPayloadPoolBytes = 512L * 1024 * 1024; // virtual worst case; pages fault in on demand
 
     // ── Slot layout (64 bytes = one cache line) ────────────────────────────────
     [StructLayout(LayoutKind.Explicit, Size = 64)]
@@ -77,9 +77,16 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
 
     // ── Construction ─────────────────────────────────────────────────────────
 
-    /// <param name="capacity">Ring sequencing slots. Must be a power of two. Recommended: 1 << 14 = 16384.</param>
+    /// <param name="capacity">Ring sequencing slots. Must be a power of two. Recommended: 1 << 16 = 65536.</param>
     /// <param name="maxPayloadBytesPerSlot">Max msgpack bytes per event (slab size). Default 64 KB.</param>
-    public IngestionRingBuffer(int capacity = 1 << 14, int maxPayloadBytesPerSlot = 64 * 1024)
+    /// <param name="payloadPoolBytes">
+    /// Slab arena budget. slabCount = min(capacity, budget / slabSize) — this, not the ring
+    /// capacity, is the true absorption window when the drainer stalls: once slabs run out,
+    /// events with payloads are dropped even with free ring slots. The arena is reserved
+    /// virtual memory; only pages actually written become resident (~real payload bytes,
+    /// not slabCount × slabSize), so a generous budget costs little RSS.
+    /// </param>
+    public IngestionRingBuffer(int capacity = 1 << 16, int maxPayloadBytesPerSlot = 64 * 1024, long payloadPoolBytes = DefaultPayloadPoolBytes)
     {
         if (capacity <= 0 || (capacity & (capacity - 1)) != 0)
             throw new ArgumentException("capacity must be a positive power of two", nameof(capacity));
@@ -94,9 +101,9 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
             _slots[i].Sequence = i;
 
         // ── Shared payload slab pool ────────────────────────────────────────────
-        // Cap the pool at PayloadPoolBytes (and never more slabs than ring slots).
+        // Cap the pool at payloadPoolBytes (and never more slabs than ring slots).
         _slabBytes = maxPayloadBytesPerSlot;
-        _slabCount = (int)Math.Min(capacity, Math.Max(1, PayloadPoolBytes / _slabBytes));
+        _slabCount = (int)Math.Min(capacity, Math.Max(1, payloadPoolBytes / _slabBytes));
 
         _payloadArenaBytes = (nuint)((long)_slabCount * _slabBytes);
         _payloadArena      = (byte*)NativeMemory.Alloc(_payloadArenaBytes); // reserve only; pages fault in on demand

@@ -18,8 +18,15 @@ public static class IngestionServiceExtensions
         // Slab size (max properties bytes per event) is taken from config; a static lambda
         // keeps this closure allocation-free.
         services.AddSingleton<IngestionRingBuffer>(static sp =>
-            new IngestionRingBuffer(
-                maxPayloadBytesPerSlot: sp.GetRequiredService<ServerOptions>().Ingestion.MaxEventPayloadBytes));
+        {
+            var ing = sp.GetRequiredService<ServerOptions>().Ingestion;
+            // The ring requires a power-of-two capacity — round the configured value up.
+            int cap = (int)System.Numerics.BitOperations.RoundUpToPowerOf2(
+                (uint)Math.Clamp(ing.RingCapacity, 1024, 1 << 24));
+            return new IngestionRingBuffer(cap,
+                maxPayloadBytesPerSlot: ing.MaxEventPayloadBytes,
+                payloadPoolBytes:       ing.PayloadPoolBytes);
+        });
 
         // Endpoint — singleton, mapped as a route handler in Program.cs
         services.AddSingleton<IngestionEndpoint>();
