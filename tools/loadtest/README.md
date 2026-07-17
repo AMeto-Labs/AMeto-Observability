@@ -64,3 +64,17 @@ Final run: **6 001 000 / 6 001 000 ingested (99 947/s), zero drops**, batch
 p95 5.2 ms, max 74 ms, RSS steady ~1 GB. The drop threshold was never the ring
 slot count but the payload slab pool — see `Ingestion.RingCapacity` /
 `Ingestion.PayloadPoolBytes` in [CONFIGURATION.md](../../docs/CONFIGURATION.md).
+
+## Measured: v1.0.10 (installed service), 2026-07-18
+
+Validation on the real Windows-service install (same box, same methodology):
+
+| Run | Ingested | Dropped | Batch latency |
+|---|---|---|---|
+| 100k/s × 60 s, cold (right after install) | 5 995 330 (99.89 %) | 6 670 (0.11 %) | p95 5.2 ms · max 175 ms |
+| 100k/s × 60 s, warm | **6 001 000 / 6 001 000** | **0 (0.00 %)** | p95 5.4 ms · max 34 ms |
+| **150k/s × 60 s** (`-e RATE=150`) | **8 998 479 (149 862/s, 99.97 %)** | 2 521 (0.028 %) | p95 4.0 ms · max 23 ms |
+
+The cold-run residue is start-up effects (JIT, WAL recovery, retention scan) —
+a warm service sustains the full offered rate with zero loss, and takes 150k/s
+with 0.03 % drops and a steady ~1.1 GB RSS.
