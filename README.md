@@ -4,7 +4,7 @@ A high-performance, self-hosted observability server — **logs, traces and metr
 
 ## Features
 
-- **150,000 events/second** measured sustained ingestion on a single node (99.97 % accepted; 100k/s runs with **zero drops** — see [tools/loadtest](tools/loadtest/README.md))
+- **150,000 events/second** measured sustained ingestion on a single node (99.97 % accepted; 100k/s runs with **zero drops**, graceful degradation up to a measured **456k/s** peak — see [tools/loadtest](tools/loadtest/README.md))
 - **Three signals, one server** — structured logs, distributed traces and metrics share the same storage and query primitives
 - **OTLP ingestion** — native `POST /otlp/v1/{logs,traces,metrics}` (protobuf), no collector required
 - **Seq-compatible Filter Expressions** — use the same query syntax you know

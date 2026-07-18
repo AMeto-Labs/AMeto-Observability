@@ -90,6 +90,23 @@ The cold-run residue is start-up effects (JIT, WAL recovery, retention scan) —
 a warm service sustains the full offered rate with zero loss, and takes 150k/s
 with 0.03 % drops and a steady ~1.1 GB RSS.
 
+### Ceiling ladder (logs, v1.0.10, 60 s per step)
+
+| Offered | Ingested | Dropped | RSS |
+|---|---|---|---|
+| 100k/s | 100 % | **0 %** | ~1.0 GB |
+| 150k/s | 149 862/s | 0.028 % | ~1.1 GB |
+| 175k/s | 174 401/s | 0.29 % | ~1.5 GB |
+| 200k/s | 198 286/s | 0.76 % | ~2.0 GB |
+| 250k/s | 246 070/s | 1.48 % | ~1.9 GB |
+| 500k/s | **456 570/s** | 7.97 % | ~3.5 GB (budget-capped) |
+
+Degradation is graceful — no cliff: past ~150k/s the flush pipeline (parallel
+index builds) becomes the wall and the back-pressure budget trades drops for
+bounded RAM. Practical zero-drop ceiling on this box: **~150k logs/s**; peak
+sustained acceptance under 5x overload: **~456k logs/s**. (k6 itself saturates
+near 500k/s co-located, so higher offered rates need a separate load box.)
+
 ## Measured: traces & metrics separately (v1.0.10 installed service), 2026-07-18
 
 Each signal driven on its own, 60 s per run, same box/methodology:
