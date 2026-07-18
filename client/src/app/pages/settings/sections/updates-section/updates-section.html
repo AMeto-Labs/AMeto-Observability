@@ -1,6 +1,7 @@
 <app-section title="Software update">
   <span class="sublabel">
-    The server checks GitHub Releases for a new version once an hour.
+    The server checks GitHub Releases for a new version once an hour. Updating is
+    two-step: download &amp; verify first, then install (restart) on your approval.
   </span>
 
   @if (loading()) {
@@ -35,10 +36,27 @@
             <lucide-icon name="check-circle" [size]="13" />
             Updated to {{ s.currentVersion }} — reload to load the new UI
           </span>
-        } @else if (applying()) {
+        } @else if (installing() || phase() === 'installing') {
           <span class="upd-state busy">
             <lucide-icon name="loader-circle" [size]="13" />
-            {{ applyMessage() ?? 'Updating…' }}
+            Installing {{ s.downloadedVersion }} — the server is restarting…
+          </span>
+        } @else if (phase() === 'downloading') {
+          <span class="upd-state busy">
+            <lucide-icon name="loader-circle" [size]="13" />
+            Downloading {{ s.latestVersion }} — {{ mb(s.downloadedBytes) }} /
+            {{ s.downloadTotalBytes > 0 ? mb(s.downloadTotalBytes) : '?' }} MB
+            @if (s.downloadTotalBytes > 0) { ({{ progressPct() }}%) }
+          </span>
+        } @else if (readyToInstall()) {
+          <span class="upd-state avail">
+            <lucide-icon name="check-circle" [size]="13" />
+            {{ s.downloadedVersion }} downloaded &amp; verified — ready to install
+          </span>
+        } @else if (phase() === 'failed') {
+          <span class="upd-state err">
+            <lucide-icon name="circle-alert" [size]="13" />
+            {{ s.downloadError ?? 'Download failed' }}
           </span>
         } @else if (s.updateAvailable) {
           <span class="upd-state avail">
@@ -54,10 +72,16 @@
       </div>
     </div>
 
+    @if (phase() === 'downloading') {
+      <div class="upd-progress" role="progressbar" [attr.aria-valuenow]="progressPct()">
+        <div class="upd-progress__fill" [style.width.%]="progressPct()"></div>
+      </div>
+    }
+
     @if (manualHint(); as hint) {
       <div class="upd-hint">{{ hint }}</div>
     }
-    @if (applyError(); as err) {
+    @if (actionError(); as err) {
       <div class="upd-error">{{ err }}</div>
     }
 
@@ -72,14 +96,19 @@
             Reload
           </button>
         } @else {
-          <button class="btn" [disabled]="checking() || applying()" (click)="checkNow()">
+          <button class="btn" [disabled]="checking() || busy() || installing() || phase() === 'downloading'" (click)="checkNow()">
             <lucide-icon [name]="checking() ? 'loader-circle' : 'refresh-cw'" [size]="13" />
             {{ checking() ? 'Checking…' : 'Check now' }}
           </button>
-          @if (s.updateAvailable && s.canSelfUpdate) {
-            <button class="btn primary" [disabled]="!canApply()" (click)="apply()">
-              <lucide-icon [name]="applying() ? 'loader-circle' : 'download'" [size]="13" />
-              {{ applying() ? 'Updating…' : 'Update to ' + s.latestVersion }}
+          @if (readyToInstall()) {
+            <button class="btn primary" [disabled]="busy()" (click)="install()">
+              <lucide-icon name="arrow-up" [size]="13" />
+              Install &amp; restart
+            </button>
+          } @else if (s.updateAvailable && s.canSelfUpdate && !installing() && phase() !== 'downloading' && phase() !== 'installing') {
+            <button class="btn primary" [disabled]="!canDownload()" (click)="download()">
+              <lucide-icon name="download" [size]="13" />
+              Download {{ s.latestVersion }}
             </button>
           }
         }
