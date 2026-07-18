@@ -1,18 +1,29 @@
-# Ingest load test (k6)
+# Ingest load tests (k6)
 
-Drives OTLP JSON logs into `POST /otlp/v1/logs` at a constant offered rate.
-The batch body is built once at init and only the timestamp is patched per
-iteration, so k6 itself stays cheap even at 100k records/s.
+One script per signal, all driving the OTLP JSON endpoints at a constant offered
+rate. Batch bodies are built once at init and only timestamps (and, for traces,
+an iteration id baked into every trace/span id) are patched per iteration, so k6
+itself stays cheap even at 100k records/s.
+
+| Script | Endpoint | Default offered load |
+|---|---|---|
+| `k6-100k.js` | `/otlp/v1/logs` | 100 req/s × 1000 records = **100k logs/s** |
+| `k6-traces.js` | `/otlp/v1/traces` | 50 req/s × 1000 spans = **50k spans/s** (5 spans/trace, root+children) |
+| `k6-metrics.js` | `/otlp/v1/metrics` | 50 req/s × 1000 points = **50k points/s** (1000 series: 15 counters + 15 gauges + 10 histograms × 25 label combos) |
 
 ## Run
 
 ```bash
-# 100k logs/s for 60 s (defaults: RATE=100 req/s × BATCH=1000 records)
+# Logs: 100k/s for 60 s
 k6 run -e AMETO_API_KEY=<key> tools/loadtest/k6-100k.js
 
-# Custom target / rate / duration
+# Traces / metrics, same knobs
+k6 run -e AMETO_API_KEY=<key> tools/loadtest/k6-traces.js
+k6 run -e AMETO_API_KEY=<key> tools/loadtest/k6-metrics.js
+
+# Custom target / rate / duration (any script)
 k6 run -e AMETO_API_KEY=<key> -e AMETO_URL=http://host:8555 \
-       -e RATE=50 -e BATCH=1000 -e DURATION=120s tools/loadtest/k6-100k.js
+       -e RATE=100 -e DURATION=120s tools/loadtest/k6-traces.js
 ```
 
 Create the API key under **Settings → API Keys** (needs the Logs permission).
@@ -78,3 +89,20 @@ Validation on the real Windows-service install (same box, same methodology):
 The cold-run residue is start-up effects (JIT, WAL recovery, retention scan) —
 a warm service sustains the full offered rate with zero loss, and takes 150k/s
 with 0.03 % drops and a steady ~1.1 GB RSS.
+
+## Measured: traces & metrics separately (v1.0.10 installed service), 2026-07-18
+
+Each signal driven on its own, 60 s per run, same box/methodology:
+
+| Run | Ingested | Dropped | Batch latency | RSS |
+|---|---|---|---|---|
+| Traces 50k spans/s | 3 000 000 / 3 000 000 | **0** | p95 20.2 ms · max 101 ms | ~230 MB |
+| **Traces 100k spans/s** | **6 001 000 / 6 001 000** | **0** | p95 21.3 ms · max 68 ms | ~240 MB |
+| Metrics 50k points/s | 3 001 000 / 3 001 000 | **0** | p95 8.3 ms · max 34 ms | ~300 MB |
+| **Metrics 100k points/s** | **6 001 000 / 6 001 000** | **0** | p95 9.8 ms · max 55 ms | ~280 MB |
+
+Traces go through the streaming OTLP parser (spans carry 6 attributes each,
+promoted http status, parent links); metrics cover 1000 distinct series
+including 15-bucket histograms. Neither signal shows drops up to 100k/s —
+the log pipeline's flush machinery remains the only path that ever needed
+back-pressure tuning.
