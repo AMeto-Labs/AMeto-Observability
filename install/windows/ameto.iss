@@ -393,19 +393,26 @@ begin
 
   { Create the service if it doesn't exist yet. The binPath is quoted INSIDE the
     stored ImagePath (\" ... \") so a path with spaces isn't vulnerable to the
-    unquoted-service-path hijack. }
+    unquoted-service-path hijack.
+    The service runs as LocalSystem (sc default): the in-app self-update has the
+    SERVICE launch the downloaded installer, and only LocalSystem can start an
+    admin-manifested setup.exe silently — NetworkService gets ERROR_ELEVATION_
+    REQUIRED and a service can never show a UAC prompt. }
   if not ServiceExists then
   begin
     BinPath := '"\"' + ExePath + '\""';
     RunHidden(ExpandConstant('{sys}\sc.exe'),
       'create {#ServiceName} binPath= ' + BinPath +
-      ' start= auto DisplayName= "{#ServiceDisplay}" obj= "NT AUTHORITY\NetworkService"');
+      ' start= auto DisplayName= "{#ServiceDisplay}"');
     RunHidden(ExpandConstant('{sys}\sc.exe'),
       'description {#ServiceName} "High-performance self-hosted structured log server (Ameto)"');
     { Auto-restart on crash: 5 s delay, reset the failure counter after a day. }
     RunHidden(ExpandConstant('{sys}\sc.exe'),
       'failure {#ServiceName} reset= 86400 actions= restart/5000/restart/5000/restart/5000');
-  end;
+  end
+  else
+    { Migrate older installs that ran as NetworkService (see comment above). }
+    RunHidden(ExpandConstant('{sys}\sc.exe'), 'config {#ServiceName} obj= LocalSystem');
 
   { Trim RAM after ingest bursts: with ConserveMemory the GC compacts and returns
     the ballooned heap to the OS instead of keeping it committed until the next

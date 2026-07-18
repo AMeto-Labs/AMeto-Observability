@@ -12,6 +12,9 @@ namespace Ameto.Server.Updates;
 /// <summary>One downloadable file attached to the latest GitHub release.</summary>
 public sealed record ReleaseAsset(string Name, string DownloadUrl);
 
+/// <summary>Self-update lifecycle: download (with progress) → explicit install approval.</summary>
+public enum UpdatePhase { Idle, Downloading, Ready, Installing, Failed }
+
 /// <summary>Immutable snapshot of the most recent successful check.</summary>
 public sealed record LatestRelease(
     string Tag,
@@ -36,7 +39,14 @@ public sealed class UpdateChecker(ServerOptions options, ILogger<UpdateChecker> 
     private string?         _etag;
     private DateTimeOffset? _checkedAt;
     private volatile string? _lastError;
-    private int _applying;               // 1 while an installer download/launch is in flight
+
+    // Self-update state machine (download progress → install approval).
+    private volatile UpdatePhase _phase = UpdatePhase.Idle;
+    private long    _dlBytes;            // Interlocked-updated by the download worker
+    private long    _dlTotal;            // 0 until Content-Length is known
+    private volatile string? _dlVersion; // tag the downloaded file belongs to
+    private volatile string? _dlPath;    // verified installer on disk (phase == Ready)
+    private volatile string? _dlError;
 
     /// <summary>Version stamped at build time (-p:Version=…); "1.0.0-dev" for local builds.</summary>
     public static readonly string CurrentVersion =
@@ -47,7 +57,12 @@ public sealed class UpdateChecker(ServerOptions options, ILogger<UpdateChecker> 
     public LatestRelease?  Latest      => _latest;
     public DateTimeOffset? CheckedAt   => _checkedAt;
     public string?         LastError   => _lastError;
-    public bool            ApplyInProgress => Volatile.Read(ref _applying) == 1;
+
+    public UpdatePhase Phase           => _phase;
+    public long        DownloadedBytes => Interlocked.Read(ref _dlBytes);
+    public long        DownloadTotalBytes => Interlocked.Read(ref _dlTotal);
+    public string?     DownloadedVersion  => _dlVersion;
+    public string?     DownloadError      => _dlError;
 
     public bool UpdateAvailable
     {
@@ -141,13 +156,14 @@ public sealed class UpdateChecker(ServerOptions options, ILogger<UpdateChecker> 
     }
 
     /// <summary>
-    /// Windows-only self-update: downloads the installer asset for this
-    /// architecture, verifies its SHA-256 against the published checksums file,
-    /// then launches it silently. The installer stops the service, replaces the
-    /// binaries and starts the service again — this process dies mid-way, which
-    /// is expected.
+    /// Phase 1 of the Windows self-update: kicks off a background download of the
+    /// installer asset for this architecture (progress is exposed via
+    /// <see cref="DownloadedBytes"/>/<see cref="DownloadTotalBytes"/>), verifies its
+    /// SHA-256 against the published checksums file and parks the file on disk.
+    /// NOTHING is installed and the server keeps running — the restart only happens
+    /// when the admin explicitly approves via <see cref="TryInstall"/>.
     /// </summary>
-    public async Task<(bool Ok, string Message)> TryApplyAsync(CancellationToken ct)
+    public (bool Ok, string Message) StartDownload()
     {
         if (!OperatingSystem.IsWindows() || IsContainer())
             return (false, "Self-update is only supported on Windows installs.");
@@ -155,44 +171,115 @@ public sealed class UpdateChecker(ServerOptions options, ILogger<UpdateChecker> 
         if (latest is null)      return (false, "No release information yet — check for updates first.");
         if (!UpdateAvailable)    return (false, "Already on the latest version.");
 
-        if (Interlocked.Exchange(ref _applying, 1) == 1)
-            return (false, "An update is already in progress.");
+        switch (_phase)
+        {
+            case UpdatePhase.Downloading: return (true, "Download already in progress.");
+            case UpdatePhase.Installing:  return (false, "An install is already in progress.");
+            case UpdatePhase.Ready when _dlVersion == latest.Tag && File.Exists(_dlPath):
+                return (true, $"{latest.Tag} is already downloaded and verified.");
+        }
+
+        var arch      = RuntimeInformation.OSArchitecture == Architecture.X86 ? "x86" : "x64";
+        var installer = Find(latest.Assets, $"-setup-{arch}.exe");
+        if (installer is null) return (false, $"Release {latest.Tag} has no {arch} installer asset.");
+        var sums = Find(latest.Assets, "SHA256SUMS-win-installer.txt");
+
+        _phase     = UpdatePhase.Downloading;
+        _dlVersion = latest.Tag;
+        _dlError   = null;
+        _dlPath    = null;
+        Interlocked.Exchange(ref _dlBytes, 0);
+        Interlocked.Exchange(ref _dlTotal, 0);
+
+        _ = Task.Run(() => DownloadWorkerAsync(latest.Tag, installer, sums));
+        return (true, $"Downloading {latest.Tag}…");
+    }
+
+    private async Task DownloadWorkerAsync(string tag, ReleaseAsset installer, ReleaseAsset? sums)
+    {
+        var path = Path.Combine(Path.GetTempPath(), installer.Name);
         try
         {
-            var arch      = RuntimeInformation.OSArchitecture == Architecture.X86 ? "x86" : "x64";
-            var installer = Find(latest.Assets, $"-setup-{arch}.exe");
-            var sums      = Find(latest.Assets, "SHA256SUMS-win-installer.txt");
-            if (installer is null) return (false, $"Release {latest.Tag} has no {arch} installer asset.");
+            using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(15));
+            using var res = await Http.GetAsync(installer.DownloadUrl,
+                HttpCompletionOption.ResponseHeadersRead, cts.Token).ConfigureAwait(false);
+            res.EnsureSuccessStatusCode();
+            Interlocked.Exchange(ref _dlTotal, res.Content.Headers.ContentLength ?? 0);
 
-            var path = Path.Combine(Path.GetTempPath(), installer.Name);
-            await DownloadAsync(installer.DownloadUrl, path, ct).ConfigureAwait(false);
-
-            if (sums is not null && !await VerifySha256Async(path, installer.Name, sums.DownloadUrl, ct).ConfigureAwait(false))
+            await using (var src = await res.Content.ReadAsStreamAsync(cts.Token).ConfigureAwait(false))
+            await using (var dst = File.Create(path))
             {
-                File.Delete(path);
-                return (false, "Checksum verification failed — download discarded.");
+                var buf = new byte[81920];
+                int n;
+                while ((n = await src.ReadAsync(buf, cts.Token).ConfigureAwait(false)) > 0)
+                {
+                    await dst.WriteAsync(buf.AsMemory(0, n), cts.Token).ConfigureAwait(false);
+                    Interlocked.Add(ref _dlBytes, n);
+                }
             }
 
-            logger.LogInformation("Launching installer {Path} for {Tag}", path, latest.Tag);
-            Process.Start(new ProcessStartInfo
+            if (sums is not null && !await VerifySha256Async(path, installer.Name, sums.DownloadUrl, cts.Token).ConfigureAwait(false))
             {
-                FileName        = path,
-                Arguments       = "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART",
-                UseShellExecute = false,
-                CreateNoWindow  = true,
-            });
-            return (true, $"Installer for {latest.Tag} started — the server will restart shortly.");
+                File.Delete(path);
+                _dlError = "Checksum verification failed — download discarded.";
+                _phase   = UpdatePhase.Failed;
+                return;
+            }
+
+            _dlPath = path;
+            _phase  = UpdatePhase.Ready;
+            logger.LogInformation("Update {Tag} downloaded and verified: {Path}", tag, path);
         }
         catch (Exception ex)
         {
-            logger.LogWarning(ex, "Self-update failed");
-            return (false, $"Update failed: {ex.Message}");
+            try { File.Delete(path); } catch { /* best effort */ }
+            _dlError = ex.Message;
+            _phase   = UpdatePhase.Failed;
+            logger.LogWarning(ex, "Update download failed");
         }
-        finally
+    }
+
+    /// <summary>
+    /// Phase 2 — the admin's explicit approval: launches the already-downloaded,
+    /// verified installer silently. The installer stops the service, replaces the
+    /// binaries and starts the service again — this process dies mid-way, which
+    /// is expected.
+    /// </summary>
+    public (bool Ok, string Message) TryInstall()
+    {
+        var latest = _latest;
+        if (_phase != UpdatePhase.Ready || _dlPath is null)
+            return (false, "No verified installer is ready — download the update first.");
+        if (latest is not null && _dlVersion != latest.Tag)
+            return (false, $"Downloaded {_dlVersion} but the latest release is now {latest.Tag} — download again.");
+        if (!File.Exists(_dlPath))
         {
-            // On success the flag stays honest too: the service is about to be
-            // stopped by the installer, so clearing it here is harmless.
-            Volatile.Write(ref _applying, 0);
+            _phase = UpdatePhase.Idle;
+            return (false, "The downloaded installer is gone — download the update again.");
+        }
+
+        try
+        {
+            _phase = UpdatePhase.Installing;
+            logger.LogInformation("Launching installer {Path} for {Tag}", _dlPath, _dlVersion);
+            Process.Start(new ProcessStartInfo
+            {
+                FileName        = _dlPath,
+                Arguments       = "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART",
+                // Service (LocalSystem): already elevated — CreateProcess starts the
+                // installer silently, no prompts. Interactive (portable/dev) run:
+                // ShellExecute is the only route, and Windows raises UAC there.
+                UseShellExecute = Environment.UserInteractive,
+                CreateNoWindow  = true,
+            });
+            return (true, $"Installing {_dlVersion} — the server will restart shortly.");
+        }
+        catch (Exception ex)
+        {
+            _phase   = UpdatePhase.Failed;
+            _dlError = ex.Message;
+            logger.LogWarning(ex, "Installer launch failed");
+            return (false, $"Installer launch failed: {ex.Message}");
         }
     }
 
@@ -216,17 +303,6 @@ public sealed class UpdateChecker(ServerOptions options, ILogger<UpdateChecker> 
             if (a.Name.EndsWith(suffix, StringComparison.OrdinalIgnoreCase))
                 return a;
         return null;
-    }
-
-    private static async Task DownloadAsync(string url, string path, CancellationToken ct)
-    {
-        // Asset downloads take much longer than API calls — use a per-call timeout.
-        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        cts.CancelAfter(TimeSpan.FromMinutes(10));
-        using var res = await Http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, cts.Token).ConfigureAwait(false);
-        res.EnsureSuccessStatusCode();
-        await using var file = File.Create(path);
-        await res.Content.CopyToAsync(file, cts.Token).ConfigureAwait(false);
     }
 
     private static async Task<bool> VerifySha256Async(string path, string fileName, string sumsUrl, CancellationToken ct)

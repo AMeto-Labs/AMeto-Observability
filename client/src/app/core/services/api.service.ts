@@ -173,6 +173,11 @@ export class ApiService {
   checkForUpdates(): Observable<UpdateStatusDto> {
     return this.http.post<UpdateStatusDto>('/api/system/update/check', {});
   }
+  /** Phase 1: download + verify the installer (progress via getUpdateStatus polling). */
+  downloadUpdate(): Observable<{ message: string }> {
+    return this.http.post<{ message: string }>('/api/system/update/download', {});
+  }
+  /** Phase 2 — explicit approval: run the verified installer (the server restarts). */
   applyUpdate(): Observable<{ message: string }> {
     return this.http.post<{ message: string }>('/api/system/update/apply', {});
   }

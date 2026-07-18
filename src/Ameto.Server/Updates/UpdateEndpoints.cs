@@ -4,9 +4,10 @@ namespace Ameto.Server.Updates;
 
 /// <summary>
 /// Admin-only software-update endpoints (Settings → Updates):
-///   GET  /api/system/update        — current/latest version snapshot
-///   POST /api/system/update/check  — force a check right now
-///   POST /api/system/update/apply  — Windows: download + launch the installer
+///   GET  /api/system/update           — version snapshot + download phase/progress
+///   POST /api/system/update/check     — force a check right now
+///   POST /api/system/update/download  — phase 1: download + verify the installer
+///   POST /api/system/update/apply     — phase 2 (admin approval): run it → restart
 /// </summary>
 public static class UpdateEndpoints
 {
@@ -23,10 +24,18 @@ public static class UpdateEndpoints
             return Results.Ok(Snapshot(checker));
         }).RequireAuthorization();
 
-        app.MapPost("/api/system/update/apply", static async (HttpContext ctx, UpdateChecker checker) =>
+        app.MapPost("/api/system/update/download", static (HttpContext ctx, UpdateChecker checker) =>
         {
             if (!IsAdmin(ctx)) return Results.Forbid();
-            var (ok, message) = await checker.TryApplyAsync(ctx.RequestAborted);
+            var (ok, message) = checker.StartDownload();
+            return ok ? Results.Accepted(value: new { message })
+                      : Results.BadRequest(new { message });
+        }).RequireAuthorization();
+
+        app.MapPost("/api/system/update/apply", static (HttpContext ctx, UpdateChecker checker) =>
+        {
+            if (!IsAdmin(ctx)) return Results.Forbid();
+            var (ok, message) = checker.TryInstall();
             return ok ? Results.Accepted(value: new { message })
                       : Results.BadRequest(new { message });
         }).RequireAuthorization();
@@ -48,10 +57,17 @@ public static class UpdateEndpoints
             checkedAt       = checker.CheckedAt,
             checkError      = checker.LastError,
             platform,
-            // The button can only truly update a Windows (service/portable) install;
+            // The buttons can only truly update a Windows (service/portable) install;
             // Docker updates via image pull (Watchtower), Linux via install.sh.
             canSelfUpdate   = !container && OperatingSystem.IsWindows(),
-            applyInProgress = checker.ApplyInProgress,
+
+            // Self-update state machine: idle → downloading (progress below) →
+            // ready (awaiting the admin's install approval) → installing | failed.
+            downloadPhase     = checker.Phase.ToString().ToLowerInvariant(),
+            downloadedBytes   = checker.DownloadedBytes,
+            downloadTotalBytes = checker.DownloadTotalBytes,
+            downloadedVersion = checker.DownloadedVersion,
+            downloadError     = checker.DownloadError,
         };
     }
 
