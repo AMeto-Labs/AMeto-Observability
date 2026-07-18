@@ -203,7 +203,10 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # ignore-error: the GHA cache backend intermittently rejects blob
+          # reservations ("failed to reserve cache") AFTER the image is already
+          # pushed — losing the cache is fine, failing the release job is not.
+          cache-to: type=gha,mode=max,ignore-error=true
 
       - name: Summary
         run: |
