@@ -204,6 +204,10 @@ RestartSec=5s
 # of MB. Two arenas is plenty for this workload and cut anon RSS ~60 MB.
 Environment=MALLOC_ARENA_MAX=2
 
+# Trim RAM after ingest bursts: the GC compacts and returns the ballooned
+# heap to the OS instead of keeping it committed until the next gen2.
+Environment=DOTNET_GCConserveMemory=5
+
 # Hardening
 NoNewPrivileges=true
 ProtectSystem=strict

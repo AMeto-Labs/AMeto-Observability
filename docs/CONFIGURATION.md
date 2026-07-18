@@ -78,7 +78,7 @@ These seed the SQLite retention table **on first run only**. Afterwards, change 
 
 ## Update check (`Ameto:Updates`)
 
-The server polls the GitHub Releases API and surfaces "new version available" in **Settings → Updates** (admin only). On Windows installs the same tab offers a one-click **Update to latest** (downloads the installer, verifies its SHA-256, runs it silently). One conditional (ETag) request per interval; `304 Not Modified` responses don't count against GitHub's rate limit.
+The server polls the GitHub Releases API and surfaces "new version available" in **Settings → Updates** (admin only). On Windows installs and Linux systemd installs the same tab offers a two-step self-update: **Download** (with progress; SHA-256-verified) and then **Install & restart** on explicit approval. Windows runs the installer silently (the service runs as LocalSystem — no UAC); Linux swaps the binaries in place and exits non-zero so systemd's `Restart=on-failure` starts the new build. One conditional (ETag) request per interval; `304 Not Modified` responses don't count against GitHub's rate limit.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
