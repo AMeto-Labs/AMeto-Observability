@@ -114,6 +114,7 @@ jobs:
           dotnet publish "$PROJECT" -c Release -r linux-x64 --self-contained true \
             -p:PublishSingleFile=true -p:EnableCompressionInSingleFile=true \
             -p:DebugType=None -p:DebugSymbols=false \
+            -p:Version="${RELEASE_VERSION#v}" \
             -o out/linux-x64
           cp install/linux/install.sh out/linux-x64/install.sh
           chmod +x out/linux-x64/install.sh out/linux-x64/Ameto.Server
@@ -124,6 +125,7 @@ jobs:
           dotnet publish "$PROJECT" -c Release -r win-x64 --self-contained true \
             -p:PublishSingleFile=true -p:EnableCompressionInSingleFile=true \
             -p:DebugType=None -p:DebugSymbols=false \
+            -p:Version="${RELEASE_VERSION#v}" \
             -o out/win-x64
           cp install/windows/install.ps1 out/win-x64/install.ps1
           (cd out/win-x64 && zip -qr "../../ameto-${RELEASE_VERSION}-win-x64.zip" .)
@@ -185,12 +187,19 @@ jobs:
             type=raw,value=latest
             type=sha,format=short
 
+      # Strip the leading v: MSBuild's Version property wants plain 1.0.4.
+      - name: Numeric version
+        id: numver
+        run: echo "value=${RELEASE_VERSION#v}" >> "$GITHUB_OUTPUT"
+
       - name: Build & push
         uses: docker/build-push-action@v6
         with:
           context: .                              # repo root (Dockerfile COPYs src/ and client/)
           file: install/docker/Dockerfile
           push: true
+          build-args: |
+            APP_VERSION=${{ steps.numver.outputs.value }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha

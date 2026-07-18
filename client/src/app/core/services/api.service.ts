@@ -13,6 +13,7 @@ import { ApiKeyDto, CreatedApiKeyDto, OAuthDomainDto, UserDto } from '../models/
 import { CompareTracesDto, LatencyServiceDto, SpanDto, SpanQueryParams, TraceQueryRequest, TraceRowDto, TraceStatsDto } from '../models/span.model';
 import { MetricSeriesDto, MetricCatalogDto, MetricQueryRequest, HeatmapDto, ExemplarDto, MetricExprRequest } from '../models/metric.model';
 import { SearchHistoryDto } from '../models/search-history.model';
+import { UpdateStatusDto } from '../models/update.model';
 import { AuthService } from './auth.service';
 
 @Injectable({ providedIn: 'root' })
@@ -163,6 +164,17 @@ export class ApiService {
 
   getDiagnostics(): Observable<DiagnosticsDto> {
     return this.http.get<DiagnosticsDto>('/api/diagnostics');
+  }
+
+  // ── Software updates (Settings → Updates, admin) ─────────────────────────
+  getUpdateStatus(): Observable<UpdateStatusDto> {
+    return this.http.get<UpdateStatusDto>('/api/system/update');
+  }
+  checkForUpdates(): Observable<UpdateStatusDto> {
+    return this.http.post<UpdateStatusDto>('/api/system/update/check', {});
+  }
+  applyUpdate(): Observable<{ message: string }> {
+    return this.http.post<{ message: string }>('/api/system/update/apply', {});
   }
 
   streamLive(filter?: string): Observable<EventDto> {

@@ -76,6 +76,20 @@ These seed the SQLite retention table **on first run only**. Afterwards, change 
 
 ---
 
+## Update check (`Ameto:Updates`)
+
+The server polls the GitHub Releases API and surfaces "new version available" in **Settings → Updates** (admin only). On Windows installs the same tab offers a one-click **Update to latest** (downloads the installer, verifies its SHA-256, runs it silently). One conditional (ETag) request per interval; `304 Not Modified` responses don't count against GitHub's rate limit.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `Enabled` | bool | `true` | Set `false` on air-gapped hosts to skip the check entirely. |
+| `CheckIntervalMinutes` | int | `60` | Minutes between checks (clamped to ≥ 15). |
+| `GitHubRepository` | string | `"AMeto-Labs/AMeto-Observability"` | `owner/repo` whose Releases are polled. |
+
+Docker installs can't self-update from inside the container — use a moving tag (`:latest`) plus the Watchtower service documented in `install/docker/docker-compose.example.yml`.
+
+---
+
 ## Replication options (`Ameto:Replication`)
 
 Symmetric replication: each node replicates its own flushed cold segments to all healthy peers. No leader election. A node is **healthy** if its last successful ping was within 30 s.

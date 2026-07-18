@@ -33,6 +33,13 @@ Ameto:
     ErrorDays: 90
     FatalDays: 90
 
+  # ── Software-update check (Settings → Updates, admin only) ───────────────────
+  # One conditional request to the GitHub Releases API per interval; a 304
+  # response costs nothing against the rate limit. Disable for air-gapped hosts.
+  Updates:
+    Enabled: true
+    CheckIntervalMinutes: 60   # min 15
+
   # ── Replication ──────────────────────────────────────────────────────────────
   # Symmetric: each node replicates its own segments to all peers.
   Replication:

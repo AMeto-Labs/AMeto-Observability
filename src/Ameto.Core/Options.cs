@@ -124,6 +124,21 @@ public sealed class RetentionConfig
 }
 
 /// <summary>
+/// Software-update check: the server polls the GitHub Releases API and surfaces
+/// "new version available" in the UI (Settings → Updates, admin only).
+/// The check is a single conditional (ETag) request; 304 responses do not count
+/// against the GitHub rate limit. Disable entirely for air-gapped installs.
+/// </summary>
+public sealed class UpdatesOptions
+{
+    public bool   Enabled              { get; init; } = true;
+    /// <summary>Minutes between checks. Clamped to ≥ 15. Default: 60.</summary>
+    public int    CheckIntervalMinutes { get; init; } = 60;
+    /// <summary>GitHub "owner/repo" whose Releases are polled.</summary>
+    public string GitHubRepository     { get; init; } = "AMeto-Labs/AMeto-Observability";
+}
+
+/// <summary>
 /// Top-level server configuration.
 /// </summary>
 public sealed class ServerOptions
@@ -134,6 +149,7 @@ public sealed class ServerOptions
     public IndexingOptions  Indexing         { get; init; } = new();
     public IngestionOptions Ingestion        { get; init; } = new();
     public RetentionConfig  Retention        { get; init; } = new();
+    public UpdatesOptions   Updates          { get; init; } = new();
     public int              HttpPort         { get; init; } = 5341;
     public string           SslCertPath      { get; init; } = "";
     public string           SslCertPassword  { get; init; } = "";

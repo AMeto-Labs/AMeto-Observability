@@ -83,12 +83,38 @@ services:
       # Ameto__Replication__SeedNodes__0: "http://ameto-2:5341"
       # Ameto__Replication__SeedNodes__1: "http://ameto-3:5341"
 
+      # ── Software-update check (Settings → Updates tab) ────────────────────
+      # Ameto__Updates__Enabled: "true"             # set "false" for air-gapped hosts
+      # Ameto__Updates__CheckIntervalMinutes: "60"
+
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:5341/health"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 10s
+
+    # Only containers carrying this label are touched by the Watchtower service below.
+    # labels:
+    #   com.centurylinklabs.watchtower.enable: "true"
+
+  # ── Automatic updates (optional) ────────────────────────────────────────────
+  # Watchtower polls the registry for a new image and recreates the container
+  # with the same volumes/env when one appears — data lives on the ameto-data
+  # volume, so an update is just a short restart. Requires pulling by a moving
+  # tag (image: ghcr.io/ameto-labs/ameto:latest, option B above); a pinned
+  # version tag never changes, so there is nothing for Watchtower to find.
+  #
+  # watchtower:
+  #   image: containrrr/watchtower
+  #   container_name: watchtower
+  #   restart: unless-stopped
+  #   volumes:
+  #     - /var/run/docker.sock:/var/run/docker.sock
+  #   environment:
+  #     WATCHTOWER_LABEL_ENABLE: "true"       # only touch labelled containers (see above)
+  #     WATCHTOWER_CLEANUP: "true"            # remove the superseded image afterwards
+  #     WATCHTOWER_SCHEDULE: "0 0 4 * * *"    # 04:00 daily (cron with seconds); default: every 24h
 
 volumes:
   ameto-data:
