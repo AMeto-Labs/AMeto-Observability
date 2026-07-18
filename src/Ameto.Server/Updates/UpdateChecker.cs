@@ -1,8 +1,11 @@
 using System.Diagnostics;
+using System.Formats.Tar;
+using System.IO.Compression;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Runtime.Versioning;
 using System.Security.Cryptography;
 using System.Text.Json;
 using Ameto.Core;
@@ -28,7 +31,10 @@ public sealed record LatestRelease(
 /// for the Settings → Updates endpoints. Cold path: runs once an hour, so plain
 /// async code — no pooling gymnastics needed here.
 /// </summary>
-public sealed class UpdateChecker(ServerOptions options, ILogger<UpdateChecker> logger) : BackgroundService
+public sealed class UpdateChecker(
+    ServerOptions options,
+    IHostApplicationLifetime lifetime,
+    ILogger<UpdateChecker> logger) : BackgroundService
 {
     private static readonly HttpClient Http = CreateClient();
 
@@ -165,8 +171,10 @@ public sealed class UpdateChecker(ServerOptions options, ILogger<UpdateChecker> 
     /// </summary>
     public (bool Ok, string Message) StartDownload()
     {
-        if (!OperatingSystem.IsWindows() || IsContainer())
-            return (false, "Self-update is only supported on Windows installs.");
+        if (!CanSelfUpdate)
+            return (false, OperatingSystem.IsLinux()
+                ? "Self-update needs the systemd service install (set up via install.sh)."
+                : "Self-update is not supported on this platform.");
         var latest = _latest;
         if (latest is null)      return (false, "No release information yet — check for updates first.");
         if (!UpdateAvailable)    return (false, "Already on the latest version.");
@@ -179,10 +187,23 @@ public sealed class UpdateChecker(ServerOptions options, ILogger<UpdateChecker> 
                 return (true, $"{latest.Tag} is already downloaded and verified.");
         }
 
-        var arch      = RuntimeInformation.OSArchitecture == Architecture.X86 ? "x86" : "x64";
-        var installer = Find(latest.Assets, $"-setup-{arch}.exe");
-        if (installer is null) return (false, $"Release {latest.Tag} has no {arch} installer asset.");
-        var sums = Find(latest.Assets, "SHA256SUMS-win-installer.txt");
+        ReleaseAsset? installer;
+        ReleaseAsset? sums;
+        if (OperatingSystem.IsWindows())
+        {
+            var arch = RuntimeInformation.OSArchitecture == Architecture.X86 ? "x86" : "x64";
+            installer = Find(latest.Assets, $"-setup-{arch}.exe");
+            sums      = Find(latest.Assets, "SHA256SUMS-win-installer.txt");
+            if (installer is null) return (false, $"Release {latest.Tag} has no {arch} installer asset.");
+        }
+        else
+        {
+            if (RuntimeInformation.OSArchitecture != Architecture.X64)
+                return (false, "Self-update archives are published for x64 only.");
+            installer = Find(latest.Assets, "-linux-x64.tar.gz");
+            sums      = Find(latest.Assets, "SHA256SUMS.txt");
+            if (installer is null) return (false, $"Release {latest.Tag} has no linux-x64 archive asset.");
+        }
 
         _phase     = UpdatePhase.Downloading;
         _dlVersion = latest.Tag;
@@ -240,10 +261,12 @@ public sealed class UpdateChecker(ServerOptions options, ILogger<UpdateChecker> 
     }
 
     /// <summary>
-    /// Phase 2 — the admin's explicit approval: launches the already-downloaded,
-    /// verified installer silently. The installer stops the service, replaces the
-    /// binaries and starts the service again — this process dies mid-way, which
-    /// is expected.
+    /// Phase 2 — the admin's explicit approval.
+    /// Windows: launches the already-downloaded, verified installer silently; it
+    /// stops the service, replaces the binaries and starts it again (this process
+    /// dies mid-way, which is expected).
+    /// Linux (systemd): extracts the verified tar.gz, swaps the install directory
+    /// in place and exits non-zero — Restart=on-failure brings up the new build.
     /// </summary>
     public (bool Ok, string Message) TryInstall()
     {
@@ -261,30 +284,124 @@ public sealed class UpdateChecker(ServerOptions options, ILogger<UpdateChecker> 
         try
         {
             _phase = UpdatePhase.Installing;
-            logger.LogInformation("Launching installer {Path} for {Tag}", _dlPath, _dlVersion);
-            Process.Start(new ProcessStartInfo
+            if (OperatingSystem.IsWindows())
             {
-                FileName        = _dlPath,
-                Arguments       = "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART",
-                // Service (LocalSystem): already elevated — CreateProcess starts the
-                // installer silently, no prompts. Interactive (portable/dev) run:
-                // ShellExecute is the only route, and Windows raises UAC there.
-                UseShellExecute = Environment.UserInteractive,
-                CreateNoWindow  = true,
-            });
-            return (true, $"Installing {_dlVersion} — the server will restart shortly.");
+                logger.LogInformation("Launching installer {Path} for {Tag}", _dlPath, _dlVersion);
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName        = _dlPath,
+                    Arguments       = "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART",
+                    // Service (LocalSystem): already elevated — CreateProcess starts the
+                    // installer silently, no prompts. Interactive (portable/dev) run:
+                    // ShellExecute is the only route, and Windows raises UAC there.
+                    UseShellExecute = Environment.UserInteractive,
+                    CreateNoWindow  = true,
+                });
+                return (true, $"Installing {_dlVersion} — the server will restart shortly.");
+            }
+
+            if (!OperatingSystem.IsLinux())
+            {
+                _phase = UpdatePhase.Failed;
+                return (false, "Self-update is not supported on this platform.");
+            }
+
+            logger.LogInformation("Applying update {Tag} from {Path}", _dlVersion, _dlPath);
+            InstallLinux(_dlPath);
+            ScheduleRestartExit();
+            return (true, $"Installing {_dlVersion} — the service will restart in a few seconds.");
         }
         catch (Exception ex)
         {
             _phase   = UpdatePhase.Failed;
             _dlError = ex.Message;
             logger.LogWarning(ex, "Installer launch failed");
-            return (false, $"Installer launch failed: {ex.Message}");
+            return (false, $"Install failed: {ex.Message}");
         }
+    }
+
+    /// <summary>
+    /// Extracts the verified release archive and swaps it over the install
+    /// directory. config.yml is never touched. Safe while running: each file is
+    /// written as "&lt;name&gt;.new" beside its target (same filesystem) and then
+    /// renamed over the original — rename(2) is atomic on Linux and legal even
+    /// for the currently executing binary (the old inode lives on until exit).
+    /// </summary>
+    [SupportedOSPlatform("linux")]
+    private static void InstallLinux(string archivePath)
+    {
+        string staging = Path.Combine(Path.GetTempPath(), "ameto-update-staging");
+        if (Directory.Exists(staging)) Directory.Delete(staging, recursive: true);
+        Directory.CreateDirectory(staging);
+        try
+        {
+            using (var fs = File.OpenRead(archivePath))
+            using (var gz = new GZipStream(fs, CompressionMode.Decompress))
+                TarFile.ExtractToDirectory(gz, staging, overwriteFiles: true);
+
+            if (!File.Exists(Path.Combine(staging, "Ameto.Server")))
+                throw new InvalidOperationException("The archive does not contain Ameto.Server.");
+
+            SwapTree(staging, AppContext.BaseDirectory, isRoot: true);
+        }
+        finally
+        {
+            try { Directory.Delete(staging, recursive: true); } catch { /* best effort */ }
+        }
+    }
+
+    [SupportedOSPlatform("linux")]
+    private static void SwapTree(string source, string target, bool isRoot)
+    {
+        Directory.CreateDirectory(target);
+        foreach (var dir in Directory.EnumerateDirectories(source))
+            SwapTree(dir, Path.Combine(target, Path.GetFileName(dir)), isRoot: false);
+
+        foreach (var file in Directory.EnumerateFiles(source))
+        {
+            var name = Path.GetFileName(file);
+            if (isRoot && name == "config.yml") continue;   // preserve the user's config
+
+            var dest = Path.Combine(target, name);
+            var tmp  = dest + ".new";
+            File.Copy(file, tmp, overwrite: true);
+            File.SetUnixFileMode(tmp, File.GetUnixFileMode(file));   // keep the exec bit
+            File.Move(tmp, dest, overwrite: true);
+        }
+    }
+
+    /// <summary>
+    /// Graceful restart-through-exit: flush/shutdown normally, but leave a
+    /// non-zero exit code so systemd's Restart=on-failure starts the swapped
+    /// binaries. A watchdog hard-exits if graceful shutdown wedges.
+    /// </summary>
+    private void ScheduleRestartExit()
+    {
+        _ = Task.Run(async () =>
+        {
+            await Task.Delay(TimeSpan.FromSeconds(1)).ConfigureAwait(false);
+            logger.LogInformation("Update applied — exiting so systemd restarts the service");
+            Environment.ExitCode = 1;
+            lifetime.StopApplication();
+            await Task.Delay(TimeSpan.FromSeconds(30)).ConfigureAwait(false);
+            Environment.Exit(1);
+        });
     }
 
     public static bool IsContainer() =>
         Environment.GetEnvironmentVariable("DOTNET_RUNNING_IN_CONTAINER") == "true";
+
+    /// <summary>
+    /// True when this install can update itself in place: any Windows install
+    /// (service or portable), or a Linux install running under systemd — the
+    /// Linux path swaps the binaries and relies on Restart=on-failure to come
+    /// back up, so a bare console run (no INVOCATION_ID) is excluded.
+    /// </summary>
+    public static bool CanSelfUpdate =>
+        !IsContainer() &&
+        (OperatingSystem.IsWindows() ||
+         (OperatingSystem.IsLinux() &&
+          Environment.GetEnvironmentVariable("INVOCATION_ID") is { Length: > 0 }));
 
     // ── helpers ──────────────────────────────────────────────────────────────
 

@@ -57,9 +57,9 @@ public static class UpdateEndpoints
             checkedAt       = checker.CheckedAt,
             checkError      = checker.LastError,
             platform,
-            // The buttons can only truly update a Windows (service/portable) install;
-            // Docker updates via image pull (Watchtower), Linux via install.sh.
-            canSelfUpdate   = !container && OperatingSystem.IsWindows(),
+            // Windows installs and Linux systemd installs self-update in place;
+            // Docker updates via image pull (Watchtower), bare console runs manually.
+            canSelfUpdate   = UpdateChecker.CanSelfUpdate,
 
             // Self-update state machine: idle → downloading (progress below) →
             // ready (awaiting the admin's install approval) → installing | failed.
