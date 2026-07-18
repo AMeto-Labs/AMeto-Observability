@@ -44,8 +44,8 @@ docker run -d --name ameto -p 5341:5341 -v ameto-data:/data \
   ghcr.io/ameto-labs/ameto:__VERSION__
 ```
 
-The image is published by the separate **Publish Docker image** workflow; if that tag is
-not up yet, use `:latest`. `install/docker/docker-compose.example.yml` documents every
+The `__VERSION__` image is pushed to GHCR by the same release workflow (`:latest`
+points at it too). `install/docker/docker-compose.example.yml` documents every
 configuration option.
 
 ### After install — send data
