@@ -20,6 +20,7 @@ import { EventsSectionComponent } from './sections/events-section/events-section
 import { RetentionSectionComponent } from './sections/retention-section/retention-section';
 import { UsersSectionComponent } from './sections/users-section/users-section';
 import { ApiKeysSectionComponent } from './sections/api-keys-section/api-keys-section';
+import { UpdatesSectionComponent } from './sections/updates-section/updates-section';
 
 @Component({
   selector: 'app-settings',
@@ -31,6 +32,7 @@ import { ApiKeysSectionComponent } from './sections/api-keys-section/api-keys-se
     RetentionSectionComponent,
     UsersSectionComponent,
     ApiKeysSectionComponent,
+    UpdatesSectionComponent,
   ],
   providers: [SettingsDirtyService],
   templateUrl: './settings.html',

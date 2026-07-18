@@ -48,6 +48,11 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
 
+    <!-- Release builds override this with -p:Version=X.Y.Z (release.yml /
+         build-installer.ps1 / Dockerfile ARG). The -dev suffix marks local
+         builds so the update checker never reports an "update" against them. -->
+    <Version>1.0.0-dev</Version>
+
     <!-- Minimal publish output: no debug symbols, no XML docs, no satellite resources. -->
     <DebugType>none</DebugType>
     <DebugSymbols>false</DebugSymbols>

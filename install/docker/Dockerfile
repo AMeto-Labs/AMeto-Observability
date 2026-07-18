@@ -61,6 +61,10 @@ RUN --mount=type=cache,target=/root/.nuget/packages \
 COPY src/ ./src/
 COPY --from=client-build /build/wwwroot ./src/Ameto.Server/wwwroot/
 
+# Release builds pass the real version (release.yml build-args). The -dev default
+# marks local builds so the in-app update checker never nags against them.
+ARG APP_VERSION=1.0.0-dev
+
 # linux-musl-x64        → Alpine runtime base (tiny vs Debian)
 # InvariantGlobalization → drop the ~28 MB ICU dependency (app parses invariantly)
 # The residual .pdb/.xml/web.config/locale strip runs in the same layer so it
@@ -75,6 +79,7 @@ RUN --mount=type=cache,target=/root/.nuget/packages \
         /p:DebugSymbols=false \
         /p:GenerateDocumentationFile=false \
         /p:InvariantGlobalization=true \
+        /p:Version=$APP_VERSION \
         --no-restore \
  && find /publish -name '*.pdb' -delete \
  && find /publish -name '*.xml' -delete \

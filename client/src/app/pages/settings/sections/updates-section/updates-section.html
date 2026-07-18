@@ -1,0 +1,89 @@
+<app-section title="Software update">
+  <span class="sublabel">
+    The server checks GitHub Releases for a new version once an hour.
+  </span>
+
+  @if (loading()) {
+    <span class="sublabel">Loading…</span>
+  } @else if (status(); as s) {
+    <div class="upd-grid">
+      <div class="upd-label">Current version</div>
+      <div class="upd-value mono">{{ s.currentVersion }}</div>
+
+      <div class="upd-label">Latest release</div>
+      <div class="upd-value">
+        @if (s.latestVersion) {
+          <span class="mono">{{ s.latestVersion }}</span>
+          @if (s.publishedAt) {
+            <span class="upd-dim">· {{ s.publishedAt | date: 'mediumDate' }}</span>
+          }
+          @if (s.releaseUrl) {
+            <a class="upd-link" [href]="s.releaseUrl" target="_blank" rel="noopener">
+              release notes
+              <lucide-icon name="external-link" [size]="11" />
+            </a>
+          }
+        } @else {
+          <span class="upd-dim">{{ s.checkError ? 'check failed — ' + s.checkError : 'not checked yet' }}</span>
+        }
+      </div>
+
+      <div class="upd-label">Status</div>
+      <div class="upd-value">
+        @if (updated()) {
+          <span class="upd-state ok">
+            <lucide-icon name="check-circle" [size]="13" />
+            Updated to {{ s.currentVersion }} — reload to load the new UI
+          </span>
+        } @else if (applying()) {
+          <span class="upd-state busy">
+            <lucide-icon name="loader-circle" [size]="13" />
+            {{ applyMessage() ?? 'Updating…' }}
+          </span>
+        } @else if (s.updateAvailable) {
+          <span class="upd-state avail">
+            <lucide-icon name="arrow-up" [size]="13" />
+            New version available
+          </span>
+        } @else {
+          <span class="upd-state ok">
+            <lucide-icon name="check-circle" [size]="13" />
+            Up to date
+          </span>
+        }
+      </div>
+    </div>
+
+    @if (manualHint(); as hint) {
+      <div class="upd-hint">{{ hint }}</div>
+    }
+    @if (applyError(); as err) {
+      <div class="upd-error">{{ err }}</div>
+    }
+
+    <div class="upd-footer">
+      <span class="upd-dim">
+        @if (s.checkedAt) { Last checked {{ s.checkedAt | date: 'medium' }} }
+      </span>
+      <div class="btn-group">
+        @if (updated()) {
+          <button class="btn primary" (click)="reload()">
+            <lucide-icon name="refresh-cw" [size]="13" />
+            Reload
+          </button>
+        } @else {
+          <button class="btn" [disabled]="checking() || applying()" (click)="checkNow()">
+            <lucide-icon [name]="checking() ? 'loader-circle' : 'refresh-cw'" [size]="13" />
+            {{ checking() ? 'Checking…' : 'Check now' }}
+          </button>
+          @if (s.updateAvailable && s.canSelfUpdate) {
+            <button class="btn primary" [disabled]="!canApply()" (click)="apply()">
+              <lucide-icon [name]="applying() ? 'loader-circle' : 'download'" [size]="13" />
+              {{ applying() ? 'Updating…' : 'Update to ' + s.latestVersion }}
+            </button>
+          }
+        }
+      </div>
+    </div>
+  }
+</app-section>

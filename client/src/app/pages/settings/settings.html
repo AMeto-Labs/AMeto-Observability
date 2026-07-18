@@ -27,6 +27,9 @@
         <app-users-section [hidden]="activeTab() !== 'users'" />
       }
       <app-api-keys-section [hidden]="activeTab() !== 'api-keys'" />
+      @if (authService.isAdmin()) {
+        <app-updates-section [hidden]="activeTab() !== 'updates'" />
+      }
     </div>
   </div>
 </div>

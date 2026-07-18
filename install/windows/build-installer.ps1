@@ -96,9 +96,13 @@ foreach ($a in $targets) {
 
     Write-Step "Publishing $rid (self-contained, single-file)"
     if (Test-Path $outDir) { Remove-Item $outDir -Recurse -Force }
+    # Stamp the assembly version (drives the in-app update checker); the
+    # installer version keeps whatever prefix was passed (e.g. v1.0.4).
+    $numVersion = $Version.TrimStart('v')
     dotnet publish $Project -c Release -r $rid --self-contained true `
         -p:PublishSingleFile=true -p:EnableCompressionInSingleFile=true `
         -p:DebugType=None -p:DebugSymbols=false `
+        -p:Version=$numVersion `
         -o $outDir
     if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed for $rid" }
 

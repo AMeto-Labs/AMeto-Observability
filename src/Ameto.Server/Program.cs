@@ -8,6 +8,7 @@ using Ameto.Otel;
 using Ameto.Query;
 using Ameto.Server;
 using Ameto.Server.Auth;
+using Ameto.Server.Updates;
 using Ameto.Storage;
 using Ameto.Tracing;
 
@@ -86,6 +87,12 @@ builder.Services
 // Short-TTL cache for GET /api/events/counts header-scan responses.
 builder.Services.AddSingleton<LogVolumeCountsCache>();
 
+// ── Software-update check (Settings → Updates) ────────────────────────────────
+// Singleton holds the latest-release snapshot for the endpoints; the hosted
+// service polls GitHub hourly (no-op when Ameto:Updates:Enabled is false).
+builder.Services.AddSingleton<UpdateChecker>();
+builder.Services.AddHostedService(static sp => sp.GetRequiredService<UpdateChecker>());
+
 // ── Optional signal subsystems (toggle via env for benchmarking / logs-only mode) ──
 //   Ameto__Metrics__Enabled / Ameto__Tracing__Enabled / Ameto__Alerts__Enabled
 bool enableTracing = builder.Configuration.GetValue("Ameto:Tracing:Enabled", true);
@@ -163,6 +170,7 @@ if (enableAlerts)
     app.MapAlertEndpoints();
 app.MapRetentionEndpoints();
 app.MapDiagnosticsEndpoints();
+app.MapUpdateEndpoints();
 app.MapReplicationEndpoints();
 app.MapOtlpEndpoints(enableTracing, enableMetrics);
 if (enableMetrics)
