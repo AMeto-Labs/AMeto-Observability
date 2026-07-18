@@ -188,6 +188,7 @@ app.Lifetime.ApplicationStarted.Register(() =>
     var addresses = app.Services.GetRequiredService<Microsoft.AspNetCore.Hosting.Server.IServer>()
                        .Features.Get<Microsoft.AspNetCore.Hosting.Server.Features.IServerAddressesFeature>()
                        ?.Addresses;
+    logger.LogInformation("Ameto version: {Version}", UpdateChecker.CurrentVersion);
     logger.LogInformation("Content root: {ContentRoot}", app.Environment.ContentRootPath);
     logger.LogInformation("Listening on: {Urls}",
         addresses is { Count: > 0 } ? string.Join(", ", addresses) : "(none)");
