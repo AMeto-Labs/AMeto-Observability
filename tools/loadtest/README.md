@@ -123,3 +123,42 @@ promoted http status, parent links); metrics cover 1000 distinct series
 including 15-bucket histograms. Neither signal shows drops up to 100k/s —
 the log pipeline's flush machinery remains the only path that ever needed
 back-pressure tuning.
+
+### Ceiling ladder (traces, v1.0.10, 60 s per step)
+
+| Offered | Ingested | Dropped | p95 | RSS |
+|---|---|---|---|---|
+| 100k spans/s | 100 % | **0 %** | 21.3 ms | ~240 MB |
+| 125k spans/s | 7 500 000 / 7 500 000 | **0 %** | 25.5 ms | ~350 MB |
+| 150k spans/s | 148 363/s | 1.03 % | 28.5 ms | ~360 MB |
+| 200k spans/s ² | 116 560/s | 41.6 % | 58.3 ms | ~400 MB |
+| 250k spans/s ² | 112 146/s | 55.1 % | 63.5 ms | ~440 MB |
+
+² 2000-span batches (100 / 125 req/s).
+
+Zero-drop ceiling: **~125k spans/s**. Unlike logs, traces degrade hard past it:
+under 1.6–2x overload accepted throughput *sags* to ~112–117k/s instead of
+holding the peak — the span drainer + trace storage path saturates and the
+ring sheds the excess. RAM stays low throughout (back-pressure is doing its
+job); the wall is CPU on the span path, not memory.
+
+### Ceiling ladder (metrics, v1.0.10, 60 s per step)
+
+| Offered | Ingested | Dropped | p95 | RSS |
+|---|---|---|---|---|
+| 100k pts/s | 100 % | **0 %** | 9.8 ms | ~280 MB |
+| 150k pts/s | 9 000 000 / 9 000 000 | **0 %** | 11.3 ms | ~370 MB |
+| 200k pts/s | 12 001 000 / 12 001 000 | **0 %** | 15.6 ms | ~330 MB |
+| 250k pts/s | 15 002 000 / 15 002 000 | **0 %** | 53.7 ms | ~500 MB |
+| 300k pts/s ³ | 235 491/s delivered | **0 %** | **1.22 s** | → 4.7 GB |
+
+³ At 300k offered the server still drops nothing — overload shows up as
+request queueing instead: batch p95 explodes to ~1.2 s, queued batches balloon
+RSS to ~4.7 GB (all reclaimable — the next GC returned it to ~0.4 GB), and k6
+itself runs out of VUs, delivering ~235k/s. Note the queueing collapse:
+250k offered cleanly ingests 249.7k/s, while 300k offered delivers *less*.
+
+Zero-drop ceiling: **≥250k points/s** — metrics aggregate into bounded series,
+so the pipeline never sheds data; past ~250k/s the cost is latency and
+transient RAM, not loss. Practical guidance: keep sustained metric load
+≤250k points/s per node to stay in the low-latency regime.
