@@ -219,6 +219,7 @@ public sealed class UpdateChecker(
     private async Task DownloadWorkerAsync(string tag, ReleaseAsset installer, ReleaseAsset? sums)
     {
         var path = Path.Combine(Path.GetTempPath(), installer.Name);
+        var sw   = Stopwatch.StartNew();
         try
         {
             using var cts = new CancellationTokenSource(TimeSpan.FromMinutes(15));
@@ -249,7 +250,11 @@ public sealed class UpdateChecker(
 
             _dlPath = path;
             _phase  = UpdatePhase.Ready;
-            logger.LogInformation("Update {Tag} downloaded and verified: {Path}", tag, path);
+            var bytes = Interlocked.Read(ref _dlBytes);
+            logger.LogInformation(
+                "Update {Tag} downloaded and verified: {Path} ({Mb:F1} MB in {Seconds:F0} s, {MbitPerSec:F1} Mbit/s)",
+                tag, path, bytes / 1048576.0, sw.Elapsed.TotalSeconds,
+                bytes * 8 / Math.Max(sw.Elapsed.TotalSeconds, 0.001) / 1e6);
         }
         catch (Exception ex)
         {
