@@ -73,6 +73,8 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
     // Cold-tier catalog (thread-safe)
     private readonly ConcurrentDictionary<ulong, SegmentInfo> _segments = new();
+    /// <summary>Background catalog scan started by the ctor (kept to observe faults).</summary>
+    private readonly Task _catalogLoad;
 
     // Hot tiers that have been frozen but whose cold-tier segment file is still
     // being written (or has just been registered but we haven't released the
@@ -131,7 +133,15 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         Directory.CreateDirectory(_segDir);
 
         _hot = CreateHotTier();
-        LoadSegmentCatalog();
+        // The next segment id MUST be known before any flush, but it lives in the
+        // file NAMES ({node}-{segId}-{minTs}-{maxTs}.seg) — a cheap directory
+        // listing, no file opens. The expensive part (opening every segment to
+        // read its catalog entry) runs in the background: ingest and the HTTP
+        // endpoints come up immediately; cold segments become queryable as the
+        // scan progresses (the catalog is a ConcurrentDictionary keyed by id, so
+        // concurrent flush registrations are safe).
+        InitNextSegmentIdFromFileNames();
+        _catalogLoad = Task.Run(LoadSegmentCatalog);
         ReplayOrphanedWals();
         OpenWal();
 
@@ -626,8 +636,26 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
     // ── Startup recovery ──────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Seeds <see cref="_nextSegmentId"/> from segment file NAMES only — must run
+    /// synchronously before the first flush so new segments never reuse an id,
+    /// while the expensive per-file catalog load happens in the background.
+    /// </summary>
+    private void InitNextSegmentIdFromFileNames()
+    {
+        foreach (var file in Directory.EnumerateFiles(_segDir, "*.seg"))
+        {
+            // {nodeId}-{segId}-{minTs}-{maxTs}.seg
+            var parts = Path.GetFileNameWithoutExtension(file).Split('-');
+            if (parts.Length >= 2 && ulong.TryParse(parts[1], out var segId) && segId >= _nextSegmentId)
+                _nextSegmentId = segId + 1;
+        }
+    }
+
     private void LoadSegmentCatalog()
     {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+
         // Clean up leftover temp files from interrupted flushes
         foreach (var tmp in Directory.EnumerateFiles(_segDir, "*.seg.tmp"))
         {
@@ -642,8 +670,6 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 using var reader = SegmentReader.Open(file);
                 var info = reader.Info;
                 _segments[info.Id.Value] = info;
-                if (info.Id.Value >= _nextSegmentId)
-                    _nextSegmentId = info.Id.Value + 1;
             }
             catch (Exception ex)
             {
@@ -652,7 +678,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 catch (Exception delEx) { _logger.LogWarning(delEx, "Failed to delete corrupt segment {File}", file); }
             }
         }
-        _logger.LogInformation("Loaded {Count} segments from {Dir}", _segments.Count, _segDir);
+        _logger.LogInformation("Loaded {Count} segments from {Dir} in {Ms} ms", _segments.Count, _segDir, sw.ElapsedMilliseconds);
     }
 
     private void ReplayOrphanedWals()

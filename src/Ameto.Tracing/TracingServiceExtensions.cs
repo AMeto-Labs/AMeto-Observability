@@ -56,14 +56,27 @@ internal sealed class TraceCompactionWorker(TraceStorageEngine engine, ILogger<T
 
     protected override async Task ExecuteAsync(CancellationToken ct)
     {
-        // First run after a short delay so startup I/O settles
-        await Task.Delay(TimeSpan.FromMinutes(5), ct).ConfigureAwait(false);
+        // Cold-segment discovery lives here, OFF the startup path: the server
+        // accepts ingest from second zero and cold trace data becomes queryable
+        // as soon as this completes.
+        try
+        {
+            await Task.Run(engine.LoadColdSegments, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            logger.LogError(ex, "TraceCompactionWorker: cold-segment load failed");
+        }
+
+        // First compaction shortly after load (drains any accumulated backlog of
+        // small segments in bounded passes), then hourly.
+        await Task.Delay(TimeSpan.FromMinutes(1), ct).ConfigureAwait(false);
 
         while (!ct.IsCancellationRequested)
         {
             try
             {
-                engine.CompactSmallSegments();
+                await Task.Run(engine.CompactSmallSegments, ct).ConfigureAwait(false);
             }
             catch (Exception ex)
             {

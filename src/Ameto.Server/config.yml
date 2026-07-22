@@ -7,6 +7,30 @@ Ameto:
   SslCertPath: ""
   SslCertPassword: ""
 
+  # Behind a reverse proxy that terminates TLS (nginx/traefik): trust
+  # X-Forwarded-Proto/Host so OAuth redirects and links use the public
+  # https scheme. Enable ONLY when the server is reachable exclusively
+  # through the proxy (clients could spoof the headers otherwise).
+  # TrustForwardedHeaders: true
+
+  # ── Sign-in providers ────────────────────────────────────────────────────────
+  # Local username/password is on by default. To add "Sign in with Google /
+  # Microsoft", set the credentials below (or via env: Ameto__Auth__Google__ClientId
+  # etc.) and restart. Redirect URI to register with the provider (https required):
+  #   https://<host>/api/auth/oauth/google/callback
+  #   https://<host>/api/auth/oauth/microsoft/callback
+  # Who may sign in is controlled in Settings → Users: exact-email OAuth users
+  # or per-domain rules ("anyone @your-company.com gets role X").
+  # Auth:
+  #   LocalEnabled: true
+  #   Google:
+  #     ClientId: ""
+  #     ClientSecret: ""
+  #   Microsoft:
+  #     ClientId: ""
+  #     ClientSecret: ""
+  #     TenantId: "common"     # Azure AD tenant id, or "common" for multi-tenant
+
   RamTargetPercent: 75
 
   HotTier:
