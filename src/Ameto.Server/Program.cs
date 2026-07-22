@@ -168,7 +168,7 @@ if (serverOptions.TrustForwardedHeaders)
                          | Microsoft.AspNetCore.HttpOverrides.ForwardedHeaders.XForwardedHost
                          | Microsoft.AspNetCore.HttpOverrides.ForwardedHeaders.XForwardedFor,
     };
-    fwd.KnownNetworks.Clear();
+    fwd.KnownIPNetworks.Clear();
     fwd.KnownProxies.Clear();
     app.UseForwardedHeaders(fwd);
 }
