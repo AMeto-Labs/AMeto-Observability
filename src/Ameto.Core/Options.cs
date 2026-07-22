@@ -105,6 +105,16 @@ public sealed class IngestionOptions
     /// budget, so a generous value is cheap. Default: 512 MB (= 8192 slabs of 64 KB).
     /// </summary>
     public long PayloadPoolBytes { get; init; } = 512L * 1024 * 1024;
+
+    /// <summary>
+    /// OTLP resource attribute names copied onto every metric data point as
+    /// series labels (e.g. ["env", "prid"]). Explicit opt-in — labels are part
+    /// of a series' identity, so adding them forks existing series; listing the
+    /// wanted keys also keeps noisy SDK defaults (telemetry.sdk.*) out.
+    /// Logs and traces always carry ALL resource attributes; this list only
+    /// affects metrics. Default: empty (off).
+    /// </summary>
+    public string[] MetricResourceLabels { get; init; } = [];
 }
 
 /// <summary>

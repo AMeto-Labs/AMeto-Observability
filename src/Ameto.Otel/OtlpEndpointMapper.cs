@@ -4,6 +4,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using System.Buffers;
 using System.Text.Json;
+using Ameto.Core;
 using Ameto.Ingestion;
 using Ameto.Metrics;
 using Ameto.Otel.Models;
@@ -109,7 +110,9 @@ public static class OtlpEndpointMapper
 
             if (request is null) { ctx.Response.StatusCode = 400; return; }
 
-            var points = OtlpMetricMapper.Map(request);
+            var resourceLabels = ctx.RequestServices.GetRequiredService<ServerOptions>()
+                                    .Ingestion.MetricResourceLabels;
+            var points = OtlpMetricMapper.Map(request, resourceLabels);
             ingester.Ingest(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(points));
             await WriteJsonOk(ctx, points.Count, 0);
         });

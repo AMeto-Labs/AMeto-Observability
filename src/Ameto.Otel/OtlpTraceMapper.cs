@@ -24,11 +24,14 @@ public static class OtlpTraceMapper
         foreach (var rs in request.ResourceSpans ?? [])
         {
             string serviceName = ExtractServiceName(rs.Resource);
+            // Resource attributes (env, deployment id, …) are shared by every span
+            // in the batch — serialise the msgpack pairs once, splice per span.
+            var (resBytes, resCount) = SerializeResourcePairs(rs.Resource);
 
             foreach (var ss in rs.ScopeSpans ?? [])
             foreach (var span in ss.Spans ?? [])
             {
-                var item = MapSpan(span, serviceName);
+                var item = MapSpan(span, serviceName, resBytes, resCount);
                 if (item is not null) result.Add(item);
             }
         }
@@ -36,7 +39,36 @@ public static class OtlpTraceMapper
         return result;
     }
 
-    private static SpanIngestItem? MapSpan(OtlpSpan span, string serviceName)
+    /// <summary>
+    /// Serialises resource attributes (minus <c>service.name</c>, which is the
+    /// dedicated service column) as msgpack KV pairs to merge into every span's
+    /// attribute map. Span attributes win on key collision — they are written
+    /// after the resource pairs, and map readers keep the last value.
+    /// </summary>
+    private static (byte[] Bytes, int Count) SerializeResourcePairs(OtlpResource? resource)
+    {
+        var attrs = resource?.Attributes;
+        if (attrs is null || attrs.Count == 0) return ([], 0);
+
+        int count = 0;
+        for (int i = 0; i < attrs.Count; i++)
+            if (attrs[i].Key is not null && attrs[i].Key != "service.name") count++;
+        if (count == 0) return ([], 0);
+
+        var buf = new ArrayBufferWriter<byte>(count * 32);
+        var w   = new MessagePackWriter(buf);
+        for (int i = 0; i < attrs.Count; i++)
+        {
+            var kv = attrs[i];
+            if (kv.Key is null || kv.Key == "service.name") continue;
+            w.Write(kv.Key);
+            WriteAnyValue(ref w, kv.Value);
+        }
+        w.Flush();
+        return (buf.WrittenMemory.ToArray(), count);
+    }
+
+    private static SpanIngestItem? MapSpan(OtlpSpan span, string serviceName, byte[] resBytes, int resCount)
     {
         if (span.TraceId is null || span.SpanId is null) return null;
 
@@ -57,7 +89,7 @@ public static class OtlpTraceMapper
         long endNano   = ParseNanoString(span.EndTimeUnixNano);
         long duration  = endNano > startNano ? endNano - startNano : 0;
 
-        byte[] attrBytes    = SerializeAttributes(span.Attributes);
+        byte[] attrBytes    = SerializeAttributes(span.Attributes, resBytes, resCount);
         short  httpStatus   = ExtractHttpStatusCode(span.Attributes);
 
         return new SpanIngestItem
@@ -114,26 +146,29 @@ public static class OtlpTraceMapper
         return "unknown";
     }
 
-    private static byte[] SerializeAttributes(List<OtlpKeyValue>? attrs)
+    private static byte[] SerializeAttributes(List<OtlpKeyValue>? attrs, byte[] resBytes, int resCount)
     {
-        if (attrs is null || attrs.Count == 0) return [];
-
         // Count valid keys first to set correct map header — avoids Dictionary<> + boxing
         int count = 0;
-        for (int i = 0; i < attrs.Count; i++)
-            if (attrs[i].Key is not null) count++;
-        if (count == 0) return [];
+        if (attrs is not null)
+            for (int i = 0; i < attrs.Count; i++)
+                if (attrs[i].Key is not null) count++;
 
-        var buf = new ArrayBufferWriter<byte>(count * 32);
+        int total = count + resCount;
+        if (total == 0) return [];
+
+        var buf = new ArrayBufferWriter<byte>(total * 32);
         var w   = new MessagePackWriter(buf);
-        w.WriteMapHeader(count);
-        for (int i = 0; i < attrs.Count; i++)
-        {
-            var kv = attrs[i];
-            if (kv.Key is null) continue;
-            w.Write(kv.Key);
-            WriteAnyValue(ref w, kv.Value);
-        }
+        w.WriteMapHeader(total);
+        if (resCount > 0) w.WriteRaw(resBytes);   // resource pairs first — span attrs win on collision
+        if (attrs is not null)
+            for (int i = 0; i < attrs.Count; i++)
+            {
+                var kv = attrs[i];
+                if (kv.Key is null) continue;
+                w.Write(kv.Key);
+                WriteAnyValue(ref w, kv.Value);
+            }
         w.Flush();
         return buf.WrittenMemory.ToArray();
     }
