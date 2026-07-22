@@ -46,7 +46,10 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         _dataDir = dataDir;
         _logger  = logger;
         Directory.CreateDirectory(dataDir);
-        LoadColdSegments();
+        // Cold-segment discovery is deliberately NOT done here: the constructor
+        // runs before Kestrel binds, and scanning thousands of .trc files would
+        // delay ingest availability. TraceCompactionWorker calls
+        // LoadColdSegments() in the background right after startup.
     }
 
     // ── Ingestion (called by SpanDrainer) ─────────────────────────────────────
@@ -302,8 +305,15 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
 
     // ── Cold segment discovery ─────────────────────────────────────────────────
 
-    private void LoadColdSegments()
+    /// <summary>
+    /// Discovers existing cold segments. Runs in the background (see
+    /// <c>TraceCompactionWorker</c>) — ingest and queries work from second zero,
+    /// cold trace data becomes queryable when this completes. Merges with any
+    /// segments flushed while the scan was running.
+    /// </summary>
+    internal void LoadColdSegments()
     {
+        var sw     = System.Diagnostics.Stopwatch.StartNew();
         var loaded = new List<SpanSegmentInfo>();
         foreach (var file in Directory.EnumerateFiles(_dataDir, "*.trc").OrderBy(f => f))
         {
@@ -318,24 +328,53 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                 DeleteSegmentFiles(file);
             }
         }
-        _coldSegments = loaded.ToArray();
-        _logger.LogInformation("Loaded {Count} cold span segments", _coldSegments.Length);
-        CompactSmallSegments();
+
+        _lock.EnterWriteLock();
+        try
+        {
+            // Segments flushed while we were scanning are already in the snapshot;
+            // keep them and add the discovered ones (dedup by path).
+            var known = new HashSet<string>(_coldSegments.Select(s => s.FilePath), StringComparer.Ordinal);
+            var next  = new List<SpanSegmentInfo>(loaded.Count + _coldSegments.Length);
+            next.AddRange(loaded.Where(s => !known.Contains(s.FilePath)));
+            next.AddRange(_coldSegments);
+            _coldSegments = next.ToArray();
+        }
+        finally { _lock.ExitWriteLock(); }
+
+        _logger.LogInformation("Loaded {Count} cold span segments in {Ms} ms",
+            _coldSegments.Length, sw.ElapsedMilliseconds);
     }
 
+    /// <summary>
+    /// Merges small cold segments until the backlog is drained. Each pass stays
+    /// memory-bounded (≤ MaxSegmentsPerPass files, ≤ MaxSpansPerPass spans), but
+    /// passes repeat until nothing small remains — one hourly run used to merge a
+    /// single batch of 20, which on a busy instance was slower than the flush rate
+    /// produced new files, so the backlog only ever grew.
+    /// </summary>
     internal void CompactSmallSegments()
+    {
+        const int MaxPasses = 500;   // safety valve, ~10k merged segments per run
+        int passes = 0;
+        while (CompactOnePass() && ++passes < MaxPasses) { }
+        if (passes > 0)
+            _logger.LogInformation("Compaction run finished: {Passes} pass(es), {Count} cold segments remain",
+                passes, _coldSegments.Length);
+    }
+
+    private bool CompactOnePass()
     {
         // Bounded pass: take only the oldest small segments and cap the spans loaded
         // into memory. Compaction used to merge ALL small segments at once, which on a
         // memory-limited container exhausted the heap (tiny allocations threw OOM) and
         // left the segments un-compacted — so they piled up and every pass failed worse.
-        // A bounded pass drains the backlog incrementally (one merge per hourly run).
         var small = _coldSegments
             .Where(s => s.SpanCount < CompactionThreshold)
             .OrderBy(s => s.MinStartNano)   // oldest first
             .Take(MaxSegmentsPerPass)
             .ToList();
-        if (small.Count < 2) return;
+        if (small.Count < 2) return false;
 
         var allSpans  = new List<SpanRecord>();
         var processed = new List<SpanSegmentInfo>(small.Count);
@@ -350,7 +389,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             catch (Exception ex) { _logger.LogWarning(ex, "Compaction: failed to read {File}", seg.FilePath); }
         }
 
-        if (processed.Count < 2 || allSpans.Count == 0) return;
+        if (processed.Count < 2 || allSpans.Count == 0) return false;
 
         try
         {
@@ -374,10 +413,12 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
 
             foreach (var seg in processed)   // delete only the segments we actually merged
                 DeleteSegmentFiles(seg.FilePath);   // .trc + all companion sidecars
+            return true;
         }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Compaction: failed to write merged segment");
+            return false;
         }
     }
 

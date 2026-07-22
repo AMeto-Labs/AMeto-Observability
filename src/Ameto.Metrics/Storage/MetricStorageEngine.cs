@@ -72,7 +72,10 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         _dataDir = dataDir;
         _logger  = logger;
         Directory.CreateDirectory(dataDir);
-        LoadColdSegments();
+        // Cold-segment discovery + catalog seeding read every .mts file — far too
+        // heavy for the startup path (it ran before Kestrel bound the port). The
+        // flush loop performs it as its first act in the background instead:
+        // ingest works from second zero, cold data becomes queryable when done.
         _flushTask  = Task.Run(FlushLoopAsync);
         _rollupTask = Task.Run(RollupLoopAsync);
     }
@@ -314,6 +317,11 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     private async Task FlushLoopAsync()
     {
         var ct = _cts.Token;
+
+        // Background init (see ctor comment): discover cold segments + seed catalog.
+        try { LoadColdSegments(); }
+        catch (Exception ex) { _logger.LogError(ex, "Cold metric segment load failed"); }
+
         while (!ct.IsCancellationRequested)
         {
             try { await Task.Delay(TimeSpan.FromSeconds(FlushIntervalSeconds), ct); }
@@ -609,12 +617,13 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
     private void LoadColdSegments()
     {
+        var sw     = System.Diagnostics.Stopwatch.StartNew();
+        var loaded = new List<MetricSegmentInfo>();
         foreach (var file in Directory.EnumerateFiles(_dataDir, "*.mts").OrderBy(f => f))
         {
             try
             {
-                var info = MetricReader.ReadSegmentInfo(file);
-                _coldSegments.Add(info);
+                loaded.Add(MetricReader.ReadSegmentInfo(file));
             }
             catch (Exception ex)
             {
@@ -623,8 +632,19 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                 try { File.Delete(file); } catch { /* best effort */ }
             }
         }
-        _logger.LogInformation("Loaded {Count} cold metric segments", _coldSegments.Count);
-        SeedCatalogFromCold();
+
+        // Runs in the background, so flushes may already have registered new
+        // segments — merge, don't overwrite (dedup by path).
+        _coldLock.EnterWriteLock();
+        try
+        {
+            var known = new HashSet<string>(_coldSegments.Select(s => s.FilePath), StringComparer.Ordinal);
+            _coldSegments.InsertRange(0, loaded.Where(s => !known.Contains(s.FilePath)));
+        }
+        finally { _coldLock.ExitWriteLock(); }
+
+        _logger.LogInformation("Loaded {Count} cold metric segments in {Ms} ms", loaded.Count, sw.ElapsedMilliseconds);
+        SeedCatalogFromCold(loaded);
     }
 
     /// <summary>
@@ -632,10 +652,10 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     /// Explore catalog / Overview detection work immediately after a restart, instead
     /// of staying blank until the next live export repopulates metadata.
     /// </summary>
-    private void SeedCatalogFromCold()
+    private void SeedCatalogFromCold(List<MetricSegmentInfo> segments)
     {
         int seeded = 0;
-        foreach (var seg in _coldSegments)
+        foreach (var seg in segments)
         {
             try
             {
