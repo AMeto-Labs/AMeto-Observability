@@ -157,6 +157,21 @@ else
 var app = builder.Build();
 
 // ── Middleware ─────────────────────────────────────────────────────────────────
+// Reverse-proxy support (opt-in): when TLS terminates on nginx/traefik, Kestrel
+// sees plain http and OAuth redirect URIs would be built with the wrong scheme.
+// The config flag is the trust gate, so accept the headers from any proxy address.
+if (serverOptions.TrustForwardedHeaders)
+{
+    var fwd = new Microsoft.AspNetCore.Builder.ForwardedHeadersOptions
+    {
+        ForwardedHeaders = Microsoft.AspNetCore.HttpOverrides.ForwardedHeaders.XForwardedProto
+                         | Microsoft.AspNetCore.HttpOverrides.ForwardedHeaders.XForwardedHost
+                         | Microsoft.AspNetCore.HttpOverrides.ForwardedHeaders.XForwardedFor,
+    };
+    fwd.KnownNetworks.Clear();
+    fwd.KnownProxies.Clear();
+    app.UseForwardedHeaders(fwd);
+}
 app.UseAuthentication();
 app.UseAuthorization();
 app.UseDefaultFiles();

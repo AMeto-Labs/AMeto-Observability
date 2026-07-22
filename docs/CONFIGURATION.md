@@ -21,7 +21,23 @@ Ameto__DataDirectory=/mnt/logs Ameto__HttpPort=5342 ./Ameto.Server
 | `HttpPort` | int | `5341` | Kestrel listen port (serves the API, SSE, OTLP, and the SPA). |
 | `SslCertPath` | string | `""` | Path to a `.pfx` TLS certificate. Empty = plain HTTP. |
 | `SslCertPassword` | string | `""` | Password for the `.pfx` certificate. |
+| `TrustForwardedHeaders` | bool | `false` | Trust `X-Forwarded-Proto/Host/For` from a reverse proxy that terminates TLS. Required for correct OAuth redirect URIs behind nginx/traefik. Enable only when the server is reachable exclusively through the proxy. |
 | `RamTargetPercent` | int | `85` | When host/container RAM load exceeds this, the hot tier is flushed to disk to release the write buffer. |
+
+---
+
+## Sign-in providers (`Ameto:Auth`)
+
+Local username/password login is on by default. Google / Microsoft OAuth buttons appear on the login page as soon as the matching credentials are set (empty = provider disabled). Secrets are best passed via environment variables rather than `config.yml`.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `LocalEnabled` | bool | `true` | Allow local username/password login. |
+| `Google:ClientId` / `Google:ClientSecret` | string | `""` | OAuth client (Google Cloud Console → Credentials → *Web application*). Redirect URI to register: `https://<host>/api/auth/oauth/google/callback` — Google requires **https** for any non-localhost host. |
+| `Microsoft:ClientId` / `Microsoft:ClientSecret` | string | `""` | Azure AD app registration. Redirect URI: `https://<host>/api/auth/oauth/microsoft/callback`. |
+| `Microsoft:TenantId` | string | `"common"` | Azure AD tenant id, or `common` for multi-tenant. |
+
+Who may sign in is controlled in **Settings → Users**: add an OAuth user by exact e-mail, or a per-domain rule ("anyone `@your-company.com` via google gets role X"). Unknown e-mails are rejected. Changing `Auth` settings requires a server restart (auth handlers are registered at startup).
 
 ---
 

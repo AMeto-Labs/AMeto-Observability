@@ -55,6 +55,14 @@ services:
       # Ameto__SslCertPath: /certs/ameto.pfx
       # Ameto__SslCertPassword: changeit
 
+      # ── Reverse proxy / OAuth sign-in ─────────────────────────────────────
+      # Ameto__TrustForwardedHeaders: "true"        # TLS terminates on nginx/traefik in front
+      # Ameto__Auth__Google__ClientId: ""           # redirect URI: https://<host>/api/auth/oauth/google/callback
+      # Ameto__Auth__Google__ClientSecret: ""
+      # Ameto__Auth__Microsoft__ClientId: ""        # redirect URI: https://<host>/api/auth/oauth/microsoft/callback
+      # Ameto__Auth__Microsoft__ClientSecret: ""
+      # Ameto__Auth__Microsoft__TenantId: "common"
+
       # ── Hot tier (write buffer → flush tuning) ───────────────────────────
       Ameto__HotTier__MaxSizeBytes: "67108864"   # default 64 MB — flush when the in-RAM tier reaches this
       Ameto__HotTier__MaxAge: "00:05:00"          # default 5 min — flush a tier at least this often

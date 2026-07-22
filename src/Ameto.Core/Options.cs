@@ -155,6 +155,16 @@ public sealed class ServerOptions
     public string           SslCertPassword  { get; init; } = "";
 
     /// <summary>
+    /// Trust X-Forwarded-Proto/Host/For from a reverse proxy (nginx, traefik).
+    /// Required for correct OAuth redirect URIs and generated links when TLS
+    /// terminates on the proxy and Kestrel itself serves plain HTTP. Enable
+    /// only when the server is reachable exclusively through that proxy —
+    /// with it on, any client can spoof its scheme/host via headers.
+    /// Default: false.
+    /// </summary>
+    public bool             TrustForwardedHeaders { get; init; } = false;
+
+    /// <summary>
     /// System-wide RAM utilisation target (0–100 %).
     /// When the OS memory load exceeds this threshold the storage engine will
     /// flush the hot tier to disk, releasing the in-memory write buffer.
