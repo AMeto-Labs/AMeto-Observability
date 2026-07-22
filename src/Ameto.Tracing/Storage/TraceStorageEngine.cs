@@ -29,7 +29,11 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
 
     // ── Cold tier ─────────────────────────────────────────────────────────────
     private readonly string                                    _dataDir;
-    private readonly List<SpanSegmentInfo>                     _coldSegments = new();
+    // Immutable snapshot, swapped under _lock's WRITE lock on every mutation
+    // (flush/compaction/retention/self-heal). Readers grab the field once and
+    // iterate without locks — a concurrent swap can never fault them, and a
+    // deleted file surfaces as a per-segment skip, not a request failure.
+    private volatile SpanSegmentInfo[]                         _coldSegments = [];
     private readonly ILogger<TraceStorageEngine>               _logger;
 
     private const int HotFlushThreshold    = 50_000;  // spans before flush
@@ -115,13 +119,63 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             foreach (var r in hotResults.OrderBy(s => s.StartTimeUnixNano))
                 yield return r;
 
-        // Cold tier
-        foreach (var seg in _coldSegments)
+        // Cold tier — scan the snapshot in parallel (bounded): a by-id lookup has
+        // no time bounds, so every segment must be consulted, and doing that
+        // sequentially took whole seconds once small segments piled up. A file
+        // that compaction/retention deleted mid-flight is skipped (and healed out
+        // of the snapshot) instead of failing the whole request.
+        var segs = _coldSegments;
+        if (segs.Length == 0) yield break;
+
+        using var gate = new SemaphoreSlim(Math.Clamp(Environment.ProcessorCount / 2, 2, 8));
+        var tasks = new Task<List<SpanRecord>?>[segs.Length];
+        for (int i = 0; i < segs.Length; i++)
         {
-            ct.ThrowIfCancellationRequested();
-            await foreach (var r in SpanReader.ReadTraceAsync(seg.FilePath, traceId, ct))
-                yield return r;
+            var seg = segs[i];
+            tasks[i] = Task.Run(async () =>
+            {
+                await gate.WaitAsync(ct).ConfigureAwait(false);
+                try
+                {
+                    List<SpanRecord>? found = null;
+                    await foreach (var r in SpanReader.ReadTraceAsync(seg.FilePath, traceId, ct).ConfigureAwait(false))
+                        (found ??= new List<SpanRecord>()).Add(r);
+                    return found;
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (FileNotFoundException)
+                {
+                    RemoveColdSegment(seg);   // deleted behind our back — heal the snapshot
+                    return null;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Trace lookup: skipping unreadable segment {File}", seg.FilePath);
+                    return null;
+                }
+                finally { gate.Release(); }
+            }, ct);
         }
+
+        var cold = new List<SpanRecord>();
+        foreach (var t in tasks)
+            if (await t.ConfigureAwait(false) is { } part)
+                cold.AddRange(part);
+
+        foreach (var r in cold.OrderBy(s => s.StartTimeUnixNano))
+            yield return r;
+    }
+
+    /// <summary>Drops a segment whose file no longer exists from the snapshot.</summary>
+    private void RemoveColdSegment(SpanSegmentInfo seg)
+    {
+        _lock.EnterWriteLock();
+        try
+        {
+            _coldSegments = Array.FindAll(_coldSegments, s => !ReferenceEquals(s, seg));
+        }
+        finally { _lock.ExitWriteLock(); }
+        _logger.LogWarning("Cold span segment {File} vanished from disk — removed from the segment list", seg.FilePath);
     }
 
     public async IAsyncEnumerable<SpanRecord> SearchSpansAsync(
@@ -184,11 +238,27 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
 
             ct.ThrowIfCancellationRequested();
 
-            await foreach (var r in SpanReader.SearchAsync(
+            // Manual enumeration so a segment deleted/corrupted mid-scan skips the
+            // segment (yield inside try-catch is not allowed by the language).
+            await using var e = SpanReader.SearchAsync(
                 seg.FilePath, fromNano, toNano,
                 serviceName, spanName, status, httpStatusCode,
-                minDurationNanos, maxDurationNanos, ct))
+                minDurationNanos, maxDurationNanos, ct).GetAsyncEnumerator(ct);
+            while (true)
             {
+                SpanRecord r;
+                try
+                {
+                    if (!await e.MoveNextAsync().ConfigureAwait(false)) break;
+                    r = e.Current;
+                }
+                catch (OperationCanceledException) { throw; }
+                catch (FileNotFoundException) { RemoveColdSegment(seg); break; }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Span search: skipping unreadable segment {File}", seg.FilePath);
+                    break;
+                }
                 if (yielded++ >= limit) yield break;
                 yield return r;
             }
@@ -217,7 +287,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         try
         {
             var info = SpanWriter.Write(_dataDir, _hotSpans);
-            _coldSegments.Add(info);
+            _coldSegments = [.. _coldSegments, info];   // under _lock write (see callers)
             _logger.LogInformation("Flushed {Count} spans to {File}", _hotSpans.Count, info.FilePath);
         }
         catch (Exception ex)
@@ -234,12 +304,12 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
 
     private void LoadColdSegments()
     {
+        var loaded = new List<SpanSegmentInfo>();
         foreach (var file in Directory.EnumerateFiles(_dataDir, "*.trc").OrderBy(f => f))
         {
             try
             {
-                var info = SpanReader.ReadSegmentInfo(file);
-                _coldSegments.Add(info);
+                loaded.Add(SpanReader.ReadSegmentInfo(file));
             }
             catch (Exception ex)
             {
@@ -248,7 +318,8 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                 DeleteSegmentFiles(file);
             }
         }
-        _logger.LogInformation("Loaded {Count} cold span segments", _coldSegments.Count);
+        _coldSegments = loaded.ToArray();
+        _logger.LogInformation("Loaded {Count} cold span segments", _coldSegments.Length);
         CompactSmallSegments();
     }
 
@@ -287,12 +358,22 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             _logger.LogInformation("Compacted {Count} small segments → {File} ({Spans} spans)",
                 processed.Count, Path.GetFileName(merged.FilePath), allSpans.Count);
 
-            foreach (var seg in processed)   // delete only the segments we actually merged
+            // Swap the snapshot first (readers stop picking the old files up),
+            // delete the merged-away files after. An in-flight reader that still
+            // holds the old snapshot skips the deleted file gracefully.
+            _lock.EnterWriteLock();
+            try
             {
-                _coldSegments.Remove(seg);
-                DeleteSegmentFiles(seg.FilePath);   // .trc + all companion sidecars
+                var next = new List<SpanSegmentInfo>(_coldSegments.Length);
+                foreach (var s in _coldSegments)
+                    if (!processed.Contains(s)) next.Add(s);
+                next.Add(merged);
+                _coldSegments = next.ToArray();
             }
-            _coldSegments.Add(merged);
+            finally { _lock.ExitWriteLock(); }
+
+            foreach (var seg in processed)   // delete only the segments we actually merged
+                DeleteSegmentFiles(seg.FilePath);   // .trc + all companion sidecars
         }
         catch (Exception ex)
         {
@@ -806,8 +887,8 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         try
         {
             toDelete = _coldSegments.Where(s => s.MaxStartNano < cutoffNano).ToList();
-            foreach (var s in toDelete)
-                _coldSegments.Remove(s);
+            if (toDelete.Count > 0)
+                _coldSegments = _coldSegments.Where(s => s.MaxStartNano >= cutoffNano).ToArray();
         }
         finally { _lock.ExitWriteLock(); }
 
