@@ -75,6 +75,24 @@ Request/size limits, in bytes. Oversized requests are rejected with `413` before
 
 ---
 
+## Resource attributes (env, deployment id, …)
+
+Attach shared attributes to everything a service sends by setting OTLP **resource attributes** on the sender — one env var, no code:
+
+```bash
+OTEL_RESOURCE_ATTRIBUTES=env=prod,prid=wallet
+```
+
+| Signal | Behaviour |
+|--------|-----------|
+| Logs | all resource attributes become event properties (filter: `env = 'prod'`) |
+| Traces | all resource attributes are merged into every span's attributes (span's own keys win) |
+| Metrics | all resource attributes become series labels (point attributes win). Note: adding a new resource attribute changes series identity, so existing series continue without it and new ones appear with it |
+
+`service.name` is always extracted into the dedicated service field/label, and the SDK's self-description (`telemetry.sdk.*` / `telemetry.distro.*`) is excluded from metric labels — the sender never sets those explicitly, and an SDK upgrade would otherwise fork every series.
+
+---
+
 ## Retention (`Ameto:Retention`)
 
 These seed the SQLite retention table **on first run only**. Afterwards, change them in the UI (**Settings → Retention**) or via `PUT /api/retention`.

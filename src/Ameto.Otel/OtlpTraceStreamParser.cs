@@ -25,8 +25,10 @@ namespace Ameto.Otel;
 /// </summary>
 public static class OtlpTraceStreamParser
 {
-    // Thread-reused scratch: span attribute pairs, and the assembled header+pairs blob.
+    // Thread-reused scratch: span attribute pairs, resource attribute pairs, and
+    // the assembled header+pairs blob.
     [ThreadStatic] private static ArrayBufferWriter<byte>? _tAttr;
+    [ThreadStatic] private static ArrayBufferWriter<byte>? _tRes;
     [ThreadStatic] private static ArrayBufferWriter<byte>? _tOut;
 
     public static List<SpanIngestItem> Parse(ReadOnlySpan<byte> json)
@@ -34,6 +36,7 @@ public static class OtlpTraceStreamParser
         var reader  = new Utf8JsonReader(json, isFinalBlock: true, state: default);
         var result  = new List<SpanIngestItem>();
         var attrBuf = _tAttr ??= new ArrayBufferWriter<byte>(4096);
+        var resBuf  = _tRes  ??= new ArrayBufferWriter<byte>(1024);
         var outBuf  = _tOut  ??= new ArrayBufferWriter<byte>(4096);
 
         if (!reader.Read() || reader.TokenType != JsonTokenType.StartObject)
@@ -46,7 +49,7 @@ public static class OtlpTraceStreamParser
                 reader.Read() && reader.TokenType == JsonTokenType.StartArray)
             {
                 while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
-                    ParseResourceSpans(ref reader, attrBuf, outBuf, result);
+                    ParseResourceSpans(ref reader, attrBuf, resBuf, outBuf, result);
             }
             else
             {
@@ -59,13 +62,17 @@ public static class OtlpTraceStreamParser
     // ── resourceSpans[] element ────────────────────────────────────────────────
     private static void ParseResourceSpans(
         ref Utf8JsonReader reader,
-        ArrayBufferWriter<byte> attrBuf, ArrayBufferWriter<byte> outBuf,
+        ArrayBufferWriter<byte> attrBuf, ArrayBufferWriter<byte> resBuf, ArrayBufferWriter<byte> outBuf,
         List<SpanIngestItem> result)
     {
         if (reader.TokenType != JsonTokenType.StartObject) { reader.Skip(); return; }
 
         // One string per resource batch, shared by every span under it (same as the DOM path).
+        // Resource attributes (env, deployment id, …) are likewise serialised once as msgpack
+        // pairs and spliced into every span's attribute map.
         string serviceName = "unknown";
+        int    resCount    = 0;
+        resBuf.Clear();
 
         while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
         {
@@ -74,7 +81,7 @@ public static class OtlpTraceStreamParser
             if (reader.ValueTextEquals("resource"u8))
             {
                 if (reader.Read() && reader.TokenType == JsonTokenType.StartObject)
-                    serviceName = ReadResourceServiceName(ref reader) ?? serviceName;
+                    serviceName = ReadResourceAttributes(ref reader, resBuf, ref resCount) ?? serviceName;
                 else reader.Skip();
             }
             else if (reader.ValueTextEquals("scopeSpans"u8))
@@ -82,7 +89,7 @@ public static class OtlpTraceStreamParser
                 if (reader.Read() && reader.TokenType == JsonTokenType.StartArray)
                 {
                     while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
-                        ParseScopeSpans(ref reader, serviceName, attrBuf, outBuf, result);
+                        ParseScopeSpans(ref reader, serviceName, attrBuf, resBuf, resCount, outBuf, result);
                 }
                 else reader.Skip();
             }
@@ -93,10 +100,20 @@ public static class OtlpTraceStreamParser
         }
     }
 
-    /// <summary>Walks resource.attributes and returns the service.name string value, if any.</summary>
-    private static string? ReadResourceServiceName(ref Utf8JsonReader reader)
+    /// <summary>
+    /// Walks resource.attributes: captures <c>service.name</c> (returned; kept out of the
+    /// pairs — it is the dedicated service column) and writes every other attribute into
+    /// <paramref name="resBuf"/> as msgpack key + value pairs, counting them in
+    /// <paramref name="resCount"/>.
+    /// </summary>
+    private static string? ReadResourceAttributes(
+        ref Utf8JsonReader reader, ArrayBufferWriter<byte> resBuf, ref int resCount)
     {
         string? service = null;
+        var w = new MessagePackWriter(resBuf);
+        // Promotion capture is span-level only — dummies for the shared AnyValue writer.
+        short dummyStatus = 0; bool dummyNew = false, dummyInternal = false;
+
         while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
         {
             if (reader.TokenType != JsonTokenType.PropertyName) { reader.Skip(); continue; }
@@ -105,44 +122,72 @@ public static class OtlpTraceStreamParser
                 while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
                 {
                     if (reader.TokenType != JsonTokenType.StartObject) { reader.Skip(); continue; }
-                    bool isService = false;
+                    bool isService = false, wroteKey = false, wroteValue = false;
                     while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
                     {
                         if (reader.TokenType != JsonTokenType.PropertyName) { reader.Skip(); continue; }
                         if (reader.ValueTextEquals("key"u8))
                         {
                             reader.Read();
-                            isService = reader.TokenType == JsonTokenType.String &&
-                                        reader.ValueTextEquals("service.name"u8);
-                        }
-                        else if (reader.ValueTextEquals("value"u8) && isService &&
-                                 reader.Read() && reader.TokenType == JsonTokenType.StartObject)
-                        {
-                            while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
+                            if (reader.TokenType != JsonTokenType.String) continue;
+                            if (reader.ValueTextEquals("service.name"u8))
                             {
-                                if (reader.TokenType != JsonTokenType.PropertyName) { reader.Skip(); continue; }
-                                if (reader.ValueTextEquals("stringValue"u8))
+                                isService = true;
+                            }
+                            else
+                            {
+                                WriteJsonStringToMsgpack(ref reader, ref w);
+                                wroteKey = true;
+                            }
+                        }
+                        else if (reader.ValueTextEquals("value"u8))
+                        {
+                            if (isService)
+                            {
+                                if (reader.Read() && reader.TokenType == JsonTokenType.StartObject)
                                 {
-                                    reader.Read();
-                                    if (reader.TokenType == JsonTokenType.String)
-                                        service = reader.GetString();
+                                    while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
+                                    {
+                                        if (reader.TokenType != JsonTokenType.PropertyName) { reader.Skip(); continue; }
+                                        if (reader.ValueTextEquals("stringValue"u8))
+                                        {
+                                            reader.Read();
+                                            if (reader.TokenType == JsonTokenType.String)
+                                                service = reader.GetString();
+                                        }
+                                        else reader.Skip();
+                                    }
                                 }
                                 else reader.Skip();
                             }
+                            else if (wroteKey)
+                            {
+                                if (reader.Read() && reader.TokenType == JsonTokenType.StartObject)
+                                    WriteAnyValue(ref reader, ref w, KeyKind.Plain,
+                                        ref dummyStatus, ref dummyNew, ref dummyInternal);
+                                else
+                                    w.WriteNil();
+                                wroteValue = true;
+                            }
+                            else reader.Skip();
                         }
                         else reader.Skip();
                     }
+                    if (wroteKey && !wroteValue) w.WriteNil();
+                    if (wroteKey) resCount++;
                 }
             }
             else reader.Skip();
         }
+        w.Flush();
         return service;
     }
 
     // ── scopeSpans[] element ───────────────────────────────────────────────────
     private static void ParseScopeSpans(
         ref Utf8JsonReader reader, string serviceName,
-        ArrayBufferWriter<byte> attrBuf, ArrayBufferWriter<byte> outBuf,
+        ArrayBufferWriter<byte> attrBuf, ArrayBufferWriter<byte> resBuf, int resCount,
+        ArrayBufferWriter<byte> outBuf,
         List<SpanIngestItem> result)
     {
         if (reader.TokenType != JsonTokenType.StartObject) { reader.Skip(); return; }
@@ -153,7 +198,7 @@ public static class OtlpTraceStreamParser
             if (reader.ValueTextEquals("spans"u8) && reader.Read() && reader.TokenType == JsonTokenType.StartArray)
             {
                 while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
-                    ParseSpan(ref reader, serviceName, attrBuf, outBuf, result);
+                    ParseSpan(ref reader, serviceName, attrBuf, resBuf, resCount, outBuf, result);
             }
             else reader.Skip();
         }
@@ -162,7 +207,8 @@ public static class OtlpTraceStreamParser
     // ── one span → one SpanIngestItem ──────────────────────────────────────────
     private static void ParseSpan(
         ref Utf8JsonReader reader, string serviceName,
-        ArrayBufferWriter<byte> attrBuf, ArrayBufferWriter<byte> outBuf,
+        ArrayBufferWriter<byte> attrBuf, ArrayBufferWriter<byte> resBuf, int resCount,
+        ArrayBufferWriter<byte> outBuf,
         List<SpanIngestItem> result)
     {
         if (reader.TokenType != JsonTokenType.StartObject) { reader.Skip(); return; }
@@ -230,8 +276,10 @@ public static class OtlpTraceStreamParser
         if (paLen == 16 && TraceIdHelper.TryParseSpanId(paHex, out ulong paRaw))
             parentId = new SpanId(paRaw);
 
+        // Final map = resource pairs first + span pairs after (span wins on collision).
+        int    totalAttrs = attrCount + resCount;
         byte[] attrBytes;
-        if (attrCount == 0)
+        if (totalAttrs == 0)
         {
             attrBytes = [];
         }
@@ -239,7 +287,8 @@ public static class OtlpTraceStreamParser
         {
             outBuf.Clear();
             var ow = new MessagePackWriter(outBuf);
-            ow.WriteMapHeader(attrCount);
+            ow.WriteMapHeader(totalAttrs);
+            if (resCount > 0) ow.WriteRaw(resBuf.WrittenSpan);
             ow.WriteRaw(attrBuf.WrittenSpan);
             ow.Flush();
             attrBytes = outBuf.WrittenSpan.ToArray();

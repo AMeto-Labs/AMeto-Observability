@@ -75,6 +75,7 @@ then override your own fields:
 | `RestrictedToMinimumLevel` | `LevelAlias.Minimum`| Static minimum level for this sink.                            |
 | `LevelSwitch`              | `null`              | Runtime-adjustable level (overrides `RestrictedToMinimumLevel`).|
 | `HttpClient`               | `null` (sink-owned) | Inject a pre-configured `HttpClient` (shared pool/proxy).      |
+| `EventBodyLimitBytes`      | `65_536`            | Max serialised size of one event. An oversized event (e.g. a runaway `{@Object}`) is replaced by a compact **Error** marker carrying `OriginalTemplate`, `OriginalLevel` and the measured size — visible and searchable in Ameto instead of being silently rejected by the server's payload cap. `0` = unlimited. |
 
 > An explicit-parameter overload (`Ameto(serverUrl, apiKey:, serviceName:, …)`) is also
 > available for simple cases and delegates to the same builder.

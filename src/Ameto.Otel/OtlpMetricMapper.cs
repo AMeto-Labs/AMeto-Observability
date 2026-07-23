@@ -16,6 +16,7 @@ public static class OtlpMetricMapper
         foreach (var rm in request.ResourceMetrics ?? [])
         {
             string? serviceName = ExtractServiceName(rm.Resource?.Attributes);
+            var resLabels       = ExtractResourceLabels(rm.Resource?.Attributes);
             foreach (var sm in rm.ScopeMetrics ?? [])
             foreach (var metric in sm.Metrics ?? [])
             {
@@ -23,21 +24,56 @@ public static class OtlpMetricMapper
 
                 if (metric.Gauge is not null)
                     MapNumberPoints(metric.Name, metric.Unit ?? "", MetricKind.Gauge,
-                        metric.Gauge.DataPoints, serviceName, result);
+                        metric.Gauge.DataPoints, serviceName, resLabels, result);
 
                 else if (metric.Sum is not null)
                     MapNumberPoints(metric.Name, metric.Unit ?? "",
                         metric.Sum.IsMonotonic ? MetricKind.Counter : MetricKind.Gauge,
-                        metric.Sum.DataPoints, serviceName, result);
+                        metric.Sum.DataPoints, serviceName, resLabels, result);
 
                 else if (metric.Histogram is not null)
                     MapHistogramPoints(metric.Name, metric.Unit ?? "",
-                        metric.Histogram.DataPoints, serviceName, result);
+                        metric.Histogram.DataPoints, serviceName, resLabels, result);
             }
         }
 
         return result;
     }
+
+    /// <summary>
+    /// Turns the batch's resource attributes (env, deployment id, …) into label
+    /// pairs stamped onto every data point — same behaviour as logs and traces:
+    /// whatever the sender chose to put on its resource travels with the data.
+    /// Excluded: <c>service.name</c> (already the dedicated label) and the
+    /// <c>telemetry.sdk.*</c>/<c>telemetry.distro.*</c> self-description the OTel
+    /// SDK injects on its own — the sender never asked for those, and an SDK
+    /// upgrade would fork every series. Point attributes win on key collision.
+    /// </summary>
+    private static List<KeyValuePair<string, string>>? ExtractResourceLabels(List<OtlpKeyValue>? attrs)
+    {
+        if (attrs is null || attrs.Count == 0) return null;
+
+        List<KeyValuePair<string, string>>? result = null;
+        for (int i = 0; i < attrs.Count; i++)
+        {
+            var kv = attrs[i];
+            if (kv.Key is null || kv.Value is null) continue;
+            if (kv.Key == "service.name") continue;
+            if (kv.Key.StartsWith("telemetry.sdk.",    StringComparison.Ordinal) ||
+                kv.Key.StartsWith("telemetry.distro.", StringComparison.Ordinal)) continue;
+            var sv = FormatLabelValue(kv.Value);
+            if (sv is not null)
+                (result ??= new List<KeyValuePair<string, string>>(attrs.Count))
+                    .Add(new KeyValuePair<string, string>(kv.Key, sv));
+        }
+        return result;
+    }
+
+    private static string? FormatLabelValue(OtlpAnyValue v) =>
+        v.StringValue
+        ?? v.IntValue
+        ?? v.DoubleValue?.ToString(System.Globalization.CultureInfo.InvariantCulture)
+        ?? (v.BoolValue.HasValue ? v.BoolValue.Value.ToString().ToLowerInvariant() : null);
 
     private static string? ExtractServiceName(List<OtlpKeyValue>? attrs)
     {
@@ -52,12 +88,13 @@ public static class OtlpMetricMapper
     }
 
     private static void MapNumberPoints(
-        string                      name,
-        string                      unit,
-        MetricKind                  kind,
-        List<OtlpNumberDataPoint>?  points,
-        string?                     serviceName,
-        List<MetricIngestItem>      result)
+        string                                   name,
+        string                                   unit,
+        MetricKind                               kind,
+        List<OtlpNumberDataPoint>?               points,
+        string?                                  serviceName,
+        List<KeyValuePair<string, string>>?      resLabels,
+        List<MetricIngestItem>                   result)
     {
         foreach (var dp in points ?? [])
         {
@@ -69,7 +106,7 @@ public static class OtlpMetricMapper
                 Name              = name,
                 Unit              = unit,
                 Kind              = kind,
-                Labels            = ExtractLabels(dp.Attributes, serviceName),
+                Labels            = ExtractLabels(dp.Attributes, serviceName, resLabels),
                 TimestampUnixNano = OtlpTraceMapper.ParseNanoString(dp.TimeUnixNano),
                 ScalarValue       = value,
             });
@@ -77,11 +114,12 @@ public static class OtlpMetricMapper
     }
 
     private static void MapHistogramPoints(
-        string                          name,
-        string                          unit,
-        List<OtlpHistogramDataPoint>?   points,
-        string?                         serviceName,
-        List<MetricIngestItem>          result)
+        string                                   name,
+        string                                   unit,
+        List<OtlpHistogramDataPoint>?            points,
+        string?                                  serviceName,
+        List<KeyValuePair<string, string>>?      resLabels,
+        List<MetricIngestItem>                   result)
     {
         foreach (var dp in points ?? [])
         {
@@ -130,7 +168,7 @@ public static class OtlpMetricMapper
                 Name              = name,
                 Unit              = unit,
                 Kind              = MetricKind.Histogram,
-                Labels            = ExtractLabels(dp.Attributes, serviceName),
+                Labels            = ExtractLabels(dp.Attributes, serviceName, resLabels),
                 TimestampUnixNano = OtlpTraceMapper.ParseNanoString(dp.TimeUnixNano),
                 HistogramCount    = count,
                 HistogramSum      = dp.Sum ?? 0,
@@ -141,9 +179,11 @@ public static class OtlpMetricMapper
         }
     }
 
-    private static LabelSet ExtractLabels(List<OtlpKeyValue>? attrs, string? serviceName = null)
+    private static LabelSet ExtractLabels(
+        List<OtlpKeyValue>? attrs, string? serviceName = null,
+        List<KeyValuePair<string, string>>? resLabels = null)
     {
-        var capacity = (attrs?.Count ?? 0) + (serviceName is not null ? 1 : 0);
+        var capacity = (attrs?.Count ?? 0) + (serviceName is not null ? 1 : 0) + (resLabels?.Count ?? 0);
         if (capacity == 0) return LabelSet.Empty;
 
         // for loop — avoids two LINQ iterator object allocations per data point
@@ -155,13 +195,21 @@ public static class OtlpMetricMapper
         {
             var kv = attrs[i];
             if (kv.Key is null || kv.Value is null) continue;
-            var sv = kv.Value.StringValue
-                ?? kv.Value.IntValue
-                ?? kv.Value.DoubleValue?.ToString(System.Globalization.CultureInfo.InvariantCulture)
-                ?? (kv.Value.BoolValue.HasValue ? kv.Value.BoolValue.Value.ToString().ToLowerInvariant() : null);
+            var sv = FormatLabelValue(kv.Value);
             if (sv is not null)
                 pairs.Add(new KeyValuePair<string, string>(kv.Key, sv));
         }
+
+        // Allow-listed resource labels — point attributes win on key collision.
+        if (resLabels is not null)
+            for (int i = 0; i < resLabels.Count; i++)
+            {
+                bool exists = false;
+                for (int j = 0; j < pairs.Count; j++)
+                    if (pairs[j].Key == resLabels[i].Key) { exists = true; break; }
+                if (!exists) pairs.Add(resLabels[i]);
+            }
+
         return pairs.Count == 0 ? LabelSet.Empty : new LabelSet(pairs);
     }
 }

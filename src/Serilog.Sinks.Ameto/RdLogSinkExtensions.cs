@@ -41,6 +41,15 @@ public sealed class AmetoSinkOptions
 
     /// <summary>Bring your own <see cref="HttpClient"/> (shared pool/proxy); null = sink owns one (30 s timeout).</summary>
     public HttpClient?         HttpClient               { get; set; }
+
+    /// <summary>
+    /// Max serialised size of a single event, in bytes. An event over the limit is
+    /// replaced by a compact Error-level marker (original template, level, size and
+    /// trace context preserved) — so a runaway <c>{@Object}</c> is VISIBLE in Ameto
+    /// instead of being silently rejected by the server's payload cap. Matches the
+    /// server's default <c>Ingestion.MaxEventPayloadBytes</c> (64 KB). 0 = unlimited.
+    /// </summary>
+    public int                 EventBodyLimitBytes      { get; set; } = 65_536;
 }
 
 /// <summary>
@@ -120,7 +129,7 @@ public static class AmetoSinkExtensions
         var opts = new AmetoSinkOptions();
         configure?.Invoke(opts);
 
-        var batched = new AmetoBatchedSink(serverUrl, apiKey, serviceName, opts.HttpClient);
+        var batched = new AmetoBatchedSink(serverUrl, apiKey, serviceName, opts.HttpClient, opts.EventBodyLimitBytes);
 
         var batchOptions = new PeriodicBatchingSinkOptions
         {

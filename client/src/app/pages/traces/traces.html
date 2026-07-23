@@ -316,7 +316,10 @@
           <div class="detail-header">
             <div class="detail-title">
               <span class="detail-trace-label">Trace</span>
-              <span class="detail-trace-id mono">{{ selectedTraceId()!.substring(0, 16) }}…</span>
+              <span class="detail-trace-id mono">{{ selectedTraceId() }}</span>
+              <lucide-icon class="copy-icon"
+                           [name]="traceIdCopied() ? 'check' : 'copy'" [size]="12"
+                           (click)="copyTraceId()" title="Copy trace ID" />
             </div>
             <div class="detail-meta">
               <span class="meta-chip">{{ totalDurLabel() }}</span>

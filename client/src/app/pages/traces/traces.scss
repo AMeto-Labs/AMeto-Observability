@@ -559,6 +559,9 @@
 .detail-trace-id {
   font-size: 12px;
   color: var(--info);
+  user-select: all;          // one click selects the whole id
+  overflow-wrap: anywhere;   // full 32-hex id wraps instead of overflowing on narrow panels
+  min-width: 0;
 }
 
 .copy-icon {

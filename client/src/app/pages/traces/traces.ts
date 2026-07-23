@@ -392,6 +392,30 @@ export class TracesComponent implements OnInit, OnDestroy {
     this.syncUrl();
   }
 
+  /** Brief ✓ feedback after the trace id is copied from the detail header. */
+  readonly traceIdCopied = signal(false);
+
+  async copyTraceId(): Promise<void> {
+    const id = this.selectedTraceId();
+    if (!id) return;
+    try {
+      await navigator.clipboard.writeText(id);
+    } catch {
+      // navigator.clipboard needs a secure context (https/localhost) and focus —
+      // plain-http hosts (e.g. http://sandbox:8555) get the legacy fallback.
+      const ta = document.createElement('textarea');
+      ta.value = id;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      ta.remove();
+    }
+    this.traceIdCopied.set(true);
+    setTimeout(() => { this.traceIdCopied.set(false); this.cdr.markForCheck(); }, 1500);
+  }
+
   selectSpan(span: SpanDto) {
     const same = this.selectedSpan()?.spanId === span.spanId;
     this.selectedSpan.set(same ? null : span);

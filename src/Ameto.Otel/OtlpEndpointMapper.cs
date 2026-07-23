@@ -4,6 +4,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using System.Buffers;
 using System.Text.Json;
+using Ameto.Core;
 using Ameto.Ingestion;
 using Ameto.Metrics;
 using Ameto.Otel.Models;
