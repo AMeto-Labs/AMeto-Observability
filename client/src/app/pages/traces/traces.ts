@@ -398,13 +398,19 @@ export class TracesComponent implements OnInit, OnDestroy {
   async copyTraceId(): Promise<void> {
     const id = this.selectedTraceId();
     if (!id) return;
+    await this.copyText(id);
+    this.traceIdCopied.set(true);
+    setTimeout(() => { this.traceIdCopied.set(false); this.cdr.markForCheck(); }, 1500);
+  }
+
+  private async copyText(text: string): Promise<void> {
     try {
-      await navigator.clipboard.writeText(id);
+      await navigator.clipboard.writeText(text);
     } catch {
       // navigator.clipboard needs a secure context (https/localhost) and focus —
       // plain-http hosts (e.g. http://sandbox:8555) get the legacy fallback.
       const ta = document.createElement('textarea');
-      ta.value = id;
+      ta.value = text;
       ta.style.position = 'fixed';
       ta.style.opacity = '0';
       document.body.appendChild(ta);
@@ -412,8 +418,78 @@ export class TracesComponent implements OnInit, OnDestroy {
       document.execCommand('copy');
       ta.remove();
     }
-    this.traceIdCopied.set(true);
-    setTimeout(() => { this.traceIdCopied.set(false); this.cdr.markForCheck(); }, 1500);
+  }
+
+  // ── Span-attribute context menu (Tags table) ──────────────────────────────
+
+  readonly attrMenu = signal<{ key: string; value: string; x: number; y: number } | null>(null);
+
+  openAttrMenu(ev: MouseEvent, key: string, value: unknown): void {
+    ev.stopPropagation();
+    // Clamp so the menu never opens below the viewport.
+    const x = Math.min(ev.clientX, window.innerWidth - 240);
+    const y = Math.min(ev.clientY, window.innerHeight - 290);
+    this.attrMenu.set({ key, value: String(value), x, y });
+  }
+
+  @HostListener('document:click')
+  closeAttrMenu(): void {
+    if (this.attrMenu()) this.attrMenu.set(null);
+  }
+
+  async attrCopy(what: 'value' | 'key'): Promise<void> {
+    const m = this.attrMenu();
+    if (!m) return;
+    await this.copyText(what === 'value' ? m.value : m.key);
+    this.attrMenu.set(null);
+  }
+
+  /** Replace the query: search traces by this attribute alone. */
+  attrFind(neq: boolean): void {
+    const m = this.attrMenu();
+    if (!m) return;
+    this.applyTraceql(`{ ${this.tqlPredicate(m.key, m.value, neq)} }`);
+  }
+
+  /** Append to the current query with && / ||. */
+  attrExpr(joiner: '&&' | '||', neq: boolean): void {
+    const m = this.attrMenu();
+    if (!m) return;
+    const pred = this.tqlPredicate(m.key, m.value, neq);
+    let inner = '';
+    if (this.traceqlMode()) {
+      const q = this.traceqlInput.trim();
+      const braced = q.match(/^\{([\s\S]*)\}$/);
+      inner = (braced ? braced[1] : q).trim();
+    }
+    this.applyTraceql(inner ? `{ (${inner}) ${joiner} ${pred} }` : `{ ${pred} }`);
+  }
+
+  /** Cross-signal jump: open the Logs page filtered by the same property. */
+  attrFindInLogs(): void {
+    const m = this.attrMenu();
+    if (!m) return;
+    this.attrMenu.set(null);
+    const ident = /^[A-Za-z_][A-Za-z0-9_]*$/.test(m.key) ? m.key : `['${m.key}']`;
+    const value = /^-?\d+(\.\d+)?$/.test(m.value) ? m.value : `'${m.value.replaceAll("'", "''")}'`;
+    void this.router.navigate(['/events'], { queryParams: { filter: `${ident} = ${value}` } });
+  }
+
+  private tqlPredicate(key: string, value: string, neq: boolean): string {
+    const op = neq ? '!=' : '=';
+    const v  = /^-?\d+(\.\d+)?$/.test(value) || value === 'true' || value === 'false'
+      ? value
+      : `"${value.replaceAll('"', '')}"`;
+    return `.${key} ${op} ${v}`;
+  }
+
+  private applyTraceql(query: string): void {
+    this.attrMenu.set(null);
+    this.traceqlMode.set(true);
+    this.traceqlError.set('');
+    this.traceqlInput = query;
+    this.activeMainTab = 'traces';
+    this.runTraceQL();
   }
 
   selectSpan(span: SpanDto) {
@@ -434,6 +510,7 @@ export class TracesComponent implements OnInit, OnDestroy {
    */
   @HostListener('document:keydown.escape')
   onEscape(): void {
+    if (this.attrMenu()) { this.attrMenu.set(null); return; }
     if (this.logModalEvent()) return;
     if (this.selectedSpan()) this.selectedSpan.set(null);
   }
