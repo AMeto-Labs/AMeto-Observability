@@ -110,9 +110,7 @@ public static class OtlpEndpointMapper
 
             if (request is null) { ctx.Response.StatusCode = 400; return; }
 
-            var resourceLabels = ctx.RequestServices.GetRequiredService<ServerOptions>()
-                                    .Ingestion.MetricResourceLabels;
-            var points = OtlpMetricMapper.Map(request, resourceLabels);
+            var points = OtlpMetricMapper.Map(request);
             ingester.Ingest(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(points));
             await WriteJsonOk(ctx, points.Count, 0);
         });

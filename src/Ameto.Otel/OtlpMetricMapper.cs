@@ -9,14 +9,14 @@ namespace Ameto.Otel;
 /// </summary>
 public static class OtlpMetricMapper
 {
-    public static List<MetricIngestItem> Map(ExportMetricsServiceRequest request, string[]? resourceLabelKeys = null)
+    public static List<MetricIngestItem> Map(ExportMetricsServiceRequest request)
     {
         var result = new List<MetricIngestItem>();
 
         foreach (var rm in request.ResourceMetrics ?? [])
         {
             string? serviceName = ExtractServiceName(rm.Resource?.Attributes);
-            var resLabels       = ExtractResourceLabels(rm.Resource?.Attributes, resourceLabelKeys);
+            var resLabels       = ExtractResourceLabels(rm.Resource?.Attributes);
             foreach (var sm in rm.ScopeMetrics ?? [])
             foreach (var metric in sm.Metrics ?? [])
             {
@@ -41,24 +41,29 @@ public static class OtlpMetricMapper
     }
 
     /// <summary>
-    /// Picks the allow-listed resource attributes (Ingestion.MetricResourceLabels)
-    /// as label pairs to stamp onto every data point of the batch. Point attributes
-    /// win on key collision.
+    /// Turns the batch's resource attributes (env, deployment id, …) into label
+    /// pairs stamped onto every data point — same behaviour as logs and traces:
+    /// whatever the sender chose to put on its resource travels with the data.
+    /// Excluded: <c>service.name</c> (already the dedicated label) and the
+    /// <c>telemetry.sdk.*</c>/<c>telemetry.distro.*</c> self-description the OTel
+    /// SDK injects on its own — the sender never asked for those, and an SDK
+    /// upgrade would fork every series. Point attributes win on key collision.
     /// </summary>
-    private static List<KeyValuePair<string, string>>? ExtractResourceLabels(
-        List<OtlpKeyValue>? attrs, string[]? keys)
+    private static List<KeyValuePair<string, string>>? ExtractResourceLabels(List<OtlpKeyValue>? attrs)
     {
-        if (attrs is null || keys is null || keys.Length == 0) return null;
+        if (attrs is null || attrs.Count == 0) return null;
 
         List<KeyValuePair<string, string>>? result = null;
         for (int i = 0; i < attrs.Count; i++)
         {
             var kv = attrs[i];
             if (kv.Key is null || kv.Value is null) continue;
-            if (Array.IndexOf(keys, kv.Key) < 0) continue;
+            if (kv.Key == "service.name") continue;
+            if (kv.Key.StartsWith("telemetry.sdk.",    StringComparison.Ordinal) ||
+                kv.Key.StartsWith("telemetry.distro.", StringComparison.Ordinal)) continue;
             var sv = FormatLabelValue(kv.Value);
             if (sv is not null)
-                (result ??= new List<KeyValuePair<string, string>>(keys.Length))
+                (result ??= new List<KeyValuePair<string, string>>(attrs.Count))
                     .Add(new KeyValuePair<string, string>(kv.Key, sv));
         }
         return result;

@@ -87,9 +87,9 @@ OTEL_RESOURCE_ATTRIBUTES=env=prod,prid=wallet
 |--------|-----------|
 | Logs | all resource attributes become event properties (filter: `env = 'prod'`) |
 | Traces | all resource attributes are merged into every span's attributes (span's own keys win) |
-| Metrics | opt-in via `Ameto:Ingestion:MetricResourceLabels` (see above) — labels are part of series identity, so the wanted keys are listed explicitly and noisy SDK defaults (`telemetry.sdk.*`) stay out |
+| Metrics | all resource attributes become series labels (point attributes win). Note: adding a new resource attribute changes series identity, so existing series continue without it and new ones appear with it |
 
-`service.name` is always extracted into the dedicated service field/label instead.
+`service.name` is always extracted into the dedicated service field/label, and the SDK's self-description (`telemetry.sdk.*` / `telemetry.distro.*`) is excluded from metric labels — the sender never sets those explicitly, and an SDK upgrade would otherwise fork every series.
 
 ---
 
