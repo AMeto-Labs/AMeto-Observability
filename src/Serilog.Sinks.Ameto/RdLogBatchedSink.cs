@@ -22,10 +22,13 @@ internal sealed class AmetoBatchedSink : IBatchedLogEventSink, IDisposable
     private readonly ReadOnlyMemory<byte> _serviceNameUtf8;
     private readonly HttpClient           _http;
     private readonly bool                 _ownsHttp;
+    private readonly int                  _eventBodyLimitBytes;
     private readonly PooledBufferWriter   _bufWriter = new(65_536);
 
-    public AmetoBatchedSink(string serverUrl, string? apiKey, string? serviceName, HttpClient? httpClient)
+    public AmetoBatchedSink(string serverUrl, string? apiKey, string? serviceName, HttpClient? httpClient,
+        int eventBodyLimitBytes = 65_536)
     {
+        _eventBodyLimitBytes = eventBodyLimitBytes;
         var baseUri      = new Uri(serverUrl, UriKind.Absolute);
         _endpoint        = new Uri(baseUri, "api/events");
         _apiKey          = apiKey;
@@ -92,13 +95,37 @@ internal sealed class AmetoBatchedSink : IBatchedLogEventSink, IDisposable
     private ReadOnlyMemory<byte> Serialize(IList<LogEvent> events)
     {
         _bufWriter.Reset();
-        var writer = new MessagePackWriter(_bufWriter);
+        var header = new MessagePackWriter(_bufWriter);
+        header.WriteArrayHeader(events.Count);
+        header.Flush();
 
-        writer.WriteArrayHeader(events.Count);
+        // One writer per event (a struct — no allocation): each is flushed so the
+        // buffer position measures the event's serialised size, and an oversized
+        // event can be rewound away and replaced 1-for-1 by its Error marker.
         // Index loop over the IList avoids the boxed IEnumerator the interface foreach allocates.
         for (int i = 0; i < events.Count; i++)
+        {
+            int before = _bufWriter.Position;
+            var writer = new MessagePackWriter(_bufWriter);
             AmetoClefFormatter.Write(ref writer, events[i], _serviceNameUtf8);
-        writer.Flush();
+            writer.Flush();
+
+            int size = _bufWriter.Position - before;
+            if (_eventBodyLimitBytes > 0 && size > _eventBodyLimitBytes)
+            {
+                // Replace with a compact Error-level marker: the oversized event is
+                // VISIBLE in Ameto (searchable by OriginalTemplate) instead of being
+                // silently rejected by the server's per-event payload cap.
+                _bufWriter.Rewind(before);
+                var marker = new MessagePackWriter(_bufWriter);
+                AmetoClefFormatter.WriteOversizedMarker(ref marker, events[i], _serviceNameUtf8, size, _eventBodyLimitBytes);
+                marker.Flush();
+
+                var template = events[i].MessageTemplate.Text;
+                SelfLog.WriteLine("Ameto sink: {0} B event exceeded EventBodyLimitBytes={1}; replaced with an Error marker (template: {2})",
+                    size, _eventBodyLimitBytes, template.Length <= 96 ? template : template[..96]);
+            }
+        }
 
         return _bufWriter.WrittenMemory;
     }
@@ -145,6 +172,12 @@ internal sealed class PooledBufferWriter : IBufferWriter<byte>, IDisposable
     }
 
     public ReadOnlyMemory<byte> WrittenMemory => _buf.AsMemory(0, _pos);
+
+    /// <summary>Current write offset — pairs with <see cref="Rewind"/> to un-write a region.</summary>
+    public int Position => _pos;
+
+    /// <summary>Rolls the writer back to an earlier <see cref="Position"/> (discards bytes after it).</summary>
+    public void Rewind(int position) => _pos = position;
 
     public void Reset() => _pos = 0;
 

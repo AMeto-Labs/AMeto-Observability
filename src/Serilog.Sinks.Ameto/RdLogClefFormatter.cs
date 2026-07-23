@@ -89,6 +89,65 @@ internal static class AmetoClefFormatter
     }
   }
 
+  /// <summary>
+  /// Replacement for an event whose serialised form exceeded the sink's
+  /// <c>EventBodyLimitBytes</c>: a compact Error-level marker that keeps the
+  /// original timestamp, trace context and service, and points at the offender
+  /// via its (truncated) template plus the measured/limit sizes — searchable in
+  /// Ameto by <c>OriginalTemplate</c> or <c>EventBodyBytes</c>.
+  /// </summary>
+  public static void WriteOversizedMarker(
+      scoped ref MessagePackWriter writer, LogEvent evt,
+      ReadOnlyMemory<byte> serviceNameUtf8, int bodyBytes, int limitBytes)
+  {
+    const int MaxTemplateChars = 256;
+
+    bool hasService = !serviceNameUtf8.IsEmpty;
+    int fieldCount = 3                                     // @t @mt @l
+                   + (evt.TraceId is not null ? 1 : 0)
+                   + (evt.SpanId  is not null ? 1 : 0)
+                   + (hasService ? 1 : 0)
+                   + 4;                                    // Original*, EventBody*
+
+    writer.WriteMapHeader(fieldCount);
+
+    Span<char> tsCharBuf = stackalloc char[33];
+    evt.Timestamp.TryFormat(tsCharBuf, out int tsLen, "o", CultureInfo.InvariantCulture);
+    writer.WriteString("@t"u8);
+    WriteAsciiString(ref writer, tsCharBuf[..tsLen]);
+
+    writer.WriteString("@mt"u8);
+    writer.Write("Log event of {EventBodyBytes} bytes exceeded the sink limit of {EventBodyLimitBytes} bytes and was dropped: {OriginalTemplate}");
+
+    writer.WriteString("@l"u8);
+    writer.Write("Error");
+
+    if (evt.TraceId.HasValue)
+    {
+      writer.WriteString("@tr"u8);
+      writer.Write(evt.TraceId.Value.ToHexString());
+    }
+    if (evt.SpanId.HasValue)
+    {
+      writer.WriteString("@sp"u8);
+      writer.Write(evt.SpanId.Value.ToHexString());
+    }
+    if (hasService) { writer.WriteString("service.name"u8); writer.WriteString(serviceNameUtf8.Span); }
+
+    writer.WriteString("EventBodyBytes"u8);
+    writer.Write(bodyBytes);
+    writer.WriteString("EventBodyLimitBytes"u8);
+    writer.Write(limitBytes);
+
+    var template = evt.MessageTemplate.Text;
+    writer.WriteString("OriginalTemplate"u8);
+    writer.Write(template.Length <= MaxTemplateChars ? template : template[..MaxTemplateChars]);
+
+    writer.WriteString("OriginalLevel"u8);
+    int li = (int)evt.Level;
+    writer.Write((uint)li < (uint)s_levelStrings.Length ? s_levelStrings[li] : evt.Level.ToString());
+  }
+
   // ── Property values ──────────────────────────────────────────────────────
 
   private static void WriteValue(scoped ref MessagePackWriter writer, LogEventPropertyValue value)
