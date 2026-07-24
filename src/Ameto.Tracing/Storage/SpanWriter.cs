@@ -9,51 +9,73 @@ namespace Ameto.Tracing.Storage;
 /// Writes a batch of <see cref="SpanRecord"/> objects to a <c>.trc</c> columnar file
 /// and a companion <c>.stats</c> sidecar with per-service duration histograms.
 ///
-/// <para>File format v2 — "RDTC":</para>
+/// <para>File format v3 — "RDTC":</para>
 /// <code>
 ///   [Header — 27 bytes]
 ///     0   Magic        : uint32  "RDTC"
-///     4   Version      : uint16  2
+///     4   Version      : uint16  3
 ///     6   SpanCount    : uint32
 ///    10   MinStartNano : int64
 ///    18   MaxStartNano : int64
 ///    26   Flags        : byte
 ///
 ///   [Span Blocks]
-///     N × { uncompSize uint32 | compSize uint32 | LZ4-msgpack bytes }
+///     N × { uncompSize uint32 | compSize uint32 | LZ4-HC msgpack bytes }
+///     span: positional 11-element array
+///       [ tid bin16, sid bin8, pid bin8|nil, Δts, dur, name, svc, kind, status, hsc, attrs map|nil ]
+///       Δts: first span of a block = absolute unix nanos, the rest = varint delta
+///       to the previous span (spans are sorted by start time, so deltas stay tiny).
+///       Blocks decompress independently — the delta chain restarts per block.
+///       attrs are written inline (typed msgpack values), not as a nested blob.
 ///
-///   [TraceId Index]
-///     traceCount uint32
-///     per trace: traceId 16B | offsetCount uint32 | offsets uint32[]
+///   [TraceId Index — one LZ4 block]
+///     uncompSize uint32 | compSize uint32 | LZ4 bytes of:
+///       traceCount uint32
+///       per trace: traceId 16B | offsetCount uint32 | offsets uint32[]
 ///
 ///   [Service Index]
 ///     serviceCount uint32
 ///     per service: nameLen uint16 | name UTF-8 | blockCount uint32 | blockIndices uint32[]
 ///
-///   [Footer — 20 bytes]
+///   [Bloom Index — per-block attribute blooms, see SpanBloom]
+///     blockCount uint32
+///     per block: byteLen uint32 | bitset bytes (0 bytes ⇒ no bloom, never skip)
+///
+///   [Footer — 28 bytes]
 ///     traceIdxOffset uint64
 ///     svcIdxOffset   uint64
+///     bloomIdxOffset uint64
 ///     footerMagic    uint32  "RDTF"
 /// </code>
+/// <para>
+/// v3 versus v2: positional arrays replace string-keyed maps (~40 B of repeated
+/// key strings per span gone), timestamps are block-local deltas instead of
+/// 9-byte absolutes, attributes serialize inline (no per-span nested buffer),
+/// root spans store nil instead of an 8-byte zero parent id, blocks use LZ4-HC,
+/// the trace index is compressed, and per-block attribute blooms let TraceQL
+/// skip blocks. v2 files remain readable (see <see cref="SpanReader"/>) and
+/// migrate to v3 through the background compaction in <see cref="TraceStorageEngine"/>.
+/// </para>
 /// </summary>
 internal static class SpanWriter
 {
     private const uint   Magic       = 0x52_44_54_43; // "RDTC"
     private const uint   FooterMagic = 0x52_44_54_46; // "RDTF"
-    private const ushort Version     = 2;
+    private const ushort Version     = 3;
     private const int    BlockSize   = 4096;
 
     public static SpanSegmentInfo Write(string dataDir, IList<SpanRecord> spans)
     {
         if (spans.Count == 0) throw new InvalidOperationException("Cannot write empty span batch.");
 
-        long minNano = long.MaxValue, maxNano = long.MinValue;
-        for (int i = 0; i < spans.Count; i++)
-        {
-            var ts = spans[i].StartTimeUnixNano;
-            if (ts < minNano) minNano = ts;
-            if (ts > maxNano) maxNano = ts;
-        }
+        // Sort by start time: keeps the per-block Δts encoding tiny and gives the
+        // trace/service indices better block locality.
+        var ordered = new List<SpanRecord>(spans);
+        ordered.Sort(static (a, b) => a.StartTimeUnixNano.CompareTo(b.StartTimeUnixNano));
+        spans = ordered;
+
+        long minNano = spans[0].StartTimeUnixNano;
+        long maxNano = spans[^1].StartTimeUnixNano;
 
         string baseName = $"spans-{minNano}-{maxNano}-{spans.Count}";
         string trcPath  = Path.Combine(dataDir, baseName + ".trc");
@@ -78,29 +100,39 @@ internal static class SpanWriter
         // ── Span blocks ────────────────────────────────────────────────────────
         int written = 0;
         var scratch = new byte[1024 * 1024];
+        var blooms  = new List<byte[]>();
 
         while (written < spans.Count)
         {
             int batchCount = Math.Min(BlockSize, spans.Count - written);
             uint blockIdx  = (uint)(written / BlockSize);
             var block      = WriteBlock(spans, written, batchCount, scratch, blockIdx,
-                                        traceIndex, svcBlockMap, svcStats);
+                                        traceIndex, svcBlockMap, svcStats, blooms);
             bw.Write((uint)block.UncompressedSize);
             bw.Write((uint)block.CompressedBytes.Length);
             bw.Write(block.CompressedBytes);
             written += batchCount;
         }
 
-        // ── TraceId index ──────────────────────────────────────────────────────
+        // ── TraceId index (one LZ4 block) ──────────────────────────────────────
         long traceIdxOffset = fs.Position;
-        bw.Write((uint)traceIndex.Count);
-        Span<byte> traceIdBuf = stackalloc byte[16];
-        foreach (var (traceId, offsets) in traceIndex)
         {
-            traceId.WriteTo(traceIdBuf);
-            bw.Write(traceIdBuf.ToArray());
-            bw.Write((uint)offsets.Count);
-            foreach (var o in offsets) bw.Write(o);
+            var idxBuf = new MemoryStream(traceIndex.Count * 32);
+            var idxBw  = new BinaryWriter(idxBuf);
+            Span<byte> traceIdBuf = stackalloc byte[16];
+            idxBw.Write((uint)traceIndex.Count);
+            foreach (var (traceId, offsets) in traceIndex)
+            {
+                traceId.WriteTo(traceIdBuf);
+                idxBw.Write(traceIdBuf);
+                idxBw.Write((uint)offsets.Count);
+                foreach (var o in offsets) idxBw.Write(o);
+            }
+            var raw        = idxBuf.ToArray();
+            var compressed = LZ4Pickler.Pickle(raw, LZ4Level.L09_HC);
+            bw.Write((uint)raw.Length);
+            bw.Write((uint)compressed.Length);
+            bw.Write(compressed);
         }
 
         // ── Service index ──────────────────────────────────────────────────────
@@ -115,9 +147,19 @@ internal static class SpanWriter
             foreach (var b in blocks) bw.Write(b);
         }
 
-        // ── Footer (20 bytes) ──────────────────────────────────────────────────
+        // ── Bloom index ────────────────────────────────────────────────────────
+        long bloomIdxOffset = fs.Position;
+        bw.Write((uint)blooms.Count);
+        foreach (var b in blooms)
+        {
+            bw.Write((uint)b.Length);
+            bw.Write(b);
+        }
+
+        // ── Footer (28 bytes) ──────────────────────────────────────────────────
         bw.Write((ulong)traceIdxOffset);
         bw.Write((ulong)svcIdxOffset);
+        bw.Write((ulong)bloomIdxOffset);
         bw.Write(FooterMagic);
 
         // ── .stats sidecar ─────────────────────────────────────────────────────
@@ -135,11 +177,12 @@ internal static class SpanWriter
 
         return new SpanSegmentInfo
         {
-            FilePath     = trcPath,
-            MinStartNano = minNano,
-            MaxStartNano = maxNano,
-            SpanCount    = spans.Count,
-            Services     = services,
+            FilePath      = trcPath,
+            MinStartNano  = minNano,
+            MaxStartNano  = maxNano,
+            SpanCount     = spans.Count,
+            Services      = services,
+            FormatVersion = Version,
         };
     }
 
@@ -153,11 +196,16 @@ internal static class SpanWriter
         uint                                     blockIdx,
         Dictionary<TraceId, List<uint>>          traceIndex,
         Dictionary<string, SortedSet<uint>>      svcBlockMap,
-        Dictionary<string, MutableServiceStats>  svcStats)
+        Dictionary<string, MutableServiceStats>  svcStats,
+        List<byte[]>                             blooms)
     {
         var bufWriter = new System.Buffers.ArrayBufferWriter<byte>(scratch.Length);
         var writer    = new MessagePackWriter(bufWriter);
         writer.WriteArrayHeader(count);
+
+        Span<byte> idBuf = stackalloc byte[16];
+        long prevTs = 0;
+        var bloomHashes = new HashSet<ulong>();
 
         for (int i = 0; i < count; i++)
         {
@@ -192,41 +240,78 @@ internal static class SpanWriter
             if (s.DurationNanos > st.MaxDuration) st.MaxDuration = s.DurationNanos;
             st.Buckets[HistogramBuckets.IndexOf(s.DurationNanos)]++;
 
-            // ── Msgpack span map ─────────────────────────────────────────────
-            bool hasAttrs  = s.Attributes is { Count: > 0 };
-            bool hasStatus = s.HttpStatusCode != 0;
-            int  fieldCnt  = 9 + (hasAttrs ? 1 : 0) + (hasStatus ? 1 : 0);
-            writer.WriteMapHeader(fieldCnt);
+            // ── Positional span array ────────────────────────────────────────
+            writer.WriteArrayHeader(11);
 
-            writer.Write("tid");  WriteTraceId(ref writer, s.TraceId);
-            writer.Write("sid");  WriteSpanId(ref writer, s.SpanId);
-            writer.Write("pid");  WriteSpanId(ref writer, s.ParentSpanId);
-            writer.Write("ts");   writer.Write(s.StartTimeUnixNano);
-            writer.Write("dur");  writer.Write(s.DurationNanos);
-            writer.Write("n");    writer.Write(s.Name);
-            writer.Write("svc");  writer.Write(s.ServiceName);
-            writer.Write("k");    writer.Write((byte)s.Kind);
-            writer.Write("st");   writer.Write((byte)s.Status);
+            s.TraceId.WriteTo(idBuf);
+            writer.Write((ReadOnlySpan<byte>)idBuf);
 
-            if (hasStatus)
+            BinaryPrimitives.WriteUInt64BigEndian(idBuf, s.SpanId.RawValue);
+            writer.Write((ReadOnlySpan<byte>)idBuf[..8]);
+
+            if (s.ParentSpanId.IsEmpty)
             {
-                writer.Write("hsc");
-                writer.Write(s.HttpStatusCode);
+                writer.WriteNil(); // root span — no parent
             }
-            if (hasAttrs)
+            else
             {
-                writer.Write("attr");
-                var attrBytes = MessagePackSerializer.Serialize(
-                    s.Attributes is Dictionary<string, object?> d
-                        ? d : new Dictionary<string, object?>(s.Attributes!));
-                writer.Write(new ReadOnlySpan<byte>(attrBytes));
+                BinaryPrimitives.WriteUInt64BigEndian(idBuf, s.ParentSpanId.RawValue);
+                writer.Write((ReadOnlySpan<byte>)idBuf[..8]);
+            }
+
+            // First span of the block: absolute nanos; the rest: delta.
+            writer.Write(i == 0 ? s.StartTimeUnixNano : s.StartTimeUnixNano - prevTs);
+            prevTs = s.StartTimeUnixNano;
+
+            writer.Write(s.DurationNanos);
+            writer.Write(s.Name);
+            writer.Write(s.ServiceName);
+            writer.Write((byte)s.Kind);
+            writer.Write((byte)s.Status);
+            writer.Write(s.HttpStatusCode);
+
+            if (s.Attributes is { Count: > 0 } attrs)
+            {
+                WriteAttributes(ref writer, attrs);
+                foreach (var (k, v) in attrs)
+                    SpanBloom.AddAttr(bloomHashes, k, v);
+            }
+            else
+            {
+                writer.WriteNil();
             }
         }
 
+        blooms.Add(SpanBloom.Build(bloomHashes));
+
         writer.Flush();
         var raw        = bufWriter.WrittenSpan.ToArray();
-        var compressed = LZ4Pickler.Pickle(raw);
+        // HC level: this runs on background flush/compaction threads only.
+        var compressed = LZ4Pickler.Pickle(raw, LZ4Level.L09_HC);
         return (compressed, raw.Length);
+    }
+
+    /// <summary>Inline typed attribute map — no nested serializer, no per-span buffers.</summary>
+    private static void WriteAttributes(ref MessagePackWriter w, IReadOnlyDictionary<string, object?> attrs)
+    {
+        w.WriteMapHeader(attrs.Count);
+        foreach (var (k, v) in attrs)
+        {
+            w.Write(k);
+            switch (v)
+            {
+                case null:       w.WriteNil();               break;
+                case string str: w.Write(str);               break;
+                case bool b:     w.Write(b);                 break;
+                case long l:     w.Write(l);                 break;
+                case int n:      w.Write((long)n);           break;
+                case short sh:   w.Write((long)sh);          break;
+                case byte by:    w.Write((long)by);          break;
+                case double d:   w.Write(d);                 break;
+                case float f:    w.Write((double)f);         break;
+                default:         w.Write(v.ToString() ?? ""); break;
+            }
+        }
     }
 
     // ── Stats sidecar ──────────────────────────────────────────────────────────
@@ -260,22 +345,6 @@ internal static class SpanWriter
             bw.Write(st.MaxDuration == long.MinValue ? 0L : st.MaxDuration);
             foreach (var b in st.Buckets) bw.Write(b);
         }
-    }
-
-    // ── Helpers ────────────────────────────────────────────────────────────────
-
-    private static void WriteTraceId(ref MessagePackWriter w, TraceId id)
-    {
-        var buf = new byte[16];
-        id.WriteTo(buf);
-        w.Write(new ReadOnlySpan<byte>(buf));
-    }
-
-    private static void WriteSpanId(ref MessagePackWriter w, SpanId id)
-    {
-        var buf = new byte[8];
-        BinaryPrimitives.WriteUInt64BigEndian(buf, id.RawValue);
-        w.Write(new ReadOnlySpan<byte>(buf));
     }
 
     // ── Mutable accumulator (not exposed outside this class) ──────────────────

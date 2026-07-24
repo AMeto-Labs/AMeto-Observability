@@ -19,6 +19,7 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="Ameto.Integration.Tests" />
+    <InternalsVisibleTo Include="Ameto.Storage.Tests" />
   </ItemGroup>
 
 </Project>

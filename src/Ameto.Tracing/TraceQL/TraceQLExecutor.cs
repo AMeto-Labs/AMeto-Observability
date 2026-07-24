@@ -8,6 +8,8 @@ public sealed class SearchHints
     public long?            MinDurationNanos { get; set; }
     public long?            MaxDurationNanos { get; set; }
     public short?           HttpStatusCode   { get; set; }
+    /// <summary>Necessary attribute conditions (AND-chain only) — drive per-block bloom skip.</summary>
+    public List<AttrHint>?  AttrHints        { get; set; }
 }
 
 /// <summary>
@@ -77,8 +79,29 @@ public static class TraceQLExecutor
                   && attr.Value.IsNumber
                   && attr.Value.Number is >= 100 and <= 999:
                 h.HttpStatusCode ??= (short)attr.Value.Number;
+                AddAttrHint(h, attr);
+                break;
+
+            // Every attribute predicate in an AND-chain requires the KEY to exist
+            // on the span (a missing attribute never matches, whatever the op);
+            // string equality additionally pins the value. Both drive the
+            // per-block bloom skip in the cold reader.
+            case AttributePredicate anyAttr:
+                AddAttrHint(h, anyAttr);
                 break;
         }
+    }
+
+    private static void AddAttrHint(SearchHints h, AttributePredicate attr)
+    {
+        // Equality on a string value → key+value probe (bloom stores lowercased
+        // values because TraceQL string comparison is OrdinalIgnoreCase). Numeric
+        // equality matches across representations (long/double/numeric string),
+        // so only the key-presence probe is safe there.
+        string? lower = attr.Op == TraceQLOp.Eq && !attr.Value.IsNumber
+            ? attr.Value.StringVal?.ToLowerInvariant()
+            : null;
+        (h.AttrHints ??= new List<AttrHint>(2)).Add(new AttrHint(attr.Key, lower));
     }
 
     // ── Execution ──────────────────────────────────────────────────────────────
@@ -107,6 +130,7 @@ public static class TraceQLExecutor
             maxDurationNanos : hints.MaxDurationNanos,
             httpStatusCode   : hints.HttpStatusCode,
             limit            : limit * 10,
+            attrHints        : hints.AttrHints,
             ct               : ct))
         {
             spans.Add(s);

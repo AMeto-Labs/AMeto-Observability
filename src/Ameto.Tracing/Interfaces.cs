@@ -125,6 +125,14 @@ public sealed class TraceVolume
 }
 
 /// <summary>
+/// A necessary attribute condition extracted from a TraceQL AND-chain, used to
+/// skip storage blocks via their attribute blooms. <see cref="LowerValue"/> is the
+/// lowercased string value for equality predicates, or null for key-presence-only
+/// (any other operator still requires the key to exist on the span).
+/// </summary>
+public readonly record struct AttrHint(string Key, string? LowerValue);
+
+/// <summary>
 /// Provides access to stored trace/span data.
 /// </summary>
 public interface ITraceProvider
@@ -137,7 +145,9 @@ public interface ITraceProvider
 
     /// <summary>
     /// Returns spans whose start time falls within [from, to], optionally filtered
-    /// by service name and/or span name substring.
+    /// by service name and/or span name substring. <paramref name="attrHints"/> are
+    /// necessary attribute conditions — storage may use them to skip data that
+    /// cannot match, and callers must still post-filter.
     /// </summary>
     IAsyncEnumerable<SpanRecord> SearchSpansAsync(
         DateTimeOffset?  from             = null,
@@ -149,5 +159,6 @@ public interface ITraceProvider
         long?            maxDurationNanos = null,
         short?           httpStatusCode   = null,
         int              limit            = 200,
+        IReadOnlyList<AttrHint>? attrHints = null,
         CancellationToken ct              = default);
 }

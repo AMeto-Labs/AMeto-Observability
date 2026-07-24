@@ -44,10 +44,14 @@ public static class OtlpMetricMapper
     /// Turns the batch's resource attributes (env, deployment id, …) into label
     /// pairs stamped onto every data point — same behaviour as logs and traces:
     /// whatever the sender chose to put on its resource travels with the data.
-    /// Excluded: <c>service.name</c> (already the dedicated label) and the
+    /// Excluded: <c>service.name</c> (already the dedicated label), the
     /// <c>telemetry.sdk.*</c>/<c>telemetry.distro.*</c> self-description the OTel
     /// SDK injects on its own — the sender never asked for those, and an SDK
-    /// upgrade would fork every series. Point attributes win on key collision.
+    /// upgrade would fork every series — and <c>service.instance.id</c>: the SDK
+    /// mints a fresh GUID per process start, so keeping it as a label forks every
+    /// series of every metric on every restart (the dominant cardinality driver).
+    /// Logs and traces keep it — there it annotates records instead of multiplying
+    /// series. Point attributes win on key collision.
     /// </summary>
     private static List<KeyValuePair<string, string>>? ExtractResourceLabels(List<OtlpKeyValue>? attrs)
     {
@@ -58,7 +62,7 @@ public static class OtlpMetricMapper
         {
             var kv = attrs[i];
             if (kv.Key is null || kv.Value is null) continue;
-            if (kv.Key == "service.name") continue;
+            if (kv.Key is "service.name" or "service.instance.id") continue;
             if (kv.Key.StartsWith("telemetry.sdk.",    StringComparison.Ordinal) ||
                 kv.Key.StartsWith("telemetry.distro.", StringComparison.Ordinal)) continue;
             var sv = FormatLabelValue(kv.Value);
