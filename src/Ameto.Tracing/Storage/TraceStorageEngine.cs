@@ -364,6 +364,41 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                 passes, _coldSegments.Length);
     }
 
+    /// <summary>
+    /// Picks the next compaction batch: the oldest small (or legacy-v2) segments
+    /// whose combined time range stays inside a 24-hour window. Trace retention
+    /// deletes a file only when its NEWEST span is past the TTL, so an unbounded
+    /// batch span would keep old spans alive past their deadline — and a merged
+    /// file that stays small on a quiet server would keep re-merging with newer
+    /// files, advancing its MaxStartNano forever and never expiring at all.
+    /// Empty result = nothing worth compacting.
+    /// </summary>
+    internal static List<SpanSegmentInfo> SelectCompactionBatch(SpanSegmentInfo[] segments)
+    {
+        const long MaxSpanNanos = 24L * 3600 * 1_000_000_000; // 24 h
+
+        var candidates = segments
+            .Where(s => s.SpanCount < CompactionThreshold || s.FormatVersion < 3)
+            .OrderBy(s => s.MinStartNano)
+            .ToList();
+
+        // Slide a 24 h window over the ordered candidates; the first window with
+        // ≥2 members (or a lone legacy file needing migration) is the batch.
+        int start = 0;
+        while (start < candidates.Count)
+        {
+            long windowStart = candidates[start].MinStartNano;
+            var window = candidates.Skip(start)
+                .TakeWhile(s => s.MaxStartNano - windowStart <= MaxSpanNanos)
+                .Take(MaxSegmentsPerPass)
+                .ToList();
+            if (window.Count >= 2) return window;
+            if (window.Count == 1 && window[0].FormatVersion < 3) return window;
+            start += Math.Max(1, window.Count);
+        }
+        return [];
+    }
+
     private bool CompactOnePass()
     {
         // Bounded pass: take only the oldest small segments and cap the spans loaded
@@ -372,13 +407,8 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         // left the segments un-compacted — so they piled up and every pass failed worse.
         // Legacy-v2 files are selected regardless of size so old data migrates to the
         // v3 format (and shrinks) in the background.
-        var small = _coldSegments
-            .Where(s => s.SpanCount < CompactionThreshold || s.FormatVersion < 3)
-            .OrderBy(s => s.MinStartNano)   // oldest first
-            .Take(MaxSegmentsPerPass)
-            .ToList();
+        var small = SelectCompactionBatch(_coldSegments);
         if (small.Count == 0) return false;
-        if (small.Count < 2 && small.All(s => s.FormatVersion >= 3)) return false;
 
         var allSpans  = new List<SpanRecord>();
         var processed = new List<SpanSegmentInfo>(small.Count);

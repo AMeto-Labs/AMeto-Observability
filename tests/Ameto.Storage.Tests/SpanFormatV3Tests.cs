@@ -230,6 +230,43 @@ public sealed class SpanFormatV3Tests : IDisposable
             $"expected v3 ≤ ⅔ of v2, got v2={v2Size:N0} B vs v3={v3Size:N0} B");
     }
 
+    /// <summary>
+    /// Compaction batches must stay inside a 24 h window: a merged file expires
+    /// whole, and on a quiet server an ever-re-merging small file would advance
+    /// its MaxStartNano forever and never leave retention.
+    /// </summary>
+    [Fact]
+    public void CompactionBatch_RespectsTimeWindow_AndMigratesLoneLegacy()
+    {
+        const long Hour = 3600L * 1_000_000_000;
+        static SpanSegmentInfo Seg(string name, long minH, long maxH, int spans = 100, ushort ver = 3) => new()
+        {
+            FilePath = name, MinStartNano = minH * Hour, MaxStartNano = maxH * Hour,
+            SpanCount = spans, FormatVersion = ver,
+        };
+
+        // Two clusters 3 days apart → only the older cluster batches.
+        var batch = TraceStorageEngine.SelectCompactionBatch(
+        [
+            Seg("a1", 0, 1), Seg("a2", 1, 2), Seg("a3", 2, 3),
+            Seg("b1", 72, 73), Seg("b2", 73, 74),
+        ]);
+        Assert.Equal(["a1", "a2", "a3"], batch.Select(s => s.FilePath));
+
+        // Everything day-spaced and already v3 → nothing to compact.
+        Assert.Empty(TraceStorageEngine.SelectCompactionBatch(
+            [Seg("d0", 0, 1), Seg("d1", 48, 49), Seg("d2", 96, 97)]));
+
+        // A lone legacy v2 file still migrates even without neighbours.
+        var lone = TraceStorageEngine.SelectCompactionBatch(
+            [Seg("old", 0, 1, ver: 2), Seg("new", 90, 91)]);
+        Assert.Equal(["old"], lone.Select(s => s.FilePath));
+
+        // Big v3 files are never candidates.
+        Assert.Empty(TraceStorageEngine.SelectCompactionBatch(
+            [Seg("big1", 0, 1, spans: 50_000), Seg("big2", 1, 2, spans: 50_000)]));
+    }
+
     // ── Legacy v2 writer (copied from the pre-v3 SpanWriter, indices trimmed) ──
 
     private static void WriteV2File(string filePath, IList<SpanRecord> spans)

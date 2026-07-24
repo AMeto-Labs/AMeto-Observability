@@ -431,7 +431,12 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
         if (toCompact.Count >= 2)  CompactSegments(toCompact, MetricGranularity.Raw);
         MergeTier(toMerge5m, MetricGranularity.FiveMin);
-        MergeTier(toMerge1h, MetricGranularity.OneHour, maxSpan: TimeSpan.FromDays(7));
+        // A merged file expires whole (MaxNano vs the retention cutoff), so its
+        // window is also its retention granularity — never let it exceed the TTL
+        // itself, or a short retention would be violated several times over.
+        var window1h = TimeSpan.FromTicks(Math.Min(TimeSpan.FromDays(7).Ticks,
+            Interlocked.Read(ref _lastPruneTtlTicks)));
+        MergeTier(toMerge1h, MetricGranularity.OneHour, maxSpan: window1h);
         if (toRollup5m.Count > 0)  Rollup(toRollup5m, MetricGranularity.FiveMin, TimeSpan.FromMinutes(5));
         if (toRollup1h.Count > 0)  Rollup(toRollup1h, MetricGranularity.OneHour, TimeSpan.FromHours(1));
 
@@ -767,8 +772,12 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
     public string RetentionKey => "metrics";
 
+    /// <summary>Last TTL retention pruned with — bounds the 1-h merge window (default 7 days).</summary>
+    private long _lastPruneTtlTicks = TimeSpan.FromDays(7).Ticks;
+
     public Task<int> PruneAsync(TimeSpan ttl, CancellationToken ct = default)
     {
+        Interlocked.Exchange(ref _lastPruneTtlTicks, ttl.Ticks);
         var cutoffNano = DateTimeOffset.UtcNow.Subtract(ttl).ToUnixTimeMilliseconds() * 1_000_000L;
 
         List<MetricSegmentInfo> toDelete;
