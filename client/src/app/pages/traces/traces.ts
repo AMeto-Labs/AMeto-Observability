@@ -431,28 +431,44 @@ export class TracesComponent implements OnInit, OnDestroy {
     tqlKey: string | null;
     /** CLEF key for the "Find in logs" cross; null hides the cross item. */
     logKey: string | null;
+    /** Epoch ms when the value is a date/timestamp — enables the Seek section. */
+    seekMs: number | null;
     x: number;
     y: number;
   } | null>(null);
 
   /** Menu for an arbitrary span attribute (Tags table): searchable + logs cross. */
   openAttrMenu(ev: MouseEvent, key: string, value: unknown): void {
-    this.openMenuAt(ev, { key, value: String(value), tqlKey: `.${key}`, logKey: key });
+    const s = String(value);
+    this.openMenuAt(ev, { key, value: s, tqlKey: `.${key}`, logKey: key, seekMs: parseDateMs(s) });
   }
 
   /**
    * Menu for a left-column span field. `tqlKey` null = copy-only (e.g. Span ID,
-   * Parent, Start, Duration); `logKey` null = no logs cross.
+   * Parent, Duration); `logKey` null = no logs cross; `seekMs` set for timestamps.
    */
-  openFieldMenu(ev: MouseEvent, key: string, value: unknown, tqlKey: string | null, logKey: string | null): void {
-    this.openMenuAt(ev, { key, value: String(value), tqlKey, logKey });
+  openFieldMenu(ev: MouseEvent, key: string, value: unknown, tqlKey: string | null, logKey: string | null, seekMs: number | null = null): void {
+    this.openMenuAt(ev, { key, value: String(value), tqlKey, logKey, seekMs });
   }
 
-  private openMenuAt(ev: MouseEvent, m: { key: string; value: string; tqlKey: string | null; logKey: string | null }): void {
+  private openMenuAt(ev: MouseEvent, m: { key: string; value: string; tqlKey: string | null; logKey: string | null; seekMs: number | null }): void {
     ev.stopPropagation();
     const x = Math.min(ev.clientX, window.innerWidth - 240);
     const y = Math.min(ev.clientY, window.innerHeight - 290);
     this.attrMenu.set({ ...m, x, y });
+  }
+
+  /** Seek the time range to the field's timestamp ± N seconds. */
+  attrSeek(seconds: number): void {
+    const m = this.attrMenu();
+    if (m?.seekMs == null) return;
+    this.attrMenu.set(null);
+    this.preset = 'custom';
+    this.customFrom = msToLocal(m.seekMs - seconds * 1000);
+    this.customTo   = msToLocal(m.seekMs + seconds * 1000);
+    this.syncUrl();
+    this.setWindow();
+    this.loadAll();
   }
 
   @HostListener('document:click')
@@ -729,6 +745,19 @@ function localToIso(local: string): string {
   if (!local) return '';
   const d = new Date(local);
   return isNaN(d.getTime()) ? '' : d.toISOString();
+}
+
+/** Recognises an ISO-8601-ish date string and returns its epoch ms, else null. */
+function parseDateMs(v: string): number | null {
+  if (!/^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/.test(v)) return null;
+  const ms = Date.parse(v);
+  return isNaN(ms) ? null : ms;
+}
+
+/** epoch ms → "yyyy-MM-ddTHH:mm:ss" in LOCAL time (datetime-local with seconds). */
+function msToLocal(ms: number): string {
+  const d = new Date(ms - new Date(ms).getTimezoneOffset() * 60_000);
+  return d.toISOString().slice(0, 19);
 }
 
 function fmtMs(ms: number): string {

@@ -452,7 +452,7 @@
                   </div>
                   <div class="sd-field">
                     <span class="sd-key">
-                      <button class="tag-menu-btn" (click)="openFieldMenu($event, 'Start', fmtTraceTime(span.startTimeUnixNano), null, null)" title="Copy">
+                      <button class="tag-menu-btn" (click)="openFieldMenu($event, 'Start', fmtTraceTime(span.startTimeUnixNano), null, null, span.startTimeUnixNano / 1000000)" title="Seek / copy">
                         <lucide-icon name="list-filter" [size]="12" />
                       </button>
                       Start
@@ -602,9 +602,11 @@
   <app-property-menu
     [x]="m.x" [y]="m.y" [propKey]="m.key" [propValue]="m.value"
     [findable]="!!m.tqlKey"
+    [seekable]="m.seekMs != null"
     [crossLabel]="m.logKey ? 'Find in logs' : null"
     (copyValue)="attrCopy('value')"
     (copyKey)="attrCopy('key')"
+    (seek)="attrSeek($event)"
     (search)="attrFind($event)"
     (andExpr)="attrExpr('&&', $event)"
     (orExpr)="attrExpr('||', $event)"

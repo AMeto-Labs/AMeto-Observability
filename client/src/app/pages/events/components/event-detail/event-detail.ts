@@ -612,6 +612,26 @@ export class EventDetailComponent {
   }
 
   // ── Shared property menu (scalar props) → CLEF filter composition ─────────
+
+  /** Epoch ms when the active property's value is an ISO date, else null. */
+  propSeekMs = computed<number | null>(() => {
+    const v = this.propMenu()?.entry.value;
+    if (!v || !/^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/.test(v)) return null;
+    const ms = Date.parse(v);
+    return isNaN(ms) ? null : ms;
+  });
+
+  /** Seek the parent time range to this date-valued property ± N seconds. */
+  propSeek(seconds: number): void {
+    const ms = this.propSeekMs();
+    if (ms == null) return;
+    this.seekRequested.emit({
+      from: new Date(ms - seconds * 1000),
+      to:   new Date(ms + seconds * 1000),
+    });
+    this.propMenu.set(null);
+  }
+
   private propPredicate(neq: boolean): string {
     const m = this.propMenu();
     if (!m) return '';

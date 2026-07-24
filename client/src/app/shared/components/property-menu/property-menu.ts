@@ -28,11 +28,15 @@ export class PropertyMenuComponent {
   readonly propValue = input<string>('');
   /** Show the Find section (Search / And / Or). Copy-only fields pass false. */
   readonly findable = input<boolean>(true);
+  /** Show the "Seek window (±)" section — set when the value is a date/timestamp. */
+  readonly seekable = input<boolean>(false);
   /** Label for the cross-signal item; null hides it. */
   readonly crossLabel = input<string | null>(null);
 
   readonly copyValue = output<void>();
   readonly copyKey = output<void>();
+  /** Seek the time range to value ± N seconds (payload: seconds). */
+  readonly seek = output<number>();
   /** Replace the current query with `key (=|≠) value`. */
   readonly search = output<boolean>();   // payload: neq
   /** Append `&& key (=|≠) value` to the current query. */
