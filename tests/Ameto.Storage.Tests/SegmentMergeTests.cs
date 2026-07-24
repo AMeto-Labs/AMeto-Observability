@@ -211,6 +211,37 @@ public sealed class SegmentMergeTests : IAsyncLifetime
         Assert.Equal(before[^1].Id, after[^1].Id);
     }
 
+    /// <summary>
+    /// One merge pass must consume only a bounded slice of the backlog. The batch
+    /// is held in managed memory, copied into a native tier and then indexed as a
+    /// whole, so peak RSS scales with it — an unbounded batch produced ~1 GB
+    /// spikes on a live server. A big backlog must therefore take several passes.
+    /// </summary>
+    [Fact]
+    public async Task Merge_BoundsBatchSize_SoPeakMemoryStaysFlat()
+    {
+        // 40 segments x 500 events x ~2 KB props ≈ 40 MB payload — above the 32 MB
+        // per-batch budget, so a single pass cannot swallow it all.
+        for (int round = 0; round < 40; round++)
+            await WriteSegmentAsync(round, 500, padBytes: 2048);
+        int before = _engine.ListSegments().Count;
+        Assert.Equal(40, before);
+
+        long allocBefore = GC.GetTotalAllocatedBytes(precise: false);
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None));
+        long allocMb = (GC.GetTotalAllocatedBytes(precise: false) - allocBefore) / 1048576;
+
+        var segs = _engine.ListSegments();
+        var merged = segs.OrderByDescending(s => s.EventCount).First();
+
+        // The merged output is capped (≈32 MB of ~2 KB events ⇒ well under 100k),
+        // and sources are left over for the next pass rather than all consumed.
+        Assert.True(merged.EventCount <= 100_000, $"merged {merged.EventCount} events — batch cap not honoured");
+        Assert.True(segs.Count > 1, "one pass consumed the entire backlog — batch is unbounded");
+        // Allocation stays in the same envelope as a normal flush, not multiples of it.
+        Assert.True(allocMb < 150, $"merge allocated {allocMb} MB in one pass (batch budget breached)");
+    }
+
     /// <summary>A merged file can only expire whole — batches must not span more than a day.</summary>
     [Fact]
     public async Task Merge_RespectsTimeSpanCap()
