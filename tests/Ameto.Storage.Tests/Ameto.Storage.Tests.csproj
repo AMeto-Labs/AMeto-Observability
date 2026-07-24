@@ -22,6 +22,7 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\Ameto.Core\Ameto.Core.csproj" />
     <ProjectReference Include="..\..\src\Ameto.Storage\Ameto.Storage.csproj" />
+    <ProjectReference Include="..\..\src\Ameto.Metrics\Ameto.Metrics.csproj" />
   </ItemGroup>
 
 </Project>

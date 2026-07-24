@@ -3,11 +3,16 @@ using MessagePack;
 
 namespace Ameto.Metrics.Storage;
 
+/// <summary>
+/// Reads <c>.mts</c> files — both the current v3 format (whole-file LZ4-HC
+/// section, ms-delta timestamps, kind-aware points) and the legacy v2 format
+/// (per-series LZ4 blocks, absolute nanosecond timestamps). v2 files are
+/// rewritten to v3 by the background compaction; v1 files are deleted on load.
+/// </summary>
 internal static class MetricReader
 {
     private const uint   Magic       = 0x52_44_4D_54; // "RDMT"
     private const uint   FooterMagic = 0x52_44_4D_46; // "RDMF"
-    private const ushort Version     = 2;
 
     public static MetricSegmentInfo ReadSegmentInfo(string filePath)
     {
@@ -18,7 +23,7 @@ internal static class MetricReader
         if (magic != Magic) throw new InvalidDataException($"Invalid .mts magic in {filePath}");
 
         ushort version = br.ReadUInt16();
-        if (version != Version) throw new InvalidDataException($"Unsupported .mts version {version} (expected {Version}) in {filePath}");
+        if (version is not (2 or 3)) throw new InvalidDataException($"Unsupported .mts version {version} in {filePath}");
         var granularity = (MetricGranularity)br.ReadByte();
         br.ReadUInt32();  // seriesCount
         long minNano = br.ReadInt64();
@@ -33,11 +38,12 @@ internal static class MetricReader
 
         return new MetricSegmentInfo
         {
-            FilePath    = filePath,
-            MetricName  = metricName,
-            MinNano     = minNano,
-            MaxNano     = maxNano,
-            Granularity = granularity,
+            FilePath      = filePath,
+            MetricName    = metricName,
+            MinNano       = minNano,
+            MaxNano       = maxNano,
+            Granularity   = granularity,
+            FormatVersion = version,
         };
     }
 
@@ -62,11 +68,12 @@ internal static class MetricReader
 
             yield return new MetricSeries
             {
-                Name   = series.Name,
-                Kind   = series.Kind,
-                Unit   = series.Unit,
-                Labels = series.Labels,
-                Points = filtered,
+                Name         = series.Name,
+                Kind         = series.Kind,
+                Unit         = series.Unit,
+                Labels       = series.Labels,
+                BucketBounds = series.BucketBounds,
+                Points       = filtered,
             };
         }
         await Task.CompletedTask;
@@ -81,7 +88,7 @@ internal static class MetricReader
         if (magic != Magic) yield break;
 
         ushort version = br.ReadUInt16();
-        if (version != Version) yield break; // v1 — incompatible, skipped (deleted on load)
+        if (version is not (2 or 3)) yield break; // v1 — incompatible, skipped (deleted on load)
         br.ReadByte();   // granularity
         int seriesCount = (int)br.ReadUInt32();
         br.ReadInt64();  // minNano
@@ -96,26 +103,58 @@ internal static class MetricReader
         ushort nameLen = br.ReadUInt16();
         string metricName = System.Text.Encoding.UTF8.GetString(br.ReadBytes(nameLen));
 
-        // Read blocks
         // Reset to after header (28 bytes)
         fs.Seek(28, SeekOrigin.Begin);
-        for (int i = 0; i < seriesCount && fs.Position < nameIdxOffset; i++)
-        {
-            uint uncompSize = br.ReadUInt32();
-            uint compSize   = br.ReadUInt32();
-            var  compBytes  = br.ReadBytes((int)compSize);
-            var  raw        = LZ4Pickler.Unpickle(compBytes);
 
-            var series = DeserializeSeries(metricName, raw);
-            if (series is not null) yield return series;
+        if (version == 3)
+        {
+            // One LZ4 block holding every series back to back.
+            br.ReadUInt32(); // uncompSize
+            uint compSize = br.ReadUInt32();
+            var  raw      = LZ4Pickler.Unpickle(br.ReadBytes((int)compSize));
+
+            foreach (var series in DeserializeSection(metricName, raw, seriesCount))
+                yield return series;
+        }
+        else
+        {
+            // v2: per-series LZ4 blocks.
+            for (int i = 0; i < seriesCount && fs.Position < nameIdxOffset; i++)
+            {
+                br.ReadUInt32(); // uncompSize
+                uint compSize = br.ReadUInt32();
+                var  raw      = LZ4Pickler.Unpickle(br.ReadBytes((int)compSize));
+
+                var series = DeserializeOne(metricName, raw, deltaMs: false);
+                if (series is not null) yield return series;
+            }
         }
     }
 
     // ── Internals ─────────────────────────────────────────────────────────────
 
-    private static MetricSeries? DeserializeSeries(string metricName, byte[] raw)
+    /// <summary>Parses every series out of a decompressed v3 section (ref-struct reader kept out of the iterator).</summary>
+    private static List<MetricSeries> DeserializeSection(string metricName, byte[] raw, int seriesCount)
+    {
+        var result = new List<MetricSeries>(seriesCount);
+        var r = new MessagePackReader(raw);
+        for (int i = 0; i < seriesCount && !r.End; i++)
+        {
+            var series = DeserializeSeries(metricName, ref r, deltaMs: true);
+            if (series is not null) result.Add(series);
+        }
+        return result;
+    }
+
+    /// <summary>Parses a single v2 series block.</summary>
+    private static MetricSeries? DeserializeOne(string metricName, byte[] raw, bool deltaMs)
     {
         var r = new MessagePackReader(raw);
+        return DeserializeSeries(metricName, ref r, deltaMs);
+    }
+
+    private static MetricSeries? DeserializeSeries(string metricName, ref MessagePackReader r, bool deltaMs)
+    {
         int fields = r.ReadMapHeader();
 
         MetricKind kind    = MetricKind.Counter;
@@ -133,8 +172,29 @@ internal static class MetricReader
                 case "u":    unit   = r.ReadString() ?? string.Empty; break;
                 case "lbs":  labels = ReadLabels(ref r); break;
                 case "bnds": bounds = ReadBounds(ref r); break;
-                case "pts":  points = ReadPoints(ref r); break;
+                case "pts":  points = deltaMs ? ReadPointsV3(ref r) : ReadPointsV2(ref r); break;
                 default:     r.Skip(); break;
+            }
+        }
+
+        // v3 stores idle histogram points (count=0, sum=0, all buckets 0) in the
+        // slim scalar shape; reconstruct their all-zero bucket arrays here so the
+        // roundtrip is lossless and delta chains in the aggregator stay intact.
+        // One shared array per series — nothing downstream mutates BucketCounts.
+        if (deltaMs && kind == MetricKind.Histogram && bounds is not null && points.Count > 0)
+        {
+            long[]? zeros = null;
+            for (int i = 0; i < points.Count; i++)
+            {
+                var p = points[i];
+                if (p.BucketCounts is not null || p.Count != 0 || p.Sum != 0) continue;
+                zeros   ??= new long[bounds.Length + 1];
+                points[i] = new MetricDataPoint
+                {
+                    TimestampUnixNano = p.TimestampUnixNano,
+                    Value             = p.Value,
+                    BucketCounts      = zeros,
+                };
             }
         }
 
@@ -171,7 +231,55 @@ internal static class MetricReader
         return new LabelSet(pairs);
     }
 
-    private static List<MetricDataPoint> ReadPoints(ref MessagePackReader r)
+    /// <summary>
+    /// v3 points: ms-delta timestamps; a 2-element (slim) point inherits the
+    /// previous point's histogram state (count / sum / buckets) — for scalar
+    /// series that state is always zero, for histograms it run-length-encodes
+    /// idle stretches losslessly.
+    /// </summary>
+    private static List<MetricDataPoint> ReadPointsV3(ref MessagePackReader r)
+    {
+        int count  = r.ReadArrayHeader();
+        var pts    = new List<MetricDataPoint>(count);
+        long ms    = 0;
+        long    cnt = 0;
+        double  sum = 0;
+        long[]? buckets = null;
+        for (int i = 0; i < count; i++)
+        {
+            int n = r.ReadArrayHeader(); // 2 = slim (state unchanged), 5 = full
+            ms = i == 0 ? r.ReadInt64() : ms + r.ReadInt64();
+
+            double val = r.ReadDouble(); // transparently accepts msgpack ints
+            if (n >= 5)
+            {
+                cnt = r.ReadInt64();
+                sum = r.ReadDouble();
+                if (r.TryReadNil())
+                {
+                    buckets = null; // state set but no buckets recorded
+                }
+                else
+                {
+                    int bn = r.ReadArrayHeader();
+                    buckets = new long[bn];
+                    for (int j = 0; j < bn; j++) buckets[j] = r.ReadInt64();
+                }
+            }
+            pts.Add(new MetricDataPoint
+            {
+                TimestampUnixNano = ms * 1_000_000,
+                Value             = val,
+                Count             = cnt,
+                Sum               = sum,
+                BucketCounts      = buckets, // shared with the previous point when slim — nothing mutates it
+            });
+        }
+        return pts;
+    }
+
+    /// <summary>v2 points: absolute nanosecond timestamps; always 5 fields.</summary>
+    private static List<MetricDataPoint> ReadPointsV2(ref MessagePackReader r)
     {
         int count = r.ReadArrayHeader();
         var pts   = new List<MetricDataPoint>(count);
