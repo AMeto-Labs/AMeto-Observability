@@ -205,6 +205,12 @@ public sealed class UpdateChecker(
             if (installer is null) return (false, $"Release {latest.Tag} has no linux-x64 archive asset.");
         }
 
+        // Fail closed: without the checksums asset the download cannot be verified,
+        // and running an unverified binary is a remote-code-execution risk. Refuse
+        // rather than silently skipping verification.
+        if (sums is null)
+            return (false, $"Release {latest.Tag} has no SHA256SUMS asset — refusing an unverifiable update.");
+
         _phase     = UpdatePhase.Downloading;
         _dlVersion = latest.Tag;
         _dlError   = null;
@@ -240,7 +246,9 @@ public sealed class UpdateChecker(
                 }
             }
 
-            if (sums is not null && !await VerifySha256Async(path, installer.Name, sums.DownloadUrl, cts.Token).ConfigureAwait(false))
+            // sums is guaranteed non-null (StartDownload fails closed otherwise);
+            // the null check keeps this defensive if the worker is ever reused.
+            if (sums is null || !await VerifySha256Async(path, installer.Name, sums.DownloadUrl, cts.Token).ConfigureAwait(false))
             {
                 File.Delete(path);
                 _dlError = "Checksum verification failed — download discarded.";
