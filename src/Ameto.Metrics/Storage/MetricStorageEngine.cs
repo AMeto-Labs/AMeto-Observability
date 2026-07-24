@@ -31,7 +31,10 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 {
     // ── Configuration ─────────────────────────────────────────────────────────
     private const int HotFlushThreshold    = 500_000;   // total points before forced flush
-    private const int FlushIntervalSeconds  = 300;        // 5 minutes
+    // 60 s bounds the crash data-loss window to about a minute (the hot tier has
+    // no WAL); traces flush every 30 s, logs are WAL-protected. The raw-file churn
+    // this causes is absorbed by the per-pass raw compaction in the rollup loop.
+    private const int FlushIntervalSeconds  = 60;
     private const int MaxLabelValuesPerKey  = 2_000;      // cap to bound catalog memory
 
     // ── Hot tier ─────────────────────────────────────────────────────────────
