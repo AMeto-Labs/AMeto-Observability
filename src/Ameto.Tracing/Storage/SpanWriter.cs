@@ -28,26 +28,33 @@ namespace Ameto.Tracing.Storage;
 ///       Blocks decompress independently — the delta chain restarts per block.
 ///       attrs are written inline (typed msgpack values), not as a nested blob.
 ///
-///   [TraceId Index]
-///     traceCount uint32
-///     per trace: traceId 16B | offsetCount uint32 | offsets uint32[]
+///   [TraceId Index — one LZ4 block]
+///     uncompSize uint32 | compSize uint32 | LZ4 bytes of:
+///       traceCount uint32
+///       per trace: traceId 16B | offsetCount uint32 | offsets uint32[]
 ///
 ///   [Service Index]
 ///     serviceCount uint32
 ///     per service: nameLen uint16 | name UTF-8 | blockCount uint32 | blockIndices uint32[]
 ///
-///   [Footer — 20 bytes]
+///   [Bloom Index — per-block attribute blooms, see SpanBloom]
+///     blockCount uint32
+///     per block: byteLen uint32 | bitset bytes (0 bytes ⇒ no bloom, never skip)
+///
+///   [Footer — 28 bytes]
 ///     traceIdxOffset uint64
 ///     svcIdxOffset   uint64
+///     bloomIdxOffset uint64
 ///     footerMagic    uint32  "RDTF"
 /// </code>
 /// <para>
 /// v3 versus v2: positional arrays replace string-keyed maps (~40 B of repeated
 /// key strings per span gone), timestamps are block-local deltas instead of
 /// 9-byte absolutes, attributes serialize inline (no per-span nested buffer),
-/// root spans store nil instead of an 8-byte zero parent id, and blocks use
-/// LZ4-HC. v2 files remain readable (see <see cref="SpanReader"/>) and migrate
-/// to v3 through the background compaction in <see cref="TraceStorageEngine"/>.
+/// root spans store nil instead of an 8-byte zero parent id, blocks use LZ4-HC,
+/// the trace index is compressed, and per-block attribute blooms let TraceQL
+/// skip blocks. v2 files remain readable (see <see cref="SpanReader"/>) and
+/// migrate to v3 through the background compaction in <see cref="TraceStorageEngine"/>.
 /// </para>
 /// </summary>
 internal static class SpanWriter
@@ -93,29 +100,39 @@ internal static class SpanWriter
         // ── Span blocks ────────────────────────────────────────────────────────
         int written = 0;
         var scratch = new byte[1024 * 1024];
+        var blooms  = new List<byte[]>();
 
         while (written < spans.Count)
         {
             int batchCount = Math.Min(BlockSize, spans.Count - written);
             uint blockIdx  = (uint)(written / BlockSize);
             var block      = WriteBlock(spans, written, batchCount, scratch, blockIdx,
-                                        traceIndex, svcBlockMap, svcStats);
+                                        traceIndex, svcBlockMap, svcStats, blooms);
             bw.Write((uint)block.UncompressedSize);
             bw.Write((uint)block.CompressedBytes.Length);
             bw.Write(block.CompressedBytes);
             written += batchCount;
         }
 
-        // ── TraceId index ──────────────────────────────────────────────────────
+        // ── TraceId index (one LZ4 block) ──────────────────────────────────────
         long traceIdxOffset = fs.Position;
-        bw.Write((uint)traceIndex.Count);
-        Span<byte> traceIdBuf = stackalloc byte[16];
-        foreach (var (traceId, offsets) in traceIndex)
         {
-            traceId.WriteTo(traceIdBuf);
-            bw.Write(traceIdBuf);
-            bw.Write((uint)offsets.Count);
-            foreach (var o in offsets) bw.Write(o);
+            var idxBuf = new MemoryStream(traceIndex.Count * 32);
+            var idxBw  = new BinaryWriter(idxBuf);
+            Span<byte> traceIdBuf = stackalloc byte[16];
+            idxBw.Write((uint)traceIndex.Count);
+            foreach (var (traceId, offsets) in traceIndex)
+            {
+                traceId.WriteTo(traceIdBuf);
+                idxBw.Write(traceIdBuf);
+                idxBw.Write((uint)offsets.Count);
+                foreach (var o in offsets) idxBw.Write(o);
+            }
+            var raw        = idxBuf.ToArray();
+            var compressed = LZ4Pickler.Pickle(raw, LZ4Level.L09_HC);
+            bw.Write((uint)raw.Length);
+            bw.Write((uint)compressed.Length);
+            bw.Write(compressed);
         }
 
         // ── Service index ──────────────────────────────────────────────────────
@@ -130,9 +147,19 @@ internal static class SpanWriter
             foreach (var b in blocks) bw.Write(b);
         }
 
-        // ── Footer (20 bytes) ──────────────────────────────────────────────────
+        // ── Bloom index ────────────────────────────────────────────────────────
+        long bloomIdxOffset = fs.Position;
+        bw.Write((uint)blooms.Count);
+        foreach (var b in blooms)
+        {
+            bw.Write((uint)b.Length);
+            bw.Write(b);
+        }
+
+        // ── Footer (28 bytes) ──────────────────────────────────────────────────
         bw.Write((ulong)traceIdxOffset);
         bw.Write((ulong)svcIdxOffset);
+        bw.Write((ulong)bloomIdxOffset);
         bw.Write(FooterMagic);
 
         // ── .stats sidecar ─────────────────────────────────────────────────────
@@ -169,7 +196,8 @@ internal static class SpanWriter
         uint                                     blockIdx,
         Dictionary<TraceId, List<uint>>          traceIndex,
         Dictionary<string, SortedSet<uint>>      svcBlockMap,
-        Dictionary<string, MutableServiceStats>  svcStats)
+        Dictionary<string, MutableServiceStats>  svcStats,
+        List<byte[]>                             blooms)
     {
         var bufWriter = new System.Buffers.ArrayBufferWriter<byte>(scratch.Length);
         var writer    = new MessagePackWriter(bufWriter);
@@ -177,6 +205,7 @@ internal static class SpanWriter
 
         Span<byte> idBuf = stackalloc byte[16];
         long prevTs = 0;
+        var bloomHashes = new HashSet<ulong>();
 
         for (int i = 0; i < count; i++)
         {
@@ -242,10 +271,18 @@ internal static class SpanWriter
             writer.Write(s.HttpStatusCode);
 
             if (s.Attributes is { Count: > 0 } attrs)
+            {
                 WriteAttributes(ref writer, attrs);
+                foreach (var (k, v) in attrs)
+                    SpanBloom.AddAttr(bloomHashes, k, v);
+            }
             else
+            {
                 writer.WriteNil();
+            }
         }
+
+        blooms.Add(SpanBloom.Build(bloomHashes));
 
         writer.Flush();
         var raw        = bufWriter.WrittenSpan.ToArray();

@@ -32,7 +32,7 @@ internal static class SpanReader
         long minNano   = br.ReadInt64();
         long maxNano   = br.ReadInt64();
 
-        var (_, svcIdxOffset) = ReadFooter(fs, br);
+        var (_, svcIdxOffset, _) = ReadFooter(fs, br, version);
         var services = ReadServicesFromIndex(fs, br, svcIdxOffset);
 
         return new SpanSegmentInfo
@@ -76,6 +76,7 @@ internal static class SpanReader
         short?           httpStatusCode,
         long?            minDurationNanos,
         long?            maxDurationNanos,
+        IReadOnlyList<AttrHint>? attrHints,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct)
     {
         // Use service index to skip blocks that cannot contain the target service.
@@ -84,6 +85,19 @@ internal static class SpanReader
         {
             allowedBlocks = ReadServiceBlockIndices(filePath, serviceName);
             if (allowedBlocks.Count == 0) yield break;
+        }
+
+        // v3 per-block attribute blooms: drop blocks that cannot satisfy every
+        // required attribute predicate (key presence / string equality).
+        if (attrHints is { Count: > 0 })
+        {
+            var bloomAllowed = BloomFilterBlocks(filePath, attrHints);
+            if (bloomAllowed is not null)
+            {
+                if (allowedBlocks is null) allowedBlocks = bloomAllowed;
+                else allowedBlocks.IntersectWith(bloomAllowed);
+                if (allowedBlocks.Count == 0) yield break;
+            }
         }
 
         var spans = ReadSpansFromFile(filePath, allowedBlocks);
@@ -170,7 +184,7 @@ internal static class SpanReader
         br.ReadInt64();  // maxNano
         br.ReadByte();   // flags
 
-        var (traceIdxOffset, _) = ReadFooter(fs, br);
+        var (traceIdxOffset, _, _) = ReadFooter(fs, br, version);
         fs.Seek(27, SeekOrigin.Begin);
 
         var result = new List<SpanRecord>(Math.Min(spanCount, 100_000));
@@ -237,7 +251,7 @@ internal static class SpanReader
         br.ReadInt64();  // maxNano
         br.ReadByte();   // flags
 
-        var (traceIdxOffset, _) = ReadFooter(fs, br);
+        var (traceIdxOffset, _, _) = ReadFooter(fs, br, version);
         fs.Seek(27, SeekOrigin.Begin); // reset to after header
 
         int capacity = allowedBlocks is null ? spanCount : spanCount / 2;
@@ -281,13 +295,42 @@ internal static class SpanReader
         using var fs = OpenRead(filePath);
         using var br = new BinaryReader(fs);
 
-        var (traceIdxOffset, _) = ReadFooter(fs, br);
+        ushort version = ReadVersion(fs, br);
+        var (traceIdxOffset, _, _) = ReadFooter(fs, br, version);
         fs.Seek(traceIdxOffset, SeekOrigin.Begin);
 
-        uint traceCount = br.ReadUInt32();
-        var  idBuf      = new byte[16];
+        if (version >= 3)
+        {
+            // v3: the index is one LZ4 block — decompress, then scan.
+            br.ReadUInt32(); // uncompSize
+            uint compSize = br.ReadUInt32();
+            var  raw      = LZ4Pickler.Unpickle(br.ReadBytes((int)compSize));
 
-        for (uint i = 0; i < traceCount; i++)
+            int pos = 0;
+            uint traceCount = BinaryPrimitives.ReadUInt32LittleEndian(raw.AsSpan(pos)); pos += 4;
+            for (uint i = 0; i < traceCount; i++)
+            {
+                var candidate = TraceId.Parse(raw.AsSpan(pos, 16)); pos += 16;
+                uint offsetCnt = BinaryPrimitives.ReadUInt32LittleEndian(raw.AsSpan(pos)); pos += 4;
+                if (candidate.Equals(traceId))
+                {
+                    var offsets = new List<uint>((int)offsetCnt);
+                    for (uint j = 0; j < offsetCnt; j++)
+                    {
+                        offsets.Add(BinaryPrimitives.ReadUInt32LittleEndian(raw.AsSpan(pos)));
+                        pos += 4;
+                    }
+                    return offsets;
+                }
+                pos += (int)offsetCnt * 4;
+            }
+            return [];
+        }
+
+        uint count = br.ReadUInt32();
+        var  idBuf = new byte[16];
+
+        for (uint i = 0; i < count; i++)
         {
             br.Read(idBuf, 0, 16);
             var candidate  = TraceId.Parse(idBuf);
@@ -304,13 +347,54 @@ internal static class SpanReader
         return [];
     }
 
+    /// <summary>
+    /// Blocks whose attribute bloom may satisfy every hint, or null when the file
+    /// has no usable bloom index (v2 file / empty blooms) — null means "no skip".
+    /// </summary>
+    private static HashSet<uint>? BloomFilterBlocks(string filePath, IReadOnlyList<AttrHint> hints)
+    {
+        using var fs = OpenRead(filePath);
+        using var br = new BinaryReader(fs);
+
+        ushort version = ReadVersion(fs, br);
+        if (version < 3) return null;
+        var (_, _, bloomIdxOffset) = ReadFooter(fs, br, version);
+        if (bloomIdxOffset <= 0) return null;
+        fs.Seek(bloomIdxOffset, SeekOrigin.Begin);
+
+        // Pre-hash the hints once.
+        Span<ulong> hashes = stackalloc ulong[Math.Min(hints.Count, 16)];
+        int nHints = Math.Min(hints.Count, hashes.Length);
+        for (int i = 0; i < nHints; i++)
+        {
+            var h = hints[i];
+            hashes[i] = h.LowerValue is null
+                ? SpanBloom.HashKey(h.Key)
+                : SpanBloom.HashKeyValue(h.Key, h.LowerValue);
+        }
+
+        uint blockCount = br.ReadUInt32();
+        var allowed = new HashSet<uint>((int)blockCount);
+        for (uint b = 0; b < blockCount; b++)
+        {
+            uint len = br.ReadUInt32();
+            var bitset = len > 0 ? br.ReadBytes((int)len) : [];
+            bool pass = true;
+            for (int i = 0; i < nHints && pass; i++)
+                pass = SpanBloom.MayContain(bitset, hashes[i]);
+            if (pass) allowed.Add(b);
+        }
+        return allowed;
+    }
+
     /// <returns>0-based block indices containing at least one span from <paramref name="serviceName"/>.</returns>
     private static HashSet<uint> ReadServiceBlockIndices(string filePath, string serviceName)
     {
         using var fs = OpenRead(filePath);
         using var br = new BinaryReader(fs);
 
-        var (_, svcIdxOffset) = ReadFooter(fs, br);
+        ushort version = ReadVersion(fs, br);
+        var (_, svcIdxOffset, _) = ReadFooter(fs, br, version);
         fs.Seek(svcIdxOffset, SeekOrigin.Begin);
 
         uint svcCount = br.ReadUInt32();
@@ -346,16 +430,29 @@ internal static class SpanReader
         return services;
     }
 
-    // ── Footer (20 bytes) ──────────────────────────────────────────────────────
+    // ── Footer (v2: 20 bytes, v3: 28 bytes — extra bloom-index offset) ────────
 
-    private static (long traceIdxOffset, long svcIdxOffset) ReadFooter(FileStream fs, BinaryReader br)
+    private static (long traceIdxOffset, long svcIdxOffset, long bloomIdxOffset) ReadFooter(
+        FileStream fs, BinaryReader br, ushort version)
     {
-        fs.Seek(-20, SeekOrigin.End);
+        int size = version >= 3 ? 28 : 20;
+        fs.Seek(-size, SeekOrigin.End);
         long traceIdx = (long)br.ReadUInt64();
         long svcIdx   = (long)br.ReadUInt64();
+        long bloomIdx = version >= 3 ? (long)br.ReadUInt64() : 0;
         uint magic    = br.ReadUInt32();
         if (magic != FooterMagic) throw new InvalidDataException($"Invalid .trc footer magic in {fs.Name}");
-        return (traceIdx, svcIdx);
+        return (traceIdx, svcIdx, bloomIdx);
+    }
+
+    /// <summary>Reads just the format version from the header of an open stream, restoring position.</summary>
+    private static ushort ReadVersion(FileStream fs, BinaryReader br)
+    {
+        long pos = fs.Position;
+        fs.Seek(4, SeekOrigin.Begin);
+        ushort v = br.ReadUInt16();
+        fs.Seek(pos, SeekOrigin.Begin);
+        return v;
     }
 
     // ── Span deserialisation ───────────────────────────────────────────────────

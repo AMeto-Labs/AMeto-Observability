@@ -191,6 +191,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         long?             maxDurationNanos = null,
         short?            httpStatusCode   = null,
         int               limit            = 200,
+        IReadOnlyList<AttrHint>? attrHints = null,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
         long fromNano = from.HasValue ? from.Value.ToUnixTimeMilliseconds() * 1_000_000L : long.MinValue;
@@ -246,7 +247,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             await using var e = SpanReader.SearchAsync(
                 seg.FilePath, fromNano, toNano,
                 serviceName, spanName, status, httpStatusCode,
-                minDurationNanos, maxDurationNanos, ct).GetAsyncEnumerator(ct);
+                minDurationNanos, maxDurationNanos, attrHints, ct).GetAsyncEnumerator(ct);
             while (true)
             {
                 SpanRecord r;
@@ -678,7 +679,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                 // (bounded per segment). Such segments vanish as retention/compaction ages them out.
                 var legacy = new Dictionary<TraceId, HotVolAcc>();
                 await foreach (var s in SpanReader.SearchAsync(
-                    seg.FilePath, fromNano, toNano, null, null, null, null, null, null, ct))
+                    seg.FilePath, fromNano, toNano, null, null, null, null, null, null, null, ct))
                     AccumulateVolume(legacy, s);
                 foreach (var a in legacy.Values) Add(a.HasRoot ? a.RootStart : a.Earliest, 1, a.Err ? 1u : 0u);
             }
@@ -763,7 +764,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                 // Legacy segment — fall back to the span read (bounded by segment + filters).
                 await foreach (var s in SpanReader.SearchAsync(
                     seg.FilePath, fromNano, toNano, serviceName, spanName, status, null,
-                    minDurationNanos, maxDurationNanos, ct))
+                    minDurationNanos, maxDurationNanos, null, ct))
                     MergeSpanInto(merged, s);
             }
         }

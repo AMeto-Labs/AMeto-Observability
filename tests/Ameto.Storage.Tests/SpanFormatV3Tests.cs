@@ -158,12 +158,40 @@ public sealed class SpanFormatV3Tests : IDisposable
         var svcExpected = corpus.Count(s => s.ServiceName == "MintRoute.API");
         int svcGot = 0;
         await foreach (var s in SpanReader.SearchAsync(info.FilePath, long.MinValue, long.MaxValue,
-                           "MintRoute.API", null, null, null, null, null, CancellationToken.None))
+                           "MintRoute.API", null, null, null, null, null, null, CancellationToken.None))
         {
             Assert.Equal("MintRoute.API", s.ServiceName);
             svcGot++;
         }
         Assert.Equal(svcExpected, svcGot);
+    }
+
+    [Fact]
+    public async Task V3_AttributeBloom_SkipsAndNeverDropsMatches()
+    {
+        var corpus = Corpus(80, 6);
+        var info   = SpanWriter.Write(_dir, corpus);
+
+        async Task<int> CountWithHints(params AttrHint[] hints)
+        {
+            int n = 0;
+            await foreach (var _ in SpanReader.SearchAsync(info.FilePath, long.MinValue, long.MaxValue,
+                               null, null, null, null, null, null, hints, CancellationToken.None)) n++;
+            return n;
+        }
+
+        // Key-presence hint: every span carrying the key must come back.
+        int withRoute = corpus.Count(s => s.Attributes?.ContainsKey("http.route") == true);
+        Assert.True(withRoute > 0);
+        // Bloom is a block-level pre-filter — it may keep whole blocks, never lose them.
+        Assert.True(await CountWithHints(new AttrHint("http.route", null)) >= withRoute);
+
+        // Value hint is case-insensitive (TraceQL OrdinalIgnoreCase semantics).
+        Assert.True(await CountWithHints(new AttrHint("PR", "pr7170")) > 0);
+
+        // A key that exists nowhere lets the bloom drop every block.
+        Assert.Equal(0, await CountWithHints(new AttrHint("definitely.absent.key", null)));
+        Assert.Equal(0, await CountWithHints(new AttrHint("PR", "no-such-value-xyz")));
     }
 
     [Fact]
