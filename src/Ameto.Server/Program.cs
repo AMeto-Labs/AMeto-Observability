@@ -223,6 +223,10 @@ app.Lifetime.ApplicationStarted.Register(() =>
                        ?.Addresses;
     logger.LogInformation("Ameto version: {Version}", UpdateChecker.CurrentVersion);
     logger.LogInformation("Content root: {ContentRoot}", app.Environment.ContentRootPath);
+    if (repOpts.Enabled && string.IsNullOrEmpty(repOpts.Secret))
+        logger.LogWarning(
+            "Replication is enabled but Ameto:Replication:Secret is not set — peer endpoints " +
+            "reject all requests (fail-closed). Set the same secret on every node to replicate.");
     logger.LogInformation("Listening on: {Urls}",
         addresses is { Count: > 0 } ? string.Join(", ", addresses) : "(none)");
 });

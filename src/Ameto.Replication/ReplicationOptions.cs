@@ -11,6 +11,15 @@ public sealed class ReplicationOptions
     public bool     Enabled       { get; init; } = false;
 
     /// <summary>
+    /// Shared secret authenticating peer-to-peer calls (ping + segment push).
+    /// REQUIRED when replication is enabled: peers send it in the
+    /// <c>X-Ameto-Replication</c> header and the receiver rejects mismatches.
+    /// When blank, the receive endpoints refuse every request (fail-closed) so an
+    /// open port can't be used to inject forged segments.
+    /// </summary>
+    public string   Secret        { get; init; } = "";
+
+    /// <summary>
     /// Peer addresses to contact on startup for initial discovery.
     /// Format: "http://host:port".
     /// </summary>
