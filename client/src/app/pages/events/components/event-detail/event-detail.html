@@ -525,3 +525,18 @@
     }
   </div>
 </ng-template>
+
+<!-- Shared scalar-property menu (same component the Traces page uses). -->
+@if (propMenu(); as m) {
+  <app-property-menu
+    [x]="m.x" [y]="m.y" [propKey]="m.entry.label" [propValue]="m.entry.value"
+    [seekable]="propSeekMs() != null"
+    crossLabel="Find in traces"
+    (copyValue)="propCopyValue()"
+    (copyKey)="propCopyKey()"
+    (seek)="propSeek($event)"
+    (search)="propSearch($event)"
+    (andExpr)="propCompose('and', $event)"
+    (orExpr)="propCompose('or', $event)"
+    (cross)="propFindInTraces()" />
+}

@@ -18,6 +18,8 @@ import { CompareTraceComponent } from './compare-trace/compare-trace';
 import { SuggestInputDirective } from '../../shared/suggest/suggest-input.directive';
 import { ModalComponent } from '../../shared/components/ui';
 import { EventDetailComponent } from '../events/components/event-detail/event-detail';
+import { EventListRowComponent } from '../events/components/event-list-row/event-list-row';
+import { PropertyMenuComponent } from '../../shared/components/property-menu/property-menu';
 
 /** TraceQL vocabulary offered by the Ctrl+Space autocomplete: intrinsics, common OTel span
  *  attributes (dotted), status/kind enum values, and the comparison/boolean operators. */
@@ -37,7 +39,7 @@ const TRACEQL_TOKENS: readonly string[] = [
 
 @Component({
   selector: 'app-traces',
-  imports: [FormsModule, LucideAngularModule, ServiceGraphComponent, FlamegraphComponent, LatencyComponent, CompareTraceComponent, SuggestInputDirective, ModalComponent, EventDetailComponent],
+  imports: [FormsModule, LucideAngularModule, ServiceGraphComponent, FlamegraphComponent, LatencyComponent, CompareTraceComponent, SuggestInputDirective, ModalComponent, EventDetailComponent, EventListRowComponent, PropertyMenuComponent],
   templateUrl: './traces.html',
   styleUrl: './traces.scss',
   changeDetection: ChangeDetectionStrategy.OnPush,
@@ -398,13 +400,19 @@ export class TracesComponent implements OnInit, OnDestroy {
   async copyTraceId(): Promise<void> {
     const id = this.selectedTraceId();
     if (!id) return;
+    await this.copyText(id);
+    this.traceIdCopied.set(true);
+    setTimeout(() => { this.traceIdCopied.set(false); this.cdr.markForCheck(); }, 1500);
+  }
+
+  private async copyText(text: string): Promise<void> {
     try {
-      await navigator.clipboard.writeText(id);
+      await navigator.clipboard.writeText(text);
     } catch {
       // navigator.clipboard needs a secure context (https/localhost) and focus —
       // plain-http hosts (e.g. http://sandbox:8555) get the legacy fallback.
       const ta = document.createElement('textarea');
-      ta.value = id;
+      ta.value = text;
       ta.style.position = 'fixed';
       ta.style.opacity = '0';
       document.body.appendChild(ta);
@@ -412,8 +420,121 @@ export class TracesComponent implements OnInit, OnDestroy {
       document.execCommand('copy');
       ta.remove();
     }
-    this.traceIdCopied.set(true);
-    setTimeout(() => { this.traceIdCopied.set(false); this.cdr.markForCheck(); }, 1500);
+  }
+
+  // ── Span property context menu (Tags table + the left-column fields) ───────
+
+  readonly attrMenu = signal<{
+    key: string;
+    value: string;
+    /** TraceQL left-hand side (e.g. '.env', 'service.name', 'name'); null = copy-only. */
+    tqlKey: string | null;
+    /** CLEF key for the "Find in logs" cross; null hides the cross item. */
+    logKey: string | null;
+    /** Epoch ms when the value is a date/timestamp — enables the Seek section. */
+    seekMs: number | null;
+    x: number;
+    y: number;
+  } | null>(null);
+
+  /** Menu for an arbitrary span attribute (Tags table): searchable + logs cross. */
+  openAttrMenu(ev: MouseEvent, key: string, value: unknown): void {
+    const s = String(value);
+    this.openMenuAt(ev, { key, value: s, tqlKey: `.${key}`, logKey: key, seekMs: parseDateMs(s) });
+  }
+
+  /**
+   * Menu for a left-column span field. `tqlKey` null = copy-only (e.g. Span ID,
+   * Parent, Duration); `logKey` null = no logs cross; `seekMs` set for timestamps.
+   */
+  openFieldMenu(ev: MouseEvent, key: string, value: unknown, tqlKey: string | null, logKey: string | null, seekMs: number | null = null): void {
+    this.openMenuAt(ev, { key, value: String(value), tqlKey, logKey, seekMs });
+  }
+
+  private openMenuAt(ev: MouseEvent, m: { key: string; value: string; tqlKey: string | null; logKey: string | null; seekMs: number | null }): void {
+    ev.stopPropagation();
+    const x = Math.min(ev.clientX, window.innerWidth - 240);
+    const y = Math.min(ev.clientY, window.innerHeight - 290);
+    this.attrMenu.set({ ...m, x, y });
+  }
+
+  /** Seek the time range to the field's timestamp ± N seconds. */
+  attrSeek(seconds: number): void {
+    const m = this.attrMenu();
+    if (m?.seekMs == null) return;
+    this.attrMenu.set(null);
+    this.preset = 'custom';
+    this.customFrom = msToLocal(m.seekMs - seconds * 1000);
+    this.customTo   = msToLocal(m.seekMs + seconds * 1000);
+    this.syncUrl();
+    this.setWindow();
+    this.loadAll();
+  }
+
+  @HostListener('document:click')
+  closeAttrMenu(): void {
+    if (this.attrMenu()) this.attrMenu.set(null);
+  }
+
+  async attrCopy(what: 'value' | 'key'): Promise<void> {
+    const m = this.attrMenu();
+    if (!m) return;
+    await this.copyText(what === 'value' ? m.value : m.key);
+    this.attrMenu.set(null);
+  }
+
+  /** Replace the query: search traces by this field alone. */
+  attrFind(neq: boolean): void {
+    const m = this.attrMenu();
+    if (!m?.tqlKey) return;
+    this.applyTraceql(`{ ${this.tqlPredicate(m.tqlKey, m.value, neq)} }`);
+  }
+
+  /** Append to the current query with && / ||. */
+  attrExpr(joiner: '&&' | '||', neq: boolean): void {
+    const m = this.attrMenu();
+    if (!m?.tqlKey) return;
+    const pred = this.tqlPredicate(m.tqlKey, m.value, neq);
+    let inner = '';
+    if (this.traceqlMode()) {
+      const q = this.traceqlInput.trim();
+      const braced = q.match(/^\{([\s\S]*)\}$/);
+      inner = (braced ? braced[1] : q).trim();
+    }
+    this.applyTraceql(inner ? `{ (${inner}) ${joiner} ${pred} }` : `{ ${pred} }`);
+  }
+
+  /** Cross-signal jump: open the Logs page filtered by the same property. */
+  attrFindInLogs(): void {
+    const m = this.attrMenu();
+    if (!m?.logKey) return;
+    this.attrMenu.set(null);
+    const ident = /^[A-Za-z_][A-Za-z0-9_]*$/.test(m.logKey) ? m.logKey : `['${m.logKey}']`;
+    const value = /^-?\d+(\.\d+)?$/.test(m.value) ? m.value : `'${m.value.replaceAll("'", "''")}'`;
+    void this.router.navigate(['/events'], { queryParams: { filter: `${ident} = ${value}` } });
+  }
+
+  /** A log row on the Logs tab emitted a CLEF filter — open it on the Events page. */
+  findInLogs(filter: string): void {
+    void this.router.navigate(['/events'], { queryParams: { filter } });
+  }
+
+  /** `tqlKey` is the already-formatted TraceQL LHS (intrinsic without a dot, attribute with). */
+  private tqlPredicate(tqlKey: string, value: string, neq: boolean): string {
+    const op = neq ? '!=' : '=';
+    const v  = /^-?\d+(\.\d+)?$/.test(value) || value === 'true' || value === 'false'
+      ? value
+      : `"${value.replaceAll('"', '')}"`;
+    return `${tqlKey} ${op} ${v}`;
+  }
+
+  private applyTraceql(query: string): void {
+    this.attrMenu.set(null);
+    this.traceqlMode.set(true);
+    this.traceqlError.set('');
+    this.traceqlInput = query;
+    this.activeMainTab = 'traces';
+    this.runTraceQL();
   }
 
   selectSpan(span: SpanDto) {
@@ -434,6 +555,7 @@ export class TracesComponent implements OnInit, OnDestroy {
    */
   @HostListener('document:keydown.escape')
   onEscape(): void {
+    if (this.attrMenu()) { this.attrMenu.set(null); return; }
     if (this.logModalEvent()) return;
     if (this.selectedSpan()) this.selectedSpan.set(null);
   }
@@ -623,6 +745,19 @@ function localToIso(local: string): string {
   if (!local) return '';
   const d = new Date(local);
   return isNaN(d.getTime()) ? '' : d.toISOString();
+}
+
+/** Recognises an ISO-8601-ish date string and returns its epoch ms, else null. */
+function parseDateMs(v: string): number | null {
+  if (!/^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/.test(v)) return null;
+  const ms = Date.parse(v);
+  return isNaN(ms) ? null : ms;
+}
+
+/** epoch ms → "yyyy-MM-ddTHH:mm:ss" in LOCAL time (datetime-local with seconds). */
+function msToLocal(ms: number): string {
+  const d = new Date(ms - new Date(ms).getTimezoneOffset() * 60_000);
+  return d.toISOString().slice(0, 19);
 }
 
 function fmtMs(ms: number): string {

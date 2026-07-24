@@ -571,6 +571,30 @@
   &:hover { color: var(--text-primary); }
 }
 
+// ── Span-attribute context menu ──────────────────────────────────────────────
+
+// Always visible, matching the Events detail property button (.d-menu-btn).
+.tag-menu-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  margin-right: 5px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  vertical-align: middle;
+  transition: color 0.12s, background 0.12s, border-color 0.12s;
+
+  &:hover, &.open { background: var(--bg-main); color: var(--text-primary); border-color: var(--border); }
+}
+
+// The span-attribute context menu now lives in the shared PropertyMenuComponent.
+
 .detail-meta {
   display: flex;
   gap: 6px;
@@ -783,7 +807,7 @@
 
 .sd-field {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 8px;
   padding: 4px 0;
   border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
@@ -792,7 +816,9 @@
 }
 
 .sd-key {
-  width: 110px;
+  display: flex;
+  align-items: center;
+  width: 122px;
   flex-shrink: 0;
   font-size: 11px;
   color: var(--text-muted);
@@ -1277,20 +1303,15 @@
   padding: 12px;
 }
 
-.log-row {
-  display: flex;
-  align-items: baseline;
-  gap: 8px;
-  padding: 4px 8px;
+// Trace Logs tab: full Events-style rows (app-event-list-row). Grow to fit the
+// wrapped message rather than the fixed 29px used by the virtual list.
+.tl-log-row {
+  display: block;
   border-bottom: 1px solid color-mix(in srgb, var(--border) 40%, transparent);
-  font-size: 12px;
   border-left: 2px solid transparent;
+  cursor: pointer;
 
   &:last-child { border-bottom: none; }
-  &:hover { background: var(--bg-card); }
-
-  // Rows open the full log-details modal.
-  &--clickable { cursor: pointer; }
 
   // Logs emitted under the currently selected span — highlighted within the
   // full trace-log list.

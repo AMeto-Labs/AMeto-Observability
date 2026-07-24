@@ -96,6 +96,7 @@
         <div class="drawer-resizer" (mousedown)="startResize($event)" title="Drag to resize"></div>
         <app-event-detail
           [event]="ev"
+          [currentFilter]="store.filter()"
           (closed)="store.selectEvent(null)"
           (filterSelected)="store.applyFilter($event)"
           (seekRequested)="store.seek($event.from, $event.to)"

@@ -20,6 +20,7 @@ import { serviceColor } from '../../../../shared/utils/service-color';
 import { JsonViewerComponent } from '../../../../shared/components/json-viewer/json-viewer';
 import { MetricSparkComponent } from '../../../../shared/components/metric-spark/metric-spark';
 import { ModalComponent } from '../../../../shared/components/ui';
+import { PropertyMenuComponent } from '../../../../shared/components/property-menu/property-menu';
 import {
   JsonViewerActions, JvMenuRequest, jvLiteral, jvWildcard,
 } from '../../../../shared/components/json-viewer/json-viewer.actions';
@@ -114,7 +115,7 @@ function wfFmtMs(ms: number): string {
  */
 @Component({
   selector: 'app-event-detail',
-  imports: [LucideAngularModule, NgTemplateOutlet, DatePipe, JsonViewerComponent, MetricSparkComponent, ModalComponent],
+  imports: [LucideAngularModule, NgTemplateOutlet, DatePipe, JsonViewerComponent, MetricSparkComponent, ModalComponent, PropertyMenuComponent],
   providers: [JsonViewerActions],
   templateUrl: './event-detail.html',
   styleUrl: './event-detail.scss',
@@ -123,6 +124,8 @@ function wfFmtMs(ms: number): string {
 export class EventDetailComponent {
   // ── Inputs / outputs ──────────────────────────────────────────────────
   event = input.required<EventDto>();
+  /** Current CLEF filter — lets the property menu compose And/Or expressions. */
+  currentFilter = input<string>('');
   filterSelected = output<string>();
   seekRequested  = output<{ from: Date; to: Date }>();
   /** Bind a timestamp to one side of the parent time-range inputs. */
@@ -144,6 +147,8 @@ export class EventDetailComponent {
   menuPos   = signal({ x: 0, y: 0 });
   /** Active JSON-viewer node context (path/value/kind) when {@link menuType} is 'jv'. */
   jvMenu = signal<JvMenuRequest | null>(null);
+  /** Shared property menu for a scalar top-level property (same menu the Traces page uses). */
+  propMenu = signal<{ entry: PropEntry; x: number; y: number } | null>(null);
 
   // ── Trace waterfall state ─────────────────────────────────────────────
   readonly traceSpans        = signal<SpanDto[]>([]);
@@ -592,9 +597,93 @@ export class EventDetailComponent {
   openPropMenu(e: MouseEvent, kv: PropEntry): void {
     e.preventDefault();
     e.stopPropagation();
-    this.jvMenu.set({ path: kv.path, rawValue: kv.raw, isContainer: kv.isStructured, x: 0, y: 0 });
-    this.positionMenu(e.currentTarget as HTMLElement);
-    this.menuType.set('jv');
+    // Structured props (object/array) keep the path-aware jv menu (has()/wildcards);
+    // a scalar key=value pair uses the shared menu — identical to the Traces page.
+    if (kv.isStructured) {
+      this.jvMenu.set({ path: kv.path, rawValue: kv.raw, isContainer: true, x: 0, y: 0 });
+      this.positionMenu(e.currentTarget as HTMLElement);
+      this.menuType.set('jv');
+      return;
+    }
+    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    const x = Math.min(r.left, window.innerWidth - 240);
+    const y = Math.min(r.bottom + 4, window.innerHeight - 290);
+    this.propMenu.set({ entry: kv, x, y });
+  }
+
+  // ── Shared property menu (scalar props) → CLEF filter composition ─────────
+
+  /** Epoch ms when the active property's value is an ISO date, else null. */
+  propSeekMs = computed<number | null>(() => {
+    const v = this.propMenu()?.entry.value;
+    if (!v || !/^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}/.test(v)) return null;
+    const ms = Date.parse(v);
+    return isNaN(ms) ? null : ms;
+  });
+
+  /** Seek the parent time range to this date-valued property ± N seconds. */
+  propSeek(seconds: number): void {
+    const ms = this.propSeekMs();
+    if (ms == null) return;
+    this.seekRequested.emit({
+      from: new Date(ms - seconds * 1000),
+      to:   new Date(ms + seconds * 1000),
+    });
+    this.propMenu.set(null);
+  }
+
+  private propPredicate(neq: boolean): string {
+    const m = this.propMenu();
+    if (!m) return '';
+    return `${m.entry.path} ${neq ? '<>' : '='} ${jvLiteral(m.entry.raw)}`;
+  }
+
+  async propCopyValue(): Promise<void> {
+    const m = this.propMenu();
+    if (m) await this.writeClipboard(m.entry.value);
+    this.propMenu.set(null);
+  }
+
+  async propCopyKey(): Promise<void> {
+    const m = this.propMenu();
+    if (m) await this.writeClipboard(m.entry.label);
+    this.propMenu.set(null);
+  }
+
+  /** Replace the query with this single predicate. */
+  propSearch(neq: boolean): void {
+    const pred = this.propPredicate(neq);
+    if (pred) { this.filterSelected.emit(pred); }
+    this.propMenu.set(null);
+  }
+
+  /** Append this predicate to the current filter with `and` / `or`. */
+  propCompose(joiner: 'and' | 'or', neq: boolean): void {
+    const pred = this.propPredicate(neq);
+    if (!pred) { this.propMenu.set(null); return; }
+    const cur = this.currentFilter().trim();
+    this.filterSelected.emit(cur ? `(${cur}) ${joiner} ${pred}` : pred);
+    this.propMenu.set(null);
+  }
+
+  /** Cross-signal jump: open the Traces page filtered by this attribute. */
+  propFindInTraces(): void {
+    const m = this.propMenu();
+    if (!m) return;
+    this.propMenu.set(null);
+    const v = /^-?\d+(\.\d+)?$/.test(m.entry.value) ? m.entry.value : `"${m.entry.value.replaceAll('"', '')}"`;
+    window.open(`/traces?ql=${encodeURIComponent(`{ .${m.entry.label} = ${v} }`)}`, '_blank');
+  }
+
+  private async writeClipboard(text: string): Promise<void> {
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      const ta = document.createElement('textarea');
+      ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta); ta.select();
+      document.execCommand('copy'); ta.remove();
+    }
   }
 
   /** Positions the context menu just below the triggering button, flipping up / clamping to the viewport. */
@@ -614,6 +703,7 @@ export class EventDetailComponent {
     // Escape is owned by onEscape below (it also closes the modals / the drawer).
     if ((e as KeyboardEvent | undefined)?.key === 'Escape') return;
     if (this.menuType()) this.menuType.set(null);
+    if (this.propMenu()) this.propMenu.set(null);
   }
 
   /**
@@ -624,6 +714,7 @@ export class EventDetailComponent {
   @HostListener('document:keydown.escape', ['$event'])
   onEscape(e: Event): void {
     if (e.defaultPrevented) return;
+    if (this.propMenu())          { this.propMenu.set(null);          return; }
     if (this.menuType())          { this.menuType.set(null);          return; }
     if (this.valueModalOpen())    { this.valueModalOpen.set(false);   return; }
     if (this.messageModalOpen())  { this.messageModalOpen.set(false); return; }

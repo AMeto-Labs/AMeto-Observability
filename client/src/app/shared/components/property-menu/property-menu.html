@@ -1,0 +1,46 @@
+<div class="prop-menu" [style.left.px]="x()" [style.top.px]="y()" (click)="$event.stopPropagation()">
+  <div class="pm-header mono" [title]="propKey() + ' = ' + propValue()">{{ propKey() }}</div>
+
+  <button class="pm-item" (click)="copyValue.emit()">
+    <lucide-icon name="copy" [size]="12" /> Copy value
+  </button>
+  <button class="pm-item" (click)="copyKey.emit()">
+    <lucide-icon name="copy" [size]="12" /> Copy key
+  </button>
+
+  @if (seekable()) {
+    <div class="pm-sep"></div>
+    <div class="pm-section">Seek window (±)</div>
+    <button class="pm-item" (click)="seek.emit(5)"><lucide-icon name="clock" [size]="12" /> ± 5 seconds</button>
+    <button class="pm-item" (click)="seek.emit(15)"><lucide-icon name="clock" [size]="12" /> ± 15 seconds</button>
+    <button class="pm-item" (click)="seek.emit(30)"><lucide-icon name="clock" [size]="12" /> ± 30 seconds</button>
+  }
+
+  @if (findable()) {
+    <div class="pm-sep"></div>
+    <div class="pm-section">Find</div>
+
+    <div class="pm-row">
+      <span class="pm-label">Search by key</span>
+      <button class="pm-op" (click)="search.emit(false)" title="Only entries where {{ propKey() }} equals this value">=</button>
+      <button class="pm-op" (click)="search.emit(true)"  title="Only entries where {{ propKey() }} differs">≠</button>
+    </div>
+    <div class="pm-row">
+      <span class="pm-label">And expression</span>
+      <button class="pm-op" (click)="andExpr.emit(false)" title="Append AND {{ propKey() }} = …">=</button>
+      <button class="pm-op" (click)="andExpr.emit(true)"  title="Append AND {{ propKey() }} ≠ …">≠</button>
+    </div>
+    <div class="pm-row">
+      <span class="pm-label">Or expression</span>
+      <button class="pm-op" (click)="orExpr.emit(false)" title="Append OR {{ propKey() }} = …">=</button>
+      <button class="pm-op" (click)="orExpr.emit(true)"  title="Append OR {{ propKey() }} ≠ …">≠</button>
+    </div>
+  }
+
+  @if (crossLabel(); as label) {
+    <div class="pm-sep"></div>
+    <button class="pm-item" (click)="cross.emit()">
+      <lucide-icon name="list" [size]="12" /> {{ label }}
+    </button>
+  }
+</div>
