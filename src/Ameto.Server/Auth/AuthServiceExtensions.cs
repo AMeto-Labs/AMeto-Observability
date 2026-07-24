@@ -15,6 +15,13 @@ public sealed class AuthOptions
     /// <summary>Allow local username/password login. Defaults to true.</summary>
     public bool LocalEnabled { get; init; } = true;
 
+    /// <summary>
+    /// Password for the auto-seeded initial <c>admin</c> account. When unset, a
+    /// random one is generated and logged once at first start — so a fresh
+    /// install is never reachable with a well-known default credential.
+    /// </summary>
+    public string? AdminPassword { get; init; }
+
     public GoogleAuthOptions? Google   { get; init; }
     public MicrosoftAuthOptions? Microsoft { get; init; }
 }

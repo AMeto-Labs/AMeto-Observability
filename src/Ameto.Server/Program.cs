@@ -77,6 +77,23 @@ builder.Services.AddSingleton<Microsoft.Extensions.Options.IOptions<ServerOption
 var authOptions = builder.Configuration.GetSection("Ameto:Auth").Get<Ameto.Server.Auth.AuthOptions>() ?? new Ameto.Server.Auth.AuthOptions();
 builder.Services.AddAmetoAuth(serverOptions.DataDirectory, authOptions);
 
+// ── Rate limiting: throttle credential-guessing on the login endpoint ─────────
+// Fixed window per client IP: brute-forcing the local admin account is otherwise
+// unbounded. Other endpoints are unaffected (ingest is API-key gated).
+builder.Services.AddRateLimiter(o =>
+{
+    o.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    o.AddPolicy("auth-login", ctx =>
+        System.Threading.RateLimiting.RateLimitPartition.GetFixedWindowLimiter(
+            partitionKey: ctx.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+            factory: _ => new System.Threading.RateLimiting.FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 10,
+                Window      = TimeSpan.FromMinutes(1),
+                QueueLimit  = 0,
+            }));
+});
+
 // ── Core services ─────────────────────────────────────────────────────────────
 builder.Services
     .AddAmetoStorage()
@@ -172,6 +189,7 @@ if (serverOptions.TrustForwardedHeaders)
     fwd.KnownProxies.Clear();
     app.UseForwardedHeaders(fwd);
 }
+app.UseRateLimiter();
 app.UseAuthentication();
 app.UseAuthorization();
 app.UseDefaultFiles();

@@ -31,7 +31,7 @@ internal static class AuthEndpoints
                 token, expiresIn = JwtIssuer.ExpiresInSeconds, role,
                 permissions = (int)(role == "admin" ? ViewPermissions.All : perms),
             });
-        });
+        }).RequireRateLimiting("auth-login");
 
         // ── OAuth: initiate ───────────────────────────────────────────────────
         // GET /api/auth/oauth/google   → redirects to Google consent screen
