@@ -336,13 +336,15 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     {
         if (_hot.IsEmpty) return;
 
-        // Snapshot and clear hot tier
+        // Snapshot and clear hot tier. Bounds must travel with the snapshot —
+        // without them cold histogram files have no bucket bounds and quantile /
+        // heatmap queries over anything older than the hot tier return nothing.
         var snapshot = new List<(SeriesKey Key, HotSeries Series)>();
         foreach (var (k, v) in _hot)
         {
             var points = v.Drain();
             if (points.Count > 0)
-                snapshot.Add((k, new HotSeries(points)));
+                snapshot.Add((k, new HotSeries(points, v.Bounds)));
         }
 
         if (snapshot.Count == 0) return;
@@ -393,6 +395,8 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         var cutoff24h  = DateTimeOffset.UtcNow.AddHours(-24).ToUnixTimeMilliseconds() * 1_000_000L;
 
         List<MetricSegmentInfo> toCompact;
+        List<MetricSegmentInfo> toMerge5m;
+        List<MetricSegmentInfo> toMerge1h;
         List<MetricSegmentInfo> toRollup5m;
         List<MetricSegmentInfo> toRollup1h;
         _coldLock.EnterReadLock();
@@ -409,10 +413,22 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
             toRollup1h = _coldSegments
                 .Where(s => s.Granularity == MetricGranularity.FiveMin && s.MaxNano < cutoff24h)
                 .ToList();
+            // Same-granularity merges: each rollup pass emits one small file per
+            // metric, so without merging the 5-min and 1-h tiers accumulate
+            // hundreds of label-repeating files per metric over the retention
+            // window. Also selects lone legacy-v2 files so old data migrates to v3.
+            toMerge5m  = _coldSegments
+                .Where(s => s.Granularity == MetricGranularity.FiveMin && s.MaxNano >= cutoff24h)
+                .ToList();
+            toMerge1h  = _coldSegments
+                .Where(s => s.Granularity == MetricGranularity.OneHour)
+                .ToList();
         }
         finally { _coldLock.ExitReadLock(); }
 
-        if (toCompact.Count >= 2)  CompactRawSegments(toCompact);
+        if (toCompact.Count >= 2)  CompactSegments(toCompact, MetricGranularity.Raw);
+        MergeTier(toMerge5m, MetricGranularity.FiveMin);
+        MergeTier(toMerge1h, MetricGranularity.OneHour, maxSpan: TimeSpan.FromDays(7));
         if (toRollup5m.Count > 0)  Rollup(toRollup5m, MetricGranularity.FiveMin, TimeSpan.FromMinutes(5));
         if (toRollup1h.Count > 0)  Rollup(toRollup1h, MetricGranularity.OneHour, TimeSpan.FromHours(1));
 
@@ -420,15 +436,49 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     }
 
     /// <summary>
-    /// Merges multiple small raw segments for the same metric into one file
-    /// without downsampling. Reduces file count for the current-hour window.
+    /// Merges same-granularity cold files per metric: when several have piled up,
+    /// or when any is still in the legacy v2 format (so old data migrates to v3
+    /// and shrinks). <paramref name="maxSpan"/> windows the merge so one file
+    /// never grows beyond that time range (used for the long-lived 1-h tier).
     /// </summary>
-    private void CompactRawSegments(List<MetricSegmentInfo> sources)
+    private void MergeTier(List<MetricSegmentInfo> tier, MetricGranularity granularity, TimeSpan? maxSpan = null)
+    {
+        foreach (var group in tier.GroupBy(s => s.MetricName))
+        {
+            // Window by maxSpan so a merged file's range stays bounded.
+            IEnumerable<List<MetricSegmentInfo>> windows;
+            if (maxSpan is { } span)
+            {
+                long spanNanos = (long)span.TotalMilliseconds * 1_000_000L;
+                windows = group
+                    .GroupBy(s => s.MinNano / spanNanos)
+                    .Select(g => g.ToList());
+            }
+            else
+            {
+                windows = [group.ToList()];
+            }
+
+            foreach (var window in windows)
+            {
+                bool hasLegacy = window.Any(s => s.FormatVersion < 3);
+                if (window.Count < 4 && !hasLegacy) continue; // not worth a rewrite yet
+                CompactSegments(window, granularity);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Merges multiple segments of one granularity into one file per metric
+    /// without downsampling. Points are de-duplicated by timestamp (last wins)
+    /// so a crash between write-new and delete-old can never double data.
+    /// </summary>
+    private void CompactSegments(List<MetricSegmentInfo> sources, MetricGranularity granularity)
     {
         foreach (var group in sources.GroupBy(s => s.MetricName))
         {
             var segs = group.ToList();
-            if (segs.Count < 2) continue;
+            if (segs.Count < 2 && segs.All(s => s.FormatVersion >= 3)) continue;
 
             try
             {
@@ -451,11 +501,11 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
                 var merged = allSeries
                     .Select(kv => (kv.Key, new HotSeries(
-                        kv.Value.OrderBy(p => p.TimestampUnixNano).ToList(),
+                        DedupeByTimestamp(kv.Value),
                         bounds.GetValueOrDefault(kv.Key))))
                     .ToList();
 
-                var newInfos = MetricWriter.Write(_dataDir, merged, MetricGranularity.Raw);
+                var newInfos = MetricWriter.Write(_dataDir, merged, granularity);
 
                 _coldLock.EnterWriteLock();
                 try
@@ -468,14 +518,28 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                 foreach (var s in segs)
                     try { File.Delete(s.FilePath); } catch { /* best effort */ }
 
-                _logger.LogDebug("Compacted {Count} raw segments for metric '{Metric}'",
-                    segs.Count, group.Key);
+                _logger.LogDebug("Compacted {Count} {Granularity} segment(s) for metric '{Metric}'",
+                    segs.Count, granularity, group.Key);
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Raw compaction failed for metric '{Metric}'", group.Key);
+                _logger.LogError(ex, "{Granularity} compaction failed for metric '{Metric}'", granularity, group.Key);
             }
         }
+    }
+
+    /// <summary>Sorts by timestamp and drops duplicate-timestamp points (last wins).</summary>
+    private static List<MetricDataPoint> DedupeByTimestamp(List<MetricDataPoint> pts)
+    {
+        pts.Sort(static (a, b) => a.TimestampUnixNano.CompareTo(b.TimestampUnixNano));
+        var result = new List<MetricDataPoint>(pts.Count);
+        for (int i = 0; i < pts.Count; i++)
+        {
+            if (i + 1 < pts.Count && pts[i + 1].TimestampUnixNano == pts[i].TimestampUnixNano)
+                continue; // superseded by the later entry with the same ts
+            result.Add(pts[i]);
+        }
+        return result;
     }
 
     private void Rollup(
@@ -873,4 +937,6 @@ public sealed class MetricSegmentInfo
     public long             MinNano    { get; init; }
     public long             MaxNano    { get; init; }
     public MetricGranularity Granularity { get; init; }
+    /// <summary>On-disk format version (2 = legacy per-series blocks, 3 = current). Drives v2→v3 migration.</summary>
+    public ushort           FormatVersion { get; init; } = 3;
 }

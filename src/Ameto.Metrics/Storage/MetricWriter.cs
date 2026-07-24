@@ -6,39 +6,46 @@ namespace Ameto.Metrics.Storage;
 /// <summary>
 /// Writes metric series to <c>.mts</c> files.
 ///
-/// <para>File format v2 — "RDMT":</para>
+/// <para>File format v3 — "RDMT":</para>
 /// <code>
 ///   [Header]
 ///     0  Magic       : uint32  "RDMT"
-///     4  Version     : uint16  2
+///     4  Version     : uint16  3
 ///     6  Granularity : uint8
 ///     7  SeriesCount : uint32
 ///    11  MinNano     : int64
 ///    19  MaxNano     : int64
 ///    27  Flags       : byte
-///   [Series blocks — LZ4-compressed msgpack]
-///     N × { uncompSize uint32 | compSize uint32 | LZ4 bytes }
-///     block map: { k, u, lbs, bnds(double[]), pts, cnt }
-///       point: [ ts, value, count, sum, bucketCounts(long[] | nil) ]
+///   [Section — ALL series in ONE LZ4-HC block]
+///     uncompSize uint32 | compSize uint32 | LZ4 bytes
+///     msgpack: SeriesCount × { k, u, lbs, bnds(double[]), pts, cnt }
+///       point: scalar     [ Δts_ms, value ]
+///               histogram [ Δts_ms, value, count, sum, bucketCounts(long[] | nil) ]
+///       Δts_ms: first point = full unix ms; the rest = varint delta to the previous.
+///       Integral doubles are written as msgpack ints (varint) — the reader's
+///       ReadDouble transparently accepts both.
 ///   [MetricName index]
 ///     nameCount uint32
-///     per-name: nameLen uint16 | name bytes | blockOffset uint64 | blockCount uint32
+///     per-name: nameLen uint16 | name bytes | blockOffset uint64 (0) | blockCount uint32
 ///   [Footer]
 ///     nameIdxOffset uint64
 ///     footerMagic   uint32  "RDMF"
 /// </code>
 /// <para>
-/// v2 adds histogram fidelity: bucket bounds are stored once per series ("bnds") and
-/// per-point bucket counts are stored on each point, enabling real percentiles
-/// (histogram_quantile) and latency heatmaps. v1 files are not read — they are deleted
-/// on load (see <see cref="MetricStorageEngine"/>).
+/// v3 versus v2: the whole series section is compressed as a single LZ4-HC block
+/// (v2 compressed each series separately, so label strings repeated across
+/// thousands of series were never deduplicated and small blocks barely
+/// compressed); timestamps are millisecond deltas instead of 9-byte nanosecond
+/// ints; scalar points drop the always-zero count/sum/buckets fields. v2 files
+/// remain readable (see <see cref="MetricReader"/>) and are migrated to v3 by the
+/// background compaction in <see cref="MetricStorageEngine"/>.
 /// </para>
 /// </summary>
 internal static class MetricWriter
 {
     private const uint   Magic       = 0x52_44_4D_54; // "RDMT"
     private const uint   FooterMagic = 0x52_44_4D_46; // "RDMF"
-    private const ushort Version     = 2;
+    private const ushort Version     = 3;
 
     /// <summary>
     /// Writes one <c>.mts</c> file per distinct metric name found in <paramref name="series"/>.
@@ -74,11 +81,12 @@ internal static class MetricWriter
             WriteFile(filePath, group.Key, granularity, items, minNano, maxNano);
             result.Add(new MetricSegmentInfo
             {
-                FilePath    = filePath,
-                MetricName  = group.Key,
-                MinNano     = minNano,
-                MaxNano     = maxNano,
-                Granularity = granularity,
+                FilePath      = filePath,
+                MetricName    = group.Key,
+                MinNano       = minNano,
+                MaxNano       = maxNano,
+                Granularity   = granularity,
+                FormatVersion = Version,
             });
         }
 
@@ -93,6 +101,23 @@ internal static class MetricWriter
         long minNano,
         long maxNano)
     {
+        // Serialize ALL series into one msgpack buffer, then compress it as a
+        // single LZ4-HC block: repeated label keys/values across series (routes,
+        // instance ids, GUIDs) deduplicate inside the shared compression window.
+        var bufWriter = new System.Buffers.ArrayBufferWriter<byte>();
+        var w = new MessagePackWriter(bufWriter);
+        foreach (var (key, hs) in items)
+        {
+            var pts = hs.GetPoints(long.MinValue, long.MaxValue);
+            WriteSeries(ref w, key, hs.Bounds, pts);
+        }
+        w.Flush();
+
+        var raw        = bufWriter.WrittenSpan.ToArray();
+        // HC level: writes happen on background flush/rollup threads only, so we
+        // trade CPU for the much better ratio.
+        var compressed = LZ4Pickler.Pickle(raw, LZ4Level.L09_HC);
+
         using var fs = new FileStream(filePath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 65536);
         using var bw = new BinaryWriter(fs);
 
@@ -105,14 +130,10 @@ internal static class MetricWriter
         bw.Write(maxNano);
         bw.Write((byte)0); // flags
 
-        // Series blocks
-        var blockOffsets = new List<long>(items.Count);
-        foreach (var (key, hs) in items)
-        {
-            var pts = hs.GetPoints(long.MinValue, long.MaxValue);
-            blockOffsets.Add(fs.Position);
-            WriteSeriesBlock(bw, key, hs.Bounds, pts);
-        }
+        // Section
+        bw.Write((uint)raw.Length);
+        bw.Write((uint)compressed.Length);
+        bw.Write(compressed);
 
         // Name index
         long nameIdxOffset = fs.Position;
@@ -120,23 +141,20 @@ internal static class MetricWriter
         var nameBytes = System.Text.Encoding.UTF8.GetBytes(metricName);
         bw.Write((ushort)nameBytes.Length);
         bw.Write(nameBytes);
-        bw.Write((ulong)blockOffsets[0]);
-        bw.Write((uint)blockOffsets.Count);
+        bw.Write((ulong)0);                 // block offset — unused in v3 (single section)
+        bw.Write((uint)items.Count);
 
         // Footer
         bw.Write((ulong)nameIdxOffset);
         bw.Write(FooterMagic);
     }
 
-    private static void WriteSeriesBlock(
-        BinaryWriter bw,
+    private static void WriteSeries(
+        ref MessagePackWriter w,
         SeriesKey key,
         double[]? bounds,
         IReadOnlyList<MetricDataPoint> points)
     {
-        var bufWriter = new System.Buffers.ArrayBufferWriter<byte>();
-        var w = new MessagePackWriter(bufWriter);
-
         w.WriteMapHeader(6);
         w.Write("k");    w.Write((byte)key.Kind);
         w.Write("u");    w.Write(key.Unit);
@@ -144,14 +162,6 @@ internal static class MetricWriter
         w.Write("bnds"); WriteBounds(ref w, bounds);
         w.Write("pts");  WritePoints(ref w, points);
         w.Write("cnt");  w.Write((uint)points.Count);
-        w.Flush();
-
-        var raw        = bufWriter.WrittenSpan.ToArray();
-        var compressed = LZ4Pickler.Pickle(raw);
-
-        bw.Write((uint)raw.Length);
-        bw.Write((uint)compressed.Length);
-        bw.Write(compressed);
     }
 
     private static void WriteLabels(ref MessagePackWriter w, LabelSet labels)
@@ -175,13 +185,32 @@ internal static class MetricWriter
     private static void WritePoints(ref MessagePackWriter w, IReadOnlyList<MetricDataPoint> pts)
     {
         w.WriteArrayHeader(pts.Count);
-        foreach (var p in pts)
+        long prevMs = 0;
+        long prevCount = 0;
+        double prevSum = 0;
+        long[]? prevBuckets = null;
+        for (int i = 0; i < pts.Count; i++)
         {
-            w.WriteArrayHeader(5);
-            w.Write(p.TimestampUnixNano);
-            w.Write(p.Value);
+            var p = pts[i];
+            long ms = p.TimestampUnixNano / 1_000_000;
+
+            // Slim shape when the histogram state (count / sum / cumulative
+            // buckets) is unchanged from the previous point — the reader inherits
+            // it. Covers scalar kinds (state is always zero) and every idle
+            // export of a cumulative histogram, which on quiet services is the
+            // overwhelming majority of points.
+            bool same = p.Count == prevCount && p.Sum == prevSum && BucketsEqual(p.BucketCounts, prevBuckets);
+            w.WriteArrayHeader(same ? 2 : 5);
+
+            // First point: absolute unix ms; the rest: delta to the previous point.
+            w.Write(i == 0 ? ms : ms - prevMs);
+            prevMs = ms;
+
+            WriteNumber(ref w, p.Value);
+            if (same) continue;
+
             w.Write(p.Count);
-            w.Write(p.Sum);
+            WriteNumber(ref w, p.Sum);
             if (p.BucketCounts is { Length: > 0 } bc)
             {
                 w.WriteArrayHeader(bc.Length);
@@ -191,7 +220,37 @@ internal static class MetricWriter
             {
                 w.WriteNil();
             }
+            prevCount   = p.Count;
+            prevSum     = p.Sum;
+            prevBuckets = p.BucketCounts;
         }
+    }
+
+    /// <summary>Bucket equality where null and all-zero are equivalent (both mean "nothing observed").</summary>
+    private static bool BucketsEqual(long[]? a, long[]? b)
+    {
+        if (ReferenceEquals(a, b)) return true;
+        if (a is null) return !HasAnyCount(b);
+        if (b is null) return !HasAnyCount(a);
+        if (a.Length != b.Length) return false;
+        for (int i = 0; i < a.Length; i++) if (a[i] != b[i]) return false;
+        return true;
+    }
+
+    private static bool HasAnyCount(long[]? buckets)
+    {
+        if (buckets is null) return false;
+        foreach (var b in buckets) if (b != 0) return true;
+        return false;
+    }
+
+    /// <summary>Writes an integral double as a msgpack varint (1–9 B instead of a fixed 9 B float64).</summary>
+    private static void WriteNumber(ref MessagePackWriter w, double v)
+    {
+        if (double.IsFinite(v) && Math.Floor(v) == v && Math.Abs(v) <= 9.0e15)
+            w.Write((long)v);
+        else
+            w.Write(v);
     }
 
     private static string SanitizeName(string name) =>
