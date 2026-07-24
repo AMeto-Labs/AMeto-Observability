@@ -74,6 +74,8 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     private readonly Task                                  _recompressLoop;
     /// <summary>Test hook: lets merge run without an index builder (tests verify the scan fallback).</summary>
     internal bool _allowIndexlessMerge;
+    /// <summary>Window anchors that produced no usable merge batch — excluded so the sweep advances (reset on restart).</summary>
+    private readonly HashSet<ulong> _mergeSkip = new();
 
     // Cold-tier catalog (thread-safe)
     private readonly ConcurrentDictionary<ulong, SegmentInfo> _segments = new();
@@ -684,38 +686,43 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         var policy = _retentionStore.GetPolicy();
 
         // Oldest-first so the stable "past" consolidates and stays consolidated;
-        // grouped by retention TTL so a merge never changes any event's expiry class.
-        var candidates = _segments.Values
-            .Where(s => s.CompressedBytes < MergeCandidateMaxBytes)
+        // grouped by retention TTL so a merge never changes any event's expiry
+        // class. Every group gets a chance — an exhausted oldest group must not
+        // starve the others.
+        var groups = _segments.Values
+            .Where(s => s.CompressedBytes < MergeCandidateMaxBytes && !_mergeSkip.Contains(s.Id.Value))
             .GroupBy(s => policy.GetTtl(s.MinLevel))
             .Select(g => g.OrderBy(s => s.MinTimestampTicks).ToList())
             .Where(g => g.Count >= MergeMinSources)
-            .OrderBy(g => g[0].MinTimestampTicks)
-            .FirstOrDefault();
-        if (candidates is null) return false;
+            .OrderBy(g => g[0].MinTimestampTicks);
 
-        // Bound the batch's time span (two-pointer over the sorted group): find
-        // the first 24 h window holding at least MergeMinSources segments.
-        int start = 0;
+        // Bound the batch's time span (two-pointer over each sorted group): the
+        // first 24 h window holding at least MergeMinSources segments wins.
         List<SegmentInfo>? window = null;
-        while (start < candidates.Count - MergeMinSources + 1)
+        foreach (var group in groups)
         {
-            long windowStart = candidates[start].MinTimestampTicks;
-            var w = candidates.Skip(start)
-                .TakeWhile(s => s.MaxTimestampTicks - windowStart <= MergeMaxSpanTicks)
-                .Take(MergeMaxSources)
-                .ToList();
-            if (w.Count >= MergeMinSources) { window = w; break; }
-            start += Math.Max(1, w.Count);
+            int start = 0;
+            while (start < group.Count - MergeMinSources + 1)
+            {
+                long windowStart = group[start].MinTimestampTicks;
+                var w = group.Skip(start)
+                    .TakeWhile(s => s.MaxTimestampTicks - windowStart <= MergeMaxSpanTicks)
+                    .Take(MergeMaxSources)
+                    .ToList();
+                if (w.Count >= MergeMinSources) { window = w; break; }
+                start += Math.Max(1, w.Count);
+            }
+            if (window is not null) break;
         }
         if (window is null) return false;
-        candidates = window;
+        var candidates = window;
 
         // Read raw events segment-by-segment until a budget is hit. Segments are
         // consumed whole — a batch never contains part of a segment.
         var dedup    = new Dictionary<string, string>(StringComparer.Ordinal);
         var events   = new List<RawSegmentEvent>();
         var consumed = new List<SegmentInfo>();
+        var segEnds  = new List<int>();  // events.Count after each consumed segment
         long payload = 0;
         foreach (var seg in candidates)
         {
@@ -737,14 +744,30 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             events.AddRange(segEvents);
             foreach (var e in segEvents) payload += e.Props?.Length ?? 0;
             consumed.Add(seg);
+            segEnds.Add(events.Count);
         }
-        if (consumed.Count < MergeMinSources || events.Count == 0) return false;
 
-        // The tier's chunks hold 16 K events / 8 MB payload each; verify the batch
-        // fits BEFORE writing so TryWrite can never fail halfway through.
-        if (!FitsChunkLayout(events))
+        // The tier's chunks hold 16 K event slots / 8 MB payload each — re-packing
+        // prop-dense events from slot 0 can exceed that even though every SOURCE
+        // segment respected it at ingest (live tiers rotate early instead). Trim
+        // the batch to the largest whole-segment prefix that fits the geometry;
+        // an all-or-nothing check would stall the sweep forever on dense days.
+        int fitting = FittingEventCount(events);
+        int keep = segEnds.Count;
+        while (keep > 0 && segEnds[keep - 1] > fitting) keep--;
+        if (keep < consumed.Count)
         {
-            _logger.LogWarning("Merge: batch of {Count} events exceeds chunk payload density — skipped", events.Count);
+            consumed.RemoveRange(keep, consumed.Count - keep);
+            events.RemoveRange(keep == 0 ? 0 : segEnds[keep - 1], events.Count - (keep == 0 ? 0 : segEnds[keep - 1]));
+        }
+
+        // Anti-stall: a window whose anchor can't produce even a 2-segment batch
+        // would be re-selected forever — exclude the anchor until restart.
+        if (consumed.Count < 2 || events.Count == 0)
+        {
+            _mergeSkip.Add(candidates[0].Id.Value);
+            _logger.LogWarning("Merge: window anchored at {File} yields no usable batch — anchor skipped",
+                Path.GetFileName(candidates[0].FilePath));
             return false;
         }
 
@@ -821,8 +844,11 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         }
     }
 
-    /// <summary>Simulates the tier's chunk assignment (16 K events / 8 MB payload per chunk).</summary>
-    private static bool FitsChunkLayout(List<RawSegmentEvent> events)
+    /// <summary>
+    /// Simulates the tier's chunk assignment (16 K event slots / 8 MB payload per
+    /// chunk) and returns the largest event-prefix length that fits.
+    /// </summary>
+    private static int FittingEventCount(List<RawSegmentEvent> events)
     {
         const int  ChunkEvents  = 16_384;
         const long ChunkPayload = 8L * 1024 * 1024;
@@ -831,9 +857,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         {
             if (i % ChunkEvents == 0) chunkBytes = 0;
             chunkBytes += events[i].Props?.Length ?? 0;
-            if (chunkBytes > ChunkPayload) return false;
+            if (chunkBytes > ChunkPayload) return i;
         }
-        return true;
+        return events.Count;
     }
 
     /// <summary>

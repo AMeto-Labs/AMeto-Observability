@@ -42,19 +42,20 @@ public sealed class SegmentMergeTests : IAsyncLifetime
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    private static byte[] Props(int i)
+    private static byte[] Props(int i, int padBytes = 0)
     {
-        var buf = new ArrayBufferWriter<byte>(64);
+        var buf = new ArrayBufferWriter<byte>(64 + padBytes);
         var w = new MessagePackWriter(buf);
-        w.WriteMapHeader(2);
+        w.WriteMapHeader(padBytes > 0 ? 3 : 2);
         w.Write("n");   w.Write((long)i);
         w.Write("key"); w.Write("wallet:" + i);
+        if (padBytes > 0) { w.Write("pad"); w.Write(new string('x', padBytes)); }
         w.Flush();
         return buf.WrittenSpan.ToArray();
     }
 
     /// <summary>Writes <paramref name="count"/> events and flushes them into one small segment.</summary>
-    private async Task WriteSegmentAsync(int round, int count, LogLevel? fixedLevel = null, long? baseTicks = null)
+    private async Task WriteSegmentAsync(int round, int count, LogLevel? fixedLevel = null, long? baseTicks = null, int padBytes = 0)
     {
         for (int i = 0; i < count; i++)
         {
@@ -73,7 +74,7 @@ public sealed class SegmentMergeTests : IAsyncLifetime
             var exc = n % 50 == 0
                 ? new ExceptionInfo { Type = "System.InvalidOperationException", Message = "boom " + n }
                 : null;
-            Assert.True(_engine.TryWrite(header, Props(n), exception: exc));
+            Assert.True(_engine.TryWrite(header, Props(n, padBytes), exception: exc));
         }
         await _engine.FlushHotTierAsync();
     }
@@ -161,6 +162,35 @@ public sealed class SegmentMergeTests : IAsyncLifetime
         Assert.Equal(LogLevel.Error, segs[1].MinLevel); // 90-day class, merged alone
         Assert.Equal(320u, segs[0].EventCount);
         Assert.Equal(320u, segs[1].EventCount);
+    }
+
+    /// <summary>
+    /// Prop-dense events (~2 KB each — the real-service shape that stalled the
+    /// sandbox sweep) exceed the tier's 8 MB-per-16K-slot chunk budget when
+    /// re-packed from slot 0. The batch must TRIM to the fitting prefix and keep
+    /// merging instead of rejecting the window forever.
+    /// </summary>
+    [Fact]
+    public async Task Merge_TrimsDenseBatches_InsteadOfStalling()
+    {
+        // 12 segments × 700 events × ~2 KB props ≈ 16 MB payload — chunk 0 fits
+        // only ~4 K such events, so the full batch can never fit as-is.
+        for (int round = 0; round < 12; round++)
+            await WriteSegmentAsync(round, 700, padBytes: 2048);
+        Assert.Equal(12, _engine.ListSegments().Count);
+        var before = ReadEverything();
+
+        // Repeated passes must make monotonic progress and eventually settle.
+        for (int i = 0; i < 10; i++)
+            if (!await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None)) break;
+
+        var segs = _engine.ListSegments();
+        Assert.True(segs.Count < 12, $"expected consolidation, still {segs.Count} segments");
+
+        var after = ReadEverything();
+        Assert.Equal(before.Count, after.Count); // nothing lost, nothing duplicated
+        Assert.Equal(before[0].Id, after[0].Id);
+        Assert.Equal(before[^1].Id, after[^1].Id);
     }
 
     /// <summary>A merged file can only expire whole — batches must not span more than a day.</summary>
