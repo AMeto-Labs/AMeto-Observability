@@ -431,6 +431,140 @@ public sealed class SegmentReader : ISegmentReader
         return list;
     }
 
+    // ── Raw event access (compaction) ─────────────────────────────────────────
+
+    /// <summary>
+    /// Decodes every event with its RAW payloads — properties/exception bytes are
+    /// not deserialised into dictionaries, so a compaction re-write is lossless
+    /// and cheap. <paramref name="stringDedup"/> collapses repeated template /
+    /// service strings across blocks and segments.
+    /// </summary>
+    internal List<RawSegmentEvent> ReadAllRaw(Dictionary<string, string> stringDedup)
+    {
+        var result = new List<RawSegmentEvent>(checked((int)Info.EventCount));
+        foreach (var (blockOffset, _) in _blocks)
+        {
+            int uncompressedSize = ReadInt32At(blockOffset);
+            int compressedSize   = ReadInt32At(blockOffset + 4);
+
+            byte[] rentedComp   = ArrayPool<byte>.Shared.Rent(compressedSize);
+            byte[] rentedUncomp = ArrayPool<byte>.Shared.Rent(uncompressedSize);
+            try
+            {
+                _view.ReadArray(blockOffset + 8, rentedComp, 0, compressedSize);
+                if (LZ4Codec.Decode(rentedComp, 0, compressedSize, rentedUncomp, 0, uncompressedSize) != uncompressedSize)
+                    throw new InvalidDataException($"Corrupt block at {blockOffset} in {Info.FilePath}");
+                DecodeColumnarBlockRaw(rentedUncomp.AsSpan(0, uncompressedSize), result, stringDedup);
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(rentedComp);
+                ArrayPool<byte>.Shared.Return(rentedUncomp);
+            }
+        }
+        return result;
+    }
+
+    private static void DecodeColumnarBlockRaw(
+        ReadOnlySpan<byte> span, List<RawSegmentEvent> result, Dictionary<string, string> dedup)
+    {
+        int    pos        = 0;
+        int    eventCount = (int)BinaryPrimitives.ReadUInt32LittleEndian(span.Slice(pos, 4));   pos += 4;
+        long   blockMinTs = BinaryPrimitives.ReadInt64LittleEndian (span.Slice(pos, 8));        pos += 8;
+        ulong  blockMinId = BinaryPrimitives.ReadUInt64LittleEndian(span.Slice(pos, 8));        pos += 8;
+        byte   colCount   = span[pos]; pos += 1;
+
+        ReadOnlySpan<byte> colT  = default, colL = default, colI = default;
+        ReadOnlySpan<byte> colMt = default, colEx = default, colPr = default;
+        ReadOnlySpan<byte> colTr = default, colSp = default, colSvc = default;
+
+        for (int c = 0; c < colCount; c++)
+        {
+            byte id      = span[pos]; pos += 1;
+            int  byteLen = (int)BinaryPrimitives.ReadUInt32LittleEndian(span.Slice(pos, 4)); pos += 4;
+            var  data    = span.Slice(pos, byteLen); pos += byteLen;
+            switch (id)
+            {
+                case 1: colT   = data; break;
+                case 2: colL   = data; break;
+                case 3: colI   = data; break;
+                case 4: colMt  = data; break;
+                case 5: colEx  = data; break;
+                case 6: colPr  = data; break;
+                case 7: colTr  = data; break;
+                case 8: colSp  = data; break;
+                case 9: colSvc = data; break;
+                default: break;
+            }
+        }
+
+        int offsetsBytes = (eventCount + 1) * 4;
+        var mtOffsets    = colMt.Slice(0, offsetsBytes);
+        var mtPayload    = colMt.Slice(offsetsBytes);
+        var exOffsets    = colEx.Slice(0, offsetsBytes);
+        var exPayload    = colEx.Slice(offsetsBytes);
+        var prOffsets    = colPr.Slice(0, offsetsBytes);
+        var prPayload    = colPr.Slice(offsetsBytes);
+        var svcOffsets   = colSvc.Length >= offsetsBytes ? colSvc.Slice(0, offsetsBytes) : default;
+        var svcPayload   = colSvc.Length >= offsetsBytes ? colSvc.Slice(offsetsBytes) : default;
+
+        for (int i = 0; i < eventCount; i++)
+        {
+            long  tDelta = BinaryPrimitives.ReadInt64LittleEndian (colT.Slice(i * 8, 8));
+            byte  lvl    = colL[i];
+            ulong iDelta = BinaryPrimitives.ReadUInt64LittleEndian(colI.Slice(i * 8, 8));
+
+            ulong trHi = colTr.Length >= (i + 1) * 16 ? BinaryPrimitives.ReadUInt64LittleEndian(colTr.Slice(i * 16, 8)) : 0;
+            ulong trLo = colTr.Length >= (i + 1) * 16 ? BinaryPrimitives.ReadUInt64LittleEndian(colTr.Slice(i * 16 + 8, 8)) : 0;
+            ulong spId = colSp.Length >= (i + 1) * 8  ? BinaryPrimitives.ReadUInt64LittleEndian(colSp.Slice(i * 8, 8)) : 0;
+
+            uint mtStart = BinaryPrimitives.ReadUInt32LittleEndian(mtOffsets.Slice(i * 4, 4));
+            uint mtEnd   = BinaryPrimitives.ReadUInt32LittleEndian(mtOffsets.Slice((i + 1) * 4, 4));
+            string mt = string.Empty;
+            if (mtEnd > mtStart)
+            {
+                mt = Encoding.UTF8.GetString(mtPayload.Slice((int)mtStart, (int)(mtEnd - mtStart)));
+                if (dedup.TryGetValue(mt, out var pooled)) mt = pooled; else dedup[mt] = mt;
+            }
+
+            string? svc = null;
+            if (svcOffsets.Length > 0)
+            {
+                uint sStart = BinaryPrimitives.ReadUInt32LittleEndian(svcOffsets.Slice(i * 4, 4));
+                uint sEnd   = BinaryPrimitives.ReadUInt32LittleEndian(svcOffsets.Slice((i + 1) * 4, 4));
+                if (sEnd > sStart)
+                {
+                    svc = Encoding.UTF8.GetString(svcPayload.Slice((int)sStart, (int)(sEnd - sStart)));
+                    if (dedup.TryGetValue(svc, out var pooled)) svc = pooled; else dedup[svc] = svc;
+                }
+            }
+
+            uint exStart = BinaryPrimitives.ReadUInt32LittleEndian(exOffsets.Slice(i * 4, 4));
+            uint exEnd   = BinaryPrimitives.ReadUInt32LittleEndian(exOffsets.Slice((i + 1) * 4, 4));
+            ExceptionInfo? exc = exEnd > exStart
+                ? ExceptionInfo.FromBytes(exPayload.Slice((int)exStart, (int)(exEnd - exStart)))
+                : null;
+
+            uint prStart = BinaryPrimitives.ReadUInt32LittleEndian(prOffsets.Slice(i * 4, 4));
+            uint prEnd   = BinaryPrimitives.ReadUInt32LittleEndian(prOffsets.Slice((i + 1) * 4, 4));
+            byte[]? props = prEnd > prStart ? prPayload.Slice((int)prStart, (int)(prEnd - prStart)).ToArray() : null;
+
+            result.Add(new RawSegmentEvent
+            {
+                Id        = blockMinId + iDelta,
+                TsTicks   = blockMinTs + tDelta,
+                Level     = lvl,
+                TraceIdHi = trHi,
+                TraceIdLo = trLo,
+                SpanId    = spId,
+                Template  = mt,
+                Service   = svc,
+                Props     = props,
+                Exception = exc,
+            });
+        }
+    }
+
     // ── Raw section access ────────────────────────────────────────────────────
 
     public byte[] ReadInvertedIndexBytes()  => ReadSection(_invertedIndexOffset);
@@ -476,6 +610,22 @@ public sealed class SegmentReader : ISegmentReader
         _view.Dispose();
         _mmf.Dispose();
     }
+}
+
+/// <summary>
+/// One event decoded with its raw payloads intact — the unit compaction re-writes
+/// into a fresh hot tier. Properties stay msgpack bytes (no dictionary roundtrip).
+/// </summary>
+internal struct RawSegmentEvent
+{
+    public ulong          Id;
+    public long           TsTicks;
+    public byte           Level;
+    public ulong          TraceIdHi, TraceIdLo, SpanId;
+    public string         Template;
+    public string?        Service;
+    public byte[]?        Props;
+    public ExceptionInfo? Exception;
 }
 
 /// <summary>

@@ -154,12 +154,12 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     }
 
     /// <summary>
-    /// Walks the cold catalog and re-compresses each segment once from the fast
-    /// LZ4 level the flush path uses to LZ4-HC (see <see cref="SegmentRecompressor"/>).
-    /// Paced by BYTES per pass, not file count — a long-running server holds
-    /// thousands of ~100 KB segments, and a fixed files-per-pass budget would
-    /// stretch the sweep over hours. The flush path stays untouched, so ingest
-    /// throughput is unaffected.
+    /// Cold-tier maintenance: first MERGE small segments into large ones (a
+    /// long-running server accumulates thousands of ~100 KB age-flush segments —
+    /// per-file index/catalog overhead dwarfs the payload), then re-compress
+    /// whatever segments remain on the fast flush-path LZ4 level to LZ4-HC
+    /// (see <see cref="SegmentRecompressor"/>). Both are one-shot per segment and
+    /// paced by bytes; the flush path stays untouched, so ingest is unaffected.
     /// </summary>
     private async Task RunRecompressLoopAsync(CancellationToken ct)
     {
@@ -172,6 +172,24 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
         while (!ct.IsCancellationRequested)
         {
+            // Finish any merge whose source deletion was blocked by an open reader
+            // (the manifest survives until every source file is gone).
+            try { RecoverInterruptedMerges(); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Merge recovery sweep failed"); }
+
+            // Merge takes priority: HC-ing a tiny file that a later merge rewrites
+            // anyway would be wasted work. One batch per iteration, short pause
+            // while a backlog exists.
+            bool merged;
+            try { merged = await TryMergeSmallSegmentsOnceAsync(ct); }
+            catch (OperationCanceledException) { break; }
+            catch (Exception ex) { _logger.LogError(ex, "Segment merge pass failed"); merged = false; }
+            if (merged)
+            {
+                try { await Task.Delay(TimeSpan.FromSeconds(15), ct); }
+                catch (OperationCanceledException) { break; }
+                continue;
+            }
             int  done = 0;
             long passBytes = 0, savedTotal = 0;
             foreach (var (segId, info) in _segments)
@@ -629,6 +647,188 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         }
     }
 
+    // ── Small-segment merge (compaction) ──────────────────────────────────────
+
+    private const long MergeCandidateMaxBytes = 8L * 1024 * 1024;   // only merge segments smaller than this
+    private const long MergeTargetPayloadBytes = 96L * 1024 * 1024; // uncompressed payload budget per batch
+    private const int  MergeMinSources = 8;                          // don't bother below this
+    private const int  MergeMaxSources = 512;
+    private const int  MergeMaxEvents  = 500_000;
+
+    /// <summary>
+    /// Merges one batch of small, time-adjacent cold segments into a single large
+    /// segment via the regular flush pipeline (shared sort + index build + writer),
+    /// preserving event ids, timestamps and raw property/exception payloads.
+    /// Crash-safe: a manifest written next to the merged file lists the source
+    /// files, so an interrupted deletion is finished on the next startup. Returns
+    /// true when a batch was merged.
+    /// </summary>
+    internal async Task<bool> TryMergeSmallSegmentsOnceAsync(CancellationToken ct)
+    {
+        // Oldest-first so the stable "past" consolidates and stays consolidated.
+        var candidates = _segments.Values
+            .Where(s => s.CompressedBytes < MergeCandidateMaxBytes)
+            .OrderBy(s => s.MinTimestampTicks)
+            .Take(MergeMaxSources)
+            .ToList();
+        if (candidates.Count < MergeMinSources) return false;
+
+        // Read raw events segment-by-segment until a budget is hit. Segments are
+        // consumed whole — a batch never contains part of a segment.
+        var dedup    = new Dictionary<string, string>(StringComparer.Ordinal);
+        var events   = new List<RawSegmentEvent>();
+        var consumed = new List<SegmentInfo>();
+        long payload = 0;
+        foreach (var seg in candidates)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (consumed.Count > 0 &&
+                (events.Count >= MergeMaxEvents || payload >= MergeTargetPayloadBytes))
+                break;
+            List<RawSegmentEvent> segEvents;
+            try
+            {
+                using var reader = SegmentReader.Open(seg.FilePath);
+                segEvents = reader.ReadAllRaw(dedup);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Merge: skipping unreadable segment {File}", seg.FilePath);
+                continue;
+            }
+            events.AddRange(segEvents);
+            foreach (var e in segEvents) payload += e.Props?.Length ?? 0;
+            consumed.Add(seg);
+        }
+        if (consumed.Count < MergeMinSources || events.Count == 0) return false;
+
+        // The tier's chunks hold 16 K events / 8 MB payload each; verify the batch
+        // fits BEFORE writing so TryWrite can never fail halfway through.
+        if (!FitsChunkLayout(events))
+        {
+            _logger.LogWarning("Merge: batch of {Count} events exceeds chunk payload density — skipped", events.Count);
+            return false;
+        }
+
+        var tier = new HotTierSegment(events.Count + 1, payload + (16L << 20));
+        try
+        {
+            foreach (var e in events)
+            {
+                var header = new LogEventHeader
+                {
+                    Id                       = e.Id,
+                    TimestampUtcTicks        = e.TsTicks,
+                    Level                    = (Ameto.Core.LogLevel)e.Level,
+                    MessageTemplatePoolIndex = TemplatePool.Intern(e.Template),
+                    ServiceNamePoolIndex     = e.Service is null ? -1 : TemplatePool.Intern(e.Service),
+                    TraceIdHi                = e.TraceIdHi,
+                    TraceIdLo                = e.TraceIdLo,
+                    SpanId                   = e.SpanId,
+                };
+                if (!tier.TryWrite(header, e.Props ?? ReadOnlySpan<byte>.Empty, template: null, exception: e.Exception))
+                {
+                    _logger.LogError("Merge: tier rejected an event ({Count} total in batch) — batch aborted", events.Count);
+                    return false;
+                }
+            }
+            tier.Freeze();
+
+            // Reserve a segment id from the same counter the flush path uses.
+            ulong reserved;
+            await _flushLock.WaitAsync(ct);
+            try { reserved = _nextSegmentId; _nextSegmentId++; }
+            finally { _flushLock.Release(); }
+
+            var segId   = new SegmentId(reserved);
+            var segPath = BuildSegmentPath(segId, tier);
+            var info    = await FlushToColdAsync(tier, segId, segPath, ct);
+
+            // Manifest before publication: if we crash mid-deletion, startup
+            // recovery deletes the remaining source files instead of serving
+            // duplicate events forever.
+            string manifestPath = segPath + ".mergemanifest";
+            await File.WriteAllLinesAsync(manifestPath, consumed.Select(s => Path.GetFileName(s.FilePath)), ct);
+
+            _segments[segId.Value] = info;
+            foreach (var seg in consumed)
+                await DeleteSegmentAsync(seg.Id, ct);
+
+            // Drop the manifest only when every source file is confirmed gone. A
+            // source held open by an in-flight query survives File.Delete — the
+            // manifest then stays behind and the recovery sweep (each maintenance
+            // iteration + startup) finishes the deletion once the reader closes.
+            // Deleting it unconditionally would resurrect those files as
+            // duplicate segments after a restart.
+            bool allGone = consumed.All(s => !File.Exists(s.FilePath));
+            if (allGone)
+                try { File.Delete(manifestPath); } catch { /* re-processed harmlessly later */ }
+            else
+                _logger.LogWarning("Merge: {Count} source file(s) still held open — manifest kept for the recovery sweep",
+                    consumed.Count(s => File.Exists(s.FilePath)));
+
+            _logger.LogInformation(
+                "Merged {Sources} small segments ({Events} events) into {File} ({Mb:F1} MB)",
+                consumed.Count, events.Count, Path.GetFileName(segPath), info.CompressedBytes / 1048576.0);
+            return true;
+        }
+        finally
+        {
+            tier.Dispose();
+        }
+    }
+
+    /// <summary>Simulates the tier's chunk assignment (16 K events / 8 MB payload per chunk).</summary>
+    private static bool FitsChunkLayout(List<RawSegmentEvent> events)
+    {
+        const int  ChunkEvents  = 16_384;
+        const long ChunkPayload = 8L * 1024 * 1024;
+        long chunkBytes = 0;
+        for (int i = 0; i < events.Count; i++)
+        {
+            if (i % ChunkEvents == 0) chunkBytes = 0;
+            chunkBytes += events[i].Props?.Length ?? 0;
+            if (chunkBytes > ChunkPayload) return false;
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Finishes merges interrupted mid-deletion: a manifest whose merged segment
+    /// exists means the listed source files are already duplicated — delete them.
+    /// A manifest without its merged segment is a merge that never committed.
+    /// </summary>
+    private void RecoverInterruptedMerges()
+    {
+        foreach (var manifest in Directory.EnumerateFiles(_segDir, "*.mergemanifest"))
+        {
+            try
+            {
+                string mergedSeg = manifest[..^".mergemanifest".Length];
+                bool   allGone   = true;
+                if (File.Exists(mergedSeg))
+                {
+                    foreach (var name in File.ReadAllLines(manifest))
+                    {
+                        var src = Path.Combine(_segDir, name);
+                        try { if (File.Exists(src)) File.Delete(src); }
+                        catch (Exception ex) { _logger.LogWarning(ex, "Merge recovery: failed to delete {File}", src); }
+                        if (File.Exists(src)) allGone = false;
+                    }
+                    if (allGone)
+                        _logger.LogInformation("Merge recovery: completed interrupted merge for {File}", Path.GetFileName(mergedSeg));
+                }
+                // Keep the manifest while any duplicate source survives (a reader
+                // may still hold it open) — the next sweep retries.
+                if (allGone) File.Delete(manifest);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Merge recovery failed for {Manifest}", manifest);
+            }
+        }
+    }
+
     private Task<SegmentInfo> FlushToColdAsync(HotTierSegment hot, SegmentId segId, string segPath, CancellationToken ct)
     {
         // Capture delegate reference before entering Task.Run
@@ -729,12 +929,17 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
 
-        // Clean up leftover temp files from interrupted flushes
-        foreach (var tmp in Directory.EnumerateFiles(_segDir, "*.seg.tmp"))
-        {
-            try { File.Delete(tmp); }
-            catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete leftover temp segment {File}", tmp); }
-        }
+        // Clean up leftover temp files from interrupted flushes / re-compressions
+        foreach (var pattern in new[] { "*.seg.tmp", "*.hctmp" })
+            foreach (var tmp in Directory.EnumerateFiles(_segDir, pattern))
+            {
+                try { File.Delete(tmp); }
+                catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete leftover temp segment {File}", tmp); }
+            }
+
+        // Finish merges interrupted between publishing the merged segment and
+        // deleting its sources — otherwise those events would be served twice.
+        RecoverInterruptedMerges();
 
         foreach (var file in Directory.EnumerateFiles(_segDir, "*.seg"))
         {
