@@ -4,18 +4,30 @@ using Microsoft.AspNetCore.Http;
 namespace Ameto.Ingestion;
 
 /// <summary>
-/// Capabilities an API key grants on the ingest endpoints. Bit flags, so one key
-/// can allow any combination. Keys created before permissions existed migrate to
-/// <see cref="All"/> so they keep working.
+/// Capabilities an API key grants. Bit flags, so one key can allow any
+/// combination of ingest (write) and query (read) per signal. The low three
+/// bits are the original ingest scopes; keys created before permissions existed
+/// migrate to <see cref="Ingest"/> so they keep working. Read scopes are
+/// separate bits so an ingest-only shipping key can never read stored data.
 /// </summary>
 [Flags]
 public enum ApiKeyPermissions
 {
-    None    = 0,
-    Logs    = 1,
-    Traces  = 2,
-    Metrics = 4,
-    All     = Logs | Traces | Metrics,
+    None        = 0,
+
+    // ── Ingest (write) ──
+    Logs        = 1,
+    Traces      = 2,
+    Metrics     = 4,
+
+    // ── Query (read) ──
+    ReadLogs    = 8,
+    ReadTraces  = 16,
+    ReadMetrics = 32,
+
+    Ingest      = Logs | Traces | Metrics,             // 7 (legacy "All")
+    Read        = ReadLogs | ReadTraces | ReadMetrics, // 56
+    All         = Ingest | Read,                       // 63
 }
 
 /// <summary>

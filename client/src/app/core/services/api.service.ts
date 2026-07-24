@@ -210,8 +210,8 @@ export class ApiService {
   createUser(username: string, password: string, role: string): Observable<UserDto> {
     return this.http.post<UserDto>('/api/users', { username, password, role });
   }
-  createOAuthUser(email: string, displayName: string, provider: string, role: string): Observable<UserDto> {
-    return this.http.post<UserDto>('/api/users/oauth', { email, displayName, provider, role });
+  createOAuthUser(email: string, displayName: string, provider: string, role: string, permissions?: number): Observable<UserDto> {
+    return this.http.post<UserDto>('/api/users/oauth', { email, displayName, provider, role, permissions });
   }
   updateUserRole(id: string, role: string): Observable<void> {
     return this.http.patch<void>(`/api/users/${id}/role`, { role });
@@ -228,8 +228,11 @@ export class ApiService {
   getOAuthDomains(): Observable<OAuthDomainDto[]> {
     return this.http.get<OAuthDomainDto[]>('/api/users/oauth-domains');
   }
-  createOAuthDomain(domain: string, provider: string, role: string): Observable<OAuthDomainDto> {
-    return this.http.post<OAuthDomainDto>('/api/users/oauth-domains', { domain, provider, role });
+  createOAuthDomain(domain: string, provider: string, role: string, permissions?: number): Observable<OAuthDomainDto> {
+    return this.http.post<OAuthDomainDto>('/api/users/oauth-domains', { domain, provider, role, permissions });
+  }
+  updateOAuthDomain(id: string, role: string, permissions: number): Observable<void> {
+    return this.http.patch<void>(`/api/users/oauth-domains/${encodeURIComponent(id)}`, { role, permissions });
   }
   deleteOAuthDomain(id: string): Observable<void> {
     return this.http.delete<void>(`/api/users/oauth-domains/${encodeURIComponent(id)}`);
@@ -241,6 +244,9 @@ export class ApiService {
     return this.http.post<CreatedApiKeyDto>('/api/auth/keys', {
       name, description, permissions, key: key || null,
     });
+  }
+  updateApiKey(id: string, patch: { name?: string; description?: string; permissions?: number }): Observable<void> {
+    return this.http.patch<void>(`/api/auth/keys/${encodeURIComponent(id)}`, patch);
   }
   deleteApiKey(id: string): Observable<void>  { return this.http.delete<void>(`/api/auth/keys/${id}`); }
 

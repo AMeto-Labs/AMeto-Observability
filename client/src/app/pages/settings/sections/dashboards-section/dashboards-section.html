@@ -43,8 +43,20 @@
     <div class="metric">
       <div class="metric-name">Storage size</div>
       <div class="metric-right">
-        <div class="metric-value">{{ fmtBytes(d.totalCompressedBytes) }}</div>
-        <div class="metric-desc">Total compressed size of all cold-tier segments on disk.</div>
+        <div class="metric-value">{{ fmtBytes(d.dataTotalBytes ?? d.totalCompressedBytes) }}</div>
+        <div class="metric-desc">
+          Total on-disk size of the data directory
+          @if (d.dataDirectory) { (<code>{{ d.dataDirectory }}</code>) }.
+        </div>
+        @if (d.dataTotalBytes != null) {
+          <div class="storage-breakdown">
+            <div class="sb-row"><span class="sb-dot logs"></span>Logs <span class="sb-val">{{ fmtBytes(d.logsStorageBytes ?? 0) }}</span></div>
+            <div class="sb-row"><span class="sb-dot metrics"></span>Metrics <span class="sb-val">{{ fmtBytes(d.metricsStorageBytes ?? 0) }}</span></div>
+            <div class="sb-row"><span class="sb-dot traces"></span>Traces <span class="sb-val">{{ fmtBytes(d.tracesStorageBytes ?? 0) }}</span></div>
+            <div class="sb-row"><span class="sb-dot db"></span>Database <span class="sb-val">{{ fmtBytes(d.databaseStorageBytes ?? 0) }}</span></div>
+            <div class="sb-row"><span class="sb-dot other"></span>Other <span class="sb-val">{{ fmtBytes(d.otherStorageBytes ?? 0) }}</span></div>
+          </div>
+        }
       </div>
     </div>
   </app-section>

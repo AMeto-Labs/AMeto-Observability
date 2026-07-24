@@ -30,12 +30,14 @@ internal sealed record ApiKeyRecord(
     public string? Key { get; init; }
 }
 
-/// <summary>An OAuth domain allowlist rule: any email @Domain via Provider may sign in.</summary>
+/// <summary>An OAuth domain allowlist rule: any email @Domain via Provider may
+/// sign in, getting <see cref="Role"/> and <see cref="Permissions"/> by default.</summary>
 internal sealed record OAuthDomainRecord(
     string Id,
     string Provider,
     string Domain,
     string Role,
+    ViewPermissions Permissions,
     DateTimeOffset CreatedAt);
 
 // ── Store ──────────────────────────────────────────────────────────────────────
@@ -111,8 +113,9 @@ internal sealed class AuthStore
         var rule = FindOAuthDomain(provider, domain);
         if (rule is null) return null;
 
-        // Auto-provision so the user appears in the users list and can be managed.
-        return CreateOAuthUser(email, displayName, provider, rule.Role);
+        // Auto-provision with the domain rule's default role + permissions so the
+        // user appears in the users list and can be managed / re-scoped afterwards.
+        return CreateOAuthUser(email, displayName, provider, rule.Role, rule.Permissions);
     }
 
     /// <summary>Looks up a domain allowlist rule for a provider + domain (case-insensitive).</summary>
@@ -121,7 +124,7 @@ internal sealed class AuthStore
         using var conn = _db.Open();
         using var cmd  = conn.CreateCommand();
         cmd.CommandText = """
-            SELECT id, provider, domain, role, created_at
+            SELECT id, provider, domain, role, permissions, created_at
             FROM oauth_domains
             WHERE provider = @p AND domain = @d COLLATE NOCASE
             """;
@@ -131,7 +134,7 @@ internal sealed class AuthStore
         if (!r.Read()) return null;
         return new OAuthDomainRecord(
             r.GetString(0), r.GetString(1), r.GetString(2),
-            r.GetString(3), DateTimeOffset.Parse(r.GetString(4)));
+            r.GetString(3), (ViewPermissions)r.GetInt32(4), DateTimeOffset.Parse(r.GetString(5)));
     }
 
     // ── Users: list / create / delete ─────────────────────────────────────────
@@ -214,12 +217,13 @@ internal sealed class AuthStore
     }
 
     /// <summary>Creates an OAuth user entry (email-allowlist approach).</summary>
-    public UserRecord CreateOAuthUser(string email, string displayName, string provider, string role)
+    public UserRecord CreateOAuthUser(string email, string displayName, string provider, string role,
+        ViewPermissions permissions = ViewPermissions.All)
     {
         var username = $"{provider}:{email.ToLowerInvariant()}";
         var rec = new UserRecord(
             Guid.NewGuid().ToString("N"), username, displayName, email.ToLowerInvariant(),
-            provider, NormaliseRole(role), ViewPermissions.All, DateTimeOffset.UtcNow);
+            provider, NormaliseRole(role), permissions, DateTimeOffset.UtcNow);
 
         using var conn = _db.Open();
         using var cmd  = conn.CreateCommand();
@@ -308,34 +312,48 @@ internal sealed class AuthStore
     {
         using var conn = _db.Open();
         using var cmd  = conn.CreateCommand();
-        cmd.CommandText = "SELECT id, provider, domain, role, created_at FROM oauth_domains ORDER BY provider, domain";
+        cmd.CommandText = "SELECT id, provider, domain, role, permissions, created_at FROM oauth_domains ORDER BY provider, domain";
         using var r    = cmd.ExecuteReader();
         var result = new List<OAuthDomainRecord>();
         while (r.Read())
             result.Add(new(r.GetString(0), r.GetString(1), r.GetString(2),
-                           r.GetString(3), DateTimeOffset.Parse(r.GetString(4))));
+                           r.GetString(3), (ViewPermissions)r.GetInt32(4), DateTimeOffset.Parse(r.GetString(5))));
         return result;
     }
 
-    public OAuthDomainRecord CreateOAuthDomain(string provider, string domain, string role)
+    public OAuthDomainRecord CreateOAuthDomain(string provider, string domain, string role,
+        ViewPermissions permissions = ViewPermissions.All)
     {
         var rec = new OAuthDomainRecord(
             Guid.NewGuid().ToString("N"), provider, domain.ToLowerInvariant(),
-            NormaliseRole(role), DateTimeOffset.UtcNow);
+            NormaliseRole(role), permissions, DateTimeOffset.UtcNow);
 
         using var conn = _db.Open();
         using var cmd  = conn.CreateCommand();
         cmd.CommandText = """
-            INSERT INTO oauth_domains (id, provider, domain, role, created_at)
-            VALUES (@id, @p, @d, @r, @ca)
+            INSERT INTO oauth_domains (id, provider, domain, role, permissions, created_at)
+            VALUES (@id, @p, @d, @r, @perm, @ca)
             """;
         cmd.Parameters.AddWithValue("@id", rec.Id);
         cmd.Parameters.AddWithValue("@p",  rec.Provider);
         cmd.Parameters.AddWithValue("@d",  rec.Domain);
         cmd.Parameters.AddWithValue("@r",  rec.Role);
+        cmd.Parameters.AddWithValue("@perm", (int)rec.Permissions);
         cmd.Parameters.AddWithValue("@ca", rec.CreatedAt.ToString("O"));
         cmd.ExecuteNonQuery();
         return rec;
+    }
+
+    /// <summary>Updates an OAuth domain rule's default role + permissions.</summary>
+    public bool UpdateOAuthDomain(string id, string role, ViewPermissions permissions)
+    {
+        using var conn = _db.Open();
+        using var cmd  = conn.CreateCommand();
+        cmd.CommandText = "UPDATE oauth_domains SET role = @r, permissions = @perm WHERE id = @id";
+        cmd.Parameters.AddWithValue("@id",   id);
+        cmd.Parameters.AddWithValue("@r",    NormaliseRole(role));
+        cmd.Parameters.AddWithValue("@perm", (int)permissions);
+        return cmd.ExecuteNonQuery() > 0;
     }
 
     public bool DeleteOAuthDomain(string id)
@@ -417,6 +435,19 @@ internal sealed class AuthStore
         using var cmd  = conn.CreateCommand();
         cmd.CommandText = "DELETE FROM api_keys WHERE id = @id";
         cmd.Parameters.AddWithValue("@id", id);
+        return cmd.ExecuteNonQuery() > 0;
+    }
+
+    /// <summary>Updates an API key's name, description and permission bits (not the secret).</summary>
+    public bool UpdateApiKey(string id, string name, string description, ApiKeyPermissions permissions)
+    {
+        using var conn = _db.Open();
+        using var cmd  = conn.CreateCommand();
+        cmd.CommandText = "UPDATE api_keys SET name = @n, description = @desc, permissions = @perm WHERE id = @id";
+        cmd.Parameters.AddWithValue("@id",   id);
+        cmd.Parameters.AddWithValue("@n",    name);
+        cmd.Parameters.AddWithValue("@desc", description);
+        cmd.Parameters.AddWithValue("@perm", (int)permissions);
         return cmd.ExecuteNonQuery() > 0;
     }
 

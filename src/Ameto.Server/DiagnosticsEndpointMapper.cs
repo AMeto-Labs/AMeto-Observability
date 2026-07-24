@@ -30,6 +30,16 @@ public static class DiagnosticsEndpointMapper
 
             var segs = storage.GetSegments(null, null);
 
+            // ── Storage: on-disk size of the whole data directory, broken down by
+            // signal. Cheap directory walks (metadata only, no file reads).
+            var dataRoot     = Path.GetFullPath(options.DataDirectory);
+            long logsBytes    = DirSize(Path.Combine(dataRoot, "segments")) + DirSize(Path.Combine(dataRoot, "wal"));
+            long metricsBytes = DirSize(Path.Combine(dataRoot, "metrics"));
+            long tracesBytes  = DirSize(Path.Combine(dataRoot, "traces"));
+            long dbBytes      = FilesSize(dataRoot, "Ameto.db*");
+            long dataTotal    = DirSize(dataRoot);
+            long otherBytes   = Math.Max(0, dataTotal - logsBytes - metricsBytes - tracesBytes - dbBytes);
+
             // Memory attribution: split process RSS into its real consumers so
             // we can stop guessing what holds the working set.
             //   gcHeap      — live managed objects on the GC heap
@@ -73,7 +83,48 @@ public static class DiagnosticsEndpointMapper
                 segmentCount         = segs.Count,
                 totalEventCount      = segs.Sum(s => (long)s.EventCount),
                 totalCompressedBytes = segs.Sum(s => s.CompressedBytes),
+
+                // On-disk data directory (whole folder, per-signal breakdown)
+                dataDirectory        = dataRoot,
+                dataTotalBytes       = dataTotal,
+                logsStorageBytes     = logsBytes,
+                metricsStorageBytes  = metricsBytes,
+                tracesStorageBytes   = tracesBytes,
+                databaseStorageBytes = dbBytes,
+                otherStorageBytes    = otherBytes,
             });
         }).RequireAuthorization();
+    }
+
+    /// <summary>Recursive on-disk size of a directory (0 if it doesn't exist). Metadata-only.</summary>
+    private static long DirSize(string path)
+    {
+        try
+        {
+            if (!Directory.Exists(path)) return 0;
+            long total = 0;
+            foreach (var f in Directory.EnumerateFiles(path, "*", SearchOption.AllDirectories))
+            {
+                try { total += new FileInfo(f).Length; } catch { /* transient/locked — skip */ }
+            }
+            return total;
+        }
+        catch { return 0; }
+    }
+
+    /// <summary>Sum of files matching a pattern in the top level of a directory.</summary>
+    private static long FilesSize(string dir, string pattern)
+    {
+        try
+        {
+            if (!Directory.Exists(dir)) return 0;
+            long total = 0;
+            foreach (var f in Directory.EnumerateFiles(dir, pattern, SearchOption.TopDirectoryOnly))
+            {
+                try { total += new FileInfo(f).Length; } catch { /* skip */ }
+            }
+            return total;
+        }
+        catch { return 0; }
     }
 }

@@ -119,7 +119,11 @@ internal static class AuthServiceExtensions
                         return Task.CompletedTask;
                     },
                 };
-            });
+            })
+            // Read-path API-key scheme: a query request carrying an ingest-style
+            // key with the right Read bit authorizes the per-view policies below.
+            .AddScheme<Microsoft.AspNetCore.Authentication.AuthenticationSchemeOptions, ApiKeyAuthenticationHandler>(
+                ApiKeyAuthenticationHandler.SchemeName, _ => { });
 
         // ── Google OAuth ───────────────────────────────────────────────────────
         if (authOptions.Google is { ClientId.Length: > 0, ClientSecret.Length: > 0 } google)
@@ -175,14 +179,18 @@ internal static class AuthServiceExtensions
             o.AddPolicy(PolicyViewer, p =>
                 p.RequireAuthenticatedUser().RequireRole("admin", "manager", "viewer"));
 
-            // Per-view read scopes — admin bypasses, otherwise the JWT 'perm' bit is required.
-            o.AddPolicy(PolicyViewLogs, p => p.RequireAuthenticatedUser()
+            // Per-view read scopes — admin bypasses, otherwise the 'perm' bit is
+            // required. Both the JWT (users) and the ApiKey scheme (read keys)
+            // can satisfy them; the api-key identity is non-admin so it only ever
+            // gets the exact scopes its Read bits map to.
+            var readSchemes = new[] { JwtBearerDefaults.AuthenticationScheme, ApiKeyAuthenticationHandler.SchemeName };
+            o.AddPolicy(PolicyViewLogs, p => p.AddAuthenticationSchemes(readSchemes).RequireAuthenticatedUser()
                 .RequireAssertion(static c => c.User.HasView(ViewPermissions.Logs)));
-            o.AddPolicy(PolicyViewMetrics, p => p.RequireAuthenticatedUser()
+            o.AddPolicy(PolicyViewMetrics, p => p.AddAuthenticationSchemes(readSchemes).RequireAuthenticatedUser()
                 .RequireAssertion(static c => c.User.HasView(ViewPermissions.Metrics)));
-            o.AddPolicy(PolicyViewTraces, p => p.RequireAuthenticatedUser()
+            o.AddPolicy(PolicyViewTraces, p => p.AddAuthenticationSchemes(readSchemes).RequireAuthenticatedUser()
                 .RequireAssertion(static c => c.User.HasView(ViewPermissions.Traces)));
-            o.AddPolicy(PolicyViewStats, p => p.RequireAuthenticatedUser()
+            o.AddPolicy(PolicyViewStats, p => p.AddAuthenticationSchemes(readSchemes).RequireAuthenticatedUser()
                 .RequireAssertion(static c => c.User.HasView(ViewPermissions.Stats)));
 
             // Default policy requires at least viewer
