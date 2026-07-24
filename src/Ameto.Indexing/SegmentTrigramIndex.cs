@@ -70,6 +70,12 @@ public sealed class SegmentTrigramIndex
     /// </summary>
     public uint[]? Lookup(ReadOnlySpan<char> text)
     {
+        // An index with no trigrams at all was never built (e.g. a WAL-recovery
+        // flush before the builder was wired) — that is "no information", not
+        // "no matches". Only a POPULATED index may treat a missing trigram as
+        // proof of absence.
+        if (_loaded.Count == 0 && _sets.Count == 0) return null;
+
         string lower = text.ToString().ToLowerInvariant();
         if (lower.Length < 3) return null;
 
