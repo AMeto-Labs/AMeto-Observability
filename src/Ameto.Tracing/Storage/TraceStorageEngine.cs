@@ -369,12 +369,15 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         // into memory. Compaction used to merge ALL small segments at once, which on a
         // memory-limited container exhausted the heap (tiny allocations threw OOM) and
         // left the segments un-compacted — so they piled up and every pass failed worse.
+        // Legacy-v2 files are selected regardless of size so old data migrates to the
+        // v3 format (and shrinks) in the background.
         var small = _coldSegments
-            .Where(s => s.SpanCount < CompactionThreshold)
+            .Where(s => s.SpanCount < CompactionThreshold || s.FormatVersion < 3)
             .OrderBy(s => s.MinStartNano)   // oldest first
             .Take(MaxSegmentsPerPass)
             .ToList();
-        if (small.Count < 2) return false;
+        if (small.Count == 0) return false;
+        if (small.Count < 2 && small.All(s => s.FormatVersion >= 3)) return false;
 
         var allSpans  = new List<SpanRecord>();
         var processed = new List<SpanSegmentInfo>(small.Count);
@@ -389,7 +392,9 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             catch (Exception ex) { _logger.LogWarning(ex, "Compaction: failed to read {File}", seg.FilePath); }
         }
 
-        if (processed.Count < 2 || allSpans.Count == 0) return false;
+        // A single v3 file needs no rewrite; a single v2 file still migrates.
+        if (allSpans.Count == 0) return false;
+        if (processed.Count < 2 && processed.All(s => s.FormatVersion >= 3)) return false;
 
         try
         {
@@ -968,4 +973,6 @@ public sealed class SpanSegmentInfo
     public int      SpanCount    { get; init; }
     /// <summary>Service names present in this segment — enables O(1) cold-tier pre-filter.</summary>
     public string[] Services     { get; init; } = [];
+    /// <summary>On-disk format version (2 = legacy string-keyed maps, 3 = current). Drives v2→v3 migration.</summary>
+    public ushort   FormatVersion { get; init; } = 3;
 }

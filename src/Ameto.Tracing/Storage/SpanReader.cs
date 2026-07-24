@@ -6,7 +6,10 @@ using MessagePack;
 namespace Ameto.Tracing.Storage;
 
 /// <summary>
-/// Reads span records from <c>.trc</c> files written by <see cref="SpanWriter"/> (v2).
+/// Reads span records from <c>.trc</c> files written by <see cref="SpanWriter"/> —
+/// both the current v3 format (positional arrays, block-local delta timestamps,
+/// inline attributes) and the legacy v2 format (string-keyed maps, absolute
+/// timestamps, nested attribute blobs).
 /// </summary>
 internal static class SpanReader
 {
@@ -23,7 +26,8 @@ internal static class SpanReader
         uint magic = br.ReadUInt32();
         if (magic != Magic) throw new InvalidDataException($"Invalid .trc magic in {filePath}");
 
-        br.ReadUInt16(); // version
+        ushort version = br.ReadUInt16();
+        if (version is not (2 or 3)) throw new InvalidDataException($"Unsupported .trc version {version} in {filePath}");
         uint spanCount = br.ReadUInt32();
         long minNano   = br.ReadInt64();
         long maxNano   = br.ReadInt64();
@@ -33,11 +37,12 @@ internal static class SpanReader
 
         return new SpanSegmentInfo
         {
-            FilePath     = filePath,
-            MinStartNano = minNano,
-            MaxStartNano = maxNano,
-            SpanCount    = (int)spanCount,
-            Services     = services,
+            FilePath      = filePath,
+            MinStartNano  = minNano,
+            MaxStartNano  = maxNano,
+            SpanCount     = (int)spanCount,
+            Services      = services,
+            FormatVersion = version,
         };
     }
 
@@ -159,7 +164,7 @@ internal static class SpanReader
         using var br = new BinaryReader(fs);
 
         br.ReadUInt32(); // magic
-        br.ReadUInt16(); // version
+        ushort version = br.ReadUInt16();
         int spanCount = (int)br.ReadUInt32();
         br.ReadInt64();  // minNano
         br.ReadInt64();  // maxNano
@@ -193,11 +198,14 @@ internal static class SpanReader
                 if (cnt > 50_000) // Safety limit for spans per block
                     throw new InvalidDataException($"Block {blockIdx} contains too many spans: {cnt}");
 
+                long prevTs = 0;
                 for (int i = 0; i < cnt; i++)
                 {
                     if (result.Count >= 1_000_000) // Total span limit
                         throw new InvalidDataException($"Total span count exceeds 1,000,000");
-                    result.Add(DeserializeSpan(ref reader));
+                    result.Add(version >= 3
+                        ? DeserializeSpanV3(ref reader, i == 0, ref prevTs)
+                        : DeserializeSpan(ref reader));
                 }
             }
             catch (OutOfMemoryException ex)
@@ -223,7 +231,7 @@ internal static class SpanReader
         using var br = new BinaryReader(fs);
 
         br.ReadUInt32(); // magic
-        br.ReadUInt16(); // version
+        ushort version = br.ReadUInt16();
         int spanCount = (int)br.ReadUInt32();
         br.ReadInt64();  // minNano
         br.ReadInt64();  // maxNano
@@ -243,7 +251,8 @@ internal static class SpanReader
 
             if (allowedBlocks is not null && !allowedBlocks.Contains(blockIdx))
             {
-                // Skip decompression + deserialization — pure seek, O(1)
+                // Skip decompression + deserialization — pure seek, O(1).
+                // Safe for v3 too: the Δts chain restarts on every block.
                 fs.Seek(compSize, SeekOrigin.Current);
             }
             else
@@ -252,8 +261,11 @@ internal static class SpanReader
                 var raw       = LZ4Pickler.Unpickle(compBytes);
                 var reader    = new MessagePackReader(raw);
                 int cnt       = reader.ReadArrayHeader();
+                long prevTs   = 0;
                 for (int i = 0; i < cnt; i++)
-                    result.Add(DeserializeSpan(ref reader));
+                    result.Add(version >= 3
+                        ? DeserializeSpanV3(ref reader, i == 0, ref prevTs)
+                        : DeserializeSpan(ref reader));
             }
 
             blockIdx++;
@@ -347,6 +359,105 @@ internal static class SpanReader
     }
 
     // ── Span deserialisation ───────────────────────────────────────────────────
+
+    /// <summary>
+    /// v3 positional span:
+    /// [ tid, sid, pid|nil, Δts, dur, name, svc, kind, status, hsc, attrs|nil ].
+    /// <paramref name="prevTs"/> carries the Δts chain across the block.
+    /// </summary>
+    private static SpanRecord DeserializeSpanV3(ref MessagePackReader r, bool first, ref long prevTs)
+    {
+        int n = r.ReadArrayHeader(); // 11 fields
+
+        TraceId traceId = default;
+        SpanId  spanId  = default;
+        SpanId  parentId = default;
+
+        var seq = r.ReadBytes();
+        if (seq is { } tidSeq) { Span<byte> b = stackalloc byte[16]; CopyFixed(tidSeq, b); traceId = TraceId.Parse(b); }
+        seq = r.ReadBytes();
+        if (seq is { } sidSeq) { Span<byte> b = stackalloc byte[8]; CopyFixed(sidSeq, b); spanId = SpanId.Parse(b); }
+        if (r.TryReadNil())
+        {
+            // root span — no parent
+        }
+        else
+        {
+            seq = r.ReadBytes();
+            if (seq is { } pidSeq) { Span<byte> b = stackalloc byte[8]; CopyFixed(pidSeq, b); parentId = SpanId.Parse(b); }
+        }
+
+        long ts = first ? r.ReadInt64() : prevTs + r.ReadInt64();
+        prevTs = ts;
+
+        long   dur    = r.ReadInt64();
+        string name   = r.ReadString() ?? string.Empty;
+        string svc    = r.ReadString() ?? string.Empty;
+        var    kind   = (SpanKind)r.ReadByte();
+        var    status = (SpanStatusCode)r.ReadByte();
+        short  httpSC = r.ReadInt16();
+
+        IReadOnlyDictionary<string, object?>? attrs = null;
+        if (r.TryReadNil())
+        {
+            // no attributes
+        }
+        else
+        {
+            int cnt = r.ReadMapHeader();
+            var dict = new Dictionary<string, object?>(cnt, StringComparer.Ordinal);
+            for (int i = 0; i < cnt; i++)
+            {
+                var key = r.ReadString() ?? string.Empty;
+                dict[key] = ReadAttrValue(ref r);
+            }
+            attrs = dict;
+        }
+
+        // Consume any fields a future minor revision might append.
+        for (int i = 11; i < n; i++) r.Skip();
+
+        return new SpanRecord
+        {
+            TraceId           = traceId,
+            SpanId            = spanId,
+            ParentSpanId      = parentId,
+            StartTimeUnixNano = ts,
+            DurationNanos     = dur,
+            Name              = name,
+            ServiceName       = svc,
+            Kind              = kind,
+            Status            = status,
+            HttpStatusCode    = httpSC,
+            Attributes        = attrs,
+        };
+    }
+
+    private static object? ReadAttrValue(ref MessagePackReader r) =>
+        r.NextMessagePackType switch
+        {
+            MessagePackType.String  => r.ReadString(),
+            MessagePackType.Integer => r.ReadInt64(),
+            MessagePackType.Float   => r.ReadDouble(),
+            MessagePackType.Boolean => r.ReadBoolean(),
+            MessagePackType.Nil     => ReadNil(ref r),
+            _                       => SkipUnknown(ref r),
+        };
+
+    private static object? ReadNil(ref MessagePackReader r) { r.ReadNil(); return null; }
+    private static object? SkipUnknown(ref MessagePackReader r) { r.Skip(); return null; }
+
+    private static void CopyFixed(in System.Buffers.ReadOnlySequence<byte> seq, Span<byte> dest)
+    {
+        int pos = 0;
+        foreach (var seg in seq)
+        {
+            int take = Math.Min(seg.Length, dest.Length - pos);
+            if (take <= 0) break;
+            seg.Span[..take].CopyTo(dest[pos..]);
+            pos += take;
+        }
+    }
 
     private static SpanRecord DeserializeSpan(ref MessagePackReader r)
     {
