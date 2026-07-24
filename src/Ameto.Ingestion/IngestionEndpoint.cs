@@ -200,7 +200,15 @@ public sealed class IngestionEndpoint : IOtlpLogSink
         ReadOnlySpan<byte> serviceUtf8)
     {
         if (msgpackProps.Length > _maxEventPayloadBytes)
-            return false; // oversized — drop (hot path: no per-event log, unlike TryIngest)
+        {
+            // Drop the oversized original, but leave a compact Error breadcrumb in
+            // the stream so the loss is visible on the Events page — not only in
+            // the server's own log. Marked DroppedBy=server to distinguish it from
+            // the client sink's own oversized marker.
+            string origTmpl = templateUtf8.IsEmpty ? string.Empty : System.Text.Encoding.UTF8.GetString(templateUtf8);
+            EnqueueServerDropMarker(tsTicks, level, origTmpl, msgpackProps.Length, traceHi, traceLo, spanId, _pool.Intern(serviceUtf8));
+            return false; // original counted as dropped by the caller
+        }
 
         int    tmplIdx = _pool.Intern(templateUtf8);           // -1 when empty
         string tmpl    = tmplIdx >= 0 ? _pool.Get(tmplIdx) : string.Empty;
@@ -230,6 +238,12 @@ public sealed class IngestionEndpoint : IOtlpLogSink
             _logger.LogWarning(
                 "Dropped oversized log event: properties {PayloadBytes} B exceed limit {LimitBytes} B (service={Service}, template=\"{Template}\")",
                 payloadLen, _maxEventPayloadBytes, ev.ServiceName ?? "(none)", Truncate(ev.MessageTemplate, 120));
+            // Also record it in the stream as an Error marker so it surfaces on the
+            // Events page, not just in the server log.
+            EnqueueServerDropMarker(
+                ev.Timestamp.UtcTicks, (byte)ev.Level, ev.MessageTemplate ?? string.Empty,
+                payloadLen, ev.TraceIdHi, ev.TraceIdLo, ev.SpanId,
+                ev.ServiceName is not null ? _pool.Intern(ev.ServiceName) : -1);
             return;
         }
 
@@ -250,6 +264,45 @@ public sealed class IngestionEndpoint : IOtlpLogSink
     }
 
     /// <summary>Clamps a template for safe logging (cold path only — the substring alloc is fine).</summary>
+    /// <summary>
+    /// Serialised template of the server-side oversized-drop marker. The
+    /// placeholders match the property keys below so the message renders with the
+    /// numbers filled in. Interned once (low cardinality).
+    /// </summary>
+    private const string DropMarkerTemplate =
+        "Ameto server dropped an oversized log event: properties {EventBodyBytes} B exceed limit {EventBodyLimitBytes} B ({OriginalTemplate})";
+
+    /// <summary>
+    /// Enqueues a compact Error event standing in for a dropped oversized one,
+    /// preserving its timestamp / trace-span / service. The marker is tiny (the
+    /// original template is truncated) so it can never itself be oversized, and it
+    /// carries <c>DroppedBy=server</c> to set it apart from the client sink's marker.
+    /// </summary>
+    private void EnqueueServerDropMarker(
+        long tsTicks, byte originalLevel, string originalTemplate,
+        int payloadBytes, ulong traceHi, ulong traceLo, ulong spanId, int serviceIdx)
+    {
+        const int MaxTemplateChars = 256;
+        string origTmpl  = originalTemplate.Length <= MaxTemplateChars ? originalTemplate : originalTemplate[..MaxTemplateChars];
+        string origLevel = ((Ameto.Core.LogLevel)originalLevel).ToString();
+
+        var buf = new ArrayBufferWriter<byte>(384);
+        var w   = new MessagePackWriter(buf);
+        w.WriteMapHeader(5);
+        w.Write("DroppedBy");           w.Write("server");
+        w.Write("EventBodyBytes");      w.Write(payloadBytes);
+        w.Write("EventBodyLimitBytes"); w.Write(_maxEventPayloadBytes);
+        w.Write("OriginalTemplate");    w.Write(origTmpl);
+        w.Write("OriginalLevel");       w.Write(origLevel);
+        w.Flush();
+
+        int mtIdx = _pool.Intern(DropMarkerTemplate);
+        bool ok = _ring.TryEnqueue(
+            tsTicks, (byte)Ameto.Core.LogLevel.Error, mtIdx, DropMarkerTemplate,
+            exception: null, buf.WrittenSpan, traceHi, traceLo, spanId, serviceIdx);
+        if (ok) _drainer.NotifyEnqueued();
+    }
+
     private static string Truncate(string? s, int max) =>
         string.IsNullOrEmpty(s) ? "(none)" : s.Length <= max ? s : string.Concat(s.AsSpan(0, max), "…");
 }
