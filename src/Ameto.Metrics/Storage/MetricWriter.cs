@@ -74,8 +74,15 @@ internal static class MetricWriter
             }
             if (minNano == long.MaxValue) continue;
 
+            // A short nonce keeps the name unique: the (name, min, max, granularity)
+            // tuple is NOT — a v2→v3 migration re-writes the same time range, and two
+            // files of the same range can legitimately coexist until the next merge
+            // dedupes them. Without it, WriteFile's FileMode.CreateNew throws
+            // "already exists" and the compaction fails every pass. The name is never
+            // parsed back (all metadata is read from the file's own header/index).
             string suffix   = granularity == MetricGranularity.Raw ? "raw" : granularity.ToString().ToLower();
-            string fileName = $"metrics-{SanitizeName(group.Key)}-{minNano}-{maxNano}-{suffix}.mts";
+            string nonce    = Guid.NewGuid().ToString("N").Substring(0, 8);
+            string fileName = $"metrics-{SanitizeName(group.Key)}-{minNano}-{maxNano}-{suffix}-{nonce}.mts";
             string filePath = Path.Combine(dataDir, fileName);
 
             WriteFile(filePath, group.Key, granularity, items, minNano, maxNano);
