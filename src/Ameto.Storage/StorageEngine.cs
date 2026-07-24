@@ -154,35 +154,44 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     }
 
     /// <summary>
-    /// Slowly walks the cold catalog and re-compresses each segment once from the
-    /// fast LZ4 level the flush path uses to LZ4-HC (see <see cref="SegmentRecompressor"/>).
-    /// A few segments per pass, low priority — the flush path stays untouched, so
-    /// ingest throughput is unaffected.
+    /// Walks the cold catalog and re-compresses each segment once from the fast
+    /// LZ4 level the flush path uses to LZ4-HC (see <see cref="SegmentRecompressor"/>).
+    /// Paced by BYTES per pass, not file count — a long-running server holds
+    /// thousands of ~100 KB segments, and a fixed files-per-pass budget would
+    /// stretch the sweep over hours. The flush path stays untouched, so ingest
+    /// throughput is unaffected.
     /// </summary>
     private async Task RunRecompressLoopAsync(CancellationToken ct)
     {
-        const int MaxPerPass = 4;
-        var visited = new HashSet<ulong>();
+        const long MaxBytesPerPass = 96L * 1024 * 1024;
+        const int  MaxAttempts     = 3;   // per segment; a persistently locked file must not stall the sweep
+        var attempts = new Dictionary<ulong, int>();
 
         try { await Task.Delay(TimeSpan.FromMinutes(3), ct); } // let startup + catalog load settle
         catch (OperationCanceledException) { return; }
 
         while (!ct.IsCancellationRequested)
         {
-            int done = 0;
-            long savedTotal = 0;
+            int  done = 0;
+            long passBytes = 0, savedTotal = 0;
             foreach (var (segId, info) in _segments)
             {
-                if (ct.IsCancellationRequested) break;
-                if (done >= MaxPerPass) break;
-                if (!visited.Add(segId)) continue;
-                if (!SegmentRecompressor.IsCandidate(info.FilePath)) continue;
+                if (ct.IsCancellationRequested || passBytes >= MaxBytesPerPass) break;
+                int tried = attempts.GetValueOrDefault(segId);
+                if (tried >= MaxAttempts) continue;
+                if (!SegmentRecompressor.IsCandidate(info.FilePath))
+                {
+                    attempts[segId] = MaxAttempts; // done already / not applicable — never re-check
+                    continue;
+                }
 
                 long? saved = await Task.Run(
                     () => SegmentRecompressor.Recompress(info.FilePath, _logger, ct), ct);
                 done++;
+                passBytes += Math.Max(info.CompressedBytes, 1);
                 if (saved is > 0)
                 {
+                    attempts[segId] = MaxAttempts;
                     savedTotal += saved.Value;
                     // Keep the catalog's size accurate for diagnostics.
                     _segments.TryUpdate(segId, new SegmentInfo
@@ -198,9 +207,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                         UncompressedBytes = info.UncompressedBytes,
                     }, info);
                 }
-                else if (saved is null)
+                else
                 {
-                    visited.Remove(segId); // transient (file busy) — retry on a later pass
+                    attempts[segId] = tried + 1; // busy or skipped — bounded retries
                 }
             }
 
@@ -208,7 +217,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 _logger.LogInformation("Recompressed {Count} log segment(s), saved {Mb:F1} MB",
                     done, savedTotal / 1048576.0);
 
-            try { await Task.Delay(TimeSpan.FromMinutes(done >= MaxPerPass ? 1 : 10), ct); }
+            try { await Task.Delay(TimeSpan.FromSeconds(passBytes >= MaxBytesPerPass ? 30 : 600), ct); }
             catch (OperationCanceledException) { break; }
         }
     }
