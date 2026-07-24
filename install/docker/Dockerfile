@@ -49,11 +49,13 @@ COPY src/Ameto.Alerts/Ameto.Alerts.csproj         src/Ameto.Alerts/
 COPY src/Ameto.Replication/Ameto.Replication.csproj src/Ameto.Replication/
 COPY src/Ameto.Server/Ameto.Server.csproj         src/Ameto.Server/
 
-# The NuGet global-packages folder is a BuildKit cache mount — persisted across
-# builds, so restore is near-instant once warm. It must be declared on BOTH the
-# restore and the publish RUN (publish --no-restore reads packages from it).
-RUN --mount=type=cache,target=/root/.nuget/packages \
-    dotnet restore src/Ameto.Server/Ameto.Server.csproj \
+# Restore into the IMAGE LAYER, not a BuildKit cache mount. A cache mount is
+# ephemeral in CI (each runner gets a fresh builder) while the RUN's layer is
+# restored from the registry/gha layer cache — so a cache-hit restore layer left
+# the packages missing and the publish below (--no-restore) failed with
+# "NETSDK1064: Package X was not found. It might have been deleted since NuGet
+# restore." Keeping the packages in the layer makes the cached restore complete.
+RUN dotnet restore src/Ameto.Server/Ameto.Server.csproj \
         --runtime linux-musl-x64
 
 # Now bring in the actual sources + the built SPA (these layers change often, but
@@ -69,8 +71,7 @@ ARG APP_VERSION=1.0.0-dev
 # InvariantGlobalization → drop the ~28 MB ICU dependency (app parses invariantly)
 # The residual .pdb/.xml/web.config/locale strip runs in the same layer so it
 # never lands in an intermediate layer.
-RUN --mount=type=cache,target=/root/.nuget/packages \
-    dotnet publish src/Ameto.Server/Ameto.Server.csproj \
+RUN dotnet publish src/Ameto.Server/Ameto.Server.csproj \
         --configuration Release \
         --output /publish \
         --runtime linux-musl-x64 \
