@@ -18,6 +18,8 @@ import { CompareTraceComponent } from './compare-trace/compare-trace';
 import { SuggestInputDirective } from '../../shared/suggest/suggest-input.directive';
 import { ModalComponent } from '../../shared/components/ui';
 import { EventDetailComponent } from '../events/components/event-detail/event-detail';
+import { EventListRowComponent } from '../events/components/event-list-row/event-list-row';
+import { PropertyMenuComponent } from '../../shared/components/property-menu/property-menu';
 
 /** TraceQL vocabulary offered by the Ctrl+Space autocomplete: intrinsics, common OTel span
  *  attributes (dotted), status/kind enum values, and the comparison/boolean operators. */
@@ -37,7 +39,7 @@ const TRACEQL_TOKENS: readonly string[] = [
 
 @Component({
   selector: 'app-traces',
-  imports: [FormsModule, LucideAngularModule, ServiceGraphComponent, FlamegraphComponent, LatencyComponent, CompareTraceComponent, SuggestInputDirective, ModalComponent, EventDetailComponent],
+  imports: [FormsModule, LucideAngularModule, ServiceGraphComponent, FlamegraphComponent, LatencyComponent, CompareTraceComponent, SuggestInputDirective, ModalComponent, EventDetailComponent, EventListRowComponent, PropertyMenuComponent],
   templateUrl: './traces.html',
   styleUrl: './traces.scss',
   changeDetection: ChangeDetectionStrategy.OnPush,
@@ -473,6 +475,11 @@ export class TracesComponent implements OnInit, OnDestroy {
     const ident = /^[A-Za-z_][A-Za-z0-9_]*$/.test(m.key) ? m.key : `['${m.key}']`;
     const value = /^-?\d+(\.\d+)?$/.test(m.value) ? m.value : `'${m.value.replaceAll("'", "''")}'`;
     void this.router.navigate(['/events'], { queryParams: { filter: `${ident} = ${value}` } });
+  }
+
+  /** A log row on the Logs tab emitted a CLEF filter — open it on the Events page. */
+  findInLogs(filter: string): void {
+    void this.router.navigate(['/events'], { queryParams: { filter } });
   }
 
   private tqlPredicate(key: string, value: string, neq: boolean): string {

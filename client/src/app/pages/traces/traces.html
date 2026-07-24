@@ -503,14 +503,12 @@
                         </div>
                       } @else {
                         @for (log of visibleLogs(); track $index) {
-                          <div class="log-row log-row--clickable"
-                               [class.log-row--match]="logMatchesSelectedSpan(log)"
-                               (click)="logModalEvent.set(log)"
-                               title="Open full log details">
-                            <span class="log-level" [class]="logLevelCls(log)">{{ logLevel(log) }}</span>
-                            <span class="log-ts mono">{{ logTs(log) }}</span>
-                            <span class="log-msg">{{ logMessage(log) }}</span>
-                          </div>
+                          <app-event-list-row
+                            class="tl-log-row"
+                            [class.tl-log-row--match]="logMatchesSelectedSpan(log)"
+                            [event]="log"
+                            (selectRequested)="logModalEvent.set(log)"
+                            (filterSelected)="findInLogs($event)" />
                         }
                       }
                     </div>
@@ -563,43 +561,18 @@
   </div>
 </div>
 
-<!-- Span-attribute context menu (opened from the Tags table). Fixed-position;
-     closes on outside click / Escape (document handlers in the component). -->
+<!-- Span-attribute context menu (opened from the Tags table). Shared with the
+     Events page; closes on outside click / Escape (document handlers below). -->
 @if (attrMenu(); as m) {
-  <div class="attr-menu" [style.left.px]="m.x" [style.top.px]="m.y" (click)="$event.stopPropagation()">
-    <div class="am-header mono" [title]="m.key + ' = ' + m.value">{{ m.key }}</div>
-
-    <button class="am-item" (click)="attrCopy('value')">
-      <lucide-icon name="copy" [size]="12" /> Copy value
-    </button>
-    <button class="am-item" (click)="attrCopy('key')">
-      <lucide-icon name="copy" [size]="12" /> Copy key
-    </button>
-
-    <div class="am-sep"></div>
-    <div class="am-section">Find</div>
-
-    <div class="am-row">
-      <span class="am-label">Search by key</span>
-      <button class="am-op" (click)="attrFind(false)" title="Only traces where {{ m.key }} equals this value">=</button>
-      <button class="am-op" (click)="attrFind(true)"  title="Only traces where {{ m.key }} differs">≠</button>
-    </div>
-    <div class="am-row">
-      <span class="am-label">And expression</span>
-      <button class="am-op" (click)="attrExpr('&&', false)" title="Append && {{ m.key }} = …">=</button>
-      <button class="am-op" (click)="attrExpr('&&', true)"  title="Append && {{ m.key }} != …">≠</button>
-    </div>
-    <div class="am-row">
-      <span class="am-label">Or expression</span>
-      <button class="am-op" (click)="attrExpr('||', false)" title="Append || {{ m.key }} = …">=</button>
-      <button class="am-op" (click)="attrExpr('||', true)"  title="Append || {{ m.key }} != …">≠</button>
-    </div>
-
-    <div class="am-sep"></div>
-    <button class="am-item" (click)="attrFindInLogs()">
-      <lucide-icon name="list" [size]="12" /> Find in logs
-    </button>
-  </div>
+  <app-property-menu
+    [x]="m.x" [y]="m.y" [propKey]="m.key" [propValue]="m.value"
+    crossLabel="Find in logs"
+    (copyValue)="attrCopy('value')"
+    (copyKey)="attrCopy('key')"
+    (search)="attrFind($event)"
+    (andExpr)="attrExpr('&&', $event)"
+    (orExpr)="attrExpr('||', $event)"
+    (cross)="attrFindInLogs()" />
 }
 
 <!-- Full log details, rendered by the same component the Events page uses (overview /
