@@ -8,24 +8,26 @@
     <lucide-icon name="copy" [size]="12" /> Copy key
   </button>
 
-  <div class="pm-sep"></div>
-  <div class="pm-section">Find</div>
+  @if (findable()) {
+    <div class="pm-sep"></div>
+    <div class="pm-section">Find</div>
 
-  <div class="pm-row">
-    <span class="pm-label">Search by key</span>
-    <button class="pm-op" (click)="search.emit(false)" title="Only entries where {{ propKey() }} equals this value">=</button>
-    <button class="pm-op" (click)="search.emit(true)"  title="Only entries where {{ propKey() }} differs">≠</button>
-  </div>
-  <div class="pm-row">
-    <span class="pm-label">And expression</span>
-    <button class="pm-op" (click)="andExpr.emit(false)" title="Append AND {{ propKey() }} = …">=</button>
-    <button class="pm-op" (click)="andExpr.emit(true)"  title="Append AND {{ propKey() }} ≠ …">≠</button>
-  </div>
-  <div class="pm-row">
-    <span class="pm-label">Or expression</span>
-    <button class="pm-op" (click)="orExpr.emit(false)" title="Append OR {{ propKey() }} = …">=</button>
-    <button class="pm-op" (click)="orExpr.emit(true)"  title="Append OR {{ propKey() }} ≠ …">≠</button>
-  </div>
+    <div class="pm-row">
+      <span class="pm-label">Search by key</span>
+      <button class="pm-op" (click)="search.emit(false)" title="Only entries where {{ propKey() }} equals this value">=</button>
+      <button class="pm-op" (click)="search.emit(true)"  title="Only entries where {{ propKey() }} differs">≠</button>
+    </div>
+    <div class="pm-row">
+      <span class="pm-label">And expression</span>
+      <button class="pm-op" (click)="andExpr.emit(false)" title="Append AND {{ propKey() }} = …">=</button>
+      <button class="pm-op" (click)="andExpr.emit(true)"  title="Append AND {{ propKey() }} ≠ …">≠</button>
+    </div>
+    <div class="pm-row">
+      <span class="pm-label">Or expression</span>
+      <button class="pm-op" (click)="orExpr.emit(false)" title="Append OR {{ propKey() }} = …">=</button>
+      <button class="pm-op" (click)="orExpr.emit(true)"  title="Append OR {{ propKey() }} ≠ …">≠</button>
+    </div>
+  }
 
   @if (crossLabel(); as label) {
     <div class="pm-sep"></div>

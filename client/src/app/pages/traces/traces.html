@@ -397,19 +397,34 @@
 
                 <div class="span-detail-left">
                   <div class="sd-field">
-                    <span class="sd-key">Service</span>
+                    <span class="sd-key">
+                      <button class="tag-menu-btn" (click)="openFieldMenu($event, 'service.name', span.serviceName, 'service.name', 'service.name')" title="Filter / copy">
+                        <lucide-icon name="list-filter" [size]="12" />
+                      </button>
+                      Service
+                    </span>
                     <span class="sd-val">
                       <span class="svc-dot sm" [style.background]="svcColor(span.serviceName)"></span>
                       {{ span.serviceName }}
                     </span>
                   </div>
                   <div class="sd-field">
-                    <span class="sd-key">Operation</span>
+                    <span class="sd-key">
+                      <button class="tag-menu-btn" (click)="openFieldMenu($event, 'name', span.name, 'name', null)" title="Filter / copy">
+                        <lucide-icon name="list-filter" [size]="12" />
+                      </button>
+                      Operation
+                    </span>
                     <span class="sd-val">{{ span.name }}</span>
                   </div>
                   @if (span.httpStatusCode) {
                     <div class="sd-field">
-                      <span class="sd-key">HTTP Status</span>
+                      <span class="sd-key">
+                        <button class="tag-menu-btn" (click)="openFieldMenu($event, 'http.status_code', span.httpStatusCode, '.http.status_code', null)" title="Filter / copy">
+                          <lucide-icon name="list-filter" [size]="12" />
+                        </button>
+                        HTTP Status
+                      </span>
                       <span class="sd-val">
                         <span class="status-badge" [class]="statusBadgeCls(span.httpStatusCode, span.status)">
                           {{ span.httpStatusCode }}
@@ -418,19 +433,39 @@
                     </div>
                   }
                   <div class="sd-field">
-                    <span class="sd-key">Span ID</span>
+                    <span class="sd-key">
+                      <button class="tag-menu-btn" (click)="openFieldMenu($event, 'Span ID', span.spanId, null, null)" title="Copy">
+                        <lucide-icon name="list-filter" [size]="12" />
+                      </button>
+                      Span ID
+                    </span>
                     <span class="sd-val mono small">{{ span.spanId }}</span>
                   </div>
                   <div class="sd-field">
-                    <span class="sd-key">Parent</span>
+                    <span class="sd-key">
+                      <button class="tag-menu-btn" (click)="openFieldMenu($event, 'Parent', span.parentSpanId || '', null, null)" title="Copy">
+                        <lucide-icon name="list-filter" [size]="12" />
+                      </button>
+                      Parent
+                    </span>
                     <span class="sd-val mono small">{{ span.parentSpanId || '—' }}</span>
                   </div>
                   <div class="sd-field">
-                    <span class="sd-key">Start</span>
+                    <span class="sd-key">
+                      <button class="tag-menu-btn" (click)="openFieldMenu($event, 'Start', fmtTraceTime(span.startTimeUnixNano), null, null)" title="Copy">
+                        <lucide-icon name="list-filter" [size]="12" />
+                      </button>
+                      Start
+                    </span>
                     <span class="sd-val mono small">{{ fmtTraceTime(span.startTimeUnixNano) }}</span>
                   </div>
                   <div class="sd-field">
-                    <span class="sd-key">Duration</span>
+                    <span class="sd-key">
+                      <button class="tag-menu-btn" (click)="openFieldMenu($event, 'Duration', fmtDurNs(span.durationNanos), null, null)" title="Copy">
+                        <lucide-icon name="list-filter" [size]="12" />
+                      </button>
+                      Duration
+                    </span>
                     <span class="sd-val mono">{{ fmtDurNs(span.durationNanos) }}</span>
                   </div>
                 </div>
@@ -566,7 +601,8 @@
 @if (attrMenu(); as m) {
   <app-property-menu
     [x]="m.x" [y]="m.y" [propKey]="m.key" [propValue]="m.value"
-    crossLabel="Find in logs"
+    [findable]="!!m.tqlKey"
+    [crossLabel]="m.logKey ? 'Find in logs' : null"
     (copyValue)="attrCopy('value')"
     (copyKey)="attrCopy('key')"
     (search)="attrFind($event)"

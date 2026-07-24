@@ -807,7 +807,7 @@
 
 .sd-field {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 8px;
   padding: 4px 0;
   border-bottom: 1px solid color-mix(in srgb, var(--border) 50%, transparent);
@@ -816,7 +816,9 @@
 }
 
 .sd-key {
-  width: 110px;
+  display: flex;
+  align-items: center;
+  width: 122px;
   flex-shrink: 0;
   font-size: 11px;
   color: var(--text-muted);

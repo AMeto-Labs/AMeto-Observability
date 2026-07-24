@@ -422,16 +422,37 @@ export class TracesComponent implements OnInit, OnDestroy {
     }
   }
 
-  // ── Span-attribute context menu (Tags table) ──────────────────────────────
+  // ── Span property context menu (Tags table + the left-column fields) ───────
 
-  readonly attrMenu = signal<{ key: string; value: string; x: number; y: number } | null>(null);
+  readonly attrMenu = signal<{
+    key: string;
+    value: string;
+    /** TraceQL left-hand side (e.g. '.env', 'service.name', 'name'); null = copy-only. */
+    tqlKey: string | null;
+    /** CLEF key for the "Find in logs" cross; null hides the cross item. */
+    logKey: string | null;
+    x: number;
+    y: number;
+  } | null>(null);
 
+  /** Menu for an arbitrary span attribute (Tags table): searchable + logs cross. */
   openAttrMenu(ev: MouseEvent, key: string, value: unknown): void {
+    this.openMenuAt(ev, { key, value: String(value), tqlKey: `.${key}`, logKey: key });
+  }
+
+  /**
+   * Menu for a left-column span field. `tqlKey` null = copy-only (e.g. Span ID,
+   * Parent, Start, Duration); `logKey` null = no logs cross.
+   */
+  openFieldMenu(ev: MouseEvent, key: string, value: unknown, tqlKey: string | null, logKey: string | null): void {
+    this.openMenuAt(ev, { key, value: String(value), tqlKey, logKey });
+  }
+
+  private openMenuAt(ev: MouseEvent, m: { key: string; value: string; tqlKey: string | null; logKey: string | null }): void {
     ev.stopPropagation();
-    // Clamp so the menu never opens below the viewport.
     const x = Math.min(ev.clientX, window.innerWidth - 240);
     const y = Math.min(ev.clientY, window.innerHeight - 290);
-    this.attrMenu.set({ key, value: String(value), x, y });
+    this.attrMenu.set({ ...m, x, y });
   }
 
   @HostListener('document:click')
@@ -446,18 +467,18 @@ export class TracesComponent implements OnInit, OnDestroy {
     this.attrMenu.set(null);
   }
 
-  /** Replace the query: search traces by this attribute alone. */
+  /** Replace the query: search traces by this field alone. */
   attrFind(neq: boolean): void {
     const m = this.attrMenu();
-    if (!m) return;
-    this.applyTraceql(`{ ${this.tqlPredicate(m.key, m.value, neq)} }`);
+    if (!m?.tqlKey) return;
+    this.applyTraceql(`{ ${this.tqlPredicate(m.tqlKey, m.value, neq)} }`);
   }
 
   /** Append to the current query with && / ||. */
   attrExpr(joiner: '&&' | '||', neq: boolean): void {
     const m = this.attrMenu();
-    if (!m) return;
-    const pred = this.tqlPredicate(m.key, m.value, neq);
+    if (!m?.tqlKey) return;
+    const pred = this.tqlPredicate(m.tqlKey, m.value, neq);
     let inner = '';
     if (this.traceqlMode()) {
       const q = this.traceqlInput.trim();
@@ -470,9 +491,9 @@ export class TracesComponent implements OnInit, OnDestroy {
   /** Cross-signal jump: open the Logs page filtered by the same property. */
   attrFindInLogs(): void {
     const m = this.attrMenu();
-    if (!m) return;
+    if (!m?.logKey) return;
     this.attrMenu.set(null);
-    const ident = /^[A-Za-z_][A-Za-z0-9_]*$/.test(m.key) ? m.key : `['${m.key}']`;
+    const ident = /^[A-Za-z_][A-Za-z0-9_]*$/.test(m.logKey) ? m.logKey : `['${m.logKey}']`;
     const value = /^-?\d+(\.\d+)?$/.test(m.value) ? m.value : `'${m.value.replaceAll("'", "''")}'`;
     void this.router.navigate(['/events'], { queryParams: { filter: `${ident} = ${value}` } });
   }
@@ -482,12 +503,13 @@ export class TracesComponent implements OnInit, OnDestroy {
     void this.router.navigate(['/events'], { queryParams: { filter } });
   }
 
-  private tqlPredicate(key: string, value: string, neq: boolean): string {
+  /** `tqlKey` is the already-formatted TraceQL LHS (intrinsic without a dot, attribute with). */
+  private tqlPredicate(tqlKey: string, value: string, neq: boolean): string {
     const op = neq ? '!=' : '=';
     const v  = /^-?\d+(\.\d+)?$/.test(value) || value === 'true' || value === 'false'
       ? value
       : `"${value.replaceAll('"', '')}"`;
-    return `.${key} ${op} ${v}`;
+    return `${tqlKey} ${op} ${v}`;
   }
 
   private applyTraceql(query: string): void {

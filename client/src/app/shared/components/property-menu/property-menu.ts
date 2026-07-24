@@ -26,6 +26,8 @@ export class PropertyMenuComponent {
   readonly propKey = input.required<string>();
   /** Display form of the value (header tooltip only). */
   readonly propValue = input<string>('');
+  /** Show the Find section (Search / And / Or). Copy-only fields pass false. */
+  readonly findable = input<boolean>(true);
   /** Label for the cross-signal item; null hides it. */
   readonly crossLabel = input<string | null>(null);
 
