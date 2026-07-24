@@ -194,6 +194,20 @@ public sealed class SpanFormatV3Tests : IDisposable
         Assert.Equal(0, await CountWithHints(new AttrHint("PR", "no-such-value-xyz")));
     }
 
+    /// <summary>Same span batch written twice (v2→v3 migration shape) must not collide on the file name.</summary>
+    [Fact]
+    public void Write_SameBatchTwice_DoesNotCollide()
+    {
+        var corpus = Corpus(20, 5);
+        var a = SpanWriter.Write(_dir, corpus);
+        var b = SpanWriter.Write(_dir, corpus); // identical min/max/count — used to throw
+        Assert.NotEqual(a.FilePath, b.FilePath);
+        Assert.True(File.Exists(a.FilePath));
+        Assert.True(File.Exists(b.FilePath));
+        Assert.Equal(corpus.Count, SpanReader.ReadAll(a.FilePath).Count);
+        Assert.Equal(corpus.Count, SpanReader.ReadAll(b.FilePath).Count);
+    }
+
     [Fact]
     public void V2_LegacyFiles_StillReadable()
     {

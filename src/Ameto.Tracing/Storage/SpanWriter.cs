@@ -77,7 +77,12 @@ internal static class SpanWriter
         long minNano = spans[0].StartTimeUnixNano;
         long maxNano = spans[^1].StartTimeUnixNano;
 
-        string baseName = $"spans-{minNano}-{maxNano}-{spans.Count}";
+        // Nonce keeps the name unique across a v2→v3 rewrite of the same span
+        // batch (same min/max/count → same name) — otherwise the CreateNew below
+        // throws "already exists" and compaction fails every pass. The name is
+        // never parsed back; sidecars share this base so they stay grouped.
+        string nonce    = Guid.NewGuid().ToString("N").Substring(0, 8);
+        string baseName = $"spans-{minNano}-{maxNano}-{spans.Count}-{nonce}";
         string trcPath  = Path.Combine(dataDir, baseName + ".trc");
 
         // Accumulate service→block mapping and stats in a single pass through WriteBlock

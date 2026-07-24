@@ -155,6 +155,30 @@ public sealed class MetricFormatV3Tests : IDisposable
         }
     }
 
+    /// <summary>
+    /// Writing the same metric + time range twice must not collide: a v2→v3
+    /// migration re-writes the identical (name, min, max, granularity) tuple, and
+    /// FileMode.CreateNew on a name-collision threw "already exists", failing the
+    /// compaction every pass (observed live on the VPS). Distinct nonces fix it.
+    /// </summary>
+    [Fact]
+    public void Write_SameRangeTwice_DoesNotCollide()
+    {
+        var corpus = ScalarCorpus(3, 8);
+
+        var a = MetricWriter.Write(_dir, corpus, MetricGranularity.OneHour);
+        var b = MetricWriter.Write(_dir, corpus, MetricGranularity.OneHour); // identical range — used to throw
+
+        Assert.Single(a);
+        Assert.Single(b);
+        Assert.NotEqual(a[0].FilePath, b[0].FilePath);
+        Assert.True(File.Exists(a[0].FilePath));
+        Assert.True(File.Exists(b[0].FilePath));
+        // Both are independently readable.
+        Assert.Equal(3, MetricReader.ReadAllSync(a[0].FilePath).Count());
+        Assert.Equal(3, MetricReader.ReadAllSync(b[0].FilePath).Count());
+    }
+
     [Fact]
     public void V2_LegacyFiles_StillReadable()
     {
