@@ -165,6 +165,14 @@ public sealed class ServerOptions
     public bool             TrustForwardedHeaders { get; init; } = false;
 
     /// <summary>
+    /// IPs of the reverse proxies whose forwarded headers are trusted. When set
+    /// (with <see cref="TrustForwardedHeaders"/>), only these sources may spoof
+    /// scheme/host/for — far safer than trusting every client. Empty keeps the
+    /// legacy "trust any proxy" behaviour (a startup warning is logged).
+    /// </summary>
+    public string[]         KnownProxies { get; init; } = [];
+
+    /// <summary>
     /// System-wide RAM utilisation target (0–100 %).
     /// When the OS memory load exceeds this threshold the storage engine will
     /// flush the hot tier to disk, releasing the in-memory write buffer.

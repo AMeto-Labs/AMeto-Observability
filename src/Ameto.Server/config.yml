@@ -12,6 +12,9 @@ Ameto:
   # https scheme. Enable ONLY when the server is reachable exclusively
   # through the proxy (clients could spoof the headers otherwise).
   # TrustForwardedHeaders: true
+  # List your proxy IP(s) so ONLY they may set forwarded headers (recommended;
+  # empty = trust any source, with a startup warning):
+  # KnownProxies: ["127.0.0.1"]
 
   # ── Sign-in providers ────────────────────────────────────────────────────────
   # Local username/password is on by default. To add "Sign in with Google /
@@ -23,6 +26,8 @@ Ameto:
   # or per-domain rules ("anyone @your-company.com gets role X").
   # Auth:
   #   LocalEnabled: true
+  #   AdminPassword: ""        # initial admin password; blank = a random one is
+  #                            # generated and logged ONCE at first start (no default creds)
   #   Google:
   #     ClientId: ""
   #     ClientSecret: ""
@@ -68,7 +73,17 @@ Ameto:
   # Symmetric: each node replicates its own segments to all peers.
   Replication:
     Enabled: true
+    Secret: ""             # REQUIRED for multi-node: same value on every peer;
+                           # authenticates peer calls. Blank = peer endpoints reject
+                           # everything (fail-closed), safe for a single node.
     SeedNodes: []
     LocalAddress: ""       # this node's publicly reachable URL, e.g. "http://node0:5341"
     PushTimeout: "00:01:00"    # per-segment HTTP push timeout
     ProbeInterval: "00:00:10"  # how often to probe peers for liveness
+
+  # ── Secrets at rest ──────────────────────────────────────────────────────────
+  # Master key encrypting alert-channel secrets (bot tokens, SMTP passwords). When
+  # unset, a key is generated in the data directory (logged once). For production
+  # set it out of band and keep it OFF the data volume, so a volume leak can't
+  # expose both the ciphertext and its key:
+  # MasterKey: ""            # or env AMETO__MasterKey

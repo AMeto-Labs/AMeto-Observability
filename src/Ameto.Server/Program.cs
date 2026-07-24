@@ -187,6 +187,11 @@ if (serverOptions.TrustForwardedHeaders)
     };
     fwd.KnownIPNetworks.Clear();
     fwd.KnownProxies.Clear();
+    // Restrict forwarded-header trust to the configured proxies when given;
+    // otherwise trust any source (legacy behaviour) — warned about at startup.
+    foreach (var ip in serverOptions.KnownProxies)
+        if (System.Net.IPAddress.TryParse(ip, out var addr))
+            fwd.KnownProxies.Add(addr);
     app.UseForwardedHeaders(fwd);
 }
 app.UseRateLimiter();
@@ -227,6 +232,10 @@ app.Lifetime.ApplicationStarted.Register(() =>
         logger.LogWarning(
             "Replication is enabled but Ameto:Replication:Secret is not set — peer endpoints " +
             "reject all requests (fail-closed). Set the same secret on every node to replicate.");
+    if (serverOptions.TrustForwardedHeaders && serverOptions.KnownProxies.Length == 0)
+        logger.LogWarning(
+            "TrustForwardedHeaders is on with no Ameto:KnownProxies — any client can spoof its " +
+            "scheme/host/IP. List your reverse-proxy IP(s) in Ameto:KnownProxies to restrict trust.");
     logger.LogInformation("Listening on: {Urls}",
         addresses is { Count: > 0 } ? string.Join(", ", addresses) : "(none)");
 });
