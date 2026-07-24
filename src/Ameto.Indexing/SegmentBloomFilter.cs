@@ -105,8 +105,17 @@ public sealed unsafe class SegmentBloomFilter : IDisposable
 
     public static SegmentBloomFilter Deserialise(ReadOnlySpan<byte> data)
     {
+        // An absent/empty bloom section means "no index was built" (e.g. a WAL
+        // recovery flushed before the index builder was wired) — that is NO
+        // information, so the filter must never reject. An all-zero Create(0)
+        // would answer "contains nothing" and make the whole segment invisible
+        // to equality-hinted queries. All-ones bits ⇒ MightContain always true.
         if (data.Length < 8)
-            return Create(0);
+        {
+            var matchAll = Create(0);
+            new Span<byte>(matchAll._bits, (int)(matchAll._blockCount * BlockBytes)).Fill(0xFF);
+            return matchAll;
+        }
 
         uint bitCount   = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(data[0..]);
         uint capacity   = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(data[4..]);

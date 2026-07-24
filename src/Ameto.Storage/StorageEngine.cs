@@ -72,6 +72,8 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     private readonly Task                                  _flushLoop;
     /// <summary>Low-priority sweep re-compressing cold segments from fast-LZ4 to HC.</summary>
     private readonly Task                                  _recompressLoop;
+    /// <summary>Test hook: lets merge run without an index builder (tests verify the scan fallback).</summary>
+    internal bool _allowIndexlessMerge;
 
     // Cold-tier catalog (thread-safe)
     private readonly ConcurrentDictionary<ulong, SegmentInfo> _segments = new();
@@ -675,6 +677,10 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// </summary>
     internal async Task<bool> TryMergeSmallSegmentsOnceAsync(CancellationToken ct)
     {
+        // Never produce index-less segments: the builder is wired by a hosted
+        // service shortly after startup — if it isn't there yet, just wait.
+        if (IndexBuilder is null && !_allowIndexlessMerge) return false;
+
         var policy = _retentionStore.GetPolicy();
 
         // Oldest-first so the stable "past" consolidates and stays consolidated;
@@ -747,18 +753,23 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         {
             foreach (var e in events)
             {
+                // Intern can return -1 when the pool is full — fall back to the
+                // tier-local template store (same as the live ingest path) so the
+                // template is never lost in the rewrite.
+                int tmplIdx = TemplatePool.Intern(e.Template);
                 var header = new LogEventHeader
                 {
                     Id                       = e.Id,
                     TimestampUtcTicks        = e.TsTicks,
                     Level                    = (Ameto.Core.LogLevel)e.Level,
-                    MessageTemplatePoolIndex = TemplatePool.Intern(e.Template),
+                    MessageTemplatePoolIndex = tmplIdx,
                     ServiceNamePoolIndex     = e.Service is null ? -1 : TemplatePool.Intern(e.Service),
                     TraceIdHi                = e.TraceIdHi,
                     TraceIdLo                = e.TraceIdLo,
                     SpanId                   = e.SpanId,
                 };
-                if (!tier.TryWrite(header, e.Props ?? ReadOnlySpan<byte>.Empty, template: null, exception: e.Exception))
+                if (!tier.TryWrite(header, e.Props ?? ReadOnlySpan<byte>.Empty,
+                        template: tmplIdx < 0 ? e.Template : null, exception: e.Exception))
                 {
                     _logger.LogError("Merge: tier rejected an event ({Count} total in batch) — batch aborted", events.Count);
                     return false;

@@ -33,7 +33,12 @@ public sealed class SegmentMergeTests : IAsyncLifetime
     private StorageEngine NewEngine() => new(
         Options.Create(new ServerOptions { DataDirectory = _dir }),
         new RetentionStore(new ServerOptions { DataDirectory = _dir }, NullLogger<RetentionStore>.Instance),
-        NullLogger<StorageEngine>.Instance);
+        NullLogger<StorageEngine>.Instance)
+    {
+        // These tests run without the index builder and verify the scan path;
+        // production merges wait until the builder is wired.
+        _allowIndexlessMerge = true,
+    };
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
