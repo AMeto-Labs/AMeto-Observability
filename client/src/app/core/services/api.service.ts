@@ -21,9 +21,31 @@ export class ApiService {
   private http = inject(HttpClient);
   private auth = inject(AuthService);
 
-  private tokenParam(): string {
-    const t = this.auth.token;
-    return t ? `?access_token=${encodeURIComponent(t)}` : '';
+  /**
+   * Opens an SSE stream authorised by a single-use ticket instead of putting the
+   * JWT in the URL (which would leak into proxy logs / history). Fetches the
+   * ticket over the normal bearer-authenticated POST, then opens EventSource with
+   * `?ticket=`. Returns a teardown that cancels the pending fetch and closes the
+   * stream.
+   */
+  private openTicketedSse(
+    path: string,
+    params: URLSearchParams,
+    wire: (es: EventSource) => void,
+    onError: () => void,
+  ): () => void {
+    let es: EventSource | undefined;
+    let cancelled = false;
+    const sub = this.http.post<{ ticket: string }>('/api/auth/sse-ticket', {}).subscribe({
+      next: ({ ticket }) => {
+        if (cancelled) return;
+        params.set('ticket', ticket);
+        es = new EventSource(`${path}?${params.toString()}`);
+        wire(es);
+      },
+      error: () => { this.auth.verifySession(); onError(); },
+    });
+    return () => { cancelled = true; sub.unsubscribe(); es?.close(); };
   }
 
   /** Stream historical events via SSE. Emits each EventDto as it arrives,
@@ -39,20 +61,20 @@ export class ApiService {
       if (params.afterId) p.set('afterId', params.afterId);
       if (params.afterTs !== undefined) p.set('afterTs', String(params.afterTs));
       if (params.levels)  p.set('levels', params.levels);
-      const token = this.auth.token;
-      if (token) p.set('access_token', token);
-      const es = new EventSource(`/api/events?${p.toString()}`);
-      es.onmessage = event => {
-        try { subscriber.next(JSON.parse(event.data) as EventDto); } catch { /* ignore */ }
-      };
-      es.addEventListener('done', () => { es.close(); subscriber.complete(); });
-      es.onerror = () => {
-        es.close();
-        // SSE bypasses authInterceptor — re-check the session so a stale token logs out.
-        this.auth.verifySession();
-        subscriber.error(new Error('Failed to load events'));
-      };
-      return () => es.close();
+      return this.openTicketedSse('/api/events', p,
+        es => {
+          es.onmessage = event => {
+            try { subscriber.next(JSON.parse(event.data) as EventDto); } catch { /* ignore */ }
+          };
+          es.addEventListener('done', () => { es.close(); subscriber.complete(); });
+          es.onerror = () => {
+            es.close();
+            // SSE bypasses authInterceptor — re-check the session so a stale token logs out.
+            this.auth.verifySession();
+            subscriber.error(new Error('Failed to load events'));
+          };
+        },
+        () => subscriber.error(new Error('Failed to load events')));
     });
   }
 
@@ -186,21 +208,19 @@ export class ApiService {
     return new Observable<EventDto>(subscriber => {
       const p = new URLSearchParams();
       if (filter) p.set('filter', filter);
-      const token = this.auth.token;
-      if (token) p.set('access_token', token);
-      const es = new EventSource(`/api/events/live?${p.toString()}`);
-      es.onmessage = event => {
-        try {
-          subscriber.next(JSON.parse(event.data) as EventDto);
-        } catch { /* ignore parse errors */ }
-      };
-      es.onerror = () => {
-        es.close();
-        // SSE bypasses authInterceptor — re-check the session so a stale token logs out.
-        this.auth.verifySession();
-        subscriber.error(new Error('SSE connection lost'));
-      };
-      return () => es.close();
+      return this.openTicketedSse('/api/events/live', p,
+        es => {
+          es.onmessage = event => {
+            try { subscriber.next(JSON.parse(event.data) as EventDto); } catch { /* ignore parse errors */ }
+          };
+          es.onerror = () => {
+            es.close();
+            // SSE bypasses authInterceptor — re-check the session so a stale token logs out.
+            this.auth.verifySession();
+            subscriber.error(new Error('SSE connection lost'));
+          };
+        },
+        () => subscriber.error(new Error('SSE connection lost')));
     });
   }
 

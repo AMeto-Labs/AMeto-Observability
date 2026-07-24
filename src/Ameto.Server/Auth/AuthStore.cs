@@ -45,10 +45,14 @@ internal sealed record OAuthDomainRecord(
 internal sealed class AuthStore
 {
     private readonly AuthDatabase _db;
+    private readonly AuthOptions  _opts;
+    private readonly Microsoft.Extensions.Logging.ILogger<AuthStore> _logger;
 
-    public AuthStore(AuthDatabase db)
+    public AuthStore(AuthDatabase db, AuthOptions opts, Microsoft.Extensions.Logging.ILogger<AuthStore> logger)
     {
-        _db = db;
+        _db     = db;
+        _opts   = opts;
+        _logger = logger;
         EnsureSeedAdmin();
     }
 
@@ -477,7 +481,34 @@ internal sealed class AuthStore
         using var cmd  = conn.CreateCommand();
         cmd.CommandText = "SELECT COUNT(*) FROM users WHERE provider = 'local'";
         var count = (long)(cmd.ExecuteScalar() ?? 0L);
+
         if (count == 0)
-            CreateUser("admin", "123123", "admin");
+        {
+            // Fresh install: never seed a well-known default. Use the configured
+            // password if given, otherwise mint a random one and surface it once.
+            bool generated = string.IsNullOrWhiteSpace(_opts.AdminPassword);
+            string password = generated ? GenerateInitialPassword() : _opts.AdminPassword!;
+            CreateUser("admin", password, "admin");
+
+            if (generated)
+                _logger.LogWarning(
+                    "Seeded the initial 'admin' account with a RANDOM password: {Password}\n" +
+                    "  Sign in and change it now (Settings → Users), or set Ameto:Auth:AdminPassword. Shown only once.",
+                    password);
+            else
+                _logger.LogInformation("Seeded the initial 'admin' account from Ameto:Auth:AdminPassword.");
+            return;
+        }
+
+        // Existing install: nudge operators still running the legacy default.
+        if (ValidateUser("admin", "123123"))
+            _logger.LogWarning(
+                "The 'admin' account is still using the default password (123123). Change it in " +
+                "Settings → Users — on a public network the server is otherwise trivially compromised.");
     }
+
+    /// <summary>16-char URL-safe random password from a cryptographic RNG.</summary>
+    private static string GenerateInitialPassword() =>
+        Convert.ToBase64String(RandomNumberGenerator.GetBytes(12))
+            .Replace('+', 'A').Replace('/', 'B').TrimEnd('=');
 }

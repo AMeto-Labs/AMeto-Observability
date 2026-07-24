@@ -77,6 +77,23 @@ builder.Services.AddSingleton<Microsoft.Extensions.Options.IOptions<ServerOption
 var authOptions = builder.Configuration.GetSection("Ameto:Auth").Get<Ameto.Server.Auth.AuthOptions>() ?? new Ameto.Server.Auth.AuthOptions();
 builder.Services.AddAmetoAuth(serverOptions.DataDirectory, authOptions);
 
+// ── Rate limiting: throttle credential-guessing on the login endpoint ─────────
+// Fixed window per client IP: brute-forcing the local admin account is otherwise
+// unbounded. Other endpoints are unaffected (ingest is API-key gated).
+builder.Services.AddRateLimiter(o =>
+{
+    o.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    o.AddPolicy("auth-login", ctx =>
+        System.Threading.RateLimiting.RateLimitPartition.GetFixedWindowLimiter(
+            partitionKey: ctx.Connection.RemoteIpAddress?.ToString() ?? "unknown",
+            factory: _ => new System.Threading.RateLimiting.FixedWindowRateLimiterOptions
+            {
+                PermitLimit = 10,
+                Window      = TimeSpan.FromMinutes(1),
+                QueueLimit  = 0,
+            }));
+});
+
 // ── Core services ─────────────────────────────────────────────────────────────
 builder.Services
     .AddAmetoStorage()
@@ -170,8 +187,14 @@ if (serverOptions.TrustForwardedHeaders)
     };
     fwd.KnownIPNetworks.Clear();
     fwd.KnownProxies.Clear();
+    // Restrict forwarded-header trust to the configured proxies when given;
+    // otherwise trust any source (legacy behaviour) — warned about at startup.
+    foreach (var ip in serverOptions.KnownProxies)
+        if (System.Net.IPAddress.TryParse(ip, out var addr))
+            fwd.KnownProxies.Add(addr);
     app.UseForwardedHeaders(fwd);
 }
+app.UseRateLimiter();
 app.UseAuthentication();
 app.UseAuthorization();
 app.UseDefaultFiles();
@@ -205,6 +228,14 @@ app.Lifetime.ApplicationStarted.Register(() =>
                        ?.Addresses;
     logger.LogInformation("Ameto version: {Version}", UpdateChecker.CurrentVersion);
     logger.LogInformation("Content root: {ContentRoot}", app.Environment.ContentRootPath);
+    if (repOpts.Enabled && string.IsNullOrEmpty(repOpts.Secret))
+        logger.LogWarning(
+            "Replication is enabled but Ameto:Replication:Secret is not set — peer endpoints " +
+            "reject all requests (fail-closed). Set the same secret on every node to replicate.");
+    if (serverOptions.TrustForwardedHeaders && serverOptions.KnownProxies.Length == 0)
+        logger.LogWarning(
+            "TrustForwardedHeaders is on with no Ameto:KnownProxies — any client can spoof its " +
+            "scheme/host/IP. List your reverse-proxy IP(s) in Ameto:KnownProxies to restrict trust.");
     logger.LogInformation("Listening on: {Urls}",
         addresses is { Count: > 0 } ? string.Join(", ", addresses) : "(none)");
 });

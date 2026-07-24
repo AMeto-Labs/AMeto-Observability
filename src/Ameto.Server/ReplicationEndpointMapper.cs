@@ -28,15 +28,17 @@ public static class ReplicationEndpointMapper
                 healthy     = n.IsHealthy,
             }))).RequireAuthorization();
 
-        // ── Peer probe — unauthenticated peer-to-peer exchange ─────────────────
+        // ── Peer probe — authenticated by the replication shared secret ───────
         // Caller announces itself; this node replies with its own identity.
         // Both sides upsert the received payload into their NodeRegistry.
         app.MapPost("/api/replication/ping",
             (PeerPayload payload,
+             HttpRequest request,
              NodeRegistry registry,
              IOptions<ReplicationOptions> replicationOpts,
              IOptions<Ameto.Core.ServerOptions> serverOpts) =>
             {
+                if (!PeerAuthorised(request, replicationOpts.Value)) return Results.Unauthorized();
                 registry.Upsert(payload);
                 return Results.Ok(new PeerPayload
                 {
@@ -46,15 +48,17 @@ public static class ReplicationEndpointMapper
                 });
             });
 
-        // ── Segment receive — unauthenticated peer-to-peer transfer ───────────
+        // ── Segment receive — authenticated by the replication shared secret ──
         // Write-then-rename ensures the segment file is never seen half-written.
         app.MapPost("/api/replication/segments/{nodeId}/{segmentId}",
             async (uint         nodeId,
                    ulong        segmentId,
                    HttpRequest  request,
                    StorageEngine storage,
+                   IOptions<ReplicationOptions> replicationOpts,
                    IOptions<Ameto.Core.ServerOptions> serverOpts) =>
             {
+                if (!PeerAuthorised(request, replicationOpts.Value)) return Results.Unauthorized();
                 var segDir   = Path.Combine(serverOpts.Value.DataDirectory, "segments");
                 var fileName = $"{nodeId}-{segmentId}.seg";
                 var filePath = Path.Combine(segDir, fileName);
@@ -78,5 +82,20 @@ public static class ReplicationEndpointMapper
 
                 return Results.NoContent();
             });
+    }
+
+    /// <summary>
+    /// Constant-time check of the <c>X-Ameto-Replication</c> header against the
+    /// configured secret. A blank secret fails closed — an enabled-but-unconfigured
+    /// node never accepts peer writes, so an exposed port can't inject segments.
+    /// </summary>
+    private static bool PeerAuthorised(HttpRequest request, ReplicationOptions opts)
+    {
+        if (string.IsNullOrEmpty(opts.Secret)) return false;
+        var presented = request.Headers["X-Ameto-Replication"].ToString();
+        if (string.IsNullOrEmpty(presented)) return false;
+        return System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(
+            System.Text.Encoding.UTF8.GetBytes(presented),
+            System.Text.Encoding.UTF8.GetBytes(opts.Secret));
     }
 }

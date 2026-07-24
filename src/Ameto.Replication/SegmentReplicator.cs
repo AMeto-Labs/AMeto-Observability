@@ -78,7 +78,9 @@ public sealed class SegmentReplicator : IDisposable
         {
             using var content = new ByteArrayContent(data);
             content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
-            using var resp = await _http.PostAsync(url, content, ct);
+            using var req = new HttpRequestMessage(HttpMethod.Post, url) { Content = content };
+            req.Headers.Add("X-Ameto-Replication", _opts.Secret);
+            using var resp = await _http.SendAsync(req, ct);
 
             if (!resp.IsSuccessStatusCode)
                 _logger.LogWarning("Push to {Addr} returned {Status}", peer.BaseAddress, resp.StatusCode);

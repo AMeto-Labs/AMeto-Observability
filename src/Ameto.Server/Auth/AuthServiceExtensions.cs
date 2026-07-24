@@ -15,6 +15,13 @@ public sealed class AuthOptions
     /// <summary>Allow local username/password login. Defaults to true.</summary>
     public bool LocalEnabled { get; init; } = true;
 
+    /// <summary>
+    /// Password for the auto-seeded initial <c>admin</c> account. When unset, a
+    /// random one is generated and logged once at first start — so a fresh
+    /// install is never reachable with a well-known default credential.
+    /// </summary>
+    public string? AdminPassword { get; init; }
+
     public GoogleAuthOptions? Google   { get; init; }
     public MicrosoftAuthOptions? Microsoft { get; init; }
 }
@@ -78,6 +85,7 @@ internal static class AuthServiceExtensions
         services.AddSingleton<SearchHistoryStore>();
         services.AddSingleton(issuer);
         services.AddSingleton<ApiKeyCache>();
+        services.AddSingleton<SseTicketStore>();
         // Expose the cache as the ingest-path validator (used by OTLP endpoints in Ameto.Otel).
         services.AddSingleton<Ameto.Ingestion.IApiKeyValidator>(sp => sp.GetRequiredService<ApiKeyCache>());
         services.AddSingleton(authOptions);
@@ -113,9 +121,15 @@ internal static class AuthServiceExtensions
                 {
                     OnMessageReceived = static ctx =>
                     {
-                        if (ctx.Request.Query.TryGetValue("access_token", out var token)
-                            && token.Count > 0)
-                            ctx.Token = token[0];
+                        // EventSource can't set Authorization, so SSE requests carry
+                        // a single-use ticket (not the JWT) in the query string; redeem
+                        // it back to the token here. No raw JWT ever rides in the URL.
+                        if (ctx.Request.Query.TryGetValue("ticket", out var ticket) && ticket.Count > 0)
+                        {
+                            var store = ctx.HttpContext.RequestServices.GetService<SseTicketStore>();
+                            var jwt   = store?.Consume(ticket[0]!);
+                            if (jwt is not null) ctx.Token = jwt;
+                        }
                         return Task.CompletedTask;
                     },
                 };

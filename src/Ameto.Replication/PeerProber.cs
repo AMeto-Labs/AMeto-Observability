@@ -98,8 +98,12 @@ public sealed class PeerProber : IHostedService, IDisposable
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             cts.CancelAfter(TimeSpan.FromSeconds(5));
 
-            var resp = await _http.PostAsJsonAsync(
-                $"{baseAddress}/api/replication/ping", payload, cts.Token);
+            using var req = new HttpRequestMessage(HttpMethod.Post, $"{baseAddress}/api/replication/ping")
+            {
+                Content = System.Net.Http.Json.JsonContent.Create(payload),
+            };
+            req.Headers.Add("X-Ameto-Replication", _opts.Secret);
+            var resp = await _http.SendAsync(req, cts.Token);
 
             if (!resp.IsSuccessStatusCode) return;
 

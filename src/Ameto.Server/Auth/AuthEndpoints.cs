@@ -31,7 +31,20 @@ internal static class AuthEndpoints
                 token, expiresIn = JwtIssuer.ExpiresInSeconds, role,
                 permissions = (int)(role == "admin" ? ViewPermissions.All : perms),
             });
-        });
+        }).RequireRateLimiting("auth-login");
+
+        // ── SSE ticket: exchange the bearer token for a single-use URL ticket ──
+        // EventSource can't send Authorization, so instead of putting the JWT in
+        // the query string (leaks into proxy logs), the SPA gets a short-lived
+        // ticket here and passes that. Auth is the normal bearer flow.
+        app.MapPost("/api/auth/sse-ticket", (HttpContext ctx, SseTicketStore store) =>
+        {
+            var auth = ctx.Request.Headers.Authorization.ToString();
+            if (!auth.StartsWith("Bearer ", StringComparison.Ordinal))
+                return Results.Unauthorized();
+            var ticket = store.Issue(auth["Bearer ".Length..]);
+            return Results.Ok(new { ticket, expiresInSeconds = SseTicketStore.TicketTtlSeconds });
+        }).RequireAuthorization();
 
         // ── OAuth: initiate ───────────────────────────────────────────────────
         // GET /api/auth/oauth/google   → redirects to Google consent screen
