@@ -693,23 +693,30 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             .Where(s => s.CompressedBytes < MergeCandidateMaxBytes && !_mergeSkip.Contains(s.Id.Value))
             .GroupBy(s => policy.GetTtl(s.MinLevel))
             .Select(g => g.OrderBy(s => s.MinTimestampTicks).ToList())
-            .Where(g => g.Count >= MergeMinSources)
+            .Where(g => g.Count >= 2)
             .OrderBy(g => g[0].MinTimestampTicks);
 
-        // Bound the batch's time span (two-pointer over each sorted group): the
-        // first 24 h window holding at least MergeMinSources segments wins.
+        // Bound the batch's time span (two-pointer over each sorted group). A
+        // RECENT window needs MergeMinSources segments (no point churning while
+        // flushes still arrive), but a SETTLED window (older than 48 h) merges
+        // from 2 sources — quiet days produce a handful of tiny age-flush
+        // segments per day, and "not worth it" thresholds would strand them as
+        // unmergeable forever (observed live: ~1,000 files parked this way).
+        long settledCutoff = DateTimeOffset.UtcNow.AddHours(-48).UtcTicks;
         List<SegmentInfo>? window = null;
         foreach (var group in groups)
         {
             int start = 0;
-            while (start < group.Count - MergeMinSources + 1)
+            while (start <= group.Count - 2)
             {
                 long windowStart = group[start].MinTimestampTicks;
                 var w = group.Skip(start)
                     .TakeWhile(s => s.MaxTimestampTicks - windowStart <= MergeMaxSpanTicks)
                     .Take(MergeMaxSources)
                     .ToList();
-                if (w.Count >= MergeMinSources) { window = w; break; }
+                int minSources = w.Count > 0 && w[^1].MaxTimestampTicks < settledCutoff
+                    ? 2 : MergeMinSources;
+                if (w.Count >= minSources) { window = w; break; }
                 start += Math.Max(1, w.Count);
             }
             if (window is not null) break;

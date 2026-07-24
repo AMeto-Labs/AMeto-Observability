@@ -131,12 +131,30 @@ public sealed class SegmentMergeTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task Merge_RefusesTinyBatches()
+    public async Task Merge_RefusesTinyBatches_WhileRecent()
     {
-        for (int round = 0; round < 3; round++) // below MergeMinSources
+        for (int round = 0; round < 3; round++) // below MergeMinSources, timestamps = now
             await WriteSegmentAsync(round, 50);
         Assert.False(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None));
         Assert.Equal(3, _engine.ListSegments().Count);
+    }
+
+    /// <summary>
+    /// A SETTLED window (older than 48 h) merges from just 2 sources — quiet days
+    /// leave a handful of tiny segments per day, and a "not worth it" threshold
+    /// would strand them forever (observed live: ~1,000 files parked that way).
+    /// </summary>
+    [Fact]
+    public async Task Merge_ConsolidatesSparseSettledWindows()
+    {
+        long old = DateTime.UtcNow.Ticks - 5 * TimeSpan.TicksPerDay;
+        for (int round = 0; round < 3; round++)
+            await WriteSegmentAsync(round, 50, baseTicks: old + round * TimeSpan.TicksPerHour);
+
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None));
+        var segs = _engine.ListSegments();
+        Assert.Single(segs);
+        Assert.Equal(150u, segs[0].EventCount);
     }
 
     /// <summary>
