@@ -190,6 +190,11 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             catch (Exception ex) { _logger.LogError(ex, "Segment merge pass failed"); merged = false; }
             if (merged)
             {
+                // A merge briefly holds the batch, its native tier copy and the
+                // index builders. Hand that back to the OS instead of letting the
+                // allocator sit on it until the next burst (RSS otherwise ratchets
+                // up across passes and never comes down on an idle server).
+                ReleaseMaintenanceMemory();
                 try { await Task.Delay(TimeSpan.FromSeconds(15), ct); }
                 catch (OperationCanceledException) { break; }
                 continue;
@@ -239,9 +244,23 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 _logger.LogInformation("Recompressed {Count} log segment(s), saved {Mb:F1} MB",
                     done, savedTotal / 1048576.0);
 
+            if (done > 0) ReleaseMaintenanceMemory();
+
             try { await Task.Delay(TimeSpan.FromSeconds(passBytes >= MaxBytesPerPass ? 30 : 600), ct); }
             catch (OperationCanceledException) { break; }
         }
+    }
+
+    /// <summary>
+    /// Returns the memory a maintenance burst just used. Maintenance is a
+    /// background, latency-insensitive path, so a compacting gen2 collection plus
+    /// a working-set trim is affordable here — unlike on the ingest/query paths,
+    /// where an induced GC would be visible to clients.
+    /// </summary>
+    private static void ReleaseMaintenanceMemory()
+    {
+        GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+        WorkingSetTrimmer.TryTrim();
     }
 
     // ── ISegmentProvider ──────────────────────────────────────────────────────
@@ -654,10 +673,17 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     // ── Small-segment merge (compaction) ──────────────────────────────────────
 
     private const long MergeCandidateMaxBytes = 8L * 1024 * 1024;   // only merge segments smaller than this
-    private const long MergeTargetPayloadBytes = 96L * 1024 * 1024; // uncompressed payload budget per batch
+    // Batch budgets deliberately mirror a NORMAL flush (hot tier: 64 MB / ~80k
+    // events). A merge runs the same pipeline — raw events in managed memory, a
+    // copy into the native tier, then an inverted+trigram+bloom index build over
+    // the whole batch — so its peak memory scales with the batch. The original
+    // 96 MB / 500k budget made that peak ~6x a regular flush and showed up as a
+    // ~1 GB RSS spike with a 45 % CPU burst on every maintenance pass. Smaller
+    // batches simply mean more passes (one every 15 s while a backlog exists).
+    private const long MergeTargetPayloadBytes = 32L * 1024 * 1024; // uncompressed payload budget per batch
     private const int  MergeMinSources = 8;                          // don't bother below this
     private const int  MergeMaxSources = 512;
-    private const int  MergeMaxEvents  = 500_000;
+    private const int  MergeMaxEvents  = 100_000;
     private const long MergeMaxSpanTicks = 24L * TimeSpan.TicksPerHour; // retention granularity per merged file
 
     /// <summary>
