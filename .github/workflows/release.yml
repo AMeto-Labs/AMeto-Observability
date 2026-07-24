@@ -3,25 +3,28 @@ name: Release
 # One workflow releases everything: win/linux binaries + Windows installers as a
 # GitHub Release, and the Docker image pushed to GHCR (ghcr.io/<owner>/ameto).
 #
-# Release flow (automatic):
-#   1. branch off:            git checkout -b release/1.0.4
-#   2. open a PR to main
-#   3. merge the PR           → this workflow runs, tags v1.0.4, publishes the
-#                               GitHub Release and pushes the Docker image.
+# Release flow (automatic, straight through main/master):
+#   push (or merge) to main that touches PROJECT CODE (src/client/install/slnx)
+#     → this workflow auto-increments the last tag's final component
+#       (v1.0.7.17 → v1.0.7.18), tags it, publishes the GitHub Release and
+#       pushes the Docker image.
 #
-# Also runs on a pushed v* tag, or manually (Actions → "Release" → Run workflow).
+# Changes that touch ONLY tests, docs, tooling or CI don't match the path filter,
+# so they never cut a release. A specific version can still be forced manually
+# (Actions → "Release" → Run workflow), and a pushed v* tag releases that tag.
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Release version / tag (e.g. v1.0.4)'
-        required: true
+        description: 'Release version / tag (e.g. v1.0.4). Leave blank to auto-increment.'
+        required: false
   push:
-    tags:
-      - 'v*'
-  pull_request:
-    types: [closed]
     branches: [main]
+    paths:
+      - 'src/**'
+      - 'client/**'
+      - 'install/**'
+      - 'Ameto.slnx'
 
 permissions:
   contents: write          # create the GitHub Release + tag
@@ -36,32 +39,43 @@ jobs:
   # ── Resolve the release version from whichever trigger fired ───────────────
   version:
     name: Resolve version
-    # Manual runs and v* tags always release; a closed PR releases only when it
-    # was actually MERGED into main from a release/* branch.
-    if: >-
-      github.event_name != 'pull_request' ||
-      (github.event.pull_request.merged == true &&
-       startsWith(github.event.pull_request.head.ref, 'release/'))
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.v.outputs.version }}
     steps:
-      - name: Derive from trigger
+      # Full history + tags so the auto-increment can find the latest release.
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Derive version
         id: v
         env:
           EVENT: ${{ github.event_name }}
           INPUT_VERSION: ${{ inputs.version }}
-          PR_BRANCH: ${{ github.event.pull_request.head.ref }}
-          REF_NAME: ${{ github.ref_name }}
         run: |
-          case "$EVENT" in
-            workflow_dispatch) RAW="$INPUT_VERSION" ;;
-            pull_request)      RAW="${PR_BRANCH#release/}" ;;  # release/1.0.4 → 1.0.4
-            *)                 RAW="$REF_NAME" ;;              # tag push: v1.0.4
-          esac
-          RAW="v${RAW#v}"                                      # normalise → v1.0.4
+          # A manual run with an explicit version wins; otherwise bump the final
+          # component of the newest v* tag (v1.0.7.17 → v1.0.7.18), skipping any
+          # that already exist. First release with no tags starts at v1.0.0.
+          if [ "$EVENT" = "workflow_dispatch" ] && [ -n "$INPUT_VERSION" ]; then
+            RAW="v${INPUT_VERSION#v}"
+          else
+            LATEST="$(git tag -l 'v*' | sort -V | tail -1)"
+            if [ -z "$LATEST" ]; then
+              RAW="v1.0.0"
+            else
+              base="${LATEST#v}"; prefix="${base%.*}"; last="${base##*.}"
+              RAW="v${prefix}.$((last + 1))"
+              while git rev-parse "$RAW" >/dev/null 2>&1; do
+                base="${RAW#v}"; prefix="${base%.*}"; last="${base##*.}"
+                RAW="v${prefix}.$((last + 1))"
+              done
+            fi
+          fi
           echo "version=$RAW" >> "$GITHUB_OUTPUT"
-          echo "Releasing $RAW" >> "$GITHUB_STEP_SUMMARY"
+          echo "Releasing **$RAW**" >> "$GITHUB_STEP_SUMMARY"
 
   # ── Binaries: self-contained single-file bundles for both RIDs ─────────────
   release:
@@ -78,8 +92,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          # For the PR trigger, build the merge commit that landed on main.
-          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          # Build exactly the commit that landed on main and triggered the run.
+          ref: ${{ github.sha }}
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -143,7 +157,7 @@ jobs:
         with:
           tag_name: ${{ env.RELEASE_VERSION }}
           name: ${{ env.RELEASE_VERSION }}
-          target_commitish: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          target_commitish: ${{ github.sha }}
           body_path: RELEASE_BODY.md
           generate_release_notes: true
           files: |
@@ -163,7 +177,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          ref: ${{ github.sha }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -229,7 +243,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.merge_commit_sha || github.sha }}
+          ref: ${{ github.sha }}
 
       - name: Setup Node
         uses: actions/setup-node@v4
