@@ -70,6 +70,8 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     private readonly ConcurrentDictionary<Task, byte>    _inFlightFlushes = new();
     private readonly CancellationTokenSource               _cts        = new();
     private readonly Task                                  _flushLoop;
+    /// <summary>Low-priority sweep re-compressing cold segments from fast-LZ4 to HC.</summary>
+    private readonly Task                                  _recompressLoop;
 
     // Cold-tier catalog (thread-safe)
     private readonly ConcurrentDictionary<ulong, SegmentInfo> _segments = new();
@@ -147,6 +149,68 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
         // Age-based flush loop
         _flushLoop = RunFlushLoopAsync(_cts.Token);
+        // Cold-segment HC re-compression sweep (one-time per segment, ~20-30 % smaller)
+        _recompressLoop = RunRecompressLoopAsync(_cts.Token);
+    }
+
+    /// <summary>
+    /// Slowly walks the cold catalog and re-compresses each segment once from the
+    /// fast LZ4 level the flush path uses to LZ4-HC (see <see cref="SegmentRecompressor"/>).
+    /// A few segments per pass, low priority — the flush path stays untouched, so
+    /// ingest throughput is unaffected.
+    /// </summary>
+    private async Task RunRecompressLoopAsync(CancellationToken ct)
+    {
+        const int MaxPerPass = 4;
+        var visited = new HashSet<ulong>();
+
+        try { await Task.Delay(TimeSpan.FromMinutes(3), ct); } // let startup + catalog load settle
+        catch (OperationCanceledException) { return; }
+
+        while (!ct.IsCancellationRequested)
+        {
+            int done = 0;
+            long savedTotal = 0;
+            foreach (var (segId, info) in _segments)
+            {
+                if (ct.IsCancellationRequested) break;
+                if (done >= MaxPerPass) break;
+                if (!visited.Add(segId)) continue;
+                if (!SegmentRecompressor.IsCandidate(info.FilePath)) continue;
+
+                long? saved = await Task.Run(
+                    () => SegmentRecompressor.Recompress(info.FilePath, _logger, ct), ct);
+                done++;
+                if (saved is > 0)
+                {
+                    savedTotal += saved.Value;
+                    // Keep the catalog's size accurate for diagnostics.
+                    _segments.TryUpdate(segId, new SegmentInfo
+                    {
+                        Id                = info.Id,
+                        NodeId            = info.NodeId,
+                        FilePath          = info.FilePath,
+                        MinTimestampTicks = info.MinTimestampTicks,
+                        MaxTimestampTicks = info.MaxTimestampTicks,
+                        EventCount        = info.EventCount,
+                        MinLevel          = info.MinLevel,
+                        CompressedBytes   = Math.Max(0, info.CompressedBytes - saved.Value),
+                        UncompressedBytes = info.UncompressedBytes,
+                    }, info);
+                }
+                else if (saved is null)
+                {
+                    visited.Remove(segId); // transient (file busy) — retry on a later pass
+                }
+            }
+
+            if (savedTotal > 0)
+                _logger.LogInformation("Recompressed {Count} log segment(s), saved {Mb:F1} MB",
+                    done, savedTotal / 1048576.0);
+
+            try { await Task.Delay(TimeSpan.FromMinutes(done >= MaxPerPass ? 1 : 10), ct); }
+            catch (OperationCanceledException) { break; }
+        }
     }
 
     // ── ISegmentProvider ──────────────────────────────────────────────────────
@@ -832,6 +896,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
         await _cts.CancelAsync();
         try { await _flushLoop; }
+        catch (OperationCanceledException) { }
+        catch (ObjectDisposedException) { }
+        try { await _recompressLoop; }
         catch (OperationCanceledException) { }
         catch (ObjectDisposedException) { }
 
