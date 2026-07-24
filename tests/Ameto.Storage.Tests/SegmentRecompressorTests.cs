@@ -27,17 +27,17 @@ public sealed class SegmentRecompressorTests : IDisposable
         byte[] InvBytes, byte[] TriBytes, byte[] BloomBytes,
         List<(long Offset, ulong FirstId, uint FirstOrdinal)> BlockIndex);
 
-    /// <summary>Builds a v5 .seg envelope with FAST-compressed compressible blocks.</summary>
-    private Envelope BuildSegment(int blocks)
+    /// <summary>Builds a v4/v5 .seg envelope with FAST-compressed compressible blocks.</summary>
+    private Envelope BuildSegment(int blocks, ushort version = 5)
     {
         var rnd  = new Random(7);
-        var path = Path.Combine(_dir, $"1-{blocks}-100-200.seg");
+        var path = Path.Combine(_dir, $"1-{blocks}{version}-100-200.seg");
         using var fs = new FileStream(path, FileMode.CreateNew, FileAccess.Write);
         using var bw = new BinaryWriter(fs);
 
         // Header (46 bytes: 42 written + 4 slack, matching SegmentWriter)
         bw.Write(Magic);
-        bw.Write((ushort)5);
+        bw.Write(version);
         bw.Write((uint)1);                    // nodeId
         bw.Write((ulong)blocks);              // segId
         bw.Write(100L); bw.Write(200L);       // min/max ts
@@ -78,7 +78,11 @@ public sealed class SegmentRecompressorTests : IDisposable
 
         long blockIdxOff = fs.Position;
         bw.Write((uint)blockIdx.Count);
-        foreach (var (off, fid, ord) in blockIdx) { bw.Write(off); bw.Write(fid); bw.Write(ord); }
+        foreach (var (off, fid, ord) in blockIdx)
+        {
+            bw.Write(off); bw.Write(fid);
+            if (version >= 5) bw.Write(ord); // v4 entries have no FirstOrdinal
+        }
 
         long footerOff = fs.Position;
         bw.Write(invOff); bw.Write(triOff); bw.Write(bloOff); bw.Write(blockIdxOff); bw.Write(footerOff);
@@ -162,5 +166,52 @@ public sealed class SegmentRecompressorTests : IDisposable
         // Second pass: flag set → not a candidate, and Recompress refuses.
         Assert.False(SegmentRecompressor.IsCandidate(env.Path));
         Assert.Null(SegmentRecompressor.Recompress(env.Path, NullLogger.Instance, CancellationToken.None));
+    }
+
+    /// <summary>v4 segments (no FirstOrdinal in block-index entries) must migrate too — they are the bulk of pre-July data.</summary>
+    [Fact]
+    public void Recompress_HandlesV4Segments()
+    {
+        var env = BuildSegment(blocks: 4, version: 4);
+        long before = new FileInfo(env.Path).Length;
+
+        Assert.True(SegmentRecompressor.IsCandidate(env.Path));
+        long? saved = SegmentRecompressor.Recompress(env.Path, NullLogger.Instance, CancellationToken.None);
+        Assert.NotNull(saved);
+        Assert.True(saved > 0);
+
+        using var fs = new FileStream(env.Path, FileMode.Open, FileAccess.Read);
+        using var br = new BinaryReader(fs);
+        var hdr = br.ReadBytes(46);
+        Assert.Equal(4, BinaryPrimitives.ReadUInt16LittleEndian(hdr.AsSpan(4))); // version preserved
+        Assert.Equal(0x01 | 0x02, hdr[39]);
+
+        fs.Seek(-44, SeekOrigin.End);
+        long invOff = br.ReadInt64(); br.ReadInt64(); br.ReadInt64();
+        long blockIdxOff = br.ReadInt64(); br.ReadInt64();
+        Assert.Equal(FooterMagic, br.ReadUInt32());
+
+        // Blocks roundtrip + block index remapped with 16-byte v4 entries.
+        fs.Seek(46, SeekOrigin.Begin);
+        var newOffsets = new List<long>();
+        foreach (var payload in env.BlockPayloads)
+        {
+            newOffsets.Add(fs.Position);
+            int uncomp = (int)br.ReadUInt32();
+            int comp   = (int)br.ReadUInt32();
+            var raw = new byte[uncomp];
+            Assert.Equal(uncomp, LZ4Codec.Decode(br.ReadBytes(comp), 0, comp, raw, 0, uncomp));
+            Assert.Equal(payload, raw);
+        }
+        Assert.Equal(invOff, fs.Position);
+
+        fs.Seek(blockIdxOff, SeekOrigin.Begin);
+        Assert.Equal((uint)env.BlockIndex.Count, br.ReadUInt32());
+        for (int i = 0; i < env.BlockIndex.Count; i++)
+        {
+            Assert.Equal(newOffsets[i], br.ReadInt64());
+            Assert.Equal(env.BlockIndex[i].FirstId, br.ReadUInt64());
+        }
+        Assert.False(SegmentRecompressor.IsCandidate(env.Path)); // one-shot for v4 too
     }
 }

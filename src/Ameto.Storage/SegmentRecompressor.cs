@@ -28,7 +28,8 @@ internal static class SegmentRecompressor
 {
     private const uint   Magic       = 0x52_44_4C_47; // "RDLG"
     private const uint   FooterMagic = 0x52_44_46_54; // "RDFT"
-    private const ushort SegVersion  = 5;
+    private const ushort MinVersion  = 4;             // v4 block-index entries are 16 B (no FirstOrdinal)
+    private const ushort MaxVersion  = 5;             // v5 entries are 20 B
     private const int    HeaderSize  = 46;
     private const int    FooterSize  = 44;            // 5 × int64 + magic
     private const int    FlagsOffset = 39;            // Magic4 Ver2 Node4 Seg8 Min8 Max8 Cnt4 Lvl1 → Flags
@@ -36,7 +37,7 @@ internal static class SegmentRecompressor
     /// <summary>Header flag: this segment has already been re-compressed with HC.</summary>
     public const byte FlagRecompressed = 0x02;
 
-    /// <summary>True when the file is a v5 segment not yet carrying the HC flag.</summary>
+    /// <summary>True when the file is a v4/v5 segment not yet carrying the HC flag.</summary>
     public static bool IsCandidate(string segPath)
     {
         try
@@ -45,7 +46,8 @@ internal static class SegmentRecompressor
             Span<byte> hdr = stackalloc byte[HeaderSize];
             if (fs.Read(hdr) != HeaderSize) return false;
             if (BinaryPrimitives.ReadUInt32LittleEndian(hdr) != Magic) return false;
-            if (BinaryPrimitives.ReadUInt16LittleEndian(hdr[4..]) != SegVersion) return false;
+            ushort v = BinaryPrimitives.ReadUInt16LittleEndian(hdr[4..]);
+            if (v is < MinVersion or > MaxVersion) return false;
             return (hdr[FlagsOffset] & FlagRecompressed) == 0;
         }
         catch { return false; }
@@ -97,7 +99,8 @@ internal static class SegmentRecompressor
         var header = br.ReadBytes(HeaderSize);
         if (header.Length != HeaderSize) return -1;
         if (BinaryPrimitives.ReadUInt32LittleEndian(header) != Magic) return -1;
-        if (BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(4)) != SegVersion) return -1;
+        ushort version = BinaryPrimitives.ReadUInt16LittleEndian(header.AsSpan(4));
+        if (version is < MinVersion or > MaxVersion) return -1;
         if ((header[FlagsOffset] & FlagRecompressed) != 0) return -1;
 
         // ── Footer ────────────────────────────────────────────────────────────
@@ -176,7 +179,7 @@ internal static class SegmentRecompressor
         long newTriOff   = newInvOff + (triOff   - invOff);
         long newBloomOff = newInvOff + (bloomOff - invOff);
 
-        // ── Block index: remap offsets ────────────────────────────────────────
+        // ── Block index: remap offsets (v5 entries carry FirstOrdinal, v4 don't) ──
         long newBlockIdxOff = dst.Position;
         src.Seek(blockIdxOff, SeekOrigin.Begin);
         uint blockCount = br.ReadUInt32();
@@ -185,11 +188,10 @@ internal static class SegmentRecompressor
         {
             long  oldBlockOffset = br.ReadInt64();
             ulong firstId        = br.ReadUInt64();
-            uint  firstOrdinal   = br.ReadUInt32();
             if (!offsetMap.TryGetValue(oldBlockOffset, out long newBlockOffset)) return -1;
             bw.Write(newBlockOffset);
             bw.Write(firstId);
-            bw.Write(firstOrdinal);
+            if (version >= 5) bw.Write(br.ReadUInt32()); // FirstOrdinal
         }
 
         // ── Footer ────────────────────────────────────────────────────────────
