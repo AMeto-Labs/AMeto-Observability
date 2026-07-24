@@ -11,8 +11,33 @@
 }
 
 .action-cell {
-  width: 32px;
-  text-align: center;
+  width: 64px;
+  text-align: right;
+  white-space: nowrap;
+}
+
+// Permissions matrix: signals × (ingest | read)
+.perm-grid {
+  border-collapse: collapse;
+  margin: 4px 0 2px;
+
+  th {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-secondary);
+    text-align: center;
+    padding: 2px 14px;
+  }
+  td {
+    padding: 3px 14px;
+    text-align: center;
+  }
+  .perm-signal {
+    text-align: left;
+    font-size: 12px;
+    color: var(--text-primary);
+  }
+  input[type="checkbox"] { cursor: pointer; }
 }
 
 .level-pill {

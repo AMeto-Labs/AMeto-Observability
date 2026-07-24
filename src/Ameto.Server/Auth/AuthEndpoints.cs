@@ -148,9 +148,10 @@ internal static class AuthEndpoints
             var providerRaw = req.Provider?.ToLowerInvariant();
             var provider = providerRaw is "google" or "microsoft" ? providerRaw : "google";
             var role     = AuthStore.NormaliseRole(req.Role ?? "viewer");
+            var perms    = req.Permissions is int p ? (ViewPermissions)p & ViewPermissions.All : ViewPermissions.All;
             try
             {
-                var user = store.CreateOAuthUser(req.Email.Trim(), req.DisplayName?.Trim() ?? req.Email.Trim(), provider, role);
+                var user = store.CreateOAuthUser(req.Email.Trim(), req.DisplayName?.Trim() ?? req.Email.Trim(), provider, role, perms);
                 return Results.Ok(new { user.Id, user.Username, user.DisplayName,
                                         user.Email, user.Provider, user.Role,
                                         Permissions = (int)user.Permissions,
@@ -209,6 +210,7 @@ internal static class AuthEndpoints
             return Results.Ok(store.ListOAuthDomains().Select(d => new
             {
                 d.Id, d.Provider, d.Domain, d.Role,
+                Permissions = (int)d.Permissions,
                 CreatedAt = d.CreatedAt.ToString("O"),
             }));
         }).RequireAuthorization();
@@ -222,14 +224,16 @@ internal static class AuthEndpoints
 
             var provider = req.Provider?.ToLowerInvariant() is "google" or "microsoft"
                 ? req.Provider.ToLowerInvariant() : "google";
-            var role = AuthStore.NormaliseRole(req.Role ?? "viewer");
+            var role  = AuthStore.NormaliseRole(req.Role ?? "viewer");
+            var perms = req.Permissions is int p ? (ViewPermissions)p & ViewPermissions.All : ViewPermissions.All;
 
             try
             {
-                var d = store.CreateOAuthDomain(provider, domain, role);
+                var d = store.CreateOAuthDomain(provider, domain, role, perms);
                 return Results.Ok(new
                 {
                     d.Id, d.Provider, d.Domain, d.Role,
+                    Permissions = (int)d.Permissions,
                     CreatedAt = d.CreatedAt.ToString("O"),
                 });
             }
@@ -237,6 +241,15 @@ internal static class AuthEndpoints
             {
                 return Results.Conflict(new { error = "Domain rule already exists for this provider." });
             }
+        }).RequireAuthorization();
+
+        // Update a domain rule's default role + permissions.
+        app.MapPatch("/api/users/oauth-domains/{id}", (HttpContext ctx, string id, UpdateOAuthDomainRequest req, AuthStore store) =>
+        {
+            if (!IsAdmin(ctx)) return Results.Forbid();
+            var role  = AuthStore.NormaliseRole(req.Role ?? "viewer");
+            var perms = req.Permissions is int p ? (ViewPermissions)p & ViewPermissions.All : ViewPermissions.All;
+            return store.UpdateOAuthDomain(id, role, perms) ? Results.NoContent() : Results.NotFound();
         }).RequireAuthorization();
 
         app.MapDelete("/api/users/oauth-domains/{id}", (HttpContext ctx, string id, AuthStore store) =>
@@ -277,9 +290,10 @@ internal static class AuthEndpoints
                 return Results.BadRequest(new { error = "Name is required." });
 
             var createdBy = ctx.User.FindFirst(ClaimTypes.Name)?.Value ?? "unknown";
-            // Mask to known bits; empty/None grants everything (a key with no scope is useless).
+            // Mask to known bits; empty/None defaults to ingest-all (back-compat — a
+            // key with no scope is useless, and read is opt-in so it stays off unless asked).
             var permissions = (ApiKeyPermissions)(req.Permissions ?? 0) & ApiKeyPermissions.All;
-            if (permissions == ApiKeyPermissions.None) permissions = ApiKeyPermissions.All;
+            if (permissions == ApiKeyPermissions.None) permissions = ApiKeyPermissions.Ingest;
             var rec = store.CreateApiKey(
                 req.Name.Trim(), req.Description?.Trim() ?? string.Empty,
                 permissions, createdBy, req.Key?.Trim());
@@ -291,6 +305,24 @@ internal static class AuthEndpoints
                 rec.Key, rec.CreatedBy,
                 CreatedAt = rec.CreatedAt.ToString("O"),
             });
+        }).RequireAuthorization(AuthServiceExtensions.PolicyManager);
+
+        // ── API keys: update name / description / permissions (manager+) ──────
+        app.MapPatch("/api/auth/keys/{id}", (string id, UpdateApiKeyRequest req, AuthStore store, ApiKeyCache cache) =>
+        {
+            var existing = store.ListApiKeys().FirstOrDefault(k => k.Id == id);
+            if (existing is null) return Results.NotFound();
+
+            var name = string.IsNullOrWhiteSpace(req.Name) ? existing.Name : req.Name.Trim();
+            var desc = req.Description?.Trim() ?? existing.Description;
+            var permissions = req.Permissions is int p
+                ? (ApiKeyPermissions)p & ApiKeyPermissions.All
+                : existing.Permissions;
+            if (permissions == ApiKeyPermissions.None) permissions = existing.Permissions;
+
+            if (!store.UpdateApiKey(id, name, desc, permissions)) return Results.NotFound();
+            cache.Invalidate();
+            return Results.NoContent();
         }).RequireAuthorization(AuthServiceExtensions.PolicyManager);
 
         // ── API keys: delete (manager+) ───────────────────────────────────────
@@ -308,14 +340,19 @@ internal static class AuthEndpoints
 
 internal sealed record LoginRequest(string Username, string Password);
 internal sealed record CreateUserRequest(string Username, string Password, string Role = "viewer", int? Permissions = null);
-internal sealed record CreateOAuthUserRequest(string Email, string? DisplayName, string? Provider, string? Role);
+internal sealed record CreateOAuthUserRequest(string Email, string? DisplayName, string? Provider, string? Role, int? Permissions = null);
 internal sealed record UpdateRoleRequest(string Role);
 internal sealed record UpdateUserRequest(string? DisplayName, string? Role, int? Permissions = null);
 internal sealed record ChangePasswordRequest(string Password);
-internal sealed record CreateOAuthDomainRequest(string? Domain, string? Provider, string? Role = "viewer");
+internal sealed record CreateOAuthDomainRequest(string? Domain, string? Provider, string? Role = "viewer", int? Permissions = null);
+internal sealed record UpdateOAuthDomainRequest(string? Role, int? Permissions = null);
 internal sealed record CreateApiKeyRequest(
     string Name,
     string? Key = null,
+    string? Description = null,
+    int? Permissions = null);
+internal sealed record UpdateApiKeyRequest(
+    string? Name = null,
     string? Description = null,
     int? Permissions = null);
 

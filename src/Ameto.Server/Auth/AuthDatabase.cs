@@ -138,6 +138,11 @@ internal sealed class AuthDatabase
         {
             try { Exec(conn, ddl); } catch { /* column already exists */ }
         }
+
+        // Default view scopes granted to users auto-provisioned by an OAuth domain
+        // rule. Defaults to 15 (All) so existing rules keep granting full read access.
+        try { Exec(conn, "ALTER TABLE oauth_domains ADD COLUMN permissions INTEGER NOT NULL DEFAULT 15"); }
+        catch { /* column already exists */ }
     }
 
     private static void Exec(SqliteConnection conn, string sql)

@@ -77,12 +77,21 @@
           <option value="manager">manager</option>
           <option value="admin">admin</option>
         </select>
+        <div class="perm-scopes" title="View scopes (ignored for admin)">
+          @for (s of viewScopes; track s.bit) {
+            <label class="perm-chip">
+              <input type="checkbox" [checked]="hasBit(newOAuthPerms(), s.bit)"
+                     (change)="togglePerm(newOAuthPerms, s.bit, $any($event.target).checked)" />
+              {{ s.label }}
+            </label>
+          }
+        </div>
         <button class="btn primary" type="submit">
           <lucide-icon name="user-plus" [size]="13" />
           Add to allowlist
         </button>
       </form>
-      <span class="sublabel">Allow a specific email to sign in via the selected OAuth provider.</span>
+      <span class="sublabel">Allow a specific email to sign in via the selected OAuth provider. Scopes apply unless the role is admin.</span>
       @if (oauthUserError()) { <span class="form-error">{{ oauthUserError() }}</span> }
     }
 
@@ -98,6 +107,15 @@
           <option value="manager">manager</option>
           <option value="admin">admin</option>
         </select>
+        <div class="perm-scopes" title="Default view scopes for users from this domain">
+          @for (s of viewScopes; track s.bit) {
+            <label class="perm-chip">
+              <input type="checkbox" [checked]="hasBit(newDomainPerms(), s.bit)"
+                     (change)="togglePerm(newDomainPerms, s.bit, $any($event.target).checked)" />
+              {{ s.label }}
+            </label>
+          }
+        </div>
         <button class="btn primary" type="submit">
           <lucide-icon name="plus" [size]="13" />
           Add domain
@@ -114,7 +132,8 @@
             <tr>
               <th>Domain</th>
               <th>Provider</th>
-              <th>Role</th>
+              <th>Default role</th>
+              <th>Default scopes</th>
               <th>Added</th>
               <th></th>
             </tr>
@@ -124,7 +143,28 @@
               <tr>
                 <td class="mono-sm">@{{ d.domain }}</td>
                 <td><span class="provider-badge" [attr.data-provider]="d.provider">{{ d.provider }}</span></td>
-                <td><span class="role-badge" [class.admin]="d.role === 'admin'">{{ d.role }}</span></td>
+                <td>
+                  <select class="field-select sm" [ngModel]="d.role" (ngModelChange)="changeDomainRole(d, $event)">
+                    <option value="viewer">viewer</option>
+                    <option value="manager">manager</option>
+                    <option value="admin">admin</option>
+                  </select>
+                </td>
+                <td>
+                  @if (d.role === 'admin') {
+                    <span class="muted">all (admin)</span>
+                  } @else {
+                    <div class="perm-scopes">
+                      @for (s of viewScopes; track s.bit) {
+                        <label class="perm-chip">
+                          <input type="checkbox" [checked]="hasBit(d.permissions, s.bit)"
+                                 (change)="toggleDomainPerm(d, s.bit, $any($event.target).checked)" />
+                          {{ s.label }}
+                        </label>
+                      }
+                    </div>
+                  }
+                </td>
                 <td class="muted">{{ d.createdAt | date: 'yyyy-MM-dd' }}</td>
                 <td class="action-cell">
                   <button class="btn-icon danger" title="Remove domain" (click)="removeDomain(d.id)">

@@ -24,11 +24,15 @@ export interface UserDto {
   createdAt: string;
 }
 
-/** API-key ingest permission bit flags (mirror of the server's ApiKeyPermissions). */
+/** API-key permission bit flags (mirror of the server's ApiKeyPermissions).
+ *  Low three = ingest (write); the Read* bits = query (read) per signal. */
 export const enum ApiKeyPermission {
-  Logs    = 1,
-  Traces  = 2,
-  Metrics = 4,
+  Logs        = 1,
+  Traces      = 2,
+  Metrics     = 4,
+  ReadLogs    = 8,
+  ReadTraces  = 16,
+  ReadMetrics = 32,
 }
 
 export interface ApiKeyDto {
@@ -56,6 +60,8 @@ export interface OAuthDomainDto {
   provider: 'google' | 'microsoft';
   domain: string;
   role: UserRole;
+  /** Default view scopes granted to users auto-provisioned by this rule. */
+  permissions: number;
   createdAt: string;
 }
 

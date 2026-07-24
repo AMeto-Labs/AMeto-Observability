@@ -16,4 +16,13 @@ export interface DiagnosticsDto {
   segmentCount:         number;
   totalEventCount:      number;
   totalCompressedBytes: number;
+
+  // On-disk data directory (whole folder, per-signal breakdown)
+  dataDirectory?:        string;
+  dataTotalBytes?:       number;
+  logsStorageBytes?:     number;
+  metricsStorageBytes?:  number;
+  tracesStorageBytes?:   number;
+  databaseStorageBytes?: number;
+  otherStorageBytes?:    number;
 }

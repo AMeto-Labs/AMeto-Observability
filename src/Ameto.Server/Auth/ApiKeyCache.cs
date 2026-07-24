@@ -35,6 +35,17 @@ internal sealed class ApiKeyCache : IApiKeyValidator
         return _keys.TryGetValue(hash, out var granted) && (granted & required) == required;
     }
 
+    /// <summary>
+    /// Returns the permissions granted by a raw key, or null when the key is
+    /// unknown. Used by the read-path API-key authentication handler (the query
+    /// endpoints), unlike <see cref="Validate"/> which the ingest hot path uses.
+    /// </summary>
+    public ApiKeyPermissions? Resolve(ReadOnlySpan<char> rawKey)
+    {
+        if (rawKey.IsEmpty) return null;
+        return _keys.TryGetValue(ComputeHash(rawKey), out var granted) ? granted : null;
+    }
+
     /// <summary>Reloads hashes + permissions from the database. Call after key create / delete.</summary>
     public void Invalidate() => _keys = Load(_db);
 

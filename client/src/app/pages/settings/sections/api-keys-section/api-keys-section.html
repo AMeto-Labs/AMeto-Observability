@@ -1,6 +1,6 @@
 <app-section title="API Keys">
   <div class="row">
-    <span class="sublabel">Issue keys for programmatic ingestion. The full key is shown only once at creation.</span>
+    <span class="sublabel">Issue keys for programmatic ingest and/or read access. The full key is shown only once at creation.</span>
     <button class="btn primary" (click)="openCreateModal()">
       <lucide-icon name="plus" [size]="13" />
       Create API key
@@ -32,6 +32,9 @@
             <td class="muted">{{ k.createdBy }}</td>
             <td class="muted">{{ k.createdAt | date: 'yyyy-MM-dd' }}</td>
             <td class="action-cell">
+              <button class="btn-icon" title="Edit permissions" (click)="openEditModal(k)">
+                <lucide-icon name="pencil" [size]="13" />
+              </button>
               <button class="btn-icon danger" title="Revoke key" (click)="removeApiKey(k.id)">
                 <lucide-icon name="trash-2" [size]="13" />
               </button>
@@ -43,7 +46,7 @@
   }
 </app-section>
 
-<app-modal [open]="modalOpen()" title="Create API key" [dismissable]="!createdKey()" (close)="closeCreateModal()">
+<app-modal [open]="modalOpen()" [title]="editing() ? 'Edit API key' : 'Create API key'" [dismissable]="!createdKey()" (close)="closeCreateModal()">
   @if (createdKey(); as ck) {
     <div class="key-reveal">
       <lucide-icon name="key" [size]="14" />
@@ -67,30 +70,44 @@
     </label>
     <div class="field">
       <span class="label">Permissions</span>
-      <label class="perm-row">
-        <input type="checkbox" [checked]="permLogs()" (change)="permLogs.set($any($event.target).checked)" />
-        <span class="perm-name">Logs</span>
-        <span class="perm-hint">POST /api/events · /otlp/v1/logs</span>
-      </label>
-      <label class="perm-row">
-        <input type="checkbox" [checked]="permTracesMetrics()" (change)="permTracesMetrics.set($any($event.target).checked)" />
-        <span class="perm-name">Traces &amp; Metrics</span>
-        <span class="perm-hint">/otlp/v1/traces · /otlp/v1/metrics</span>
-      </label>
-      <span class="hint">Which ingest endpoints this key may write to.</span>
+      <table class="perm-grid">
+        <thead>
+          <tr><th></th><th>Ingest (write)</th><th>Read (query)</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="perm-signal">Logs</td>
+            <td><input type="checkbox" [checked]="ingestLogs()" (change)="ingestLogs.set($any($event.target).checked)" /></td>
+            <td><input type="checkbox" [checked]="readLogs()" (change)="readLogs.set($any($event.target).checked)" /></td>
+          </tr>
+          <tr>
+            <td class="perm-signal">Traces</td>
+            <td><input type="checkbox" [checked]="ingestTraces()" (change)="ingestTraces.set($any($event.target).checked)" /></td>
+            <td><input type="checkbox" [checked]="readTraces()" (change)="readTraces.set($any($event.target).checked)" /></td>
+          </tr>
+          <tr>
+            <td class="perm-signal">Metrics</td>
+            <td><input type="checkbox" [checked]="ingestMetrics()" (change)="ingestMetrics.set($any($event.target).checked)" /></td>
+            <td><input type="checkbox" [checked]="readMetrics()" (change)="readMetrics.set($any($event.target).checked)" /></td>
+          </tr>
+        </tbody>
+      </table>
+      <span class="hint">Ingest = write to <code>/api/events</code> · <code>/otlp/v1/*</code>. Read = query that signal's data via the API (<code>X-Seq-ApiKey</code> / <code>?apiKey=</code>).</span>
     </div>
-    <label class="field">
-      <span class="label">Manual key (optional)</span>
-      <input class="field-input" placeholder="Leave empty to auto-generate" [ngModel]="newKeyManual()" (ngModelChange)="newKeyManual.set($event)" />
-    </label>
+    @if (!editing()) {
+      <label class="field">
+        <span class="label">Manual key (optional)</span>
+        <input class="field-input" placeholder="Leave empty to auto-generate" [ngModel]="newKeyManual()" (ngModelChange)="newKeyManual.set($event)" />
+      </label>
+    }
 
     @if (keyError()) { <span class="form-error">{{ keyError() }}</span> }
 
     <div class="modal-actions">
-      <button class="btn" (click)="closeCreateModal()" [disabled]="creating()">Cancel</button>
-      <button class="btn primary" (click)="create()" [disabled]="creating()">
-        <lucide-icon [name]="creating() ? 'loader-circle' : 'plus'" [size]="13" />
-        {{ creating() ? 'Creating…' : 'Create' }}
+      <button class="btn" (click)="closeCreateModal()" [disabled]="saving()">Cancel</button>
+      <button class="btn primary" (click)="save()" [disabled]="saving()">
+        <lucide-icon [name]="saving() ? 'loader-circle' : (editing() ? 'save' : 'plus')" [size]="13" />
+        {{ saving() ? 'Saving…' : (editing() ? 'Save' : 'Create') }}
       </button>
     </div>
   }
