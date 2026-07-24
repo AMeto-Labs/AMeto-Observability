@@ -573,25 +573,24 @@
 
 // ── Span-attribute context menu ──────────────────────────────────────────────
 
+// Always visible, matching the Events detail property button (.d-menu-btn).
 .tag-menu-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 16px;
-  height: 16px;
-  margin-right: 4px;
+  width: 18px;
+  height: 18px;
+  margin-right: 5px;
   padding: 0;
-  border: none;
-  border-radius: 3px;
+  border: 1px solid transparent;
+  border-radius: 4px;
   background: transparent;
   color: var(--text-muted);
   cursor: pointer;
-  opacity: 0;
   vertical-align: middle;
-  transition: opacity 0.1s;
+  transition: color 0.12s, background 0.12s, border-color 0.12s;
 
-  tr:hover &, &.open { opacity: 1; }
-  &:hover, &.open { background: var(--bg-main); color: var(--text-primary); }
+  &:hover, &.open { background: var(--bg-main); color: var(--text-primary); border-color: var(--border); }
 }
 
 // The span-attribute context menu now lives in the shared PropertyMenuComponent.
