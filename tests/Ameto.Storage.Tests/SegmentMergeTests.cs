@@ -49,7 +49,7 @@ public sealed class SegmentMergeTests : IAsyncLifetime
     }
 
     /// <summary>Writes <paramref name="count"/> events and flushes them into one small segment.</summary>
-    private async Task WriteSegmentAsync(int round, int count)
+    private async Task WriteSegmentAsync(int round, int count, LogLevel? fixedLevel = null, long? baseTicks = null)
     {
         for (int i = 0; i < count; i++)
         {
@@ -57,8 +57,8 @@ public sealed class SegmentMergeTests : IAsyncLifetime
             var header = new LogEventHeader
             {
                 Id                       = new EventId(0u, (uint)(round * 100_000 + i)).RawValue,
-                TimestampUtcTicks        = DateTime.UtcNow.Ticks + n * TimeSpan.TicksPerMillisecond,
-                Level                    = (LogLevel)(n % 6),
+                TimestampUtcTicks        = (baseTicks ?? DateTime.UtcNow.Ticks) + n * TimeSpan.TicksPerMillisecond,
+                Level                    = fixedLevel ?? (LogLevel)(n % 6),
                 MessageTemplatePoolIndex = _engine.TemplatePool.Intern("evt {n} round " + round % 3),
                 ServiceNamePoolIndex     = _engine.TemplatePool.Intern("Svc." + round % 4),
                 TraceIdHi                = (ulong)(n + 1),
@@ -131,6 +131,44 @@ public sealed class SegmentMergeTests : IAsyncLifetime
             await WriteSegmentAsync(round, 50);
         Assert.False(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None));
         Assert.Equal(3, _engine.ListSegments().Count);
+    }
+
+    /// <summary>
+    /// Segment expiry is MaxTs + Ttl(MinLevel) — merging across TTL classes would
+    /// delete long-lived events early (or keep short-lived ones 30× longer). The
+    /// default policy gives Debug 3 days and Error 90, so these must never mix.
+    /// </summary>
+    [Fact]
+    public async Task Merge_NeverMixesRetentionTtlClasses()
+    {
+        for (int round = 0; round < 8; round++)
+            await WriteSegmentAsync(round, 40, fixedLevel: LogLevel.Debug);
+        for (int round = 8; round < 16; round++)
+            await WriteSegmentAsync(round, 40, fixedLevel: LogLevel.Error);
+        Assert.Equal(16, _engine.ListSegments().Count);
+
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None));
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None));
+
+        var segs = _engine.ListSegments().OrderBy(s => s.MinLevel).ToList();
+        Assert.Equal(2, segs.Count);
+        Assert.Equal(LogLevel.Debug, segs[0].MinLevel); // 3-day class, merged alone
+        Assert.Equal(LogLevel.Error, segs[1].MinLevel); // 90-day class, merged alone
+        Assert.Equal(320u, segs[0].EventCount);
+        Assert.Equal(320u, segs[1].EventCount);
+    }
+
+    /// <summary>A merged file can only expire whole — batches must not span more than a day.</summary>
+    [Fact]
+    public async Task Merge_RespectsTimeSpanCap()
+    {
+        long dayTicks = TimeSpan.TicksPerDay;
+        long origin   = DateTime.UtcNow.Ticks - 30 * dayTicks;
+        for (int round = 0; round < 9; round++) // one segment per day → no 24 h window holds 8
+            await WriteSegmentAsync(round, 40, baseTicks: origin + round * dayTicks);
+
+        Assert.False(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None));
+        Assert.Equal(9, _engine.ListSegments().Count);
     }
 
     [Fact]

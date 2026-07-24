@@ -654,24 +654,56 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     private const int  MergeMinSources = 8;                          // don't bother below this
     private const int  MergeMaxSources = 512;
     private const int  MergeMaxEvents  = 500_000;
+    private const long MergeMaxSpanTicks = 24L * TimeSpan.TicksPerHour; // retention granularity per merged file
 
     /// <summary>
     /// Merges one batch of small, time-adjacent cold segments into a single large
     /// segment via the regular flush pipeline (shared sort + index build + writer),
     /// preserving event ids, timestamps and raw property/exception payloads.
+    ///
+    /// <para>Retention-aware selection: segment expiry is
+    /// <c>MaxTimestamp + Ttl(MinLevel)</c>, so a batch only combines segments of
+    /// the SAME retention TTL class (merging a 3-day-TTL debug segment into a
+    /// 90-day one would either delete the neighbours' events early or keep the
+    /// debug ones 30× longer), and a batch never spans more than
+    /// <see cref="MergeMaxSpanTicks"/> — the span is exactly how much longer the
+    /// oldest events can outlive their per-segment deadline.</para>
+    ///
     /// Crash-safe: a manifest written next to the merged file lists the source
     /// files, so an interrupted deletion is finished on the next startup. Returns
     /// true when a batch was merged.
     /// </summary>
     internal async Task<bool> TryMergeSmallSegmentsOnceAsync(CancellationToken ct)
     {
-        // Oldest-first so the stable "past" consolidates and stays consolidated.
+        var policy = _retentionStore.GetPolicy();
+
+        // Oldest-first so the stable "past" consolidates and stays consolidated;
+        // grouped by retention TTL so a merge never changes any event's expiry class.
         var candidates = _segments.Values
             .Where(s => s.CompressedBytes < MergeCandidateMaxBytes)
-            .OrderBy(s => s.MinTimestampTicks)
-            .Take(MergeMaxSources)
-            .ToList();
-        if (candidates.Count < MergeMinSources) return false;
+            .GroupBy(s => policy.GetTtl(s.MinLevel))
+            .Select(g => g.OrderBy(s => s.MinTimestampTicks).ToList())
+            .Where(g => g.Count >= MergeMinSources)
+            .OrderBy(g => g[0].MinTimestampTicks)
+            .FirstOrDefault();
+        if (candidates is null) return false;
+
+        // Bound the batch's time span (two-pointer over the sorted group): find
+        // the first 24 h window holding at least MergeMinSources segments.
+        int start = 0;
+        List<SegmentInfo>? window = null;
+        while (start < candidates.Count - MergeMinSources + 1)
+        {
+            long windowStart = candidates[start].MinTimestampTicks;
+            var w = candidates.Skip(start)
+                .TakeWhile(s => s.MaxTimestampTicks - windowStart <= MergeMaxSpanTicks)
+                .Take(MergeMaxSources)
+                .ToList();
+            if (w.Count >= MergeMinSources) { window = w; break; }
+            start += Math.Max(1, w.Count);
+        }
+        if (window is null) return false;
+        candidates = window;
 
         // Read raw events segment-by-segment until a budget is hit. Segments are
         // consumed whole — a batch never contains part of a segment.
