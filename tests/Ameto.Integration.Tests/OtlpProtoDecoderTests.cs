@@ -6,7 +6,7 @@ using Google.Protobuf;
 using Ameto.Otel;
 using Xunit;
 
-namespace Ameto.Perf;
+namespace Ameto.Integration.Tests;
 
 /// <summary>
 /// Characterisation tests for <see cref="OtlpProtoDecoder"/>, which had none.
@@ -193,5 +193,104 @@ public sealed class OtlpProtoDecoderTests
     {
         var req = OtlpProtoDecoder.DecodeTraces([], 0);
         Assert.Empty(req.ResourceSpans!);
+    }
+
+    // ── Metrics and logs ──────────────────────────────────────────────────────
+    // The three entry points share SubStream but not their field numbers or nesting, so a
+    // rewrite of the submessage strategy would land on all three. Guarding only traces would
+    // leave two of them uncovered — the exact gap these tests exist to close.
+
+    [Fact]
+    public void Decodes_metrics_with_repeated_children_at_every_level()
+    {
+        byte[] payload = Msg(root =>
+        {
+            for (int r = 0; r < 2; r++)
+            {
+                int rr = r;
+                Sub(root, 1, Msg(rm =>                                     // resource_metrics
+                {
+                    Sub(rm, 1, Msg(res => Sub(res, 1, StringAttr("service.name", $"svc-{rr}"))));
+                    for (int s = 0; s < 2; s++)
+                        Sub(rm, 2, Msg(sm =>                               // scope_metrics
+                        {
+                            Sub(sm, 2, Msg(m =>                            // metric: gauge
+                            {
+                                Str(m, 1, $"cpu.{rr}");
+                                Str(m, 3, "%");
+                                Sub(m, 5, Msg(g =>                         // gauge
+                                {
+                                    Sub(g, 1, Msg(dp => { Fixed64(dp, 3, 1_700); dp.WriteTag(4, WireFormat.WireType.Fixed64); dp.WriteDouble(42.5); }));
+                                    Sub(g, 1, Msg(dp => { Fixed64(dp, 3, 1_800); dp.WriteTag(4, WireFormat.WireType.Fixed64); dp.WriteDouble(43.5); }));
+                                }));
+                                // Unit AFTER the nested gauge — canary for a leaked boundary.
+                                Str(m, 2, "cpu usage");
+                            }));
+                        }));
+                    Str(rm, 3, "schema://resource");
+                }));
+            }
+        });
+
+        var req = OtlpProtoDecoder.DecodeMetrics(payload, payload.Length);
+
+        Assert.Equal(2, req.ResourceMetrics.Count);
+        var sm0 = req.ResourceMetrics[0].ScopeMetrics;
+        Assert.Equal(2, sm0.Count);
+        var metric = sm0[0].Metrics[0];
+        Assert.Equal("cpu.0", metric.Name);
+        Assert.Equal("%", metric.Unit);
+        Assert.Equal("cpu usage", metric.Description);          // the field after the gauge
+        Assert.NotNull(metric.Gauge);
+        Assert.Equal(2, metric.Gauge!.DataPoints.Count);
+        Assert.Equal(42.5, metric.Gauge.DataPoints[0].AsDouble);
+        Assert.Equal(43.5, metric.Gauge.DataPoints[1].AsDouble);
+        Assert.Equal("svc-1", req.ResourceMetrics[1].Resource!.Attributes![0].Value!.StringValue);
+    }
+
+    [Fact]
+    public void Decodes_logs_with_repeated_children_at_every_level()
+    {
+        byte[] payload = Msg(root =>
+        {
+            for (int r = 0; r < 2; r++)
+            {
+                int rr = r;
+                Sub(root, 1, Msg(rl =>                                     // resource_logs
+                {
+                    Sub(rl, 1, Msg(res => Sub(res, 1, StringAttr("service.name", $"svc-{rr}"))));
+                    Sub(rl, 2, Msg(sl =>                                   // scope_logs
+                    {
+                        for (int i = 0; i < 3; i++)
+                        {
+                            int ii = i;
+                            Sub(sl, 2, Msg(lr =>                           // log_record
+                            {
+                                Fixed64(lr, 1, (ulong)(9_000 + ii));
+                                VarInt(lr, 2, 9);                          // severity_number
+                                Str(lr, 3, "INFO");
+                                Sub(lr, 5, Msg(b => Str(b, 1, $"message {rr}{ii}")));
+                                Sub(lr, 6, StringAttr("k", $"v{ii}"));
+                                // Severity text re-stated AFTER the nested body/attributes.
+                                Str(lr, 3, "INFO2");
+                            }));
+                        }
+                        Str(sl, 3, "schema://scope");
+                    }));
+                }));
+            }
+        });
+
+        var req = OtlpProtoDecoder.DecodeLogs(payload, payload.Length);
+
+        Assert.Equal(2, req.ResourceLogs.Count);
+        var recs = req.ResourceLogs[0].ScopeLogs[0].LogRecords;
+        Assert.Equal(3, recs.Count);
+        Assert.Equal("message 00", recs[0].Body!.StringValue);
+        Assert.Equal("message 02", recs[2].Body!.StringValue);
+        Assert.Equal(9, recs[0].SeverityNumber);
+        Assert.Equal("INFO2", recs[0].SeverityText);           // the field after the nested ones
+        Assert.Equal("v1", recs[1].Attributes![0].Value!.StringValue);
+        Assert.Equal("svc-1", req.ResourceLogs[1].Resource!.Attributes![0].Value!.StringValue);
     }
 }

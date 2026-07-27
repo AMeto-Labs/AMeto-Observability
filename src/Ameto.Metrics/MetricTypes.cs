@@ -17,7 +17,8 @@ public enum MetricKind : byte
 
 /// <summary>
 /// Immutable, comparable set of label key-value pairs.
-/// Stored sorted by key so two identical label sets have the same hash.
+/// Stored sorted by key, then by value, so two identical label sets have the same hash
+/// regardless of the order their pairs arrived in.
 /// </summary>
 public sealed class LabelSet : IEquatable<LabelSet>
 {
@@ -38,6 +39,11 @@ public sealed class LabelSet : IEquatable<LabelSet>
             _labels = new (string Key, string Value)[c.Count];
             int i = 0;
             foreach (var kv in labels) _labels[i++] = (kv.Key, kv.Value);
+            // Count and enumeration can disagree if the source is mutated concurrently.
+            // Yielding MORE throws above, which is loud and fine; yielding fewer would leave
+            // trailing (null, null) pairs that sort and hash without complaining — a
+            // silently wrong LabelSet. Trim instead.
+            if (i != _labels.Length) Array.Resize(ref _labels, i);
         }
         else
         {

@@ -11,8 +11,8 @@
   </ItemGroup>
 
   <ItemGroup>
-    <!-- OtlpProtoDecoder is internal; its characterisation tests live in Ameto.Perf. -->
-    <InternalsVisibleTo Include="Ameto.Perf" />
+    <!-- OtlpProtoDecoder is internal; its characterisation tests live in Ameto.Integration.Tests. -->
+    <InternalsVisibleTo Include="Ameto.Integration.Tests" />
   </ItemGroup>
 
   <ItemGroup>

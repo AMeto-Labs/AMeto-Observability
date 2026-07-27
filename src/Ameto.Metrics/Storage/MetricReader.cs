@@ -378,12 +378,26 @@ internal static class MetricReader
     }
 
     /// <summary>
-    /// Unbuffered on purpose. Every read here is either a header field or a whole LZ4 block
-    /// pulled straight into an <see cref="ArrayPool{T}"/> buffer, so FileStream's own 64 KB
-    /// intermediate buffer copied bytes for nothing — and it is allocated per open, while
-    /// <c>RewriteMetricInChunks</c> reopens every source file once per series chunk. An
-    /// allocation trace attributed ~6 MB/min to that buffer alone on a background path.
+    /// Buffered at 64 KB, deliberately, even though the buffer is allocated per open and
+    /// <c>RewriteMetricInChunks</c> reopens every source once per series chunk (~6 MB/min of
+    /// gen0 in an allocation trace).
+    ///
+    /// <para>Dropping the buffer looks free because the v3 path reads a dozen header fields
+    /// and then pulls whole LZ4 blocks into pooled buffers. The v2 path does not: it reads
+    /// two <see cref="BinaryReader.ReadUInt32"/> per SERIES, and v2 files are exactly the
+    /// ones with unbounded series counts. Measured on that shape, 5 000 series per file:</para>
+    ///
+    /// <code>
+    ///   bufferSize     ms/open     alloc/open
+    ///            0       20.54            238 B
+    ///         4096        1.75          4.4 KB
+    ///        65536        0.34         65.9 KB
+    /// </code>
+    ///
+    /// <para>Unbuffered is 60x slower here — trading gen0 garbage, which the collector
+    /// handles for almost nothing, for syscalls, which it cannot help with at all. The 6 MB
+    /// is 2 % of this server's allocation; the syscalls are not 2 % of anything.</para>
     /// </summary>
     private static FileStream OpenRead(string path) =>
-        new(path, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 0, FileOptions.SequentialScan);
+        new(path, FileMode.Open, FileAccess.Read, FileShare.Read, 65536, FileOptions.SequentialScan);
 }
