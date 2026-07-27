@@ -461,12 +461,22 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     }
 
     /// <summary>
-    /// Picks the next compaction batch: the oldest small (or legacy-v2) segments
-    /// whose combined time range stays inside a 24-hour window. Trace retention
-    /// deletes a file only when its NEWEST span is past the TTL, so an unbounded
-    /// batch span would keep old spans alive past their deadline — and a merged
-    /// file that stays small on a quiet server would keep re-merging with newer
-    /// files, advancing its MaxStartNano forever and never expiring at all.
+    /// Picks the next compaction batch: the oldest segments of COMPARABLE SIZE whose
+    /// combined time range stays inside a 24-hour window.
+    ///
+    /// <para>Trace retention deletes a file only when its NEWEST span is past the TTL, so
+    /// an unbounded batch span would keep old spans alive past their deadline — and a
+    /// merged file that stays small on a quiet server would keep re-merging with newer
+    /// files, advancing its MaxStartNano forever and never expiring at all. Hence the
+    /// window.</para>
+    ///
+    /// <para>The size tier is what keeps the rewrite bounded. Merging strictly by age let
+    /// one accumulator file absorb every new arrival hour after hour, rewriting all of its
+    /// spans each time, until it finally crossed <see cref="CompactionThreshold"/> — about
+    /// nine bytes written per byte of data retained. Restricting a batch to one tier means
+    /// a file only ever merges with peers of its own magnitude, so it roughly doubles per
+    /// merge and a span is rewritten O(log) times instead of O(n).</para>
+    ///
     /// Empty result = nothing worth compacting.
     /// </summary>
     internal static List<SpanSegmentInfo> SelectCompactionBatch(SpanSegmentInfo[] segments)
@@ -478,21 +488,43 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             .OrderBy(s => s.MinStartNano)
             .ToList();
 
-        // Slide a 24 h window over the ordered candidates; the first window with
-        // ≥2 members (or a lone legacy file needing migration) is the batch.
-        int start = 0;
-        while (start < candidates.Count)
+        // Oldest candidate first, so old data still drains ahead of new. Each seed offers
+        // its own tier and 24 h window; peers outside either are left for a later pass.
+        for (int i = 0; i < candidates.Count; i++)
         {
-            long windowStart = candidates[start].MinStartNano;
-            var window = candidates.Skip(start)
-                .TakeWhile(s => s.MaxStartNano - windowStart <= MaxSpanNanos)
-                .Take(MaxSegmentsPerPass)
-                .ToList();
-            if (window.Count >= 2) return window;
-            if (window.Count == 1 && window[0].FormatVersion < 3) return window;
-            start += Math.Max(1, window.Count);
+            var  seed        = candidates[i];
+            int  tier        = TierOf(seed.SpanCount);
+            long windowStart = seed.MinStartNano;
+
+            var batch = new List<SpanSegmentInfo>(MaxSegmentsPerPass) { seed };
+            for (int j = i + 1; j < candidates.Count && batch.Count < MaxSegmentsPerPass; j++)
+            {
+                var s = candidates[j];
+                if (s.MaxStartNano - windowStart > MaxSpanNanos) break;   // past the window
+                if (TierOf(s.SpanCount) != tier) continue;                // wrong magnitude
+                batch.Add(s);
+            }
+
+            if (batch.Count >= 2) return batch;
+            // A lone legacy file has no peer to wait for — it is rewritten to migrate it,
+            // not to merge it, so the tier rule does not apply.
+            if (seed.FormatVersion < 3) return [seed];
         }
         return [];
+    }
+
+    /// <summary>
+    /// Size bucket of a segment: <c>floor(log4(spanCount))</c> by integer division, so a
+    /// tier covers a 4× range of sizes. Four is a compromise — a smaller ratio merges more
+    /// eagerly and rewrites more, a larger one leaves more files lying around for queries
+    /// to open.
+    /// </summary>
+    private static int TierOf(int spanCount)
+    {
+        const int TierRatio = 4;
+        int tier = 0;
+        for (int n = Math.Max(1, spanCount); n >= TierRatio; n /= TierRatio) tier++;
+        return tier;
     }
 
     private bool CompactOnePass()
