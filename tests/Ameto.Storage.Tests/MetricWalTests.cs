@@ -174,20 +174,67 @@ public sealed class MetricWalTests : IDisposable
     // ── Generation ────────────────────────────────────────────────────────────
 
     [Fact]
-    public void Reset_drops_everything_it_logged()
+    public void A_committed_flush_drops_everything_it_covered()
     {
         var wal = MetricWriteAheadLog.Open(WalPath);
         for (int i = 0; i < 10; i++) Append(wal, Scalar("m", 1_700_000_000_000_000_000L + i, i));
-        wal.Reset();
+        wal.CommitFlush(wal.BeginFlush());
         wal.Dispose();
 
         var reopened = MetricWriteAheadLog.Open(WalPath);
         Assert.Empty(reopened.ReadAll(out _));
         reopened.Dispose();
+
+        Assert.Equal(0, new FileInfo(PoolPath).Length);   // nothing references it any more
+    }
+
+    /// <summary>
+    /// The defect this two-phase protocol exists for. Points keep arriving while the files
+    /// are written; those are in no file, so wiping the whole log on completion left them
+    /// durable nowhere. Only the snapshot's generation may be reclaimed.
+    /// </summary>
+    [Fact]
+    public void Points_appended_during_a_flush_survive_the_commit()
+    {
+        long baseNano = 1_700_000_000_000_000_000L;
+
+        var wal = MetricWriteAheadLog.Open(WalPath);
+        for (int i = 0; i < 5; i++) Append(wal, Scalar("m", baseNano + i, i));   // in the snapshot
+
+        ulong flushing = wal.BeginFlush();
+        for (int i = 5; i < 9; i++) Append(wal, Scalar("m", baseNano + i, i));   // arrive mid-write
+
+        wal.CommitFlush(flushing);
+        wal.Dispose();
+
+        var reopened = MetricWriteAheadLog.Open(WalPath);
+        var replayed = reopened.ReadAll(out int unresolved);
+        reopened.Dispose();
+
+        Assert.Equal(0, unresolved);                                  // the pool survived too
+        Assert.Equal([5.0, 6.0, 7.0, 8.0], replayed.Select(r => r.Point.Value).OrderBy(v => v));
     }
 
     [Fact]
-    public void Points_appended_after_a_reset_survive_however_early_they_are_stamped()
+    public void A_flush_that_never_commits_leaves_everything_replayable()
+    {
+        long baseNano = 1_700_000_000_000_000_000L;
+
+        var wal = MetricWriteAheadLog.Open(WalPath);
+        for (int i = 0; i < 5; i++) Append(wal, Scalar("m", baseNano + i, i));
+        wal.BeginFlush();                                             // files failed to write
+        for (int i = 5; i < 8; i++) Append(wal, Scalar("m", baseNano + i, i));
+        wal.Dispose();
+
+        var reopened = MetricWriteAheadLog.Open(WalPath);
+        var replayed = reopened.ReadAll(out _);
+        reopened.Dispose();
+
+        Assert.Equal(8, replayed.Count);   // snapshot AND the points that followed it
+    }
+
+    [Fact]
+    public void Points_logged_after_a_flush_survive_however_early_they_are_stamped()
     {
         // A metric point's timestamp is reported by the exporter, not assigned by us, and an
         // export can arrive stamped before the flush that preceded it. Replay must key off
@@ -196,7 +243,8 @@ public sealed class MetricWalTests : IDisposable
 
         var wal = MetricWriteAheadLog.Open(WalPath);
         Append(wal, Scalar("m", flushed, 1));
-        wal.Reset();
+        ulong gen = wal.BeginFlush();
+        wal.CommitFlush(gen);
 
         Append(wal, Scalar("m", flushed - 30_000_000_000L, 2));   // stamped 30 s earlier
         Append(wal, Scalar("m", flushed + 1_000_000_000L,  3));
@@ -207,6 +255,23 @@ public sealed class MetricWalTests : IDisposable
         reopened.Dispose();
 
         Assert.Equal([2.0, 3.0], values);
+    }
+
+    [Fact]
+    public void Repeated_flush_cycles_keep_the_log_and_pool_bounded()
+    {
+        var wal = MetricWriteAheadLog.Open(WalPath);
+        for (int cycle = 0; cycle < 50; cycle++)
+        {
+            for (int i = 0; i < 100; i++)
+                Append(wal, Scalar("m", 1_700_000_000_000_000_000L + cycle * 1000 + i, i,
+                                   Labels(("cycle", cycle.ToString()))));
+            wal.CommitFlush(wal.BeginFlush());
+            Assert.Equal(0, wal.WrittenBytes);            // fully reclaimed each time
+        }
+        wal.Dispose();
+
+        Assert.Equal(0, new FileInfo(PoolPath).Length);   // and the pool with it
     }
 
     [Fact]
@@ -343,6 +408,46 @@ public sealed class MetricWalTests : IDisposable
         Assert.Contains("service", engine.GetLabelKeys("cpu.utilisation"));
 
         await engine.DisposeAsync();
+    }
+
+    /// <summary>
+    /// Engine-level counterpart: ingest from several threads across a threshold-triggered
+    /// flush and account for every point afterwards. The flush drains the tier concurrently
+    /// with those appends, so anything the snapshot boundary mishandles shows up as a point
+    /// that reached neither a file nor the surviving hot tier.
+    /// </summary>
+    [Fact]
+    public async Task No_point_is_lost_when_ingest_races_a_flush()
+    {
+        var engine = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
+
+        const int threads = 8;
+        const int perThread = 80_000;              // 640 000 total, past HotFlushThreshold
+        long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+
+        await Task.WhenAll(Enumerable.Range(0, threads).Select(t => Task.Run(() =>
+        {
+            var buf = new MetricIngestItem[1];
+            for (int i = 0; i < perThread; i++)
+            {
+                buf[0] = Scalar("race.metric", baseNano + i * 1_000L, 1.0,
+                                Labels(("thread", t.ToString())));
+                engine.Ingest(buf);
+            }
+        })));
+
+        await engine.DisposeAsync();              // final flush lands whatever is left
+
+        // Every ingested point must be in a file. A logical series spans as many entries as
+        // the files it was split across, so account for points and label sets, not entries.
+        var reader = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
+        var series = await QueryWhenColdLoadedAsync(reader, "race.metric");
+        long total  = series.Sum(s => (long)s.Points.Count);
+        int  labels = series.Select(s => s.Labels).Distinct().Count();
+        await reader.DisposeAsync();
+
+        Assert.Equal(threads, labels);
+        Assert.Equal((long)threads * perThread, total);
     }
 
     [Fact]

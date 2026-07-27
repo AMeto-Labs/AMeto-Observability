@@ -55,6 +55,12 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     /// </summary>
     private readonly MetricWriteAheadLog _wal;
 
+    /// <summary>
+    /// Serialises "log the point, then publish it" against a flush taking its snapshot.
+    /// Held only for those two steps and for the drain — never while files are written.
+    /// </summary>
+    private readonly Lock _snapshotLock = new();
+
     // ── Hot tier ─────────────────────────────────────────────────────────────
     private readonly ConcurrentDictionary<SeriesKey, HotSeries> _hot = new();
     private          int _hotPointCount;
@@ -165,49 +171,57 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
     public void Ingest(ReadOnlySpan<MetricIngestItem> items)
     {
+        int total = 0;
+
+        // Logging a point and making it visible must be one step with respect to a flush's
+        // snapshot, or a point that lands between the two would be in neither the files nor
+        // (after the commit) the log — durable nowhere despite the guarantee above. The
+        // section is short: an append is a struct store, and the flush holds this only for
+        // the drain, never for the file write.
+        lock (_snapshotLock)
+        {
+            foreach (var item in items)
+            {
+                var point = new MetricDataPoint
+                {
+                    TimestampUnixNano = item.TimestampUnixNano,
+                    Value             = item.Kind == MetricKind.Histogram
+                                            ? (item.HistogramCount > 0 ? item.HistogramSum / item.HistogramCount : 0)
+                                            : item.ScalarValue,
+                    Count             = item.HistogramCount,
+                    Sum               = item.HistogramSum,
+                    BucketCounts      = item.BucketCounts,   // preserved for real percentiles + heatmap
+                };
+
+                _wal.Append(item, in point);
+                total = ApplyToHotTier(item, in point);
+            }
+        }
+
+        // Exemplars live in their own ring and are not logged, so they stay off that path.
         foreach (var item in items)
         {
-            var point = new MetricDataPoint
-            {
-                TimestampUnixNano = item.TimestampUnixNano,
-                Value             = item.Kind == MetricKind.Histogram
-                                        ? (item.HistogramCount > 0 ? item.HistogramSum / item.HistogramCount : 0)
-                                        : item.ScalarValue,
-                Count             = item.HistogramCount,
-                Sum               = item.HistogramSum,
-                BucketCounts      = item.BucketCounts,   // preserved for real percentiles + heatmap
-            };
-
-            // Write-ahead: the point is durable before it is queryable, which is what lets
-            // the flush wait for a batch worth one .mts per metric name instead of running
-            // on a timer purely so a crash cannot lose a minute of data.
-            _wal.Append(item, in point);
-
-            int total = ApplyToHotTier(item, in point);
-
-            if (item.Exemplars is { Length: > 0 } exs)
-            {
-                var ring = _exemplars.GetOrAdd(item.Name, static _ => new ExemplarRing(ExemplarsPerMetric));
-                foreach (var ex in exs)
-                    ring.Add(new ExemplarSample
-                    {
-                        TimestampUnixNano = ex.TimestampUnixNano,
-                        Value             = ex.Value,
-                        TraceId           = ex.TraceId,
-                        SpanId            = ex.SpanId,
-                        Labels            = item.Labels,
-                    });
-            }
-
-            if (total >= HotFlushThreshold
-                && System.Threading.Interlocked.CompareExchange(ref _thresholdFlushScheduled, 1, 0) == 0)
-            {
-                _ = Task.Run(async () =>
+            if (item.Exemplars is not { Length: > 0 } exs) continue;
+            var ring = _exemplars.GetOrAdd(item.Name, static _ => new ExemplarRing(ExemplarsPerMetric));
+            foreach (var ex in exs)
+                ring.Add(new ExemplarSample
                 {
-                    try { await FlushHotTierAsync().ConfigureAwait(false); }
-                    finally { System.Threading.Interlocked.Exchange(ref _thresholdFlushScheduled, 0); }
+                    TimestampUnixNano = ex.TimestampUnixNano,
+                    Value             = ex.Value,
+                    TraceId           = ex.TraceId,
+                    SpanId            = ex.SpanId,
+                    Labels            = item.Labels,
                 });
-            }
+        }
+
+        if (total >= HotFlushThreshold
+            && System.Threading.Interlocked.CompareExchange(ref _thresholdFlushScheduled, 1, 0) == 0)
+        {
+            _ = Task.Run(async () =>
+            {
+                try { await FlushHotTierAsync().ConfigureAwait(false); }
+                finally { System.Threading.Interlocked.Exchange(ref _thresholdFlushScheduled, 0); }
+            });
         }
     }
 
@@ -454,18 +468,28 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         // Snapshot and clear hot tier. Bounds must travel with the snapshot —
         // without them cold histogram files have no bucket bounds and quantile /
         // heatmap queries over anything older than the hot tier return nothing.
+        //
+        // The drain, the counter reset and the log's generation bump are one atomic step
+        // against ingest: a point that arrives while this runs must land wholly on one side,
+        // either inside the snapshot or stamped with the next generation. Writing the files
+        // happens after the lock is released, so ingest is never blocked on disk.
         var snapshot = new List<(SeriesKey Key, HotSeries Series)>();
-        foreach (var (k, v) in _hot)
+        ulong flushedGeneration;
+        lock (_snapshotLock)
         {
-            var points = v.Drain();
-            if (points.Count > 0)
-                snapshot.Add((k, new HotSeries(points, v.Bounds)));
+            foreach (var (k, v) in _hot)
+            {
+                var points = v.Drain();
+                if (points.Count > 0)
+                    snapshot.Add((k, new HotSeries(points, v.Bounds)));
+            }
+
+            if (snapshot.Count == 0) return;
+
+            System.Threading.Interlocked.Exchange(ref _hotPointCount, 0);
+            _hotSince = null;
+            flushedGeneration = _wal.BeginFlush();
         }
-
-        if (snapshot.Count == 0) return;
-
-        System.Threading.Interlocked.Exchange(ref _hotPointCount, 0);
-        _hotSince = null;
 
         try
         {
@@ -483,28 +507,33 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
             // lose them outright. Put them back: the log still holds them, but only a restart
             // would have brought them back, and a transient disk error is not a restart.
             int restored = 0;
-            foreach (var (key, snap) in snapshot)
+            lock (_snapshotLock)
             {
-                var live = _hot.GetOrAdd(key, static _ => new HotSeries());
-                foreach (var p in snap.GetPoints(long.MinValue, long.MaxValue))
+                foreach (var (key, snap) in snapshot)
                 {
-                    live.Append(p, snap.Bounds);
-                    restored++;
+                    var live = _hot.GetOrAdd(key, static _ => new HotSeries());
+                    foreach (var p in snap.GetPoints(long.MinValue, long.MaxValue))
+                    {
+                        live.Append(p, snap.Bounds);
+                        restored++;
+                    }
                 }
+                System.Threading.Interlocked.Add(ref _hotPointCount, restored);
+                if (restored > 0) _hotSince ??= DateTime.UtcNow;
             }
-            System.Threading.Interlocked.Add(ref _hotPointCount, restored);
-            if (restored > 0) _hotSince ??= DateTime.UtcNow;
 
             _logger.LogError(ex,
                 "Failed to flush metric hot tier — {Count} point(s) kept in memory for the next attempt",
                 restored);
-            return;   // the log keeps its generation, so a crash before the retry still recovers
+            // No commit: the snapshot's records stay below an unchanged watermark, so a crash
+            // before the retry replays them.
+            return;
         }
 
-        // Files are on disk — the log has nothing left to protect. A new generation is what
-        // lets recovery tell these now-cold points from anything appended afterwards.
-        try { _wal.Reset(); }
-        catch (Exception ex) { _logger.LogWarning(ex, "Metric WAL reset failed after flush"); }
+        // Files are on disk. Committing the flushed generation reclaims its space and leaves
+        // everything appended during the write — which is durable nowhere else — untouched.
+        try { _wal.CommitFlush(flushedGeneration); }
+        catch (Exception ex) { _logger.LogWarning(ex, "Metric WAL commit failed after flush"); }
 
         await Task.CompletedTask;
     }

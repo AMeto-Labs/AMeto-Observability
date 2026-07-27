@@ -27,26 +27,42 @@ namespace Ameto.Metrics.Storage;
 /// <code>
 ///   metrics.wal
 ///     [File Header — 32 bytes]
-///       0   Magic       uint32  "RDMW"
-///       4   Version     uint16  1
-///       6   _pad        uint16
-///       8   WriteOffset int64
-///      16   Generation  uint32
-///      20   _reserved   uint32 + int64
+///       0   Magic               uint32  "RDMW"
+///       4   Version             uint16  1
+///       6   _pad                uint16
+///       8   WriteOffset         int64
+///      16   Generation          uint64  stamped on new appends
+///      24   CommittedGeneration uint64  everything at or below this is already in files
 ///     [Entry — 48 bytes, Pack = 1][BucketCounts: BucketCount × int64]
 ///
 ///   metrics.wal.pool
 ///     [index uint32][byteLen uint32][kind, name, unit, labels, bounds]  (repeated)
 /// </code>
 ///
-/// <para><b>Crash recovery.</b> A flush writes the segments first and resets the log second.
-/// The reset opens a new generation in the header BEFORE zeroing the write offset, and
-/// recovery keeps only entries stamped with the generation the header now carries — so a
-/// crash in between cannot replay points that are already cold. The generation is assigned
-/// here, under this class's own lock; nothing derived from the data (a point's timestamp,
-/// say) would do, because those come from the instrumented client and are not monotonic in
-/// append order. Only a crash landing between the segment write and the generation bump can
-/// duplicate points.</para>
+/// <para><b>Flush protocol.</b> A flush is two-phase, because points keep arriving while the
+/// files are being written and their log records must survive:</para>
+/// <list type="number">
+/// <item><see cref="BeginFlush"/>, called while the caller holds whatever lock makes the
+/// hot-tier snapshot atomic, closes the current generation and opens the next. Everything
+/// snapshotted carries generation G; everything appended from now on carries G+1.</item>
+/// <item><see cref="CommitFlush"/>, called once the files are durable, records G as
+/// committed and then compacts the log — the generations at or below G form a prefix
+/// (generation is non-decreasing in append order), so reclaiming them is one move of the
+/// surviving tail to the front.</item>
+/// </list>
+///
+/// <para>A flush that fails simply never commits: the snapshot's records still sit in the
+/// log below an unchanged watermark, so a crash before the retry replays them. This is what
+/// makes "durable before queryable" true for a point that arrives mid-flush — an earlier
+/// design zeroed the whole log after writing the files and destroyed exactly those
+/// records.</para>
+///
+/// <para><b>Crash recovery.</b> Recovery keeps entries whose generation is ABOVE the
+/// committed watermark. The watermark is written before any bytes move, so a crash during
+/// compaction cannot resurrect cold points. The generation is assigned here, under this
+/// class's own lock; nothing derived from the data (a point's timestamp, say) would do,
+/// because those come from the instrumented client and are not monotonic in append order.
+/// Only a crash landing between the file write and the commit can duplicate points.</para>
 ///
 /// <para>Generation 0 is never written by an append, so it also marks the end of real data —
 /// a zero-filled region is otherwise indistinguishable from a valid entry whose point
@@ -62,7 +78,7 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     private const ushort WalVersion      = 1;
     private const int    FileHeaderSize  = 32;
     private const int    EntryHeaderSize = 48;
-    private const uint   FirstGeneration = 1;
+    private const ulong  FirstGeneration = 1;
 
     /// <summary>8 MB holds ~150k scalar points; the log is reset on every flush.</summary>
     private const long DefaultCapacity = 8 * 1024 * 1024;
@@ -77,19 +93,19 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
         public ushort Version;
         private ushort _pad;
         public long   WriteOffset;
-        public uint   Generation;
-        private uint  _reserved0;
-        private long  _reserved1;
+        public ulong  Generation;
+        public ulong  CommittedGeneration;
     }
 
     /// <summary>
-    /// Pack = 1 pins the fields at 42 bytes inside the 48-byte stride. Without it the 8-byte
+    /// Pack = 1 pins the fields at 46 bytes inside the 48-byte stride. Without it the 8-byte
     /// members would align and push the tail past the stride into the payload area.
+    /// A 64-bit generation removes any need to reason about wrap-around.
     /// </summary>
     [StructLayout(LayoutKind.Sequential, Pack = 1, Size = EntryHeaderSize)]
     private struct MetricWalEntryHeader
     {
-        public uint   Generation;        // 0 = unwritten; see the class remarks
+        public ulong  Generation;        // 0 = unwritten; see the class remarks
         public uint   SeriesIndex;
         public long   TimestampUnixNano;
         public double Value;
@@ -112,7 +128,8 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     private byte*                     _ptr;
     private long                      _capacity;
     private long                      _writeOffset;   // logical, excludes the file header
-    private uint                      _generation;
+    private ulong                     _generation;
+    private ulong                     _committedGeneration;
     private bool                      _disposed;
 
     // Series registry for the CURRENT generation. Cleared on reset together with the pool
@@ -156,17 +173,20 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
         ref var hdr = ref Unsafe.AsRef<WalFileHeader>(_ptr);
         if (!exists || hdr.Magic != MagicNumber || hdr.Version != WalVersion)
         {
-            hdr.Magic       = MagicNumber;
-            hdr.Version     = WalVersion;
-            hdr.WriteOffset = FileHeaderSize;
-            hdr.Generation  = FirstGeneration;
-            _writeOffset    = 0;
-            _generation     = FirstGeneration;
+            hdr.Magic               = MagicNumber;
+            hdr.Version             = WalVersion;
+            hdr.WriteOffset         = FileHeaderSize;
+            hdr.Generation          = FirstGeneration;
+            hdr.CommittedGeneration = 0;
+            _writeOffset            = 0;
+            _generation             = FirstGeneration;
+            _committedGeneration    = 0;
         }
         else
         {
-            _writeOffset = Math.Max(0, hdr.WriteOffset - FileHeaderSize);
-            _generation  = hdr.Generation == 0 ? FirstGeneration : hdr.Generation;
+            _writeOffset         = Math.Max(0, hdr.WriteOffset - FileHeaderSize);
+            _generation          = hdr.Generation == 0 ? FirstGeneration : hdr.Generation;
+            _committedGeneration = hdr.CommittedGeneration;
             if (_writeOffset > _capacity) _writeOffset = _capacity;
         }
 
@@ -273,26 +293,81 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     // ── Reset ────────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Drops every logged point by opening a new generation. Call only after the segments
-    /// carrying these points are on disk.
+    /// Closes the generation being flushed and opens the next one. Call while holding the
+    /// lock that makes the hot-tier snapshot atomic, so that every point in the snapshot has
+    /// already been stamped with the returned generation and every point that arrives while
+    /// the files are written gets the next one.
     /// </summary>
-    public void Reset()
+    /// <returns>The generation the snapshot belongs to — pass it to <see cref="CommitFlush"/>.</returns>
+    public ulong BeginFlush()
+    {
+        lock (_writeLock)
+        {
+            ulong flushing = _generation;
+            if (_disposed || _ptr is null) return flushing;
+
+            _generation = flushing + 1;
+            Unsafe.AsRef<WalFileHeader>(_ptr).Generation = _generation;
+            return flushing;
+        }
+    }
+
+    /// <summary>
+    /// Marks everything up to <paramref name="flushedGeneration"/> as durable elsewhere and
+    /// reclaims its space. Call only after the files carrying those points are on disk; a
+    /// flush that failed must simply never call this, leaving its records replayable.
+    /// </summary>
+    public void CommitFlush(ulong flushedGeneration)
     {
         lock (_writeLock)
         {
             if (_disposed || _ptr is null) return;
+            if (flushedGeneration <= _committedGeneration) return;   // already committed
 
-            _generation = _generation == uint.MaxValue ? FirstGeneration : _generation + 1;
+            _committedGeneration = flushedGeneration;
 
+            // The watermark lands before a single byte moves: a crash mid-compaction then
+            // still replays exactly the survivors, never the points already in files.
             ref var hdr = ref Unsafe.AsRef<WalFileHeader>(_ptr);
-            hdr.Generation  = _generation;      // (1) must land before the offset
-            hdr.WriteOffset = FileHeaderSize;   // (2)
-            _writeOffset    = 0;
+            hdr.CommittedGeneration = flushedGeneration;
 
-            // (3) The pool is only useful to entries that still exist, so it is truncated
-            // last. A crash before this leaves stale records, which is harmless: appends
-            // re-register from index 0 and their records land after the stale ones, and
-            // replay resolves an index to the LAST record carrying it.
+            Compact(flushedGeneration);
+        }
+    }
+
+    /// <summary>
+    /// Moves entries above the watermark to the front. Generation is non-decreasing in append
+    /// order, so the committed entries are a prefix and the survivors one contiguous tail —
+    /// a single move, bounded by whatever arrived while the files were being written.
+    /// </summary>
+    private void Compact(ulong committed)
+    {
+        byte* data = _ptr + FileHeaderSize;
+
+        long firstSurvivor = _writeOffset;
+        long pos = 0;
+        while (pos + EntryHeaderSize <= _writeOffset)
+        {
+            ref var eh = ref Unsafe.AsRef<MetricWalEntryHeader>(data + pos);
+            long total = (long)EntryHeaderSize + eh.BucketCount * sizeof(long);
+            if (total <= 0 || pos + total > _writeOffset) break;
+            if (eh.Generation == 0) break;
+            if (eh.Generation > committed) { firstSurvivor = pos; break; }
+            pos += total;
+        }
+
+        long surviving = _writeOffset - firstSurvivor;
+        if (surviving > 0 && firstSurvivor > 0)
+            Buffer.MemoryCopy(data + firstSurvivor, data, _capacity, surviving);
+
+        _writeOffset = Math.Max(0, surviving);
+        Unsafe.AsRef<WalFileHeader>(_ptr).WriteOffset = FileHeaderSize + _writeOffset;
+
+        // The pool is only reclaimable once nothing references it. Survivors still carry
+        // their series indices, so it is truncated on the flushes that empty the log — which
+        // is the normal case — and simply kept otherwise, bounded by the series cardinality.
+        if (_writeOffset == 0)
+        {
             _seriesIndex.Clear();
             _nextSeriesIndex = 0;
             try
@@ -307,9 +382,10 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     // ── Recovery ─────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Replays every complete point of the current generation. Points whose series is
-    /// missing from the pool are skipped — they cannot be reconstructed — and reported
-    /// through <paramref name="unresolved"/> rather than silently dropped.
+    /// Replays every complete point above the committed watermark — that is, everything not
+    /// yet known to be in a file, including a snapshot whose flush never completed. Points
+    /// whose series is missing from the pool are skipped, since they cannot be reconstructed,
+    /// and reported through <paramref name="unresolved"/> rather than silently dropped.
     /// </summary>
     public List<RecoveredPoint> ReadAll(out int unresolved)
     {
@@ -333,7 +409,7 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
                 if (total <= 0 || pos + total > end) break;   // torn tail
                 if (eh.Generation == 0) break;                // end of real data
 
-                if (eh.Generation == _generation)
+                if (eh.Generation > _committedGeneration)
                 {
                     if (pool.TryGetValue(eh.SeriesIndex, out var series))
                     {
