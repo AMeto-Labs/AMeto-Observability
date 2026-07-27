@@ -11,19 +11,34 @@ namespace Ameto.Otel;
 /// Field numbers and wire types follow the OTLP proto spec v1.x:
 ///   https://github.com/open-telemetry/opentelemetry-proto
 ///
-/// Nested messages are parsed by reading raw bytes via ReadBytes() and creating
-/// a child CodedInputStream — avoids dependency on the removed PushLimit/PopLimit
-/// public API (removed from Google.Protobuf ≥ 3.21).
+/// Nested messages are parsed by reading the length-prefixed bytes and handing them to a
+/// child parser via ByteString.CreateCodedInput. PushLimit/PopLimit would let this parse in
+/// place with no child parser and no copy at all, but stopped being public in
+/// Google.Protobuf 3.21.
 ///
 /// Only the fields consumed by the existing mappers are decoded; everything
 /// else is skipped via SkipLastField().
 /// </summary>
 internal static class OtlpProtoDecoder
 {
-    // Convenience: for an embedded-message field (wire type 2), the caller has
-    // already read the tag; we read the length-prefixed bytes and parse them.
+    /// <summary>
+    /// For an embedded-message field (wire type 2): the caller has already read the tag, so
+    /// this reads the length-prefixed bytes and returns a parser over them.
+    ///
+    /// <para><see cref="ByteString.CreateCodedInput"/> reads the ByteString in place. The
+    /// previous shape — <c>new CodedInputStream(bytes.ToByteArray())</c> — copied every
+    /// nested message's payload a SECOND time purely to hand the parser a <c>byte[]</c>, at
+    /// every level of the tree. An allocation trace of an idle server attributed ~27 MB/min
+    /// of <c>System.Byte[]</c> to the decode path; this is that copy.</para>
+    ///
+    /// <para>The remaining copy is <c>ReadBytes()</c> itself, and the parser object per
+    /// message; removing those needs <c>PushLimit</c>/<c>PopLimit</c>, which Google.Protobuf
+    /// stopped exposing publicly in 3.21 — the note this comment replaces was right about
+    /// that. Doing better means hand-rolling a span-based varint reader, which is a rewrite
+    /// of this file rather than a fix, and belongs in its own change.</para>
+    /// </summary>
     private static CodedInputStream SubStream(CodedInputStream cis)
-        => new(cis.ReadBytes().ToByteArray());
+        => cis.ReadBytes().CreateCodedInput();
 
     // ── Public entry points ───────────────────────────────────────────────────
 

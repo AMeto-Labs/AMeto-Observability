@@ -377,6 +377,13 @@ internal static class MetricReader
         return offset;
     }
 
+    /// <summary>
+    /// Unbuffered on purpose. Every read here is either a header field or a whole LZ4 block
+    /// pulled straight into an <see cref="ArrayPool{T}"/> buffer, so FileStream's own 64 KB
+    /// intermediate buffer copied bytes for nothing — and it is allocated per open, while
+    /// <c>RewriteMetricInChunks</c> reopens every source file once per series chunk. An
+    /// allocation trace attributed ~6 MB/min to that buffer alone on a background path.
+    /// </summary>
     private static FileStream OpenRead(string path) =>
-        new(path, FileMode.Open, FileAccess.Read, FileShare.Read, 65536, FileOptions.SequentialScan);
+        new(path, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 0, FileOptions.SequentialScan);
 }
