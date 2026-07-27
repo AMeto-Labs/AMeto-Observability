@@ -1,3 +1,4 @@
+using System.Buffers;
 using K4os.Compression.LZ4;
 using MessagePack;
 
@@ -108,13 +109,34 @@ internal static class MetricReader
 
         if (version == 3)
         {
-            // One LZ4 block holding every series back to back.
+            // One LZ4 block holding every series back to back. Series are decoded one
+            // at a time — materialising the whole section would make the caller's peak
+            // the file's series count, which is unbounded in files written before the
+            // 512-series cap (exactly what a high-cardinality deployment has on disk).
             br.ReadUInt32(); // uncompSize
             uint compSize = br.ReadUInt32();
-            var  raw      = LZ4Pickler.Unpickle(br.ReadBytes((int)compSize));
 
-            foreach (var series in DeserializeSection(metricName, raw, seriesCount))
-                yield return series;
+            byte[] comp = ArrayPool<byte>.Shared.Rent((int)compSize);
+            byte[]? raw  = null;
+            try
+            {
+                fs.ReadExactly(comp, 0, (int)compSize);
+                int rawLen = LZ4Pickler.UnpickledSize(comp.AsSpan(0, (int)compSize));
+                raw = ArrayPool<byte>.Shared.Rent(rawLen);
+                LZ4Pickler.Unpickle(comp.AsSpan(0, (int)compSize), raw.AsSpan(0, rawLen));
+
+                int offset = 0;
+                for (int i = 0; i < seriesCount && offset < rawLen; i++)
+                {
+                    var series = DeserializeNext(metricName, raw, offset, rawLen, deltaMs: true, out offset);
+                    if (series is not null) yield return series;
+                }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(comp);
+                if (raw is not null) ArrayPool<byte>.Shared.Return(raw);
+            }
         }
         else
         {
@@ -123,9 +145,24 @@ internal static class MetricReader
             {
                 br.ReadUInt32(); // uncompSize
                 uint compSize = br.ReadUInt32();
-                var  raw      = LZ4Pickler.Unpickle(br.ReadBytes((int)compSize));
 
-                var series = DeserializeOne(metricName, raw, deltaMs: false);
+                byte[] comp = ArrayPool<byte>.Shared.Rent((int)compSize);
+                byte[]? raw = null;
+                MetricSeries? series;
+                try
+                {
+                    fs.ReadExactly(comp, 0, (int)compSize);
+                    int rawLen = LZ4Pickler.UnpickledSize(comp.AsSpan(0, (int)compSize));
+                    raw = ArrayPool<byte>.Shared.Rent(rawLen);
+                    LZ4Pickler.Unpickle(comp.AsSpan(0, (int)compSize), raw.AsSpan(0, rawLen));
+                    series = DeserializeNext(metricName, raw, 0, rawLen, deltaMs: false, out _);
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(comp);
+                    if (raw is not null) ArrayPool<byte>.Shared.Return(raw);
+                }
+
                 if (series is not null) yield return series;
             }
         }
@@ -133,24 +170,19 @@ internal static class MetricReader
 
     // ── Internals ─────────────────────────────────────────────────────────────
 
-    /// <summary>Parses every series out of a decompressed v3 section (ref-struct reader kept out of the iterator).</summary>
-    private static List<MetricSeries> DeserializeSection(string metricName, byte[] raw, int seriesCount)
+    /// <summary>
+    /// Decodes the series starting at <paramref name="offset"/> and reports where the next
+    /// one begins. Non-iterator by necessity: <see cref="MessagePackReader"/> is a ref struct
+    /// and cannot live across a <c>yield</c>, so the cursor is carried out as a plain int and
+    /// the reader is rebuilt per call (it is a span wrapper — no allocation).
+    /// </summary>
+    private static MetricSeries? DeserializeNext(
+        string metricName, byte[] raw, int offset, int length, bool deltaMs, out int next)
     {
-        var result = new List<MetricSeries>(seriesCount);
-        var r = new MessagePackReader(raw);
-        for (int i = 0; i < seriesCount && !r.End; i++)
-        {
-            var series = DeserializeSeries(metricName, ref r, deltaMs: true);
-            if (series is not null) result.Add(series);
-        }
-        return result;
-    }
-
-    /// <summary>Parses a single v2 series block.</summary>
-    private static MetricSeries? DeserializeOne(string metricName, byte[] raw, bool deltaMs)
-    {
-        var r = new MessagePackReader(raw);
-        return DeserializeSeries(metricName, ref r, deltaMs);
+        var r = new MessagePackReader(new ReadOnlyMemory<byte>(raw, offset, length - offset));
+        var series = DeserializeSeries(metricName, ref r, deltaMs);
+        next = offset + (int)r.Consumed;
+        return series;
     }
 
     private static MetricSeries? DeserializeSeries(string metricName, ref MessagePackReader r, bool deltaMs)
