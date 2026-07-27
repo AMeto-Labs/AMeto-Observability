@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Ameto.Alerts;
+using Ameto.Server.Auth;
 
 namespace Ameto.Server;
 
@@ -13,10 +14,21 @@ public static class AlertEndpointMapper
     ///   GET  /api/alerts/history
     ///   GET/POST/DELETE /api/alerts/silences[/{id}]
     ///   POST /api/alerts/preview
+    ///
+    /// Three privilege tiers rather than one:
+    ///   read   (any signed-in user) — state, history, and the redacted rule list.
+    ///   ops    (manager+)           — silences, maintenance windows, acknowledgements.
+    ///   manage (admin)              — anything that writes a rule, because a rule owns its
+    ///                                 channels: they hold credentials and they name the
+    ///                                 outbound destination the server will dial. Handing
+    ///                                 that to a read-only role makes the server a proxy
+    ///                                 into its own network and a courier for its secrets.
     /// </summary>
     public static void MapAlertEndpoints(this WebApplication app)
     {
-        var group = app.MapGroup("/api/alerts").RequireAuthorization();
+        var group  = app.MapGroup("/api/alerts").RequireAuthorization();
+        var ops    = app.MapGroup("/api/alerts").RequireAuthorization(AuthServiceExtensions.PolicyManager);
+        var manage = app.MapGroup("/api/alerts").RequireAuthorization(AuthServiceExtensions.PolicyAdmin);
 
         // ── Live state / history (literal segments before {id}) ─────────────────
         group.MapGet("/state", (AlertEvaluator ev) => Results.Ok(ev.GetStates()));
@@ -27,7 +39,7 @@ public static class AlertEndpointMapper
         // ── Silences ────────────────────────────────────────────────────────────
         group.MapGet("/silences", (AlertEvaluator ev) => Results.Ok(ev.GetSilences()));
 
-        group.MapPost("/silences", (SilenceRequest req, AlertEvaluator ev) =>
+        ops.MapPost("/silences", (SilenceRequest req, AlertEvaluator ev) =>
         {
             if (string.IsNullOrWhiteSpace(req.RuleId) || req.Minutes <= 0)
                 return Results.BadRequest("ruleId and positive minutes required");
@@ -41,13 +53,13 @@ public static class AlertEndpointMapper
             return Results.Ok(s);
         });
 
-        group.MapDelete("/silences/{id}", (string id, AlertEvaluator ev) =>
+        ops.MapDelete("/silences/{id}", (string id, AlertEvaluator ev) =>
             ev.RemoveSilence(id) ? Results.NoContent() : Results.NotFound());
 
         // ── Maintenance windows (scheduled recurring silences) ──────────────────
         group.MapGet("/maintenance", (AlertEvaluator ev) => Results.Ok(ev.GetMaintenance()));
 
-        group.MapPost("/maintenance", (MaintenanceRequest req, AlertEvaluator ev) =>
+        ops.MapPost("/maintenance", (MaintenanceRequest req, AlertEvaluator ev) =>
         {
             if (string.IsNullOrWhiteSpace(req.Name)) return Results.BadRequest("name is required");
             var w = BuildMaintenance(null, req);
@@ -55,30 +67,34 @@ public static class AlertEndpointMapper
             return Results.Created($"/api/alerts/maintenance/{w.Id}", w);
         });
 
-        group.MapPut("/maintenance/{id}", (string id, MaintenanceRequest req, AlertEvaluator ev) =>
+        ops.MapPut("/maintenance/{id}", (string id, MaintenanceRequest req, AlertEvaluator ev) =>
         {
             ev.UpsertMaintenance(BuildMaintenance(id, req));
             return Results.Ok(BuildMaintenance(id, req));
         });
 
-        group.MapDelete("/maintenance/{id}", (string id, AlertEvaluator ev) =>
+        ops.MapDelete("/maintenance/{id}", (string id, AlertEvaluator ev) =>
             ev.RemoveMaintenance(id) ? Results.NoContent() : Results.NotFound());
 
         // ── Preview: evaluate the condition value right now ─────────────────────
-        group.MapPost("/preview", async (AlertRuleUpsertRequest req, AlertEvaluator ev, CancellationToken ct) =>
+        // No stored rule is passed, so no masked secret can resolve here; preview
+        // only evaluates the condition and never dispatches to a channel.
+        manage.MapPost("/preview", async (AlertRuleUpsertRequest req, AlertEvaluator ev, CancellationToken ct) =>
         {
-            var rule  = BuildRule(req.Id, req, null);
+            if (!TryBuildRule(req.Id, req, null, out var rule, out var error))
+                return Results.BadRequest(new { error });
             double v  = await ev.PreviewAsync(rule, ct);
             bool fires = Compare(v, rule.Comparator, rule.Threshold);
             return Results.Ok(new { value = v, threshold = rule.Threshold, wouldFire = fires });
         });
 
         // ── Test: send a one-off notification through the rule's channels ────────
-        group.MapPost("/test", async (AlertRuleUpsertRequest req, AlertRuleStore store, AlertEvaluator ev, CancellationToken ct) =>
+        manage.MapPost("/test", async (AlertRuleUpsertRequest req, AlertRuleStore store, AlertEvaluator ev, CancellationToken ct) =>
         {
             // Resolve masked secrets against the stored rule so the test uses real credentials.
             var existing = string.IsNullOrEmpty(req.Id) ? null : store.GetById(req.Id!);
-            var rule = BuildRule(req.Id, req, existing);
+            if (!TryBuildRule(req.Id, req, existing, out var rule, out var error))
+                return Results.BadRequest(new { error });
             if (rule.Channels.Count == 0)
                 return Results.BadRequest("No channels configured to test.");
             await ev.SendTestAsync(rule, ct);
@@ -86,10 +102,10 @@ public static class AlertEndpointMapper
         });
 
         // ── Acknowledge / un-acknowledge a firing incident (mutes re-notify) ─────
-        group.MapPost("/{id}/ack", (string id, HttpContext ctx, AlertEvaluator ev) =>
+        ops.MapPost("/{id}/ack", (string id, HttpContext ctx, AlertEvaluator ev) =>
             ev.Acknowledge(id, ctx.User.Identity?.Name) ? Results.Ok() : Results.BadRequest("Rule is not firing."));
 
-        group.MapDelete("/{id}/ack", (string id, AlertEvaluator ev) =>
+        ops.MapDelete("/{id}/ack", (string id, AlertEvaluator ev) =>
             ev.Unacknowledge(id) ? Results.NoContent() : Results.NotFound());
 
         // ── CRUD ────────────────────────────────────────────────────────────────
@@ -100,23 +116,25 @@ public static class AlertEndpointMapper
         group.MapGet("/{id}", (string id, AlertRuleStore store) =>
             store.GetById(id) is { } r ? Results.Ok(Redact(r)) : Results.NotFound());
 
-        group.MapPost("/", (AlertRuleUpsertRequest req, AlertRuleStore store) =>
+        manage.MapPost("/", (AlertRuleUpsertRequest req, AlertRuleStore store) =>
         {
-            var rule = BuildRule(null, req, null);
+            if (!TryBuildRule(null, req, null, out var rule, out var error))
+                return Results.BadRequest(new { error });
             store.Upsert(rule);
             return Results.Created($"/api/alerts/{rule.Id}", Redact(rule));
         });
 
-        group.MapPut("/{id}", (string id, AlertRuleUpsertRequest req, AlertRuleStore store) =>
+        manage.MapPut("/{id}", (string id, AlertRuleUpsertRequest req, AlertRuleStore store) =>
         {
             var existing = store.GetById(id);
             if (existing is null) return Results.NotFound();
-            var rule = BuildRule(id, req, existing);
+            if (!TryBuildRule(id, req, existing, out var rule, out var error))
+                return Results.BadRequest(new { error });
             store.Upsert(rule);
             return Results.Ok(Redact(rule));
         });
 
-        group.MapDelete("/{id}", (string id, AlertRuleStore store) =>
+        manage.MapDelete("/{id}", (string id, AlertRuleStore store) =>
             store.Delete(id) ? Results.NoContent() : Results.NotFound());
     }
 
@@ -126,7 +144,15 @@ public static class AlertEndpointMapper
     /// ASCII so it round-trips through any client body encoding.</summary>
     private const string SecretMask = "********";
 
-    private static AlertRule BuildRule(string? id, AlertRuleUpsertRequest req, AlertRule? existing)
+    /// <summary>
+    /// Maps an upsert payload onto an <see cref="AlertRule"/>, resolving masked secrets against
+    /// <paramref name="existing"/>. Returns false with <paramref name="error"/> set when the
+    /// payload tries to keep a stored secret while redirecting the channel — see
+    /// <see cref="RedirectsAMaskedSecret"/>.
+    /// </summary>
+    private static bool TryBuildRule(
+        string? id, AlertRuleUpsertRequest req, AlertRule? existing,
+        out AlertRule rule, out string? error)
     {
         var prev = existing?.Channels ?? [];
         var dtos = req.Channels ?? [];
@@ -134,11 +160,20 @@ public static class AlertEndpointMapper
         for (int i = 0; i < dtos.Count; i++)
         {
             // Match against the same-index existing channel to resolve masked (unchanged) secrets.
-            var ch = MapChannel(dtos[i], i < prev.Count ? prev[i] : null);
+            var prevCh = i < prev.Count ? prev[i] : null;
+            if (RedirectsAMaskedSecret(dtos[i], prevCh))
+            {
+                rule  = null!;
+                error = $"Channel #{i + 1}: the destination changed while a secret was left masked. " +
+                        "Re-enter the secret to point this channel somewhere new.";
+                return false;
+            }
+            var ch = MapChannel(dtos[i], prevCh);
             if (ch is not null) channels.Add(ch);
         }
 
-        return new AlertRule
+        error = null;
+        rule  = new AlertRule
         {
             Id          = id ?? (string.IsNullOrEmpty(req.Id) ? Guid.NewGuid().ToString("N")[..8] : req.Id!),
             Name        = string.IsNullOrWhiteSpace(req.Name) ? "Unnamed" : req.Name!,
@@ -164,7 +199,61 @@ public static class AlertEndpointMapper
             Channels    = channels,
             Template    = req.Template,
         };
+        return true;
     }
+
+    /// <summary>
+    /// True when the payload asks to keep a stored secret — a field left at
+    /// <see cref="SecretMask"/> — while aiming the channel at a different destination than the
+    /// one that secret was stored against.
+    /// <para>
+    /// Redaction means a caller can read a rule back with every secret masked. Without this
+    /// check they could then change only the URL, host or chat id, send the mask straight back,
+    /// and have the server resolve the stored credential and hand it to a destination of their
+    /// choosing — an SMTP password offered to an attacker's mail server, a webhook's
+    /// <c>Authorization</c> header POSTed to an attacker's endpoint, a <c>{{secret.*}}</c>
+    /// interpolated into an attacker's HTTP-flow step. Requiring the secret to be re-entered
+    /// whenever the destination moves keeps a redirected channel from inheriting it.
+    /// </para>
+    /// <para>
+    /// Channels whose destination <em>is</em> the secret (slack / discord / teams / pagerduty)
+    /// cannot be redirected this way: changing the destination means supplying the secret. Nor
+    /// does a type change or a brand-new channel need checking — neither resolves a stored value.
+    /// </para>
+    /// </summary>
+    private static bool RedirectsAMaskedSecret(ChannelDto d, AlertChannel? prev)
+    {
+        if (prev is null) return false; // nothing stored at this slot to resolve a mask against
+
+        return d.Type?.ToLowerInvariant() switch
+        {
+            "webhook" => HasMasked(d.Headers) && prev is WebhookChannel w
+                      && !string.Equals(d.Url, w.Url, StringComparison.Ordinal),
+
+            // The credential travels to Host:Port via SMTP AUTH, so both pin the secret.
+            "smtp" => d.Password == SecretMask && prev is SmtpChannel s
+                   && (!string.Equals(d.Host, s.Host, StringComparison.OrdinalIgnoreCase)
+                       || (d.Port ?? 587) != s.Port),
+
+            // The bot token is spent by messaging ChatId — a new chat is a new destination.
+            "telegram" => d.BotToken == SecretMask && prev is TelegramChannel t
+                       && !string.Equals(d.ChatId, t.ChatId, StringComparison.Ordinal),
+
+            // Any step edit can move a {{secret.*}} somewhere new — URL, header or body —
+            // so the whole step list must be untouched for masked secrets to resolve.
+            "httpflow" => HasMasked(d.Secrets) && prev is HttpFlowChannel h
+                       && !SameSteps(d.Steps, h.Steps),
+
+            _ => false,
+        };
+    }
+
+    private static bool HasMasked(Dictionary<string, string>? values) =>
+        values is not null && values.Values.Any(static v => v == SecretMask);
+
+    /// <summary>Structural equality over the step list — any field change counts as a move.</summary>
+    private static bool SameSteps(List<HttpFlowStep>? incoming, List<HttpFlowStep> stored) =>
+        JsonSerializer.Serialize(incoming ?? []) == JsonSerializer.Serialize(stored);
 
     private static AlertChannel? MapChannel(ChannelDto d, AlertChannel? prev)
     {

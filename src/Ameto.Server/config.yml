@@ -34,7 +34,12 @@ Ameto:
   #   Microsoft:
   #     ClientId: ""
   #     ClientSecret: ""
-  #     TenantId: "common"     # Azure AD tenant id, or "common" for multi-tenant
+  #     TenantId: ""           # REQUIRED: your Entra tenant id. A tenant-agnostic endpoint
+  #                            # ("common"/"organizations"/"consumers", or blank) leaves the
+  #                            # provider disabled: the email claim would then come from any
+  #                            # tenant, including one an attacker registers, and sign-in is
+  #                            # matched on that address.
+  #     AllowMultiTenant: false # set true only if you really do accept sign-ins from any tenant
 
   # Flush the hot tier when memory pressure exceeds this percentage. NOTE: without a
   # cgroup limit (always on Windows; in Docker unless you pass --memory / mem_limit)
