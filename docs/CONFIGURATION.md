@@ -46,6 +46,8 @@ Sign-in is matched on the e-mail address the provider asserts, so that address h
 
 Two further checks apply regardless: Google sign-ins must carry `email_verified`, and every OAuth account is bound to the provider's immutable subject id on first sign-in — after which a different identity asserting the same address is refused.
 
+**One gap remains if you set `AllowMultiTenant`.** Subject binding protects an account only once it is bound, and binding happens at the *first* sign-in. So an entry you add ahead of time — the usual "add the new hire to the allowlist, they join next week" flow — belongs to whoever signs in as that address first. With the tenant pinned that can only be someone from your directory; with `AllowMultiTenant` it can be anyone who asserts the address from any tenant. The binding is recorded in the log at `Information` ("bound to subject … on first sign-in"), which is the only signal distinguishing that from a normal sign-in, so if you run multi-tenant, watch that line. Prefer pinning the tenant and adding allowlist entries close to when they will be used.
+
 ---
 
 ## Hot-tier options (`Ameto:HotTier`)

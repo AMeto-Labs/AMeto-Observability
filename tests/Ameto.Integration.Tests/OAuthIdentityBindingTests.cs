@@ -1,5 +1,5 @@
 using Ameto.Server.Auth;
-using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Logging;
 
 namespace Ameto.Integration.Tests;
 
@@ -15,8 +15,9 @@ namespace Ameto.Integration.Tests;
 /// </summary>
 public sealed class OAuthIdentityBindingTests : IDisposable
 {
-    private readonly string    _dir;
-    private readonly AuthStore _store;
+    private readonly string          _dir;
+    private readonly AuthStore       _store;
+    private readonly CapturingLogger _log = new();
 
     public OAuthIdentityBindingTests()
     {
@@ -24,7 +25,18 @@ public sealed class OAuthIdentityBindingTests : IDisposable
         _store = new AuthStore(
             new AuthDatabase(_dir),
             new AuthOptions { AdminPassword = "seeded-for-tests" },
-            NullLogger<AuthStore>.Instance);
+            _log);
+    }
+
+    /// <summary>Collects formatted log lines so the binding audit trail can be asserted on.</summary>
+    private sealed class CapturingLogger : ILogger<AuthStore>
+    {
+        public readonly List<string> Lines = [];
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(LogLevel logLevel) => true;
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state,
+            Exception? exception, Func<TState, Exception?, string> formatter) =>
+            Lines.Add(formatter(state, exception));
     }
 
     public void Dispose()
@@ -55,6 +67,26 @@ public sealed class OAuthIdentityBindingTests : IDisposable
         var impostor = _store.FindOrCreateOAuthUser("erin@corp.example", "Erin", "microsoft", "attacker-tenant-oid");
 
         Assert.Null(impostor);
+    }
+
+    [Fact]
+    public void BindingAnAccountToItsFirstSubjectIsLogged()
+    {
+        // Adoption is the moment an unbound allowlist row acquires an owner. Under
+        // AllowMultiTenant that "owner" may be a stranger, and every sign-in afterwards looks
+        // ordinary — this line is the only thing separating the two after the fact.
+        _store.CreateOAuthUser("ivan@corp.example", "Ivan", "microsoft", "admin");
+        _store.FindOrCreateOAuthUser("ivan@corp.example", "Ivan", "microsoft", "entra-oid-ivan");
+
+        var bound = Assert.Single(_log.Lines, l => l.Contains("bound to subject", StringComparison.Ordinal));
+        Assert.Contains("ivan@corp.example", bound, StringComparison.Ordinal);
+        Assert.Contains("entra-oid-ivan",    bound, StringComparison.Ordinal);
+        Assert.Contains("admin",             bound, StringComparison.Ordinal);
+
+        // An already-bound account signing in again is routine and stays quiet.
+        _log.Lines.Clear();
+        _store.FindOrCreateOAuthUser("ivan@corp.example", "Ivan", "microsoft", "entra-oid-ivan");
+        Assert.DoesNotContain(_log.Lines, l => l.Contains("bound to subject", StringComparison.Ordinal));
     }
 
     [Fact]

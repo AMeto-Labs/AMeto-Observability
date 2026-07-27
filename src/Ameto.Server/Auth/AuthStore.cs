@@ -130,7 +130,16 @@ internal sealed class AuthStore
             {
                 // Row predates subject binding (or was created from the admin allowlist):
                 // adopt this subject as the account's identity from here on.
+                //
+                // This is the moment the account acquires an owner, so it is logged. Until it
+                // happens the row belongs to whoever signs in first — fine when the provider is
+                // pinned to one tenant, but under AllowMultiTenant "first" can be a stranger,
+                // and every sign-in afterwards looks ordinary. The binding line is what makes
+                // that distinguishable after the fact.
                 BindProviderSubject(existing.Id, subject);
+                _logger.LogInformation(
+                    "OAuth account {Email} ({Provider}, role {Role}) bound to subject {Subject} on first sign-in",
+                    existing.Email, provider, existing.Role, subject);
                 return existing with { ProviderSubject = subject };
             }
 
