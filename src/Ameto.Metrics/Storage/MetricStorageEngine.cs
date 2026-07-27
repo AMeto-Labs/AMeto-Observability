@@ -384,6 +384,8 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
             try { await PerformRollupAsync(ct); }
             catch (Exception ex) { _logger.LogError(ex, "Metric rollup error"); }
+            // Advance the round-robin so the next pass serves the next metrics.
+            _rollupCursor += MaxMetricsPerPass;
         }
     }
 
@@ -429,6 +431,18 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         }
         finally { _coldLock.ExitReadLock(); }
 
+        // Work budget: every stage below materialises a WHOLE metric (all series,
+        // all points — histograms carry a bucket array per point) before writing
+        // it back. Processing all metrics in one pass therefore scales with total
+        // cardinality: on a 38k-series deployment it allocated ~180 MB/s for
+        // minutes and drove the working set past 1 GB every 5 minutes. Take only a
+        // few metrics per pass, rotating so every metric is served across passes.
+        toCompact  = TakeMetricSlice(toCompact);
+        toMerge5m  = TakeMetricSlice(toMerge5m);
+        toMerge1h  = TakeMetricSlice(toMerge1h);
+        toRollup5m = TakeMetricSlice(toRollup5m);
+        toRollup1h = TakeMetricSlice(toRollup1h);
+
         if (toCompact.Count >= 2)  CompactSegments(toCompact, MetricGranularity.Raw);
         MergeTier(toMerge5m, MetricGranularity.FiveMin);
         // A merged file expires whole (MaxNano vs the retention cutoff), so its
@@ -440,7 +454,37 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         if (toRollup5m.Count > 0)  Rollup(toRollup5m, MetricGranularity.FiveMin, TimeSpan.FromMinutes(5));
         if (toRollup1h.Count > 0)  Rollup(toRollup1h, MetricGranularity.OneHour, TimeSpan.FromHours(1));
 
+        // Hand the pass's peak back to the OS instead of letting it ratchet up
+        // across passes. This is a background path — an induced GC is affordable.
+        GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+
         return Task.CompletedTask;
+    }
+
+    /// <summary>Metrics processed per rollup pass (rotating) — bounds peak memory.</summary>
+    private const int MaxMetricsPerPass = 4;
+
+    /// <summary>Round-robin cursor over metric names, so no metric is starved.</summary>
+    private int _rollupCursor;
+
+    /// <summary>
+    /// Restricts a work list to <see cref="MaxMetricsPerPass"/> metric names,
+    /// starting where the previous pass stopped. Segments of the chosen metrics
+    /// are kept whole — a metric is never split across passes, which would leave
+    /// its files half-merged.
+    /// </summary>
+    private List<MetricSegmentInfo> TakeMetricSlice(List<MetricSegmentInfo> segments)
+    {
+        if (segments.Count == 0) return segments;
+        var names = segments.Select(s => s.MetricName).Distinct().OrderBy(n => n, StringComparer.Ordinal).ToList();
+        if (names.Count <= MaxMetricsPerPass) return segments;
+
+        int start = _rollupCursor % names.Count;
+        var take  = new HashSet<string>(StringComparer.Ordinal);
+        for (int i = 0; i < MaxMetricsPerPass; i++)
+            take.Add(names[(start + i) % names.Count]);
+
+        return segments.Where(s => take.Contains(s.MetricName)).ToList();
     }
 
     /// <summary>

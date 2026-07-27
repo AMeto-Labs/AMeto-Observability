@@ -179,6 +179,33 @@ public sealed class MetricFormatV3Tests : IDisposable
         Assert.Equal(3, MetricReader.ReadAllSync(b[0].FilePath).Count());
     }
 
+    /// <summary>
+    /// A high-cardinality metric must be split across several files. The writer
+    /// serialises a whole file into one msgpack buffer before compressing, so an
+    /// unbounded series count meant an unbounded buffer — with 38k series live
+    /// that alone drove ~180 MB/s of allocation and a >1 GB working set on every
+    /// rollup. Splitting is lossless: the reader merges across files.
+    /// </summary>
+    [Fact]
+    public void Write_SplitsHighCardinalityMetricAcrossFiles()
+    {
+        var corpus = ScalarCorpus(1300, 6);   // one metric, 1300 series
+        var infos  = MetricWriter.Write(_dir, corpus, MetricGranularity.OneHour);
+
+        // 1300 series ⇒ 3 files at the 512-series cap, none exceeding it.
+        Assert.Equal(3, infos.Count);
+        Assert.All(infos, i => Assert.True(new FileInfo(i.FilePath).Exists));
+
+        var readBack = infos.SelectMany(i => MetricReader.ReadAllSync(i.FilePath)).ToList();
+        Assert.Equal(1300, readBack.Count);
+        Assert.All(infos, i => Assert.True(MetricReader.ReadAllSync(i.FilePath).Count() <= 512));
+
+        // Every series survives with its points intact.
+        var expected = corpus.ToDictionary(c => c.Item1.Labels, c => c.Item2.GetPoints(long.MinValue, long.MaxValue).Count);
+        foreach (var s in readBack)
+            Assert.Equal(expected[s.Labels], s.Points.Count);
+    }
+
     [Fact]
     public void V2_LegacyFiles_StillReadable()
     {
