@@ -52,6 +52,32 @@ public sealed class HotTierOptions
 }
 
 /// <summary>
+/// Server log-file configuration.
+///
+/// Running as a Windows Service there is no console, and the Event Log provider
+/// installed by <c>AddWindowsService</c> enforces its own <c>Warning</c> minimum —
+/// so without a file sink every Information-level diagnostic is silently discarded
+/// on exactly the deployment that most needs it.
+/// </summary>
+public sealed class LoggingOptions
+{
+    /// <summary>Write a rolling log file under <c>{DataDirectory}/logs</c>. Default: on.</summary>
+    public bool FileEnabled { get; init; } = true;
+
+    /// <summary>
+    /// Minimum level for the file sink — one of Trace/Debug/Information/Warning/Error/Critical.
+    /// Information keeps the periodic memory-attribution line and flush/merge progress, which
+    /// is what any RAM or CPU investigation starts from. A string rather than an enum because
+    /// Ameto.Core deliberately carries no Microsoft.Extensions.Logging reference (and its own
+    /// <see cref="LogLevel"/> is the CLEF event vocabulary, not the host's).
+    /// </summary>
+    public string FileMinimumLevel { get; init; } = "Information";
+
+    /// <summary>Daily files retained before the oldest are pruned. Default: 7.</summary>
+    public int FileRetainDays { get; init; } = 7;
+}
+
+/// <summary>
 /// Indexing configuration (segment flush-time index building).
 /// </summary>
 public sealed class IndexingOptions
@@ -150,6 +176,7 @@ public sealed class ServerOptions
     public IngestionOptions Ingestion        { get; init; } = new();
     public RetentionConfig  Retention        { get; init; } = new();
     public UpdatesOptions   Updates          { get; init; } = new();
+    public LoggingOptions   Logging          { get; init; } = new();
     public int              HttpPort         { get; init; } = 5341;
     public string           SslCertPath      { get; init; } = "";
     public string           SslCertPassword  { get; init; } = "";

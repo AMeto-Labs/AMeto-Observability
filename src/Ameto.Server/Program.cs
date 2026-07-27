@@ -59,6 +59,24 @@ var AmetoSection = builder.Configuration.GetSection("Ameto");
 // Auto-bind the entire Ameto section to ServerOptions; class defaults are the fallback.
 var serverOptions = AmetoSection.Get<ServerOptions>() ?? new ServerOptions();
 
+// ── File log ──────────────────────────────────────────────────────────────────
+// Needed because the Windows Event Log provider that AddWindowsService installs
+// applies its own Warning minimum: as a service, every Information diagnostic
+// (the periodic MEM attribution line, flush/merge progress, the flush budgets
+// logged at startup) otherwise had no sink at all. See FileLoggerProvider.
+if (serverOptions.Logging.FileEnabled)
+{
+    var fileLevel = Enum.TryParse<Microsoft.Extensions.Logging.LogLevel>(
+        serverOptions.Logging.FileMinimumLevel, ignoreCase: true, out var lvl)
+        ? lvl
+        : Microsoft.Extensions.Logging.LogLevel.Information;
+
+    builder.Logging.AddProvider(new FileLoggerProvider(
+        Path.Combine(serverOptions.DataDirectory, "logs"),
+        fileLevel,
+        serverOptions.Logging.FileRetainDays));
+}
+
 
 
 //// Enable reflection-based JSON for minimal-API model binding.

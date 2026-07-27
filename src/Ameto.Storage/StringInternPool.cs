@@ -21,13 +21,27 @@ public sealed class StringInternPool
 
     public static readonly StringInternPool Shared = new();
 
+    /// <summary>
+    /// Raised once, the first time the pool saturates. Past that point every event carries
+    /// its own template string in the hot tier instead of a 2-byte pool index, so memory per
+    /// event rises permanently and never recovers (there is no eviction). That used to happen
+    /// in complete silence; the storage layer subscribes so it reaches the operator.
+    /// </summary>
+    public event Action<int>? PoolExhausted;
+
+    private int _exhaustedSignalled;
+
     public int Intern(string template)
     {
         if (_stringToIndex.TryGetValue(template, out int idx))
             return idx;
 
         if (_nextIndex >= MaxPoolSize)
+        {
+            if (Interlocked.Exchange(ref _exhaustedSignalled, 1) == 0)
+                PoolExhausted?.Invoke(MaxPoolSize);
             return -1; // pool full — caller stores -1, template resolved differently
+        }
 
         int newIdx = System.Threading.Interlocked.Increment(ref _nextIndex) - 1;
 
@@ -97,5 +111,6 @@ public sealed class StringInternPool
         _stringToIndex.Clear();
         _indexToString.Clear();
         System.Threading.Interlocked.Exchange(ref _nextIndex, 0);
+        System.Threading.Interlocked.Exchange(ref _exhaustedSignalled, 0);
     }
 }

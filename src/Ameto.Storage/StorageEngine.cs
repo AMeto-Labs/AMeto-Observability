@@ -74,6 +74,29 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     private readonly Task                                  _recompressLoop;
     /// <summary>Test hook: lets merge run without an index builder (tests verify the scan fallback).</summary>
     internal bool _allowIndexlessMerge;
+
+    // ── Flush memory budgets (see the constructor for how these combine) ───────
+
+    /// <summary>
+    /// Managed bytes one in-flight index build retains per event. Measured on the flush
+    /// path by <c>tests/Ameto.Perf/IndexBuildRetentionProbe</c>: 147 MB of accumulators +
+    /// 28 MB of serialised blobs for a 130k-event trace-carrying tier ≈ 1.35 KB/event;
+    /// 123 MB for the same tier without trace ids ≈ 0.95 KB/event. Budget the worse case.
+    /// </summary>
+    private const long IndexBuildBytesPerEvent = 1_400;
+
+    /// <summary>
+    /// Ceiling on managed index-build state across all concurrent flushes. At the default
+    /// 64 MB tier (131,072 events ⇒ ~184 MB per build) this yields a width of 3 — enough to
+    /// stay ahead of ingest (a tier fills in ~0.9 s at 150k events/s, a build takes ~1.3 s,
+    /// so 3 in flight clears one every ~0.44 s) while capping the burst near 550 MB instead
+    /// of the 8 × 300 MB the old core-count heuristic allowed. Override with
+    /// <c>HotTier.FlushConcurrency</c> when trading RAM for throughput deliberately.
+    /// </summary>
+    private const long FlushManagedBudgetBytes = 640L * 1024 * 1024;
+
+    /// <summary>Ceiling on native memory held by frozen-but-not-yet-persisted tiers.</summary>
+    private const long FlushNativeBudgetBytes = 512L * 1024 * 1024;
     /// <summary>Window anchors that produced no usable merge batch — excluded so the sweep advances (reset on restart).</summary>
     private readonly HashSet<ulong> _mergeSkip = new();
 
@@ -116,20 +139,44 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         _options        = options.Value;
         _retentionStore = retentionStore;
         _logger         = logger;
-        // Parallel cold-flush width: concurrent index+compress+write jobs saturate idle
-        // cores so flush throughput exceeds ingest and the backlog drains. Configurable
-        // (HotTier.FlushConcurrency); 0 = auto ≈ processor count / 2, capped 2–8.
+        // ── Flush RAM budgets ────────────────────────────────────────────────────
+        // A flush costs memory in two separate places, and each needs its own bound:
+        //
+        //   managed — the index build (inverted + trigram + bloom accumulators, then the
+        //             serialised blobs). Measured at ~1.15 KB/event for trace-carrying
+        //             events, ~0.8 KB/event without trace ids
+        //             (tests/Ameto.Perf/IndexBuildRetentionProbe). One of these is live
+        //             per CONCURRENT flush, so it scales with _flushConcurrency.
+        //   native  — the frozen tier itself, held until its cold segment is written.
+        //             Scales with _flushSlots.
+        //
+        // Sizing the width off Environment.ProcessorCount alone (the old
+        // ProcessorCount / 2, capped 8) ignored the managed half entirely: on a 20-core
+        // host that is 8 concurrent builds, i.e. 8 × ~150 MB of index state on top of the
+        // frozen tiers — the observed ~1 GB sawtooth, at ~40 % CPU for the length of the
+        // burst. The width is now the smaller of the core-based figure and what the
+        // managed budget affords.
+        long tierFootprint  = HotTierSegment.NativeBytesFor(Math.Max(1, _options.HotTier.MaxSizeBytes));
+        int  eventCapacity  = HotTierSegment.EventCapacityFor(Math.Max(1, _options.HotTier.MaxSizeBytes));
+        long perFlushManaged = Math.Max(1L, (long)eventCapacity * IndexBuildBytesPerEvent);
+
+        int widthByMemory = (int)Math.Clamp(FlushManagedBudgetBytes / perFlushManaged, 1, 64);
         int flushWidth = _options.HotTier.FlushConcurrency > 0
             ? Math.Min(_options.HotTier.FlushConcurrency, 64)
-            : Math.Clamp(Environment.ProcessorCount / 2, 1, 8);
+            : Math.Clamp(Math.Min(Environment.ProcessorCount / 2, widthByMemory), 1, 8);
         _flushConcurrency = new SemaphoreSlim(flushWidth);
-        // In-flight tier cap: bound the frozen-tier backlog to ~1 GB of RSS. A frozen tier
-        // costs roughly 1.4 × MaxSizeBytes resident (payload + headers + partial last chunk),
-        // so budget against that, floored at the flush width so every concurrent flush can
-        // hold a slot. Smaller tiers ⇒ a deeper backlog for the same ceiling (smoother).
-        long tierFootprint = (long)(Math.Max(1, _options.HotTier.MaxSizeBytes) * 1.4);
-        int  flushSlots    = Math.Clamp((int)(1_073_741_824L / tierFootprint), flushWidth, 64);
+
+        // In-flight tier cap: bound the frozen-tier backlog by REAL native footprint.
+        // The previous 1.4 × MaxSizeBytes estimate under-counted by up to 17x on small
+        // events, so the "1 GB" budget it computed could hold multiple GB in practice.
+        // Floored at the flush width so every concurrent flush can still hold a slot.
+        int flushSlots = Math.Clamp((int)(FlushNativeBudgetBytes / tierFootprint), flushWidth, 64);
         _flushSlots = new SemaphoreSlim(flushSlots, flushSlots);
+
+        _logger.LogInformation(
+            "Flush budgets: width={Width} (×{PerFlush} MB managed), slots={Slots} (×{Tier} MB native), tier={Events} events / {Payload} MB payload",
+            flushWidth, perFlushManaged / 1048576, flushSlots, tierFootprint / 1048576,
+            eventCapacity, _options.HotTier.MaxSizeBytes / 1048576);
         _idGen    = new EventIdGenerator(_options.NodeId);
         _dataDir  = _options.DataDirectory;
         _walDir   = Path.Combine(_dataDir, "wal");
@@ -137,6 +184,14 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
         Directory.CreateDirectory(_walDir);
         Directory.CreateDirectory(_segDir);
+
+        // Surface intern-pool saturation: past it, every event stores its own template
+        // string instead of a pool index, so per-event memory rises permanently.
+        TemplatePool.PoolExhausted += size => _logger.LogWarning(
+            "Message-template intern pool exhausted at {Size} entries. Templates and service " +
+            "names are no longer de-duplicated — per-event memory will rise. This usually means " +
+            "message templates are being built by interpolation (a distinct template per event) " +
+            "rather than passed as structured parameters.", size);
 
         _hot = CreateHotTier();
         // The next segment id MUST be known before any flush, but it lives in the
@@ -1175,9 +1230,12 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
     private HotTierSegment CreateHotTier()
     {
-        const int maxEvents      = 2_000_000;       // ~100k/sec × 20s headroom
-        long payloadCapacity     = _options.HotTier.MaxSizeBytes;
-        return new HotTierSegment(maxEvents, payloadCapacity);
+        long payloadCapacity = _options.HotTier.MaxSizeBytes;
+        // Event cap derived from the chunk geometry rather than a flat 2,000,000: chunks
+        // are allocated whole, so a payload-only bound let a "64 MB" tier reach 1.1 GB
+        // resident on small events (see HotTierSegment.ChunksFor). Both limits now cap the
+        // same chunk count, making MaxSizeBytes a genuine ceiling on native memory.
+        return new HotTierSegment(HotTierSegment.EventCapacityFor(payloadCapacity), payloadCapacity);
     }
 
     private void OpenWal()
