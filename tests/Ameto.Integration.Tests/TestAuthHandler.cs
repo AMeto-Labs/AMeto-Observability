@@ -24,6 +24,13 @@ internal sealed class TestAuthHandler : AuthenticationHandler<AuthenticationSche
 {
     public const string SchemeName = "IntegrationTest";
 
+    /// <summary>
+    /// Request header letting a test authenticate as something other than an admin, so the
+    /// role-gated endpoints can be exercised from below. Absent — the case for every test that
+    /// predates it — still means admin, and the full view scope with it.
+    /// </summary>
+    public const string RoleHeader = "X-Test-Role";
+
     public TestAuthHandler(
         IOptionsMonitor<AuthenticationSchemeOptions> options,
         ILoggerFactory                               logger,
@@ -34,12 +41,19 @@ internal sealed class TestAuthHandler : AuthenticationHandler<AuthenticationSche
 
     protected override Task<AuthenticateResult> HandleAuthenticateAsync()
     {
+        var role = Request.Headers.TryGetValue(RoleHeader, out var hdr) && hdr.Count > 0
+                && !string.IsNullOrWhiteSpace(hdr[0])
+            ? hdr[0]!
+            : "admin";
+
         // ClaimTypes.Role = "admin" satisfies every RequireRole policy the app
-        // defines (admin / manager / viewer).
+        // defines (admin / manager / viewer). Lesser roles carry the full view
+        // bitmask so a refusal in a test is about the role, never a missing scope.
         Claim[] claims =
         [
-            new(ClaimTypes.Name, "integration-test-admin"),
-            new(ClaimTypes.Role, "admin"),
+            new(ClaimTypes.Name, "integration-test-" + role),
+            new(ClaimTypes.Role, role),
+            new("perm", ((int)Ameto.Server.Auth.ViewPermissions.All).ToString()),
         ];
 
         var identity  = new ClaimsIdentity(claims, SchemeName);

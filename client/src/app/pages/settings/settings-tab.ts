@@ -12,7 +12,9 @@ export interface SettingsTab {
 export const SETTINGS_TABS: readonly SettingsTab[] = [
   { id: 'dashboards', label: 'Dashboards', icon: 'layout-dashboard' },
   { id: 'events',     label: 'Events',     icon: 'list' },
-  { id: 'retention',  label: 'Retention',  icon: 'database' },
+  // Admin-only: saving a window and running enforcement delete stored data for good,
+  // and the server now refuses both for anyone below admin.
+  { id: 'retention',  label: 'Retention',  icon: 'database', adminOnly: true },
   { id: 'users',      label: 'Users',      icon: 'users', adminOnly: true },
   { id: 'api-keys',   label: 'API Keys',   icon: 'key' },
   { id: 'updates',    label: 'Updates',    icon: 'download', adminOnly: true },

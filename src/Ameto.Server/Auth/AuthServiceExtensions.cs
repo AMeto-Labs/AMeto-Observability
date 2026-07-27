@@ -30,14 +30,51 @@ public sealed class GoogleAuthOptions
 {
     public string ClientId     { get; init; } = "";
     public string ClientSecret { get; init; } = "";
+
+    /// <summary>True when the provider is configured well enough to register.</summary>
+    public bool IsUsable => ClientId.Length > 0 && ClientSecret.Length > 0;
 }
 
 public sealed class MicrosoftAuthOptions
 {
     public string ClientId     { get; init; } = "";
     public string ClientSecret { get; init; } = "";
-    /// <summary>Azure AD tenant ID or "common" for multi-tenant.</summary>
-    public string TenantId     { get; init; } = "common";
+
+    /// <summary>
+    /// Azure AD tenant ID. There is deliberately no default: a tenant-scoped endpoint is what
+    /// makes the <c>email</c> claim trustworthy, because only that tenant's directory can mint
+    /// it. See <see cref="AllowMultiTenant"/>.
+    /// </summary>
+    public string TenantId     { get; init; } = "";
+
+    /// <summary>
+    /// Opt in to a tenant-agnostic endpoint (<c>common</c> / <c>organizations</c> /
+    /// <c>consumers</c>, or an unset <see cref="TenantId"/>).
+    /// <para>
+    /// Off by default, and the provider stays unregistered without it, because the email claim
+    /// from an arbitrary tenant is an attribute that tenant's own admin controls — anyone can
+    /// register a tenant and assert any address in it. Combined with an email-keyed allowlist
+    /// that is an account takeover of the matching Ameto user. Subject binding in
+    /// <see cref="AuthStore.FindOrCreateOAuthUser"/> blocks the takeover of an already-bound
+    /// row; pinning the tenant is what stops the claim being forgeable in the first place.
+    /// </para>
+    /// </summary>
+    public bool AllowMultiTenant { get; init; }
+
+    /// <summary>True when <see cref="TenantId"/> is unset or names a tenant-agnostic endpoint.</summary>
+    public bool IsMultiTenant =>
+        TenantId.Length == 0
+        || TenantId.Equals("common",        StringComparison.OrdinalIgnoreCase)
+        || TenantId.Equals("organizations", StringComparison.OrdinalIgnoreCase)
+        || TenantId.Equals("consumers",     StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>True when the provider is configured and safe to register.</summary>
+    public bool IsUsable =>
+        ClientId.Length > 0 && ClientSecret.Length > 0 && (!IsMultiTenant || AllowMultiTenant);
+
+    /// <summary>Set but refused — used to explain the missing sign-in button at startup.</summary>
+    public bool IsMisconfigured =>
+        ClientId.Length > 0 && ClientSecret.Length > 0 && IsMultiTenant && !AllowMultiTenant;
 }
 
 internal static class AuthServiceExtensions
@@ -140,7 +177,7 @@ internal static class AuthServiceExtensions
                 ApiKeyAuthenticationHandler.SchemeName, _ => { });
 
         // ── Google OAuth ───────────────────────────────────────────────────────
-        if (authOptions.Google is { ClientId.Length: > 0, ClientSecret.Length: > 0 } google)
+        if (authOptions.Google is { IsUsable: true } google)
         {
             authBuilder.AddGoogle(o =>
             {
@@ -148,6 +185,9 @@ internal static class AuthServiceExtensions
                 o.ClientSecret = google.ClientSecret;
                 o.CallbackPath = "/api/auth/oauth/google/callback";
                 o.SaveTokens   = false;
+                // Google reports whether it verified the address; without this claim
+                // HandleOAuthTicket cannot tell a proven address from a self-asserted one.
+                o.ClaimActions.MapJsonKey(VerifiedEmailClaim, "email_verified");
                 // Allow correlation cookie to work over plain HTTP (development / self-hosted)
                 o.CorrelationCookie.SameSite     = Microsoft.AspNetCore.Http.SameSiteMode.Lax;
                 o.CorrelationCookie.SecurePolicy = Microsoft.AspNetCore.Http.CookieSecurePolicy.SameAsRequest;
@@ -159,7 +199,10 @@ internal static class AuthServiceExtensions
         }
 
         // ── Microsoft OAuth ────────────────────────────────────────────────────
-        if (authOptions.Microsoft is { ClientId.Length: > 0, ClientSecret.Length: > 0 } ms)
+        // A multi-tenant endpoint without an explicit opt-in leaves the provider
+        // unregistered rather than trusting an email any tenant admin can set;
+        // Program.cs logs why at startup so the missing button is not a mystery.
+        if (authOptions.Microsoft is { IsUsable: true } ms)
         {
             authBuilder.AddMicrosoftAccount(o =>
             {
@@ -216,6 +259,9 @@ internal static class AuthServiceExtensions
 
     // ── OAuth ticket event handlers ────────────────────────────────────────────
 
+    /// <summary>Claim holding the provider's assertion that it verified the email address.</summary>
+    internal const string VerifiedEmailClaim = "email_verified";
+
     /// <summary>
     /// Called by the OAuth middleware after it has validated the code, obtained
     /// the access token, and built the ClaimsPrincipal.
@@ -240,9 +286,29 @@ internal static class AuthServiceExtensions
             return Task.CompletedTask;
         }
 
+        // Google states whether it verified the address. An unverified one is a string the
+        // signer-in typed, and the allowlist is keyed on the address — so refuse it.
+        // Microsoft has no equivalent claim; there the tenant pin carries that weight.
+        if (provider == "google" && !string.Equals(
+                ctx.Principal?.FindFirst(VerifiedEmailClaim)?.Value, "true", StringComparison.OrdinalIgnoreCase))
+        {
+            ctx.Response.Redirect("/login?error=email_unverified");
+            ctx.HandleResponse();
+            return Task.CompletedTask;
+        }
+
+        // The immutable subject id — the identity the account is actually bound to.
+        var subject = ctx.Principal?.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
+        if (string.IsNullOrWhiteSpace(subject))
+        {
+            ctx.Response.Redirect("/login?error=no_subject");
+            ctx.HandleResponse();
+            return Task.CompletedTask;
+        }
+
         var displayName = ctx.Principal?.FindFirst(System.Security.Claims.ClaimTypes.Name)?.Value ?? email;
         // Per-email allowlist first, then domain allowlist (auto-provisions on first match).
-        var user = store.FindOrCreateOAuthUser(email, displayName, provider);
+        var user = store.FindOrCreateOAuthUser(email, displayName, provider, subject);
         if (user is null)
         {
             ctx.Response.Redirect($"/login?error=access_denied&email={Uri.EscapeDataString(email)}");

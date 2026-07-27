@@ -143,6 +143,12 @@ internal sealed class AuthDatabase
         // rule. Defaults to 15 (All) so existing rules keep granting full read access.
         try { Exec(conn, "ALTER TABLE oauth_domains ADD COLUMN permissions INTEGER NOT NULL DEFAULT 15"); }
         catch { /* column already exists */ }
+
+        // The provider's immutable subject id (Google `sub`, Entra `oid`) for OAuth users.
+        // Empty on rows created before this column existed; those bind on next sign-in.
+        // See AuthStore.FindOrCreateOAuthUser — an email alone is not an identity.
+        try { Exec(conn, "ALTER TABLE users ADD COLUMN provider_subject TEXT NOT NULL DEFAULT ''"); }
+        catch { /* column already exists */ }
     }
 
     private static void Exec(SqliteConnection conn, string sql)

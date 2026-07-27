@@ -297,7 +297,7 @@ Returns current per-level retention settings (days).
 
 Updates and persists retention settings to SQLite.
 
-**Auth:** JWT Bearer.
+**Auth:** JWT Bearer, role `admin` — shortening a window deletes stored data irreversibly.
 
 **Body:**
 ```json
@@ -319,7 +319,7 @@ Updates and persists retention settings to SQLite.
 
 Force-runs retention enforcement immediately.
 
-**Auth:** JWT Bearer.
+**Auth:** JWT Bearer, role `admin` — this deletes every segment past the current horizon.
 
 **Response `200 OK`:** enforcement result summary.
 
@@ -416,7 +416,19 @@ Metric query surface (points ingested via OTLP). All require JWT Bearer.
 
 ## Alerts
 
-Threshold rules over logs/metrics with webhook/SMTP dispatch and silences. Mapped under the alerts group; all require JWT Bearer (rule CRUD is admin/manager). Key endpoints: rule CRUD (`GET/POST/PUT/DELETE`), `GET …/state` (firing state), `POST …/{id}/ack`, `POST …/test`, `POST …/preview`, `…/silences`, `…/maintenance`, `…/history`.
+Threshold rules over logs/metrics with webhook/SMTP dispatch and silences. Mapped under the alerts group; all require JWT Bearer. Key endpoints: rule CRUD (`GET/POST/PUT/DELETE`), `GET …/state` (firing state), `POST …/{id}/ack`, `POST …/test`, `POST …/preview`, `…/silences`, `…/maintenance`, `…/history`.
+
+Three privilege tiers:
+
+| Tier | Role | Endpoints |
+|------|------|-----------|
+| Read | any signed-in user | `GET` rule list/detail, `…/state`, `…/history`, `…/silences`, `…/maintenance` |
+| Ops | `manager`+ | `POST/DELETE …/silences`, `POST/PUT/DELETE …/maintenance`, `POST/DELETE …/{id}/ack` |
+| Manage | `admin` | `POST/PUT/DELETE` a rule, `POST …/test`, `POST …/preview` |
+
+Rule writes are admin-only because a rule owns its channels, and a channel holds a credential and names the host the server dials on dispatch.
+
+**Secrets in channels.** Every response redacts channel secrets to `********`. Sending that sentinel back on an upsert means "unchanged" and the stored value is merged in — but only while the channel's destination is unchanged too (webhook URL, SMTP host/port, Telegram chat id, or the whole HTTP-flow step list). Moving the destination while leaving a secret masked returns `400`; re-send the secret to point a channel somewhere new.
 
 ---
 

@@ -53,10 +53,12 @@ internal static class AuthEndpoints
         // event in AuthServiceExtensions), not by a separate endpoint here.
         app.MapGet("/api/auth/oauth/{provider}", async (string provider, HttpContext ctx, AuthOptions opts) =>
         {
+            // IsUsable, not merely "configured": a provider refused at registration
+            // (e.g. multi-tenant Microsoft without an opt-in) has no scheme to challenge.
             var scheme = provider.ToLowerInvariant() switch
             {
-                "google"    when opts.Google    is { ClientId.Length: > 0 } => GoogleDefaults.AuthenticationScheme,
-                "microsoft" when opts.Microsoft is { ClientId.Length: > 0 } => MicrosoftAccountDefaults.AuthenticationScheme,
+                "google"    when opts.Google    is { IsUsable: true } => GoogleDefaults.AuthenticationScheme,
+                "microsoft" when opts.Microsoft is { IsUsable: true } => MicrosoftAccountDefaults.AuthenticationScheme,
                 _ => null,
             };
 
@@ -74,8 +76,8 @@ internal static class AuthEndpoints
         app.MapGet("/api/auth/providers", (AuthOptions opts) => Results.Ok(new
         {
             local     = opts.LocalEnabled,
-            google    = opts.Google    is { ClientId.Length: > 0 },
-            microsoft = opts.Microsoft is { ClientId.Length: > 0 },
+            google    = opts.Google    is { IsUsable: true },
+            microsoft = opts.Microsoft is { IsUsable: true },
         }));
 
         // ── Refresh ───────────────────────────────────────────────────────────

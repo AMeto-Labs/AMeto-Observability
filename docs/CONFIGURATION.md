@@ -35,9 +35,18 @@ Local username/password login is on by default. Google / Microsoft OAuth buttons
 | `LocalEnabled` | bool | `true` | Allow local username/password login. |
 | `Google:ClientId` / `Google:ClientSecret` | string | `""` | OAuth client (Google Cloud Console → Credentials → *Web application*). Redirect URI to register: `https://<host>/api/auth/oauth/google/callback` — Google requires **https** for any non-localhost host. |
 | `Microsoft:ClientId` / `Microsoft:ClientSecret` | string | `""` | Azure AD app registration. Redirect URI: `https://<host>/api/auth/oauth/microsoft/callback`. |
-| `Microsoft:TenantId` | string | `"common"` | Azure AD tenant id, or `common` for multi-tenant. |
+| `Microsoft:TenantId` | string | `""` | **Required** for Microsoft sign-in: your Entra tenant id. Blank or a tenant-agnostic value (`common` / `organizations` / `consumers`) leaves the provider disabled unless `AllowMultiTenant` is set — see below. |
+| `Microsoft:AllowMultiTenant` | bool | `false` | Accept a tenant-agnostic endpoint anyway. |
 
 Who may sign in is controlled in **Settings → Users**: add an OAuth user by exact e-mail, or a per-domain rule ("anyone `@your-company.com` via google gets role X"). Unknown e-mails are rejected. Changing `Auth` settings requires a server restart (auth handlers are registered at startup).
+
+### Why the tenant id is required
+
+Sign-in is matched on the e-mail address the provider asserts, so that address has to be one only the right directory can claim. A tenant-scoped endpoint gives that: the claim can only come from the tenant you named. A tenant-agnostic one does not — anyone may register an Entra tenant and set any address on a user in it, including one already on your allowlist. Ameto therefore refuses to register the Microsoft provider unless you pin `TenantId` (or explicitly opt in with `AllowMultiTenant`), and logs an error at startup explaining the missing sign-in button.
+
+Two further checks apply regardless: Google sign-ins must carry `email_verified`, and every OAuth account is bound to the provider's immutable subject id on first sign-in — after which a different identity asserting the same address is refused.
+
+**One gap remains if you set `AllowMultiTenant`.** Subject binding protects an account only once it is bound, and binding happens at the *first* sign-in. So an entry you add ahead of time — the usual "add the new hire to the allowlist, they join next week" flow — belongs to whoever signs in as that address first. With the tenant pinned that can only be someone from your directory; with `AllowMultiTenant` it can be anyone who asserts the address from any tenant. The binding is recorded in the log at `Information` ("bound to subject … on first sign-in"), which is the only signal distinguishing that from a normal sign-in, so if you run multi-tenant, watch that line. Prefer pinning the tenant and adding allowlist entries close to when they will be used.
 
 ---
 

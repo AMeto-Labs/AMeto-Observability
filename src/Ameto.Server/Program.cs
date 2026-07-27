@@ -254,6 +254,12 @@ app.Lifetime.ApplicationStarted.Register(() =>
         logger.LogWarning(
             "TrustForwardedHeaders is on with no Ameto:KnownProxies — any client can spoof its " +
             "scheme/host/IP. List your reverse-proxy IP(s) in Ameto:KnownProxies to restrict trust.");
+    if (authOptions.Microsoft is { IsMisconfigured: true })
+        logger.LogError(
+            "Microsoft sign-in is configured but DISABLED: Ameto:Auth:Microsoft:TenantId is unset or " +
+            "tenant-agnostic ('common'/'organizations'/'consumers'). Any Entra tenant could then assert " +
+            "any email address, and the allowlist is keyed on that address. Set your tenant id, or set " +
+            "Ameto:Auth:Microsoft:AllowMultiTenant to true to accept the risk.");
     logger.LogInformation("Listening on: {Urls}",
         addresses is { Count: > 0 } ? string.Join(", ", addresses) : "(none)");
 });

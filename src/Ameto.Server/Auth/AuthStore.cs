@@ -15,7 +15,14 @@ internal sealed record UserRecord(
     string Provider,
     string Role,
     ViewPermissions Permissions,
-    DateTimeOffset CreatedAt);
+    DateTimeOffset CreatedAt)
+{
+    /// <summary>
+    /// The provider's immutable subject id (Google <c>sub</c>, Entra <c>oid</c>) for OAuth
+    /// users; empty for local accounts and for OAuth rows created before subject binding.
+    /// </summary>
+    public string ProviderSubject { get; init; } = "";
+}
 
 internal sealed record ApiKeyRecord(
     string Id,
@@ -87,7 +94,7 @@ internal sealed class AuthStore
         using var conn = _db.Open();
         using var cmd  = conn.CreateCommand();
         cmd.CommandText = """
-            SELECT id, username, display_name, email, provider, role, created_at, permissions
+            SELECT id, username, display_name, email, provider, role, created_at, permissions, provider_subject
             FROM users
             WHERE email = @e COLLATE NOCASE AND provider = @p
             """;
@@ -104,10 +111,48 @@ internal sealed class AuthStore
     /// auto-provisioned (so subsequent sign-ins and admin management use the
     /// per-email path). Returns null when neither matches (sign-in refused).
     /// </summary>
-    public UserRecord? FindOrCreateOAuthUser(string email, string displayName, string provider)
+    /// <param name="subject">
+    /// The provider's immutable subject id for this identity (Google <c>sub</c>, Entra
+    /// <c>oid</c>). It — not the email — is what actually identifies the account: an email
+    /// claim is a mutable, tenant-controlled attribute, so matching on it alone lets anyone
+    /// who can assert an address take over the matching row. The first sign-in for a stored
+    /// row binds the subject; from then on a mismatch is refused, so a second identity
+    /// asserting the same address cannot inherit the account.
+    /// </param>
+    public UserRecord? FindOrCreateOAuthUser(string email, string displayName, string provider, string subject)
     {
+        if (string.IsNullOrEmpty(subject)) return null; // no stable identity — refuse
+
         var existing = FindOAuthUser(email, provider);
-        if (existing is not null) return existing;
+        if (existing is not null)
+        {
+            if (existing.ProviderSubject.Length == 0)
+            {
+                // Row predates subject binding (or was created from the admin allowlist):
+                // adopt this subject as the account's identity from here on.
+                //
+                // This is the moment the account acquires an owner, so it is logged. Until it
+                // happens the row belongs to whoever signs in first — fine when the provider is
+                // pinned to one tenant, but under AllowMultiTenant "first" can be a stranger,
+                // and every sign-in afterwards looks ordinary. The binding line is what makes
+                // that distinguishable after the fact.
+                BindProviderSubject(existing.Id, subject);
+                _logger.LogInformation(
+                    "OAuth account {Email} ({Provider}, role {Role}) bound to subject {Subject} on first sign-in",
+                    existing.Email, provider, existing.Role, subject);
+                return existing with { ProviderSubject = subject };
+            }
+
+            if (!string.Equals(existing.ProviderSubject, subject, StringComparison.Ordinal))
+            {
+                _logger.LogWarning(
+                    "Refused an OAuth sign-in for {Email} via {Provider}: the account is bound to a " +
+                    "different {Provider} subject. Another identity is asserting this address.",
+                    email, provider, provider);
+                return null;
+            }
+            return existing;
+        }
 
         // Extract the host part (after the last '@') without allocating when empty.
         var at = email.LastIndexOf('@');
@@ -119,7 +164,18 @@ internal sealed class AuthStore
 
         // Auto-provision with the domain rule's default role + permissions so the
         // user appears in the users list and can be managed / re-scoped afterwards.
-        return CreateOAuthUser(email, displayName, provider, rule.Role, rule.Permissions);
+        return CreateOAuthUser(email, displayName, provider, rule.Role, rule.Permissions, subject);
+    }
+
+    /// <summary>Binds a provider subject to a row that does not have one yet (first sign-in).</summary>
+    private void BindProviderSubject(string id, string subject)
+    {
+        using var conn = _db.Open();
+        using var cmd  = conn.CreateCommand();
+        cmd.CommandText = "UPDATE users SET provider_subject = @s WHERE id = @id AND provider_subject = ''";
+        cmd.Parameters.AddWithValue("@s",  subject);
+        cmd.Parameters.AddWithValue("@id", id);
+        cmd.ExecuteNonQuery();
     }
 
     /// <summary>Looks up a domain allowlist rule for a provider + domain (case-insensitive).</summary>
@@ -152,7 +208,7 @@ internal sealed class AuthStore
         using var conn = _db.Open();
         using var cmd  = conn.CreateCommand();
         cmd.CommandText = """
-            SELECT id, username, display_name, email, provider, role, created_at, permissions
+            SELECT id, username, display_name, email, provider, role, created_at, permissions, provider_subject
             FROM users
             WHERE username = @u COLLATE NOCASE
                OR (email != '' AND email = @e COLLATE NOCASE)
@@ -170,7 +226,7 @@ internal sealed class AuthStore
         using var conn = _db.Open();
         using var cmd  = conn.CreateCommand();
         cmd.CommandText = """
-            SELECT id, username, display_name, email, provider, role, created_at, permissions
+            SELECT id, username, display_name, email, provider, role, created_at, permissions, provider_subject
             FROM users ORDER BY created_at
             """;
         using var r    = cmd.ExecuteReader();
@@ -184,7 +240,7 @@ internal sealed class AuthStore
         using var conn = _db.Open();
         using var cmd  = conn.CreateCommand();
         cmd.CommandText = """
-            SELECT id, username, display_name, email, provider, role, created_at, permissions
+            SELECT id, username, display_name, email, provider, role, created_at, permissions, provider_subject
             FROM users WHERE id = @id
             """;
         cmd.Parameters.AddWithValue("@id", id);
@@ -220,20 +276,27 @@ internal sealed class AuthStore
         return rec;
     }
 
-    /// <summary>Creates an OAuth user entry (email-allowlist approach).</summary>
+    /// <summary>
+    /// Creates an OAuth user entry (email-allowlist approach). <paramref name="subject"/> is the
+    /// provider's immutable subject id; empty when an admin pre-creates an allowlist entry, in
+    /// which case the account binds to whichever subject first signs in as that address.
+    /// </summary>
     public UserRecord CreateOAuthUser(string email, string displayName, string provider, string role,
-        ViewPermissions permissions = ViewPermissions.All)
+        ViewPermissions permissions = ViewPermissions.All, string subject = "")
     {
         var username = $"{provider}:{email.ToLowerInvariant()}";
         var rec = new UserRecord(
             Guid.NewGuid().ToString("N"), username, displayName, email.ToLowerInvariant(),
-            provider, NormaliseRole(role), permissions, DateTimeOffset.UtcNow);
+            provider, NormaliseRole(role), permissions, DateTimeOffset.UtcNow)
+        {
+            ProviderSubject = subject,
+        };
 
         using var conn = _db.Open();
         using var cmd  = conn.CreateCommand();
         cmd.CommandText = """
-            INSERT INTO users (id, username, display_name, email, provider, password_hash, salt, role, permissions, created_at)
-            VALUES (@id, @u, @dn, @e, @p, '', '', @r, @perm, @ca)
+            INSERT INTO users (id, username, display_name, email, provider, password_hash, salt, role, permissions, created_at, provider_subject)
+            VALUES (@id, @u, @dn, @e, @p, '', '', @r, @perm, @ca, @sub)
             """;
         cmd.Parameters.AddWithValue("@id", rec.Id);
         cmd.Parameters.AddWithValue("@u",  rec.Username);
@@ -243,6 +306,7 @@ internal sealed class AuthStore
         cmd.Parameters.AddWithValue("@r",  rec.Role);
         cmd.Parameters.AddWithValue("@perm", (int)rec.Permissions);
         cmd.Parameters.AddWithValue("@ca", rec.CreatedAt.ToString("O"));
+        cmd.Parameters.AddWithValue("@sub", rec.ProviderSubject);
         cmd.ExecuteNonQuery();
         return rec;
     }
@@ -461,7 +525,10 @@ internal sealed class AuthStore
         r.GetString(0), r.GetString(1), r.GetString(2),
         r.GetString(3), r.GetString(4), r.GetString(5),
         (ViewPermissions)r.GetInt32(7),
-        DateTimeOffset.Parse(r.GetString(6)));
+        DateTimeOffset.Parse(r.GetString(6)))
+    {
+        ProviderSubject = r.IsDBNull(8) ? "" : r.GetString(8),
+    };
 
     private static string HashPassword(string password, byte[] salt)
     {

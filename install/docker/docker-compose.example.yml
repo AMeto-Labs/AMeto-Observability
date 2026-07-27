@@ -61,7 +61,9 @@ services:
       # Ameto__Auth__Google__ClientSecret: ""
       # Ameto__Auth__Microsoft__ClientId: ""        # redirect URI: https://<host>/api/auth/oauth/microsoft/callback
       # Ameto__Auth__Microsoft__ClientSecret: ""
-      # Ameto__Auth__Microsoft__TenantId: "common"
+      # Ameto__Auth__Microsoft__TenantId: ""       # REQUIRED: your Entra tenant id. "common"/
+      #                                            # "organizations"/"consumers"/blank disables the
+      #                                            # provider — any tenant could assert any address.
 
       # ── Hot tier (write buffer → flush tuning) ───────────────────────────
       Ameto__HotTier__MaxSizeBytes: "67108864"   # default 64 MB — flush when the in-RAM tier reaches this
