@@ -84,6 +84,9 @@ public static class StorageServiceExtensions
         // Expose the engine's shared intern pool so Ingestion can inject it directly
         services.AddSingleton(sp => sp.GetRequiredService<StorageEngine>().TemplatePool);
         services.AddHostedService<RetentionBackgroundService>();
+        // Shared so the 30 s attribution line and /api/diagnostics measure the same interval
+        // — a CPU percentage only exists between two reads of the process total.
+        services.AddSingleton<ProcessCpuSampler>();
         services.AddHostedService<RamPressureService>();
         return services;
     }

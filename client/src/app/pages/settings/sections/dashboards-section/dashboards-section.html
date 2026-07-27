@@ -116,6 +116,32 @@
   <!-- ── Process ────────────────────────────────────────── -->
   <app-section title="Process">
     <div class="metric">
+      <div class="metric-name">CPU usage</div>
+      <div class="metric-right">
+        @if (d.processCpuPercent != null && d.processCpuPercent >= 0) {
+          <div class="metric-value" [class.accent]="d.processCpuPercent >= 75">
+            {{ d.processCpuPercent }} %
+          </div>
+          <div class="ram-bar-track">
+            <div class="ram-bar-fill {{ cpuClass(d.processCpuPercent) }}"
+                 [style.width.%]="d.processCpuPercent"></div>
+          </div>
+        } @else {
+          <div class="metric-value">—</div>
+        }
+        <div class="metric-desc">
+          Share of ALL {{ d.processorCount ?? '?' }} logical processors used by this server
+          process — the figure Task Manager shows, not the per-core one where a saturated
+          8-core box reads 800 %. Measured over the last 30-second interval; a dash means
+          no interval has closed yet.
+          @if (d.processCpuSeconds != null) {
+            Total CPU consumed since start: <strong>{{ fmtDuration(d.processCpuSeconds) }}</strong>.
+          }
+        </div>
+      </div>
+    </div>
+
+    <div class="metric">
       <div class="metric-name">Process uptime</div>
       <div class="metric-right">
         <div class="metric-value">{{ fmtUptime(d.processStartedAt) }}</div>

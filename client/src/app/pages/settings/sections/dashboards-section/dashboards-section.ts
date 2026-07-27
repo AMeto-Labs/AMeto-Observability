@@ -64,4 +64,19 @@ export class DashboardsSectionComponent implements OnInit, OnDestroy {
     if (pct >= target - 10) return 'warning';
     return 'ok';
   }
+
+  /** Fixed thresholds, unlike RAM: CPU has no configured target to compare against. */
+  cpuClass(pct: number): string {
+    if (pct >= 75) return 'danger';
+    if (pct >= 50) return 'warning';
+    return 'ok';
+  }
+
+  /** Total CPU seconds as a compact duration — "3h 12m", not "11520 s". */
+  fmtDuration(seconds: number): string {
+    if (seconds < 60)   return `${Math.round(seconds)}s`;
+    if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
+    const h = Math.floor(seconds / 3600);
+    return `${h}h ${Math.round((seconds - h * 3600) / 60)}m`;
+  }
 }

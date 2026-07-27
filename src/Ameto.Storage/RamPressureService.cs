@@ -19,6 +19,7 @@ public sealed class RamPressureService : BackgroundService
 {
     private readonly StorageEngine                  _storage;
     private readonly ServerOptions                  _options;
+    private readonly ProcessCpuSampler              _cpu;
     private readonly ILogger<RamPressureService>    _logger;
 
     private static readonly TimeSpan _checkInterval = TimeSpan.FromSeconds(30);
@@ -27,10 +28,12 @@ public sealed class RamPressureService : BackgroundService
     public RamPressureService(
         StorageEngine               storage,
         ServerOptions               options,
+        ProcessCpuSampler           cpu,
         ILogger<RamPressureService> logger)
     {
         _storage = storage;
         _options = options;
+        _cpu     = cpu;
         _logger  = logger;
     }
 
@@ -52,15 +55,24 @@ public sealed class RamPressureService : BackgroundService
                 // hitting the authorized /api/diagnostics endpoint.
                 var gc = GC.GetGCMemoryInfo();
                 const long MB = 1024 * 1024;
+
+                // This tick is the ONLY place the CPU interval is closed, so the figure below
+                // and the one /api/diagnostics reports come from the same 30 s window. Sampled
+                // here rather than in the endpoint because a percentage needs two reads, and a
+                // dashboard poll re-sampling on its own would cut this window short.
+                double cpuPct = _cpu.Sample();
+
                 _logger.LogInformation(
-                    "MEM ws={WS}MB gc_heap={Heap}MB gc_committed={Committed}MB gc_frag={Frag}MB hot_tier={Hot}MB mode={Mode} sys_ram={Pct}%",
+                    "MEM ws={WS}MB gc_heap={Heap}MB gc_committed={Committed}MB gc_frag={Frag}MB hot_tier={Hot}MB mode={Mode} sys_ram={Pct}% cpu={Cpu}% ({Cores} cores)",
                     Environment.WorkingSet      / MB,
                     gc.HeapSizeBytes            / MB,
                     gc.TotalCommittedBytes      / MB,
                     gc.FragmentedBytes          / MB,
                     _storage.HotTierAllocatedBytes / MB,
                     System.Runtime.GCSettings.IsServerGC ? "Server" : "Workstation",
-                    pct);
+                    pct,
+                    cpuPct < 0 ? 0 : Math.Round(cpuPct, 1),
+                    _cpu.Cores);
 
                 if (pct > _options.RamTargetPercent)
                 {
