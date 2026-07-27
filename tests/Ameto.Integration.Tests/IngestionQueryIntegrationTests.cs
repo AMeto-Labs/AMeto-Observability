@@ -90,7 +90,9 @@ public sealed class IngestionQueryIntegrationTests
         // Replication/clustering is disabled in the test factory, so no node API is
         // mapped (the real endpoint is /api/replication/nodes, registered only when
         // Replication.Enabled = true). An unmapped GET path falls through to the SPA
-        // fallback — index.html (text/html) — rather than returning cluster data.
+        // fallback — index.html (text/html) — rather than returning cluster data. The
+        // factory supplies a stub wwwroot so this asserts ROUTING, not whether someone
+        // ran `npm run build` (see AmetoWebAppFactory).
         var response = await _client.GetAsync("/api/nodes");
         Assert.Equal(HttpStatusCode.OK, response.StatusCode);
         Assert.Equal("text/html", response.Content.Headers.ContentType?.MediaType);
@@ -123,6 +125,19 @@ public sealed class AmetoWebAppFactory : WebApplicationFactory<Program>
         builder.UseSetting("Ameto:DataDirectory", _tempDir);
         builder.UseSetting("Ameto:HttpPort", "0");       // random port
         builder.UseSetting("Ameto:Cluster:Enabled", "false");
+
+        // Stub web root. The SPA-fallback test asserts that an unmapped /api/* GET falls
+        // through to index.html, but the real wwwroot is emitted by `npm run build` and
+        // is gitignored — in a plain source checkout there is nothing to fall through TO,
+        // so that test reported a missing optional build step as a routing failure. A
+        // one-line stub makes the assertion about routing and nothing else, and keeps the
+        // suite green without the Angular toolchain. Lives under the per-run temp dir, so
+        // it is disposed with it and never touches the repo.
+        string webRoot = Path.Combine(_tempDir, "wwwroot");
+        Directory.CreateDirectory(webRoot);
+        File.WriteAllText(Path.Combine(webRoot, "index.html"),
+            "<!doctype html><title>Ameto test SPA stub</title>");
+        builder.UseSetting(Microsoft.AspNetCore.Hosting.WebHostDefaults.WebRootKey, webRoot);
 
         // Override the ServerOptions with test-specific settings
         builder.ConfigureServices(services =>
