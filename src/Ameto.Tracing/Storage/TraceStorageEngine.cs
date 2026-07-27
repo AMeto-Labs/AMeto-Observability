@@ -41,6 +41,25 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     private const int MaxSegmentsPerPass   = 20;       // merge at most N oldest small segments per run
     private const int MaxSpansPerPass      = 200_000;  // hard cap on spans loaded into memory per run
 
+    // ── Flush policy ──────────────────────────────────────────────────────────
+    // Durability belongs to the WAL, not to the segment writer, so a timed flush no
+    // longer has to run just to avoid losing spans. A .trc costs a sort, LZ4-HC over the
+    // blocks and the trace index, four index structures and a .stats sidecar — that is a
+    // price worth paying for a real batch and pure waste for five spans. Below the
+    // minimum the hot tier simply keeps accumulating; the hard age bound still lands a
+    // trickle on disk so it becomes eligible for compaction and retention.
+    private const int MinSegmentSpans = 500;
+    private static readonly TimeSpan MaxHotAge = TimeSpan.FromHours(1);
+
+    /// <summary>When the oldest span currently in the hot tier arrived. Null = tier empty.</summary>
+    private DateTime? _hotSince;
+
+    /// <summary>
+    /// Write-ahead log for the hot tier. Every span lands here before it is visible in
+    /// memory, so an unflushed tier survives a crash without a segment per 30 seconds.
+    /// </summary>
+    private readonly SpanWriteAheadLog _wal;
+
     public TraceStorageEngine(string dataDir, ILogger<TraceStorageEngine> logger)
     {
         _dataDir = dataDir;
@@ -50,11 +69,70 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         // runs before Kestrel binds, and scanning thousands of .trc files would
         // delay ingest availability. TraceCompactionWorker calls
         // LoadColdSegments() in the background right after startup.
+
+        // The WAL, by contrast, must be open and replayed before the first span is
+        // accepted, or a restart would interleave recovered and live spans. Replay is a
+        // sequential walk of one mmap'd file bounded by the flush thresholds, so it costs
+        // milliseconds even at the 50k ceiling.
+        _wal = SpanWriteAheadLog.Open(Path.Combine(dataDir, "spans.wal"));
+        RecoverFromWal();
+    }
+
+    /// <summary>
+    /// Rebuilds the hot tier from the log left behind by an unclean shutdown. Recovered
+    /// spans are NOT re-appended to the log — they are already in it, and the log keeps
+    /// writing after the last valid entry.
+    /// </summary>
+    private void RecoverFromWal()
+    {
+        List<SpanIngestItem> recovered;
+        try { recovered = _wal.ReadAll(); }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Span WAL replay failed — continuing with an empty hot tier");
+            return;
+        }
+
+        if (recovered.Count == 0) return;
+
+        _lock.EnterWriteLock();
+        try
+        {
+            for (int i = 0; i < recovered.Count; i++)
+                AddToHotTierLocked(recovered[i]);
+        }
+        finally { _lock.ExitWriteLock(); }
+
+        _logger.LogInformation("Recovered {Count} span(s) from the write-ahead log", recovered.Count);
     }
 
     // ── Ingestion (called by SpanDrainer) ─────────────────────────────────────
 
     internal void WriteSpan(SpanIngestItem item)
+    {
+        _lock.EnterWriteLock();
+        try
+        {
+            // Write-ahead: the span is durable before it is queryable. Held under the same
+            // write lock as the hot tier so a flush can never interleave with an append —
+            // that ordering is what lets Reset's watermark be trusted on recovery.
+            _wal.Append(item);
+            AddToHotTierLocked(item);
+
+            if (_hotSpans.Count >= HotFlushThreshold)
+                FlushHotTierLocked();
+        }
+        finally
+        {
+            _lock.ExitWriteLock();
+        }
+    }
+
+    /// <summary>
+    /// Materialises a span into the hot tier and its trace index. Shared by live ingest
+    /// and WAL replay — replay must not append to the log it is reading from.
+    /// </summary>
+    private void AddToHotTierLocked(SpanIngestItem item)
     {
         var record = new SpanRecord
         {
@@ -73,26 +151,17 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                                     : null,
         };
 
-        _lock.EnterWriteLock();
-        try
-        {
-            int offset = _hotSpans.Count;
-            _hotSpans.Add(record);
+        int offset = _hotSpans.Count;
+        _hotSpans.Add(record);
 
-            if (!_traceIdx.TryGetValue(item.TraceId, out var offsets))
-            {
-                offsets = new List<int>(4);
-                _traceIdx[item.TraceId] = offsets;
-            }
-            offsets.Add(offset);
-
-            if (_hotSpans.Count >= HotFlushThreshold)
-                FlushHotTierLocked();
-        }
-        finally
+        if (!_traceIdx.TryGetValue(item.TraceId, out var offsets))
         {
-            _lock.ExitWriteLock();
+            offsets = new List<int>(4);
+            _traceIdx[item.TraceId] = offsets;
         }
+        offsets.Add(offset);
+
+        _hotSince ??= DateTime.UtcNow;
     }
 
     // ── Query ─────────────────────────────────────────────────────────────────
@@ -272,10 +341,8 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     // ── Flush ─────────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Flushes the in-memory hot tier to a cold segment. No-op when empty.
-    /// Thread-safe — called periodically by <see cref="Ingestion.SpanDrainer"/> so
-    /// spans are not stranded in RAM (and lost on restart) under low-traffic loads
-    /// that never reach <see cref="HotFlushThreshold"/>.
+    /// Unconditionally flushes the in-memory hot tier to a cold segment. No-op when empty.
+    /// Used on shutdown and by tests; the periodic path is <see cref="FlushIfDue"/>.
     /// </summary>
     internal void FlushHotTier()
     {
@@ -284,24 +351,53 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         finally { _lock.ExitWriteLock(); }
     }
 
+    /// <summary>
+    /// Flushes only when the hot tier has earned a segment: enough spans to be worth the
+    /// index build and compression, or old enough that it should become compactable and
+    /// retention-eligible regardless. Called on <see cref="Ingestion.SpanDrainer"/>'s tick;
+    /// spans that do not meet either bar stay in memory, durable through the WAL.
+    /// </summary>
+    internal void FlushIfDue()
+    {
+        _lock.EnterWriteLock();
+        try
+        {
+            if (_hotSpans.Count == 0) return;
+            bool due = _hotSpans.Count >= MinSegmentSpans
+                    || (_hotSince is { } since && DateTime.UtcNow - since >= MaxHotAge);
+            if (due) FlushHotTierLocked();
+        }
+        finally { _lock.ExitWriteLock(); }
+    }
+
     private void FlushHotTierLocked()
     {
         if (_hotSpans.Count == 0) return;
 
+        SpanSegmentInfo info;
         try
         {
-            var info = SpanWriter.Write(_dataDir, _hotSpans);
+            info = SpanWriter.Write(_dataDir, _hotSpans);
             _coldSegments = [.. _coldSegments, info];   // under _lock write (see callers)
             _logger.LogInformation("Flushed {Count} spans to {File}", _hotSpans.Count, info.FilePath);
         }
         catch (Exception ex)
         {
+            // Keep the spans in memory AND in the log: a failed write must not be the
+            // moment we drop the only two copies we have.
             _logger.LogError(ex, "Failed to flush hot-tier spans to cold storage");
             return;
         }
 
+        // Segment is on disk — the log has nothing left to protect. Stamped with the
+        // segment's newest start time so a crash before the offset store cannot replay
+        // spans that are already cold.
+        try { _wal.Reset(info.MaxStartNano); }
+        catch (Exception ex) { _logger.LogWarning(ex, "Span WAL reset failed after flush"); }
+
         _hotSpans.Clear();
         _traceIdx.Clear();
+        _hotSince = null;
     }
 
     // ── Cold segment discovery ─────────────────────────────────────────────────
@@ -946,9 +1042,10 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         if (System.Threading.Interlocked.Exchange(ref _disposed, 1) != 0) return;
 
         _lock.EnterWriteLock();
-        try { FlushHotTierLocked(); }
+        try { FlushHotTierLocked(); }   // resets the WAL, so a clean stop leaves nothing to replay
         finally { _lock.ExitWriteLock(); }
         _lock.Dispose();
+        _wal.Dispose();
     }
 
     // ── IRetentionTarget ───────────────────────────────────────────────────

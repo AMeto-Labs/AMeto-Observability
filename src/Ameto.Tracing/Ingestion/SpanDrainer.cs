@@ -13,11 +13,12 @@ internal sealed class SpanDrainer : IAsyncDisposable
     private const int BatchSize = 512;
 
     /// <summary>
-    /// How often the in-memory hot tier is flushed to disk regardless of fill level.
-    /// Bounds data loss on restart to this interval under low-traffic loads that never
-    /// reach the engine's 50k-span flush threshold.
+    /// How often the engine is asked whether the hot tier has earned a cold segment.
+    /// This is a CHECK interval, not a flush interval: durability is the write-ahead log's
+    /// job now, so a tick with only a handful of spans buffered correctly does nothing
+    /// rather than writing a segment (plus its .stats sidecar) for them.
     /// </summary>
-    private static readonly TimeSpan FlushInterval = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan FlushCheckInterval = TimeSpan.FromSeconds(30);
 
     private readonly SpanRingBuffer       _ring;
     private readonly TraceStorageEngine   _storage;
@@ -89,12 +90,12 @@ internal sealed class SpanDrainer : IAsyncDisposable
         } while (remaining > 0);
     }
 
-    /// <summary>Flushes the hot tier when <see cref="FlushInterval"/> has elapsed. No-op when empty.</summary>
+    /// <summary>Asks the engine to flush if the hot tier is due, every <see cref="FlushCheckInterval"/>.</summary>
     private void MaybeFlush()
     {
-        if (DateTime.UtcNow - _lastFlush < FlushInterval) return;
+        if (DateTime.UtcNow - _lastFlush < FlushCheckInterval) return;
         _lastFlush = DateTime.UtcNow;
-        try { _storage.FlushHotTier(); }
+        try { _storage.FlushIfDue(); }
         catch (Exception ex) { _logger.LogWarning(ex, "SpanDrainer: periodic hot-tier flush failed"); }
     }
 
