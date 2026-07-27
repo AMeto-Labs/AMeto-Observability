@@ -41,7 +41,9 @@
   align-items: center;
   justify-content: center;
   gap: 3px;
-  padding: 7px 4px 6px;
+  /* 3px sides, not 4px: buys the label box back the last few pixels it needs so
+     "Reference" fits on one line without widening --nav-w any further. */
+  padding: 7px 3px 6px;
   border-radius: var(--radius-sm);
   color: var(--txt-muted);
   background: none;
@@ -72,6 +74,14 @@
   font-weight: 500;
   letter-spacing: .15px;
   white-space: nowrap;
+  /* Backstop for a label longer than the rail: nowrap text in a centred column
+     overflows BOTH sides of the item, escaping the --active background. The rail
+     is sized for today's labels; this makes a future longer one truncate inside
+     the highlight instead of spilling out of it. Every item carries a [title],
+     so the full text stays reachable on hover. */
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* ── Bottom section ─────────────────────────────────────────────── */
