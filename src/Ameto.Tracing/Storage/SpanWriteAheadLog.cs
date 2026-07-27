@@ -25,11 +25,11 @@ namespace Ameto.Tracing.Storage;
 ///     4   Version            uint16  1
 ///     6   _pad               uint16
 ///     8   WriteOffset        int64   next byte to write (absolute, includes this header)
-///    16   FlushedThroughNano int64   see the crash-recovery note below
-///    24   _reserved          int64
+///    16   Generation         uint32  flush generation, see the crash-recovery note below
+///    20   _reserved          uint32 + int64
 ///
 ///   [Entry 0 …]
-///     [Entry Header — 64 bytes, Pack = 1]
+///     [Entry Header — 64 bytes, Pack = 1, carries the generation it was written under]
 ///     [Name UTF-8][ServiceName UTF-8][Attributes msgpack]
 /// </code>
 ///
@@ -38,12 +38,30 @@ namespace Ameto.Tracing.Storage;
 /// cold segment.</para>
 ///
 /// <para><b>Crash recovery.</b> A flush writes the segment first and resets the log second,
-/// so a crash between the two would replay spans that are already cold. To close all but a
-/// sliver of that window the flush stamps <c>FlushedThroughNano</c> — the newest start time
-/// the segment contains — into the header BEFORE zeroing the write offset, and recovery
-/// skips replayed entries at or below it. Appends are serialised by the engine's write lock
-/// and cannot interleave with a flush, so no live span is ever skipped by that test. Only a
-/// crash landing between the segment write and the header stamp can duplicate spans.</para>
+/// so a crash between the two would replay spans that are already cold. The flush therefore
+/// bumps <see cref="WalFileHeader.Generation"/> BEFORE zeroing the write offset, and recovery
+/// keeps only entries stamped with the generation the header now carries. Only a crash
+/// landing between the segment write and the generation bump can duplicate spans.</para>
+///
+/// <para>The generation is assigned by this class under its own write lock, which is what
+/// makes the test sound. An earlier design compared each entry's span START TIME against the
+/// newest start time in the flushed segment — but that time comes from the instrumented
+/// client, not from us, and is not monotonic in append order. An OTLP exporter ships a span
+/// when it ENDS, so a long span appended after the flush can easily have started before it;
+/// under the old rule such spans were silently dropped on replay. Serialising appends against
+/// flushes proves they do not interleave, which is a different and weaker claim than "a span
+/// appended after the reset has a later start time" — the latter simply is not true.</para>
+///
+/// <para>Generation 0 means "never written", so it doubles as the end-of-data marker: a
+/// zero-filled region is otherwise indistinguishable from a valid entry with an empty name,
+/// an empty service and no attributes. That matters because a span may legitimately carry a
+/// zero start time — <c>OtlpTraceStreamParser</c> defaults <c>startTimeUnixNano</c> to 0 when
+/// the field is absent and nothing downstream rejects it.</para>
+///
+/// <para><b>Known limitation.</b> Spans duplicated by a crash in the window above are
+/// replayed into the hot tier while also living in the flushed segment, and no read path
+/// de-duplicates by span id — such a span would appear twice in a trace waterfall until
+/// retention removes the segment.</para>
 /// </summary>
 internal sealed unsafe class SpanWriteAheadLog : IDisposable
 {
@@ -55,6 +73,9 @@ internal sealed unsafe class SpanWriteAheadLog : IDisposable
     /// <summary>8 MB holds ~40k spans; the log is reset on every flush, so it rarely grows.</summary>
     private const long DefaultCapacity = 8 * 1024 * 1024;
 
+    /// <summary>First generation of a fresh log. 0 is reserved for "never written".</summary>
+    private const uint FirstGeneration = 1;
+
     [StructLayout(LayoutKind.Sequential, Size = FileHeaderSize)]
     private struct WalFileHeader
     {
@@ -62,14 +83,16 @@ internal sealed unsafe class SpanWriteAheadLog : IDisposable
         public ushort Version;
         private ushort _pad;
         public long   WriteOffset;
-        public long   FlushedThroughNano;
-        private long  _reserved;
+        public uint   Generation;
+        private uint  _reserved0;
+        private long  _reserved1;
     }
 
     /// <summary>
-    /// Pack = 1 keeps the fields at exactly 60 bytes inside the 64-byte stride — without it
-    /// the 8-byte members would align and push the tail past the stride, straight into the
-    /// payload area (the corruption the logs WAL hit in its v2 layout).
+    /// Pack = 1 keeps the fields at exactly 64 bytes — without it the 8-byte members would
+    /// align and push the tail past the stride, straight into the payload area (the
+    /// corruption the logs WAL hit in its v2 layout). <see cref="Generation"/> occupies the
+    /// four bytes that were previously padding.
     /// </summary>
     [StructLayout(LayoutKind.Sequential, Pack = 1, Size = EntryHeaderSize)]
     private struct SpanWalEntryHeader
@@ -85,6 +108,7 @@ internal sealed unsafe class SpanWriteAheadLog : IDisposable
         public short  HttpStatusCode;
         public byte   Kind;
         public byte   Status;
+        public uint   Generation;             // 0 = unwritten; see the class remarks
     }
 
     private readonly string _filePath;
@@ -95,7 +119,7 @@ internal sealed unsafe class SpanWriteAheadLog : IDisposable
     private byte*                     _ptr;
     private long                      _capacity;
     private long                      _writeOffset;        // logical, excludes the file header
-    private long                      _flushedThroughNano;
+    private uint                      _generation;
 
     public string FilePath => _filePath;
 
@@ -130,17 +154,17 @@ internal sealed unsafe class SpanWriteAheadLog : IDisposable
         {
             // New, foreign or future-versioned file — reinitialise in place. Anything
             // already there cannot be replayed under a layout we do not know.
-            hdr.Magic              = MagicNumber;
-            hdr.Version            = WalVersion;
-            hdr.WriteOffset        = FileHeaderSize;
-            hdr.FlushedThroughNano = 0;
-            _writeOffset           = 0;
-            _flushedThroughNano    = 0;
+            hdr.Magic       = MagicNumber;
+            hdr.Version     = WalVersion;
+            hdr.WriteOffset = FileHeaderSize;
+            hdr.Generation  = FirstGeneration;
+            _writeOffset    = 0;
+            _generation     = FirstGeneration;
         }
         else
         {
-            _writeOffset        = Math.Max(0, hdr.WriteOffset - FileHeaderSize);
-            _flushedThroughNano = hdr.FlushedThroughNano;
+            _writeOffset = Math.Max(0, hdr.WriteOffset - FileHeaderSize);
+            _generation  = hdr.Generation == 0 ? FirstGeneration : hdr.Generation;
             if (_writeOffset > _capacity) _writeOffset = _capacity;  // truncated file — replay what is mapped
         }
     }
@@ -178,7 +202,11 @@ internal sealed unsafe class SpanWriteAheadLog : IDisposable
 
         lock (_writeLock)
         {
-            if (_ptr is null) return;                       // disposed — drop rather than fault
+            if (_disposed) return;                          // shutdown race — dropping is correct
+            if (_ptr is null)
+                throw new InvalidOperationException(
+                    "Span WAL has no mapping; the log is not accepting appends.");
+
             while (_writeOffset + entrySize > _capacity)
                 Grow();
 
@@ -199,6 +227,7 @@ internal sealed unsafe class SpanWriteAheadLog : IDisposable
             eh.HttpStatusCode    = item.HttpStatusCode;
             eh.Kind              = (byte)item.Kind;
             eh.Status            = (byte)item.Status;
+            eh.Generation        = _generation;
 
             byte* p = dest + EntryHeaderSize;
             if (nameLen > 0) { Encoding.UTF8.GetBytes(name,    new Span<byte>(p, nameLen)); p += nameLen; }
@@ -213,31 +242,33 @@ internal sealed unsafe class SpanWriteAheadLog : IDisposable
     // ── Reset ────────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Drops every logged span, stamping the watermark first so a crash between the two
-    /// stores cannot replay spans the caller has already made cold. Call only after the
+    /// Drops every logged span by opening a new generation. The generation is stored before
+    /// the write offset, so a crash between the two stores leaves entries that recovery can
+    /// still recognise as belonging to the flushed generation and skip. Call only after the
     /// segment carrying these spans is on disk.
     /// </summary>
-    /// <param name="flushedThroughNano">Newest start time contained in the flushed segment.</param>
-    public void Reset(long flushedThroughNano)
+    public void Reset()
     {
         lock (_writeLock)
         {
-            if (_ptr is null) return;
-            _flushedThroughNano = flushedThroughNano;
+            if (_disposed || _ptr is null) return;
+
+            // Wrap past 0 — it is the "never written" marker recovery relies on.
+            _generation = _generation == uint.MaxValue ? FirstGeneration : _generation + 1;
 
             ref var hdr = ref Unsafe.AsRef<WalFileHeader>(_ptr);
-            hdr.FlushedThroughNano = flushedThroughNano;   // must land before the offset
-            hdr.WriteOffset        = FileHeaderSize;
-            _writeOffset           = 0;
+            hdr.Generation  = _generation;                // must land before the offset
+            hdr.WriteOffset = FileHeaderSize;
+            _writeOffset    = 0;
         }
     }
 
     // ── Recovery ─────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Replays every complete entry that the last flush did not cover. A short or
-    /// impossible entry ends the replay: the tail of an append-only log is the only place
-    /// a torn write can be, and everything before it is intact.
+    /// Replays every complete entry belonging to the current generation. A short entry ends
+    /// the replay: the tail of an append-only log is the only place a torn write can be, and
+    /// everything before it is intact.
     /// </summary>
     public List<SpanIngestItem> ReadAll()
     {
@@ -258,13 +289,15 @@ internal sealed unsafe class SpanWriteAheadLog : IDisposable
                 long total = (long)EntryHeaderSize + eh.NameLength + eh.ServiceLength + eh.AttrLength;
                 if (total <= 0 || pos + total > end) break;   // torn tail
 
-                // A zero-filled header is a valid-looking 64-byte entry, so bounds alone
-                // cannot tell "never written" from "empty name, empty service, no attrs".
-                // A span start time is unix nanoseconds and therefore always positive —
-                // anything else means we have walked past the data the header claimed.
-                if (eh.StartTimeUnixNano <= 0) break;
+                // Generation 0 is never written by an append, so it marks the end of real
+                // data. Nothing about the span's own fields can serve here: an empty name,
+                // an empty service, no attributes and a zero start time are all individually
+                // legal, which makes a zero-filled region look like a valid entry.
+                if (eh.Generation == 0) break;
 
-                if (eh.StartTimeUnixNano > _flushedThroughNano)
+                // A surviving entry from a flushed generation — the segment already holds it.
+                // Skip the entry, not the rest of the log.
+                if (eh.Generation == _generation)
                 {
                     byte* p = src + EntryHeaderSize;
                     string name = eh.NameLength    > 0 ? Encoding.UTF8.GetString(p, eh.NameLength)    : string.Empty;
@@ -304,21 +337,52 @@ internal sealed unsafe class SpanWriteAheadLog : IDisposable
 
     // ── Grow ─────────────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Doubles the mapped capacity. Windows will not resize a file while it is mapped, so the
+    /// old mapping has to go first — which means a failure here (a full disk, i.e. exactly
+    /// when a log grows) would otherwise leave the object alive with no mapping, silently
+    /// refusing every later append. The old mapping is therefore restored before the
+    /// exception is allowed out, so a failed growth costs only the append that triggered it.
+    /// </summary>
     private void Grow()
     {
+        long oldFileSize = FileHeaderSize + _capacity;
         long newCapacity = _capacity * 2;
         long newFileSize = FileHeaderSize + newCapacity;
 
-        _accessor!.SafeMemoryMappedViewHandle.ReleasePointer();
-        _accessor.Dispose();
-        _mmf!.Dispose();
-        _ptr = null;
+        Unmap();
+        try
+        {
+            using (var fs = new FileStream(_filePath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+                fs.SetLength(newFileSize);
 
-        using (var fs = new FileStream(_filePath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
-            fs.SetLength(newFileSize);
+            Map(newFileSize);
+            _capacity = newCapacity;
+        }
+        catch
+        {
+            try
+            {
+                using (var fs = new FileStream(_filePath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+                    if (fs.Length < oldFileSize) fs.SetLength(oldFileSize);
+                Map(oldFileSize);
+            }
+            catch { /* nothing left to restore to — the throw below is the honest signal */ }
+            throw;
+        }
+    }
 
-        _capacity = newCapacity;
-        Map(newFileSize);
+    private void Unmap()
+    {
+        if (_accessor is not null)
+        {
+            try { _accessor.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
+            _accessor.Dispose();
+        }
+        _mmf?.Dispose();
+        _accessor = null;
+        _mmf      = null;
+        _ptr      = null;
     }
 
     // ── Dispose ──────────────────────────────────────────────────────────────
@@ -331,16 +395,7 @@ internal sealed unsafe class SpanWriteAheadLog : IDisposable
         {
             if (_disposed) return;
             _disposed = true;
-
-            if (_accessor is not null)
-            {
-                try { _accessor.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
-                _accessor.Dispose();
-            }
-            _mmf?.Dispose();
-            _accessor = null;
-            _mmf      = null;
-            _ptr      = null;
+            Unmap();
         }
     }
 

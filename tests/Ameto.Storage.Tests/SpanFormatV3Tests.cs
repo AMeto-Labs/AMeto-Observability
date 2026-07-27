@@ -322,6 +322,43 @@ public sealed class SpanFormatV3Tests : IDisposable
         Assert.Equal("old1", oldest[0].FilePath);
     }
 
+    /// <summary>
+    /// Candidates are ordered by MinStartNano, but the window is tested on MaxStartNano,
+    /// which is not monotonic in that order. Abandoning the scan at the first out-of-window
+    /// segment therefore strands peers that sit well inside it — and once batches are also
+    /// filtered by size tier, matches are sparse enough that a single wide segment could
+    /// make a pass select nothing at all.
+    /// </summary>
+    [Fact]
+    public void CompactionBatch_IsNotBlockedByAWideSegment()
+    {
+        const long Hour = 3600L * 1_000_000_000;
+        static SpanSegmentInfo Seg(string name, long minH, long maxH, int spans) => new()
+        {
+            FilePath = name, MinStartNano = minH * Hour, MaxStartNano = maxH * Hour,
+            SpanCount = spans, FormatVersion = 3,
+        };
+
+        var picked = TraceStorageEngine.SelectCompactionBatch(
+        [
+            Seg("a",    0,  1,  500),      // tier 4, inside the window
+            Seg("wide", 1,  30, 9_000),    // spans 30 h, still under the 10k threshold
+            Seg("c",    2,  3,  500),      // tier 4, deep inside the window
+        ]);
+
+        Assert.Equal(["a", "c"], picked.Select(s => s.FilePath));
+
+        // The wide segment is still excluded from a batch it does not fit — the window is
+        // enforced per candidate, not abandoned.
+        var far = TraceStorageEngine.SelectCompactionBatch(
+        [
+            Seg("a",    0,  1,  500),
+            Seg("wide", 1,  30, 500),      // same tier now, but 30 h wide
+            Seg("c",    2,  3,  500),
+        ]);
+        Assert.Equal(["a", "c"], far.Select(s => s.FilePath));
+    }
+
     // ── Legacy v2 writer (copied from the pre-v3 SpanWriter, indices trimmed) ──
 
     private static void WriteV2File(string filePath, IList<SpanRecord> spans)

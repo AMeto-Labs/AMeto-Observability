@@ -100,6 +100,21 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         {
             for (int i = 0; i < recovered.Count; i++)
                 AddToHotTierLocked(recovered[i]);
+
+            // Date the tier by the data, not by this restart. Leaving _hotSince at "now"
+            // restarts the MaxHotAge clock on every start, so a crash-restart loop could
+            // keep spans out of a segment indefinitely. Clamped to now because the start
+            // time is the client's to report, and a skewed clock must not push the tier
+            // into the future — an implausibly old one merely flushes a little early.
+            DateTime oldest = DateTime.UtcNow;
+            for (int i = 0; i < recovered.Count; i++)
+            {
+                long nano = recovered[i].StartTimeUnixNano;
+                if (nano <= 0) continue;
+                var at = DateTimeOffset.FromUnixTimeMilliseconds(nano / 1_000_000L).UtcDateTime;
+                if (at < oldest) oldest = at;
+            }
+            _hotSince = oldest;
         }
         finally { _lock.ExitWriteLock(); }
 
@@ -389,10 +404,9 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             return;
         }
 
-        // Segment is on disk — the log has nothing left to protect. Stamped with the
-        // segment's newest start time so a crash before the offset store cannot replay
-        // spans that are already cold.
-        try { _wal.Reset(info.MaxStartNano); }
+        // Segment is on disk — the log has nothing left to protect. Opening a new generation
+        // is what lets recovery tell these now-cold entries from spans appended afterwards.
+        try { _wal.Reset(); }
         catch (Exception ex) { _logger.LogWarning(ex, "Span WAL reset failed after flush"); }
 
         _hotSpans.Clear();
@@ -500,7 +514,17 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             for (int j = i + 1; j < candidates.Count && batch.Count < MaxSegmentsPerPass; j++)
             {
                 var s = candidates[j];
-                if (s.MaxStartNano - windowStart > MaxSpanNanos) break;   // past the window
+
+                // MinStartNano is the sort key, so once it clears the window nothing later
+                // can qualify — the only sound place to stop early.
+                if (s.MinStartNano - windowStart > MaxSpanNanos) break;
+
+                // MaxStartNano is NOT monotonic in that order: one wide segment (a long time
+                // range, still under the compaction threshold) says nothing about the ones
+                // behind it. Stopping here would strand same-tier peers that sit well inside
+                // the window — with the tier filter narrowing matches, often to the point of
+                // selecting nothing at all.
+                if (s.MaxStartNano - windowStart > MaxSpanNanos) continue;
                 if (TierOf(s.SpanCount) != tier) continue;                // wrong magnitude
                 batch.Add(s);
             }

@@ -90,14 +90,14 @@ public sealed class SpanWalTests : IDisposable
         Assert.Equal("платёж → провайдер 🚀", replayed[1].Name);
     }
 
-    // ── Watermark ─────────────────────────────────────────────────────────────
+    // ── Generation ────────────────────────────────────────────────────────────
 
     [Fact]
     public void Reset_drops_everything_it_logged()
     {
         var wal = SpanWriteAheadLog.Open(WalPath);
         for (int i = 0; i < 10; i++) wal.Append(Item(i, 5_000 + i));
-        wal.Reset(flushedThroughNano: 5_009);
+        wal.Reset();
         wal.Dispose();
 
         var reopened = SpanWriteAheadLog.Open(WalPath);
@@ -106,32 +106,78 @@ public sealed class SpanWalTests : IDisposable
     }
 
     [Fact]
-    public void Watermark_skips_spans_a_segment_already_holds()
+    public void Spans_appended_after_a_reset_survive_however_early_they_started()
     {
-        // Simulates the crash window: the segment reached disk and the watermark landed,
-        // but the write offset was never zeroed. Replay must not resurrect cold spans.
+        // An OTLP exporter ships a span when it ENDS, so a long-running span reaches the log
+        // after a flush while having started before it. Filtering replay on the span's own
+        // start time dropped exactly these; the generation is assigned by us, under our lock,
+        // and does not care what the client's clock says.
+        const long segmentMaxStart = 1_700_000_000_000_000_000L;
+
         var wal = SpanWriteAheadLog.Open(WalPath);
-        for (int i = 0; i < 6; i++) wal.Append(Item(i, 9_000 + i));
+        wal.Append(Item(0, segmentMaxStart));
+        wal.Reset();                                                   // segment flushed
+
+        wal.Append(Item(1, segmentMaxStart - 30_000_000_000L));        // 30 s span, just ended
+        wal.Append(Item(2, segmentMaxStart -  1_000_000_000L));        // client clock behind
+        wal.Append(Item(3, segmentMaxStart +  5_000_000_000L));        // ordinary
         wal.Dispose();
 
-        // Re-open and stamp the watermark WITHOUT clearing the entries, by writing them
-        // again after the reset — the first six are now at or below the flush point.
-        var mid = SpanWriteAheadLog.Open(WalPath);
-        var all = mid.ReadAll();
-        Assert.Equal(6, all.Count);
-        mid.Dispose();
+        var reopened = SpanWriteAheadLog.Open(WalPath);
+        var ids = reopened.ReadAll().Select(s => s.SpanId.RawValue).OrderBy(x => x).ToArray();
+        reopened.Dispose();
 
-        var stamped = SpanWriteAheadLog.Open(WalPath);
-        stamped.Reset(flushedThroughNano: 9_003);          // covers 9_000..9_003
-        for (int i = 0; i < 6; i++) stamped.Append(Item(i, 9_000 + i));   // replay-equivalent tail
-        stamped.Dispose();
+        Assert.Equal([101UL, 102UL, 103UL], ids);
+    }
 
-        var after = SpanWriteAheadLog.Open(WalPath);
-        var kept  = after.ReadAll();
-        after.Dispose();
+    [Fact]
+    public void A_reset_that_never_zeroed_the_offset_still_hides_flushed_spans()
+    {
+        // The crash window: generation bumped, write offset not yet stored. Entries from the
+        // flushed generation are still addressable and must not come back.
+        var wal = SpanWriteAheadLog.Open(WalPath);
+        for (int i = 0; i < 6; i++) wal.Append(Item(i, 9_000 + i));
+        long flushedBytes = wal.WrittenBytes;
+        wal.Reset();
+        for (int i = 6; i < 9; i++) wal.Append(Item(i, 9_000 + i));     // new generation
+        long liveBytes = wal.WrittenBytes;
+        wal.Dispose();
 
-        Assert.Equal(2, kept.Count);                        // only 9_004 and 9_005 survive
-        Assert.All(kept, s => Assert.True(s.StartTimeUnixNano > 9_003));
+        // Rewind the header to cover both generations, as a lost offset store would.
+        using (var fs = new FileStream(WalPath, FileMode.Open, FileAccess.ReadWrite))
+        {
+            fs.Seek(8, SeekOrigin.Begin);
+            fs.Write(BitConverter.GetBytes(32 + flushedBytes + liveBytes));
+        }
+
+        var reopened = SpanWriteAheadLog.Open(WalPath);
+        var kept     = reopened.ReadAll();
+        reopened.Dispose();
+
+        Assert.Equal(3, kept.Count);                                    // only the new generation
+        Assert.All(kept, s => Assert.True(s.SpanId.RawValue >= 106));
+    }
+
+    [Fact]
+    public void A_span_without_a_start_time_does_not_truncate_the_log()
+    {
+        // OtlpTraceStreamParser leaves startTimeUnixNano at 0 when the field is absent and
+        // nothing downstream rejects it, so such a span reaches the log. It must cost only
+        // itself, not everything written after it.
+        var wal = SpanWriteAheadLog.Open(WalPath);
+        wal.Append(Item(0, 1_700_000_000_000_000_000L));
+        wal.Append(Item(1, 0));
+        wal.Append(Item(2, 1_700_000_000_000_000_002L));
+        wal.Append(Item(3, 1_700_000_000_000_000_003L));
+        wal.Dispose();
+
+        var reopened = SpanWriteAheadLog.Open(WalPath);
+        var replayed = reopened.ReadAll();
+        reopened.Dispose();
+
+        Assert.Equal(4, replayed.Count);
+        Assert.Contains(replayed, s => s.SpanId.RawValue == 102);
+        Assert.Contains(replayed, s => s.SpanId.RawValue == 103);
     }
 
     // ── Durability edges ──────────────────────────────────────────────────────
