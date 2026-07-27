@@ -51,6 +51,17 @@ internal static class MetricWriter
     /// Writes one <c>.mts</c> file per distinct metric name found in <paramref name="series"/>.
     /// Returns metadata for all created files.
     /// </summary>
+    /// <summary>
+    /// Upper bound on series packed into one .mts file. The writer serialises a
+    /// whole file into a single msgpack buffer before compressing it, so an
+    /// unbounded series count turns into an unbounded (doubling) buffer — with
+    /// high-cardinality metrics (observed live: 4,098 series for one metric,
+    /// 38,741 in total) that alone drove GB-scale allocation during rollup.
+    /// Splitting into several files costs nothing: multiple files per metric and
+    /// granularity are normal, and the reader already merges across them.
+    /// </summary>
+    private const int MaxSeriesPerFile = 512;
+
     public static List<MetricSegmentInfo> Write(
         string dataDir,
         IList<(SeriesKey Key, HotSeries Series)> series,
@@ -60,8 +71,8 @@ internal static class MetricWriter
         var result   = new List<MetricSegmentInfo>();
 
         foreach (var group in byMetric)
+        foreach (var items in Chunk(group.ToList(), MaxSeriesPerFile))
         {
-            var items = group.ToList();
             long minNano = long.MaxValue, maxNano = long.MinValue;
             foreach (var (_, hs) in items)
             {
@@ -98,6 +109,15 @@ internal static class MetricWriter
         }
 
         return result;
+    }
+
+    /// <summary>Splits a metric's series into files of at most <paramref name="size"/> series.</summary>
+    private static IEnumerable<List<(SeriesKey Key, HotSeries Series)>> Chunk(
+        List<(SeriesKey Key, HotSeries Series)> items, int size)
+    {
+        if (items.Count <= size) { yield return items; yield break; }
+        for (int i = 0; i < items.Count; i += size)
+            yield return items.GetRange(i, Math.Min(size, items.Count - i));
     }
 
     private static void WriteFile(
