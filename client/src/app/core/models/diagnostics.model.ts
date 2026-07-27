@@ -12,6 +12,13 @@ export interface DiagnosticsDto {
   processThreads:         number;
   processStartedAt:       string; // ISO-8601
 
+  // CPU. `processCpuPercent` is the last closed 30 s interval measured by the server,
+  // normalised across all cores; -1 while no interval has closed yet (first ~30 s after
+  // start). `processCpuSeconds` is the monotonic total, for differencing across polls.
+  processCpuPercent?:     number;
+  processCpuSeconds?:     number;
+  processorCount?:        number;
+
   // Storage
   segmentCount:         number;
   totalEventCount:      number;

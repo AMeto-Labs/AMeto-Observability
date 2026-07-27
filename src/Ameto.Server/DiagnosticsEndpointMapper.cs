@@ -13,7 +13,7 @@ public static class DiagnosticsEndpointMapper
 {
     public static void MapDiagnosticsEndpoints(this WebApplication app)
     {
-        app.MapGet("/api/diagnostics", (StorageEngine storage, ServerOptions options) =>
+        app.MapGet("/api/diagnostics", (StorageEngine storage, ServerOptions options, ProcessCpuSampler cpu) =>
         {
             var proc = Process.GetCurrentProcess();
 
@@ -69,6 +69,16 @@ public static class DiagnosticsEndpointMapper
                 processPrivateBytes    = proc.PrivateMemorySize64,
                 processThreads         = proc.Threads.Count,
                 processStartedAt       = proc.StartTime.ToUniversalTime().ToString("O"),
+
+                // CPU. The percentage is the last closed 30-second interval, sampled by
+                // RamPressureService — this endpoint deliberately does not sample, because a
+                // second reader would shorten that interval and make both figures jitter.
+                // -1 means no interval has closed yet (first ~30 s after start).
+                // processCpuSeconds is the monotonic total, for callers that would rather
+                // difference it across their own polls.
+                processCpuPercent      = cpu.LastPercent < 0 ? -1 : Math.Round(cpu.LastPercent, 1),
+                processCpuSeconds      = Math.Round(ProcessCpuSampler.TotalProcessorTime.TotalSeconds, 1),
+                processorCount         = cpu.Cores,
 
                 // Memory breakdown
                 gcMode                 = GCSettings.IsServerGC ? "Server" : "Workstation",
