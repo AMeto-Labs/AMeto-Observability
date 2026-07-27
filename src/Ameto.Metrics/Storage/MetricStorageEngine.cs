@@ -534,30 +534,8 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
             try
             {
-                var allSeries = new Dictionary<SeriesKey, List<MetricDataPoint>>();
-                var bounds    = new Dictionary<SeriesKey, double[]?>();
-                foreach (var seg in segs)
-                {
-                    foreach (var series in MetricReader.ReadAllSync(seg.FilePath))
-                    {
-                        var key = new SeriesKey(series.Name, series.Kind, series.Unit, series.Labels);
-                        if (!allSeries.TryGetValue(key, out var pts))
-                        {
-                            pts = new List<MetricDataPoint>();
-                            allSeries[key] = pts;
-                        }
-                        pts.AddRange(series.Points);
-                        if (series.BucketBounds is not null) bounds[key] = series.BucketBounds;
-                    }
-                }
-
-                var merged = allSeries
-                    .Select(kv => (kv.Key, new HotSeries(
-                        DedupeByTimestamp(kv.Value),
-                        bounds.GetValueOrDefault(kv.Key))))
-                    .ToList();
-
-                var newInfos = MetricWriter.Write(_dataDir, merged, granularity);
+                var newInfos = RewriteMetricInChunks(
+                    segs, granularity, static (pts, _) => DedupeByTimestamp(pts));
 
                 _coldLock.EnterWriteLock();
                 try
@@ -578,6 +556,75 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                 _logger.LogError(ex, "{Granularity} compaction failed for metric '{Metric}'", granularity, group.Key);
             }
         }
+    }
+
+    /// <summary>
+    /// Series retained in memory at once while rewriting a metric. Matches the
+    /// writer's per-file cap so each chunk becomes exactly one output file.
+    /// </summary>
+    private const int SeriesChunk = 512;
+
+    /// <summary>
+    /// Rewrites ONE metric's source files, transforming each series' points, with
+    /// peak retained memory bounded by <see cref="SeriesChunk"/> — independent of
+    /// the metric's cardinality.
+    ///
+    /// <para>A metric with more series than the chunk is processed in several
+    /// passes: pass 0 collects the key set (the points it decodes are transient
+    /// gen0 garbage, never retained), then each chunk re-reads the sources and
+    /// keeps only its own series. Re-reading costs LZ4 decompression, which on a
+    /// background path is far cheaper than retaining hundreds of MB and paying
+    /// for it in blocking gen2 collections. Metrics that fit in one chunk take
+    /// the single-pass path and read each file exactly once.</para>
+    /// </summary>
+    internal List<MetricSegmentInfo> RewriteMetricInChunks(
+        List<MetricSegmentInfo> segs,
+        MetricGranularity       target,
+        Func<List<MetricDataPoint>, MetricKind, List<MetricDataPoint>> transform)
+    {
+        // ── Pass 0: key set + bucket bounds (no points retained) ───────────────
+        var keys   = new List<SeriesKey>();
+        var seen   = new HashSet<SeriesKey>();
+        var bounds = new Dictionary<SeriesKey, double[]?>();
+        foreach (var seg in segs)
+            foreach (var s in MetricReader.ReadAllSync(seg.FilePath))
+            {
+                var key = new SeriesKey(s.Name, s.Kind, s.Unit, s.Labels);
+                if (seen.Add(key)) keys.Add(key);
+                if (s.BucketBounds is not null) bounds[key] = s.BucketBounds;
+            }
+        if (keys.Count == 0) return [];
+
+        var written = new List<MetricSegmentInfo>();
+        for (int off = 0; off < keys.Count; off += SeriesChunk)
+        {
+            int take  = Math.Min(SeriesChunk, keys.Count - off);
+            // Single-chunk metric: no filtering needed, one pass over the files.
+            var wanted = keys.Count <= SeriesChunk
+                ? null
+                : new HashSet<SeriesKey>(keys.GetRange(off, take));
+
+            var acc = new Dictionary<SeriesKey, List<MetricDataPoint>>(take);
+            foreach (var seg in segs)
+                foreach (var s in MetricReader.ReadAllSync(seg.FilePath))
+                {
+                    var key = new SeriesKey(s.Name, s.Kind, s.Unit, s.Labels);
+                    if (wanted is not null && !wanted.Contains(key)) continue;
+                    if (!acc.TryGetValue(key, out var pts))
+                    {
+                        pts = new List<MetricDataPoint>();
+                        acc[key] = pts;
+                    }
+                    pts.AddRange(s.Points);
+                }
+
+            var batch = new List<(SeriesKey, HotSeries)>(acc.Count);
+            foreach (var (key, pts) in acc)
+                batch.Add((key, new HotSeries(transform(pts, key.Kind), bounds.GetValueOrDefault(key))));
+
+            if (batch.Count > 0) written.AddRange(MetricWriter.Write(_dataDir, batch, target));
+        }
+        return written;
     }
 
     /// <summary>Sorts by timestamp and drops duplicate-timestamp points (last wins).</summary>
@@ -606,34 +653,13 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         {
             try
             {
-                // Read all series from sources for this metric
-                var allSeries = new Dictionary<SeriesKey, List<MetricDataPoint>>();
-                var bounds    = new Dictionary<SeriesKey, double[]?>();
-                foreach (var seg in group)
-                {
-                    foreach (var series in MetricReader.ReadAllSync(seg.FilePath))
-                    {
-                        var key = new SeriesKey(series.Name, series.Kind, series.Unit, series.Labels);
-                        if (!allSeries.TryGetValue(key, out var pts))
-                        {
-                            pts = new List<MetricDataPoint>();
-                            allSeries[key] = pts;
-                        }
-                        pts.AddRange(series.Points);
-                        if (series.BucketBounds is not null) bounds[key] = series.BucketBounds;
-                    }
-                }
-
-                // Aggregate into time buckets — type-aware (see Downsample).
-                var rolled = new List<(SeriesKey Key, HotSeries Series)>();
-                foreach (var (key, pts) in allSeries)
-                {
-                    var bucketed = Downsample(pts.OrderBy(p => p.TimestampUnixNano).ToList(), bucketSize, key.Kind)
-                        .ToList();
-                    rolled.Add((key, new HotSeries(bucketed, bounds.GetValueOrDefault(key))));
-                }
-
-                var newInfos = MetricWriter.Write(_dataDir, rolled, targetGranularity);
+                // Aggregate into time buckets — type-aware (see Downsample) — in
+                // bounded series chunks so a high-cardinality metric can't pin
+                // hundreds of MB while it is rewritten.
+                var newInfos = RewriteMetricInChunks(
+                    group.ToList(), targetGranularity,
+                    (pts, kind) => Downsample(
+                        pts.OrderBy(p => p.TimestampUnixNano).ToList(), bucketSize, kind).ToList());
 
                 _coldLock.EnterWriteLock();
                 try
