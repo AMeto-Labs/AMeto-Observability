@@ -25,4 +25,10 @@ export interface DiagnosticsDto {
   tracesStorageBytes?:   number;
   databaseStorageBytes?: number;
   otherStorageBytes?:    number;
+
+  // Segment counts per signal, shown alongside each size in the breakdown.
+  // `logsSegmentCount` is the engine's own figure, so it matches the Stats page.
+  logsSegmentCount?:     number;
+  metricsSegmentCount?:  number;
+  tracesSegmentCount?:   number;
 }

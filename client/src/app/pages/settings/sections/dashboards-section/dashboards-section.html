@@ -50,9 +50,27 @@
         </div>
         @if (d.dataTotalBytes != null) {
           <div class="storage-breakdown">
-            <div class="sb-row"><span class="sb-dot logs"></span>Logs <span class="sb-val">{{ fmtBytes(d.logsStorageBytes ?? 0) }}</span></div>
-            <div class="sb-row"><span class="sb-dot metrics"></span>Metrics <span class="sb-val">{{ fmtBytes(d.metricsStorageBytes ?? 0) }}</span></div>
-            <div class="sb-row"><span class="sb-dot traces"></span>Traces <span class="sb-val">{{ fmtBytes(d.tracesStorageBytes ?? 0) }}</span></div>
+            <div class="sb-row">
+              <span class="sb-dot logs"></span>Logs
+              <span class="sb-val">
+                @if (d.logsSegmentCount != null) { <span class="sb-seg">{{ fmtNum(d.logsSegmentCount) }} seg</span> }
+                {{ fmtBytes(d.logsStorageBytes ?? 0) }}
+              </span>
+            </div>
+            <div class="sb-row">
+              <span class="sb-dot metrics"></span>Metrics
+              <span class="sb-val">
+                @if (d.metricsSegmentCount != null) { <span class="sb-seg">{{ fmtNum(d.metricsSegmentCount) }} seg</span> }
+                {{ fmtBytes(d.metricsStorageBytes ?? 0) }}
+              </span>
+            </div>
+            <div class="sb-row">
+              <span class="sb-dot traces"></span>Traces
+              <span class="sb-val">
+                @if (d.tracesSegmentCount != null) { <span class="sb-seg">{{ fmtNum(d.tracesSegmentCount) }} seg</span> }
+                {{ fmtBytes(d.tracesStorageBytes ?? 0) }}
+              </span>
+            </div>
             <div class="sb-row"><span class="sb-dot db"></span>Database <span class="sb-val">{{ fmtBytes(d.databaseStorageBytes ?? 0) }}</span></div>
             <div class="sb-row"><span class="sb-dot other"></span>Other <span class="sb-val">{{ fmtBytes(d.otherStorageBytes ?? 0) }}</span></div>
           </div>
@@ -91,30 +109,9 @@
     </div>
   </app-section>
 
-  <!-- ── Storage ────────────────────────────────────────── -->
-  <app-section title="Storage">
-    <div class="metric">
-      <div class="metric-name">Segments</div>
-      <div class="metric-right">
-        <div class="metric-value">{{ fmtNum(d.segmentCount) }}</div>
-        <div class="metric-desc">
-          Number of cold-tier segments currently on disk.
-          Each segment holds a time-bounded batch of events.
-        </div>
-      </div>
-    </div>
-
-    <div class="metric">
-      <div class="metric-name">Total events</div>
-      <div class="metric-right">
-        <div class="metric-value">{{ fmtNum(d.totalEventCount) }}</div>
-        <div class="metric-desc">
-          Sum of all events across all cold-tier segments.
-          Does not include events still in the hot tier (not yet flushed).
-        </div>
-      </div>
-    </div>
-  </app-section>
+  <!-- Segment count and stored-event total live on the Stats page ("Segments on
+       disk" / "Stored events"); the per-signal segment counts in the storage
+       breakdown above carry what this section used to add here. -->
 
   <!-- ── Process ────────────────────────────────────────── -->
   <app-section title="Process">
