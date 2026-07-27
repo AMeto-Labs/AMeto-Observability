@@ -257,6 +257,39 @@ public sealed class MetricWalTests : IDisposable
         Assert.Equal([2.0, 3.0], values);
     }
 
+    /// <summary>
+    /// Compaction moves the survivors but cannot erase where they came from, so a crash
+    /// between the move and the offset store leaves an offset covering both copies. The new
+    /// tail is terminated with a generation-0 slot precisely so such a scan stops on time.
+    /// </summary>
+    [Fact]
+    public void A_compaction_whose_offset_store_was_lost_replays_survivors_once()
+    {
+        long baseNano = 1_700_000_000_000_000_000L;
+        long offsetBeforeCommit;
+
+        var wal = MetricWriteAheadLog.Open(WalPath);
+        for (int i = 0; i < 6; i++) Append(wal, Scalar("m", baseNano + i, i));      // snapshot
+        ulong flushing = wal.BeginFlush();
+        for (int i = 6; i < 10; i++) Append(wal, Scalar("m", baseNano + i, i));     // survivors
+        offsetBeforeCommit = wal.WrittenBytes;
+        wal.CommitFlush(flushing);
+        wal.Dispose();
+
+        // Rewind the header to its pre-commit value: "the move landed, the store did not".
+        using (var fs = new FileStream(WalPath, FileMode.Open, FileAccess.ReadWrite))
+        {
+            fs.Seek(8, SeekOrigin.Begin);
+            fs.Write(BitConverter.GetBytes(32L + offsetBeforeCommit));
+        }
+
+        var reopened = MetricWriteAheadLog.Open(WalPath);
+        var values   = reopened.ReadAll(out _).Select(r => r.Point.Value).OrderBy(v => v).ToArray();
+        reopened.Dispose();
+
+        Assert.Equal([6.0, 7.0, 8.0, 9.0], values);   // once each, and no cold point back
+    }
+
     [Fact]
     public void Repeated_flush_cycles_keep_the_log_and_pool_bounded()
     {

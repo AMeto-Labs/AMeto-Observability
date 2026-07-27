@@ -59,7 +59,9 @@ namespace Ameto.Metrics.Storage;
 ///
 /// <para><b>Crash recovery.</b> Recovery keeps entries whose generation is ABOVE the
 /// committed watermark. The watermark is written before any bytes move, so a crash during
-/// compaction cannot resurrect cold points. The generation is assigned here, under this
+/// compaction cannot resurrect cold points; the relocated tail is terminated with a
+/// generation-0 slot before the new write offset is stored, so such a crash cannot return
+/// the survivors twice either. The generation is assigned here, under this
 /// class's own lock; nothing derived from the data (a point's timestamp, say) would do,
 /// because those come from the instrumented client and are not monotonic in append order.
 /// Only a crash landing between the file write and the commit can duplicate points.</para>
@@ -361,6 +363,16 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
             Buffer.MemoryCopy(data + firstSurvivor, data, _capacity, surviving);
 
         _writeOffset = Math.Max(0, surviving);
+
+        // The move does not erase its source. A crash before the offset store below would
+        // therefore leave the old, larger offset covering BOTH the relocated survivors and
+        // the originals they were copied from, and replay would return each twice. Marking
+        // the slot past the new end with generation 0 makes such a scan stop exactly where
+        // the data now ends — ReadAll already treats 0 as end-of-data. (No room for the
+        // marker means the log is at capacity, where the next append grows it anyway.)
+        if (_writeOffset + EntryHeaderSize <= _capacity)
+            Unsafe.AsRef<MetricWalEntryHeader>(data + _writeOffset).Generation = 0;
+
         Unsafe.AsRef<WalFileHeader>(_ptr).WriteOffset = FileHeaderSize + _writeOffset;
 
         // The pool is only reclaimable once nothing references it. Survivors still carry

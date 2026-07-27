@@ -56,10 +56,13 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     private readonly MetricWriteAheadLog _wal;
 
     /// <summary>
-    /// Serialises "log the point, then publish it" against a flush taking its snapshot.
-    /// Held only for those two steps and for the drain — never while files are written.
+    /// Makes "log the point, then publish it" atomic against a flush taking its snapshot.
+    /// Ingest holds it shared and stays parallel — concurrent ingests are already safe
+    /// against each other (a concurrent dictionary plus a per-series lock, which is how this
+    /// worked before the log existed); only the drain needs exclusion, and it holds the lock
+    /// for the drain alone, never while files are written.
     /// </summary>
-    private readonly Lock _snapshotLock = new();
+    private readonly ReaderWriterLockSlim _snapshotLock = new();
 
     // ── Hot tier ─────────────────────────────────────────────────────────────
     private readonly ConcurrentDictionary<SeriesKey, HotSeries> _hot = new();
@@ -175,10 +178,10 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
         // Logging a point and making it visible must be one step with respect to a flush's
         // snapshot, or a point that lands between the two would be in neither the files nor
-        // (after the commit) the log — durable nowhere despite the guarantee above. The
-        // section is short: an append is a struct store, and the flush holds this only for
-        // the drain, never for the file write.
-        lock (_snapshotLock)
+        // (after the commit) the log — durable nowhere despite the guarantee above. Held
+        // shared: this excludes the drain, not other ingests, which need no exclusion.
+        _snapshotLock.EnterReadLock();
+        try
         {
             foreach (var item in items)
             {
@@ -197,6 +200,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                 total = ApplyToHotTier(item, in point);
             }
         }
+        finally { _snapshotLock.ExitReadLock(); }
 
         // Exemplars live in their own ring and are not logged, so they stay off that path.
         foreach (var item in items)
@@ -475,7 +479,8 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         // happens after the lock is released, so ingest is never blocked on disk.
         var snapshot = new List<(SeriesKey Key, HotSeries Series)>();
         ulong flushedGeneration;
-        lock (_snapshotLock)
+        _snapshotLock.EnterWriteLock();
+        try
         {
             foreach (var (k, v) in _hot)
             {
@@ -490,6 +495,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
             _hotSince = null;
             flushedGeneration = _wal.BeginFlush();
         }
+        finally { _snapshotLock.ExitWriteLock(); }
 
         try
         {
@@ -507,7 +513,8 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
             // lose them outright. Put them back: the log still holds them, but only a restart
             // would have brought them back, and a transient disk error is not a restart.
             int restored = 0;
-            lock (_snapshotLock)
+            _snapshotLock.EnterWriteLock();
+            try
             {
                 foreach (var (key, snap) in snapshot)
                 {
@@ -521,6 +528,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                 System.Threading.Interlocked.Add(ref _hotPointCount, restored);
                 if (restored > 0) _hotSince ??= DateTime.UtcNow;
             }
+            finally { _snapshotLock.ExitWriteLock(); }
 
             _logger.LogError(ex,
                 "Failed to flush metric hot tier — {Count} point(s) kept in memory for the next attempt",
@@ -1013,7 +1021,8 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         catch (OperationCanceledException) { }
         _cts.Dispose();
         _coldLock.Dispose();
-        _wal.Dispose();   // after the loop's final flush, which resets it
+        _snapshotLock.Dispose();
+        _wal.Dispose();   // after the loop's final flush, which commits it
     }
 
     // ── IRetentionTarget ──────────────────────────────────────────────────────
