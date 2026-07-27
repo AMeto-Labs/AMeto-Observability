@@ -31,11 +31,29 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 {
     // ── Configuration ─────────────────────────────────────────────────────────
     private const int HotFlushThreshold    = 500_000;   // total points before forced flush
-    // 60 s bounds the crash data-loss window to about a minute (the hot tier has
-    // no WAL); traces flush every 30 s, logs are WAL-protected. The raw-file churn
-    // this causes is absorbed by the per-pass raw compaction in the rollup loop.
-    private const int FlushIntervalSeconds  = 60;
+    // Durability belongs to the WAL now, so this is a CHECK interval, not a flush interval:
+    // a tick decides whether the tier has earned its files. It used to be a flush interval,
+    // sized at 60 s purely to bound crash loss to about a minute — and since a flush writes
+    // one .mts PER METRIC NAME, a 40-instrument deployment paid 40 files a minute for that.
+    private const int FlushCheckIntervalSeconds = 60;
     private const int MaxLabelValuesPerKey  = 2_000;      // cap to bound catalog memory
+
+    // ── Flush policy ──────────────────────────────────────────────────────────
+    // Below the minimum the tier keeps accumulating: the points are already durable, and a
+    // file per metric name is not worth writing for a handful of them. The age bound still
+    // lands a trickle on disk so it becomes eligible for rollup and retention — one hour
+    // matches the rollup's own first cutoff, so nothing waits longer because of this.
+    private const int MinFlushPoints = 50_000;
+    private static readonly TimeSpan MaxHotAge = TimeSpan.FromHours(1);
+
+    /// <summary>When the hot tier last went from empty to holding points. Null = empty.</summary>
+    private DateTime? _hotSince;
+
+    /// <summary>
+    /// Write-ahead log for the hot tier. Every point lands here before it is visible to a
+    /// query, so an unflushed tier survives a crash without a file per metric per minute.
+    /// </summary>
+    private readonly MetricWriteAheadLog _wal;
 
     // ── Hot tier ─────────────────────────────────────────────────────────────
     private readonly ConcurrentDictionary<SeriesKey, HotSeries> _hot = new();
@@ -75,6 +93,13 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         _dataDir = dataDir;
         _logger  = logger;
         Directory.CreateDirectory(dataDir);
+
+        // The WAL, unlike cold-segment discovery, must be open and replayed before the first
+        // point is accepted, or a restart would interleave recovered and live data. Replay is
+        // a sequential walk of one mmap'd file bounded by the flush thresholds.
+        _wal = MetricWriteAheadLog.Open(Path.Combine(dataDir, "metrics.wal"));
+        RecoverFromWal();
+
         // Cold-segment discovery + catalog seeding read every .mts file — far too
         // heavy for the startup path (it ran before Kestrel bound the port). The
         // flush loop performs it as its first act in the background instead:
@@ -83,15 +108,65 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         _rollupTask = Task.Run(RollupLoopAsync);
     }
 
+    /// <summary>
+    /// Rebuilds the hot tier from the log left behind by an unclean shutdown. Recovered
+    /// points are NOT written back to the log — they are already in it, and it keeps
+    /// appending after the last valid entry.
+    /// </summary>
+    private void RecoverFromWal()
+    {
+        List<MetricWriteAheadLog.RecoveredPoint> recovered;
+        int unresolved;
+        try { recovered = _wal.ReadAll(out unresolved); }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Metric WAL replay failed — continuing with an empty hot tier");
+            return;
+        }
+
+        if (unresolved > 0)
+            _logger.LogWarning("Metric WAL: {Count} point(s) referenced a series missing from the pool and were skipped",
+                unresolved);
+        if (recovered.Count == 0) return;
+
+        long oldestNano = long.MaxValue;
+        foreach (var r in recovered)
+        {
+            var item = new MetricIngestItem
+            {
+                Name              = r.Name,
+                Kind              = r.Kind,
+                Unit              = r.Unit,
+                Labels            = r.Labels,
+                TimestampUnixNano = r.Point.TimestampUnixNano,
+                BucketBounds      = r.Bounds,
+                // Exemplars are not logged (see MetricWriteAheadLog) — a flush never
+                // persisted them either, so replay restores exactly what a flush would have.
+            };
+            ApplyToHotTier(item, r.Point);
+            if (r.Point.TimestampUnixNano > 0 && r.Point.TimestampUnixNano < oldestNano)
+                oldestNano = r.Point.TimestampUnixNano;
+        }
+
+        // Date the tier by the data, not by this restart: leaving _hotSince at "now" would
+        // restart the MaxHotAge clock on every start, so a crash-restart loop could keep
+        // points out of a file indefinitely. Clamped to now, because the timestamp comes
+        // from the client and a skewed clock must not push the tier into the future.
+        if (oldestNano is > 0 and < long.MaxValue)
+        {
+            var at = DateTimeOffset.FromUnixTimeMilliseconds(oldestNano / 1_000_000L).UtcDateTime;
+            _hotSince = at < DateTime.UtcNow ? at : DateTime.UtcNow;
+        }
+
+        _logger.LogInformation("Recovered {Count} metric point(s) from the write-ahead log", recovered.Count);
+    }
+
     // ── IMetricIngester ───────────────────────────────────────────────────────
 
     public void Ingest(ReadOnlySpan<MetricIngestItem> items)
     {
         foreach (var item in items)
         {
-            var key    = new SeriesKey(item.Name, item.Kind, item.Unit, item.Labels);
-            var series = _hot.GetOrAdd(key, _ => new HotSeries());
-
             var point = new MetricDataPoint
             {
                 TimestampUnixNano = item.TimestampUnixNano,
@@ -103,8 +178,12 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                 BucketCounts      = item.BucketCounts,   // preserved for real percentiles + heatmap
             };
 
-            series.Append(point, item.BucketBounds);
-            UpdateMeta(item);
+            // Write-ahead: the point is durable before it is queryable, which is what lets
+            // the flush wait for a batch worth one .mts per metric name instead of running
+            // on a timer purely so a crash cannot lose a minute of data.
+            _wal.Append(item, in point);
+
+            int total = ApplyToHotTier(item, in point);
 
             if (item.Exemplars is { Length: > 0 } exs)
             {
@@ -120,7 +199,6 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                     });
             }
 
-            int total = System.Threading.Interlocked.Increment(ref _hotPointCount);
             if (total >= HotFlushThreshold
                 && System.Threading.Interlocked.CompareExchange(ref _thresholdFlushScheduled, 1, 0) == 0)
             {
@@ -131,6 +209,24 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                 });
             }
         }
+    }
+
+    /// <summary>
+    /// Files one point into its series and the metadata catalog, returning the new hot-tier
+    /// point count. Shared by live ingest and WAL replay — replay must not write back into
+    /// the log it is reading from, and must not trigger a flush from the constructor.
+    /// </summary>
+    private int ApplyToHotTier(MetricIngestItem item, in MetricDataPoint point)
+    {
+        var key    = new SeriesKey(item.Name, item.Kind, item.Unit, item.Labels);
+        var series = _hot.GetOrAdd(key, static _ => new HotSeries());
+
+        series.Append(point, item.BucketBounds);
+        UpdateMeta(item);
+
+        int total = System.Threading.Interlocked.Increment(ref _hotPointCount);
+        if (total == 1) _hotSince = DateTime.UtcNow;   // tier went from empty to holding data
+        return total;
     }
 
     private void UpdateMeta(MetricIngestItem item)
@@ -327,12 +423,28 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
         while (!ct.IsCancellationRequested)
         {
-            try { await Task.Delay(TimeSpan.FromSeconds(FlushIntervalSeconds), ct); }
+            try { await Task.Delay(TimeSpan.FromSeconds(FlushCheckIntervalSeconds), ct); }
             catch (OperationCanceledException) { break; }
-            await FlushHotTierAsync();
+            await FlushIfDueAsync();
         }
-        // Final flush on shutdown
+        // Final flush on shutdown — unconditional, so a clean stop leaves nothing to replay.
         await FlushHotTierAsync();
+    }
+
+    /// <summary>
+    /// Flushes only when the hot tier has earned its files: enough points to be worth one
+    /// <c>.mts</c> per metric name, or old enough that it should become rollup- and
+    /// retention-eligible regardless. Points below both bars stay in memory, durable through
+    /// the WAL and fully queryable — every read path consults the hot tier.
+    /// </summary>
+    private async Task FlushIfDueAsync()
+    {
+        int points = Volatile.Read(ref _hotPointCount);
+        if (points == 0) return;
+
+        bool due = points >= MinFlushPoints
+                || (_hotSince is { } since && DateTime.UtcNow - since >= MaxHotAge);
+        if (due) await FlushHotTierAsync().ConfigureAwait(false);
     }
 
     private async Task FlushHotTierAsync()
@@ -353,6 +465,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         if (snapshot.Count == 0) return;
 
         System.Threading.Interlocked.Exchange(ref _hotPointCount, 0);
+        _hotSince = null;
 
         try
         {
@@ -366,8 +479,32 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         }
         catch (Exception ex)
         {
-            _logger.LogError(ex, "Failed to flush metric hot tier");
+            // The points were drained out of _hot before the write, so a failure here used to
+            // lose them outright. Put them back: the log still holds them, but only a restart
+            // would have brought them back, and a transient disk error is not a restart.
+            int restored = 0;
+            foreach (var (key, snap) in snapshot)
+            {
+                var live = _hot.GetOrAdd(key, static _ => new HotSeries());
+                foreach (var p in snap.GetPoints(long.MinValue, long.MaxValue))
+                {
+                    live.Append(p, snap.Bounds);
+                    restored++;
+                }
+            }
+            System.Threading.Interlocked.Add(ref _hotPointCount, restored);
+            if (restored > 0) _hotSince ??= DateTime.UtcNow;
+
+            _logger.LogError(ex,
+                "Failed to flush metric hot tier — {Count} point(s) kept in memory for the next attempt",
+                restored);
+            return;   // the log keeps its generation, so a crash before the retry still recovers
         }
+
+        // Files are on disk — the log has nothing left to protect. A new generation is what
+        // lets recovery tell these now-cold points from anything appended afterwards.
+        try { _wal.Reset(); }
+        catch (Exception ex) { _logger.LogWarning(ex, "Metric WAL reset failed after flush"); }
 
         await Task.CompletedTask;
     }
@@ -847,6 +984,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         catch (OperationCanceledException) { }
         _cts.Dispose();
         _coldLock.Dispose();
+        _wal.Dispose();   // after the loop's final flush, which resets it
     }
 
     // ── IRetentionTarget ──────────────────────────────────────────────────────
