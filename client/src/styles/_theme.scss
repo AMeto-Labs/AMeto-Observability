@@ -69,7 +69,13 @@
   --shadow-sm: 0 2px 8px rgba(0, 0, 0, .35);
   --shadow: 0 6px 24px rgba(0, 0, 0, .45);
 
-  --nav-w: 52px;
+  /* Wide enough for the longest nav label. At 52px the label box was 32px while
+     "Reference" measures 50.2px at 10px/500 — so five of the eight labels (Traces,
+     Metrics, Settings, Sign out and Reference worst at +18px) rendered past the
+     item's padding box, and .nav-item--active paints its background on that box:
+     the selected entry showed its text hanging outside its own highlight.
+     72px leaves 54px of label room — see .nav-item/.nav-label in nav.scss. */
+  --nav-w: 72px;
   --panel-w: 264px;
   --toolbar-h: 44px;
   --radius: 6px;
