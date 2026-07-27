@@ -565,17 +565,28 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     private const int SeriesChunk = 512;
 
     /// <summary>
-    /// Rewrites ONE metric's source files, transforming each series' points, with
-    /// peak retained memory bounded by <see cref="SeriesChunk"/> — independent of
-    /// the metric's cardinality.
+    /// Rewrites ONE metric's source files, transforming each series' points, with the
+    /// retained <em>point</em> volume bounded by <see cref="SeriesChunk"/> series. That
+    /// is the bound that matters — points are what scale with time and dominate the
+    /// heap. It is NOT fully independent of cardinality: <c>keys</c>/<c>seen</c>/
+    /// <c>bounds</c> below hold one entry per series for the whole rewrite (a key is a
+    /// name + kind + unit + <see cref="LabelSet"/>, tens of bytes, so 40k series cost
+    /// single-digit MB against the hundreds of MB of points this avoids).
     ///
-    /// <para>A metric with more series than the chunk is processed in several
-    /// passes: pass 0 collects the key set (the points it decodes are transient
-    /// gen0 garbage, never retained), then each chunk re-reads the sources and
-    /// keeps only its own series. Re-reading costs LZ4 decompression, which on a
-    /// background path is far cheaper than retaining hundreds of MB and paying
-    /// for it in blocking gen2 collections. Metrics that fit in one chunk take
-    /// the single-pass path and read each file exactly once.</para>
+    /// <para>A metric with more series than the chunk is processed in several passes:
+    /// pass 0 collects the key set (its points are decoded one series at a time by
+    /// <see cref="MetricReader"/> and dropped immediately), then each chunk re-reads the
+    /// sources and keeps only its own series. Chunk boundaries are deliberately NOT
+    /// aligned to source files even though <see cref="SeriesChunk"/> equals the writer's
+    /// per-file cap: file membership is insertion order at write time, so the same series
+    /// lands in different file slots across time windows, and the sources being merged
+    /// here are of mixed vintage (pre-cap files carry unbounded series counts). Pairing
+    /// by file index would silently split a series across two outputs. Re-reading costs
+    /// LZ4 decompression on a background path — cheaper than retaining hundreds of MB and
+    /// paying for it in blocking gen2 collections. The reader rents its compressed and
+    /// decompressed buffers from <see cref="System.Buffers.ArrayPool{T}"/>, so the extra
+    /// passes do not churn the LOH (this process runs workstation GC, which never
+    /// compacts it). Metrics that fit in one chunk read each file exactly once.</para>
     /// </summary>
     internal List<MetricSegmentInfo> RewriteMetricInChunks(
         List<MetricSegmentInfo> segs,
