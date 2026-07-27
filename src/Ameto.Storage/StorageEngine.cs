@@ -173,10 +173,32 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         int flushSlots = Math.Clamp((int)(FlushNativeBudgetBytes / tierFootprint), flushWidth, 64);
         _flushSlots = new SemaphoreSlim(flushSlots, flushSlots);
 
+        // Report the ceilings these settings actually produce, not just the inputs — an
+        // explicit HotTier.FlushConcurrency override raises them, and that should be
+        // visible in the journal rather than inferred.
+        long managedCeiling = (long)flushWidth * perFlushManaged;
+        long nativeCeiling  = (long)flushSlots * tierFootprint;
+
         _logger.LogInformation(
-            "Flush budgets: width={Width} (×{PerFlush} MB managed), slots={Slots} (×{Tier} MB native), tier={Events} events / {Payload} MB payload",
-            flushWidth, perFlushManaged / 1048576, flushSlots, tierFootprint / 1048576,
+            "Flush budgets: width={Width} (×{PerFlush} MB managed = {ManagedCeiling} MB), " +
+            "slots={Slots} (×{Tier} MB native = {NativeCeiling} MB), tier={Events} events / {Payload} MB payload",
+            flushWidth, perFlushManaged / 1048576, managedCeiling / 1048576,
+            flushSlots, tierFootprint / 1048576, nativeCeiling / 1048576,
             eventCapacity, _options.HotTier.MaxSizeBytes / 1048576);
+
+        // Both clamps are floored so at least one flush can always proceed. That floor
+        // WINS over the budget: at a large MaxSizeBytes a single tier no longer fits, and
+        // the engine quietly runs above the ceiling rather than refusing to start. The
+        // budget is a target, not a guarantee — say so instead of letting the line above
+        // read like one.
+        if (perFlushManaged > FlushManagedBudgetBytes || tierFootprint > FlushNativeBudgetBytes)
+            _logger.LogWarning(
+                "A single flush of a {Payload} MB tier ({PerFlush} MB managed + {Tier} MB native) does not fit " +
+                "the flush budget ({ManagedBudget} MB managed / {NativeBudget} MB native). One flush must always " +
+                "be allowed to run, so these budgets cannot be honoured at this tier size — peak RAM will exceed " +
+                "them. Lower HotTier.MaxSizeBytes to bring the peak down.",
+                _options.HotTier.MaxSizeBytes / 1048576, perFlushManaged / 1048576, tierFootprint / 1048576,
+                FlushManagedBudgetBytes / 1048576, FlushNativeBudgetBytes / 1048576);
         _idGen    = new EventIdGenerator(_options.NodeId);
         _dataDir  = _options.DataDirectory;
         _walDir   = Path.Combine(_dataDir, "wal");
@@ -896,7 +918,25 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
             var segId   = new SegmentId(reserved);
             var segPath = BuildSegmentPath(segId, tier);
-            var info    = await FlushToColdAsync(tier, segId, segPath, ct);
+
+            // Take a flush slot for the heavy phase. A merge runs the SAME index build +
+            // compress + write pipeline as an ingest flush, and its batch budgets are
+            // deliberately sized to mirror one (see MergeTargetPayloadBytes) — so it costs
+            // about one flush's worth of managed memory, ~140 MB at the 100k-event cap.
+            // Running it outside _flushConcurrency meant the ceiling logged at startup
+            // (width × per-flush managed) was not the ceiling actually enforced: a
+            // maintenance pass could add another concurrent index build on top of an
+            // already-saturated flush path. Gating here makes the reported budget real.
+            //
+            // _flushSlots is deliberately NOT taken. That gate is the ingest back-pressure
+            // signal — acquired non-blocking, and a miss means "stop swapping hot tiers" —
+            // so parking compaction behind it would let sustained ingest starve the sweep
+            // that keeps the segment count down. The merge tier's own native footprint is
+            // already bounded by MergeMaxEvents / MergeTargetPayloadBytes.
+            SegmentInfo info;
+            await _flushConcurrency.WaitAsync(ct).ConfigureAwait(false);
+            try     { info = await FlushToColdAsync(tier, segId, segPath, ct); }
+            finally { _flushConcurrency.Release(); }
 
             // Manifest before publication: if we crash mid-deletion, startup
             // recovery deletes the remaining source files instead of serving

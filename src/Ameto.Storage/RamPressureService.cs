@@ -45,7 +45,7 @@ public sealed class RamPressureService : BackgroundService
         {
             try
             {
-                int pct = GetSystemRamPercent();
+                int pct = GetSystemRamPercent(out bool scopedToThisProcess);
 
                 // Memory attribution snapshot — lets us split process RSS into
                 // managed heap vs. native hot tier from the journal without
@@ -71,17 +71,29 @@ public sealed class RamPressureService : BackgroundService
                     // would flush its tier, force a blocking compacting gen2 and empty its
                     // working set every cooldown forever, no matter how little it held: a
                     // self-inflicted CPU-and-RSS sawtooth caused entirely by OTHER processes.
-                    // Requiring a tier's worth of reclaimable memory makes the response
-                    // proportional to what this process can actually give back.
                     long reclaimable = _storage.HotTierAllocatedBytes + gc.HeapSizeBytes;
                     long floor       = Math.Max(64L * 1024 * 1024, _options.HotTier.MaxSizeBytes);
 
-                    if (reclaimable < floor)
+                    // A tier's worth of reclaimable memory is necessary but nowhere near
+                    // sufficient on a host-wide reading: this server's managed heap alone
+                    // clears a 64 MB floor almost from startup, so that test passes even when
+                    // the process holds a rounding error of the machine's RAM and the flush is
+                    // pure waste. When the number we are reacting to describes the WHOLE host,
+                    // also require that giving our memory back would move it by at least one
+                    // percentage point. Under a cgroup limit the reading is genuinely about
+                    // this container, so the floor alone governs.
+                    long hostTotal = gc.TotalAvailableMemoryBytes;
+                    long needed    = scopedToThisProcess || hostTotal <= 0
+                        ? floor
+                        : Math.Max(floor, hostTotal / 100);
+
+                    if (reclaimable < needed)
                     {
                         _logger.LogDebug(
-                            "RAM pressure at {Pct}% but only {Reclaimable} MB is reclaimable here " +
-                            "(floor {Floor} MB) — the pressure is not ours; skipping flush.",
-                            pct, reclaimable / MB, floor / MB);
+                            "RAM pressure at {Pct}% ({Scope}) but only {Reclaimable} MB is reclaimable here " +
+                            "(need {Needed} MB to be worth a flush) — the pressure is not ours; skipping.",
+                            pct, scopedToThisProcess ? "this container" : "whole host",
+                            reclaimable / MB, needed / MB);
                     }
                     else if (DateTimeOffset.UtcNow - lastFlush >= _cooldown)
                     {
@@ -132,12 +144,26 @@ public sealed class RamPressureService : BackgroundService
     /// treat a high reading as evidence that this process is responsible; see the
     /// reclaimable-memory guard in <see cref="ExecuteAsync"/>.</para>
     /// </summary>
-    public static int GetSystemRamPercent()
+    public static int GetSystemRamPercent() => GetSystemRamPercent(out _);
+
+    /// <inheritdoc cref="GetSystemRamPercent()"/>
+    /// <param name="scopedToThisProcess">
+    /// <c>true</c> when the figure came from a cgroup limit and therefore describes THIS
+    /// container's usage against its own ceiling — pressure this process can relieve.
+    /// <c>false</c> when it fell back to whole-machine load, where a high reading may be
+    /// entirely someone else's doing. Callers that take corrective action must branch on
+    /// this; callers that merely display the number (diagnostics) can ignore it.
+    /// </param>
+    public static int GetSystemRamPercent(out bool scopedToThisProcess)
     {
         if (TryGetCgroupMemoryPercent(out int pct))
+        {
+            scopedToThisProcess = true;
             return pct;
+        }
 
         // Fallback: GC's view of physical memory (host RAM when uncontained).
+        scopedToThisProcess = false;
         var info  = GC.GetGCMemoryInfo();
         long total = info.TotalAvailableMemoryBytes;
         if (total <= 0) return 0;

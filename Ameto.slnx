@@ -10,12 +10,16 @@
     <Project Path="src/Ameto.Replication/Ameto.Replication.csproj" />
     <Project Path="src/Ameto.Server/Ameto.Server.csproj" />
     <Project Path="src/Ameto.Storage/Ameto.Storage.csproj" />
+    <Project Path="src/Ameto.Tracing/Ameto.Tracing.csproj" />
     <Project Path="src/Serilog.Sinks.Ameto/Serilog.Sinks.Ameto.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/Ameto.Core.Tests/Ameto.Core.Tests.csproj" />
     <Project Path="tests/Ameto.Indexing.Tests/Ameto.Indexing.Tests.csproj" />
+    <Project Path="tests/Ameto.Integration.Tests/Ameto.Integration.Tests.csproj" />
+    <Project Path="tests/Ameto.Perf/Ameto.Perf.csproj" />
     <Project Path="tests/Ameto.Query.Tests/Ameto.Query.Tests.csproj" />
+    <Project Path="tests/Ameto.Storage.Tests/Ameto.Storage.Tests.csproj" />
   </Folder>
   <Folder Name="/tools/">
     <Project Path="tools/loggen/loggen.csproj" />

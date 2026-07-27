@@ -52,6 +52,8 @@ Ameto:
     FileEnabled: true
     FileMinimumLevel: "Information"   # Trace|Debug|Information|Warning|Error|Critical
     FileRetainDays: 7                 # written to {DataDirectory}/logs/ameto-YYYYMMDD.log
+                                      # (pruned on the date in the file name, so a gap in
+                                      #  uptime does not keep stale files alive)
 
   HotTier:
     # Maximum size of the in-memory hot tier before it is flushed to disk.
@@ -65,6 +67,11 @@ Ameto:
     # the smaller of (cores / 2) and what the 640 MB index-build budget affords —
     # at the default tier that is 3. Raise for more flush throughput at the cost of
     # peak RAM (~175 MB per concurrent flush); lower on memory-constrained hosts.
+    #
+    # The budget is a TARGET, not a guarantee. One flush must always be able to run,
+    # so if a single tier's index build already exceeds the budget (a large
+    # MaxSizeBytes), the engine runs above it and logs a warning at startup. The
+    # effective ceilings are printed on the "Flush budgets:" line either way.
     FlushConcurrency: 0
 
   Indexing:
