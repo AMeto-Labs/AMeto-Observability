@@ -281,6 +281,84 @@ public sealed class SpanFormatV3Tests : IDisposable
             [Seg("big1", 0, 1, spans: 50_000), Seg("big2", 1, 2, spans: 50_000)]));
     }
 
+    /// <summary>
+    /// Batches are restricted to one size tier. Merging purely by age let a single
+    /// accumulator absorb every new arrival hour after hour, rewriting all of its spans
+    /// each time — ~9 spans written per span retained. Same-magnitude batching makes a
+    /// file roughly double per merge, so a span is rewritten O(log) times.
+    /// </summary>
+    [Fact]
+    public void CompactionBatch_MergesOnlyComparableSizes()
+    {
+        const long Hour = 3600L * 1_000_000_000;
+        static SpanSegmentInfo Seg(string name, long minH, long maxH, int spans) => new()
+        {
+            FilePath = name, MinStartNano = minH * Hour, MaxStartNano = maxH * Hour,
+            SpanCount = spans, FormatVersion = 3,
+        };
+
+        // The small pair merges; the accumulator is left alone rather than rewriting
+        // 5 000 spans to absorb 40.
+        var batch = TraceStorageEngine.SelectCompactionBatch(
+            [Seg("acc", 0, 1, 5_000), Seg("s1", 1, 2, 20), Seg("s2", 2, 3, 20)]);
+        Assert.Equal(["s1", "s2"], batch.Select(s => s.FilePath));
+
+        // A lone straggler beside the accumulator costs no rewrite at all.
+        Assert.Empty(TraceStorageEngine.SelectCompactionBatch(
+            [Seg("acc", 0, 1, 5_000), Seg("s1", 1, 2, 20)]));
+
+        // Peers inside one tier still merge even when their counts differ.
+        var mates = TraceStorageEngine.SelectCompactionBatch(
+            [Seg("a", 0, 1, 300), Seg("b", 1, 2, 900)]);          // both in [256, 1024)
+        Assert.Equal(["a", "b"], mates.Select(s => s.FilePath));
+
+        // …and stop merging across the boundary.
+        Assert.Empty(TraceStorageEngine.SelectCompactionBatch(
+            [Seg("a", 0, 1, 300), Seg("b", 1, 2, 2_000)]));       // tier 4 vs tier 5
+
+        // Age still wins inside a tier: the oldest eligible pair goes first.
+        var oldest = TraceStorageEngine.SelectCompactionBatch(
+            [Seg("young1", 10, 11, 20), Seg("old1", 0, 1, 20), Seg("old2", 1, 2, 20)]);
+        Assert.Equal("old1", oldest[0].FilePath);
+    }
+
+    /// <summary>
+    /// Candidates are ordered by MinStartNano, but the window is tested on MaxStartNano,
+    /// which is not monotonic in that order. Abandoning the scan at the first out-of-window
+    /// segment therefore strands peers that sit well inside it — and once batches are also
+    /// filtered by size tier, matches are sparse enough that a single wide segment could
+    /// make a pass select nothing at all.
+    /// </summary>
+    [Fact]
+    public void CompactionBatch_IsNotBlockedByAWideSegment()
+    {
+        const long Hour = 3600L * 1_000_000_000;
+        static SpanSegmentInfo Seg(string name, long minH, long maxH, int spans) => new()
+        {
+            FilePath = name, MinStartNano = minH * Hour, MaxStartNano = maxH * Hour,
+            SpanCount = spans, FormatVersion = 3,
+        };
+
+        var picked = TraceStorageEngine.SelectCompactionBatch(
+        [
+            Seg("a",    0,  1,  500),      // tier 4, inside the window
+            Seg("wide", 1,  30, 9_000),    // spans 30 h, still under the 10k threshold
+            Seg("c",    2,  3,  500),      // tier 4, deep inside the window
+        ]);
+
+        Assert.Equal(["a", "c"], picked.Select(s => s.FilePath));
+
+        // The wide segment is still excluded from a batch it does not fit — the window is
+        // enforced per candidate, not abandoned.
+        var far = TraceStorageEngine.SelectCompactionBatch(
+        [
+            Seg("a",    0,  1,  500),
+            Seg("wide", 1,  30, 500),      // same tier now, but 30 h wide
+            Seg("c",    2,  3,  500),
+        ]);
+        Assert.Equal(["a", "c"], far.Select(s => s.FilePath));
+    }
+
     // ── Legacy v2 writer (copied from the pre-v3 SpanWriter, indices trimmed) ──
 
     private static void WriteV2File(string filePath, IList<SpanRecord> spans)

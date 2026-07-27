@@ -41,6 +41,25 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     private const int MaxSegmentsPerPass   = 20;       // merge at most N oldest small segments per run
     private const int MaxSpansPerPass      = 200_000;  // hard cap on spans loaded into memory per run
 
+    // ── Flush policy ──────────────────────────────────────────────────────────
+    // Durability belongs to the WAL, not to the segment writer, so a timed flush no
+    // longer has to run just to avoid losing spans. A .trc costs a sort, LZ4-HC over the
+    // blocks and the trace index, four index structures and a .stats sidecar — that is a
+    // price worth paying for a real batch and pure waste for five spans. Below the
+    // minimum the hot tier simply keeps accumulating; the hard age bound still lands a
+    // trickle on disk so it becomes eligible for compaction and retention.
+    private const int MinSegmentSpans = 500;
+    private static readonly TimeSpan MaxHotAge = TimeSpan.FromHours(1);
+
+    /// <summary>When the oldest span currently in the hot tier arrived. Null = tier empty.</summary>
+    private DateTime? _hotSince;
+
+    /// <summary>
+    /// Write-ahead log for the hot tier. Every span lands here before it is visible in
+    /// memory, so an unflushed tier survives a crash without a segment per 30 seconds.
+    /// </summary>
+    private readonly SpanWriteAheadLog _wal;
+
     public TraceStorageEngine(string dataDir, ILogger<TraceStorageEngine> logger)
     {
         _dataDir = dataDir;
@@ -50,11 +69,85 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         // runs before Kestrel binds, and scanning thousands of .trc files would
         // delay ingest availability. TraceCompactionWorker calls
         // LoadColdSegments() in the background right after startup.
+
+        // The WAL, by contrast, must be open and replayed before the first span is
+        // accepted, or a restart would interleave recovered and live spans. Replay is a
+        // sequential walk of one mmap'd file bounded by the flush thresholds, so it costs
+        // milliseconds even at the 50k ceiling.
+        _wal = SpanWriteAheadLog.Open(Path.Combine(dataDir, "spans.wal"));
+        RecoverFromWal();
+    }
+
+    /// <summary>
+    /// Rebuilds the hot tier from the log left behind by an unclean shutdown. Recovered
+    /// spans are NOT re-appended to the log — they are already in it, and the log keeps
+    /// writing after the last valid entry.
+    /// </summary>
+    private void RecoverFromWal()
+    {
+        List<SpanIngestItem> recovered;
+        try { recovered = _wal.ReadAll(); }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Span WAL replay failed — continuing with an empty hot tier");
+            return;
+        }
+
+        if (recovered.Count == 0) return;
+
+        _lock.EnterWriteLock();
+        try
+        {
+            for (int i = 0; i < recovered.Count; i++)
+                AddToHotTierLocked(recovered[i]);
+
+            // Date the tier by the data, not by this restart. Leaving _hotSince at "now"
+            // restarts the MaxHotAge clock on every start, so a crash-restart loop could
+            // keep spans out of a segment indefinitely. Clamped to now because the start
+            // time is the client's to report, and a skewed clock must not push the tier
+            // into the future — an implausibly old one merely flushes a little early.
+            DateTime oldest = DateTime.UtcNow;
+            for (int i = 0; i < recovered.Count; i++)
+            {
+                long nano = recovered[i].StartTimeUnixNano;
+                if (nano <= 0) continue;
+                var at = DateTimeOffset.FromUnixTimeMilliseconds(nano / 1_000_000L).UtcDateTime;
+                if (at < oldest) oldest = at;
+            }
+            _hotSince = oldest;
+        }
+        finally { _lock.ExitWriteLock(); }
+
+        _logger.LogInformation("Recovered {Count} span(s) from the write-ahead log", recovered.Count);
     }
 
     // ── Ingestion (called by SpanDrainer) ─────────────────────────────────────
 
     internal void WriteSpan(SpanIngestItem item)
+    {
+        _lock.EnterWriteLock();
+        try
+        {
+            // Write-ahead: the span is durable before it is queryable. Held under the same
+            // write lock as the hot tier so a flush can never interleave with an append —
+            // that ordering is what lets Reset's watermark be trusted on recovery.
+            _wal.Append(item);
+            AddToHotTierLocked(item);
+
+            if (_hotSpans.Count >= HotFlushThreshold)
+                FlushHotTierLocked();
+        }
+        finally
+        {
+            _lock.ExitWriteLock();
+        }
+    }
+
+    /// <summary>
+    /// Materialises a span into the hot tier and its trace index. Shared by live ingest
+    /// and WAL replay — replay must not append to the log it is reading from.
+    /// </summary>
+    private void AddToHotTierLocked(SpanIngestItem item)
     {
         var record = new SpanRecord
         {
@@ -73,26 +166,17 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                                     : null,
         };
 
-        _lock.EnterWriteLock();
-        try
-        {
-            int offset = _hotSpans.Count;
-            _hotSpans.Add(record);
+        int offset = _hotSpans.Count;
+        _hotSpans.Add(record);
 
-            if (!_traceIdx.TryGetValue(item.TraceId, out var offsets))
-            {
-                offsets = new List<int>(4);
-                _traceIdx[item.TraceId] = offsets;
-            }
-            offsets.Add(offset);
-
-            if (_hotSpans.Count >= HotFlushThreshold)
-                FlushHotTierLocked();
-        }
-        finally
+        if (!_traceIdx.TryGetValue(item.TraceId, out var offsets))
         {
-            _lock.ExitWriteLock();
+            offsets = new List<int>(4);
+            _traceIdx[item.TraceId] = offsets;
         }
+        offsets.Add(offset);
+
+        _hotSince ??= DateTime.UtcNow;
     }
 
     // ── Query ─────────────────────────────────────────────────────────────────
@@ -101,6 +185,15 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         TraceId traceId,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
+        // A span can legitimately reach a reader twice. The WAL replays spans into the hot
+        // tier that a segment written just before the crash may already hold, and a crash
+        // between a compaction's merge write and its source deletion leaves the same spans
+        // in two cold files. Span id identifies a span within a trace in the OTel model, so
+        // a second copy is one span reported twice and the waterfall must show it once.
+        // Empty ids are never folded together: a producer that omits the field would
+        // otherwise collapse every such span into one, which is data loss, not de-duplication.
+        var seen = new HashSet<ulong>();
+
         // Hot tier
         _lock.EnterReadLock();
         List<SpanRecord>? hotResults = null;
@@ -120,7 +213,10 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
 
         if (hotResults != null)
             foreach (var r in hotResults.OrderBy(s => s.StartTimeUnixNano))
+            {
+                if (!r.SpanId.IsEmpty && !seen.Add(r.SpanId.RawValue)) continue;
                 yield return r;
+            }
 
         // Cold tier — scan the snapshot in parallel (bounded): a by-id lookup has
         // no time bounds, so every segment must be consulted, and doing that
@@ -166,7 +262,10 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                 cold.AddRange(part);
 
         foreach (var r in cold.OrderBy(s => s.StartTimeUnixNano))
+        {
+            if (!r.SpanId.IsEmpty && !seen.Add(r.SpanId.RawValue)) continue;
             yield return r;
+        }
     }
 
     /// <summary>Drops a segment whose file no longer exists from the snapshot.</summary>
@@ -199,6 +298,10 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
 
         int yielded = 0;
 
+        // Same duplicate sources as GetTraceAsync, but results here cross traces, so the
+        // identity is the pair. Bounded by `limit`, which also bounds this set.
+        var seen = new HashSet<(TraceId Trace, ulong Span)>();
+
         // Hot tier (newest first)
         _lock.EnterReadLock();
         List<SpanRecord>? candidates = null;
@@ -225,6 +328,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
 
         foreach (var r in candidates)
         {
+            if (!r.SpanId.IsEmpty && !seen.Add((r.TraceId, r.SpanId.RawValue))) continue;
             if (yielded++ >= limit) yield break;
             yield return r;
         }
@@ -263,6 +367,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                     _logger.LogWarning(ex, "Span search: skipping unreadable segment {File}", seg.FilePath);
                     break;
                 }
+                if (!r.SpanId.IsEmpty && !seen.Add((r.TraceId, r.SpanId.RawValue))) continue;
                 if (yielded++ >= limit) yield break;
                 yield return r;
             }
@@ -272,10 +377,8 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     // ── Flush ─────────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Flushes the in-memory hot tier to a cold segment. No-op when empty.
-    /// Thread-safe — called periodically by <see cref="Ingestion.SpanDrainer"/> so
-    /// spans are not stranded in RAM (and lost on restart) under low-traffic loads
-    /// that never reach <see cref="HotFlushThreshold"/>.
+    /// Unconditionally flushes the in-memory hot tier to a cold segment. No-op when empty.
+    /// Used on shutdown and by tests; the periodic path is <see cref="FlushIfDue"/>.
     /// </summary>
     internal void FlushHotTier()
     {
@@ -284,24 +387,52 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         finally { _lock.ExitWriteLock(); }
     }
 
+    /// <summary>
+    /// Flushes only when the hot tier has earned a segment: enough spans to be worth the
+    /// index build and compression, or old enough that it should become compactable and
+    /// retention-eligible regardless. Called on <see cref="Ingestion.SpanDrainer"/>'s tick;
+    /// spans that do not meet either bar stay in memory, durable through the WAL.
+    /// </summary>
+    internal void FlushIfDue()
+    {
+        _lock.EnterWriteLock();
+        try
+        {
+            if (_hotSpans.Count == 0) return;
+            bool due = _hotSpans.Count >= MinSegmentSpans
+                    || (_hotSince is { } since && DateTime.UtcNow - since >= MaxHotAge);
+            if (due) FlushHotTierLocked();
+        }
+        finally { _lock.ExitWriteLock(); }
+    }
+
     private void FlushHotTierLocked()
     {
         if (_hotSpans.Count == 0) return;
 
+        SpanSegmentInfo info;
         try
         {
-            var info = SpanWriter.Write(_dataDir, _hotSpans);
+            info = SpanWriter.Write(_dataDir, _hotSpans);
             _coldSegments = [.. _coldSegments, info];   // under _lock write (see callers)
             _logger.LogInformation("Flushed {Count} spans to {File}", _hotSpans.Count, info.FilePath);
         }
         catch (Exception ex)
         {
+            // Keep the spans in memory AND in the log: a failed write must not be the
+            // moment we drop the only two copies we have.
             _logger.LogError(ex, "Failed to flush hot-tier spans to cold storage");
             return;
         }
 
+        // Segment is on disk — the log has nothing left to protect. Opening a new generation
+        // is what lets recovery tell these now-cold entries from spans appended afterwards.
+        try { _wal.Reset(); }
+        catch (Exception ex) { _logger.LogWarning(ex, "Span WAL reset failed after flush"); }
+
         _hotSpans.Clear();
         _traceIdx.Clear();
+        _hotSince = null;
     }
 
     // ── Cold segment discovery ─────────────────────────────────────────────────
@@ -365,12 +496,22 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     }
 
     /// <summary>
-    /// Picks the next compaction batch: the oldest small (or legacy-v2) segments
-    /// whose combined time range stays inside a 24-hour window. Trace retention
-    /// deletes a file only when its NEWEST span is past the TTL, so an unbounded
-    /// batch span would keep old spans alive past their deadline — and a merged
-    /// file that stays small on a quiet server would keep re-merging with newer
-    /// files, advancing its MaxStartNano forever and never expiring at all.
+    /// Picks the next compaction batch: the oldest segments of COMPARABLE SIZE whose
+    /// combined time range stays inside a 24-hour window.
+    ///
+    /// <para>Trace retention deletes a file only when its NEWEST span is past the TTL, so
+    /// an unbounded batch span would keep old spans alive past their deadline — and a
+    /// merged file that stays small on a quiet server would keep re-merging with newer
+    /// files, advancing its MaxStartNano forever and never expiring at all. Hence the
+    /// window.</para>
+    ///
+    /// <para>The size tier is what keeps the rewrite bounded. Merging strictly by age let
+    /// one accumulator file absorb every new arrival hour after hour, rewriting all of its
+    /// spans each time, until it finally crossed <see cref="CompactionThreshold"/> — about
+    /// nine bytes written per byte of data retained. Restricting a batch to one tier means
+    /// a file only ever merges with peers of its own magnitude, so it roughly doubles per
+    /// merge and a span is rewritten O(log) times instead of O(n).</para>
+    ///
     /// Empty result = nothing worth compacting.
     /// </summary>
     internal static List<SpanSegmentInfo> SelectCompactionBatch(SpanSegmentInfo[] segments)
@@ -382,21 +523,53 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             .OrderBy(s => s.MinStartNano)
             .ToList();
 
-        // Slide a 24 h window over the ordered candidates; the first window with
-        // ≥2 members (or a lone legacy file needing migration) is the batch.
-        int start = 0;
-        while (start < candidates.Count)
+        // Oldest candidate first, so old data still drains ahead of new. Each seed offers
+        // its own tier and 24 h window; peers outside either are left for a later pass.
+        for (int i = 0; i < candidates.Count; i++)
         {
-            long windowStart = candidates[start].MinStartNano;
-            var window = candidates.Skip(start)
-                .TakeWhile(s => s.MaxStartNano - windowStart <= MaxSpanNanos)
-                .Take(MaxSegmentsPerPass)
-                .ToList();
-            if (window.Count >= 2) return window;
-            if (window.Count == 1 && window[0].FormatVersion < 3) return window;
-            start += Math.Max(1, window.Count);
+            var  seed        = candidates[i];
+            int  tier        = TierOf(seed.SpanCount);
+            long windowStart = seed.MinStartNano;
+
+            var batch = new List<SpanSegmentInfo>(MaxSegmentsPerPass) { seed };
+            for (int j = i + 1; j < candidates.Count && batch.Count < MaxSegmentsPerPass; j++)
+            {
+                var s = candidates[j];
+
+                // MinStartNano is the sort key, so once it clears the window nothing later
+                // can qualify — the only sound place to stop early.
+                if (s.MinStartNano - windowStart > MaxSpanNanos) break;
+
+                // MaxStartNano is NOT monotonic in that order: one wide segment (a long time
+                // range, still under the compaction threshold) says nothing about the ones
+                // behind it. Stopping here would strand same-tier peers that sit well inside
+                // the window — with the tier filter narrowing matches, often to the point of
+                // selecting nothing at all.
+                if (s.MaxStartNano - windowStart > MaxSpanNanos) continue;
+                if (TierOf(s.SpanCount) != tier) continue;                // wrong magnitude
+                batch.Add(s);
+            }
+
+            if (batch.Count >= 2) return batch;
+            // A lone legacy file has no peer to wait for — it is rewritten to migrate it,
+            // not to merge it, so the tier rule does not apply.
+            if (seed.FormatVersion < 3) return [seed];
         }
         return [];
+    }
+
+    /// <summary>
+    /// Size bucket of a segment: <c>floor(log4(spanCount))</c> by integer division, so a
+    /// tier covers a 4× range of sizes. Four is a compromise — a smaller ratio merges more
+    /// eagerly and rewrites more, a larger one leaves more files lying around for queries
+    /// to open.
+    /// </summary>
+    private static int TierOf(int spanCount)
+    {
+        const int TierRatio = 4;
+        int tier = 0;
+        for (int n = Math.Max(1, spanCount); n >= TierRatio; n /= TierRatio) tier++;
+        return tier;
     }
 
     private bool CompactOnePass()
@@ -946,9 +1119,10 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         if (System.Threading.Interlocked.Exchange(ref _disposed, 1) != 0) return;
 
         _lock.EnterWriteLock();
-        try { FlushHotTierLocked(); }
+        try { FlushHotTierLocked(); }   // resets the WAL, so a clean stop leaves nothing to replay
         finally { _lock.ExitWriteLock(); }
         _lock.Dispose();
+        _wal.Dispose();
     }
 
     // ── IRetentionTarget ───────────────────────────────────────────────────
