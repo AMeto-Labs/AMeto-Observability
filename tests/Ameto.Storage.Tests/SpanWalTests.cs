@@ -339,6 +339,81 @@ public sealed class SpanWalTests : IDisposable
         Assert.Equal(1, TrcCount(_dir));                     // still just the pre-existing file
     }
 
+    // ── De-duplication on read ────────────────────────────────────────────────
+
+    /// <summary>
+    /// The crash window this design admits: the segment reached disk, the generation bump
+    /// did not, so replay puts spans back into the hot tier that the segment also holds.
+    /// A waterfall must not show them twice.
+    /// </summary>
+    [Fact]
+    public void A_span_in_both_the_hot_tier_and_a_segment_is_returned_once()
+    {
+        long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+        var traceId   = new TraceId(0xBBBB_0000_0000_0002UL, 42);
+
+        // The segment written just before the crash.
+        SpanWriter.Write(_dir,
+        [
+            new SpanRecord
+            {
+                TraceId = traceId, SpanId = new SpanId(900), StartTimeUnixNano = baseNano,
+                DurationNanos = 1_000_000L, Name = "dup", ServiceName = "MintRoute.API",
+                Kind = SpanKind.Server, Status = SpanStatusCode.Unset,
+            },
+        ]);
+
+        using var engine = new TraceStorageEngine(_dir, NullLogger<TraceStorageEngine>.Instance);
+        engine.LoadColdSegments();
+
+        // The same span replayed into the hot tier, plus one that only exists there.
+        engine.WriteSpan(new SpanIngestItem
+        {
+            TraceId = traceId, SpanId = new SpanId(900), StartTimeUnixNano = baseNano,
+            DurationNanos = 1_000_000L, Name = "dup", ServiceName = "MintRoute.API",
+            Kind = SpanKind.Server, Status = SpanStatusCode.Unset,
+        });
+        engine.WriteSpan(new SpanIngestItem
+        {
+            TraceId = traceId, SpanId = new SpanId(901), StartTimeUnixNano = baseNano + 1_000L,
+            DurationNanos = 1_000_000L, Name = "only-hot", ServiceName = "MintRoute.API",
+            Kind = SpanKind.Client, Status = SpanStatusCode.Unset,
+        });
+
+        var spans = engine.GetTraceAsync(traceId).ToBlockingEnumerable().ToList();
+
+        Assert.Equal(2, spans.Count);
+        Assert.Single(spans, s => s.SpanId.RawValue == 900);
+        Assert.Single(spans, s => s.SpanId.RawValue == 901);
+
+        // The search path returns individual spans too, and folds the same repeat.
+        var found = engine.SearchSpansAsync(
+            from: DateTimeOffset.UtcNow.AddHours(-1), to: DateTimeOffset.UtcNow.AddHours(1))
+            .ToBlockingEnumerable().ToList();
+        Assert.Equal(2, found.Count);
+    }
+
+    [Fact]
+    public void Spans_without_an_id_are_never_folded_together()
+    {
+        // A producer omitting the span id would otherwise collapse every such span into one.
+        // Dropping distinct spans is data loss, not de-duplication.
+        long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+        var traceId   = new TraceId(0xCCCC_0000_0000_0003UL, 7);
+
+        using var engine = new TraceStorageEngine(_dir, NullLogger<TraceStorageEngine>.Instance);
+        for (int i = 0; i < 3; i++)
+            engine.WriteSpan(new SpanIngestItem
+            {
+                TraceId = traceId, SpanId = default, StartTimeUnixNano = baseNano + i * 1_000L,
+                DurationNanos = 1_000_000L, Name = $"no-id-{i}", ServiceName = "MintRoute.API",
+                Kind = SpanKind.Internal, Status = SpanStatusCode.Unset,
+            });
+
+        var spans = engine.GetTraceAsync(traceId).ToBlockingEnumerable().ToList();
+        Assert.Equal(3, spans.Count);
+    }
+
     [Fact]
     public void Unflushed_spans_come_back_after_a_crash()
     {

@@ -58,10 +58,12 @@ namespace Ameto.Tracing.Storage;
 /// zero start time — <c>OtlpTraceStreamParser</c> defaults <c>startTimeUnixNano</c> to 0 when
 /// the field is absent and nothing downstream rejects it.</para>
 ///
-/// <para><b>Known limitation.</b> Spans duplicated by a crash in the window above are
-/// replayed into the hot tier while also living in the flushed segment, and no read path
-/// de-duplicates by span id — such a span would appear twice in a trace waterfall until
-/// retention removes the segment.</para>
+/// <para>Spans duplicated by a crash in the window above are replayed into the hot tier
+/// while also living in the flushed segment. The read paths that return individual spans —
+/// <c>TraceStorageEngine.GetTraceAsync</c> and <c>SearchSpansAsync</c> — drop the repeat by
+/// span id, so a waterfall shows it once. The aggregate paths (trace list, per-service
+/// stats, service graph, volume) do not: they scan unbounded span volumes, where tracking
+/// every id costs far more than the one-span skew it would correct.</para>
 /// </summary>
 internal sealed unsafe class SpanWriteAheadLog : IDisposable
 {

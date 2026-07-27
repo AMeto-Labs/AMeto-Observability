@@ -185,6 +185,15 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         TraceId traceId,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
+        // A span can legitimately reach a reader twice. The WAL replays spans into the hot
+        // tier that a segment written just before the crash may already hold, and a crash
+        // between a compaction's merge write and its source deletion leaves the same spans
+        // in two cold files. Span id identifies a span within a trace in the OTel model, so
+        // a second copy is one span reported twice and the waterfall must show it once.
+        // Empty ids are never folded together: a producer that omits the field would
+        // otherwise collapse every such span into one, which is data loss, not de-duplication.
+        var seen = new HashSet<ulong>();
+
         // Hot tier
         _lock.EnterReadLock();
         List<SpanRecord>? hotResults = null;
@@ -204,7 +213,10 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
 
         if (hotResults != null)
             foreach (var r in hotResults.OrderBy(s => s.StartTimeUnixNano))
+            {
+                if (!r.SpanId.IsEmpty && !seen.Add(r.SpanId.RawValue)) continue;
                 yield return r;
+            }
 
         // Cold tier — scan the snapshot in parallel (bounded): a by-id lookup has
         // no time bounds, so every segment must be consulted, and doing that
@@ -250,7 +262,10 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                 cold.AddRange(part);
 
         foreach (var r in cold.OrderBy(s => s.StartTimeUnixNano))
+        {
+            if (!r.SpanId.IsEmpty && !seen.Add(r.SpanId.RawValue)) continue;
             yield return r;
+        }
     }
 
     /// <summary>Drops a segment whose file no longer exists from the snapshot.</summary>
@@ -283,6 +298,10 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
 
         int yielded = 0;
 
+        // Same duplicate sources as GetTraceAsync, but results here cross traces, so the
+        // identity is the pair. Bounded by `limit`, which also bounds this set.
+        var seen = new HashSet<(TraceId Trace, ulong Span)>();
+
         // Hot tier (newest first)
         _lock.EnterReadLock();
         List<SpanRecord>? candidates = null;
@@ -309,6 +328,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
 
         foreach (var r in candidates)
         {
+            if (!r.SpanId.IsEmpty && !seen.Add((r.TraceId, r.SpanId.RawValue))) continue;
             if (yielded++ >= limit) yield break;
             yield return r;
         }
@@ -347,6 +367,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                     _logger.LogWarning(ex, "Span search: skipping unreadable segment {File}", seg.FilePath);
                     break;
                 }
+                if (!r.SpanId.IsEmpty && !seen.Add((r.TraceId, r.SpanId.RawValue))) continue;
                 if (yielded++ >= limit) yield break;
                 yield return r;
             }
