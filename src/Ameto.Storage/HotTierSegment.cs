@@ -52,6 +52,38 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
     /// <summary>Total NativeMemory bytes allocated per chunk.</summary>
     private static readonly long ChunkTotalBytes  = ChunkHeaderBytes + ChunkPayloadBytes;
 
+    // ── Capacity planning (used by StorageEngine to size its RAM budgets) ──────
+    //
+    // A chunk is allocated WHOLE — ChunkHeaderBytes of header slots plus the full
+    // ChunkPayloadBytes arena — however little of its payload area ends up used.
+    // A tier bounded only by payload bytes therefore has no native ceiling: at a
+    // 64 B average payload, 64 MB of payload needs 1,048,576 slots = 64 chunks =
+    // 576 MB resident, and the old 2,000,000-event cap allowed 123 chunks = 1.1 GB
+    // for a tier configured as "64 MB". StorageEngine's flat 1.4x footprint estimate
+    // was consequently off by up to 17x, and the frozen-tier backlog it sized against
+    // that estimate could not hold its 1 GB budget. Deriving the event cap from the
+    // chunk count instead makes MaxSizeBytes a real bound: native stays within
+    // ChunksFor() * 9 MB no matter how small the events are.
+
+    /// <summary>Chunks needed to hold <paramref name="maxPayloadBytes"/> of payload.</summary>
+    public static int ChunksFor(long maxPayloadBytes) =>
+        (int)Math.Max(1, (maxPayloadBytes + ChunkPayloadBytes - 1) / ChunkPayloadBytes);
+
+    /// <summary>
+    /// Event capacity that keeps a tier within <see cref="ChunksFor"/> chunks. Pair it
+    /// with the same <paramref name="maxPayloadBytes"/> when constructing the tier so
+    /// neither limit can be exceeded without the other stopping the writer first.
+    /// </summary>
+    public static int EventCapacityFor(long maxPayloadBytes) =>
+        ChunksFor(maxPayloadBytes) * ChunkEventCapacity;
+
+    /// <summary>
+    /// Worst-case native bytes a tier built with <see cref="EventCapacityFor"/> can hold —
+    /// payload arenas plus header arrays. This is the number to budget RSS against.
+    /// </summary>
+    public static long NativeBytesFor(long maxPayloadBytes) =>
+        (long)ChunksFor(maxPayloadBytes) * ChunkTotalBytes;
+
     // ── Per-chunk state ───────────────────────────────────────────────────────
 
     // Store arena base pointers as nuint (avoids pointer-in-class-field restriction).

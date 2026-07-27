@@ -64,12 +64,31 @@ public sealed class RamPressureService : BackgroundService
 
                 if (pct > _options.RamTargetPercent)
                 {
-                    if (DateTimeOffset.UtcNow - lastFlush >= _cooldown)
+                    // Only act if flushing would actually free something. GetSystemRamPercent
+                    // falls back to HOST memory load whenever there is no cgroup limit — which
+                    // is always on Windows and on any container started without --memory. A
+                    // busy host therefore kept this branch permanently true, and the server
+                    // would flush its tier, force a blocking compacting gen2 and empty its
+                    // working set every cooldown forever, no matter how little it held: a
+                    // self-inflicted CPU-and-RSS sawtooth caused entirely by OTHER processes.
+                    // Requiring a tier's worth of reclaimable memory makes the response
+                    // proportional to what this process can actually give back.
+                    long reclaimable = _storage.HotTierAllocatedBytes + gc.HeapSizeBytes;
+                    long floor       = Math.Max(64L * 1024 * 1024, _options.HotTier.MaxSizeBytes);
+
+                    if (reclaimable < floor)
+                    {
+                        _logger.LogDebug(
+                            "RAM pressure at {Pct}% but only {Reclaimable} MB is reclaimable here " +
+                            "(floor {Floor} MB) — the pressure is not ours; skipping flush.",
+                            pct, reclaimable / MB, floor / MB);
+                    }
+                    else if (DateTimeOffset.UtcNow - lastFlush >= _cooldown)
                     {
                         _logger.LogWarning(
-                            "RAM pressure: system memory at {Pct}% (target {Target}%). " +
-                            "Flushing hot tier to release memory.",
-                            pct, _options.RamTargetPercent);
+                            "RAM pressure: system memory at {Pct}% (target {Target}%), " +
+                            "{Reclaimable} MB reclaimable. Flushing hot tier to release memory.",
+                            pct, _options.RamTargetPercent, reclaimable / MB);
 
                         await _storage.FlushHotTierAsync(stoppingToken);
 
@@ -104,8 +123,14 @@ public sealed class RamPressureService : BackgroundService
     /// effective limit. When running under a cgroup memory limit (i.e. in a
     /// container) it reports <c>(memory.current − reclaimable page cache) / memory.max</c>,
     /// so memory-mapped cold segments — which the kernel evicts before OOM — do
-    /// not inflate the reading. Falls back to <see cref="GC.GetGCMemoryInfo"/>
-    /// when no cgroup limit is present (bare-metal / non-Linux).
+    /// not inflate the reading.
+    ///
+    /// <para>CAVEAT: the cgroup files are Linux-only AND require a finite limit, so on
+    /// Windows, on bare metal, and in any container started without <c>--memory</c> /
+    /// <c>mem_limit</c>, this falls through to <see cref="GC.GetGCMemoryInfo"/> and reports
+    /// the load of the WHOLE MACHINE — including every unrelated process. Callers must not
+    /// treat a high reading as evidence that this process is responsible; see the
+    /// reclaimable-memory guard in <see cref="ExecuteAsync"/>.</para>
     /// </summary>
     public static int GetSystemRamPercent()
     {

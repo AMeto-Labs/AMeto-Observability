@@ -93,7 +93,13 @@ internal static class SpanBloom
 
         static ulong HashUtf8(ulong h, string s, bool lower)
         {
+            // BOTH buffers must live OUTSIDE the loop. `stackalloc` inside a loop is not
+            // freed per iteration — the frame keeps growing until the method returns
+            // (CA2014). The non-ASCII branch is only "rare" for English text: for Cyrillic,
+            // CJK or any accented input it is taken on EVERY character, so a long message
+            // walked the stack down one allocation per char until the thread overflowed.
             Span<byte> buf = stackalloc byte[128];
+            Span<char> one = stackalloc char[1];
             for (int i = 0; i < s.Length; i++)
             {
                 char c = s[i];
@@ -104,8 +110,8 @@ internal static class SpanBloom
                 }
                 else
                 {
-                    // Rare non-ASCII path — encode the single char.
-                    int n = Encoding.UTF8.GetBytes(stackalloc char[] { c }, buf);
+                    one[0] = c;
+                    int n  = Encoding.UTF8.GetBytes(one, buf);
                     for (int j = 0; j < n; j++) h = (h ^ buf[j]) * Prime;
                 }
             }

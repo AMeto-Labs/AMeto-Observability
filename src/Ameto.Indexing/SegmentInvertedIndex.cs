@@ -196,47 +196,76 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
     {
         lock (_writeLock)
         {
-            using var ms = new MemoryStream();
-            using var bw = new BinaryWriter(ms);
-            byte[] utf8 = System.Buffers.ArrayPool<byte>.Shared.Rent(256);
-            byte[] code = System.Buffers.ArrayPool<byte>.Shared.Rent(1024);
-            try
-            {
-                bw.Write(CodecMagic);          // distinguishes the codec format from a legacy propertyCount
-                bw.Write((uint)_index.Count);
+            // Written through an ArrayBufferWriter sized up front rather than
+            // BinaryWriter-over-MemoryStream: the stream doubles its backing array as it
+            // grows and ms.ToArray() then copies the finished blob a second time, so a
+            // multi-MB index cost two Large Object Heap allocations plus every intermediate
+            // doubling — and the Workstation GC this server runs never compacts the LOH,
+            // so that garbage ratchets the resident set up flush after flush.
+            var w = new System.Buffers.ArrayBufferWriter<byte>(EstimateSerialisedSize());
+            WriteUInt32(w, CodecMagic);        // distinguishes the codec format from a legacy propertyCount
+            WriteUInt32(w, (uint)_index.Count);
 
-                foreach (var (propName, values) in _index)
+            foreach (var (propName, values) in _index)
+            {
+                WriteUtf8(w, propName);
+                WriteUInt32(w, (uint)values.Count);
+
+                foreach (var (valStr, list) in values)
                 {
-                    WriteUtf8(bw, propName, ref utf8);
-                    bw.Write((uint)values.Count);
+                    WriteUtf8(w, valStr);
 
-                    foreach (var (valStr, list) in values)
-                    {
-                        WriteUtf8(bw, valStr, ref utf8);
-
-                        // Encode the ascending offset list with the zero-alloc codec instead of
-                        // RoaringBitmap.Create+Serialize — the flush allocation hot spot.
-                        var offsets = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(list);
-                        int need = SegmentBitmapCodec.MaxEncodedSize(offsets.Length);
-                        if (need > code.Length)
-                        {
-                            System.Buffers.ArrayPool<byte>.Shared.Return(code);
-                            code = System.Buffers.ArrayPool<byte>.Shared.Rent(need);
-                        }
-                        int n = SegmentBitmapCodec.Encode(offsets, code);
-                        bw.Write((uint)n);
-                        bw.Write(code, 0, n);
-                    }
+                    // Encode the ascending offset list with the zero-alloc codec instead of
+                    // RoaringBitmap.Create+Serialize — the flush allocation hot spot.
+                    var offsets = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(list);
+                    var dest    = w.GetSpan(4 + SegmentBitmapCodec.MaxEncodedSize(offsets.Length));
+                    int n       = SegmentBitmapCodec.Encode(offsets, dest[4..]);
+                    BinaryPrimitives.WriteUInt32LittleEndian(dest, (uint)n);
+                    w.Advance(4 + n);
                 }
+            }
 
-                return ms.ToArray();
-            }
-            finally
-            {
-                System.Buffers.ArrayPool<byte>.Shared.Return(utf8);
-                System.Buffers.ArrayPool<byte>.Shared.Return(code);
-            }
+            return w.WrittenSpan.ToArray();
         }
+    }
+
+    /// <summary>Upper-bound estimate so the writer allocates its buffer once: header, then
+    /// per bucket a length-prefixed key and one varint byte per posting (the dense case).</summary>
+    private int EstimateSerialisedSize()
+    {
+        long size = 8;
+        foreach (var (propName, values) in _index)
+        {
+            size += 2 + propName.Length * 3 + 4;
+            foreach (var (valStr, list) in values)
+                size += 2 + valStr.Length * 3 + 4 + list.Count + 8;
+        }
+        return (int)Math.Min(int.MaxValue - 64, size + 64);
+    }
+
+    private static void WriteUInt32(System.Buffers.ArrayBufferWriter<byte> w, uint v)
+    {
+        BinaryPrimitives.WriteUInt32LittleEndian(w.GetSpan(4), v);
+        w.Advance(4);
+    }
+
+    /// <summary>Length-prefixed UTF-8, encoded straight into the writer's buffer.</summary>
+    private static void WriteUtf8(System.Buffers.ArrayBufferWriter<byte> w, string s)
+    {
+        var dest = w.GetSpan(2 + System.Text.Encoding.UTF8.GetMaxByteCount(s.Length));
+        int n    = System.Text.Encoding.UTF8.GetBytes(s, dest[2..]);
+        if (n > ushort.MaxValue)
+        {
+            // The prefix is 16-bit. Writing a truncated COUNT would desynchronise every
+            // subsequent read and corrupt the whole blob; trimming the VALUE on a UTF-8
+            // boundary only costs one over-long index term. Reachable only if the ingest
+            // payload cap (Ingestion.MaxEventPayloadBytes) is raised above 64 KB.
+            n = ushort.MaxValue;
+            var body = dest[2..];
+            while (n > 0 && (body[n] & 0xC0) == 0x80) n--;   // back off continuation bytes
+        }
+        BinaryPrimitives.WriteUInt16LittleEndian(dest, (ushort)n);
+        w.Advance(2 + n);
     }
 
     /// <summary>Legacy RoaringBitmap serialisation — retained only to generate blobs for the
@@ -269,20 +298,6 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
             }
             return ms.ToArray();
         }
-    }
-
-    /// <summary>Writes a length-prefixed UTF-8 string via a reused scratch buffer (no per-call byte[]).</summary>
-    internal static void WriteUtf8(BinaryWriter bw, string s, ref byte[] scratch)
-    {
-        int max = System.Text.Encoding.UTF8.GetMaxByteCount(s.Length);
-        if (max > scratch.Length)
-        {
-            System.Buffers.ArrayPool<byte>.Shared.Return(scratch);
-            scratch = System.Buffers.ArrayPool<byte>.Shared.Rent(max);
-        }
-        int n = System.Text.Encoding.UTF8.GetBytes(s, scratch);
-        bw.Write((ushort)n);
-        bw.Write(scratch, 0, n);
     }
 
     public static SegmentInvertedIndex Deserialise(ReadOnlySpan<byte> data)
