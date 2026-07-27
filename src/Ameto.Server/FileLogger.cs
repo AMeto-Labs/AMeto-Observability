@@ -71,8 +71,10 @@ public sealed class FileLoggerProvider : ILoggerProvider
             }
         }
         catch (OperationCanceledException) { }
-        // Also covers ObjectDisposedException (it derives from InvalidOperationException),
-        // which is what a Dispose racing this enumeration would raise.
+        // Also covers ObjectDisposedException (it derives from InvalidOperationException).
+        // Dispose no longer cancels or disposes anything while this loop is live, so that
+        // race is gone and this is defence in depth rather than the load-bearing handler
+        // it briefly was.
         catch (InvalidOperationException)  { /* collection completed or disposed */ }
         finally
         {
@@ -129,17 +131,25 @@ public sealed class FileLoggerProvider : ILoggerProvider
         try     { drained = _drain.Wait(TimeSpan.FromSeconds(5)); }
         catch   { drained = true; }   // faulted — it is no longer reading the queue
 
-        _cts.Cancel();
-        _cts.Dispose();
-
-        // Reclaim the collection only once nothing can still be enumerating it. A drain
-        // wedged on a slow or full disk outlives the 5 s wait; disposing underneath it
-        // aborts the enumeration mid-backlog, discarding lines that were about to be
-        // written — precisely the shutdown diagnostics most worth keeping. (The drain's
-        // InvalidOperationException handler does swallow the resulting throw, so this is
-        // about not losing the tail of the log, not about an unhandled exception.)
-        // Leaking a BlockingCollection on the way out of the process costs nothing.
-        if (drained) _queue.Dispose();
+        // Tear down ONLY when the drain has actually finished. All three of these kill a
+        // still-running drain, not just the Dispose calls: the enumeration is
+        // GetConsumingEnumerable(_cts.Token), so Cancel ends it at the next MoveNext just
+        // as surely as disposing the collection would — the backlog is dropped either way,
+        // and that backlog is exactly the shutdown diagnostics worth keeping. Disposing the
+        // CTS out from under a live waiter is separately unsafe: GetConsumingEnumerable
+        // waits on the token's handle.
+        //
+        // If the drain is still going (a slow or full disk), leave everything alone.
+        // CompleteAdding has already been called, so it ends by itself once the queue
+        // empties and its finally flushes the writer. It runs on a thread-pool thread and
+        // will not hold up process exit; leaking a CTS and a BlockingCollection on the way
+        // out costs nothing next to losing the last lines written before shutdown.
+        if (drained)
+        {
+            _cts.Cancel();
+            _cts.Dispose();
+            _queue.Dispose();
+        }
     }
 
     private sealed class FileLogger(FileLoggerProvider owner, string category) : ILogger
