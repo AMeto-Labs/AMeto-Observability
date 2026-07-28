@@ -329,15 +329,18 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     }
 
     /// <summary>
-    /// Returns the memory a maintenance burst just used. Maintenance is a
-    /// background, latency-insensitive path, so a compacting gen2 collection plus
-    /// a working-set trim is affordable here — unlike on the ingest/query paths,
-    /// where an induced GC would be visible to clients.
+    /// Returns the memory a maintenance burst just used. The TRIGGER is background,
+    /// but the pause is not: a blocking compacting gen2 stops every thread, ingest
+    /// and query included, so this is visible to clients no matter which thread asks
+    /// for it. Routed through <see cref="AggressiveGcGate"/> so bursts from the other
+    /// maintenance paths can't line up several such pauses back to back; skipping is
+    /// fine — the next natural gen2 reclaims the garbage either way, aggressive
+    /// collection only accelerates handing pages back to the OS.
     /// </summary>
     private static void ReleaseMaintenanceMemory()
     {
-        GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
-        WorkingSetTrimmer.TryTrim();
+        if (AggressiveGcGate.TryCollect(TimeSpan.FromMinutes(2)))
+            WorkingSetTrimmer.TryTrim();
     }
 
     // ── ISegmentProvider ──────────────────────────────────────────────────────

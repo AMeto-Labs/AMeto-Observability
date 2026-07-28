@@ -36,8 +36,22 @@ public static class LogEventSerializer
 
     public static LogEvent Deserialize(ReadOnlySpan<byte> span, EventId id)
     {
-        var sequence = new ReadOnlySequence<byte>(span.ToArray()); // only alloc here
-        return Deserialize(sequence, id);
+        // MessagePackReader needs a Memory/Sequence, the callers hold spans over pooled
+        // segment buffers — a copy is unavoidable, but it can live in the pool instead of
+        // being a fresh byte[] per event (~110 MB of gen0 churn on the query path in a
+        // 7-minute allocation trace). Safe to return in finally: ReadEvent copies every
+        // string, id and raw-property slice into the event's own storage.
+        byte[] rented = ArrayPool<byte>.Shared.Rent(span.Length);
+        try
+        {
+            span.CopyTo(rented);
+            var reader = new MessagePackReader(rented.AsMemory(0, span.Length));
+            return ReadEvent(ref reader, id);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(rented);
+        }
     }
 
     // ── Deserialise a batch (array of maps) ─────────────────────────────────
@@ -336,12 +350,20 @@ public static class LogEventSerializer
     public static Dictionary<string, object?>? DeserializePropertiesMap(ReadOnlySpan<byte> span)
     {
         if (span.IsEmpty) return null;
+        // Pooled copy instead of ToArray() — same reasoning as Deserialize(span) above;
+        // ReadMap materialises strings/boxes, nothing references the source buffer after it.
+        byte[] rented = ArrayPool<byte>.Shared.Rent(span.Length);
         try
         {
-            var reader = new MessagePackReader(new System.Buffers.ReadOnlySequence<byte>(span.ToArray()));
+            span.CopyTo(rented);
+            var reader = new MessagePackReader(rented.AsMemory(0, span.Length));
             return ReadMap(ref reader);
         }
         catch { return null; }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(rented);
+        }
     }
 
     private static Dictionary<string, object?> ReadMap(ref MessagePackReader reader)

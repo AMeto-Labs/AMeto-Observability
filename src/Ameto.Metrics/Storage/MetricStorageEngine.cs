@@ -628,9 +628,12 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         if (toRollup5m.Count > 0)  Rollup(toRollup5m, MetricGranularity.FiveMin, TimeSpan.FromMinutes(5));
         if (toRollup1h.Count > 0)  Rollup(toRollup1h, MetricGranularity.OneHour, TimeSpan.FromHours(1));
 
-        // Hand the pass's peak back to the OS instead of letting it ratchet up
-        // across passes. This is a background path — an induced GC is affordable.
-        GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
+        // Hand the pass's peak back to the OS instead of letting it ratchet up across
+        // passes. Gated: the pause of a blocking compacting gen2 hits every thread in
+        // the process, and without coordination this call and StorageEngine's
+        // maintenance collect landed 8 s apart mid-load — the two longest pauses in a
+        // 7-minute GC trace. Skipping under the gate is harmless (see AggressiveGcGate).
+        AggressiveGcGate.TryCollect(TimeSpan.FromMinutes(2));
 
         return Task.CompletedTask;
     }

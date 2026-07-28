@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Text;
 using K4os.Compression.LZ4;
@@ -201,13 +202,20 @@ internal static class SpanReader
             if (totalBytesRead + compSize > MaxTotalBytes)
                 throw new InvalidDataException($"Total data exceeds {MaxTotalBytes} bytes limit");
 
-            var compBytes = br.ReadBytes((int)compSize);
             totalBytesRead += compSize;
 
+            // Pooled block buffers — see ReadSpansFromFile; compaction reads whole files,
+            // so unpooled blocks here were pure LOH churn on every merge pass.
+            byte[]  comp   = ArrayPool<byte>.Shared.Rent((int)compSize);
+            byte[]? rawBuf = null;
             try
             {
-                var raw = LZ4Pickler.Unpickle(compBytes);
-                var reader = new MessagePackReader(raw);
+                fs.ReadExactly(comp, 0, (int)compSize);
+                int rawLen = LZ4Pickler.UnpickledSize(comp.AsSpan(0, (int)compSize));
+                rawBuf = ArrayPool<byte>.Shared.Rent(rawLen);
+                LZ4Pickler.Unpickle(comp.AsSpan(0, (int)compSize), rawBuf.AsSpan(0, rawLen));
+
+                var reader = new MessagePackReader(rawBuf.AsMemory(0, rawLen));
                 int cnt = reader.ReadArrayHeader();
                 if (cnt > 50_000) // Safety limit for spans per block
                     throw new InvalidDataException($"Block {blockIdx} contains too many spans: {cnt}");
@@ -225,6 +233,11 @@ internal static class SpanReader
             catch (OutOfMemoryException ex)
             {
                 throw new InvalidDataException($"Out of memory while processing block {blockIdx} (size: {compSize} bytes)", ex);
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(comp);
+                if (rawBuf is not null) ArrayPool<byte>.Shared.Return(rawBuf);
             }
             blockIdx++;
         }
@@ -271,15 +284,30 @@ internal static class SpanReader
             }
             else
             {
-                var compBytes = br.ReadBytes((int)compSize);
-                var raw       = LZ4Pickler.Unpickle(compBytes);
-                var reader    = new MessagePackReader(raw);
-                int cnt       = reader.ReadArrayHeader();
-                long prevTs   = 0;
-                for (int i = 0; i < cnt; i++)
-                    result.Add(version >= 3
-                        ? DeserializeSpanV3(ref reader, i == 0, ref prevTs)
-                        : DeserializeSpan(ref reader));
+                // Pooled compressed + decompressed block buffers — every decoded value is
+                // copied out by the span deserialisers, so nothing outlives the loop turn.
+                byte[]  comp   = ArrayPool<byte>.Shared.Rent((int)compSize);
+                byte[]? rawBuf = null;
+                try
+                {
+                    fs.ReadExactly(comp, 0, (int)compSize);
+                    int rawLen = LZ4Pickler.UnpickledSize(comp.AsSpan(0, (int)compSize));
+                    rawBuf = ArrayPool<byte>.Shared.Rent(rawLen);
+                    LZ4Pickler.Unpickle(comp.AsSpan(0, (int)compSize), rawBuf.AsSpan(0, rawLen));
+
+                    var reader  = new MessagePackReader(rawBuf.AsMemory(0, rawLen));
+                    int cnt     = reader.ReadArrayHeader();
+                    long prevTs = 0;
+                    for (int i = 0; i < cnt; i++)
+                        result.Add(version >= 3
+                            ? DeserializeSpanV3(ref reader, i == 0, ref prevTs)
+                            : DeserializeSpan(ref reader));
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(comp);
+                    if (rawBuf is not null) ArrayPool<byte>.Shared.Return(rawBuf);
+                }
             }
 
             blockIdx++;
@@ -304,27 +332,47 @@ internal static class SpanReader
             // v3: the index is one LZ4 block — decompress, then scan.
             br.ReadUInt32(); // uncompSize
             uint compSize = br.ReadUInt32();
-            var  raw      = LZ4Pickler.Unpickle(br.ReadBytes((int)compSize));
 
-            int pos = 0;
-            uint traceCount = BinaryPrimitives.ReadUInt32LittleEndian(raw.AsSpan(pos)); pos += 4;
-            for (uint i = 0; i < traceCount; i++)
+            // Pooled on both sides of the decompress. This runs once per file on EVERY
+            // trace lookup, and both arrays are index-of-the-whole-file sized (hundreds
+            // of KB — straight into the LOH). The previous ReadBytes+Unpickle pair
+            // allocated both fresh each call: ~470 MB of LOH churn in a 7-minute
+            // allocation trace, and the fragmentation that kept forcing compacting GCs.
+            byte[]  comp   = ArrayPool<byte>.Shared.Rent((int)compSize);
+            byte[]? rawBuf = null;
+            try
             {
-                var candidate = TraceId.Parse(raw.AsSpan(pos, 16)); pos += 16;
-                uint offsetCnt = BinaryPrimitives.ReadUInt32LittleEndian(raw.AsSpan(pos)); pos += 4;
-                if (candidate.Equals(traceId))
+                fs.ReadExactly(comp, 0, (int)compSize);
+                int rawLen = LZ4Pickler.UnpickledSize(comp.AsSpan(0, (int)compSize));
+                rawBuf = ArrayPool<byte>.Shared.Rent(rawLen);
+                LZ4Pickler.Unpickle(comp.AsSpan(0, (int)compSize), rawBuf.AsSpan(0, rawLen));
+                ReadOnlySpan<byte> raw = rawBuf.AsSpan(0, rawLen);
+
+                int pos = 0;
+                uint traceCount = BinaryPrimitives.ReadUInt32LittleEndian(raw[pos..]); pos += 4;
+                for (uint i = 0; i < traceCount; i++)
                 {
-                    var offsets = new List<uint>((int)offsetCnt);
-                    for (uint j = 0; j < offsetCnt; j++)
+                    var candidate = TraceId.Parse(raw.Slice(pos, 16)); pos += 16;
+                    uint offsetCnt = BinaryPrimitives.ReadUInt32LittleEndian(raw[pos..]); pos += 4;
+                    if (candidate.Equals(traceId))
                     {
-                        offsets.Add(BinaryPrimitives.ReadUInt32LittleEndian(raw.AsSpan(pos)));
-                        pos += 4;
+                        var offsets = new List<uint>((int)offsetCnt);
+                        for (uint j = 0; j < offsetCnt; j++)
+                        {
+                            offsets.Add(BinaryPrimitives.ReadUInt32LittleEndian(raw[pos..]));
+                            pos += 4;
+                        }
+                        return offsets;
                     }
-                    return offsets;
+                    pos += (int)offsetCnt * 4;
                 }
-                pos += (int)offsetCnt * 4;
+                return [];
             }
-            return [];
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(comp);
+                if (rawBuf is not null) ArrayPool<byte>.Shared.Return(rawBuf);
+            }
         }
 
         uint count = br.ReadUInt32();
