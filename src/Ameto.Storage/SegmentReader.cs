@@ -91,19 +91,6 @@ public sealed class SegmentReader : ISegmentReader
         if (version is < MinSupportedVersion or > MaxSupportedVersion)
             throw new InvalidDataException($"Unsupported segment version {version} in {filePath}; expected {MinSupportedVersion}-{MaxSupportedVersion}. Delete the data directory and restart.");
 
-        Info = new SegmentInfo
-        {
-            Id                = new SegmentId(segId),
-            NodeId            = new NodeId(nodeId),
-            FilePath          = filePath,
-            MinTimestampTicks = minTs,
-            MaxTimestampTicks = maxTs,
-            EventCount        = evCount,
-            MinLevel          = (LogLevel)minLevel,
-            CompressedBytes   = fileSize,
-            UncompressedBytes = fileSize,
-        };
-
         int blockCount = ReadInt32At(_blockIndexOffset);
         _blocks        = new (long, ulong)[blockCount];
         _blockOrdinals = version >= 5 ? new uint[blockCount] : null;
@@ -118,6 +105,28 @@ public sealed class SegmentReader : ISegmentReader
             _blocks[i] = (offset, firstId);
             pos += stride;
         }
+
+        // Honest uncompressed size: every block frame starts with a uint32
+        // uncompressedSize (see ReadAllRaw) — sum them instead of reporting the
+        // compressed file size. The merge planner's co-fit gate relies on this
+        // to spot prop-dense segments that would overflow a tier chunk when
+        // re-packed from slot 0.
+        long uncompressedBytes = 0;
+        foreach (var (blockOffset, _) in _blocks)
+            uncompressedBytes += (uint)ReadInt32At(blockOffset);
+
+        Info = new SegmentInfo
+        {
+            Id                = new SegmentId(segId),
+            NodeId            = new NodeId(nodeId),
+            FilePath          = filePath,
+            MinTimestampTicks = minTs,
+            MaxTimestampTicks = maxTs,
+            EventCount        = evCount,
+            MinLevel          = (LogLevel)minLevel,
+            CompressedBytes   = fileSize,
+            UncompressedBytes = uncompressedBytes,
+        };
     }
 
     public async IAsyncEnumerable<LogEvent> ReadEventsAsync(

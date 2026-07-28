@@ -54,6 +54,12 @@ public sealed class SegmentWriter : IDisposable
     private long _blockIndexOffset;
 
     private int      _eventsWritten;
+    // Sum of the blocks' uncompressed sizes (the uint32 each block frame starts
+    // with). This is the HONEST UncompressedBytes for SegmentInfo — before this,
+    // it was set to the compressed file size, which made the merge planner blind
+    // to prop-dense segments whose payload re-packs to far more than their file
+    // size (the compaction poison-anchor bug).
+    private long     _uncompressedBytes;
     private long     _minTimestamp = long.MaxValue;
     private long     _maxTimestamp = long.MinValue;
     private LogLevel _minLevel     = LogLevel.Fatal;
@@ -201,7 +207,7 @@ public sealed class SegmentWriter : IDisposable
             EventCount        = (uint)_eventsWritten,
             MinLevel          = _minLevel,
             CompressedBytes   = totalSize,
-            UncompressedBytes = totalSize,
+            UncompressedBytes = _uncompressedBytes,
         };
     }
 
@@ -368,7 +374,8 @@ public sealed class SegmentWriter : IDisposable
 
             long blockOffset = _fs.Position;
             _blockIndex.Add((blockOffset, firstEventId, (uint)_eventsFlushed));
-            _eventsFlushed += n;
+            _eventsFlushed     += n;
+            _uncompressedBytes += uncompressedLen;
 
             _bw.Write((uint)uncompressedLen);
             _bw.Write((uint)compressedLen);

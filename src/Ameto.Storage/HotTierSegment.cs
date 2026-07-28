@@ -40,11 +40,13 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
     //   Keep: ChunkEventCapacity * avgPayloadBytes  <=  ChunkPayloadBytes.
     //   At 16384 * 512B = 8 MB this covers structured logs up to ~512 B average.
 
-    /// <summary>Events per chunk. Power-of-2 for fast modulo/division by JIT.</summary>
-    private const int  ChunkEventCapacity = 16_384;
+    /// <summary>Events per chunk. Power-of-2 for fast modulo/division by JIT.
+    /// Public: the merge planner's co-fit gate reasons about this geometry.</summary>
+    public const int  ChunkEventCapacity = 16_384;
 
-    /// <summary>Payload bytes per chunk. 8 MB / 16384 slots = 512 B/event headroom (see invariant above).</summary>
-    private const long ChunkPayloadBytes  = 8 * 1024 * 1024; // 8 MB
+    /// <summary>Payload bytes per chunk. 8 MB / 16384 slots = 512 B/event headroom (see invariant above).
+    /// Public: the merge planner's co-fit gate reasons about this geometry.</summary>
+    public const long ChunkPayloadBytes  = 8 * 1024 * 1024; // 8 MB
 
     /// <summary>Bytes occupied by the header array at the start of every chunk.</summary>
     private static readonly long ChunkHeaderBytes = (long)ChunkEventCapacity * LogEventHeader.SizeOf;

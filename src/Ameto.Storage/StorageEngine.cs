@@ -759,6 +759,16 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     // ── Small-segment merge (compaction) ──────────────────────────────────────
 
     private const long MergeCandidateMaxBytes = 8L * 1024 * 1024;   // only merge segments smaller than this
+    // Co-fit gate: a candidate must fit HALF a tier chunk (payload and slots), so
+    // any TWO candidates always co-fit chunk 0 when re-packed from slot 0. This
+    // makes the "window yields no usable batch" poison-anchor path unreachable
+    // for geometry reasons — a dense flush segment (~8 MB uncompressed props in
+    // a ~4 MB file) used to pass the compressed-size filter, blow the chunk
+    // budget in FittingEventCount, and anchor-skip one window per pass forever.
+    // UncompressedBytes (sum of block sizes, all columns) over-counts the props
+    // payload, so the gate errs conservative — never admits a non-co-fitting pair.
+    private const long MergeCandidateMaxUncompressedBytes = HotTierSegment.ChunkPayloadBytes / 2;
+    private const uint MergeCandidateMaxEvents            = HotTierSegment.ChunkEventCapacity / 2;
     // Batch budgets deliberately mirror a NORMAL flush (hot tier: 64 MB / ~80k
     // events). A merge runs the same pipeline — raw events in managed memory, a
     // copy into the native tier, then an inverted+trigram+bloom index build over
@@ -802,7 +812,10 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         // class. Every group gets a chance — an exhausted oldest group must not
         // starve the others.
         var groups = _segments.Values
-            .Where(s => s.CompressedBytes < MergeCandidateMaxBytes && !_mergeSkip.Contains(s.Id.Value))
+            .Where(s => s.CompressedBytes < MergeCandidateMaxBytes
+                     && s.UncompressedBytes <= MergeCandidateMaxUncompressedBytes
+                     && s.EventCount <= MergeCandidateMaxEvents
+                     && !_mergeSkip.Contains(s.Id.Value))
             .GroupBy(s => policy.GetTtl(s.MinLevel))
             .Select(g => g.OrderBy(s => s.MinTimestampTicks).ToList())
             .Where(g => g.Count >= 2)
