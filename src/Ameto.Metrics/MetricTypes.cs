@@ -17,7 +17,8 @@ public enum MetricKind : byte
 
 /// <summary>
 /// Immutable, comparable set of label key-value pairs.
-/// Stored sorted by key so two identical label sets have the same hash.
+/// Stored sorted by key, then by value, so two identical label sets have the same hash
+/// regardless of the order their pairs arrived in.
 /// </summary>
 public sealed class LabelSet : IEquatable<LabelSet>
 {
@@ -28,10 +29,37 @@ public sealed class LabelSet : IEquatable<LabelSet>
 
     public LabelSet(IEnumerable<KeyValuePair<string, string>> labels)
     {
-        _labels = labels
-            .Select(kv => (kv.Key, kv.Value))
-            .OrderBy(t => t.Key, StringComparer.Ordinal)
-            .ToArray();
+        // Materialise once and sort in place. The obvious LINQ shape —
+        // Select(...).OrderBy(...).ToArray() — allocates a projection iterator, an
+        // EnumerableSorter, its index array and a comparison delegate for EVERY label set,
+        // and a label set is built per ingested point AND again per series on every rollup
+        // chunk pass. An allocation trace put that chain at ~10 MB/min on an idle server.
+        if (labels is ICollection<KeyValuePair<string, string>> c)
+        {
+            _labels = new (string Key, string Value)[c.Count];
+            int i = 0;
+            foreach (var kv in labels) _labels[i++] = (kv.Key, kv.Value);
+            // Count and enumeration can disagree if the source is mutated concurrently.
+            // Yielding MORE throws above, which is loud and fine; yielding fewer would leave
+            // trailing (null, null) pairs that sort and hash without complaining — a
+            // silently wrong LabelSet. Trim instead.
+            if (i != _labels.Length) Array.Resize(ref _labels, i);
+        }
+        else
+        {
+            var list = new List<(string Key, string Value)>();
+            foreach (var kv in labels) list.Add((kv.Key, kv.Value));
+            _labels = list.ToArray();
+        }
+
+        // Ordered by key, then value. OrderBy was stable, so duplicate keys used to keep
+        // their arrival order and two equal label sets built from differently-ordered input
+        // hashed differently; comparing the value as well makes the layout canonical.
+        Array.Sort(_labels, static (a, b) =>
+        {
+            int k = string.CompareOrdinal(a.Key, b.Key);
+            return k != 0 ? k : string.CompareOrdinal(a.Value, b.Value);
+        });
 
         var h = new HashCode();
         foreach (var (k, v) in _labels)

@@ -157,7 +157,21 @@ public static class OtlpTraceMapper
         int total = count + resCount;
         if (total == 0) return [];
 
-        var buf = new ArrayBufferWriter<byte>(total * 32);
+        // Size the buffer from the actual strings, not from a flat 32 bytes per pair. Real
+        // attributes are URLs, SQL statements and stack frames, so the flat estimate was
+        // short for most spans and MessagePackWriter grew the writer by repeated
+        // Array.Resize — 6 MB/min of pure copying in an allocation trace. Overshooting
+        // costs one transient array that WrittenMemory.ToArray() discards anyway.
+        int estimate = 8 + resBytes.Length;
+        if (attrs is not null)
+            for (int i = 0; i < attrs.Count; i++)
+            {
+                var kv = attrs[i];
+                if (kv.Key is null) continue;
+                estimate += kv.Key.Length + 5 + EstimateValueBytes(kv.Value);
+            }
+
+        var buf = new ArrayBufferWriter<byte>(estimate);
         var w   = new MessagePackWriter(buf);
         w.WriteMapHeader(total);
         if (resCount > 0) w.WriteRaw(resBytes);   // resource pairs first — span attrs win on collision
@@ -171,6 +185,37 @@ public static class OtlpTraceMapper
             }
         w.Flush();
         return buf.WrittenMemory.ToArray();
+    }
+
+    /// <summary>
+    /// Upper-ish bound on the msgpack size of one value, used only to size the write buffer.
+    /// String lengths are multiplied by 3 because that is the worst case for UTF-8 from
+    /// UTF-16; being generous here trades a slightly larger transient array for not
+    /// re-copying the buffer two or three times as it grows.
+    /// </summary>
+    private static int EstimateValueBytes(OtlpAnyValue? v)
+    {
+        if (v is null) return 1;
+        if (v.StringValue is not null) return v.StringValue.Length * 3 + 5;
+        if (v.BoolValue.HasValue || v.DoubleValue.HasValue) return 9;
+        if (v.IntValue is not null) return 9;
+        if (v.ArrayValue?.Values is { } arr)
+        {
+            int n = 5;
+            for (int i = 0; i < arr.Count; i++) n += EstimateValueBytes(arr[i]);
+            return n;
+        }
+        if (v.KvlistValue?.Values is { } kvl)
+        {
+            int n = 5;
+            for (int i = 0; i < kvl.Count; i++)
+            {
+                var kv = kvl[i];
+                if (kv.Key is not null) n += kv.Key.Length + 5 + EstimateValueBytes(kv.Value);
+            }
+            return n;
+        }
+        return 1;
     }
 
     /// <summary>

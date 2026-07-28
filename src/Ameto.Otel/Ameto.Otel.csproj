@@ -11,6 +11,11 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- OtlpProtoDecoder is internal; its characterisation tests live in Ameto.Integration.Tests. -->
+    <InternalsVisibleTo Include="Ameto.Integration.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\Ameto.Tracing\Ameto.Tracing.csproj" />
     <ProjectReference Include="..\Ameto.Metrics\Ameto.Metrics.csproj" />
     <ProjectReference Include="..\Ameto.Ingestion\Ameto.Ingestion.csproj" />
