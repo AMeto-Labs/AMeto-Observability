@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Text;
 using K4os.Compression.LZ4;
@@ -103,15 +104,20 @@ internal static class SpanWriter
         bw.Write((byte)0); // flags
 
         // ── Span blocks ────────────────────────────────────────────────────────
-        int written = 0;
-        var scratch = new byte[1024 * 1024];
-        var blooms  = new List<byte[]>();
+        // One block buffer for the whole file, reset (not reallocated) per block.
+        // The old shape allocated a fresh 1 MB ArrayBufferWriter per block, grew it
+        // by Array.Resize under large attributes, then copied the whole thing again
+        // with WrittenSpan.ToArray() — three LOH-sized allocations per 4096 spans,
+        // ~145 MB of flush-path LOH churn in a 7-minute allocation trace.
+        int written  = 0;
+        var blockBuf = new ArrayBufferWriter<byte>(1024 * 1024);
+        var blooms   = new List<byte[]>();
 
         while (written < spans.Count)
         {
             int batchCount = Math.Min(BlockSize, spans.Count - written);
             uint blockIdx  = (uint)(written / BlockSize);
-            var block      = WriteBlock(spans, written, batchCount, scratch, blockIdx,
+            var block      = WriteBlock(spans, written, batchCount, blockBuf, blockIdx,
                                         traceIndex, svcBlockMap, svcStats, blooms);
             bw.Write((uint)block.UncompressedSize);
             bw.Write((uint)block.CompressedBytes.Length);
@@ -133,7 +139,9 @@ internal static class SpanWriter
                 idxBw.Write((uint)offsets.Count);
                 foreach (var o in offsets) idxBw.Write(o);
             }
-            var raw        = idxBuf.ToArray();
+            // Compress from the stream's own backing array — ToArray() duplicated the
+            // whole index (LOH-sized on a busy segment) for nothing.
+            var raw        = idxBuf.GetBuffer().AsSpan(0, (int)idxBuf.Length);
             var compressed = LZ4Pickler.Pickle(raw, LZ4Level.L09_HC);
             bw.Write((uint)raw.Length);
             bw.Write((uint)compressed.Length);
@@ -197,15 +205,17 @@ internal static class SpanWriter
         IList<SpanRecord>                        spans,
         int                                      offset,
         int                                      count,
-        byte[]                                   scratch,
+        ArrayBufferWriter<byte>                  bufWriter,
         uint                                     blockIdx,
         Dictionary<TraceId, List<uint>>          traceIndex,
         Dictionary<string, SortedSet<uint>>      svcBlockMap,
         Dictionary<string, MutableServiceStats>  svcStats,
         List<byte[]>                             blooms)
     {
-        var bufWriter = new System.Buffers.ArrayBufferWriter<byte>(scratch.Length);
-        var writer    = new MessagePackWriter(bufWriter);
+        // Caller-owned buffer, reused across blocks: reset the index without
+        // clearing the backing array (Clear() would memset the full capacity).
+        bufWriter.ResetWrittenCount();
+        var writer = new MessagePackWriter(bufWriter);
         writer.WriteArrayHeader(count);
 
         Span<byte> idBuf = stackalloc byte[16];
@@ -290,8 +300,10 @@ internal static class SpanWriter
         blooms.Add(SpanBloom.Build(bloomHashes));
 
         writer.Flush();
-        var raw        = bufWriter.WrittenSpan.ToArray();
+        // Pickle straight from the written span — the ToArray() copy the old code made
+        // here existed only to hand Pickle a byte[] it never kept.
         // HC level: this runs on background flush/compaction threads only.
+        var raw        = bufWriter.WrittenSpan;
         var compressed = LZ4Pickler.Pickle(raw, LZ4Level.L09_HC);
         return (compressed, raw.Length);
     }

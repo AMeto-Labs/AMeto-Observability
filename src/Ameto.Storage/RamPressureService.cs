@@ -118,9 +118,16 @@ public sealed class RamPressureService : BackgroundService
 
                         // Ask the GC to reclaim any freed managed memory, then
                         // release the freed resident pages back to the OS
-                        // (Windows working set + Linux arenas).
-                        GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
-                        WorkingSetTrimmer.TryTrim();
+                        // (Windows working set + Linux arenas). Gated so this can't
+                        // stack a second stop-the-world onto a maintenance pass that
+                        // compacted moments ago. The short interval only ensures
+                        // pressure never waits out the 2-minute maintenance cadence;
+                        // when the gate DOES skip, this cycle still spends its full
+                        // cooldown below — accepted, because the expensive relief
+                        // (the flush) has already happened, and a collect right after
+                        // a maintenance compaction would find little to return.
+                        if (AggressiveGcGate.TryCollect(TimeSpan.FromSeconds(30)))
+                            WorkingSetTrimmer.TryTrim();
 
                         lastFlush = DateTimeOffset.UtcNow;
                     }

@@ -45,6 +45,7 @@ internal static class MetricReader
             MaxNano       = maxNano,
             Granularity   = granularity,
             FormatVersion = version,
+            SizeBytes     = fs.Length,
         };
     }
 

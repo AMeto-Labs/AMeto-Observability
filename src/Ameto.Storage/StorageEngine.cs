@@ -246,6 +246,12 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     {
         const long MaxBytesPerPass = 96L * 1024 * 1024;
         const int  MaxAttempts     = 3;   // per segment; a persistently locked file must not stall the sweep
+        // A pass below the shared floor does NOT get a maintenance release. The idle
+        // steady-state pass recompresses the one or two tiny segments flushed since the
+        // last tick ("saved 0.0 MB") — a day's log showed that shape paying a blocking
+        // compacting gen2 + working-set dump six times an hour, around the clock, with
+        // the working set sawing between ~50 and ~130 MB. The burst worth returning is
+        // proportional to the bytes a pass actually chewed through, so gate on that.
         var attempts = new Dictionary<ulong, int>();
 
         try { await Task.Delay(TimeSpan.FromMinutes(3), ct); } // let startup + catalog load settle
@@ -321,7 +327,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 _logger.LogInformation("Recompressed {Count} log segment(s), saved {Mb:F1} MB",
                     done, savedTotal / 1048576.0);
 
-            if (done > 0) ReleaseMaintenanceMemory();
+            if (done > 0 && passBytes >= AggressiveGcGate.MaintenancePassBytesFloor) ReleaseMaintenanceMemory();
 
             try { await Task.Delay(TimeSpan.FromSeconds(passBytes >= MaxBytesPerPass ? 30 : 600), ct); }
             catch (OperationCanceledException) { break; }
@@ -329,15 +335,18 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     }
 
     /// <summary>
-    /// Returns the memory a maintenance burst just used. Maintenance is a
-    /// background, latency-insensitive path, so a compacting gen2 collection plus
-    /// a working-set trim is affordable here — unlike on the ingest/query paths,
-    /// where an induced GC would be visible to clients.
+    /// Returns the memory a maintenance burst just used. The TRIGGER is background,
+    /// but the pause is not: a blocking compacting gen2 stops every thread, ingest
+    /// and query included, so this is visible to clients no matter which thread asks
+    /// for it. Routed through <see cref="AggressiveGcGate"/> so bursts from the other
+    /// maintenance paths can't line up several such pauses back to back; skipping is
+    /// fine — the next natural gen2 reclaims the garbage either way, aggressive
+    /// collection only accelerates handing pages back to the OS.
     /// </summary>
     private static void ReleaseMaintenanceMemory()
     {
-        GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
-        WorkingSetTrimmer.TryTrim();
+        if (AggressiveGcGate.TryCollect(TimeSpan.FromMinutes(2)))
+            WorkingSetTrimmer.TryTrim();
     }
 
     // ── ISegmentProvider ──────────────────────────────────────────────────────
@@ -873,10 +882,13 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
         // Anti-stall: a window whose anchor can't produce even a 2-segment batch
         // would be re-selected forever — exclude the anchor until restart.
+        // Debug, not Warning: this is the planner's EXPECTED outcome whenever there is
+        // simply nothing to merge (a day's log carried 54 of these, every anchor
+        // different) — at WRN it drowns the signal it was meant to be.
         if (consumed.Count < 2 || events.Count == 0)
         {
             _mergeSkip.Add(candidates[0].Id.Value);
-            _logger.LogWarning("Merge: window anchored at {File} yields no usable batch — anchor skipped",
+            _logger.LogDebug("Merge: window anchored at {File} yields no usable batch — anchor skipped",
                 Path.GetFileName(candidates[0].FilePath));
             return false;
         }
