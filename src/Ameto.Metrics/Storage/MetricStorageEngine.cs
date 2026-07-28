@@ -617,6 +617,12 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         toRollup5m = TakeMetricSlice(toRollup5m);
         toRollup1h = TakeMetricSlice(toRollup1h);
 
+        // Bytes this pass is about to chew through, measured BEFORE the stages run
+        // (they delete/replace the source files). The five lists are disjoint by
+        // construction (granularity/cutoff windows don't overlap), so no double count.
+        long passBytes = SizeOnDisk(toCompact) + SizeOnDisk(toMerge5m) + SizeOnDisk(toMerge1h)
+                       + SizeOnDisk(toRollup5m) + SizeOnDisk(toRollup1h);
+
         if (toCompact.Count >= 2)  CompactSegments(toCompact, MetricGranularity.Raw);
         MergeTier(toMerge5m, MetricGranularity.FiveMin);
         // A merged file expires whole (MaxNano vs the retention cutoff), so its
@@ -629,17 +635,43 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         if (toRollup1h.Count > 0)  Rollup(toRollup1h, MetricGranularity.OneHour, TimeSpan.FromHours(1));
 
         // Hand the pass's peak back to the OS instead of letting it ratchet up across
-        // passes. Gated: the pause of a blocking compacting gen2 hits every thread in
-        // the process, and without coordination this call and StorageEngine's
-        // maintenance collect landed 8 s apart mid-load — the two longest pauses in a
-        // 7-minute GC trace. Skipping under the gate is harmless (see AggressiveGcGate).
-        AggressiveGcGate.TryCollect(TimeSpan.FromMinutes(2));
+        // passes — but only when there WAS a peak. This used to run unconditionally:
+        // a silent blocking compacting gen2 every 5 minutes around the clock, even for
+        // a pass whose every work list was empty. A day's MEM telemetry showed exactly
+        // that shape — the idle CPU sawing 0.2→5% on a drifting 5-minute period with
+        // nothing in the log to explain it, 41 of 46 idle spikes unaccounted for.
+        // Aggressive mode also raises the memory-pressure signal that drains
+        // ArrayPool.Shared, undoing the pooling on the ingest/query hot paths.
+        // The gate interval still applies when the floor is met (see AggressiveGcGate);
+        // without coordination this call and StorageEngine's maintenance collect once
+        // landed 8 s apart mid-load — the two longest pauses in a 7-minute GC trace.
+        if (passBytes >= ReleasePassBytesFloor)
+            AggressiveGcGate.TryCollect(TimeSpan.FromMinutes(2));
 
         return Task.CompletedTask;
     }
 
     /// <summary>Metrics processed per rollup pass (rotating) — bounds peak memory.</summary>
     private const int MaxMetricsPerPass = 4;
+
+    /// <summary>A rollup pass below this does not warrant a compacting gen2 — the
+    /// materialised peak is small enough for the next natural GC to absorb. Mirrors
+    /// the recompress loop's floor in StorageEngine.</summary>
+    private const long ReleasePassBytesFloor = 8L * 1024 * 1024;
+
+    private static long SizeOnDisk(List<MetricSegmentInfo> segments)
+    {
+        long bytes = 0;
+        foreach (var s in segments)
+        {
+            // A file may vanish between catalog snapshot and here (pruning) — that
+            // just means the pass has less to do, not that sizing should fail.
+            try { bytes += new FileInfo(s.FilePath).Length; }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
+        return bytes;
+    }
 
     /// <summary>Round-robin cursor over metric names, so no metric is starved.</summary>
     private int _rollupCursor;
