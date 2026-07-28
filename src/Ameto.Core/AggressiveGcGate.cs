@@ -16,6 +16,14 @@ namespace Ameto.Core;
 /// </summary>
 public static class AggressiveGcGate
 {
+    /// <summary>
+    /// Floor for maintenance passes: below this many source bytes a pass should skip its
+    /// aggressive release entirely — the materialised peak is small enough for the next
+    /// natural gen2 to absorb. Shared by the log-recompress and metric-rollup loops so
+    /// the two policies cannot drift apart silently.
+    /// </summary>
+    public const long MaintenancePassBytesFloor = 8L * 1024 * 1024;
+
     /// <summary><see cref="Environment.TickCount64"/> (ms) of the last collection; 0 = never.</summary>
     private static long _lastCollectMs;
 

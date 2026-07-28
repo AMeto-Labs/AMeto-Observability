@@ -105,6 +105,7 @@ internal static class MetricWriter
                 MaxNano       = maxNano,
                 Granularity   = granularity,
                 FormatVersion = Version,
+                SizeBytes     = new FileInfo(filePath).Length,
             });
         }
 

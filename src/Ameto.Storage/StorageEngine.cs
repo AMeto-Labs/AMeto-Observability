@@ -246,13 +246,12 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     {
         const long MaxBytesPerPass = 96L * 1024 * 1024;
         const int  MaxAttempts     = 3;   // per segment; a persistently locked file must not stall the sweep
-        // Floor below which a pass does NOT get a maintenance release. The idle
+        // A pass below the shared floor does NOT get a maintenance release. The idle
         // steady-state pass recompresses the one or two tiny segments flushed since the
         // last tick ("saved 0.0 MB") — a day's log showed that shape paying a blocking
         // compacting gen2 + working-set dump six times an hour, around the clock, with
         // the working set sawing between ~50 and ~130 MB. The burst worth returning is
         // proportional to the bytes a pass actually chewed through, so gate on that.
-        const long ReleasePassBytesFloor = 8L * 1024 * 1024;
         var attempts = new Dictionary<ulong, int>();
 
         try { await Task.Delay(TimeSpan.FromMinutes(3), ct); } // let startup + catalog load settle
@@ -328,7 +327,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 _logger.LogInformation("Recompressed {Count} log segment(s), saved {Mb:F1} MB",
                     done, savedTotal / 1048576.0);
 
-            if (done > 0 && passBytes >= ReleasePassBytesFloor) ReleaseMaintenanceMemory();
+            if (done > 0 && passBytes >= AggressiveGcGate.MaintenancePassBytesFloor) ReleaseMaintenanceMemory();
 
             try { await Task.Delay(TimeSpan.FromSeconds(passBytes >= MaxBytesPerPass ? 30 : 600), ct); }
             catch (OperationCanceledException) { break; }

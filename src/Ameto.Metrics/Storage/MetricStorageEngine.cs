@@ -617,11 +617,11 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         toRollup5m = TakeMetricSlice(toRollup5m);
         toRollup1h = TakeMetricSlice(toRollup1h);
 
-        // Bytes this pass is about to chew through, measured BEFORE the stages run
-        // (they delete/replace the source files). The five lists are disjoint by
+        // Bytes this pass is about to chew through, from catalog metadata (sized once
+        // at write/load — no per-pass stat calls). The five lists are disjoint by
         // construction (granularity/cutoff windows don't overlap), so no double count.
-        long passBytes = SizeOnDisk(toCompact) + SizeOnDisk(toMerge5m) + SizeOnDisk(toMerge1h)
-                       + SizeOnDisk(toRollup5m) + SizeOnDisk(toRollup1h);
+        long passBytes = TotalSizeBytes(toCompact) + TotalSizeBytes(toMerge5m) + TotalSizeBytes(toMerge1h)
+                       + TotalSizeBytes(toRollup5m) + TotalSizeBytes(toRollup1h);
 
         if (toCompact.Count >= 2)  CompactSegments(toCompact, MetricGranularity.Raw);
         MergeTier(toMerge5m, MetricGranularity.FiveMin);
@@ -645,7 +645,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         // The gate interval still applies when the floor is met (see AggressiveGcGate);
         // without coordination this call and StorageEngine's maintenance collect once
         // landed 8 s apart mid-load — the two longest pauses in a 7-minute GC trace.
-        if (passBytes >= ReleasePassBytesFloor)
+        if (passBytes >= AggressiveGcGate.MaintenancePassBytesFloor)
             AggressiveGcGate.TryCollect(TimeSpan.FromMinutes(2));
 
         return Task.CompletedTask;
@@ -654,22 +654,10 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     /// <summary>Metrics processed per rollup pass (rotating) — bounds peak memory.</summary>
     private const int MaxMetricsPerPass = 4;
 
-    /// <summary>A rollup pass below this does not warrant a compacting gen2 — the
-    /// materialised peak is small enough for the next natural GC to absorb. Mirrors
-    /// the recompress loop's floor in StorageEngine.</summary>
-    private const long ReleasePassBytesFloor = 8L * 1024 * 1024;
-
-    private static long SizeOnDisk(List<MetricSegmentInfo> segments)
+    private static long TotalSizeBytes(List<MetricSegmentInfo> segments)
     {
         long bytes = 0;
-        foreach (var s in segments)
-        {
-            // A file may vanish between catalog snapshot and here (pruning) — that
-            // just means the pass has less to do, not that sizing should fail.
-            try { bytes += new FileInfo(s.FilePath).Length; }
-            catch (IOException) { }
-            catch (UnauthorizedAccessException) { }
-        }
+        foreach (var s in segments) bytes += s.SizeBytes;
         return bytes;
     }
 
@@ -1243,4 +1231,7 @@ public sealed class MetricSegmentInfo
     public MetricGranularity Granularity { get; init; }
     /// <summary>On-disk format version (2 = legacy per-series blocks, 3 = current). Drives v2→v3 migration.</summary>
     public ushort           FormatVersion { get; init; } = 3;
+    /// <summary>On-disk size, captured at write/load time (mirrors <c>SegmentInfo.CompressedBytes</c>) —
+    /// lets the rollup pass budget itself without a stat call per file.</summary>
+    public long             SizeBytes  { get; init; }
 }
