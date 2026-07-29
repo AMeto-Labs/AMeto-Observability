@@ -781,6 +781,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     private const int  MergeMaxSources = 512;
     private const int  MergeMaxEvents  = 100_000;
     private const long MergeMaxSpanTicks = 24L * TimeSpan.TicksPerHour; // retention granularity per merged file
+    private const int  MergeWindowAttempts = 4;  // window re-selections per pass after an anchor skip
 
     /// <summary>
     /// Merges one batch of small, time-adjacent cold segments into a single large
@@ -806,106 +807,130 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         if (IndexBuilder is null && !_allowIndexlessMerge) return false;
 
         var policy = _retentionStore.GetPolicy();
-
-        // Oldest-first so the stable "past" consolidates and stays consolidated;
-        // grouped by retention TTL so a merge never changes any event's expiry
-        // class. Every group gets a chance — an exhausted oldest group must not
-        // starve the others.
-        var groups = _segments.Values
-            .Where(s => s.CompressedBytes < MergeCandidateMaxBytes
-                     && s.UncompressedBytes <= MergeCandidateMaxUncompressedBytes
-                     && s.EventCount <= MergeCandidateMaxEvents
-                     && !_mergeSkip.Contains(s.Id.Value))
-            .GroupBy(s => policy.GetTtl(s.MinLevel))
-            .Select(g => g.OrderBy(s => s.MinTimestampTicks).ToList())
-            .Where(g => g.Count >= 2)
-            .OrderBy(g => g[0].MinTimestampTicks);
-
-        // Bound the batch's time span (two-pointer over each sorted group). A
-        // RECENT window needs MergeMinSources segments (no point churning while
-        // flushes still arrive), but a SETTLED window (older than 48 h) merges
-        // from 2 sources — quiet days produce a handful of tiny age-flush
-        // segments per day, and "not worth it" thresholds would strand them as
-        // unmergeable forever (observed live: ~1,000 files parked this way).
         long settledCutoff = DateTimeOffset.UtcNow.AddHours(-48).UtcTicks;
-        List<SegmentInfo>? window = null;
-        foreach (var group in groups)
-        {
-            int start = 0;
-            while (start <= group.Count - 2)
-            {
-                long windowStart = group[start].MinTimestampTicks;
-                var w = group.Skip(start)
-                    .TakeWhile(s => s.MaxTimestampTicks - windowStart <= MergeMaxSpanTicks)
-                    .Take(MergeMaxSources)
-                    .ToList();
-                int minSources = w.Count > 0 && w[^1].MaxTimestampTicks < settledCutoff
-                    ? 2 : MergeMinSources;
-                if (w.Count >= minSources) { window = w; break; }
-                start += Math.Max(1, w.Count);
-            }
-            if (window is not null) break;
-        }
-        if (window is null) return false;
-        var candidates = window;
 
-        // Read raw events segment-by-segment until a budget is hit. Segments are
-        // consumed whole — a batch never contains part of a segment.
-        var dedup    = new Dictionary<string, string>(StringComparer.Ordinal);
-        var events   = new List<RawSegmentEvent>();
-        var consumed = new List<SegmentInfo>();
-        var segEnds  = new List<int>();  // events.Count after each consumed segment
+        // A skipped window used to burn the whole maintenance pause (600 s) on a
+        // single discarded anchor. Skips are rare now — the co-fit gate makes the
+        // geometric "no usable batch" unreachable, leaving unreadable/empty
+        // segments — so when one happens, re-select immediately. Bounded and
+        // livelock-free: every failed attempt adds to _mergeSkip first, so the
+        // candidate set strictly shrinks.
+        List<SegmentInfo>?     consumed = null;
+        List<RawSegmentEvent>? events   = null;
         long payload = 0;
-        foreach (var seg in candidates)
+        for (int attempt = 0; attempt < MergeWindowAttempts && consumed is null; attempt++)
         {
             ct.ThrowIfCancellationRequested();
-            if (consumed.Count > 0 &&
-                (events.Count >= MergeMaxEvents || payload >= MergeTargetPayloadBytes))
-                break;
-            List<RawSegmentEvent> segEvents;
-            try
+
+            // Oldest-first so the stable "past" consolidates and stays consolidated;
+            // grouped by retention TTL so a merge never changes any event's expiry
+            // class. Every group gets a chance — an exhausted oldest group must not
+            // starve the others. Recomputed per attempt: _mergeSkip may have grown.
+            var groups = _segments.Values
+                .Where(s => s.CompressedBytes < MergeCandidateMaxBytes
+                         && s.UncompressedBytes <= MergeCandidateMaxUncompressedBytes
+                         && s.EventCount <= MergeCandidateMaxEvents
+                         && !_mergeSkip.Contains(s.Id.Value))
+                .GroupBy(s => policy.GetTtl(s.MinLevel))
+                .Select(g => g.OrderBy(s => s.MinTimestampTicks).ToList())
+                .Where(g => g.Count >= 2)
+                .OrderBy(g => g[0].MinTimestampTicks);
+
+            // Bound the batch's time span (two-pointer over each sorted group). A
+            // RECENT window needs MergeMinSources segments (no point churning while
+            // flushes still arrive), but a SETTLED window (older than 48 h) merges
+            // from 2 sources — quiet days produce a handful of tiny age-flush
+            // segments per day, and "not worth it" thresholds would strand them as
+            // unmergeable forever (observed live: ~1,000 files parked this way).
+            List<SegmentInfo>? window = null;
+            foreach (var group in groups)
             {
-                using var reader = SegmentReader.Open(seg.FilePath);
-                segEvents = reader.ReadAllRaw(dedup);
+                int start = 0;
+                while (start <= group.Count - 2)
+                {
+                    long windowStart = group[start].MinTimestampTicks;
+                    var w = group.Skip(start)
+                        .TakeWhile(s => s.MaxTimestampTicks - windowStart <= MergeMaxSpanTicks)
+                        .Take(MergeMaxSources)
+                        .ToList();
+                    int minSources = w.Count > 0 && w[^1].MaxTimestampTicks < settledCutoff
+                        ? 2 : MergeMinSources;
+                    if (w.Count >= minSources) { window = w; break; }
+                    start += Math.Max(1, w.Count);
+                }
+                if (window is not null) break;
             }
-            catch (Exception ex)
+            if (window is null) return false;
+            var candidates = window;
+
+            // Read raw events segment-by-segment until a budget is hit. Segments are
+            // consumed whole — a batch never contains part of a segment.
+            var dedup   = new Dictionary<string, string>(StringComparer.Ordinal);
+            var batch   = new List<RawSegmentEvent>();
+            var sources = new List<SegmentInfo>();
+            var segEnds = new List<int>();  // batch.Count after each consumed segment
+            payload = 0;
+            foreach (var seg in candidates)
             {
-                _logger.LogWarning(ex, "Merge: skipping unreadable segment {File}", seg.FilePath);
+                ct.ThrowIfCancellationRequested();
+                if (sources.Count > 0 &&
+                    (batch.Count >= MergeMaxEvents || payload >= MergeTargetPayloadBytes))
+                    break;
+                List<RawSegmentEvent> segEvents;
+                try
+                {
+                    using var reader = SegmentReader.Open(seg.FilePath);
+                    segEvents = reader.ReadAllRaw(dedup);
+                }
+                catch (Exception ex)
+                {
+                    // Skip-list the segment ITSELF, not just the window's anchor: a
+                    // persistently unreadable file would otherwise be re-opened and
+                    // re-decompressed by every future pass, forever.
+                    _mergeSkip.Add(seg.Id.Value);
+                    _logger.LogWarning(ex, "Merge: skipping unreadable segment {File}", seg.FilePath);
+                    continue;
+                }
+                batch.AddRange(segEvents);
+                foreach (var e in segEvents) payload += e.Props?.Length ?? 0;
+                sources.Add(seg);
+                segEnds.Add(batch.Count);
+            }
+
+            // The tier's chunks hold 16 K event slots / 8 MB payload each — re-packing
+            // prop-dense events from slot 0 can exceed that even though every SOURCE
+            // segment respected it at ingest (live tiers rotate early instead). Trim
+            // the batch to the largest whole-segment prefix that fits the geometry;
+            // an all-or-nothing check would stall the sweep forever on dense days.
+            int fitting = FittingEventCount(batch);
+            int keep = segEnds.Count;
+            while (keep > 0 && segEnds[keep - 1] > fitting) keep--;
+            if (keep < sources.Count)
+            {
+                sources.RemoveRange(keep, sources.Count - keep);
+                batch.RemoveRange(keep == 0 ? 0 : segEnds[keep - 1], batch.Count - (keep == 0 ? 0 : segEnds[keep - 1]));
+            }
+
+            // Anti-stall: a window whose anchor can't produce even a 2-segment batch
+            // would be re-selected forever — exclude the anchor until restart.
+            // Debug, not Warning: this is the planner's EXPECTED outcome whenever there is
+            // simply nothing to merge (a day's log carried 54 of these, every anchor
+            // different) — at WRN it drowns the signal it was meant to be.
+            if (sources.Count < 2 || batch.Count == 0)
+            {
+                _mergeSkip.Add(candidates[0].Id.Value);
+                _logger.LogDebug("Merge: window anchored at {File} yields no usable batch — anchor skipped",
+                    Path.GetFileName(candidates[0].FilePath));
                 continue;
             }
-            events.AddRange(segEvents);
-            foreach (var e in segEvents) payload += e.Props?.Length ?? 0;
-            consumed.Add(seg);
-            segEnds.Add(events.Count);
+            consumed = sources;
+            events   = batch;
         }
+        if (consumed is null || events is null) return false;
 
-        // The tier's chunks hold 16 K event slots / 8 MB payload each — re-packing
-        // prop-dense events from slot 0 can exceed that even though every SOURCE
-        // segment respected it at ingest (live tiers rotate early instead). Trim
-        // the batch to the largest whole-segment prefix that fits the geometry;
-        // an all-or-nothing check would stall the sweep forever on dense days.
-        int fitting = FittingEventCount(events);
-        int keep = segEnds.Count;
-        while (keep > 0 && segEnds[keep - 1] > fitting) keep--;
-        if (keep < consumed.Count)
-        {
-            consumed.RemoveRange(keep, consumed.Count - keep);
-            events.RemoveRange(keep == 0 ? 0 : segEnds[keep - 1], events.Count - (keep == 0 ? 0 : segEnds[keep - 1]));
-        }
-
-        // Anti-stall: a window whose anchor can't produce even a 2-segment batch
-        // would be re-selected forever — exclude the anchor until restart.
-        // Debug, not Warning: this is the planner's EXPECTED outcome whenever there is
-        // simply nothing to merge (a day's log carried 54 of these, every anchor
-        // different) — at WRN it drowns the signal it was meant to be.
-        if (consumed.Count < 2 || events.Count == 0)
-        {
-            _mergeSkip.Add(candidates[0].Id.Value);
-            _logger.LogDebug("Merge: window anchored at {File} yields no usable batch — anchor skipped",
-                Path.GetFileName(candidates[0].FilePath));
-            return false;
-        }
-
+        // NOTE: payload is the PRE-trim sum. A looser tier budget can only prevent
+        // TryWrite rejections, never cause them — do not "tighten" it to the
+        // post-trim sum: the no-reject proof relies on _maxPayloadBytes >= actual.
         var tier = new HotTierSegment(events.Count + 1, payload + (16L << 20));
         try
         {
@@ -1003,14 +1028,12 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// </summary>
     private static int FittingEventCount(List<RawSegmentEvent> events)
     {
-        const int  ChunkEvents  = 16_384;
-        const long ChunkPayload = 8L * 1024 * 1024;
         long chunkBytes = 0;
         for (int i = 0; i < events.Count; i++)
         {
-            if (i % ChunkEvents == 0) chunkBytes = 0;
+            if (i % HotTierSegment.ChunkEventCapacity == 0) chunkBytes = 0;
             chunkBytes += events[i].Props?.Length ?? 0;
-            if (chunkBytes > ChunkPayload) return i;
+            if (chunkBytes > HotTierSegment.ChunkPayloadBytes) return i;
         }
         return events.Count;
     }
@@ -1167,7 +1190,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         {
             try
             {
-                using var reader = SegmentReader.Open(file);
+                using var reader = SegmentReader.Open(file, computeUncompressedBytes: true);
                 var info = reader.Info;
                 _segments[info.Id.Value] = info;
             }
@@ -1278,7 +1301,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     {
         try
         {
-            using var reader = SegmentReader.Open(filePath);
+            using var reader = SegmentReader.Open(filePath, computeUncompressedBytes: true);
             var info = reader.Info;
             _segments[info.Id.Value] = info;
             if (info.Id.Value >= _nextSegmentId)

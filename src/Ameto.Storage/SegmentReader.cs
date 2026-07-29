@@ -39,7 +39,17 @@ public sealed class SegmentReader : ISegmentReader
 
     public SegmentInfo Info { get; }
 
-    public static SegmentReader Open(string filePath)
+    /// <param name="computeUncompressedBytes">
+    /// When true, <see cref="SegmentInfo.UncompressedBytes"/> is the real sum of the
+    /// blocks' uncompressed sizes (one 4-byte read AT each block offset — pages in a
+    /// slice of every block). The merge planner's co-fit gate needs the honest value,
+    /// so the catalog-building call sites (startup scan, replication import) pass
+    /// true. Query/merge-read opens keep the default: they never read the field, and
+    /// paying a page-fault walk over the whole file on every query open would undo
+    /// the header+footer-only open this reader is designed around. With the default,
+    /// UncompressedBytes falls back to the compressed file size (legacy value).
+    /// </param>
+    public static SegmentReader Open(string filePath, bool computeUncompressedBytes = false)
     {
         var fi = new FileInfo(filePath);
         if (!fi.Exists) throw new FileNotFoundException("Segment file not found", filePath);
@@ -50,7 +60,7 @@ public sealed class SegmentReader : ISegmentReader
         try
         {
             view = mmf.CreateViewAccessor(0, fileSize, MemoryMappedFileAccess.Read);
-            return new SegmentReader(filePath, mmf, view, fileSize);
+            return new SegmentReader(filePath, mmf, view, fileSize, computeUncompressedBytes);
         }
         catch
         {
@@ -60,7 +70,8 @@ public sealed class SegmentReader : ISegmentReader
         }
     }
 
-    private SegmentReader(string filePath, MemoryMappedFile mmf, MemoryMappedViewAccessor view, long fileSize)
+    private SegmentReader(string filePath, MemoryMappedFile mmf, MemoryMappedViewAccessor view, long fileSize,
+                          bool computeUncompressedBytes)
     {
         _mmf      = mmf;
         _view     = view;
@@ -110,10 +121,17 @@ public sealed class SegmentReader : ISegmentReader
         // uncompressedSize (see ReadAllRaw) — sum them instead of reporting the
         // compressed file size. The merge planner's co-fit gate relies on this
         // to spot prop-dense segments that would overflow a tier chunk when
-        // re-packed from slot 0.
-        long uncompressedBytes = 0;
-        foreach (var (blockOffset, _) in _blocks)
-            uncompressedBytes += (uint)ReadInt32At(blockOffset);
+        // re-packed from slot 0. Same quantity SegmentWriter accumulates: event
+        // blocks only, index sections excluded — the two sides must agree or a
+        // segment's candidacy would flip across a restart. Opt-in (see Open):
+        // only catalog-building opens pay the block walk.
+        long uncompressedBytes = fileSize;
+        if (computeUncompressedBytes)
+        {
+            uncompressedBytes = 0;
+            foreach (var (blockOffset, _) in _blocks)
+                uncompressedBytes += (uint)ReadInt32At(blockOffset);
+        }
 
         Info = new SegmentInfo
         {
