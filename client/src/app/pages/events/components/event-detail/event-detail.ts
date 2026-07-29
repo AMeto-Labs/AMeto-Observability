@@ -638,6 +638,16 @@ export class EventDetailComponent {
     return `${m.entry.path} ${neq ? '<>' : '='} ${jvLiteral(m.entry.raw)}`;
   }
 
+  /** Opens the full-value modal for the active scalar property — the row clamps
+   *  to one line, so this is the way to read a long value in full. */
+  propViewValue(): void {
+    const m = this.propMenu();
+    if (!m) return;
+    this.valueModal.set({ path: m.entry.path, text: formatFullValue(m.entry.raw) });
+    this.valueModalOpen.set(true);
+    this.propMenu.set(null);
+  }
+
   async propCopyValue(): Promise<void> {
     const m = this.propMenu();
     if (m) await this.writeClipboard(m.entry.value);

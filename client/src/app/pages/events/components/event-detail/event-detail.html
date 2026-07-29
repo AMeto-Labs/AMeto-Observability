@@ -531,7 +531,9 @@
   <app-property-menu
     [x]="m.x" [y]="m.y" [propKey]="m.entry.label" [propValue]="m.entry.value"
     [seekable]="propSeekMs() != null"
+    [viewable]="true"
     crossLabel="Find in traces"
+    (viewValue)="propViewValue()"
     (copyValue)="propCopyValue()"
     (copyKey)="propCopyKey()"
     (seek)="propSeek($event)"

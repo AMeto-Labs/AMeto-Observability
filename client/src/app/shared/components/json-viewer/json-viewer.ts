@@ -1,5 +1,6 @@
 import {
-  Component, input, signal, computed, inject,
+  Component, input, signal, computed, inject, untracked, linkedSignal,
+  afterRenderEffect, viewChild, ElementRef,
   ChangeDetectionStrategy,
 } from '@angular/core';
 import { LucideAngularModule } from 'lucide-angular';
@@ -139,8 +140,19 @@ function highlightJsonLine(json: string): string {
         }
       </span>
     } @else {
-      <span class="jv-leaf">
-        <span [class]="leafClass(value())" [innerHTML]="hl(leafText(value()))"></span>
+      <span class="jv-leaf" [class.jv-leaf--open]="leafExpanded()">
+        @if (oneLine() && (clipped() || leafExpanded())) {
+          <button
+            type="button"
+            class="jv-toggle"
+            (click)="toggleLeaf($event)"
+            [attr.aria-expanded]="leafExpanded()"
+            [title]="leafExpanded() ? 'Collapse' : 'Expand'"
+          >
+            <lucide-icon [name]="leafExpanded() ? 'chevron-down' : 'chevron-right'" [size]="10" />
+          </button>
+        }
+        <span #leafEl [class]="leafTextClass(value())" [innerHTML]="hl(leafText(value()))"></span>
         @if (actions && rootMenu()) {
           <button class="jv-menu-btn" type="button" title="Filter…"
                   (click)="openMenu($event, path(), value(), false)">
@@ -174,9 +186,52 @@ export class JsonViewerComponent {
 
   readonly expanded = signal(false);
 
+  /** The leaf's text span — measured to find out whether the one-line clamp hides anything. */
+  private readonly leafEl = viewChild<ElementRef<HTMLElement>>('leafEl');
+  /** True while the collapsed one-line leaf is wider than its column. */
+  readonly clipped = signal(false);
+  /** Leaf unfolded to its full, wrapped text (the plain-value counterpart of
+   *  {@link expanded}). Re-collapses whenever the bound value changes, so a reused
+   *  row never inherits the previous event's expansion. */
+  readonly leafExpanded = linkedSignal<unknown, boolean>({
+    source: () => this.value(),
+    computation: () => false,
+  });
+
   constructor() {
     // Apply the requested initial state once the input is available.
     queueMicrotask(() => this.expanded.set(this.initialExpanded()));
+
+    // A clamped leaf earns an expand toggle — but only when the clamp actually
+    // hides something. Measured after render (and on every resize) rather than
+    // guessed from the string length: the column is narrow and user-resizable, so
+    // a length threshold would both miss short-but-clipped values and stick a dead
+    // button on values that happen to fit.
+    afterRenderEffect({
+      read: (onCleanup) => {
+        const el = this.leafEl()?.nativeElement;
+        this.value();                          // re-measure when the value changes
+        if (!el || !this.oneLine()) {
+          untracked(() => this.clipped.set(false));
+          return;
+        }
+        const measure = () => untracked(() => {
+          // Expanded text wraps and therefore never overflows — keep the last
+          // collapsed verdict so the toggle cannot vanish under the cursor.
+          if (this.leafExpanded()) return;
+          this.clipped.set(el.scrollWidth > el.clientWidth + 1);
+        });
+        measure();
+        const ro = new ResizeObserver(measure);
+        ro.observe(el);
+        onCleanup(() => ro.disconnect());
+      },
+    });
+  }
+
+  toggleLeaf(e: Event): void {
+    e.stopPropagation();
+    this.leafExpanded.update(x => !x);
   }
 
   /** Full path of an entry, accounting for array-index vs object-key notation. */
@@ -222,6 +277,11 @@ export class JsonViewerComponent {
   /** A child rendered directly (not via a nested viewer) — i.e. a primitive/empty container. */
   isContainerLeaf(v: unknown): boolean {
     return !isContainerValue(v);
+  }
+
+  /** Root-leaf text span: the clamp/expand hook plus the value-type colour. */
+  leafTextClass(v: unknown): string {
+    return `jv-leaf-text ${this.leafClass(v)}`;
   }
 
   leafClass(v: unknown): string {

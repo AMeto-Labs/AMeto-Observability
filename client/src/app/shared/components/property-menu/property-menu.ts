@@ -28,11 +28,15 @@ export class PropertyMenuComponent {
   readonly propValue = input<string>('');
   /** Show the Find section (Search / And / Or). Copy-only fields pass false. */
   readonly findable = input<boolean>(true);
+  /** Show "View full value" — hosts that can render a full-value modal opt in. */
+  readonly viewable = input<boolean>(false);
   /** Show the "Seek window (±)" section — set when the value is a date/timestamp. */
   readonly seekable = input<boolean>(false);
   /** Label for the cross-signal item; null hides it. */
   readonly crossLabel = input<string | null>(null);
 
+  /** Open the host's full-value modal — the row clamps to one line, this shows all of it. */
+  readonly viewValue = output<void>();
   readonly copyValue = output<void>();
   readonly copyKey = output<void>();
   /** Seek the time range to value ± N seconds (payload: seconds). */

@@ -1,6 +1,11 @@
 <div class="prop-menu" [style.left.px]="x()" [style.top.px]="y()" (click)="$event.stopPropagation()">
   <div class="pm-header mono" [title]="propKey() + ' = ' + propValue()">{{ propKey() }}</div>
 
+  @if (viewable()) {
+    <button class="pm-item" (click)="viewValue.emit()">
+      <lucide-icon name="maximize-2" [size]="12" /> View full value
+    </button>
+  }
   <button class="pm-item" (click)="copyValue.emit()">
     <lucide-icon name="copy" [size]="12" /> Copy value
   </button>
