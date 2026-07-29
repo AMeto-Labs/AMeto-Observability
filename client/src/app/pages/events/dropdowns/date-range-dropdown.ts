@@ -98,7 +98,10 @@ export interface DateDropdownController {
             @if (c.timePreset() === 'custom') { <span class="date-sec-badge">custom</span> }
           </div>
 
-          <div class="date-abs-fields">
+          <!-- In custom mode the calendar fills whichever field is "picking" next,
+               so that one blinks (see .date-abs-fields--custom) — with a quick range
+               selected there is nothing to aim at and the highlight stays static. -->
+          <div class="date-abs-fields" [class.date-abs-fields--custom]="c.timePreset() === 'custom'">
             <div class="date-field" [class.picking]="!c.calPickingEnd()" [class.invalid]="c.customFrom() && !c.customFromValid()">
               <span class="date-field-lbl">From</span>
               <div class="date-field-box">

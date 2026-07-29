@@ -394,6 +394,30 @@
   border-color: var(--accent);
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 22%, transparent);
 }
+/* Custom range: the next calendar click lands in the picking field, so pulse it —
+   a static ring reads as decoration, the blink reads as "type/click here next".
+   Skipped while the field is focused (you already found it) and while it is
+   invalid (red must not be overpainted with accent). */
+.date-abs-fields--custom .date-field.picking:not(.invalid) .date-field-box {
+  animation: date-field-blink 1.25s ease-in-out infinite;
+}
+.date-abs-fields--custom .date-field.picking:focus-within .date-field-box { animation: none; }
+
+@keyframes date-field-blink {
+  0%, 100% {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 22%, transparent);
+  }
+  50% {
+    border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 7%, transparent);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .date-abs-fields--custom .date-field.picking .date-field-box { animation: none; }
+}
+
 .date-field.invalid .date-field-box { border-color: var(--lvl-e); }
 .date-field-input {
   flex: 1;
