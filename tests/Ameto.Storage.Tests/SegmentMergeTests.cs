@@ -255,6 +255,103 @@ public sealed class SegmentMergeTests : IAsyncLifetime
         Assert.Equal(9, _engine.ListSegments().Count);
     }
 
+    /// <summary>
+    /// The co-fit gate: a candidate must fit HALF a tier chunk (payload and slots),
+    /// so any two candidates always co-fit chunk 0 when re-packed from slot 0. A
+    /// payload-dense flush segment (~8 MB uncompressed in a ~4 MB file — the real
+    /// sandbox shape) used to pass the compressed-size filter, blow the chunk
+    /// budget and poison one window per pass; now it is simply not a candidate.
+    /// </summary>
+    [Fact]
+    public async Task Merge_ExcludesDenseSegments_FromCandidacy()
+    {
+        long old = DateTime.UtcNow.Ticks - 5 * TimeSpan.TicksPerDay; // settled → 2 sources suffice
+        // Two payload-dense segments: 2500 × ~3.1 KB ≈ 7.8 MB props — over the 4 MB gate.
+        await WriteSegmentAsync(0, 2500, baseTicks: old,                               padBytes: 3072);
+        await WriteSegmentAsync(1, 2500, baseTicks: old + 1 * TimeSpan.TicksPerHour,  padBytes: 3072);
+        // One slot-dense segment: 9000 tiny events — over the 8192-event gate.
+        await WriteSegmentAsync(2, 9000, baseTicks: old + 2 * TimeSpan.TicksPerHour);
+        // Dust — the segments the sweep exists for.
+        await WriteSegmentAsync(3, 50,   baseTicks: old + 3 * TimeSpan.TicksPerHour);
+        await WriteSegmentAsync(4, 50,   baseTicks: old + 4 * TimeSpan.TicksPerHour);
+        Assert.Equal(5, _engine.ListSegments().Count);
+
+        // The catalog must see the HONEST uncompressed size (writer-side F1) —
+        // this is what makes the payload-dense pair visible to the gate at all.
+        var dense = _engine.ListSegments().Where(s => s.EventCount == 2500).ToList();
+        Assert.Equal(2, dense.Count);
+        Assert.All(dense, s => Assert.True(s.UncompressedBytes > 4L * 1024 * 1024,
+            $"dense segment reports {s.UncompressedBytes} B uncompressed — gate would admit it"));
+
+        // The dust merges; the dense segments are left untouched, not poisoning anchors.
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None));
+        var segs = _engine.ListSegments();
+        Assert.Equal(4, segs.Count);
+        Assert.Contains(segs, s => s.EventCount == 100);   // dust consolidated
+        Assert.Equal(2, segs.Count(s => s.EventCount == 2500));
+        Assert.Contains(segs, s => s.EventCount == 9000);
+
+        // Nothing mergeable remains → clean false, no anchor-skip churn.
+        Assert.False(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None));
+    }
+
+    /// <summary>
+    /// An anchor skip must not burn the whole pass: when a selected window yields
+    /// no usable batch (here: its segments are unreadable on disk), the pass
+    /// re-selects the next window instead of returning false for 600 s. Unreadable
+    /// segments are skip-listed individually so they are never re-opened.
+    /// </summary>
+    [Fact]
+    public async Task Merge_RetriesNextWindow_AfterAnchorSkip()
+    {
+        long old = DateTime.UtcNow.Ticks - 6 * TimeSpan.TicksPerDay;
+        // Window 1 (oldest, settled): two segments, both corrupted after flush.
+        await WriteSegmentAsync(0, 50, baseTicks: old);
+        await WriteSegmentAsync(1, 50, baseTicks: old + 1 * TimeSpan.TicksPerHour);
+        // Window 2 (>24 h later, still settled): two healthy segments.
+        await WriteSegmentAsync(2, 50, baseTicks: old + 40 * TimeSpan.TicksPerHour);
+        await WriteSegmentAsync(3, 50, baseTicks: old + 41 * TimeSpan.TicksPerHour);
+
+        var byTime  = _engine.ListSegments().OrderBy(s => s.MinTimestampTicks).ToList();
+        foreach (var victim in byTime.Take(2))
+            File.WriteAllBytes(victim.FilePath, [0xDE, 0xAD, 0xBE, 0xEF]); // magic mismatch
+
+        // One pass: window 1 fails (both sources unreadable → no usable batch),
+        // the retry selects window 2 and merges it — the pass still succeeds.
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None));
+
+        var segs = _engine.ListSegments();
+        Assert.Contains(segs, s => s.EventCount == 100);            // window 2 merged
+        Assert.True(File.Exists(byTime[0].FilePath));               // corrupt files untouched
+        Assert.True(File.Exists(byTime[1].FilePath));
+
+        // Corrupt segments are skip-listed → nothing left to select, clean false.
+        Assert.False(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None));
+    }
+
+    /// <summary>
+    /// Writer-side and reader-side UncompressedBytes must be the SAME quantity
+    /// (sum of event-block uncompressed sizes) — if they drifted, a segment near
+    /// the 4 MB co-fit gate would flip candidacy across a restart. The default
+    /// (cheap) open keeps the legacy file-size fallback: query-path opens never
+    /// pay the block walk.
+    /// </summary>
+    [Fact]
+    public async Task UncompressedBytes_IsHonest_AndRestartStable()
+    {
+        await WriteSegmentAsync(0, 300, padBytes: 512);
+        var info = _engine.ListSegments().Single(); // writer-produced catalog entry
+
+        Assert.True(info.UncompressedBytes > info.CompressedBytes,
+            $"expected uncompressed {info.UncompressedBytes} > compressed {info.CompressedBytes} for compressible padding");
+
+        using var honest = SegmentReader.Open(info.FilePath, computeUncompressedBytes: true);
+        Assert.Equal(info.UncompressedBytes, honest.Info.UncompressedBytes);
+
+        using var cheap = SegmentReader.Open(info.FilePath);
+        Assert.Equal(cheap.Info.CompressedBytes, cheap.Info.UncompressedBytes);
+    }
+
     [Fact]
     public async Task InterruptedMerge_IsFinishedOnRestart()
     {
