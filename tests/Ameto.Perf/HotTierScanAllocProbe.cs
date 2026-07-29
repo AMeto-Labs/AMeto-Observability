@@ -64,8 +64,14 @@ public sealed class HotTierScanAllocProbe
         _out.WriteLine($"old path : {oldBytes / 1024.0:F1} KB allocated");
         _out.WriteLine($"new path : {newBytes / 1024.0:F1} KB allocated  ({(double)oldBytes / newBytes:F1}x less)");
 
-        Assert.True(newBytes * 10 < oldBytes,
-            $"expected ≥10x reduction, got old={oldBytes} new={newBytes}");
+        // Threshold recalibrated from 10x to 4x when materialisation stopped decoding
+        // properties into a dictionary (LogEvent.Properties is lazy; decoders carry the
+        // msgpack through). That made the BASELINE 2.9x cheaper — 10.7 MB -> 3.7 MB for
+        // 20 000 events — while the page path barely moved (653 KB -> 635 KB), so the
+        // measured gap fell to ~5.9x without the page path regressing. The guard still
+        // catches the thing it was written for: a page query that materialises the tier.
+        Assert.True(newBytes * 4 < oldBytes,
+            $"expected ≥4x reduction, got old={oldBytes} new={newBytes}");
     }
 
     private static HotTierSegment BuildTier(StringInternPool pool)

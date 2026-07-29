@@ -348,9 +348,14 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
         byte* payloadPtr  = ChunkPayloadPtr(ci) + h.PropertiesArenaOffset;
         var   payloadSpan = new ReadOnlySpan<byte>(payloadPtr, h.PropertiesByteLength);
 
-        Dictionary<string, object?>? props = null;
-        if (h.PropertiesByteLength > 0)
-            props = Ameto.Core.Serialization.LogEventSerializer.DeserializePropertiesMap(payloadSpan);
+        // Copy the msgpack out instead of decoding it. The arena is native memory owned by
+        // this tier, so a reference could outlive it — but the copy replaces the dictionary
+        // rather than adding to it, which is what made the old note reject copying here.
+        // Delivery re-serialises these bytes straight to JSON; a filter still materialises
+        // a dictionary on demand through LogEvent.Properties.
+        ReadOnlyMemory<byte> rawProps = h.PropertiesByteLength > 0
+            ? payloadSpan.ToArray()
+            : default;
 
         // Prefer the template carried alongside the event; this is robust to pool
         // misses (e.g. after WAL recovery if the pool wasn't reloaded). Fall back
@@ -365,10 +370,7 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
             Level           = h.Level,
             MessageTemplate = template,
             Exception       = GetException(index),
-            Properties      = props,
-            // RawProperties deliberately left empty: nothing on the query path reads it
-            // (only ingest-side LogEvents carry it), and copying every payload made each
-            // hot-tier query re-allocate the entire tier's property bytes.
+            RawProperties   = rawProps,
             TraceIdHi       = h.TraceIdHi,
             TraceIdLo       = h.TraceIdLo,
             SpanId          = h.SpanId,

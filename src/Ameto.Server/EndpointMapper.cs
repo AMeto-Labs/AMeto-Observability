@@ -476,7 +476,7 @@ internal sealed class LogEventDto
     [JsonPropertyName("@tr")]           public string? TraceId        { get; init; }
     [JsonPropertyName("@sp")]           public string? SpanId         { get; init; }
     [JsonPropertyName("service.name")]  public string? ServiceName    { get; init; }
-    [JsonPropertyName("props")]         public Dictionary<string, object?>? Properties { get; init; }
+    [JsonPropertyName("props")]         public EventProps? Properties { get; init; }
 
     public static LogEventDto From(LogEvent ev) => new()
     {
@@ -488,8 +488,55 @@ internal sealed class LogEventDto
         TraceId         = TraceIdHelper.FormatTraceId(ev.TraceIdHi, ev.TraceIdLo),
         SpanId          = TraceIdHelper.FormatSpanId(ev.SpanId),
         ServiceName     = ev.ServiceName,
-        Properties      = ev.Properties,
+        // Raw first: touching ev.Properties would materialise the dictionary this
+        // exists to avoid. Decoders that produce one directly still work.
+        Properties      = !ev.RawProperties.IsEmpty ? new EventProps(ev.RawProperties)
+                        : ev.Properties is { } map  ? new EventProps(map)
+                        : null,
     };
+}
+
+/// <summary>
+/// The <c>props</c> payload as it reaches the serialiser: either the msgpack bytes the
+/// decoder carried through (written straight to JSON by <see cref="EventPropsConverter"/>)
+/// or an already-materialised dictionary.
+/// </summary>
+[JsonConverter(typeof(EventPropsConverter))]
+internal readonly struct EventProps
+{
+    public readonly ReadOnlyMemory<byte>         Raw;
+    public readonly Dictionary<string, object?>? Map;
+
+    public EventProps(ReadOnlyMemory<byte> raw)         { Raw = raw;     Map = null; }
+    public EventProps(Dictionary<string, object?> map)  { Raw = default; Map = map;  }
+}
+
+/// <summary>
+/// Writes <see cref="EventProps"/>. The msgpack branch skips the
+/// dictionary-then-reserialise round trip that dominated the log-scrolling profile;
+/// the dictionary branch delegates to <see cref="DynamicObjectConverter"/> so both
+/// produce identical JSON.
+/// </summary>
+internal sealed class EventPropsConverter : JsonConverter<EventProps>
+{
+    public override EventProps Read(ref Utf8JsonReader reader, Type t, JsonSerializerOptions o)
+        => throw new NotSupportedException();
+
+    public override void Write(Utf8JsonWriter writer, EventProps value, JsonSerializerOptions options)
+    {
+        if (!value.Raw.IsEmpty)
+        {
+            Ameto.Core.Serialization.MsgPackJsonTranscoder.WriteMap(writer, value.Raw);
+            return;
+        }
+        if (value.Map is { } map)
+        {
+            JsonSerializer.Serialize(writer, (object)map, options);
+            return;
+        }
+        writer.WriteStartObject();
+        writer.WriteEndObject();
+    }
 }
 
 /// <summary>JSON-serialisable view of an <see cref="ExceptionInfo"/> tree.</summary>

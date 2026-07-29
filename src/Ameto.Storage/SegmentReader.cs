@@ -436,9 +436,14 @@ public sealed class SegmentReader : ISegmentReader
 
             uint prStart = BinaryPrimitives.ReadUInt32LittleEndian(prOffsets.Slice(i * 4, 4));
             uint prEnd   = BinaryPrimitives.ReadUInt32LittleEndian(prOffsets.Slice((i + 1) * 4, 4));
-            Dictionary<string, object?>? props = prEnd > prStart
-                ? LogEventSerializer.DeserializePropertiesMap(prPayload.Slice((int)prStart, (int)(prEnd - prStart)))
-                : null;
+            // Carry the msgpack through instead of decoding it here. Delivery re-serialises
+            // it straight to JSON, and a filter still gets a dictionary on demand via
+            // LogEvent.Properties — so an unfiltered scroll never builds one. The copy is
+            // required: prPayload points into the block buffer, which goes back to the pool
+            // as soon as this block is decoded.
+            ReadOnlyMemory<byte> rawProps = prEnd > prStart
+                ? prPayload.Slice((int)prStart, (int)(prEnd - prStart)).ToArray()
+                : default;
 
             list.Add(new LogEvent
             {
@@ -447,7 +452,7 @@ public sealed class SegmentReader : ISegmentReader
                 Level           = (LogLevel)lvl,
                 MessageTemplate = mt,
                 Exception       = exc,
-                Properties      = props,
+                RawProperties   = rawProps,
                 TraceIdHi       = trHi,
                 TraceIdLo       = trLo,
                 SpanId          = spId,

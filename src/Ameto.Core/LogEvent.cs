@@ -91,7 +91,28 @@ public sealed class LogEvent
     public required LogLevel Level                       { get; init; }
     public required string MessageTemplate               { get; init; }
     public ExceptionInfo? Exception                      { get; init; }
-    public Dictionary<string, object?>? Properties       { get; init; }
+
+    private Dictionary<string, object?>? _properties;
+
+    /// <summary>
+    /// Decoded properties. Materialised on first access from <see cref="RawProperties"/>
+    /// when the decoder supplied only the raw bytes.
+    ///
+    /// <para>Lazy because the two consumers want different things: a filter needs the
+    /// values, but delivery only needs to re-serialise them, and the SSE path now writes
+    /// the msgpack straight to JSON (see <c>MsgPackJsonTranscoder</c>). An unfiltered
+    /// query — scrolling the log list — therefore never builds a dictionary at all.</para>
+    ///
+    /// <para>Not synchronised: a race materialises twice and one result wins, which is
+    /// harmless because both are equal and an event is consumed by one reader.</para>
+    /// </summary>
+    public Dictionary<string, object?>? Properties
+    {
+        get => _properties ??= RawProperties.IsEmpty
+                   ? null
+                   : Serialization.LogEventSerializer.DeserializePropertiesMap(RawProperties.Span);
+        init => _properties = value;
+    }
 
     /// <summary>Raw msgpack bytes of the properties map (for re-serialization without re-deserializing).</summary>
     public ReadOnlyMemory<byte> RawProperties            { get; init; }
