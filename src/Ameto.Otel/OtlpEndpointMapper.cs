@@ -97,20 +97,28 @@ public static class OtlpEndpointMapper
             var (body, bodyLen) = await ReadBodyAsync(ctx);
             if (body is null) return;
 
-            ExportMetricsServiceRequest? request;
+            List<Ameto.Metrics.MetricIngestItem> points;
             try
             {
                 bool isProto = ctx.Request.ContentType?.StartsWith(ProtobufContentType, StringComparison.OrdinalIgnoreCase) ?? false;
-                request = isProto
-                    ? OtlpProtoDecoder.DecodeMetrics(body, bodyLen)
-                    : JsonSerializer.Deserialize<ExportMetricsServiceRequest>(body.AsSpan(0, bodyLen), _jsonOptions);
+                if (isProto)
+                {
+                    // Protobuf: parse straight to ingest items — no OTLP object graph, no
+                    // parser object per nested message, no wire-int→string→int round trip
+                    // (see OtlpMetricProtoParser). This is the encoding SDK exporters use.
+                    points = OtlpMetricProtoParser.Parse(body.AsSpan(0, bodyLen));
+                }
+                else
+                {
+                    var request = JsonSerializer.Deserialize<ExportMetricsServiceRequest>(
+                        body.AsSpan(0, bodyLen), _jsonOptions);
+                    if (request is null) { ctx.Response.StatusCode = 400; return; }
+                    points = OtlpMetricMapper.Map(request);
+                }
             }
             catch { ctx.Response.StatusCode = 400; return; }
             finally { ArrayPool<byte>.Shared.Return(body); }
 
-            if (request is null) { ctx.Response.StatusCode = 400; return; }
-
-            var points = OtlpMetricMapper.Map(request);
             ingester.Ingest(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(points));
             await WriteJsonOk(ctx, points.Count, 0);
         });
