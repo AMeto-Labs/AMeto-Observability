@@ -259,6 +259,10 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         foreach (var (k, v) in item.Labels.Pairs)
         {
             var values = meta.LabelValues.GetOrAdd(k, static _ => new ConcurrentDictionary<string, byte>(StringComparer.Ordinal));
+            // ContainsKey first: ConcurrentDictionary.Count acquires EVERY lock in the
+            // table, and this ran once per label per data point. In the steady state the
+            // value is already known, so the cap only needs checking for a new one.
+            if (values.ContainsKey(v)) continue;
             if (values.Count < MaxLabelValuesPerKey) values.TryAdd(v, 0);
         }
 
@@ -1143,21 +1147,25 @@ internal sealed class MetricMeta
     public ConcurrentDictionary<string, ConcurrentDictionary<string, byte>> LabelValues { get; } =
         new(StringComparer.Ordinal);
 
-    private readonly HashSet<int> _seriesHashes = new();
-    private readonly object       _lock         = new();
+    // Cardinality tracking sits on the ingest hot path — it runs once per data point, on
+    // every OTLP request, from every Kestrel thread at once. A HashSet behind a Monitor
+    // serialised all of them on one lock per metric name, and a CPU profile of the stand
+    // showed the contention (Monitor.Enter_Slowpath under MetricStorageEngine.Ingest).
+    // The steady state is "this series was already seen" — exporters re-send the same
+    // series every interval — so make that case a lock-free read and pay only for a
+    // genuinely new series. Count is tracked separately because ConcurrentDictionary.Count
+    // takes every lock in the table.
+    private readonly ConcurrentDictionary<int, byte> _seriesHashes = new();
+    private int _trackedCount;
 
-    public int Cardinality
-    {
-        get { lock (_lock) return _seriesHashes.Count; }
-    }
+    public int Cardinality => Volatile.Read(ref _trackedCount);
 
     public void AddSeries(int labelSetHash)
     {
-        lock (_lock)
-        {
-            if (_seriesHashes.Count < MaxTrackedSeries)
-                _seriesHashes.Add(labelSetHash);
-        }
+        if (_seriesHashes.ContainsKey(labelSetHash)) return;                   // hot path, no lock
+        if (Volatile.Read(ref _trackedCount) >= MaxTrackedSeries) return;
+        if (_seriesHashes.TryAdd(labelSetHash, 0))
+            Interlocked.Increment(ref _trackedCount);
     }
 }
 
