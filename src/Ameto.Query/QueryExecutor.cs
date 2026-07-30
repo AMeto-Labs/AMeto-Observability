@@ -134,26 +134,62 @@ public sealed class QueryExecutor : IQueryExecutor
         // of segments was the dominant query cost (~7-10s for 217 segments).
         var prefiltered = await PrefilterSegmentsAsync(segInfos, filter, ct);
 
-        var iterators = new List<IAsyncEnumerator<LogEvent>>(prefiltered.Count);
+        // Priming order: the merge front moves one way through time, so segments are
+        // consumed in that order too — newest MaxTs first going backward, oldest MinTs
+        // first going forward.
+        var ordered = forward
+            ? prefiltered.OrderBy(p => p.Info.MinTimestampTicks).ToList()
+            : prefiltered.OrderByDescending(p => p.Info.MaxTimestampTicks).ToList();
+
+        var iterators = new List<IAsyncEnumerator<LogEvent>>(ordered.Count);
         try
         {
-            foreach (var (info, candidateOffsets) in prefiltered)
-            {
-                var stream = ScanSegmentAsync(info, filter, levels, candidateOffsets, from, to, afterTs, afterId, !forward, ct);
-                var it = stream.GetAsyncEnumerator(ct);
-                if (await it.MoveNextAsync())
-                    iterators.Add(it);
-                else
-                    await it.DisposeAsync();
-            }
-
             // PriorityQueue ordered by (ts, id). For backward (newest-first) we invert
             // the comparer; .NET's PriorityQueue is a min-heap.
             var comparer = forward ? MergeAsc : MergeDesc;
-
             var heap = new PriorityQueue<IAsyncEnumerator<LogEvent>, (long ts, ulong id)>(comparer);
-            foreach (var it in iterators)
-                heap.Enqueue(it, (it.Current.Timestamp.UtcTicks, it.Current.Id.RawValue));
+            int next = 0;
+
+            // Open segments LAZILY. Priming every surviving segment up front is what made a
+            // page cost the whole catalog: an unfiltered `count=50` takes GetSegments(null,
+            // null) — every segment there is — memory-maps all of them and decompresses a
+            // block from each, only to serve 50 events off the top of the heap. On the
+            // sandbox stand that is 291 opens for one page.
+            //
+            // A segment can only matter while it could still beat the merge front: going
+            // backward its MaxTs is an upper bound on anything it can produce, so once the
+            // heap's best is newer than that, neither it nor any later segment (they are
+            // ordered) can contribute. Ties prime, so equal timestamps are never dropped.
+            async ValueTask PrimeAsync()
+            {
+                while (next < ordered.Count)
+                {
+                    if (heap.Count > 0 && heap.TryPeek(out _, out var best))
+                    {
+                        var info = ordered[next].Info;
+                        bool couldBeat = forward
+                            ? info.MinTimestampTicks <= best.ts
+                            : info.MaxTimestampTicks >= best.ts;
+                        if (!couldBeat) return;
+                    }
+
+                    var (segInfo, candidateOffsets) = ordered[next++];
+                    var stream = ScanSegmentAsync(segInfo, filter, levels, candidateOffsets,
+                                                  from, to, afterTs, afterId, !forward, ct);
+                    var newIt = stream.GetAsyncEnumerator(ct);
+                    if (await newIt.MoveNextAsync())
+                    {
+                        iterators.Add(newIt);
+                        heap.Enqueue(newIt, (newIt.Current.Timestamp.UtcTicks, newIt.Current.Id.RawValue));
+                    }
+                    else
+                    {
+                        await newIt.DisposeAsync();
+                    }
+                }
+            }
+
+            await PrimeAsync();
 
             while (heap.Count > 0)
             {
@@ -166,6 +202,10 @@ public sealed class QueryExecutor : IQueryExecutor
                     heap.Enqueue(it, (it.Current.Timestamp.UtcTicks, it.Current.Id.RawValue));
                 else
                     await it.DisposeAsync();
+
+                // The front just moved; a segment that could not contribute before may be
+                // able to now.
+                await PrimeAsync();
             }
         }
         finally
