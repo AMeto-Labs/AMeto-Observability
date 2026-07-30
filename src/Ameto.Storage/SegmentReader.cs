@@ -20,16 +20,27 @@ public sealed class SegmentReader : ISegmentReader
     // v5: block-index entry gains FirstOrdinal (file-order position of the block's first
     //     event) and index posting lists store file ordinals — enables candidate-driven
     //     block/row skipping. v4 segments remain readable (full scan, no skipping).
+    // v6: block-index entry carries the block's MinTs (time zone map).
+    // v7: INDEX GROUPS — the three index sections repeat per group of blocks instead of once
+    //     per file, and a group directory names their offsets and time bounds. v4-v6 files
+    //     stay readable as ONE implicit group covering the whole file, so no data is wiped.
     private const ushort MinSupportedVersion = 4;
-    private const ushort MaxSupportedVersion = 6;
+    private const ushort MaxSupportedVersion = 7;
 
     /// <summary>Block MinTs for a pre-v6 segment, which has no zone map — never prunes.</summary>
     private const long UnknownBlockMinTs = long.MinValue;
 
-    private readonly long _invertedIndexOffset;
-    private readonly long _trigramIndexOffset;
-    private readonly long _bloomFilterOffset;
+    /// <summary>Group-directory entry size on disk — one definition, shared with the writer.</summary>
+    private const int GroupEntrySize = SegmentWriter.GroupEntrySize;
+
     private readonly long _blockIndexOffset;
+
+    /// <summary>
+    /// Index groups in file order. Exactly one synthetic entry for v4-v6, whose section
+    /// offsets are the footer's file-level ones — so every consumer can be written against
+    /// groups alone and old files need no special case beyond this constructor.
+    /// </summary>
+    private readonly SegmentIndexGroup[] _groups;
 
     /// <summary>
     /// Per-block (byte offset, min timestamp). MinTs is the v6 time zone map and is
@@ -89,9 +100,12 @@ public sealed class SegmentReader : ISegmentReader
         const int footerSize = 44;
         long footerStart = fileSize - footerSize;
 
-        _invertedIndexOffset = ReadInt64At(footerStart);
-        _trigramIndexOffset  = ReadInt64At(footerStart + 8);
-        _bloomFilterOffset   = ReadInt64At(footerStart + 16);
+        // The footer is parsed BEFORE the header, so its five int64 slots are read raw and
+        // only interpreted once the version is known. v7 reuses slot 0 for the group
+        // directory offset; v4-v6 spend slots 0-2 on the file-level section offsets.
+        long slot0           = ReadInt64At(footerStart);
+        long slot1           = ReadInt64At(footerStart + 8);
+        long slot2           = ReadInt64At(footerStart + 16);
         _blockIndexOffset    = ReadInt64At(footerStart + 24);
         uint footerMagic     = (uint)ReadInt32At(footerStart + 40);
         if (footerMagic != MagicFooter)
@@ -142,6 +156,13 @@ public sealed class SegmentReader : ISegmentReader
         }
         finally { ArrayPool<byte>.Shared.Return(rented); }
 
+        _groups = version >= 7
+            ? ReadGroupDirectory(slot0, filePath)
+            // v4-v6: ONE implicit group spanning the file, taking its section offsets from
+            // the footer slots v7 repurposes. Everything above the reader then sees a single
+            // uniform shape and no version branch survives past this constructor.
+            : [new SegmentIndexGroup(0, blockCount, 0, evCount, minTs, maxTs, slot0, slot1, slot2)];
+
         // Honest uncompressed size: every block frame starts with a uint32
         // uncompressedSize (see ReadAllRaw) — sum them instead of reporting the
         // compressed file size. The merge planner's co-fit gate relies on this
@@ -171,6 +192,53 @@ public sealed class SegmentReader : ISegmentReader
             UncompressedBytes = uncompressedBytes,
         };
     }
+
+    /// <summary>
+    /// Parses the v7 group directory in ONE mapped read, for the same reason the block index
+    /// is read that way: Open is on the query hot path and must not cost view reads
+    /// proportional to segment size.
+    /// </summary>
+    private SegmentIndexGroup[] ReadGroupDirectory(long directoryOffset, string filePath)
+    {
+        if (directoryOffset <= 0)
+            throw new InvalidDataException($"v7 segment {filePath} has no group directory");
+
+        int count = ReadInt32At(directoryOffset);
+        if (count <= 0) return [];
+
+        var groups = new SegmentIndexGroup[count];
+        int bytes  = count * GroupEntrySize;
+        byte[] rented = ArrayPool<byte>.Shared.Rent(bytes);
+        try
+        {
+            _view.ReadArray(directoryOffset + 4, rented, 0, bytes);
+            var raw = rented.AsSpan(0, bytes);
+            for (int i = 0; i < count; i++)
+            {
+                var e = raw.Slice(i * GroupEntrySize, GroupEntrySize);
+                groups[i] = new SegmentIndexGroup(
+                    FirstBlock:     (int)BinaryPrimitives.ReadUInt32LittleEndian(e),
+                    BlockCount:     (int)BinaryPrimitives.ReadUInt32LittleEndian(e.Slice(4, 4)),
+                    FirstOrdinal:   BinaryPrimitives.ReadUInt32LittleEndian(e.Slice(8, 4)),
+                    EventCount:     BinaryPrimitives.ReadUInt32LittleEndian(e.Slice(12, 4)),
+                    MinTs:          BinaryPrimitives.ReadInt64LittleEndian(e.Slice(16, 8)),
+                    MaxTs:          BinaryPrimitives.ReadInt64LittleEndian(e.Slice(24, 8)),
+                    InvertedOffset: BinaryPrimitives.ReadInt64LittleEndian(e.Slice(32, 8)),
+                    TrigramOffset:  BinaryPrimitives.ReadInt64LittleEndian(e.Slice(40, 8)),
+                    BloomOffset:    BinaryPrimitives.ReadInt64LittleEndian(e.Slice(48, 8)));
+            }
+        }
+        finally { ArrayPool<byte>.Shared.Return(rented); }
+        return groups;
+    }
+
+    /// <summary>
+    /// The segment's index groups, in file order. A prefilter must consult these one at a
+    /// time: the whole reason v7 exists is that ONE bloom over a day prunes nothing, so the
+    /// filter's selectivity now lives per group and a rejected group costs no section read.
+    /// v4-v6 files expose exactly one group, so a caller needs no version branch.
+    /// </summary>
+    public ReadOnlySpan<SegmentIndexGroup> Groups => _groups;
 
     public async IAsyncEnumerable<LogEvent> ReadEventsAsync(
         uint[]? candidateOffsets,
@@ -656,17 +724,20 @@ public sealed class SegmentReader : ISegmentReader
 
     // ── Raw section access ────────────────────────────────────────────────────
 
-    public byte[] ReadInvertedIndexBytes()  => ReadSection(_invertedIndexOffset);
-    public byte[] ReadTrigramIndexBytes()   => ReadSection(_trigramIndexOffset);
-    public byte[] ReadBloomFilterBytes()    => ReadSection(_bloomFilterOffset);
+    // Sections belong to a GROUP, not to the file. The no-argument overloads name group 0,
+    // which for a v4-v6 file (and for any segment small enough to seal in one group) is the
+    // whole segment — that keeps single-group call sites unchanged.
+    public byte[] ReadInvertedIndexBytes(int group = 0)  => ReadSection(_groups[group].InvertedOffset);
+    public byte[] ReadTrigramIndexBytes(int group = 0)   => ReadSection(_groups[group].TrigramOffset);
+    public byte[] ReadBloomFilterBytes(int group = 0)    => ReadSection(_groups[group].BloomOffset);
 
     // Pooled variants for the query prefilter: index sections run to several MB per
     // segment and are only needed transiently (every deserialiser copies out of the
     // span), so renting kills what used to be gigabytes of short-lived arrays when
     // prefiltering hundreds of segments in parallel.
-    public PooledSection RentInvertedIndexBytes() => RentSection(_invertedIndexOffset);
-    public PooledSection RentTrigramIndexBytes()  => RentSection(_trigramIndexOffset);
-    public PooledSection RentBloomFilterBytes()   => RentSection(_bloomFilterOffset);
+    public PooledSection RentInvertedIndexBytes(int group = 0) => RentSection(_groups[group].InvertedOffset);
+    public PooledSection RentTrigramIndexBytes(int group = 0)  => RentSection(_groups[group].TrigramOffset);
+    public PooledSection RentBloomFilterBytes(int group = 0)   => RentSection(_groups[group].BloomOffset);
 
     private byte[] ReadSection(long offset)
     {
@@ -700,6 +771,31 @@ public sealed class SegmentReader : ISegmentReader
         _mmf.Dispose();
     }
 }
+
+/// <summary>
+/// One index group of a segment: a run of consecutive blocks plus the inverted/trigram/bloom
+/// sections built over exactly those blocks' events.
+///
+/// <para><paramref name="FirstOrdinal"/> and <paramref name="EventCount"/> delimit the group's
+/// rows in FILE ordinals — the same space posting lists use — so a candidate array needs no
+/// rebasing when it crosses a group boundary. <paramref name="MinTs"/>/<paramref name="MaxTs"/>
+/// bound the group's events exactly, making the directory a coarse time zone map above the
+/// block-level one: a windowed query drops a whole group's index sections without reading
+/// them.</para>
+///
+/// <para>A section offset of 0 means the section is absent (no index was built for the group),
+/// which readers must treat as NO INFORMATION rather than "no matches".</para>
+/// </summary>
+public readonly record struct SegmentIndexGroup(
+    int  FirstBlock,
+    int  BlockCount,
+    uint FirstOrdinal,
+    uint EventCount,
+    long MinTs,
+    long MaxTs,
+    long InvertedOffset,
+    long TrigramOffset,
+    long BloomOffset);
 
 /// <summary>
 /// One event decoded with its raw payloads intact — the unit compaction re-writes

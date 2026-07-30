@@ -218,7 +218,10 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
                     // Encode the ascending offset list with the zero-alloc codec instead of
                     // RoaringBitmap.Create+Serialize — the flush allocation hot spot.
                     var offsets = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(list);
-                    var dest    = w.GetSpan(4 + SegmentBitmapCodec.MaxEncodedSize(offsets.Length));
+                    // checked: a bucket dense enough to need >2 GB of varints cannot be
+                    // encoded at all, and truncating the request would hand Encode a short
+                    // buffer whose -1 result is written as the section's length prefix.
+                    var dest    = w.GetSpan(checked((int)(4 + SegmentBitmapCodec.MaxEncodedSize(offsets.Length))));
                     int n       = SegmentBitmapCodec.Encode(offsets, dest[4..]);
                     BinaryPrimitives.WriteUInt32LittleEndian(dest, (uint)n);
                     w.Advance(4 + n);

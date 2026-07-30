@@ -132,7 +132,9 @@ public sealed class QueryExecutor : IQueryExecutor
         // segments — each segment opens its mmap independently and we typically
         // discard most of them via bloom. Doing this sequentially across hundreds
         // of segments was the dominant query cost (~7-10s for 217 segments).
-        var prefiltered = await PrefilterSegmentsAsync(segInfos, filter, ct);
+        var prefiltered = await PrefilterSegmentsAsync(
+            segInfos, filter,
+            from?.UtcTicks ?? long.MinValue, to?.UtcTicks ?? long.MaxValue, ct);
 
         // Priming order: the merge front moves one way through time, so segments are
         // consumed in that order too — newest MaxTs first going backward, oldest MinTs
@@ -232,10 +234,19 @@ public sealed class QueryExecutor : IQueryExecutor
     /// segment in parallel, opening each segment's mmap exactly once. Returns
     /// the surviving segments in the original (descending-Max-ts) order so the
     /// k-way merge sees a deterministic priority.
+    ///
+    /// <para>The unit of prefiltering is the INDEX GROUP, not the file. A single bloom
+    /// stretched over 24 h answers "maybe" to everything, so a day-scale segment would
+    /// survive every query and the fast-skip would stop being a skip; per group the filter
+    /// keeps the ~10 bits/term it is sized for. A rejected group costs one bloom read and
+    /// never touches its multi-MB inverted/trigram sections. v4-v6 segments expose exactly
+    /// one group, so they take the same path with the same result as before.</para>
     /// </summary>
     private async Task<List<PrefilterResult>> PrefilterSegmentsAsync(
         IReadOnlyList<SegmentInfo> segInfos,
         CompiledFilter             filter,
+        long                       fromTicks,
+        long                       toTicks,
         CancellationToken          ct)
     {
         // GetTrigramHints() returns a pre-computed list — no .ToList() allocation needed.
@@ -273,91 +284,127 @@ public sealed class QueryExecutor : IQueryExecutor
                 {
                     using var reader = SegmentReader.Open(info.FilePath);
 
-                    // Phase 1: cheap bloom-only check for the equality hint.
-                    // Bloom bytes are ~a few KB; inverted/trigram can be MB.
-                    // For a high-cardinality value (e.g. a GUID), bloom rejects
-                    // ~99% of segments here without ever loading the big indexes.
-                    if (hasIndexHint
-                        && filter.TryGetIndexHint(out string hintProp, out object? hintVal))
-                    {
-                        using var bloomSec = reader.RentBloomFilterBytes();
-                        using var bloom    = SegmentBloomFilter.Deserialise(bloomSec.Span);
-                        string valStr = hintVal?.ToString() ?? string.Empty;
-                        if (!bloom.MightContain(valStr))
-                            return ValueTask.CompletedTask;
-                        _ = hintProp; // inverted check happens via the full index below
-                    }
+                    // Accumulated across the surviving groups. Posting offsets are FILE
+                    // ordinals in every group, so the groups' candidate arrays simply
+                    // concatenate — no rebasing, and the result stays ascending because
+                    // groups are in file order.
+                    List<uint>? candidates = null;
+                    bool anyGroupSurvived  = false;
+                    // A surviving group that could not narrow (its index sections are absent —
+                    // e.g. a WAL-recovery flush that ran before the builder was wired) is NO
+                    // information about its rows. Candidates would then silently exclude them,
+                    // so the whole segment falls back to a full scan.
+                    bool unnarrowedGroup   = false;
 
-                    // Phase 2: only segments that survived (or filters without
-                    // an equality hint) load the big indexes for trigram offset
-                    // lookup and the inverted-index definitive check.
-                    uint[]? candidates = null;
-                    if (trigramHints.Count > 0 || hasIndexHint)
+                    var groups = reader.Groups;
+                    for (int g = 0; g < groups.Length; g++)
                     {
-                        // Pooled: sections are copied out inside the deserialisers, so the
-                        // rented buffers go back to the pool as soon as the index is built.
-                        using var invSec = reader.RentInvertedIndexBytes();
-                        using var bloSec = reader.RentBloomFilterBytes();
-                        // The trigram section is the biggest thing in the file (~43% of it)
-                        // and every posting list is materialised into int[] on load. Only
-                        // pay for it when the filter actually has a substring predicate —
-                        // an `@l = 'Error'` query used to deserialise the whole thing.
-                        using var triSec = trigramHints.Count > 0
-                            ? reader.RentTrigramIndexBytes()
-                            : default;
-                        using var idx = _indexFactory.Create(invSec.Span, triSec.Span, bloSec.Span);
+                        ref readonly var grp = ref groups[g];
+                        if (grp.EventCount == 0) continue;
+                        // Group time bounds are exact, so this drops a group's index sections
+                        // without reading them. The reader's per-event window check remains
+                        // the correctness gate.
+                        if (grp.MaxTs < fromTicks || grp.MinTs > toTicks) continue;
 
-                        // Definitive inverted-index check (bloom can have false positives)
+                        // Phase 1: cheap bloom-only check for the equality hint.
+                        // Bloom bytes are ~a few KB; inverted/trigram can be MB.
+                        // For a high-cardinality value (e.g. a GUID), bloom rejects
+                        // ~99% of groups here without ever loading the big indexes.
                         if (hasIndexHint
-                            && filter.TryGetIndexHint(out string prop, out object? val)
-                            && !idx.MightContain(prop, val))
+                            && filter.TryGetIndexHint(out string hintProp, out object? hintVal))
                         {
-                            return ValueTask.CompletedTask;
+                            using var bloomSec = reader.RentBloomFilterBytes(g);
+                            using var bloom    = SegmentBloomFilter.Deserialise(bloomSec.Span);
+                            string valStr = hintVal?.ToString() ?? string.Empty;
+                            if (!bloom.MightContain(valStr))
+                                continue;
+                            _ = hintProp; // inverted check happens via the full index below
                         }
 
-                        if (trigramHints.Count > 0)
+                        // Phase 2: only groups that survived (or filters without
+                        // an equality hint) load the big indexes for trigram offset
+                        // lookup and the inverted-index definitive check.
+                        uint[]? groupCandidates = null;
+                        if (trigramHints.Count > 0 || hasIndexHint)
                         {
-                            HashSet<uint>? acc = null;
-                            foreach (var (_, text) in trigramHints)
+                            // Pooled: sections are copied out inside the deserialisers, so the
+                            // rented buffers go back to the pool as soon as the index is built.
+                            using var invSec = reader.RentInvertedIndexBytes(g);
+                            using var bloSec = reader.RentBloomFilterBytes(g);
+                            // The trigram section is the biggest thing in the file (~43% of it)
+                            // and every posting list is materialised into int[] on load. Only
+                            // pay for it when the filter actually has a substring predicate —
+                            // an `@l = 'Error'` query used to deserialise the whole thing.
+                            using var triSec = trigramHints.Count > 0
+                                ? reader.RentTrigramIndexBytes(g)
+                                : default;
+                            using var idx = _indexFactory.Create(invSec.Span, triSec.Span, bloSec.Span);
+
+                            // Definitive inverted-index check (bloom can have false positives)
+                            if (hasIndexHint
+                                && filter.TryGetIndexHint(out string prop, out object? val)
+                                && !idx.MightContain(prop, val))
                             {
-                                var offsets = idx.LookupTrigram(text);
-                                if (offsets is null) continue;
-                                if (acc is null) acc = new HashSet<uint>(offsets);
-                                else             acc.IntersectWith(offsets);
-                                if (acc.Count == 0) return ValueTask.CompletedTask;
+                                continue;
                             }
-                            candidates = acc?.ToArray();
+
+                            bool rejected = false;
+                            if (trigramHints.Count > 0)
+                            {
+                                HashSet<uint>? acc = null;
+                                foreach (var (_, text) in trigramHints)
+                                {
+                                    var offsets = idx.LookupTrigram(text);
+                                    if (offsets is null) continue;
+                                    if (acc is null) acc = new HashSet<uint>(offsets);
+                                    else             acc.IntersectWith(offsets);
+                                    if (acc.Count == 0) { rejected = true; break; }
+                                }
+                                if (rejected) continue;
+                                groupCandidates = acc?.ToArray();
+                            }
+
+                            // Inverted-index event-level narrowing: AND posting lists for all
+                            // equality predicates. This gives exact event offsets within the
+                            // group — the reader will only deserialise those events.
+                            if (hasInvHints)
+                            {
+                                var invOffsets = idx.LookupIntersect(invertedHints);
+                                if (invOffsets is not null)
+                                {
+                                    if (invOffsets.Length == 0) continue;
+
+                                    if (groupCandidates is null)
+                                    {
+                                        groupCandidates = invOffsets;
+                                    }
+                                    else
+                                    {
+                                        var invSet = new HashSet<uint>(invOffsets);
+                                        var merged = new List<uint>(Math.Min(groupCandidates.Length, invOffsets.Length));
+                                        foreach (var o in groupCandidates)
+                                            if (invSet.Contains(o)) merged.Add(o);
+                                        if (merged.Count == 0) continue;
+                                        groupCandidates = [.. merged];
+                                    }
+                                }
+                            }
                         }
 
-                        // Inverted-index event-level narrowing: AND posting lists for all
-                        // equality predicates. This gives exact event offsets within the
-                        // segment — the reader will only deserialise those events.
-                        if (hasInvHints)
+                        anyGroupSurvived = true;
+                        if (groupCandidates is null) unnarrowedGroup = true;
+                        else
                         {
-                            var invOffsets = idx.LookupIntersect(invertedHints);
-                            if (invOffsets is not null)
-                            {
-                                if (invOffsets.Length == 0)
-                                    return ValueTask.CompletedTask;
-
-                                if (candidates is null)
-                                {
-                                    candidates = invOffsets;
-                                }
-                                else
-                                {
-                                    var invSet = new HashSet<uint>(invOffsets);
-                                    var merged = new List<uint>(Math.Min(candidates.Length, invOffsets.Length));
-                                    foreach (var o in candidates)
-                                        if (invSet.Contains(o)) merged.Add(o);
-                                    if (merged.Count == 0) return ValueTask.CompletedTask;
-                                    candidates = [.. merged];
-                                }
-                            }
+                            candidates ??= new List<uint>(groupCandidates.Length);
+                            candidates.AddRange(groupCandidates);
                         }
                     }
 
-                    results[i] = new PrefilterResult(info, candidates);
+                    // Every group rejected ⇒ the segment holds nothing this query can match.
+                    if (!anyGroupSurvived) return ValueTask.CompletedTask;
+
+                    results[i] = new PrefilterResult(
+                        info, unnarrowedGroup ? null : candidates?.ToArray());
                 }
                 catch (Exception ex)
                 {

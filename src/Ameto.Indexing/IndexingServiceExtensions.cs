@@ -41,12 +41,17 @@ public sealed class IndexingWiring : Microsoft.Extensions.Hosting.IHostedService
     public Task StartAsync(CancellationToken cancellationToken)
     {
         int maxDepth = _opts.MaxPropertyFlattenDepth;
-        _storage.IndexBuilder = (hot, pool, order) =>
+        _storage.IndexBuilder = (hot, pool, order, firstOrdinal, eventCount) =>
         {
-            // Size on the SUBSET being written — a level-split flush produces one segment
-            // per level out of a single tier.
-            var builder = new SegmentIndexBuilder(order?.Length ?? hot.Count, maxDepth);
-            builder.Build(hot, pool, order);
+            // A FRESH builder per index group — that is the mechanism, not an accident. The
+            // accumulators (trigram especially, ~7.6 B/posting scaling with indexed text
+            // bytes) die with the builder as soon as its sections are serialised, so peak
+            // index-build memory is O(group) and no longer grows with the segment.
+            //
+            // Sized on the group, not the segment: the bloom's ~10 bits/term budget is what
+            // makes it selective, and one filter stretched over a day's terms prunes nothing.
+            var builder = new SegmentIndexBuilder(eventCount, maxDepth);
+            builder.Build(hot, pool, order, firstOrdinal, eventCount);
             return (builder.SerialisedInvertedIndex,
                     builder.SerialisedTrigramIndex,
                     builder.SerialisedBloomFilter);

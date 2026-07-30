@@ -43,8 +43,10 @@ public sealed class SegmentIndexBuilder
     ///
     /// <para>An estimate rather than a count because the filter is allocated up front. It is
     /// deliberately generous — over-sizing wastes a few bits, under-sizing brings back the
-    /// saturation this fixes. An exact count becomes practical once index groups bound the
-    /// build, and belongs with that change.</para>
+    /// saturation this fixes. An exact count would need a second pass over every property
+    /// payload; it is still not worth that, but the over-sizing is now bounded by an index
+    /// GROUP rather than by the file: ~10.5 MB of bloom for a full 64 MB group, against the
+    /// ~230 MB of accumulators the same group's trigram index costs to build.</para>
     /// </summary>
     private const int EstimatedBloomTermsPerEvent = 64;
 
@@ -67,11 +69,24 @@ public sealed class SegmentIndexBuilder
     /// without sorting (tests).
     /// </summary>
     public void Build(HotTierSegment hot, StringInternPool pool, int[]? order = null)
+        => Build(hot, pool, order, 0, order?.Length ?? hot.Count);
+
+    /// <summary>
+    /// Indexes one INDEX GROUP: the events at file ordinals
+    /// <c>[firstOrdinal, firstOrdinal + eventCount)</c>, i.e. <c>order[firstOrdinal..]</c>.
+    ///
+    /// <para>Posting offsets stay file-global (<c>firstOrdinal + pos</c>), not group-local —
+    /// see the ordinal contract on <c>SegmentWriter.ComputeSortOrder</c>. A fresh builder per
+    /// group is what bounds peak memory: the trigram accumulator costs ~7.6 B per posting and
+    /// scales with indexed text bytes, so a day of one level would otherwise retain ~610 MB
+    /// of managed state in a single build.</para>
+    /// </summary>
+    public void Build(HotTierSegment hot, StringInternPool pool, int[]? order, int firstOrdinal, int eventCount)
     {
         // Bound by the ORDER, not the tier: a level-split flush indexes one level's subset
         // per segment, and posting offsets are ordinals within that segment's own file.
-        int n = order?.Length ?? hot.Count;
-        for (int pos = 0; pos < n; pos++)
+        int n = Math.Min(firstOrdinal + eventCount, order?.Length ?? hot.Count);
+        for (int pos = firstOrdinal; pos < n; pos++)
         {
             int  i      = order?[pos] ?? pos;
             uint offset = (uint)pos;

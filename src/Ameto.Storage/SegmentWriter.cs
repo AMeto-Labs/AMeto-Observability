@@ -7,6 +7,19 @@ using Ameto.Core;
 namespace Ameto.Storage;
 
 /// <summary>
+/// Builds the three index sections for ONE index group: the events at file ordinals
+/// <c>[firstOrdinal, firstOrdinal + eventCount)</c>, i.e. <c>order[firstOrdinal..]</c>.
+/// Injected by <see cref="StorageEngine"/> so the writer can seal a group the moment its
+/// payload budget is reached, without Ameto.Storage referencing the indexing layer.
+///
+/// <para>The implementation MUST emit posting-list offsets as FILE ordinals (base
+/// <paramref name="firstOrdinal"/>, not 0) — see the ordinal contract on
+/// <see cref="SegmentWriter"/>.</para>
+/// </summary>
+public delegate (byte[] Inverted, byte[] Trigram, byte[] Bloom) SegmentGroupIndexBuilder(
+    int firstOrdinal, int eventCount);
+
+/// <summary>
 /// Writes a cold-tier .seg file (v3, columnar) from a frozen HotTierSegment.
 ///
 /// File layout — see ARCHITECTURE.md for full spec.
@@ -28,24 +41,59 @@ namespace Ameto.Storage;
 ///   6 props: nullable msgpack map            — uint32[eventCount+1] offsets + bytes
 ///
 /// Block outer frame: uint32 uncompressedSize, uint32 compressedSize, bytes[compressedSize].
+///
+/// v7 file layout:
+///   header (46 B)
+///   group 0: blocks… | inverted | trigram | bloom
+///   group 1: blocks… | inverted | trigram | bloom
+///   …
+///   group directory: uint32 count + entries[56 B]
+///     { uint32 firstBlock, blockCount, firstOrdinal, eventCount;
+///       int64 minTs, maxTs, invertedOff, trigramOff, bloomOff }   (offset 0 = absent)
+///   block index: uint32 count + entries[20 B]                     (unchanged since v6)
+///   footer (44 B)
 /// </summary>
 public sealed class SegmentWriter : IDisposable
 {
     private const uint   MagicHeader = 0x52_44_4C_47; // "RDLG"
     private const uint   MagicFooter = 0x52_44_46_54; // "RDFT"
+    // v7: INDEX GROUPS. The three index sections are no longer one-per-file; the file is cut
+    // into groups of blocks, each carrying its own inverted/trigram/bloom section and its own
+    // time bounds. This decouples INDEX granularity from FILE granularity, which is what makes
+    // a day-scale segment possible at all: the trigram accumulator costs ~7.6 B per posting and
+    // scales with indexed text bytes, so one day of one level would need ~610 MB of managed
+    // build state, and one bloom over 24 h is saturated enough to prune nothing.
     // v6: the block index carries the block's MIN TIMESTAMP in the slot v5 spent on
     // FirstEventId — which was written by every flush and read by nothing. That makes the
     // block index a time zone map, so a windowed query seeks to its blocks instead of
     // decompressing the file. Without it a segment's own Min/MaxTimestamp is the ONLY time
     // index there is, which is why segments have to stay small to be queryable.
-    private const ushort SegVersion  = 6;             // v5: block index carried FirstOrdinal; v4: + TraceId/SpanId/ServiceName columns
+    private const ushort SegVersion  = 7;             // v6: block-index MinTs zone map; v5: FirstOrdinal; v4: + TraceId/SpanId/ServiceName columns
     private const int    BlockSize   = 64 * 1024;      // 64 KB target uncompressed block size
+
+    /// <summary>
+    /// Uncompressed block bytes a group accumulates before it is sealed and its indexes built.
+    ///
+    /// <para>Set to the default hot-tier size deliberately. <c>StorageEngine</c> budgets
+    /// <c>IndexBuildBytesPerEvent = 1400</c> managed bytes per in-flight event and sizes flush
+    /// concurrency so that a 64 MB tier (~131 k events ⇒ ~184 MB of accumulators) fits three
+    /// deep inside <c>FlushManagedBudgetBytes</c>. Sealing on the same quantity means the peak
+    /// index-build state of a DAY-scale segment equals that of one of today's flushes — the
+    /// budget that is already measured and already enforced. A larger group would silently
+    /// break that ceiling; a smaller one would only cost extra sections and per-group bloom
+    /// overhead for no reduction the flush path can spend.</para>
+    /// </summary>
+    public const long DefaultGroupPayloadBudgetBytes = 64L * 1024 * 1024;
+
+    /// <summary>Group-directory entry size on disk (4×uint32 + 2×int64 bounds + 3×int64 offsets).</summary>
+    internal const int GroupEntrySize = 56;
 
     public  const byte   FlagCompressed = 0x01;
 
     private readonly string       _filePath;
     private readonly FileStream   _fs;
     private readonly BinaryWriter _bw;
+    private readonly long         _groupBudget;
 
     // v6 block-index entry: byte offset of the block, the block's MIN timestamp, and the
     // ordinal (file-order position, 0-based) of the block's first event. Index posting
@@ -55,10 +103,26 @@ public sealed class SegmentWriter : IDisposable
     private readonly List<(long Offset, long MinTs, uint FirstOrdinal)> _blockIndex = new();
     private int _eventsFlushed;
 
+    // ── Index groups ──────────────────────────────────────────────────────────
+    // A group is a run of consecutive blocks plus the three index sections built over
+    // exactly those blocks' events. Posting offsets stay FILE ordinals (see the ordinal
+    // contract on WriteEvents), so the reader needs no translation and the block index —
+    // which already maps file ordinal → block — keeps working unchanged.
+    private readonly List<GroupEntry> _groups = new();
+    private int  _groupFirstBlock;
+    private uint _groupFirstOrdinal;
+    private uint _groupEventCount;
+    private long _groupMinTs = long.MaxValue;
+    private long _groupMaxTs = long.MinValue;
+    private long _groupPayloadBytes;
+
+    // Offsets of the CURRENT (open) group's sections; folded into its directory entry when
+    // the group closes and reset to 0 (= section absent) for the next one.
     private long _invertedIndexOffset;
     private long _trigramIndexOffset;
     private long _bloomFilterOffset;
     private long _blockIndexOffset;
+    private long _groupDirectoryOffset;
 
     private int      _eventsWritten;
     // Sum of the blocks' uncompressed sizes (the uint32 each block frame starts
@@ -71,11 +135,20 @@ public sealed class SegmentWriter : IDisposable
     private long     _maxTimestamp = long.MinValue;
     private LogLevel _minLevel     = LogLevel.Fatal;
 
-    public SegmentWriter(string filePath)
+    public SegmentWriter(string filePath) : this(filePath, DefaultGroupPayloadBudgetBytes) { }
+
+    /// <param name="groupPayloadBudgetBytes">
+    /// Uncompressed block bytes per index group — see <see cref="DefaultGroupPayloadBudgetBytes"/>.
+    /// Only honoured by the <see cref="SegmentGroupIndexBuilder"/> overload of
+    /// <see cref="WriteEvents(HotTierSegment, StringInternPool, int[], SegmentGroupIndexBuilder?)"/>;
+    /// a caller that writes sections itself always produces exactly one group.
+    /// </param>
+    public SegmentWriter(string filePath, long groupPayloadBudgetBytes)
     {
-        _filePath = filePath;
-        _fs       = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None, 65536, FileOptions.SequentialScan);
-        _bw       = new BinaryWriter(_fs);
+        _filePath    = filePath;
+        _groupBudget = Math.Max(1, groupPayloadBudgetBytes);
+        _fs          = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None, 65536, FileOptions.SequentialScan);
+        _bw          = new BinaryWriter(_fs);
     }
 
     // ── Public API ────────────────────────────────────────────────────────────
@@ -84,6 +157,13 @@ public sealed class SegmentWriter : IDisposable
     /// File write order: event indices sorted ascending by (TimestampUtcTicks, EventId).
     /// The SAME array must be passed to <see cref="WriteEvents(HotTierSegment, StringInternPool, int[])"/>
     /// and <c>SegmentIndexBuilder.Build</c> so index posting-list offsets equal file ordinals.
+    ///
+    /// <para>ORDINAL CONTRACT (v7): posting offsets are FILE-GLOBAL ordinals even though the
+    /// indexes are now per group. Group-local offsets would buy nothing — the codec is
+    /// delta-encoded, so absolute magnitude costs no bytes — and would force every candidate
+    /// array to be rebased on the way out, adding a group-boundary off-by-one to the one path
+    /// where a mistake silently drops rows. File-global keeps the block index (which already
+    /// maps file ordinal → block) as the single translation table for candidates.</para>
     /// </summary>
     public static int[] ComputeSortOrder(HotTierSegment hot)
     {
@@ -103,12 +183,27 @@ public sealed class SegmentWriter : IDisposable
     public void WriteEvents(HotTierSegment hot, StringInternPool templatePool)
         => WriteEvents(hot, templatePool, ComputeSortOrder(hot));
 
+    public void WriteEvents(HotTierSegment hot, StringInternPool templatePool, int[] order)
+        => WriteEvents(hot, templatePool, order, null);
+
     /// <param name="order">
     /// Tier indices to write, in output order. It need NOT cover the whole tier: a subset
     /// lets one tier be written as several segments, which is how a flush is split by log
     /// level so that a segment holds exactly one level. The bound is the order's length.
     /// </param>
-    public void WriteEvents(HotTierSegment hot, StringInternPool templatePool, int[] order)
+    /// <param name="indexBuilder">
+    /// When supplied, the file is cut into index groups: every time the blocks written since
+    /// the last cut exceed the group budget, the builder is called for exactly those events
+    /// and the three sections it returns are written right there, between the group's last
+    /// block and the next group's first.
+    ///
+    /// <para>This is the whole point of v7 — the builder's accumulators are reset per group,
+    /// so peak index-build memory is O(group) instead of O(file). Passing null keeps the
+    /// pre-v7 shape: one implicit group covering the file, with sections written by the
+    /// caller via <see cref="WriteInvertedIndex"/> and friends.</para>
+    /// </param>
+    public void WriteEvents(HotTierSegment hot, StringInternPool templatePool, int[] order,
+                            SegmentGroupIndexBuilder? indexBuilder)
     {
         _fs.Seek(SegmentFileHeader.Size, SeekOrigin.Begin);
 
@@ -139,6 +234,12 @@ public sealed class SegmentWriter : IDisposable
                 FlushColumnarBlock(hot, templatePool, batch);
                 batch.Clear();
                 approxBytes = 0;
+
+                // Cut only on a block boundary: a group owns whole blocks, so the block
+                // index stays a single flat array and candidate → block resolution is
+                // untouched by grouping.
+                if (indexBuilder is not null && _groupPayloadBytes >= _groupBudget)
+                    SealGroup(indexBuilder);
             }
 
             batch.Add(i);
@@ -148,6 +249,9 @@ public sealed class SegmentWriter : IDisposable
 
         if (batch.Count > 0)
             FlushColumnarBlock(hot, templatePool, batch);
+
+        if (indexBuilder is not null)
+            SealGroup(indexBuilder);
     }
 
     public void WriteInvertedIndex(ReadOnlySpan<byte> indexBytes)
@@ -171,8 +275,71 @@ public sealed class SegmentWriter : IDisposable
         _bw.Write(filterBytes);
     }
 
+    /// <summary>Builds and writes the open group's index sections, then closes it.</summary>
+    private void SealGroup(SegmentGroupIndexBuilder indexBuilder)
+    {
+        if (_groupEventCount == 0) return;
+
+        var (inverted, trigram, bloom) = indexBuilder((int)_groupFirstOrdinal, (int)_groupEventCount);
+        WriteInvertedIndex(inverted);
+        WriteTrigramIndex(trigram);
+        WriteBloomFilter(bloom);
+        CloseGroup();
+    }
+
+    /// <summary>
+    /// Folds the open group's accumulators into a directory entry and starts the next one.
+    /// The section offsets are reset to 0, which the reader reads as "absent".
+    /// </summary>
+    private void CloseGroup()
+    {
+        _groups.Add(new GroupEntry
+        {
+            FirstBlock     = (uint)_groupFirstBlock,
+            BlockCount     = (uint)(_blockIndex.Count - _groupFirstBlock),
+            FirstOrdinal   = _groupFirstOrdinal,
+            EventCount     = _groupEventCount,
+            MinTs          = _groupMinTs == long.MaxValue ? 0 : _groupMinTs,
+            MaxTs          = _groupMaxTs == long.MinValue ? 0 : _groupMaxTs,
+            InvertedOffset = _invertedIndexOffset,
+            TrigramOffset  = _trigramIndexOffset,
+            BloomOffset    = _bloomFilterOffset,
+        });
+
+        _groupFirstBlock     = _blockIndex.Count;
+        _groupFirstOrdinal   = (uint)_eventsFlushed;
+        _groupEventCount     = 0;
+        _groupMinTs          = long.MaxValue;
+        _groupMaxTs          = long.MinValue;
+        _groupPayloadBytes   = 0;
+        _invertedIndexOffset = 0;
+        _trigramIndexOffset  = 0;
+        _bloomFilterOffset   = 0;
+    }
+
     public SegmentInfo Finalise(NodeId nodeId, SegmentId segmentId)
     {
+        // A caller that wrote its own sections (or none) leaves one open group covering the
+        // whole file — the pre-v7 shape, expressed as a one-entry directory. An empty
+        // segment still gets that entry so the directory is never zero-length.
+        if (_groupEventCount > 0 || _groups.Count == 0)
+            CloseGroup();
+
+        _groupDirectoryOffset = _fs.Position;
+        _bw.Write((uint)_groups.Count);
+        foreach (var g in _groups)
+        {
+            _bw.Write(g.FirstBlock);
+            _bw.Write(g.BlockCount);
+            _bw.Write(g.FirstOrdinal);
+            _bw.Write(g.EventCount);
+            _bw.Write(g.MinTs);
+            _bw.Write(g.MaxTs);
+            _bw.Write(g.InvertedOffset);
+            _bw.Write(g.TrigramOffset);
+            _bw.Write(g.BloomOffset);
+        }
+
         _blockIndexOffset = _fs.Position;
         _bw.Write((uint)_blockIndex.Count);
         foreach (var (offset, minTs, firstOrdinal) in _blockIndex)
@@ -182,10 +349,14 @@ public sealed class SegmentWriter : IDisposable
             _bw.Write(firstOrdinal);   // maps index posting-list offsets → block
         }
 
+        // Footer stays 44 B — the reader parses it BEFORE it knows the version, so its SIZE
+        // is load-bearing across every format. v7 reinterprets slot 0 (v4-v6: the file-level
+        // inverted-index offset) as the GROUP DIRECTORY offset; slots 1 and 2, which held the
+        // file-level trigram/bloom offsets, no longer name anything file-wide and are zeroed.
         long footerOffset = _fs.Position;
-        _bw.Write(_invertedIndexOffset);
-        _bw.Write(_trigramIndexOffset);
-        _bw.Write(_bloomFilterOffset);
+        _bw.Write(_groupDirectoryOffset);
+        _bw.Write(0L);
+        _bw.Write(0L);
         _bw.Write(_blockIndexOffset);
         _bw.Write(footerOffset);
         _bw.Write(MagicFooter);
@@ -261,11 +432,13 @@ public sealed class SegmentWriter : IDisposable
         int n = rowIndices.Count;
 
         long  blockMinTs = long.MaxValue;
+        long  blockMaxTs = long.MinValue;
         ulong blockMinId = ulong.MaxValue;
         for (int k = 0; k < n; k++)
         {
             ref var h = ref hot.GetHeader(rowIndices[k]);
             if (h.TimestampUtcTicks < blockMinTs) blockMinTs = h.TimestampUtcTicks;
+            if (h.TimestampUtcTicks > blockMaxTs) blockMaxTs = h.TimestampUtcTicks;
             if (h.Id < blockMinId)               blockMinId = h.Id;
         }
 
@@ -389,6 +562,14 @@ public sealed class SegmentWriter : IDisposable
             _eventsFlushed     += n;
             _uncompressedBytes += uncompressedLen;
 
+            // Group accumulators. The budget is measured in UNCOMPRESSED payload because that
+            // is what index-build memory tracks (postings scale with indexed text bytes), not
+            // the compressed size — which varies by an order of magnitude with content.
+            _groupEventCount   += (uint)n;
+            _groupPayloadBytes += uncompressedLen;
+            if (blockMinTs < _groupMinTs) _groupMinTs = blockMinTs;
+            if (blockMaxTs > _groupMaxTs) _groupMaxTs = blockMaxTs;
+
             _bw.Write((uint)uncompressedLen);
             _bw.Write((uint)compressedLen);
             _bw.Write(compBuf, 0, compressedLen);
@@ -464,6 +645,20 @@ public sealed class SegmentWriter : IDisposable
     {
         _bw.Dispose();
         _fs.Dispose();
+    }
+
+    /// <summary>One group-directory entry — <see cref="GroupEntrySize"/> bytes on disk.</summary>
+    private struct GroupEntry
+    {
+        public uint FirstBlock;
+        public uint BlockCount;
+        public uint FirstOrdinal;
+        public uint EventCount;
+        public long MinTs;
+        public long MaxTs;
+        public long InvertedOffset;
+        public long TrigramOffset;
+        public long BloomOffset;
     }
 
     private struct SegmentFileHeader

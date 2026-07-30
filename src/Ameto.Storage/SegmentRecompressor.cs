@@ -29,6 +29,13 @@ internal static class SegmentRecompressor
     private const uint   Magic       = 0x52_44_4C_47; // "RDLG"
     private const uint   FooterMagic = 0x52_44_46_54; // "RDFT"
     private const ushort MinVersion  = 4;             // v4 block-index entries are 16 B (no FirstOrdinal)
+    // v6+ are NOT candidates, and raising this bound without rewriting Transform would corrupt
+    // them. The transform's whole shape rests on "blocks run from the header to invOff, then
+    // come the three sections" — v6 still satisfies that but reinterprets the block-index slot
+    // this code copies as FirstEventId, and v7 breaks it outright: sections are interleaved
+    // BETWEEN groups of blocks, so there is no single boundary to copy verbatim. A v7-aware
+    // transform has to walk the group directory, re-encode each group's blocks, copy that
+    // group's sections, and remap offsets in both the directory and the block index.
     private const ushort MaxVersion  = 5;             // v5 entries are 20 B
     private const int    HeaderSize  = 46;
     private const int    FooterSize  = 44;            // 5 × int64 + magic

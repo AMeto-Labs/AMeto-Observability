@@ -130,13 +130,18 @@ public sealed class SegmentBitmapCodecTests
     {
         var offsets = new int[200];
         for (int i = 0; i < offsets.Length; i++) offsets[i] = i * 3;
-        byte[] buf = ArrayPool<byte>.Shared.Rent(SegmentBitmapCodec.MaxEncodedSize(offsets.Length));
+        byte[] buf = ArrayPool<byte>.Shared.Rent((int)SegmentBitmapCodec.MaxEncodedSize(offsets.Length));
         int[] outBuf = ArrayPool<int>.Shared.Rent(offsets.Length);
 
         // Warm up hard so tiered JIT recompilation happens BEFORE the measured section.
         for (int i = 0; i < 2_000; i++) { int w = SegmentBitmapCodec.Encode(offsets, buf); SegmentBitmapCodec.Decode(buf.AsSpan(0, w), outBuf); }
 
         const int iters = 100_000;
+        // The sum is consumed by an assertion after the loop rather than by GC.KeepAlive:
+        // KeepAlive takes an object, so passing a long BOXED it — 24 B per iteration, all of
+        // it charged to the codec, which made this test report 24 B/call for a codec that
+        // allocates nothing at all.
+        long sink   = 0;
         long before = GC.GetAllocatedBytesForCurrentThread();
         for (int i = 0; i < iters; i++)
         {
@@ -144,9 +149,11 @@ public sealed class SegmentBitmapCodecTests
             long sum = 0;
             var e = SegmentBitmapCodec.Enumerate(buf.AsSpan(0, w));
             while (e.MoveNext()) sum += e.Current;
-            GC.KeepAlive(sum);
+            sink += sum;
         }
         long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+        // 0+3+…+597 per iteration — proves the loop was not optimised away.
+        Assert.Equal(199L * 200 / 2 * 3 * iters, sink);
 
         ArrayPool<byte>.Shared.Return(buf);
         ArrayPool<int>.Shared.Return(outBuf);

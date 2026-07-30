@@ -23,11 +23,14 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// Returns (invertedIndexBytes, trigramIndexBytes, bloomFilterBytes).
     /// </summary>
     /// <summary>
-    /// Builds (inverted, trigram, bloom) index bytes for a frozen tier. The third argument
-    /// is the file write order (<see cref="SegmentWriter.ComputeSortOrder"/>) — the builder
-    /// must emit posting-list offsets in that order so they equal .seg file ordinals.
+    /// Builds (inverted, trigram, bloom) index bytes for ONE INDEX GROUP of a frozen tier:
+    /// the events at <c>order[firstOrdinal .. firstOrdinal + eventCount)</c>, where order is
+    /// the file write order (<see cref="SegmentWriter.ComputeSortOrder"/>). The builder must
+    /// emit posting-list offsets as FILE ordinals — base <c>firstOrdinal</c>, not 0 — and must
+    /// build from scratch each call, which is what keeps peak index-build memory O(group)
+    /// rather than O(segment).
     /// </summary>
-    public Func<HotTierSegment, StringInternPool, int[], (byte[], byte[], byte[])>? IndexBuilder { get; set; }
+    public Func<HotTierSegment, StringInternPool, int[], int, int, (byte[], byte[], byte[])>? IndexBuilder { get; set; }
 
     /// <summary>
     /// Optional hook called on the write path after each event is accepted into the hot tier.
@@ -74,6 +77,8 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     private readonly Task                                  _recompressLoop;
     /// <summary>Test hook: lets merge run without an index builder (tests verify the scan fallback).</summary>
     internal bool _allowIndexlessMerge;
+    /// <summary>Test hook: shrinks the index-group budget so a small segment still spans several groups.</summary>
+    internal long _groupPayloadBudgetBytes = SegmentWriter.DefaultGroupPayloadBudgetBytes;
 
     // ── Flush memory budgets (see the constructor for how these combine) ───────
 
@@ -1142,21 +1147,22 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     {
         // Capture delegate reference before entering Task.Run
         var indexBuilder = IndexBuilder;
+        long groupBudget = _groupPayloadBudgetBytes;
         return Task.Run(() =>
         {
-            byte[] invertedBytes = Array.Empty<byte>();
-            byte[] trigramBytes  = Array.Empty<byte>();
-            byte[] bloomBytes    = Array.Empty<byte>();
-
             // One sort order shared by the index build and the block writer: posting-list
             // offsets become file ordinals, which the reader maps back to blocks/rows.
             // A caller-supplied order may be a SUBSET of the tier (level-split flush).
             int[] order = order_ ?? SegmentWriter.ComputeSortOrder(hot);
 
-            if (indexBuilder is not null)
-            {
-                (invertedBytes, trigramBytes, bloomBytes) = indexBuilder(hot, TemplatePool, order);
-            }
+            // The writer drives the index build now, one INDEX GROUP at a time: it knows
+            // where the group's payload budget falls, and only it can interleave a group's
+            // sections between its own blocks. Building the whole file up front is what
+            // made index memory scale with segment size — the ceiling that kept segments
+            // small in the first place.
+            SegmentGroupIndexBuilder? groupIndex = indexBuilder is null
+                ? null
+                : (firstOrdinal, eventCount) => indexBuilder(hot, TemplatePool, order, firstOrdinal, eventCount);
 
             // Write to a temp file first; rename to final path only after Finalise()
             // succeeds. This prevents corrupt .seg files when the process is killed mid-flush.
@@ -1164,12 +1170,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             try
             {
                 SegmentInfo info;
-                using (var writer = new SegmentWriter(tmpPath))
+                using (var writer = new SegmentWriter(tmpPath, groupBudget))
                 {
-                    writer.WriteEvents(hot, TemplatePool, order);
-                    writer.WriteInvertedIndex(invertedBytes);
-                    writer.WriteTrigramIndex(trigramBytes);
-                    writer.WriteBloomFilter(bloomBytes);
+                    writer.WriteEvents(hot, TemplatePool, order, groupIndex);
                     info = writer.Finalise(_options.NodeId, segId);
                 } // FileStream closed here before Move
                 File.Move(tmpPath, segPath, overwrite: false);
