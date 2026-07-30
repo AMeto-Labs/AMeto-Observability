@@ -257,9 +257,15 @@ public sealed class QueryExecutor : IQueryExecutor
                         // Pooled: sections are copied out inside the deserialisers, so the
                         // rented buffers go back to the pool as soon as the index is built.
                         using var invSec = reader.RentInvertedIndexBytes();
-                        using var triSec = reader.RentTrigramIndexBytes();
                         using var bloSec = reader.RentBloomFilterBytes();
-                        var idx = _indexFactory.Create(invSec.Span, triSec.Span, bloSec.Span);
+                        // The trigram section is the biggest thing in the file (~43% of it)
+                        // and every posting list is materialised into int[] on load. Only
+                        // pay for it when the filter actually has a substring predicate —
+                        // an `@l = 'Error'` query used to deserialise the whole thing.
+                        using var triSec = trigramHints.Count > 0
+                            ? reader.RentTrigramIndexBytes()
+                            : default;
+                        using var idx = _indexFactory.Create(invSec.Span, triSec.Span, bloSec.Span);
 
                         // Definitive inverted-index check (bloom can have false positives)
                         if (hasIndexHint

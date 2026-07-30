@@ -28,9 +28,30 @@ public sealed class SegmentIndexBuilder
     private char[] _key = new char[256];   // accumulated flat (dot-notation) key
     private char[] _val = new char[128];   // formatted value (serialised form, prefix at [0..2])
 
+    /// <summary>
+    /// Terms this builder adds to the bloom filter per event. The filter is a TERM filter —
+    /// level, message template, exception type, trace/span id, service name and every
+    /// flattened property key and value all go in — but it used to be sized by EVENT count,
+    /// i.e. ~10 bits per event against 50-150 entries per event. That is roughly 0.2 bits
+    /// per term: the filter said "maybe" to everything, and the prefilter it exists to power
+    /// (a bloom miss drops the whole segment before the MB-sized indexes are read) never
+    /// rejected anything on prop-dense events.
+    ///
+    /// <para>Sizing on terms restores ~10 bits/term. The cost is trivial and bounded: at the
+    /// sandbox stand's ~73k events/day that is ~5.5 MB for a whole day, against a trigram
+    /// section of ~107 MB.</para>
+    ///
+    /// <para>An estimate rather than a count because the filter is allocated up front. It is
+    /// deliberately generous — over-sizing wastes a few bits, under-sizing brings back the
+    /// saturation this fixes. An exact count becomes practical once index groups bound the
+    /// build, and belongs with that change.</para>
+    /// </summary>
+    private const int EstimatedBloomTermsPerEvent = 64;
+
     public SegmentIndexBuilder(int expectedEventCount, int maxFlattenDepth = 5)
     {
-        _bloom            = SegmentBloomFilter.Create(expectedEventCount);
+        _bloom            = SegmentBloomFilter.Create(
+                                (long)Math.Max(1, expectedEventCount) * EstimatedBloomTermsPerEvent);
         _maxFlattenDepth  = maxFlattenDepth;
     }
 

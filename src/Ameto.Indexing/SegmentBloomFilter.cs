@@ -36,17 +36,29 @@ public sealed unsafe class SegmentBloomFilter : IDisposable
         _capacity   = capacity;
     }
 
+    /// <summary>
+    /// Largest item count that still sizes honestly. Above it the filter is capped rather
+    /// than allowed to wrap: <c>expectedItems * 10</c> in int arithmetic used to overflow
+    /// silently and hand back a 64-byte match-everything filter — no crash, just a
+    /// prefilter that stops rejecting anything. Callers now size by TERM count, which
+    /// reaches this an order of magnitude sooner than event count did.
+    /// </summary>
+    private const long MaxExpectedItems = (long)int.MaxValue / 10;
+
     /// <summary>Creates a new empty filter sized for <paramref name="expectedItems"/>.</summary>
-    public static SegmentBloomFilter Create(int expectedItems)
+    public static SegmentBloomFilter Create(long expectedItems)
     {
-        // ~10 bits per item → ~1% FPR; round up to multiple of 512
-        uint totalBits  = (uint)Math.Max(expectedItems * 10, BlockBits);
+        // ~10 bits per item → ~1% FPR; round up to multiple of 512. Long arithmetic
+        // throughout, then clamped — the old int product wrapped instead of saturating.
+        long clamped   = Math.Clamp(expectedItems, 1, MaxExpectedItems);
+        long bitsWanted = Math.Max(clamped * 10, BlockBits);
+        uint totalBits  = (uint)Math.Min(bitsWanted, uint.MaxValue - BlockBits);
         totalBits       = (totalBits + (uint)(BlockBits - 1)) & ~(uint)(BlockBits - 1);
         uint blockCount = totalBits / BlockBits;
         uint byteCount  = totalBits / 8;
 
         var bits = (byte*)NativeMemory.AllocZeroed(byteCount);
-        return new SegmentBloomFilter(bits, blockCount, (uint)expectedItems);
+        return new SegmentBloomFilter(bits, blockCount, (uint)clamped);
     }
 
     // ── Write ─────────────────────────────────────────────────────────────────
