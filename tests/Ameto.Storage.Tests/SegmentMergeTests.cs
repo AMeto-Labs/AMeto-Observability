@@ -54,7 +54,14 @@ public sealed class SegmentMergeTests : IAsyncLifetime
         return buf.WrittenSpan.ToArray();
     }
 
-    /// <summary>Writes <paramref name="count"/> events and flushes them into one small segment.</summary>
+    /// <summary>
+    /// Writes <paramref name="count"/> events and flushes them into one small segment.
+    ///
+    /// <para>Single-level by default: a flush now writes ONE SEGMENT PER LEVEL, so a
+    /// mixed-level round would produce six segments and every "N rounds ⇒ N segments"
+    /// assertion below would be counting something else. Tests that care about level
+    /// behaviour pass <paramref name="fixedLevel"/> explicitly.</para>
+    /// </summary>
     private async Task WriteSegmentAsync(int round, int count, LogLevel? fixedLevel = null, long? baseTicks = null, int padBytes = 0)
     {
         for (int i = 0; i < count; i++)
@@ -64,7 +71,7 @@ public sealed class SegmentMergeTests : IAsyncLifetime
             {
                 Id                       = new EventId(0u, (uint)(round * 100_000 + i)).RawValue,
                 TimestampUtcTicks        = (baseTicks ?? DateTime.UtcNow.Ticks) + n * TimeSpan.TicksPerMillisecond,
-                Level                    = fixedLevel ?? (LogLevel)(n % 6),
+                Level                    = fixedLevel ?? LogLevel.Information,
                 MessageTemplatePoolIndex = _engine.TemplatePool.Intern("evt {n} round " + round % 3),
                 ServiceNamePoolIndex     = _engine.TemplatePool.Intern("Svc." + round % 4),
                 TraceIdHi                = (ulong)(n + 1),

@@ -47,7 +47,10 @@ public sealed class SegmentIndexBuilder
     /// </summary>
     public void Build(HotTierSegment hot, StringInternPool pool, int[]? order = null)
     {
-        for (int pos = 0; pos < hot.Count; pos++)
+        // Bound by the ORDER, not the tier: a level-split flush indexes one level's subset
+        // per segment, and posting offsets are ordinals within that segment's own file.
+        int n = order?.Length ?? hot.Count;
+        for (int pos = 0; pos < n; pos++)
         {
             int  i      = order?[pos] ?? pos;
             uint offset = (uint)pos;
@@ -63,7 +66,8 @@ public sealed class SegmentIndexBuilder
     /// </summary>
     public void BuildReference(HotTierSegment hot, StringInternPool pool, int[]? order = null)
     {
-        for (int pos = 0; pos < hot.Count; pos++)
+        int n = order?.Length ?? hot.Count;
+        for (int pos = 0; pos < n; pos++)
         {
             int  i      = order?[pos] ?? pos;
             uint offset = (uint)pos;

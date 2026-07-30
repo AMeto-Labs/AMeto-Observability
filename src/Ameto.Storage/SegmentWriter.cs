@@ -103,11 +103,16 @@ public sealed class SegmentWriter : IDisposable
     public void WriteEvents(HotTierSegment hot, StringInternPool templatePool)
         => WriteEvents(hot, templatePool, ComputeSortOrder(hot));
 
+    /// <param name="order">
+    /// Tier indices to write, in output order. It need NOT cover the whole tier: a subset
+    /// lets one tier be written as several segments, which is how a flush is split by log
+    /// level so that a segment holds exactly one level. The bound is the order's length.
+    /// </param>
     public void WriteEvents(HotTierSegment hot, StringInternPool templatePool, int[] order)
     {
         _fs.Seek(SegmentFileHeader.Size, SeekOrigin.Begin);
 
-        int count = hot.Count;
+        int count = order.Length;
         if (count == 0) return;
 
         var batch = new List<int>(1024);

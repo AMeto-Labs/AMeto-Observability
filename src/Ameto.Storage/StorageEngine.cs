@@ -100,6 +100,21 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// <summary>Window anchors that produced no usable merge batch — excluded so the sweep advances (reset on restart).</summary>
     private readonly HashSet<ulong> _mergeSkip = new();
 
+    /// <summary>
+    /// Segment ids reserved per flushed tier: one per <see cref="LogLevel"/>, so a tier
+    /// can be written as one segment PER LEVEL and the level's id is always
+    /// <c>firstId + (byte)level</c>.
+    ///
+    /// <para>Level-pure segments are what makes retention exact. Expiry is
+    /// <c>MaxTimestamp + Ttl(MinLevel)</c>, and MinLevel is the lowest severity VALUE in
+    /// the segment — but TTL is not monotonic in that value (Debug 3 d sits below
+    /// Information 90 d), so one Debug event in a mixed segment used to drag every Error
+    /// beside it to a 3-day deadline. Measured on the sandbox stand before this change:
+    /// 279 segments / 1116 MB inside 3 days, 10 segments / ~2 MB older — a clean cliff
+    /// exactly where Debug's TTL falls.</para>
+    /// </summary>
+    private const int LevelSegmentSlots = 6;   // Verbose..Fatal
+
     // Cold-tier catalog (thread-safe)
     private readonly ConcurrentDictionary<ulong, SegmentInfo> _segments = new();
     /// <summary>Background catalog scan started by the ctor (kept to observe faults).</summary>
@@ -410,11 +425,15 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             else
             {
                 frozen  = new HotTierSegment[_frozenHot.Count];
-                covered = new HashSet<ulong>(_frozenHot.Count);
+                covered = new HashSet<ulong>(_frozenHot.Count * LevelSegmentSlots);
                 for (int i = 0; i < _frozenHot.Count; i++)
                 {
                     frozen[i] = _frozenHot[i].Tier;
-                    covered.Add(_frozenHot[i].SegId);
+                    // The tier flushes to one segment per level, so every id in its
+                    // reserved block is covered — otherwise a query would serve the
+                    // already-registered per-level segments AND the still-frozen tier.
+                    ulong first = _frozenHot[i].SegId;
+                    for (int s = 0; s < LevelSegmentSlots; s++) covered.Add(first + (ulong)s);
                 }
             }
             Interlocked.Increment(ref _activeReaders);
@@ -651,9 +670,12 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             oldWalPath = oldWal?.FilePath;
             oldHot.Freeze();
 
-            // Publish oldHot + reserve its segment id under the lock queries snapshot
+            // Publish oldHot + reserve its segment ids under the lock queries snapshot
             // from, so a concurrent query sees oldHot's events AND skips the reserved
-            // cold segment id (no duplicates during the register/remove overlap).
+            // cold segment ids (no duplicates during the register/remove overlap).
+            // A tier flushes to ONE SEGMENT PER LEVEL, so a whole block of ids is
+            // reserved and the level's segment is always firstId + (byte)level. Levels
+            // absent from the tier simply never become files; a burnt id costs nothing.
             reservedSegId = _nextSegmentId;
             lock (_frozenLock) { _frozenHot.Add((oldHot, reservedSegId)); }
 
@@ -664,7 +686,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             // flushes up to 64 MB of dirty mmap pages to disk, and doing that here
             // stalled every writer (hot tier stays full for the whole swap) long enough
             // to overflow the ingest ring under sustained 100k/s load.
-            _nextSegmentId++;
+            _nextSegmentId += LevelSegmentSlots;
             _wal = null;
             OpenWal();
         }
@@ -685,13 +707,10 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             await _flushConcurrency.WaitAsync(ct).ConfigureAwait(false);
             try
             {
-                var segId   = new SegmentId(reservedSegId);
-                var segPath = BuildSegmentPath(segId, oldHot);
-
-                SegmentInfo info;
+                List<SegmentInfo> written;
                 try
                 {
-                    info = await FlushToColdAsync(oldHot, segId, segPath, ct);
+                    written = await FlushTierByLevelAsync(oldHot, reservedSegId, ct);
                 }
                 catch (Exception ex)
                 {
@@ -701,15 +720,16 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                     return;
                 }
 
-                // Register the cold segment AND drop oldHot from the frozen list atomically.
+                // Register the cold segments AND drop oldHot from the frozen list atomically.
                 lock (_frozenLock)
                 {
-                    _segments[segId.Value] = info;
+                    foreach (var w in written) _segments[w.Id.Value] = w;
                     _frozenHot.RemoveAll(f => ReferenceEquals(f.Tier, oldHot));
                 }
-                _logger.LogInformation("Flushed segment {Id}: {Count} events → {Path}", segId, info.EventCount, segPath);
+                _logger.LogInformation("Flushed {Segments} level segment(s), {Count} events total",
+                    written.Count, written.Sum(w => (long)w.EventCount));
 
-                SegmentFlushed?.Invoke(info);
+                foreach (var w in written) SegmentFlushed?.Invoke(w);
 
                 if (oldWalPath is not null)
                 {
@@ -831,7 +851,12 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                          && s.UncompressedBytes <= MergeCandidateMaxUncompressedBytes
                          && s.EventCount <= MergeCandidateMaxEvents
                          && !_mergeSkip.Contains(s.Id.Value))
-                .GroupBy(s => policy.GetTtl(s.MinLevel))
+                // Group by LEVEL, not by TTL class. Segments are level-pure as written
+                // (see FlushTierByLevelAsync), and grouping by TTL would merge Information
+                // with Error — same 90-day class, different levels — handing the merged
+                // file back the mixed-level shape whose retention this change exists to
+                // make exact. Same-level implies same TTL, so the old invariant still holds.
+                .GroupBy(s => s.MinLevel)
                 .Select(g => g.OrderBy(s => s.MinTimestampTicks).ToList())
                 .Where(g => g.Count >= 2)
                 .OrderBy(g => g[0].MinTimestampTicks);
@@ -1074,7 +1099,46 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         }
     }
 
-    private Task<SegmentInfo> FlushToColdAsync(HotTierSegment hot, SegmentId segId, string segPath, CancellationToken ct)
+    /// <summary>
+    /// Writes a frozen tier as ONE SEGMENT PER LOG LEVEL, so every segment holds a single
+    /// level and its retention deadline is exact rather than governed by whichever level
+    /// happened to have the lowest enum value inside it.
+    ///
+    /// <para>The tier is sorted once; the order is then partitioned by level, which keeps
+    /// each level's subsequence sorted by (ts, id) — everything downstream (block order,
+    /// the query k-way merge, cursor pagination) is unaffected. Levels absent from the
+    /// tier produce no file. The level's id is <c>firstSegId + (byte)level</c>, matching
+    /// the block of ids reserved at freeze so a concurrent query skips them all.</para>
+    /// </summary>
+    private async Task<List<SegmentInfo>> FlushTierByLevelAsync(
+        HotTierSegment hot, ulong firstSegId, CancellationToken ct)
+    {
+        int[] order = SegmentWriter.ComputeSortOrder(hot);
+
+        var perLevel = new List<int>[LevelSegmentSlots];
+        for (int oi = 0; oi < order.Length; oi++)
+        {
+            int lvl = (int)hot.GetHeader(order[oi]).Level;
+            if ((uint)lvl >= LevelSegmentSlots) lvl = (int)Ameto.Core.LogLevel.Information;   // defensive
+            (perLevel[lvl] ??= new List<int>()).Add(order[oi]);
+        }
+
+        var written = new List<SegmentInfo>(LevelSegmentSlots);
+        for (int lvl = 0; lvl < LevelSegmentSlots; lvl++)
+        {
+            var idx = perLevel[lvl];
+            if (idx is null || idx.Count == 0) continue;
+
+            var subset  = idx.ToArray();
+            var segId   = new SegmentId(firstSegId + (ulong)lvl);
+            var segPath = BuildSegmentPath(segId, hot, subset);
+            written.Add(await FlushToColdAsync(hot, segId, segPath, ct, subset));
+        }
+        return written;
+    }
+
+    private Task<SegmentInfo> FlushToColdAsync(
+        HotTierSegment hot, SegmentId segId, string segPath, CancellationToken ct, int[]? order_ = null)
     {
         // Capture delegate reference before entering Task.Run
         var indexBuilder = IndexBuilder;
@@ -1086,7 +1150,8 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
             // One sort order shared by the index build and the block writer: posting-list
             // offsets become file ordinals, which the reader maps back to blocks/rows.
-            int[] order = SegmentWriter.ComputeSortOrder(hot);
+            // A caller-supplied order may be a SUBSET of the tier (level-split flush).
+            int[] order = order_ ?? SegmentWriter.ComputeSortOrder(hot);
 
             if (indexBuilder is not null)
             {
@@ -1333,11 +1398,18 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         _wal        = WriteAheadLog.Open(walPath, _options.NodeId, segId);
     }
 
-    private string BuildSegmentPath(SegmentId segId, HotTierSegment hot)
+    /// <param name="order">
+    /// Tier indices this segment will contain; null = the whole tier. The file name
+    /// carries the range, and retention reads MaxTimestamp out of it, so a level-split
+    /// segment must be named from ITS OWN events rather than the tier's.
+    /// </param>
+    private string BuildSegmentPath(SegmentId segId, HotTierSegment hot, int[]? order = null)
     {
         long minTs = long.MaxValue, maxTs = long.MinValue;
-        for (int i = 0; i < hot.Count; i++)
+        int n = order?.Length ?? hot.Count;
+        for (int k = 0; k < n; k++)
         {
+            int i = order?[k] ?? k;
             ref var h = ref hot.GetHeader(i);
             if (h.TimestampUtcTicks < minTs) minTs = h.TimestampUtcTicks;
             if (h.TimestampUtcTicks > maxTs) maxTs = h.TimestampUtcTicks;

@@ -43,7 +43,9 @@ public sealed class IndexingWiring : Microsoft.Extensions.Hosting.IHostedService
         int maxDepth = _opts.MaxPropertyFlattenDepth;
         _storage.IndexBuilder = (hot, pool, order) =>
         {
-            var builder = new SegmentIndexBuilder(hot.Count, maxDepth);
+            // Size on the SUBSET being written — a level-split flush produces one segment
+            // per level out of a single tier.
+            var builder = new SegmentIndexBuilder(order?.Length ?? hot.Count, maxDepth);
             builder.Build(hot, pool, order);
             return (builder.SerialisedInvertedIndex,
                     builder.SerialisedTrigramIndex,
