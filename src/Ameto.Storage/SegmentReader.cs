@@ -21,14 +21,23 @@ public sealed class SegmentReader : ISegmentReader
     //     event) and index posting lists store file ordinals — enables candidate-driven
     //     block/row skipping. v4 segments remain readable (full scan, no skipping).
     private const ushort MinSupportedVersion = 4;
-    private const ushort MaxSupportedVersion = 5;
+    private const ushort MaxSupportedVersion = 6;
+
+    /// <summary>Block MinTs for a pre-v6 segment, which has no zone map — never prunes.</summary>
+    private const long UnknownBlockMinTs = long.MinValue;
 
     private readonly long _invertedIndexOffset;
     private readonly long _trigramIndexOffset;
     private readonly long _bloomFilterOffset;
     private readonly long _blockIndexOffset;
 
-    private readonly (long FileOffset, ulong FirstEventId)[] _blocks;
+    /// <summary>
+    /// Per-block (byte offset, min timestamp). MinTs is the v6 time zone map and is
+    /// non-decreasing, because blocks are written in (ts, id) order — that ordering is
+    /// what lets a windowed read skip blocks instead of decompressing them.
+    /// <see cref="UnknownBlockMinTs"/> for pre-v6 files.
+    /// </summary>
+    private readonly (long FileOffset, long MinTs)[] _blocks;
 
     /// <summary>Per-block file ordinal of its first event (v5+); null for v4 segments.</summary>
     private readonly uint[]? _blockOrdinals;
@@ -103,19 +112,35 @@ public sealed class SegmentReader : ISegmentReader
             throw new InvalidDataException($"Unsupported segment version {version} in {filePath}; expected {MinSupportedVersion}-{MaxSupportedVersion}. Delete the data directory and restart.");
 
         int blockCount = ReadInt32At(_blockIndexOffset);
-        _blocks        = new (long, ulong)[blockCount];
+        _blocks        = new (long, long)[blockCount];
         _blockOrdinals = version >= 5 ? new uint[blockCount] : null;
-        long pos    = _blockIndexOffset + 4;
-        int  stride = version >= 5 ? 20 : 16;
-        for (int i = 0; i < blockCount; i++)
+        int stride = version >= 5 ? 20 : 16;
+
+        // Pull the whole block index in ONE mapped read and parse it from the span. The
+        // per-entry shape cost three MemoryMappedViewAccessor calls per block, so opening a
+        // segment was O(segment size) in view reads — the cost that decides whether large
+        // segments are cheap to open, and Open is on the query hot path.
+        int idxBytes = blockCount * stride;
+        byte[] rented = ArrayPool<byte>.Shared.Rent(Math.Max(idxBytes, 1));
+        try
         {
-            long  offset  = ReadInt64At(pos);
-            ulong firstId = (ulong)ReadInt64At(pos + 8);
-            if (_blockOrdinals is not null)
-                _blockOrdinals[i] = (uint)ReadInt32At(pos + 16);
-            _blocks[i] = (offset, firstId);
-            pos += stride;
+            if (idxBytes > 0) _view.ReadArray(_blockIndexOffset + 4, rented, 0, idxBytes);
+            var raw = rented.AsSpan(0, idxBytes);
+            for (int i = 0; i < blockCount; i++)
+            {
+                var entry   = raw.Slice(i * stride, stride);
+                long offset = BinaryPrimitives.ReadInt64LittleEndian(entry);
+                // v6 stores the block's min timestamp in the slot v4/v5 spent on
+                // FirstEventId (written, never read). Older files have no zone map.
+                long blockMinTs = version >= 6
+                    ? BinaryPrimitives.ReadInt64LittleEndian(entry.Slice(8, 8))
+                    : UnknownBlockMinTs;
+                if (_blockOrdinals is not null)
+                    _blockOrdinals[i] = BinaryPrimitives.ReadUInt32LittleEndian(entry.Slice(16, 4));
+                _blocks[i] = (offset, blockMinTs);
+            }
         }
+        finally { ArrayPool<byte>.Shared.Return(rented); }
 
         // Honest uncompressed size: every block frame starts with a uint32
         // uncompressedSize (see ReadAllRaw) — sum them instead of reporting the
@@ -174,6 +199,8 @@ public sealed class SegmentReader : ISegmentReader
             int idx = reversed ? blockCount - 1 - bi : bi;
             ct.ThrowIfCancellationRequested();
 
+            if (SkipByWindow(idx, fromTicks, toTicks)) continue;
+
             int candStart = 0, candEnd = 0;
             if (cands is not null)
             {
@@ -195,6 +222,36 @@ public sealed class SegmentReader : ISegmentReader
             }
         }
         await Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// True when block <paramref name="idx"/> provably holds nothing in [from, to], using
+    /// the v6 zone map alone — no decompression.
+    ///
+    /// <para>Blocks are ordered by (ts, id), so block i's events all fall in
+    /// [MinTs(i), MinTs(i+1)]. Two provable cases:</para>
+    /// <list type="bullet">
+    ///   <item>MinTs(i) &gt; to — every event in the block is past the window.</item>
+    ///   <item>MinTs(i+1) &lt; from — every event in the block is before it. Strict &lt;,
+    ///         because an event sitting exactly on `from` belongs to the window and may
+    ///         live in block i.</item>
+    /// </list>
+    ///
+    /// <para>This is an optimisation only: the per-event window check in the caller stays,
+    /// so a wrong skip would be a bug rather than merely slower results — hence the
+    /// conservative bounds and the pre-v6 opt-out.</para>
+    /// </summary>
+    private bool SkipByWindow(int idx, long fromTicks, long toTicks)
+    {
+        long minTs = _blocks[idx].MinTs;
+        if (minTs == UnknownBlockMinTs) return false;          // pre-v6: no zone map
+        if (minTs > toTicks) return true;
+        if (idx + 1 < _blocks.Length)
+        {
+            long nextMinTs = _blocks[idx + 1].MinTs;
+            if (nextMinTs != UnknownBlockMinTs && nextMinTs < fromTicks) return true;
+        }
+        return false;
     }
 
     /// <summary>First index in ascending <paramref name="a"/> whose value is ≥ <paramref name="key"/>.</summary>

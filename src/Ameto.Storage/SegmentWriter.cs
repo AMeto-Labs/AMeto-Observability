@@ -33,7 +33,12 @@ public sealed class SegmentWriter : IDisposable
 {
     private const uint   MagicHeader = 0x52_44_4C_47; // "RDLG"
     private const uint   MagicFooter = 0x52_44_46_54; // "RDFT"
-    private const ushort SegVersion  = 5;             // v5: block index carries FirstOrdinal (v4: + TraceId/SpanId/ServiceName columns)
+    // v6: the block index carries the block's MIN TIMESTAMP in the slot v5 spent on
+    // FirstEventId — which was written by every flush and read by nothing. That makes the
+    // block index a time zone map, so a windowed query seeks to its blocks instead of
+    // decompressing the file. Without it a segment's own Min/MaxTimestamp is the ONLY time
+    // index there is, which is why segments have to stay small to be queryable.
+    private const ushort SegVersion  = 6;             // v5: block index carried FirstOrdinal; v4: + TraceId/SpanId/ServiceName columns
     private const int    BlockSize   = 64 * 1024;      // 64 KB target uncompressed block size
 
     public  const byte   FlagCompressed = 0x01;
@@ -42,10 +47,12 @@ public sealed class SegmentWriter : IDisposable
     private readonly FileStream   _fs;
     private readonly BinaryWriter _bw;
 
-    // v5 block-index entry: byte offset of the block, first EventId, and the ordinal
-    // (file-order position, 0-based) of the block's first event. Index posting lists
-    // store these same ordinals, so the reader can map candidates → block → row.
-    private readonly List<(long Offset, ulong FirstEventId, uint FirstOrdinal)> _blockIndex = new();
+    // v6 block-index entry: byte offset of the block, the block's MIN timestamp, and the
+    // ordinal (file-order position, 0-based) of the block's first event. Index posting
+    // lists store those ordinals, so the reader can map candidates → block → row; the
+    // timestamp lets it skip whole blocks outside a query window without decompressing.
+    // Blocks are written in (ts, id) order, so MinTs is non-decreasing across the index.
+    private readonly List<(long Offset, long MinTs, uint FirstOrdinal)> _blockIndex = new();
     private int _eventsFlushed;
 
     private long _invertedIndexOffset;
@@ -163,11 +170,11 @@ public sealed class SegmentWriter : IDisposable
     {
         _blockIndexOffset = _fs.Position;
         _bw.Write((uint)_blockIndex.Count);
-        foreach (var (offset, firstId, firstOrdinal) in _blockIndex)
+        foreach (var (offset, minTs, firstOrdinal) in _blockIndex)
         {
             _bw.Write(offset);
-            _bw.Write(firstId);
-            _bw.Write(firstOrdinal);   // v5: maps index posting-list offsets → block
+            _bw.Write(minTs);          // v6: time zone map (v5 wrote FirstEventId here)
+            _bw.Write(firstOrdinal);   // maps index posting-list offsets → block
         }
 
         long footerOffset = _fs.Position;
@@ -373,7 +380,7 @@ public sealed class SegmentWriter : IDisposable
             int compressedLen = LZ4Codec.Encode(uncompressed, 0, uncompressedLen, compBuf, 0, maxOut, LZ4Level.L00_FAST);
 
             long blockOffset = _fs.Position;
-            _blockIndex.Add((blockOffset, firstEventId, (uint)_eventsFlushed));
+            _blockIndex.Add((blockOffset, blockMinTs, (uint)_eventsFlushed));
             _eventsFlushed     += n;
             _uncompressedBytes += uncompressedLen;
 
