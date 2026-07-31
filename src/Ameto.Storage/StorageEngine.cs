@@ -827,9 +827,15 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// <see cref="MergeMaxSpanTicks"/> — the span is exactly how much longer the
     /// oldest events can outlive their per-segment deadline.</para>
     ///
-    /// Crash-safe: a manifest written next to the merged file lists the source
-    /// files, so an interrupted deletion is finished on the next startup. Returns
-    /// true when a batch was merged.
+    /// <para>Crash-safe, and the ORDER is the proof. A manifest listing the source files is
+    /// written first; the merged file is built at <c>.seg.tmp</c> (which the startup scan
+    /// deletes) and only then moved to a name the catalog can see; the sources are deleted
+    /// after that; the manifest is dropped only once every one of them is confirmed gone. So a
+    /// merged file never exists beside its un-deleted sources without a manifest naming them,
+    /// and a manifest never names sources that are not already duplicated. Recovery reads both
+    /// halves: merged file present ⇒ finish deleting, absent ⇒ the merge never committed.</para>
+    ///
+    /// Returns true when a batch was merged.
     /// </summary>
     internal async Task<bool> TryMergeSmallSegmentsOnceAsync(CancellationToken ct)
     {
