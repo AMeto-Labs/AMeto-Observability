@@ -313,6 +313,104 @@ public sealed class SegmentBucketAdversarialProbe : IAsyncLifetime
         return deepest;
     }
 
+    // ── 2b. A terminal state under NON-UNIFORM flush sizes ────────────────────
+
+    /// <summary>
+    /// Files present, per size tier, so a terminal state can be stated as a bound rather than a
+    /// number that happened to come out.
+    /// </summary>
+    private int DistinctSizeTiers() =>
+        _engine.ListSegments()
+               .Select(s => StorageEngine.SizeTier(Math.Max(s.UncompressedBytes, s.CompressedBytes)))
+               .Distinct().Count();
+
+    /// <summary>
+    /// THE SECOND BLOCKER. Every convergence test before this one drove UNIFORM flush volumes,
+    /// and uniform sizes are the one distribution under which time-contiguity and the size ratio
+    /// never disagree. Give adjacent flushes a 5× size difference — which a producer does by
+    /// itself, since the flush fires on a 5-minute timer and its size is simply the traffic in
+    /// that window — and the contiguous rule strands every file between two neighbours it cannot
+    /// take. MEASURED at 30b0d93: 240 flushes into a bucket sealed 30 days ago produced 240
+    /// files and ZERO merges, at fixpoint after every flush. The pre-fix commit 37c4521 produced
+    /// 1 file. So the shape went from "converges, too expensively" to "never converges".
+    ///
+    /// <para>The bound asserted here is the one the size ladder gives, and it holds for ANY size
+    /// distribution: at fixpoint a tier holds fewer files than the fanout (three same-tier files
+    /// always satisfy the growth rule, since the largest is under
+    /// <see cref="StorageEngine.MergeRunSizeRatio"/> of the smallest), so a sealed bucket holds
+    /// at most 2 files per tier and the tier count is <c>log₄(bucket bytes / flush bytes)</c> —
+    /// a function of the geometry, never of uptime.</para>
+    /// </summary>
+    [Fact]
+    public async Task ASealedBucketConvergesWhateverTheFlushSizeDistribution()
+    {
+        long b = BucketStart(LogLevel.Information, DateTime.UtcNow.Ticks - 30 * TimeSpan.TicksPerDay);
+        var  files = new Dictionary<int, int>();
+        int  expected = 0, merges = 0;
+
+        for (int f = 0; f < 240; f++)
+        {
+            int n = f % 2 == 0 ? 200 : 40;        // 5× between adjacent flushes, above the ratio
+            expected += n;
+            await FlushAsync(n, LogLevel.Information, b + f * 20 * TimeSpan.TicksPerMinute, padBytes: 256);
+            merges += (await CompactToExhaustionAsync()).Merges;
+            if (f + 1 is 40 or 80 or 160 or 240) files[f + 1] = _engine.ListSegments().Count;
+        }
+
+        _out.WriteLine($"alternating 200/40 events, SEALED bucket, compacted after every flush: " +
+                       string.Join(", ", files.Select(kv => $"{kv.Key} flushes -> {kv.Value} file(s)")) +
+                       $" in {merges} merges");
+
+        // Was 40 / 80 / 160 / 240 — one file per flush, and 0 merges throughout.
+        Assert.True(files[240] <= files[40],
+            $"file count grows with uptime: {files[40]} at 40 flushes, {files[240]} at 240");
+        Assert.True(files[240] <= MergeSealedFanout * DistinctSizeTiers(),
+            $"{files[240]} files across {DistinctSizeTiers()} size tier(s) — above the ladder bound");
+        Assert.Equal(expected, ServedEvents());
+    }
+
+    private const int MergeSealedFanout = 2;   // StorageEngine.MergeSealedMinSources
+
+    /// <summary>
+    /// The same failure on the shape a real producer makes without trying: a quiet baseline with
+    /// a burst every twentieth flush — a deploy, an error storm, or just diurnal traffic against
+    /// a fixed flush cadence. MEASURED at 30b0d93 in a bucket sealed 30 days ago: 6 / 12 / 24 /
+    /// 48 / 96 files at 40 / 80 / 160 / 320 / 640 flushes. Exactly 0.15 files per flush, linear,
+    /// forever, with the planner at fixpoint after every one of them — the bucket settled into a
+    /// repeating (455 KB, 69 KB, 13 KB) triple whose adjacent ratios, 6.6 and 5.3, both exceed
+    /// the size ratio, so no contiguous run of length 2 existed anywhere in it.
+    ///
+    /// <para>The amplification that shape reported — a flat 1.95× — read well only because
+    /// almost nothing merged. That is why file count is guarded here and not just bytes.</para>
+    /// </summary>
+    [Fact]
+    public async Task ABurstyProducerDoesNotGrowTheCatalogWithUptime()
+    {
+        long b = BucketStart(LogLevel.Information, DateTime.UtcNow.Ticks - 30 * TimeSpan.TicksPerDay);
+        var  files = new Dictionary<int, int>();
+        int  expected = 0;
+
+        for (int f = 0; f < 640; f++)
+        {
+            int n = f % 20 == 19 ? 800 : 40;
+            expected += n;
+            await FlushAsync(n, LogLevel.Information, b + f * 10 * TimeSpan.TicksPerMinute, padBytes: 256);
+            await CompactToExhaustionAsync();
+            if (f + 1 is 40 or 80 or 160 or 320 or 640) files[f + 1] = _engine.ListSegments().Count;
+        }
+
+        _out.WriteLine("bursty 40/800 events, SEALED bucket: " +
+                       string.Join(", ", files.Select(kv => $"{kv.Key}->{kv.Value}")) +
+                       $"; {DistinctSizeTiers()} size tier(s)");
+
+        // 16× the flushes must not cost 16× the files. Was 6 -> 96.
+        Assert.True(files[640] <= files[40] * 2,
+            $"file count tracks uptime: {files[40]} at 40 flushes, {files[640]} at 640");
+        Assert.True(files[640] <= MergeSealedFanout * DistinctSizeTiers(),
+            $"{files[640]} files across {DistinctSizeTiers()} size tier(s) — above the ladder bound");
+        Assert.Equal(expected, ServedEvents());
+    }
+
     // ── 3. The batch budget must not stall a bucket ───────────────────────────
 
     /// <summary>
