@@ -294,7 +294,19 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         // proportional to the bytes a pass actually chewed through, so gate on that.
         var attempts = new Dictionary<ulong, int>();
 
-        try { await Task.Delay(TimeSpan.FromMinutes(3), ct); } // let startup + catalog load settle
+        // Wait for the catalog ENUMERATION, not for a guess at how long it takes. It opens every
+        // .seg with computeUncompressedBytes: true, which is slowest in exactly the
+        // thousands-of-small-segments case compaction exists for — so a fixed delay can expire
+        // mid-scan, and a source this sweep deletes then gets re-registered by the enumeration
+        // still running behind it, leaving a catalog entry pointing at a file that is gone.
+        // (Not data loss: RecoverInterruptedMerges does run before the enumeration. But the
+        // resurrected entry becomes a merge candidate, fails to open and is skip-listed until
+        // restart.)
+        try { await _catalogLoad.WaitAsync(ct); }
+        catch (OperationCanceledException) { return; }
+        catch (Exception ex) { _logger.LogWarning(ex, "Segment catalog load faulted — maintenance continues"); }
+
+        try { await Task.Delay(TimeSpan.FromMinutes(3), ct); } // let startup settle
         catch (OperationCanceledException) { return; }
 
         while (!ct.IsCancellationRequested)
