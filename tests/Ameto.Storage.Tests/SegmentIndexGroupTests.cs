@@ -297,6 +297,56 @@ public sealed class SegmentIndexGroupTests : IDisposable
     }
 
     /// <summary>
+    /// A group's bloom filter is allocated from a forecast made at its FIRST EVENT and can never
+    /// be resized, so the forecast has to survive an unrepresentative first row. Sizing it from
+    /// that row's own cost let one fat event shrink the whole file's filter by the ratio of its
+    /// size to the rest — measured elsewhere at 36× on a 20,000-event segment, which saturates
+    /// the filter and leaves the prefilter rejecting nothing.
+    /// </summary>
+    [Fact]
+    public void AFatFirstRowDoesNotShrinkTheGroupsEventForecast()
+    {
+        var pool = new StringInternPool();
+        using var hot = new HotTierSegment(Events + 2, (long)Events * 640 + (16L << 20));
+        int    tmplIdx = pool.Intern("group event {n}");
+        string tmpl    = pool.Get(tmplIdx);
+
+        for (int i = 0; i <= Events; i++)
+        {
+            var buf = new ArrayBufferWriter<byte>(512);
+            var w   = new MessagePackWriter(buf);
+            w.WriteMapHeader(2);
+            w.Write("n");   w.Write((long)i);
+            w.Write("pad"); w.Write(new string('x', i == 0 ? 120 * 1024 : 300));   // one fat row, first
+            w.Flush();
+            Assert.True(hot.TryWrite(new LogEventHeader
+            {
+                Id                       = new EventId(0u, (uint)i).RawValue,
+                TimestampUtcTicks        = TickAt(i),
+                Level                    = LogLevel.Information,
+                MessageTemplatePoolIndex = tmplIdx,
+            }, buf.WrittenSpan, tmpl));
+        }
+        hot.Freeze();
+
+        var estimates = new List<int>();
+        using (var sw = new SegmentWriter(Path.Combine(_dir, "fat-first.seg"),
+                                          SegmentWriter.DefaultGroupPayloadBudgetBytes))
+        {
+            sw.WriteEvents(hot, pool, SegmentWriter.ComputeSortOrder(hot),
+                           n => { estimates.Add(n); return new StubSink(() => 1); });
+            sw.Finalise(new NodeId(0), new SegmentId(1UL));
+        }
+
+        // One group at the production budget, forecast at the source's own remaining count
+        // (which excludes the event already in the writer's hand, hence Events and not Events+1)
+        // rather than at what one 120 KB row suggests the budget affords — that would be 546.
+        Assert.Single(estimates);
+        Assert.True(estimates[0] >= Events,
+            $"forecast {estimates[0]} for a {Events + 1}-event group — the fat first row shrank it");
+    }
+
+    /// <summary>
     /// Stand-in index sink: records the group's ordinal range from the events actually pushed
     /// into it, and emits sections sized differently per group so a mixed-up section offset
     /// shows up as a wrong length rather than as silence.

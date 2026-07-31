@@ -156,14 +156,32 @@ internal sealed class SegmentEventCursor : IDisposable
     }
 
     /// <summary>
+    /// Entries the shared dedup table may hold before it is emptied. Matches
+    /// <see cref="StringInternPool"/>'s ceiling, and for the same reason: past it the values are
+    /// not a vocabulary any more.
+    /// </summary>
+    private const int MaxDedupEntries = 65_536;
+
+    /// <summary>
     /// Collapses repeated template / service strings across blocks AND across the merge's source
     /// files. A day's segments share a handful of templates between them, so without this the
     /// merge would allocate one string per event for a value that is already on the heap.
+    ///
+    /// <para>BOUNDED, because the table is otherwise the one thing in the merge that is not
+    /// O(block + group): it retains an entry per DISTINCT template for the whole merge, and a
+    /// template built by interpolation is distinct per event — the shape
+    /// <see cref="StringInternPool"/>'s exhaustion warning exists for. At ~240 B an entry that
+    /// extrapolates to the better part of a gigabyte across a full-sized merged file, which
+    /// would silently reintroduce the memory ceiling the streaming merge removed. Dedup is a
+    /// pure allocation optimisation — nothing is correct or incorrect about the result — so the
+    /// table is simply emptied at the cap and refills with whatever the merge is seeing now.
+    /// The dictionary keeps its buckets; what is released is the strings, which are the bulk.</para>
     /// </summary>
     private string? Dedup(string? s)
     {
         if (s is null) return null;
         if (_stringDedup.TryGetValue(s, out var pooled)) return pooled;
+        if (_stringDedup.Count >= MaxDedupEntries) _stringDedup.Clear();
         _stringDedup[s] = s;
         return s;
     }

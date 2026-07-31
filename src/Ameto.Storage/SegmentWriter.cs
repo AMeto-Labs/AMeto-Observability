@@ -85,6 +85,21 @@ public sealed class SegmentWriter : IDisposable
     /// </summary>
     private const long MinAssumedRowCostBytes = 32;
 
+    /// <summary>
+    /// Row cost the group budget's documented bloom figure is expressed in — a full 64 MB group
+    /// at ~10.5 MB of filter is 512 B a row.
+    ///
+    /// <para>Used as a FLOOR on the first group's forecast, so an unrepresentative first row can
+    /// only make the filter bigger, never smaller. The forecast is made at the group's first
+    /// event and cannot be revised, and one row is not a measurement: MEASURED on the flush path,
+    /// a single 120 KB first row forecast 558 events for a 20,000-event segment — a 36× under-size
+    /// — and through a merge it drove one group's false-positive rate to 75 %, which is the
+    /// prefilter not filtering. Over-forecasting is the benign direction (it wastes bloom bits),
+    /// and this bounds even that: the first group can be over-sized to at most the budget the
+    /// group was designed for.</para>
+    /// </summary>
+    private const long AssumedRowCostBytes = 512;
+
     /// <summary>Group-directory entry size on disk (4×uint32 + 2×int64 bounds + 3×int64 offsets).</summary>
     internal const int GroupEntrySize = 56;
 
@@ -286,21 +301,25 @@ public sealed class SegmentWriter : IDisposable
     /// <para>The bloom filter is allocated up front and cannot be resized, so the sink needs an
     /// event-count forecast the moment the group starts. Two bounds, whichever is tighter: what
     /// the source says is left, and what the group's PAYLOAD budget affords at the average row
-    /// cost measured over the file so far (this event's own cost for the first group, which has
-    /// nothing to measure). Over-forecasting only wastes bloom bits; under-forecasting
-    /// saturates the filter and the prefilter stops rejecting — so both bounds are ceilings and
-    /// neither is trusted alone.</para>
+    /// cost. Over-forecasting only wastes bloom bits; under-forecasting saturates the filter and
+    /// the prefilter stops rejecting — so both bounds are ceilings and neither is trusted alone.</para>
+    ///
+    /// <para>From the second group on the row cost is the file's own measured average, over
+    /// however many events have already been written. The FIRST group has only this one event,
+    /// which is a sample of one — so it is used only where it makes the forecast LARGER, floored
+    /// at <see cref="AssumedRowCostBytes"/>. See that constant for what a fat first row used to
+    /// do to the whole file's filter.</para>
     /// </summary>
     private ISegmentIndexSink? EnsureSink(int rowCost, long remainingHint)
     {
         if (_sinkFactory is null) return null;
         if (_sink is not null)    return _sink;
 
-        long avgRowCost = _eventsFlushed > 0
-            ? Math.Max(MinAssumedRowCostBytes, _uncompressedBytes / _eventsFlushed)
-            : Math.Max(MinAssumedRowCostBytes, rowCost);
-        long byBudget = Math.Max(1, _groupBudget / avgRowCost);
-        long estimate = Math.Clamp(Math.Min(remainingHint, byBudget), 1, int.MaxValue);
+        long byBudget = _eventsFlushed > 0
+            ? _groupBudget / Math.Max(MinAssumedRowCostBytes, _uncompressedBytes / _eventsFlushed)
+            : Math.Max(_groupBudget / Math.Max(MinAssumedRowCostBytes, rowCost),
+                       _groupBudget / AssumedRowCostBytes);
+        long estimate = Math.Clamp(Math.Min(remainingHint, Math.Max(1, byBudget)), 1, int.MaxValue);
         return _sink = _sinkFactory((int)estimate);
     }
 

@@ -47,6 +47,58 @@ public sealed class StreamingMergeMemoryProbe : IDisposable
         GC.Collect();
     }
 
+    /// <summary>
+    /// The k-way merge's string-dedup table is the one thing in the pipeline that is NOT
+    /// O(block + group): it holds an entry per distinct template or service name for the whole
+    /// merge. With structured templates that is a handful of strings; with a RENDERED message —
+    /// a template built by interpolation, which is what <see cref="StringInternPool"/>'s
+    /// exhaustion warning exists for — it is one per event, and unbounded it would put back the
+    /// memory ceiling the streaming merge removed, at a merged file that may now hold millions
+    /// of rows.
+    ///
+    /// <para>Measured on the SOURCE alone — no writer, no index sink — because that is where the
+    /// table lives and the writer's own flat cost would drown it. Ten times the events must not
+    /// cost ten times the retention.</para>
+    /// </summary>
+    [Fact]
+    public void TheMergeStreamsStringDedupIsBounded()
+    {
+        const double MB = 1048576.0;
+
+        MeasureSourceRetention(200, "hc-warm");
+        var small = MeasureSourceRetention(2_000,  "hc-small");   // 24k events — inside the cap
+        var large = MeasureSourceRetention(20_000, "hc-large");   // 240k events — well past it
+
+        _out.WriteLine(
+            $"  dedup retention with a distinct template per event: {small.Events:N0} events " +
+            $"{small.Bytes / MB:F1} MB ({small.Bytes / (double)small.Events:F0} B/event) -> " +
+            $"{large.Events:N0} events {large.Bytes / MB:F1} MB " +
+            $"({large.Bytes / (double)large.Events:F0} B/event)");
+
+        Assert.Equal(small.Events * 10, large.Events);
+        Assert.True(large.Bytes < small.Bytes * 5,
+            $"10x the events retained {large.Bytes / (double)small.Bytes:F1}x the memory — the dedup table is unbounded");
+    }
+
+    /// <summary>Live bytes the merge SOURCE still holds after draining it — the dedup table.</summary>
+    private (int Events, long Bytes) MeasureSourceRetention(int eventsPerSource, string name)
+    {
+        string sub = Path.Combine(_dir, name);
+        Directory.CreateDirectory(sub);
+
+        var paths = new List<string>(Sources);
+        for (int s = 0; s < Sources; s++)
+            paths.Add(WriteSource(sub, s, eventsPerSource, distinctTemplates: true));
+
+        long baseline = GC.GetTotalMemory(forceFullCollection: true);
+        using var source = MergingSegmentEventSource.Open(paths);
+        int n = 0;
+        while (source.TryReadNext(out var ev)) { if (ev.Id != 0) n++; else n++; }
+        long live = GC.GetTotalMemory(forceFullCollection: true) - baseline;
+        GC.KeepAlive(source);
+        return (n, live);
+    }
+
     [Fact]
     public void PeakMergeMemoryIsFlatInTheMergedSegmentSize()
     {
@@ -87,14 +139,14 @@ public sealed class StreamingMergeMemoryProbe : IDisposable
 
     private readonly record struct Result(int Events, int Groups, long PeakBytes, long MaterialisedBytes);
 
-    private Result Measure(int eventsPerSource, string name)
+    private Result Measure(int eventsPerSource, string name, bool distinctTemplates = false)
     {
         string sub = Path.Combine(_dir, name.Replace(' ', '-'));
         Directory.CreateDirectory(sub);
 
         var paths = new List<string>(Sources);
         for (int s = 0; s < Sources; s++)
-            paths.Add(WriteSource(sub, s, eventsPerSource));
+            paths.Add(WriteSource(sub, s, eventsPerSource, distinctTemplates));
 
         int totalEvents = Sources * eventsPerSource;
         long peak = 0;
@@ -168,7 +220,12 @@ public sealed class StreamingMergeMemoryProbe : IDisposable
     /// One source segment: trace-carrying, prop-dense events, disjoint time ranges per source so
     /// the heap actually has to interleave them (sources overlap by half a range).
     /// </summary>
-    private static string WriteSource(string dir, int sourceIndex, int events)
+    /// <param name="distinctTemplates">
+    /// Give every event its own message template — a rendered message rather than a structured
+    /// one. It is what the merge's string dedup has to stay bounded against, and the shared
+    /// template below hides it completely.
+    /// </param>
+    private static string WriteSource(string dir, int sourceIndex, int events, bool distinctTemplates = false)
     {
         var pool = new StringInternPool();
         using var hot = new HotTierSegment(events + 1, (long)events * 768 + (16L << 20));
@@ -209,7 +266,10 @@ public sealed class StreamingMergeMemoryProbe : IDisposable
                 TraceIdLo                = (ulong)rng.NextInt64(),
                 SpanId                   = (ulong)rng.NextInt64(),
             };
-            if (!hot.TryWrite(h, buf.WrittenSpan)) break;
+            string? tmpl = distinctTemplates
+                ? $"HTTP GET /api/pay/{sourceIndex}/{i} responded 200 in {i % 500} ms for cust-{i}"
+                : null;
+            if (!hot.TryWrite(h, buf.WrittenSpan, tmpl)) break;
         }
         hot.Freeze();
 
