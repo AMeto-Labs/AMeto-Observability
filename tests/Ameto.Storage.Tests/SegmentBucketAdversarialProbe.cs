@@ -267,6 +267,44 @@ public sealed class SegmentBucketAdversarialProbe : IAsyncLifetime
     }
 
     /// <summary>
+    /// Write amplification once the size ladder has more than one rung.
+    ///
+    /// <para><see cref="SegmentBucketCompactionTests.OpenBucketAmplificationStaysBounded"/> runs 40
+    /// flushes, which is exactly one rung: five merges of eight raw segments each, then five merged
+    /// files and no sixth — <c>MergeMinSources</c> is 8, so they cannot batch. Its 1.40x is the cost
+    /// of that single rung and its <c>amp &lt; 3.0</c> guard is never approached. Run to 400 flushes,
+    /// where the second and third rungs do form, the same shape MEASURES 3.34x and is still
+    /// climbing; the stand's Information level flushes ~288 times a day into a 7-day bucket, so it
+    /// sits several rungs above what the shipped figure covers.</para>
+    /// </summary>
+    [Fact]
+    public async Task OpenBucketAmplificationClimbsWithTheSizeLadder()
+    {
+        // 64 MB target against ~69 KB flush segments leaves room for three rungs of 8x.
+        _engine._mergeTargetPayloadBytes = 64L * 1024 * 1024;
+        long today = DateTime.UtcNow.Ticks - 20 * TimeSpan.TicksPerHour;
+        long written = 0, ingested = 0;
+        int  merges  = 0;
+
+        for (int f = 0; f < 400; f++)
+        {
+            long before = _engine.ListSegments().Sum(s => s.UncompressedBytes);
+            await FlushAsync(200, LogLevel.Information, today + f * TimeSpan.TicksPerMinute, padBytes: 256);
+            ingested += _engine.ListSegments().Sum(s => s.UncompressedBytes) - before;
+
+            var pass = await CompactToExhaustionAsync();
+            merges  += pass.Merges;
+            written += pass.BytesWritten;
+
+            if ((f + 1) % 80 == 0)
+                _out.WriteLine($"{f + 1,4} flushes: {_engine.ListSegments().Count,3} file(s), {merges,3} merges, " +
+                               $"{written / 1024} KB written / {ingested / 1024} KB ingested = " +
+                               $"{written / (double)ingested:F2}x");
+        }
+        Assert.Equal(80_000, ServedEvents());
+    }
+
+    /// <summary>
     /// The bucket widths and the over-retention they buy, per level, under the default policy —
     /// the floor at one whole day means Debug's is 33 %, not the 8.3 % the divisor implies.
     /// </summary>
