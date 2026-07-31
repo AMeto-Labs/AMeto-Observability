@@ -147,7 +147,8 @@ public sealed class DayBucketCompactionProbe : IAsyncLifetime
             long mb = a.Sum(s => s.UncompressedBytes) / 1048576;
             _out.WriteLine(
                 $"  {level,-11} {b.Count,5} -> {a.Count,3} file(s), {mb,4} MB payload, " +
-                $"largest span {maxSpanDays:F2} d, bound {StorageEngine.MergeBucketTicks(RetentionPolicy.Default.GetTtl(level)) / TimeSpan.TicksPerDay} d");
+                $"largest span {maxSpanDays * 24:F1} h, bound " +
+                $"{StorageEngine.MergeBucketTicks(RetentionPolicy.Default.GetTtl(level)) / (double)TimeSpan.TicksPerHour:F0} h");
         }
 
         // Every event still served, exactly once.
@@ -161,8 +162,9 @@ public sealed class DayBucketCompactionProbe : IAsyncLifetime
         Assert.Equal(ingested, served);
 
         // The headline: file count is a function of buckets, not of uptime. Eight days at six
-        // levels cannot exceed 8 one-day buckets for the short-TTL levels plus a couple of
-        // size-capped files for the dominant one.
+        // levels is 32 six-hour Debug buckets, two seven-day buckets for each 90-day level, and
+        // a handful of size-capped files for the dominant one — MEASURED 1728 -> 45 at 1.00x,
+        // because a backfill this settled hits every bucket's terminal state in one pass.
         Assert.True(after.Count < before.Count / 10,
             $"{before.Count} -> {after.Count} segments is not a collapse");
         foreach (var s in after)

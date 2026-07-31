@@ -128,13 +128,15 @@ internal sealed class SegmentEventCursor : IDisposable
             string  template = Dedup(StringColumn(span, _layout.MtOff, _layout.MtLen, i, n)) ?? string.Empty;
             string? service  = Dedup(StringColumn(span, _layout.SvcOff, _layout.SvcLen, i, n));
 
+            // The exception column travels as BYTES, exactly like properties. Decoding it here
+            // and re-encoding it in the writer, per row, cost this merge 11116 B/event against
+            // 211 B/event for the same events without exceptions — 53×, on the path that
+            // level-split flush sends every Error segment down.
             var excBytes = RawColumn(span, _layout.ExOff, _layout.ExLen, i, n);
-            ExceptionInfo? exception = excBytes.IsEmpty ? null : ExceptionInfo.FromBytes(excBytes);
-
-            var props = RawColumn(span, _layout.PrOff, _layout.PrLen, i, n);
+            var props    = RawColumn(span, _layout.PrOff, _layout.PrLen, i, n);
 
             return new SegmentEventRef(Id, TsTicks, (LogLevel)level, trHi, trLo, spanId,
-                                       template, service, exception, props);
+                                       template, service, exception: null, props, excBytes);
         }
     }
 

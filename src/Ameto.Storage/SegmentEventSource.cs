@@ -27,7 +27,24 @@ public readonly ref struct SegmentEventRef
     /// <summary>Never null; <see cref="string.Empty"/> when the event carries no template.</summary>
     public readonly string             MessageTemplate;
     public readonly string?            ServiceName;
+    /// <summary>
+    /// The decoded exception — set only by a producer that already holds one (the hot tier
+    /// stores exceptions as objects). On the merge path this is null and
+    /// <see cref="ExceptionPayload"/> carries the same value as bytes; call
+    /// <see cref="DecodeException"/> rather than reading this field.
+    /// </summary>
     public readonly ExceptionInfo?     Exception;
+    /// <summary>
+    /// The exception exactly as it sits in the source file — empty when there is none, or when
+    /// the producer only has the decoded form.
+    ///
+    /// <para>This is what makes the exception column zero-copy through a merge, like every other
+    /// column. Decoding it into an object graph and re-serialising it per row cost 6843 B/event
+    /// against 182 B for the same merge without exceptions — 37×, and it lands squarely on the
+    /// compaction path, because level-split flush means an Error segment is 100 % exceptions and
+    /// compaction is what gathers them.</para>
+    /// </summary>
+    public readonly ReadOnlySpan<byte> ExceptionPayload;
     /// <summary>Raw msgpack property map — empty when the event has no properties.</summary>
     public readonly ReadOnlySpan<byte> Properties;
 
@@ -35,7 +52,7 @@ public readonly ref struct SegmentEventRef
         ulong id, long timestampUtcTicks, LogLevel level,
         ulong traceIdHi, ulong traceIdLo, ulong spanId,
         string messageTemplate, string? serviceName, ExceptionInfo? exception,
-        ReadOnlySpan<byte> properties)
+        ReadOnlySpan<byte> properties, ReadOnlySpan<byte> exceptionPayload = default)
     {
         Id                = id;
         TimestampUtcTicks = timestampUtcTicks;
@@ -46,11 +63,24 @@ public readonly ref struct SegmentEventRef
         MessageTemplate   = messageTemplate;
         ServiceName       = serviceName;
         Exception         = exception;
+        ExceptionPayload  = exceptionPayload;
         Properties        = properties;
     }
 
-    public bool HasTraceId => (TraceIdHi | TraceIdLo) != 0;
-    public bool HasSpanId  => SpanId != 0;
+    public bool HasTraceId   => (TraceIdHi | TraceIdLo) != 0;
+    public bool HasSpanId    => SpanId != 0;
+    public bool HasException => Exception is not null || !ExceptionPayload.IsEmpty;
+
+    /// <summary>
+    /// The exception as an object graph, decoding the raw payload if that is all we have.
+    ///
+    /// <para>Only the INDEX BUILD needs this — it indexes the type, the message and the inner
+    /// type as strings. The writer does not, and asking for it there is what put a decode plus a
+    /// re-encode on every exception-carrying row of every merge. A merge that runs without an
+    /// index sink now never decodes at all.</para>
+    /// </summary>
+    public ExceptionInfo? DecodeException() =>
+        Exception ?? (ExceptionPayload.IsEmpty ? null : ExceptionInfo.FromBytes(ExceptionPayload));
 }
 
 /// <summary>

@@ -114,6 +114,75 @@ public sealed class StreamingMergeOrderTests : IAsyncLifetime
         Assert.Equal(Enumerable.Range(0, Rounds * PerRound).Count(i => i % 40 == 7), spread.Count);
     }
 
+    /// <summary>
+    /// The exception column is COPIED through a merge as raw bytes rather than decoded and
+    /// re-encoded, so the index build is now the only thing that ever turns it back into an
+    /// object graph. That split has to hold on both sides: the merged file must still serve
+    /// <c>@x.type</c> from its index, and the payload it stores must still decode to the same
+    /// exception a reader hands the query layer.
+    ///
+    /// <para>Level-split flush makes this the normal shape for Error, not an edge case — an
+    /// Error segment is 100 % exceptions and compaction is what gathers them.</para>
+    /// </summary>
+    [Fact]
+    public async Task AMergedFileStillIndexesExceptionsItCopiedThroughAsBytes()
+    {
+        long old  = DateTime.UtcNow.Ticks - 5 * TimeSpan.TicksPerDay;
+        int  tmpl = _engine.TemplatePool.Intern("settlement failed for {OrderId}");
+        int  svc  = _engine.TemplatePool.Intern("Svc.Payments");
+
+        const int Rounds = 10, PerRound = 900;
+        for (int r = 0; r < Rounds; r++)
+        {
+            for (int i = 0; i < PerRound; i++)
+            {
+                int n = r * PerRound + i;
+                // Two exception types, so a query can select a known subset rather than "all".
+                var exc = new ExceptionInfo
+                {
+                    Type       = n % 3 == 0 ? "System.TimeoutException" : "System.InvalidOperationException",
+                    Message    = n % 3 == 0 ? "settlementbarrier not cleared" : "order could not be settled",
+                    StackTrace = "   at Ameto.Payments.Settle(Int32 n) in /src/Settle.cs:line " + (100 + n % 50),
+                    Inner      = new ExceptionInfo { Type = "System.Net.Sockets.SocketException", Message = "reset" },
+                };
+                Assert.True(_engine.TryWrite(new LogEventHeader
+                {
+                    TimestampUtcTicks        = old + n * TimeSpan.TicksPerSecond,
+                    Level                    = LogLevel.Error,
+                    MessageTemplatePoolIndex = tmpl,
+                    ServiceNamePoolIndex     = svc,
+                }, Props(n), exception: exc));
+            }
+            await _engine.FlushHotTierAsync();
+        }
+
+        // The same query against the UNMERGED flush segments, so the number the merged file has
+        // to reproduce is measured on this build rather than assumed. Free text, because it is
+        // routed through the TRIGRAM index the builder fills from the exception's own strings —
+        // which is precisely the state that would go missing if the merge stopped handing the
+        // sink a decodable exception.
+        var query    = new QueryExecutor(_engine, new SegmentIndexReaderFactory(), NullLogger<QueryExecutor>.Instance);
+        int expected = await CountAsync(query, "settlementbarrier", Rounds * PerRound);
+        Assert.Equal(Enumerable.Range(0, Rounds * PerRound).Count(n => n % 3 == 0), expected);
+
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None));
+        var merged = _engine.ListSegments().Single();
+        Assert.Equal((uint)(Rounds * PerRound), merged.EventCount);
+
+        // The payload survived the copy: it still decodes, whole, inner exception included.
+        using (var reader = SegmentReader.Open(merged.FilePath))
+        {
+            Assert.True(reader.Groups.Length >= 3, $"only {reader.Groups.Length} group(s) — this proves nothing");
+            var rows = reader.ReadAllRaw(new Dictionary<string, string>(StringComparer.Ordinal));
+            Assert.Equal(Rounds * PerRound, rows.Count);
+            Assert.All(rows, r => Assert.NotNull(r.Exception));
+            Assert.Equal("System.Net.Sockets.SocketException", rows[0].Exception!.Inner!.Type);
+        }
+
+        // …and the index built from those same bytes still resolves the term, to the same rows.
+        Assert.Equal(expected, await CountAsync(query, "settlementbarrier", Rounds * PerRound));
+    }
+
     // ── The heap's tie-break ──────────────────────────────────────────────────
 
     /// <summary>
@@ -202,6 +271,9 @@ public sealed class StreamingMergeOrderTests : IAsyncLifetime
         w.Flush();
         return buf.WrittenSpan.ToArray();
     }
+
+    private static async Task<int> CountAsync(QueryExecutor q, string filter, int cap) =>
+        (await RunAsync(q, filter, cap)).Count;
 
     private static async Task<List<LogEvent>> RunAsync(QueryExecutor q, string? filter, int count)
     {

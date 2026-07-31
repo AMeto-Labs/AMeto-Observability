@@ -244,10 +244,11 @@ public sealed class SegmentWriter : IDisposable
         {
             int tmplBytes = Encoding.UTF8.GetByteCount(ev.MessageTemplate);
             int svcBytes  = ev.ServiceName is null ? 0 : Encoding.UTF8.GetByteCount(ev.ServiceName);
-            // Approximate: the exception blob is only serialised once, at staging time.
+            // Approximate: the exception blob is only serialised once, at staging time (and on
+            // the merge path not at all — its bytes are copied straight through).
             int rowCost   = 8 + 1 + 8 + 16 + 8 + 16
                           + tmplBytes + svcBytes + ev.Properties.Length
-                          + (ev.Exception is null ? 0 : 64);
+                          + (ev.HasException ? Math.Max(64, ev.ExceptionPayload.Length) : 0);
 
             if (_stagedCount > 0 && _stagedBytes + rowCost > BlockSize)
             {
@@ -532,7 +533,14 @@ public sealed class SegmentWriter : IDisposable
         AppendUtf8(_tmplBytes, ev.MessageTemplate, tmplByteLen);
 
         _excOffsets[k] = (uint)_excBytes.Length;
-        if (ev.Exception is not null)
+        // Prefer the raw payload: on the merge path the bytes are already in the shape this
+        // column stores, so re-encoding them would be a decode and an encode per row for an
+        // identical result. Only a producer that holds the decoded form (the hot tier) pays it.
+        if (!ev.ExceptionPayload.IsEmpty)
+        {
+            _excBytes.Write(ev.ExceptionPayload);
+        }
+        else if (ev.Exception is not null)
         {
             var b = ev.Exception.ToBytes();
             _excBytes.Write(b, 0, b.Length);

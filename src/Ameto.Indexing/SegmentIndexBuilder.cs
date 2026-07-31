@@ -148,8 +148,10 @@ public sealed class SegmentIndexBuilder : ISegmentIndexSink
             _bloom.Add(template);
         }
 
-        // Exception (structured)
-        var exception = ev.Exception;
+        // Exception (structured). The index is the ONLY consumer that needs the object graph —
+        // it indexes type, message and inner type as strings — so this is where the decode
+        // belongs. On the merge path the writer copies the same bytes through untouched.
+        var exception = ev.DecodeException();
         if (exception is not null)
         {
             _inverted.Add(offset, "@x.exists", "true");
