@@ -832,7 +832,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     //
     // Inside a bucket the planner takes a TIME-CONTIGUOUS RUN OF SIMILARLY-SIZED FILES. Both
     // halves are load-bearing:
-    //   - similarly sized (within MergeOpenSizeRatio, and the run's largest no more than
+    //   - similarly sized (within MergeRunSizeRatio, and the run's largest no more than
     //     MergeGrowthFactor of its total) is what makes a straggler cost the straggler. The
     //     previous rule dropped the size guard entirely for a sealed bucket, so one late row and
     //     the bucket's collapsed file were admissible together: measured, five one-event flushes
@@ -876,8 +876,8 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// <see cref="MergeSealedSourceBytes"/>; a run of <see cref="MergeMinSources"/> same-size
     /// files multiplies it by that fanout each time it is rewritten, so a byte is rewritten
     /// log₈(maximal / flush size) ≈ 2.6 times at the stand's ~1.3 MB flush segments and 512 MB
-    /// target. MEASURED over 1000 flushes with stragglers, at the same size ratio: 1.70x,
-    /// 1.80x, 2.86x, 2.92x per stretch — flat, not a staircase.</para>
+    /// target. That count is a CONSTANT — MEASURED over 1000 flushes with stragglers, at this
+    /// ratio: 1.70x, 1.80x, 2.86x, 2.92x per stretch, flat rather than a staircase.</para>
     ///
     /// <para>It is STRICTLY BELOW <see cref="MergeMinSources"/>, and that inequality is the
     /// point. At ratio 8 with a fanout of 8, a merge's own output is exactly 8× its sources and
@@ -890,14 +890,14 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// straggler cost a full bucket rewrite. It is kept for sealed buckets now; what a sealed
     /// bucket relaxes is only the FANOUT (see <see cref="MergeSealedMinSources"/>).</para>
     /// </summary>
-    private const int MergeOpenSizeRatio = 4;
+    private const int MergeRunSizeRatio = 4;
 
     /// <summary>
     /// A merge must grow its largest source by at least this factor, expressed as the fraction
     /// of that source the REST of the batch has to add up to (1/2 ⇒ the output is ≥ 1.5× the
     /// largest input).
     ///
-    /// <para><see cref="MergeOpenSizeRatio"/> alone does not bound amplification once a bucket
+    /// <para><see cref="MergeRunSizeRatio"/> alone does not bound amplification once a bucket
     /// holds one big file and a trickle of small ones: at a ratio of 8 the big file becomes
     /// admissible again as soon as the trickle reaches an eighth of it, so it is rewritten once
     /// per (size/8) bytes of new data — an amplification of 8 that grows with the file. This
@@ -946,7 +946,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
     /// <summary>
     /// Sources an OPEN bucket needs before a merge is worth doing. This is the fanout: the run
-    /// it gates is what multiplies a file's size by ~<see cref="MergeOpenSizeRatio"/>, and the
+    /// it gates is what multiplies a file's size by ~<see cref="MergeRunSizeRatio"/>, and the
     /// number of rewrites a byte sees is log of the size range in that multiplier. Eight trades
     /// ~2.5 rewrites per byte at the stand's geometry against holding up to eight uncompacted
     /// flush segments per level in the catalog.
@@ -1091,7 +1091,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// <para>Three conditions decide whether the run is worth it, and each answers a measured
     /// failure:</para>
     /// <list type="bullet">
-    /// <item>SIZE SPREAD — the run's largest may be at most <see cref="MergeOpenSizeRatio"/>×
+    /// <item>SIZE SPREAD — the run's largest may be at most <see cref="MergeRunSizeRatio"/>×
     ///       its smallest. Without it a single late row was admissible beside the bucket's
     ///       collapsed file (5 stragglers ⇒ 5 merges, 7151 KB written, cost never decaying).</item>
     /// <item>GROWTH — the rest of the run must add up to at least
@@ -1119,7 +1119,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 var  s = byTime[i];
                 long p = Math.Max(1, SegmentPayloadBytes(s));
                 long lo = Math.Min(runMin, p), hi = Math.Max(runMax, p);
-                if (run.Count > 0 && (hi > lo * MergeOpenSizeRatio ||
+                if (run.Count > 0 && (hi > lo * MergeRunSizeRatio ||
                                       payload + p > target ||
                                       events + s.EventCount > MergeMaxEvents)) break;
 
