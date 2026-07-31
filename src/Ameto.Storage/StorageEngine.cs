@@ -813,18 +813,34 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         }
     }
 
-    // ── Compaction: ONE MAXIMAL SEGMENT PER (TIME BUCKET, LEVEL) ──────────────
+    // ── Compaction: SIZE-TIERED RUNS INSIDE AN (EXPIRY BUCKET, LEVEL) ─────────
     //
     // The goal is a catalog whose file count is proportional to the RETENTION WINDOW, not to
-    // uptime: one file per level per bucket of time, as large as policy allows. Level purity
-    // comes from the flush (one segment per level) and is what keeps expiry exact; the bucket
-    // is what makes compaction converge and stop.
+    // uptime, at a WRITE AMPLIFICATION that stops climbing. Level purity comes from the flush
+    // (one segment per level) and is what keeps expiry exact; the bucket bounds how far a merge
+    // may move a row's deadline; the size tier bounds how often a byte is rewritten.
     //
-    // Buckets are ALIGNED, not sliding. A segment's bucket is floor(MinTimestamp / width) and
-    // never changes, so a bucket that has collapsed to one file stays collapsed. The previous
-    // planner anchored a 24 h window on whichever segment happened to be oldest, so two passes
-    // could cut the same day differently and a "day" was never finished — there was no state
-    // in which the sweep was done.
+    // Buckets are ALIGNED, not sliding, and a segment's bucket is floor(MaxTimestamp / width).
+    // MAX, not Min, because Max is the only timestamp retention reads: expiry is
+    // MaxTimestamp + Ttl(MinLevel), so grouping by Max makes the merge's effect on retention
+    // exact — every source's deadline moves by less than one bucket width, by construction.
+    // Bucketing by MIN could not say that, and it had no home for a segment whose Min and Max
+    // fall either side of a boundary: measured, 6 such segments produced 0 merges and kept a
+    // 32.2-day span against a 7-day bound, because the span guard discarded every partner they
+    // could have had. Under Max bucketing they land with the data they were flushed beside and
+    // compact normally.
+    //
+    // Inside a bucket the planner takes a TIME-CONTIGUOUS RUN OF SIMILARLY-SIZED FILES. Both
+    // halves are load-bearing:
+    //   - similarly sized (within MergeOpenSizeRatio, and the run's largest no more than
+    //     MergeGrowthFactor of its total) is what makes a straggler cost the straggler. The
+    //     previous rule dropped the size guard entirely for a sealed bucket, so one late row and
+    //     the bucket's collapsed file were admissible together: measured, five one-event flushes
+    //     into a collapsed bucket cost five merges and 7151 KB of writes, and the cost never
+    //     decayed because the rewritten file was still under the maximal threshold.
+    //   - time-contiguous is what makes the pieces of an over-large bucket partition it rather
+    //     than interleave it (see MergeTargetPayloadBytes), and it is why the run BREAKS at the
+    //     first file it cannot take instead of skipping past it.
 
     /// <summary>
     /// Uncompressed payload one merged file aims for.
@@ -842,52 +858,83 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
     /// <summary>
     /// A segment at or past this is MAXIMAL: never a merge source again, whatever else lands in
-    /// its bucket. Without it a bucket never converges — the merged file is itself the biggest
-    /// candidate in the bucket, so the next pass would rewrite it whole to absorb one more
-    /// small neighbour, forever. Half the target, so a sealed pass can always combine two
-    /// eligible files without overshooting.
+    /// its bucket. It is the TOP RUNG of the size ladder, and having a reachable one is what
+    /// makes write amplification a constant rather than a function of how long the server has
+    /// been running — a byte is rewritten log(maximal / flush-segment size) times and then never
+    /// again. Measured with the top rung out of reach (a 64 MB target against 69 KB segments):
+    /// 2.06x at 80 flushes, 3.20x at 160, 3.34x at 400, still climbing. Half the target, so two
+    /// eligible files can always be combined without overshooting.
     /// </summary>
     private const long MergeSealedSourceBytes = MergeTargetPayloadBytes / 2;
 
     /// <summary>
-    /// While a bucket is still OPEN, a batch may not mix sizes further apart than this ratio.
+    /// A merge batch may not mix sizes further apart than this ratio — in an open bucket AND in
+    /// a sealed one.
     ///
-    /// <para>This is the whole answer to write amplification. Today's bucket keeps receiving
-    /// flush segments, and a planner that simply took everything in the bucket would rewrite
-    /// the day-so-far every time a handful of new files appeared — quadratic in the day's size,
-    /// ~26 GB of writes for 370 MB of data at the stand's flush cadence. Restricting a batch to
-    /// sources within 8× of the bucket's median makes each merge cost proportional to the data
-    /// it consumes, so a byte is rewritten about log₈(MergeSealedSourceBytes / flush-segment
-    /// size) times before it stops being a candidate — 3 passes at the stand's ~1.3 MB flush
-    /// segments — plus one final pass when the bucket seals. MEASURED end to end (five waves of
-    /// eight flushes, compaction run to exhaustion after each, as the maintenance loop does):
-    /// 1.4× the ingested payload. A single flush never triggers a rewrite of anything larger
-    /// than the eight flushes around it.</para>
+    /// <para>This, with <see cref="MergeGrowthFactor"/>, is the whole answer to write
+    /// amplification. A byte enters at flush-segment size and leaves the policy at
+    /// <see cref="MergeSealedSourceBytes"/>; a run of <see cref="MergeMinSources"/> same-size
+    /// files multiplies it by that fanout each time it is rewritten, so a byte is rewritten
+    /// log₈(maximal / flush size) ≈ 2.6 times at the stand's ~1.3 MB flush segments and 512 MB
+    /// target. MEASURED over 1000 flushes with stragglers, at the same size ratio: 1.70x,
+    /// 1.80x, 2.86x, 2.92x per stretch — flat, not a staircase.</para>
+    ///
+    /// <para>It is STRICTLY BELOW <see cref="MergeMinSources"/>, and that inequality is the
+    /// point. At ratio 8 with a fanout of 8, a merge's own output is exactly 8× its sources and
+    /// therefore admissible beside the very next batch of flush segments — so the freshly
+    /// written file is rewritten again for the next 8 arrivals, at double the cost, forever.
+    /// MEASURED over 1000 flushes with stragglers: 3.34x steady state at ratio 8 against 2.92x
+    /// at ratio 4, for the same fanout and the same data.</para>
+    ///
+    /// <para>Dropping it for sealed buckets — the previous rule — is what made a one-row
+    /// straggler cost a full bucket rewrite. It is kept for sealed buckets now; what a sealed
+    /// bucket relaxes is only the FANOUT (see <see cref="MergeSealedMinSources"/>).</para>
     /// </summary>
-    private const int MergeOpenSizeRatio = 8;
+    private const int MergeOpenSizeRatio = 4;
 
     /// <summary>
-    /// A bucket is SEALED this long after its window ends: no more data is expected, so the
-    /// remaining files are collapsed toward one maximal segment in a single pass and the bucket
-    /// is finished. Generous because a sealing merge is the one pass that is NOT
-    /// amplification-bounded — it rewrites whatever the bucket still holds — so it should
-    /// happen once, after the stragglers (batch imports, a client with a slow clock) have
-    /// arrived, rather than twice.
+    /// A merge must grow its largest source by at least this factor, expressed as the fraction
+    /// of that source the REST of the batch has to add up to (1/2 ⇒ the output is ≥ 1.5× the
+    /// largest input).
+    ///
+    /// <para><see cref="MergeOpenSizeRatio"/> alone does not bound amplification once a bucket
+    /// holds one big file and a trickle of small ones: at a ratio of 8 the big file becomes
+    /// admissible again as soon as the trickle reaches an eighth of it, so it is rewritten once
+    /// per (size/8) bytes of new data — an amplification of 8 that grows with the file. This
+    /// says instead that a merge is only worth doing when the data it is ADDING is a real
+    /// fraction of the data it is rewriting, which caps that per-rewrite cost at 3× and, being
+    /// a multiplicative floor on file growth, also caps the number of rewrites a byte can ever
+    /// see at log₁.₅(maximal / flush size).</para>
+    /// </summary>
+    private const int MergeGrowthFactor = 2;
+
+    /// <summary>
+    /// A bucket is SEALED this long after its window ends — capped at one bucket width. Sealing
+    /// only lowers the FANOUT a batch needs (<see cref="MergeSealedMinSources"/>); it no longer
+    /// lifts the size guard, so there is nothing left that has to happen exactly once and the
+    /// grace can be short.
+    ///
+    /// <para>Capping at the width is what keeps the arithmetic sane for a short-TTL level: at a
+    /// flat 48 h, Debug — whose entire TTL is 3 days — spent two thirds of its data's life
+    /// waiting for stragglers that a 6 h bucket has no room for anyway.</para>
     /// </summary>
     private const long MergeBucketGraceTicks = 48L * TimeSpan.TicksPerHour;
 
+    private static long MergeSealGraceTicks(long bucketWidthTicks) =>
+        Math.Min(MergeBucketGraceTicks, bucketWidthTicks);
+
     /// <summary>
-    /// A merged segment's time span may cover at most <c>Ttl(level) / 12</c> — bounded below by
-    /// one day, which is the granularity everything else in this design is expressed in.
+    /// A bucket covers at most <c>Ttl(level) / 12</c>, so a merge moves no row's expiry by more
+    /// than 8.3 % of that row's own TTL.
     ///
-    /// <para>Expiry is <c>MaxTimestamp + Ttl(MinLevel)</c>, so a segment's SPAN is exactly how
-    /// much longer its oldest event outlives its own deadline. A flat 24 h reads as the safe
-    /// choice and is, for a busy level — but for a RARE level it is the reason the catalog
-    /// fills with near-empty files: a service that logs four Fatals a week gets one file per
-    /// day regardless, each carrying a full index and catalog entry for a handful of rows.
-    /// One twelfth is chosen because 8.3 % of over-retention is smaller than the error already
-    /// baked into a retention policy expressed in whole days, and it buys a 7× reduction in
-    /// file count at the default 90-day TTLs (7-day buckets; Debug's 3 days floor at one).</para>
+    /// <para>Expiry is <c>MaxTimestamp + Ttl(MinLevel)</c>, so the bucket width is exactly how
+    /// much extra retention compaction can buy a row. A flat 24 h reads as the safe choice and
+    /// is, for a busy level — but for a RARE level it is the reason the catalog fills with
+    /// near-empty files: a service that logs four Fatals a week gets one file per day
+    /// regardless, each carrying a full index and catalog entry for a handful of rows. One
+    /// twelfth is chosen because 8.3 % is smaller than the error already baked into a retention
+    /// policy expressed in whole days, and it buys a 7× reduction in file count at the default
+    /// 90-day TTLs.</para>
     ///
     /// <para>It is a CEILING, and for busy levels it is not the binding one:
     /// <see cref="MergeTargetPayloadBytes"/> stops a batch long before 7 days of Information
@@ -897,8 +944,23 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// </summary>
     private const int MergeSpanTtlDivisor = 12;
 
-    /// <summary>Don't bother compacting an open bucket below this many sources.</summary>
+    /// <summary>
+    /// Sources an OPEN bucket needs before a merge is worth doing. This is the fanout: the run
+    /// it gates is what multiplies a file's size by ~<see cref="MergeOpenSizeRatio"/>, and the
+    /// number of rewrites a byte sees is log of the size range in that multiplier. Eight trades
+    /// ~2.5 rewrites per byte at the stand's geometry against holding up to eight uncompacted
+    /// flush segments per level in the catalog.
+    /// </summary>
     private const int MergeMinSources = 8;
+
+    /// <summary>
+    /// Sources a SEALED bucket needs. Two, because a quiet day leaves a handful of tiny segments
+    /// that a fanout of eight would strand forever (observed live: ~1,000 files parked that
+    /// way), and because a low fanout is no longer dangerous — <see cref="MergeGrowthFactor"/>
+    /// is what stops a pair being "the bucket's big file plus one straggler", which is the shape
+    /// that used to make this number costly.
+    /// </summary>
+    private const int MergeSealedMinSources = 2;
     // Each source contributes one open reader and one decompressed block (~64 KB) for the
     // length of the merge — the k-way merge's only per-source cost, ~36 MB at this cap.
     private const int MergeMaxSources = 512;
@@ -911,14 +973,37 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     private const int MergeWindowAttempts = 4;  // bucket re-selections per pass after an anchor skip
 
     /// <summary>
-    /// Width of the time bucket for a level with this TTL, in whole days so every boundary is a
-    /// UTC midnight (ticks run from a midnight, so a whole-day width keeps the grid aligned to
-    /// one). See <see cref="MergeSpanTtlDivisor"/> for why it is a fraction of the TTL.
+    /// Widths a sub-day bucket may take. Every one DIVIDES a day, which is the property that
+    /// matters: ticks run from a midnight, so a width that divides a day puts a boundary on
+    /// every UTC midnight and the grid stays aligned with the whole-day widths above it.
+    /// </summary>
+    private static readonly long[] SubDayBucketWidths =
+    [
+        1 * TimeSpan.TicksPerHour,  2 * TimeSpan.TicksPerHour,  3 * TimeSpan.TicksPerHour,
+        4 * TimeSpan.TicksPerHour,  6 * TimeSpan.TicksPerHour,  8 * TimeSpan.TicksPerHour,
+        12 * TimeSpan.TicksPerHour,
+    ];
+
+    /// <summary>
+    /// Width of the expiry bucket for a level with this TTL: the largest aligned width at or
+    /// below <c>Ttl / <see cref="MergeSpanTtlDivisor"/></c>.
+    ///
+    /// <para>The old whole-day floor made the divisor a claim the code did not keep. Debug's TTL
+    /// is 3 days, so its share is 6 h — floored to a day, its rows lived 4 days instead of 3,
+    /// i.e. 33 % of over-retention advertised as 8.3 %, on the level that is usually the largest
+    /// on disk. Sub-day widths that divide a day give Debug its 6 h and leave every 90-day level
+    /// exactly where it was (7 days, 7.8 %).</para>
     /// </summary>
     internal static long MergeBucketTicks(TimeSpan ttl)
     {
-        long days = Math.Max(1, ttl.Ticks / MergeSpanTtlDivisor / TimeSpan.TicksPerDay);
-        return days * TimeSpan.TicksPerDay;
+        long budget = Math.Max(TimeSpan.TicksPerHour, ttl.Ticks / MergeSpanTtlDivisor);
+        if (budget >= TimeSpan.TicksPerDay)
+            return budget / TimeSpan.TicksPerDay * TimeSpan.TicksPerDay;
+
+        long width = SubDayBucketWidths[0];
+        foreach (long candidate in SubDayBucketWidths)
+            if (candidate <= budget) width = candidate;
+        return width;
     }
 
     /// <summary>
@@ -930,10 +1015,10 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         Math.Max(s.UncompressedBytes, s.CompressedBytes);
 
     /// <summary>
-    /// Picks the next batch: the oldest (level, bucket) group with enough candidates, and as
-    /// many of its segments as one merged file affords. Null when nothing is worth merging —
-    /// which is the steady state, not a failure: every bucket has either collapsed to one file
-    /// or filled its files to <see cref="MergeSealedSourceBytes"/>.
+    /// Picks the next batch: the oldest (level, expiry bucket) group that holds a mergeable run,
+    /// and as many of that run's segments as one merged file affords. Null when nothing is worth
+    /// merging — which is the steady state, not a failure: every bucket has either reached
+    /// <see cref="MergeSealedSourceBytes"/> or holds only files no run can legally combine.
     ///
     /// <para>Chosen from CATALOG METADATA alone; no file is opened, let alone decoded, until
     /// the merge itself streams it.</para>
@@ -958,7 +1043,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             if (SegmentPayloadBytes(s) >= maximal) continue;
 
             long width = MergeBucketTicks(policy.GetTtl(s.MinLevel));
-            long start = s.MinTimestampTicks / width * width;
+            long start = s.MaxTimestampTicks / width * width;
 
             var key = (Level: s.MinLevel, Start: start);
             if (!buckets.TryGetValue(key, out var list)) buckets[key] = list = new List<SegmentInfo>(8);
@@ -972,65 +1057,82 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
         foreach (var key in keys)
         {
-            var  list     = buckets[key];
-            long width    = MergeBucketTicks(policy.GetTtl(key.Level));
-            bool isSealed = now - (key.Start + width) >= MergeBucketGraceTicks;
-            int  minSources = isSealed ? 2 : MergeMinSources;
-            if (list.Count < minSources) continue;
+            var  list  = buckets[key];
+            if (list.Count < 2) continue;
+            long width = MergeBucketTicks(policy.GetTtl(key.Level));
+            bool isSealed = now - (key.Start + width) >= MergeSealGraceTicks(width);
 
-            // WHICH files may be rewritten together is a size question; WHICH ONES actually go
-            // into this batch is a time question. Both, in that order.
-            //
-            // The size ratio is anchored on the MEDIAN, not the smallest. A quiet minute
-            // produces a flush segment of a few hundred bytes, and anchoring on that would put
-            // the ceiling below every real file in the bucket — no batch would ever form and
-            // today's data would stay uncompacted until the bucket sealed. The median is a size
-            // the bucket actually has, so half its files are admissible by construction and the
-            // sweep always makes progress, while a file an order of magnitude larger than the
-            // bucket's typical one is still kept out of a batch it would dominate.
-            list.Sort(static (a, b) => SegmentPayloadBytes(a).CompareTo(SegmentPayloadBytes(b)));
-            long ratioCeiling = isSealed
-                ? long.MaxValue
-                : SegmentPayloadBytes(list[list.Count / 2]) * MergeOpenSizeRatio;
+            // Oldest first, so a run is a time-contiguous slice of the bucket. A bucket too big
+            // for one file has to be cut somehow, and cutting it by time is what makes the
+            // pieces useful: files that partition their bucket prune by window and expire in
+            // sequence, where files that interleave it all span the whole bucket, are all opened
+            // by every query into it, and all carry the bucket's newest timestamp — so its
+            // oldest events over-retain by the full bucket width instead of by one file's share
+            // of it. Measured on the stand shape at 1/16 (see DayBucketCompactionProbe): 5.72 d
+            // of span per Information file when the batch was picked smallest-first, 1.6 d when
+            // picked oldest-first.
+            list.Sort(static (a, b) => a.MinTimestampTicks.CompareTo(b.MinTimestampTicks));
 
-            var admissible = new List<SegmentInfo>(list.Count);
-            foreach (var s in list)
-                if (SegmentPayloadBytes(s) <= ratioCeiling) admissible.Add(s);
+            var run = SelectMergeRun(list, isSealed ? MergeSealedMinSources : MergeMinSources, target, maximal);
+            if (run is not null) return run;
+        }
+        return null;
+    }
 
-            // Then oldest first, and take a CONTIGUOUS run. A bucket too big for one file has
-            // to be cut somehow, and cutting it by time is what makes the pieces useful: files
-            // that partition their bucket prune by window and expire in sequence, where files
-            // that interleave it all span the whole bucket, are all opened by every query into
-            // it, and all carry the bucket's newest timestamp — so its oldest events over-retain
-            // by the full bucket width instead of by one file's share of it. Measured on the
-            // stand shape at 1/16 (see DayBucketCompactionProbe): 5.72 d of span per Information
-            // file when the batch was picked smallest-first, 1.6 d when picked oldest-first.
-            admissible.Sort(static (a, b) => a.MinTimestampTicks.CompareTo(b.MinTimestampTicks));
+    /// <summary>
+    /// The first time-contiguous run in <paramref name="byTime"/> that is worth rewriting, or
+    /// null if the bucket holds none.
+    ///
+    /// <para>A run is grown from each start in turn and STOPS at the first file it cannot take —
+    /// it never steps over one. Skipping was the previous behaviour and it broke the property
+    /// the oldest-first ordering exists to give: the merged file spanned right across the source
+    /// it had skipped, so the two overlapped and every query into that window opened both.</para>
+    ///
+    /// <para>Three conditions decide whether the run is worth it, and each answers a measured
+    /// failure:</para>
+    /// <list type="bullet">
+    /// <item>SIZE SPREAD — the run's largest may be at most <see cref="MergeOpenSizeRatio"/>×
+    ///       its smallest. Without it a single late row was admissible beside the bucket's
+    ///       collapsed file (5 stragglers ⇒ 5 merges, 7151 KB written, cost never decaying).</item>
+    /// <item>GROWTH — the rest of the run must add up to at least
+    ///       1/<see cref="MergeGrowthFactor"/> of its largest member, so a merge always makes
+    ///       real progress up the size ladder and a big file is only rewritten when a comparable
+    ///       amount of new data has arrived to pay for it.</item>
+    /// <item>FANOUT — <paramref name="minSources"/> files, OR a payload that already fills the
+    ///       target. The fallback is not a loophole, it is the fix for a stall: the count used to
+    ///       be tested AFTER the payload budget had truncated the batch, so an open bucket whose
+    ///       files had grown past target/8 could never assemble a legal batch again (measured: 40
+    ///       segments, 0 merges). A run that fills the target produces a MAXIMAL file, which is
+    ///       the last rewrite those bytes will ever get — always worth doing.</item>
+    /// </list>
+    /// </summary>
+    private static List<SegmentInfo>? SelectMergeRun(
+        List<SegmentInfo> byTime, int minSources, long target, long maximal)
+    {
+        for (int start = 0; start + 1 < byTime.Count; start++)
+        {
+            var  run     = new List<SegmentInfo>(Math.Min(byTime.Count - start, MergeMaxSources));
+            long payload = 0, events = 0, runMin = long.MaxValue, runMax = 0;
 
-            var  batch   = new List<SegmentInfo>(Math.Min(admissible.Count, MergeMaxSources));
-            long payload = 0, events = 0, minTs = long.MaxValue, maxTs = long.MinValue;
-            foreach (var s in admissible)
+            for (int i = start; i < byTime.Count && run.Count < MergeMaxSources; i++)
             {
-                if (batch.Count >= MergeMaxSources) break;
-                long p = SegmentPayloadBytes(s);
-                if (batch.Count > 0 &&
-                    (payload + p > target || events + s.EventCount > MergeMaxEvents))
-                    break;
+                var  s = byTime[i];
+                long p = Math.Max(1, SegmentPayloadBytes(s));
+                long lo = Math.Min(runMin, p), hi = Math.Max(runMax, p);
+                if (run.Count > 0 && (hi > lo * MergeOpenSizeRatio ||
+                                      payload + p > target ||
+                                      events + s.EventCount > MergeMaxEvents)) break;
 
-                // Hard span bound. Same-bucket membership already puts every MinTimestamp
-                // inside one window, but a source may reach past its own bucket's end (a flush
-                // straddling midnight), so the batch's real span is checked rather than assumed.
-                long lo = Math.Min(minTs, s.MinTimestampTicks);
-                long hi = Math.Max(maxTs, s.MaxTimestampTicks);
-                if (batch.Count > 0 && hi - lo > width) continue;
-
-                batch.Add(s);
+                run.Add(s);
                 payload += p;
                 events  += s.EventCount;
-                minTs = lo; maxTs = hi;
+                runMin = lo; runMax = hi;
             }
 
-            if (batch.Count >= minSources) return batch;
+            if (run.Count < 2) continue;
+            if (payload - runMax < runMax / MergeGrowthFactor) continue;
+            if (run.Count < minSources && payload < maximal) continue;
+            return run;
         }
         return null;
     }
@@ -1046,12 +1148,13 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// peaked at ~3× the batch, which is why the batch had to be capped at 32 MB and why the
     /// tier's fixed chunk geometry excluded dense segments from compaction entirely.</para>
     ///
-    /// <para>The batch comes from <see cref="SelectMergeBatch"/>: one (level, aligned time
-    /// bucket) group, compacted toward the single maximal segment that bucket is entitled to.
-    /// Level purity keeps expiry exact — expiry is <c>MaxTimestamp + Ttl(MinLevel)</c>, and
-    /// merging a 3-day Debug segment into a 90-day one would either delete its neighbours early
-    /// or keep the Debug rows 30× longer — while bucket alignment is what lets the sweep
-    /// FINISH: a bucket that has collapsed is never re-cut by the next pass.</para>
+    /// <para>The batch comes from <see cref="SelectMergeBatch"/>: a time-contiguous run of
+    /// similarly-sized files inside one (level, expiry bucket) group. Level purity keeps expiry
+    /// exact — expiry is <c>MaxTimestamp + Ttl(MinLevel)</c>, and merging a 3-day Debug segment
+    /// into a 90-day one would either delete its neighbours early or keep the Debug rows 30×
+    /// longer — while the size run is what lets the sweep FINISH: every merge multiplies its
+    /// sources' size, so a file reaches <see cref="MergeSealedSourceBytes"/> after a bounded
+    /// number of rewrites and then leaves the candidate set for good.</para>
     ///
     /// <para>Crash-safe, and the ORDER is the proof. A manifest listing the source files is
     /// written first; the merged file is built at <c>.seg.tmp</c> (which the startup scan

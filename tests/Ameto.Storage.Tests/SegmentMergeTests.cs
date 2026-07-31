@@ -286,6 +286,13 @@ public sealed class SegmentMergeTests : IAsyncLifetime
     /// <para>There is no tier and no chunk geometry in the pipeline now, so the gate is gone.
     /// This is the proof it can be: the exact shape it used to exclude — 2500 × ~3.1 KB props,
     /// ~7.8 MB uncompressed per file — merges, and every event survives byte for byte.</para>
+    ///
+    /// <para>The DENSE PAIR merges; the ~900 KB file beside them does not join it, and the
+    /// bucket settles at two files. That is the trade, stated deliberately: the third file is
+    /// 9× smaller than the pair, so taking it would rewrite 15.6 MB to absorb 900 KB. A policy
+    /// that always collapses a bucket to exactly one file is a policy that rewrites whatever
+    /// the bucket holds for whatever arrives late — which is how one row came to cost a 1.4 MB
+    /// rewrite five times running. Two files is the correct terminal state here.</para>
     /// </summary>
     [Fact]
     public async Task Merge_MergesDenseSegments_Losslessly()
@@ -309,9 +316,11 @@ public sealed class SegmentMergeTests : IAsyncLifetime
 
         Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None));
 
-        var segs = _engine.ListSegments();
-        Assert.Single(segs);
-        Assert.Equal(14_000u, segs[0].EventCount);
+        var segs = _engine.ListSegments().OrderByDescending(s => s.UncompressedBytes).ToList();
+        Assert.Equal(2, segs.Count);
+        Assert.Equal(5_000u, segs[0].EventCount);   // the two dense files, merged
+        Assert.Equal(9_000u, segs[1].EventCount);   // 9× smaller, left alone
+        Assert.Equal(14_000u, (uint)segs.Sum(s => s.EventCount));
 
         var after = ReadEverything();
         Assert.Equal(before.Count, after.Count);
@@ -327,21 +336,30 @@ public sealed class SegmentMergeTests : IAsyncLifetime
     }
 
     /// <summary>
-    /// An anchor skip must not burn the whole pass: when a selected window yields
+    /// An anchor skip must not burn the whole pass: when a selected bucket yields
     /// no usable batch (here: its segments are unreadable on disk), the pass
-    /// re-selects the next window instead of returning false for 600 s. Unreadable
+    /// re-selects the next bucket instead of returning false for 600 s. Unreadable
     /// segments are skip-listed individually so they are never re-opened.
+    ///
+    /// <para>The two buckets are computed from the bucket GRID, not from <c>UtcNow</c> plus a
+    /// 40 h offset. That offset predates buckets: whether two segments 40 h apart land in one
+    /// bucket or two depends on where the wall clock happens to sit relative to a boundary, so
+    /// the test passed or failed by time of day (2 failures of 2 runs on the pristine tree).
+    /// A test whose result depends on when it is run is worse than no test.</para>
     /// </summary>
     [Fact]
     public async Task Merge_RetriesNextWindow_AfterAnchorSkip()
     {
-        long old = DateTime.UtcNow.Ticks - 6 * TimeSpan.TicksPerDay;
-        // Window 1 (oldest, settled): two segments, both corrupted after flush.
-        await WriteSegmentAsync(0, 50, baseTicks: old);
-        await WriteSegmentAsync(1, 50, baseTicks: old + 1 * TimeSpan.TicksPerHour);
-        // Window 2 (>24 h later, still settled): two healthy segments.
-        await WriteSegmentAsync(2, 50, baseTicks: old + 40 * TimeSpan.TicksPerHour);
-        await WriteSegmentAsync(3, 50, baseTicks: old + 41 * TimeSpan.TicksPerHour);
+        long width = StorageEngine.MergeBucketTicks(RetentionPolicy.Default.GetTtl(LogLevel.Information));
+        // Two ADJACENT buckets, both far enough back to be sealed. Anchoring on the grid is
+        // what makes "these two are in different buckets" true on every run.
+        long b0 = (DateTime.UtcNow.Ticks - 30 * TimeSpan.TicksPerDay) / width * width;
+        // Bucket 0 (oldest, sealed): two segments, both corrupted after flush.
+        await WriteSegmentAsync(0, 50, baseTicks: b0 + TimeSpan.TicksPerHour);
+        await WriteSegmentAsync(1, 50, baseTicks: b0 + 2 * TimeSpan.TicksPerHour);
+        // Bucket 1 (the next window on the grid, still sealed): two healthy segments.
+        await WriteSegmentAsync(2, 50, baseTicks: b0 + width + TimeSpan.TicksPerHour);
+        await WriteSegmentAsync(3, 50, baseTicks: b0 + width + 2 * TimeSpan.TicksPerHour);
 
         var byTime  = _engine.ListSegments().OrderBy(s => s.MinTimestampTicks).ToList();
         foreach (var victim in byTime.Take(2))

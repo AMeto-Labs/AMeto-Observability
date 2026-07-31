@@ -140,18 +140,25 @@ public sealed class SegmentBucketCompactionTests : IAsyncLifetime
     // ── 1. A bucket compacts toward one segment ───────────────────────────────
 
     /// <summary>
-    /// Three settled days of Debug — whose 3-day TTL puts its bucket at the one-day floor — end
-    /// as exactly three files, one per day. Not "fewer files": the count is the number of
-    /// buckets, which is what makes catalog size a function of the retention window instead of
-    /// uptime.
+    /// Three settled Debug buckets end as exactly three files, one per bucket. Not "fewer
+    /// files": the count is the number of buckets, which is what makes catalog size a function
+    /// of the retention window instead of uptime.
+    ///
+    /// <para>Debug's bucket is SIX HOURS, not a day — its 3-day TTL divided by
+    /// <c>MergeSpanTtlDivisor</c>. The old whole-day floor gave Debug rows a fourth day of life
+    /// while the divisor advertised 8.3 %, on the level that is usually the largest on
+    /// disk.</para>
     /// </summary>
     [Fact]
-    public async Task EachDayBucketCollapsesToOneSegment()
+    public async Task EachBucketCollapsesToOneSegment()
     {
-        long day0 = BucketStart(LogLevel.Debug, DateTime.UtcNow.Ticks - 10 * TimeSpan.TicksPerDay);
-        for (int d = 0; d < 3; d++)
+        long width = BucketTicks(LogLevel.Debug);
+        Assert.Equal(6 * TimeSpan.TicksPerHour, width);
+
+        long b0 = BucketStart(LogLevel.Debug, DateTime.UtcNow.Ticks - 10 * TimeSpan.TicksPerDay);
+        for (int b = 0; b < 3; b++)
             for (int f = 0; f < 5; f++)
-                await FlushAsync(60, LogLevel.Debug, day0 + d * TimeSpan.TicksPerDay + f * 4 * TimeSpan.TicksPerHour);
+                await FlushAsync(60, LogLevel.Debug, b0 + b * width + f * TimeSpan.TicksPerHour);
 
         Assert.Equal(15, _engine.ListSegments().Count);
         var before = ReadEverything();
@@ -162,11 +169,11 @@ public sealed class SegmentBucketCompactionTests : IAsyncLifetime
         var segs = SegmentsOf(LogLevel.Debug);
         Assert.Equal(3, merges);
         Assert.Equal(3, segs.Count);
-        for (int d = 0; d < 3; d++)
+        for (int b = 0; b < 3; b++)
         {
-            Assert.Equal(300u, segs[d].EventCount);
-            Assert.Equal(day0 + d * TimeSpan.TicksPerDay, BucketStart(LogLevel.Debug, segs[d].MinTimestampTicks));
-            Assert.True(segs[d].MaxTimestampTicks - segs[d].MinTimestampTicks < TimeSpan.TicksPerDay);
+            Assert.Equal(300u, segs[b].EventCount);
+            Assert.Equal(b0 + b * width, BucketStart(LogLevel.Debug, segs[b].MinTimestampTicks));
+            Assert.True(segs[b].MaxTimestampTicks - segs[b].MinTimestampTicks < width);
         }
 
         var after = ReadEverything();
@@ -192,7 +199,7 @@ public sealed class SegmentBucketCompactionTests : IAsyncLifetime
     {
         long day0 = BucketStart(LogLevel.Debug, DateTime.UtcNow.Ticks - 10 * TimeSpan.TicksPerDay);
         for (int f = 0; f < 6; f++)
-            await FlushAsync(50, LogLevel.Debug, day0 + f * 3 * TimeSpan.TicksPerHour);
+            await FlushAsync(50, LogLevel.Debug, day0 + f * 30 * TimeSpan.TicksPerMinute);
 
         var (merges, _) = await CompactToExhaustionAsync();
         Assert.Equal(1, merges);
@@ -221,13 +228,14 @@ public sealed class SegmentBucketCompactionTests : IAsyncLifetime
     ///
     /// <para>This is the whole argument for making the bound a fraction rather than a flat 24 h:
     /// a rare level otherwise pays a full index and catalog entry per day for a handful of
-    /// rows.</para>
+    /// rows. It cuts BOTH ways — Debug's 3-day TTL earns a 6 h bucket, not a whole day, so its
+    /// rows die on day 3 as the policy says rather than on day 4.</para>
     /// </summary>
     [Fact]
     public async Task TheSpanBoundIsAFractionOfTheLevelsOwnTtl()
     {
-        Assert.Equal(7 * TimeSpan.TicksPerDay, BucketTicks(LogLevel.Fatal));
-        Assert.Equal(1 * TimeSpan.TicksPerDay, BucketTicks(LogLevel.Debug));
+        Assert.Equal(7 * TimeSpan.TicksPerDay,   BucketTicks(LogLevel.Fatal));
+        Assert.Equal(6 * TimeSpan.TicksPerHour,  BucketTicks(LogLevel.Debug));
 
         // One Fatal bucket, comfortably past its grace period.
         long start = BucketStart(LogLevel.Fatal, DateTime.UtcNow.Ticks - 20 * TimeSpan.TicksPerDay);
@@ -251,9 +259,9 @@ public sealed class SegmentBucketCompactionTests : IAsyncLifetime
         Assert.True(span <= BucketTicks(LogLevel.Fatal), $"Fatal segment spans {span / TimeSpan.TicksPerDay} days");
         Assert.True(span <= RetentionPolicy.Default.GetTtl(LogLevel.Fatal).Ticks / 12);
 
-        Assert.Equal(7, debug.Count);   // one day per bucket, nothing to combine
+        Assert.Equal(7, debug.Count);   // one flush per bucket, nothing to combine
         Assert.All(debug, s => Assert.True(
-            s.MaxTimestampTicks - s.MinTimestampTicks < TimeSpan.TicksPerDay));
+            s.MaxTimestampTicks - s.MinTimestampTicks < BucketTicks(LogLevel.Debug)));
 
         _out.WriteLine($"7 rare-level days: Fatal {fatal.Count} file(s), Debug {debug.Count} file(s)");
     }
@@ -345,9 +353,18 @@ public sealed class SegmentBucketCompactionTests : IAsyncLifetime
 
     /// <summary>
     /// One near-empty flush segment — a quiet minute in an otherwise busy hour — must not gate
-    /// its bucket. The open-bucket size ratio is anchored on the bucket's MEDIAN for exactly
-    /// this: anchored on the smallest file, the ceiling lands below every real file there, no
-    /// batch ever forms, and today's data stays uncompacted until the bucket seals days later.
+    /// its bucket: the nine real files behind it merge on schedule.
+    ///
+    /// <para>What it must ALSO not do is get dragged into that merge, and that is the change
+    /// here. The bucket ends with TWO files, not one, and the second is the one-event segment
+    /// left exactly where it was. "A bucket always collapses to exactly one file" is the goal
+    /// that made a straggler cost a full bucket rewrite — the same rule that lets a 300-byte
+    /// file join a 3.6 MB batch is the rule that let one late row rewrite a collapsed 1.4 MB
+    /// bucket five times over. The one-event file is 40 KB of index and catalog overhead; a
+    /// rewrite of everything around it is not worth paying to avoid that, and paying it once
+    /// does not even end — the rewritten file stays a candidate for the next straggler. So the
+    /// tiny file waits for other tiny files, and the bucket's terminal state is "one file per
+    /// size tier" rather than "one file".</para>
     /// </summary>
     [Fact]
     public async Task ANearEmptyFlushSegmentDoesNotGateItsBucket()
@@ -362,8 +379,15 @@ public sealed class SegmentBucketCompactionTests : IAsyncLifetime
         Assert.True(sizes[^1] > sizes[0] * 8, "test is meaningless unless the outlier is beyond the ratio");
 
         Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None));
-        Assert.Single(_engine.ListSegments());
+
+        var after = _engine.ListSegments().OrderBy(s => s.EventCount).ToList();
+        Assert.Equal(2, after.Count);
+        Assert.Equal(1u,    after[0].EventCount);      // the quiet minute, untouched
+        Assert.Equal(3600u, after[1].EventCount);      // the nine real flushes, merged
         Assert.Equal(3601, ReadEverything().Count);
+
+        // And it stays that way: a second pass has nothing legal to do.
+        Assert.False(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None));
     }
 
     /// <summary>
@@ -410,11 +434,12 @@ public sealed class SegmentBucketCompactionTests : IAsyncLifetime
     [Fact]
     public async Task RetentionDeletesExactlyTheExpiredBuckets()
     {
-        long day0 = BucketStart(LogLevel.Debug, DateTime.UtcNow.Ticks - 12 * TimeSpan.TicksPerDay);
-        for (int d = 0; d < 3; d++)
+        long width = BucketTicks(LogLevel.Debug);
+        long day0  = BucketStart(LogLevel.Debug, DateTime.UtcNow.Ticks - 12 * TimeSpan.TicksPerDay);
+        for (int b = 0; b < 3; b++)
             for (int f = 0; f < 4; f++)
             {
-                long t = day0 + d * TimeSpan.TicksPerDay + f * 5 * TimeSpan.TicksPerHour;
+                long t = day0 + b * width + f * TimeSpan.TicksPerHour;
                 Write(30, LogLevel.Debug, t);
                 Write(30, LogLevel.Error, t);
                 await _engine.FlushHotTierAsync();
@@ -422,7 +447,7 @@ public sealed class SegmentBucketCompactionTests : IAsyncLifetime
 
         await CompactToExhaustionAsync();
         var errorsBefore = SegmentsOf(LogLevel.Error);
-        Assert.Equal(3, SegmentsOf(LogLevel.Debug).Count);   // 3 one-day buckets
+        Assert.Equal(3, SegmentsOf(LogLevel.Debug).Count);   // 3 Debug buckets, 6 h each
         Assert.NotEmpty(errorsBefore);
 
         var result = await _engine.EnforceRetentionAsync();

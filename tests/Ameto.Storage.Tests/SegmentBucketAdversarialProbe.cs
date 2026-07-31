@@ -8,22 +8,21 @@ using Ameto.Core;
 namespace Ameto.Storage.Tests;
 
 /// <summary>
-/// The (bucket, level) policy measured in the shapes <see cref="SegmentBucketCompactionTests"/>
-/// does not construct: a straggler landing in a bucket that has already collapsed, a flush
-/// segment whose Min and Max fall in different buckets, and an open bucket run long enough for
-/// its files to outgrow the batch budget. Each of these prints what the planner actually does;
-/// they assert only that no event is lost, because the behaviour they record is the behaviour
-/// under review, not a contract.
+/// The shapes <see cref="SegmentBucketCompactionTests"/> does not construct, and which the
+/// (bucket, level) policy got wrong: a straggler landing in a bucket that has already collapsed,
+/// a flush segment whose Min and Max fall either side of a bucket boundary, an open bucket run
+/// long enough for its files to outgrow the batch budget, and a long run of all three together.
 ///
-/// <para>MEASURED here (Release, 2026-07-31):</para>
+/// <para>Every one of these was a MEASURED failure before the size-tiered run planner:</para>
 /// <list type="bullet">
-/// <item>a collapsed 1430 KB sealed bucket is rewritten IN FULL for every one-event straggler
-///       that lands in it — 5 stragglers, 5 merges, 7151 KB written;</item>
-/// <item>six flush segments straddling a bucket boundary (one 30-day-late row each) produce
-///       0 merges: the bucket never converges and every file keeps a 32-day span, against the
-///       7-day bound the policy advertises;</item>
-/// <item>an open bucket whose files have outgrown <c>target / MergeMinSources</c> stops merging
-///       entirely — 40 flush segments, target = 5 segments' worth, 0 merges.</item>
+/// <item>a collapsed 1430 KB sealed bucket was rewritten IN FULL for every one-event straggler —
+///       5 stragglers, 5 merges, 7151 KB written, and the cost did not decay;</item>
+/// <item>six flush segments straddling a bucket boundary produced 0 merges and kept a 32.2-day
+///       span against a 7-day bound;</item>
+/// <item>an open bucket whose files had outgrown <c>target / MergeMinSources</c> stopped merging
+///       entirely — 40 segments, 0 merges;</item>
+/// <item>write amplification of the open bucket was 2.06× at 80 flushes, 3.20× at 160 and 3.34×
+///       at 400 — a staircase, still climbing, past the policy's own <c>amp &lt; 3.0</c> guard.</item>
 /// </list>
 /// </summary>
 public sealed class SegmentBucketAdversarialProbe : IAsyncLifetime
@@ -122,52 +121,72 @@ public sealed class SegmentBucketAdversarialProbe : IAsyncLifetime
         return n;
     }
 
+    /// <summary>Identity of a file on disk, so "was it rewritten" is answerable byte for byte.</summary>
+    private static (ulong Id, long Length, DateTime Written) Fingerprint(SegmentInfo s) =>
+        (s.Id.Value, new FileInfo(s.FilePath).Length, File.GetLastWriteTimeUtc(s.FilePath));
+
+    // ── 1. A straggler costs the straggler ────────────────────────────────────
+
     /// <summary>
-    /// A straggler lands in a bucket that collapsed days ago. The bucket is sealed, so the
-    /// planner drops the size ratio and takes a 2-source batch — and the second source is the
-    /// bucket's whole collapsed file. One event therefore costs a full rewrite, and the cost
-    /// does not decay: the merged file is still below <c>MergeTargetPayloadBytes / 2</c>, so it
-    /// stays a candidate for the next straggler too.
+    /// THE BLOCKER. A straggler lands in a bucket that collapsed days ago. The bucket is sealed,
+    /// and the previous planner dropped the size ratio for a sealed bucket, so a 2-source batch
+    /// of "one event plus the bucket's whole collapsed file" was legal — and stayed legal,
+    /// because the rewritten file was still under the maximal threshold. Five one-event flushes
+    /// cost five merges and 7151 KB of writes.
+    ///
+    /// <para>The size ratio now applies to sealed buckets too, so the collapsed file is not a
+    /// legal partner for anything 800× smaller. The stragglers coalesce among THEMSELVES, which
+    /// is the late-arrival segment the design wanted, obtained without a second code path.</para>
     /// </summary>
     [Fact]
-    public async Task AStragglerRewritesACollapsedSealedBucket()
+    public async Task AStragglerCostsTheStragglerNotTheBucket()
     {
         long day0 = BucketStart(LogLevel.Debug, DateTime.UtcNow.Ticks - 10 * TimeSpan.TicksPerDay);
         for (int f = 0; f < 6; f++)
-            await FlushAsync(400, LogLevel.Debug, day0 + f * 3 * TimeSpan.TicksPerHour, padBytes: 512);
+            await FlushAsync(400, LogLevel.Debug, day0 + f * 30 * TimeSpan.TicksPerMinute, padBytes: 512);
 
         await CompactToExhaustionAsync();
         var collapsed = _engine.ListSegments().Single();
+        var before    = Fingerprint(collapsed);
 
         long rewritten = 0;
         int  merges    = 0;
         for (int late = 0; late < 5; late++)
         {
-            await FlushAsync(1, LogLevel.Debug, day0 + 5 * TimeSpan.TicksPerHour + late);
+            await FlushAsync(1, LogLevel.Debug, day0 + 2 * TimeSpan.TicksPerHour + late);
             var pass = await CompactToExhaustionAsync();
             merges    += pass.Merges;
             rewritten += pass.BytesWritten;
         }
 
         _out.WriteLine($"collapsed bucket {collapsed.UncompressedBytes / 1024} KB; " +
-                       $"5 one-event stragglers => {merges} merge(s), {rewritten / 1024} KB rewritten");
+                       $"5 one-event stragglers => {merges} merge(s), {rewritten} B rewritten");
+
+        // The collapsed file is the same file, byte for byte — never a merge source.
+        var still = _engine.ListSegments().Single(s => s.Id.Value == collapsed.Id.Value);
+        Assert.Equal(before, Fingerprint(still));
+
+        // And what WAS rewritten is proportional to the stragglers, not to the bucket.
+        Assert.True(rewritten < collapsed.UncompressedBytes / 100,
+            $"{rewritten} B rewritten for 5 one-event stragglers against a {collapsed.UncompressedBytes} B bucket");
         Assert.Equal(2405, ServedEvents());
     }
 
     /// <summary>
     /// The same shape without a contrived flush: one late Fatal row inside a live tier of
-    /// Information. The level-split flush writes it as a Fatal segment of its own, so its Min
-    /// AND Max are both inside the old bucket — which is exactly what makes it a merge source
-    /// for that bucket's collapsed file.
+    /// Information. The level-split flush writes it as a Fatal segment of its own whose Max is
+    /// back in the old bucket — which is exactly what used to make it a merge source for that
+    /// bucket's collapsed file.
     /// </summary>
     [Fact]
-    public async Task OneLateFatalRowRewritesTheWholeFatalBucket()
+    public async Task OneLateFatalRowDoesNotRewriteTheFatalBucket()
     {
         long day0 = BucketStart(LogLevel.Fatal, DateTime.UtcNow.Ticks - 30 * TimeSpan.TicksPerDay);
         for (int f = 0; f < 8; f++)
             await FlushAsync(300, LogLevel.Fatal, day0 + f * TimeSpan.TicksPerHour, padBytes: 512);
         await CompactToExhaustionAsync();
         var collapsed = _engine.ListSegments().Single();
+        var before    = Fingerprint(collapsed);
 
         long rewritten = 0;
         int  merges    = 0;
@@ -182,75 +201,100 @@ public sealed class SegmentBucketAdversarialProbe : IAsyncLifetime
         }
 
         _out.WriteLine($"collapsed Fatal bucket {collapsed.UncompressedBytes / 1024} KB; " +
-                       $"4 single-row stragglers => {merges} merge(s), {rewritten / 1024} KB rewritten");
+                       $"4 single-row stragglers => {merges} merge(s), {rewritten} B rewritten");
+
+        Assert.Equal(before, Fingerprint(_engine.ListSegments().Single(s => s.Id.Value == collapsed.Id.Value)));
+        Assert.True(rewritten < collapsed.UncompressedBytes / 100, $"{rewritten} B rewritten for 4 late rows");
         Assert.Equal(2400 + 4 + 800, ServedEvents());
     }
 
+    // ── 2. A straddler has a terminal state ───────────────────────────────────
+
     /// <summary>
-    /// A flush segment whose oldest row is 30 days late spans from that row to now. Its bucket is
-    /// the OLD one (bucket = floor(Min / width)), but its span is five times the bucket width, so
-    /// the planner's span guard rejects every partner it could have — including other straddlers
-    /// with the same shape. The bucket has no terminal state and its files keep a span the policy
-    /// says is impossible.
+    /// A flush segment whose oldest row is 30 days late spans from that row to now. Under
+    /// Min-bucketing it belonged to the OLD bucket while its span was five times the bucket
+    /// width, so the planner's span guard rejected every partner it could have had — including
+    /// other straddlers of the same shape. Measured: 6 such segments, 0 merges, 32.2-day spans.
+    ///
+    /// <para>A segment's bucket is now <c>floor(MaxTimestamp / width)</c>, so a straddler
+    /// belongs with the data it was flushed beside and compacts with it normally. Its span is
+    /// still 30 days — that is the lateness of the row, which no merge can undo — but the
+    /// bucket TERMINATES, and the thing the span guard was protecting (a row's deadline moving)
+    /// is now guaranteed directly: every source's Max is inside one width window.</para>
     /// </summary>
     [Fact]
-    public async Task StraddlingSegmentsNeverCompactAndKeepAnUnboundedSpan()
+    public async Task StraddlingSegmentsReachATerminalState()
     {
         long w   = BucketTicks(LogLevel.Information);
         long b   = BucketStart(LogLevel.Information, DateTime.UtcNow.Ticks - 30 * TimeSpan.TicksPerDay);
         long now = DateTime.UtcNow.Ticks;
 
-        for (int f = 0; f < 6; f++)
+        for (int f = 0; f < 8; f++)
         {
             Write(1,  LogLevel.Information, b + TimeSpan.TicksPerHour + f);
             Write(50, LogLevel.Information, now - (60 - f) * TimeSpan.TicksPerMinute);
             await _engine.FlushHotTierAsync();
         }
+        var deadlines = _engine.ListSegments().Select(s => s.MaxTimestampTicks).ToList();
 
         var pass  = await CompactToExhaustionAsync();
         var after = _engine.ListSegments();
         double maxSpan = after.Max(s => (s.MaxTimestampTicks - s.MinTimestampTicks) / (double)TimeSpan.TicksPerDay);
-        _out.WriteLine($"6 straddlers, bucket width {w / TimeSpan.TicksPerDay} d: {pass.Merges} merge(s), " +
+        _out.WriteLine($"8 straddlers, bucket width {w / TimeSpan.TicksPerDay} d: {pass.Merges} merge(s), " +
                        $"{after.Count} file(s), largest span {maxSpan:F1} d");
-        Assert.Equal(306, ServedEvents());
+
+        Assert.Equal(1, pass.Merges);
+        Assert.Single(after);
+        Assert.Equal(408, ServedEvents());
+
+        // The property the span guard was standing in for: no row's expiry moved by more than
+        // one bucket width. That holds for a straddler where "span <= width" never could.
+        long merged = after[0].MaxTimestampTicks;
+        Assert.All(deadlines, d => Assert.True(merged - d < w, $"deadline moved by {merged - d} ticks"));
     }
 
     /// <summary>
-    /// The span guard <c>continue</c>s past a source instead of stopping, so the "contiguous
-    /// oldest-first run" is not contiguous when a straddler sits in the middle of a bucket: the
-    /// merged file spans right across the straddler it skipped, and the two overlap.
+    /// The run planner STOPS at the first source it cannot take instead of stepping over it. The
+    /// old span guard <c>continue</c>d, so with an outlier in the middle of a bucket the merged
+    /// file spanned right across the source it had skipped and the two overlapped — every query
+    /// into that window then opened both.
     /// </summary>
     [Fact]
-    public async Task ASkippedStraddlerLeavesOverlappingFiles()
+    public async Task AMergeNeverSpansASourceItSkipped()
     {
         long b = BucketStart(LogLevel.Information, DateTime.UtcNow.Ticks - 30 * TimeSpan.TicksPerDay);
 
-        for (int f = 0; f < 4; f++)
-            await FlushAsync(50, LogLevel.Information, b + (1 + f) * TimeSpan.TicksPerHour);
-        Write(1,  LogLevel.Information, b + 5 * TimeSpan.TicksPerHour);
-        Write(50, LogLevel.Information, DateTime.UtcNow.Ticks - TimeSpan.TicksPerHour);
-        await _engine.FlushHotTierAsync();
-        for (int f = 0; f < 4; f++)
-            await FlushAsync(50, LogLevel.Information, b + (6 + f) * TimeSpan.TicksPerHour);
+        // A size outlier in the middle: two small flushes, one 20× larger, two more small.
+        await FlushAsync(50,   LogLevel.Information, b + 1 * TimeSpan.TicksPerHour);
+        await FlushAsync(50,   LogLevel.Information, b + 2 * TimeSpan.TicksPerHour);
+        await FlushAsync(1200, LogLevel.Information, b + 3 * TimeSpan.TicksPerHour, padBytes: 512);
+        await FlushAsync(50,   LogLevel.Information, b + 5 * TimeSpan.TicksPerHour);
+        await FlushAsync(50,   LogLevel.Information, b + 6 * TimeSpan.TicksPerHour);
 
         await CompactToExhaustionAsync();
 
         var segs = _engine.ListSegments().OrderBy(s => s.MinTimestampTicks).ToList();
-        bool overlap = false;
         for (int i = 1; i < segs.Count; i++)
-            if (segs[i].MinTimestampTicks < segs[i - 1].MaxTimestampTicks) overlap = true;
-        _out.WriteLine($"{segs.Count} file(s) after cutting a bucket that holds a straddler, overlap={overlap}");
-        Assert.Equal(451, ServedEvents());
+            Assert.True(segs[i].MinTimestampTicks >= segs[i - 1].MaxTimestampTicks,
+                $"files {i - 1} and {i} overlap — a merge spanned a source it skipped");
+        _out.WriteLine($"{segs.Count} file(s) after compacting a bucket with a size outlier in the middle");
+        Assert.Equal(1400, ServedEvents());
     }
 
+    // ── 3. The batch budget must not stall a bucket ───────────────────────────
+
     /// <summary>
-    /// <c>MergeMinSources</c> is tested against the batch AFTER the payload budget has cut it, so
-    /// an open bucket whose files have grown past <c>target / 8</c> can never assemble a legal
-    /// batch again. At the shipped 512 MB target that is any file over 64 MB; the bucket then
-    /// waits for its 48 h-past-window seal (up to 9 days for a 90-day level) to consolidate.
+    /// <c>MergeMinSources</c> used to be tested against the batch AFTER the payload budget had
+    /// cut it, so an open bucket whose files had grown past <c>target / 8</c> could never
+    /// assemble a legal batch again — measured, 40 segments produced 0 merges. At the shipped
+    /// 512 MB target that is any file over 64 MB; the bucket then waited for its seal (up to 9
+    /// days for a 90-day level) to consolidate.
+    ///
+    /// <para>A run that fills the target now merges whatever its source count, because the file
+    /// it produces is MAXIMAL — the last rewrite those bytes will ever get.</para>
     /// </summary>
     [Fact]
-    public async Task AnOpenBucketStallsOnceItsFilesOutgrowTheBatchBudget()
+    public async Task AnOpenBucketKeepsCompactingPastTheBatchBudget()
     {
         long today = DateTime.UtcNow.Ticks - 20 * TimeSpan.TicksPerHour;
         await FlushAsync(200, LogLevel.Information, today, padBytes: 256);
@@ -260,67 +304,121 @@ public sealed class SegmentBucketAdversarialProbe : IAsyncLifetime
         for (int f = 1; f < 40; f++)
             await FlushAsync(200, LogLevel.Information, today + f * TimeSpan.TicksPerMinute, padBytes: 256);
 
-        var pass = await CompactToExhaustionAsync();
+        var pass  = await CompactToExhaustionAsync();
+        var after = _engine.ListSegments();
         _out.WriteLine($"flush segment {one / 1024} KB, target {one * 5 / 1024} KB: " +
-                       $"{pass.Merges} merge(s), {_engine.ListSegments().Count} of 40 file(s) left");
+                       $"{pass.Merges} merge(s), {after.Count} of 40 file(s) left");
+
+        Assert.True(pass.Merges >= 8, $"{pass.Merges} merges — the bucket is still stalling");
+        Assert.True(after.Count <= 12, $"{after.Count} files left of 40");
+        // Each output is at or past maximal, so it is out of the candidate set for good — which
+        // is why a run that fills the target is worth merging however few sources it has.
+        Assert.All(after, s => Assert.True(s.UncompressedBytes >= one * 5 / 2,
+            $"a {s.UncompressedBytes} B file survived below the {one * 5 / 2} B maximal"));
         Assert.Equal(8000, ServedEvents());
     }
 
+    // ── 4. Amplification over a long run, with stragglers ─────────────────────
+
     /// <summary>
-    /// Write amplification once the size ladder has more than one rung.
+    /// WRITE AMPLIFICATION, measured as a curve rather than a point, over a run long enough for
+    /// files to reach the maximal size and stop being candidates — which is the only thing that
+    /// makes the number converge.
     ///
-    /// <para><see cref="SegmentBucketCompactionTests.OpenBucketAmplificationStaysBounded"/> runs 40
-    /// flushes, which is exactly one rung: five merges of eight raw segments each, then five merged
-    /// files and no sixth — <c>MergeMinSources</c> is 8, so they cannot batch. Its 1.40x is the cost
-    /// of that single rung and its <c>amp &lt; 3.0</c> guard is never approached. Run to 400 flushes,
-    /// where the second and third rungs do form, the same shape MEASURES 3.34x and is still
-    /// climbing; the stand's Information level flushes ~288 times a day into a 7-day bucket, so it
-    /// sits several rungs above what the shipped figure covers.</para>
+    /// <para>The previous claim of 1.40× was one step of a staircase: 40 flushes is exactly one
+    /// rung of the size ladder. The same shape measured 2.06× at 80, 3.20× at 160 and 3.34× at
+    /// 400 and was still climbing, because with a 64 MB target against 69 KB flush segments no
+    /// file ever reached maximal and every new rung rewrote everything below it. Amplification
+    /// is <c>log_ratio(maximal / flush size)</c>, so it converges only when maximal is
+    /// REACHABLE; the target here is set to put that ratio (~475) near the stand's own
+    /// (512 MB maximal-halved against ~1.3 MB flush segments ≈ 394).</para>
+    ///
+    /// <para>Stragglers are part of the run — a late row every tenth flush into an old sealed
+    /// bucket, and a straddling flush every fiftieth — because a policy measured only on
+    /// well-behaved input measures the case that was never broken.</para>
     /// </summary>
     [Fact]
-    public async Task OpenBucketAmplificationClimbsWithTheSizeLadder()
+    public async Task OpenBucketAmplificationConverges()
     {
-        // 64 MB target against ~69 KB flush segments leaves room for three rungs of 8x.
-        _engine._mergeTargetPayloadBytes = 64L * 1024 * 1024;
-        long today = DateTime.UtcNow.Ticks - 20 * TimeSpan.TicksPerHour;
-        long written = 0, ingested = 0;
-        int  merges  = 0;
+        _engine._mergeTargetPayloadBytes = 32L * 1024 * 1024;
 
-        for (int f = 0; f < 400; f++)
+        long today = DateTime.UtcNow.Ticks - 20 * TimeSpan.TicksPerHour;
+        long stale = BucketStart(LogLevel.Warning, DateTime.UtcNow.Ticks - 30 * TimeSpan.TicksPerDay);
+        long written = 0, ingested = 0, lastWritten = 0, lastIngested = 0;
+        int  merges  = 0, expected = 0;
+        var  marginal = new Dictionary<int, double>();
+
+        for (int f = 0; f < 1000; f++)
         {
             long before = _engine.ListSegments().Sum(s => s.UncompressedBytes);
-            await FlushAsync(200, LogLevel.Information, today + f * TimeSpan.TicksPerMinute, padBytes: 256);
+
+            Write(200, LogLevel.Information, today + f * TimeSpan.TicksPerMinute, padBytes: 256);
+            expected += 200;
+            // A late row of its own level lands in a bucket that sealed weeks ago.
+            if (f % 10 == 0) { Write(1, LogLevel.Warning, stale + f); expected++; }
+            // A late row of the LIVE level makes the flush segment straddle a boundary.
+            if (f % 50 == 0) { Write(1, LogLevel.Information, stale + f); expected++; }
+            await _engine.FlushHotTierAsync();
+
             ingested += _engine.ListSegments().Sum(s => s.UncompressedBytes) - before;
 
-            var pass = await CompactToExhaustionAsync();
+            var pass = await CompactToExhaustionAsync(cap: 100);
             merges  += pass.Merges;
             written += pass.BytesWritten;
 
-            if ((f + 1) % 80 == 0)
-                _out.WriteLine($"{f + 1,4} flushes: {_engine.ListSegments().Count,3} file(s), {merges,3} merges, " +
-                               $"{written / 1024} KB written / {ingested / 1024} KB ingested = " +
-                               $"{written / (double)ingested:F2}x");
+            if (f + 1 is 80 or 160 or 400 or 1000)
+            {
+                // The CUMULATIVE ratio is a running average and lags by construction — it is
+                // what made 1.40x look like a result. The number that says whether the policy
+                // has settled is the MARGINAL one: what this stretch alone cost.
+                double amp  = written / (double)ingested;
+                double marg = (written - lastWritten) / (double)(ingested - lastIngested);
+                marginal[f + 1] = marg;
+                lastWritten = written; lastIngested = ingested;
+                _out.WriteLine($"{f + 1,5} flushes: {_engine.ListSegments().Count,3} file(s), {merges,3} merges, " +
+                               $"{written / 1024,7} KB written / {ingested / 1024,7} KB ingested = " +
+                               $"{amp:F2}x cumulative, {marg:F2}x over this stretch");
+            }
         }
-        Assert.Equal(80_000, ServedEvents());
+
+        Assert.Equal(expected, ServedEvents());
+
+        // CONVERGED means the last stretch costs what the one before it did. 400 → 1000 flushes
+        // is 2.5× the data of 160 → 400, and the whole point of a size ladder whose top rung is
+        // REACHABLE (a file at MergeSealedSourceBytes leaves the candidate set for good) is that
+        // more data costs no more rewrites per byte. The old policy had no such top — with a
+        // 64 MB target against 69 KB segments nothing ever reached it — so every new rung
+        // rewrote everything below it and the curve stepped up forever: 2.06x, 3.20x, 3.34x.
+        Assert.True(marginal[1000] <= marginal[400] * 1.15,
+            $"amplification is still climbing: {marginal[400]:F2}x over 160-400, {marginal[1000]:F2}x over 400-1000");
+        // MEASURED 2.92x over 400-1000, against log₄(maximal / flush size) = 4.1 rewrites if
+        // every rung cost a full pass. The guard is that number plus room for the run planner
+        // to pick a different cut, not a round figure chosen to pass.
+        Assert.True(marginal[1000] < 3.2, $"steady-state write amplification is {marginal[1000]:F2}x");
     }
 
     /// <summary>
-    /// The bucket widths and the over-retention they buy, per level, under the default policy —
-    /// the floor at one whole day means Debug's is 33 %, not the 8.3 % the divisor implies.
+    /// The bucket widths and the over-retention they buy, per level, under the default policy.
+    /// Debug's 3-day TTL earns a 6 h bucket: the old whole-day floor made its over-retention
+    /// 33 %, not the 8.3 % <c>MergeSpanTtlDivisor</c> advertises, and its bucket did not seal
+    /// until day 2 of a 3-day life.
     /// </summary>
     [Fact]
     public void BucketWidthOverRetentionPerLevel()
     {
         foreach (var lvl in new[] { LogLevel.Verbose, LogLevel.Debug, LogLevel.Information })
         {
-            var  ttl = RetentionPolicy.Default.GetTtl(lvl);
-            long w   = BucketTicks(lvl);
-            _out.WriteLine($"{lvl,-11} ttl {ttl.TotalDays,2} d, width {w / (double)TimeSpan.TicksPerDay:F0} d, " +
+            var  ttl   = RetentionPolicy.Default.GetTtl(lvl);
+            long w     = BucketTicks(lvl);
+            long grace = Math.Min(48L * TimeSpan.TicksPerHour, w);
+            _out.WriteLine($"{lvl,-11} ttl {ttl.TotalDays,2} d, width {w / (double)TimeSpan.TicksPerHour:F0} h, " +
                            $"over-retention {100.0 * w / ttl.Ticks:F1} %, seals at bucket start " +
-                           $"+{(w + 48L * TimeSpan.TicksPerHour) / (double)TimeSpan.TicksPerDay:F0} d, " +
-                           $"oldest row dies at +{(w + ttl.Ticks) / (double)TimeSpan.TicksPerDay:F0} d");
+                           $"+{(w + grace) / (double)TimeSpan.TicksPerHour:F0} h, " +
+                           $"oldest row dies at +{(w + ttl.Ticks) / (double)TimeSpan.TicksPerDay:F1} d");
+            Assert.True(100.0 * w / ttl.Ticks <= 100.0 / 12 + 0.01,
+                $"{lvl} over-retains {100.0 * w / ttl.Ticks:F1} %, above the advertised 8.3 %");
         }
-        Assert.Equal(7 * TimeSpan.TicksPerDay, BucketTicks(LogLevel.Information));
-        Assert.Equal(1 * TimeSpan.TicksPerDay, BucketTicks(LogLevel.Debug));
+        Assert.Equal(7 * TimeSpan.TicksPerDay,  BucketTicks(LogLevel.Information));
+        Assert.Equal(6 * TimeSpan.TicksPerHour, BucketTicks(LogLevel.Debug));
     }
 }
