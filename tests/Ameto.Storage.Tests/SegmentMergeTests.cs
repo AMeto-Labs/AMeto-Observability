@@ -251,17 +251,29 @@ public sealed class SegmentMergeTests : IAsyncLifetime
         Assert.True(allocMb < 20, $"merge allocated {allocMb} MB streaming 40 MB of payload");
     }
 
-    /// <summary>A merged file can only expire whole — batches must not span more than a day.</summary>
+    /// <summary>
+    /// A merged file can only expire whole, so a batch never reaches outside ONE bucket — the
+    /// span is exactly how much longer its oldest event outlives its own deadline. Nine
+    /// consecutive days of Information straddle two of Information's 7-day buckets, so they
+    /// collapse to two files rather than one, each inside the bound.
+    /// </summary>
     [Fact]
-    public async Task Merge_RespectsTimeSpanCap()
+    public async Task Merge_NeverSpansMoreThanOneBucket()
     {
-        long dayTicks = TimeSpan.TicksPerDay;
-        long origin   = DateTime.UtcNow.Ticks - 30 * dayTicks;
-        for (int round = 0; round < 9; round++) // one segment per day → no 24 h window holds 8
-            await WriteSegmentAsync(round, 40, baseTicks: origin + round * dayTicks);
+        long width  = StorageEngine.MergeBucketTicks(RetentionPolicy.Default.GetTtl(LogLevel.Information));
+        long origin = (DateTime.UtcNow.Ticks - 30 * TimeSpan.TicksPerDay) / width * width;
+        for (int round = 0; round < 9; round++)
+            await WriteSegmentAsync(round, 40, baseTicks: origin + round * TimeSpan.TicksPerDay);
 
-        Assert.False(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None));
-        Assert.Equal(9, _engine.ListSegments().Count);
+        int passes = 0;
+        while (await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None)) Assert.True(++passes < 10);
+
+        var segs = _engine.ListSegments();
+        Assert.Equal(2, segs.Count);                                    // days 0-6 and days 7-8
+        Assert.Equal(360u, (uint)segs.Sum(s => s.EventCount));
+        foreach (var s in segs)
+            Assert.True(s.MaxTimestampTicks - s.MinTimestampTicks <= width,
+                $"segment spans {(s.MaxTimestampTicks - s.MinTimestampTicks) / (double)TimeSpan.TicksPerDay:F2} days");
     }
 
     /// <summary>

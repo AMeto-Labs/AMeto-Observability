@@ -212,7 +212,15 @@ public sealed class SegmentWriter : IDisposable
     /// keeps the pre-v7 shape: one implicit group covering the file, with sections written by
     /// the caller via <see cref="WriteInvertedIndex"/> and friends.</para>
     /// </param>
-    public void WriteEvents(ISegmentEventSource source, SegmentIndexSinkFactory? indexSink)
+    /// <param name="ct">
+    /// Checked once per emitted block (~64 KB), which is free next to the LZ4 + msgpack work of
+    /// filling one. A merged file can now be 512 MB / 4M events, so an un-cancellable write loop
+    /// would mean shutdown waiting tens of seconds for a pass whose output is thrown away
+    /// anyway: the file is still at <c>.seg.tmp</c> and no source has been touched, so throwing
+    /// out of here unwinds to exactly the pre-merge state.
+    /// </param>
+    public void WriteEvents(ISegmentEventSource source, SegmentIndexSinkFactory? indexSink,
+                            CancellationToken ct = default)
     {
         _fs.Seek(SegmentFileHeader.Size, SeekOrigin.Begin);
         _sinkFactory = indexSink;
@@ -228,6 +236,7 @@ public sealed class SegmentWriter : IDisposable
 
             if (_stagedCount > 0 && _stagedBytes + rowCost > BlockSize)
             {
+                ct.ThrowIfCancellationRequested();
                 EmitBlock();
 
                 // Cut only on a block boundary: a group owns whole blocks, so the block
