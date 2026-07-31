@@ -282,6 +282,32 @@ public sealed class SegmentBucketCompactionTests : IAsyncLifetime
         }
     }
 
+    /// <summary>
+    /// A bucket with more payload than one file may hold has to be cut, and it is cut by TIME:
+    /// the pieces partition the bucket instead of interleaving it. Interleaved pieces each span
+    /// the whole bucket, so every query into it opens all of them and every one of them carries
+    /// the bucket's newest timestamp — which means the oldest events over-retain by the full
+    /// bucket width rather than by one file's share of it.
+    /// </summary>
+    [Fact]
+    public async Task ABucketTooBigForOneFileIsCutByTime()
+    {
+        _engine._mergeTargetPayloadBytes = 256 * 1024;
+
+        long start = BucketStart(LogLevel.Information, DateTime.UtcNow.Ticks - 20 * TimeSpan.TicksPerDay);
+        for (int f = 0; f < 14; f++)
+            await FlushAsync(120, LogLevel.Information, start + f * 12 * TimeSpan.TicksPerHour, padBytes: 512);
+
+        await CompactToExhaustionAsync();
+
+        var segs = _engine.ListSegments().OrderBy(s => s.MinTimestampTicks).ToList();
+        Assert.True(segs.Count >= 3, $"target too large to force a cut — only {segs.Count} file(s)");
+        for (int i = 1; i < segs.Count; i++)
+            Assert.True(segs[i].MinTimestampTicks >= segs[i - 1].MaxTimestampTicks,
+                $"segments {i - 1} and {i} overlap in time — the bucket was interleaved, not partitioned");
+        Assert.Equal(1680, ReadEverything().Count);
+    }
+
     // ── 4. Today's bucket keeps working ───────────────────────────────────────
 
     /// <summary>

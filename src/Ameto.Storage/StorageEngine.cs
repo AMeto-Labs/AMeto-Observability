@@ -77,6 +77,12 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     internal long _groupPayloadBudgetBytes = SegmentWriter.DefaultGroupPayloadBudgetBytes;
     /// <summary>Test hook: first id of the block reserved for the live WAL (see <see cref="_walSegId"/>).</summary>
     internal ulong LiveWalSegmentId => _walSegId;
+    /// <summary>
+    /// Test hook: scales the merged-file target. What determines how many files a bucket ends
+    /// with is the RATIO of the bucket's payload to this, so dividing both by the same factor
+    /// reproduces a stand's file geometry at a fraction of its volume.
+    /// </summary>
+    internal long _mergeTargetPayloadBytes = MergeTargetPayloadBytes;
 
     // ── Flush memory budgets (see the constructor for how these combine) ───────
 
@@ -922,8 +928,10 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// </summary>
     private List<SegmentInfo>? SelectMergeBatch()
     {
-        var  policy = _retentionStore.GetPolicy();
-        long now    = DateTimeOffset.UtcNow.UtcTicks;
+        var  policy  = _retentionStore.GetPolicy();
+        long now     = DateTimeOffset.UtcNow.UtcTicks;
+        long target  = _mergeTargetPayloadBytes;
+        long maximal = target / 2;   // MergeSealedSourceBytes — scaled with the target, not fixed
 
         // Group by (level, aligned bucket start). Grouping by LEVEL rather than by TTL class
         // matters even though same-level implies same TTL: Information and Error share the
@@ -935,7 +943,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             if (_mergeSkip.Contains(s.Id.Value)) continue;
 
             // A maximal segment is done — it is the OUTPUT of this policy, not an input to it.
-            if (SegmentPayloadBytes(s) >= MergeSealedSourceBytes) continue;
+            if (SegmentPayloadBytes(s) >= maximal) continue;
 
             long width = MergeBucketTicks(policy.GetTtl(s.MinLevel));
             long start = s.MinTimestampTicks / width * width;
@@ -958,33 +966,43 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             int  minSources = isSealed ? 2 : MergeMinSources;
             if (list.Count < minSources) continue;
 
-            // Smallest first: it packs the most sources into one pass, leaves the remainder as
-            // ONE partial file rather than several, and makes the open-bucket size ratio a
-            // simple prefix test.
+            // WHICH files may be rewritten together is a size question; WHICH ONES actually go
+            // into this batch is a time question. Both, in that order.
+            //
+            // The size ratio is anchored on the MEDIAN, not the smallest. A quiet minute
+            // produces a flush segment of a few hundred bytes, and anchoring on that would put
+            // the ceiling below every real file in the bucket — no batch would ever form and
+            // today's data would stay uncompacted until the bucket sealed. The median is a size
+            // the bucket actually has, so half its files are admissible by construction and the
+            // sweep always makes progress, while a file an order of magnitude larger than the
+            // bucket's typical one is still kept out of a batch it would dominate.
             list.Sort(static (a, b) => SegmentPayloadBytes(a).CompareTo(SegmentPayloadBytes(b)));
-
-            // The ratio is anchored on the MEDIAN, not the smallest. A quiet minute produces a
-            // flush segment of a few hundred bytes, and anchoring on that would put the ceiling
-            // below every real file in the bucket — no batch would ever form and today's data
-            // would stay uncompacted until the bucket sealed. The median is a size the bucket
-            // actually has, so half its files are admissible by construction and the sweep
-            // always makes progress, while a file an order of magnitude larger than the bucket's
-            // typical one is still kept out of a batch it would dominate.
             long ratioCeiling = isSealed
                 ? long.MaxValue
                 : SegmentPayloadBytes(list[list.Count / 2]) * MergeOpenSizeRatio;
 
-            var  batch   = new List<SegmentInfo>(Math.Min(list.Count, MergeMaxSources));
-            long payload = 0, events = 0, minTs = long.MaxValue, maxTs = long.MinValue;
+            var admissible = new List<SegmentInfo>(list.Count);
             foreach (var s in list)
+                if (SegmentPayloadBytes(s) <= ratioCeiling) admissible.Add(s);
+
+            // Then oldest first, and take a CONTIGUOUS run. A bucket too big for one file has
+            // to be cut somehow, and cutting it by time is what makes the pieces useful: files
+            // that partition their bucket prune by window and expire in sequence, where files
+            // that interleave it all span the whole bucket, are all opened by every query into
+            // it, and all carry the bucket's newest timestamp — so its oldest events over-retain
+            // by the full bucket width instead of by one file's share of it. Measured on the
+            // stand shape at 1/16 (see DayBucketCompactionProbe): 5.72 d of span per Information
+            // file when the batch was picked smallest-first, 1.6 d when picked oldest-first.
+            admissible.Sort(static (a, b) => a.MinTimestampTicks.CompareTo(b.MinTimestampTicks));
+
+            var  batch   = new List<SegmentInfo>(Math.Min(admissible.Count, MergeMaxSources));
+            long payload = 0, events = 0, minTs = long.MaxValue, maxTs = long.MinValue;
+            foreach (var s in admissible)
             {
                 if (batch.Count >= MergeMaxSources) break;
                 long p = SegmentPayloadBytes(s);
-                // Sorted ascending, so the first source that fails a size test ends the batch.
                 if (batch.Count > 0 &&
-                    (p > ratioCeiling ||
-                     payload + p > MergeTargetPayloadBytes ||
-                     events + s.EventCount > MergeMaxEvents))
+                    (payload + p > target || events + s.EventCount > MergeMaxEvents))
                     break;
 
                 // Hard span bound. Same-bucket membership already puts every MinTimestamp
