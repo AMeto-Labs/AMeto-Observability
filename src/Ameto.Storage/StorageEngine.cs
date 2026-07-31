@@ -1096,6 +1096,12 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// merging — which is the steady state, not a failure: every bucket has either reached
     /// <see cref="MergeSealedSourceBytes"/> or holds only files no run can legally combine.
     ///
+    /// <para>Two candidate sources, in strict order. A TIME-CONTIGUOUS run
+    /// (<see cref="SelectMergeRun"/>) everywhere it can be found, because its output never
+    /// overlaps a file it left behind; and only when that finds nothing in the whole catalog, a
+    /// run inside one SIZE TIER (<see cref="SelectMergeTierRun"/>), which may overlap and is
+    /// what gives a bucket of unevenly sized files a terminal state at all.</para>
+    ///
     /// <para>Chosen from CATALOG METADATA alone; no file is opened, let alone decoded, until
     /// the merge itself streams it.</para>
     /// </summary>
@@ -1214,6 +1220,13 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         // made it O(n²) GARBAGE as well: measured 5.5 MB and 2.4 ms per planner pass at 1600
         // files in one bucket, every pass returning null. The list escapes on exactly one path,
         // and the method allocates a fresh one per call, so the caller owns what it gets.
+        //
+        // The n that O(n²) is quadratic in is BOUNDED, which is why it needs no memoisation on
+        // top: a bucket only survives a pass with files left over if every tier of it holds
+        // fewer than minSources (3 same-tier files always satisfy growth), so at fixpoint a
+        // (level, bucket) group holds under minSources × 32 files whatever arrives — 224 in an
+        // open bucket, 64 in a sealed one. Thousands of stuck files in one group was a symptom
+        // of the stranding bug, not a state the planner can now reach.
         var run = new List<SegmentInfo>(Math.Min(byTime.Count, MergeMaxSources));
 
         for (int start = 0; start + 1 < byTime.Count; start++)
