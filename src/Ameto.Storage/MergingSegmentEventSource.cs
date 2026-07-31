@@ -232,6 +232,26 @@ public sealed class MergingSegmentEventSource : ISegmentEventSource, IDisposable
         }
     }
 
+    /// <summary>
+    /// Opens every source file and merges them; throws (having closed whatever it opened) if any
+    /// file cannot be read. The engine's own merge opens its sources during PLANNING instead, so
+    /// an unreadable one can be skip-listed before a manifest is written.
+    /// </summary>
+    public static MergingSegmentEventSource Open(IReadOnlyList<string> filePaths)
+    {
+        var readers = new List<SegmentReader>(filePaths.Count);
+        try
+        {
+            foreach (var path in filePaths) readers.Add(SegmentReader.Open(path));
+            return new MergingSegmentEventSource(readers);
+        }
+        catch
+        {
+            foreach (var r in readers) r.Dispose();
+            throw;
+        }
+    }
+
     /// <summary>Exact, not an estimate: every source's event count is in its file header.</summary>
     public long RemainingEventHint => Math.Max(0, _remaining);
 
