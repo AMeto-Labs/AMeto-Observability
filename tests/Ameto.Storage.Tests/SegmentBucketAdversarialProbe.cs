@@ -411,6 +411,38 @@ public sealed class SegmentBucketAdversarialProbe : IAsyncLifetime
         Assert.Equal(expected, ServedEvents());
     }
 
+    /// <summary>
+    /// And the same in the bucket every deployment always has: the OPEN one, at wall clock.
+    /// Sealing was never the mechanism — the size ratio blocked the run, and the fanout, which is
+    /// all sealing lowers, was not what stood in the way — so the open bucket failed identically
+    /// and had to wait days for a seal that would not have helped. MEASURED at 30b0d93 with
+    /// flush volumes strictly alternating 25 and 800 events: 3000 flushes, 0 merges, 3000 files.
+    /// </summary>
+    [Fact]
+    public async Task AnOpenBucketConvergesWhateverTheFlushSizeDistribution()
+    {
+        long today = DateTime.UtcNow.Ticks - 20 * TimeSpan.TicksPerHour;
+        int  expected = 0;
+
+        for (int f = 0; f < 600; f++)
+        {
+            int n = f % 2 == 0 ? 25 : 800;
+            expected += n;
+            await FlushAsync(n, LogLevel.Information, today + f * TimeSpan.TicksPerMinute, padBytes: 256);
+            await CompactToExhaustionAsync();
+        }
+
+        var files = _engine.ListSegments().Count;
+        long allowance = StorageEngine.MergeMinSources * (long)DistinctSizeTiers();
+        _out.WriteLine($"alternating 25/800 events, OPEN bucket: 600 flushes -> {files} file(s) " +
+                       $"across {DistinctSizeTiers()} size tier(s)");
+
+        // An open bucket's fanout is 8, so it may hold up to 7 files per tier in flight — that is
+        // the ladder's allowance, and it is a function of the size range, not of the flush count.
+        Assert.True(files <= allowance, $"{files} files, above the {allowance}-file ladder allowance");
+        Assert.Equal(expected, ServedEvents());
+    }
+
     // ── 3. The batch budget must not stall a bucket ───────────────────────────
 
     /// <summary>
