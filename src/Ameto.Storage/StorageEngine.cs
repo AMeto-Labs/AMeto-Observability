@@ -896,15 +896,23 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// amplification. A byte enters at flush-segment size and leaves the policy at
     /// <see cref="MergeSealedSourceBytes"/>; a run of <see cref="MergeMinSources"/> same-size
     /// files multiplies it by that fanout each time it is rewritten, so a byte is rewritten
-    /// log₈(maximal / flush size) ≈ 2.6 times at the stand's ~1.3 MB flush segments and 512 MB
-    /// target. That count is a CONSTANT — MEASURED over 1000 flushes with stragglers, at this
-    /// ratio: 1.70x, 1.80x, 2.86x, 2.92x per stretch, flat rather than a staircase.</para>
+    /// about log₄(maximal / flush size) times.</para>
+    ///
+    /// <para>THAT IS A FUNCTION OF THE DEPLOYMENT'S GEOMETRY, NOT A CONSTANT OF THE POLICY, and
+    /// the published figure has to be read that way. Measured over 6000 flushes with stragglers
+    /// at maximal/flush ≈ 235 — the marginal cost of each stretch, which is the only reading
+    /// that says whether the policy has settled, since the cumulative one is a running average
+    /// and lags: 1.80x, 1.80x, 3.13x, 2.81x, 3.05x, 2.98x, 3.05x per stretch at 80 / 160 / 400 /
+    /// 1000 / 2000 / 3000 / 4000 / 6000 flushes. A BAND of 2.81–3.13, flat over 15× the data,
+    /// not a staircase and not a point. A quieter server with 20 KB flush segments has two more
+    /// rungs on the same ladder and pays for them. The figure also counts REWRITES ONLY — the
+    /// device sees 1 + that per ingested byte.</para>
     ///
     /// <para>It is STRICTLY BELOW <see cref="MergeMinSources"/>, and that inequality is the
     /// point. At ratio 8 with a fanout of 8, a merge's own output is exactly 8× its sources and
     /// therefore admissible beside the very next batch of flush segments — so the freshly
     /// written file is rewritten again for the next 8 arrivals, at double the cost, forever.
-    /// MEASURED over 1000 flushes with stragglers: 3.34x steady state at ratio 8 against 2.92x
+    /// MEASURED over 1000 flushes with stragglers: 3.34x steady state at ratio 8 against 2.81x
     /// at ratio 4, for the same fanout and the same data.</para>
     ///
     /// <para>Dropping it for sealed buckets — the previous rule — is what made a one-row
@@ -981,6 +989,11 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// have accumulated, so the dominant level's files still span about a day and over-retain
     /// by ~1 %. The fraction only bites where there is too little data to fill a file, which is
     /// exactly where it should.</para>
+    ///
+    /// <para>The 8.3 % holds for any TTL at or above 12 MINUTES; below that the grid's own
+    /// one-minute floor binds and over-retention is <c>1 min / Ttl</c> instead (see
+    /// <see cref="MergeBucketTicks"/>). It is stated because TTLs are settable at runtime, not
+    /// because any shipped default is near it — the smallest is Debug's 3 days.</para>
     /// </summary>
     private const int MergeSpanTtlDivisor = 12;
 
@@ -999,6 +1012,19 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// way), and because a low fanout is no longer dangerous — <see cref="MergeGrowthFactor"/>
     /// is what stops a pair being "the bucket's big file plus one straggler", which is the shape
     /// that used to make this number costly.
+    ///
+    /// <para>What a fanout of two does cost is a MERGE RATE, and the rate is per arriving FLUSH,
+    /// not per late row: measured, 200 one-row stragglers into a collapsed 1430 KB bucket cost
+    /// 148 merges — 701 B rewritten each, so the bytes are bounded, but each is still a manifest
+    /// write-through, an index build, a segment write and fsync, two unlinks and a
+    /// <c>_flushConcurrency</c> slot. There is no byte floor guarding it deliberately: a floor
+    /// would strand exactly the files this fanout exists to rescue (a service logging four Fatals
+    /// a week produces genuinely tiny segments, and they never grow). The rate is bounded instead
+    /// by the two things that already bound it — one flush emits at most one segment per level
+    /// however many late rows it carries, and the maintenance pass runs on its own timer, so
+    /// stragglers that arrive between two passes coalesce in a single merge of their size tier
+    /// rather than pairwise. The measured 148 is the pathological reading taken by compacting to
+    /// exhaustion after every single flush.</para>
     /// </summary>
     internal const int MergeSealedMinSources = 2;
     // Each source contributes one open reader and one decompressed block (~64 KB) for the
@@ -1019,6 +1045,10 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// </summary>
     private static readonly long[] SubDayBucketWidths =
     [
+        1 * TimeSpan.TicksPerMinute,  2 * TimeSpan.TicksPerMinute,  3 * TimeSpan.TicksPerMinute,
+        4 * TimeSpan.TicksPerMinute,  5 * TimeSpan.TicksPerMinute,  6 * TimeSpan.TicksPerMinute,
+        10 * TimeSpan.TicksPerMinute, 12 * TimeSpan.TicksPerMinute, 15 * TimeSpan.TicksPerMinute,
+        20 * TimeSpan.TicksPerMinute, 30 * TimeSpan.TicksPerMinute,
         1 * TimeSpan.TicksPerHour,  2 * TimeSpan.TicksPerHour,  3 * TimeSpan.TicksPerHour,
         4 * TimeSpan.TicksPerHour,  6 * TimeSpan.TicksPerHour,  8 * TimeSpan.TicksPerHour,
         12 * TimeSpan.TicksPerHour,
@@ -1033,10 +1063,16 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// i.e. 33 % of over-retention advertised as 8.3 %, on the level that is usually the largest
     /// on disk. Sub-day widths that divide a day give Debug its 6 h and leave every 90-day level
     /// exactly where it was (7 days, 7.8 %).</para>
+    ///
+    /// <para>The ladder runs down to ONE MINUTE, not to one hour. TTLs are settable at runtime,
+    /// and a 1 h floor was the same hidden floor one order of magnitude down: it over-retained a
+    /// 3 h level by 33 %, a 1 h level by 100 % and a 30 min level by 200 %, all while the
+    /// divisor's doc comment said 8.3 %. The minute floor keeps the guarantee down to a 12-minute
+    /// TTL, which is below anything a retention policy is written to mean.</para>
     /// </summary>
     internal static long MergeBucketTicks(TimeSpan ttl)
     {
-        long budget = Math.Max(TimeSpan.TicksPerHour, ttl.Ticks / MergeSpanTtlDivisor);
+        long budget = ttl.Ticks / MergeSpanTtlDivisor;
         if (budget >= TimeSpan.TicksPerDay)
             return budget / TimeSpan.TicksPerDay * TimeSpan.TicksPerDay;
 
