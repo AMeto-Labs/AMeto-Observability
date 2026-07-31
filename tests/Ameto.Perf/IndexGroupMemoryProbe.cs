@@ -99,26 +99,38 @@ public sealed class IndexGroupMemoryProbe : IDisposable
             // we attribute to the build is only what the BUILDER retains.
             long baseline = GC.GetTotalMemory(forceFullCollection: true);
 
-            writer.WriteEvents(hot, pool, order, (firstOrdinal, count) =>
-            {
-                // A FRESH builder per group — the mechanism under test. The previous group's
-                // accumulators are unreachable by now, so the forced collection below leaves
-                // only this group's live.
-                var builder = new SegmentIndexBuilder(count);
-                builder.Build(hot, pool, order, firstOrdinal, count);
-
-                long live = GC.GetTotalMemory(forceFullCollection: true) - baseline;
-                if (live > peak) peak = live;
-                groups++;
-
-                return (builder.SerialisedInvertedIndex,
-                        builder.SerialisedTrigramIndex,
-                        builder.SerialisedBloomFilter);
-            });
+            // A FRESH builder per group — the mechanism under test. The previous group's
+            // accumulators are unreachable by the time the next one seals, so the forced
+            // collection inside the probe leaves only the current group's state live.
+            writer.WriteEvents(hot, pool, order, count => new PeakProbeSink(
+                new SegmentIndexBuilder(count),
+                () =>
+                {
+                    long live = GC.GetTotalMemory(forceFullCollection: true) - baseline;
+                    if (live > peak) peak = live;
+                    groups++;
+                }));
             writer.Finalise(new NodeId(0), new SegmentId((ulong)events));
         }
 
         return new Result(events, groups, peak);
+    }
+
+    /// <summary>
+    /// Wraps the real builder and samples the live heap at the instant a group seals — the
+    /// group's accumulators at their fullest, everything from earlier groups already garbage.
+    /// </summary>
+    private sealed class PeakProbeSink(SegmentIndexBuilder inner, Action onSeal) : ISegmentIndexSink
+    {
+        public void Add(uint fileOrdinal, in SegmentEventRef ev) => inner.Add(fileOrdinal, in ev);
+
+        public (byte[] Inverted, byte[] Trigram, byte[] Bloom) Serialise()
+        {
+            onSeal();
+            return inner.Serialise();
+        }
+
+        public void Dispose() => inner.Dispose();
     }
 
     /// <summary>Trace-carrying, prop-dense events — the shape that makes the trigram

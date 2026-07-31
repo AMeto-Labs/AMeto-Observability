@@ -290,17 +290,37 @@ public sealed class SegmentIndexGroupTests : IDisposable
         int groups  = 0;
         using (var sw = new SegmentWriter(path, groupBudget))
         {
-            sw.WriteEvents(hot, pool, SegmentWriter.ComputeSortOrder(hot), (firstOrdinal, count) =>
-            {
-                groups++;
-                // Stand-in sections, sized differently per group so a mixed-up offset shows up.
-                return (Encoding.UTF8.GetBytes($"inv:{firstOrdinal}:{count}"),
-                        Encoding.UTF8.GetBytes($"tri:{firstOrdinal}:{count}:{new string('t', groups)}"),
-                        Encoding.UTF8.GetBytes($"bloom:{firstOrdinal}:{count}"));
-            });
+            sw.WriteEvents(hot, pool, SegmentWriter.ComputeSortOrder(hot), _ => new StubSink(() => ++groups));
             sw.Finalise(new NodeId(0), new SegmentId(1UL));
         }
         return (path, rows, groups);
+    }
+
+    /// <summary>
+    /// Stand-in index sink: records the group's ordinal range from the events actually pushed
+    /// into it, and emits sections sized differently per group so a mixed-up section offset
+    /// shows up as a wrong length rather than as silence.
+    /// </summary>
+    private sealed class StubSink(Func<int> onSeal) : ISegmentIndexSink
+    {
+        private uint _first = uint.MaxValue;
+        private int  _count;
+
+        public void Add(uint fileOrdinal, in SegmentEventRef ev)
+        {
+            if (fileOrdinal < _first) _first = fileOrdinal;
+            _count++;
+        }
+
+        public (byte[] Inverted, byte[] Trigram, byte[] Bloom) Serialise()
+        {
+            int seq = onSeal();
+            return (Encoding.UTF8.GetBytes($"inv:{_first}:{_count}"),
+                    Encoding.UTF8.GetBytes($"tri:{_first}:{_count}:{new string('t', seq)}"),
+                    Encoding.UTF8.GetBytes($"bloom:{_first}:{_count}"));
+        }
+
+        public void Dispose() { }
     }
 
     private static List<LogEvent> ReadAll(string path) => Read(path, null, null);

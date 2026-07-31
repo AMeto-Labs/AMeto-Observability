@@ -18,19 +18,15 @@ namespace Ameto.Storage;
 public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDisposable
 {
     /// <summary>
-    /// Optional delegate that builds all index byte sections for a frozen hot-tier segment.
-    /// Injected by the Indexing layer at startup to avoid a circular project reference.
-    /// Returns (invertedIndexBytes, trigramIndexBytes, bloomFilterBytes).
+    /// Creates the index sink for ONE INDEX GROUP. Injected by the Indexing layer at startup to
+    /// avoid a circular project reference; null until it is wired, which is why merge waits.
+    ///
+    /// <para>A FRESH sink per group is the mechanism that keeps peak index-build memory
+    /// O(group) rather than O(segment) — the accumulators die at the boundary. The sink must
+    /// emit posting-list offsets as the FILE ordinals the writer hands it, not group-local
+    /// ones.</para>
     /// </summary>
-    /// <summary>
-    /// Builds (inverted, trigram, bloom) index bytes for ONE INDEX GROUP of a frozen tier:
-    /// the events at <c>order[firstOrdinal .. firstOrdinal + eventCount)</c>, where order is
-    /// the file write order (<see cref="SegmentWriter.ComputeSortOrder"/>). The builder must
-    /// emit posting-list offsets as FILE ordinals — base <c>firstOrdinal</c>, not 0 — and must
-    /// build from scratch each call, which is what keeps peak index-build memory O(group)
-    /// rather than O(segment).
-    /// </summary>
-    public Func<HotTierSegment, StringInternPool, int[], int, int, (byte[], byte[], byte[])>? IndexBuilder { get; set; }
+    public SegmentIndexSinkFactory? IndexSinkFactory { get; set; }
 
     /// <summary>
     /// Optional hook called on the write path after each event is accepted into the hot tier.
@@ -784,34 +780,44 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     // ── Small-segment merge (compaction) ──────────────────────────────────────
 
     private const long MergeCandidateMaxBytes = 8L * 1024 * 1024;   // only merge segments smaller than this
-    // Co-fit gate: a candidate must fit HALF a tier chunk (payload and slots), so
-    // any TWO candidates always co-fit chunk 0 when re-packed from slot 0. This
-    // makes the "window yields no usable batch" poison-anchor path unreachable
-    // for geometry reasons — a dense flush segment (~8 MB uncompressed props in
-    // a ~4 MB file) used to pass the compressed-size filter, blow the chunk
-    // budget in FittingEventCount, and anchor-skip one window per pass forever.
-    // UncompressedBytes (sum of block sizes, all columns) over-counts the props
-    // payload, so the gate errs conservative — never admits a non-co-fitting pair.
-    private const long MergeCandidateMaxUncompressedBytes = HotTierSegment.ChunkPayloadBytes / 2;
-    private const uint MergeCandidateMaxEvents            = HotTierSegment.ChunkEventCapacity / 2;
-    // Batch budgets deliberately mirror a NORMAL flush (hot tier: 64 MB / ~80k
-    // events). A merge runs the same pipeline — raw events in managed memory, a
-    // copy into the native tier, then an inverted+trigram+bloom index build over
-    // the whole batch — so its peak memory scales with the batch. The original
-    // 96 MB / 500k budget made that peak ~6x a regular flush and showed up as a
-    // ~1 GB RSS spike with a 45 % CPU burst on every maintenance pass. Smaller
-    // batches simply mean more passes (one every 15 s while a backlog exists).
-    private const long MergeTargetPayloadBytes = 32L * 1024 * 1024; // uncompressed payload budget per batch
+
+    // ── Batch budgets: POLICY, not memory ─────────────────────────────────────
+    //
+    // These used to be a memory bound. A merge read every source with ReadAllRaw into a
+    // managed List<RawSegmentEvent>, copied it into a HotTierSegment and indexed the whole
+    // batch, so peak ≈ 3× the batch — 32 MB / 100k events was chosen to make one merge cost
+    // about one flush. Two further gates existed only because of the TIER: a hot tier divides
+    // by FIXED chunks (idx / 16384, 8 MB payload each), so a prop-dense batch could overflow
+    // chunk 0 no matter how small it was in total. That forced a co-fit gate
+    // (UncompressedBytes <= 4 MB, EventCount <= 8192) which excluded dense segments from
+    // compaction ENTIRELY — on the sandbox stand, most of the files.
+    //
+    // The writer now consumes a k-way merged STREAM (MergingSegmentEventSource) and holds one
+    // block plus one index group, so peak is flat in the merged size and there is no chunk
+    // geometry left to fit. What remains is a policy choice about how big a merged file should
+    // be: big enough that per-file index/catalog overhead disappears, small enough that one
+    // pass is interruptible and one expiry deletes a sensible unit. Sources are still consumed
+    // whole, and the 24 h span cap still bounds how much longer the oldest events outlive their
+    // per-segment deadline.
+    private const long MergeTargetPayloadBytes = 256L * 1024 * 1024; // uncompressed payload per merged file
     private const int  MergeMinSources = 8;                          // don't bother below this
+    // Each source contributes one open reader and one decompressed block (~64 KB) for the
+    // length of the merge — the k-way merge's only per-source cost, ~36 MB at this cap.
     private const int  MergeMaxSources = 512;
-    private const int  MergeMaxEvents  = 100_000;
+    private const int  MergeMaxEvents  = 2_000_000;
     private const long MergeMaxSpanTicks = 24L * TimeSpan.TicksPerHour; // retention granularity per merged file
     private const int  MergeWindowAttempts = 4;  // window re-selections per pass after an anchor skip
 
     /// <summary>
-    /// Merges one batch of small, time-adjacent cold segments into a single large
-    /// segment via the regular flush pipeline (shared sort + index build + writer),
-    /// preserving event ids, timestamps and raw property/exception payloads.
+    /// Merges one batch of small, time-adjacent cold segments into a single large segment by
+    /// STREAMING them: the sources are read as sorted event streams, merged with a heap on
+    /// (timestamp, id) and written straight through <see cref="SegmentWriter"/>, preserving
+    /// event ids, timestamps and raw property/exception payloads.
+    ///
+    /// <para>Nothing is materialised. The previous shape — read every source with
+    /// <c>ReadAllRaw</c>, copy the batch into a <see cref="HotTierSegment"/>, index it whole —
+    /// peaked at ~3× the batch, which is why the batch had to be capped at 32 MB and why the
+    /// tier's fixed chunk geometry excluded dense segments from compaction entirely.</para>
     ///
     /// <para>Retention-aware selection: segment expiry is
     /// <c>MaxTimestamp + Ttl(MinLevel)</c>, so a batch only combines segments of
@@ -829,20 +835,17 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     {
         // Never produce index-less segments: the builder is wired by a hosted
         // service shortly after startup — if it isn't there yet, just wait.
-        if (IndexBuilder is null && !_allowIndexlessMerge) return false;
+        if (IndexSinkFactory is null && !_allowIndexlessMerge) return false;
 
-        var policy = _retentionStore.GetPolicy();
         long settledCutoff = DateTimeOffset.UtcNow.AddHours(-48).UtcTicks;
 
         // A skipped window used to burn the whole maintenance pause (600 s) on a
-        // single discarded anchor. Skips are rare now — the co-fit gate makes the
-        // geometric "no usable batch" unreachable, leaving unreadable/empty
-        // segments — so when one happens, re-select immediately. Bounded and
+        // single discarded anchor. Skips are rare — what remains is unreadable or
+        // empty segments — so when one happens, re-select immediately. Bounded and
         // livelock-free: every failed attempt adds to _mergeSkip first, so the
         // candidate set strictly shrinks.
-        List<SegmentInfo>?     consumed = null;
-        List<RawSegmentEvent>? events   = null;
-        long payload = 0;
+        List<SegmentInfo>?   consumed = null;
+        List<SegmentReader>? readers  = null;
         for (int attempt = 0; attempt < MergeWindowAttempts && consumed is null; attempt++)
         {
             ct.ThrowIfCancellationRequested();
@@ -853,8 +856,6 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             // starve the others. Recomputed per attempt: _mergeSkip may have grown.
             var groups = _segments.Values
                 .Where(s => s.CompressedBytes < MergeCandidateMaxBytes
-                         && s.UncompressedBytes <= MergeCandidateMaxUncompressedBytes
-                         && s.EventCount <= MergeCandidateMaxEvents
                          && !_mergeSkip.Contains(s.Id.Value))
                 // Group by LEVEL, not by TTL class. Segments are level-pure as written
                 // (see FlushTierByLevelAsync), and grouping by TTL would merge Information
@@ -893,52 +894,45 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             if (window is null) return false;
             var candidates = window;
 
-            // Read raw events segment-by-segment until a budget is hit. Segments are
-            // consumed whole — a batch never contains part of a segment.
-            var dedup   = new Dictionary<string, string>(StringComparer.Ordinal);
-            var batch   = new List<RawSegmentEvent>();
-            var sources = new List<SegmentInfo>();
-            var segEnds = new List<int>();  // batch.Count after each consumed segment
-            payload = 0;
+            // Pick the batch from CATALOG METADATA alone — no file is opened, let alone
+            // decoded, until the merge itself streams it. Segments are consumed whole: a
+            // batch never contains part of a segment, so a source is either fully duplicated
+            // into the merged file or not consumed at all, which is what makes the delete
+            // step safe to interrupt.
+            var sources    = new List<SegmentInfo>();
+            long payload   = 0;
+            long eventCount = 0;
             foreach (var seg in candidates)
             {
-                ct.ThrowIfCancellationRequested();
                 if (sources.Count > 0 &&
-                    (batch.Count >= MergeMaxEvents || payload >= MergeTargetPayloadBytes))
+                    (eventCount >= MergeMaxEvents || payload >= MergeTargetPayloadBytes))
                     break;
-                List<RawSegmentEvent> segEvents;
+                sources.Add(seg);
+                payload    += Math.Max(seg.UncompressedBytes, seg.CompressedBytes);
+                eventCount += seg.EventCount;
+            }
+
+            // Open every source BEFORE anything is written. An unreadable file is skip-listed
+            // individually — a persistently corrupt segment would otherwise be re-selected by
+            // every future pass — and the batch continues with what opened, exactly as the
+            // read-everything planner did. Discovering it after the manifest is on disk would
+            // mean unwinding published state instead of simply choosing a different window.
+            var opened = new List<SegmentReader>(sources.Count);
+            var usable = new List<SegmentInfo>(sources.Count);
+            long usableEvents = 0;
+            foreach (var seg in sources)
+            {
                 try
                 {
-                    using var reader = SegmentReader.Open(seg.FilePath);
-                    segEvents = reader.ReadAllRaw(dedup);
+                    opened.Add(SegmentReader.Open(seg.FilePath));
+                    usable.Add(seg);
+                    usableEvents += seg.EventCount;
                 }
                 catch (Exception ex)
                 {
-                    // Skip-list the segment ITSELF, not just the window's anchor: a
-                    // persistently unreadable file would otherwise be re-opened and
-                    // re-decompressed by every future pass, forever.
                     _mergeSkip.Add(seg.Id.Value);
                     _logger.LogWarning(ex, "Merge: skipping unreadable segment {File}", seg.FilePath);
-                    continue;
                 }
-                batch.AddRange(segEvents);
-                foreach (var e in segEvents) payload += e.Props?.Length ?? 0;
-                sources.Add(seg);
-                segEnds.Add(batch.Count);
-            }
-
-            // The tier's chunks hold 16 K event slots / 8 MB payload each — re-packing
-            // prop-dense events from slot 0 can exceed that even though every SOURCE
-            // segment respected it at ingest (live tiers rotate early instead). Trim
-            // the batch to the largest whole-segment prefix that fits the geometry;
-            // an all-or-nothing check would stall the sweep forever on dense days.
-            int fitting = FittingEventCount(batch);
-            int keep = segEnds.Count;
-            while (keep > 0 && segEnds[keep - 1] > fitting) keep--;
-            if (keep < sources.Count)
-            {
-                sources.RemoveRange(keep, sources.Count - keep);
-                batch.RemoveRange(keep == 0 ? 0 : segEnds[keep - 1], batch.Count - (keep == 0 ? 0 : segEnds[keep - 1]));
             }
 
             // Anti-stall: a window whose anchor can't produce even a 2-segment batch
@@ -946,126 +940,189 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             // Debug, not Warning: this is the planner's EXPECTED outcome whenever there is
             // simply nothing to merge (a day's log carried 54 of these, every anchor
             // different) — at WRN it drowns the signal it was meant to be.
-            if (sources.Count < 2 || batch.Count == 0)
+            if (usable.Count < 2 || usableEvents == 0)
             {
+                foreach (var r in opened) r.Dispose();
                 _mergeSkip.Add(candidates[0].Id.Value);
                 _logger.LogDebug("Merge: window anchored at {File} yields no usable batch — anchor skipped",
                     Path.GetFileName(candidates[0].FilePath));
                 continue;
             }
-            consumed = sources;
-            events   = batch;
+            consumed = usable;
+            readers  = opened;
         }
-        if (consumed is null || events is null) return false;
+        if (consumed is null || readers is null) return false;
 
-        // NOTE: payload is the PRE-trim sum. A looser tier budget can only prevent
-        // TryWrite rejections, never cause them — do not "tighten" it to the
-        // post-trim sum: the no-reject proof relies on _maxPayloadBytes >= actual.
-        var tier = new HotTierSegment(events.Count + 1, payload + (16L << 20));
+        // Reserve a segment id from the same counter the flush path uses.
+        ulong reserved;
+        await _flushLock.WaitAsync(ct);
+        try { reserved = _nextSegmentId; _nextSegmentId++; }
+        finally { _flushLock.Release(); }
+
+        var  segId        = new SegmentId(reserved);
+        long expectEvents = 0, minTs = long.MaxValue, maxTs = long.MinValue;
+        foreach (var s in consumed)
+        {
+            expectEvents += s.EventCount;
+            if (s.MinTimestampTicks < minTs) minTs = s.MinTimestampTicks;
+            if (s.MaxTimestampTicks > maxTs) maxTs = s.MaxTimestampTicks;
+        }
+        var segPath = Path.Combine(_segDir, $"{_options.NodeId.Value}-{segId.Value}-{minTs}-{maxTs}.seg");
+        string manifestPath = segPath + ".mergemanifest";
+
+        // ── MANIFEST FIRST. The merged segment only becomes visible to the catalog when it
+        //    is MOVED to segPath, and that move happens after this line — so at no instant
+        //    does a .seg exist on disk whose sources are still there without a manifest
+        //    naming them. Recovery reads it both ways: manifest without the merged file =
+        //    a merge that never committed (drop the manifest, the sources are untouched);
+        //    manifest WITH it = the sources are already duplicated (finish deleting them).
+        //    Writing it after publication, as this did before, left a window where a crash
+        //    resurrected every source alongside the merged file — duplicate events, forever.
         try
         {
-            foreach (var e in events)
-            {
-                // Intern can return -1 when the pool is full — fall back to the
-                // tier-local template store (same as the live ingest path) so the
-                // template is never lost in the rewrite.
-                int tmplIdx = TemplatePool.Intern(e.Template);
-                var header = new LogEventHeader
-                {
-                    Id                       = e.Id,
-                    TimestampUtcTicks        = e.TsTicks,
-                    Level                    = (Ameto.Core.LogLevel)e.Level,
-                    MessageTemplatePoolIndex = tmplIdx,
-                    ServiceNamePoolIndex     = e.Service is null ? -1 : TemplatePool.Intern(e.Service),
-                    TraceIdHi                = e.TraceIdHi,
-                    TraceIdLo                = e.TraceIdLo,
-                    SpanId                   = e.SpanId,
-                };
-                if (!tier.TryWrite(header, e.Props ?? ReadOnlySpan<byte>.Empty,
-                        template: tmplIdx < 0 ? e.Template : null, exception: e.Exception))
-                {
-                    _logger.LogError("Merge: tier rejected an event ({Count} total in batch) — batch aborted", events.Count);
-                    return false;
-                }
-            }
-            tier.Freeze();
-
-            // Reserve a segment id from the same counter the flush path uses.
-            ulong reserved;
-            await _flushLock.WaitAsync(ct);
-            try { reserved = _nextSegmentId; _nextSegmentId++; }
-            finally { _flushLock.Release(); }
-
-            var segId   = new SegmentId(reserved);
-            var segPath = BuildSegmentPath(segId, tier);
-
-            // Take a flush slot for the heavy phase. A merge runs the SAME index build +
-            // compress + write pipeline as an ingest flush, and its batch budgets are
-            // deliberately sized to mirror one (see MergeTargetPayloadBytes) — so it costs
-            // about one flush's worth of managed memory, ~140 MB at the 100k-event cap.
-            // Running it outside _flushConcurrency meant the ceiling logged at startup
-            // (width × per-flush managed) was not the ceiling actually enforced: a
-            // maintenance pass could add another concurrent index build on top of an
-            // already-saturated flush path. Gating here makes the reported budget real.
-            //
-            // _flushSlots is deliberately NOT taken. That gate is the ingest back-pressure
-            // signal — acquired non-blocking, and a miss means "stop swapping hot tiers" —
-            // so parking compaction behind it would let sustained ingest starve the sweep
-            // that keeps the segment count down. The merge tier's own native footprint is
-            // already bounded by MergeMaxEvents / MergeTargetPayloadBytes.
-            SegmentInfo info;
-            await _flushConcurrency.WaitAsync(ct).ConfigureAwait(false);
-            try     { info = await FlushToColdAsync(tier, segId, segPath, ct); }
-            finally { _flushConcurrency.Release(); }
-
-            // Manifest before publication: if we crash mid-deletion, startup
-            // recovery deletes the remaining source files instead of serving
-            // duplicate events forever.
-            string manifestPath = segPath + ".mergemanifest";
             await File.WriteAllLinesAsync(manifestPath, consumed.Select(s => Path.GetFileName(s.FilePath)), ct);
-
-            _segments[segId.Value] = info;
-            foreach (var seg in consumed)
-                await DeleteSegmentAsync(seg.Id, ct);
-
-            // Drop the manifest only when every source file is confirmed gone. A
-            // source held open by an in-flight query survives File.Delete — the
-            // manifest then stays behind and the recovery sweep (each maintenance
-            // iteration + startup) finishes the deletion once the reader closes.
-            // Deleting it unconditionally would resurrect those files as
-            // duplicate segments after a restart.
-            bool allGone = consumed.All(s => !File.Exists(s.FilePath));
-            if (allGone)
-                try { File.Delete(manifestPath); } catch { /* re-processed harmlessly later */ }
-            else
-                _logger.LogWarning("Merge: {Count} source file(s) still held open — manifest kept for the recovery sweep",
-                    consumed.Count(s => File.Exists(s.FilePath)));
-
-            _logger.LogInformation(
-                "Merged {Sources} small segments ({Events} events) into {File} ({Mb:F1} MB)",
-                consumed.Count, events.Count, Path.GetFileName(segPath), info.CompressedBytes / 1048576.0);
-            return true;
         }
-        finally
+        catch
         {
-            tier.Dispose();
+            // The readers were opened by the planner; MergeToColdAsync takes ownership of them
+            // and it is never reached from here.
+            foreach (var r in readers) r.Dispose();
+            try { File.Delete(manifestPath); } catch { }
+            throw;
         }
+
+        // Take a flush slot for the heavy phase: a merge runs the SAME index build +
+        // compress + write pipeline as an ingest flush. Running it outside _flushConcurrency
+        // meant the ceiling logged at startup (width × per-flush managed) was not the
+        // ceiling actually enforced. _flushSlots is deliberately NOT taken — that gate is
+        // the ingest back-pressure signal, and parking compaction behind it would let
+        // sustained ingest starve the sweep that keeps the segment count down.
+        SegmentInfo info;
+        try
+        {
+            await _flushConcurrency.WaitAsync(ct).ConfigureAwait(false);
+        }
+        catch
+        {
+            foreach (var r in readers) r.Dispose();
+            try { File.Delete(manifestPath); } catch { }
+            throw;
+        }
+        try
+        {
+            info = await MergeToColdAsync(readers, segId, segPath, ct);
+        }
+        catch (Exception ex)
+        {
+            // Nothing has been deleted and the merged file never reached segPath, so the
+            // only state to undo is the manifest. A source that failed mid-stream is
+            // skip-listed so the next pass does not re-select the same doomed window.
+            _logger.LogWarning(ex, "Merge: aborted while streaming {Count} source(s) — sources left intact", consumed.Count);
+            foreach (var s in consumed) _mergeSkip.Add(s.Id.Value);
+            try { File.Delete(manifestPath); } catch { /* recovery drops it anyway */ }
+            return false;
+        }
+        finally { _flushConcurrency.Release(); }
+
+        // Refuse to delete the sources unless every one of their events is in the merged
+        // file. The counts come from file headers on both sides, so a mismatch means the
+        // stream lost or duplicated rows — abort loudly rather than delete the originals.
+        if (info.EventCount != expectEvents)
+        {
+            _logger.LogError(
+                "Merge: wrote {Written} events but sources hold {Expected} — merged file discarded, sources kept",
+                info.EventCount, expectEvents);
+            foreach (var s in consumed) _mergeSkip.Add(s.Id.Value);
+            try { File.Delete(segPath); }      catch { /* left for the tmp sweep */ }
+            try { File.Delete(manifestPath); } catch { }
+            return false;
+        }
+
+        _segments[segId.Value] = info;
+        foreach (var seg in consumed)
+            await DeleteSegmentAsync(seg.Id, ct);
+
+        // Drop the manifest only when every source file is confirmed gone. A
+        // source held open by an in-flight query survives File.Delete — the
+        // manifest then stays behind and the recovery sweep (each maintenance
+        // iteration + startup) finishes the deletion once the reader closes.
+        // Deleting it unconditionally would resurrect those files as
+        // duplicate segments after a restart.
+        bool allGone = consumed.All(s => !File.Exists(s.FilePath));
+        if (allGone)
+            try { File.Delete(manifestPath); } catch { /* re-processed harmlessly later */ }
+        else
+            _logger.LogWarning("Merge: {Count} source file(s) still held open — manifest kept for the recovery sweep",
+                consumed.Count(s => File.Exists(s.FilePath)));
+
+        _logger.LogInformation(
+            "Merged {Sources} small segments ({Events} events) into {File} ({Mb:F1} MB)",
+            consumed.Count, info.EventCount, Path.GetFileName(segPath), info.CompressedBytes / 1048576.0);
+        return true;
     }
 
     /// <summary>
-    /// Simulates the tier's chunk assignment (16 K event slots / 8 MB payload per
-    /// chunk) and returns the largest event-prefix length that fits.
+    /// Streams the sources through a k-way merge straight into a new segment file.
+    ///
+    /// <para>Nothing between the source blocks and the output block is retained: the writer
+    /// pulls one event at a time, copies it into the open block and pushes it into the open
+    /// index group's sink. Peak is one decompressed block per source plus one index group —
+    /// flat in the merged segment's size, which is the whole point.</para>
     /// </summary>
-    private static int FittingEventCount(List<RawSegmentEvent> events)
+    private Task<SegmentInfo> MergeToColdAsync(
+        List<SegmentReader> readers, SegmentId segId, string segPath, CancellationToken ct)
     {
-        long chunkBytes = 0;
-        for (int i = 0; i < events.Count; i++)
+        var  sinkFactory = IndexSinkFactory;
+        long groupBudget = _groupPayloadBudgetBytes;
+
+        return Task.Run(() =>
         {
-            if (i % HotTierSegment.ChunkEventCapacity == 0) chunkBytes = 0;
-            chunkBytes += events[i].Props?.Length ?? 0;
-            if (chunkBytes > HotTierSegment.ChunkPayloadBytes) return i;
-        }
-        return events.Count;
+            // The .tmp suffix is load-bearing: the catalog scan deletes leftover *.seg.tmp at
+            // startup, so a crash any time before the Move leaves nothing to recover from.
+            string tmpPath = segPath + ".tmp";
+            MergingSegmentEventSource? source = null;
+            try
+            {
+                SegmentInfo info;
+                source = new MergingSegmentEventSource(readers);
+                using (var writer = new SegmentWriter(tmpPath, groupBudget))
+                {
+                    writer.WriteEvents(source, sinkFactory);
+                    info = writer.Finalise(_options.NodeId, segId);
+                }
+                // Close the readers BEFORE the caller starts deleting sources: on Windows a
+                // mapped file cannot be unlinked, and a leaked view would leave the merge
+                // permanently stuck in its "sources still held open" recovery path.
+                source.Dispose();
+                source = null;
+                foreach (var r in readers) r.Dispose();
+
+                ct.ThrowIfCancellationRequested();
+                File.Move(tmpPath, segPath, overwrite: false);
+                return new SegmentInfo
+                {
+                    Id                = info.Id,
+                    NodeId            = info.NodeId,
+                    FilePath          = segPath,
+                    MinTimestampTicks = info.MinTimestampTicks,
+                    MaxTimestampTicks = info.MaxTimestampTicks,
+                    EventCount        = info.EventCount,
+                    MinLevel          = info.MinLevel,
+                    CompressedBytes   = info.CompressedBytes,
+                    UncompressedBytes = info.UncompressedBytes,
+                };
+            }
+            catch
+            {
+                try { File.Delete(tmpPath); } catch { /* best-effort cleanup */ }
+                throw;
+            }
+            finally
+            {
+                source?.Dispose();
+                foreach (var r in readers) r.Dispose();   // idempotent — safe after the happy path
+            }
+        }, ct);
     }
 
     /// <summary>
@@ -1146,7 +1203,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         HotTierSegment hot, SegmentId segId, string segPath, CancellationToken ct, int[]? order_ = null)
     {
         // Capture delegate reference before entering Task.Run
-        var indexBuilder = IndexBuilder;
+        var sinkFactory  = IndexSinkFactory;
         long groupBudget = _groupPayloadBudgetBytes;
         return Task.Run(() =>
         {
@@ -1160,9 +1217,6 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             // sections between its own blocks. Building the whole file up front is what
             // made index memory scale with segment size — the ceiling that kept segments
             // small in the first place.
-            SegmentGroupIndexBuilder? groupIndex = indexBuilder is null
-                ? null
-                : (firstOrdinal, eventCount) => indexBuilder(hot, TemplatePool, order, firstOrdinal, eventCount);
 
             // Write to a temp file first; rename to final path only after Finalise()
             // succeeds. This prevents corrupt .seg files when the process is killed mid-flush.
@@ -1172,7 +1226,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 SegmentInfo info;
                 using (var writer = new SegmentWriter(tmpPath, groupBudget))
                 {
-                    writer.WriteEvents(hot, TemplatePool, order, groupIndex);
+                    writer.WriteEvents(new HotTierEventSource(hot, TemplatePool, order), sinkFactory);
                     info = writer.Finalise(_options.NodeId, segId);
                 } // FileStream closed here before Move
                 File.Move(tmpPath, segPath, overwrite: false);

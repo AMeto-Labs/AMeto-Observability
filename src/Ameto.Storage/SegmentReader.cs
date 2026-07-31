@@ -622,6 +622,44 @@ public sealed class SegmentReader : ISegmentReader
         return result;
     }
 
+    // ── Block streaming (compaction) ──────────────────────────────────────────
+
+    /// <summary>Blocks in the file, in (ts, id) order — the unit a merge reads one at a time.</summary>
+    internal int BlockCount => _blocks.Length;
+
+    /// <summary>
+    /// Decompresses one block into <paramref name="buffer"/>, growing it from
+    /// <see cref="ArrayPool{T}.Shared"/> when needed, and returns the uncompressed length.
+    ///
+    /// <para>This is what lets compaction read a segment as a STREAM: <see cref="ReadAllRaw"/>
+    /// materialises every event of the file (plus a <c>byte[]</c> per properties payload) before
+    /// the caller sees the first one, so a merge's peak was ~3× its batch and the batch had to be
+    /// capped at 32 MB. One block at a time is ~64 KB, whatever the segment's size.</para>
+    /// </summary>
+    internal int ReadBlockInto(int index, ref byte[] buffer)
+    {
+        long blockOffset     = _blocks[index].FileOffset;
+        int uncompressedSize = ReadInt32At(blockOffset);
+        int compressedSize   = ReadInt32At(blockOffset + 4);
+
+        if (buffer.Length < uncompressedSize)
+        {
+            if (buffer.Length > 0) ArrayPool<byte>.Shared.Return(buffer);
+            buffer = ArrayPool<byte>.Shared.Rent(uncompressedSize);
+        }
+
+        byte[] comp = ArrayPool<byte>.Shared.Rent(compressedSize);
+        try
+        {
+            _view.ReadArray(blockOffset + 8, comp, 0, compressedSize);
+            if (LZ4Codec.Decode(comp, 0, compressedSize, buffer, 0, uncompressedSize) != uncompressedSize)
+                throw new InvalidDataException($"Corrupt block {index} at {blockOffset} in {Info.FilePath}");
+        }
+        finally { ArrayPool<byte>.Shared.Return(comp); }
+
+        return uncompressedSize;
+    }
+
     private static void DecodeColumnarBlockRaw(
         ReadOnlySpan<byte> span, List<RawSegmentEvent> result, Dictionary<string, string> dedup)
     {

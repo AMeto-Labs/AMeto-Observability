@@ -7,20 +7,7 @@ using Ameto.Core;
 namespace Ameto.Storage;
 
 /// <summary>
-/// Builds the three index sections for ONE index group: the events at file ordinals
-/// <c>[firstOrdinal, firstOrdinal + eventCount)</c>, i.e. <c>order[firstOrdinal..]</c>.
-/// Injected by <see cref="StorageEngine"/> so the writer can seal a group the moment its
-/// payload budget is reached, without Ameto.Storage referencing the indexing layer.
-///
-/// <para>The implementation MUST emit posting-list offsets as FILE ordinals (base
-/// <paramref name="firstOrdinal"/>, not 0) — see the ordinal contract on
-/// <see cref="SegmentWriter"/>.</para>
-/// </summary>
-public delegate (byte[] Inverted, byte[] Trigram, byte[] Bloom) SegmentGroupIndexBuilder(
-    int firstOrdinal, int eventCount);
-
-/// <summary>
-/// Writes a cold-tier .seg file (v3, columnar) from a frozen HotTierSegment.
+/// Writes a cold-tier .seg file (v3, columnar) from an <see cref="ISegmentEventSource"/>.
 ///
 /// File layout — see ARCHITECTURE.md for full spec.
 ///
@@ -52,6 +39,12 @@ public delegate (byte[] Inverted, byte[] Trigram, byte[] Bloom) SegmentGroupInde
 ///       int64 minTs, maxTs, invertedOff, trigramOff, bloomOff }   (offset 0 = absent)
 ///   block index: uint32 count + entries[20 B]                     (unchanged since v6)
 ///   footer (44 B)
+///
+/// <para>STREAMING: the writer holds exactly ONE BLOCK of staged rows plus the open index
+/// group's accumulators. It never sees the segment. That is what decouples a segment's size
+/// from RAM: compaction merges k sorted .seg files straight into a new one, where before it had
+/// to materialise the whole batch into a <see cref="HotTierSegment"/> first (~3× the batch,
+/// which is why merge budgets were 32 MB / 100k events).</para>
 /// </summary>
 public sealed class SegmentWriter : IDisposable
 {
@@ -85,6 +78,13 @@ public sealed class SegmentWriter : IDisposable
     /// </summary>
     public const long DefaultGroupPayloadBudgetBytes = 64L * 1024 * 1024;
 
+    /// <summary>
+    /// Bytes per row assumed when sizing the FIRST index group's bloom filter and nothing has
+    /// been measured yet. Only a starting point: from the second group on, the real
+    /// <c>uncompressedBytes / events</c> of the file so far is used.
+    /// </summary>
+    private const long MinAssumedRowCostBytes = 32;
+
     /// <summary>Group-directory entry size on disk (4×uint32 + 2×int64 bounds + 3×int64 offsets).</summary>
     internal const int GroupEntrySize = 56;
 
@@ -116,6 +116,10 @@ public sealed class SegmentWriter : IDisposable
     private long _groupMaxTs = long.MinValue;
     private long _groupPayloadBytes;
 
+    /// <summary>Index sink for the OPEN group, created on its first event and dropped when sealed.</summary>
+    private SegmentIndexSinkFactory? _sinkFactory;
+    private ISegmentIndexSink?       _sink;
+
     // Offsets of the CURRENT (open) group's sections; folded into its directory entry when
     // the group closes and reset to 0 (= section absent) for the next one.
     private long _invertedIndexOffset;
@@ -139,9 +143,8 @@ public sealed class SegmentWriter : IDisposable
 
     /// <param name="groupPayloadBudgetBytes">
     /// Uncompressed block bytes per index group — see <see cref="DefaultGroupPayloadBudgetBytes"/>.
-    /// Only honoured by the <see cref="SegmentGroupIndexBuilder"/> overload of
-    /// <see cref="WriteEvents(HotTierSegment, StringInternPool, int[], SegmentGroupIndexBuilder?)"/>;
-    /// a caller that writes sections itself always produces exactly one group.
+    /// Only honoured when a <see cref="SegmentIndexSinkFactory"/> is supplied; a caller that
+    /// writes sections itself always produces exactly one group.
     /// </param>
     public SegmentWriter(string filePath, long groupPayloadBudgetBytes)
     {
@@ -155,8 +158,6 @@ public sealed class SegmentWriter : IDisposable
 
     /// <summary>
     /// File write order: event indices sorted ascending by (TimestampUtcTicks, EventId).
-    /// The SAME array must be passed to <see cref="WriteEvents(HotTierSegment, StringInternPool, int[])"/>
-    /// and <c>SegmentIndexBuilder.Build</c> so index posting-list offsets equal file ordinals.
     ///
     /// <para>ORDINAL CONTRACT (v7): posting offsets are FILE-GLOBAL ordinals even though the
     /// indexes are now per group. Group-local offsets would buy nothing — the codec is
@@ -189,69 +190,64 @@ public sealed class SegmentWriter : IDisposable
     /// <param name="order">
     /// Tier indices to write, in output order. It need NOT cover the whole tier: a subset
     /// lets one tier be written as several segments, which is how a flush is split by log
-    /// level so that a segment holds exactly one level. The bound is the order's length.
-    /// </param>
-    /// <param name="indexBuilder">
-    /// When supplied, the file is cut into index groups: every time the blocks written since
-    /// the last cut exceed the group budget, the builder is called for exactly those events
-    /// and the three sections it returns are written right there, between the group's last
-    /// block and the next group's first.
-    ///
-    /// <para>This is the whole point of v7 — the builder's accumulators are reset per group,
-    /// so peak index-build memory is O(group) instead of O(file). Passing null keeps the
-    /// pre-v7 shape: one implicit group covering the file, with sections written by the
-    /// caller via <see cref="WriteInvertedIndex"/> and friends.</para>
+    /// level so that a segment holds exactly one level.
     /// </param>
     public void WriteEvents(HotTierSegment hot, StringInternPool templatePool, int[] order,
-                            SegmentGroupIndexBuilder? indexBuilder)
+                            SegmentIndexSinkFactory? indexSink)
+        => WriteEvents(new HotTierEventSource(hot, templatePool, order), indexSink);
+
+    /// <param name="source">
+    /// Events in file write order — ascending (timestamp, id). Read once, forward only; each
+    /// event's payload is copied into the open block before the next is pulled, so a source may
+    /// hand out spans over a buffer it reuses.
+    /// </param>
+    /// <param name="indexSink">
+    /// When supplied, the file is cut into index groups: the writer pushes every event into the
+    /// open group's sink as it stages it, and every time the blocks written since the last cut
+    /// exceed the group budget it seals the sink and writes the three sections it returns right
+    /// there, between the group's last block and the next group's first.
+    ///
+    /// <para>This is the whole point of v7 — a fresh sink per group means the accumulators die
+    /// at the boundary, so peak index-build memory is O(group) instead of O(file). Passing null
+    /// keeps the pre-v7 shape: one implicit group covering the file, with sections written by
+    /// the caller via <see cref="WriteInvertedIndex"/> and friends.</para>
+    /// </param>
+    public void WriteEvents(ISegmentEventSource source, SegmentIndexSinkFactory? indexSink)
     {
         _fs.Seek(SegmentFileHeader.Size, SeekOrigin.Begin);
+        _sinkFactory = indexSink;
 
-        int count = order.Length;
-        if (count == 0) return;
-
-        var batch = new List<int>(1024);
-        int approxBytes = 0;
-
-        for (int oi = 0; oi < count; oi++)
+        while (source.TryReadNext(out var ev))
         {
-            int i = order[oi];
-            ref var h = ref hot.GetHeader(i);
+            int tmplBytes = Encoding.UTF8.GetByteCount(ev.MessageTemplate);
+            int svcBytes  = ev.ServiceName is null ? 0 : Encoding.UTF8.GetByteCount(ev.ServiceName);
+            // Approximate: the exception blob is only serialised once, at staging time.
+            int rowCost   = 8 + 1 + 8 + 16 + 8 + 16
+                          + tmplBytes + svcBytes + ev.Properties.Length
+                          + (ev.Exception is null ? 0 : 64);
 
-            long ts = h.TimestampUtcTicks;
-            if (ts < _minTimestamp) _minTimestamp = ts;
-            if (ts > _maxTimestamp) _maxTimestamp = ts;
-            if (h.Level < _minLevel) _minLevel = h.Level;
-
-            string template = hot.GetTemplate(i) ?? templatePool.Get(h.MessageTemplatePoolIndex) ?? string.Empty;
-            int propsLen  = hot.GetPropertiesPayload(i).Length;
-            int tmplLen   = Encoding.UTF8.GetByteCount(template);
-            int excApprox = hot.GetException(i) is null ? 0 : 64;
-            int rowCost   = 8 + 1 + 8 + 4 + tmplLen + 4 + excApprox + 4 + propsLen;
-
-            if (batch.Count > 0 && approxBytes + rowCost > BlockSize)
+            if (_stagedCount > 0 && _stagedBytes + rowCost > BlockSize)
             {
-                FlushColumnarBlock(hot, templatePool, batch);
-                batch.Clear();
-                approxBytes = 0;
+                EmitBlock();
 
                 // Cut only on a block boundary: a group owns whole blocks, so the block
                 // index stays a single flat array and candidate → block resolution is
                 // untouched by grouping.
-                if (indexBuilder is not null && _groupPayloadBytes >= _groupBudget)
-                    SealGroup(indexBuilder);
+                if (_sinkFactory is not null && _groupPayloadBytes >= _groupBudget)
+                    SealGroup();
             }
 
-            batch.Add(i);
-            approxBytes += rowCost;
+            // Push BEFORE staging, while the source's spans are still guaranteed valid. The
+            // ordinal is the file ordinal (see the contract above) and groups always start on
+            // a block boundary, so a group's postings never straddle the sink that owns them.
+            EnsureSink(rowCost, source.RemainingEventHint)?.Add((uint)_eventsWritten, in ev);
+
+            StageEvent(in ev, tmplBytes, svcBytes);
             _eventsWritten++;
         }
 
-        if (batch.Count > 0)
-            FlushColumnarBlock(hot, templatePool, batch);
-
-        if (indexBuilder is not null)
-            SealGroup(indexBuilder);
+        if (_stagedCount > 0) EmitBlock();
+        if (_sinkFactory is not null) SealGroup();
     }
 
     public void WriteInvertedIndex(ReadOnlySpan<byte> indexBytes)
@@ -275,15 +271,46 @@ public sealed class SegmentWriter : IDisposable
         _bw.Write(filterBytes);
     }
 
-    /// <summary>Builds and writes the open group's index sections, then closes it.</summary>
-    private void SealGroup(SegmentGroupIndexBuilder indexBuilder)
+    /// <summary>
+    /// Opens the group's index sink on its first event.
+    ///
+    /// <para>The bloom filter is allocated up front and cannot be resized, so the sink needs an
+    /// event-count forecast the moment the group starts. Two bounds, whichever is tighter: what
+    /// the source says is left, and what the group's PAYLOAD budget affords at the average row
+    /// cost measured over the file so far (this event's own cost for the first group, which has
+    /// nothing to measure). Over-forecasting only wastes bloom bits; under-forecasting
+    /// saturates the filter and the prefilter stops rejecting — so both bounds are ceilings and
+    /// neither is trusted alone.</para>
+    /// </summary>
+    private ISegmentIndexSink? EnsureSink(int rowCost, long remainingHint)
     {
-        if (_groupEventCount == 0) return;
+        if (_sinkFactory is null) return null;
+        if (_sink is not null)    return _sink;
 
-        var (inverted, trigram, bloom) = indexBuilder((int)_groupFirstOrdinal, (int)_groupEventCount);
-        WriteInvertedIndex(inverted);
-        WriteTrigramIndex(trigram);
-        WriteBloomFilter(bloom);
+        long avgRowCost = _eventsFlushed > 0
+            ? Math.Max(MinAssumedRowCostBytes, _uncompressedBytes / _eventsFlushed)
+            : Math.Max(MinAssumedRowCostBytes, rowCost);
+        long byBudget = Math.Max(1, _groupBudget / avgRowCost);
+        long estimate = Math.Clamp(Math.Min(remainingHint, byBudget), 1, int.MaxValue);
+        return _sink = _sinkFactory((int)estimate);
+    }
+
+    /// <summary>Serialises the open group's index sections, writes them, then closes the group.</summary>
+    private void SealGroup()
+    {
+        if (_sink is not null)
+        {
+            if (_groupEventCount > 0)
+            {
+                var (inverted, trigram, bloom) = _sink.Serialise();
+                WriteInvertedIndex(inverted);
+                WriteTrigramIndex(trigram);
+                WriteBloomFilter(bloom);
+            }
+            _sink.Dispose();
+            _sink = null;
+        }
+        if (_groupEventCount == 0) return;
         CloseGroup();
     }
 
@@ -394,7 +421,7 @@ public sealed class SegmentWriter : IDisposable
         };
     }
 
-    // ── Columnar block writer ─────────────────────────────────────────────────
+    // ── Columnar block staging ────────────────────────────────────────────────
 
     // ── Per-block scratch, reused across the ~1000 blocks of a segment flush ──
     // One SegmentWriter serialises one segment on one thread, so plain instance
@@ -402,9 +429,13 @@ public sealed class SegmentWriter : IDisposable
     // MemoryStreams, a ToArray of the whole block and four Stream.CopyTo buffers —
     // hundreds of MB of (largely LOH) garbage per flushed tier, which slowed
     // flushes into the back-pressure budget and showed up as ingest drops.
-    private byte[] _colT = [];
+    //
+    // Streaming turned this from scratch into STAGING: the block is filled event by
+    // event as the source yields them, because there is nothing to re-read. @t and @i
+    // are held raw and delta-encoded at emit, when the block's bases are finally known.
+    private long[] _stgTs = [];
+    private ulong[] _stgId = [];
     private byte[] _colL = [];
-    private byte[] _colI = [];
     private byte[] _colTr = [];
     private byte[] _colSp = [];
     private uint[] _tmplOffsets = [];
@@ -417,119 +448,97 @@ public sealed class SegmentWriter : IDisposable
     private readonly MemoryStream _svcBytes   = new(256);
     private readonly MemoryStream _blk        = new(BlockSize + 4096);
 
-    private static void Ensure(ref byte[] buf, int size)
+    private int   _stagedCount;
+    private int   _stagedBytes;
+    private long  _blockMinTs = long.MaxValue;
+    private long  _blockMaxTs = long.MinValue;
+    private ulong _blockMinId = ulong.MaxValue;
+
+    /// <summary>
+    /// Grows a staging column, PRESERVING what is already in it. Copying is not optional here:
+    /// the pre-streaming writer sized every column once, up front, from a known block length —
+    /// staging grows mid-block, so a plain reallocation silently drops the rows staged so far.
+    /// </summary>
+    private static void Ensure<T>(ref T[] buf, int size)
     {
-        if (buf.Length < size) buf = new byte[Math.Max(size, buf.Length * 2)];
+        if (buf.Length < size) Array.Resize(ref buf, Math.Max(size, Math.Max(64, buf.Length * 2)));
     }
 
-    private static void Ensure(ref uint[] buf, int size)
+    /// <summary>Appends one event to the open block's columns.</summary>
+    private void StageEvent(in SegmentEventRef ev, int tmplByteLen, int svcByteLen)
     {
-        if (buf.Length < size) buf = new uint[Math.Max(size, buf.Length * 2)];
+        int k = _stagedCount;
+        Ensure(ref _stgTs, k + 1);
+        Ensure(ref _stgId, k + 1);
+        Ensure(ref _colL,  k + 1);
+        Ensure(ref _colTr, (k + 1) * 16);
+        Ensure(ref _colSp, (k + 1) * 8);
+        Ensure(ref _tmplOffsets,  k + 2);
+        Ensure(ref _excOffsets,   k + 2);
+        Ensure(ref _propsOffsets, k + 2);
+        Ensure(ref _svcOffsets,   k + 2);
+
+        long ts = ev.TimestampUtcTicks;
+        if (ts < _minTimestamp) _minTimestamp = ts;
+        if (ts > _maxTimestamp) _maxTimestamp = ts;
+        if (ev.Level < _minLevel) _minLevel = ev.Level;
+        if (ts < _blockMinTs)   _blockMinTs = ts;
+        if (ts > _blockMaxTs)   _blockMaxTs = ts;
+        if (ev.Id < _blockMinId) _blockMinId = ev.Id;
+
+        _stgTs[k] = ts;
+        _stgId[k] = ev.Id;
+        _colL[k]  = (byte)ev.Level;
+        BinaryPrimitives.WriteUInt64LittleEndian(_colTr.AsSpan(k * 16),     ev.TraceIdHi);
+        BinaryPrimitives.WriteUInt64LittleEndian(_colTr.AsSpan(k * 16 + 8), ev.TraceIdLo);
+        BinaryPrimitives.WriteUInt64LittleEndian(_colSp.AsSpan(k * 8),      ev.SpanId);
+
+        _tmplOffsets[k] = (uint)_tmplBytes.Length;
+        AppendUtf8(_tmplBytes, ev.MessageTemplate, tmplByteLen);
+
+        _excOffsets[k] = (uint)_excBytes.Length;
+        if (ev.Exception is not null)
+        {
+            var b = ev.Exception.ToBytes();
+            _excBytes.Write(b, 0, b.Length);
+        }
+
+        _propsOffsets[k] = (uint)_propsBytes.Length;
+        if (!ev.Properties.IsEmpty) _propsBytes.Write(ev.Properties);
+
+        _svcOffsets[k] = (uint)_svcBytes.Length;
+        AppendUtf8(_svcBytes, ev.ServiceName, svcByteLen);
+
+        _stagedCount = k + 1;
+        _stagedBytes += 8 + 1 + 8 + 16 + 8 + 16 + tmplByteLen + svcByteLen
+                      + ev.Properties.Length + (int)(_excBytes.Length - _excOffsets[k]);
     }
 
-    private void FlushColumnarBlock(HotTierSegment hot, StringInternPool templatePool, List<int> rowIndices)
+    private static void AppendUtf8(MemoryStream dst, string? value, int byteLen)
     {
-        int n = rowIndices.Count;
-
-        long  blockMinTs = long.MaxValue;
-        long  blockMaxTs = long.MinValue;
-        ulong blockMinId = ulong.MaxValue;
-        for (int k = 0; k < n; k++)
+        if (byteLen == 0 || string.IsNullOrEmpty(value)) return;
+        var tmp = ArrayPool<byte>.Shared.Rent(byteLen);
+        try
         {
-            ref var h = ref hot.GetHeader(rowIndices[k]);
-            if (h.TimestampUtcTicks < blockMinTs) blockMinTs = h.TimestampUtcTicks;
-            if (h.TimestampUtcTicks > blockMaxTs) blockMaxTs = h.TimestampUtcTicks;
-            if (h.Id < blockMinId)               blockMinId = h.Id;
+            int written = Encoding.UTF8.GetBytes(value, 0, value.Length, tmp, 0);
+            dst.Write(tmp, 0, written);
         }
+        finally { ArrayPool<byte>.Shared.Return(tmp); }
+    }
 
-        Ensure(ref _colT,  n * 8);
-        Ensure(ref _colL,  n);
-        Ensure(ref _colI,  n * 8);
-        Ensure(ref _colTr, n * 16);   // TraceId: Hi(8) + Lo(8) per event
-        Ensure(ref _colSp, n * 8);    // SpanId: 8 bytes per event
-        Ensure(ref _tmplOffsets,  n + 1);
-        Ensure(ref _excOffsets,   n + 1);
-        Ensure(ref _propsOffsets, n + 1);
-        Ensure(ref _svcOffsets,   n + 1);
-        var colT = _colT;
-        var colL = _colL;
-        var colI = _colI;
-        var colTr = _colTr;
-        var colSp = _colSp;
-        var tmplOffsets  = _tmplOffsets;
-        var excOffsets   = _excOffsets;
-        var propsOffsets = _propsOffsets;
-        var svcOffsets   = _svcOffsets;
-        var tmplBytes  = _tmplBytes;   tmplBytes.SetLength(0);
-        var excBytes   = _excBytes;    excBytes.SetLength(0);
-        var propsBytes = _propsBytes;  propsBytes.SetLength(0);
-        var svcBytes   = _svcBytes;    svcBytes.SetLength(0);
+    /// <summary>Delta-encodes, frames, compresses and writes the staged block, then resets staging.</summary>
+    private void EmitBlock()
+    {
+        int n = _stagedCount;
+        if (n == 0) return;
 
-        ulong firstEventId = 0;
+        _tmplOffsets[n]  = (uint)_tmplBytes.Length;
+        _excOffsets[n]   = (uint)_excBytes.Length;
+        _propsOffsets[n] = (uint)_propsBytes.Length;
+        _svcOffsets[n]   = (uint)_svcBytes.Length;
 
-        for (int k = 0; k < n; k++)
-        {
-            int i = rowIndices[k];
-            ref var h = ref hot.GetHeader(i);
-
-            if (k == 0) firstEventId = h.Id;
-
-            BinaryPrimitives.WriteInt64LittleEndian(colT.AsSpan(k * 8), h.TimestampUtcTicks - blockMinTs);
-            colL[k] = (byte)h.Level;
-            BinaryPrimitives.WriteUInt64LittleEndian(colI.AsSpan(k * 8), h.Id - blockMinId);
-
-            BinaryPrimitives.WriteUInt64LittleEndian(colTr.AsSpan(k * 16),     h.TraceIdHi);
-            BinaryPrimitives.WriteUInt64LittleEndian(colTr.AsSpan(k * 16 + 8), h.TraceIdLo);
-            BinaryPrimitives.WriteUInt64LittleEndian(colSp.AsSpan(k * 8),      h.SpanId);
-
-            string template = hot.GetTemplate(i) ?? templatePool.Get(h.MessageTemplatePoolIndex) ?? string.Empty;
-            tmplOffsets[k]  = (uint)tmplBytes.Length;
-            if (template.Length > 0)
-            {
-                int byteLen = Encoding.UTF8.GetByteCount(template);
-                var tmp     = ArrayPool<byte>.Shared.Rent(byteLen);
-                try
-                {
-                    int written = Encoding.UTF8.GetBytes(template, 0, template.Length, tmp, 0);
-                    tmplBytes.Write(tmp, 0, written);
-                }
-                finally { ArrayPool<byte>.Shared.Return(tmp); }
-            }
-
-            excOffsets[k] = (uint)excBytes.Length;
-            var exc = hot.GetException(i);
-            if (exc is not null)
-            {
-                var b = exc.ToBytes();
-                excBytes.Write(b, 0, b.Length);
-            }
-
-            propsOffsets[k] = (uint)propsBytes.Length;
-            var props = hot.GetPropertiesPayload(i);
-            if (props.Length > 0)
-                propsBytes.Write(props);
-
-            // ServiceName string column
-            svcOffsets[k] = (uint)svcBytes.Length;
-            string? svcName = h.ServiceNamePoolIndex >= 0
-                ? templatePool.Get(h.ServiceNamePoolIndex)
-                : null;
-            if (!string.IsNullOrEmpty(svcName))
-            {
-                int byteLen = Encoding.UTF8.GetByteCount(svcName);
-                var tmp     = ArrayPool<byte>.Shared.Rent(byteLen);
-                try
-                {
-                    int written = Encoding.UTF8.GetBytes(svcName, 0, svcName.Length, tmp, 0);
-                    svcBytes.Write(tmp, 0, written);
-                }
-                finally { ArrayPool<byte>.Shared.Return(tmp); }
-            }
-        }
-        tmplOffsets[n]  = (uint)tmplBytes.Length;
-        excOffsets[n]   = (uint)excBytes.Length;
-        propsOffsets[n] = (uint)propsBytes.Length;
-        svcOffsets[n]   = (uint)svcBytes.Length;
+        long  blockMinTs = _blockMinTs;
+        ulong blockMinId = _blockMinId;
 
         var blk = _blk;
         blk.SetLength(0);
@@ -538,15 +547,15 @@ public sealed class SegmentWriter : IDisposable
         WriteUInt64(blk, blockMinId);
         blk.WriteByte(9);
 
-        WriteColumn(blk, 1, colT, n * 8);
-        WriteColumn(blk, 2, colL, n);
-        WriteColumn(blk, 3, colI, n * 8);
-        WriteStringColumn(blk, 4, tmplOffsets,  n + 1, tmplBytes);
-        WriteStringColumn(blk, 5, excOffsets,   n + 1, excBytes);
-        WriteStringColumn(blk, 6, propsOffsets, n + 1, propsBytes);
-        WriteColumn(blk, 7, colTr, n * 16);
-        WriteColumn(blk, 8, colSp, n * 8);
-        WriteStringColumn(blk, 9, svcOffsets, n + 1, svcBytes);
+        WriteInt64DeltaColumn(blk, 1, _stgTs, n, blockMinTs);
+        WriteColumn(blk, 2, _colL, n);
+        WriteUInt64DeltaColumn(blk, 3, _stgId, n, blockMinId);
+        WriteStringColumn(blk, 4, _tmplOffsets,  n + 1, _tmplBytes);
+        WriteStringColumn(blk, 5, _excOffsets,   n + 1, _excBytes);
+        WriteStringColumn(blk, 6, _propsOffsets, n + 1, _propsBytes);
+        WriteColumn(blk, 7, _colTr, n * 16);
+        WriteColumn(blk, 8, _colSp, n * 8);
+        WriteStringColumn(blk, 9, _svcOffsets, n + 1, _svcBytes);
 
         // Compress straight from the stream's internal buffer — no ToArray copy.
         int    uncompressedLen = (int)blk.Length;
@@ -567,8 +576,8 @@ public sealed class SegmentWriter : IDisposable
             // the compressed size — which varies by an order of magnitude with content.
             _groupEventCount   += (uint)n;
             _groupPayloadBytes += uncompressedLen;
-            if (blockMinTs < _groupMinTs) _groupMinTs = blockMinTs;
-            if (blockMaxTs > _groupMaxTs) _groupMaxTs = blockMaxTs;
+            if (blockMinTs  < _groupMinTs) _groupMinTs = blockMinTs;
+            if (_blockMaxTs > _groupMaxTs) _groupMaxTs = _blockMaxTs;
 
             _bw.Write((uint)uncompressedLen);
             _bw.Write((uint)compressedLen);
@@ -578,6 +587,16 @@ public sealed class SegmentWriter : IDisposable
         {
             ArrayPool<byte>.Shared.Return(compBuf);
         }
+
+        _stagedCount = 0;
+        _stagedBytes = 0;
+        _blockMinTs  = long.MaxValue;
+        _blockMaxTs  = long.MinValue;
+        _blockMinId  = ulong.MaxValue;
+        _tmplBytes.SetLength(0);
+        _excBytes.SetLength(0);
+        _propsBytes.SetLength(0);
+        _svcBytes.SetLength(0);
     }
 
     private static void WriteColumn(MemoryStream dst, byte id, byte[] payload, int length)
@@ -585,6 +604,30 @@ public sealed class SegmentWriter : IDisposable
         dst.WriteByte(id);
         WriteUInt32(dst, (uint)length);
         dst.Write(payload, 0, length);
+    }
+
+    private static void WriteInt64DeltaColumn(MemoryStream dst, byte id, long[] src, int n, long baseValue)
+    {
+        dst.WriteByte(id);
+        WriteUInt32(dst, (uint)(n * 8));
+        Span<byte> tmp = stackalloc byte[8];
+        for (int k = 0; k < n; k++)
+        {
+            BinaryPrimitives.WriteInt64LittleEndian(tmp, src[k] - baseValue);
+            dst.Write(tmp);
+        }
+    }
+
+    private static void WriteUInt64DeltaColumn(MemoryStream dst, byte id, ulong[] src, int n, ulong baseValue)
+    {
+        dst.WriteByte(id);
+        WriteUInt32(dst, (uint)(n * 8));
+        Span<byte> tmp = stackalloc byte[8];
+        for (int k = 0; k < n; k++)
+        {
+            BinaryPrimitives.WriteUInt64LittleEndian(tmp, src[k] - baseValue);
+            dst.Write(tmp);
+        }
     }
 
     private static void WriteStringColumn(MemoryStream dst, byte id, uint[] offsets, int offsetCount, MemoryStream payload)
@@ -643,6 +686,10 @@ public sealed class SegmentWriter : IDisposable
 
     public void Dispose()
     {
+        // An abandoned write (source threw mid-stream) still owns the open group's
+        // accumulators — the bloom filter is NativeMemory, so leaking it leaks off-heap.
+        _sink?.Dispose();
+        _sink = null;
         _bw.Dispose();
         _fs.Dispose();
     }

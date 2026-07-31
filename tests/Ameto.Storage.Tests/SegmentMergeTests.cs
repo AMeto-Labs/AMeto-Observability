@@ -190,27 +190,26 @@ public sealed class SegmentMergeTests : IAsyncLifetime
     }
 
     /// <summary>
-    /// Prop-dense events (~2 KB each — the real-service shape that stalled the
-    /// sandbox sweep) exceed the tier's 8 MB-per-16K-slot chunk budget when
-    /// re-packed from slot 0. The batch must TRIM to the fitting prefix and keep
-    /// merging instead of rejecting the window forever.
+    /// Prop-dense events (~2 KB each — the real-service shape that stalled the sandbox sweep)
+    /// used to be trimmed out of the batch because a hot tier divides payload into fixed 8 MB
+    /// chunks. There is no tier in the pipeline any more, so the whole backlog merges in one
+    /// pass and every event survives.
     /// </summary>
     [Fact]
-    public async Task Merge_TrimsDenseBatches_InsteadOfStalling()
+    public async Task Merge_ConsumesDenseBatchesWhole()
     {
-        // 12 segments × 700 events × ~2 KB props ≈ 16 MB payload — chunk 0 fits
-        // only ~4 K such events, so the full batch can never fit as-is.
+        // 12 segments × 700 events × ~2 KB props ≈ 16 MB payload — four times what a tier
+        // chunk could hold from slot 0, i.e. exactly the shape the old trim path cut up.
         for (int round = 0; round < 12; round++)
             await WriteSegmentAsync(round, 700, padBytes: 2048);
         Assert.Equal(12, _engine.ListSegments().Count);
         var before = ReadEverything();
 
-        // Repeated passes must make monotonic progress and eventually settle.
-        for (int i = 0; i < 10; i++)
-            if (!await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None)) break;
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None));
 
         var segs = _engine.ListSegments();
-        Assert.True(segs.Count < 12, $"expected consolidation, still {segs.Count} segments");
+        Assert.Single(segs);
+        Assert.Equal(8400u, segs[0].EventCount);
 
         var after = ReadEverything();
         Assert.Equal(before.Count, after.Count); // nothing lost, nothing duplicated
@@ -219,34 +218,35 @@ public sealed class SegmentMergeTests : IAsyncLifetime
     }
 
     /// <summary>
-    /// One merge pass must consume only a bounded slice of the backlog. The batch
-    /// is held in managed memory, copied into a native tier and then indexed as a
-    /// whole, so peak RSS scales with it — an unbounded batch produced ~1 GB
-    /// spikes on a live server. A big backlog must therefore take several passes.
+    /// The merged segment's size is now bounded by POLICY (MergeTargetPayloadBytes /
+    /// MergeMaxEvents), not by how much fits in memory. What must stay flat is the
+    /// ALLOCATION: the writer holds one block per source plus one index group, so merging a
+    /// backlog several times larger than the old 32 MB batch cap must not cost several times
+    /// the garbage.
     /// </summary>
     [Fact]
-    public async Task Merge_BoundsBatchSize_SoPeakMemoryStaysFlat()
+    public async Task Merge_AllocationStaysFlatAcrossALargeBacklog()
     {
-        // 40 segments x 500 events x ~2 KB props ≈ 40 MB payload — above the 32 MB
-        // per-batch budget, so a single pass cannot swallow it all.
+        // 40 segments x 500 events x ~2 KB props ≈ 40 MB payload — comfortably past the old
+        // per-batch cap, so the whole lot is consumed in a single pass.
         for (int round = 0; round < 40; round++)
             await WriteSegmentAsync(round, 500, padBytes: 2048);
-        int before = _engine.ListSegments().Count;
-        Assert.Equal(40, before);
+        Assert.Equal(40, _engine.ListSegments().Count);
+        var before = ReadEverything();
 
         long allocBefore = GC.GetTotalAllocatedBytes(precise: false);
         Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None));
         long allocMb = (GC.GetTotalAllocatedBytes(precise: false) - allocBefore) / 1048576;
 
         var segs = _engine.ListSegments();
-        var merged = segs.OrderByDescending(s => s.EventCount).First();
+        Assert.Single(segs);
+        Assert.Equal(20_000u, segs[0].EventCount);
+        Assert.Equal(before.Count, ReadEverything().Count);
 
-        // The merged output is capped (≈32 MB of ~2 KB events ⇒ well under 100k),
-        // and sources are left over for the next pass rather than all consumed.
-        Assert.True(merged.EventCount <= 100_000, $"merged {merged.EventCount} events — batch cap not honoured");
-        Assert.True(segs.Count > 1, "one pass consumed the entire backlog — batch is unbounded");
-        // Allocation stays in the same envelope as a normal flush, not multiples of it.
-        Assert.True(allocMb < 150, $"merge allocated {allocMb} MB in one pass (batch budget breached)");
+        // The old pipeline allocated a managed List<RawSegmentEvent> plus a byte[] per event's
+        // properties for the whole batch before writing anything; 40 MB of payload through it
+        // was ~120 MB of garbage. Streaming copies each payload once, into the open block.
+        Assert.True(allocMb < 80, $"merge allocated {allocMb} MB streaming 40 MB of payload");
     }
 
     /// <summary>A merged file can only expire whole — batches must not span more than a day.</summary>
@@ -263,40 +263,50 @@ public sealed class SegmentMergeTests : IAsyncLifetime
     }
 
     /// <summary>
-    /// The co-fit gate: a candidate must fit HALF a tier chunk (payload and slots),
-    /// so any two candidates always co-fit chunk 0 when re-packed from slot 0. A
-    /// payload-dense flush segment (~8 MB uncompressed in a ~4 MB file — the real
-    /// sandbox shape) used to pass the compressed-size filter, blow the chunk
-    /// budget and poison one window per pass; now it is simply not a candidate.
+    /// DENSE SEGMENTS MERGE AGAIN. The co-fit gate (UncompressedBytes ≤ 4 MB, EventCount ≤
+    /// 8192) existed only because a merge re-packed its batch into a hot tier, whose chunks
+    /// are a FIXED division of the event index (idx / 16384) with 8 MB of payload each — two
+    /// prop-dense segments could not co-fit chunk 0 however small they were in total. On the
+    /// sandbox stand that gate excluded most of the files from compaction.
+    ///
+    /// <para>There is no tier and no chunk geometry in the pipeline now, so the gate is gone.
+    /// This is the proof it can be: the exact shape it used to exclude — 2500 × ~3.1 KB props,
+    /// ~7.8 MB uncompressed per file — merges, and every event survives byte for byte.</para>
     /// </summary>
     [Fact]
-    public async Task Merge_ExcludesDenseSegments_FromCandidacy()
+    public async Task Merge_MergesDenseSegments_Losslessly()
     {
         long old = DateTime.UtcNow.Ticks - 5 * TimeSpan.TicksPerDay; // settled → 2 sources suffice
-        // Two payload-dense segments: 2500 × ~3.1 KB ≈ 7.8 MB props — over the 4 MB gate.
-        await WriteSegmentAsync(0, 2500, baseTicks: old,                               padBytes: 3072);
-        await WriteSegmentAsync(1, 2500, baseTicks: old + 1 * TimeSpan.TicksPerHour,  padBytes: 3072);
-        // One slot-dense segment: 9000 tiny events — over the 8192-event gate.
+        await WriteSegmentAsync(0, 2500, baseTicks: old,                              padBytes: 3072);
+        await WriteSegmentAsync(1, 2500, baseTicks: old + 1 * TimeSpan.TicksPerHour, padBytes: 3072);
+        // Slot-dense too: 9000 events in one file, over the old 8192-event half-chunk gate.
         await WriteSegmentAsync(2, 9000, baseTicks: old + 2 * TimeSpan.TicksPerHour);
-        // Dust — the segments the sweep exists for.
-        await WriteSegmentAsync(3, 50,   baseTicks: old + 3 * TimeSpan.TicksPerHour);
-        await WriteSegmentAsync(4, 50,   baseTicks: old + 4 * TimeSpan.TicksPerHour);
-        Assert.Equal(5, _engine.ListSegments().Count);
+        Assert.Equal(3, _engine.ListSegments().Count);
 
-        // The catalog must see the HONEST uncompressed size (writer-side F1) —
-        // this is what makes the payload-dense pair visible to the gate at all.
+        // These are the files the gate used to reject: each reports more uncompressed payload
+        // than half a tier chunk.
         var dense = _engine.ListSegments().Where(s => s.EventCount == 2500).ToList();
         Assert.Equal(2, dense.Count);
         Assert.All(dense, s => Assert.True(s.UncompressedBytes > 4L * 1024 * 1024,
-            $"dense segment reports {s.UncompressedBytes} B uncompressed — gate would admit it"));
+            $"test is meaningless: segment reports only {s.UncompressedBytes} B uncompressed"));
 
-        // The dust merges; the dense segments are left untouched, not poisoning anchors.
+        var before = ReadEverything();
+        Assert.Equal(14_000, before.Count);
+
         Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None));
+
         var segs = _engine.ListSegments();
-        Assert.Equal(4, segs.Count);
-        Assert.Contains(segs, s => s.EventCount == 100);   // dust consolidated
-        Assert.Equal(2, segs.Count(s => s.EventCount == 2500));
-        Assert.Contains(segs, s => s.EventCount == 9000);
+        Assert.Single(segs);
+        Assert.Equal(14_000u, segs[0].EventCount);
+
+        var after = ReadEverything();
+        Assert.Equal(before.Count, after.Count);
+        for (int i = 0; i < before.Count; i++)
+        {
+            Assert.Equal(before[i].Id,      after[i].Id);
+            Assert.Equal(before[i].TsTicks, after[i].TsTicks);
+            Assert.Equal(before[i].Props ?? [], after[i].Props ?? []);
+        }
 
         // Nothing mergeable remains → clean false, no anchor-skip churn.
         Assert.False(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None));

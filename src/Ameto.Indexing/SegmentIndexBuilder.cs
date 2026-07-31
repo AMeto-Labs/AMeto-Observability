@@ -6,16 +6,21 @@ using Ameto.Storage;
 namespace Ameto.Indexing;
 
 /// <summary>
-/// Builds all three index structures (inverted, trigram, bloom) from a sealed HotTierSegment.
+/// Builds all three index structures (inverted, trigram, bloom) for ONE INDEX GROUP.
 ///
-/// Called during segment flush (after Freeze()) before writing the .seg file. The property
-/// walk reads each event's msgpack payload with a streaming <see cref="MessagePackReader"/> and
-/// feeds the indexes directly — no per-event <c>Dictionary</c>, no boxing, no per-attribute
-/// strings. This is the flush-path allocation hot spot (index build was ~16 KB/event); the
-/// streaming walk is byte-parity with the old dictionary path (see <see cref="BuildReference"/>,
-/// exercised by the parity test).
+/// <para>An <see cref="ISegmentIndexSink"/>: the segment writer pushes each event in as it
+/// stages it, and asks for the sections when the group's payload budget is reached. Pushing is
+/// what lets a segment be written from a stream — the previous contract had the builder re-read
+/// the group's events out of a <see cref="HotTierSegment"/> at the boundary, which only works
+/// while something still holds them.</para>
+///
+/// The property walk reads each event's msgpack payload with a streaming
+/// <see cref="MessagePackReader"/> and feeds the indexes directly — no per-event
+/// <c>Dictionary</c>, no boxing, no per-attribute strings. This is the flush-path allocation hot
+/// spot (index build was ~16 KB/event); the streaming walk is byte-parity with the old dictionary
+/// path (see <see cref="BuildReference"/>, exercised by the parity test).
 /// </summary>
-public sealed class SegmentIndexBuilder
+public sealed class SegmentIndexBuilder : ISegmentIndexSink
 {
     private readonly SegmentInvertedIndex _inverted = new();
     private readonly SegmentTrigramIndex  _trigram  = new();
@@ -60,6 +65,17 @@ public sealed class SegmentIndexBuilder
     // ── Build ─────────────────────────────────────────────────────────────────
 
     /// <summary>
+    /// Indexes one event at its FILE ordinal. The writer calls this while the event is in its
+    /// hand, so <c>ev.Properties</c> is still a live span over the producer's buffer and
+    /// nothing has to be copied or retained.
+    /// </summary>
+    public void Add(uint fileOrdinal, in SegmentEventRef ev)
+    {
+        IndexHeaderFields(in ev, fileOrdinal);
+        IndexPropertiesStreaming(ev.Properties, fileOrdinal);
+    }
+
+    /// <summary>
     /// Streaming (zero-alloc) build. Must be called while <paramref name="hot"/> is frozen.
     ///
     /// <paramref name="order"/> is the file write order produced by
@@ -75,6 +91,10 @@ public sealed class SegmentIndexBuilder
     /// Indexes one INDEX GROUP: the events at file ordinals
     /// <c>[firstOrdinal, firstOrdinal + eventCount)</c>, i.e. <c>order[firstOrdinal..]</c>.
     ///
+    /// <para>The by-index entry point, kept for the flush-path probes and the parity oracle;
+    /// production drives <see cref="Add"/> from the writer. Both read the event through
+    /// <see cref="HotTierEventSource.EventAt"/>, so there is one definition of what a row is.</para>
+    ///
     /// <para>Posting offsets stay file-global (<c>firstOrdinal + pos</c>), not group-local —
     /// see the ordinal contract on <c>SegmentWriter.ComputeSortOrder</c>. A fresh builder per
     /// group is what bounds peak memory: the trigram accumulator costs ~7.6 B per posting and
@@ -88,11 +108,8 @@ public sealed class SegmentIndexBuilder
         int n = Math.Min(firstOrdinal + eventCount, order?.Length ?? hot.Count);
         for (int pos = firstOrdinal; pos < n; pos++)
         {
-            int  i      = order?[pos] ?? pos;
-            uint offset = (uint)pos;
-            ref readonly var header = ref hot.GetHeader(i);
-            IndexHeaderFields(in header, i, offset, hot, pool);
-            IndexPropertiesStreaming(hot.GetPropertiesPayload(i), offset);
+            int i = order?[pos] ?? pos;
+            Add((uint)pos, HotTierEventSource.EventAt(hot, pool, i));
         }
     }
 
@@ -107,8 +124,7 @@ public sealed class SegmentIndexBuilder
         {
             int  i      = order?[pos] ?? pos;
             uint offset = (uint)pos;
-            ref readonly var header = ref hot.GetHeader(i);
-            IndexHeaderFields(in header, i, offset, hot, pool);
+            IndexHeaderFields(HotTierEventSource.EventAt(hot, pool, i), offset);
 
             var props = hot.ReadPropertiesPayload(i, pool);
             if (props is not null)
@@ -117,15 +133,15 @@ public sealed class SegmentIndexBuilder
     }
 
     // ── Per-event header fields (shared by both paths) ─────────────────────────
-    private void IndexHeaderFields(in LogEventHeader header, int i, uint offset, HotTierSegment hot, StringInternPool pool)
+    private void IndexHeaderFields(in SegmentEventRef ev, uint offset)
     {
         // Level — inverted + bloom
-        string levelStr = header.Level.ToSeqString();
+        string levelStr = ev.Level.ToSeqString();
         _inverted.Add(offset, "@l", levelStr);
         _bloom.Add(levelStr);
 
         // Message template — trigram only.
-        string template = hot.GetTemplate(i) ?? pool.Get(header.MessageTemplatePoolIndex);
+        string template = ev.MessageTemplate;
         if (!string.IsNullOrEmpty(template))
         {
             _trigram.Add(offset, template);
@@ -133,7 +149,7 @@ public sealed class SegmentIndexBuilder
         }
 
         // Exception (structured)
-        var exception = hot.GetException(i);
+        var exception = ev.Exception;
         if (exception is not null)
         {
             _inverted.Add(offset, "@x.exists", "true");
@@ -155,28 +171,24 @@ public sealed class SegmentIndexBuilder
         }
 
         // TraceId / SpanId
-        if (header.HasTraceId)
+        if (ev.HasTraceId)
         {
-            string traceHex = TraceIdHelper.FormatTraceId(header.TraceIdHi, header.TraceIdLo)!;
+            string traceHex = TraceIdHelper.FormatTraceId(ev.TraceIdHi, ev.TraceIdLo)!;
             _inverted.Add(offset, ClefFields.TraceId, traceHex);
             _bloom.Add(traceHex);
         }
-        if (header.HasSpanId)
+        if (ev.HasSpanId)
         {
-            string spanHex = TraceIdHelper.FormatSpanId(header.SpanId)!;
+            string spanHex = TraceIdHelper.FormatSpanId(ev.SpanId)!;
             _inverted.Add(offset, ClefFields.SpanId, spanHex);
             _bloom.Add(spanHex);
         }
 
         // ServiceName
-        if (header.ServiceNamePoolIndex >= 0)
+        if (!string.IsNullOrEmpty(ev.ServiceName))
         {
-            string svcName = pool.Get(header.ServiceNamePoolIndex);
-            if (!string.IsNullOrEmpty(svcName))
-            {
-                _inverted.Add(offset, ClefFields.ServiceName, svcName);
-                _bloom.Add(svcName);
-            }
+            _inverted.Add(offset, ClefFields.ServiceName, ev.ServiceName);
+            _bloom.Add(ev.ServiceName);
         }
     }
 
@@ -361,4 +373,16 @@ public sealed class SegmentIndexBuilder
     public byte[] SerialisedInvertedIndex  => _inverted.Serialise();
     public byte[] SerialisedTrigramIndex   => _trigram.Serialise();
     public byte[] SerialisedBloomFilter    => _bloom.Serialise();
+
+    public (byte[] Inverted, byte[] Trigram, byte[] Bloom) Serialise()
+        => (_inverted.Serialise(), _trigram.Serialise(), _bloom.Serialise());
+
+    /// <summary>
+    /// Frees the bloom filter's bits. They live in <c>NativeMemory</c> and
+    /// <see cref="SegmentBloomFilter"/> has no finaliser, so before the sink contract made the
+    /// builder's lifetime explicit every sealed group leaked its filter off-heap — ~10 MB per
+    /// group at the documented ~10 bits/term sizing, invisible to every managed-heap probe.
+    /// <see cref="Serialise"/> copies the bits out, so disposing right after it is safe.
+    /// </summary>
+    public void Dispose() => _bloom.Dispose();
 }
