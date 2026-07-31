@@ -1613,15 +1613,21 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 try { File.Delete(poolPath); } catch { }
             }
 
-            // Flush recovered events to a cold segment (no index — acceptable for crash recovery)
+            // Flush recovered events to cold segments (no index — acceptable for crash recovery),
+            // ONE PER LEVEL like the live flush path. Writing the recovered tier as a single
+            // mixed-level segment reopened the data loss the level split exists to prevent:
+            // expiry is Ttl(MinLevel), TTL is not monotonic in the level's value, so a
+            // recovered tier holding one Debug event put every Error beside it on a 3-day
+            // deadline. Crash recovery is exactly when that is least acceptable.
             if (recoveredHot?.Count > 0)
             {
-                var segId   = new SegmentId(_nextSegmentId++);
-                var segPath = BuildSegmentPath(segId, recoveredHot);
-                var info    = FlushToColdAsync(recoveredHot, segId, segPath, CancellationToken.None)
+                ulong firstSegId = _nextSegmentId;
+                _nextSegmentId  += LevelSegmentSlots;
+                var written = FlushTierByLevelAsync(recoveredHot, firstSegId, CancellationToken.None)
                                   .GetAwaiter().GetResult();
-                _segments[segId.Value] = info;
-                _logger.LogInformation("WAL recovery: wrote segment {Id} with {Count} events", segId, info.EventCount);
+                foreach (var info in written) _segments[info.Id.Value] = info;
+                _logger.LogInformation("WAL recovery: wrote {Segments} level segment(s), {Count} events",
+                    written.Count, written.Sum(w => (long)w.EventCount));
             }
         }
         catch (Exception ex)

@@ -162,4 +162,62 @@ public sealed class LevelSplitFlushTests : IAsyncLifetime
             Assert.Equal(shortLived, seg.IsExpired(policy, inTenDays));
         }
     }
+
+    /// <summary>
+    /// WAL recovery must split by level too. It wrote the recovered tier as ONE mixed-level
+    /// segment, which reopened exactly the data loss the split exists to prevent — and did
+    /// so on the path taken after a crash, when losing Errors is least acceptable. The live
+    /// flush path was covered by the tests above; this one was not.
+    /// </summary>
+    [Fact]
+    public async Task WalRecoveryAlsoSplitsByLevel()
+    {
+        // Write mixed levels WITHOUT flushing, then drop the engine so the WAL is orphaned.
+        long baseTicks = DateTime.UtcNow.Ticks;
+        int n = 0;
+        for (int i = 0; i < 12; i++)
+            for (int lvl = 0; lvl < 6; lvl++)
+            {
+                var h = new LogEventHeader
+                {
+                    Id                       = new EventId(0u, (uint)n).RawValue,
+                    TimestampUtcTicks        = baseTicks + n * TimeSpan.TicksPerMillisecond,
+                    Level                    = (LogLevel)lvl,
+                    MessageTemplatePoolIndex = _engine.TemplatePool.Intern("evt {n}"),
+                    ServiceNamePoolIndex     = _engine.TemplatePool.Intern("Svc.A"),
+                };
+                Assert.True(_engine.TryWrite(h, Props(n)));
+                n++;
+            }
+
+        await _engine.DisposeAsync();          // leaves the WAL on disk, unflushed
+
+        // A fresh engine replays it. Recovery must produce level-pure segments.
+        _engine = new StorageEngine(
+            Options.Create(new ServerOptions { DataDirectory = _dir }),
+            new RetentionStore(new ServerOptions { DataDirectory = _dir }, NullLogger<RetentionStore>.Instance),
+            NullLogger<StorageEngine>.Instance)
+        { _allowIndexlessMerge = true };
+
+        for (int i = 0; i < 100 && _engine.ListSegments().Count == 0; i++)
+            await Task.Delay(50);
+
+        var segs = _engine.ListSegments();
+        Assert.NotEmpty(segs);
+
+        var dedup = new Dictionary<string, string>(StringComparer.Ordinal);
+        var ids = new List<ulong>();
+        foreach (var seg in segs)
+        {
+            using var r = SegmentReader.Open(seg.FilePath);
+            foreach (var ev in r.ReadAllRaw(dedup))
+            {
+                Assert.Equal((byte)seg.MinLevel, ev.Level);   // level-pure
+                ids.Add(ev.Id);
+            }
+        }
+
+        Assert.Equal(72, ids.Count);                          // nothing lost
+        Assert.Equal(72, ids.Distinct().Count());             // nothing duplicated
+    }
 }
