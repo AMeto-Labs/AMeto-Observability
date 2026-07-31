@@ -79,9 +79,24 @@ public sealed class DayBucketCompactionProbe : IAsyncLifetime
         return buf.WrittenSpan.ToArray();
     }
 
-    [Fact]
-    public async Task StandShapeCollapsesToOneFilePerBucketPerLevel()
+    /// <summary>
+    /// <paramref name="sizeSpread"/> 1 is the stand's own smooth shape. 8 gives each (flush,
+    /// level) a log-uniform volume multiplier spanning 8× — the shape level-split flushing makes
+    /// by itself, since Warning and Error are bursty by construction (three events in one
+    /// five-minute window, four hundred in the next) and each gets a segment of its own. Every
+    /// file-count claim on this branch was measured at spread 1, and uniform sizes are the one
+    /// distribution under which the size ratio and time-contiguity never disagree.
+    /// </summary>
+    [Theory]
+    [InlineData(1)]
+    [InlineData(8)]
+    public async Task StandShapeCollapsesToOneFilePerBucketPerLevel(int sizeSpread)
     {
+        // Geometric mean 1, so the two runs carry comparable payload and only the SPREAD differs.
+        var    rnd   = new Random(20260731);
+        double lo    = 1.0 / Math.Sqrt(sizeSpread);
+        double Scale1() => sizeSpread <= 1 ? 1.0 : lo * Math.Pow(sizeSpread, rnd.NextDouble());
+
         long dayPayload = StandDailyPayloadBytes / Scale;
         long width      = StorageEngine.MergeBucketTicks(RetentionPolicy.Default.GetTtl(LogLevel.Fatal));
         // Start far enough back that every bucket, including the last, is past its grace period:
@@ -96,7 +111,7 @@ public sealed class DayBucketCompactionProbe : IAsyncLifetime
                 long t = day0 + d * TimeSpan.TicksPerDay + f * (TimeSpan.TicksPerDay / FlushesPerDay);
                 foreach (var (level, share) in Mix)
                 {
-                    int events = (int)(dayPayload * share / FlushesPerDay / BytesPerEvent);
+                    int events = (int)(dayPayload * share / FlushesPerDay / BytesPerEvent * Scale1());
                     for (int i = 0; i < events; i++)
                     {
                         _engine.TryWrite(new LogEventHeader
@@ -124,18 +139,18 @@ public sealed class DayBucketCompactionProbe : IAsyncLifetime
         while (await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None))
         {
             merges++;
-            Assert.True(merges < 400, "compaction did not converge");
+            Assert.True(merges < 3000, "compaction did not converge");
             written += _engine.ListSegments().OrderByDescending(s => s.Id.Value).First().UncompressedBytes;
         }
         sw.Stop();
 
-        var after = _engine.ListSegments();
+        var    after = _engine.ListSegments();
+        double amp   = written / (double)Math.Max(1, before.Sum(s => s.UncompressedBytes));
         _out.WriteLine(
-            $"stand shape at 1/{Scale}: {Days} days x {FlushesPerDay} flushes, {ingested:N0} events, " +
-            $"{beforeMb} MB payload ({beforeDisk} MB on disk)");
+            $"stand shape at 1/{Scale}, size spread {sizeSpread}x: {Days} days x {FlushesPerDay} flushes, " +
+            $"{ingested:N0} events, {beforeMb} MB payload ({beforeDisk} MB on disk)");
         _out.WriteLine($"segments: {before.Count} -> {after.Count} in {merges} merges, {sw.ElapsedMilliseconds} ms");
-        _out.WriteLine($"compaction wrote {written / 1048576} MB for {beforeMb} MB ingested " +
-                       $"= {written / (double)Math.Max(1, before.Sum(s => s.UncompressedBytes)):F2}x");
+        _out.WriteLine($"compaction wrote {written / 1048576} MB for {beforeMb} MB ingested = {amp:F2}x");
 
         foreach (var (level, _) in Mix)
         {
@@ -165,8 +180,18 @@ public sealed class DayBucketCompactionProbe : IAsyncLifetime
         // levels is 32 six-hour Debug buckets, two seven-day buckets for each 90-day level, and
         // a handful of size-capped files for the dominant one — MEASURED 1728 -> 45 at 1.00x,
         // because a backfill this settled hits every bucket's terminal state in one pass.
+        //
+        // Under an 8× spread the same backfill measures 1728 -> 96 in 502 merges at 3.36x. Both
+        // halves of that are the size ladder rather than a defect, and the 1.00x is the outlier:
+        // when every flush segment in a bucket is the same size they are ONE run and one merge
+        // takes them all, where a spread splits them across tiers that have to climb the ladder
+        // separately. log₄(65 MB per Information bucket / 455 KB per flush) = 3.6 rewrites, which
+        // is what 3.36x is. The steady-state incremental figure is the same either way
+        // (2.81–3.13× uniform, 2.91–3.19× at an 8× spread — see
+        // SegmentBucketAdversarialProbe.AmplificationAndFileCountSurviveNonUniformFlushSizes).
         Assert.True(after.Count < before.Count / 10,
             $"{before.Count} -> {after.Count} segments is not a collapse");
+        Assert.True(amp < 4.5, $"the backfill rewrote every byte {amp:F2} times");
         foreach (var s in after)
             Assert.True(s.MaxTimestampTicks - s.MinTimestampTicks <=
                         StorageEngine.MergeBucketTicks(RetentionPolicy.Default.GetTtl(s.MinLevel)),
@@ -176,8 +201,14 @@ public sealed class DayBucketCompactionProbe : IAsyncLifetime
         // that shows whether the cut partitions the bucket in time or interleaves it. Picking
         // the batch smallest-first gave 5.72 d per file here — every file spanning the whole
         // bucket — against 1.92 d oldest-first.
+        //
+        // Only asserted on the smooth shape. Under size variance the contiguous planner runs out
+        // and the tier fallback takes over, and interleaving is precisely what it trades for a
+        // terminal state: a 7-day bucket whose files all span it costs a query one extra open
+        // file per size tier, where the contiguous-only rule cost it one per flush, forever.
         double infoSpan = after.Where(s => s.MinLevel == LogLevel.Information)
                                .Max(s => (s.MaxTimestampTicks - s.MinTimestampTicks) / (double)TimeSpan.TicksPerDay);
-        Assert.True(infoSpan < 3.0, $"Information files span {infoSpan:F2} d — the bucket was interleaved, not partitioned");
+        if (sizeSpread <= 1)
+            Assert.True(infoSpan < 3.0, $"Information files span {infoSpan:F2} d — the bucket was interleaved, not partitioned");
     }
 }
