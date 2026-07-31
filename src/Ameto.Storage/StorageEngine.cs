@@ -75,6 +75,8 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     internal bool _allowIndexlessMerge;
     /// <summary>Test hook: shrinks the index-group budget so a small segment still spans several groups.</summary>
     internal long _groupPayloadBudgetBytes = SegmentWriter.DefaultGroupPayloadBudgetBytes;
+    /// <summary>Test hook: first id of the block reserved for the live WAL (see <see cref="_walSegId"/>).</summary>
+    internal ulong LiveWalSegmentId => _walSegId;
 
     // ── Flush memory budgets (see the constructor for how these combine) ───────
 
@@ -140,8 +142,24 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     // release retired hot tiers when no query could possibly observe them.
     private int _activeReaders;
 
-    // Monotonic segment counter
+    // Monotonic segment-id allocator. Every id a segment file can ever carry comes from
+    // here — flush blocks, merges, WAL-recovery segments — so an id is never reused.
     private          ulong                                _nextSegmentId = 1;
+
+    /// <summary>
+    /// First id of the block RESERVED FOR THE LIVE WAL, i.e. the ids its events will occupy
+    /// once they are flushed. The WAL file is named from it, and startup uses that name to
+    /// decide whether a WAL still holds unflushed events.
+    ///
+    /// <para>It is a reservation, not a peek at <see cref="_nextSegmentId"/>, and that is the
+    /// whole point. The WAL used to be named from whatever <c>_nextSegmentId</c> happened to
+    /// be, which is also the id a MERGE takes — so the first merge after any flush published a
+    /// segment carrying the live WAL's id, the restart check "a segment with this id exists ⇒
+    /// this WAL was already flushed" fired on it, and every un-flushed event in that WAL was
+    /// deleted. Measured before this change: WAL id 25, merged segment id 25, 30 events
+    /// written, 0 recovered, on 3 of 3 runs.</para>
+    /// </summary>
+    private          ulong                                _walSegId;
 
     // Time-sortable event id generator (Snowflake layout). Assigns EventId.RawValue
     // on the write path so sorting by Id ≡ sorting by ingest time.
@@ -671,23 +689,23 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             oldWalPath = oldWal?.FilePath;
             oldHot.Freeze();
 
-            // Publish oldHot + reserve its segment ids under the lock queries snapshot
-            // from, so a concurrent query sees oldHot's events AND skips the reserved
-            // cold segment ids (no duplicates during the register/remove overlap).
-            // A tier flushes to ONE SEGMENT PER LEVEL, so a whole block of ids is
-            // reserved and the level's segment is always firstId + (byte)level. Levels
-            // absent from the tier simply never become files; a burnt id costs nothing.
-            reservedSegId = _nextSegmentId;
+            // Publish oldHot under the lock queries snapshot from, so a concurrent query
+            // sees oldHot's events AND skips the reserved cold segment ids (no duplicates
+            // during the register/remove overlap). A tier flushes to ONE SEGMENT PER LEVEL,
+            // and the block of ids for exactly that was reserved when this tier's WAL was
+            // opened — the level's segment is always firstId + (byte)level. Levels absent
+            // from the tier simply never become files; a burnt id costs nothing.
+            reservedSegId = _walSegId;
             lock (_frozenLock) { _frozenHot.Add((oldHot, reservedSegId)); }
 
             _hot = CreateHotTier();
 
-            // Rotate the WAL: bump the counter first so the new WAL uses the *next* id.
-            // The OLD WAL is disposed in the heavy phase, off the swap lock — disposing
-            // flushes up to 64 MB of dirty mmap pages to disk, and doing that here
-            // stalled every writer (hot tier stays full for the whole swap) long enough
-            // to overflow the ingest ring under sustained 100k/s load.
-            _nextSegmentId += LevelSegmentSlots;
+            // Rotate the WAL: opening the next one reserves the next block, so the WAL on
+            // disk always names the ids ITS events will occupy. The OLD WAL is disposed in
+            // the heavy phase, off the swap lock — disposing flushes up to 64 MB of dirty
+            // mmap pages to disk, and doing that here stalled every writer (hot tier stays
+            // full for the whole swap) long enough to overflow the ingest ring under
+            // sustained 100k/s load.
             _wal = null;
             OpenWal();
         }
@@ -959,9 +977,23 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         }
         if (consumed is null || readers is null) return false;
 
-        // Reserve a segment id from the same counter the flush path uses.
+        // Reserve a segment id from the same allocator the flush path uses. Safe now only
+        // because the live WAL holds a RESERVED block (see _walSegId): the allocator is
+        // already past it, so a merged file can never be handed the id a WAL is named from.
         ulong reserved;
-        await _flushLock.WaitAsync(ct);
+        try
+        {
+            await _flushLock.WaitAsync(ct);
+        }
+        catch
+        {
+            // The only cancellable step between opening the sources and taking ownership of
+            // them. Unguarded, shutdown left up to MergeMaxSources mapped views alive for the
+            // life of the process — and on Windows a mapped file cannot be unlinked, so those
+            // segments could then be neither compacted nor expired.
+            foreach (var r in readers) r.Dispose();
+            throw;
+        }
         try { reserved = _nextSegmentId; _nextSegmentId++; }
         finally { _flushLock.Release(); }
 
@@ -1332,6 +1364,24 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         _logger.LogInformation("Loaded {Count} segments from {Dir} in {Ms} ms", _segments.Count, _segDir, sw.ElapsedMilliseconds);
     }
 
+    /// <summary>
+    /// True when the flush of the WAL named <paramref name="walSegId"/> left at least one
+    /// segment file behind.
+    ///
+    /// <para>The whole reserved BLOCK is probed, not just the first id: a tier writes one
+    /// segment per level and only for the levels it actually holds, so a tier of pure
+    /// Information events produces <c>walSegId + 2</c> and nothing at <c>walSegId</c>.
+    /// Checking the first id alone reads "never flushed" for that tier and replays a WAL
+    /// whose events are already cold.</para>
+    /// </summary>
+    private bool FlushedSegmentExistsOnDisk(ulong walSegId)
+    {
+        for (ulong id = walSegId; id < walSegId + LevelSegmentSlots; id++)
+            foreach (var _ in Directory.EnumerateFiles(_segDir, $"{_options.NodeId.Value}-{id}-*.seg"))
+                return true;
+        return false;
+    }
+
     private void ReplayOrphanedWals()
     {
         var walFiles = Directory.EnumerateFiles(_walDir, "*.wal").ToList();
@@ -1353,8 +1403,12 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                     continue;
                 }
 
-                // WAL already flushed (segment exists) — delete orphaned WAL
-                if (_segments.ContainsKey(segId))
+                // WAL already flushed — delete the orphan. "Flushed" is read off the segment
+                // DIRECTORY, not off _segments: the catalog load runs in the background (it
+                // opens every file), so a catalog lookup here races the enumeration that
+                // would answer it, and losing that race replays a WAL whose events are
+                // already in cold storage — duplicates.
+                if (FlushedSegmentExistsOnDisk(segId))
                 {
                     _logger.LogInformation("WAL {File} already flushed — removing", walFile);
                     try { File.Delete(walFile); } catch { }
@@ -1454,9 +1508,17 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         return new HotTierSegment(HotTierSegment.EventCapacityFor(payloadCapacity), payloadCapacity);
     }
 
+    /// <summary>
+    /// Opens the next WAL, RESERVING the block of segment ids its events will flush into.
+    /// The reservation is what keeps the WAL's name meaningful: nothing else — no merge, no
+    /// recovery segment — can subsequently be handed an id inside it.
+    /// </summary>
     private void OpenWal()
     {
-        var segId   = new SegmentId(_nextSegmentId);
+        _walSegId      = _nextSegmentId;
+        _nextSegmentId += LevelSegmentSlots;
+
+        var segId   = new SegmentId(_walSegId);
         var walPath = Path.Combine(_walDir, $"{_options.NodeId.Value}-{segId.Value}.wal");
         _wal        = WriteAheadLog.Open(walPath, _options.NodeId, segId);
     }
