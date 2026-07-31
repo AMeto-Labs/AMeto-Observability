@@ -244,9 +244,11 @@ public sealed class SegmentMergeTests : IAsyncLifetime
         Assert.Equal(before.Count, ReadEverything().Count);
 
         // The old pipeline allocated a managed List<RawSegmentEvent> plus a byte[] per event's
-        // properties for the whole batch before writing anything; 40 MB of payload through it
-        // was ~120 MB of garbage. Streaming copies each payload once, into the open block.
-        Assert.True(allocMb < 80, $"merge allocated {allocMb} MB streaming 40 MB of payload");
+        // properties for the whole batch before writing anything. Streaming copies each payload
+        // once, straight into the open block: MEASURED 4 MB of managed allocation for 40 MB of
+        // payload. (These merges run without an index sink — the index build's own state is
+        // bounded by the group budget and measured by IndexGroupMemoryProbe.)
+        Assert.True(allocMb < 20, $"merge allocated {allocMb} MB streaming 40 MB of payload");
     }
 
     /// <summary>A merged file can only expire whole — batches must not span more than a day.</summary>
