@@ -415,6 +415,13 @@ public sealed class SegmentWriter : IDisposable
         WriteFileHeader(hdr);
 
         _bw.Flush();
+        // To the PLATTER, not just to the OS. Both callers delete their sources as soon as this
+        // returns — a flush unlinks the WAL that still holds the events, a merge unlinks up to
+        // MergeMaxSources whole segments — and NTFS journals those unlinks independently of
+        // lazily-written file data, so the two halves can reach disk out of order. Without this
+        // the manifest-first ordering is an in-process ordering only: a host loses power, the
+        // deletions are durable and the segment that replaced them is still in page cache.
+        _fs.Flush(flushToDisk: true);
 
         return new SegmentInfo
         {

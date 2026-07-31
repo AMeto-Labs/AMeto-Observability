@@ -1134,9 +1134,19 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         //    manifest WITH it = the sources are already duplicated (finish deleting them).
         //    Writing it after publication, as this did before, left a window where a crash
         //    resurrected every source alongside the merged file — duplicate events, forever.
+        //    Written THROUGH to the platter, for the same reason the merged file is: the whole
+        //    protocol is an ordering between this file and a set of unlinks, and an ordering
+        //    only the page cache observes does not survive a power loss.
         try
         {
-            await File.WriteAllLinesAsync(manifestPath, consumed.Select(s => Path.GetFileName(s.FilePath)), ct);
+            await using (var mf = new FileStream(manifestPath, FileMode.Create, FileAccess.Write, FileShare.None,
+                                                 4096, FileOptions.WriteThrough))
+            using (var mw = new StreamWriter(mf))
+            {
+                foreach (var s in consumed) await mw.WriteLineAsync(Path.GetFileName(s.FilePath));
+                await mw.FlushAsync(ct);
+                mf.Flush(flushToDisk: true);
+            }
         }
         catch
         {
@@ -1166,7 +1176,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         }
         try
         {
-            info = await MergeToColdAsync(readers, segId, segPath, ct);
+            info = await MergeToColdAsync(readers, segId, segPath, expectEvents, ct);
         }
         catch (Exception ex)
         {
@@ -1179,20 +1189,6 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             return false;
         }
         finally { _flushConcurrency.Release(); }
-
-        // Refuse to delete the sources unless every one of their events is in the merged
-        // file. The counts come from file headers on both sides, so a mismatch means the
-        // stream lost or duplicated rows — abort loudly rather than delete the originals.
-        if (info.EventCount != expectEvents)
-        {
-            _logger.LogError(
-                "Merge: wrote {Written} events but sources hold {Expected} — merged file discarded, sources kept",
-                info.EventCount, expectEvents);
-            foreach (var s in consumed) _mergeSkip.Add(s.Id.Value);
-            try { File.Delete(segPath); }      catch { /* left for the tmp sweep */ }
-            try { File.Delete(manifestPath); } catch { }
-            return false;
-        }
 
         _segments[segId.Value] = info;
         foreach (var seg in consumed)
@@ -1225,8 +1221,14 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// index group's sink. Peak is one decompressed block per source plus one index group —
     /// flat in the merged segment's size, which is the whole point.</para>
     /// </summary>
+    /// <param name="expectEvents">
+    /// Sum of the sources' header event counts. Verified while the merged file is still at
+    /// <c>.seg.tmp</c> — BEFORE the move that makes it catalog-visible, because recovery decides
+    /// on <c>File.Exists</c> alone: a crash between a move and a later check would commit an
+    /// unverified merge and recovery would then finish deleting its sources for it.
+    /// </param>
     private Task<SegmentInfo> MergeToColdAsync(
-        List<SegmentReader> readers, SegmentId segId, string segPath, CancellationToken ct)
+        List<SegmentReader> readers, SegmentId segId, string segPath, long expectEvents, CancellationToken ct)
     {
         var  sinkFactory = IndexSinkFactory;
         long groupBudget = _groupPayloadBudgetBytes;
@@ -1252,6 +1254,15 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 source.Dispose();
                 source = null;
                 foreach (var r in readers) r.Dispose();
+
+                // Refuse to publish unless every source event is in the merged file. Counts come
+                // from file headers on both sides, so a mismatch means the stream lost or
+                // duplicated rows. Throwing here leaves the file at .seg.tmp — invisible to the
+                // catalog, deleted by the startup sweep — and the caller drops the manifest, so
+                // the pre-merge state is restored exactly.
+                if (info.EventCount != expectEvents)
+                    throw new InvalidDataException(
+                        $"merge wrote {info.EventCount} events but its sources hold {expectEvents}");
 
                 ct.ThrowIfCancellationRequested();
                 File.Move(tmpPath, segPath, overwrite: false);
