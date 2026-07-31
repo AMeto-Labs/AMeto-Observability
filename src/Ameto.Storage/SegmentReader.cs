@@ -591,10 +591,14 @@ public sealed class SegmentReader : ISegmentReader
     // ── Raw event access (compaction) ─────────────────────────────────────────
 
     /// <summary>
-    /// Decodes every event with its RAW payloads — properties/exception bytes are
-    /// not deserialised into dictionaries, so a compaction re-write is lossless
-    /// and cheap. <paramref name="stringDedup"/> collapses repeated template /
-    /// service strings across blocks and segments.
+    /// Decodes every event of the file with its RAW payloads — properties/exception bytes are
+    /// not deserialised into dictionaries. <paramref name="stringDedup"/> collapses repeated
+    /// template / service strings across blocks and segments.
+    ///
+    /// <para>WHOLE-FILE: this materialises the segment, one <c>byte[]</c> per properties
+    /// payload. Compaction used to be built on it and paid ~3× the batch for it; it streams
+    /// through <see cref="ReadBlockInto"/> now. What is left is the byte-parity oracle the merge
+    /// tests compare against — do not put it back on a production path.</para>
     /// </summary>
     internal List<RawSegmentEvent> ReadAllRaw(Dictionary<string, string> stringDedup)
     {
@@ -836,8 +840,9 @@ public readonly record struct SegmentIndexGroup(
     long BloomOffset);
 
 /// <summary>
-/// One event decoded with its raw payloads intact — the unit compaction re-writes
-/// into a fresh hot tier. Properties stay msgpack bytes (no dictionary roundtrip).
+/// One event decoded with its raw payloads intact; properties stay msgpack bytes (no dictionary
+/// roundtrip). The materialised counterpart of <see cref="SegmentEventRef"/>, which is what the
+/// streaming paths use — this one owns its bytes and so costs an allocation per event.
 /// </summary>
 internal struct RawSegmentEvent
 {
