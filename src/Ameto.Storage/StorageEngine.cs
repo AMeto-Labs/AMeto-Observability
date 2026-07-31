@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Numerics;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Ameto.Core;
@@ -841,6 +842,26 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     //   - time-contiguous is what makes the pieces of an over-large bucket partition it rather
     //     than interleave it (see MergeTargetPayloadBytes), and it is why the run BREAKS at the
     //     first file it cannot take instead of skipping past it.
+    //
+    // Requiring BOTH of a single run, however, is what left a bucket with no terminal state at
+    // all: a file whose time-neighbours are all more than MergeRunSizeRatio away in size can
+    // never join anything, not even a file of its own exact size elsewhere in the bucket,
+    // because the run would have to step over the neighbour. Measured on the shape a bursty
+    // producer makes on its own — 240 flushes alternating 200 and 40 events into a bucket that
+    // sealed 30 days ago — 240 files and ZERO merges, at fixpoint, forever. So the run planner
+    // gets a SECOND source of candidates, tried only when the first finds nothing anywhere:
+    // the bucket's files GROUPED BY SIZE TIER (floor(log_ratio(payload))), each tier still taken
+    // as a time-contiguous run of its own members. Same three conditions, a strictly smaller
+    // input, and same-size files therefore always find each other. The same 240 flushes leave
+    // 2 files. The cost is that two files of a bucket may overlap in time — which is why it is
+    // a FALLBACK: overlap costs a query one extra open file, where the alternative costs it one
+    // open file per flush that ever landed in the window.
+    //
+    // The tiers are also what bounds the terminal state, and the bound is a property of the
+    // geometry rather than of the workload: at fixpoint a tier holds fewer files than the
+    // fanout (three same-tier files always satisfy the growth rule, since the largest is under
+    // MergeRunSizeRatio of the smallest), so a bucket holds at most
+    // fanout × log_ratio(maximal / flush size) files whatever the size distribution.
 
     /// <summary>
     /// Uncompressed payload one merged file aims for.
@@ -889,8 +910,27 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// <para>Dropping it for sealed buckets — the previous rule — is what made a one-row
     /// straggler cost a full bucket rewrite. It is kept for sealed buckets now; what a sealed
     /// bucket relaxes is only the FANOUT (see <see cref="MergeSealedMinSources"/>).</para>
+    ///
+    /// <para>It is also the base of the SIZE TIER (see <see cref="SizeTier"/>), which is why it
+    /// is expressed as a shift: two files are in the same tier exactly when neither is more than
+    /// this ratio from the tier's own floor, so a tier's members satisfy the spread rule by
+    /// construction and the fallback planner needs no separate check.</para>
     /// </summary>
-    private const int MergeRunSizeRatio = 4;
+    private const int MergeRunSizeShift = 2;
+    internal const int MergeRunSizeRatio = 1 << MergeRunSizeShift;
+
+    /// <summary>
+    /// Which rung of the size ladder a file is on: <c>floor(log₍ratio₎ payload)</c>, computed as
+    /// a shift of its bit length so the planner can bucket by it without a division or a
+    /// floating-point log.
+    ///
+    /// <para>The tier is what lets same-sized files find each other when time-contiguity keeps
+    /// them apart, and its rigidity is deliberate: two files either side of a rung boundary are
+    /// within 1× of each other and still never merge DIRECTLY — but each coalesces with its own
+    /// tier and climbs, so the pair costs at most one extra file, never a stall.</para>
+    /// </summary>
+    internal static int SizeTier(long payload) =>
+        BitOperations.Log2((ulong)Math.Max(1, payload)) / MergeRunSizeShift;
 
     /// <summary>
     /// A merge must grow its largest source by at least this factor, expressed as the fraction
@@ -951,7 +991,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// ~2.5 rewrites per byte at the stand's geometry against holding up to eight uncompacted
     /// flush segments per level in the catalog.
     /// </summary>
-    private const int MergeMinSources = 8;
+    internal const int MergeMinSources = 8;
 
     /// <summary>
     /// Sources a SEALED bucket needs. Two, because a quiet day leaves a handful of tiny segments
@@ -960,7 +1000,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// is what stops a pair being "the bucket's big file plus one straggler", which is the shape
     /// that used to make this number costly.
     /// </summary>
-    private const int MergeSealedMinSources = 2;
+    internal const int MergeSealedMinSources = 2;
     // Each source contributes one open reader and one decompressed block (~64 KB) for the
     // length of the merge — the k-way merge's only per-source cost, ~36 MB at this cap.
     private const int MergeMaxSources = 512;
@@ -1059,8 +1099,6 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         {
             var  list  = buckets[key];
             if (list.Count < 2) continue;
-            long width = MergeBucketTicks(policy.GetTtl(key.Level));
-            bool isSealed = now - (key.Start + width) >= MergeSealGraceTicks(width);
 
             // Oldest first, so a run is a time-contiguous slice of the bucket. A bucket too big
             // for one file has to be cut somehow, and cutting it by time is what makes the
@@ -1073,10 +1111,34 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             // picked oldest-first.
             list.Sort(static (a, b) => a.MinTimestampTicks.CompareTo(b.MinTimestampTicks));
 
-            var run = SelectMergeRun(list, isSealed ? MergeSealedMinSources : MergeMinSources, target, maximal);
+            var run = SelectMergeRun(list, MinSourcesFor(key, policy, now), target, maximal);
+            if (run is not null) return run;
+        }
+
+        // NOTHING in the whole catalog can be merged without stepping over a source. Only now is
+        // the overlap worth it: group each bucket by size tier and take a run inside one tier.
+        // Second loop rather than second branch, so a bucket that can still be compacted
+        // cleanly is ALWAYS preferred over one that cannot — the fallback fires at what would
+        // otherwise be a permanent fixpoint, which is the only place its cost is the lesser one.
+        foreach (var key in keys)
+        {
+            var list = buckets[key];        // already sorted by Min above
+            if (list.Count < 2) continue;
+
+            var run = SelectMergeTierRun(list, MinSourcesFor(key, policy, now), target, maximal);
             if (run is not null) return run;
         }
         return null;
+
+        // A bucket past its window plus a grace needs only a pair: nothing more is coming that
+        // could make a bigger batch, so waiting for the open fanout would strand what is there.
+        static int MinSourcesFor((Ameto.Core.LogLevel Level, long Start) key, RetentionPolicy policy, long now)
+        {
+            long width = MergeBucketTicks(policy.GetTtl(key.Level));
+            return now - (key.Start + width) >= MergeSealGraceTicks(width)
+                ? MergeSealedMinSources
+                : MergeMinSources;
+        }
     }
 
     /// <summary>
@@ -1106,12 +1168,21 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     ///       the last rewrite those bytes will ever get — always worth doing.</item>
     /// </list>
     /// </summary>
-    private static List<SegmentInfo>? SelectMergeRun(
+    internal static List<SegmentInfo>? SelectMergeRun(
         List<SegmentInfo> byTime, int minSources, long target, long maximal)
     {
+        // ONE scratch list for the whole scan. Every start index has to be tried — a run that
+        // stops at j says nothing about the starts inside (start, j): with payloads [1, 4, 16]
+        // the run from 0 is [1, 4] because 16 > 1 × ratio, while the run from 1 is the legal
+        // [4, 16] — so the O(n²) walk is load-bearing and stays. Allocating a list per attempt
+        // made it O(n²) GARBAGE as well: measured 5.5 MB and 2.4 ms per planner pass at 1600
+        // files in one bucket, every pass returning null. The list escapes on exactly one path,
+        // and the method allocates a fresh one per call, so the caller owns what it gets.
+        var run = new List<SegmentInfo>(Math.Min(byTime.Count, MergeMaxSources));
+
         for (int start = 0; start + 1 < byTime.Count; start++)
         {
-            var  run     = new List<SegmentInfo>(Math.Min(byTime.Count - start, MergeMaxSources));
+            run.Clear();
             long payload = 0, events = 0, runMin = long.MaxValue, runMax = 0;
 
             for (int i = start; i < byTime.Count && run.Count < MergeMaxSources; i++)
@@ -1133,6 +1204,54 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             if (payload - runMax < runMax / MergeGrowthFactor) continue;
             if (run.Count < minSources && payload < maximal) continue;
             return run;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// The fallback: the first run worth rewriting among the files of ONE SIZE TIER, or null.
+    ///
+    /// <para>Time-contiguity across the whole bucket is what
+    /// <see cref="SelectMergeRun"/> gives up here, and only here. A file whose time-neighbours
+    /// are all more than <see cref="MergeRunSizeRatio"/> away in size is unmergeable under the
+    /// contiguous rule — it cannot even reach a file of its own exact size, because the run
+    /// would have to step over the neighbour — and a producer whose volume swings between
+    /// adjacent flushes builds that shape by itself. MEASURED at 30b0d93: 240 flushes
+    /// alternating 200 and 40 events into a bucket sealed 30 days ago left 240 files and 0
+    /// merges, at fixpoint; six byte-identical 172 B files in one bucket refused to coalesce
+    /// because a 244 KB file sat between each pair in time order.</para>
+    ///
+    /// <para>Grouping by tier restores the property the size rule was supposed to have: files
+    /// of a size merge with files of that size. The three conditions are unchanged — the tier
+    /// simply satisfies the spread one by construction — and the run inside a tier is still
+    /// time-contiguous WITHIN the tier, so the pieces of an over-large tier still partition it.
+    /// Smallest tier first: it is the cheapest progress per file removed, and it is what lets a
+    /// straggler ladder coalesce among itself while the bucket's collapsed file, several tiers
+    /// up, is never a partner for it.</para>
+    /// </summary>
+    internal static List<SegmentInfo>? SelectMergeTierRun(
+        List<SegmentInfo> byTime, int minSources, long target, long maximal)
+    {
+        int lowest = int.MaxValue, highest = int.MinValue;
+        foreach (var s in byTime)
+        {
+            int t = SizeTier(SegmentPayloadBytes(s));
+            if (t < lowest)  lowest  = t;
+            if (t > highest) highest = t;
+        }
+        if (lowest == highest) return null;   // one tier ⇒ SelectMergeRun already saw this list
+
+        var tier = new List<SegmentInfo>(byTime.Count);
+        for (int t = lowest; t <= highest; t++)
+        {
+            tier.Clear();
+            foreach (var s in byTime)
+                if (SizeTier(SegmentPayloadBytes(s)) == t) tier.Add(s);
+            if (tier.Count < 2) continue;
+
+            // byTime is ordered by Min, so tier is too: the run is still oldest-first.
+            var run = SelectMergeRun(tier, minSources, target, maximal);
+            if (run is not null) return run;
         }
         return null;
     }

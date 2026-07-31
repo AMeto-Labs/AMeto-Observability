@@ -254,13 +254,20 @@ public sealed class SegmentBucketAdversarialProbe : IAsyncLifetime
     }
 
     /// <summary>
-    /// The run planner STOPS at the first source it cannot take instead of stepping over it. The
-    /// old span guard <c>continue</c>d, so with an outlier in the middle of a bucket the merged
-    /// file spanned right across the source it had skipped and the two overlapped — every query
-    /// into that window then opened both.
+    /// A size outlier in the middle of a bucket. The contiguous planner STOPS at it rather than
+    /// stepping over it (see <see cref="MergeRunPlannerTests.AContiguousRunStopsAtTheFirstFileItCannotTake"/>,
+    /// which is where that decision stays observable) — but once it is exhausted the tier
+    /// fallback merges the small files on both sides, and the file it produces DOES span the
+    /// outlier. That overlap is deliberate and it is the price of a terminal state: without it
+    /// this bucket, and every bucket a bursty producer writes, keeps one file per flush forever.
+    ///
+    /// <para>What is bounded is how much overlap: files inside one size tier never overlap each
+    /// other, because a tier's run is still time-contiguous, so at any instant a query opens at
+    /// most one file PER TIER. Here that is 2, against 5 flushes and against the unbounded count
+    /// the contiguous-only rule produced.</para>
     /// </summary>
     [Fact]
-    public async Task AMergeNeverSpansASourceItSkipped()
+    public async Task OverlapCostsOneFilePerSizeTierNotOnePerFlush()
     {
         long b = BucketStart(LogLevel.Information, DateTime.UtcNow.Ticks - 30 * TimeSpan.TicksPerDay);
 
@@ -273,12 +280,37 @@ public sealed class SegmentBucketAdversarialProbe : IAsyncLifetime
 
         await CompactToExhaustionAsync();
 
-        var segs = _engine.ListSegments().OrderBy(s => s.MinTimestampTicks).ToList();
-        for (int i = 1; i < segs.Count; i++)
-            Assert.True(segs[i].MinTimestampTicks >= segs[i - 1].MaxTimestampTicks,
-                $"files {i - 1} and {i} overlap — a merge spanned a source it skipped");
-        _out.WriteLine($"{segs.Count} file(s) after compacting a bucket with a size outlier in the middle");
+        var segs  = _engine.ListSegments();
+        int tiers = segs.Select(s => StorageEngine.SizeTier(Math.Max(s.UncompressedBytes, s.CompressedBytes)))
+                        .Distinct().Count();
+        _out.WriteLine($"{segs.Count} file(s) in {tiers} size tier(s) after compacting a bucket " +
+                       $"with a size outlier in the middle; deepest overlap {DeepestOverlap(segs)}");
+
+        // No two files of one tier overlap: inside a tier the run is contiguous.
+        foreach (var group in segs.GroupBy(s => StorageEngine.SizeTier(Math.Max(s.UncompressedBytes, s.CompressedBytes))))
+        {
+            var inTier = group.OrderBy(s => s.MinTimestampTicks).ToList();
+            for (int i = 1; i < inTier.Count; i++)
+                Assert.True(inTier[i].MinTimestampTicks >= inTier[i - 1].MaxTimestampTicks,
+                    $"two files of tier {group.Key} overlap — a tier's run is not contiguous");
+        }
+        Assert.True(DeepestOverlap(segs) <= tiers,
+            $"{DeepestOverlap(segs)} files cover one instant, above the {tiers}-tier bound");
         Assert.Equal(1400, ServedEvents());
+    }
+
+    /// <summary>Most files covering any single instant — what a point query has to open.</summary>
+    private static int DeepestOverlap(IReadOnlyList<SegmentInfo> segs)
+    {
+        int deepest = 0;
+        foreach (var probe in segs)
+        {
+            int n = 0;
+            foreach (var s in segs)
+                if (s.MinTimestampTicks <= probe.MinTimestampTicks && probe.MinTimestampTicks <= s.MaxTimestampTicks) n++;
+            if (n > deepest) deepest = n;
+        }
+        return deepest;
     }
 
     // ── 3. The batch budget must not stall a bucket ───────────────────────────
