@@ -1544,7 +1544,17 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             {
                 SegmentInfo info;
                 source = new MergingSegmentEventSource(readers);
-                using (var writer = new SegmentWriter(tmpPath, groupBudget))
+                // HC HAPPENS HERE, and only here. A merge already rewrites every block it reads,
+                // it is off the ingest path, and its output is the long-lived file — so the extra
+                // encode is paid once, on a background pass, against a file that is read and kept
+                // until retention deletes it. The flush path stays on the fast level: its output
+                // is short-lived and this merge is what rewrites it.
+                //
+                // MEASURED (MergeCompressionProbe, 48k trace-carrying prop-dense events): the
+                // blocks shrink 12.8 % (26.5 % on body-logging events), the FILE shrinks 2.8 %
+                // because index sections are 78-90 % of it, and the merge costs ~18 % more wall
+                // clock — on the stand's volume, seconds of one core a day.
+                using (var writer = new SegmentWriter(tmpPath, groupBudget, SegmentCompression.High))
                 {
                     writer.WriteEvents(source, sinkFactory, ct);
                     info = writer.Finalise(_options.NodeId, segId);

@@ -105,10 +105,23 @@ public sealed class SegmentWriter : IDisposable
 
     public  const byte   FlagCompressed = 0x01;
 
+    /// <summary>
+    /// Header flag: this segment's blocks are LZ4-HC, not the fast flush level.
+    ///
+    /// <para>Same bit the retired background re-compressor set, and deliberately so: on disk
+    /// 0x02 has always meant "these blocks are HC", and a v4/v5 file that sweep already
+    /// rewrote keeps saying exactly that. Nothing in the read path consults it — LZ4 block
+    /// output is level-independent — it is a diagnostic, so "is my cold data actually
+    /// compressed hard?" is answerable from the file rather than from a log line.</para>
+    /// </summary>
+    public  const byte   FlagHighCompression = 0x02;
+
     private readonly string       _filePath;
     private readonly FileStream   _fs;
     private readonly BinaryWriter _bw;
     private readonly long         _groupBudget;
+    private readonly LZ4Level     _lz4Level;
+    private readonly byte         _compressionFlag;
 
     // v6 block-index entry: byte offset of the block, the block's MIN timestamp, and the
     // ordinal (file-order position, 0-based) of the block's first event. Index posting
@@ -156,15 +169,31 @@ public sealed class SegmentWriter : IDisposable
 
     public SegmentWriter(string filePath) : this(filePath, DefaultGroupPayloadBudgetBytes) { }
 
+    public SegmentWriter(string filePath, long groupPayloadBudgetBytes)
+        : this(filePath, groupPayloadBudgetBytes, SegmentCompression.Fast) { }
+
     /// <param name="groupPayloadBudgetBytes">
     /// Uncompressed block bytes per index group — see <see cref="DefaultGroupPayloadBudgetBytes"/>.
     /// Only honoured when a <see cref="SegmentIndexSinkFactory"/> is supplied; a caller that
     /// writes sections itself always produces exactly one group.
     /// </param>
-    public SegmentWriter(string filePath, long groupPayloadBudgetBytes)
+    /// <param name="compression">
+    /// Which LZ4 level the blocks are encoded at — see <see cref="SegmentCompression"/>. The
+    /// choice is per FILE and costs the reader nothing: an LZ4 block decodes identically
+    /// whichever level produced it, so this is a write-side knob only.
+    /// </param>
+    public SegmentWriter(string filePath, long groupPayloadBudgetBytes, SegmentCompression compression)
     {
         _filePath    = filePath;
         _groupBudget = Math.Max(1, groupPayloadBudgetBytes);
+        // L06, not the L09 the retired sweep used: MeasuredMergeCompressionProbe walks the whole
+        // ladder on two event shapes and L06 takes 99 % of L09's shrink (12.7 % vs 12.8 % on
+        // id-dense events, 26.5 % vs 26.7 % on text-dense) at 1.7× the encode rate — 235 MB/s
+        // against 135. L12 is 5× slower than L09 again for another 0.3 %.
+        _lz4Level    = compression == SegmentCompression.High ? LZ4Level.L06_HC : LZ4Level.L00_FAST;
+        _compressionFlag = compression == SegmentCompression.High
+            ? (byte)(FlagCompressed | FlagHighCompression)
+            : FlagCompressed;
         _fs          = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None, 65536, FileOptions.SequentialScan);
         _bw          = new BinaryWriter(_fs);
     }
@@ -430,7 +459,7 @@ public sealed class SegmentWriter : IDisposable
             MaxTimestampTicks  = _maxTimestamp == long.MinValue ? 0 : _maxTimestamp,
             EventCount         = (uint)_eventsWritten,
             MinLevelValue      = (byte)_minLevel,
-            Flags              = FlagCompressed,
+            Flags              = _compressionFlag,
         };
         WriteFileHeader(hdr);
 
@@ -607,7 +636,7 @@ public sealed class SegmentWriter : IDisposable
         byte[] compBuf         = ArrayPool<byte>.Shared.Rent(maxOut);
         try
         {
-            int compressedLen = LZ4Codec.Encode(uncompressed, 0, uncompressedLen, compBuf, 0, maxOut, LZ4Level.L00_FAST);
+            int compressedLen = LZ4Codec.Encode(uncompressed, 0, uncompressedLen, compBuf, 0, maxOut, _lz4Level);
 
             long blockOffset = _fs.Position;
             _blockIndex.Add((blockOffset, blockMinTs, (uint)_eventsFlushed));
