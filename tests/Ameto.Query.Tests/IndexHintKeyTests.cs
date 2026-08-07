@@ -171,6 +171,20 @@ public sealed class IndexHintKeyTests : IDisposable
     [Fact] public void BareLevelKeyword() => AssertIndexPath("Error", 9001);
     [Fact] public void ServiceNameBracketed() => AssertIndexPath("['service.name'] = 'Auth.API'", 9002);
 
+    // ── Reversed operands: the only entry that returned too MANY rows ─────────
+
+    [Fact]
+    public void LiteralOnTheLeft_FiltersOnTheRightHandProperty()
+    {
+        // Used to match every event in the hot tier (null compared to null) and none in
+        // cold — the same predicate failing in opposite directions in the two tiers.
+        AssertIndexPath($"'{TimeoutType}' = @x", 9001);
+    }
+
+    [Fact]
+    public void LiteralOnTheLeft_OrdersComparisonsTheRightWayRound() =>
+        AssertIndexPath("'ae-dxb' = Region", 9001);
+
     [Fact]
     public void AndOfTwoAliases() =>
         AssertIndexPath($"Level = 'Error' and @x = '{TimeoutType}'", 9001);

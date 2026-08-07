@@ -700,11 +700,23 @@ public sealed class FilterParser
         // Comparison operator
         if (TryConsumeOp(out var op))
         {
-            object? rhv = ParseValue(out _);
+            object? rhv = ParseValue(out string? rhProp);
             // If left is a property and right is a value, emit CompareNode
             if (lhProp is not null)
                 return new CompareNode(lhProp, op, rhv);
-            // right-hand side property with literal on left (swap)
+
+            // Literal on the left: the property is the RIGHT operand, so swap the operands
+            // and flip the operator. The right-hand property name used to be discarded, which
+            // built CompareNode(<the literal's text>, op, null) — a predicate whose "property"
+            // was the literal, resolving to null against every event. `'x' = @x` then compared
+            // null to null and matched EVERY event in the scan, while the hint went out under
+            // that same nonsense name and dropped every indexed segment. One predicate, the
+            // opposite error in each tier.
+            if (rhProp is not null)
+                return new CompareNode(rhProp, FlipOp(op), lhv);
+
+            // Two literals — there is no property to filter on. Preserved as-is: the
+            // left-hand text resolves to nothing and the comparison is simply false.
             return new CompareNode(lhv?.ToString() ?? "", FlipOp(op), rhv);
         }
 
