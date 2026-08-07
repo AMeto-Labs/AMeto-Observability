@@ -106,6 +106,65 @@ public sealed class EmptyIndexSemanticsTests
         Assert.True(read.MightContain("system.timeoutexception"));
     }
 
+    // ── Bloom filters that were already on disk when folding shipped ──────────
+
+    [Fact]
+    public void PreFoldingBloom_CannotProveAbsenceOfACasedValue()
+    {
+        using var read = SegmentBloomFilter.Deserialise(PreFoldingBlob("Error", "AE-DXB", "Wallet.API"));
+
+        // Its own casing still answers exactly...
+        Assert.True(read.MightContain("Error"));
+        Assert.True(read.MightContain("AE-DXB"));
+
+        // ...and every other casing must answer "might", not "no": the filter holds one
+        // arbitrary spelling, the scan compares OrdinalIgnoreCase, and phase 1 drops the
+        // segment before the inverted index gets a say. Folding on the WRITE side does
+        // nothing for bytes already written.
+        Assert.True(read.MightContain("error"));
+        Assert.True(read.MightContain("ERROR"));
+        Assert.True(read.MightContain("ae-dxb"));
+        Assert.True(read.MightContain("wallet.api"));
+    }
+
+    [Fact]
+    public void PreFoldingBloom_StillPrunesValuesThatHaveOnlyOneSpelling()
+    {
+        // A value with no cased characters has exactly one spelling, so the miss IS proof
+        // and these segments keep the cheap gate for the ids and numbers it matters most for.
+        using var read = SegmentBloomFilter.Deserialise(PreFoldingBlob("12345", "8080"));
+
+        Assert.True(read.MightContain("12345"));
+        Assert.False(read.MightContain("99999"));
+    }
+
+    [Fact]
+    public void PostFoldingBloom_StillPrunes()
+    {
+        using var build = SegmentBloomFilter.Create(16);
+        build.Add("Error");
+        using var read = SegmentBloomFilter.Deserialise(build.Serialise());
+
+        Assert.True(read.MightContain("error"));
+        Assert.False(read.MightContain("Warning"));
+    }
+
+    /// <summary>
+    /// A blob as an older build wrote it: values stored in their ORIGINAL casing (the byte
+    /// overload does not fold) and no folded marker in the capacity word.
+    /// </summary>
+    private static byte[] PreFoldingBlob(params string[] values)
+    {
+        using var build = SegmentBloomFilter.Create(16);
+        foreach (var v in values)
+            build.Add(System.Text.Encoding.UTF8.GetBytes(v));
+
+        var blob = build.Serialise();
+        uint capacity = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(blob.AsSpan(4));
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(blob.AsSpan(4), capacity & 0x7FFF_FFFFu);
+        return blob;
+    }
+
     private static SegmentInvertedIndex Build(params (string Property, string Value)[] pairs)
     {
         var build = new SegmentInvertedIndex();
