@@ -96,12 +96,12 @@ public sealed class SegmentIndexBuilder
         var exception = hot.GetException(i);
         if (exception is not null)
         {
-            _inverted.Add(offset, "@x.exists", "true");
-            _bloom.Add("@x.exists");
+            _inverted.Add(offset, ClefFields.ExceptionExists, "true");
+            _bloom.Add(ClefFields.ExceptionExists);
 
             if (!string.IsNullOrEmpty(exception.Type))
             {
-                _inverted.Add(offset, "@x.type", exception.Type);
+                _inverted.Add(offset, ClefFields.ExceptionType, exception.Type);
                 _bloom.Add(exception.Type);
                 if (exception.Type.Length >= 3) _trigram.Add(offset, exception.Type);
             }
@@ -109,7 +109,7 @@ public sealed class SegmentIndexBuilder
                 _trigram.Add(offset, exception.Message);
             if (exception.Inner is { Type.Length: > 0 } inner)
             {
-                _inverted.Add(offset, "@x.inner.type", inner.Type);
+                _inverted.Add(offset, ClefFields.ExceptionInnerType, inner.Type);
                 _bloom.Add(inner.Type);
             }
         }

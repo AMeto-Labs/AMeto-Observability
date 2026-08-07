@@ -163,25 +163,13 @@ public static class FilterEvaluator
 
     private static object? GetValue(LogEvent ev, string prop)
     {
-        // Built-in CLEF fields. Keys with a dot in the user grammar arrive
-        // here as PropertyPath.Separator-joined segments (e.g. "@x\u0001type").
-        switch (prop)
-        {
-            case "@l" or "Level":            return ev.Level.ToSeqString();
-            case "@mt" or "MessageTemplate": return ev.MessageTemplate;
-            case "@m" or "Message":          return ev.MessageTemplate;
-            case "@x" or "Exception":        return ev.Exception?.Type;
-            case "@x\u0001type"          or "Exception\u0001Type":          return ev.Exception?.Type;
-            case "@x\u0001message"       or "Exception\u0001Message":       return ev.Exception?.Message;
-            case "@x\u0001stack"         or "Exception\u0001StackTrace":    return ev.Exception?.StackTrace;
-            case "@x\u0001inner\u0001type"    or "Exception\u0001Inner\u0001Type":    return ev.Exception?.Inner?.Type;
-            case "@x\u0001inner\u0001message" or "Exception\u0001Inner\u0001Message": return ev.Exception?.Inner?.Message;
-            case "@t" or "Timestamp":        return ev.Timestamp.ToString("O");
-            case "@tr" or "TraceId":         return TraceIdHelper.FormatTraceId(ev.TraceIdHi, ev.TraceIdLo);
-            case "@sp" or "SpanId":          return TraceIdHelper.FormatSpanId(ev.SpanId);
-            case "@id" or "Id":              return ev.Id.RawValue;
-            case ClefFields.ServiceName:     return ev.ServiceName;
-        }
+        // Built-in CLEF fields. Which spellings count as built-in lives in BuiltinFields —
+        // the same table CompiledFilter consults to learn which index bucket a field is
+        // written to, so an alias accepted here can never be hinted under a name the index
+        // has never heard of. Keys with a dot in the user grammar arrive here as
+        // PropertyPath.Separator-joined segments (e.g. "@x\u0001type").
+        if (BuiltinFields.TryResolve(prop, out var field))
+            return ReadBuiltin(ev, field);
 
         if (ev.Properties is null) return null;
 
@@ -193,6 +181,28 @@ public static class FilterEvaluator
         // Nested path: walk dictionary tree segment-by-segment.
         return WalkPath(ev.Properties, prop.AsSpan());
     }
+
+    /// <summary>
+    /// Reads one resolved built-in field off the event. A switch over the enum compiles to a
+    /// jump table, so the per-event cost is the frozen-dictionary probe in
+    /// <see cref="BuiltinFields.TryResolve"/> plus one indirect branch — no allocation.
+    /// </summary>
+    private static object? ReadBuiltin(LogEvent ev, BuiltinField field) => field switch
+    {
+        BuiltinField.Level                 => ev.Level.ToSeqString(),
+        BuiltinField.MessageTemplate       => ev.MessageTemplate,
+        BuiltinField.ExceptionType         => ev.Exception?.Type,
+        BuiltinField.ExceptionMessage      => ev.Exception?.Message,
+        BuiltinField.ExceptionStack        => ev.Exception?.StackTrace,
+        BuiltinField.InnerExceptionType    => ev.Exception?.Inner?.Type,
+        BuiltinField.InnerExceptionMessage => ev.Exception?.Inner?.Message,
+        BuiltinField.Timestamp             => ev.Timestamp.ToString("O"),
+        BuiltinField.TraceId               => TraceIdHelper.FormatTraceId(ev.TraceIdHi, ev.TraceIdLo),
+        BuiltinField.SpanId                => TraceIdHelper.FormatSpanId(ev.SpanId),
+        BuiltinField.EventId               => ev.Id.RawValue,
+        BuiltinField.ServiceName           => ev.ServiceName,
+        _                                  => null,
+    };
 
     /// <summary>
     /// Walks a separator-delimited path through nested
