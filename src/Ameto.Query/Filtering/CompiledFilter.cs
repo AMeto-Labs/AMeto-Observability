@@ -199,21 +199,47 @@ public sealed class CompiledFilter
         return list.Count == 0 ? Array.Empty<(string, string)>() : list;
     }
 
+    /// <summary>
+    /// Whether <c>SegmentIndexBuilder</c> hands this filter-side property's text to the
+    /// trigram index — the <see cref="TryIndexKey"/> question, asked of the other index.
+    ///
+    /// <para>It has to be asked separately and it has to be asked at all:
+    /// <c>SegmentTrigramIndex.Lookup</c> returns an empty array for a trigram it does not
+    /// hold, and <c>QueryExecutor</c> reads that as proof and drops the segment. So a
+    /// <c>contains</c> on <c>@tr</c>, <c>@sp</c>, <c>@l</c>, <c>@id</c>, <c>service.name</c>
+    /// or the exception stack — none of which is ever trigrammed — returned rows while the
+    /// events were hot and zero the moment the segment flushed. Same shape as the seed
+    /// defect, different index.</para>
+    ///
+    /// <para>User properties are covered: the builder trigrams every scalar it flattens.</para>
+    /// </summary>
+    private static bool IsTrigramCovered(string property) =>
+        !BuiltinFields.TryResolve(property, out var field) || BuiltinFields.IsTrigramIndexed(field);
+
+    /// <summary>
+    /// Both SQL wildcards, so a LIKE pattern is cut into the literal runs the event text
+    /// really contains. Splitting on <c>%</c> alone handed <c>_</c> to the trigram index as
+    /// if it were a character of the value: <c>Region like 'ae_dxb'</c> looked up the
+    /// trigrams of the PATTERN, found none, and dropped the segment — while the scan's
+    /// <c>LikeMatchFast</c> happily matched the stored <c>ae-dxb</c>.
+    /// </summary>
+    private static readonly char[] LikeWildcards = ['%', '_'];
+
     private static void CollectTrigram(FilterNode node, List<(string, string)> out_)
     {
         switch (node)
         {
-            case ContainsNode ct when ct.Text.Length >= 3:
+            case ContainsNode ct when ct.Text.Length >= 3 && IsTrigramCovered(ct.Property):
                 out_.Add((ct.Property, ct.Text));
                 break;
 
-            case StartsWithNode sw when sw.Prefix.Length >= 3:
+            case StartsWithNode sw when sw.Prefix.Length >= 3 && IsTrigramCovered(sw.Property):
                 out_.Add((sw.Property, sw.Prefix));
                 break;
 
-            case LikeNode like:
-                // Extract every non-wildcard segment long enough for the trigram index
-                foreach (var p in like.Pattern.Split('%'))
+            case LikeNode like when IsTrigramCovered(like.Property):
+                // Extract every non-wildcard run long enough for the trigram index
+                foreach (var p in like.Pattern.Split(LikeWildcards))
                     if (p.Length >= 3) out_.Add((like.Property, p));
                 break;
 

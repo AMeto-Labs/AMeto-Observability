@@ -178,30 +178,19 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
     // ── Value identity: the index is typed, the scan is coercing ───────────────
 
     /// <summary>
-    /// Upper bound on the serialised spellings one filter literal can match — the exact
-    /// typed form, the untyped text, the four numeric tags and the one bool bucket.
-    /// </summary>
-    private const int MaxValueForms = 7;
-
-    /// <summary>Stack buffer for <see cref="CollectValueForms"/> — managed refs cannot be
-    /// <c>stackalloc</c>ed, and an inline array keeps the probe allocation-free.</summary>
-    [System.Runtime.CompilerServices.InlineArray(MaxValueForms)]
-    private struct ValueFormBuffer { private string? _element0; }
-
-    /// <summary>
-    /// Unions the postings of every serialised spelling of <paramref name="value"/> the bucket
-    /// actually holds. Returns null only when it holds NONE of them — the single state a
-    /// caller may read as proof that no event matches.
+    /// Unions the postings of every encoding of <paramref name="value"/> the bucket actually
+    /// holds (see <see cref="IndexValueForms.Serialised"/>). Returns null only when it holds
+    /// NONE of them — the single state a caller may read as proof that no event matches.
     ///
-    /// <para>The union is complete, not a guess: a spelling with no bucket entry describes no
-    /// event, so adding it changes nothing, and every spelling the scan would accept is
+    /// <para>The union is complete, not a guess: an encoding with no bucket entry describes no
+    /// event, so adding it changes nothing, and every encoding the scan would accept is
     /// probed.</para>
     /// </summary>
     private static int[]? PostingsFor(Dictionary<string, int[]> values, object? value)
     {
-        ValueFormBuffer buf = default;
+        IndexValueForms.Buffer buf = default;
         Span<string?> forms = buf;
-        int n = CollectValueForms(value, forms);
+        int n = IndexValueForms.Serialised(value, forms);
 
         int[]? acc = null;
         for (int i = 0; i < n; i++)
@@ -210,90 +199,6 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
             acc = acc is null ? offsets : UnionAscending(acc, offsets);
         }
         return acc;
-    }
-
-    /// <summary>
-    /// Every serialised spelling a STORED value can have that <c>FilterEvaluator.Compare</c>
-    /// would consider equal to <paramref name="value"/>.
-    ///
-    /// <para><see cref="SerialiseValue"/> gives the index a TYPED notion of value identity —
-    /// <c>\0l5</c> for an integer, <c>\0d5</c> for a double, <c>\0true</c> for a bool, bare
-    /// text for a string. The scan's notion is deliberately COERCING: it compares numbers
-    /// across types through <c>ToDouble</c>, tests a stored bool against the literal's TEXT,
-    /// and parses a numeric string. Probing only the exact form therefore let the index answer
-    /// "absent" for a value the scan matches — and because a known bucket with an absent value
-    /// is proof (see <see cref="LookupIntersect"/>), the whole segment was dropped unread.
-    /// <c>Count = '5'</c> against a stored msgpack integer, <c>Enabled = 'true'</c> against a
-    /// stored bool and <c>Ratio = 5</c> against a stored 5.0 each returned rows while the
-    /// events were hot and nothing at all once the segment flushed.</para>
-    ///
-    /// <para>The key axis of this bug class is closed by suppressing hints for fields the
-    /// index does not store; the value axis cannot be closed that way — the stored TYPE is
-    /// unknown until the bucket is open — so it is closed by probing instead.</para>
-    /// </summary>
-    private static int CollectValueForms(object? value, Span<string?> forms)
-    {
-        // `X = null` matches a missing property, which no bucket records, so the literal nil
-        // is the only spelling worth probing. (Compare short-circuits every cross-type case
-        // when either side is null.)
-        if (value is null) { forms[0] = "\0null"; return 1; }
-
-        int n = 0;
-        Append(forms, ref n, SerialiseValue(value));
-
-        // A stored STRING is compared against the literal's text (OrdinalIgnoreCase, which the
-        // posting dictionary itself already uses), so the untyped spelling always qualifies.
-        string plain = value.ToString() ?? string.Empty;
-        Append(forms, ref n, plain);
-
-        // Stored numbers are compared cross-type through ToDouble, so every numeric tag that
-        // formats to the same number qualifies — including from a quoted literal, which
-        // ToDouble parses.
-        if (TryAsDouble(value, out double d))
-        {
-            // Only inside 2^53 is the long round-trip exact; past it a double cannot name a
-            // distinct integer anyway.
-            if (d == Math.Truncate(d) && Math.Abs(d) <= 9007199254740992d)
-            {
-                long l = (long)d;
-                Append(forms, ref n, $"\0l{l}");
-                Append(forms, ref n, $"\0i{l}");
-            }
-            Append(forms, ref n, $"\0d{d:R}");
-            Append(forms, ref n, $"\0f{(float)d:R}");
-        }
-
-        // A stored BOOL is compared against the literal's TEXT ("true" ⇒ true, anything else
-        // ⇒ false), so exactly one bool bucket can match a non-bool literal.
-        if (value is not bool)
-            Append(forms, ref n,
-                string.Equals(plain, "true", StringComparison.OrdinalIgnoreCase) ? "\0true" : "\0false");
-
-        return n;
-    }
-
-    private static void Append(Span<string?> forms, ref int n, string form)
-    {
-        for (int i = 0; i < n; i++)
-            if (string.Equals(forms[i], form, StringComparison.Ordinal)) return;
-        forms[n++] = form;
-    }
-
-    /// <summary>Mirrors <c>FilterEvaluator.ToDouble</c> for the types a filter literal or a
-    /// msgpack scalar can be — same invariant-culture string parse, so the two agree.</summary>
-    private static bool TryAsDouble(object value, out double d)
-    {
-        switch (value)
-        {
-            case long   l: d = l;  return true;
-            case int    i: d = i;  return true;
-            case double x: d = x;  return !double.IsNaN(x);
-            case float  f: d = f;  return !float.IsNaN(f);
-            case string s:
-                return double.TryParse(s, System.Globalization.NumberStyles.Any,
-                    System.Globalization.CultureInfo.InvariantCulture, out d);
-            default: d = 0; return false;
-        }
     }
 
     /// <summary>Unions two ascending, distinct int arrays into a new ascending array.</summary>
@@ -528,15 +433,7 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
         return list.ToArray();
     }
 
-    private static string SerialiseValue(object? value) => value switch
-    {
-        null          => "\0null",
-        bool b        => b ? "\0true" : "\0false",
-        int i         => $"\0i{i}",
-        long l        => $"\0l{l}",
-        double d      => $"\0d{d:R}",
-        float f       => $"\0f{f:R}",
-        string s      => s,
-        _             => value.ToString() ?? string.Empty,
-    };
+    /// <summary>The one encoding a stored value is filed under — see
+    /// <see cref="IndexValueForms"/>, which also enumerates what a query may match it with.</summary>
+    private static string SerialiseValue(object? value) => IndexValueForms.Serialise(value);
 }

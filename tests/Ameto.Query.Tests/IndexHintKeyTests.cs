@@ -58,7 +58,8 @@ public sealed class IndexHintKeyTests : IDisposable
         };
 
         Write(id: 9001, LogLevel.Error, ShippedTpl, "Wallet.API", boom,
-              trace: true, props: Props(("Region", "ae-dxb"), ("Tags", new[] { "urgent", "ops" })));
+              trace: true, props: Props(("Region", "ae-dxb"), ("Tags", new[] { "urgent", "ops" }),
+                                        ("Score", 12345L), ("Ratio", 2.5d), ("Enabled", true)));
 
         Write(id: 9002, LogLevel.Information, "User {User} signed in", "Auth.API", exception: null,
               trace: false, props: Props(("Region", "ae-auh")));
@@ -189,6 +190,64 @@ public sealed class IndexHintKeyTests : IDisposable
     public void AndOfTwoAliases() =>
         AssertIndexPath($"Level = 'Error' and @x = '{TimeoutType}'", 9001);
 
+    // ── Trigram coverage axis: the same defect, one index over ────────────────
+    // SegmentTrigramIndex.Lookup reads a missing trigram in a POPULATED index as proof of
+    // absence, so a substring/prefix hint on text the builder never trigrammed drops the
+    // segment exactly as fatally as the seed defect's unanswerable bucket name did. The
+    // builder trigrams the message template, the exception type and message, and property
+    // values — never a hex id, a level, an event id, a service name or a stack trace.
+
+    [Fact] public void ContainsTraceId()      => AssertIndexPath($"contains(@tr, '{TraceHex[..8]}')", 9001);
+    [Fact] public void StartsWithTraceId()    => AssertIndexPath($"startsWith(@tr, '{TraceHex[..8]}')", 9001);
+    [Fact] public void LikeTraceId()          => AssertIndexPath($"@tr like '{TraceHex[..8]}%'", 9001);
+    [Fact] public void ContainsSpanId()       => AssertIndexPath($"contains(@sp, '{SpanHex[..6]}')", 9001);
+    [Fact] public void ContainsLevel()        => AssertIndexPath("contains(@l, 'rro')", 9001);
+    [Fact] public void ContainsEventId()      => AssertIndexPath("contains(@id, '900')", 9001, 9002, 9003);
+    [Fact] public void ContainsStackTrace()   => AssertIndexPath("contains(@x.stack, 'Wallet.Api')", 9001);
+    [Fact] public void ContainsServiceName()  => AssertIndexPath("contains(service.name, 'allet')", 9001, 9003);
+    [Fact] public void LikeServiceName()      => AssertIndexPath("service.name like 'Wallet%'", 9001, 9003);
+    [Fact] public void ContainsInnerType()    => AssertIndexPath("contains(@x.inner.type, 'Sockets')", 9001);
+
+    /// <summary>A msgpack integer is not a string, and the scan stringifies it anyway.</summary>
+    [Fact] public void ContainsNumericProperty() => AssertIndexPath("contains(Score, '234')", 9001);
+
+    /// <summary>A msgpack bool, same shape.</summary>
+    [Fact] public void ContainsBoolProperty() => AssertIndexPath("contains(Enabled, 'rue')", 9001);
+
+    /// <summary>
+    /// The LIKE single-character wildcard is a PATTERN character, not a character of the
+    /// value: hinting the raw <c>ae_dxb</c> looks up trigrams the event never had.
+    /// </summary>
+    [Fact] public void LikeSingleCharWildcard() => AssertIndexPath("Region like 'ae_dxb'", 9001);
+
+    [Fact] public void LikeSingleCharWildcardMidPattern() => AssertIndexPath("Region like '%e_dx%'", 9001);
+
+    // ── The trigram index must still narrow, not just stop being wrong ────────
+
+    [Fact]
+    public void AbsentTrigramInCoveredText_StillSkipsTheSegment()
+    {
+        // The message template IS trigrammed, so its silence is proof and must keep pruning.
+        var filter = CompiledFilter.Compile("contains(@mt, 'zzqqxx')");
+        Assert.False(Prefilter(filter, out _), "trigrammed text the index lacks must still skip the segment");
+    }
+
+    // ── Value type-form axis: the index is typed, the scan coerces ────────────
+
+    [Fact] public void QuotedIntegerLiteral() => AssertIndexPath("Score = '12345'", 9001);
+    [Fact] public void IntegerLiteral()       => AssertIndexPath("Score = 12345", 9001);
+    [Fact] public void QuotedBoolLiteral()    => AssertIndexPath("Enabled = 'true'", 9001);
+    [Fact] public void BoolLiteral()          => AssertIndexPath("Enabled = true", 9001);
+    [Fact] public void QuotedDoubleLiteral()  => AssertIndexPath("Ratio = '2.5'", 9001);
+    [Fact] public void DoubleLiteral()        => AssertIndexPath("Ratio = 2.5", 9001);
+
+    [Fact]
+    public void WrongNumericValue_StillSkipsTheSegment()
+    {
+        var filter = CompiledFilter.Compile("Score = 999");
+        Assert.False(Prefilter(filter, out _));
+    }
+
     // ── The constants BuiltinFields hints with must name real buckets ─────────
 
     [Theory]
@@ -282,9 +341,14 @@ public sealed class IndexHintKeyTests : IDisposable
     }
 
     /// <summary>
-    /// Mirrors <c>QueryExecutor.PrefilterSegmentsAsync</c> for one segment: phase-1 bloom
-    /// gate on the equality hint, phase-2 definitive <c>MightContain</c>, trigram offsets,
-    /// then inverted narrowing. Returns false when the segment would be dropped outright.
+    /// Runs <c>QueryExecutor</c>'s own prefilter over this fixture's segment: the phase-1
+    /// bloom gate on the equality hint, then phase-2's definitive <c>MightContain</c>,
+    /// trigram offsets and inverted narrowing. Returns false when the segment would be
+    /// dropped outright.
+    ///
+    /// <para>These are the production methods, not a copy of them. A copy passed this suite
+    /// green while <c>PrefilterSegmentsAsync</c> itself was reverted to a losing version —
+    /// which is precisely the failure these tests exist to catch.</para>
     /// </summary>
     private bool Prefilter(CompiledFilter filter, out uint[]? candidates)
     {
@@ -293,54 +357,18 @@ public sealed class IndexHintKeyTests : IDisposable
         var invertedHints   = filter.GetInvertedHints();
         bool hasIndexHint   = !filter.IsMatchAll && filter.TryGetIndexHint(out _, out _);
 
+        // The executor's own fast path: nothing to ask the index, so nothing may be dropped.
         if (!hasIndexHint && invertedHints.Count == 0 && trigramHints.Count == 0)
             return true;
 
-        if (hasIndexHint && filter.TryGetIndexHint(out _, out object? hintVal))
+        if (hasIndexHint)
         {
             using var bloom = SegmentBloomFilter.Deserialise(_bloomBytes);
-            if (!bloom.MightContain(hintVal?.ToString() ?? string.Empty)) return false;
+            if (!QueryExecutor.PassesBloomGate(filter, bloom)) return false;
         }
 
         var idx = SegmentIndexReader.Load(_invertedBytes, _trigramBytes, _bloomBytes);
-
-        if (hasIndexHint && filter.TryGetIndexHint(out string prop, out object? val)
-            && !idx.MightContain(prop, val))
-            return false;
-
-        if (trigramHints.Count > 0)
-        {
-            HashSet<uint>? acc = null;
-            foreach (var (_, text) in trigramHints)
-            {
-                var offsets = idx.LookupTrigram(text);
-                if (offsets is null) continue;
-                if (acc is null) acc = [.. offsets];
-                else             acc.IntersectWith(offsets);
-                if (acc.Count == 0) return false;
-            }
-            candidates = acc?.ToArray();
-        }
-
-        if (invertedHints.Count > 0)
-        {
-            var invOffsets = idx.LookupIntersect(invertedHints);
-            if (invOffsets is not null)
-            {
-                if (invOffsets.Length == 0) return false;
-                if (candidates is null) candidates = invOffsets;
-                else
-                {
-                    var invSet = new HashSet<uint>(invOffsets);
-                    var merged = new List<uint>();
-                    foreach (var o in candidates)
-                        if (invSet.Contains(o)) merged.Add(o);
-                    if (merged.Count == 0) return false;
-                    candidates = [.. merged];
-                }
-            }
-        }
-        return true;
+        return QueryExecutor.TryNarrowWithIndex(filter, idx, out candidates);
     }
 
     // ── Fixture helpers ───────────────────────────────────────────────────────
@@ -376,6 +404,9 @@ public sealed class IndexHintKeyTests : IDisposable
             {
                 case string s:   w.Write(s); break;
                 case int i:      w.Write(i); break;
+                case long l:     w.Write(l); break;
+                case double d:   w.Write(d); break;
+                case bool b:     w.Write(b); break;
                 case string[] a:
                     w.WriteArrayHeader(a.Length);
                     foreach (var item in a) w.Write(item);
