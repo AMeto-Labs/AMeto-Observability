@@ -72,6 +72,14 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     // reset the counter — a stampede of concurrent flush tasks under load.
     private          int _thresholdFlushScheduled;
 
+    // Handle on that flush, because it runs OFF the flush loop and so was invisible to
+    // shutdown. DisposeAsync awaited _flushTask/_rollupTask and then disposed the WAL and
+    // both locks while a threshold flush could still be writing its file — the orphan then
+    // took a disposed lock and committed a disposed WAL. The commit is caught and logged,
+    // which is the damaging part: an uncommitted generation is replayed on the next start,
+    // so points already in the file come back a second time as duplicates.
+    private Task _thresholdFlushTask = Task.CompletedTask;
+
     // ── Metadata catalog (maintained at ingestion, survives hot-tier drains) ───
     private readonly ConcurrentDictionary<string, MetricMeta> _meta =
         new(StringComparer.Ordinal);
@@ -84,6 +92,16 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     // ── Cold tier ─────────────────────────────────────────────────────────────
     private readonly List<MetricSegmentInfo>      _coldSegments = new();
     private readonly ReaderWriterLockSlim          _coldLock     = new();
+
+    // Cold discovery is deliberately off the startup path (see the constructor), so for a
+    // window after construction a query legitimately sees no cold data at all. Without a
+    // signal there is no way to tell that window apart from "there is nothing on disk",
+    // and a caller that treats the first non-empty answer as the whole answer reads a
+    // fraction of the data and cannot know it.
+    private readonly TaskCompletionSource _coldLoaded = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>Completes once the background cold-segment scan has published its result.</summary>
+    internal Task ColdLoadCompleted => _coldLoaded.Task;
 
     private readonly string                        _dataDir;
     private readonly ILogger<MetricStorageEngine>  _logger;
@@ -221,11 +239,14 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         if (total >= HotFlushThreshold
             && System.Threading.Interlocked.CompareExchange(ref _thresholdFlushScheduled, 1, 0) == 0)
         {
-            _ = Task.Run(async () =>
+            // Published before the gate is reset inside the lambda, so shutdown always sees a
+            // handle on the newest in-flight flush. A later ingest can overwrite it only after
+            // that reset, by which point the previous flush has finished its file and commit.
+            Volatile.Write(ref _thresholdFlushTask, Task.Run(async () =>
             {
                 try { await FlushHotTierAsync().ConfigureAwait(false); }
                 finally { System.Threading.Interlocked.Exchange(ref _thresholdFlushScheduled, 0); }
-            });
+            }));
         }
     }
 
@@ -442,6 +463,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         // Background init (see ctor comment): discover cold segments + seed catalog.
         try { LoadColdSegments(); }
         catch (Exception ex) { _logger.LogError(ex, "Cold metric segment load failed"); }
+        finally { _coldLoaded.TrySetResult(); }   // a failed scan must not leave waiters hanging
 
         while (!ct.IsCancellationRequested)
         {
@@ -1046,6 +1068,13 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         _cts.Cancel();
         try { await Task.WhenAll(_flushTask, _rollupTask); }
         catch (OperationCanceledException) { }
+
+        // A threshold flush is scheduled off the ingest path, so it is in neither loop and
+        // outlived shutdown. Awaiting it here is what makes the ordering below safe: nothing
+        // touches the WAL or the locks after this point.
+        try { await Volatile.Read(ref _thresholdFlushTask); }
+        catch (Exception ex) { _logger.LogWarning(ex, "Metric threshold flush failed during shutdown"); }
+
         _cts.Dispose();
         _coldLock.Dispose();
         _snapshotLock.Dispose();

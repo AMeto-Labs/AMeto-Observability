@@ -49,16 +49,19 @@ public sealed class MetricWalTests : IDisposable
 
     private static int TrcCount(string dir, string pattern) => Directory.GetFiles(dir, pattern).Length;
 
-    /// <summary>Polls until the engine's background cold-segment scan has published its files.</summary>
+    /// <summary>
+    /// Waits for the engine's background cold-segment scan, then queries.
+    ///
+    /// <para>This polled for the first non-empty answer, which is not the same thing: the hot
+    /// tier is populated from the WAL in the constructor and answers immediately, so the poll
+    /// returned as soon as the recovered points showed up — before a single cold file had been
+    /// registered. A test that asserts nothing was lost then measured a fraction of the data
+    /// and blamed the engine for it.</para>
+    /// </summary>
     private static async Task<List<MetricSeries>> QueryWhenColdLoadedAsync(MetricStorageEngine engine, string name)
     {
-        for (int i = 0; i < 100; i++)
-        {
-            var s = engine.QueryAsync(name).ToBlockingEnumerable().ToList();
-            if (s.Count > 0) return s;
-            await Task.Delay(50);
-        }
-        return [];
+        await engine.ColdLoadCompleted.WaitAsync(TimeSpan.FromSeconds(30));
+        return engine.QueryAsync(name).ToBlockingEnumerable().ToList();
     }
 
     // ── Roundtrip ─────────────────────────────────────────────────────────────
