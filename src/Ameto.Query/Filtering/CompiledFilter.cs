@@ -63,7 +63,7 @@ public sealed class CompiledFilter
 
         switch (node)
         {
-            case CompareNode { Op: CompareOp.Eq } cmp when cmp.Value is not null:
+            case CompareNode { Op: CompareOp.Eq, RightProperty: null } cmp when cmp.Value is not null:
                 if (!TryBloomHintKey(cmp.Property, out prop)) { prop = string.Empty; return false; }
                 val = cmp.Value;
                 return true;
@@ -174,8 +174,9 @@ public sealed class CompiledFilter
         {
             // `X = null` is deliberately not hinted: the evaluator treats a missing property
             // as null and matches, but the index only files events that carried an explicit
-            // nil, so the posting list is a subset of the matches.
-            case CompareNode { Op: CompareOp.Eq } cmp when cmp.Value is not null:
+            // nil, so the posting list is a subset of the matches. `A = B` is not hinted
+            // either — its right side is read off the event, so there is no value to look up.
+            case CompareNode { Op: CompareOp.Eq, RightProperty: null } cmp when cmp.Value is not null:
                 if (TryIndexKey(cmp.Property, out string cmpKey)) out_.Add((cmpKey, cmp.Value));
                 break;
             case LevelNode lvl:

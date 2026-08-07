@@ -59,7 +59,8 @@ public sealed class IndexHintKeyTests : IDisposable
 
         Write(id: 9001, LogLevel.Error, ShippedTpl, "Wallet.API", boom,
               trace: true, props: Props(("Region", "ae-dxb"), ("Tags", new[] { "urgent", "ops" }),
-                                        ("Score", 12345L), ("Ratio", 2.5d), ("Enabled", true)));
+                                        ("Score", 12345L), ("Ratio", 2.5d), ("Enabled", true),
+                                        ("Mirror", "ae-dxb")));
 
         Write(id: 9002, LogLevel.Information, "User {User} signed in", "Auth.API", exception: null,
               trace: false, props: Props(("Region", "ae-auh")));
@@ -189,6 +190,31 @@ public sealed class IndexHintKeyTests : IDisposable
     [Fact]
     public void AndOfTwoAliases() =>
         AssertIndexPath($"Level = 'Error' and @x = '{TimeoutType}'", 9001);
+
+    // ── Both operands properties: the right-hand NAME used to be discarded ────
+
+    [Fact]
+    public void PropertyComparedToProperty_ReadsBothOffTheEvent()
+    {
+        // `Region = Mirror` used to parse as `Region = null`, so it could never match two
+        // properties that held the same value. Event 9001 carries Region and Mirror equal.
+        AssertIndexPath("Region = Mirror", 9001);
+    }
+
+    [Fact]
+    public void PropertyComparedToADifferentProperty_DoesNotMatch() =>
+        AssertIndexPath("Region = Score");
+
+    [Fact]
+    public void PropertyComparedToProperty_EmitsNoHint()
+    {
+        // Nothing to look up: the right side is not known until an event is read. Per the
+        // standing rule that is NO hint, never a hint the index answers "nothing" to.
+        var filter = CompiledFilter.Compile("Region = Mirror");
+        Assert.Empty(filter.GetInvertedHints());
+        Assert.False(filter.TryGetIndexHint(out _, out _));
+        Assert.True(Prefilter(filter, out _));
+    }
 
     // ── Trigram coverage axis: the same defect, one index over ────────────────
     // SegmentTrigramIndex.Lookup reads a missing trigram in a POPULATED index as proof of

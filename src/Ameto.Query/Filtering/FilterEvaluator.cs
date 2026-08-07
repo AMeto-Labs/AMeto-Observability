@@ -254,13 +254,17 @@ public static class FilterEvaluator
     {
         // Inline MatchAny: avoids closure/delegate allocation on every event
         object? actual = GetValue(ev, node.Property);
+
+        // `A = B`: the right operand is read off the same event, not off the AST.
+        object? expected = node.RightProperty is { } rhs ? GetValue(ev, rhs) : node.Value;
+
         if (actual is IList list && actual is not byte[] && actual is not string)
         {
             for (int i = 0; i < list.Count; i++)
-                if (Compare(list[i], node.Value, node.Op)) return true;
+                if (Compare(list[i], expected, node.Op)) return true;
             return false;
         }
-        return Compare(actual, node.Value, node.Op);
+        return Compare(actual, expected, node.Op);
     }
 
     /// <summary>

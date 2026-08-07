@@ -701,9 +701,17 @@ public sealed class FilterParser
         if (TryConsumeOp(out var op))
         {
             object? rhv = ParseValue(out string? rhProp);
-            // If left is a property and right is a value, emit CompareNode
+
+            // Property on the left. If the right side is also a property, keep its NAME —
+            // dropping it turned `Region = Fallback` into `Region = null`, an is-absent test
+            // wearing the syntax of a comparison: it could never match two equal properties
+            // and it matched every event carrying neither. `Region = urgent` (quotes
+            // forgotten) is the same shape, and reading it as "compare with the property
+            // named urgent" is at least the thing the grammar says.
             if (lhProp is not null)
-                return new CompareNode(lhProp, op, rhv);
+                return rhProp is not null
+                    ? new CompareNode(lhProp, op, null, rhProp)
+                    : new CompareNode(lhProp, op, rhv);
 
             // Literal on the left: the property is the RIGHT operand, so swap the operands
             // and flip the operator. The right-hand property name used to be discarded, which
