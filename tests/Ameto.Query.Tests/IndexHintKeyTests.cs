@@ -62,12 +62,22 @@ public sealed class IndexHintKeyTests : IDisposable
                                         ("Score", 12345L), ("Ratio", 2.5d), ("Enabled", true),
                                         ("Mirror", "ae-dxb")));
 
+        // Flat, dotted attribute names — exactly what OtlpLogMapper writes.
         Write(id: 9002, LogLevel.Information, "User {User} signed in", "Auth.API", exception: null,
-              trace: false, props: Props(("Region", "ae-auh")));
+              trace: false, props: Props(("Region", "ae-auh"),
+                                         ("http.request.method", "GET"),
+                                         ("http.method", "GET"),
+                                         ("db.system", "postgresql")));
 
+        // The same names as a nested map — the reading the grammar always had.
         Write(id: 9003, LogLevel.Warning, "Retrying {Attempt}", "Wallet.API",
               new ExceptionInfo { Type = InvalidOpType },
-              trace: false, props: Props(("Region", "ae-shj")));
+              trace: false, props: Props(("Region", "ae-shj"),
+                                         ("http", new Dictionary<string, object>
+                                         {
+                                             ["route"]  = "/orders",
+                                             ["method"] = "GET",
+                                         })));
 
         _hot.Freeze();
         _events = [.. _hot.ReadAll(_pool)];
@@ -190,6 +200,39 @@ public sealed class IndexHintKeyTests : IDisposable
     [Fact]
     public void AndOfTwoAliases() =>
         AssertIndexPath($"Level = 'Error' and @x = '{TimeoutType}'", 9001);
+
+    // ── Dotted key axis: every OTLP attribute name has dots in it ─────────────
+    // The parser splits a dotted name into path segments, but OtlpLogMapper copies resource
+    // and record attributes VERBATIM, so `http.request.method` is one key with dots — not a
+    // nested `http` map. On an OTLP server that made every semantic-convention filter match
+    // nothing unless the user knew to bracket-quote it.
+
+    [Fact] public void DottedAttributeName()          => AssertIndexPath("http.request.method = 'GET'", 9002);
+    [Fact] public void DottedAttributeNameBracketed() => AssertIndexPath("['http.request.method'] = 'GET'", 9002);
+    [Fact] public void DottedAttributeTwoSegments()   => AssertIndexPath("db.system = 'postgresql'", 9002);
+
+    [Fact]
+    public void NestedMapKeepsItsMeaning()
+    {
+        // A genuinely nested map is still read as a walk — the flat spelling is only ever a
+        // fallback, so nothing that worked before changes meaning.
+        AssertIndexPath("http.route = '/orders'", 9003);
+    }
+
+    [Fact]
+    public void DottedAttributeAndNestedMapCoexist()
+    {
+        // Event 9002 holds the flat key, 9003 the nested map, and one filter must find both:
+        // the index unions the two buckets instead of pruning on whichever it looked at first.
+        AssertIndexPath("http.method = 'GET'", 9002, 9003);
+    }
+
+    [Fact]
+    public void DottedAttributeWrongValue_StillSkipsTheSegment()
+    {
+        var filter = CompiledFilter.Compile("http.request.method = 'TRACE'");
+        Assert.False(Prefilter(filter, out _));
+    }
 
     // ── Both operands properties: the right-hand NAME used to be discarded ────
 
@@ -420,27 +463,36 @@ public sealed class IndexHintKeyTests : IDisposable
     /// <summary>Msgpack map of the given (key, value) pairs — the payload shape ingest writes.</summary>
     private static byte[] Props(params (string Key, object Value)[] pairs)
     {
-        var buf = new ArrayBufferWriter<byte>(128);
+        var buf = new ArrayBufferWriter<byte>(256);
         var w   = new MessagePackWriter(buf);
         w.WriteMapHeader(pairs.Length);
         foreach (var (key, value) in pairs)
         {
             w.Write(key);
-            switch (value)
-            {
-                case string s:   w.Write(s); break;
-                case int i:      w.Write(i); break;
-                case long l:     w.Write(l); break;
-                case double d:   w.Write(d); break;
-                case bool b:     w.Write(b); break;
-                case string[] a:
-                    w.WriteArrayHeader(a.Length);
-                    foreach (var item in a) w.Write(item);
-                    break;
-                default: throw new NotSupportedException(value.GetType().Name);
-            }
+            WriteValue(ref w, value);
         }
         w.Flush();
         return buf.WrittenSpan.ToArray();
+    }
+
+    private static void WriteValue(ref MessagePackWriter w, object value)
+    {
+        switch (value)
+        {
+            case string s:   w.Write(s); break;
+            case int i:      w.Write(i); break;
+            case long l:     w.Write(l); break;
+            case double d:   w.Write(d); break;
+            case bool b:     w.Write(b); break;
+            case string[] a:
+                w.WriteArrayHeader(a.Length);
+                foreach (var item in a) w.Write(item);
+                break;
+            case Dictionary<string, object> map:
+                w.WriteMapHeader(map.Count);
+                foreach (var (k, v) in map) { w.Write(k); WriteValue(ref w, v); }
+                break;
+            default: throw new NotSupportedException(value.GetType().Name);
+        }
     }
 }

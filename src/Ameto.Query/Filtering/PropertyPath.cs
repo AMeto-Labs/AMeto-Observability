@@ -34,6 +34,35 @@ public static class PropertyPath
     public static ReadOnlySpan<char> SegmentValue(ReadOnlySpan<char> segment) =>
         IsIndexSegment(segment) ? segment[1..] : segment;
 
+    /// <summary>
+    /// True when the encoded path could ALSO name a single flat property key spelled with
+    /// literal dots — i.e. it is nested and carries no array subscript.
+    ///
+    /// <para><c>FilterParser.ReadPropertyPath</c> splits <c>http.request.method</c> on the dot
+    /// and rejoins with <see cref="Separator"/>, but an OTLP attribute of that name is ONE key
+    /// with dots in it: <c>OtlpLogMapper</c> copies resource and record attributes verbatim,
+    /// <c>LogEventSerializer.ReadMap</c> stores them verbatim, and <c>SegmentIndexBuilder</c>
+    /// files them verbatim. So the grammar's only reading of a dotted name was "walk a nested
+    /// map", and every semantic-convention attribute filter on an OTLP server matched nothing
+    /// unless the user knew to bracket-quote it. Both spellings are now candidates, on the
+    /// evaluator side and in the index lookup alike.</para>
+    /// </summary>
+    public static bool MayBeFlatKey(string path) =>
+        path.IndexOf(Separator) >= 0 && path.IndexOf(IndexMarker) < 0;
+
+    /// <summary>
+    /// Writes the literal-dot spelling of an encoded path into <paramref name="dest"/> and
+    /// returns its length, or -1 when <paramref name="dest"/> is too small. Allocation-free:
+    /// the evaluator calls this per event.
+    /// </summary>
+    public static int WriteFlatKey(ReadOnlySpan<char> path, Span<char> dest)
+    {
+        if (dest.Length < path.Length) return -1;
+        for (int i = 0; i < path.Length; i++)
+            dest[i] = path[i] == Separator ? '.' : path[i];
+        return path.Length;
+    }
+
     /// <summary>Number of segments in an encoded path (always at least one).</summary>
     public static int SegmentCount(string path)
     {

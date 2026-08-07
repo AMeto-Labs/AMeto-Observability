@@ -101,10 +101,8 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
         // Query mode: return a copy of the decoded ascending offsets.
         if (_postings is not null)
         {
-            if (_postings.TryGetValue(propertyName, out var values) &&
-                PostingsFor(values, value) is { } offsets)
-                return ToUInt(offsets);
-            return null;
+            var offsets = PostingsForKey(propertyName, value, out _);
+            return offsets is null ? null : ToUInt(offsets);
         }
 
         // Build mode (test-only: production queries always read a deserialised index).
@@ -128,8 +126,8 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
     /// turns every filter/index naming disagreement into missing rows instead of a slower
     /// query. The predicate is therefore dropped from the intersection and re-checked by the
     /// scan. A property that IS present with NO FORM of the value (see
-    /// <see cref="CollectValueForms"/>) is the third case: the bucket is complete, so its
-    /// silence is proof.</para>
+    /// <see cref="IndexValueForms.Serialised"/>) is the third case: the bucket is complete, so
+    /// its silence is proof.</para>
     /// </summary>
     public uint[]? LookupIntersect(IReadOnlyList<(string property, object? value)> predicates)
     {
@@ -139,10 +137,8 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
         int used = 0;
         for (int i = 0; i < predicates.Count; i++)
         {
-            if (!_postings.TryGetValue(predicates[i].property, out var values))
-                continue;                                   // unknown property → no information
-
-            int[]? offsets = PostingsFor(values, predicates[i].value);
+            int[]? offsets = PostingsForKey(predicates[i].property, predicates[i].value, out bool known);
+            if (!known) continue;                           // unknown property → no information
             if (offsets is null)
                 return Array.Empty<uint>();                 // known bucket, absent value → proven empty
 
@@ -166,14 +162,61 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
     {
         if (_postings is not null)
         {
-            if (!_postings.TryGetValue(propertyName, out var values)) return true; // property not indexed
-            return PostingsFor(values, value) is not null;
+            var offsets = PostingsForKey(propertyName, value, out bool known);
+            return !known || offsets is not null;    // property not indexed → no information
         }
 
         if (!_index.TryGetValue(propertyName, out var buildValues))
             return true;
         return buildValues.ContainsKey(SerialiseValue(value));
     }
+
+    // ── Key identity: one filter path, two possible bucket names ───────────────
+
+    /// <summary>
+    /// Resolves a hint key against every bucket that could hold it and unions their postings.
+    /// <paramref name="known"/> is false when NO candidate bucket exists — "no information,
+    /// scan" — and the return is null when candidates exist but none holds the value, which
+    /// is the only state that proves no event matches.
+    ///
+    /// <para>An encoded path such as <c>http</c>U+0001<c>method</c> can name two different
+    /// things the builder writes differently: a nested <c>http</c> map (flattened to exactly
+    /// that key) or ONE flat attribute literally named <c>http.method</c>, which is how every
+    /// OTLP semantic-convention attribute arrives. <c>FilterEvaluator.GetValue</c> now accepts
+    /// both, so the index must too — pruning on one spelling while the scan matches the other
+    /// is the same silent false negative in a new place. The union is complete: a bucket that
+    /// does not exist describes no event.</para>
+    /// </summary>
+    private int[]? PostingsForKey(string property, object? value, out bool known)
+    {
+        known = false;
+        int[]? acc = null;
+
+        if (_postings!.TryGetValue(property, out var values))
+        {
+            known = true;
+            acc   = PostingsFor(values, value);
+        }
+
+        // The flat spelling, when the encoded path could also be one dotted key name.
+        int sep = property.IndexOf(ClefFields.PropertyPathSeparator);
+        if (sep >= 0 && property.IndexOf(PathIndexMarker) < 0)
+        {
+            string flat = property.Replace(ClefFields.PropertyPathSeparator, '.');
+            if (_postings.TryGetValue(flat, out var flatValues))
+            {
+                known = true;
+                if (PostingsFor(flatValues, value) is { } flatOffsets)
+                    acc = acc is null ? flatOffsets : UnionAscending(acc, flatOffsets);
+            }
+        }
+
+        return acc;
+    }
+
+    /// <summary>U+0002, the subscript marker <c>PropertyPath</c> writes for <c>Foo[0]</c>. A
+    /// path carrying one is not a flat key name, so it gets no dotted alternate.</summary>
+    private const char PathIndexMarker = (char)2;
 
     // ── Value identity: the index is typed, the scan is coercing ───────────────
 

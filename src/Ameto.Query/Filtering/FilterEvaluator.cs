@@ -179,7 +179,39 @@ public static class FilterEvaluator
             return ev.Properties.TryGetValue(prop, out var v) ? v : null;
 
         // Nested path: walk dictionary tree segment-by-segment.
-        return WalkPath(ev.Properties, prop.AsSpan());
+        object? nested = WalkPath(ev.Properties, prop.AsSpan());
+        if (nested is not null) return nested;
+
+        // ...or ONE key that happens to contain dots. Every OTLP semantic-convention
+        // attribute is spelled that way (http.request.method, k8s.pod.name), and the grammar
+        // read a dotted name only as a walk, so those filters matched nothing at all unless
+        // the user knew to write ['http.request.method']. Tried second, so a genuinely nested
+        // map keeps the meaning it had.
+        return PropertyPath.MayBeFlatKey(prop) ? ReadFlatKey(ev.Properties, prop) : null;
+    }
+
+    /// <summary>
+    /// Longest flat property key probed through the stack. Beyond this the walk's answer
+    /// stands; a key this long is not a name anyone types.
+    /// </summary>
+    private const int MaxFlatKeyChars = 512;
+
+    /// <summary>
+    /// Reads a property whose NAME contains the dots the parser split on. Allocation-free —
+    /// this runs per event for every dotted-attribute filter, so the flattened spelling is
+    /// built in stack scratch and probed through the dictionary's span alternate lookup.
+    /// </summary>
+    private static object? ReadFlatKey(Dictionary<string, object?> props, string prop)
+    {
+        if (prop.Length > MaxFlatKeyChars) return null;
+
+        Span<char> flat = stackalloc char[MaxFlatKeyChars];
+        int n = PropertyPath.WriteFlatKey(prop.AsSpan(), flat);
+        if (n < 0) return null;
+
+        return props.GetAlternateLookup<ReadOnlySpan<char>>().TryGetValue(flat[..n], out var v)
+            ? v
+            : null;
     }
 
     /// <summary>
