@@ -117,20 +117,42 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
         return null;
     }
 
+    /// <summary>
+    /// Intersects the posting lists of an AND-chain of equality predicates.
+    ///
+    /// <para>Return values are three different statements and the caller acts on each
+    /// differently: <c>null</c> is "I cannot narrow this, scan the segment", a non-empty
+    /// array is "these offsets and no others", and an EMPTY array is "no event in this
+    /// segment matches" — which makes the caller drop the segment unread.</para>
+    ///
+    /// <para>A property this index never wrote is the first case, not the third. The index
+    /// has no opinion about a bucket it does not have, and answering "no matches" for one
+    /// turns every filter/index naming disagreement into missing rows instead of a slower
+    /// query. The predicate is therefore dropped from the intersection and re-checked by the
+    /// scan. A property that IS present with the value absent is the third case: the bucket
+    /// is complete, so its silence is proof.</para>
+    /// </summary>
     public uint[]? LookupIntersect(IReadOnlyList<(string property, object? value)> predicates)
     {
         if (_postings is null || predicates.Count == 0) return null;
 
-        // Gather each predicate's ascending offset array; empty match ⇒ AND is empty.
-        var lists = new int[predicates.Count][];
+        int[][]? lists = null;
+        int used = 0;
         for (int i = 0; i < predicates.Count; i++)
         {
+            if (!_postings.TryGetValue(predicates[i].property, out var values))
+                continue;                                   // unknown property → no information
+
             string serialised = SerialiseValue(predicates[i].value);
-            if (!_postings.TryGetValue(predicates[i].property, out var values) ||
-                !values.TryGetValue(serialised, out var offsets))
-                return Array.Empty<uint>();
-            lists[i] = offsets;
+            if (!values.TryGetValue(serialised, out var offsets))
+                return Array.Empty<uint>();                 // known bucket, absent value → proven empty
+
+            lists ??= new int[predicates.Count][];
+            lists[used++] = offsets;
         }
+
+        if (used == 0) return null;                          // nothing usable → scan
+        if (used < lists!.Length) Array.Resize(ref lists, used);
 
         // Intersect ascending arrays, smallest first (merge against the running result).
         Array.Sort(lists, static (a, b) => a.Length - b.Length);
