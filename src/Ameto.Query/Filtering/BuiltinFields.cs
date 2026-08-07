@@ -164,12 +164,4 @@ public static class BuiltinFields
 
     /// <summary>True when the field's VALUE is added to the segment bloom filter.</summary>
     public static bool IsBloomIndexed(BuiltinField field) => BloomFlags[(int)field];
-
-    /// <summary>Every recognised spelling — for tests that pin the filter/index contract.</summary>
-    internal static IEnumerable<string> AllAliases()
-    {
-        foreach (var entry in Table)
-            foreach (var alias in entry.Aliases)
-                yield return alias;
-    }
 }

@@ -189,6 +189,30 @@ public sealed class IndexHintKeyTests : IDisposable
     public void AndOfTwoAliases() =>
         AssertIndexPath($"Level = 'Error' and @x = '{TimeoutType}'", 9001);
 
+    // ── The constants BuiltinFields hints with must name real buckets ─────────
+
+    [Theory]
+    [InlineData(ClefFields.Level,              "Error",      0u)]
+    [InlineData(ClefFields.ExceptionType,      TimeoutType,  0u)]
+    [InlineData(ClefFields.ExceptionInnerType, SocketType,   0u)]
+    [InlineData(ClefFields.ServiceName,        "Auth.API",   1u)]
+    public void HintKey_NamesABucketTheBuilderWrote(string indexKey, string value, uint offset)
+    {
+        // If a constant here ever stops matching what SegmentIndexBuilder writes, the lookup
+        // returns null ("unknown property") instead of the event — which is the whole defect,
+        // caught at the seam rather than through a filter expression.
+        var idx = SegmentIndexReader.Load(_invertedBytes, _trigramBytes, _bloomBytes);
+        Assert.Equal([offset], idx.LookupIntersect([(indexKey, (object?)value)]));
+    }
+
+    [Fact]
+    public void TraceAndSpanHintKeys_NameBucketsTheBuilderWrote()
+    {
+        var idx = SegmentIndexReader.Load(_invertedBytes, _trigramBytes, _bloomBytes);
+        Assert.Equal([0u], idx.LookupIntersect([(ClefFields.TraceId, (object?)TraceHex)]));
+        Assert.Equal([0u], idx.LookupIntersect([(ClefFields.SpanId,  (object?)SpanHex)]));
+    }
+
     // ── The index must still narrow, not just stop being wrong ────────────────
 
     [Fact]
