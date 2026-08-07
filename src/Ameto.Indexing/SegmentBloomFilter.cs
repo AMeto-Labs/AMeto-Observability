@@ -64,10 +64,31 @@ public sealed unsafe class SegmentBloomFilter : IDisposable
     public void Add(string value) => Add((ReadOnlySpan<char>)value);
 
     /// <summary>
-    /// Encodes into stack/pooled scratch instead of allocating a byte[] per add — the hashed
-    /// bytes are identical to <see cref="Add(string)"/>, so the filter output is unchanged.
+    /// Adds the CASE-FOLDED form of <paramref name="value"/>, encoding into stack/pooled
+    /// scratch instead of allocating a byte[] per add.
+    ///
+    /// <para>Folding is a correctness requirement, not a nicety: the per-event scan compares
+    /// strings <see cref="StringComparison.OrdinalIgnoreCase"/>, so a filter keyed on the raw
+    /// casing answers "not here" for a value that differs from the query literal only in case
+    /// — <c>@l = 'error'</c> against a stored <c>Error</c> — and the whole segment is dropped
+    /// unread. Folding also keeps the filter's occupancy where it was; storing both casings
+    /// would have raised the false-positive rate for every segment.</para>
     /// </summary>
     public void Add(ReadOnlySpan<char> value)
+    {
+        char[]? foldRented = value.Length > 256
+            ? System.Buffers.ArrayPool<char>.Shared.Rent(value.Length)
+            : null;
+        Span<char> foldBuf = foldRented ?? stackalloc char[256];
+        int foldLen = value.ToLowerInvariant(foldBuf);
+        ReadOnlySpan<char> folded = foldLen < 0 ? value : foldBuf[..foldLen];
+
+        AddRaw(folded);
+
+        if (foldRented is not null) System.Buffers.ArrayPool<char>.Shared.Return(foldRented);
+    }
+
+    private void AddRaw(ReadOnlySpan<char> value)
     {
         int max = System.Text.Encoding.UTF8.GetMaxByteCount(value.Length);
         byte[]? rented = max > 512 ? System.Buffers.ArrayPool<byte>.Shared.Rent(max) : null;
@@ -89,7 +110,42 @@ public sealed unsafe class SegmentBloomFilter : IDisposable
                TestBit(block, h2 % BlockBits);
     }
 
-    public bool MightContain(string value) => MightContain(System.Text.Encoding.UTF8.GetBytes(value));
+    public bool MightContain(string value) => MightContain((ReadOnlySpan<char>)value);
+
+    /// <summary>
+    /// Probes the folded form first — that is what <see cref="Add(ReadOnlySpan{char})"/>
+    /// stores. Segments written before folding hold the original casing, so a miss falls back
+    /// to the raw form: those keep exactly the behaviour they had, and segments written since
+    /// answer case-insensitively. The fallback is skipped when the value was already folded,
+    /// which is the common shape for the high-cardinality values the filter exists for
+    /// (hex trace ids, guids).
+    /// </summary>
+    public bool MightContain(ReadOnlySpan<char> value)
+    {
+        char[]? foldRented = value.Length > 256
+            ? System.Buffers.ArrayPool<char>.Shared.Rent(value.Length)
+            : null;
+        Span<char> foldBuf = foldRented ?? stackalloc char[256];
+        int foldLen = value.ToLowerInvariant(foldBuf);
+        ReadOnlySpan<char> folded = foldLen < 0 ? value : foldBuf[..foldLen];
+
+        bool hit = MightContainRaw(folded);
+        if (!hit && !folded.SequenceEqual(value)) hit = MightContainRaw(value);
+
+        if (foldRented is not null) System.Buffers.ArrayPool<char>.Shared.Return(foldRented);
+        return hit;
+    }
+
+    private bool MightContainRaw(ReadOnlySpan<char> value)
+    {
+        int max = System.Text.Encoding.UTF8.GetMaxByteCount(value.Length);
+        byte[]? rented = max > 512 ? System.Buffers.ArrayPool<byte>.Shared.Rent(max) : null;
+        Span<byte> buf = rented ?? stackalloc byte[max];
+        int n = System.Text.Encoding.UTF8.GetBytes(value, buf);
+        bool hit = MightContain(buf[..n]);
+        if (rented is not null) System.Buffers.ArrayPool<byte>.Shared.Return(rented);
+        return hit;
+    }
 
     // ── Serialisation ─────────────────────────────────────────────────────────
 

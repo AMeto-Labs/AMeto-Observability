@@ -178,6 +178,23 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
         return buildValues.ContainsKey(serialised);
     }
 
+    /// <summary>Unions two ascending, distinct int arrays into a new ascending array.</summary>
+    private static int[] UnionAscending(int[] a, int[] b)
+    {
+        var outp = new int[a.Length + b.Length];
+        int i = 0, j = 0, k = 0;
+        while (i < a.Length && j < b.Length)
+        {
+            int x = a[i], y = b[j];
+            if      (x < y) outp[k++] = a[i++];
+            else if (x > y) outp[k++] = b[j++];
+            else { outp[k++] = x; i++; j++; }
+        }
+        while (i < a.Length) outp[k++] = a[i++];
+        while (j < b.Length) outp[k++] = b[j++];
+        return k == outp.Length ? outp : outp[..k];
+    }
+
     /// <summary>Intersects two ascending, distinct int arrays into a new ascending array.</summary>
     private static int[] IntersectSorted(int[] a, int[] b)
     {
@@ -341,7 +358,14 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
             string propName = System.Text.Encoding.UTF8.GetString(data.Slice(pos, nameLen)); pos += nameLen;
 
             uint valCount   = BinaryPrimitives.ReadUInt32LittleEndian(data[pos..]); pos += 4;
-            var values      = new Dictionary<string, int[]>(StringComparer.Ordinal);
+
+            // Case-insensitive on the QUERY side only: values are stored exactly as written,
+            // but FilterEvaluator compares strings OrdinalIgnoreCase, so two buckets that
+            // differ only in case are one bucket to a query. Keeping them apart let the index
+            // answer "absent" for a value the scan would have matched — `@l = 'error'` against
+            // a stored "Error" — and drop the segment. Property NAMES stay ordinal; the
+            // evaluator resolves those case-sensitively.
+            var values = new Dictionary<string, int[]>((int)valCount, StringComparer.OrdinalIgnoreCase);
 
             for (uint v = 0; v < valCount; v++)
             {
@@ -351,7 +375,13 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
                 uint bmLen  = BinaryPrimitives.ReadUInt32LittleEndian(data[pos..]); pos += 4;
                 var bmBytes = data.Slice(pos, (int)bmLen); pos += (int)bmLen;
 
-                values[valStr] = codec ? DecodeCodec(bmBytes) : DecodeRoaring(bmBytes);
+                var decoded = codec ? DecodeCodec(bmBytes) : DecodeRoaring(bmBytes);
+
+                // Merge, never overwrite: a case collision would otherwise lose one bucket's
+                // postings outright, trading one silent false negative for another.
+                values[valStr] = values.TryGetValue(valStr, out var prior)
+                    ? UnionAscending(prior, decoded)
+                    : decoded;
             }
 
             idx._postings[propName] = values;

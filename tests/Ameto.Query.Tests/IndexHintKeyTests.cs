@@ -144,6 +144,24 @@ public sealed class IndexHintKeyTests : IDisposable
     [Fact] public void ArraySubscript()      => AssertIndexPath("Tags[0] = 'urgent'", 9001);
     [Fact] public void ArraySubscriptSecond() => AssertIndexPath("Tags[1] = 'ops'", 9001);
 
+    // ── Value axis: the key is right and the casing is not ────────────────────
+    // The scan compares strings case-insensitively, so a value bucket the index refuses to
+    // match on casing alone prunes rows the scan would have returned.
+
+    [Fact] public void LevelValueLowercase() => AssertIndexPath("@l = 'error'", 9001);
+    [Fact] public void LevelAliasLowercase() => AssertIndexPath("Level = 'ERROR'", 9001);
+
+    [Fact]
+    public void TraceIdUppercaseHex() =>
+        AssertIndexPath($"@tr = '{TraceHex.ToUpperInvariant()}'", 9001);
+
+    [Fact]
+    public void ExceptionTypeDifferentCase() =>
+        AssertIndexPath($"@x = '{TimeoutType.ToUpperInvariant()}'", 9001);
+
+    [Fact]
+    public void UserPropertyValueDifferentCase() => AssertIndexPath("Region = 'AE-DXB'", 9001);
+
     // ── Spellings that already worked must keep working ───────────────────────
 
     [Fact] public void CanonicalLevel()   => AssertIndexPath("@l = 'Error'", 9001);

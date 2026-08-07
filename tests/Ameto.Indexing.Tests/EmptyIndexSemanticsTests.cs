@@ -67,6 +67,45 @@ public sealed class EmptyIndexSemanticsTests
         Assert.Equal([], idx.LookupIntersect([("region", "eu-fra")]));
     }
 
+    // ── Value casing: the scan matches it, so the index must not veto it ──────
+
+    [Fact]
+    public void ValueCasing_DoesNotHideAPosting()
+    {
+        var idx = Build(("@l", "Error"));
+
+        Assert.Equal([0u], idx.LookupIntersect([("@l", "error")]));
+        Assert.True(idx.MightContain("@l", "ERROR"));
+    }
+
+    [Fact]
+    public void ValueCasing_CollidingBucketsMergeInsteadOfOverwriting()
+    {
+        var build = new SegmentInvertedIndex();
+        build.Add(0u, "region", "AE-DXB");
+        build.Add(1u, "region", "ae-dxb");
+        var idx = SegmentInvertedIndex.Deserialise(build.Serialise());
+
+        // Both events are reachable through either spelling — dropping one of the two
+        // buckets would trade one silent false negative for another.
+        Assert.Equal([0u, 1u], idx.LookupIntersect([("region", "ae-dxb")]));
+        Assert.Equal([0u, 1u], idx.LookupIntersect([("region", "AE-DXB")]));
+    }
+
+    [Fact]
+    public void BloomFilter_MatchesRegardlessOfValueCasing()
+    {
+        using var build = SegmentBloomFilter.Create(16);
+        build.Add("Error");
+        build.Add("System.TimeoutException");
+        using var read = SegmentBloomFilter.Deserialise(build.Serialise());
+
+        Assert.True(read.MightContain("Error"));
+        Assert.True(read.MightContain("error"));
+        Assert.True(read.MightContain("ERROR"));
+        Assert.True(read.MightContain("system.timeoutexception"));
+    }
+
     private static SegmentInvertedIndex Build(params (string Property, string Value)[] pairs)
     {
         var build = new SegmentInvertedIndex();
