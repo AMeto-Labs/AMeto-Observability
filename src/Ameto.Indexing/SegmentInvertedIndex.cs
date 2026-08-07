@@ -199,11 +199,18 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
         }
 
         // The flat spelling, when the encoded path could also be one dotted key name.
-        int sep = property.IndexOf(ClefFields.PropertyPathSeparator);
-        if (sep >= 0 && property.IndexOf(PathIndexMarker) < 0)
+        // Written into stack scratch and probed through the span alternate lookup: a string
+        // per predicate per segment would be pure garbage for a bucket that usually is absent.
+        if (property.Length <= MaxFlatKeyChars &&
+            property.IndexOf(ClefFields.PropertyPathSeparator) >= 0 &&
+            property.IndexOf(PathIndexMarker) < 0)
         {
-            string flat = property.Replace(ClefFields.PropertyPathSeparator, '.');
-            if (_postings.TryGetValue(flat, out var flatValues))
+            Span<char> flat = stackalloc char[MaxFlatKeyChars];
+            for (int i = 0; i < property.Length; i++)
+                flat[i] = property[i] == ClefFields.PropertyPathSeparator ? '.' : property[i];
+
+            if (_postings.GetAlternateLookup<ReadOnlySpan<char>>()
+                         .TryGetValue(flat[..property.Length], out var flatValues))
             {
                 known = true;
                 if (PostingsFor(flatValues, value) is { } flatOffsets)
@@ -213,6 +220,10 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
 
         return acc;
     }
+
+    /// <summary>Longest path given a flat alternate — matches
+    /// <c>FilterEvaluator.MaxFlatKeyChars</c>, which decides the same thing on the scan side.</summary>
+    private const int MaxFlatKeyChars = 512;
 
     /// <summary>U+0002, the subscript marker <c>PropertyPath</c> writes for <c>Foo[0]</c>. A
     /// path carrying one is not a flat key name, so it gets no dotted alternate.</summary>
