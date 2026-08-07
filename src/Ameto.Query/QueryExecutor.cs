@@ -205,7 +205,7 @@ public sealed class QueryExecutor : IQueryExecutor
         bool hasInvHints   = invertedHints.Count > 0;
 
         // Fast path: nothing to prefilter — pass every segment through.
-        if (!hasIndexHint && trigramHints.Count == 0)
+        if (!hasIndexHint && !hasInvHints && trigramHints.Count == 0)
         {
             var passthrough = new List<PrefilterResult>(segInfos.Count);
             foreach (var info in segInfos)
@@ -252,7 +252,7 @@ public sealed class QueryExecutor : IQueryExecutor
                     // an equality hint) load the big indexes for trigram offset
                     // lookup and the inverted-index definitive check.
                     uint[]? candidates = null;
-                    if (trigramHints.Count > 0 || hasIndexHint)
+                    if (trigramHints.Count > 0 || hasIndexHint || hasInvHints)
                     {
                         // Pooled: sections are copied out inside the deserialisers, so the
                         // rented buffers go back to the pool as soon as the index is built.
