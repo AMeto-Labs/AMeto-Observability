@@ -147,14 +147,19 @@ public sealed class SegmentMergeTests : IAsyncLifetime
     }
 
     /// <summary>
-    /// A SETTLED window (older than 48 h) merges from just 2 sources — quiet days
-    /// leave a handful of tiny segments per day, and a "not worth it" threshold
-    /// would strand them forever (observed live: ~1,000 files parked that way).
+    /// A SETTLED window merges from just 2 sources — quiet days leave a handful of tiny
+    /// segments per day, and a "not worth it" threshold would strand them forever (observed
+    /// live: ~1,000 files parked that way).
+    ///
+    /// <para>Anchored on the BUCKET GRID, not at <c>UtcNow - 5d</c>. The planner buckets on an
+    /// absolute grid, so a fixed offset back from now lands in a sealed bucket or in the open
+    /// one depending on the time of day — and in the open one these 3 sources are below the
+    /// fanout of 8 and nothing merges. See <see cref="MergeBucketGrid"/>.</para>
     /// </summary>
     [Fact]
     public async Task Merge_ConsolidatesSparseSettledWindows()
     {
-        long old = DateTime.UtcNow.Ticks - 5 * TimeSpan.TicksPerDay;
+        long old = MergeBucketGrid.SealedBucketStart(LogLevel.Information);
         for (int round = 0; round < 3; round++)
             await WriteSegmentAsync(round, 50, baseTicks: old + round * TimeSpan.TicksPerHour);
 
@@ -260,8 +265,10 @@ public sealed class SegmentMergeTests : IAsyncLifetime
     [Fact]
     public async Task Merge_NeverSpansMoreThanOneBucket()
     {
-        long width  = StorageEngine.MergeBucketTicks(RetentionPolicy.Default.GetTtl(LogLevel.Information));
-        long origin = (DateTime.UtcNow.Ticks - 30 * TimeSpan.TicksPerDay) / width * width;
+        long width  = MergeBucketGrid.BucketWidth(LogLevel.Information);
+        // Nine days straddle two buckets, and BOTH have to be sealed for the pair of merges
+        // below to run on the 2-source threshold.
+        long origin = MergeBucketGrid.SealedBucketStart(LogLevel.Information, bucketsSpanned: 2);
         for (int round = 0; round < 9; round++)
             await WriteSegmentAsync(round, 40, baseTicks: origin + round * TimeSpan.TicksPerDay);
 
@@ -297,7 +304,7 @@ public sealed class SegmentMergeTests : IAsyncLifetime
     [Fact]
     public async Task Merge_MergesDenseSegments_Losslessly()
     {
-        long old = DateTime.UtcNow.Ticks - 5 * TimeSpan.TicksPerDay; // settled → 2 sources suffice
+        long old = MergeBucketGrid.SealedBucketStart(LogLevel.Information); // settled → 2 sources suffice
         await WriteSegmentAsync(0, 2500, baseTicks: old,                              padBytes: 3072);
         await WriteSegmentAsync(1, 2500, baseTicks: old + 1 * TimeSpan.TicksPerHour, padBytes: 3072);
         // Slot-dense too: 9000 events in one file, over the old 8192-event half-chunk gate.
@@ -350,10 +357,10 @@ public sealed class SegmentMergeTests : IAsyncLifetime
     [Fact]
     public async Task Merge_RetriesNextWindow_AfterAnchorSkip()
     {
-        long width = StorageEngine.MergeBucketTicks(RetentionPolicy.Default.GetTtl(LogLevel.Information));
+        long width = MergeBucketGrid.BucketWidth(LogLevel.Information);
         // Two ADJACENT buckets, both far enough back to be sealed. Anchoring on the grid is
         // what makes "these two are in different buckets" true on every run.
-        long b0 = (DateTime.UtcNow.Ticks - 30 * TimeSpan.TicksPerDay) / width * width;
+        long b0 = MergeBucketGrid.SealedBucketStart(LogLevel.Information, bucketsSpanned: 2);
         // Bucket 0 (oldest, sealed): two segments, both corrupted after flush.
         await WriteSegmentAsync(0, 50, baseTicks: b0 + TimeSpan.TicksPerHour);
         await WriteSegmentAsync(1, 50, baseTicks: b0 + 2 * TimeSpan.TicksPerHour);
