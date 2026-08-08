@@ -421,7 +421,12 @@ public sealed class SegmentBucketAdversarialProbe : IAsyncLifetime
     [Fact]
     public async Task AnOpenBucketConvergesWhateverTheFlushSizeDistribution()
     {
-        long today = DateTime.UtcNow.Ticks - 20 * TimeSpan.TicksPerHour;
+        // ONE open bucket, on the grid. 600 flushes a minute apart cover 10.2 h of event time,
+        // which a 7-day boundary falls inside on 6.1 % of instants; the run then converges as two
+        // independent open buckets, each entitled to its own files-in-flight. Measured, that does
+        // not breach the allowance (26 files against 40) — but the allowance is the ladder's
+        // bound for ONE bucket, and testing it against two is testing a different claim.
+        long today = MergeBucketGrid.OpenBucketStart(LogLevel.Information);
         int  expected = 0;
 
         for (int f = 0; f < 600; f++)
@@ -458,7 +463,11 @@ public sealed class SegmentBucketAdversarialProbe : IAsyncLifetime
     [Fact]
     public async Task AnOpenBucketKeepsCompactingPastTheBatchBudget()
     {
-        long today = DateTime.UtcNow.Ticks - 20 * TimeSpan.TicksPerHour;
+        // On the grid: 40 flushes a minute apart cover 2539 s, and a boundary inside that window
+        // splits them across two open buckets. Measured at this staging: 9 merges, 13 files and
+        // FOUR of them below maximal — so both the file-count bound and the maximality assertion
+        // below break, on 0.4 % of instants.
+        long today = MergeBucketGrid.OpenBucketStart(LogLevel.Information);
         await FlushAsync(200, LogLevel.Information, today, padBytes: 256);
         long one = _engine.ListSegments().Single().UncompressedBytes;
         _engine._mergeTargetPayloadBytes = one * 5;   // five sources fill the budget, eight are required
@@ -561,7 +570,15 @@ public sealed class SegmentBucketAdversarialProbe : IAsyncLifetime
     {
         _engine._mergeTargetPayloadBytes = 32L * 1024 * 1024;
 
-        long today = DateTime.UtcNow.Ticks - 20 * TimeSpan.TicksPerHour;
+        // The live bucket, on the grid. At a minute per flush this run covers up to 66.8 h of
+        // event time — the widest staging window in the suite — which a 7-day boundary falls
+        // inside on ~40 % of instants, splitting the run into two independently converging open
+        // buckets. Measured, the band survives that (2.73x..3.13x, inside both the 1.25x spread
+        // and the 3.6x ceiling), so this is determinism rather than a repair: the band is a
+        // calibrated number and it should be calibrated against one bucket, not against whichever
+        // of two shapes the calendar picks. The sweep pins the window inside one width, which is
+        // what would catch a future flush count that no longer fits.
+        long today = MergeBucketGrid.OpenBucketStart(LogLevel.Information);
         long stale = BucketStart(LogLevel.Warning, DateTime.UtcNow.Ticks - 30 * TimeSpan.TicksPerDay);
         long written = 0, ingested = 0, lastWritten = 0, lastIngested = 0;
         int  merges  = 0, expected = 0;

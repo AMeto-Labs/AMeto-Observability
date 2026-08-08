@@ -329,6 +329,56 @@ public sealed class MergeBucketGridSweepTests
     }
 
     /// <summary>
+    /// The OPEN-anchored tests, whose claim is the mirror image: every source must land in ONE
+    /// bucket, and that bucket must be open at every instant.
+    ///
+    /// <para>The failure these guard is the same straddle. Anchored at an offset from the wall
+    /// clock, a staging window that crosses a 7-day boundary splits into two buckets which — the
+    /// anchors all being well inside the 48 h grace — are BOTH open, so each is tested against
+    /// the fanout of 8 separately. Measured on a real engine: TodaysBucketStaysQueryable merges
+    /// nothing and keeps 8 files; ANearEmptyFlushSegmentDoesNotGateItsBucket ends with 3 files
+    /// and 3200 events where it asserts 2 and 3600; AnOpenBucketKeepsCompactingPastTheBatchBudget
+    /// leaves 13 files, 4 of them below maximal.</para>
+    ///
+    /// <para>The span is what decides it, so the span is what this pins. An anchor on the grid is
+    /// only single-bucket while the staging still FITS in a bucket, and the widest of these —
+    /// the amplification driver at 4000 flushes a minute apart — already uses 40 % of the width.
+    /// Raising that flush count is the realistic way this regresses, and it regresses silently,
+    /// so the bound is checked here rather than left to arithmetic in a comment.</para>
+    /// </summary>
+    [Theory]
+    // span = (flushes - 1) × spacing + (events per flush - 1) × 1 s, i.e. anchor to the newest
+    // MAX timestamp, which is the value the planner buckets on.
+    [InlineData("TodaysBucketStaysQueryable_AndAFlushDoesNotForceARewrite",   519L)]     //   8 × 1 min, 100 ev
+    [InlineData("ANearEmptyFlushSegmentDoesNotGateItsBucket",                939L)]     //  10 × 1 min, 400 ev
+    [InlineData("OpenBucketAmplificationStaysBounded",                      2539L)]     //  40 × 1 min, 200 ev
+    [InlineData("AnOpenBucketKeepsCompactingPastTheBatchBudget",            2539L)]     //  40 × 1 min, 200 ev
+    [InlineData("AnOpenBucketConvergesWhateverTheFlushSizeDistribution",   36739L)]     // 600 × 1 min, 800 ev
+    [InlineData("AmplificationRunAsync",                                  240339L)]     // 4000 × 1 min, 400 ev
+    public void EveryOpenAnchorStaysInOneOpenBucketAtEveryInstant(string testName, long spanSeconds)
+    {
+        const LogLevel Level = LogLevel.Information;
+        long width = MergeBucketGrid.BucketWidth(Level);
+        long span  = spanSeconds * TimeSpan.TicksPerSecond;
+
+        Assert.True(span < width,
+            $"{testName}: staging covers {span / (double)width:F2} bucket widths — it cannot be single-bucket " +
+            "on ANY grid position, so the anchor no longer decides anything");
+
+        foreach (long now in NowSweep(width))
+        {
+            long anchor = MergeBucketGrid.OpenBucketStartAt(now, Level);
+
+            // Single bucket: the anchor is aligned, so the whole window is in it iff span < width.
+            Assert.Equal(BucketOf(anchor, width), BucketOf(anchor + span, width));
+
+            // …and that bucket is the OPEN one, so the fanout of 8 these tests are written
+            // against is the threshold actually applied.
+            Assert.Equal(StorageEngine.MergeMinSources, SourcesNeeded(anchor, width, now));
+        }
+    }
+
+    /// <summary>
     /// The <c>*At</c> overloads the sweep drives must be the same code the tests call, or the
     /// sweep is checking a copy of the helper rather than the helper.
     /// </summary>

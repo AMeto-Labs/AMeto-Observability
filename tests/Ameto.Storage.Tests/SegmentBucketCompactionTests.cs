@@ -327,7 +327,13 @@ public sealed class SegmentBucketCompactionTests : IAsyncLifetime
     [Fact]
     public async Task TodaysBucketStaysQueryable_AndAFlushDoesNotForceARewrite()
     {
-        long today = DateTime.UtcNow.Ticks - 2 * TimeSpan.TicksPerHour;
+        // THE OPEN BUCKET, by construction. "UtcNow - 2h" is not a position on the grid: the
+        // eight flushes cover 420 s of event time, and when a 7-day boundary falls inside that
+        // window they split across two buckets. Both are open — the older one ended less than
+        // 2 h ago, far inside the 48 h seal grace, so it keeps the fanout of 8 rather than
+        // dropping to 2 — and neither side reaches 8, so nothing merges and the assertion below
+        // fails. Measured on a real engine at this staging: merge=False, 8 files left.
+        long today = MergeBucketGrid.OpenBucketStart(LogLevel.Information);
 
         for (int f = 0; f < 4; f++)
         {
@@ -369,7 +375,11 @@ public sealed class SegmentBucketCompactionTests : IAsyncLifetime
     [Fact]
     public async Task ANearEmptyFlushSegmentDoesNotGateItsBucket()
     {
-        long today = DateTime.UtcNow.Ticks - 3 * TimeSpan.TicksPerHour;
+        // On the grid — see TodaysBucketStaysQueryable. Ten flushes of 400 events at 1 s spacing
+        // cover 939 s, and a boundary inside that window splits them across two open buckets.
+        // Measured at this staging: the upper bucket's 8 sources merge to 3200 and the lower
+        // two are stranded, so the bucket ends with THREE files and the 3600 below is 3200.
+        long today = MergeBucketGrid.OpenBucketStart(LogLevel.Information);
         await FlushAsync(1, LogLevel.Information, today);                       // the quiet minute
         for (int f = 1; f < 10; f++)
             await FlushAsync(400, LogLevel.Information, today + f * TimeSpan.TicksPerMinute, padBytes: 256);
@@ -400,7 +410,12 @@ public sealed class SegmentBucketCompactionTests : IAsyncLifetime
     [Fact]
     public async Task OpenBucketAmplificationStaysBounded()
     {
-        long today = DateTime.UtcNow.Ticks - 6 * TimeSpan.TicksPerHour;
+        // On the grid, so the figure is measured on ONE open bucket every run. A straddle here
+        // does not breach the guard — splitting the waves means fewer merges, so the ratio FALLS
+        // (measured 0.95x against the 3.0x ceiling) — but an amplification number whose bucket
+        // structure depends on the time of day is a weaker measurement than the same number
+        // taken on a fixed shape, and the ceiling is only meaningful against a fixed shape.
+        long today = MergeBucketGrid.OpenBucketStart(LogLevel.Information);
         int  merges = 0;
         long written = 0, flushed = 0;
 
