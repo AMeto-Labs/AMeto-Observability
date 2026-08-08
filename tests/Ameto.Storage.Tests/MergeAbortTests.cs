@@ -85,6 +85,17 @@ public sealed class MergeAbortTests : IAsyncLifetime
         return files;
     }
 
+    /// <summary>
+    /// Proves nothing still has the file open. A <see cref="SegmentReader"/> maps its segment, and
+    /// the mapping's own handle is opened without <c>FileShare.Delete</c> — which is why a leaked
+    /// reader is not merely wasted address space: on Windows retention cannot unlink the file and
+    /// compaction cannot rewrite it, for as long as the process lives.
+    /// </summary>
+    private static void AssertNotHeldOpen(string path)
+    {
+        using var exclusive = new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+    }
+
     private static void AssertUntouched(string segDir, List<string> sources)
     {
         Assert.Empty(Directory.GetFiles(segDir, "*.mergemanifest"));
@@ -122,6 +133,27 @@ public sealed class MergeAbortTests : IAsyncLifetime
         Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None));
         Assert.Single(_engine.ListSegments());
         Assert.Equal(240u, _engine.ListSegments()[0].EventCount);
+    }
+
+    /// <summary>
+    /// The readers a merge owns are closed even when the cancellation lands in the window between
+    /// the flush-slot wait and the merge task. <c>Task.Run(delegate, ct)</c> with an already
+    /// cancelled token never invokes the delegate at all — so the <c>finally</c> that closes them,
+    /// which lives inside it, never ran, and up to 512 mapped views survived for the life of the
+    /// process.
+    /// </summary>
+    [Fact]
+    public async Task AMergeCancelledBeforeItStreams_ClosesEverySourceItOpened()
+    {
+        var sources = await WriteFourSourcesAsync();
+
+        using var cts = new CancellationTokenSource();
+        _engine._beforeMergeStream = cts.Cancel;
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => _engine.TryMergeSmallSegmentsOnceAsync(cts.Token));
+
+        foreach (var f in sources) AssertNotHeldOpen(f);
     }
 
     /// <summary>

@@ -1504,6 +1504,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             // WARNING on every single stop, swallowed the cancellation the maintenance loop
             // stops on, and quarantined the window — so the segments a clean restart had every
             // reason to merge first were the ones it then refused to look at.
+            foreach (var r in readers) r.Dispose();
             try { File.Delete(manifestPath); } catch { /* recovery drops it anyway */ }
             throw;
         }
@@ -1521,6 +1522,13 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             // condition that clears itself would end compaction for that bucket for the life of
             // the process, and the small-file backlog those segments form is the exact thing the
             // sweep exists to remove. Left in the candidate set, the next pass simply retries.
+            //
+            // Disposing here as well as in the merge task is deliberate, and it is the same
+            // discipline the two waits above follow: MergeToColdAsync only takes ownership of the
+            // readers once its delegate is entered, and from out here there is no way to know
+            // whether it was. Dispose is idempotent, so the rule can simply be that every exit
+            // from this method that does not publish closes them.
+            foreach (var r in readers) r.Dispose();
             if (IsSourceCorruption(ex))
             {
                 foreach (var s in consumed) _mergeSkip.Add(s.Id.Value);
@@ -1602,6 +1610,17 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             MergingSegmentEventSource? source = null;
             try
             {
+                // Cancellation is observed HERE, and the token is deliberately NOT handed to
+                // Task.Run: a Task.Run whose token is already signalled transitions the task
+                // straight to Canceled WITHOUT ever invoking the delegate — and the delegate is
+                // the only place the readers this method took ownership of are closed. Cancelling
+                // in the window between _flushConcurrency.WaitAsync returning and the delegate
+                // being scheduled therefore left up to MergeMaxSources mapped views alive for the
+                // life of the process, and a mapped file on Windows can be neither compacted nor
+                // unlinked by retention. That is the very hazard the wait's own catch guards
+                // against one step earlier; this closes the second door into it.
+                ct.ThrowIfCancellationRequested();
+
                 SegmentInfo info;
                 source = new MergingSegmentEventSource(readers);
                 // HC HAPPENS HERE, and only here. A merge already rewrites every block it reads,
@@ -1660,7 +1679,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 source?.Dispose();
                 foreach (var r in readers) r.Dispose();   // idempotent — safe after the happy path
             }
-        }, ct);
+        });
     }
 
     /// <summary>
