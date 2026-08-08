@@ -117,11 +117,16 @@ public sealed class WalSegmentIdTests : IAsyncLifetime
     /// <summary>
     /// The one-line invariant: after compaction, no segment carries an id out of the live WAL's
     /// reserved block. This assertion alone fails on the pre-fix planner.
+    ///
+    /// <para>The four sources sit in a SEALED bucket, so the merge runs on the 2-source
+    /// threshold. Anchored on the grid rather than at <c>UtcNow - 5d</c>, which lands in the
+    /// open bucket — and its fanout of 8 — for two days in every seven
+    /// (see <see cref="MergeBucketGrid"/>).</para>
     /// </summary>
     [Fact]
     public async Task AMergeNeverTakesAnIdOutOfTheLiveWalsBlock()
     {
-        long old = DateTime.UtcNow.Ticks - 5 * TimeSpan.TicksPerDay;
+        long old = MergeBucketGrid.SealedBucketStart(LogLevel.Information);
         for (int round = 0; round < 4; round++)
             await WriteSegmentAsync(round, 50, old + round * TimeSpan.TicksPerHour);
 
@@ -142,7 +147,7 @@ public sealed class WalSegmentIdTests : IAsyncLifetime
     [Fact]
     public async Task EventsLivingOnlyInTheWalSurviveACrashAfterAMerge()
     {
-        long old = DateTime.UtcNow.Ticks - 5 * TimeSpan.TicksPerDay;
+        long old = MergeBucketGrid.SealedBucketStart(LogLevel.Information);
         for (int round = 0; round < 4; round++)
             await WriteSegmentAsync(round, 50, old + round * TimeSpan.TicksPerHour);
 
