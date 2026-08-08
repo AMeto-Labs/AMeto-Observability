@@ -648,8 +648,17 @@ public sealed class SegmentReader : ISegmentReader
 
         if (buffer.Length < uncompressedSize)
         {
+            // RENT BEFORE RETURNING. `buffer` is the caller's own field taken by ref —
+            // SegmentEventCursor._block — so returning first and renting second leaves a window
+            // where the caller still references an array that is already back in the pool. If the
+            // rent throws (a large block under memory pressure is the realistic way), the cursor
+            // survives long enough to be disposed and returns that same array a second time.
+            // A double return does not fault: the pool simply stacks the array twice and hands it
+            // to two renters at once, so the failure is one buffer's contents appearing in an
+            // unrelated reader's block. Holding both for the length of a copy costs one block.
+            byte[] grown = ArrayPool<byte>.Shared.Rent(uncompressedSize);
             if (buffer.Length > 0) ArrayPool<byte>.Shared.Return(buffer);
-            buffer = ArrayPool<byte>.Shared.Rent(uncompressedSize);
+            buffer = grown;
         }
 
         byte[] comp = ArrayPool<byte>.Shared.Rent(compressedSize);
