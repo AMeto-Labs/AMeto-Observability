@@ -168,11 +168,24 @@ public sealed class LevelSplitFlushTests : IAsyncLifetime
     /// segment, which reopened exactly the data loss the split exists to prevent — and did
     /// so on the path taken after a crash, when losing Errors is least acceptable. The live
     /// flush path was covered by the tests above; this one was not.
+    ///
+    /// <para>THE CRASH HAS TO BE RECONSTRUCTED, not approximated by dropping the engine.
+    /// <c>DisposeAsync</c> flushes a non-empty hot tier and the flush deletes the WAL it
+    /// drained, so "write without flushing, then dispose" leaves no orphan: measured, dispose
+    /// wrote 6 segments and the restarted engine logged no recovery at all. Every assertion
+    /// below then described the LIVE flush path — the one the tests above already cover — and
+    /// <c>ReplayOrphanedWals</c> was never executed.</para>
+    ///
+    /// <para>So the on-disk state a kill -9 leaves is built explicitly, the way
+    /// <c>WalSegmentIdTests</c> builds it: keep the WAL bytes, let shutdown flush and remove
+    /// them, then delete the segments that flush produced and put the WAL back. The reserved
+    /// block is what identifies those segments — startup reads "this WAL was already flushed"
+    /// off a segment carrying one of its ids, so the orphan is only believable once they are
+    /// gone.</para>
     /// </summary>
     [Fact]
     public async Task WalRecoveryAlsoSplitsByLevel()
     {
-        // Write mixed levels WITHOUT flushing, then drop the engine so the WAL is orphaned.
         long baseTicks = DateTime.UtcNow.Ticks;
         int n = 0;
         for (int i = 0; i < 12; i++)
@@ -190,7 +203,27 @@ public sealed class LevelSplitFlushTests : IAsyncLifetime
                 n++;
             }
 
-        await _engine.DisposeAsync();          // leaves the WAL on disk, unflushed
+        // The block of segment ids this WAL's events will occupy, and the WAL bytes themselves.
+        ulong walId  = _engine.LiveWalSegmentId;
+        var   walDir = Path.Combine(_dir, "wal");
+        var   segDir = Path.Combine(_dir, "segments");
+        var   wal    = Directory.GetFiles(walDir, "*.wal").Single();
+        File.Copy(wal, wal + ".crash", overwrite: true);
+        if (File.Exists(wal + ".pool")) File.Copy(wal + ".pool", wal + ".pool.crash", overwrite: true);
+
+        await _engine.DisposeAsync();   // flushes the 72 events and removes the WAL
+
+        // Undo the shutdown flush: drop every segment the WAL's own block produced...
+        foreach (var f in Directory.GetFiles(segDir, "*.seg"))
+        {
+            var parts = Path.GetFileNameWithoutExtension(f).Split('-');
+            if (ulong.TryParse(parts[1], out var id) && id >= walId && id < walId + 6) File.Delete(f);
+        }
+        Assert.Empty(Directory.GetFiles(segDir, "*.seg"));   // the flush produced nothing else
+
+        // ...and put the WAL back, so the tree reads "never flushed".
+        File.Copy(wal + ".crash", wal, overwrite: true);
+        if (File.Exists(wal + ".pool.crash")) File.Copy(wal + ".pool.crash", wal + ".pool", overwrite: true);
 
         // A fresh engine replays it. Recovery must produce level-pure segments.
         _engine = new StorageEngine(
@@ -203,7 +236,9 @@ public sealed class LevelSplitFlushTests : IAsyncLifetime
             await Task.Delay(50);
 
         var segs = _engine.ListSegments();
-        Assert.NotEmpty(segs);
+        // Six levels in, six level-pure segments out — recovery ran and split, rather than
+        // writing the recovered tier as one mixed file.
+        Assert.Equal(6, segs.Count);
 
         var dedup = new Dictionary<string, string>(StringComparer.Ordinal);
         var ids = new List<ulong>();
