@@ -1596,7 +1596,14 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// on <c>File.Exists</c> alone: a crash between a move and a later check would commit an
     /// unverified merge and recovery would then finish deleting its sources for it.
     /// </param>
-    private Task<SegmentInfo> MergeToColdAsync(
+    /// <remarks>
+    /// Internal rather than private so its reader-ownership contract can be tested where it is
+    /// actually made. Driven through <see cref="TryMergeSmallSegmentsOnceAsync"/> the contract is
+    /// invisible: that method's own abort paths close the readers too, deliberately, so a test
+    /// that cancels a whole merge pass cannot tell which of the two did it — and passes just as
+    /// well when this one does nothing at all.
+    /// </remarks>
+    internal Task<SegmentInfo> MergeToColdAsync(
         List<SegmentReader> readers, SegmentId segId, string segPath, long expectEvents, CancellationToken ct)
     {
         var  sinkFactory = IndexSinkFactory;

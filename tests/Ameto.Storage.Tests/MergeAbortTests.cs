@@ -136,14 +136,15 @@ public sealed class MergeAbortTests : IAsyncLifetime
     }
 
     /// <summary>
-    /// The readers a merge owns are closed even when the cancellation lands in the window between
-    /// the flush-slot wait and the merge task. <c>Task.Run(delegate, ct)</c> with an already
-    /// cancelled token never invokes the delegate at all — so the <c>finally</c> that closes them,
-    /// which lives inside it, never ran, and up to 512 mapped views survived for the life of the
-    /// process.
+    /// A cancelled merge PASS closes the readers its planner opened, whichever of the two owners
+    /// gets there first. This is the caller's half of the contract — <c>TryMergeSmallSegmentsOnceAsync</c>
+    /// closing them on the way out — and it is deliberately the weaker of the two assertions here,
+    /// because it holds even when the merge task itself never runs. The merge task's own half is
+    /// <see cref="AMergeTaskAlwaysEntersItsDelegate_AndClosesWhatItWasHanded"/>; this test cannot
+    /// see it and must not be read as covering it.
     /// </summary>
     [Fact]
-    public async Task AMergeCancelledBeforeItStreams_ClosesEverySourceItOpened()
+    public async Task AMergePassThatIsCancelled_ClosesEverySourceItOpened()
     {
         var sources = await WriteFourSourcesAsync();
 
@@ -154,6 +155,50 @@ public sealed class MergeAbortTests : IAsyncLifetime
             () => _engine.TryMergeSmallSegmentsOnceAsync(cts.Token));
 
         foreach (var f in sources) AssertNotHeldOpen(f);
+    }
+
+    /// <summary>
+    /// THE MERGE TASK'S DELEGATE ALWAYS RUNS. <c>Task.Run(delegate, ct)</c> with an already
+    /// cancelled token transitions the task straight to Canceled without ever invoking the
+    /// delegate — and the delegate is where the <c>finally</c> that closes the readers lives, so
+    /// a shutdown landing between the flush-slot wait returning and the task being scheduled left
+    /// up to <c>MergeMaxSources</c> = 512 mapped views open for the life of the process. On
+    /// Windows those files can then be neither unlinked by retention nor rewritten by compaction.
+    ///
+    /// <para>Driven directly, because through a whole merge pass this is invisible: the caller
+    /// closes the readers on its own abort paths too, so the pass-level test above passes
+    /// identically whether the delegate ran or not — VERIFIED by putting the token back on
+    /// <c>Task.Run</c>, at which point all four of this file's tests stayed green.</para>
+    ///
+    /// <para>The two assertions pin the two halves separately. The exception must be an
+    /// <see cref="OperationCanceledException"/> and not a <see cref="DirectoryNotFoundException"/>:
+    /// the output path is inside a directory that does not exist, so a delegate that skipped its
+    /// opening <c>ct.ThrowIfCancellationRequested()</c> and went on to open a writer would fail
+    /// there instead, and say so. And every source must be closed, which is the part that fails
+    /// the moment the token goes back on <c>Task.Run</c> — the delegate not having run, nothing
+    /// closed them.</para>
+    /// </summary>
+    [Fact]
+    public async Task AMergeTaskAlwaysEntersItsDelegate_AndClosesWhatItWasHanded()
+    {
+        var sources = await WriteFourSourcesAsync();
+
+        using var cts = new CancellationTokenSource();
+        await cts.CancelAsync();
+
+        var  readers = sources.Select(static f => SegmentReader.Open(f)).ToList();
+        long expect  = readers.Sum(static r => (long)r.Info.EventCount);
+        // Nothing may be written before cancellation is observed, and this is what proves it: the
+        // writer's first act is to create its .seg.tmp, which cannot succeed here.
+        string segPath = Path.Combine(SegDir, "no-such-directory", "merged.seg");
+        try
+        {
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                () => _engine.MergeToColdAsync(readers, new SegmentId(9_999UL), segPath, expect, cts.Token));
+
+            foreach (var f in sources) AssertNotHeldOpen(f);
+        }
+        finally { foreach (var r in readers) r.Dispose(); }
     }
 
     /// <summary>
