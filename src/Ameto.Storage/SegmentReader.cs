@@ -790,12 +790,28 @@ public sealed class SegmentReader : ISegmentReader
         return data;
     }
 
+    /// <summary>
+    /// Pooled sections rented by any reader in this process since it started.
+    ///
+    /// <para>A DIAGNOSTIC, and the only way from outside to tell how many times a query read a
+    /// group's sections — which is a question worth being able to ask, because renting the same
+    /// section twice is invisible in every other instrument. Below 1 MB the pool absorbs the
+    /// second rent and the cost hides in noise; above it <see cref="ArrayPool{T}.Shared"/> stops
+    /// pooling altogether and serves each rent from a fresh LOH allocation that Return then drops,
+    /// so the same redundant call goes from free to the most expensive thing on the prefilter
+    /// path — once per group, per segment, in parallel across the whole catalog. The counter
+    /// costs one interlocked increment against a read of the section's whole length out of a
+    /// mapped view.</para>
+    /// </summary>
+    internal static long PooledSectionRents;
+
     private PooledSection RentSection(long offset)
     {
         if (offset <= 0) return default;
         uint len  = (uint)ReadInt32At(offset);
         var  data = ArrayPool<byte>.Shared.Rent((int)len);
         _view.ReadArray(offset + 4, data, 0, (int)len);
+        Interlocked.Increment(ref PooledSectionRents);
         return new PooledSection(data, (int)len);
     }
 

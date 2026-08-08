@@ -75,15 +75,37 @@ public sealed class SegmentWriter : IDisposable
     /// budget that is already measured and already enforced. A larger group would silently
     /// break that ceiling; a smaller one would only cost extra sections and per-group bloom
     /// overhead for no reduction the flush path can spend.</para>
+    ///
+    /// <para>The bloom section a full group carries is NOT a fixed share of this budget, and it
+    /// used to be documented as though it were ("~10.5 MB for a full 64 MB group"). It is
+    /// ~1.25 bytes per bloom TERM, so what a group costs depends entirely on how many terms its
+    /// events hold per byte of payload — the same 64 MB is 203 729 prop-dense events at 21.1
+    /// terms each (~5.4 MB of filter at the design's 10 bits/term) or 445 079 thin ones at 7.0
+    /// (~3.7 MB). The old figure was true only at ~488 bytes per event, and the forecast that
+    /// produced it assumed a fixed 64 terms/event, which at this budget divided by
+    /// <see cref="FixedRowCostBytes"/> — the most events a 64 MB group can be forecast to hold,
+    /// 1 177 348 — reached 89.8 MiB for one group. Sizing is measured now (see
+    /// <see cref="EnsureSink"/>), bounded absolutely by <c>SegmentBloomFilter</c>'s filter
+    /// ceiling, and a group that fills its filter early is sealed early (see
+    /// <see cref="GroupIsFull"/>) rather than allowed to overrun it.</para>
     /// </summary>
     public const long DefaultGroupPayloadBudgetBytes = 64L * 1024 * 1024;
 
     /// <summary>
-    /// Bytes per row assumed when sizing the FIRST index group's bloom filter and nothing has
-    /// been measured yet. Only a starting point: from the second group on, the real
-    /// <c>uncompressedBytes / events</c> of the file so far is used.
+    /// Uncompressed bytes this block format spends on ONE row before a single byte of that row's
+    /// CONTENT: the fixed-width columns (@t 8, @l 1, @i 8, trace 16, span 8) plus one uint32
+    /// offset in each of the four string columns (@mt, @x, props, @svc).
+    ///
+    /// <para>It is both the base of a row's cost estimate and the FLOOR on the divisor that turns
+    /// a group's payload budget into an event forecast, and those are the same number on purpose:
+    /// no row and no file average can come in under it, so the floor is an invariant of the
+    /// format rather than a guess. It used to be a guessed 32, which no row could reach either —
+    /// leaving the divisor floored by something unreachable, and the worst case documented
+    /// against it overstated by 1.8x. <c>SegmentBlockGeometryTests</c> pins it against what a
+    /// written segment actually costs, so a format change that lowers the fixed cost fails there
+    /// rather than silently making a paragraph elsewhere true.</para>
     /// </summary>
-    private const long MinAssumedRowCostBytes = 32;
+    internal const long FixedRowCostBytes = 8 + 1 + 8 + 16 + 8 + 4 * 4;   // 57
 
     /// <summary>
     /// Row cost the group budget's documented bloom figure is expressed in — a full 64 MB group
@@ -275,7 +297,7 @@ public sealed class SegmentWriter : IDisposable
             int svcBytes  = ev.ServiceName is null ? 0 : Encoding.UTF8.GetByteCount(ev.ServiceName);
             // Approximate: the exception blob is only serialised once, at staging time (and on
             // the merge path not at all — its bytes are copied straight through).
-            int rowCost   = 8 + 1 + 8 + 16 + 8 + 16
+            int rowCost   = (int)FixedRowCostBytes
                           + tmplBytes + svcBytes + ev.Properties.Length
                           + (ev.HasException ? Math.Max(64, ev.ExceptionPayload.Length) : 0);
 
@@ -287,7 +309,7 @@ public sealed class SegmentWriter : IDisposable
                 // Cut only on a block boundary: a group owns whole blocks, so the block
                 // index stays a single flat array and candidate → block resolution is
                 // untouched by grouping.
-                if (_sinkFactory is not null && _groupPayloadBytes >= _groupBudget)
+                if (_sinkFactory is not null && GroupIsFull())
                     SealGroup();
             }
 
@@ -328,17 +350,19 @@ public sealed class SegmentWriter : IDisposable
     /// <summary>
     /// Opens the group's index sink on its first event.
     ///
-    /// <para>The bloom filter is allocated up front and cannot be resized, so the sink needs an
-    /// event-count forecast the moment the group starts. Two bounds, whichever is tighter: what
-    /// the source says is left, and what the group's PAYLOAD budget affords at the average row
-    /// cost. Over-forecasting only wastes bloom bits; under-forecasting saturates the filter and
-    /// the prefilter stops rejecting — so both bounds are ceilings and neither is trusted alone.</para>
+    /// <para>The bloom filter is allocated up front and cannot be resized, so the sink needs a
+    /// forecast the moment the group starts, in two parts: how many EVENTS the group will hold,
+    /// and how many bloom TERMS each of them contributes. The section's size is their product.</para>
     ///
-    /// <para>From the second group on the row cost is the file's own measured average, over
-    /// however many events have already been written. The FIRST group has only this one event,
-    /// which is a sample of one — so it is used only where it makes the forecast LARGER, floored
-    /// at <see cref="AssumedRowCostBytes"/>. See that constant for what a fat first row used to
-    /// do to the whole file's filter.</para>
+    /// <para>EVENTS: two bounds, whichever is tighter — what the source says is left, and what the
+    /// group's PAYLOAD budget affords at the average row cost. From the second group on the row
+    /// cost is the file's own measured average, over however many events have already been
+    /// written. The FIRST group has only this one event, which is a sample of one — so it is used
+    /// only where it makes the forecast LARGER, floored at <see cref="AssumedRowCostBytes"/>. See
+    /// that constant for what a fat first row used to do to the whole file's filter.</para>
+    ///
+    /// <para>TERMS: measured, from the groups this file has already sealed. See
+    /// <see cref="BloomTermHeadroom"/>.</para>
     /// </summary>
     private ISegmentIndexSink? EnsureSink(int rowCost, long remainingHint)
     {
@@ -346,11 +370,123 @@ public sealed class SegmentWriter : IDisposable
         if (_sink is not null)    return _sink;
 
         long byBudget = _eventsFlushed > 0
-            ? _groupBudget / Math.Max(MinAssumedRowCostBytes, _uncompressedBytes / _eventsFlushed)
-            : Math.Max(_groupBudget / Math.Max(MinAssumedRowCostBytes, rowCost),
+            ? _groupBudget / Math.Max(FixedRowCostBytes, _uncompressedBytes / _eventsFlushed)
+            : Math.Max(_groupBudget / Math.Max(FixedRowCostBytes, rowCost),
                        _groupBudget / AssumedRowCostBytes);
         long estimate = Math.Clamp(Math.Min(remainingHint, Math.Max(1, byBudget)), 1, int.MaxValue);
-        return _sink = _sinkFactory((int)estimate);
+        return _sink = _sinkFactory((int)estimate, EstimateTermsPerEvent());
+    }
+
+    /// <summary>
+    /// Is the open group finished — either its payload budget is spent, or its bloom filter has
+    /// no room left for the terms the next block would add?
+    ///
+    /// <para>The SECOND condition is what keeps a forecast from becoming a saturated filter. A
+    /// filter is allocated at the group's first event and cannot be resized, so a group that
+    /// turns out denser than the groups it was forecast from has exactly two possible endings:
+    /// keep adding terms to bits that are already spent, or stop the group. Stopping it is the
+    /// graceful one — a short group costs one extra set of index sections, a saturated one costs
+    /// the query prefilter its whole reason to exist. MEASURED (<c>BloomStepSizingProbe</c>, a
+    /// merge whose events go from two long properties to twenty-four short ones): without this,
+    /// the group the change lands in runs at 3.2 bits per term against a 10-bit design point.</para>
+    ///
+    /// <para>Sealed BEFORE the capacity is passed, not after: the check runs at a block boundary,
+    /// so the next block's terms are already committed by the time it could run again. The last
+    /// block's own term count is the estimate of the next one's — blocks within a group hold the
+    /// same events, and this only has to be right to about a block.</para>
+    ///
+    /// <para>A sink that reports no capacity (0) leaves this exactly as it was: payload alone.</para>
+    /// </summary>
+    private bool GroupIsFull()
+    {
+        long groupTerms = _sink?.BloomTermsAdded ?? 0;
+        long blockTerms = groupTerms - _groupTermsAtLastBlock;
+        _groupTermsAtLastBlock = groupTerms;
+
+        if (_groupPayloadBytes >= _groupBudget) return true;
+
+        long capacity = _sink?.BloomTermCapacity ?? 0;
+        return capacity > 0 && groupTerms + blockTerms >= capacity;
+    }
+
+    /// <summary>
+    /// Headroom on the measured terms-per-event carried into the next group.
+    ///
+    /// <para>The measurement is of groups already written; the group being sized has not happened
+    /// yet, and a burst of property-heavy events can make it denser than anything before it. The
+    /// two directions are not symmetric — over-sizing wastes bits at 1.25 bytes a term, while
+    /// under-sizing saturates the filter and the query's phase-1 gate stops rejecting — so the
+    /// forecast is deliberately doubled. A group would have to hold twice the terms per event of
+    /// the group before it, all at once, before its filter fell below the ~10 bits/term design
+    /// point — and <see cref="GroupIsFull"/> catches even that, by ending the group.</para>
+    /// </summary>
+    private const long BloomTermHeadroom = 2;
+
+    /// <summary>
+    /// Floor on the forecast terms-per-event, so a degenerate opening group cannot starve the
+    /// rest of the file's filters. Three terms are structural on any event carrying them at all
+    /// (level, message template, service name) and two short properties add four more, so the
+    /// thinnest shape measured contributes seven; a whole group averaging below that has almost
+    /// nothing for a filter to be selective about. Applied AFTER the headroom multiplier, so it
+    /// binds only when the measurement is genuinely degenerate rather than merely thin.
+    ///
+    /// <para>What it buys, now that <see cref="GroupIsFull"/> ends a group rather than letting it
+    /// overrun its filter, is a bound on FRAGMENTATION: a forecast taken from a group holding one
+    /// or two terms an event would have the seal cut the first normal group after it to a sliver,
+    /// and every sliver carries its own inverted and trigram sections. Reachable — a level and a
+    /// message template are two terms, which doubled is four — and reached by
+    /// <c>BloomStepSizingProbe</c>, which is what stops this from becoming another constant that
+    /// documents a case nothing produces.</para>
+    /// </summary>
+    internal const long MinBloomTermsPerEvent = 8;
+
+    // Bloom terms the sealed groups of this file actually added, and the events that produced
+    // them: the whole file, and separately the group that sealed last. Read off each sink at
+    // SealGroup, which is the only moment both numbers are final.
+    private long _bloomTermsSealed;
+    private long _bloomTermEventsSealed;
+    private long _bloomTermsLastGroup;
+    private long _bloomEventsLastGroup;
+
+    // Terms the open group's filter held at the previous block boundary, so the last block's
+    // contribution can be read off as a delta. See GroupIsFull.
+    private long _groupTermsAtLastBlock;
+
+    /// <summary>
+    /// Terms per event to size the next group's filter for.
+    ///
+    /// <para>MEASURED rather than assumed, which is the whole point: the assumption was a fixed
+    /// 64, and the shapes a log store actually holds are nowhere near it. <c>BloomSizingProbe</c>
+    /// merges eight sources of each shape and reads the filters back out of the file — thin
+    /// events (level, template, service, two short properties) contribute 7.0 terms each and
+    /// prop-dense ones (trace ids, eight properties, an exception on one in twenty) 21.1. At 64
+    /// the thin file's filter ran 91 bits per term against a 10-bit design point, i.e. eight of
+    /// every nine bloom bytes it wrote bought nothing.</para>
+    ///
+    /// <para>The LAST group and the whole file, whichever is denser. A file average alone is what
+    /// this used to be, and it cannot follow a step change: it moves by 1/n, so a file whose
+    /// events start carrying more structured context — an ordinary thing for a merge to read,
+    /// since sources arrive in timestamp order — has its density change absorbed over tens of
+    /// groups rather than one. MEASURED (<c>BloomStepSizingProbe</c>): after fifteen thin groups,
+    /// a step to twenty-four short properties left the file average forecasting 7 terms/event
+    /// against the 51 the groups were holding, and ten consecutive groups came out below the
+    /// design point, recovering by about half a bit per group. The last group alone follows the
+    /// step in one; keeping the file average as a FLOOR is what stops an alternating file from
+    /// forecasting each group from the opposite shape.</para>
+    ///
+    /// <para>Nothing sealed yet ⇒ 0, which the sink reads as "use your own assumption". Only the
+    /// first group of a file is ever in that position.</para>
+    /// </summary>
+    private int EstimateTermsPerEvent()
+    {
+        long fromFile = _bloomTermEventsSealed > 0
+            ? BloomTermHeadroom * _bloomTermsSealed / _bloomTermEventsSealed : 0;
+        long fromLast = _bloomEventsLastGroup > 0
+            ? BloomTermHeadroom * _bloomTermsLastGroup / _bloomEventsLastGroup : 0;
+
+        long perEvent = Math.Max(fromFile, fromLast);
+        if (perEvent <= 0) return 0;
+        return (int)Math.Clamp(perEvent, MinBloomTermsPerEvent, int.MaxValue);
     }
 
     /// <summary>Serialises the open group's index sections, writes them, then closes the group.</summary>
@@ -364,10 +500,23 @@ public sealed class SegmentWriter : IDisposable
                 WriteInvertedIndex(inverted);
                 WriteTrigramIndex(trigram);
                 WriteBloomFilter(bloom);
+
+                // What this group cost, banked for the next one's forecast. Here and not in
+                // CloseGroup because this is the last moment the sink is in hand and the group's
+                // event count is final — every block of it has been emitted.
+                long terms = _sink.BloomTermsAdded;
+                if (terms > 0)
+                {
+                    _bloomTermsSealed      += terms;
+                    _bloomTermEventsSealed += _groupEventCount;
+                    _bloomTermsLastGroup    = terms;
+                    _bloomEventsLastGroup   = _groupEventCount;
+                }
             }
             _sink.Dispose();
             _sink = null;
         }
+        _groupTermsAtLastBlock = 0;
         if (_groupEventCount == 0) return;
         CloseGroup();
     }

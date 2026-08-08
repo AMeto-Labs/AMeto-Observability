@@ -64,6 +64,8 @@ internal sealed class SegmentEventCursor : IDisposable
 {
     private readonly SegmentReader              _reader;
     private readonly Dictionary<string, string> _stringDedup;
+    /// <summary>The dedup table probed by UTF-8 bytes — see <see cref="Dedup"/>.</summary>
+    private readonly Dictionary<string, string>.AlternateLookup<ReadOnlySpan<byte>> _dedupByUtf8;
 
     private byte[]            _block = [];
     private int               _blockLen;
@@ -79,6 +81,7 @@ internal sealed class SegmentEventCursor : IDisposable
     {
         _reader      = reader;
         _stringDedup = stringDedup;
+        _dedupByUtf8 = stringDedup.GetAlternateLookup<ReadOnlySpan<byte>>();
     }
 
     public string FilePath => _reader.Info.FilePath;
@@ -125,8 +128,8 @@ internal sealed class SegmentEventCursor : IDisposable
             if (_layout.SpLen >= (i + 1) * 8)
                 spanId = BinaryPrimitives.ReadUInt64LittleEndian(span.Slice(_layout.SpOff + i * 8, 8));
 
-            string  template = Dedup(StringColumn(span, _layout.MtOff, _layout.MtLen, i, n)) ?? string.Empty;
-            string? service  = Dedup(StringColumn(span, _layout.SvcOff, _layout.SvcLen, i, n));
+            string  template = Dedup(RawColumn(span, _layout.MtOff,  _layout.MtLen,  i, n)) ?? string.Empty;
+            string? service  = Dedup(RawColumn(span, _layout.SvcOff, _layout.SvcLen, i, n));
 
             // The exception column travels as BYTES, exactly like properties. Decoding it here
             // and re-encoding it in the writer, per row, cost this merge 11116 B/event against
@@ -151,12 +154,6 @@ internal sealed class SegmentEventCursor : IDisposable
         return span.Slice(off + offsetsBytes + (int)start, (int)(end - start));
     }
 
-    private static string? StringColumn(ReadOnlySpan<byte> span, int off, int len, int i, int n)
-    {
-        var utf8 = RawColumn(span, off, len, i, n);
-        return utf8.IsEmpty ? null : Encoding.UTF8.GetString(utf8);
-    }
-
     /// <summary>
     /// Entries the shared dedup table may hold before it is emptied. Matches
     /// <see cref="StringInternPool"/>'s ceiling, and for the same reason: past it the values are
@@ -166,8 +163,16 @@ internal sealed class SegmentEventCursor : IDisposable
 
     /// <summary>
     /// Collapses repeated template / service strings across blocks AND across the merge's source
-    /// files. A day's segments share a handful of templates between them, so without this the
-    /// merge would allocate one string per event for a value that is already on the heap.
+    /// files. A day's segments share a handful of templates between them, so a merged file's
+    /// distinct vocabulary is a rounding error against its event count.
+    ///
+    /// <para>The lookup is BY UTF-8, straight off the block where the value already lies. This
+    /// used to decode first and deduplicate the result, which ran Encoding.UTF8.GetString for
+    /// every string of every event and then handed the fresh instance to the GC the moment the
+    /// table produced the one already on the heap — two strings per merged event, eight million
+    /// Gen0 strings across a four-million-event file, not one of them ever read. Probing through
+    /// an alternate comparer over the byte spelling builds a string once per DISTINCT value,
+    /// which is what deduplicating was always supposed to mean.</para>
     ///
     /// <para>BOUNDED, because the table is otherwise the one thing in the merge that is not
     /// O(block + group): it retains an entry per DISTINCT template for the whole merge, and a
@@ -179,19 +184,91 @@ internal sealed class SegmentEventCursor : IDisposable
     /// table is simply emptied at the cap and refills with whatever the merge is seeing now.
     /// The dictionary keeps its buckets; what is released is the strings, which are the bulk.</para>
     /// </summary>
-    private string? Dedup(string? s)
+    private string? Dedup(ReadOnlySpan<byte> utf8)
     {
-        if (s is null) return null;
-        if (_stringDedup.TryGetValue(s, out var pooled)) return pooled;
+        if (utf8.IsEmpty) return null;
+        if (_dedupByUtf8.TryGetValue(utf8, out var pooled)) return pooled;
         if (_stringDedup.Count >= MaxDedupEntries) _stringDedup.Clear();
-        _stringDedup[s] = s;
-        return s;
+
+        // Inserted through the alternate too: keyed by the bytes, the entry costs the one
+        // transcode that produced the string rather than a second one to hash it.
+        string created = Encoding.UTF8.GetString(utf8);
+        _dedupByUtf8[utf8] = created;
+        return created;
     }
 
     public void Dispose()
     {
         if (_block.Length > 0) { ArrayPool<byte>.Shared.Return(_block); _block = []; }
         _reader.Dispose();
+    }
+}
+
+/// <summary>
+/// Ordinal string equality with a UTF-8 alternate, so a string-keyed table can be PROBED with the
+/// bytes of a segment column and only build a string when the value turns out to be one it has
+/// not seen.
+///
+/// <para>The two sides agree because they hash the same thing — the UTF-8 spelling. The string
+/// side pays a transcode into scratch, which happens once per DISTINCT value on insert (and not
+/// even then when the entry goes in through the alternate); the span side, the one running twice
+/// per merged event, hashes the block's bytes where they lie.</para>
+/// </summary>
+internal sealed class Utf8StringComparer : IEqualityComparer<string>,
+                                           IAlternateEqualityComparer<ReadOnlySpan<byte>, string>
+{
+    public static readonly Utf8StringComparer Instance = new();
+    private Utf8StringComparer() { }
+
+    /// <summary>Templates and service names sit far inside this; longer values borrow from the pool.</summary>
+    private const int StackScratch = 512;
+
+    public bool Equals(string? x, string? y) => string.Equals(x, y, StringComparison.Ordinal);
+
+    public int GetHashCode(string value)
+    {
+        int needed = Encoding.UTF8.GetByteCount(value);
+        byte[]? rented = null;
+        Span<byte> scratch = stackalloc byte[StackScratch];
+        if (needed > StackScratch) scratch = rented = ArrayPool<byte>.Shared.Rent(needed);
+        try
+        {
+            int written = Encoding.UTF8.GetBytes(value, scratch);
+            return HashUtf8(scratch[..written]);
+        }
+        finally { if (rented is not null) ArrayPool<byte>.Shared.Return(rented); }
+    }
+
+    public string Create(ReadOnlySpan<byte> utf8) => Encoding.UTF8.GetString(utf8);
+
+    public int GetHashCode(ReadOnlySpan<byte> utf8) => HashUtf8(utf8);
+
+    public bool Equals(ReadOnlySpan<byte> utf8, string other)
+    {
+        // A yes here is final, and for the ASCII that a template or a service name almost always
+        // is, that settles the comparison against the UTF-16 string with no buffer at all. A no is
+        // not an answer — Ascii.Equals also reports false when either side simply is not ASCII —
+        // so anything it rejects is decided on the decoded text.
+        if (Ascii.Equals(utf8, other.AsSpan())) return true;
+        if (other.Length > utf8.Length) return false;   // UTF-8 never spends fewer bytes than UTF-16 units
+
+        char[]? rented = null;
+        Span<char> scratch = stackalloc char[StackScratch];
+        int needed = Encoding.UTF8.GetMaxCharCount(utf8.Length);
+        if (needed > StackScratch) scratch = rented = ArrayPool<char>.Shared.Rent(needed);
+        try
+        {
+            int written = Encoding.UTF8.GetChars(utf8, scratch);
+            return other.AsSpan().SequenceEqual(scratch[..written]);
+        }
+        finally { if (rented is not null) ArrayPool<char>.Shared.Return(rented); }
+    }
+
+    private static int HashUtf8(ReadOnlySpan<byte> utf8)
+    {
+        var hash = new HashCode();
+        hash.AddBytes(utf8);
+        return hash.ToHashCode();
     }
 }
 
@@ -226,8 +303,9 @@ public sealed class MergingSegmentEventSource : ISegmentEventSource, IDisposable
     {
         // One dedup table for the whole merge: templates and service names repeat across every
         // source file, so sharing it is what keeps string allocation proportional to distinct
-        // values instead of to events.
-        var dedup = new Dictionary<string, string>(StringComparer.Ordinal);
+        // values instead of to events. Keyed for probing BY UTF-8 (see SegmentEventCursor.Dedup),
+        // which is what makes that sentence true rather than merely intended.
+        var dedup = new Dictionary<string, string>(Utf8StringComparer.Instance);
 
         // Every cursor exists before any I/O happens, so a corrupt first block leaves a fully
         // formed object for Dispose to clean up — no reader is orphaned on a failed open.

@@ -131,16 +131,54 @@ public interface ISegmentIndexSink : IDisposable
 {
     void Add(uint fileOrdinal, in SegmentEventRef ev);
 
+    /// <summary>
+    /// Bloom TERMS this sink has added so far — the quantity the bloom section is actually
+    /// sized in, as opposed to the events the writer forecasts.
+    ///
+    /// <para>The writer reads it when it seals a group and sizes the next group's filter from
+    /// it (see <c>SegmentWriter.EnsureSink</c>). A sink that cannot count may return 0, which
+    /// the writer reads as "nothing measured" and falls back to its assumption — so the
+    /// property is a measurement, never a contract. Must remain readable after
+    /// <see cref="IDisposable.Dispose"/>: the writer seals before it asks.</para>
+    /// </summary>
+    long BloomTermsAdded { get; }
+
+    /// <summary>
+    /// Bloom terms this sink's filter can hold at its design bits-per-term — what the forecast
+    /// BOUGHT, after the sink applied its own bounds to what the writer asked for.
+    ///
+    /// <para>The writer compares it against <see cref="BloomTermsAdded"/> at every block boundary
+    /// and seals the group before it is exceeded, which is what turns a wrong forecast into a
+    /// SMALLER GROUP rather than a saturated filter. That distinction is the whole value of the
+    /// property: a filter cannot be resized once allocated, so without it the only response to a
+    /// group denser than the one it was forecast from is to keep adding terms to bits that are
+    /// already spent, and the query's phase-1 gate stops rejecting.</para>
+    ///
+    /// <para>It is the sink's number, not the writer's product of two forecasts, precisely
+    /// because the sink is where the forecast is bounded — <c>SegmentBloomFilter</c> caps one
+    /// filter's bytes absolutely, and a writer recomputing the request would enforce a budget the
+    /// filter was never given. 0 means "no filter, or one that cannot say", and the writer then
+    /// seals on payload alone, exactly as it did before this existed.</para>
+    /// </summary>
+    long BloomTermCapacity { get; }
+
     /// <summary>Serialises the group's sections. Called once, after the last <see cref="Add"/>.</summary>
     (byte[] Inverted, byte[] Trigram, byte[] Bloom) Serialise();
 }
 
 /// <summary>
-/// Creates the sink for one index group. <paramref name="estimatedEventCount"/> is the writer's
-/// forecast for the group (see <see cref="SegmentWriter"/>) — the bloom filter is sized up front
-/// and cannot be resized, so it is a hint the sink should respect but must not trust.
+/// Creates the sink for one index group. Both arguments are the writer's forecast for the group
+/// (see <see cref="SegmentWriter"/>) — the bloom filter is sized up front and cannot be resized,
+/// so they are hints the sink should respect but must not trust.
 /// </summary>
-public delegate ISegmentIndexSink SegmentIndexSinkFactory(int estimatedEventCount);
+/// <param name="estimatedEventCount">Events the group is expected to hold.</param>
+/// <param name="estimatedTermsPerEvent">
+/// Bloom terms each of those events is expected to contribute. Measured from the groups already
+/// sealed in this file (<see cref="ISegmentIndexSink.BloomTermsAdded"/>) wherever there are any.
+/// ZERO means nothing has been measured — the first group of a file, or a sink that does not
+/// count — and the sink must fall back to its own assumption rather than read it as "no terms".
+/// </param>
+public delegate ISegmentIndexSink SegmentIndexSinkFactory(int estimatedEventCount, int estimatedTermsPerEvent);
 
 /// <summary>
 /// The flush path's <see cref="ISegmentEventSource"/>: a frozen hot tier walked in the order

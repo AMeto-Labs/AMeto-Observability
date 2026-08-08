@@ -34,31 +34,43 @@ public sealed class SegmentIndexBuilder : ISegmentIndexSink
     private char[] _val = new char[128];   // formatted value (serialised form, prefix at [0..2])
 
     /// <summary>
-    /// Terms this builder adds to the bloom filter per event. The filter is a TERM filter —
-    /// level, message template, exception type, trace/span id, service name and every
-    /// flattened property key and value all go in — but it used to be sized by EVENT count,
-    /// i.e. ~10 bits per event against 50-150 entries per event. That is roughly 0.2 bits
+    /// Terms per event assumed when the caller has nothing measured to offer. The filter is a
+    /// TERM filter — level, message template, exception type, trace/span id, service name and
+    /// every flattened property key and value all go in — but it used to be sized by EVENT
+    /// count, i.e. ~10 bits per event against 50-150 entries per event. That is roughly 0.2 bits
     /// per term: the filter said "maybe" to everything, and the prefilter it exists to power
     /// (a bloom miss drops the whole segment before the MB-sized indexes are read) never
-    /// rejected anything on prop-dense events.
+    /// rejected anything on prop-dense events. Sizing on terms restores ~10 bits/term.
     ///
-    /// <para>Sizing on terms restores ~10 bits/term. The cost is trivial and bounded: at the
-    /// sandbox stand's ~73k events/day that is ~5.5 MB for a whole day, against a trigram
-    /// section of ~107 MB.</para>
-    ///
-    /// <para>An estimate rather than a count because the filter is allocated up front. It is
-    /// deliberately generous — over-sizing wastes a few bits, under-sizing brings back the
-    /// saturation this fixes. An exact count would need a second pass over every property
-    /// payload; it is still not worth that, but the over-sizing is now bounded by an index
-    /// GROUP rather than by the file: ~10.5 MB of bloom for a full 64 MB group, against the
-    /// ~230 MB of accumulators the same group's trigram index costs to build.</para>
+    /// <para>It is a fallback, not the normal path, and it is deliberately generous: 64 is
+    /// above every shape measured (<c>BloomSizingProbe</c>: 21.1 terms/event prop-dense, 7.0
+    /// thin), because under-sizing brings back the saturation this exists to prevent and
+    /// over-sizing only wastes bits. Generous is not free, though — at 10 bits a term it is
+    /// 80 bytes of filter per event WHATEVER the event holds, so a thin-event group paid nine
+    /// times the bits its terms could use. So the writer measures instead: it reads
+    /// <see cref="BloomTermsAdded"/> off each sealed group and forecasts the next one from it
+    /// (see <c>SegmentWriter.EnsureSink</c>), and this number is left for the first group of a
+    /// file, which has nothing behind it to measure.</para>
     /// </summary>
-    private const int EstimatedBloomTermsPerEvent = 64;
+    public const int EstimatedBloomTermsPerEvent = 64;
 
-    public SegmentIndexBuilder(int expectedEventCount, int maxFlattenDepth = 5)
+    /// <param name="estimatedTermsPerEvent">
+    /// Bloom terms the caller expects each event to contribute. The filter is allocated up front
+    /// and cannot be resized, so this decides the section's size outright; over-estimating wastes
+    /// bits, under-estimating saturates the filter and the query prefilter stops rejecting.
+    /// <see cref="SegmentBloomFilter.Create"/> bounds the product absolutely, so a wrong estimate
+    /// costs selectivity rather than an unbounded allocation.
+    ///
+    /// <para>ZERO OR LESS means the caller has measured nothing and
+    /// <see cref="EstimatedBloomTermsPerEvent"/> is used. That is a real case, not a guard: the
+    /// first group of a file has no sealed group behind it to measure. It must not be read as
+    /// "no terms" — a filter sized for one term per event saturates instantly.</para>
+    /// </param>
+    public SegmentIndexBuilder(int expectedEventCount, int maxFlattenDepth = 5,
+                               int estimatedTermsPerEvent = EstimatedBloomTermsPerEvent)
     {
-        _bloom            = SegmentBloomFilter.Create(
-                                (long)Math.Max(1, expectedEventCount) * EstimatedBloomTermsPerEvent);
+        long termsPerEvent = estimatedTermsPerEvent > 0 ? estimatedTermsPerEvent : EstimatedBloomTermsPerEvent;
+        _bloom            = SegmentBloomFilter.Create((long)Math.Max(1, expectedEventCount) * termsPerEvent);
         _maxFlattenDepth  = maxFlattenDepth;
     }
 
@@ -395,6 +407,22 @@ public sealed class SegmentIndexBuilder : ISegmentIndexSink
     }
 
     // ── Serialise ─────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Bloom terms added so far — see <see cref="ISegmentIndexSink.BloomTermsAdded"/>. Counted
+    /// by the filter itself, so it costs one increment on a path that was already hashing
+    /// three times, and it stays readable after <see cref="Dispose"/>.
+    /// </summary>
+    public long BloomTermsAdded => _bloom.AddedTermCount;
+
+    /// <summary>
+    /// Terms the filter was actually able to buy — see
+    /// <see cref="ISegmentIndexSink.BloomTermCapacity"/>. Read off the filter rather than
+    /// recomputed from this constructor's two arguments, because the filter is where the request
+    /// is bounded: <see cref="SegmentBloomFilter.Create"/> caps one filter's bytes, and a
+    /// capacity taken from the request would have the writer fill bits that were never allocated.
+    /// </summary>
+    public long BloomTermCapacity => _bloom.Capacity;
 
     public byte[] SerialisedInvertedIndex  => _inverted.Serialise();
     public byte[] SerialisedTrigramIndex   => _trigram.Serialise();

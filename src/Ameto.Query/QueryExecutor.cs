@@ -306,10 +306,38 @@ public sealed class QueryExecutor : IQueryExecutor
                         // the correctness gate.
                         if (grp.MaxTs < fromTicks || grp.MinTs > toTicks) continue;
 
-                        // Phase 1: cheap bloom-only check for the equality hint.
-                        // Bloom bytes are ~a few KB; inverted/trigram can be MB.
-                        // For a high-cardinality value (e.g. a GUID), bloom rejects
-                        // ~99% of groups here without ever loading the big indexes.
+                        // Both phases read the bloom section, so it is rented ONCE per group and
+                        // held across them. It used to be rented twice, and a section is not a
+                        // small thing to rent twice: ArrayPool<byte>.Shared does not pool arrays
+                        // over 1 MB — it satisfies the rent with a fresh allocation and drops it
+                        // on Return — so above that size every rent is an LOH allocation the
+                        // pooling was there to avoid, once per group, per segment, in parallel
+                        // across the catalog.
+                        //
+                        // Unconditional: the fast path above already returned for a filter with
+                        // no hint of any kind, so every group reaching here reads this section in
+                        // one phase or the other.
+                        using var bloomSec = reader.RentBloomFilterBytes(g);
+
+                        // Phase 1: the cheap bloom-only check for the equality hint. For a
+                        // high-cardinality value (e.g. a GUID), bloom rejects ~99% of groups
+                        // here without ever loading the inverted and trigram sections.
+                        //
+                        // "Cheap" is relative and was once documented as absolute — "bloom bytes
+                        // are ~a few KB; inverted/trigram can be MB". They are all MB. MEASURED
+                        // by BloomSizingProbe over an 8-source merge, as a share of a group's
+                        // three index sections: bloom is 15.6% of a prop-dense group and 26.6%
+                        // of a thin-event one, so rejecting in phase 1 costs 6.4x and 3.8x less
+                        // than reaching phase 2 — not the three orders of magnitude the old
+                        // comment implied, but the right side of a decision that is taken once
+                        // per group of every segment a query touches.
+                        //
+                        // That ratio is something the write side has to keep earning. The filter
+                        // is sized from a forecast, and while that forecast assumed a fixed 64
+                        // terms per event, a thin-event group's bloom was 62% of its own index
+                        // and phase 1 saved only 1.6x — the split had very nearly stopped paying
+                        // for itself. Sizing groups from measured terms (SegmentWriter.EnsureSink)
+                        // is what puts it back at 3.8x.
                         //
                         // The gate itself lives in PassesBloomGate rather than inline: it has
                         // to fold case and probe every value form the scan would accept, and
@@ -317,8 +345,7 @@ public sealed class QueryExecutor : IQueryExecutor
                         // rows a scan would have matched.
                         if (hasIndexHint)
                         {
-                            using var bloomSec = reader.RentBloomFilterBytes(g);
-                            using var bloom    = SegmentBloomFilter.Deserialise(bloomSec.Span);
+                            using var bloom = SegmentBloomFilter.Deserialise(bloomSec.Span);
                             if (!PassesBloomGate(filter, bloom))
                                 continue;
                         }
@@ -332,7 +359,6 @@ public sealed class QueryExecutor : IQueryExecutor
                             // Pooled: sections are copied out inside the deserialisers, so the
                             // rented buffers go back to the pool as soon as the index is built.
                             using var invSec = reader.RentInvertedIndexBytes(g);
-                            using var bloSec = reader.RentBloomFilterBytes(g);
                             // The trigram section is the biggest thing in the file (~43% of it)
                             // and every posting list is materialised into int[] on load. Only
                             // pay for it when the filter actually has a substring predicate —
@@ -340,7 +366,7 @@ public sealed class QueryExecutor : IQueryExecutor
                             using var triSec = trigramHints.Count > 0
                                 ? reader.RentTrigramIndexBytes(g)
                                 : default;
-                            using var idx = _indexFactory.Create(invSec.Span, triSec.Span, bloSec.Span);
+                            using var idx = _indexFactory.Create(invSec.Span, triSec.Span, bloomSec.Span);
 
                             // A group that is provably empty for this filter is skipped, not
                             // the whole segment — the next group may still hold matches.

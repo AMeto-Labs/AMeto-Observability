@@ -76,6 +76,19 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     internal bool _allowIndexlessMerge;
     /// <summary>Test hook: shrinks the index-group budget so a small segment still spans several groups.</summary>
     internal long _groupPayloadBudgetBytes = SegmentWriter.DefaultGroupPayloadBudgetBytes;
+    /// <summary>
+    /// Test hook: called with the level whose segment has just been MOVED into place — the exact
+    /// seam at which a crash can split a multi-level flush. Throwing from it reproduces a kill
+    /// between two <c>File.Move</c>s without needing a second process.
+    /// </summary>
+    internal Action<int>? _afterLevelPublished;
+    /// <summary>
+    /// Test hook: called with the manifest on disk and the sources owned but not yet streamed —
+    /// the window in which a merge can be cancelled or fail transiently. Cancelling a token from
+    /// it reproduces a shutdown landing between the flush-slot wait and the merge task; throwing
+    /// from it reproduces a source that dies mid-stream, without corrupting a file to get there.
+    /// </summary>
+    internal Action? _beforeMergeStream;
     /// <summary>Test hook: first id of the block reserved for the live WAL (see <see cref="_walSegId"/>).</summary>
     internal ulong LiveWalSegmentId => _walSegId;
     /// <summary>
@@ -774,6 +787,11 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                     try { File.Delete(oldWalPath); }
                     catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete WAL {Path}", oldWalPath); }
                     try { File.Delete(oldWalPath + ".pool"); } catch { /* best-effort */ }
+                    // The marker is what AUTHORISES the delete above, so it outlives it: dropping
+                    // it first would leave a WAL that recovery has to replay to find out its
+                    // levels are all published. A crash in between leaves a marker with no WAL,
+                    // which the startup sweep clears.
+                    try { File.Delete(FlushMarkerPath(reservedSegId)); } catch { /* swept at startup */ }
                 }
 
                 RetireHotTier(oldHot);
@@ -1477,15 +1495,53 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         }
         try
         {
+            _beforeMergeStream?.Invoke();
             info = await MergeToColdAsync(readers, segId, segPath, expectEvents, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Shutdown is not a verdict on the batch. Swept up with everything else it logged a
+            // WARNING on every single stop, swallowed the cancellation the maintenance loop
+            // stops on, and quarantined the window — so the segments a clean restart had every
+            // reason to merge first were the ones it then refused to look at.
+            foreach (var r in readers) r.Dispose();
+            try { File.Delete(manifestPath); } catch { /* recovery drops it anyway */ }
+            throw;
         }
         catch (Exception ex)
         {
-            // Nothing has been deleted and the merged file never reached segPath, so the
-            // only state to undo is the manifest. A source that failed mid-stream is
-            // skip-listed so the next pass does not re-select the same doomed window.
-            _logger.LogWarning(ex, "Merge: aborted while streaming {Count} source(s) — sources left intact", consumed.Count);
-            foreach (var s in consumed) _mergeSkip.Add(s.Id.Value);
+            // Nothing has been deleted and the merged file never reached segPath, so the only
+            // state to undo is the manifest.
+            //
+            // Skip-listing is QUARANTINE and it lasts until the process restarts, so it belongs
+            // to a batch that CANNOT be merged, not to one that could not be merged now. Corrupt
+            // sources are the first kind: the stream fails the same way on every future pass,
+            // and because the merge reads all of them interleaved there is no telling which file
+            // is the bad one, so the window goes as a whole. A disk that filled up or a network
+            // volume that blinked is the second: retiring up to MergeMaxSources segments over a
+            // condition that clears itself would end compaction for that bucket for the life of
+            // the process, and the small-file backlog those segments form is the exact thing the
+            // sweep exists to remove. Left in the candidate set, the next pass simply retries.
+            //
+            // Disposing here as well as in the merge task is deliberate, and it is the same
+            // discipline the two waits above follow: MergeToColdAsync only takes ownership of the
+            // readers once its delegate is entered, and from out here there is no way to know
+            // whether it was. Dispose is idempotent, so the rule can simply be that every exit
+            // from this method that does not publish closes them.
+            foreach (var r in readers) r.Dispose();
+            if (IsSourceCorruption(ex))
+            {
+                foreach (var s in consumed) _mergeSkip.Add(s.Id.Value);
+                _logger.LogWarning(ex,
+                    "Merge: {Count} source(s) unreadable while streaming — sources left intact, batch skip-listed until restart",
+                    consumed.Count);
+            }
+            else
+            {
+                _logger.LogWarning(ex,
+                    "Merge: aborted while streaming {Count} source(s) — sources left intact, batch retried next pass",
+                    consumed.Count);
+            }
             try { File.Delete(manifestPath); } catch { /* recovery drops it anyway */ }
             return false;
         }
@@ -1515,6 +1571,18 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     }
 
     /// <summary>
+    /// Tells a batch that will never merge from one that merely did not merge this time.
+    ///
+    /// <para><see cref="InvalidDataException"/> is what every structural check throws — footer
+    /// and header magic, an unsupported version, a block whose stored length does not match its
+    /// frame, and the merge's own event-count verification. <see cref="EndOfStreamException"/> is
+    /// a truncated file. Both are properties of the bytes on disk and will still be true on the
+    /// next pass. Everything else — no space left, an I/O error, a file momentarily locked — is
+    /// the machine's condition rather than the segments', and gets another attempt.</para>
+    /// </summary>
+    private static bool IsSourceCorruption(Exception ex) => ex is InvalidDataException or EndOfStreamException;
+
+    /// <summary>
     /// Streams the sources through a k-way merge straight into a new segment file.
     ///
     /// <para>Nothing between the source blocks and the output block is retained: the writer
@@ -1528,7 +1596,14 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// on <c>File.Exists</c> alone: a crash between a move and a later check would commit an
     /// unverified merge and recovery would then finish deleting its sources for it.
     /// </param>
-    private Task<SegmentInfo> MergeToColdAsync(
+    /// <remarks>
+    /// Internal rather than private so its reader-ownership contract can be tested where it is
+    /// actually made. Driven through <see cref="TryMergeSmallSegmentsOnceAsync"/> the contract is
+    /// invisible: that method's own abort paths close the readers too, deliberately, so a test
+    /// that cancels a whole merge pass cannot tell which of the two did it — and passes just as
+    /// well when this one does nothing at all.
+    /// </remarks>
+    internal Task<SegmentInfo> MergeToColdAsync(
         List<SegmentReader> readers, SegmentId segId, string segPath, long expectEvents, CancellationToken ct)
     {
         var  sinkFactory = IndexSinkFactory;
@@ -1542,6 +1617,17 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             MergingSegmentEventSource? source = null;
             try
             {
+                // Cancellation is observed HERE, and the token is deliberately NOT handed to
+                // Task.Run: a Task.Run whose token is already signalled transitions the task
+                // straight to Canceled WITHOUT ever invoking the delegate — and the delegate is
+                // the only place the readers this method took ownership of are closed. Cancelling
+                // in the window between _flushConcurrency.WaitAsync returning and the delegate
+                // being scheduled therefore left up to MergeMaxSources mapped views alive for the
+                // life of the process, and a mapped file on Windows can be neither compacted nor
+                // unlinked by retention. That is the very hazard the wait's own catch guards
+                // against one step earlier; this closes the second door into it.
+                ct.ThrowIfCancellationRequested();
+
                 SegmentInfo info;
                 source = new MergingSegmentEventSource(readers);
                 // HC HAPPENS HERE, and only here. A merge already rewrites every block it reads,
@@ -1600,7 +1686,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 source?.Dispose();
                 foreach (var r in readers) r.Dispose();   // idempotent — safe after the happy path
             }
-        }, ct);
+        });
     }
 
     /// <summary>
@@ -1649,9 +1735,27 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// the query k-way merge, cursor pagination) is unaffected. Levels absent from the
     /// tier produce no file. The level's id is <c>firstSegId + (byte)level</c>, matching
     /// the block of ids reserved at freeze so a concurrent query skips them all.</para>
+    ///
+    /// <para>CRASH-SAFE VIA A COMPLETION MARKER, and like the merge protocol the ORDER is the
+    /// proof. Each level is built at <c>.seg.tmp</c> and moved into place one at a time, so
+    /// between the first move and the last the directory holds a PARTIAL set — and the WAL that
+    /// still holds every one of those events is only deleted afterwards. Recovery therefore
+    /// cannot read "some segment of this block exists" as "the flush finished": that predicate
+    /// answers true for a set of one, and the WAL it then deletes is the only copy of the levels
+    /// that never got published. So the last thing this method does, after every move, is write
+    /// and FSYNC <c>{nodeId}-{firstSegId}.flushed</c>. A present marker — nothing else — means
+    /// the block is complete, and it is dropped together with the WAL it authorises.</para>
     /// </summary>
+    /// <param name="skipPublishedLevels">
+    /// Recovery only. A level is published by ONE move of ONE whole file, so a segment already
+    /// sitting at <c>firstSegId + level</c> means that level is fully persisted and its rows must
+    /// not be written a second time — the replayed tier fills in the missing levels and nothing
+    /// else. This is what makes replaying a markerless WAL idempotent, which in turn is what lets
+    /// a data directory written by the previous build (complete flush, no marker anywhere) be
+    /// replayed without producing a single duplicate.
+    /// </param>
     private async Task<List<SegmentInfo>> FlushTierByLevelAsync(
-        HotTierSegment hot, ulong firstSegId, CancellationToken ct)
+        HotTierSegment hot, ulong firstSegId, CancellationToken ct, bool skipPublishedLevels = false)
     {
         int[] order = SegmentWriter.ComputeSortOrder(hot);
 
@@ -1669,12 +1773,72 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             var idx = perLevel[lvl];
             if (idx is null || idx.Count == 0) continue;
 
+            var segId = new SegmentId(firstSegId + (ulong)lvl);
+            if (skipPublishedLevels && SegmentFileExists(segId.Value))
+            {
+                _logger.LogInformation(
+                    "WAL recovery: level {Level} is already published as segment {Id} — {Count} event(s) not rewritten",
+                    (Ameto.Core.LogLevel)lvl, segId.Value, idx.Count);
+                continue;
+            }
+
             var subset  = idx.ToArray();
-            var segId   = new SegmentId(firstSegId + (ulong)lvl);
             var segPath = BuildSegmentPath(segId, hot, subset);
             written.Add(await FlushToColdAsync(hot, segId, segPath, ct, subset));
+            _afterLevelPublished?.Invoke(lvl);
         }
+
+        // ── MARKER LAST. Every level is on disk and fsynced (SegmentWriter.Finalise flushes to
+        //    the platter before the move), so this file is the durable "the block is complete"
+        //    record the WAL delete keys off. Written THROUGH for the same reason the merge
+        //    manifest is: the protocol is an ordering between these files and an unlink, and an
+        //    ordering only the page cache observes does not survive a power loss.
+        WriteFlushCompletionMarker(firstSegId, written);
         return written;
+    }
+
+    /// <summary>True when a segment file carrying <paramref name="segId"/> is on disk.</summary>
+    private bool SegmentFileExists(ulong segId)
+    {
+        foreach (var _ in Directory.EnumerateFiles(_segDir, $"{_options.NodeId.Value}-{segId}-*.seg"))
+            return true;
+        return false;
+    }
+
+    /// <summary>
+    /// Path of the record that a tier's whole level block reached disk. It lives beside the WAL
+    /// it certifies rather than among the segments: its lifetime is exactly that WAL's — created
+    /// after the last level is published, deleted immediately after the WAL — and the segment
+    /// directory is enumerated by the catalog load, the merge planner and every retention pass.
+    /// </summary>
+    private string FlushMarkerPath(ulong firstSegId) =>
+        Path.Combine(_walDir, $"{_options.NodeId.Value}-{firstSegId}.flushed");
+
+    /// <summary>
+    /// Writes and fsyncs the completion marker for a level block. Failure to write it is NOT
+    /// fatal to the flush — the segments are already durable — it only costs a re-flush of the
+    /// levels the next restart cannot prove were published, so it is logged and swallowed.
+    /// </summary>
+    private void WriteFlushCompletionMarker(ulong firstSegId, List<SegmentInfo> written)
+    {
+        string path = FlushMarkerPath(firstSegId);
+        try
+        {
+            using var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None,
+                                          4096, FileOptions.WriteThrough);
+            using (var w = new StreamWriter(fs, leaveOpen: true))
+            {
+                // The names are for diagnostics only — recovery decides on the file's EXISTENCE,
+                // exactly as merge recovery decides on the manifest's.
+                for (int i = 0; i < written.Count; i++) w.WriteLine(Path.GetFileName(written[i].FilePath));
+                w.Flush();
+            }
+            fs.Flush(flushToDisk: true);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to write flush completion marker {Path} — the WAL will be replayed on restart", path);
+        }
     }
 
     private Task<SegmentInfo> FlushToColdAsync(
@@ -1805,120 +1969,151 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     }
 
     /// <summary>
-    /// True when the flush of the WAL named <paramref name="walSegId"/> left at least one
-    /// segment file behind.
+    /// Replays every WAL left behind by a previous process, one at a time, then clears markers
+    /// whose WAL is already gone.
     ///
-    /// <para>The whole reserved BLOCK is probed, not just the first id: a tier writes one
-    /// segment per level and only for the levels it actually holds, so a tier of pure
-    /// Information events produces <c>walSegId + 2</c> and nothing at <c>walSegId</c>.
-    /// Checking the first id alone reads "never flushed" for that tier and replays a WAL
-    /// whose events are already cold.</para>
+    /// <para>A WAL is dropped only against a COMPLETION MARKER. It used to be dropped against
+    /// "some segment inside its reserved block exists", which was exact only while a tier
+    /// flushed to a single file. It now flushes to one file per level, published one move at a
+    /// time, so that predicate answers true the instant the FIRST level lands — and the WAL it
+    /// then deleted was the only copy of every level that had not been published yet. A crash,
+    /// or an exception on one level, between the first move and the last was silent, total loss
+    /// of the rest of the tier.</para>
     /// </summary>
-    private bool FlushedSegmentExistsOnDisk(ulong walSegId)
-    {
-        for (ulong id = walSegId; id < walSegId + LevelSegmentSlots; id++)
-            foreach (var _ in Directory.EnumerateFiles(_segDir, $"{_options.NodeId.Value}-{id}-*.seg"))
-                return true;
-        return false;
-    }
-
     private void ReplayOrphanedWals()
     {
-        var walFiles = Directory.EnumerateFiles(_walDir, "*.wal").ToList();
-        if (walFiles.Count == 0) return;
-
-        HotTierSegment? recoveredHot = null;
-        try
+        foreach (var walFile in Directory.EnumerateFiles(_walDir, "*.wal"))
         {
-            foreach (var walFile in walFiles)
+            // Per WAL, so one unreadable log cannot strand the others behind it.
+            try { ReplayOrphanedWal(walFile); }
+            catch (Exception ex) { _logger.LogError(ex, "WAL recovery failed for {File}", walFile); }
+        }
+
+        // Markers whose WAL is gone: the delete pair is WAL-then-marker, so a crash between
+        // them leaves this. Harmless but unbounded if never collected.
+        foreach (var marker in Directory.EnumerateFiles(_walDir, "*.flushed"))
+        {
+            string wal = marker[..^".flushed".Length] + ".wal";
+            if (File.Exists(wal)) continue;
+            try { File.Delete(marker); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete stale flush marker {File}", marker); }
+        }
+    }
+
+    private void ReplayOrphanedWal(string walFile)
+    {
+        string poolPath   = walFile + ".pool";
+        var (segId, entries) = WriteAheadLog.ReadForRecovery(walFile);
+
+        // Empty or corrupt WAL — clean up
+        if (segId == 0 || entries.Count == 0)
+        {
+            try { File.Delete(walFile); } catch { }
+            try { File.Delete(poolPath); } catch { }
+            if (segId != 0)
             {
-                string poolPath = walFile + ".pool";
-                var (segId, entries) = WriteAheadLog.ReadForRecovery(walFile);
-
-                // Empty or corrupt WAL — clean up
-                if (segId == 0 || entries.Count == 0)
-                {
-                    try { File.Delete(walFile); } catch { }
-                    try { File.Delete(poolPath); } catch { }
-                    continue;
-                }
-
-                // WAL already flushed — delete the orphan. "Flushed" is read off the segment
-                // DIRECTORY, not off _segments: the catalog load runs in the background (it
-                // opens every file), so a catalog lookup here races the enumeration that
-                // would answer it, and losing that race replays a WAL whose events are
-                // already in cold storage — duplicates.
-                if (FlushedSegmentExistsOnDisk(segId))
-                {
-                    _logger.LogInformation("WAL {File} already flushed — removing", walFile);
-                    try { File.Delete(walFile); } catch { }
-                    try { File.Delete(poolPath); } catch { }
-                    continue;
-                }
-
-                // Load template pool
-                var pool = WriteAheadLog.LoadPool(poolPath);
-                if (pool.Count == 0)
-                {
-                    _logger.LogWarning("Orphaned WAL {File}: no template pool, discarding {Count} events",
-                        walFile, entries.Count);
-                    try { File.Delete(walFile); } catch { }
-                    continue;
-                }
-
-                // Restore templates into TemplatePool
-                foreach (var (idx, tmpl) in pool)
-                    TemplatePool.ForceIntern(idx, tmpl);
-
-                // Replay entries into recovered hot tier
-                recoveredHot ??= CreateHotTier();
-                int replayed = 0;
-                foreach (var entry in entries)
-                {
-                    var header = new LogEventHeader
-                    {
-                        Id                       = _idGen.Next(entry.TimestampTicks),
-                        TimestampUtcTicks        = entry.TimestampTicks,
-                        Level                    = entry.Level,
-                        MessageTemplatePoolIndex = entry.TemplateIndex,
-                    };
-                    // Resolve template via the freshly restored pool and attach it
-                    // to the hot tier so the recovery flush persists @mt correctly.
-                    string tmpl = TemplatePool.Get(entry.TemplateIndex);
-                    if (recoveredHot.TryWrite(header, entry.Payload, tmpl, entry.Exception))
-                        replayed++;
-                }
-
-                _logger.LogInformation("WAL recovery: replayed {Count} events from {File}", replayed, walFile);
-                try { File.Delete(walFile); } catch { }
-                try { File.Delete(poolPath); } catch { }
+                ReserveWalBlock(segId);
+                try { File.Delete(FlushMarkerPath(segId)); } catch { }
             }
+            return;
+        }
 
-            // Flush recovered events to cold segments (no index — acceptable for crash recovery),
-            // ONE PER LEVEL like the live flush path. Writing the recovered tier as a single
-            // mixed-level segment reopened the data loss the level split exists to prevent:
-            // expiry is Ttl(MinLevel), TTL is not monotonic in the level's value, so a
-            // recovered tier holding one Debug event put every Error beside it on a 3-day
-            // deadline. Crash recovery is exactly when that is least acceptable.
-            if (recoveredHot?.Count > 0)
+        // The block this WAL names is spent whatever happens next — its levels are either
+        // already on disk or about to be written below. Burning it here stops a later flush or
+        // merge being handed an id that already carries a file: the allocator is seeded from
+        // segment file NAMES, and a block whose flush never produced one leaves it behind.
+        ReserveWalBlock(segId);
+
+        // The flush of this WAL completed — every level reached disk before the marker did.
+        // Read off the FILESYSTEM, not off _segments: the catalog load runs in the background
+        // (it opens every file), so a catalog lookup here races the enumeration that would
+        // answer it, and losing that race replays a WAL whose events are already cold.
+        string marker = FlushMarkerPath(segId);
+        if (File.Exists(marker))
+        {
+            _logger.LogInformation("WAL {File} already flushed — removing", walFile);
+            try { File.Delete(walFile); } catch { }
+            try { File.Delete(poolPath); } catch { }
+            try { File.Delete(marker); } catch { }
+            return;
+        }
+
+        // Load template pool
+        var pool = WriteAheadLog.LoadPool(poolPath);
+        if (pool.Count == 0)
+        {
+            _logger.LogWarning("Orphaned WAL {File}: no template pool, discarding {Count} events",
+                walFile, entries.Count);
+            try { File.Delete(walFile); } catch { }
+            try { File.Delete(poolPath); } catch { }
+            return;
+        }
+
+        // Restore templates into TemplatePool
+        foreach (var (idx, tmpl) in pool)
+            TemplatePool.ForceIntern(idx, tmpl);
+
+        // Replay entries into a hot tier of this WAL's own — one WAL per tier, so the recovered
+        // events flush into the block the WAL is NAMED from and recovery obeys exactly the same
+        // marker protocol as the live flush. Pooling several WALs into one tier could not: their
+        // events would land in some other block, no marker would ever be written for the WAL's
+        // own, and a crash before the WAL was unlinked would replay it into duplicates.
+        using var recoveredHot = CreateHotTier();
+        int replayed = 0;
+        foreach (var entry in entries)
+        {
+            var header = new LogEventHeader
             {
-                ulong firstSegId = _nextSegmentId;
-                _nextSegmentId  += LevelSegmentSlots;
-                var written = FlushTierByLevelAsync(recoveredHot, firstSegId, CancellationToken.None)
-                                  .GetAwaiter().GetResult();
-                foreach (var info in written) _segments[info.Id.Value] = info;
-                _logger.LogInformation("WAL recovery: wrote {Segments} level segment(s), {Count} events",
-                    written.Count, written.Sum(w => (long)w.EventCount));
+                Id                       = _idGen.Next(entry.TimestampTicks),
+                TimestampUtcTicks        = entry.TimestampTicks,
+                Level                    = entry.Level,
+                MessageTemplatePoolIndex = entry.TemplateIndex,
+            };
+            // Resolve template via the freshly restored pool and attach it
+            // to the hot tier so the recovery flush persists @mt correctly.
+            string tmpl = TemplatePool.Get(entry.TemplateIndex);
+            if (recoveredHot.TryWrite(header, entry.Payload, tmpl, entry.Exception))
+                replayed++;
+        }
+        _logger.LogInformation("WAL recovery: replayed {Count} events from {File}", replayed, walFile);
+
+        // Flush recovered events to cold segments (no index — acceptable for crash recovery),
+        // ONE PER LEVEL like the live flush path. Writing the recovered tier as a single
+        // mixed-level segment reopened the data loss the level split exists to prevent:
+        // expiry is Ttl(MinLevel), TTL is not monotonic in the level's value, so a
+        // recovered tier holding one Debug event put every Error beside it on a 3-day
+        // deadline. Crash recovery is exactly when that is least acceptable.
+        //
+        // skipPublishedLevels: the interrupted flush may have got some levels out. Those files
+        // are whole — a level is one move of one file — so they are kept and only the missing
+        // levels are written. That is what makes this replay idempotent, and it is also the
+        // answer for a data directory written by the PREVIOUS build, which carries no marker at
+        // all: its complete flush replays to zero new segments and the WAL is simply dropped.
+        if (recoveredHot.Count > 0)
+        {
+            var written = FlushTierByLevelAsync(recoveredHot, segId, CancellationToken.None, skipPublishedLevels: true)
+                              .GetAwaiter().GetResult();
+            long recovered = 0;
+            for (int i = 0; i < written.Count; i++)
+            {
+                _segments[written[i].Id.Value] = written[i];
+                recovered += written[i].EventCount;
             }
+            _logger.LogInformation("WAL recovery: wrote {Segments} level segment(s), {Count} events",
+                written.Count, recovered);
         }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "WAL recovery failed");
-        }
-        finally
-        {
-            recoveredHot?.Dispose();
-        }
+        // A tier that accepted nothing needs no marker: replaying it again writes nothing again.
+
+        try { File.Delete(walFile); } catch { }
+        try { File.Delete(poolPath); } catch { }
+        try { File.Delete(FlushMarkerPath(segId)); } catch { }
+    }
+
+    /// <summary>Pushes the id allocator past a WAL's reserved level block so it is never reused.</summary>
+    private void ReserveWalBlock(ulong walSegId)
+    {
+        ulong afterBlock = walSegId + LevelSegmentSlots;
+        if (afterBlock > _nextSegmentId) _nextSegmentId = afterBlock;
     }
 
     /// <summary>

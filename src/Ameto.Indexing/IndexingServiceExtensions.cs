@@ -47,10 +47,11 @@ public sealed class IndexingWiring : Microsoft.Extensions.Hosting.IHostedService
         // memory is O(group) and no longer grows with the segment.
         //
         // Sized on the group, not the segment: the bloom's ~10 bits/term budget is what makes
-        // it selective, and one filter stretched over a day's terms prunes nothing. The count
-        // is the writer's forecast for the group — see SegmentWriter.EnsureSink.
-        _storage.IndexSinkFactory = estimatedEventCount =>
-            new SegmentIndexBuilder(estimatedEventCount, maxDepth);
+        // it selective, and one filter stretched over a day's terms prunes nothing. Both counts
+        // are the writer's forecast for the group — events from the payload budget, terms per
+        // event from what the file's already-sealed groups measured. See SegmentWriter.EnsureSink.
+        _storage.IndexSinkFactory = (estimatedEventCount, estimatedTermsPerEvent) =>
+            new SegmentIndexBuilder(estimatedEventCount, maxDepth, estimatedTermsPerEvent);
         return Task.CompletedTask;
     }
 

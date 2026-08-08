@@ -45,7 +45,8 @@ public sealed class IndexGroupPrefilterTests : IAsyncLifetime
         _engine._groupPayloadBudgetBytes = GroupBudget;
         // The same wiring IndexingWiring installs in production: a fresh builder per group,
         // posting offsets based at the group's first FILE ordinal.
-        _engine.IndexSinkFactory = estimatedEventCount => new SegmentIndexBuilder(estimatedEventCount);
+        _engine.IndexSinkFactory = (estimatedEventCount, termsPerEvent) =>
+            new SegmentIndexBuilder(estimatedEventCount, 5, termsPerEvent);
         _query = new QueryExecutor(_engine, new SegmentIndexReaderFactory(), NullLogger<QueryExecutor>.Instance);
 
         _baseTicks = new DateTimeOffset(2026, 7, 30, 0, 0, 0, TimeSpan.Zero).UtcTicks;
@@ -211,10 +212,45 @@ public sealed class IndexGroupPrefilterTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// The BLOOM SECTION IS RENTED ONCE PER GROUP, not once per phase. Both phases need the same
+    /// bytes, and renting them twice is invisible to every other instrument here: under 1 MB the
+    /// pool absorbs the second rent, which is exactly the size these tests run at. Over 1 MB —
+    /// where a production 64 MB-group file's sections live — <c>ArrayPool&lt;byte&gt;.Shared</c>
+    /// stops pooling and serves each rent from a fresh LOH allocation that Return drops, so the
+    /// redundant call becomes the most expensive thing on the prefilter path, once per group, per
+    /// segment, in parallel across the catalog.
+    ///
+    /// <para>Counted rather than weighed, for that reason. The predicate is an equality on a
+    /// low-cardinality value that every group holds and no group can reject, so every group runs
+    /// both phases: bloom once, then inverted. Trigram is not read at all — the filter has no
+    /// substring predicate — which is the other thing this pins.</para>
+    /// </summary>
+    [Fact]
+    public async Task EveryGroupReadsItsBloomSectionOnce()
+    {
+        await RunAsync("Customer = 'cust-7'");   // warm
+        int groups = GroupCount();
+
+        long before = SegmentReader.PooledSectionRents;
+        await RunAsync("Customer = 'cust-7'");
+        long rents = SegmentReader.PooledSectionRents - before;
+
+        _out.WriteLine($"{groups} groups → {rents} section rents ({rents / (double)groups:F1} per group)");
+        Assert.Equal(2L * groups, rents);
+    }
+
+    /// <summary>
     /// The selectivity claim. A per-file prefilter over a multi-group segment would have to
     /// read the whole file's inverted+trigram sections; per group, a unique value survives in
-    /// one group and the rest are dropped on a few KB of bloom. Allocation is the proxy: the
+    /// one group and the rest are dropped on their bloom alone. Allocation is the proxy: the
     /// sections are what get deserialised into dictionaries and int[].
+    ///
+    /// <para>"Their bloom alone" is the whole saving, and it is a factor of four to six rather
+    /// than the orders of magnitude it used to be described as — MEASURED by
+    /// <c>BloomSizingProbe</c>, bloom is 15.6 % of a prop-dense group's three index sections and
+    /// 26.6 % of a thin one's. This fixture shrinks the group budget to a test value, so its own
+    /// sections are far smaller than a production file's and the ratio it prints is not that
+    /// number.</para>
     /// </summary>
     [Fact]
     public async Task AUniqueValueCostsFarLessThanReadingTheSegment()

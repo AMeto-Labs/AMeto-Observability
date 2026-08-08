@@ -137,6 +137,107 @@ public sealed class SegmentMergeTests : IAsyncLifetime
         }
     }
 
+    /// <summary>
+    /// The merge cursor deduplicates templates and service names by their UTF-8 bytes, so the
+    /// values worth carrying through a real merge are the ones where bytes and characters part
+    /// company — Cyrillic at two bytes a character, an emoji at four bytes for two UTF-16 units,
+    /// and a pair that agrees for its whole ASCII prefix and differs after it.
+    /// </summary>
+    [Fact]
+    public async Task Merge_PreservesTemplatesThatAreNotAscii()
+    {
+        string[] templates = ["Заказ {id} отклонён", "order {id} declined", "ordér {id} declinéd", "payment 🙂 {id}"];
+        string[] services  = ["Платежи.Ядро", "Payments.Core", "Płatności"];
+        long     origin    = MergeBucketGrid.SealedBucketStart(LogLevel.Information);
+
+        for (int round = 0; round < 6; round++)
+        {
+            for (int i = 0; i < 40; i++)
+            {
+                int n = round * 1000 + i;
+                Assert.True(_engine.TryWrite(new LogEventHeader
+                {
+                    Id                       = new EventId(0u, (uint)(round * 100_000 + i)).RawValue,
+                    TimestampUtcTicks        = origin + n * TimeSpan.TicksPerMillisecond,
+                    Level                    = LogLevel.Information,
+                    MessageTemplatePoolIndex = _engine.TemplatePool.Intern(templates[n % templates.Length]),
+                    ServiceNamePoolIndex     = _engine.TemplatePool.Intern(services[n % services.Length]),
+                }, Props(n), exception: null));
+            }
+            await _engine.FlushHotTierAsync();
+        }
+        var before = ReadEverything();
+        Assert.Equal(240, before.Count);
+
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None));
+        Assert.Single(_engine.ListSegments());
+
+        var after = ReadEverything();
+        Assert.Equal(before.Count, after.Count);
+        for (int i = 0; i < before.Count; i++)
+        {
+            Assert.Equal(before[i].Id,       after[i].Id);
+            Assert.Equal(before[i].Template, after[i].Template);
+            Assert.Equal(before[i].Service,  after[i].Service);
+        }
+        // Every distinct spelling survived as itself — a comparer that conflated two of them
+        // would leave the merged file short of one.
+        Assert.Equal(templates.Length, after.Select(e => e.Template).Distinct().Count());
+        Assert.Equal(services.Length,  after.Select(e => e.Service).Distinct().Count());
+    }
+
+    /// <summary>
+    /// ONE STRING PER DISTINCT VALUE, not one per event — the thing the dedup table is for, and
+    /// the thing it did not do while the cursor decoded a template and a service name out of the
+    /// block before asking the table whether it already held them. The table always answered yes;
+    /// the two fresh strings went to Gen0 unread.
+    ///
+    /// <para>Measured on the merge SOURCE alone, with no writer downstream, because that is the
+    /// only resolution at which the answer is visible. Through a whole merge pass the two strings
+    /// come to ~88 B an event inside a total of a few megabytes, which is why
+    /// <see cref="Merge_AllocationStaysFlatAcrossALargeBacklog"/> — the assertion this claim used
+    /// to be written beside — reads 5 MB with the decode and 3 MB without it, against a bound of
+    /// 20. Here they are nearly the whole reading: the cursor otherwise hands out spans over the
+    /// block it already holds, so a drained source allocates essentially nothing per event.</para>
+    ///
+    /// <para>The warm-up pass is not ceremony. The block buffers come from
+    /// <see cref="System.Buffers.ArrayPool{T}"/>, and a first rent against an empty pool
+    /// allocates — over 20 000 events that alone would be larger than the signal.</para>
+    /// </summary>
+    [Fact]
+    public async Task Merge_BuildsAStringPerDistinctValue_NotPerEvent()
+    {
+        for (int round = 0; round < 8; round++)
+            await WriteSegmentAsync(round, 2_500);
+        var sources = Directory.GetFiles(Path.Combine(_dir, "segments"), "*.seg").Order().ToList();
+        Assert.Equal(8, sources.Count);
+
+        Assert.Equal(20_000, DrainMerge(sources, out _));
+
+        long   events   = DrainMerge(sources, out long bytes);
+        double perEvent = bytes / (double)events;
+
+        // Three templates and four service names across the whole 20 000, so the honest cost of
+        // this loop is seven strings. 8 B/event allows over a hundred of them and is still an
+        // order of magnitude under the ~88 B two throwaway strings a row come to.
+        Assert.True(perEvent < 8.0,
+            $"the merge source allocated {perEvent:F1} B/event draining {events:N0} events — it is " +
+            "building a template and a service name per row again, for values already in the table");
+    }
+
+    /// <summary>Drains a k-way merge of <paramref name="sources"/> and reports what the DRAIN
+    /// allocated — opening and closing the sources sits outside the measurement.</summary>
+    private static long DrainMerge(List<string> sources, out long allocatedBytes)
+    {
+        using var src = MergingSegmentEventSource.Open(sources);
+
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        long events = 0;
+        while (src.TryReadNext(out _)) events++;
+        allocatedBytes = GC.GetAllocatedBytesForCurrentThread() - before;
+        return events;
+    }
+
     [Fact]
     public async Task Merge_RefusesTinyBatches_WhileRecent()
     {
@@ -192,6 +293,226 @@ public sealed class SegmentMergeTests : IAsyncLifetime
         Assert.Equal(LogLevel.Error, segs[1].MinLevel); // 90-day class, merged alone
         Assert.Equal(320u, segs[0].EventCount);
         Assert.Equal(320u, segs[1].EventCount);
+    }
+
+    // ── Legacy mixed-level segments ───────────────────────────────────────────
+
+    /// <summary>
+    /// Writes ONE segment holding SEVERAL levels, straight through <see cref="SegmentWriter"/>.
+    ///
+    /// <para>It has to bypass the engine, because the engine can no longer produce this file: a
+    /// flush partitions its tier by level and writes one segment per level. That is exactly the
+    /// point — this is the on-disk shape every build BEFORE the level split wrote, and an
+    /// upgrade inherits those files untouched. <c>LoadSegmentCatalog</c> takes a segment's
+    /// metadata from the file's own footer and never from its name, so dropping one into the
+    /// segment directory before the engine starts is all it takes to reproduce an upgraded
+    /// install exactly.</para>
+    ///
+    /// <para>Levels cycle in <paramref name="levels"/> order, so <c>MinLevel</c> is the lowest
+    /// severity VALUE among them — the field retention and the merge planner both read.</para>
+    /// </summary>
+    private static SegmentInfo WriteMixedLevelSegmentFile(
+        string segDir, ulong segId, long baseTicks, int perLevel, params LogLevel[] levels)
+    {
+        const string Template = "evt {n} round 0";
+        var pool  = new StringInternPool();
+        int total = perLevel * levels.Length;
+        using var hot = new HotTierSegment(total + 1, (long)total * 1024 + (8L << 20));
+
+        for (int i = 0; i < total; i++)
+            Assert.True(hot.TryWrite(new LogEventHeader
+            {
+                Id                       = new EventId(0u, (uint)(segId * 100_000 + (ulong)i)).RawValue,
+                TimestampUtcTicks        = baseTicks + i * TimeSpan.TicksPerMillisecond,
+                Level                    = levels[i % levels.Length],
+                MessageTemplatePoolIndex = pool.Intern(Template),
+                ServiceNamePoolIndex     = pool.Intern("Svc.0"),
+            }, Props(i), Template));
+        hot.Freeze();
+
+        long minTs = baseTicks;
+        long maxTs = baseTicks + (total - 1) * TimeSpan.TicksPerMillisecond;
+        string path = Path.Combine(segDir, $"{NodeId.Local.Value}-{segId}-{minTs}-{maxTs}.seg");
+        using var writer = new SegmentWriter(path);
+        writer.WriteEvents(hot, pool);
+        return writer.Finalise(NodeId.Local, new SegmentId(segId));
+    }
+
+    /// <summary>
+    /// Stages the state an UPGRADE leaves behind: two legacy mixed-level files carrying levels
+    /// Debug..Error, beside one genuinely level-pure Debug segment written by the current flush
+    /// path — all three in the same sealed Debug bucket, all three in a fresh engine's catalog.
+    ///
+    /// <para>The pure segment is flushed FIRST and the engine is then restarted, because the
+    /// catalog is loaded once at construction: a file dropped into the directory afterwards is
+    /// invisible until the next start, which is also the only moment a real upgrade has.</para>
+    /// </summary>
+    private async Task<(SegmentInfo MixedA, SegmentInfo MixedB, SegmentInfo Pure)> StageUpgradedInstallAsync()
+    {
+        long bucket = MergeBucketGrid.SealedBucketStart(LogLevel.Debug);
+
+        // The level-pure partner, through the real flush path — same event count and same
+        // property shape as the mixed files, so the planner's size-spread rule (a run's largest
+        // may be at most MergeRunSizeRatio× its smallest) cannot be what decides this test.
+        await WriteSegmentAsync(round: 0, count: 120, fixedLevel: LogLevel.Debug,
+                                baseTicks: bucket + 3 * TimeSpan.TicksPerHour);
+        var pure = _engine.ListSegments().Single();
+
+        await _engine.DisposeAsync();
+        string segDir = Path.Combine(_dir, "segments");
+        var mixedA = WriteMixedLevelSegmentFile(segDir, 5000, bucket + 1 * TimeSpan.TicksPerHour, 30,
+            LogLevel.Debug, LogLevel.Information, LogLevel.Warning, LogLevel.Error);
+        var mixedB = WriteMixedLevelSegmentFile(segDir, 5001, bucket + 2 * TimeSpan.TicksPerHour, 30,
+            LogLevel.Debug, LogLevel.Information, LogLevel.Warning, LogLevel.Error);
+
+        _engine = NewEngine();
+        for (int i = 0; i < 100 && _engine.ListSegments().Count < 3; i++) await Task.Delay(50);
+        Assert.Equal(3, _engine.ListSegments().Count);
+
+        // Both mixed files report the LOWEST level they hold, which is what puts them in the
+        // same planner bucket as the pure Debug segment beside them.
+        Assert.Equal(LogLevel.Debug, mixedA.MinLevel);
+        Assert.Equal(LogLevel.Debug, mixedB.MinLevel);
+        return (mixedA, mixedB, pure);
+    }
+
+    /// <summary>
+    /// ACCEPTED BEHAVIOUR, PINNED ON PURPOSE — this test asserts something the storage engine
+    /// gets WRONG, and the assertions below are the ones to change if that is ever fixed.
+    ///
+    /// <para>WHAT HAPPENS. The merge planner buckets on <c>SegmentInfo.MinLevel</c>, and
+    /// MinLevel is the lowest severity VALUE in a file, not proof that the file holds one level.
+    /// A segment written before the level split holds every level its flush happened to see, so
+    /// it reports the lowest of them and is bucketed as though it were level-pure — then merged
+    /// with segments that genuinely are. The output is a NEW file, mixed again, carrying the
+    /// lowest level's TTL; and because a merged file takes the NEWEST source's MaxTimestamp,
+    /// each pass moves its deadline further out. Confirmed on a live server: the deployed build
+    /// wrote fresh v7 files holding levels [2,3,4], [2,3] and [1,2,3,4] — the last 26,386 events
+    /// and 11.2 MB, whose Debug-derived 3-day deadline had already passed.</para>
+    ///
+    /// <para>WHY IT IS ACCEPTED RATHER THAN FIXED. Splitting on the merge side would mean
+    /// deciding a segment is level-homogeneous, and MinLevel cannot answer that — only a READ
+    /// of every row can, which is a full decode of every candidate on the planning path that
+    /// today touches no file at all. It is not worth it, because the condition SELF-HEALS: a
+    /// mixed segment carries the shortest TTL of the levels inside it (Debug's 3 days here), so
+    /// it expires within days of the upgrade, and once the last one is gone every segment on
+    /// disk is level-pure — after which same-MinLevel inputs give level-pure output by
+    /// construction and this test's premise can no longer be built by the engine at all.</para>
+    ///
+    /// <para>TO MAKE MERGES LEVEL-PURE: this test should then produce FOUR segments, one per
+    /// level present, and <see cref="Merge_ALegacyMixedSegmentKeepsTheLowestLevelsRetention"/>
+    /// should stop finding Error rows on a 3-day deadline. Nothing else here needs to move.</para>
+    /// </summary>
+    [Fact]
+    public async Task Merge_CarriesALegacyMixedLevelSegmentForward_Accepted()
+    {
+        var (mixedA, _, pure) = await StageUpgradedInstallAsync();
+
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None));
+
+        var segs = _engine.ListSegments();
+        Assert.Single(segs);                       // mixed + mixed + pure ⇒ ONE file, not one per level
+        var merged = segs[0];
+        Assert.Equal(360u, merged.EventCount);     // 120 + 120 + 120, nothing dropped on the way
+
+        // ACCEPTED (1): the output is MIXED again — every level that went in is still in one file.
+        var dedup  = new Dictionary<string, string>(StringComparer.Ordinal);
+        using (var r = SegmentReader.Open(merged.FilePath))
+        {
+            var levels = new HashSet<byte>();
+            foreach (var ev in r.ReadAllRaw(dedup)) levels.Add(ev.Level);
+            Assert.Equal(new[] { LogLevel.Debug, LogLevel.Information, LogLevel.Warning, LogLevel.Error }
+                             .Select(static l => (byte)l).OrderBy(static b => b),
+                         levels.OrderBy(static b => b));
+        }
+
+        // ACCEPTED (2): its MinLevel is the LOWEST level present, so the merged file inherits
+        // the mixed sources' shape rather than the pure partner's.
+        Assert.Equal(LogLevel.Debug, merged.MinLevel);
+
+        // ACCEPTED (3): the deadline MOVED FORWARD. Expiry is MaxTimestamp + Ttl(MinLevel), and
+        // the merged file takes the newest source's MaxTimestamp — so the mixed sources' rows
+        // now expire when the pure segment's do, three hours later than they would have. The
+        // shift is bounded by one bucket width per pass, but it happens again on every pass.
+        Assert.Equal(pure.MaxTimestampTicks, merged.MaxTimestampTicks);
+        Assert.True(merged.MaxTimestampTicks > mixedA.MaxTimestampTicks,
+            "the merged file should carry the newest source's MaxTimestamp");
+    }
+
+    /// <summary>
+    /// The retention consequence of the segment above, stated in days.
+    ///
+    /// <para>Expiry is <c>MaxTimestamp + Ttl(MinLevel)</c> and TTL is NOT monotonic in the
+    /// level's value — Debug (1) sits below Information (2) while living 3 days against 90 — so
+    /// the single Debug row in a mixed file sets the deadline for every Error row beside it.
+    /// That is the same data loss <see cref="LevelSplitFlushTests"/> proves the flush no longer
+    /// causes; on the merge path, for files an upgrade inherited, it is ACCEPTED and it is
+    /// self-limiting: the short TTL is precisely what makes these files disappear.</para>
+    /// </summary>
+    [Fact]
+    public async Task Merge_ALegacyMixedSegmentKeepsTheLowestLevelsRetention()
+    {
+        await StageUpgradedInstallAsync();
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None));
+        var merged = _engine.ListSegments().Single();
+
+        var policy = RetentionPolicy.Default;      // Debug 3 days, every other level 90
+        var actual = merged.MaxTimestamp.Add(policy.GetTtl(merged.MinLevel));
+        var earned = merged.MaxTimestamp.Add(policy.GetTtl(LogLevel.Error));
+
+        Assert.False(merged.IsExpired(policy, actual.AddTicks(-1)));
+        Assert.True(merged.IsExpired(policy, actual.AddTicks(1)));
+
+        // ACCEPTED: the 90 Error rows in this file are deleted 87 days early, because one Debug
+        // row shares it with them. A level-pure Error segment would keep them for 90 days.
+        Assert.Equal(TimeSpan.FromDays(87), earned - actual);
+
+        // And they really are in there — this is data being dropped, not an empty guarantee.
+        var dedup = new Dictionary<string, string>(StringComparer.Ordinal);
+        using var r = SegmentReader.Open(merged.FilePath);
+        int errors = 0;
+        foreach (var ev in r.ReadAllRaw(dedup)) if (ev.Level == (byte)LogLevel.Error) errors++;
+        Assert.Equal(60, errors);                  // 30 per mixed file, two of them
+    }
+
+    /// <summary>
+    /// The LEVEL COLUMN survives a merge unchanged, row by row.
+    ///
+    /// <para>This is coverage that was lost rather than never written. <c>WriteSegmentAsync</c>
+    /// used to stamp <c>(LogLevel)(n % 6)</c> and the level split changed it to a constant
+    /// Information — necessary, because a mixed-level round now flushes to six segments and
+    /// every "N rounds ⇒ N segments" assertion in this file would count something else. But it
+    /// left <see cref="Merge_CollapsesSmallSegments_Losslessly"/> comparing a column that no
+    /// longer varies: a merge that wrote a constant level, or dropped the column and let the
+    /// reader default it, would still pass every assertion in this suite. Mixed sources restore
+    /// the check without disturbing the segment arithmetic, because these files are staged on
+    /// disk instead of flushed.</para>
+    /// </summary>
+    [Fact]
+    public async Task Merge_PreservesTheLevelOfEveryRow()
+    {
+        await StageUpgradedInstallAsync();
+
+        var dedup  = new Dictionary<string, string>(StringComparer.Ordinal);
+        var before = new Dictionary<ulong, byte>(360);
+        foreach (var seg in _engine.ListSegments())
+        {
+            using var r = SegmentReader.Open(seg.FilePath);
+            foreach (var ev in r.ReadAllRaw(dedup)) before[ev.Id] = ev.Level;
+        }
+        Assert.Equal(360, before.Count);
+        Assert.Equal(4, before.Values.Distinct().Count());   // the column genuinely varies
+
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None));
+
+        using var merged = SegmentReader.Open(_engine.ListSegments().Single().FilePath);
+        int seen = 0;
+        foreach (var ev in merged.ReadAllRaw(dedup))
+        {
+            Assert.Equal(before[ev.Id], ev.Level);
+            seen++;
+        }
+        Assert.Equal(360, seen);
     }
 
     /// <summary>
@@ -253,6 +574,12 @@ public sealed class SegmentMergeTests : IAsyncLifetime
         // once, straight into the open block: MEASURED 4 MB of managed allocation for 40 MB of
         // payload. (These merges run without an index sink — the index build's own state is
         // bounded by the group budget and measured by IndexGroupMemoryProbe.)
+        //
+        // This bound is about the STREAM, not about the cursor's strings. Per event these 20k
+        // ran 265.8 B while the cursor decoded every template and service name before
+        // deduplicating the result and 177.8 B once the table began probing by UTF-8 — 5 MB
+        // against 3 MB here, both comfortably inside 20, so nothing in this assertion can see the
+        // difference. Merge_BuildsAStringPerDistinctValue_NotPerEvent is where that is measured.
         Assert.True(allocMb < 20, $"merge allocated {allocMb} MB streaming 40 MB of payload");
     }
 
