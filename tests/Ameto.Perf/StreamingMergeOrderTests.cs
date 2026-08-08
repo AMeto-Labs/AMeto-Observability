@@ -6,6 +6,7 @@ using Ameto.Core;
 using Ameto.Indexing;
 using Ameto.Query;
 using Ameto.Storage;
+using Ameto.Storage.Tests;   // MergeBucketGrid, compiled in from the merge suite (see .csproj)
 using Xunit;
 using Xunit.Abstractions;
 
@@ -67,7 +68,12 @@ public sealed class StreamingMergeOrderTests : IAsyncLifetime
     [Fact]
     public async Task AMergedFileServesEveryRowThroughItsGroupIndexes()
     {
-        long old  = DateTime.UtcNow.Ticks - 5 * TimeSpan.TicksPerDay;
+        // On the grid, not at an offset from the wall clock. The ten rounds cover 8100 s of event
+        // time, and a bucket boundary landing inside that window splits them across two buckets —
+        // the older sealed, the newer holding now and therefore open at a fanout of 8. Neither
+        // side then consumes all ten and ListSegments().Single() throws. Ten sources is not what
+        // saves it: the straddle is the failure mode, and it is reachable on ~1.3 % of instants.
+        long old  = MergeBucketGrid.SealedBucketStart(LogLevel.Information);
         int  tmpl = _engine.TemplatePool.Intern("order {OrderId} processed");
         int  svc  = _engine.TemplatePool.Intern("Svc.Orders");
 
@@ -127,7 +133,10 @@ public sealed class StreamingMergeOrderTests : IAsyncLifetime
     [Fact]
     public async Task AMergedFileStillIndexesExceptionsItCopiedThroughAsBytes()
     {
-        long old  = DateTime.UtcNow.Ticks - 5 * TimeSpan.TicksPerDay;
+        // Error's own bucket, on the grid — see the sibling test above for why the offset-from-now
+        // idiom straddles. Error shares Information's 90-day TTL and so its 7-day width, but the
+        // anchor is taken for the level actually written rather than assumed equal to it.
+        long old  = MergeBucketGrid.SealedBucketStart(LogLevel.Error);
         int  tmpl = _engine.TemplatePool.Intern("settlement failed for {OrderId}");
         int  svc  = _engine.TemplatePool.Intern("Svc.Payments");
 

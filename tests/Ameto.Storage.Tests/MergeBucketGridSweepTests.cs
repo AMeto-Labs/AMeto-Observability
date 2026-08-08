@@ -99,7 +99,23 @@ public sealed class MergeBucketGridSweepTests
         // the last two sit one full width along, in the next window on the grid.
         new("Merge_RetriesNextWindow_AfterAnchorSkip", LogLevel.Information, 2,
             [1 * H, 2 * H, W + 1 * H, W + 2 * H]),
+
+        // Ameto.Perf.StreamingMergeOrderTests — both tests, 10 rounds of 900 events at 1 s
+        // spacing, so round r runs to base + (900r + 899) s. These live in another assembly and
+        // compile MergeBucketGrid.cs in by link; they are swept here because this is where the
+        // helper's guarantee is checked, and an anchor is only as good as the shape staged on it.
+        new("AMergedFileServesEveryRowThroughItsGroupIndexes", LogLevel.Information, 1,
+            PerfRoundOffsets()),
+        new("AMergedFileStillIndexesExceptionsItCopiedThroughAsBytes", LogLevel.Error, 1,
+            PerfRoundOffsets()),
     ];
+
+    private static long[] PerfRoundOffsets()
+    {
+        var o = new long[10];
+        for (int r = 0; r < o.Length; r++) o[r] = (900 * r + 899) * TimeSpan.TicksPerSecond;
+        return o;
+    }
 
     private static long[] OffsetsOf(Shape s) => s.SourceMaxOffsets;
 

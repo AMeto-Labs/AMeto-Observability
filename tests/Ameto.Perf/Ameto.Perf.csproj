@@ -23,6 +23,13 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- The merge planner's bucket grid, shared with Ameto.Storage.Tests rather than copied:
+         MergeBucketGridSweepTests machine-checks that helper across a full bucket period, and a
+         second copy here would be a second thing to keep true with nothing checking it. -->
+    <Compile Include="..\Ameto.Storage.Tests\MergeBucketGrid.cs" Link="MergeBucketGrid.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\..\src\Ameto.Core\Ameto.Core.csproj" />
     <ProjectReference Include="..\..\src\Ameto.Storage\Ameto.Storage.csproj" />
     <ProjectReference Include="..\..\src\Ameto.Ingestion\Ameto.Ingestion.csproj" />
