@@ -82,6 +82,13 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// between two <c>File.Move</c>s without needing a second process.
     /// </summary>
     internal Action<int>? _afterLevelPublished;
+    /// <summary>
+    /// Test hook: called with the manifest on disk and the sources owned but not yet streamed —
+    /// the window in which a merge can be cancelled or fail transiently. Cancelling a token from
+    /// it reproduces a shutdown landing between the flush-slot wait and the merge task; throwing
+    /// from it reproduces a source that dies mid-stream, without corrupting a file to get there.
+    /// </summary>
+    internal Action? _beforeMergeStream;
     /// <summary>Test hook: first id of the block reserved for the live WAL (see <see cref="_walSegId"/>).</summary>
     internal ulong LiveWalSegmentId => _walSegId;
     /// <summary>
@@ -1488,15 +1495,45 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         }
         try
         {
+            _beforeMergeStream?.Invoke();
             info = await MergeToColdAsync(readers, segId, segPath, expectEvents, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Shutdown is not a verdict on the batch. Swept up with everything else it logged a
+            // WARNING on every single stop, swallowed the cancellation the maintenance loop
+            // stops on, and quarantined the window — so the segments a clean restart had every
+            // reason to merge first were the ones it then refused to look at.
+            try { File.Delete(manifestPath); } catch { /* recovery drops it anyway */ }
+            throw;
         }
         catch (Exception ex)
         {
-            // Nothing has been deleted and the merged file never reached segPath, so the
-            // only state to undo is the manifest. A source that failed mid-stream is
-            // skip-listed so the next pass does not re-select the same doomed window.
-            _logger.LogWarning(ex, "Merge: aborted while streaming {Count} source(s) — sources left intact", consumed.Count);
-            foreach (var s in consumed) _mergeSkip.Add(s.Id.Value);
+            // Nothing has been deleted and the merged file never reached segPath, so the only
+            // state to undo is the manifest.
+            //
+            // Skip-listing is QUARANTINE and it lasts until the process restarts, so it belongs
+            // to a batch that CANNOT be merged, not to one that could not be merged now. Corrupt
+            // sources are the first kind: the stream fails the same way on every future pass,
+            // and because the merge reads all of them interleaved there is no telling which file
+            // is the bad one, so the window goes as a whole. A disk that filled up or a network
+            // volume that blinked is the second: retiring up to MergeMaxSources segments over a
+            // condition that clears itself would end compaction for that bucket for the life of
+            // the process, and the small-file backlog those segments form is the exact thing the
+            // sweep exists to remove. Left in the candidate set, the next pass simply retries.
+            if (IsSourceCorruption(ex))
+            {
+                foreach (var s in consumed) _mergeSkip.Add(s.Id.Value);
+                _logger.LogWarning(ex,
+                    "Merge: {Count} source(s) unreadable while streaming — sources left intact, batch skip-listed until restart",
+                    consumed.Count);
+            }
+            else
+            {
+                _logger.LogWarning(ex,
+                    "Merge: aborted while streaming {Count} source(s) — sources left intact, batch retried next pass",
+                    consumed.Count);
+            }
             try { File.Delete(manifestPath); } catch { /* recovery drops it anyway */ }
             return false;
         }
@@ -1524,6 +1561,18 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             consumed.Count, info.EventCount, Path.GetFileName(segPath), info.CompressedBytes / 1048576.0);
         return true;
     }
+
+    /// <summary>
+    /// Tells a batch that will never merge from one that merely did not merge this time.
+    ///
+    /// <para><see cref="InvalidDataException"/> is what every structural check throws — footer
+    /// and header magic, an unsupported version, a block whose stored length does not match its
+    /// frame, and the merge's own event-count verification. <see cref="EndOfStreamException"/> is
+    /// a truncated file. Both are properties of the bytes on disk and will still be true on the
+    /// next pass. Everything else — no space left, an I/O error, a file momentarily locked — is
+    /// the machine's condition rather than the segments', and gets another attempt.</para>
+    /// </summary>
+    private static bool IsSourceCorruption(Exception ex) => ex is InvalidDataException or EndOfStreamException;
 
     /// <summary>
     /// Streams the sources through a k-way merge straight into a new segment file.
