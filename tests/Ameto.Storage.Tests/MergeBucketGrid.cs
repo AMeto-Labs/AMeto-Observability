@@ -30,6 +30,35 @@ internal static class MergeBucketGrid
         StorageEngine.MergeBucketTicks((policy ?? RetentionPolicy.Default).GetTtl(level));
 
     /// <summary>
+    /// The planner's own <c>MinSourcesFor</c> (StorageEngine.cs:1177-1183), mirrored: a bucket
+    /// whose window ended at least a grace ago merges from
+    /// <see cref="StorageEngine.MergeSealedMinSources"/>, otherwise it needs the full
+    /// <see cref="StorageEngine.MergeMinSources"/> fanout.
+    ///
+    /// <para>Mirrored because the planner's copy is private, and kept HERE rather than in each
+    /// test that wants it so there is one copy to keep true. <c>MergeBucketGridSweepTests</c>
+    /// drives it across a full bucket period, and a test can use it to assert POSITIVELY that
+    /// its staging clears the threshold — which is what stops a test whose expected outcome is
+    /// "the merge returned false" from passing because the planner selected nothing at all.</para>
+    /// </summary>
+    internal static int PlannerFanoutFor(long bucketStartTicks, LogLevel level, long nowTicks,
+                                         RetentionPolicy? policy = null)
+    {
+        long width = BucketWidth(level, policy);
+        long grace = Math.Min(48L * TimeSpan.TicksPerHour, width);   // StorageEngine.MergeSealGraceTicks
+        return nowTicks - (bucketStartTicks + width) >= grace
+            ? StorageEngine.MergeSealedMinSources
+            : StorageEngine.MergeMinSources;
+    }
+
+    /// <summary>The bucket <paramref name="ticks"/> falls in, for <paramref name="level"/>'s width.</summary>
+    internal static long BucketOf(long ticks, LogLevel level, RetentionPolicy? policy = null)
+    {
+        long width = BucketWidth(level, policy);
+        return ticks / width * width;
+    }
+
+    /// <summary>
     /// Start of the bucket <paramref name="level"/>'s data would land in if it were written NOW.
     /// This bucket is always OPEN — its window has not ended, so a merge inside it needs the full
     /// <see cref="StorageEngine.MergeMinSources"/> fanout.

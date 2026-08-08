@@ -22,6 +22,32 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
     private readonly string _dir = Path.Combine(Path.GetTempPath(), "ameto-mergecrash-" + Guid.NewGuid().ToString("N"));
     private string SegDir => Path.Combine(_dir, "segments");
     private StorageEngine _engine = null!;
+    private CapturingLogger _log = new();
+
+    /// <summary>
+    /// What the engine logged, so "the merge ran and unwound itself" is OBSERVABLE rather than
+    /// inferred. The abort path is the only place a merge pass logs a warning carrying an
+    /// exception, which is what lets a test tell it apart from a pass that selected no batch.
+    /// </summary>
+    private sealed class CapturingLogger : Microsoft.Extensions.Logging.ILogger<StorageEngine>
+    {
+        private readonly List<(string Message, Exception? Error)> _entries = [];
+
+        public IReadOnlyList<(string Message, Exception? Error)> Entries
+        {
+            get { lock (_entries) return _entries.ToList(); }
+        }
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel level) => true;
+
+        public void Log<TState>(Microsoft.Extensions.Logging.LogLevel level,
+                                Microsoft.Extensions.Logging.EventId eventId, TState state,
+                                Exception? error, Func<TState, Exception?, string> formatter)
+        {
+            lock (_entries) _entries.Add((formatter(state, error), error));
+        }
+    }
 
     public Task InitializeAsync()
     {
@@ -36,15 +62,41 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
         try { Directory.Delete(_dir, true); } catch { }
     }
 
-    private StorageEngine NewEngine() => new(
-        Options.Create(new ServerOptions { DataDirectory = _dir }),
-        new RetentionStore(new ServerOptions { DataDirectory = _dir }, NullLogger<RetentionStore>.Instance),
-        NullLogger<StorageEngine>.Instance)
+    private StorageEngine NewEngine()
     {
-        // These tests exercise the crash protocol, not the index build; production merges
-        // wait until the sink factory is wired.
-        _allowIndexlessMerge = true,
-    };
+        _log = new CapturingLogger();
+        return new StorageEngine(
+            Options.Create(new ServerOptions { DataDirectory = _dir }),
+            new RetentionStore(new ServerOptions { DataDirectory = _dir }, NullLogger<RetentionStore>.Instance),
+            _log)
+        {
+            // These tests exercise the crash protocol, not the index build; production merges
+            // wait until the sink factory is wired.
+            _allowIndexlessMerge = true,
+        };
+    }
+
+    /// <summary>
+    /// Asserts the planner really HAD a batch to select from what is currently staged: every
+    /// segment in one bucket, that bucket over its own threshold. Without it, a test whose
+    /// expected outcome is "the merge returned false and touched nothing" is satisfied just as
+    /// well by a planner that selected nothing and never opened a file — the two leave
+    /// bit-identical state, and no assertion anywhere would notice the difference.
+    /// </summary>
+    private void AssertABatchWasSelectable(LogLevel level)
+    {
+        var staged = _engine.ListSegments();
+        long now   = DateTime.UtcNow.Ticks;
+
+        var buckets = staged.Select(s => MergeBucketGrid.BucketOf(s.MaxTimestampTicks, level)).Distinct().ToList();
+        Assert.True(buckets.Count == 1,
+            $"staging spread over {buckets.Count} buckets — the threshold applies to each separately");
+
+        int needed = MergeBucketGrid.PlannerFanoutFor(buckets[0], level, now);
+        Assert.True(staged.Count >= needed,
+            $"{staged.Count} source(s) against a fanout of {needed} — the planner would select nothing, " +
+            "so anything this test observes afterwards it would observe with the merge path removed");
+    }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -339,6 +391,14 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
     /// holds for a reason that has nothing to do with the abort path. Anchoring on the grid is
     /// what makes that false mean "the merge ran and unwound itself" on every run
     /// (see <see cref="MergeBucketGrid"/>).</para>
+    ///
+    /// <para>The anchor is not ENOUGH, though, and that is the point of the two positive
+    /// assertions below. "Returned false, nothing on disk changed" is bit-for-bit the state a
+    /// planner that selected nothing would leave, so the test's meaning rested entirely on an
+    /// anchor it never checked: verified by mutation, deleting the abort's manifest unwind AND
+    /// moving the anchor to an open bucket makes this test pass. Nothing in it distinguished a
+    /// working unwind from a merge that never ran. It now requires that a batch WAS selectable,
+    /// and that the merge actually reached the corrupt block and aborted on the whole batch.</para>
     /// </summary>
     [Fact]
     public async Task CorruptBlockMidStream_AbortsTheMerge_AndLeavesNoManifest()
@@ -358,7 +418,19 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
         File.WriteAllBytes(victim, bytes);
         using (var probe = SegmentReader.Open(victim)) { }   // still opens: the damage is inside a block
 
+        // The planner has a batch to take: four sources in one bucket, and that bucket sealed.
+        AssertABatchWasSelectable(LogLevel.Information);
+
+        int loggedBefore = _log.Entries.Count;
         Assert.False(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None));
+
+        // …and it took it, streamed into the corrupt block and unwound. The abort is the only
+        // thing in a merge pass that logs an exception, and it names the size of the batch it
+        // gave up on — four, the whole window, not one skipped file.
+        var aborts = _log.Entries.Skip(loggedBefore).Where(e => e.Error is not null).ToList();
+        Assert.True(aborts.Count == 1,
+            $"expected exactly one aborted merge, saw {aborts.Count}: {string.Join(" | ", aborts.Select(a => a.Message))}");
+        Assert.Contains("4 source(s)", aborts[0].Message);
 
         Assert.Empty(Directory.GetFiles(SegDir, "*.mergemanifest"));
         Assert.Empty(Directory.GetFiles(SegDir, "*.seg.tmp"));
@@ -380,6 +452,8 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
         long old = MergeBucketGrid.SealedBucketStart(LogLevel.Information);
         for (int round = 0; round < 4; round++)
             await WriteSegmentAsync(round, 60, baseTicks: old + round * TimeSpan.TicksPerHour);
+
+        AssertABatchWasSelectable(LogLevel.Information);
 
         var victim = _engine.ListSegments().OrderBy(s => s.MinTimestampTicks).First();
         File.WriteAllBytes(victim.FilePath, [0xDE, 0xAD, 0xBE, 0xEF]);  // magic mismatch

@@ -16,26 +16,25 @@ namespace Ameto.Storage.Tests;
 ///
 /// <para>There is no clock seam in <see cref="StorageEngine"/> — <c>SelectMergeBatch</c> reads
 /// <c>DateTimeOffset.UtcNow</c> directly — so the sweep evaluates the predicate rather than
-/// driving a real engine. <see cref="SealedFanout"/> mirrors the planner's private
-/// <c>MinSourcesFor</c> (StorageEngine.cs:1177-1183) line for line, and
+/// driving a real engine. <see cref="MergeBucketGrid.PlannerFanoutFor"/> mirrors the planner's
+/// private <c>MinSourcesFor</c> (StorageEngine.cs:1177-1183) line for line, and
 /// <see cref="TheSweepHasTeeth_TheOldIdiomStillFails"/> proves the sweep can tell the two apart
 /// by running the OLD idiom through it and requiring it to fail.</para>
 /// </summary>
 public sealed class MergeBucketGridSweepTests
 {
-    // ── The planner's predicate, mirrored ─────────────────────────────────────
+    // ── The planner's predicate ───────────────────────────────────────────────
 
     /// <summary>StorageEngine.MergeSealGraceTicks — private, so restated here.</summary>
     private static long SealGrace(long width) => Math.Min(48L * TimeSpan.TicksPerHour, width);
 
     /// <summary>
-    /// StorageEngine.MinSourcesFor, verbatim: a bucket whose window ended at least a grace ago
-    /// merges from 2 sources, otherwise it needs the full fanout of 8.
+    /// StorageEngine.MinSourcesFor. The mirror lives in <see cref="MergeBucketGrid"/> so the
+    /// crash-safety tests can assert against the SAME copy this sweep validates; the level is
+    /// carried through because the width is per level.
     /// </summary>
-    private static int SourcesNeeded(long bucketStart, long width, long now) =>
-        now - (bucketStart + width) >= SealGrace(width)
-            ? StorageEngine.MergeSealedMinSources
-            : StorageEngine.MergeMinSources;
+    private static int SourcesNeeded(long bucketStart, LogLevel level, long now) =>
+        MergeBucketGrid.PlannerFanoutFor(bucketStart, level, now);
 
     private static long BucketOf(long ticks, long width) => ticks / width * width;
 
@@ -200,7 +199,7 @@ public sealed class MergeBucketGridSweepTests
                 Assert.True(sources >= StorageEngine.MergeSealedMinSources,
                     $"{testName}: bucket holds {sources} source(s), below the sealed floor");
 
-                Assert.Equal(StorageEngine.MergeSealedMinSources, SourcesNeeded(bucketStart, width, now));
+                Assert.Equal(StorageEngine.MergeSealedMinSources, SourcesNeeded(bucketStart, shape.Level, now));
 
                 // Stronger, and the reason the helper backs off a whole width rather than
                 // reading the private grace: the margin dominates ANY grace the planner can
@@ -250,7 +249,7 @@ public sealed class MergeBucketGridSweepTests
             foreach (long now in NowSweep(width))
             {
                 long start = MergeBucketGrid.OpenBucketStartAt(now, level);
-                Assert.Equal(StorageEngine.MergeMinSources, SourcesNeeded(start, width, now));
+                Assert.Equal(StorageEngine.MergeMinSources, SourcesNeeded(start, level, now));
             }
         }
     }
@@ -277,7 +276,7 @@ public sealed class MergeBucketGridSweepTests
                 long anchor = MergeBucketGrid.SealedBucketStartAt(now, level, spanned);
                 for (int b = 0; b < spanned; b++)
                     Assert.Equal(StorageEngine.MergeSealedMinSources,
-                                 SourcesNeeded(anchor + b * width, width, now));
+                                 SourcesNeeded(anchor + b * width, level, now));
             }
     }
 
@@ -310,7 +309,7 @@ public sealed class MergeBucketGridSweepTests
                 perBucket[key] = perBucket.GetValueOrDefault(key) + 1;
             }
             foreach ((long start, int sources) in perBucket)
-                if (sources < SourcesNeeded(start, width, now)) merges = false;
+                if (sources < SourcesNeeded(start, LogLevel.Information, now)) merges = false;
             if (!merges) wouldFail++;
         }
 
@@ -374,7 +373,7 @@ public sealed class MergeBucketGridSweepTests
 
             // …and that bucket is the OPEN one, so the fanout of 8 these tests are written
             // against is the threshold actually applied.
-            Assert.Equal(StorageEngine.MergeMinSources, SourcesNeeded(anchor, width, now));
+            Assert.Equal(StorageEngine.MergeMinSources, SourcesNeeded(anchor, Level, now));
         }
     }
 
