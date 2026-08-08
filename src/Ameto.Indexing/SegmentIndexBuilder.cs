@@ -415,6 +415,15 @@ public sealed class SegmentIndexBuilder : ISegmentIndexSink
     /// </summary>
     public long BloomTermsAdded => _bloom.AddedTermCount;
 
+    /// <summary>
+    /// Terms the filter was actually able to buy — see
+    /// <see cref="ISegmentIndexSink.BloomTermCapacity"/>. Read off the filter rather than
+    /// recomputed from this constructor's two arguments, because the filter is where the request
+    /// is bounded: <see cref="SegmentBloomFilter.Create"/> caps one filter's bytes, and a
+    /// capacity taken from the request would have the writer fill bits that were never allocated.
+    /// </summary>
+    public long BloomTermCapacity => _bloom.Capacity;
+
     public byte[] SerialisedInvertedIndex  => _inverted.Serialise();
     public byte[] SerialisedTrigramIndex   => _trigram.Serialise();
     public byte[] SerialisedBloomFilter    => _bloom.Serialise();

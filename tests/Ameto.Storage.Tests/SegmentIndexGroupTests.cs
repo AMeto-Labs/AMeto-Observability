@@ -362,9 +362,11 @@ public sealed class SegmentIndexGroupTests : IDisposable
             _count++;
         }
 
-        /// <summary>No bloom here, so nothing is measured — the writer falls back to its
-        /// assumption, which is what makes the forecast tests below read the same as before.</summary>
-        public long BloomTermsAdded => 0;
+        /// <summary>No bloom here, so nothing is measured and nothing is bounded — the writer
+        /// falls back to its assumption and seals on payload alone, which is what makes the
+        /// forecast and geometry tests below read the same as before.</summary>
+        public long BloomTermsAdded   => 0;
+        public long BloomTermCapacity => 0;
 
         public (byte[] Inverted, byte[] Trigram, byte[] Bloom) Serialise()
         {

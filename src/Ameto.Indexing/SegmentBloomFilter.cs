@@ -122,6 +122,18 @@ public sealed unsafe class SegmentBloomFilter : IDisposable
     /// </summary>
     public long AddedTermCount => _added;
 
+    /// <summary>
+    /// Terms these bits carry at the design's ~10 bits each — what the filter can actually hold,
+    /// which is the request only when <see cref="MaxFilterBytes"/> did not bite.
+    ///
+    /// <para>The writer reads it off the group's sink and seals the group before
+    /// <see cref="AddedTermCount"/> reaches it, so a forecast that was too small costs a smaller
+    /// group instead of a saturated filter. That is also what makes the ceiling a real bound
+    /// rather than a quality setting: a capped filter reports the capped number, so the group is
+    /// cut at the bits it was given.</para>
+    /// </summary>
+    public long Capacity => _capacity;
+
     public void Add(ReadOnlySpan<byte> key)
     {
         _added++;

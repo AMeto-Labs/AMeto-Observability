@@ -297,7 +297,7 @@ public sealed class SegmentWriter : IDisposable
                 // Cut only on a block boundary: a group owns whole blocks, so the block
                 // index stays a single flat array and candidate → block resolution is
                 // untouched by grouping.
-                if (_sinkFactory is not null && _groupPayloadBytes >= _groupBudget)
+                if (_sinkFactory is not null && GroupIsFull())
                     SealGroup();
             }
 
@@ -366,6 +366,38 @@ public sealed class SegmentWriter : IDisposable
     }
 
     /// <summary>
+    /// Is the open group finished — either its payload budget is spent, or its bloom filter has
+    /// no room left for the terms the next block would add?
+    ///
+    /// <para>The SECOND condition is what keeps a forecast from becoming a saturated filter. A
+    /// filter is allocated at the group's first event and cannot be resized, so a group that
+    /// turns out denser than the groups it was forecast from has exactly two possible endings:
+    /// keep adding terms to bits that are already spent, or stop the group. Stopping it is the
+    /// graceful one — a short group costs one extra set of index sections, a saturated one costs
+    /// the query prefilter its whole reason to exist. MEASURED (<c>BloomStepSizingProbe</c>, a
+    /// merge whose events go from two long properties to twenty-four short ones): without this,
+    /// the group the change lands in runs at 3.2 bits per term against a 10-bit design point.</para>
+    ///
+    /// <para>Sealed BEFORE the capacity is passed, not after: the check runs at a block boundary,
+    /// so the next block's terms are already committed by the time it could run again. The last
+    /// block's own term count is the estimate of the next one's — blocks within a group hold the
+    /// same events, and this only has to be right to about a block.</para>
+    ///
+    /// <para>A sink that reports no capacity (0) leaves this exactly as it was: payload alone.</para>
+    /// </summary>
+    private bool GroupIsFull()
+    {
+        long groupTerms = _sink?.BloomTermsAdded ?? 0;
+        long blockTerms = groupTerms - _groupTermsAtLastBlock;
+        _groupTermsAtLastBlock = groupTerms;
+
+        if (_groupPayloadBytes >= _groupBudget) return true;
+
+        long capacity = _sink?.BloomTermCapacity ?? 0;
+        return capacity > 0 && groupTerms + blockTerms >= capacity;
+    }
+
+    /// <summary>
     /// Headroom on the measured terms-per-event carried into the next group.
     ///
     /// <para>The measurement is of groups already written; the group being sized has not happened
@@ -373,8 +405,8 @@ public sealed class SegmentWriter : IDisposable
     /// two directions are not symmetric — over-sizing wastes bits at 1.25 bytes a term, while
     /// under-sizing saturates the filter and the query's phase-1 gate stops rejecting — so the
     /// forecast is deliberately doubled. A group would have to hold twice the terms per event of
-    /// the whole file before it, all at once, before its filter fell below the ~10 bits/term
-    /// design point.</para>
+    /// the group before it, all at once, before its filter fell below the ~10 bits/term design
+    /// point — and <see cref="GroupIsFull"/> catches even that, by ending the group.</para>
     /// </summary>
     private const long BloomTermHeadroom = 2;
 
@@ -389,9 +421,16 @@ public sealed class SegmentWriter : IDisposable
     private const long MinBloomTermsPerEvent = 8;
 
     // Bloom terms the sealed groups of this file actually added, and the events that produced
-    // them. Read off each sink at SealGroup, which is the only moment both numbers are final.
+    // them: the whole file, and separately the group that sealed last. Read off each sink at
+    // SealGroup, which is the only moment both numbers are final.
     private long _bloomTermsSealed;
     private long _bloomTermEventsSealed;
+    private long _bloomTermsLastGroup;
+    private long _bloomEventsLastGroup;
+
+    // Terms the open group's filter held at the previous block boundary, so the last block's
+    // contribution can be read off as a delta. See GroupIsFull.
+    private long _groupTermsAtLastBlock;
 
     /// <summary>
     /// Terms per event to size the next group's filter for.
@@ -404,13 +443,29 @@ public sealed class SegmentWriter : IDisposable
     /// the thin file's filter ran 91 bits per term against a 10-bit design point, i.e. eight of
     /// every nine bloom bytes it wrote bought nothing.</para>
     ///
+    /// <para>The LAST group and the whole file, whichever is denser. A file average alone is what
+    /// this used to be, and it cannot follow a step change: it moves by 1/n, so a file whose
+    /// events start carrying more structured context — an ordinary thing for a merge to read,
+    /// since sources arrive in timestamp order — has its density change absorbed over tens of
+    /// groups rather than one. MEASURED (<c>BloomStepSizingProbe</c>): after fifteen thin groups,
+    /// a step to twenty-four short properties left the file average forecasting 7 terms/event
+    /// against the 51 the groups were holding, and ten consecutive groups came out below the
+    /// design point, recovering by about half a bit per group. The last group alone follows the
+    /// step in one; keeping the file average as a FLOOR is what stops an alternating file from
+    /// forecasting each group from the opposite shape.</para>
+    ///
     /// <para>Nothing sealed yet ⇒ 0, which the sink reads as "use your own assumption". Only the
     /// first group of a file is ever in that position.</para>
     /// </summary>
     private int EstimateTermsPerEvent()
     {
-        if (_bloomTermsSealed <= 0 || _bloomTermEventsSealed <= 0) return 0;
-        long perEvent = BloomTermHeadroom * _bloomTermsSealed / _bloomTermEventsSealed;
+        long fromFile = _bloomTermEventsSealed > 0
+            ? BloomTermHeadroom * _bloomTermsSealed / _bloomTermEventsSealed : 0;
+        long fromLast = _bloomEventsLastGroup > 0
+            ? BloomTermHeadroom * _bloomTermsLastGroup / _bloomEventsLastGroup : 0;
+
+        long perEvent = Math.Max(fromFile, fromLast);
+        if (perEvent <= 0) return 0;
         return (int)Math.Clamp(perEvent, MinBloomTermsPerEvent, int.MaxValue);
     }
 
@@ -434,11 +489,14 @@ public sealed class SegmentWriter : IDisposable
                 {
                     _bloomTermsSealed      += terms;
                     _bloomTermEventsSealed += _groupEventCount;
+                    _bloomTermsLastGroup    = terms;
+                    _bloomEventsLastGroup   = _groupEventCount;
                 }
             }
             _sink.Dispose();
             _sink = null;
         }
+        _groupTermsAtLastBlock = 0;
         if (_groupEventCount == 0) return;
         CloseGroup();
     }

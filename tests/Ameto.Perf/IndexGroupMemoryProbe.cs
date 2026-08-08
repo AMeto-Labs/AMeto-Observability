@@ -125,9 +125,11 @@ public sealed class IndexGroupMemoryProbe : IDisposable
         public void Add(uint fileOrdinal, in SegmentEventRef ev) => inner.Add(fileOrdinal, in ev);
 
         // Forwarded, not stubbed to 0: this is what the writer sizes the NEXT group's filter
-        // from, and a wrapper that swallowed it would make the probe measure a blind writer
-        // rather than the one production runs.
-        public long BloomTermsAdded => inner.BloomTermsAdded;
+        // from, and what it seals the CURRENT one on when the filter fills before the payload
+        // budget does. A wrapper that swallowed either would make the probe measure a blind
+        // writer rather than the one production runs.
+        public long BloomTermsAdded   => inner.BloomTermsAdded;
+        public long BloomTermCapacity => inner.BloomTermCapacity;
 
         public (byte[] Inverted, byte[] Trigram, byte[] Bloom) Serialise()
         {

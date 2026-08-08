@@ -143,6 +143,25 @@ public interface ISegmentIndexSink : IDisposable
     /// </summary>
     long BloomTermsAdded { get; }
 
+    /// <summary>
+    /// Bloom terms this sink's filter can hold at its design bits-per-term — what the forecast
+    /// BOUGHT, after the sink applied its own bounds to what the writer asked for.
+    ///
+    /// <para>The writer compares it against <see cref="BloomTermsAdded"/> at every block boundary
+    /// and seals the group before it is exceeded, which is what turns a wrong forecast into a
+    /// SMALLER GROUP rather than a saturated filter. That distinction is the whole value of the
+    /// property: a filter cannot be resized once allocated, so without it the only response to a
+    /// group denser than the one it was forecast from is to keep adding terms to bits that are
+    /// already spent, and the query's phase-1 gate stops rejecting.</para>
+    ///
+    /// <para>It is the sink's number, not the writer's product of two forecasts, precisely
+    /// because the sink is where the forecast is bounded — <c>SegmentBloomFilter</c> caps one
+    /// filter's bytes absolutely, and a writer recomputing the request would enforce a budget the
+    /// filter was never given. 0 means "no filter, or one that cannot say", and the writer then
+    /// seals on payload alone, exactly as it did before this existed.</para>
+    /// </summary>
+    long BloomTermCapacity { get; }
+
     /// <summary>Serialises the group's sections. Called once, after the last <see cref="Add"/>.</summary>
     (byte[] Inverted, byte[] Trigram, byte[] Bloom) Serialise();
 }

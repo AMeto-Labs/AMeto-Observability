@@ -207,9 +207,10 @@ public sealed class StreamingMergeMemoryProbe : IDisposable
     {
         public void Add(uint fileOrdinal, in SegmentEventRef ev) => inner.Add(fileOrdinal, in ev);
 
-        // See IndexGroupMemoryProbe.PeakProbeSink — forwarded so the writer sizes as it does
-        // in production.
-        public long BloomTermsAdded => inner.BloomTermsAdded;
+        // See IndexGroupMemoryProbe.PeakProbeSink — forwarded so the writer sizes and seals as
+        // it does in production.
+        public long BloomTermsAdded   => inner.BloomTermsAdded;
+        public long BloomTermCapacity => inner.BloomTermCapacity;
 
         public (byte[] Inverted, byte[] Trigram, byte[] Bloom) Serialise()
         {
