@@ -48,9 +48,23 @@ public sealed class SegmentBloomFilterLifetimeTests
     }
 
     /// <summary>
-    /// A LONG value takes the pooled-buffer branch of the char overloads. The guard sits ahead of
-    /// the rent, so the throw cannot strand a buffer the pool will never see again — those paths
-    /// return their rentals without a finally.
+    /// A LONG value takes the pooled-buffer branch of the char overloads, and those paths return
+    /// their rental without a <c>finally</c> — so the guard has to sit AHEAD of the rent or the
+    /// throw strands a buffer the pool never sees again.
+    ///
+    /// <para>Asserting only that an <see cref="ObjectDisposedException"/> comes out does not test
+    /// that. The byte overload throws too, so a guard anywhere on the call chain satisfies it:
+    /// with the two char-overload guards deleted, <c>Add</c> rents its fold buffer, <c>AddRaw</c>
+    /// rents an encode buffer, the byte overload throws from underneath both, and the assertion is
+    /// still green while two buffers per call leak. Measured under exactly that revert: 6 of 6 in
+    /// this class passed.</para>
+    ///
+    /// <para>So the rent is observed instead. <c>ArrayPool&lt;T&gt;.Shared</c> parks the most
+    /// recently returned array of a bucket in a THREAD-LOCAL slot that <c>Rent</c> drains first,
+    /// which makes rent → return → rent hand back the same instance on one thread — and makes a
+    /// rent that never came back visible as a different instance. The round trip is asserted first
+    /// so that a runtime that stopped behaving that way fails HERE, saying so, rather than making
+    /// the probe fail for a reason that is not the one it is named for.</para>
     /// </summary>
     [Fact]
     public void Disposed_char_overloads_throw_before_renting()
@@ -58,9 +72,33 @@ public sealed class SegmentBloomFilterLifetimeTests
         var filter = SegmentBloomFilter.Create(1024);
         filter.Dispose();
 
-        string longValue = new('x', 4096);
-        Assert.Throws<ObjectDisposedException>(() => filter.Add(longValue));
-        Assert.Throws<ObjectDisposedException>(() => { _ = filter.MightContain(longValue); });
+        string longValue = new('x', PooledLength);   // > 256 ⇒ the pooled branch, not the stackalloc one
+
+        AssertNothingWasRented(() => filter.Add(longValue));
+        AssertNothingWasRented(() => { _ = filter.MightContain(longValue); });
+    }
+
+    /// <summary>Length of the probe value: past the 256-char stackalloc threshold in both char
+    /// overloads, and rented at exactly this size, so the probe below shares their bucket.</summary>
+    private const int PooledLength = 4096;
+
+    private static void AssertNothingWasRented(Action disposedCall)
+    {
+        var pool = System.Buffers.ArrayPool<char>.Shared;
+
+        // Precondition, not the assertion under test: the pool must round-trip one instance on
+        // this thread for the probe to mean anything.
+        char[] first = pool.Rent(PooledLength);
+        pool.Return(first);
+        char[] second = pool.Rent(PooledLength);
+        pool.Return(second);
+        Assert.Same(first, second);
+
+        Assert.Throws<ObjectDisposedException>(disposedCall);
+
+        char[] after = pool.Rent(PooledLength);
+        pool.Return(after);
+        Assert.Same(second, after);   // the guarded call took nothing out of the bucket
     }
 
     /// <summary>
