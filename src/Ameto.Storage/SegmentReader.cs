@@ -254,6 +254,14 @@ public sealed class SegmentReader : ISegmentReader
         // whole blocks with no candidate and, inside a touched block, materialise ONLY the
         // candidate rows — the dominant query-path saving (no Dictionary/string per
         // rejected event). Candidates may arrive unsorted (trigram set → array).
+        //
+        // The sort below is REQUIRED, not defensive. Everything downstream — the
+        // LowerBound block window and the single-cursor walk in DecodeColumnarBlock —
+        // assumes ascending candidates, so one out-of-order pair makes the cursor step
+        // past a candidate and drop a row the caller's index proved matches. The caller
+        // makes no ordering promise: QueryExecutor's trigram narrowing returns a
+        // HashSet's enumeration order. The clone is what lets that stay true without
+        // mutating an array the caller still owns.
         uint[]? cands = null;
         if (candidateOffsets is { Length: > 0 } && _blockOrdinals is not null)
         {

@@ -184,6 +184,60 @@ public sealed class SegmentIndexGroupTests : IDisposable
             Assert.Equal(expected[(int)cands[i]].Id, got[i].Id.RawValue);
     }
 
+    /// <summary>
+    /// The caller makes no ordering promise about candidates. QueryExecutor's trigram
+    /// narrowing hands back a <c>HashSet&lt;uint&gt;</c>'s enumeration order, which is
+    /// unspecified by contract, and the reader's block window (LowerBound) and row walk
+    /// (a single cursor advancing alongside ascending ordinals) both need ascending input —
+    /// so ReadEventsAsync sorts a clone of what it is given.
+    ///
+    /// <para>Every other candidate test in the suite passes an already-sorted array, so
+    /// deleting that sort broke nothing anyone would notice until a query quietly returned
+    /// fewer rows than the index proved it should. This feeds shuffles instead, and checks
+    /// the caller's own array is left alone — the clone is why the sort is safe to do.</para>
+    /// </summary>
+    [Fact]
+    public void UnsortedCandidatesReturnTheSameRowsAndTheCallersArrayIsNotReordered()
+    {
+        var (path, expected, groupCount) = BuildSegment(GroupBudget);
+        Assert.True(groupCount > 3, $"test is meaningless with {groupCount} group(s)");
+        using var reader = SegmentReader.Open(path);
+
+        // Spread across group and block edges so a mis-stepped cursor loses rows rather
+        // than happening to land right.
+        var wanted = new List<uint> { 0, 1, (uint)(expected.Count - 1) };
+        var groups = reader.Groups;
+        for (int g = 1; g < groups.Length; g++)
+        {
+            wanted.Add(groups[g].FirstOrdinal - 1);
+            wanted.Add(groups[g].FirstOrdinal);
+            wanted.Add(groups[g].FirstOrdinal + 7);
+        }
+        var sorted = wanted.Distinct().Where(o => o < expected.Count).OrderBy(x => x).ToArray();
+
+        var baseline = Drain(reader.ReadEventsAsync(sorted, null, null, false, default));
+        Assert.Equal(sorted.Length, baseline.Count);
+
+        var rng = new Random(20260808);
+        for (int trial = 0; trial < 16; trial++)
+        {
+            var shuffled = (uint[])sorted.Clone();
+            for (int i = shuffled.Length - 1; i > 0; i--)
+            {
+                int j = rng.Next(i + 1);
+                (shuffled[i], shuffled[j]) = (shuffled[j], shuffled[i]);
+            }
+            var snapshot = (uint[])shuffled.Clone();
+
+            var got = Drain(reader.ReadEventsAsync(shuffled, null, null, false, default));
+
+            Assert.Equal(baseline.Count, got.Count);
+            for (int i = 0; i < baseline.Count; i++)
+                Assert.Equal(baseline[i].Id.RawValue, got[i].Id.RawValue);
+            Assert.Equal(snapshot, shuffled);   // the reader sorted a clone, not the caller's array
+        }
+    }
+
     // ── Backward compatibility ────────────────────────────────────────────────
 
     /// <summary>

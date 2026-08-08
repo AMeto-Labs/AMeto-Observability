@@ -231,9 +231,12 @@ public sealed class QueryExecutor : IQueryExecutor
 
     /// <summary>
     /// Runs bloom/inverted fast-skip and trigram offset lookup for every cold
-    /// segment in parallel, opening each segment's mmap exactly once. Returns
-    /// the surviving segments in the original (descending-Max-ts) order so the
-    /// k-way merge sees a deterministic priority.
+    /// segment in parallel, opening each segment's mmap exactly once. Survivors come
+    /// back in <paramref name="segInfos"/> order — results are written into a slot per
+    /// input index, so the parallel completion order does not leak out — but that is
+    /// only determinism, not a priority: <see cref="MergeColdSegmentsAsync"/> re-sorts
+    /// by MinTs or MaxTs for the lazy-priming order before it opens anything, so
+    /// nothing downstream reads any meaning into the order returned here.
     ///
     /// <para>The unit of prefiltering is the INDEX GROUP, not the file. A single bloom
     /// stretched over 24 h answers "maybe" to everything, so a day-scale segment would
@@ -285,9 +288,27 @@ public sealed class QueryExecutor : IQueryExecutor
                     using var reader = SegmentReader.Open(info.FilePath);
 
                     // Accumulated across the surviving groups. Posting offsets are FILE
-                    // ordinals in every group, so the groups' candidate arrays simply
-                    // concatenate — no rebasing, and the result stays ascending because
-                    // groups are in file order.
+                    // ordinals in every group (SegmentIndexBuilder.Build writes
+                    // firstOrdinal + pos), so the groups' candidate arrays simply
+                    // concatenate — no rebasing.
+                    //
+                    // The ORDER of what comes out is not guaranteed and must not be relied
+                    // on. TryNarrowWithIndex builds its trigram result in a HashSet<uint>
+                    // and hands back acc.ToArray(); HashSet enumeration order is unspecified
+                    // by contract. It happens to come out ascending today — measured over
+                    // 2000 random inputs, single-hint and intersected alike, because the set
+                    // is filled from an already-sorted array and thereafter only ever has
+                    // entries removed, and removal neither reorders survivors nor frees a
+                    // slot that a later Add could reuse — but that is a property of one
+                    // implementation of HashSet, not of this code.
+                    //
+                    // SegmentReader.ReadEventsAsync clones and Array.Sorts before its
+                    // two-pointer walk, and that sort is the contract, not a belt-and-braces
+                    // extra: the walk advances a single cursor through the candidates
+                    // alongside ascending row ordinals, so one descending pair makes it step
+                    // past a candidate it will never come back to and the query silently
+                    // loses rows the index proved it should return. Do not delete that sort
+                    // on the strength of a comment here.
                     List<uint>? candidates = null;
                     bool anyGroupSurvived  = false;
                     // A surviving group that could not narrow (its index sections are absent —
