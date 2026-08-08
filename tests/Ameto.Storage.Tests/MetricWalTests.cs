@@ -771,6 +771,56 @@ public sealed class MetricWalTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// The scheduling seam, held open for the whole of shutdown and past it. One drain runs,
+    /// so everything scheduled from its snapshot onwards rests on the _disposed gate alone:
+    /// such a flush must return before it reaches a lock, the log or the disk, and must never
+    /// fault. Ingest can schedule one at any of these instants in production, because it stays
+    /// open until the last step of the teardown.
+    /// </summary>
+    [Fact]
+    public async Task A_flush_scheduled_throughout_shutdown_never_touches_anything()
+    {
+        var engine = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
+        long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+
+        engine.Ingest(SlowFlushBatch(baseNano));
+        var writing = engine.ScheduleThresholdFlushForTest();
+        await DrainedAsync(engine);
+
+        using var stop = new CancellationTokenSource();
+        var scheduled = new List<Task>();
+        var hammer = Task.Run(async () =>
+        {
+            while (!stop.IsCancellationRequested)
+            {
+                lock (scheduled) { scheduled.Add(engine.ScheduleThresholdFlushForTest()); }
+                await Task.Delay(1);
+            }
+        });
+
+        await engine.DisposeAsync();
+        int runningAtReturn = engine.RunningThresholdFlushes;
+
+        await Task.Delay(50);          // and past the return, the worst moment of all
+        stop.Cancel();
+        await hammer;
+
+        Task[] all;
+        lock (scheduled) { all = [.. scheduled]; }
+        var faulted = new List<string>();
+        foreach (var t in all)
+        {
+            try { await t; }
+            catch (Exception ex) { faulted.Add(ex.GetType().Name); }
+        }
+
+        Assert.Equal(0, runningAtReturn);
+        Assert.True(faulted.Count == 0,
+            $"{faulted.Count} of {all.Length} flushes scheduled during shutdown faulted: " +
+            string.Join(", ", faulted.Distinct()));
+    }
+
     [Fact]
     public async Task Existing_files_survive_the_upgrade_and_stay_queryable()
     {

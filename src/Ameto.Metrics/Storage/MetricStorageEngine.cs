@@ -1191,19 +1191,22 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
             catch (OperationCanceledException) { }
 
             // Threshold flushes are scheduled off the ingest path, so they are in neither loop
-            // and used to outlive shutdown entirely. Drained twice, as StorageEngine.DisposeAsync
-            // does, because the first drain is not instantaneous — it waits on a flush writing
-            // one .mts per metric name — and ingest keeps running throughout: this engine is
-            // disposed by MetricStorageHostedService.StopAsync, and hosted services stop in
-            // reverse registration order, so Kestrel can still be serving /otlp/v1/metrics for
-            // the whole of it. Anything scheduled during the first drain is registered before the
-            // second one takes its snapshot.
-            await DrainThresholdFlushesAsync().ConfigureAwait(false);
+            // and used to outlive shutdown entirely. Ingest keeps scheduling them throughout
+            // this — the engine is disposed by MetricStorageHostedService.StopAsync, hosted
+            // services stop in reverse registration order, and Kestrel can still be serving
+            // /otlp/v1/metrics for all of it — and ONE drain covers them, because _disposed
+            // was set above and a flush is registered before its body can run (see
+            // ScheduleThresholdFlush). For any flush: either this snapshot holds it and awaits
+            // it, or it was registered after the snapshot, hence after _disposed, and its body
+            // returns before reaching a lock, the log or the disk. There is no third case.
+            //
+            // StorageEngine.DisposeAsync drains twice for a reason that does not carry over:
+            // it FLUSHES between its two calls, and that flush can schedule more work. Two
+            // back-to-back calls would close only the window between them, which is empty.
             await DrainThresholdFlushesAsync().ConfigureAwait(false);
 
             // For threshold flushes this is now exact: one already running was awaited above,
-            // and one that registers from here on returns without touching anything, because
-            // _disposed was set before the drains (see RunThresholdFlushAsync).
+            // and one that registers from here on returns without touching anything.
             //
             // Shut the door on ingest, and wait for the callers already through it. Ingest is
             // ungated for the whole shutdown up to this line, deliberately: the log is open
@@ -1220,7 +1223,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
             // every remaining Append hit `if (_disposed) return;` and the caller was told its
             // points had landed. Measured at ~48 000 points per shutdown under load, silently.
             _snapshotLock.EnterWriteLock();
-            try { System.Threading.Volatile.Write(ref _ingestClosed, 1); }
+            try { Volatile.Write(ref _ingestClosed, 1); }
             finally { _snapshotLock.ExitWriteLock(); }
 
             // The log first: nothing durable depends on the locks, and disposing a
