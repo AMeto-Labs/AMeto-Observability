@@ -137,6 +137,55 @@ public sealed class SegmentMergeTests : IAsyncLifetime
         }
     }
 
+    /// <summary>
+    /// The merge cursor deduplicates templates and service names by their UTF-8 bytes, so the
+    /// values worth carrying through a real merge are the ones where bytes and characters part
+    /// company — Cyrillic at two bytes a character, an emoji at four bytes for two UTF-16 units,
+    /// and a pair that agrees for its whole ASCII prefix and differs after it.
+    /// </summary>
+    [Fact]
+    public async Task Merge_PreservesTemplatesThatAreNotAscii()
+    {
+        string[] templates = ["Заказ {id} отклонён", "order {id} declined", "ordér {id} declinéd", "payment 🙂 {id}"];
+        string[] services  = ["Платежи.Ядро", "Payments.Core", "Płatności"];
+        long     origin    = MergeBucketGrid.SealedBucketStart(LogLevel.Information);
+
+        for (int round = 0; round < 6; round++)
+        {
+            for (int i = 0; i < 40; i++)
+            {
+                int n = round * 1000 + i;
+                Assert.True(_engine.TryWrite(new LogEventHeader
+                {
+                    Id                       = new EventId(0u, (uint)(round * 100_000 + i)).RawValue,
+                    TimestampUtcTicks        = origin + n * TimeSpan.TicksPerMillisecond,
+                    Level                    = LogLevel.Information,
+                    MessageTemplatePoolIndex = _engine.TemplatePool.Intern(templates[n % templates.Length]),
+                    ServiceNamePoolIndex     = _engine.TemplatePool.Intern(services[n % services.Length]),
+                }, Props(n), exception: null));
+            }
+            await _engine.FlushHotTierAsync();
+        }
+        var before = ReadEverything();
+        Assert.Equal(240, before.Count);
+
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None));
+        Assert.Single(_engine.ListSegments());
+
+        var after = ReadEverything();
+        Assert.Equal(before.Count, after.Count);
+        for (int i = 0; i < before.Count; i++)
+        {
+            Assert.Equal(before[i].Id,       after[i].Id);
+            Assert.Equal(before[i].Template, after[i].Template);
+            Assert.Equal(before[i].Service,  after[i].Service);
+        }
+        // Every distinct spelling survived as itself — a comparer that conflated two of them
+        // would leave the merged file short of one.
+        Assert.Equal(templates.Length, after.Select(e => e.Template).Distinct().Count());
+        Assert.Equal(services.Length,  after.Select(e => e.Service).Distinct().Count());
+    }
+
     [Fact]
     public async Task Merge_RefusesTinyBatches_WhileRecent()
     {
@@ -253,6 +302,11 @@ public sealed class SegmentMergeTests : IAsyncLifetime
         // once, straight into the open block: MEASURED 4 MB of managed allocation for 40 MB of
         // payload. (These merges run without an index sink — the index build's own state is
         // bounded by the group budget and measured by IndexGroupMemoryProbe.)
+        //
+        // Per event, over these 20k: 265.8 B while the cursor decoded every template and service
+        // name before deduplicating the result, 177.8 B once the dedup table began probing by
+        // UTF-8. The 88 B is exactly the two strings a row used to build and drop — one ~15-char
+        // template, one 5-char service name — for values already sitting in the table.
         Assert.True(allocMb < 20, $"merge allocated {allocMb} MB streaming 40 MB of payload");
     }
 
