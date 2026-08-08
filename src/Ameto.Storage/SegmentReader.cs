@@ -20,15 +20,35 @@ public sealed class SegmentReader : ISegmentReader
     // v5: block-index entry gains FirstOrdinal (file-order position of the block's first
     //     event) and index posting lists store file ordinals — enables candidate-driven
     //     block/row skipping. v4 segments remain readable (full scan, no skipping).
+    // v6: block-index entry carries the block's MinTs (time zone map).
+    // v7: INDEX GROUPS — the three index sections repeat per group of blocks instead of once
+    //     per file, and a group directory names their offsets and time bounds. v4-v6 files
+    //     stay readable as ONE implicit group covering the whole file, so no data is wiped.
     private const ushort MinSupportedVersion = 4;
-    private const ushort MaxSupportedVersion = 5;
+    private const ushort MaxSupportedVersion = 7;
 
-    private readonly long _invertedIndexOffset;
-    private readonly long _trigramIndexOffset;
-    private readonly long _bloomFilterOffset;
+    /// <summary>Block MinTs for a pre-v6 segment, which has no zone map — never prunes.</summary>
+    private const long UnknownBlockMinTs = long.MinValue;
+
+    /// <summary>Group-directory entry size on disk — one definition, shared with the writer.</summary>
+    private const int GroupEntrySize = SegmentWriter.GroupEntrySize;
+
     private readonly long _blockIndexOffset;
 
-    private readonly (long FileOffset, ulong FirstEventId)[] _blocks;
+    /// <summary>
+    /// Index groups in file order. Exactly one synthetic entry for v4-v6, whose section
+    /// offsets are the footer's file-level ones — so every consumer can be written against
+    /// groups alone and old files need no special case beyond this constructor.
+    /// </summary>
+    private readonly SegmentIndexGroup[] _groups;
+
+    /// <summary>
+    /// Per-block (byte offset, min timestamp). MinTs is the v6 time zone map and is
+    /// non-decreasing, because blocks are written in (ts, id) order — that ordering is
+    /// what lets a windowed read skip blocks instead of decompressing them.
+    /// <see cref="UnknownBlockMinTs"/> for pre-v6 files.
+    /// </summary>
+    private readonly (long FileOffset, long MinTs)[] _blocks;
 
     /// <summary>Per-block file ordinal of its first event (v5+); null for v4 segments.</summary>
     private readonly uint[]? _blockOrdinals;
@@ -80,9 +100,12 @@ public sealed class SegmentReader : ISegmentReader
         const int footerSize = 44;
         long footerStart = fileSize - footerSize;
 
-        _invertedIndexOffset = ReadInt64At(footerStart);
-        _trigramIndexOffset  = ReadInt64At(footerStart + 8);
-        _bloomFilterOffset   = ReadInt64At(footerStart + 16);
+        // The footer is parsed BEFORE the header, so its five int64 slots are read raw and
+        // only interpreted once the version is known. v7 reuses slot 0 for the group
+        // directory offset; v4-v6 spend slots 0-2 on the file-level section offsets.
+        long slot0           = ReadInt64At(footerStart);
+        long slot1           = ReadInt64At(footerStart + 8);
+        long slot2           = ReadInt64At(footerStart + 16);
         _blockIndexOffset    = ReadInt64At(footerStart + 24);
         uint footerMagic     = (uint)ReadInt32At(footerStart + 40);
         if (footerMagic != MagicFooter)
@@ -103,19 +126,42 @@ public sealed class SegmentReader : ISegmentReader
             throw new InvalidDataException($"Unsupported segment version {version} in {filePath}; expected {MinSupportedVersion}-{MaxSupportedVersion}. Delete the data directory and restart.");
 
         int blockCount = ReadInt32At(_blockIndexOffset);
-        _blocks        = new (long, ulong)[blockCount];
+        _blocks        = new (long, long)[blockCount];
         _blockOrdinals = version >= 5 ? new uint[blockCount] : null;
-        long pos    = _blockIndexOffset + 4;
-        int  stride = version >= 5 ? 20 : 16;
-        for (int i = 0; i < blockCount; i++)
+        int stride = version >= 5 ? 20 : 16;
+
+        // Pull the whole block index in ONE mapped read and parse it from the span. The
+        // per-entry shape cost three MemoryMappedViewAccessor calls per block, so opening a
+        // segment was O(segment size) in view reads — the cost that decides whether large
+        // segments are cheap to open, and Open is on the query hot path.
+        int idxBytes = blockCount * stride;
+        byte[] rented = ArrayPool<byte>.Shared.Rent(Math.Max(idxBytes, 1));
+        try
         {
-            long  offset  = ReadInt64At(pos);
-            ulong firstId = (ulong)ReadInt64At(pos + 8);
-            if (_blockOrdinals is not null)
-                _blockOrdinals[i] = (uint)ReadInt32At(pos + 16);
-            _blocks[i] = (offset, firstId);
-            pos += stride;
+            if (idxBytes > 0) _view.ReadArray(_blockIndexOffset + 4, rented, 0, idxBytes);
+            var raw = rented.AsSpan(0, idxBytes);
+            for (int i = 0; i < blockCount; i++)
+            {
+                var entry   = raw.Slice(i * stride, stride);
+                long offset = BinaryPrimitives.ReadInt64LittleEndian(entry);
+                // v6 stores the block's min timestamp in the slot v4/v5 spent on
+                // FirstEventId (written, never read). Older files have no zone map.
+                long blockMinTs = version >= 6
+                    ? BinaryPrimitives.ReadInt64LittleEndian(entry.Slice(8, 8))
+                    : UnknownBlockMinTs;
+                if (_blockOrdinals is not null)
+                    _blockOrdinals[i] = BinaryPrimitives.ReadUInt32LittleEndian(entry.Slice(16, 4));
+                _blocks[i] = (offset, blockMinTs);
+            }
         }
+        finally { ArrayPool<byte>.Shared.Return(rented); }
+
+        _groups = version >= 7
+            ? ReadGroupDirectory(slot0, filePath)
+            // v4-v6: ONE implicit group spanning the file, taking its section offsets from
+            // the footer slots v7 repurposes. Everything above the reader then sees a single
+            // uniform shape and no version branch survives past this constructor.
+            : [new SegmentIndexGroup(0, blockCount, 0, evCount, minTs, maxTs, slot0, slot1, slot2)];
 
         // Honest uncompressed size: every block frame starts with a uint32
         // uncompressedSize (see ReadAllRaw) — sum them instead of reporting the
@@ -147,6 +193,53 @@ public sealed class SegmentReader : ISegmentReader
         };
     }
 
+    /// <summary>
+    /// Parses the v7 group directory in ONE mapped read, for the same reason the block index
+    /// is read that way: Open is on the query hot path and must not cost view reads
+    /// proportional to segment size.
+    /// </summary>
+    private SegmentIndexGroup[] ReadGroupDirectory(long directoryOffset, string filePath)
+    {
+        if (directoryOffset <= 0)
+            throw new InvalidDataException($"v7 segment {filePath} has no group directory");
+
+        int count = ReadInt32At(directoryOffset);
+        if (count <= 0) return [];
+
+        var groups = new SegmentIndexGroup[count];
+        int bytes  = count * GroupEntrySize;
+        byte[] rented = ArrayPool<byte>.Shared.Rent(bytes);
+        try
+        {
+            _view.ReadArray(directoryOffset + 4, rented, 0, bytes);
+            var raw = rented.AsSpan(0, bytes);
+            for (int i = 0; i < count; i++)
+            {
+                var e = raw.Slice(i * GroupEntrySize, GroupEntrySize);
+                groups[i] = new SegmentIndexGroup(
+                    FirstBlock:     (int)BinaryPrimitives.ReadUInt32LittleEndian(e),
+                    BlockCount:     (int)BinaryPrimitives.ReadUInt32LittleEndian(e.Slice(4, 4)),
+                    FirstOrdinal:   BinaryPrimitives.ReadUInt32LittleEndian(e.Slice(8, 4)),
+                    EventCount:     BinaryPrimitives.ReadUInt32LittleEndian(e.Slice(12, 4)),
+                    MinTs:          BinaryPrimitives.ReadInt64LittleEndian(e.Slice(16, 8)),
+                    MaxTs:          BinaryPrimitives.ReadInt64LittleEndian(e.Slice(24, 8)),
+                    InvertedOffset: BinaryPrimitives.ReadInt64LittleEndian(e.Slice(32, 8)),
+                    TrigramOffset:  BinaryPrimitives.ReadInt64LittleEndian(e.Slice(40, 8)),
+                    BloomOffset:    BinaryPrimitives.ReadInt64LittleEndian(e.Slice(48, 8)));
+            }
+        }
+        finally { ArrayPool<byte>.Shared.Return(rented); }
+        return groups;
+    }
+
+    /// <summary>
+    /// The segment's index groups, in file order. A prefilter must consult these one at a
+    /// time: the whole reason v7 exists is that ONE bloom over a day prunes nothing, so the
+    /// filter's selectivity now lives per group and a rejected group costs no section read.
+    /// v4-v6 files expose exactly one group, so a caller needs no version branch.
+    /// </summary>
+    public ReadOnlySpan<SegmentIndexGroup> Groups => _groups;
+
     public async IAsyncEnumerable<LogEvent> ReadEventsAsync(
         uint[]? candidateOffsets,
         DateTimeOffset? from,
@@ -161,6 +254,14 @@ public sealed class SegmentReader : ISegmentReader
         // whole blocks with no candidate and, inside a touched block, materialise ONLY the
         // candidate rows — the dominant query-path saving (no Dictionary/string per
         // rejected event). Candidates may arrive unsorted (trigram set → array).
+        //
+        // The sort below is REQUIRED, not defensive. Everything downstream — the
+        // LowerBound block window and the single-cursor walk in DecodeColumnarBlock —
+        // assumes ascending candidates, so one out-of-order pair makes the cursor step
+        // past a candidate and drop a row the caller's index proved matches. The caller
+        // makes no ordering promise: QueryExecutor's trigram narrowing returns a
+        // HashSet's enumeration order. The clone is what lets that stay true without
+        // mutating an array the caller still owns.
         uint[]? cands = null;
         if (candidateOffsets is { Length: > 0 } && _blockOrdinals is not null)
         {
@@ -173,6 +274,8 @@ public sealed class SegmentReader : ISegmentReader
         {
             int idx = reversed ? blockCount - 1 - bi : bi;
             ct.ThrowIfCancellationRequested();
+
+            if (SkipByWindow(idx, fromTicks, toTicks)) continue;
 
             int candStart = 0, candEnd = 0;
             if (cands is not null)
@@ -195,6 +298,36 @@ public sealed class SegmentReader : ISegmentReader
             }
         }
         await Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// True when block <paramref name="idx"/> provably holds nothing in [from, to], using
+    /// the v6 zone map alone — no decompression.
+    ///
+    /// <para>Blocks are ordered by (ts, id), so block i's events all fall in
+    /// [MinTs(i), MinTs(i+1)]. Two provable cases:</para>
+    /// <list type="bullet">
+    ///   <item>MinTs(i) &gt; to — every event in the block is past the window.</item>
+    ///   <item>MinTs(i+1) &lt; from — every event in the block is before it. Strict &lt;,
+    ///         because an event sitting exactly on `from` belongs to the window and may
+    ///         live in block i.</item>
+    /// </list>
+    ///
+    /// <para>This is an optimisation only: the per-event window check in the caller stays,
+    /// so a wrong skip would be a bug rather than merely slower results — hence the
+    /// conservative bounds and the pre-v6 opt-out.</para>
+    /// </summary>
+    private bool SkipByWindow(int idx, long fromTicks, long toTicks)
+    {
+        long minTs = _blocks[idx].MinTs;
+        if (minTs == UnknownBlockMinTs) return false;          // pre-v6: no zone map
+        if (minTs > toTicks) return true;
+        if (idx + 1 < _blocks.Length)
+        {
+            long nextMinTs = _blocks[idx + 1].MinTs;
+            if (nextMinTs != UnknownBlockMinTs && nextMinTs < fromTicks) return true;
+        }
+        return false;
     }
 
     /// <summary>First index in ascending <paramref name="a"/> whose value is ≥ <paramref name="key"/>.</summary>
@@ -466,10 +599,14 @@ public sealed class SegmentReader : ISegmentReader
     // ── Raw event access (compaction) ─────────────────────────────────────────
 
     /// <summary>
-    /// Decodes every event with its RAW payloads — properties/exception bytes are
-    /// not deserialised into dictionaries, so a compaction re-write is lossless
-    /// and cheap. <paramref name="stringDedup"/> collapses repeated template /
-    /// service strings across blocks and segments.
+    /// Decodes every event of the file with its RAW payloads — properties/exception bytes are
+    /// not deserialised into dictionaries. <paramref name="stringDedup"/> collapses repeated
+    /// template / service strings across blocks and segments.
+    ///
+    /// <para>WHOLE-FILE: this materialises the segment, one <c>byte[]</c> per properties
+    /// payload. Compaction used to be built on it and paid ~3× the batch for it; it streams
+    /// through <see cref="ReadBlockInto"/> now. What is left is the byte-parity oracle the merge
+    /// tests compare against — do not put it back on a production path.</para>
     /// </summary>
     internal List<RawSegmentEvent> ReadAllRaw(Dictionary<string, string> stringDedup)
     {
@@ -495,6 +632,53 @@ public sealed class SegmentReader : ISegmentReader
             }
         }
         return result;
+    }
+
+    // ── Block streaming (compaction) ──────────────────────────────────────────
+
+    /// <summary>Blocks in the file, in (ts, id) order — the unit a merge reads one at a time.</summary>
+    internal int BlockCount => _blocks.Length;
+
+    /// <summary>
+    /// Decompresses one block into <paramref name="buffer"/>, growing it from
+    /// <see cref="ArrayPool{T}.Shared"/> when needed, and returns the uncompressed length.
+    ///
+    /// <para>This is what lets compaction read a segment as a STREAM: <see cref="ReadAllRaw"/>
+    /// materialises every event of the file (plus a <c>byte[]</c> per properties payload) before
+    /// the caller sees the first one, so a merge's peak was ~3× its batch and the batch had to be
+    /// capped at 32 MB. One block at a time is ~64 KB, whatever the segment's size.</para>
+    /// </summary>
+    internal int ReadBlockInto(int index, ref byte[] buffer)
+    {
+        long blockOffset     = _blocks[index].FileOffset;
+        int uncompressedSize = ReadInt32At(blockOffset);
+        int compressedSize   = ReadInt32At(blockOffset + 4);
+
+        if (buffer.Length < uncompressedSize)
+        {
+            // RENT BEFORE RETURNING. `buffer` is the caller's own field taken by ref —
+            // SegmentEventCursor._block — so returning first and renting second leaves a window
+            // where the caller still references an array that is already back in the pool. If the
+            // rent throws (a large block under memory pressure is the realistic way), the cursor
+            // survives long enough to be disposed and returns that same array a second time.
+            // A double return does not fault: the pool simply stacks the array twice and hands it
+            // to two renters at once, so the failure is one buffer's contents appearing in an
+            // unrelated reader's block. Holding both for the length of a copy costs one block.
+            byte[] grown = ArrayPool<byte>.Shared.Rent(uncompressedSize);
+            if (buffer.Length > 0) ArrayPool<byte>.Shared.Return(buffer);
+            buffer = grown;
+        }
+
+        byte[] comp = ArrayPool<byte>.Shared.Rent(compressedSize);
+        try
+        {
+            _view.ReadArray(blockOffset + 8, comp, 0, compressedSize);
+            if (LZ4Codec.Decode(comp, 0, compressedSize, buffer, 0, uncompressedSize) != uncompressedSize)
+                throw new InvalidDataException($"Corrupt block {index} at {blockOffset} in {Info.FilePath}");
+        }
+        finally { ArrayPool<byte>.Shared.Return(comp); }
+
+        return uncompressedSize;
     }
 
     private static void DecodeColumnarBlockRaw(
@@ -599,17 +783,20 @@ public sealed class SegmentReader : ISegmentReader
 
     // ── Raw section access ────────────────────────────────────────────────────
 
-    public byte[] ReadInvertedIndexBytes()  => ReadSection(_invertedIndexOffset);
-    public byte[] ReadTrigramIndexBytes()   => ReadSection(_trigramIndexOffset);
-    public byte[] ReadBloomFilterBytes()    => ReadSection(_bloomFilterOffset);
+    // Sections belong to a GROUP, not to the file. The no-argument overloads name group 0,
+    // which for a v4-v6 file (and for any segment small enough to seal in one group) is the
+    // whole segment — that keeps single-group call sites unchanged.
+    public byte[] ReadInvertedIndexBytes(int group = 0)  => ReadSection(_groups[group].InvertedOffset);
+    public byte[] ReadTrigramIndexBytes(int group = 0)   => ReadSection(_groups[group].TrigramOffset);
+    public byte[] ReadBloomFilterBytes(int group = 0)    => ReadSection(_groups[group].BloomOffset);
 
     // Pooled variants for the query prefilter: index sections run to several MB per
     // segment and are only needed transiently (every deserialiser copies out of the
     // span), so renting kills what used to be gigabytes of short-lived arrays when
     // prefiltering hundreds of segments in parallel.
-    public PooledSection RentInvertedIndexBytes() => RentSection(_invertedIndexOffset);
-    public PooledSection RentTrigramIndexBytes()  => RentSection(_trigramIndexOffset);
-    public PooledSection RentBloomFilterBytes()   => RentSection(_bloomFilterOffset);
+    public PooledSection RentInvertedIndexBytes(int group = 0) => RentSection(_groups[group].InvertedOffset);
+    public PooledSection RentTrigramIndexBytes(int group = 0)  => RentSection(_groups[group].TrigramOffset);
+    public PooledSection RentBloomFilterBytes(int group = 0)   => RentSection(_groups[group].BloomOffset);
 
     private byte[] ReadSection(long offset)
     {
@@ -620,12 +807,28 @@ public sealed class SegmentReader : ISegmentReader
         return data;
     }
 
+    /// <summary>
+    /// Pooled sections rented by any reader in this process since it started.
+    ///
+    /// <para>A DIAGNOSTIC, and the only way from outside to tell how many times a query read a
+    /// group's sections — which is a question worth being able to ask, because renting the same
+    /// section twice is invisible in every other instrument. Below 1 MB the pool absorbs the
+    /// second rent and the cost hides in noise; above it <see cref="ArrayPool{T}.Shared"/> stops
+    /// pooling altogether and serves each rent from a fresh LOH allocation that Return then drops,
+    /// so the same redundant call goes from free to the most expensive thing on the prefilter
+    /// path — once per group, per segment, in parallel across the whole catalog. The counter
+    /// costs one interlocked increment against a read of the section's whole length out of a
+    /// mapped view.</para>
+    /// </summary>
+    internal static long PooledSectionRents;
+
     private PooledSection RentSection(long offset)
     {
         if (offset <= 0) return default;
         uint len  = (uint)ReadInt32At(offset);
         var  data = ArrayPool<byte>.Shared.Rent((int)len);
         _view.ReadArray(offset + 4, data, 0, (int)len);
+        Interlocked.Increment(ref PooledSectionRents);
         return new PooledSection(data, (int)len);
     }
 
@@ -645,8 +848,34 @@ public sealed class SegmentReader : ISegmentReader
 }
 
 /// <summary>
-/// One event decoded with its raw payloads intact — the unit compaction re-writes
-/// into a fresh hot tier. Properties stay msgpack bytes (no dictionary roundtrip).
+/// One index group of a segment: a run of consecutive blocks plus the inverted/trigram/bloom
+/// sections built over exactly those blocks' events.
+///
+/// <para><paramref name="FirstOrdinal"/> and <paramref name="EventCount"/> delimit the group's
+/// rows in FILE ordinals — the same space posting lists use — so a candidate array needs no
+/// rebasing when it crosses a group boundary. <paramref name="MinTs"/>/<paramref name="MaxTs"/>
+/// bound the group's events exactly, making the directory a coarse time zone map above the
+/// block-level one: a windowed query drops a whole group's index sections without reading
+/// them.</para>
+///
+/// <para>A section offset of 0 means the section is absent (no index was built for the group),
+/// which readers must treat as NO INFORMATION rather than "no matches".</para>
+/// </summary>
+public readonly record struct SegmentIndexGroup(
+    int  FirstBlock,
+    int  BlockCount,
+    uint FirstOrdinal,
+    uint EventCount,
+    long MinTs,
+    long MaxTs,
+    long InvertedOffset,
+    long TrigramOffset,
+    long BloomOffset);
+
+/// <summary>
+/// One event decoded with its raw payloads intact; properties stay msgpack bytes (no dictionary
+/// roundtrip). The materialised counterpart of <see cref="SegmentEventRef"/>, which is what the
+/// streaming paths use — this one owns its bytes and so costs an allocation per event.
 /// </summary>
 internal struct RawSegmentEvent
 {

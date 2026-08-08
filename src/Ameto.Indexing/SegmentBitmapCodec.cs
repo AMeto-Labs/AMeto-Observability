@@ -17,8 +17,18 @@ namespace Ameto.Indexing;
 /// </summary>
 public static class SegmentBitmapCodec
 {
-    /// <summary>Upper bound on encoded size for <paramref name="count"/> offsets (worst-case varints).</summary>
-    public static int MaxEncodedSize(int count) => VarintMax + count * VarintMax;
+    /// <summary>
+    /// Upper bound on encoded size for <paramref name="count"/> offsets (worst-case varints).
+    ///
+    /// <para>Long arithmetic because both the product and the sum overflowed int: at 429,496,724
+    /// postings in ONE bucket <c>count * VarintMax</c> wrapped negative, the caller's
+    /// <c>GetSpan</c> then sized the destination far too small, <see cref="Encode"/> returned -1
+    /// for "did not fit", and the caller wrote that -1 as an unsigned posting-list LENGTH —
+    /// a silently corrupt index section rather than a failure. A single bucket that dense is
+    /// unreachable at ~100k events/day, and index groups cap it further, but the failure mode
+    /// is data corruption, so the arithmetic is widened rather than argued about.</para>
+    /// </summary>
+    public static long MaxEncodedSize(int count) => (long)VarintMax + (long)count * VarintMax;
 
     private const int VarintMax = 5; // a uint is at most 5 varint bytes
 

@@ -176,7 +176,9 @@ public sealed class SegmentTrigramIndex
                 // Already ascending and distinct by construction — encode straight out
                 // of the list's backing store, no per-bucket ToArray()/Sort().
                 var offsets = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(list);
-                var dest    = w.GetSpan(4 + SegmentBitmapCodec.MaxEncodedSize(offsets.Length));
+                // checked: see SegmentInvertedIndex.Serialise — a truncated size request turns
+                // Encode's -1 ("did not fit") into a corrupt posting-list length prefix.
+                var dest    = w.GetSpan(checked((int)(4 + SegmentBitmapCodec.MaxEncodedSize(offsets.Length))));
                 int n       = SegmentBitmapCodec.Encode(offsets, dest[4..]);
                 System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(dest, (uint)n);
                 w.Advance(4 + n);

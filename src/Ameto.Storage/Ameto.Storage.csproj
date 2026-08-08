@@ -6,6 +6,12 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="Ameto.Storage.Tests" />
+    <InternalsVisibleTo Include="Ameto.Perf" />
+    <!-- The query suite writes real segments to test the prefilter over, which needs the two
+         test hooks that exist for exactly that: StorageEngine._groupPayloadBudgetBytes, to get
+         several index groups out of a small file, and SegmentReader.PooledSectionRents, to
+         assert a section is read once per group rather than once per phase. -->
+    <InternalsVisibleTo Include="Ameto.Query.Tests" />
   </ItemGroup>
 
   <ItemGroup>

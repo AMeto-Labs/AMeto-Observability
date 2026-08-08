@@ -24,6 +24,12 @@
     <ProjectReference Include="..\..\src\Ameto.Storage\Ameto.Storage.csproj" />
     <ProjectReference Include="..\..\src\Ameto.Metrics\Ameto.Metrics.csproj" />
     <ProjectReference Include="..\..\src\Ameto.Tracing\Ameto.Tracing.csproj" />
+    <!-- StreamingMergeOrderTests merges with the REAL index wiring and then reads the merged
+         file back through a query — a merge that mis-numbers a group's ordinals loses rows at
+         query time, where no count notices. Proving that needs the builder and the executor,
+         not stand-in sinks. -->
+    <ProjectReference Include="..\..\src\Ameto.Indexing\Ameto.Indexing.csproj" />
+    <ProjectReference Include="..\..\src\Ameto.Query\Ameto.Query.csproj" />
   </ItemGroup>
 
 </Project>

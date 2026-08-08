@@ -455,8 +455,13 @@ public static class OtlpLogStreamParser
         int max = reader.ValueSpan.Length;
         if (max > dest.Length)
         {
+            // Rent first, then return — same reasoning as SegmentReader.ReadBlockInto. `dest` is
+            // the caller's buffer by ref and the caller returns it in its own finally, so a throw
+            // between the return and the reassignment would have it returned twice and the pool
+            // would then lease one array to two owners.
+            byte[] grown = ArrayPool<byte>.Shared.Rent(max);
             ArrayPool<byte>.Shared.Return(dest);
-            dest = ArrayPool<byte>.Shared.Rent(max);
+            dest = grown;
         }
         if (!reader.ValueIsEscaped) { reader.ValueSpan.CopyTo(dest); return reader.ValueSpan.Length; }
         return reader.CopyString(dest);

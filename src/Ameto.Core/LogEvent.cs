@@ -160,4 +160,20 @@ public static class ClefFields
     public const string EventId         = "@i";
     /// <summary>Service/application name — OTLP resource attribute key and Ameto canonical property key.</summary>
     public const string ServiceName     = "service.name";
+
+    // ── Segment-index bucket names for the structured exception ───────────────
+    // An exception is not one indexable value: the builder writes the type, the inner
+    // type and an existence marker into separate inverted buckets. These constants are
+    // the ONLY spelling of those bucket names — SegmentIndexBuilder writes them and
+    // BuiltinFields maps filter-side aliases (@x, Exception, @x.type, …) onto them, so
+    // the writer and the query hint cannot drift apart. Note the literal dots: unlike a
+    // user property path (joined with <see cref="PropertyPathSeparator"/>) these are
+    // single opaque key names, not paths.
+
+    /// <summary>Inverted bucket holding <c>ExceptionInfo.Type</c>.</summary>
+    public const string ExceptionType      = "@x.type";
+    /// <summary>Inverted bucket holding <c>ExceptionInfo.Inner.Type</c>.</summary>
+    public const string ExceptionInnerType = "@x.inner.type";
+    /// <summary>Inverted bucket marking "this event carries an exception".</summary>
+    public const string ExceptionExists    = "@x.exists";
 }

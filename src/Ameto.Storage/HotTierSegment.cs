@@ -40,12 +40,15 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
     //   Keep: ChunkEventCapacity * avgPayloadBytes  <=  ChunkPayloadBytes.
     //   At 16384 * 512B = 8 MB this covers structured logs up to ~512 B average.
 
-    /// <summary>Events per chunk. Power-of-2 for fast modulo/division by JIT.
-    /// Public: the merge planner's co-fit gate reasons about this geometry.</summary>
+    // This geometry is now the INGEST path's alone. Compaction used to re-pack its batch into a
+    // tier and therefore had to reason about chunk fitting from slot 0, which is what produced
+    // the co-fit gate that excluded dense segments from merging; it streams straight into
+    // SegmentWriter now and never sees a chunk.
+
+    /// <summary>Events per chunk. Power-of-2 for fast modulo/division by JIT.</summary>
     public const int  ChunkEventCapacity = 16_384;
 
-    /// <summary>Payload bytes per chunk. 8 MB / 16384 slots = 512 B/event headroom (see invariant above).
-    /// Public: the merge planner's co-fit gate reasons about this geometry.</summary>
+    /// <summary>Payload bytes per chunk. 8 MB / 16384 slots = 512 B/event headroom (see invariant above).</summary>
     public const long ChunkPayloadBytes  = 8 * 1024 * 1024; // 8 MB
 
     /// <summary>Bytes occupied by the header array at the start of every chunk.</summary>

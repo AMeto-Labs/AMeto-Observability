@@ -23,6 +23,13 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- Fixtures shared with Ameto.Query.Tests rather than copied. The probes below measure the
+         same segments the functional tests assert over, and a second copy of the setup here
+         would be a second thing to keep true with nothing checking it. -->
+    <Compile Include="..\Ameto.Query.Tests\QuerySegmentFixtures.cs" Link="QuerySegmentFixtures.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\..\src\Ameto.Core\Ameto.Core.csproj" />
     <ProjectReference Include="..\..\src\Ameto.Storage\Ameto.Storage.csproj" />
     <ProjectReference Include="..\..\src\Ameto.Ingestion\Ameto.Ingestion.csproj" />

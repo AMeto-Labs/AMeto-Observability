@@ -43,7 +43,7 @@ public sealed class SegmentCandidateAllocProbe
             }
 
             using var reader = SegmentReader.Open(path);
-            var idx = SegmentIndexReader.Load(
+            using var idx = SegmentIndexReader.Load(
                 reader.ReadInvertedIndexBytes(),
                 reader.ReadTrigramIndexBytes(),
                 reader.ReadBloomFilterBytes());

@@ -4,7 +4,7 @@ namespace Ameto.Core;
 /// Process-wide gate in front of <c>GC.Collect(2, Aggressive, blocking, compacting)</c>.
 ///
 /// <para>Three independent paths ask for an aggressive collection — RAM pressure
-/// (<c>RamPressureService</c>), log-segment maintenance (<c>StorageEngine</c>) and metric
+/// (<c>RamPressureService</c>), log-segment merges (<c>StorageEngine</c>) and metric
 /// rollup (<c>MetricStorageEngine</c>). Each is individually a "background" trigger, but
 /// the pause is not background: a blocking compacting gen2 stops EVERY thread, ingest and
 /// query included. With no coordination, a GC trace caught two of them 8 s apart in the
@@ -19,8 +19,14 @@ public static class AggressiveGcGate
     /// <summary>
     /// Floor for maintenance passes: below this many source bytes a pass should skip its
     /// aggressive release entirely — the materialised peak is small enough for the next
-    /// natural gen2 to absorb. Shared by the log-recompress and metric-rollup loops so
-    /// the two policies cannot drift apart silently.
+    /// natural gen2 to absorb.
+    ///
+    /// <para>Only the metric-rollup loop tests it now. It was shared with the log side's HC
+    /// re-compression sweep, whose idle pass rewrote a couple of tiny segments per tick and
+    /// paid a stop-the-world gen2 for it; that sweep is gone, and log maintenance releases on
+    /// a merge having happened rather than on a byte count. Kept here rather than moved into
+    /// the metric engine so a second maintenance loop that ever needs a floor adopts this one
+    /// instead of inventing its own.</para>
     /// </summary>
     public const long MaintenancePassBytesFloor = 8L * 1024 * 1024;
 

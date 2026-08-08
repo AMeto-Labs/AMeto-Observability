@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Numerics;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using Ameto.Core;
@@ -18,16 +19,15 @@ namespace Ameto.Storage;
 public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDisposable
 {
     /// <summary>
-    /// Optional delegate that builds all index byte sections for a frozen hot-tier segment.
-    /// Injected by the Indexing layer at startup to avoid a circular project reference.
-    /// Returns (invertedIndexBytes, trigramIndexBytes, bloomFilterBytes).
+    /// Creates the index sink for ONE INDEX GROUP. Injected by the Indexing layer at startup to
+    /// avoid a circular project reference; null until it is wired, which is why merge waits.
+    ///
+    /// <para>A FRESH sink per group is the mechanism that keeps peak index-build memory
+    /// O(group) rather than O(segment) — the accumulators die at the boundary. The sink must
+    /// emit posting-list offsets as the FILE ordinals the writer hands it, not group-local
+    /// ones.</para>
     /// </summary>
-    /// <summary>
-    /// Builds (inverted, trigram, bloom) index bytes for a frozen tier. The third argument
-    /// is the file write order (<see cref="SegmentWriter.ComputeSortOrder"/>) — the builder
-    /// must emit posting-list offsets in that order so they equal .seg file ordinals.
-    /// </summary>
-    public Func<HotTierSegment, StringInternPool, int[], (byte[], byte[], byte[])>? IndexBuilder { get; set; }
+    public SegmentIndexSinkFactory? IndexSinkFactory { get; set; }
 
     /// <summary>
     /// Optional hook called on the write path after each event is accepted into the hot tier.
@@ -70,10 +70,33 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     private readonly ConcurrentDictionary<Task, byte>    _inFlightFlushes = new();
     private readonly CancellationTokenSource               _cts        = new();
     private readonly Task                                  _flushLoop;
-    /// <summary>Low-priority sweep re-compressing cold segments from fast-LZ4 to HC.</summary>
-    private readonly Task                                  _recompressLoop;
+    /// <summary>Low-priority cold-tier loop: merge recovery, then small-segment merges.</summary>
+    private readonly Task                                  _maintenanceLoop;
     /// <summary>Test hook: lets merge run without an index builder (tests verify the scan fallback).</summary>
     internal bool _allowIndexlessMerge;
+    /// <summary>Test hook: shrinks the index-group budget so a small segment still spans several groups.</summary>
+    internal long _groupPayloadBudgetBytes = SegmentWriter.DefaultGroupPayloadBudgetBytes;
+    /// <summary>
+    /// Test hook: called with the level whose segment has just been MOVED into place — the exact
+    /// seam at which a crash can split a multi-level flush. Throwing from it reproduces a kill
+    /// between two <c>File.Move</c>s without needing a second process.
+    /// </summary>
+    internal Action<int>? _afterLevelPublished;
+    /// <summary>
+    /// Test hook: called with the manifest on disk and the sources owned but not yet streamed —
+    /// the window in which a merge can be cancelled or fail transiently. Cancelling a token from
+    /// it reproduces a shutdown landing between the flush-slot wait and the merge task; throwing
+    /// from it reproduces a source that dies mid-stream, without corrupting a file to get there.
+    /// </summary>
+    internal Action? _beforeMergeStream;
+    /// <summary>Test hook: first id of the block reserved for the live WAL (see <see cref="_walSegId"/>).</summary>
+    internal ulong LiveWalSegmentId => _walSegId;
+    /// <summary>
+    /// Test hook: scales the merged-file target. What determines how many files a bucket ends
+    /// with is the RATIO of the bucket's payload to this, so dividing both by the same factor
+    /// reproduces a stand's file geometry at a fraction of its volume.
+    /// </summary>
+    internal long _mergeTargetPayloadBytes = MergeTargetPayloadBytes;
 
     // ── Flush memory budgets (see the constructor for how these combine) ───────
 
@@ -100,6 +123,21 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// <summary>Window anchors that produced no usable merge batch — excluded so the sweep advances (reset on restart).</summary>
     private readonly HashSet<ulong> _mergeSkip = new();
 
+    /// <summary>
+    /// Segment ids reserved per flushed tier: one per <see cref="LogLevel"/>, so a tier
+    /// can be written as one segment PER LEVEL and the level's id is always
+    /// <c>firstId + (byte)level</c>.
+    ///
+    /// <para>Level-pure segments are what makes retention exact. Expiry is
+    /// <c>MaxTimestamp + Ttl(MinLevel)</c>, and MinLevel is the lowest severity VALUE in
+    /// the segment — but TTL is not monotonic in that value (Debug 3 d sits below
+    /// Information 90 d), so one Debug event in a mixed segment used to drag every Error
+    /// beside it to a 3-day deadline. Measured on the sandbox stand before this change:
+    /// 279 segments / 1116 MB inside 3 days, 10 segments / ~2 MB older — a clean cliff
+    /// exactly where Debug's TTL falls.</para>
+    /// </summary>
+    private const int LevelSegmentSlots = 6;   // Verbose..Fatal
+
     // Cold-tier catalog (thread-safe)
     private readonly ConcurrentDictionary<ulong, SegmentInfo> _segments = new();
     /// <summary>Background catalog scan started by the ctor (kept to observe faults).</summary>
@@ -124,8 +162,40 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     // release retired hot tiers when no query could possibly observe them.
     private int _activeReaders;
 
-    // Monotonic segment counter
+    // Monotonic segment-id allocator. Every id a segment file can ever carry comes from
+    // here — flush blocks, merges, WAL-recovery segments — so an id is never reused.
+    //
+    // NEVER touch this field directly. Go through AllocateSegmentId /
+    // AllocateSegmentIdBlock / AdvanceSegmentIdFloor, which hold _segIdLock.
     private          ulong                                _nextSegmentId = 1;
+
+    /// <summary>
+    /// Guards <see cref="_nextSegmentId"/>. Its own lock rather than <c>_flushLock</c> because the
+    /// writers do not share a thread model: flush and merge reserve ids while holding the async
+    /// flush lock, but <see cref="ImportSegment"/> runs synchronously on whatever thread the
+    /// replication endpoint handed it, and making that path wait on a <c>SemaphoreSlim</c> would
+    /// either block a request thread behind a swap or force the import path to become async.
+    ///
+    /// <para>Every critical section under it is a read, an add and a store — no I/O, no await, so
+    /// the lock is never held across a suspension point and the ordering (_flushLock outside,
+    /// _segIdLock inside) is the only one that exists.</para>
+    /// </summary>
+    private readonly System.Threading.Lock                _segIdLock = new();
+
+    /// <summary>
+    /// First id of the block RESERVED FOR THE LIVE WAL, i.e. the ids its events will occupy
+    /// once they are flushed. The WAL file is named from it, and startup uses that name to
+    /// decide whether a WAL still holds unflushed events.
+    ///
+    /// <para>It is a reservation, not a peek at <see cref="_nextSegmentId"/>, and that is the
+    /// whole point. The WAL used to be named from whatever <c>_nextSegmentId</c> happened to
+    /// be, which is also the id a MERGE takes — so the first merge after any flush published a
+    /// segment carrying the live WAL's id, the restart check "a segment with this id exists ⇒
+    /// this WAL was already flushed" fired on it, and every un-flushed event in that WAL was
+    /// deleted. Measured before this change: WAL id 25, merged segment id 25, 30 events
+    /// written, 0 recovered, on 3 of 3 runs.</para>
+    /// </summary>
+    private          ulong                                _walSegId;
 
     // Time-sortable event id generator (Snowflake layout). Assigns EventId.RawValue
     // on the write path so sorting by Id ≡ sorting by ingest time.
@@ -230,31 +300,37 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
         // Age-based flush loop
         _flushLoop = RunFlushLoopAsync(_cts.Token);
-        // Cold-segment HC re-compression sweep (one-time per segment, ~20-30 % smaller)
-        _recompressLoop = RunRecompressLoopAsync(_cts.Token);
+        // Cold-tier maintenance: interrupted-merge recovery + small-segment merges
+        _maintenanceLoop = RunColdMaintenanceLoopAsync(_cts.Token);
     }
 
     /// <summary>
-    /// Cold-tier maintenance: first MERGE small segments into large ones (a
-    /// long-running server accumulates thousands of ~100 KB age-flush segments —
-    /// per-file index/catalog overhead dwarfs the payload), then re-compress
-    /// whatever segments remain on the fast flush-path LZ4 level to LZ4-HC
-    /// (see <see cref="SegmentRecompressor"/>). Both are one-shot per segment and
-    /// paced by bytes; the flush path stays untouched, so ingest is unaffected.
+    /// Cold-tier maintenance: finish any interrupted merge, then MERGE small segments into
+    /// large ones. A long-running server accumulates thousands of ~100 KB age-flush segments
+    /// and per-file index/catalog overhead dwarfs their payload. Paced by a pause between
+    /// batches; the flush path stays untouched, so ingest is unaffected.
+    ///
+    /// <para>This loop also ran a one-shot LZ4-HC sweep over cold segments, removed once the
+    /// merge started writing <see cref="SegmentCompression.High"/> itself. The sweep could
+    /// only rewrite v4/v5 envelopes, so on a v7 catalog it walked every segment on every tick
+    /// and rewrote none — see the commit that deleted it for why a v7-capable transform is
+    /// not worth having.</para>
     /// </summary>
-    private async Task RunRecompressLoopAsync(CancellationToken ct)
+    private async Task RunColdMaintenanceLoopAsync(CancellationToken ct)
     {
-        const long MaxBytesPerPass = 96L * 1024 * 1024;
-        const int  MaxAttempts     = 3;   // per segment; a persistently locked file must not stall the sweep
-        // A pass below the shared floor does NOT get a maintenance release. The idle
-        // steady-state pass recompresses the one or two tiny segments flushed since the
-        // last tick ("saved 0.0 MB") — a day's log showed that shape paying a blocking
-        // compacting gen2 + working-set dump six times an hour, around the clock, with
-        // the working set sawing between ~50 and ~130 MB. The burst worth returning is
-        // proportional to the bytes a pass actually chewed through, so gate on that.
-        var attempts = new Dictionary<ulong, int>();
+        // Wait for the catalog ENUMERATION, not for a guess at how long it takes. It opens every
+        // .seg with computeUncompressedBytes: true, which is slowest in exactly the
+        // thousands-of-small-segments case compaction exists for — so a fixed delay can expire
+        // mid-scan, and a source this sweep deletes then gets re-registered by the enumeration
+        // still running behind it, leaving a catalog entry pointing at a file that is gone.
+        // (Not data loss: RecoverInterruptedMerges does run before the enumeration. But the
+        // resurrected entry becomes a merge candidate, fails to open and is skip-listed until
+        // restart.)
+        try { await _catalogLoad.WaitAsync(ct); }
+        catch (OperationCanceledException) { return; }
+        catch (Exception ex) { _logger.LogWarning(ex, "Segment catalog load faulted — maintenance continues"); }
 
-        try { await Task.Delay(TimeSpan.FromMinutes(3), ct); } // let startup + catalog load settle
+        try { await Task.Delay(TimeSpan.FromMinutes(3), ct); } // let startup settle
         catch (OperationCanceledException) { return; }
 
         while (!ct.IsCancellationRequested)
@@ -264,9 +340,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             try { RecoverInterruptedMerges(); }
             catch (Exception ex) { _logger.LogWarning(ex, "Merge recovery sweep failed"); }
 
-            // Merge takes priority: HC-ing a tiny file that a later merge rewrites
-            // anyway would be wasted work. One batch per iteration, short pause
-            // while a backlog exists.
+            // One batch per iteration, short pause while a backlog exists.
             bool merged;
             try { merged = await TryMergeSmallSegmentsOnceAsync(ct); }
             catch (OperationCanceledException) { break; }
@@ -277,59 +351,22 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 // index builders. Hand that back to the OS instead of letting the
                 // allocator sit on it until the next burst (RSS otherwise ratchets
                 // up across passes and never comes down on an idle server).
+                //
+                // Gated on a merge having HAPPENED, which is what keeps an idle server from
+                // paying for this. The removed HC sweep had its own release behind a bytes
+                // floor for the same reason: its idle pass rewrote the one or two tiny
+                // segments flushed since the last tick ("saved 0.0 MB") and a day's log
+                // showed that shape paying a blocking compacting gen2 plus a working-set
+                // dump six times an hour, around the clock, the working set sawing between
+                // ~50 and ~130 MB. With the sweep gone an idle tick does no work at all, so
+                // there is nothing to release and no floor to test.
                 ReleaseMaintenanceMemory();
                 try { await Task.Delay(TimeSpan.FromSeconds(15), ct); }
                 catch (OperationCanceledException) { break; }
                 continue;
             }
-            int  done = 0;
-            long passBytes = 0, savedTotal = 0;
-            foreach (var (segId, info) in _segments)
-            {
-                if (ct.IsCancellationRequested || passBytes >= MaxBytesPerPass) break;
-                int tried = attempts.GetValueOrDefault(segId);
-                if (tried >= MaxAttempts) continue;
-                if (!SegmentRecompressor.IsCandidate(info.FilePath))
-                {
-                    attempts[segId] = MaxAttempts; // done already / not applicable — never re-check
-                    continue;
-                }
 
-                long? saved = await Task.Run(
-                    () => SegmentRecompressor.Recompress(info.FilePath, _logger, ct), ct);
-                done++;
-                passBytes += Math.Max(info.CompressedBytes, 1);
-                if (saved is > 0)
-                {
-                    attempts[segId] = MaxAttempts;
-                    savedTotal += saved.Value;
-                    // Keep the catalog's size accurate for diagnostics.
-                    _segments.TryUpdate(segId, new SegmentInfo
-                    {
-                        Id                = info.Id,
-                        NodeId            = info.NodeId,
-                        FilePath          = info.FilePath,
-                        MinTimestampTicks = info.MinTimestampTicks,
-                        MaxTimestampTicks = info.MaxTimestampTicks,
-                        EventCount        = info.EventCount,
-                        MinLevel          = info.MinLevel,
-                        CompressedBytes   = Math.Max(0, info.CompressedBytes - saved.Value),
-                        UncompressedBytes = info.UncompressedBytes,
-                    }, info);
-                }
-                else
-                {
-                    attempts[segId] = tried + 1; // busy or skipped — bounded retries
-                }
-            }
-
-            if (savedTotal > 0)
-                _logger.LogInformation("Recompressed {Count} log segment(s), saved {Mb:F1} MB",
-                    done, savedTotal / 1048576.0);
-
-            if (done > 0 && passBytes >= AggressiveGcGate.MaintenancePassBytesFloor) ReleaseMaintenanceMemory();
-
-            try { await Task.Delay(TimeSpan.FromSeconds(passBytes >= MaxBytesPerPass ? 30 : 600), ct); }
+            try { await Task.Delay(TimeSpan.FromSeconds(600), ct); }
             catch (OperationCanceledException) { break; }
         }
     }
@@ -410,11 +447,15 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             else
             {
                 frozen  = new HotTierSegment[_frozenHot.Count];
-                covered = new HashSet<ulong>(_frozenHot.Count);
+                covered = new HashSet<ulong>(_frozenHot.Count * LevelSegmentSlots);
                 for (int i = 0; i < _frozenHot.Count; i++)
                 {
                     frozen[i] = _frozenHot[i].Tier;
-                    covered.Add(_frozenHot[i].SegId);
+                    // The tier flushes to one segment per level, so every id in its
+                    // reserved block is covered — otherwise a query would serve the
+                    // already-registered per-level segments AND the still-frozen tier.
+                    ulong first = _frozenHot[i].SegId;
+                    for (int s = 0; s < LevelSegmentSlots; s++) covered.Add(first + (ulong)s);
                 }
             }
             Interlocked.Increment(ref _activeReaders);
@@ -651,20 +692,23 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             oldWalPath = oldWal?.FilePath;
             oldHot.Freeze();
 
-            // Publish oldHot + reserve its segment id under the lock queries snapshot
-            // from, so a concurrent query sees oldHot's events AND skips the reserved
-            // cold segment id (no duplicates during the register/remove overlap).
-            reservedSegId = _nextSegmentId;
+            // Publish oldHot under the lock queries snapshot from, so a concurrent query
+            // sees oldHot's events AND skips the reserved cold segment ids (no duplicates
+            // during the register/remove overlap). A tier flushes to ONE SEGMENT PER LEVEL,
+            // and the block of ids for exactly that was reserved when this tier's WAL was
+            // opened — the level's segment is always firstId + (byte)level. Levels absent
+            // from the tier simply never become files; a burnt id costs nothing.
+            reservedSegId = _walSegId;
             lock (_frozenLock) { _frozenHot.Add((oldHot, reservedSegId)); }
 
             _hot = CreateHotTier();
 
-            // Rotate the WAL: bump the counter first so the new WAL uses the *next* id.
-            // The OLD WAL is disposed in the heavy phase, off the swap lock — disposing
-            // flushes up to 64 MB of dirty mmap pages to disk, and doing that here
-            // stalled every writer (hot tier stays full for the whole swap) long enough
-            // to overflow the ingest ring under sustained 100k/s load.
-            _nextSegmentId++;
+            // Rotate the WAL: opening the next one reserves the next block, so the WAL on
+            // disk always names the ids ITS events will occupy. The OLD WAL is disposed in
+            // the heavy phase, off the swap lock — disposing flushes up to 64 MB of dirty
+            // mmap pages to disk, and doing that here stalled every writer (hot tier stays
+            // full for the whole swap) long enough to overflow the ingest ring under
+            // sustained 100k/s load.
             _wal = null;
             OpenWal();
         }
@@ -685,13 +729,10 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             await _flushConcurrency.WaitAsync(ct).ConfigureAwait(false);
             try
             {
-                var segId   = new SegmentId(reservedSegId);
-                var segPath = BuildSegmentPath(segId, oldHot);
-
-                SegmentInfo info;
+                List<SegmentInfo> written;
                 try
                 {
-                    info = await FlushToColdAsync(oldHot, segId, segPath, ct);
+                    written = await FlushTierByLevelAsync(oldHot, reservedSegId, ct);
                 }
                 catch (Exception ex)
                 {
@@ -701,21 +742,27 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                     return;
                 }
 
-                // Register the cold segment AND drop oldHot from the frozen list atomically.
+                // Register the cold segments AND drop oldHot from the frozen list atomically.
                 lock (_frozenLock)
                 {
-                    _segments[segId.Value] = info;
+                    foreach (var w in written) _segments[w.Id.Value] = w;
                     _frozenHot.RemoveAll(f => ReferenceEquals(f.Tier, oldHot));
                 }
-                _logger.LogInformation("Flushed segment {Id}: {Count} events → {Path}", segId, info.EventCount, segPath);
+                _logger.LogInformation("Flushed {Segments} level segment(s), {Count} events total",
+                    written.Count, written.Sum(w => (long)w.EventCount));
 
-                SegmentFlushed?.Invoke(info);
+                foreach (var w in written) SegmentFlushed?.Invoke(w);
 
                 if (oldWalPath is not null)
                 {
                     try { File.Delete(oldWalPath); }
                     catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete WAL {Path}", oldWalPath); }
                     try { File.Delete(oldWalPath + ".pool"); } catch { /* best-effort */ }
+                    // The marker is what AUTHORISES the delete above, so it outlives it: dropping
+                    // it first would leave a WAL that recovery has to replay to find out its
+                    // levels are all published. A crash in between leaves a marker with no WAL,
+                    // which the startup sweep clears.
+                    try { File.Delete(FlushMarkerPath(reservedSegId)); } catch { /* swept at startup */ }
                 }
 
                 RetireHotTier(oldHot);
@@ -756,286 +803,866 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         }
     }
 
-    // ── Small-segment merge (compaction) ──────────────────────────────────────
-
-    private const long MergeCandidateMaxBytes = 8L * 1024 * 1024;   // only merge segments smaller than this
-    // Co-fit gate: a candidate must fit HALF a tier chunk (payload and slots), so
-    // any TWO candidates always co-fit chunk 0 when re-packed from slot 0. This
-    // makes the "window yields no usable batch" poison-anchor path unreachable
-    // for geometry reasons — a dense flush segment (~8 MB uncompressed props in
-    // a ~4 MB file) used to pass the compressed-size filter, blow the chunk
-    // budget in FittingEventCount, and anchor-skip one window per pass forever.
-    // UncompressedBytes (sum of block sizes, all columns) over-counts the props
-    // payload, so the gate errs conservative — never admits a non-co-fitting pair.
-    private const long MergeCandidateMaxUncompressedBytes = HotTierSegment.ChunkPayloadBytes / 2;
-    private const uint MergeCandidateMaxEvents            = HotTierSegment.ChunkEventCapacity / 2;
-    // Batch budgets deliberately mirror a NORMAL flush (hot tier: 64 MB / ~80k
-    // events). A merge runs the same pipeline — raw events in managed memory, a
-    // copy into the native tier, then an inverted+trigram+bloom index build over
-    // the whole batch — so its peak memory scales with the batch. The original
-    // 96 MB / 500k budget made that peak ~6x a regular flush and showed up as a
-    // ~1 GB RSS spike with a 45 % CPU burst on every maintenance pass. Smaller
-    // batches simply mean more passes (one every 15 s while a backlog exists).
-    private const long MergeTargetPayloadBytes = 32L * 1024 * 1024; // uncompressed payload budget per batch
-    private const int  MergeMinSources = 8;                          // don't bother below this
-    private const int  MergeMaxSources = 512;
-    private const int  MergeMaxEvents  = 100_000;
-    private const long MergeMaxSpanTicks = 24L * TimeSpan.TicksPerHour; // retention granularity per merged file
-    private const int  MergeWindowAttempts = 4;  // window re-selections per pass after an anchor skip
+    // ── Compaction: SIZE-TIERED RUNS INSIDE AN (EXPIRY BUCKET, LEVEL) ─────────
+    //
+    // The goal is a catalog whose file count is proportional to the RETENTION WINDOW, not to
+    // uptime, at a WRITE AMPLIFICATION that stops climbing. Level purity comes from the flush
+    // (one segment per level) and is what keeps expiry exact; the bucket bounds how far a merge
+    // may move a row's deadline; the size tier bounds how often a byte is rewritten.
+    //
+    // Buckets are ALIGNED, not sliding, and a segment's bucket is floor(MaxTimestamp / width).
+    // MAX, not Min, because Max is the only timestamp retention reads: expiry is
+    // MaxTimestamp + Ttl(MinLevel), so grouping by Max makes the merge's effect on retention
+    // exact — every source's deadline moves by less than one bucket width, by construction.
+    // Bucketing by MIN could not say that, and it had no home for a segment whose Min and Max
+    // fall either side of a boundary: measured, 6 such segments produced 0 merges and kept a
+    // 32.2-day span against a 7-day bound, because the span guard discarded every partner they
+    // could have had. Under Max bucketing they land with the data they were flushed beside and
+    // compact normally.
+    //
+    // Inside a bucket the planner takes a TIME-CONTIGUOUS RUN OF SIMILARLY-SIZED FILES. Both
+    // halves are load-bearing:
+    //   - similarly sized (within MergeRunSizeRatio, and the run's largest no more than
+    //     MergeGrowthFactor of its total) is what makes a straggler cost the straggler. The
+    //     previous rule dropped the size guard entirely for a sealed bucket, so one late row and
+    //     the bucket's collapsed file were admissible together: measured, five one-event flushes
+    //     into a collapsed bucket cost five merges and 7151 KB of writes, and the cost never
+    //     decayed because the rewritten file was still under the maximal threshold.
+    //   - time-contiguous is what makes the pieces of an over-large bucket partition it rather
+    //     than interleave it (see MergeTargetPayloadBytes), and it is why the run BREAKS at the
+    //     first file it cannot take instead of skipping past it.
+    //
+    // Requiring BOTH of a single run, however, is what left a bucket with no terminal state at
+    // all: a file whose time-neighbours are all more than MergeRunSizeRatio away in size can
+    // never join anything, not even a file of its own exact size elsewhere in the bucket,
+    // because the run would have to step over the neighbour. Measured on the shape a bursty
+    // producer makes on its own — 240 flushes alternating 200 and 40 events into a bucket that
+    // sealed 30 days ago — 240 files and ZERO merges, at fixpoint, forever. So the run planner
+    // gets a SECOND source of candidates, tried only when the first finds nothing anywhere:
+    // the bucket's files GROUPED BY SIZE TIER (floor(log_ratio(payload))), each tier still taken
+    // as a time-contiguous run of its own members. Same three conditions, a strictly smaller
+    // input, and same-size files therefore always find each other. The same 240 flushes leave
+    // 2 files. The cost is that two files of a bucket may overlap in time — which is why it is
+    // a FALLBACK: overlap costs a query one extra open file, where the alternative costs it one
+    // open file per flush that ever landed in the window.
+    //
+    // The tiers are also what bounds the terminal state, and the bound is a property of the
+    // geometry rather than of the workload: at fixpoint a tier holds fewer files than the
+    // fanout (three same-tier files always satisfy the growth rule, since the largest is under
+    // MergeRunSizeRatio of the smallest), so a bucket holds at most
+    // fanout × log_ratio(maximal / flush size) files whatever the size distribution.
 
     /// <summary>
-    /// Merges one batch of small, time-adjacent cold segments into a single large
-    /// segment via the regular flush pipeline (shared sort + index build + writer),
-    /// preserving event ids, timestamps and raw property/exception payloads.
+    /// Uncompressed payload one merged file aims for.
     ///
-    /// <para>Retention-aware selection: segment expiry is
-    /// <c>MaxTimestamp + Ttl(MinLevel)</c>, so a batch only combines segments of
-    /// the SAME retention TTL class (merging a 3-day-TTL debug segment into a
-    /// 90-day one would either delete the neighbours' events early or keep the
-    /// debug ones 30× longer), and a batch never spans more than
-    /// <see cref="MergeMaxSpanTicks"/> — the span is exactly how much longer the
-    /// oldest events can outlive their per-segment deadline.</para>
+    /// <para>This is a POLICY number now, not a memory one — the streaming merge holds one
+    /// block per source plus one index group, so peak is flat in the merged size. It has to be
+    /// at least ONE DAY of the busiest level, or the (day, level) bucket the whole design
+    /// targets cannot land in a single file: the sandbox stand's entire log corpus is ~370 MB
+    /// of payload per day across all six levels, Information dominant, so 512 MB leaves the
+    /// dominant level roughly 1.7× headroom. Above that the return diminishes — per-file index
+    /// and catalog overhead has already vanished — while the unit an expiry deletes, and the
+    /// work a single interrupted pass throws away, keep growing.</para>
+    /// </summary>
+    private const long MergeTargetPayloadBytes = 512L * 1024 * 1024;
+
+    /// <summary>
+    /// A segment at or past this is MAXIMAL: never a merge source again, whatever else lands in
+    /// its bucket. It is the TOP RUNG of the size ladder, and having a reachable one is what
+    /// makes write amplification a constant rather than a function of how long the server has
+    /// been running — a byte is rewritten log(maximal / flush-segment size) times and then never
+    /// again. Measured with the top rung out of reach (a 64 MB target against 69 KB segments):
+    /// 2.06x at 80 flushes, 3.20x at 160, 3.34x at 400, still climbing. Half the target, so two
+    /// eligible files can always be combined without overshooting.
+    /// </summary>
+    private const long MergeSealedSourceBytes = MergeTargetPayloadBytes / 2;
+
+    /// <summary>
+    /// A merge batch may not mix sizes further apart than this ratio — in an open bucket AND in
+    /// a sealed one.
     ///
-    /// Crash-safe: a manifest written next to the merged file lists the source
-    /// files, so an interrupted deletion is finished on the next startup. Returns
-    /// true when a batch was merged.
+    /// <para>This, with <see cref="MergeGrowthFactor"/>, is the whole answer to write
+    /// amplification. A byte enters at flush-segment size and leaves the policy at
+    /// <see cref="MergeSealedSourceBytes"/>; a run of <see cref="MergeMinSources"/> same-size
+    /// files multiplies it by that fanout each time it is rewritten, so a byte is rewritten
+    /// about log₄(maximal / flush size) times.</para>
+    ///
+    /// <para>THAT IS A FUNCTION OF THE DEPLOYMENT'S GEOMETRY, NOT A CONSTANT OF THE POLICY, and
+    /// the published figure has to be read that way. Measured over 6000 flushes with stragglers
+    /// at maximal/flush ≈ 235 — the marginal cost of each stretch, which is the only reading
+    /// that says whether the policy has settled, since the cumulative one is a running average
+    /// and lags: 1.80x, 1.80x, 3.13x, 2.81x, 3.05x, 2.98x, 3.05x per stretch at 80 / 160 / 400 /
+    /// 1000 / 2000 / 3000 / 4000 / 6000 flushes. A BAND of 2.81–3.13, flat over 15× the data,
+    /// not a staircase and not a point. A quieter server with 20 KB flush segments has two more
+    /// rungs on the same ladder and pays for them. The figure also counts REWRITES ONLY — the
+    /// device sees 1 + that per ingested byte.</para>
+    ///
+    /// <para>It is STRICTLY BELOW <see cref="MergeMinSources"/>, and that inequality is the
+    /// point. At ratio 8 with a fanout of 8, a merge's own output is exactly 8× its sources and
+    /// therefore admissible beside the very next batch of flush segments — so the freshly
+    /// written file is rewritten again for the next 8 arrivals, at double the cost, forever.
+    /// MEASURED over 1000 flushes with stragglers: 3.34x steady state at ratio 8 against 2.81x
+    /// at ratio 4, for the same fanout and the same data.</para>
+    ///
+    /// <para>Dropping it for sealed buckets — the previous rule — is what made a one-row
+    /// straggler cost a full bucket rewrite. It is kept for sealed buckets now; what a sealed
+    /// bucket relaxes is only the FANOUT (see <see cref="MergeSealedMinSources"/>).</para>
+    ///
+    /// <para>It is also the base of the SIZE TIER (see <see cref="SizeTier"/>), which is why it
+    /// is expressed as a shift: two files are in the same tier exactly when neither is more than
+    /// this ratio from the tier's own floor, so a tier's members satisfy the spread rule by
+    /// construction and the fallback planner needs no separate check.</para>
+    /// </summary>
+    private const int MergeRunSizeShift = 2;
+    internal const int MergeRunSizeRatio = 1 << MergeRunSizeShift;
+
+    /// <summary>
+    /// Which rung of the size ladder a file is on: <c>floor(log₍ratio₎ payload)</c>, computed as
+    /// a shift of its bit length so the planner can bucket by it without a division or a
+    /// floating-point log.
+    ///
+    /// <para>The tier is what lets same-sized files find each other when time-contiguity keeps
+    /// them apart, and its rigidity is deliberate: two files either side of a rung boundary are
+    /// within 1× of each other and still never merge DIRECTLY — but each coalesces with its own
+    /// tier and climbs, so the pair costs at most one extra file, never a stall.</para>
+    /// </summary>
+    internal static int SizeTier(long payload) =>
+        BitOperations.Log2((ulong)Math.Max(1, payload)) / MergeRunSizeShift;
+
+    /// <summary>
+    /// A merge must grow its largest source by at least this factor, expressed as the fraction
+    /// of that source the REST of the batch has to add up to (1/2 ⇒ the output is ≥ 1.5× the
+    /// largest input).
+    ///
+    /// <para><see cref="MergeRunSizeRatio"/> alone does not bound amplification once a bucket
+    /// holds one big file and a trickle of small ones: at a ratio of 8 the big file becomes
+    /// admissible again as soon as the trickle reaches an eighth of it, so it is rewritten once
+    /// per (size/8) bytes of new data — an amplification of 8 that grows with the file. This
+    /// says instead that a merge is only worth doing when the data it is ADDING is a real
+    /// fraction of the data it is rewriting, which caps that per-rewrite cost at 3× and, being
+    /// a multiplicative floor on file growth, also caps the number of rewrites a byte can ever
+    /// see at log₁.₅(maximal / flush size).</para>
+    /// </summary>
+    private const int MergeGrowthFactor = 2;
+
+    /// <summary>
+    /// A bucket is SEALED this long after its window ends — capped at one bucket width. Sealing
+    /// only lowers the FANOUT a batch needs (<see cref="MergeSealedMinSources"/>); it no longer
+    /// lifts the size guard, so there is nothing left that has to happen exactly once and the
+    /// grace can be short.
+    ///
+    /// <para>Capping at the width is what keeps the arithmetic sane for a short-TTL level: at a
+    /// flat 48 h, Debug — whose entire TTL is 3 days — spent two thirds of its data's life
+    /// waiting for stragglers that a 6 h bucket has no room for anyway.</para>
+    /// </summary>
+    private const long MergeBucketGraceTicks = 48L * TimeSpan.TicksPerHour;
+
+    private static long MergeSealGraceTicks(long bucketWidthTicks) =>
+        Math.Min(MergeBucketGraceTicks, bucketWidthTicks);
+
+    /// <summary>
+    /// A bucket covers at most <c>Ttl(level) / 12</c>, so a merge moves no row's expiry by more
+    /// than 8.3 % of that row's own TTL.
+    ///
+    /// <para>Expiry is <c>MaxTimestamp + Ttl(MinLevel)</c>, so the bucket width is exactly how
+    /// much extra retention compaction can buy a row. A flat 24 h reads as the safe choice and
+    /// is, for a busy level — but for a RARE level it is the reason the catalog fills with
+    /// near-empty files: a service that logs four Fatals a week gets one file per day
+    /// regardless, each carrying a full index and catalog entry for a handful of rows. One
+    /// twelfth is chosen because 8.3 % is smaller than the error already baked into a retention
+    /// policy expressed in whole days, and it buys a 7× reduction in file count at the default
+    /// 90-day TTLs.</para>
+    ///
+    /// <para>It is a CEILING, and for busy levels it is not the binding one:
+    /// <see cref="MergeTargetPayloadBytes"/> stops a batch long before 7 days of Information
+    /// have accumulated, so the dominant level's files still span about a day and over-retain
+    /// by ~1 %. The fraction only bites where there is too little data to fill a file, which is
+    /// exactly where it should.</para>
+    ///
+    /// <para>The 8.3 % holds for any TTL at or above 12 MINUTES; below that the grid's own
+    /// one-minute floor binds and over-retention is <c>1 min / Ttl</c> instead (see
+    /// <see cref="MergeBucketTicks"/>). It is stated because TTLs are settable at runtime, not
+    /// because any shipped default is near it — the smallest is Debug's 3 days.</para>
+    /// </summary>
+    private const int MergeSpanTtlDivisor = 12;
+
+    /// <summary>
+    /// Sources an OPEN bucket needs before a merge is worth doing. This is the fanout: the run
+    /// it gates is what multiplies a file's size by ~<see cref="MergeRunSizeRatio"/>, and the
+    /// number of rewrites a byte sees is log of the size range in that multiplier. Eight trades
+    /// ~2.5 rewrites per byte at the stand's geometry against holding up to eight uncompacted
+    /// flush segments per level in the catalog.
+    /// </summary>
+    internal const int MergeMinSources = 8;
+
+    /// <summary>
+    /// Sources a SEALED bucket needs. Two, because a quiet day leaves a handful of tiny segments
+    /// that a fanout of eight would strand forever (observed live: ~1,000 files parked that
+    /// way), and because a low fanout is no longer dangerous — <see cref="MergeGrowthFactor"/>
+    /// is what stops a pair being "the bucket's big file plus one straggler", which is the shape
+    /// that used to make this number costly.
+    ///
+    /// <para>What a fanout of two does cost is a MERGE RATE, and the rate is per arriving FLUSH,
+    /// not per late row: measured, 200 one-row stragglers into a collapsed 1430 KB bucket cost
+    /// 148 merges — 701 B rewritten each, so the bytes are bounded, but each is still a manifest
+    /// write-through, an index build, a segment write and fsync, two unlinks and a
+    /// <c>_flushConcurrency</c> slot. There is no byte floor guarding it deliberately: a floor
+    /// would strand exactly the files this fanout exists to rescue (a service logging four Fatals
+    /// a week produces genuinely tiny segments, and they never grow). The rate is bounded instead
+    /// by the two things that already bound it — one flush emits at most one segment per level
+    /// however many late rows it carries, and the maintenance pass runs on its own timer, so
+    /// stragglers that arrive between two passes coalesce in a single merge of their size tier
+    /// rather than pairwise. The measured 148 is the pathological reading taken by compacting to
+    /// exhaustion after every single flush.</para>
+    /// </summary>
+    internal const int MergeSealedMinSources = 2;
+    // Each source contributes one open reader and one decompressed block (~64 KB) for the
+    // length of the merge — the k-way merge's only per-source cost, ~36 MB at this cap.
+    private const int MergeMaxSources = 512;
+    /// <summary>
+    /// Events per merged file. Interruptibility is handled by the writer's per-block
+    /// cancellation check, so this exists only to keep one file's block index and group
+    /// directory a sane size for workloads whose events are far smaller than the stand's ~2 KB.
+    /// </summary>
+    private const int MergeMaxEvents = 4_000_000;
+    private const int MergeWindowAttempts = 4;  // bucket re-selections per pass after an anchor skip
+
+    /// <summary>
+    /// Widths a sub-day bucket may take. Every one DIVIDES a day, which is the property that
+    /// matters: ticks run from a midnight, so a width that divides a day puts a boundary on
+    /// every UTC midnight and the grid stays aligned with the whole-day widths above it.
+    /// </summary>
+    private static readonly long[] SubDayBucketWidths =
+    [
+        1 * TimeSpan.TicksPerMinute,  2 * TimeSpan.TicksPerMinute,  3 * TimeSpan.TicksPerMinute,
+        4 * TimeSpan.TicksPerMinute,  5 * TimeSpan.TicksPerMinute,  6 * TimeSpan.TicksPerMinute,
+        10 * TimeSpan.TicksPerMinute, 12 * TimeSpan.TicksPerMinute, 15 * TimeSpan.TicksPerMinute,
+        20 * TimeSpan.TicksPerMinute, 30 * TimeSpan.TicksPerMinute,
+        1 * TimeSpan.TicksPerHour,  2 * TimeSpan.TicksPerHour,  3 * TimeSpan.TicksPerHour,
+        4 * TimeSpan.TicksPerHour,  6 * TimeSpan.TicksPerHour,  8 * TimeSpan.TicksPerHour,
+        12 * TimeSpan.TicksPerHour,
+    ];
+
+    /// <summary>
+    /// Width of the expiry bucket for a level with this TTL: the largest aligned width at or
+    /// below <c>Ttl / <see cref="MergeSpanTtlDivisor"/></c>.
+    ///
+    /// <para>The old whole-day floor made the divisor a claim the code did not keep. Debug's TTL
+    /// is 3 days, so its share is 6 h — floored to a day, its rows lived 4 days instead of 3,
+    /// i.e. 33 % of over-retention advertised as 8.3 %, on the level that is usually the largest
+    /// on disk. Sub-day widths that divide a day give Debug its 6 h and leave every 90-day level
+    /// exactly where it was (7 days, 7.8 %).</para>
+    ///
+    /// <para>The ladder runs down to ONE MINUTE, not to one hour. TTLs are settable at runtime,
+    /// and a 1 h floor was the same hidden floor one order of magnitude down: it over-retained a
+    /// 3 h level by 33 %, a 1 h level by 100 % and a 30 min level by 200 %, all while the
+    /// divisor's doc comment said 8.3 %. The minute floor keeps the guarantee down to a 12-minute
+    /// TTL, which is below anything a retention policy is written to mean.</para>
+    /// </summary>
+    internal static long MergeBucketTicks(TimeSpan ttl)
+    {
+        long budget = ttl.Ticks / MergeSpanTtlDivisor;
+        if (budget >= TimeSpan.TicksPerDay)
+            return budget / TimeSpan.TicksPerDay * TimeSpan.TicksPerDay;
+
+        long width = SubDayBucketWidths[0];
+        foreach (long candidate in SubDayBucketWidths)
+            if (candidate <= budget) width = candidate;
+        return width;
+    }
+
+    /// <summary>
+    /// What a segment costs a merge: its uncompressed payload, which is what the target budget
+    /// and the index build both scale with. Falls back to the file size for a catalog entry
+    /// opened cheaply (the reader only walks the blocks when asked to).
+    /// </summary>
+    private static long SegmentPayloadBytes(SegmentInfo s) =>
+        Math.Max(s.UncompressedBytes, s.CompressedBytes);
+
+    /// <summary>
+    /// Picks the next batch: the oldest (level, expiry bucket) group that holds a mergeable run,
+    /// and as many of that run's segments as one merged file affords. Null when nothing is worth
+    /// merging — which is the steady state, not a failure: every bucket has either reached
+    /// <see cref="MergeSealedSourceBytes"/> or holds only files no run can legally combine.
+    ///
+    /// <para>Two candidate sources, in strict order. A TIME-CONTIGUOUS run
+    /// (<see cref="SelectMergeRun"/>) everywhere it can be found, because its output never
+    /// overlaps a file it left behind; and only when that finds nothing in the whole catalog, a
+    /// run inside one SIZE TIER (<see cref="SelectMergeTierRun"/>), which may overlap and is
+    /// what gives a bucket of unevenly sized files a terminal state at all.</para>
+    ///
+    /// <para>Chosen from CATALOG METADATA alone; no file is opened, let alone decoded, until
+    /// the merge itself streams it.</para>
+    /// </summary>
+    private List<SegmentInfo>? SelectMergeBatch()
+    {
+        var  policy  = _retentionStore.GetPolicy();
+        long now     = DateTimeOffset.UtcNow.UtcTicks;
+        long target  = _mergeTargetPayloadBytes;
+        long maximal = target / 2;   // MergeSealedSourceBytes — scaled with the target, not fixed
+
+        // Group by (level, aligned bucket start). Grouping by LEVEL rather than by TTL class
+        // matters even though same-level implies same TTL: Information and Error share the
+        // 90-day class, and merging them would hand the merged file back the mixed-level shape
+        // whose retention the level-split flush exists to make exact.
+        var buckets = new Dictionary<(Ameto.Core.LogLevel Level, long Start), List<SegmentInfo>>();
+        foreach (var s in _segments.Values)
+        {
+            if (_mergeSkip.Contains(s.Id.Value)) continue;
+
+            // A maximal segment is done — it is the OUTPUT of this policy, not an input to it.
+            if (SegmentPayloadBytes(s) >= maximal) continue;
+
+            long width = MergeBucketTicks(policy.GetTtl(s.MinLevel));
+            long start = s.MaxTimestampTicks / width * width;
+
+            var key = (Level: s.MinLevel, Start: start);
+            if (!buckets.TryGetValue(key, out var list)) buckets[key] = list = new List<SegmentInfo>(8);
+            list.Add(s);
+        }
+        if (buckets.Count == 0) return null;
+
+        // Oldest bucket first, so the settled past consolidates and then stays consolidated.
+        var keys = new List<(Ameto.Core.LogLevel Level, long Start)>(buckets.Keys);
+        keys.Sort((a, b) => a.Start != b.Start ? a.Start.CompareTo(b.Start) : ((byte)a.Level).CompareTo((byte)b.Level));
+
+        foreach (var key in keys)
+        {
+            var  list  = buckets[key];
+            if (list.Count < 2) continue;
+
+            // Oldest first, so a run is a time-contiguous slice of the bucket. A bucket too big
+            // for one file has to be cut somehow, and cutting it by time is what makes the
+            // pieces useful: files that partition their bucket prune by window and expire in
+            // sequence, where files that interleave it all span the whole bucket, are all opened
+            // by every query into it, and all carry the bucket's newest timestamp — so its
+            // oldest events over-retain by the full bucket width instead of by one file's share
+            // of it. Measured on the stand shape at 1/16 (see DayBucketCompactionProbe): 5.72 d
+            // of span per Information file when the batch was picked smallest-first, 1.6 d when
+            // picked oldest-first.
+            list.Sort(static (a, b) => a.MinTimestampTicks.CompareTo(b.MinTimestampTicks));
+
+            var run = SelectMergeRun(list, MinSourcesFor(key, policy, now), target, maximal);
+            if (run is not null) return run;
+        }
+
+        // NOTHING in the whole catalog can be merged without stepping over a source. Only now is
+        // the overlap worth it: group each bucket by size tier and take a run inside one tier.
+        // Second loop rather than second branch, so a bucket that can still be compacted
+        // cleanly is ALWAYS preferred over one that cannot — the fallback fires at what would
+        // otherwise be a permanent fixpoint, which is the only place its cost is the lesser one.
+        foreach (var key in keys)
+        {
+            var list = buckets[key];        // already sorted by Min above
+            if (list.Count < 2) continue;
+
+            var run = SelectMergeTierRun(list, MinSourcesFor(key, policy, now), target, maximal);
+            if (run is not null) return run;
+        }
+        return null;
+
+        // A bucket past its window plus a grace needs only a pair: nothing more is coming that
+        // could make a bigger batch, so waiting for the open fanout would strand what is there.
+        static int MinSourcesFor((Ameto.Core.LogLevel Level, long Start) key, RetentionPolicy policy, long now)
+        {
+            long width = MergeBucketTicks(policy.GetTtl(key.Level));
+            return now - (key.Start + width) >= MergeSealGraceTicks(width)
+                ? MergeSealedMinSources
+                : MergeMinSources;
+        }
+    }
+
+    /// <summary>
+    /// The first time-contiguous run in <paramref name="byTime"/> that is worth rewriting, or
+    /// null if the bucket holds none.
+    ///
+    /// <para>A run is grown from each start in turn and STOPS at the first file it cannot take —
+    /// it never steps over one. Skipping was the previous behaviour and it broke the property
+    /// the oldest-first ordering exists to give: the merged file spanned right across the source
+    /// it had skipped, so the two overlapped and every query into that window opened both.</para>
+    ///
+    /// <para>Three conditions decide whether the run is worth it, and each answers a measured
+    /// failure:</para>
+    /// <list type="bullet">
+    /// <item>SIZE SPREAD — the run's largest may be at most <see cref="MergeRunSizeRatio"/>×
+    ///       its smallest. Without it a single late row was admissible beside the bucket's
+    ///       collapsed file (5 stragglers ⇒ 5 merges, 7151 KB written, cost never decaying).</item>
+    /// <item>GROWTH — the rest of the run must add up to at least
+    ///       1/<see cref="MergeGrowthFactor"/> of its largest member, so a merge always makes
+    ///       real progress up the size ladder and a big file is only rewritten when a comparable
+    ///       amount of new data has arrived to pay for it.</item>
+    /// <item>FANOUT — <paramref name="minSources"/> files, OR a payload that already fills the
+    ///       target. The fallback is not a loophole, it is the fix for a stall: the count used to
+    ///       be tested AFTER the payload budget had truncated the batch, so an open bucket whose
+    ///       files had grown past target/8 could never assemble a legal batch again (measured: 40
+    ///       segments, 0 merges). A run that fills the target produces a MAXIMAL file, which is
+    ///       the last rewrite those bytes will ever get — always worth doing.</item>
+    /// </list>
+    /// </summary>
+    internal static List<SegmentInfo>? SelectMergeRun(
+        List<SegmentInfo> byTime, int minSources, long target, long maximal)
+    {
+        // ONE scratch list for the whole scan. Every start index has to be tried — a run that
+        // stops at j says nothing about the starts inside (start, j): with payloads [1, 4, 16]
+        // the run from 0 is [1, 4] because 16 > 1 × ratio, while the run from 1 is the legal
+        // [4, 16] — so the O(n²) walk is load-bearing and stays. Allocating a list per attempt
+        // made it O(n²) GARBAGE as well: measured 5.5 MB and 2.4 ms per planner pass at 1600
+        // files in one bucket, every pass returning null. The list escapes on exactly one path,
+        // and the method allocates a fresh one per call, so the caller owns what it gets.
+        //
+        // The n that O(n²) is quadratic in is BOUNDED, which is why it needs no memoisation on
+        // top: a bucket only survives a pass with files left over if every tier of it holds
+        // fewer than minSources (3 same-tier files always satisfy growth), so at fixpoint a
+        // (level, bucket) group holds under minSources × 32 files whatever arrives — 224 in an
+        // open bucket, 64 in a sealed one. Thousands of stuck files in one group was a symptom
+        // of the stranding bug, not a state the planner can now reach.
+        var run = new List<SegmentInfo>(Math.Min(byTime.Count, MergeMaxSources));
+
+        for (int start = 0; start + 1 < byTime.Count; start++)
+        {
+            run.Clear();
+            long payload = 0, events = 0, runMin = long.MaxValue, runMax = 0;
+
+            for (int i = start; i < byTime.Count && run.Count < MergeMaxSources; i++)
+            {
+                var  s = byTime[i];
+                long p = Math.Max(1, SegmentPayloadBytes(s));
+                long lo = Math.Min(runMin, p), hi = Math.Max(runMax, p);
+                if (run.Count > 0 && (hi > lo * MergeRunSizeRatio ||
+                                      payload + p > target ||
+                                      events + s.EventCount > MergeMaxEvents)) break;
+
+                run.Add(s);
+                payload += p;
+                events  += s.EventCount;
+                runMin = lo; runMax = hi;
+            }
+
+            if (run.Count < 2) continue;
+            if (payload - runMax < runMax / MergeGrowthFactor) continue;
+            if (run.Count < minSources && payload < maximal) continue;
+            return run;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// The fallback: the first run worth rewriting among the files of ONE SIZE TIER, or null.
+    ///
+    /// <para>Time-contiguity across the whole bucket is what
+    /// <see cref="SelectMergeRun"/> gives up here, and only here. A file whose time-neighbours
+    /// are all more than <see cref="MergeRunSizeRatio"/> away in size is unmergeable under the
+    /// contiguous rule — it cannot even reach a file of its own exact size, because the run
+    /// would have to step over the neighbour — and a producer whose volume swings between
+    /// adjacent flushes builds that shape by itself. MEASURED at 30b0d93: 240 flushes
+    /// alternating 200 and 40 events into a bucket sealed 30 days ago left 240 files and 0
+    /// merges, at fixpoint; six byte-identical 172 B files in one bucket refused to coalesce
+    /// because a 244 KB file sat between each pair in time order.</para>
+    ///
+    /// <para>Grouping by tier restores the property the size rule was supposed to have: files
+    /// of a size merge with files of that size. The three conditions are unchanged — the tier
+    /// simply satisfies the spread one by construction — and the run inside a tier is still
+    /// time-contiguous WITHIN the tier, so the pieces of an over-large tier still partition it.
+    /// Smallest tier first: it is the cheapest progress per file removed, and it is what lets a
+    /// straggler ladder coalesce among itself while the bucket's collapsed file, several tiers
+    /// up, is never a partner for it.</para>
+    /// </summary>
+    internal static List<SegmentInfo>? SelectMergeTierRun(
+        List<SegmentInfo> byTime, int minSources, long target, long maximal)
+    {
+        int lowest = int.MaxValue, highest = int.MinValue;
+        foreach (var s in byTime)
+        {
+            int t = SizeTier(SegmentPayloadBytes(s));
+            if (t < lowest)  lowest  = t;
+            if (t > highest) highest = t;
+        }
+        if (lowest == highest) return null;   // one tier ⇒ SelectMergeRun already saw this list
+
+        var tier = new List<SegmentInfo>(byTime.Count);
+        for (int t = lowest; t <= highest; t++)
+        {
+            tier.Clear();
+            foreach (var s in byTime)
+                if (SizeTier(SegmentPayloadBytes(s)) == t) tier.Add(s);
+            if (tier.Count < 2) continue;
+
+            // byTime is ordered by Min, so tier is too: the run is still oldest-first.
+            var run = SelectMergeRun(tier, minSources, target, maximal);
+            if (run is not null) return run;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Merges one batch of small, time-adjacent cold segments into a single large segment by
+    /// STREAMING them: the sources are read as sorted event streams, merged with a heap on
+    /// (timestamp, id) and written straight through <see cref="SegmentWriter"/>, preserving
+    /// event ids, timestamps and raw property/exception payloads.
+    ///
+    /// <para>Nothing is materialised. The previous shape — read every source with
+    /// <c>ReadAllRaw</c>, copy the batch into a <see cref="HotTierSegment"/>, index it whole —
+    /// peaked at ~3× the batch, which is why the batch had to be capped at 32 MB and why the
+    /// tier's fixed chunk geometry excluded dense segments from compaction entirely.</para>
+    ///
+    /// <para>The batch comes from <see cref="SelectMergeBatch"/>: a time-contiguous run of
+    /// similarly-sized files inside one (level, expiry bucket) group. Level purity keeps expiry
+    /// exact — expiry is <c>MaxTimestamp + Ttl(MinLevel)</c>, and merging a 3-day Debug segment
+    /// into a 90-day one would either delete its neighbours early or keep the Debug rows 30×
+    /// longer — while the size run is what lets the sweep FINISH: every merge multiplies its
+    /// sources' size, so a file reaches <see cref="MergeSealedSourceBytes"/> after a bounded
+    /// number of rewrites and then leaves the candidate set for good.</para>
+    ///
+    /// <para>Crash-safe, and the ORDER is the proof. A manifest listing the source files is
+    /// written first; the merged file is built at <c>.seg.tmp</c> (which the startup scan
+    /// deletes) and only then moved to a name the catalog can see; the sources are deleted
+    /// after that; the manifest is dropped only once every one of them is confirmed gone. So a
+    /// merged file never exists beside its un-deleted sources without a manifest naming them,
+    /// and a manifest never names sources that are not already duplicated. Recovery reads both
+    /// halves: merged file present ⇒ finish deleting, absent ⇒ the merge never committed.</para>
+    ///
+    /// Returns true when a batch was merged.
     /// </summary>
     internal async Task<bool> TryMergeSmallSegmentsOnceAsync(CancellationToken ct)
     {
         // Never produce index-less segments: the builder is wired by a hosted
         // service shortly after startup — if it isn't there yet, just wait.
-        if (IndexBuilder is null && !_allowIndexlessMerge) return false;
+        if (IndexSinkFactory is null && !_allowIndexlessMerge) return false;
 
-        var policy = _retentionStore.GetPolicy();
-        long settledCutoff = DateTimeOffset.UtcNow.AddHours(-48).UtcTicks;
-
-        // A skipped window used to burn the whole maintenance pause (600 s) on a
-        // single discarded anchor. Skips are rare now — the co-fit gate makes the
-        // geometric "no usable batch" unreachable, leaving unreadable/empty
-        // segments — so when one happens, re-select immediately. Bounded and
+        // A skipped bucket used to burn the whole maintenance pause (600 s) on a
+        // single discarded anchor. Skips are rare — what remains is unreadable or
+        // empty segments — so when one happens, re-select immediately. Bounded and
         // livelock-free: every failed attempt adds to _mergeSkip first, so the
         // candidate set strictly shrinks.
-        List<SegmentInfo>?     consumed = null;
-        List<RawSegmentEvent>? events   = null;
-        long payload = 0;
+        List<SegmentInfo>?   consumed = null;
+        List<SegmentReader>? readers  = null;
         for (int attempt = 0; attempt < MergeWindowAttempts && consumed is null; attempt++)
         {
             ct.ThrowIfCancellationRequested();
 
-            // Oldest-first so the stable "past" consolidates and stays consolidated;
-            // grouped by retention TTL so a merge never changes any event's expiry
-            // class. Every group gets a chance — an exhausted oldest group must not
-            // starve the others. Recomputed per attempt: _mergeSkip may have grown.
-            var groups = _segments.Values
-                .Where(s => s.CompressedBytes < MergeCandidateMaxBytes
-                         && s.UncompressedBytes <= MergeCandidateMaxUncompressedBytes
-                         && s.EventCount <= MergeCandidateMaxEvents
-                         && !_mergeSkip.Contains(s.Id.Value))
-                .GroupBy(s => policy.GetTtl(s.MinLevel))
-                .Select(g => g.OrderBy(s => s.MinTimestampTicks).ToList())
-                .Where(g => g.Count >= 2)
-                .OrderBy(g => g[0].MinTimestampTicks);
+            // Recomputed per attempt: _mergeSkip may have grown.
+            var sources = SelectMergeBatch();
+            if (sources is null) return false;
 
-            // Bound the batch's time span (two-pointer over each sorted group). A
-            // RECENT window needs MergeMinSources segments (no point churning while
-            // flushes still arrive), but a SETTLED window (older than 48 h) merges
-            // from 2 sources — quiet days produce a handful of tiny age-flush
-            // segments per day, and "not worth it" thresholds would strand them as
-            // unmergeable forever (observed live: ~1,000 files parked this way).
-            List<SegmentInfo>? window = null;
-            foreach (var group in groups)
+            // Open every source BEFORE anything is written. An unreadable file is skip-listed
+            // individually — a persistently corrupt segment would otherwise be re-selected by
+            // every future pass — and the batch continues with what opened, exactly as the
+            // read-everything planner did. Discovering it after the manifest is on disk would
+            // mean unwinding published state instead of simply choosing a different window.
+            var opened = new List<SegmentReader>(sources.Count);
+            var usable = new List<SegmentInfo>(sources.Count);
+            long usableEvents = 0;
+            foreach (var seg in sources)
             {
-                int start = 0;
-                while (start <= group.Count - 2)
-                {
-                    long windowStart = group[start].MinTimestampTicks;
-                    var w = group.Skip(start)
-                        .TakeWhile(s => s.MaxTimestampTicks - windowStart <= MergeMaxSpanTicks)
-                        .Take(MergeMaxSources)
-                        .ToList();
-                    int minSources = w.Count > 0 && w[^1].MaxTimestampTicks < settledCutoff
-                        ? 2 : MergeMinSources;
-                    if (w.Count >= minSources) { window = w; break; }
-                    start += Math.Max(1, w.Count);
-                }
-                if (window is not null) break;
-            }
-            if (window is null) return false;
-            var candidates = window;
-
-            // Read raw events segment-by-segment until a budget is hit. Segments are
-            // consumed whole — a batch never contains part of a segment.
-            var dedup   = new Dictionary<string, string>(StringComparer.Ordinal);
-            var batch   = new List<RawSegmentEvent>();
-            var sources = new List<SegmentInfo>();
-            var segEnds = new List<int>();  // batch.Count after each consumed segment
-            payload = 0;
-            foreach (var seg in candidates)
-            {
-                ct.ThrowIfCancellationRequested();
-                if (sources.Count > 0 &&
-                    (batch.Count >= MergeMaxEvents || payload >= MergeTargetPayloadBytes))
-                    break;
-                List<RawSegmentEvent> segEvents;
                 try
                 {
-                    using var reader = SegmentReader.Open(seg.FilePath);
-                    segEvents = reader.ReadAllRaw(dedup);
+                    opened.Add(SegmentReader.Open(seg.FilePath));
+                    usable.Add(seg);
+                    usableEvents += seg.EventCount;
                 }
                 catch (Exception ex)
                 {
-                    // Skip-list the segment ITSELF, not just the window's anchor: a
-                    // persistently unreadable file would otherwise be re-opened and
-                    // re-decompressed by every future pass, forever.
                     _mergeSkip.Add(seg.Id.Value);
                     _logger.LogWarning(ex, "Merge: skipping unreadable segment {File}", seg.FilePath);
-                    continue;
                 }
-                batch.AddRange(segEvents);
-                foreach (var e in segEvents) payload += e.Props?.Length ?? 0;
-                sources.Add(seg);
-                segEnds.Add(batch.Count);
             }
 
-            // The tier's chunks hold 16 K event slots / 8 MB payload each — re-packing
-            // prop-dense events from slot 0 can exceed that even though every SOURCE
-            // segment respected it at ingest (live tiers rotate early instead). Trim
-            // the batch to the largest whole-segment prefix that fits the geometry;
-            // an all-or-nothing check would stall the sweep forever on dense days.
-            int fitting = FittingEventCount(batch);
-            int keep = segEnds.Count;
-            while (keep > 0 && segEnds[keep - 1] > fitting) keep--;
-            if (keep < sources.Count)
-            {
-                sources.RemoveRange(keep, sources.Count - keep);
-                batch.RemoveRange(keep == 0 ? 0 : segEnds[keep - 1], batch.Count - (keep == 0 ? 0 : segEnds[keep - 1]));
-            }
-
-            // Anti-stall: a window whose anchor can't produce even a 2-segment batch
+            // Anti-stall: a bucket whose anchor can't produce even a 2-segment batch
             // would be re-selected forever — exclude the anchor until restart.
             // Debug, not Warning: this is the planner's EXPECTED outcome whenever there is
             // simply nothing to merge (a day's log carried 54 of these, every anchor
             // different) — at WRN it drowns the signal it was meant to be.
-            if (sources.Count < 2 || batch.Count == 0)
+            if (usable.Count < 2 || usableEvents == 0)
             {
-                _mergeSkip.Add(candidates[0].Id.Value);
-                _logger.LogDebug("Merge: window anchored at {File} yields no usable batch — anchor skipped",
-                    Path.GetFileName(candidates[0].FilePath));
+                foreach (var r in opened) r.Dispose();
+                _mergeSkip.Add(sources[0].Id.Value);
+                _logger.LogDebug("Merge: bucket anchored at {File} yields no usable batch — anchor skipped",
+                    Path.GetFileName(sources[0].FilePath));
                 continue;
             }
-            consumed = sources;
-            events   = batch;
+            consumed = usable;
+            readers  = opened;
         }
-        if (consumed is null || events is null) return false;
+        if (consumed is null || readers is null) return false;
 
-        // NOTE: payload is the PRE-trim sum. A looser tier budget can only prevent
-        // TryWrite rejections, never cause them — do not "tighten" it to the
-        // post-trim sum: the no-reject proof relies on _maxPayloadBytes >= actual.
-        var tier = new HotTierSegment(events.Count + 1, payload + (16L << 20));
+        // Reserve a segment id from the same allocator the flush path uses. Safe now only
+        // because the live WAL holds a RESERVED block (see _walSegId): the allocator is
+        // already past it, so a merged file can never be handed the id a WAL is named from.
+        //
+        // The flush lock is no longer what makes the reservation atomic — AllocateSegmentId
+        // holds _segIdLock for that, and has to, because the import path cannot take a
+        // SemaphoreSlim. It is still taken here because this await is the one cancellable step
+        // between opening the sources and taking ownership of them, and losing that would leak
+        // mapped views on shutdown (see the catch).
+        ulong reserved;
         try
         {
-            foreach (var e in events)
-            {
-                // Intern can return -1 when the pool is full — fall back to the
-                // tier-local template store (same as the live ingest path) so the
-                // template is never lost in the rewrite.
-                int tmplIdx = TemplatePool.Intern(e.Template);
-                var header = new LogEventHeader
-                {
-                    Id                       = e.Id,
-                    TimestampUtcTicks        = e.TsTicks,
-                    Level                    = (Ameto.Core.LogLevel)e.Level,
-                    MessageTemplatePoolIndex = tmplIdx,
-                    ServiceNamePoolIndex     = e.Service is null ? -1 : TemplatePool.Intern(e.Service),
-                    TraceIdHi                = e.TraceIdHi,
-                    TraceIdLo                = e.TraceIdLo,
-                    SpanId                   = e.SpanId,
-                };
-                if (!tier.TryWrite(header, e.Props ?? ReadOnlySpan<byte>.Empty,
-                        template: tmplIdx < 0 ? e.Template : null, exception: e.Exception))
-                {
-                    _logger.LogError("Merge: tier rejected an event ({Count} total in batch) — batch aborted", events.Count);
-                    return false;
-                }
-            }
-            tier.Freeze();
-
-            // Reserve a segment id from the same counter the flush path uses.
-            ulong reserved;
             await _flushLock.WaitAsync(ct);
-            try { reserved = _nextSegmentId; _nextSegmentId++; }
-            finally { _flushLock.Release(); }
-
-            var segId   = new SegmentId(reserved);
-            var segPath = BuildSegmentPath(segId, tier);
-
-            // Take a flush slot for the heavy phase. A merge runs the SAME index build +
-            // compress + write pipeline as an ingest flush, and its batch budgets are
-            // deliberately sized to mirror one (see MergeTargetPayloadBytes) — so it costs
-            // about one flush's worth of managed memory, ~140 MB at the 100k-event cap.
-            // Running it outside _flushConcurrency meant the ceiling logged at startup
-            // (width × per-flush managed) was not the ceiling actually enforced: a
-            // maintenance pass could add another concurrent index build on top of an
-            // already-saturated flush path. Gating here makes the reported budget real.
-            //
-            // _flushSlots is deliberately NOT taken. That gate is the ingest back-pressure
-            // signal — acquired non-blocking, and a miss means "stop swapping hot tiers" —
-            // so parking compaction behind it would let sustained ingest starve the sweep
-            // that keeps the segment count down. The merge tier's own native footprint is
-            // already bounded by MergeMaxEvents / MergeTargetPayloadBytes.
-            SegmentInfo info;
-            await _flushConcurrency.WaitAsync(ct).ConfigureAwait(false);
-            try     { info = await FlushToColdAsync(tier, segId, segPath, ct); }
-            finally { _flushConcurrency.Release(); }
-
-            // Manifest before publication: if we crash mid-deletion, startup
-            // recovery deletes the remaining source files instead of serving
-            // duplicate events forever.
-            string manifestPath = segPath + ".mergemanifest";
-            await File.WriteAllLinesAsync(manifestPath, consumed.Select(s => Path.GetFileName(s.FilePath)), ct);
-
-            _segments[segId.Value] = info;
-            foreach (var seg in consumed)
-                await DeleteSegmentAsync(seg.Id, ct);
-
-            // Drop the manifest only when every source file is confirmed gone. A
-            // source held open by an in-flight query survives File.Delete — the
-            // manifest then stays behind and the recovery sweep (each maintenance
-            // iteration + startup) finishes the deletion once the reader closes.
-            // Deleting it unconditionally would resurrect those files as
-            // duplicate segments after a restart.
-            bool allGone = consumed.All(s => !File.Exists(s.FilePath));
-            if (allGone)
-                try { File.Delete(manifestPath); } catch { /* re-processed harmlessly later */ }
-            else
-                _logger.LogWarning("Merge: {Count} source file(s) still held open — manifest kept for the recovery sweep",
-                    consumed.Count(s => File.Exists(s.FilePath)));
-
-            _logger.LogInformation(
-                "Merged {Sources} small segments ({Events} events) into {File} ({Mb:F1} MB)",
-                consumed.Count, events.Count, Path.GetFileName(segPath), info.CompressedBytes / 1048576.0);
-            return true;
         }
-        finally
+        catch
         {
-            tier.Dispose();
+            // Unguarded, shutdown left up to MergeMaxSources mapped views alive for the life of
+            // the process — and on Windows a mapped file cannot be unlinked, so those segments
+            // could then be neither compacted nor expired.
+            foreach (var r in readers) r.Dispose();
+            throw;
         }
+        try { reserved = AllocateSegmentId(); }
+        finally { _flushLock.Release(); }
+
+        var  segId        = new SegmentId(reserved);
+        long expectEvents = 0, minTs = long.MaxValue, maxTs = long.MinValue;
+        foreach (var s in consumed)
+        {
+            expectEvents += s.EventCount;
+            if (s.MinTimestampTicks < minTs) minTs = s.MinTimestampTicks;
+            if (s.MaxTimestampTicks > maxTs) maxTs = s.MaxTimestampTicks;
+        }
+        var segPath = Path.Combine(_segDir, $"{_options.NodeId.Value}-{segId.Value}-{minTs}-{maxTs}.seg");
+        string manifestPath = segPath + ".mergemanifest";
+
+        // ── MANIFEST FIRST. The merged segment only becomes visible to the catalog when it
+        //    is MOVED to segPath, and that move happens after this line — so at no instant
+        //    does a .seg exist on disk whose sources are still there without a manifest
+        //    naming them. Recovery reads it both ways: manifest without the merged file =
+        //    a merge that never committed (drop the manifest, the sources are untouched);
+        //    manifest WITH it = the sources are already duplicated (finish deleting them).
+        //    Writing it after publication, as this did before, left a window where a crash
+        //    resurrected every source alongside the merged file — duplicate events, forever.
+        //    Written THROUGH to the platter, for the same reason the merged file is: the whole
+        //    protocol is an ordering between this file and a set of unlinks, and an ordering
+        //    only the page cache observes does not survive a power loss.
+        try
+        {
+            await using (var mf = new FileStream(manifestPath, FileMode.Create, FileAccess.Write, FileShare.None,
+                                                 4096, FileOptions.WriteThrough))
+            using (var mw = new StreamWriter(mf))
+            {
+                foreach (var s in consumed) await mw.WriteLineAsync(Path.GetFileName(s.FilePath));
+                await mw.FlushAsync(ct);
+                mf.Flush(flushToDisk: true);
+            }
+        }
+        catch
+        {
+            // The readers were opened by the planner; MergeToColdAsync takes ownership of them
+            // and it is never reached from here.
+            foreach (var r in readers) r.Dispose();
+            try { File.Delete(manifestPath); } catch { }
+            throw;
+        }
+
+        // Take a flush slot for the heavy phase: a merge runs the SAME index build +
+        // compress + write pipeline as an ingest flush. Running it outside _flushConcurrency
+        // meant the ceiling logged at startup (width × per-flush managed) was not the
+        // ceiling actually enforced. _flushSlots is deliberately NOT taken — that gate is
+        // the ingest back-pressure signal, and parking compaction behind it would let
+        // sustained ingest starve the sweep that keeps the segment count down.
+        SegmentInfo info;
+        try
+        {
+            await _flushConcurrency.WaitAsync(ct).ConfigureAwait(false);
+        }
+        catch
+        {
+            foreach (var r in readers) r.Dispose();
+            try { File.Delete(manifestPath); } catch { }
+            throw;
+        }
+        try
+        {
+            _beforeMergeStream?.Invoke();
+            info = await MergeToColdAsync(readers, segId, segPath, expectEvents, ct);
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            // Shutdown is not a verdict on the batch. Swept up with everything else it logged a
+            // WARNING on every single stop, swallowed the cancellation the maintenance loop
+            // stops on, and quarantined the window — so the segments a clean restart had every
+            // reason to merge first were the ones it then refused to look at.
+            foreach (var r in readers) r.Dispose();
+            try { File.Delete(manifestPath); } catch { /* recovery drops it anyway */ }
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // Nothing has been deleted and the merged file never reached segPath, so the only
+            // state to undo is the manifest.
+            //
+            // Skip-listing is QUARANTINE and it lasts until the process restarts, so it belongs
+            // to a batch that CANNOT be merged, not to one that could not be merged now. Corrupt
+            // sources are the first kind: the stream fails the same way on every future pass,
+            // and because the merge reads all of them interleaved there is no telling which file
+            // is the bad one, so the window goes as a whole. A disk that filled up or a network
+            // volume that blinked is the second: retiring up to MergeMaxSources segments over a
+            // condition that clears itself would end compaction for that bucket for the life of
+            // the process, and the small-file backlog those segments form is the exact thing the
+            // sweep exists to remove. Left in the candidate set, the next pass simply retries.
+            //
+            // Disposing here as well as in the merge task is deliberate, and it is the same
+            // discipline the two waits above follow: MergeToColdAsync only takes ownership of the
+            // readers once its delegate is entered, and from out here there is no way to know
+            // whether it was. Dispose is idempotent, so the rule can simply be that every exit
+            // from this method that does not publish closes them.
+            foreach (var r in readers) r.Dispose();
+            if (IsSourceCorruption(ex))
+            {
+                foreach (var s in consumed) _mergeSkip.Add(s.Id.Value);
+                _logger.LogWarning(ex,
+                    "Merge: {Count} source(s) unreadable while streaming — sources left intact, batch skip-listed until restart",
+                    consumed.Count);
+            }
+            else
+            {
+                _logger.LogWarning(ex,
+                    "Merge: aborted while streaming {Count} source(s) — sources left intact, batch retried next pass",
+                    consumed.Count);
+            }
+            try { File.Delete(manifestPath); } catch { /* recovery drops it anyway */ }
+            return false;
+        }
+        finally { _flushConcurrency.Release(); }
+
+        _segments[segId.Value] = info;
+        foreach (var seg in consumed)
+            await DeleteSegmentAsync(seg.Id, ct);
+
+        // Drop the manifest only when every source file is confirmed gone. A
+        // source held open by an in-flight query survives File.Delete — the
+        // manifest then stays behind and the recovery sweep (each maintenance
+        // iteration + startup) finishes the deletion once the reader closes.
+        // Deleting it unconditionally would resurrect those files as
+        // duplicate segments after a restart.
+        bool allGone = consumed.All(s => !File.Exists(s.FilePath));
+        if (allGone)
+            try { File.Delete(manifestPath); } catch { /* re-processed harmlessly later */ }
+        else
+            _logger.LogWarning("Merge: {Count} source file(s) still held open — manifest kept for the recovery sweep",
+                consumed.Count(s => File.Exists(s.FilePath)));
+
+        _logger.LogInformation(
+            "Merged {Sources} small segments ({Events} events) into {File} ({Mb:F1} MB)",
+            consumed.Count, info.EventCount, Path.GetFileName(segPath), info.CompressedBytes / 1048576.0);
+        return true;
     }
 
     /// <summary>
-    /// Simulates the tier's chunk assignment (16 K event slots / 8 MB payload per
-    /// chunk) and returns the largest event-prefix length that fits.
+    /// Tells a batch that will never merge from one that merely did not merge this time.
+    ///
+    /// <para><see cref="InvalidDataException"/> is what every structural check throws — footer
+    /// and header magic, an unsupported version, a block whose stored length does not match its
+    /// frame, and the merge's own event-count verification. <see cref="EndOfStreamException"/> is
+    /// a truncated file. Both are properties of the bytes on disk and will still be true on the
+    /// next pass. Everything else — no space left, an I/O error, a file momentarily locked — is
+    /// the machine's condition rather than the segments', and gets another attempt.</para>
     /// </summary>
-    private static int FittingEventCount(List<RawSegmentEvent> events)
+    private static bool IsSourceCorruption(Exception ex) => ex is InvalidDataException or EndOfStreamException;
+
+    /// <summary>
+    /// Streams the sources through a k-way merge straight into a new segment file.
+    ///
+    /// <para>Nothing between the source blocks and the output block is retained: the writer
+    /// pulls one event at a time, copies it into the open block and pushes it into the open
+    /// index group's sink. Peak is one decompressed block per source plus one index group —
+    /// flat in the merged segment's size, which is the whole point.</para>
+    /// </summary>
+    /// <param name="expectEvents">
+    /// Sum of the sources' header event counts. Verified while the merged file is still at
+    /// <c>.seg.tmp</c> — BEFORE the move that makes it catalog-visible, because recovery decides
+    /// on <c>File.Exists</c> alone: a crash between a move and a later check would commit an
+    /// unverified merge and recovery would then finish deleting its sources for it.
+    /// </param>
+    /// <remarks>
+    /// Internal rather than private so its reader-ownership contract can be tested where it is
+    /// actually made. Driven through <see cref="TryMergeSmallSegmentsOnceAsync"/> the contract is
+    /// invisible: that method's own abort paths close the readers too, deliberately, so a test
+    /// that cancels a whole merge pass cannot tell which of the two did it — and passes just as
+    /// well when this one does nothing at all.
+    /// </remarks>
+    internal Task<SegmentInfo> MergeToColdAsync(
+        List<SegmentReader> readers, SegmentId segId, string segPath, long expectEvents, CancellationToken ct)
     {
-        long chunkBytes = 0;
-        for (int i = 0; i < events.Count; i++)
+        var  sinkFactory = IndexSinkFactory;
+        long groupBudget = _groupPayloadBudgetBytes;
+
+        return Task.Run(() =>
         {
-            if (i % HotTierSegment.ChunkEventCapacity == 0) chunkBytes = 0;
-            chunkBytes += events[i].Props?.Length ?? 0;
-            if (chunkBytes > HotTierSegment.ChunkPayloadBytes) return i;
-        }
-        return events.Count;
+            // The .tmp suffix is load-bearing: the catalog scan deletes leftover *.seg.tmp at
+            // startup, so a crash any time before the Move leaves nothing to recover from.
+            string tmpPath = segPath + ".tmp";
+            MergingSegmentEventSource? source = null;
+            try
+            {
+                // Cancellation is observed HERE, and the token is deliberately NOT handed to
+                // Task.Run: a Task.Run whose token is already signalled transitions the task
+                // straight to Canceled WITHOUT ever invoking the delegate — and the delegate is
+                // the only place the readers this method took ownership of are closed. Cancelling
+                // in the window between _flushConcurrency.WaitAsync returning and the delegate
+                // being scheduled therefore left up to MergeMaxSources mapped views alive for the
+                // life of the process, and a mapped file on Windows can be neither compacted nor
+                // unlinked by retention. That is the very hazard the wait's own catch guards
+                // against one step earlier; this closes the second door into it.
+                ct.ThrowIfCancellationRequested();
+
+                SegmentInfo info;
+                source = new MergingSegmentEventSource(readers);
+                // HC HAPPENS HERE, and only here. A merge already rewrites every block it reads,
+                // it is off the ingest path, and its output is the long-lived file — so the extra
+                // encode is paid once, on a background pass, against a file that is read and kept
+                // until retention deletes it. The flush path stays on the fast level: its output
+                // is short-lived and this merge is what rewrites it.
+                //
+                // MEASURED (MergeCompressionProbe, 48k trace-carrying prop-dense events): the
+                // blocks shrink 12.8 % (26.5 % on body-logging events), the FILE shrinks 2.8 %
+                // because index sections are 78-90 % of it, and the merge costs ~18 % more wall
+                // clock — on the stand's volume, seconds of one core a day.
+                using (var writer = new SegmentWriter(tmpPath, groupBudget, SegmentCompression.High))
+                {
+                    writer.WriteEvents(source, sinkFactory, ct);
+                    info = writer.Finalise(_options.NodeId, segId);
+                }
+                // Close the readers BEFORE the caller starts deleting sources: on Windows a
+                // mapped file cannot be unlinked, and a leaked view would leave the merge
+                // permanently stuck in its "sources still held open" recovery path.
+                source.Dispose();
+                source = null;
+                foreach (var r in readers) r.Dispose();
+
+                // Refuse to publish unless every source event is in the merged file. Counts come
+                // from file headers on both sides, so a mismatch means the stream lost or
+                // duplicated rows. Throwing here leaves the file at .seg.tmp — invisible to the
+                // catalog, deleted by the startup sweep — and the caller drops the manifest, so
+                // the pre-merge state is restored exactly.
+                if (info.EventCount != expectEvents)
+                    throw new InvalidDataException(
+                        $"merge wrote {info.EventCount} events but its sources hold {expectEvents}");
+
+                ct.ThrowIfCancellationRequested();
+                File.Move(tmpPath, segPath, overwrite: false);
+                return new SegmentInfo
+                {
+                    Id                = info.Id,
+                    NodeId            = info.NodeId,
+                    FilePath          = segPath,
+                    MinTimestampTicks = info.MinTimestampTicks,
+                    MaxTimestampTicks = info.MaxTimestampTicks,
+                    EventCount        = info.EventCount,
+                    MinLevel          = info.MinLevel,
+                    CompressedBytes   = info.CompressedBytes,
+                    UncompressedBytes = info.UncompressedBytes,
+                };
+            }
+            catch
+            {
+                try { File.Delete(tmpPath); } catch { /* best-effort cleanup */ }
+                throw;
+            }
+            finally
+            {
+                source?.Dispose();
+                foreach (var r in readers) r.Dispose();   // idempotent — safe after the happy path
+            }
+        });
     }
 
     /// <summary>
@@ -1074,24 +1701,140 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         }
     }
 
-    private Task<SegmentInfo> FlushToColdAsync(HotTierSegment hot, SegmentId segId, string segPath, CancellationToken ct)
+    /// <summary>
+    /// Writes a frozen tier as ONE SEGMENT PER LOG LEVEL, so every segment holds a single
+    /// level and its retention deadline is exact rather than governed by whichever level
+    /// happened to have the lowest enum value inside it.
+    ///
+    /// <para>The tier is sorted once; the order is then partitioned by level, which keeps
+    /// each level's subsequence sorted by (ts, id) — everything downstream (block order,
+    /// the query k-way merge, cursor pagination) is unaffected. Levels absent from the
+    /// tier produce no file. The level's id is <c>firstSegId + (byte)level</c>, matching
+    /// the block of ids reserved at freeze so a concurrent query skips them all.</para>
+    ///
+    /// <para>CRASH-SAFE VIA A COMPLETION MARKER, and like the merge protocol the ORDER is the
+    /// proof. Each level is built at <c>.seg.tmp</c> and moved into place one at a time, so
+    /// between the first move and the last the directory holds a PARTIAL set — and the WAL that
+    /// still holds every one of those events is only deleted afterwards. Recovery therefore
+    /// cannot read "some segment of this block exists" as "the flush finished": that predicate
+    /// answers true for a set of one, and the WAL it then deletes is the only copy of the levels
+    /// that never got published. So the last thing this method does, after every move, is write
+    /// and FSYNC <c>{nodeId}-{firstSegId}.flushed</c>. A present marker — nothing else — means
+    /// the block is complete, and it is dropped together with the WAL it authorises.</para>
+    /// </summary>
+    /// <param name="skipPublishedLevels">
+    /// Recovery only. A level is published by ONE move of ONE whole file, so a segment already
+    /// sitting at <c>firstSegId + level</c> means that level is fully persisted and its rows must
+    /// not be written a second time — the replayed tier fills in the missing levels and nothing
+    /// else. This is what makes replaying a markerless WAL idempotent, which in turn is what lets
+    /// a data directory written by the previous build (complete flush, no marker anywhere) be
+    /// replayed without producing a single duplicate.
+    /// </param>
+    private async Task<List<SegmentInfo>> FlushTierByLevelAsync(
+        HotTierSegment hot, ulong firstSegId, CancellationToken ct, bool skipPublishedLevels = false)
+    {
+        int[] order = SegmentWriter.ComputeSortOrder(hot);
+
+        var perLevel = new List<int>[LevelSegmentSlots];
+        for (int oi = 0; oi < order.Length; oi++)
+        {
+            int lvl = (int)hot.GetHeader(order[oi]).Level;
+            if ((uint)lvl >= LevelSegmentSlots) lvl = (int)Ameto.Core.LogLevel.Information;   // defensive
+            (perLevel[lvl] ??= new List<int>()).Add(order[oi]);
+        }
+
+        var written = new List<SegmentInfo>(LevelSegmentSlots);
+        for (int lvl = 0; lvl < LevelSegmentSlots; lvl++)
+        {
+            var idx = perLevel[lvl];
+            if (idx is null || idx.Count == 0) continue;
+
+            var segId = new SegmentId(firstSegId + (ulong)lvl);
+            if (skipPublishedLevels && SegmentFileExists(segId.Value))
+            {
+                _logger.LogInformation(
+                    "WAL recovery: level {Level} is already published as segment {Id} — {Count} event(s) not rewritten",
+                    (Ameto.Core.LogLevel)lvl, segId.Value, idx.Count);
+                continue;
+            }
+
+            var subset  = idx.ToArray();
+            var segPath = BuildSegmentPath(segId, hot, subset);
+            written.Add(await FlushToColdAsync(hot, segId, segPath, ct, subset));
+            _afterLevelPublished?.Invoke(lvl);
+        }
+
+        // ── MARKER LAST. Every level is on disk and fsynced (SegmentWriter.Finalise flushes to
+        //    the platter before the move), so this file is the durable "the block is complete"
+        //    record the WAL delete keys off. Written THROUGH for the same reason the merge
+        //    manifest is: the protocol is an ordering between these files and an unlink, and an
+        //    ordering only the page cache observes does not survive a power loss.
+        WriteFlushCompletionMarker(firstSegId, written);
+        return written;
+    }
+
+    /// <summary>True when a segment file carrying <paramref name="segId"/> is on disk.</summary>
+    private bool SegmentFileExists(ulong segId)
+    {
+        foreach (var _ in Directory.EnumerateFiles(_segDir, $"{_options.NodeId.Value}-{segId}-*.seg"))
+            return true;
+        return false;
+    }
+
+    /// <summary>
+    /// Path of the record that a tier's whole level block reached disk. It lives beside the WAL
+    /// it certifies rather than among the segments: its lifetime is exactly that WAL's — created
+    /// after the last level is published, deleted immediately after the WAL — and the segment
+    /// directory is enumerated by the catalog load, the merge planner and every retention pass.
+    /// </summary>
+    private string FlushMarkerPath(ulong firstSegId) =>
+        Path.Combine(_walDir, $"{_options.NodeId.Value}-{firstSegId}.flushed");
+
+    /// <summary>
+    /// Writes and fsyncs the completion marker for a level block. Failure to write it is NOT
+    /// fatal to the flush — the segments are already durable — it only costs a re-flush of the
+    /// levels the next restart cannot prove were published, so it is logged and swallowed.
+    /// </summary>
+    private void WriteFlushCompletionMarker(ulong firstSegId, List<SegmentInfo> written)
+    {
+        string path = FlushMarkerPath(firstSegId);
+        try
+        {
+            using var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None,
+                                          4096, FileOptions.WriteThrough);
+            using (var w = new StreamWriter(fs, leaveOpen: true))
+            {
+                // The names are for diagnostics only — recovery decides on the file's EXISTENCE,
+                // exactly as merge recovery decides on the manifest's.
+                for (int i = 0; i < written.Count; i++) w.WriteLine(Path.GetFileName(written[i].FilePath));
+                w.Flush();
+            }
+            fs.Flush(flushToDisk: true);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Failed to write flush completion marker {Path} — the WAL will be replayed on restart", path);
+        }
+    }
+
+    private Task<SegmentInfo> FlushToColdAsync(
+        HotTierSegment hot, SegmentId segId, string segPath, CancellationToken ct, int[]? order_ = null)
     {
         // Capture delegate reference before entering Task.Run
-        var indexBuilder = IndexBuilder;
+        var sinkFactory  = IndexSinkFactory;
+        long groupBudget = _groupPayloadBudgetBytes;
         return Task.Run(() =>
         {
-            byte[] invertedBytes = Array.Empty<byte>();
-            byte[] trigramBytes  = Array.Empty<byte>();
-            byte[] bloomBytes    = Array.Empty<byte>();
-
             // One sort order shared by the index build and the block writer: posting-list
             // offsets become file ordinals, which the reader maps back to blocks/rows.
-            int[] order = SegmentWriter.ComputeSortOrder(hot);
+            // A caller-supplied order may be a SUBSET of the tier (level-split flush).
+            int[] order = order_ ?? SegmentWriter.ComputeSortOrder(hot);
 
-            if (indexBuilder is not null)
-            {
-                (invertedBytes, trigramBytes, bloomBytes) = indexBuilder(hot, TemplatePool, order);
-            }
+            // The writer drives the index build now, one INDEX GROUP at a time: it knows
+            // where the group's payload budget falls, and only it can interleave a group's
+            // sections between its own blocks. Building the whole file up front is what
+            // made index memory scale with segment size — the ceiling that kept segments
+            // small in the first place.
 
             // Write to a temp file first; rename to final path only after Finalise()
             // succeeds. This prevents corrupt .seg files when the process is killed mid-flush.
@@ -1099,12 +1842,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             try
             {
                 SegmentInfo info;
-                using (var writer = new SegmentWriter(tmpPath))
+                using (var writer = new SegmentWriter(tmpPath, groupBudget))
                 {
-                    writer.WriteEvents(hot, TemplatePool, order);
-                    writer.WriteInvertedIndex(invertedBytes);
-                    writer.WriteTrigramIndex(trigramBytes);
-                    writer.WriteBloomFilter(bloomBytes);
+                    writer.WriteEvents(new HotTierEventSource(hot, TemplatePool, order), sinkFactory);
                     info = writer.Finalise(_options.NodeId, segId);
                 } // FileStream closed here before Move
                 File.Move(tmpPath, segPath, overwrite: false);
@@ -1165,8 +1905,8 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         {
             // {nodeId}-{segId}-{minTs}-{maxTs}.seg
             var parts = Path.GetFileNameWithoutExtension(file).Split('-');
-            if (parts.Length >= 2 && ulong.TryParse(parts[1], out var segId) && segId >= _nextSegmentId)
-                _nextSegmentId = segId + 1;
+            if (parts.Length >= 2 && ulong.TryParse(parts[1], out var segId))
+                AdvanceSegmentIdFloor(segId + 1);
         }
     }
 
@@ -1204,98 +1944,221 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         _logger.LogInformation("Loaded {Count} segments from {Dir} in {Ms} ms", _segments.Count, _segDir, sw.ElapsedMilliseconds);
     }
 
+    /// <summary>
+    /// Replays every WAL left behind by a previous process, one at a time, then clears markers
+    /// whose WAL is already gone.
+    ///
+    /// <para>A WAL is dropped only against a COMPLETION MARKER. It used to be dropped against
+    /// "some segment inside its reserved block exists", which was exact only while a tier
+    /// flushed to a single file. It now flushes to one file per level, published one move at a
+    /// time, so that predicate answers true the instant the FIRST level lands — and the WAL it
+    /// then deleted was the only copy of every level that had not been published yet. A crash,
+    /// or an exception on one level, between the first move and the last was silent, total loss
+    /// of the rest of the tier.</para>
+    /// </summary>
     private void ReplayOrphanedWals()
     {
-        var walFiles = Directory.EnumerateFiles(_walDir, "*.wal").ToList();
-        if (walFiles.Count == 0) return;
-
-        HotTierSegment? recoveredHot = null;
-        try
+        foreach (var walFile in Directory.EnumerateFiles(_walDir, "*.wal"))
         {
-            foreach (var walFile in walFiles)
-            {
-                string poolPath = walFile + ".pool";
-                var (segId, entries) = WriteAheadLog.ReadForRecovery(walFile);
-
-                // Empty or corrupt WAL — clean up
-                if (segId == 0 || entries.Count == 0)
-                {
-                    try { File.Delete(walFile); } catch { }
-                    try { File.Delete(poolPath); } catch { }
-                    continue;
-                }
-
-                // WAL already flushed (segment exists) — delete orphaned WAL
-                if (_segments.ContainsKey(segId))
-                {
-                    _logger.LogInformation("WAL {File} already flushed — removing", walFile);
-                    try { File.Delete(walFile); } catch { }
-                    try { File.Delete(poolPath); } catch { }
-                    continue;
-                }
-
-                // Load template pool
-                var pool = WriteAheadLog.LoadPool(poolPath);
-                if (pool.Count == 0)
-                {
-                    _logger.LogWarning("Orphaned WAL {File}: no template pool, discarding {Count} events",
-                        walFile, entries.Count);
-                    try { File.Delete(walFile); } catch { }
-                    continue;
-                }
-
-                // Restore templates into TemplatePool
-                foreach (var (idx, tmpl) in pool)
-                    TemplatePool.ForceIntern(idx, tmpl);
-
-                // Replay entries into recovered hot tier
-                recoveredHot ??= CreateHotTier();
-                int replayed = 0;
-                foreach (var entry in entries)
-                {
-                    var header = new LogEventHeader
-                    {
-                        Id                       = _idGen.Next(entry.TimestampTicks),
-                        TimestampUtcTicks        = entry.TimestampTicks,
-                        Level                    = entry.Level,
-                        MessageTemplatePoolIndex = entry.TemplateIndex,
-                    };
-                    // Resolve template via the freshly restored pool and attach it
-                    // to the hot tier so the recovery flush persists @mt correctly.
-                    string tmpl = TemplatePool.Get(entry.TemplateIndex);
-                    if (recoveredHot.TryWrite(header, entry.Payload, tmpl, entry.Exception))
-                        replayed++;
-                }
-
-                _logger.LogInformation("WAL recovery: replayed {Count} events from {File}", replayed, walFile);
-                try { File.Delete(walFile); } catch { }
-                try { File.Delete(poolPath); } catch { }
-            }
-
-            // Flush recovered events to a cold segment (no index — acceptable for crash recovery)
-            if (recoveredHot?.Count > 0)
-            {
-                var segId   = new SegmentId(_nextSegmentId++);
-                var segPath = BuildSegmentPath(segId, recoveredHot);
-                var info    = FlushToColdAsync(recoveredHot, segId, segPath, CancellationToken.None)
-                                  .GetAwaiter().GetResult();
-                _segments[segId.Value] = info;
-                _logger.LogInformation("WAL recovery: wrote segment {Id} with {Count} events", segId, info.EventCount);
-            }
+            // Per WAL, so one unreadable log cannot strand the others behind it.
+            try { ReplayOrphanedWal(walFile); }
+            catch (Exception ex) { _logger.LogError(ex, "WAL recovery failed for {File}", walFile); }
         }
-        catch (Exception ex)
+
+        // Markers whose WAL is gone: the delete pair is WAL-then-marker, so a crash between
+        // them leaves this. Harmless but unbounded if never collected.
+        foreach (var marker in Directory.EnumerateFiles(_walDir, "*.flushed"))
         {
-            _logger.LogError(ex, "WAL recovery failed");
+            string wal = marker[..^".flushed".Length] + ".wal";
+            if (File.Exists(wal)) continue;
+            try { File.Delete(marker); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete stale flush marker {File}", marker); }
         }
-        finally
+    }
+
+    private void ReplayOrphanedWal(string walFile)
+    {
+        string poolPath   = walFile + ".pool";
+        var (segId, entries) = WriteAheadLog.ReadForRecovery(walFile);
+
+        // Empty or corrupt WAL — clean up
+        if (segId == 0 || entries.Count == 0)
         {
-            recoveredHot?.Dispose();
+            try { File.Delete(walFile); } catch { }
+            try { File.Delete(poolPath); } catch { }
+            if (segId != 0)
+            {
+                ReserveWalBlock(segId);
+                try { File.Delete(FlushMarkerPath(segId)); } catch { }
+            }
+            return;
+        }
+
+        // The block this WAL names is spent whatever happens next — its levels are either
+        // already on disk or about to be written below. Burning it here stops a later flush or
+        // merge being handed an id that already carries a file: the allocator is seeded from
+        // segment file NAMES, and a block whose flush never produced one leaves it behind.
+        ReserveWalBlock(segId);
+
+        // The flush of this WAL completed — every level reached disk before the marker did.
+        // Read off the FILESYSTEM, not off _segments: the catalog load runs in the background
+        // (it opens every file), so a catalog lookup here races the enumeration that would
+        // answer it, and losing that race replays a WAL whose events are already cold.
+        string marker = FlushMarkerPath(segId);
+        if (File.Exists(marker))
+        {
+            _logger.LogInformation("WAL {File} already flushed — removing", walFile);
+            try { File.Delete(walFile); } catch { }
+            try { File.Delete(poolPath); } catch { }
+            try { File.Delete(marker); } catch { }
+            return;
+        }
+
+        // Load template pool
+        var pool = WriteAheadLog.LoadPool(poolPath);
+        if (pool.Count == 0)
+        {
+            _logger.LogWarning("Orphaned WAL {File}: no template pool, discarding {Count} events",
+                walFile, entries.Count);
+            try { File.Delete(walFile); } catch { }
+            try { File.Delete(poolPath); } catch { }
+            return;
+        }
+
+        // Restore templates into TemplatePool
+        foreach (var (idx, tmpl) in pool)
+            TemplatePool.ForceIntern(idx, tmpl);
+
+        // Replay entries into a hot tier of this WAL's own — one WAL per tier, so the recovered
+        // events flush into the block the WAL is NAMED from and recovery obeys exactly the same
+        // marker protocol as the live flush. Pooling several WALs into one tier could not: their
+        // events would land in some other block, no marker would ever be written for the WAL's
+        // own, and a crash before the WAL was unlinked would replay it into duplicates.
+        using var recoveredHot = CreateHotTier();
+        int replayed = 0;
+        foreach (var entry in entries)
+        {
+            var header = new LogEventHeader
+            {
+                Id                       = _idGen.Next(entry.TimestampTicks),
+                TimestampUtcTicks        = entry.TimestampTicks,
+                Level                    = entry.Level,
+                MessageTemplatePoolIndex = entry.TemplateIndex,
+            };
+            // Resolve template via the freshly restored pool and attach it
+            // to the hot tier so the recovery flush persists @mt correctly.
+            string tmpl = TemplatePool.Get(entry.TemplateIndex);
+            if (recoveredHot.TryWrite(header, entry.Payload, tmpl, entry.Exception))
+                replayed++;
+        }
+        _logger.LogInformation("WAL recovery: replayed {Count} events from {File}", replayed, walFile);
+
+        // Flush recovered events to cold segments (no index — acceptable for crash recovery),
+        // ONE PER LEVEL like the live flush path. Writing the recovered tier as a single
+        // mixed-level segment reopened the data loss the level split exists to prevent:
+        // expiry is Ttl(MinLevel), TTL is not monotonic in the level's value, so a
+        // recovered tier holding one Debug event put every Error beside it on a 3-day
+        // deadline. Crash recovery is exactly when that is least acceptable.
+        //
+        // skipPublishedLevels: the interrupted flush may have got some levels out. Those files
+        // are whole — a level is one move of one file — so they are kept and only the missing
+        // levels are written. That is what makes this replay idempotent, and it is also the
+        // answer for a data directory written by the PREVIOUS build, which carries no marker at
+        // all: its complete flush replays to zero new segments and the WAL is simply dropped.
+        if (recoveredHot.Count > 0)
+        {
+            var written = FlushTierByLevelAsync(recoveredHot, segId, CancellationToken.None, skipPublishedLevels: true)
+                              .GetAwaiter().GetResult();
+            long recovered = 0;
+            for (int i = 0; i < written.Count; i++)
+            {
+                _segments[written[i].Id.Value] = written[i];
+                recovered += written[i].EventCount;
+            }
+            _logger.LogInformation("WAL recovery: wrote {Segments} level segment(s), {Count} events",
+                written.Count, recovered);
+        }
+        // A tier that accepted nothing needs no marker: replaying it again writes nothing again.
+
+        try { File.Delete(walFile); } catch { }
+        try { File.Delete(poolPath); } catch { }
+        try { File.Delete(FlushMarkerPath(segId)); } catch { }
+    }
+
+    // ── Segment-id allocator ──────────────────────────────────────────────────
+    //
+    // The three entry points below are the ONLY code allowed to read or write
+    // _nextSegmentId. They exist because the field had four writers on three thread models —
+    // startup recovery, the flush swap, the merge planner and the replication import — and
+    // only the middle two were synchronised with each other. See ImportSegment.
+    //
+    // internal, not private, so SegmentIdAllocatorTests can put them under contention directly.
+    // Driving the race through ImportSegment does not reproduce it: that path opens and reads a
+    // segment file before it touches the counter, which is thousands of times longer than the
+    // read-modify-write it has to land inside, so an end-to-end test passes with or without the
+    // lock. The property is real regardless of whether a test can hit it by luck, so it is
+    // asserted where it can be hit on purpose.
+
+    /// <summary>Reserves ONE id — the merge path's unit.</summary>
+    internal ulong AllocateSegmentId()
+    {
+        lock (_segIdLock) return _nextSegmentId++;
+    }
+
+    /// <summary>
+    /// Reserves a whole level block and returns its first id — the flush path's unit, since a
+    /// tier writes one segment per level at <c>first + (byte)level</c>.
+    /// </summary>
+    internal ulong AllocateSegmentIdBlock()
+    {
+        lock (_segIdLock)
+        {
+            ulong first = _nextSegmentId;
+            _nextSegmentId += LevelSegmentSlots;
+            return first;
         }
     }
 
     /// <summary>
+    /// Raises the allocator to at least <paramref name="floor"/>, for the callers that learn an id
+    /// is spent from somewhere other than the allocator — a file name on disk, a WAL's reserved
+    /// block, a segment received from a peer. Monotonic: it can only ever move forward, so a
+    /// caller arriving with stale information cannot hand out an id twice.
+    /// </summary>
+    internal void AdvanceSegmentIdFloor(ulong floor)
+    {
+        lock (_segIdLock)
+        {
+            if (floor > _nextSegmentId) _nextSegmentId = floor;
+        }
+    }
+
+    /// <summary>Pushes the id allocator past a WAL's reserved level block so it is never reused.</summary>
+    private void ReserveWalBlock(ulong walSegId) => AdvanceSegmentIdFloor(walSegId + LevelSegmentSlots);
+
+    /// <summary>
     /// Registers a replicated segment file received from the cluster leader.
     /// The file must already reside in the segments directory.
+    ///
+    /// <para>Runs on a request thread, concurrently with everything: the flush swap reserving a
+    /// level block, the merge planner reserving a single id, another import. The allocator update
+    /// below therefore goes through <see cref="AdvanceSegmentIdFloor"/> like every other one — it
+    /// used to be a bare read-compare-write on a field whose other writers hold <c>_flushLock</c>,
+    /// which is not a lock this path can take.</para>
+    ///
+    /// <para>An imported id INSIDE the live WAL's reserved block is a separate matter and this
+    /// does not fix it. The floor update is a no-op there — the allocator is already past the
+    /// block — so the reservation itself is safe and the WAL keeps its name. What is not safe is
+    /// the catalog: <c>_segments</c> is keyed by id alone, so when that WAL's tier flushes, the
+    /// level segment landing on the same id silently replaces the imported entry. The file stays
+    /// on disk, invisible to queries and to retention (which enumerates the catalog, not the
+    /// directory), and a restart re-races the two through the same keyed assignment in
+    /// <c>LoadSegmentCatalog</c>. The mismatch is that a peer's ids and this node's ids share one
+    /// namespace; the fix is to key the catalog by (node, id) or to re-number on import, and
+    /// neither belongs in a lock change. Recovery, at least, is not fooled: the WAL is dropped
+    /// against its completion marker, and <c>SegmentFileExists</c> matches
+    /// <c>{node}-{id}-*.seg</c>, which the two-part name the replication endpoint writes cannot
+    /// satisfy. So the failure is a hidden segment, not a lost WAL.</para>
     /// </summary>
     public void ImportSegment(string filePath)
     {
@@ -1303,9 +2166,19 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         {
             using var reader = SegmentReader.Open(filePath, computeUncompressedBytes: true);
             var info = reader.Info;
+
+            // A same-id, different-file overwrite is the shape described above. Re-importing the
+            // SAME segment is legitimate (the endpoint moves with overwrite: true), so it is the
+            // differing path that is worth a word — otherwise the loss is entirely silent.
+            if (_segments.TryGetValue(info.Id.Value, out var existing) &&
+                !string.Equals(existing.FilePath, info.FilePath, StringComparison.OrdinalIgnoreCase))
+                _logger.LogWarning(
+                    "Imported segment {Id} collides with local segment {Existing}; the local one is " +
+                    "no longer served or expired. Peer and local segment ids share one namespace.",
+                    info.Id, existing.FilePath);
+
             _segments[info.Id.Value] = info;
-            if (info.Id.Value >= _nextSegmentId)
-                _nextSegmentId = info.Id.Value + 1;
+            AdvanceSegmentIdFloor(info.Id.Value + 1);
             _logger.LogInformation("Imported replicated segment {Id} ({Events} events)", info.Id, info.EventCount);
         }
         catch (Exception ex)
@@ -1326,18 +2199,32 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         return new HotTierSegment(HotTierSegment.EventCapacityFor(payloadCapacity), payloadCapacity);
     }
 
+    /// <summary>
+    /// Opens the next WAL, RESERVING the block of segment ids its events will flush into.
+    /// The reservation is what keeps the WAL's name meaningful: nothing else — no merge, no
+    /// recovery segment — can subsequently be handed an id inside it.
+    /// </summary>
     private void OpenWal()
     {
-        var segId   = new SegmentId(_nextSegmentId);
+        _walSegId = AllocateSegmentIdBlock();
+
+        var segId   = new SegmentId(_walSegId);
         var walPath = Path.Combine(_walDir, $"{_options.NodeId.Value}-{segId.Value}.wal");
         _wal        = WriteAheadLog.Open(walPath, _options.NodeId, segId);
     }
 
-    private string BuildSegmentPath(SegmentId segId, HotTierSegment hot)
+    /// <param name="order">
+    /// Tier indices this segment will contain; null = the whole tier. The file name
+    /// carries the range, and retention reads MaxTimestamp out of it, so a level-split
+    /// segment must be named from ITS OWN events rather than the tier's.
+    /// </param>
+    private string BuildSegmentPath(SegmentId segId, HotTierSegment hot, int[]? order = null)
     {
         long minTs = long.MaxValue, maxTs = long.MinValue;
-        for (int i = 0; i < hot.Count; i++)
+        int n = order?.Length ?? hot.Count;
+        for (int k = 0; k < n; k++)
         {
+            int i = order?[k] ?? k;
             ref var h = ref hot.GetHeader(i);
             if (h.TimestampUtcTicks < minTs) minTs = h.TimestampUtcTicks;
             if (h.TimestampUtcTicks > maxTs) maxTs = h.TimestampUtcTicks;
@@ -1360,7 +2247,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         try { await _flushLoop; }
         catch (OperationCanceledException) { }
         catch (ObjectDisposedException) { }
-        try { await _recompressLoop; }
+        try { await _maintenanceLoop; }
         catch (OperationCanceledException) { }
         catch (ObjectDisposedException) { }
 

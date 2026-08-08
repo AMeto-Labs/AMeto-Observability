@@ -24,35 +24,131 @@ public sealed unsafe class SegmentBloomFilter : IDisposable
     private const int BlockBytes = 64;
     private const int BlockBits  = BlockBytes * 8; // 512
 
+    /// <summary>
+    /// High bit of the serialised <c>capacity</c> word, set by writers that case-fold on
+    /// <see cref="Add(ReadOnlySpan{char})"/>.
+    ///
+    /// <para>Capacity is informational — it is the segment's expected event count, never
+    /// within nine orders of magnitude of 2^31 — so the spare bit costs nothing and saves a
+    /// whole-file version bump. A blob without it was written by a build that stored the
+    /// ORIGINAL casing, and <see cref="MightContain(ReadOnlySpan{char})"/> must not treat its
+    /// silence as proof; see there.</para>
+    /// </summary>
+    private const uint FoldedMarker = 0x8000_0000u;
+
     private readonly byte*  _bits;
     private readonly uint   _blockCount;
     private readonly uint   _capacity;
+    private readonly bool   _folded;
     private          bool   _disposed;
+    private          long   _added;
 
-    private SegmentBloomFilter(byte* bits, uint blockCount, uint capacity)
+    private SegmentBloomFilter(byte* bits, uint blockCount, uint capacity, bool folded = true)
     {
         _bits       = bits;
         _blockCount = blockCount;
         _capacity   = capacity;
+        _folded     = folded;
     }
 
-    /// <summary>Creates a new empty filter sized for <paramref name="expectedItems"/>.</summary>
-    public static SegmentBloomFilter Create(int expectedItems)
+    /// <summary>
+    /// Largest item count that still sizes honestly. Above it the filter is capped rather
+    /// than allowed to wrap: <c>expectedItems * 10</c> in int arithmetic used to overflow
+    /// silently and hand back a 64-byte match-everything filter — no crash, just a
+    /// prefilter that stops rejecting anything. Callers now size by TERM count, which
+    /// reaches this an order of magnitude sooner than event count did.
+    /// </summary>
+    private const long MaxExpectedItems = (long)int.MaxValue / 10;
+
+    /// <summary>
+    /// Hard ceiling on ONE filter's bits, in bytes. A filter is allocated from a FORECAST — the
+    /// writer's guess at how many terms a group will hold, made before the group's first event is
+    /// indexed — and a forecast has no upper bound of its own. This gives it one.
+    ///
+    /// <para>16 MiB is ~13.4 M terms at the design's 10 bits/term, which is more terms than a
+    /// 64 MB index group can hold. MEASURED on the two ends of event shape: prop-dense events
+    /// (trace ids, eight properties, an exception on one in twenty) run 21.1 terms per event over
+    /// 329 payload bytes, so a full 64 MB group holds ~4.3 M terms; thin ones run 7.0 terms over
+    /// 151 bytes, ~3.1 M terms. Even doubled for headroom the densest of those asks for 10.7 MB,
+    /// so the ceiling is a backstop against a wrong forecast rather than a budget anything
+    /// realistic bumps into.</para>
+    ///
+    /// <para>What it backstops: the writer's event forecast divides the group's payload budget by
+    /// the file's measured bytes per row, floored at what the block format spends on a row before
+    /// any content — 57 bytes (<c>SegmentWriter.FixedRowCostBytes</c>). On the merge path, where
+    /// the source's remaining-event hint is the sum of every source and so does not bind, a 64 MB
+    /// group can therefore be forecast at up to 1 177 348 events; at the fallback 64 terms/event
+    /// that is 75.3 M terms and 89.8 MiB of <see cref="NativeMemory"/> for a SINGLE group's
+    /// filter, copied into an equally large managed array at <see cref="Serialise"/> and written
+    /// to the file. Capping costs selectivity only in the case that was already pathological, and
+    /// costs it gracefully: bits are shared out over more terms rather than the allocation being
+    /// let run.</para>
+    ///
+    /// <para>That 57 is the whole basis of the figure, so it is pinned by
+    /// <c>SegmentBlockGeometryTests</c> rather than merely asserted here. The paragraph used to
+    /// read 2 097 152 events and 160 MiB, which needs a 32-byte row — a divisor nothing in the
+    /// format could produce, since the fixed columns and the four string columns' offsets cost 57
+    /// before a template, a service name or a property is written.</para>
+    /// </summary>
+    private const long MaxFilterBytes = 16L * 1024 * 1024;
+
+    /// <summary>Creates a new empty filter sized for <paramref name="expectedItems"/>, subject to
+    /// <see cref="MaxFilterBytes"/>.</summary>
+    public static SegmentBloomFilter Create(long expectedItems)
     {
-        // ~10 bits per item → ~1% FPR; round up to multiple of 512
-        uint totalBits  = (uint)Math.Max(expectedItems * 10, BlockBits);
+        // ~10 bits per item → ~1% FPR; round up to multiple of 512. Long arithmetic
+        // throughout, then clamped — the old int product wrapped instead of saturating.
+        long clamped    = Math.Clamp(expectedItems, 1, MaxExpectedItems);
+        long bitsWanted = Math.Clamp(clamped * 10, BlockBits, MaxFilterBytes * 8);
+        uint totalBits  = (uint)Math.Min(bitsWanted, uint.MaxValue - BlockBits);
         totalBits       = (totalBits + (uint)(BlockBits - 1)) & ~(uint)(BlockBits - 1);
         uint blockCount = totalBits / BlockBits;
         uint byteCount  = totalBits / 8;
 
+        // Capacity describes the FILTER, not the request: when the ceiling bites, saying the
+        // filter was sized for items it has no bits for would make every bits-per-term reading
+        // taken from a file a lie. Rounding up to a block multiple means this is a no-op for
+        // every filter that is not capped.
+        long affordable = Math.Min(clamped, totalBits / 10);
+
         var bits = (byte*)NativeMemory.AllocZeroed(byteCount);
-        return new SegmentBloomFilter(bits, blockCount, (uint)expectedItems);
+        return new SegmentBloomFilter(bits, blockCount, (uint)affordable);
     }
 
     // ── Write ─────────────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Terms handed to <see cref="Add(ReadOnlySpan{byte})"/> since construction — the count the
+    /// filter was ACTUALLY asked to hold, against the <c>expectedItems</c> it was sized for.
+    ///
+    /// <para>Every overload funnels through the byte one, so this is the whole write side in a
+    /// single counter, and it survives <see cref="Dispose"/> (only the bits are native) — the one
+    /// deliberate exception to the disposed-state guards on <see cref="Add(ReadOnlySpan{byte})"/>,
+    /// <see cref="MightContain(ReadOnlySpan{byte})"/> and <see cref="Serialise"/>, and required to
+    /// be so by <c>ISegmentIndexSink.BloomTermsAdded</c>. It
+    /// exists because sizing a filter by a guessed terms-per-event is what makes the section
+    /// cost what it does; a writer that can read this back sizes the next group from what the
+    /// last one measured. Reading it back is also the only way to state bits-per-term, which is
+    /// the number that says whether a filter is selective or saturated.</para>
+    /// </summary>
+    public long AddedTermCount => _added;
+
+    /// <summary>
+    /// Terms these bits carry at the design's ~10 bits each — what the filter can actually hold,
+    /// which is the request only when <see cref="MaxFilterBytes"/> did not bite.
+    ///
+    /// <para>The writer reads it off the group's sink and seals the group before
+    /// <see cref="AddedTermCount"/> reaches it, so a forecast that was too small costs a smaller
+    /// group instead of a saturated filter. That is also what makes the ceiling a real bound
+    /// rather than a quality setting: a capped filter reports the capped number, so the group is
+    /// cut at the bits it was given.</para>
+    /// </summary>
+    public long Capacity => _capacity;
+
     public void Add(ReadOnlySpan<byte> key)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        _added++;
         var (h0, h1, h2) = Hash3(key);
         uint blockIdx    = h0 % _blockCount;
         byte* block      = _bits + blockIdx * BlockBytes;
@@ -64,10 +160,36 @@ public sealed unsafe class SegmentBloomFilter : IDisposable
     public void Add(string value) => Add((ReadOnlySpan<char>)value);
 
     /// <summary>
-    /// Encodes into stack/pooled scratch instead of allocating a byte[] per add — the hashed
-    /// bytes are identical to <see cref="Add(string)"/>, so the filter output is unchanged.
+    /// Adds the CASE-FOLDED form of <paramref name="value"/>, encoding into stack/pooled
+    /// scratch instead of allocating a byte[] per add.
+    ///
+    /// <para>Folding is a correctness requirement, not a nicety: the per-event scan compares
+    /// strings <see cref="StringComparison.OrdinalIgnoreCase"/>, so a filter keyed on the raw
+    /// casing answers "not here" for a value that differs from the query literal only in case
+    /// — <c>@l = 'error'</c> against a stored <c>Error</c> — and the whole segment is dropped
+    /// unread. Folding also keeps the filter's occupancy where it was; storing both casings
+    /// would have raised the false-positive rate for every segment.</para>
     /// </summary>
     public void Add(ReadOnlySpan<char> value)
+    {
+        // Guarded HERE as well as in the byte overload, and before the rent: this path takes a
+        // pooled buffer and returns it without a finally, so a throw from further in would strand
+        // it. The duplicate check is a load of an already-hot bool against three Murmur passes.
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        char[]? foldRented = value.Length > 256
+            ? System.Buffers.ArrayPool<char>.Shared.Rent(value.Length)
+            : null;
+        Span<char> foldBuf = foldRented ?? stackalloc char[256];
+        int foldLen = value.ToLowerInvariant(foldBuf);
+        ReadOnlySpan<char> folded = foldLen < 0 ? value : foldBuf[..foldLen];
+
+        AddRaw(folded);
+
+        if (foldRented is not null) System.Buffers.ArrayPool<char>.Shared.Return(foldRented);
+    }
+
+    private void AddRaw(ReadOnlySpan<char> value)
     {
         int max = System.Text.Encoding.UTF8.GetMaxByteCount(value.Length);
         byte[]? rented = max > 512 ? System.Buffers.ArrayPool<byte>.Shared.Rent(max) : null;
@@ -81,6 +203,7 @@ public sealed unsafe class SegmentBloomFilter : IDisposable
 
     public bool MightContain(ReadOnlySpan<byte> key)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         var (h0, h1, h2) = Hash3(key);
         uint blockIdx    = h0 % _blockCount;
         byte* block      = _bits + blockIdx * BlockBytes;
@@ -89,16 +212,91 @@ public sealed unsafe class SegmentBloomFilter : IDisposable
                TestBit(block, h2 % BlockBits);
     }
 
-    public bool MightContain(string value) => MightContain(System.Text.Encoding.UTF8.GetBytes(value));
+    public bool MightContain(string value) => MightContain((ReadOnlySpan<char>)value);
+
+    /// <summary>
+    /// Probes the folded form first — that is what <see cref="Add(ReadOnlySpan{char})"/>
+    /// stores — then the raw form, which is what a pre-folding writer stored.
+    ///
+    /// <para>For a segment written BEFORE folding, two probes are still not enough to prove
+    /// absence. The filter holds one arbitrary casing and the scan compares
+    /// OrdinalIgnoreCase, so <c>@l = 'error'</c> misses a stored <c>Error</c> on the folded
+    /// probe AND on the raw probe, and the phase-1 gate drops the segment before the (now
+    /// case-insensitive) inverted index can disagree. Folding on the WRITE side fixes nothing
+    /// for bytes already on disk. So an unfolded filter may only answer "no" for a value that
+    /// has no cased characters — a number, a punctuation-only key — where its one spelling is
+    /// the only spelling. Everything else gets "might", which costs those segments the cheap
+    /// gate and keeps their rows; the inverted index still prunes them one phase later, and
+    /// compaction retires the state as it rewrites them.</para>
+    /// </summary>
+    public bool MightContain(ReadOnlySpan<char> value)
+    {
+        // Before the rent, for the reason given on Add(ReadOnlySpan{char}).
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        char[]? foldRented = value.Length > 256
+            ? System.Buffers.ArrayPool<char>.Shared.Rent(value.Length)
+            : null;
+        Span<char> foldBuf = foldRented ?? stackalloc char[256];
+        int foldLen = value.ToLowerInvariant(foldBuf);
+        ReadOnlySpan<char> folded = foldLen < 0 ? value : foldBuf[..foldLen];
+
+        bool hit = MightContainRaw(folded);
+        if (!hit && !folded.SequenceEqual(value)) hit = MightContainRaw(value);
+        if (!hit && !_folded && HasCasedChars(value)) hit = true;   // cannot prove absence
+
+        if (foldRented is not null) System.Buffers.ArrayPool<char>.Shared.Return(foldRented);
+        return hit;
+    }
+
+    /// <summary>True when some character has a different upper/lower spelling, i.e. when a
+    /// pre-folding writer could have stored a casing this probe will not reproduce.</summary>
+    private static bool HasCasedChars(ReadOnlySpan<char> value)
+    {
+        for (int i = 0; i < value.Length; i++)
+        {
+            char c = value[i];
+            if (char.ToLowerInvariant(c) != c || char.ToUpperInvariant(c) != c) return true;
+        }
+        return false;
+    }
+
+    private bool MightContainRaw(ReadOnlySpan<char> value)
+    {
+        int max = System.Text.Encoding.UTF8.GetMaxByteCount(value.Length);
+        byte[]? rented = max > 512 ? System.Buffers.ArrayPool<byte>.Shared.Rent(max) : null;
+        Span<byte> buf = rented ?? stackalloc byte[max];
+        int n = System.Text.Encoding.UTF8.GetBytes(value, buf);
+        bool hit = MightContain(buf[..n]);
+        if (rented is not null) System.Buffers.ArrayPool<byte>.Shared.Return(rented);
+        return hit;
+    }
 
     // ── Serialisation ─────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Copies the filter out as a section blob.
+    ///
+    /// <para>Guarded, because the copy is <c>new Span&lt;byte&gt;(_bits, byteCount)</c> and
+    /// <see cref="Dispose"/> hands those bytes back to the allocator without clearing
+    /// <c>_bits</c> — the pointer is <c>readonly</c> and stays valid-looking forever. Calling this
+    /// after disposal therefore READ FREED MEMORY and returned whatever had since been allocated
+    /// over it, with no exception and no null to trip over: a segment's bloom section written from
+    /// another allocation's bytes, which the query prefilter then trusts to reject segments.
+    /// Measured before this guard, on a 4096-term filter disposed and then re-serialised with 32
+    /// native allocations squatting on the block: 5120 of 5120 payload bytes came back as the
+    /// squatter's fill pattern.</para>
+    /// </summary>
     public byte[] Serialise()
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         uint byteCount = _blockCount * BlockBytes;
-        var buf = new byte[4 + 4 + byteCount]; // bitCount + capacity + bits
+        var buf = new byte[4 + 4 + byteCount]; // bitCount + capacity | foldedMarker + bits
         System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(0), _blockCount * BlockBits);
-        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(4), _capacity);
+        // Only claim folded when this instance's contents really were folded — a filter that
+        // was read back from a pre-folding blob and re-serialised must keep saying so.
+        uint capacityWord = _folded ? (_capacity & ~FoldedMarker) | FoldedMarker : _capacity & ~FoldedMarker;
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(4), capacityWord);
         new Span<byte>(_bits, (int)byteCount).CopyTo(buf.AsSpan(8));
         return buf;
     }
@@ -117,14 +315,37 @@ public sealed unsafe class SegmentBloomFilter : IDisposable
             return matchAll;
         }
 
-        uint bitCount   = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(data[0..]);
-        uint capacity   = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(data[4..]);
-        uint blockCount = bitCount / BlockBits;
-        uint byteCount  = bitCount / 8;
+        uint bitCount     = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(data[0..]);
+        uint capacityWord = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(data[4..]);
+        bool folded       = (capacityWord & FoldedMarker) != 0;
+        uint capacity     = capacityWord & ~FoldedMarker;
+
+        // CHECKED BEFORE THE ALLOCATION, because the allocation is NativeMemory and the thing
+        // that would throw after it is the copy. A section whose header overstates its own length
+        // used to allocate first and fail on the Slice, and by then the pointer lived only in a
+        // local of a frame that was unwinding — no owner constructed, no finaliser on this class,
+        // nothing to free it. One blob claiming 0xFFFFFFFF bits committed 513 MB and lost it.
+        //
+        // What made that unbounded rather than a one-off is the caller: QueryExecutor's prefilter
+        // catches per group, per segment, per query and falls back to a full scan, so the same
+        // corrupt section is re-read and re-leaked by every query that touches it, forever, while
+        // every managed-heap instrument reads flat.
+        //
+        // The multiple-of-512 check is the same guard wearing its other face. A bitCount in
+        // [8, 512) passes the length test on a tiny blob and yields blockCount == 0, which is a
+        // DivideByZeroException inside Add/MightContain rather than at construction — thrown from
+        // under the pooled buffers AddRaw and MightContainRaw take, which they return without a
+        // finally. The format has always required the multiple; nothing enforced it.
+        if (bitCount == 0 || (bitCount & (uint)(BlockBits - 1)) != 0 || data.Length < 8L + bitCount / 8)
+            throw new InvalidDataException(
+                $"Bloom section declares {bitCount} bits ({bitCount / 8} bytes) in a {data.Length}-byte section");
+
+        uint blockCount   = bitCount / BlockBits;
+        uint byteCount    = bitCount / 8;
 
         var bits = (byte*)NativeMemory.AllocZeroed(byteCount);
         data.Slice(8, (int)byteCount).CopyTo(new Span<byte>(bits, (int)byteCount));
-        return new SegmentBloomFilter(bits, blockCount, capacity);
+        return new SegmentBloomFilter(bits, blockCount, capacity, folded);
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
