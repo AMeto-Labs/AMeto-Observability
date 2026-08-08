@@ -99,10 +99,11 @@ public sealed class MergeBucketGridSweepTests
         new("Merge_RetriesNextWindow_AfterAnchorSkip", LogLevel.Information, 2,
             [1 * H, 2 * H, W + 1 * H, W + 2 * H]),
 
-        // Ameto.Perf.StreamingMergeOrderTests — both tests, 10 rounds of 900 events at 1 s
-        // spacing, so round r runs to base + (900r + 899) s. These live in another assembly and
-        // compile MergeBucketGrid.cs in by link; they are swept here because this is where the
-        // helper's guarantee is checked, and an anchor is only as good as the shape staged on it.
+        // StreamingMergeOrderTests — both tests, 10 rounds of 900 events at 1 s spacing, so
+        // round r runs to base + (900r + 899) s. They used to live in Ameto.Perf and compile
+        // MergeBucketGrid.cs in by link; they are in this assembly now, but still swept here
+        // rather than there, because this is where the helper's guarantee is checked and an
+        // anchor is only as good as the shape staged on it.
         new("AMergedFileServesEveryRowThroughItsGroupIndexes", LogLevel.Information, 1,
             PerfRoundOffsets()),
         new("AMergedFileStillIndexesExceptionsItCopiedThroughAsBytes", LogLevel.Error, 1,

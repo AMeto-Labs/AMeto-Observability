@@ -21,6 +21,11 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\Ameto.Core\Ameto.Core.csproj" />
     <ProjectReference Include="..\..\src\Ameto.Query\Ameto.Query.csproj" />
+    <!-- Both arrive transitively through Ameto.Query; named here because this suite now writes
+         real segments (StorageEngine) and builds real indexes over them (SegmentIndexBuilder)
+         to test the prefilter against, rather than only parsing and evaluating filters. -->
+    <ProjectReference Include="..\..\src\Ameto.Storage\Ameto.Storage.csproj" />
+    <ProjectReference Include="..\..\src\Ameto.Indexing\Ameto.Indexing.csproj" />
   </ItemGroup>
 
 </Project>

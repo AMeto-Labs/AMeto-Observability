@@ -23,10 +23,10 @@
   </ItemGroup>
 
   <ItemGroup>
-    <!-- The merge planner's bucket grid, shared with Ameto.Storage.Tests rather than copied:
-         MergeBucketGridSweepTests machine-checks that helper across a full bucket period, and a
-         second copy here would be a second thing to keep true with nothing checking it. -->
-    <Compile Include="..\Ameto.Storage.Tests\MergeBucketGrid.cs" Link="MergeBucketGrid.cs" />
+    <!-- Fixtures shared with Ameto.Query.Tests rather than copied. The probes below measure the
+         same segments the functional tests assert over, and a second copy of the setup here
+         would be a second thing to keep true with nothing checking it. -->
+    <Compile Include="..\Ameto.Query.Tests\QuerySegmentFixtures.cs" Link="QuerySegmentFixtures.cs" />
   </ItemGroup>
 
   <ItemGroup>

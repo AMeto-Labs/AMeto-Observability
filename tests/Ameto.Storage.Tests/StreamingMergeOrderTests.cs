@@ -5,12 +5,10 @@ using Microsoft.Extensions.Options;
 using Ameto.Core;
 using Ameto.Indexing;
 using Ameto.Query;
-using Ameto.Storage;
-using Ameto.Storage.Tests;   // MergeBucketGrid, compiled in from the merge suite (see .csproj)
 using Xunit;
 using Xunit.Abstractions;
 
-namespace Ameto.Perf;
+namespace Ameto.Storage.Tests;
 
 /// <summary>
 /// Two things the merge suite could not see, both of which would destroy data silently
