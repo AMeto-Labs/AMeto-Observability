@@ -74,13 +74,21 @@ public sealed unsafe class SegmentBloomFilter : IDisposable
     /// realistic bumps into.</para>
     ///
     /// <para>What it backstops: the writer's event forecast divides the group's payload budget by
-    /// an assumed row cost floored at 32 bytes, which on the merge path (where the source's
-    /// remaining-event hint does not bind) reaches 2 097 152 events for one group. At the old
-    /// fixed 64 terms/event that was 160 MiB of <see cref="NativeMemory"/> for a single group's
+    /// the file's measured bytes per row, floored at what the block format spends on a row before
+    /// any content — 57 bytes (<c>SegmentWriter.FixedRowCostBytes</c>). On the merge path, where
+    /// the source's remaining-event hint is the sum of every source and so does not bind, a 64 MB
+    /// group can therefore be forecast at up to 1 177 348 events; at the fallback 64 terms/event
+    /// that is 75.3 M terms and 89.8 MiB of <see cref="NativeMemory"/> for a SINGLE group's
     /// filter, copied into an equally large managed array at <see cref="Serialise"/> and written
     /// to the file. Capping costs selectivity only in the case that was already pathological, and
     /// costs it gracefully: bits are shared out over more terms rather than the allocation being
     /// let run.</para>
+    ///
+    /// <para>That 57 is the whole basis of the figure, so it is pinned by
+    /// <c>SegmentBlockGeometryTests</c> rather than merely asserted here. The paragraph used to
+    /// read 2 097 152 events and 160 MiB, which needs a 32-byte row — a divisor nothing in the
+    /// format could produce, since the fixed columns and the four string columns' offsets cost 57
+    /// before a template, a service name or a property is written.</para>
     /// </summary>
     private const long MaxFilterBytes = 16L * 1024 * 1024;
 

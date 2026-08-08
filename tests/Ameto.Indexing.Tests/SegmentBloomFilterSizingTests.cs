@@ -37,18 +37,27 @@ public sealed class SegmentBloomFilterSizingTests
     /// <summary>
     /// The ceiling, at the size the writer's own worst case asks for.
     ///
-    /// <para>2 097 152 events is what <c>SegmentWriter.EnsureSink</c> forecasts for one 64 MB
-    /// group when the row-cost floor (32 B) is the divisor and the source's remaining-event hint
-    /// does not bind — which on the merge path it does not, because the hint there is the sum of
-    /// every source's events. At the fallback 64 terms/event that is 134 M terms, and without a
-    /// ceiling the filter is 160 MiB of native memory for ONE group, copied into an equally large
-    /// managed array at <c>Serialise</c> and written to the file.</para>
+    /// <para>1 177 348 events is what <c>SegmentWriter.EnsureSink</c> forecasts for one 64 MB
+    /// group when its row-cost floor is the divisor and the source's remaining-event hint does
+    /// not bind — which on the merge path it does not, because the hint there is the sum of every
+    /// source's events. The floor is the 57 bytes the block format spends on a row before any of
+    /// its content (<c>SegmentWriter.FixedRowCostBytes</c>, held against a written segment by
+    /// <c>SegmentBlockGeometryTests</c>). At the fallback 64 terms/event that is 75.3 M terms,
+    /// and without a ceiling the filter is 89.8 MiB of native memory for ONE group, copied into
+    /// an equally large managed array at <c>Serialise</c> and written to the file.</para>
+    ///
+    /// <para>This used to read 2 097 152 events and 160 MiB, which is 64 MB over a 32-byte row —
+    /// a divisor the format cannot produce, since the fixed columns and the four string columns'
+    /// offsets cost 57 before a template is written. The conclusion survived the correction; the
+    /// arithmetic under it did not.</para>
     /// </summary>
     [Fact]
     public void TheWritersWorstCaseForecastCannotAllocateAnUnboundedFilter()
     {
-        const long Events = 2_097_152;
+        const long Events = 64L * 1024 * 1024 / 57;
         const long Terms  = Events * 64;
+
+        Assert.Equal(1_177_348, Events);
 
         using var filter = SegmentBloomFilter.Create(Terms);
         long bytes = filter.Serialise().Length - 8L;

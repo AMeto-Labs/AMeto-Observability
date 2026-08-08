@@ -82,18 +82,30 @@ public sealed class SegmentWriter : IDisposable
     /// events hold per byte of payload — the same 64 MB is 203 729 prop-dense events at 21.1
     /// terms each (~5.4 MB of filter at the design's 10 bits/term) or 445 079 thin ones at 7.0
     /// (~3.7 MB). The old figure was true only at ~488 bytes per event, and the forecast that
-    /// produced it assumed a fixed 64 terms/event, which at this budget's own row-cost floor
-    /// reached 160 MiB for one group. Sizing is measured now (see <see cref="EnsureSink"/>) and
-    /// bounded absolutely by <c>SegmentBloomFilter</c>'s filter ceiling.</para>
+    /// produced it assumed a fixed 64 terms/event, which at this budget divided by
+    /// <see cref="FixedRowCostBytes"/> — the most events a 64 MB group can be forecast to hold,
+    /// 1 177 348 — reached 89.8 MiB for one group. Sizing is measured now (see
+    /// <see cref="EnsureSink"/>), bounded absolutely by <c>SegmentBloomFilter</c>'s filter
+    /// ceiling, and a group that fills its filter early is sealed early (see
+    /// <see cref="GroupIsFull"/>) rather than allowed to overrun it.</para>
     /// </summary>
     public const long DefaultGroupPayloadBudgetBytes = 64L * 1024 * 1024;
 
     /// <summary>
-    /// Bytes per row assumed when sizing the FIRST index group's bloom filter and nothing has
-    /// been measured yet. Only a starting point: from the second group on, the real
-    /// <c>uncompressedBytes / events</c> of the file so far is used.
+    /// Uncompressed bytes this block format spends on ONE row before a single byte of that row's
+    /// CONTENT: the fixed-width columns (@t 8, @l 1, @i 8, trace 16, span 8) plus one uint32
+    /// offset in each of the four string columns (@mt, @x, props, @svc).
+    ///
+    /// <para>It is both the base of a row's cost estimate and the FLOOR on the divisor that turns
+    /// a group's payload budget into an event forecast, and those are the same number on purpose:
+    /// no row and no file average can come in under it, so the floor is an invariant of the
+    /// format rather than a guess. It used to be a guessed 32, which no row could reach either —
+    /// leaving the divisor floored by something unreachable, and the worst case documented
+    /// against it overstated by 1.8x. <c>SegmentBlockGeometryTests</c> pins it against what a
+    /// written segment actually costs, so a format change that lowers the fixed cost fails there
+    /// rather than silently making a paragraph elsewhere true.</para>
     /// </summary>
-    private const long MinAssumedRowCostBytes = 32;
+    internal const long FixedRowCostBytes = 8 + 1 + 8 + 16 + 8 + 4 * 4;   // 57
 
     /// <summary>
     /// Row cost the group budget's documented bloom figure is expressed in — a full 64 MB group
@@ -285,7 +297,7 @@ public sealed class SegmentWriter : IDisposable
             int svcBytes  = ev.ServiceName is null ? 0 : Encoding.UTF8.GetByteCount(ev.ServiceName);
             // Approximate: the exception blob is only serialised once, at staging time (and on
             // the merge path not at all — its bytes are copied straight through).
-            int rowCost   = 8 + 1 + 8 + 16 + 8 + 16
+            int rowCost   = (int)FixedRowCostBytes
                           + tmplBytes + svcBytes + ev.Properties.Length
                           + (ev.HasException ? Math.Max(64, ev.ExceptionPayload.Length) : 0);
 
@@ -358,8 +370,8 @@ public sealed class SegmentWriter : IDisposable
         if (_sink is not null)    return _sink;
 
         long byBudget = _eventsFlushed > 0
-            ? _groupBudget / Math.Max(MinAssumedRowCostBytes, _uncompressedBytes / _eventsFlushed)
-            : Math.Max(_groupBudget / Math.Max(MinAssumedRowCostBytes, rowCost),
+            ? _groupBudget / Math.Max(FixedRowCostBytes, _uncompressedBytes / _eventsFlushed)
+            : Math.Max(_groupBudget / Math.Max(FixedRowCostBytes, rowCost),
                        _groupBudget / AssumedRowCostBytes);
         long estimate = Math.Clamp(Math.Min(remainingHint, Math.Max(1, byBudget)), 1, int.MaxValue);
         return _sink = _sinkFactory((int)estimate, EstimateTermsPerEvent());
