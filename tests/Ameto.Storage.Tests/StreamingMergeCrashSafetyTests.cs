@@ -332,11 +332,18 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
     /// where the manifest-first ordering has to unwind itself: the merged file never reaches its
     /// final name (it is written to .seg.tmp), so dropping the manifest restores the pre-merge
     /// state exactly. Nothing published, nothing deleted, nothing left behind.
+    ///
+    /// <para>The sealed anchor is load-bearing even though this test asserts FALSE. In an open
+    /// bucket four sources are below the fanout, so the planner selects no batch at all and the
+    /// merge returns false without ever opening the corrupt file — every assertion below then
+    /// holds for a reason that has nothing to do with the abort path. Anchoring on the grid is
+    /// what makes that false mean "the merge ran and unwound itself" on every run
+    /// (see <see cref="MergeBucketGrid"/>).</para>
     /// </summary>
     [Fact]
     public async Task CorruptBlockMidStream_AbortsTheMerge_AndLeavesNoManifest()
     {
-        long old = DateTime.UtcNow.Ticks - 5 * TimeSpan.TicksPerDay;
+        long old = MergeBucketGrid.SealedBucketStart(LogLevel.Information);
         for (int round = 0; round < 4; round++)
             await WriteSegmentAsync(round, 60, baseTicks: old + round * TimeSpan.TicksPerHour);
         var files = Directory.GetFiles(SegDir, "*.seg").OrderBy(f => f).ToList();
@@ -367,7 +374,10 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
     [Fact]
     public async Task UnreadableSource_AbortsTheBatch_WithoutTouchingAnything()
     {
-        long old = DateTime.UtcNow.Ticks - 5 * TimeSpan.TicksPerDay;   // settled → 2 sources suffice
+        // Settled by construction → 2 sources suffice. A fixed offset back from UtcNow lands in
+        // the open bucket for two days in every seven, where four sources are below the fanout
+        // and the merge never runs at all (see MergeBucketGrid).
+        long old = MergeBucketGrid.SealedBucketStart(LogLevel.Information);
         for (int round = 0; round < 4; round++)
             await WriteSegmentAsync(round, 60, baseTicks: old + round * TimeSpan.TicksPerHour);
 
