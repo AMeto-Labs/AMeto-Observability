@@ -674,6 +674,62 @@ public sealed class MetricWalTests : IDisposable
         Assert.True(durable == flushed.Length, Verdict(durable, flushed.Length));
     }
 
+    /// <summary>
+    /// Ingest is ungated for the whole of shutdown by design, so the answer it gives has to be
+    /// true: a batch it RETURNS from is a batch the exporter was told had landed. Kestrel is
+    /// still serving <c>/otlp/v1/metrics</c> while the engine is disposed — hosted services
+    /// stop in reverse registration order — so batches are offered until one is refused, and
+    /// every accepted point must then be findable on the next start. It used to hold the
+    /// snapshot lock shared across the whole batch while the log was unmapped underneath it:
+    /// <c>Append</c> returns silently once disposed, so the rest of the batch went nowhere and
+    /// the caller was told otherwise.
+    /// </summary>
+    [Fact]
+    public async Task Every_batch_ingest_returns_from_during_shutdown_is_durable()
+    {
+        var engine = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
+        long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+
+        // Give the teardown real work to wait on, so the batches below straddle it rather than
+        // arriving before or after: 2 000 series of files, with the tier emptied by the
+        // snapshot so the loop's own final pass returns at snapshot.Count == 0.
+        var first = SlowFlushBatch(baseNano);
+        engine.Ingest(first);
+        var writing = engine.ScheduleThresholdFlushForTest();
+        await DrainedAsync(engine);
+        Assert.False(writing.IsCompleted, "setup: the flush must still be writing its files");
+
+        var late = new MetricIngestItem[12][];
+        for (int i = 0; i < late.Length; i++)
+            late[i] = SlowFlushBatch(baseNano + (i + 1) * 3_600_000_000_000L, "late" + i,
+                                     series: 200, pointsPerSeries: 250);   // 50 000 each
+
+        long accepted = 0;
+        string refusal = "(never refused)";
+        var disposing = Task.Run(async () => await engine.DisposeAsync());
+        var ingesting = Task.Run(() =>
+        {
+            for (int i = 0; i < late.Length; i++)
+            {
+                try { engine.Ingest(late[i]); Interlocked.Add(ref accepted, late[i].Length); }
+                catch (ObjectDisposedException) { refusal = "ObjectDisposedException"; return; }
+            }
+        });
+
+        await disposing;
+        await ingesting;
+
+        // Refusal is the only acceptable way to stop accepting: a batch that returns normally
+        // has been acknowledged. (If every batch landed the run is still valid — it just did
+        // not reach the door.)
+        Assert.True(refusal is "ObjectDisposedException" or "(never refused)", refusal);
+
+        long expected = first.Length + Interlocked.Read(ref accepted);
+        long durable  = await DurablePointsAsync(_dir, "instrument.0");
+        Assert.True(durable >= expected,
+            $"LOST {expected - durable} of {expected} ACKNOWLEDGED points ({durable} durable)");
+    }
+
     [Fact]
     public async Task Existing_files_survive_the_upgrade_and_stay_queryable()
     {

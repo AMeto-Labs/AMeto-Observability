@@ -148,6 +148,14 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     // that occur at host shutdown (see DisposeAsync).
     private int _disposed;
 
+    /// <summary>
+    /// 1 once the log is about to be unmapped. <see cref="Ingest"/> is gated on THIS and not
+    /// on <see cref="_disposed"/>, because everything between the two is still fully durable:
+    /// the log is open, the final flush has not run, and a point arriving there is written and
+    /// replayed like any other. Only the last step of the teardown has to turn callers away.
+    /// </summary>
+    private int _ingestClosed;
+
     public MetricStorageEngine(string dataDir, ILogger<MetricStorageEngine> logger)
     {
         _dataDir = dataDir;
@@ -234,6 +242,14 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         _snapshotLock.EnterReadLock();
         try
         {
+            // The log is gone or is about to be. MetricWriteAheadLog.Append returns SILENTLY
+            // once disposed, so carrying on would file every remaining point of this batch
+            // into a hot tier nobody will flush again and then return normally — the caller is
+            // told a batch was accepted that is durable nowhere. Throwing is what an exporter
+            // reads as a failed export and retries. Checked under the read lock, which the
+            // teardown takes exclusively before it sets this: no Append can straddle the two.
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _ingestClosed) != 0, this);
+
             foreach (var item in items)
             {
                 var point = new MetricDataPoint
@@ -1166,17 +1182,37 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         // one that registers from here on returns without touching anything, because
         // _disposed was set before the drains (see RunThresholdFlushAsync).
         //
-        // It is NOT a claim about Ingest, which is deliberately left ungated. A caller whose
-        // point arrives during shutdown still gets it written to the log — durable, replayed
-        // on the next start — and one that arrives after the line below fails loudly with
-        // ObjectDisposedException out of EnterReadLock, which the exporter sees as a failed
-        // export and retries. Dropping it silently on a _disposed check would turn a point
-        // that survives into one that does not, which is the failure this whole change is
-        // about.
+        // Shut the door on ingest, and wait for the callers already through it. Ingest is
+        // ungated for the whole shutdown up to this line, deliberately: the log is open until
+        // a few instructions below, so a point arriving during the final flush is still
+        // written and still replayed, and refusing it early would turn a point that survives
+        // into one that does not.
+        //
+        // What it must not do is keep accepting points once the log is gone. Ingest holds the
+        // snapshot lock shared across a WHOLE batch — an OTLP request — and taking it
+        // exclusively here is what makes "no Append is in flight" true rather than likely:
+        // ReaderWriterLockSlim.Dispose does NOT throw for a read lock held on another thread
+        // (it inspects the calling thread's counts and the global waiter counts), so without
+        // this fence the unmapping below happened underneath a live batch, every remaining
+        // Append hit `if (_disposed) return;` and the caller was told its points had landed.
+        // Measured at ~48 000 points per shutdown under load, silently, nothing logged.
+        _snapshotLock.EnterWriteLock();
+        try { System.Threading.Volatile.Write(ref _ingestClosed, 1); }
+        finally { _snapshotLock.ExitWriteLock(); }
+
+        // The log first: nothing durable depends on the locks, and disposing a
+        // ReaderWriterLockSlim throws if a thread happens to be WAITING on it, which must not
+        // be able to skip the unmap. After the loop's final flush, which commits it.
+        _wal.Dispose();
         _cts.Dispose();
         _coldLock.Dispose();
-        _snapshotLock.Dispose();
-        _wal.Dispose();   // after the loop's final flush, which commits it
+
+        // _snapshotLock is deliberately NOT disposed. Its only two users are Ingest and
+        // FlushHotTierAsync; both are shut above, and the gate turns a late ingest away by
+        // itself, so disposal would buy nothing — while costing something real, because a
+        // reader released by the ExitWriteLock a few lines up is still counted as waiting
+        // until it wakes, and Dispose throws SynchronizationLockException on a waiter. Its
+        // wait handles are finalizable and this engine is a process-lifetime singleton.
     }
 
     /// <summary>Awaits every threshold flush registered as of this call.</summary>
