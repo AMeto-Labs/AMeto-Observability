@@ -157,8 +157,8 @@ public sealed class StreamingMergeMemoryProbe : IDisposable
         using (var source = MergingSegmentEventSource.Open(paths))
         using (var writer = new SegmentWriter(mergedPath, GroupBudget))
         {
-            writer.WriteEvents(source, count => new PeakSink(
-                new SegmentIndexBuilder(count),
+            writer.WriteEvents(source, (count, termsPerEvent) => new PeakSink(
+                new SegmentIndexBuilder(count, 5, termsPerEvent),
                 () =>
                 {
                     // Sampled at the seal: the group's accumulators at their fullest, with
@@ -206,6 +206,10 @@ public sealed class StreamingMergeMemoryProbe : IDisposable
     private sealed class PeakSink(SegmentIndexBuilder inner, Action onSeal) : ISegmentIndexSink
     {
         public void Add(uint fileOrdinal, in SegmentEventRef ev) => inner.Add(fileOrdinal, in ev);
+
+        // See IndexGroupMemoryProbe.PeakProbeSink — forwarded so the writer sizes as it does
+        // in production.
+        public long BloomTermsAdded => inner.BloomTermsAdded;
 
         public (byte[] Inverted, byte[] Trigram, byte[] Bloom) Serialise()
         {

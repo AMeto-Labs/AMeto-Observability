@@ -290,7 +290,7 @@ public sealed class SegmentIndexGroupTests : IDisposable
         int groups  = 0;
         using (var sw = new SegmentWriter(path, groupBudget))
         {
-            sw.WriteEvents(hot, pool, SegmentWriter.ComputeSortOrder(hot), _ => new StubSink(() => ++groups));
+            sw.WriteEvents(hot, pool, SegmentWriter.ComputeSortOrder(hot), (_, _) => new StubSink(() => ++groups));
             sw.Finalise(new NodeId(0), new SegmentId(1UL));
         }
         return (path, rows, groups);
@@ -334,7 +334,7 @@ public sealed class SegmentIndexGroupTests : IDisposable
                                           SegmentWriter.DefaultGroupPayloadBudgetBytes))
         {
             sw.WriteEvents(hot, pool, SegmentWriter.ComputeSortOrder(hot),
-                           n => { estimates.Add(n); return new StubSink(() => 1); });
+                           (n, _) => { estimates.Add(n); return new StubSink(() => 1); });
             sw.Finalise(new NodeId(0), new SegmentId(1UL));
         }
 
@@ -361,6 +361,10 @@ public sealed class SegmentIndexGroupTests : IDisposable
             if (fileOrdinal < _first) _first = fileOrdinal;
             _count++;
         }
+
+        /// <summary>No bloom here, so nothing is measured — the writer falls back to its
+        /// assumption, which is what makes the forecast tests below read the same as before.</summary>
+        public long BloomTermsAdded => 0;
 
         public (byte[] Inverted, byte[] Trigram, byte[] Bloom) Serialise()
         {

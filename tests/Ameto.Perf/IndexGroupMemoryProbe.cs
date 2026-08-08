@@ -102,8 +102,8 @@ public sealed class IndexGroupMemoryProbe : IDisposable
             // A FRESH builder per group — the mechanism under test. The previous group's
             // accumulators are unreachable by the time the next one seals, so the forced
             // collection inside the probe leaves only the current group's state live.
-            writer.WriteEvents(hot, pool, order, count => new PeakProbeSink(
-                new SegmentIndexBuilder(count),
+            writer.WriteEvents(hot, pool, order, (count, termsPerEvent) => new PeakProbeSink(
+                new SegmentIndexBuilder(count, 5, termsPerEvent),
                 () =>
                 {
                     long live = GC.GetTotalMemory(forceFullCollection: true) - baseline;
@@ -123,6 +123,11 @@ public sealed class IndexGroupMemoryProbe : IDisposable
     private sealed class PeakProbeSink(SegmentIndexBuilder inner, Action onSeal) : ISegmentIndexSink
     {
         public void Add(uint fileOrdinal, in SegmentEventRef ev) => inner.Add(fileOrdinal, in ev);
+
+        // Forwarded, not stubbed to 0: this is what the writer sizes the NEXT group's filter
+        // from, and a wrapper that swallowed it would make the probe measure a blind writer
+        // rather than the one production runs.
+        public long BloomTermsAdded => inner.BloomTermsAdded;
 
         public (byte[] Inverted, byte[] Trigram, byte[] Bloom) Serialise()
         {

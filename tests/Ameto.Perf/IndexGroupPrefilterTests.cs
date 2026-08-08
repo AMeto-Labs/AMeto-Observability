@@ -45,7 +45,8 @@ public sealed class IndexGroupPrefilterTests : IAsyncLifetime
         _engine._groupPayloadBudgetBytes = GroupBudget;
         // The same wiring IndexingWiring installs in production: a fresh builder per group,
         // posting offsets based at the group's first FILE ordinal.
-        _engine.IndexSinkFactory = estimatedEventCount => new SegmentIndexBuilder(estimatedEventCount);
+        _engine.IndexSinkFactory = (estimatedEventCount, termsPerEvent) =>
+            new SegmentIndexBuilder(estimatedEventCount, 5, termsPerEvent);
         _query = new QueryExecutor(_engine, new SegmentIndexReaderFactory(), NullLogger<QueryExecutor>.Instance);
 
         _baseTicks = new DateTimeOffset(2026, 7, 30, 0, 0, 0, TimeSpan.Zero).UtcTicks;

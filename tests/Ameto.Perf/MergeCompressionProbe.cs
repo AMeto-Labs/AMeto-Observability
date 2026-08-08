@@ -245,7 +245,7 @@ public sealed class MergeCompressionProbe : IDisposable
         using (var source = MergingSegmentEventSource.Open(paths))
         using (var writer = new SegmentWriter(p, budget, c))
         {
-            writer.WriteEvents(source, static count => new SegmentIndexBuilder(count), CancellationToken.None);
+            writer.WriteEvents(source, static (count, termsPerEvent) => new SegmentIndexBuilder(count, 5, termsPerEvent), CancellationToken.None);
             writer.Finalise(new NodeId(0), new SegmentId(3UL));
         }
 
@@ -303,7 +303,7 @@ public sealed class MergeCompressionProbe : IDisposable
         using (var source = MergingSegmentEventSource.Open(paths))
         using (var writer = new SegmentWriter(merged, GroupBudget, compression))
         {
-            writer.WriteEvents(source, static count => new SegmentIndexBuilder(count), CancellationToken.None);
+            writer.WriteEvents(source, static (count, termsPerEvent) => new SegmentIndexBuilder(count, 5, termsPerEvent), CancellationToken.None);
             info = writer.Finalise(new NodeId(0), new SegmentId(1UL));
         }
         sw.Stop();
@@ -365,7 +365,7 @@ public sealed class MergeCompressionProbe : IDisposable
         using (var source = MergingSegmentEventSource.Open(paths))
         using (var writer = new SegmentWriter(p, GroupBudget))
         {
-            writer.WriteEvents(source, static count => new SegmentIndexBuilder(count), CancellationToken.None);
+            writer.WriteEvents(source, static (count, termsPerEvent) => new SegmentIndexBuilder(count, 5, termsPerEvent), CancellationToken.None);
             writer.Finalise(new NodeId(0), new SegmentId(2UL));
         }
 

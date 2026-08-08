@@ -41,6 +41,7 @@ public sealed unsafe class SegmentBloomFilter : IDisposable
     private readonly uint   _capacity;
     private readonly bool   _folded;
     private          bool   _disposed;
+    private          long   _added;
 
     private SegmentBloomFilter(byte* bits, uint blockCount, uint capacity, bool folded = true)
     {
@@ -59,26 +60,71 @@ public sealed unsafe class SegmentBloomFilter : IDisposable
     /// </summary>
     private const long MaxExpectedItems = (long)int.MaxValue / 10;
 
-    /// <summary>Creates a new empty filter sized for <paramref name="expectedItems"/>.</summary>
+    /// <summary>
+    /// Hard ceiling on ONE filter's bits, in bytes. A filter is allocated from a FORECAST — the
+    /// writer's guess at how many terms a group will hold, made before the group's first event is
+    /// indexed — and a forecast has no upper bound of its own. This gives it one.
+    ///
+    /// <para>16 MiB is ~13.4 M terms at the design's 10 bits/term, which is more terms than a
+    /// 64 MB index group can hold. MEASURED on the two ends of event shape: prop-dense events
+    /// (trace ids, eight properties, an exception on one in twenty) run 21.1 terms per event over
+    /// 329 payload bytes, so a full 64 MB group holds ~4.3 M terms; thin ones run 7.0 terms over
+    /// 151 bytes, ~3.1 M terms. Even doubled for headroom the densest of those asks for 10.7 MB,
+    /// so the ceiling is a backstop against a wrong forecast rather than a budget anything
+    /// realistic bumps into.</para>
+    ///
+    /// <para>What it backstops: the writer's event forecast divides the group's payload budget by
+    /// an assumed row cost floored at 32 bytes, which on the merge path (where the source's
+    /// remaining-event hint does not bind) reaches 2 097 152 events for one group. At the old
+    /// fixed 64 terms/event that was 160 MiB of <see cref="NativeMemory"/> for a single group's
+    /// filter, copied into an equally large managed array at <see cref="Serialise"/> and written
+    /// to the file. Capping costs selectivity only in the case that was already pathological, and
+    /// costs it gracefully: bits are shared out over more terms rather than the allocation being
+    /// let run.</para>
+    /// </summary>
+    private const long MaxFilterBytes = 16L * 1024 * 1024;
+
+    /// <summary>Creates a new empty filter sized for <paramref name="expectedItems"/>, subject to
+    /// <see cref="MaxFilterBytes"/>.</summary>
     public static SegmentBloomFilter Create(long expectedItems)
     {
         // ~10 bits per item → ~1% FPR; round up to multiple of 512. Long arithmetic
         // throughout, then clamped — the old int product wrapped instead of saturating.
-        long clamped   = Math.Clamp(expectedItems, 1, MaxExpectedItems);
-        long bitsWanted = Math.Max(clamped * 10, BlockBits);
+        long clamped    = Math.Clamp(expectedItems, 1, MaxExpectedItems);
+        long bitsWanted = Math.Clamp(clamped * 10, BlockBits, MaxFilterBytes * 8);
         uint totalBits  = (uint)Math.Min(bitsWanted, uint.MaxValue - BlockBits);
         totalBits       = (totalBits + (uint)(BlockBits - 1)) & ~(uint)(BlockBits - 1);
         uint blockCount = totalBits / BlockBits;
         uint byteCount  = totalBits / 8;
 
+        // Capacity describes the FILTER, not the request: when the ceiling bites, saying the
+        // filter was sized for items it has no bits for would make every bits-per-term reading
+        // taken from a file a lie. Rounding up to a block multiple means this is a no-op for
+        // every filter that is not capped.
+        long affordable = Math.Min(clamped, totalBits / 10);
+
         var bits = (byte*)NativeMemory.AllocZeroed(byteCount);
-        return new SegmentBloomFilter(bits, blockCount, (uint)clamped);
+        return new SegmentBloomFilter(bits, blockCount, (uint)affordable);
     }
 
     // ── Write ─────────────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Terms handed to <see cref="Add(ReadOnlySpan{byte})"/> since construction — the count the
+    /// filter was ACTUALLY asked to hold, against the <c>expectedItems</c> it was sized for.
+    ///
+    /// <para>Every overload funnels through the byte one, so this is the whole write side in a
+    /// single counter, and it survives <see cref="Dispose"/> (only the bits are native). It
+    /// exists because sizing a filter by a guessed terms-per-event is what makes the section
+    /// cost what it does; a writer that can read this back sizes the next group from what the
+    /// last one measured. Reading it back is also the only way to state bits-per-term, which is
+    /// the number that says whether a filter is selective or saturated.</para>
+    /// </summary>
+    public long AddedTermCount => _added;
+
     public void Add(ReadOnlySpan<byte> key)
     {
+        _added++;
         var (h0, h1, h2) = Hash3(key);
         uint blockIdx    = h0 % _blockCount;
         byte* block      = _bits + blockIdx * BlockBytes;

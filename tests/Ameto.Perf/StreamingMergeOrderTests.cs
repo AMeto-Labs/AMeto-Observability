@@ -45,7 +45,8 @@ public sealed class StreamingMergeOrderTests : IAsyncLifetime
         // Small enough that a few thousand ordinary events span several groups — the shape a
         // day-scale merged file has by default, reached here without writing a day of events.
         _engine._groupPayloadBudgetBytes = 256 * 1024;
-        _engine.IndexSinkFactory = estimatedEventCount => new SegmentIndexBuilder(estimatedEventCount);
+        _engine.IndexSinkFactory = (estimatedEventCount, termsPerEvent) =>
+            new SegmentIndexBuilder(estimatedEventCount, 5, termsPerEvent);
         return Task.CompletedTask;
     }
 
