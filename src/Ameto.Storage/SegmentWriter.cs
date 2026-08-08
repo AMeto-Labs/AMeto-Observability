@@ -429,8 +429,16 @@ public sealed class SegmentWriter : IDisposable
     /// thinnest shape measured contributes seven; a whole group averaging below that has almost
     /// nothing for a filter to be selective about. Applied AFTER the headroom multiplier, so it
     /// binds only when the measurement is genuinely degenerate rather than merely thin.
+    ///
+    /// <para>What it buys, now that <see cref="GroupIsFull"/> ends a group rather than letting it
+    /// overrun its filter, is a bound on FRAGMENTATION: a forecast taken from a group holding one
+    /// or two terms an event would have the seal cut the first normal group after it to a sliver,
+    /// and every sliver carries its own inverted and trigram sections. Reachable — a level and a
+    /// message template are two terms, which doubled is four — and reached by
+    /// <c>BloomStepSizingProbe</c>, which is what stops this from becoming another constant that
+    /// documents a case nothing produces.</para>
     /// </summary>
-    private const long MinBloomTermsPerEvent = 8;
+    internal const long MinBloomTermsPerEvent = 8;
 
     // Bloom terms the sealed groups of this file actually added, and the events that produced
     // them: the whole file, and separately the group that sealed last. Read off each sink at

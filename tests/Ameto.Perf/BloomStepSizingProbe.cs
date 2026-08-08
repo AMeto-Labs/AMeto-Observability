@@ -122,12 +122,57 @@ public sealed class BloomStepSizingProbe : IDisposable
         }
     }
 
+    /// <summary>
+    /// The floor under the forecast, at the only shape that can reach it: a level and a message
+    /// template and nothing else — no service name, no properties — which is two bloom terms an
+    /// event, four after the headroom, under <see cref="SegmentWriter.MinBloomTermsPerEvent"/>.
+    ///
+    /// <para>Left unfloored, a file like this teaches the writer to forecast one or two terms an
+    /// event, and the first group of normal traffic after it gets cut to a sliver by the seal —
+    /// each sliver carrying its own inverted and trigram sections. The floor is what bounds that,
+    /// and it costs bits only on files this degenerate.</para>
+    /// </summary>
+    [Fact]
+    public void ADegenerateGroupsForecastIsFlooredAtTheMinimumTermsPerEvent()
+    {
+        var bare   = new PropShape(0, 0);
+        var groups = MergeAndMeasure(bare, bare, sourcesBefore: 8, sourcesAfter: 8, eventsPerSource: 4_000,
+                                     withService: false, name: "bare");
+
+        _out.WriteLine($"  bare events, {groups.Count} groups");
+        foreach (var g in groups)
+            _out.WriteLine($"  {g.Index,4} | {g.Events,7:N0} events | {g.Terms / (double)g.Events,4:F1} terms/ev | " +
+                           $"{g.BloomBytes * 8.0 / g.Events,5:F1} filter bits/event");
+
+        Assert.True(groups.Count >= 3, $"{groups.Count} group(s) — not enough to have a forecast carried into one");
+
+        for (int i = 1; i < groups.Count; i++)
+        {
+            double termsPerEvent = groups[i].Terms / (double)groups[i].Events;
+            double bitsPerEvent  = groups[i].BloomBytes * 8.0 / groups[i].Events;
+
+            // The floor is what is being tested, so first prove the measurement would have gone
+            // under it: doubled, this shape is still below the floor.
+            Assert.True(termsPerEvent * 2 < SegmentWriter.MinBloomTermsPerEvent,
+                $"group {i} holds {termsPerEvent:F1} terms/event — not degenerate enough for the floor to bind, " +
+                "so this test proves nothing about it");
+
+            // The last group is short (it holds whatever is left), which makes its forecast
+            // generous rather than tight — so the bound is one-sided and only ever too weak here.
+            Assert.True(bitsPerEvent >= SegmentWriter.MinBloomTermsPerEvent * 10 * 0.9,
+                $"group {i} was sized at {bitsPerEvent:F1} filter bits/event, under the " +
+                $"{SegmentWriter.MinBloomTermsPerEvent * 10} the floor buys — the forecast followed the " +
+                "degenerate measurement down");
+        }
+    }
+
     private readonly record struct GroupCost(int Index, long Events, long Terms, long BloomBytes, long PayloadBytes);
 
     private List<GroupCost> MergeAndMeasure(
-        PropShape before, PropShape after, int sourcesBefore, int sourcesAfter, int eventsPerSource)
+        PropShape before, PropShape after, int sourcesBefore, int sourcesAfter, int eventsPerSource,
+        bool withService = true, string name = "merged")
     {
-        string sub = Path.Combine(_dir, $"src-{before.Count}x{before.ValueChars}-{after.Count}x{after.ValueChars}");
+        string sub = Path.Combine(_dir, $"src-{name}-{before.Count}x{before.ValueChars}-{after.Count}x{after.ValueChars}");
         Directory.CreateDirectory(sub);
 
         // Non-overlapping in time, and the merge reads in timestamp order, so every "before"
@@ -135,13 +180,13 @@ public sealed class BloomStepSizingProbe : IDisposable
         long origin = new DateTimeOffset(2026, 8, 1, 0, 0, 0, TimeSpan.Zero).UtcTicks;
         var  paths  = new List<string>(sourcesBefore + sourcesAfter);
         for (int s = 0; s < sourcesBefore; s++)
-            paths.Add(WriteSource(sub, s, eventsPerSource, before,
+            paths.Add(WriteSource(sub, s, eventsPerSource, before, withService,
                                   origin + (long)s * eventsPerSource * TimeSpan.TicksPerMillisecond));
         for (int s = 0; s < sourcesAfter; s++)
-            paths.Add(WriteSource(sub, sourcesBefore + s, eventsPerSource, after,
+            paths.Add(WriteSource(sub, sourcesBefore + s, eventsPerSource, after, withService,
                                   origin + (long)(sourcesBefore + s) * eventsPerSource * TimeSpan.TicksPerMillisecond));
 
-        string p     = Path.Combine(_dir, "merged.seg");
+        string p     = Path.Combine(_dir, name + ".seg");
         var    built = new List<SegmentIndexBuilder>();
         using (var source = MergingSegmentEventSource.Open(paths))
         using (var writer = new SegmentWriter(p, GroupBudget))
@@ -176,7 +221,8 @@ public sealed class BloomStepSizingProbe : IDisposable
         return costs;
     }
 
-    private static string WriteSource(string dir, int sourceIndex, int events, PropShape shape, long baseTicks)
+    private static string WriteSource(string dir, int sourceIndex, int events, PropShape shape,
+                                      bool withService, long baseTicks)
     {
         string path = Path.Combine(dir, $"src-{sourceIndex:D2}.seg");
         if (File.Exists(path)) return path;
@@ -184,7 +230,7 @@ public sealed class BloomStepSizingProbe : IDisposable
         var pool = new StringInternPool();
         using var hot = new HotTierSegment(events + 1, (long)events * 2048 + (32L << 20));
         int tmplIdx = pool.Intern("Settlement {Stage} for wallet {Wallet} finished with {Status}");
-        int svcIdx  = pool.Intern("Etisalat.Payments.Settlement");
+        int svcIdx  = withService ? pool.Intern("Etisalat.Payments.Settlement") : -1;
 
         var rng = new Random(4242 + sourceIndex);
         var buf = new ArrayBufferWriter<byte>(4096);
