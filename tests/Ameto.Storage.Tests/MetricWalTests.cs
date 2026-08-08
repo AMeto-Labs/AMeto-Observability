@@ -730,6 +730,47 @@ public sealed class MetricWalTests : IDisposable
             $"LOST {expected - durable} of {expected} ACKNOWLEDGED points ({durable} durable)");
     }
 
+    /// <summary>
+    /// The second caller of <c>DisposeAsync</c> must not return before the first has finished.
+    /// Both are real at host shutdown — the hosted service disposes the engine from StopAsync
+    /// and from its own DisposeAsync, and the container disposes the singleton — and the
+    /// shutdown timeout makes them concurrent rather than sequential. Returning on the
+    /// _disposed exchange handed the loser a completion guarantee it had never waited for: it
+    /// came back in about a millisecond with the flush still inside FlushHotTierAsync, and the
+    /// process is then free to exit on top of it.
+    /// </summary>
+    [Fact]
+    public async Task A_second_dispose_waits_for_the_first_rather_than_returning()
+    {
+        var engine = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
+        long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+
+        engine.Ingest(SlowFlushBatch(baseNano));
+        var writing = engine.ScheduleThresholdFlushForTest();
+        await DrainedAsync(engine);
+        Assert.False(writing.IsCompleted, "setup: the flush must still be writing its files");
+
+        // Observed AT each caller's return, not afterwards — the question is what a caller is
+        // entitled to believe the moment it gets control back.
+        static async Task<(bool FlushDone, int Running)> DisposeAndLook(
+            MetricStorageEngine e, Task flush)
+        {
+            await e.DisposeAsync();
+            return (flush.IsCompleted, e.RunningThresholdFlushes);
+        }
+
+        var seen = await Task.WhenAll(Task.Run(() => DisposeAndLook(engine, writing)),
+                                      Task.Run(() => DisposeAndLook(engine, writing)));
+
+        foreach (var (flushDone, running) in seen)
+        {
+            Assert.True(flushDone,
+                "DisposeAsync returned while the threshold flush was still writing its files");
+            Assert.True(running == 0,
+                $"DisposeAsync returned with {running} threshold flush(es) inside FlushHotTierAsync");
+        }
+    }
+
     [Fact]
     public async Task Existing_files_survive_the_upgrade_and_stay_queryable()
     {
