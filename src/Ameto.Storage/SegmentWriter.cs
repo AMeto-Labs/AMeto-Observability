@@ -130,11 +130,11 @@ public sealed class SegmentWriter : IDisposable
     /// <summary>
     /// Header flag: this segment's blocks are LZ4-HC, not the fast flush level.
     ///
-    /// <para>Same bit the retired background re-compressor set, and deliberately so: on disk
+    /// <para>Same bit the deleted background re-compressor set, and deliberately so: on disk
     /// 0x02 has always meant "these blocks are HC", and a v4/v5 file that sweep already
-    /// rewrote keeps saying exactly that. Nothing in the read path consults it — LZ4 block
-    /// output is level-independent — it is a diagnostic, so "is my cold data actually
-    /// compressed hard?" is answerable from the file rather than from a log line.</para>
+    /// rewrote on an older build keeps saying exactly that. Nothing in the read path consults
+    /// it — LZ4 block output is level-independent — it is a diagnostic, so "is my cold data
+    /// actually compressed hard?" is answerable from the file rather than from a log line.</para>
     /// </summary>
     public  const byte   FlagHighCompression = 0x02;
 

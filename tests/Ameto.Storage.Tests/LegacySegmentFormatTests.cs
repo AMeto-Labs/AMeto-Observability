@@ -236,6 +236,12 @@ public sealed class LegacySegmentFormatTests : IDisposable
     /// mixed-level legacy files of different versions in, one v7 file out, every row present
     /// and byte-identical, and the output's MinLevel equal to the sources' minimum (which is
     /// what keeps its retention deadline the same as theirs).
+    ///
+    /// <para>This path is also the ONLY thing that HC-compresses legacy data now. A background
+    /// sweep used to rewrite v4/v5 envelopes in place at LZ4-HC; it was deleted because it
+    /// could not be taught v7, and the guarantee it provided moved here — a legacy segment
+    /// reaches HC by being merged. So the output's high-compression flag is asserted rather
+    /// than assumed: it is the observable end of that guarantee.</para>
     /// </summary>
     [Fact]
     public void AMixedLevelV4AndV5MergeIntoAV7FileWithoutLosingARow()
@@ -256,7 +262,11 @@ public sealed class LegacySegmentFormatTests : IDisposable
             Assert.Equal(LogLevel.Debug, info.MinLevel);
         }
 
-        Assert.Equal(7, BinaryPrimitives.ReadUInt16LittleEndian(File.ReadAllBytes(outPath).AsSpan(4)));
+        var outHeader = File.ReadAllBytes(outPath);
+        Assert.Equal(7, BinaryPrimitives.ReadUInt16LittleEndian(outHeader.AsSpan(4)));
+        // Flags byte: the sources came in at the fast flush level (0x01 alone); merging is what
+        // puts legacy blocks on HC, so the output must carry 0x02 as well.
+        Assert.Equal(SegmentWriter.FlagCompressed | SegmentWriter.FlagHighCompression, outHeader[39]);
 
         var expected = a.Concat(b)
             .OrderBy(r => r.Ticks).ThenBy(r => r.Id)

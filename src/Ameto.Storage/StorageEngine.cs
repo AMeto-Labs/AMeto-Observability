@@ -70,8 +70,8 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     private readonly ConcurrentDictionary<Task, byte>    _inFlightFlushes = new();
     private readonly CancellationTokenSource               _cts        = new();
     private readonly Task                                  _flushLoop;
-    /// <summary>Low-priority sweep re-compressing cold segments from fast-LZ4 to HC.</summary>
-    private readonly Task                                  _recompressLoop;
+    /// <summary>Low-priority cold-tier loop: merge recovery, then small-segment merges.</summary>
+    private readonly Task                                  _maintenanceLoop;
     /// <summary>Test hook: lets merge run without an index builder (tests verify the scan fallback).</summary>
     internal bool _allowIndexlessMerge;
     /// <summary>Test hook: shrinks the index-group budget so a small segment still spans several groups.</summary>
@@ -300,30 +300,24 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
         // Age-based flush loop
         _flushLoop = RunFlushLoopAsync(_cts.Token);
-        // Cold-segment HC re-compression sweep (one-time per segment, ~20-30 % smaller)
-        _recompressLoop = RunRecompressLoopAsync(_cts.Token);
+        // Cold-tier maintenance: interrupted-merge recovery + small-segment merges
+        _maintenanceLoop = RunColdMaintenanceLoopAsync(_cts.Token);
     }
 
     /// <summary>
-    /// Cold-tier maintenance: first MERGE small segments into large ones (a
-    /// long-running server accumulates thousands of ~100 KB age-flush segments —
-    /// per-file index/catalog overhead dwarfs the payload), then re-compress
-    /// whatever segments remain on the fast flush-path LZ4 level to LZ4-HC
-    /// (see <see cref="SegmentRecompressor"/>). Both are one-shot per segment and
-    /// paced by bytes; the flush path stays untouched, so ingest is unaffected.
+    /// Cold-tier maintenance: finish any interrupted merge, then MERGE small segments into
+    /// large ones. A long-running server accumulates thousands of ~100 KB age-flush segments
+    /// and per-file index/catalog overhead dwarfs their payload. Paced by a pause between
+    /// batches; the flush path stays untouched, so ingest is unaffected.
+    ///
+    /// <para>This loop also ran a one-shot LZ4-HC sweep over cold segments, removed once the
+    /// merge started writing <see cref="SegmentCompression.High"/> itself. The sweep could
+    /// only rewrite v4/v5 envelopes, so on a v7 catalog it walked every segment on every tick
+    /// and rewrote none — see the commit that deleted it for why a v7-capable transform is
+    /// not worth having.</para>
     /// </summary>
-    private async Task RunRecompressLoopAsync(CancellationToken ct)
+    private async Task RunColdMaintenanceLoopAsync(CancellationToken ct)
     {
-        const long MaxBytesPerPass = 96L * 1024 * 1024;
-        const int  MaxAttempts     = 3;   // per segment; a persistently locked file must not stall the sweep
-        // A pass below the shared floor does NOT get a maintenance release. The idle
-        // steady-state pass recompresses the one or two tiny segments flushed since the
-        // last tick ("saved 0.0 MB") — a day's log showed that shape paying a blocking
-        // compacting gen2 + working-set dump six times an hour, around the clock, with
-        // the working set sawing between ~50 and ~130 MB. The burst worth returning is
-        // proportional to the bytes a pass actually chewed through, so gate on that.
-        var attempts = new Dictionary<ulong, int>();
-
         // Wait for the catalog ENUMERATION, not for a guess at how long it takes. It opens every
         // .seg with computeUncompressedBytes: true, which is slowest in exactly the
         // thousands-of-small-segments case compaction exists for — so a fixed delay can expire
@@ -346,9 +340,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             try { RecoverInterruptedMerges(); }
             catch (Exception ex) { _logger.LogWarning(ex, "Merge recovery sweep failed"); }
 
-            // Merge takes priority: HC-ing a tiny file that a later merge rewrites
-            // anyway would be wasted work. One batch per iteration, short pause
-            // while a backlog exists.
+            // One batch per iteration, short pause while a backlog exists.
             bool merged;
             try { merged = await TryMergeSmallSegmentsOnceAsync(ct); }
             catch (OperationCanceledException) { break; }
@@ -359,59 +351,22 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 // index builders. Hand that back to the OS instead of letting the
                 // allocator sit on it until the next burst (RSS otherwise ratchets
                 // up across passes and never comes down on an idle server).
+                //
+                // Gated on a merge having HAPPENED, which is what keeps an idle server from
+                // paying for this. The removed HC sweep had its own release behind a bytes
+                // floor for the same reason: its idle pass rewrote the one or two tiny
+                // segments flushed since the last tick ("saved 0.0 MB") and a day's log
+                // showed that shape paying a blocking compacting gen2 plus a working-set
+                // dump six times an hour, around the clock, the working set sawing between
+                // ~50 and ~130 MB. With the sweep gone an idle tick does no work at all, so
+                // there is nothing to release and no floor to test.
                 ReleaseMaintenanceMemory();
                 try { await Task.Delay(TimeSpan.FromSeconds(15), ct); }
                 catch (OperationCanceledException) { break; }
                 continue;
             }
-            int  done = 0;
-            long passBytes = 0, savedTotal = 0;
-            foreach (var (segId, info) in _segments)
-            {
-                if (ct.IsCancellationRequested || passBytes >= MaxBytesPerPass) break;
-                int tried = attempts.GetValueOrDefault(segId);
-                if (tried >= MaxAttempts) continue;
-                if (!SegmentRecompressor.IsCandidate(info.FilePath))
-                {
-                    attempts[segId] = MaxAttempts; // done already / not applicable — never re-check
-                    continue;
-                }
 
-                long? saved = await Task.Run(
-                    () => SegmentRecompressor.Recompress(info.FilePath, _logger, ct), ct);
-                done++;
-                passBytes += Math.Max(info.CompressedBytes, 1);
-                if (saved is > 0)
-                {
-                    attempts[segId] = MaxAttempts;
-                    savedTotal += saved.Value;
-                    // Keep the catalog's size accurate for diagnostics.
-                    _segments.TryUpdate(segId, new SegmentInfo
-                    {
-                        Id                = info.Id,
-                        NodeId            = info.NodeId,
-                        FilePath          = info.FilePath,
-                        MinTimestampTicks = info.MinTimestampTicks,
-                        MaxTimestampTicks = info.MaxTimestampTicks,
-                        EventCount        = info.EventCount,
-                        MinLevel          = info.MinLevel,
-                        CompressedBytes   = Math.Max(0, info.CompressedBytes - saved.Value),
-                        UncompressedBytes = info.UncompressedBytes,
-                    }, info);
-                }
-                else
-                {
-                    attempts[segId] = tried + 1; // busy or skipped — bounded retries
-                }
-            }
-
-            if (savedTotal > 0)
-                _logger.LogInformation("Recompressed {Count} log segment(s), saved {Mb:F1} MB",
-                    done, savedTotal / 1048576.0);
-
-            if (done > 0 && passBytes >= AggressiveGcGate.MaintenancePassBytesFloor) ReleaseMaintenanceMemory();
-
-            try { await Task.Delay(TimeSpan.FromSeconds(passBytes >= MaxBytesPerPass ? 30 : 600), ct); }
+            try { await Task.Delay(TimeSpan.FromSeconds(600), ct); }
             catch (OperationCanceledException) { break; }
         }
     }
@@ -2292,7 +2247,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         try { await _flushLoop; }
         catch (OperationCanceledException) { }
         catch (ObjectDisposedException) { }
-        try { await _recompressLoop; }
+        try { await _maintenanceLoop; }
         catch (OperationCanceledException) { }
         catch (ObjectDisposedException) { }
 
