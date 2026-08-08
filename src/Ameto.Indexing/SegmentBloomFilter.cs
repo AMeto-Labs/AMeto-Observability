@@ -319,6 +319,27 @@ public sealed unsafe class SegmentBloomFilter : IDisposable
         uint capacityWord = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(data[4..]);
         bool folded       = (capacityWord & FoldedMarker) != 0;
         uint capacity     = capacityWord & ~FoldedMarker;
+
+        // CHECKED BEFORE THE ALLOCATION, because the allocation is NativeMemory and the thing
+        // that would throw after it is the copy. A section whose header overstates its own length
+        // used to allocate first and fail on the Slice, and by then the pointer lived only in a
+        // local of a frame that was unwinding — no owner constructed, no finaliser on this class,
+        // nothing to free it. One blob claiming 0xFFFFFFFF bits committed 513 MB and lost it.
+        //
+        // What made that unbounded rather than a one-off is the caller: QueryExecutor's prefilter
+        // catches per group, per segment, per query and falls back to a full scan, so the same
+        // corrupt section is re-read and re-leaked by every query that touches it, forever, while
+        // every managed-heap instrument reads flat.
+        //
+        // The multiple-of-512 check is the same guard wearing its other face. A bitCount in
+        // [8, 512) passes the length test on a tiny blob and yields blockCount == 0, which is a
+        // DivideByZeroException inside Add/MightContain rather than at construction — thrown from
+        // under the pooled buffers AddRaw and MightContainRaw take, which they return without a
+        // finally. The format has always required the multiple; nothing enforced it.
+        if (bitCount == 0 || (bitCount & (uint)(BlockBits - 1)) != 0 || data.Length < 8L + bitCount / 8)
+            throw new InvalidDataException(
+                $"Bloom section declares {bitCount} bits ({bitCount / 8} bytes) in a {data.Length}-byte section");
+
         uint blockCount   = bitCount / BlockBits;
         uint byteCount    = bitCount / 8;
 
