@@ -430,6 +430,14 @@ public sealed class SegmentBucketCompactionTests : IAsyncLifetime
     /// Compaction must not move any event's deadline. Merged files stay level-pure, so a
     /// 3-day-TTL Debug bucket expires whole and a 90-day Error bucket beside it — same days, same
     /// merge passes — loses nothing.
+    ///
+    /// <para>That conclusion rests on every SOURCE being level-pure, which is true of everything
+    /// this build writes and is why the test stages its data through the flush path. It is NOT
+    /// true of files inherited from a build older than the level split: those are mixed, report
+    /// the lowest level they hold, and merge into a mixed output carrying that level's TTL. That
+    /// is accepted, self-healing behaviour, pinned by
+    /// <c>SegmentMergeTests.Merge_CarriesALegacyMixedLevelSegmentForward_Accepted</c> — do not
+    /// read this test as covering it.</para>
     /// </summary>
     [Fact]
     public async Task RetentionDeletesExactlyTheExpiredBuckets()
