@@ -186,6 +186,58 @@ public sealed class SegmentMergeTests : IAsyncLifetime
         Assert.Equal(services.Length,  after.Select(e => e.Service).Distinct().Count());
     }
 
+    /// <summary>
+    /// ONE STRING PER DISTINCT VALUE, not one per event — the thing the dedup table is for, and
+    /// the thing it did not do while the cursor decoded a template and a service name out of the
+    /// block before asking the table whether it already held them. The table always answered yes;
+    /// the two fresh strings went to Gen0 unread.
+    ///
+    /// <para>Measured on the merge SOURCE alone, with no writer downstream, because that is the
+    /// only resolution at which the answer is visible. Through a whole merge pass the two strings
+    /// come to ~88 B an event inside a total of a few megabytes, which is why
+    /// <see cref="Merge_AllocationStaysFlatAcrossALargeBacklog"/> — the assertion this claim used
+    /// to be written beside — reads 5 MB with the decode and 3 MB without it, against a bound of
+    /// 20. Here they are nearly the whole reading: the cursor otherwise hands out spans over the
+    /// block it already holds, so a drained source allocates essentially nothing per event.</para>
+    ///
+    /// <para>The warm-up pass is not ceremony. The block buffers come from
+    /// <see cref="System.Buffers.ArrayPool{T}"/>, and a first rent against an empty pool
+    /// allocates — over 20 000 events that alone would be larger than the signal.</para>
+    /// </summary>
+    [Fact]
+    public async Task Merge_BuildsAStringPerDistinctValue_NotPerEvent()
+    {
+        for (int round = 0; round < 8; round++)
+            await WriteSegmentAsync(round, 2_500);
+        var sources = Directory.GetFiles(Path.Combine(_dir, "segments"), "*.seg").Order().ToList();
+        Assert.Equal(8, sources.Count);
+
+        Assert.Equal(20_000, DrainMerge(sources, out _));
+
+        long   events   = DrainMerge(sources, out long bytes);
+        double perEvent = bytes / (double)events;
+
+        // Three templates and four service names across the whole 20 000, so the honest cost of
+        // this loop is seven strings. 8 B/event allows over a hundred of them and is still an
+        // order of magnitude under the ~88 B two throwaway strings a row come to.
+        Assert.True(perEvent < 8.0,
+            $"the merge source allocated {perEvent:F1} B/event draining {events:N0} events — it is " +
+            "building a template and a service name per row again, for values already in the table");
+    }
+
+    /// <summary>Drains a k-way merge of <paramref name="sources"/> and reports what the DRAIN
+    /// allocated — opening and closing the sources sits outside the measurement.</summary>
+    private static long DrainMerge(List<string> sources, out long allocatedBytes)
+    {
+        using var src = MergingSegmentEventSource.Open(sources);
+
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        long events = 0;
+        while (src.TryReadNext(out _)) events++;
+        allocatedBytes = GC.GetAllocatedBytesForCurrentThread() - before;
+        return events;
+    }
+
     [Fact]
     public async Task Merge_RefusesTinyBatches_WhileRecent()
     {
@@ -523,10 +575,11 @@ public sealed class SegmentMergeTests : IAsyncLifetime
         // payload. (These merges run without an index sink — the index build's own state is
         // bounded by the group budget and measured by IndexGroupMemoryProbe.)
         //
-        // Per event, over these 20k: 265.8 B while the cursor decoded every template and service
-        // name before deduplicating the result, 177.8 B once the dedup table began probing by
-        // UTF-8. The 88 B is exactly the two strings a row used to build and drop — one ~15-char
-        // template, one 5-char service name — for values already sitting in the table.
+        // This bound is about the STREAM, not about the cursor's strings. Per event these 20k
+        // ran 265.8 B while the cursor decoded every template and service name before
+        // deduplicating the result and 177.8 B once the table began probing by UTF-8 — 5 MB
+        // against 3 MB here, both comfortably inside 20, so nothing in this assertion can see the
+        // difference. Merge_BuildsAStringPerDistinctValue_NotPerEvent is where that is measured.
         Assert.True(allocMb < 20, $"merge allocated {allocMb} MB streaming 40 MB of payload");
     }
 
