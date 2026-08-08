@@ -14,8 +14,16 @@ public sealed class MetricWalTests : IDisposable
 {
     private readonly string _dir = Path.Combine(Path.GetTempPath(), "ameto-mwal-" + Guid.NewGuid().ToString("N"));
 
+    /// <summary>Set by <see cref="FreezeDataDir"/> — see there for what it holds.</summary>
+    private string? _frozen;
+
     public MetricWalTests() => Directory.CreateDirectory(_dir);
-    public void Dispose() { try { Directory.Delete(_dir, true); } catch { } }
+
+    public void Dispose()
+    {
+        try { Directory.Delete(_dir, true); } catch { }
+        if (_frozen is not null) { try { Directory.Delete(_frozen, true); } catch { } }
+    }
 
     private string WalPath  => Path.Combine(_dir, "metrics.wal");
     private string PoolPath => WalPath + ".pool";
@@ -484,6 +492,186 @@ public sealed class MetricWalTests : IDisposable
 
         Assert.Equal(threads, labels);
         Assert.Equal((long)threads * perThread, total);
+    }
+
+    // ── Shutdown versus a flush that belongs to neither background loop ───────
+
+    /// <summary>
+    /// A tier whose files take long enough to write that the flush is provably still running
+    /// while shutdown does its work — 300 000 points over 2 000 series, which is also
+    /// comfortably under <c>HotFlushThreshold</c>, so the only flushes in these tests are the
+    /// ones they schedule.
+    /// </summary>
+    private static MetricIngestItem[] SlowFlushBatch(
+        long baseNano, string seriesPrefix = "s", int series = 2_000, int pointsPerSeries = 150)
+    {
+        var items = new List<MetricIngestItem>(series * pointsPerSeries);
+        for (int s = 0; s < series; s++)
+        for (int p = 0; p < pointsPerSeries; p++)
+            items.Add(Scalar("instrument.0", baseNano + p * 1_000_000L, p,
+                             Labels(("series", seriesPrefix + s))));
+        return [.. items];
+    }
+
+    /// <summary>Waits until a scheduled flush has taken its snapshot and moved on to the files.</summary>
+    private static async Task DrainedAsync(MetricStorageEngine engine)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (engine.HotPointCount > 0)
+        {
+            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(30), "the scheduled flush never took its snapshot");
+            await Task.Delay(1);
+        }
+    }
+
+    /// <summary>
+    /// Copies the data directory as it stands, which is what killing the process at this
+    /// instant would leave behind. A file still being written is held with
+    /// <see cref="FileShare.None"/> by the writer, so it copies as "not there" — which is
+    /// exactly what it would be.
+    /// </summary>
+    private string FreezeDataDir()
+    {
+        _frozen = _dir + "-frozen";
+        Directory.CreateDirectory(_frozen);
+        foreach (var f in Directory.GetFiles(_dir))
+        {
+            try { File.Copy(f, Path.Combine(_frozen, Path.GetFileName(f))); }
+            catch (IOException) { /* mid-write — a kill would not have it either */ }
+        }
+        return _frozen;
+    }
+
+    /// <summary>
+    /// Everything durable in <paramref name="dir"/>, counted the way the next start counts it:
+    /// the log replayed into the hot tier plus every cold file. Short of what was ingested
+    /// means points were lost, over means they came back twice.
+    /// </summary>
+    private static async Task<long> DurablePointsAsync(string dir, string metric)
+    {
+        var reader = new MetricStorageEngine(dir, NullLogger<MetricStorageEngine>.Instance);
+        var series = await QueryWhenColdLoadedAsync(reader, metric);
+        long total = series.Sum(s => (long)s.Points.Count);
+        await reader.DisposeAsync();
+        return total;
+    }
+
+    private static string Verdict(long durable, long expected) =>
+        durable < expected
+            ? $"LOST {expected - durable} of {expected} points"
+            : $"DUPLICATED {durable - expected} points ({durable} where {expected} were ingested)";
+
+    /// <summary>
+    /// Two threshold flushes, where the one that finishes FIRST is the one whose handle is
+    /// published LAST: a thread descheduled between starting its flush and storing the handle
+    /// stores an already-completed task over a live one. A single <c>Task</c> field then holds
+    /// a task that is done, and shutdown walks straight past the flush still writing its
+    /// files. Membership in a set cannot be overwritten, so there is no order to lose.
+    /// </summary>
+    [Fact]
+    public async Task A_finished_flush_cannot_hide_one_that_is_still_writing()
+    {
+        var engine = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
+        long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+
+        engine.Ingest(SlowFlushBatch(baseNano));
+        var writing = engine.ScheduleThresholdFlushForTest();
+        await DrainedAsync(engine);                          // past its snapshot, into the files
+
+        // Empty tier, so this returns at snapshot.Count == 0 — the flush that finishes first
+        // and publishes last.
+        await engine.ScheduleThresholdFlushForTest();
+        Assert.False(writing.IsCompleted, "setup: the first flush must still be writing its files");
+
+        await engine.DisposeAsync();
+        int running = engine.RunningThresholdFlushes;
+
+        Assert.True(running == 0,
+            $"DisposeAsync returned with {running} threshold flush(es) still inside FlushHotTierAsync, " +
+            "with the WAL and both locks being disposed underneath them");
+        Assert.True(writing.IsCompletedSuccessfully, "the tracked flush did not complete cleanly");
+        Assert.True(TrcCount(_dir, "*.mts") > 0);
+    }
+
+    /// <summary>
+    /// The other half of "shutdown cannot see it". A single handle is read once and cannot
+    /// cover a flush scheduled afterwards, and ingest is deliberately NOT gated on shutdown —
+    /// hosted services stop in reverse registration order, so Kestrel serves
+    /// <c>/otlp/v1/metrics</c> throughout this. Scheduled here at the worst possible moment,
+    /// after DisposeAsync has already returned: the flush must find the door shut rather than
+    /// enter a disposed lock.
+    /// </summary>
+    [Fact]
+    public async Task A_flush_scheduled_after_shutdown_touches_nothing()
+    {
+        var engine = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
+        long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+        engine.Ingest(Minute(baseNano, metricNames: 4, seriesPerName: 50));
+
+        await engine.DisposeAsync();
+
+        var orphan = engine.ScheduleThresholdFlushForTest();
+        await orphan;   // ObjectDisposedException out of here is the defect, not a flaky test
+        Assert.Equal(0, engine.RunningThresholdFlushes);
+    }
+
+    /// <summary>
+    /// The loss variant, and the one that actually bites in production: ingest is still
+    /// flowing, so the loop's final flush has real data, opens generation G+1 and COMMITS it —
+    /// which reclaims everything at or below G+1, the orphan's own generation G included. Its
+    /// records leave the log while its file is still being written, so a kill at that instant
+    /// finds them in neither place. Measured exactly that way: the directory is frozen the
+    /// instant DisposeAsync returns.
+    /// </summary>
+    [Fact]
+    public async Task A_kill_the_instant_shutdown_returns_loses_nothing_when_the_tier_was_not_empty()
+    {
+        var engine = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
+        long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+
+        var flushed = SlowFlushBatch(baseNano);
+        engine.Ingest(flushed);
+        var writing = engine.ScheduleThresholdFlushForTest();
+        await DrainedAsync(engine);
+        await engine.ScheduleThresholdFlushForTest();        // the handle a single field keeps
+        Assert.False(writing.IsCompleted, "setup: the orphan must still be writing its files");
+
+        var stillArriving = SlowFlushBatch(baseNano + 3_600_000_000_000L, "late", series: 200, pointsPerSeries: 10);
+        engine.Ingest(stillArriving);                        // tier NOT empty at the final flush
+
+        await engine.DisposeAsync();
+        string frozen = FreezeDataDir();
+
+        long expected = flushed.Length + stillArriving.Length;
+        long durable  = await DurablePointsAsync(frozen, "instrument.0");
+        Assert.True(durable == expected, Verdict(durable, expected));
+    }
+
+    /// <summary>
+    /// The duplicate variant, which is what the tier being empty turns the same shutdown into:
+    /// the final flush returns at <c>snapshot.Count == 0</c> before <c>BeginFlush</c>, so the
+    /// orphan's generation is never superseded and never committed — the log still holds every
+    /// point whose file the orphan did land. Measured after everything settles, because that
+    /// is when it shows: on the next start, beside the file.
+    /// </summary>
+    [Fact]
+    public async Task A_quiesced_tier_does_not_replay_the_orphans_points_beside_its_file()
+    {
+        var engine = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
+        long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+
+        var flushed = SlowFlushBatch(baseNano);
+        engine.Ingest(flushed);
+        var writing = engine.ScheduleThresholdFlushForTest();
+        await DrainedAsync(engine);
+        await engine.ScheduleThresholdFlushForTest();        // the handle a single field keeps
+        Assert.False(writing.IsCompleted, "setup: the orphan must still be writing its files");
+
+        await engine.DisposeAsync();                          // tier quiesced — no final flush data
+        try { await writing; } catch (ObjectDisposedException) { /* the orphan's own end */ }
+
+        long durable = await DurablePointsAsync(_dir, "instrument.0");
+        Assert.True(durable == flushed.Length, Verdict(durable, flushed.Length));
     }
 
     [Fact]
