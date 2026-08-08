@@ -34,10 +34,18 @@ internal static class MergeBucketGrid
     /// This bucket is always OPEN — its window has not ended, so a merge inside it needs the full
     /// <see cref="StorageEngine.MergeMinSources"/> fanout.
     /// </summary>
-    internal static long OpenBucketStart(LogLevel level, RetentionPolicy? policy = null)
+    internal static long OpenBucketStart(LogLevel level, RetentionPolicy? policy = null) =>
+        OpenBucketStartAt(DateTime.UtcNow.Ticks, level, policy);
+
+    /// <summary>
+    /// <see cref="OpenBucketStart"/> with "now" as a free variable, so
+    /// <c>MergeBucketGridSweepTests</c> can evaluate the predicate at every position inside a
+    /// bucket instead of only at whatever instant the suite happens to run.
+    /// </summary>
+    internal static long OpenBucketStartAt(long nowTicks, LogLevel level, RetentionPolicy? policy = null)
     {
         long width = BucketWidth(level, policy);
-        return DateTime.UtcNow.Ticks / width * width;
+        return nowTicks / width * width;
     }
 
     /// <summary>
@@ -56,12 +64,21 @@ internal static class MergeBucketGrid
     /// make the tests pass for a second reason — distance — and stop exercising the boundary they
     /// are about; this returns the closest position to now that is provably sealed.</para>
     /// </summary>
-    internal static long SealedBucketStart(LogLevel level, int bucketsSpanned = 1, RetentionPolicy? policy = null)
+    internal static long SealedBucketStart(LogLevel level, int bucketsSpanned = 1, RetentionPolicy? policy = null) =>
+        SealedBucketStartAt(DateTime.UtcNow.Ticks, level, bucketsSpanned, policy);
+
+    /// <summary>
+    /// <see cref="SealedBucketStart"/> with "now" as a free variable. The claim above — "the
+    /// margin holds at every instant" — is a claim about ALL values of now, and a suite that
+    /// runs at one instant cannot check it; <c>MergeBucketGridSweepTests</c> sweeps this overload
+    /// across a full bucket period so the guarantee is machine-checked rather than argued.
+    /// </summary>
+    internal static long SealedBucketStartAt(long nowTicks, LogLevel level, int bucketsSpanned = 1, RetentionPolicy? policy = null)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(bucketsSpanned, 1);
 
         long width = BucketWidth(level, policy);
-        long nowBucketStart = DateTime.UtcNow.Ticks / width * width;
+        long nowBucketStart = nowTicks / width * width;
 
         // The newest sealed bucket starts at nowBucketStart - 2*width: its window ends at
         // nowBucketStart - width, i.e. at least one full width before now. Older buckets stack
