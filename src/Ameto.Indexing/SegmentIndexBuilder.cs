@@ -154,12 +154,12 @@ public sealed class SegmentIndexBuilder : ISegmentIndexSink
         var exception = ev.DecodeException();
         if (exception is not null)
         {
-            _inverted.Add(offset, "@x.exists", "true");
-            _bloom.Add("@x.exists");
+            _inverted.Add(offset, ClefFields.ExceptionExists, "true");
+            _bloom.Add(ClefFields.ExceptionExists);
 
             if (!string.IsNullOrEmpty(exception.Type))
             {
-                _inverted.Add(offset, "@x.type", exception.Type);
+                _inverted.Add(offset, ClefFields.ExceptionType, exception.Type);
                 _bloom.Add(exception.Type);
                 if (exception.Type.Length >= 3) _trigram.Add(offset, exception.Type);
             }
@@ -167,7 +167,7 @@ public sealed class SegmentIndexBuilder : ISegmentIndexSink
                 _trigram.Add(offset, exception.Message);
             if (exception.Inner is { Type.Length: > 0 } inner)
             {
-                _inverted.Add(offset, "@x.inner.type", inner.Type);
+                _inverted.Add(offset, ClefFields.ExceptionInnerType, inner.Type);
                 _bloom.Add(inner.Type);
             }
         }
@@ -276,7 +276,7 @@ public sealed class SegmentIndexBuilder : ISegmentIndexSink
                 // serialised = "\0d" + R-format; plain = same digits (default ToString == R in modern .NET).
                 _val[0] = '\0'; _val[1] = 'd';
                 EnsureVal(2 + 40);
-                d.TryFormat(_val.AsSpan(2), out int w, "R", System.Globalization.CultureInfo.CurrentCulture);
+                d.TryFormat(_val.AsSpan(2), out int w, "R", System.Globalization.CultureInfo.InvariantCulture);
                 AddNumeric(offset, flatKey, _val.AsSpan(2, w), _val.AsSpan(0, 2 + w));
                 break;
             }
@@ -285,6 +285,7 @@ public sealed class SegmentIndexBuilder : ISegmentIndexSink
                 bool b = reader.ReadBoolean();
                 if (b) { _bloom.Add(flatKey); _bloom.Add("True");  _inverted.AddSpan(offset, flatKey, "\0true");  }
                 else   { _bloom.Add(flatKey); _bloom.Add("False"); _inverted.AddSpan(offset, flatKey, "\0false"); }
+                _trigram.Add(offset, b ? "True" : "False");
                 break;
             }
             case MessagePackType.Nil:
@@ -305,7 +306,7 @@ public sealed class SegmentIndexBuilder : ISegmentIndexSink
     {
         _val[0] = '\0'; _val[1] = 'l';
         EnsureVal(2 + 24);
-        l.TryFormat(_val.AsSpan(2), out int w, default, System.Globalization.CultureInfo.CurrentCulture);
+        l.TryFormat(_val.AsSpan(2), out int w, default, System.Globalization.CultureInfo.InvariantCulture);
         AddNumeric(offset, flatKey, _val.AsSpan(2, w), _val.AsSpan(0, 2 + w));
     }
 
@@ -313,15 +314,34 @@ public sealed class SegmentIndexBuilder : ISegmentIndexSink
     {
         // ulong > long.Max: SerialiseValue default → plain ToString(), no prefix.
         EnsureVal(24);
-        u.TryFormat(_val, out int w, default, System.Globalization.CultureInfo.CurrentCulture);
+        u.TryFormat(_val, out int w, default, System.Globalization.CultureInfo.InvariantCulture);
         plain = serialised = _val.AsSpan(0, w);
     }
 
+    /// <summary>
+    /// Files one numeric scalar: typed value in the inverted bucket, plain digits in the
+    /// bloom, and — since this change — the plain digits in the trigram index too.
+    ///
+    /// <para><c>FilterEvaluator</c>'s <c>contains</c>/<c>startsWith</c>/<c>like</c> stringify
+    /// whatever the property holds (<c>val?.ToString()</c>), so <c>contains(StatusCode,'50')</c>
+    /// matches a msgpack integer 503 on a full scan. The trigram index saw string values only,
+    /// and <c>SegmentTrigramIndex.Lookup</c> reads a missing trigram in a populated index as
+    /// PROOF of absence — so that predicate returned rows while the events were hot and
+    /// dropped the segment unread the moment it flushed.</para>
+    ///
+    /// <para>The alternative was to narrow the SCAN to the index (what free-text search does
+    /// in <c>FilterEvaluator.ValueContainsTerm</c>), but that makes substring search over
+    /// numbers silently match nothing in BOTH tiers — consistent and useless. Widening the
+    /// index is the direction that keeps rows, and an index covering MORE than the scan costs
+    /// a re-check, never a row. Cost is bounded: <c>SegmentTrigramIndex.Add</c> ignores
+    /// anything shorter than three characters, so one- and two-digit values add nothing.</para>
+    /// </summary>
     private void AddNumeric(uint offset, ReadOnlySpan<char> flatKey, ReadOnlySpan<char> plain, ReadOnlySpan<char> serialised)
     {
         _inverted.AddSpan(offset, flatKey, serialised);
         _bloom.Add(flatKey);
         _bloom.Add(plain);
+        _trigram.Add(offset, plain);
     }
 
     private static ReadOnlySpan<byte> ReadStr(ref MessagePackReader reader)
@@ -363,9 +383,13 @@ public sealed class SegmentIndexBuilder : ISegmentIndexSink
             default:
                 _inverted.Add(offset, flatKey, v);
                 _bloom.Add(flatKey);
-                string valStr = v?.ToString() ?? string.Empty;
+                // Invariant, exactly like the streaming path's `plain` — the parity test
+                // compares the two builds byte for byte, and a ru-KZ host formats 2.5 as "2,5".
+                string valStr = IndexValueForms.PlainText(v);
                 _bloom.Add(valStr);
-                if (v is string strVal && strVal.Length >= 3) _trigram.Add(offset, strVal);
+                // Every scalar's text, not just strings — mirrors AddNumeric/AddScalar on the
+                // streaming path, which is what the parity test compares this against.
+                if (valStr.Length >= 3) _trigram.Add(offset, valStr);
                 break;
         }
     }

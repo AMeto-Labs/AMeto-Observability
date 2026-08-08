@@ -256,7 +256,7 @@ public sealed class QueryExecutor : IQueryExecutor
         bool hasInvHints   = invertedHints.Count > 0;
 
         // Fast path: nothing to prefilter — pass every segment through.
-        if (!hasIndexHint && trigramHints.Count == 0)
+        if (!hasIndexHint && !hasInvHints && trigramHints.Count == 0)
         {
             var passthrough = new List<PrefilterResult>(segInfos.Count);
             foreach (var info in segInfos)
@@ -310,22 +310,24 @@ public sealed class QueryExecutor : IQueryExecutor
                         // Bloom bytes are ~a few KB; inverted/trigram can be MB.
                         // For a high-cardinality value (e.g. a GUID), bloom rejects
                         // ~99% of groups here without ever loading the big indexes.
-                        if (hasIndexHint
-                            && filter.TryGetIndexHint(out string hintProp, out object? hintVal))
+                        //
+                        // The gate itself lives in PassesBloomGate rather than inline: it has
+                        // to fold case and probe every value form the scan would accept, and
+                        // an inline copy of that decision is exactly what let the index prune
+                        // rows a scan would have matched.
+                        if (hasIndexHint)
                         {
                             using var bloomSec = reader.RentBloomFilterBytes(g);
                             using var bloom    = SegmentBloomFilter.Deserialise(bloomSec.Span);
-                            string valStr = hintVal?.ToString() ?? string.Empty;
-                            if (!bloom.MightContain(valStr))
+                            if (!PassesBloomGate(filter, bloom))
                                 continue;
-                            _ = hintProp; // inverted check happens via the full index below
                         }
 
                         // Phase 2: only groups that survived (or filters without
                         // an equality hint) load the big indexes for trigram offset
                         // lookup and the inverted-index definitive check.
                         uint[]? groupCandidates = null;
-                        if (trigramHints.Count > 0 || hasIndexHint)
+                        if (trigramHints.Count > 0 || hasIndexHint || hasInvHints)
                         {
                             // Pooled: sections are copied out inside the deserialisers, so the
                             // rented buffers go back to the pool as soon as the index is built.
@@ -340,55 +342,10 @@ public sealed class QueryExecutor : IQueryExecutor
                                 : default;
                             using var idx = _indexFactory.Create(invSec.Span, triSec.Span, bloSec.Span);
 
-                            // Definitive inverted-index check (bloom can have false positives)
-                            if (hasIndexHint
-                                && filter.TryGetIndexHint(out string prop, out object? val)
-                                && !idx.MightContain(prop, val))
-                            {
+                            // A group that is provably empty for this filter is skipped, not
+                            // the whole segment — the next group may still hold matches.
+                            if (!TryNarrowWithIndex(filter, idx, out groupCandidates))
                                 continue;
-                            }
-
-                            bool rejected = false;
-                            if (trigramHints.Count > 0)
-                            {
-                                HashSet<uint>? acc = null;
-                                foreach (var (_, text) in trigramHints)
-                                {
-                                    var offsets = idx.LookupTrigram(text);
-                                    if (offsets is null) continue;
-                                    if (acc is null) acc = new HashSet<uint>(offsets);
-                                    else             acc.IntersectWith(offsets);
-                                    if (acc.Count == 0) { rejected = true; break; }
-                                }
-                                if (rejected) continue;
-                                groupCandidates = acc?.ToArray();
-                            }
-
-                            // Inverted-index event-level narrowing: AND posting lists for all
-                            // equality predicates. This gives exact event offsets within the
-                            // group — the reader will only deserialise those events.
-                            if (hasInvHints)
-                            {
-                                var invOffsets = idx.LookupIntersect(invertedHints);
-                                if (invOffsets is not null)
-                                {
-                                    if (invOffsets.Length == 0) continue;
-
-                                    if (groupCandidates is null)
-                                    {
-                                        groupCandidates = invOffsets;
-                                    }
-                                    else
-                                    {
-                                        var invSet = new HashSet<uint>(invOffsets);
-                                        var merged = new List<uint>(Math.Min(groupCandidates.Length, invOffsets.Length));
-                                        foreach (var o in groupCandidates)
-                                            if (invSet.Contains(o)) merged.Add(o);
-                                        if (merged.Count == 0) continue;
-                                        groupCandidates = [.. merged];
-                                    }
-                                }
-                            }
                         }
 
                         anyGroupSurvived = true;
@@ -421,6 +378,86 @@ public sealed class QueryExecutor : IQueryExecutor
             if (results[i] is { } r)
                 surviving.Add(r);
         return surviving;
+    }
+
+    /// <summary>
+    /// Phase 1 of the prefilter: the cheap bloom-only gate on the equality hint. False drops
+    /// the segment without ever loading the multi-megabyte index sections.
+    ///
+    /// <para>Factored out of the parallel body together with <see cref="TryNarrowWithIndex"/>
+    /// so the tests that assert "the index never costs a query its rows" can run the decision
+    /// this method makes instead of a copy of it. A copy passed while the original was
+    /// reverted, which is the one thing those tests exist to catch.</para>
+    /// </summary>
+    internal static bool PassesBloomGate(CompiledFilter filter, SegmentBloomFilter bloom)
+    {
+        if (!filter.TryGetIndexHint(out _, out object? hintVal)) return true;
+        return SegmentIndexReader.MightContainValue(bloom, hintVal);
+    }
+
+    /// <summary>
+    /// Phase 2: the definitive <c>MightContain</c> gate, trigram offset lookup and inverted
+    /// posting-list narrowing, against an already-loaded index.
+    ///
+    /// <para>Returns false when the segment is provably empty for this filter — the caller
+    /// then never reads it. <paramref name="candidates"/> is null for "scan every block" and
+    /// otherwise the exact local offsets worth deserialising.</para>
+    /// </summary>
+    internal static bool TryNarrowWithIndex(CompiledFilter filter, ISegmentIndex idx, out uint[]? candidates)
+    {
+        candidates = null;
+
+        var trigramHints  = filter.GetTrigramHints();
+        var invertedHints = filter.GetInvertedHints();
+        bool hasIndexHint = !filter.IsMatchAll && filter.TryGetIndexHint(out _, out _);
+
+        // Definitive inverted-index check (bloom can have false positives)
+        if (hasIndexHint
+            && filter.TryGetIndexHint(out string prop, out object? val)
+            && !idx.MightContain(prop, val))
+            return false;
+
+        if (trigramHints.Count > 0)
+        {
+            HashSet<uint>? acc = null;
+            foreach (var (_, text) in trigramHints)
+            {
+                var offsets = idx.LookupTrigram(text);
+                if (offsets is null) continue;
+                if (acc is null) acc = new HashSet<uint>(offsets);
+                else             acc.IntersectWith(offsets);
+                if (acc.Count == 0) return false;
+            }
+            candidates = acc?.ToArray();
+        }
+
+        // Inverted-index event-level narrowing: AND posting lists for all equality
+        // predicates. This gives exact event offsets within the segment — the reader will
+        // only deserialise those events.
+        if (invertedHints.Count > 0)
+        {
+            var invOffsets = idx.LookupIntersect(invertedHints);
+            if (invOffsets is not null)
+            {
+                if (invOffsets.Length == 0) return false;
+
+                if (candidates is null)
+                {
+                    candidates = invOffsets;
+                }
+                else
+                {
+                    var invSet = new HashSet<uint>(invOffsets);
+                    var merged = new List<uint>(Math.Min(candidates.Length, invOffsets.Length));
+                    foreach (var o in candidates)
+                        if (invSet.Contains(o)) merged.Add(o);
+                    if (merged.Count == 0) return false;
+                    candidates = [.. merged];
+                }
+            }
+        }
+
+        return true;
     }
 
     // ── Segment scan ──────────────────────────────────────────────────────────

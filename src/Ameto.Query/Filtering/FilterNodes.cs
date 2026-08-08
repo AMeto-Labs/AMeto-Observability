@@ -37,11 +37,29 @@ public sealed class CompareNode : FilterNode
     public string     Property { get; }
     public CompareOp  Op       { get; }
     public object?    Value    { get; }
-    public CompareNode(string property, CompareOp op, object? value)
+
+    /// <summary>
+    /// Set when the right operand is a PROPERTY rather than a literal, e.g. <c>Region =
+    /// Fallback</c>. <see cref="Value"/> is then null and meaningless — the right side is read
+    /// off the event, per event, like the left one.
+    ///
+    /// <para>The parser used to read this name and throw it away, so <c>A = B</c> silently
+    /// became <c>A = null</c>: an is-absent test wearing the syntax of a comparison. It could
+    /// never match two properties that were equal, and it matched every event carrying
+    /// neither.</para>
+    ///
+    /// <para>Both hint builders in <c>CompiledFilter</c> skip these nodes. The right side is
+    /// not known until the event is read, so there is no value to look up — and per the
+    /// standing rule, no hint is the answer, never a hint that matches nothing.</para>
+    /// </summary>
+    public string?    RightProperty { get; }
+
+    public CompareNode(string property, CompareOp op, object? value, string? rightProperty = null)
     {
-        Property = property;
-        Op       = op;
-        Value    = value;
+        Property      = property;
+        Op            = op;
+        Value         = value;
+        RightProperty = rightProperty;
     }
 }
 

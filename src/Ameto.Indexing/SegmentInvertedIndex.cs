@@ -98,39 +98,56 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
 
     public uint[]? Lookup(string propertyName, object? value)
     {
-        string serialised = SerialiseValue(value);
-
         // Query mode: return a copy of the decoded ascending offsets.
         if (_postings is not null)
         {
-            if (_postings.TryGetValue(propertyName, out var values) &&
-                values.TryGetValue(serialised, out var offsets))
-                return ToUInt(offsets);
-            return null;
+            var offsets = PostingsForKey(propertyName, value, out _);
+            return offsets is null ? null : ToUInt(offsets);
         }
 
-        // Build mode: enumerate from List<int>
+        // Build mode (test-only: production queries always read a deserialised index).
         if (_index.TryGetValue(propertyName, out var buildValues) &&
-            buildValues.TryGetValue(serialised, out var list))
+            buildValues.TryGetValue(SerialiseValue(value), out var list))
             return list.Select(x => (uint)x).ToArray();
 
         return null;
     }
 
+    /// <summary>
+    /// Intersects the posting lists of an AND-chain of equality predicates.
+    ///
+    /// <para>Return values are three different statements and the caller acts on each
+    /// differently: <c>null</c> is "I cannot narrow this, scan the segment", a non-empty
+    /// array is "these offsets and no others", and an EMPTY array is "no event in this
+    /// segment matches" — which makes the caller drop the segment unread.</para>
+    ///
+    /// <para>A property this index never wrote is the first case, not the third. The index
+    /// has no opinion about a bucket it does not have, and answering "no matches" for one
+    /// turns every filter/index naming disagreement into missing rows instead of a slower
+    /// query. The predicate is therefore dropped from the intersection and re-checked by the
+    /// scan. A property that IS present with NO FORM of the value (see
+    /// <see cref="IndexValueForms.Serialised"/>) is the third case: the bucket is complete, so
+    /// its silence is proof.</para>
+    /// </summary>
     public uint[]? LookupIntersect(IReadOnlyList<(string property, object? value)> predicates)
     {
         if (_postings is null || predicates.Count == 0) return null;
 
-        // Gather each predicate's ascending offset array; empty match ⇒ AND is empty.
-        var lists = new int[predicates.Count][];
+        int[][]? lists = null;
+        int used = 0;
         for (int i = 0; i < predicates.Count; i++)
         {
-            string serialised = SerialiseValue(predicates[i].value);
-            if (!_postings.TryGetValue(predicates[i].property, out var values) ||
-                !values.TryGetValue(serialised, out var offsets))
-                return Array.Empty<uint>();
-            lists[i] = offsets;
+            int[]? offsets = PostingsForKey(predicates[i].property, predicates[i].value, out bool known);
+            if (!known) continue;                           // unknown property → no information
+            if (offsets is null)
+                return Array.Empty<uint>();                 // known bucket, absent value → proven empty
+
+            lists ??= new int[predicates.Count][];
+            lists[used++] = offsets;
         }
+
+        if (used == 0) return null;                          // nothing usable → scan
+        if (used < lists!.Length) Array.Resize(ref lists, used);
 
         // Intersect ascending arrays, smallest first (merge against the running result).
         Array.Sort(lists, static (a, b) => a.Length - b.Length);
@@ -143,17 +160,116 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
 
     public bool MightContain(string propertyName, object? value)
     {
-        string serialised = SerialiseValue(value);
-
         if (_postings is not null)
         {
-            if (!_postings.TryGetValue(propertyName, out var values)) return true; // property not indexed
-            return values.ContainsKey(serialised);
+            var offsets = PostingsForKey(propertyName, value, out bool known);
+            return !known || offsets is not null;    // property not indexed → no information
         }
 
         if (!_index.TryGetValue(propertyName, out var buildValues))
             return true;
-        return buildValues.ContainsKey(serialised);
+        return buildValues.ContainsKey(SerialiseValue(value));
+    }
+
+    // ── Key identity: one filter path, two possible bucket names ───────────────
+
+    /// <summary>
+    /// Resolves a hint key against every bucket that could hold it and unions their postings.
+    /// <paramref name="known"/> is false when NO candidate bucket exists — "no information,
+    /// scan" — and the return is null when candidates exist but none holds the value, which
+    /// is the only state that proves no event matches.
+    ///
+    /// <para>An encoded path such as <c>http</c>U+0001<c>method</c> can name two different
+    /// things the builder writes differently: a nested <c>http</c> map (flattened to exactly
+    /// that key) or ONE flat attribute literally named <c>http.method</c>, which is how every
+    /// OTLP semantic-convention attribute arrives. <c>FilterEvaluator.GetValue</c> now accepts
+    /// both, so the index must too — pruning on one spelling while the scan matches the other
+    /// is the same silent false negative in a new place. The union is complete: a bucket that
+    /// does not exist describes no event.</para>
+    /// </summary>
+    private int[]? PostingsForKey(string property, object? value, out bool known)
+    {
+        known = false;
+        int[]? acc = null;
+
+        if (_postings!.TryGetValue(property, out var values))
+        {
+            known = true;
+            acc   = PostingsFor(values, value);
+        }
+
+        // The flat spelling, when the encoded path could also be one dotted key name.
+        // Written into stack scratch and probed through the span alternate lookup: a string
+        // per predicate per segment would be pure garbage for a bucket that usually is absent.
+        if (property.Length <= MaxFlatKeyChars &&
+            property.IndexOf(ClefFields.PropertyPathSeparator) >= 0 &&
+            property.IndexOf(PathIndexMarker) < 0)
+        {
+            Span<char> flat = stackalloc char[MaxFlatKeyChars];
+            for (int i = 0; i < property.Length; i++)
+                flat[i] = property[i] == ClefFields.PropertyPathSeparator ? '.' : property[i];
+
+            if (_postings.GetAlternateLookup<ReadOnlySpan<char>>()
+                         .TryGetValue(flat[..property.Length], out var flatValues))
+            {
+                known = true;
+                if (PostingsFor(flatValues, value) is { } flatOffsets)
+                    acc = acc is null ? flatOffsets : UnionAscending(acc, flatOffsets);
+            }
+        }
+
+        return acc;
+    }
+
+    /// <summary>Longest path given a flat alternate — matches
+    /// <c>FilterEvaluator.MaxFlatKeyChars</c>, which decides the same thing on the scan side.</summary>
+    private const int MaxFlatKeyChars = 512;
+
+    /// <summary>U+0002, the subscript marker <c>PropertyPath</c> writes for <c>Foo[0]</c>. A
+    /// path carrying one is not a flat key name, so it gets no dotted alternate.</summary>
+    private const char PathIndexMarker = (char)2;
+
+    // ── Value identity: the index is typed, the scan is coercing ───────────────
+
+    /// <summary>
+    /// Unions the postings of every encoding of <paramref name="value"/> the bucket actually
+    /// holds (see <see cref="IndexValueForms.Serialised"/>). Returns null only when it holds
+    /// NONE of them — the single state a caller may read as proof that no event matches.
+    ///
+    /// <para>The union is complete, not a guess: an encoding with no bucket entry describes no
+    /// event, so adding it changes nothing, and every encoding the scan would accept is
+    /// probed.</para>
+    /// </summary>
+    private static int[]? PostingsFor(Dictionary<string, int[]> values, object? value)
+    {
+        IndexValueForms.Buffer buf = default;
+        Span<string?> forms = buf;
+        int n = IndexValueForms.Serialised(value, forms);
+
+        int[]? acc = null;
+        for (int i = 0; i < n; i++)
+        {
+            if (!values.TryGetValue(forms[i]!, out var offsets)) continue;
+            acc = acc is null ? offsets : UnionAscending(acc, offsets);
+        }
+        return acc;
+    }
+
+    /// <summary>Unions two ascending, distinct int arrays into a new ascending array.</summary>
+    private static int[] UnionAscending(int[] a, int[] b)
+    {
+        var outp = new int[a.Length + b.Length];
+        int i = 0, j = 0, k = 0;
+        while (i < a.Length && j < b.Length)
+        {
+            int x = a[i], y = b[j];
+            if      (x < y) outp[k++] = a[i++];
+            else if (x > y) outp[k++] = b[j++];
+            else { outp[k++] = x; i++; j++; }
+        }
+        while (i < a.Length) outp[k++] = a[i++];
+        while (j < b.Length) outp[k++] = b[j++];
+        return k == outp.Length ? outp : outp[..k];
     }
 
     /// <summary>Intersects two ascending, distinct int arrays into a new ascending array.</summary>
@@ -322,7 +438,14 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
             string propName = System.Text.Encoding.UTF8.GetString(data.Slice(pos, nameLen)); pos += nameLen;
 
             uint valCount   = BinaryPrimitives.ReadUInt32LittleEndian(data[pos..]); pos += 4;
-            var values      = new Dictionary<string, int[]>(StringComparer.Ordinal);
+
+            // Case-insensitive on the QUERY side only: values are stored exactly as written,
+            // but FilterEvaluator compares strings OrdinalIgnoreCase, so two buckets that
+            // differ only in case are one bucket to a query. Keeping them apart let the index
+            // answer "absent" for a value the scan would have matched — `@l = 'error'` against
+            // a stored "Error" — and drop the segment. Property NAMES stay ordinal; the
+            // evaluator resolves those case-sensitively.
+            var values = new Dictionary<string, int[]>((int)valCount, StringComparer.OrdinalIgnoreCase);
 
             for (uint v = 0; v < valCount; v++)
             {
@@ -332,7 +455,13 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
                 uint bmLen  = BinaryPrimitives.ReadUInt32LittleEndian(data[pos..]); pos += 4;
                 var bmBytes = data.Slice(pos, (int)bmLen); pos += (int)bmLen;
 
-                values[valStr] = codec ? DecodeCodec(bmBytes) : DecodeRoaring(bmBytes);
+                var decoded = codec ? DecodeCodec(bmBytes) : DecodeRoaring(bmBytes);
+
+                // Merge, never overwrite: a case collision would otherwise lose one bucket's
+                // postings outright, trading one silent false negative for another.
+                values[valStr] = values.TryGetValue(valStr, out var prior)
+                    ? UnionAscending(prior, decoded)
+                    : decoded;
             }
 
             idx._postings[propName] = values;
@@ -361,15 +490,7 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
         return list.ToArray();
     }
 
-    private static string SerialiseValue(object? value) => value switch
-    {
-        null          => "\0null",
-        bool b        => b ? "\0true" : "\0false",
-        int i         => $"\0i{i}",
-        long l        => $"\0l{l}",
-        double d      => $"\0d{d:R}",
-        float f       => $"\0f{f:R}",
-        string s      => s,
-        _             => value.ToString() ?? string.Empty,
-    };
+    /// <summary>The one encoding a stored value is filed under — see
+    /// <see cref="IndexValueForms"/>, which also enumerates what a query may match it with.</summary>
+    private static string SerialiseValue(object? value) => IndexValueForms.Serialise(value);
 }

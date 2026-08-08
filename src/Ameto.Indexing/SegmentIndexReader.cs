@@ -62,8 +62,29 @@ public sealed class SegmentIndexReader : ISegmentIndex, IDisposable
     public bool MightContain(string propertyName, object? value)
     {
         // Bloom filter gives a cheap first gate; inverted index is the definitive check.
-        string valStr = value?.ToString() ?? string.Empty;
-        return _bloom.MightContain(valStr) && _inverted.MightContain(propertyName, value);
+        return MightContainValue(_bloom, value) && _inverted.MightContain(propertyName, value);
+    }
+
+    /// <summary>
+    /// Probes the bloom for every PLAIN text the builder could have stored for a value the
+    /// scan would accept.
+    ///
+    /// <para>The bloom is keyless: it answers "did any value here look like this", and the
+    /// only text it holds is what <c>SegmentIndexBuilder</c> added. One literal can match
+    /// several of those — <c>Count = '5'</c> against a stored integer, and (before the index
+    /// went invariant) <c>Ratio = '2.5'</c> against a <c>ru-KZ</c> host's <c>2,5</c>. Probing
+    /// a single spelling made the cheap gate drop the segment before the inverted index,
+    /// which by then knew better, was ever consulted.</para>
+    /// </summary>
+    public static bool MightContainValue(SegmentBloomFilter bloom, object? value)
+    {
+        IndexValueForms.Buffer buf = default;
+        Span<string?> forms = buf;
+        int n = IndexValueForms.Plain(value, forms);
+
+        for (int i = 0; i < n; i++)
+            if (bloom.MightContain(forms[i]!)) return true;
+        return false;
     }
 
     /// <inheritdoc/>

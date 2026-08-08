@@ -24,16 +24,30 @@ public sealed unsafe class SegmentBloomFilter : IDisposable
     private const int BlockBytes = 64;
     private const int BlockBits  = BlockBytes * 8; // 512
 
+    /// <summary>
+    /// High bit of the serialised <c>capacity</c> word, set by writers that case-fold on
+    /// <see cref="Add(ReadOnlySpan{char})"/>.
+    ///
+    /// <para>Capacity is informational — it is the segment's expected event count, never
+    /// within nine orders of magnitude of 2^31 — so the spare bit costs nothing and saves a
+    /// whole-file version bump. A blob without it was written by a build that stored the
+    /// ORIGINAL casing, and <see cref="MightContain(ReadOnlySpan{char})"/> must not treat its
+    /// silence as proof; see there.</para>
+    /// </summary>
+    private const uint FoldedMarker = 0x8000_0000u;
+
     private readonly byte*  _bits;
     private readonly uint   _blockCount;
     private readonly uint   _capacity;
+    private readonly bool   _folded;
     private          bool   _disposed;
 
-    private SegmentBloomFilter(byte* bits, uint blockCount, uint capacity)
+    private SegmentBloomFilter(byte* bits, uint blockCount, uint capacity, bool folded = true)
     {
         _bits       = bits;
         _blockCount = blockCount;
         _capacity   = capacity;
+        _folded     = folded;
     }
 
     /// <summary>
@@ -76,10 +90,31 @@ public sealed unsafe class SegmentBloomFilter : IDisposable
     public void Add(string value) => Add((ReadOnlySpan<char>)value);
 
     /// <summary>
-    /// Encodes into stack/pooled scratch instead of allocating a byte[] per add — the hashed
-    /// bytes are identical to <see cref="Add(string)"/>, so the filter output is unchanged.
+    /// Adds the CASE-FOLDED form of <paramref name="value"/>, encoding into stack/pooled
+    /// scratch instead of allocating a byte[] per add.
+    ///
+    /// <para>Folding is a correctness requirement, not a nicety: the per-event scan compares
+    /// strings <see cref="StringComparison.OrdinalIgnoreCase"/>, so a filter keyed on the raw
+    /// casing answers "not here" for a value that differs from the query literal only in case
+    /// — <c>@l = 'error'</c> against a stored <c>Error</c> — and the whole segment is dropped
+    /// unread. Folding also keeps the filter's occupancy where it was; storing both casings
+    /// would have raised the false-positive rate for every segment.</para>
     /// </summary>
     public void Add(ReadOnlySpan<char> value)
+    {
+        char[]? foldRented = value.Length > 256
+            ? System.Buffers.ArrayPool<char>.Shared.Rent(value.Length)
+            : null;
+        Span<char> foldBuf = foldRented ?? stackalloc char[256];
+        int foldLen = value.ToLowerInvariant(foldBuf);
+        ReadOnlySpan<char> folded = foldLen < 0 ? value : foldBuf[..foldLen];
+
+        AddRaw(folded);
+
+        if (foldRented is not null) System.Buffers.ArrayPool<char>.Shared.Return(foldRented);
+    }
+
+    private void AddRaw(ReadOnlySpan<char> value)
     {
         int max = System.Text.Encoding.UTF8.GetMaxByteCount(value.Length);
         byte[]? rented = max > 512 ? System.Buffers.ArrayPool<byte>.Shared.Rent(max) : null;
@@ -101,16 +136,74 @@ public sealed unsafe class SegmentBloomFilter : IDisposable
                TestBit(block, h2 % BlockBits);
     }
 
-    public bool MightContain(string value) => MightContain(System.Text.Encoding.UTF8.GetBytes(value));
+    public bool MightContain(string value) => MightContain((ReadOnlySpan<char>)value);
+
+    /// <summary>
+    /// Probes the folded form first — that is what <see cref="Add(ReadOnlySpan{char})"/>
+    /// stores — then the raw form, which is what a pre-folding writer stored.
+    ///
+    /// <para>For a segment written BEFORE folding, two probes are still not enough to prove
+    /// absence. The filter holds one arbitrary casing and the scan compares
+    /// OrdinalIgnoreCase, so <c>@l = 'error'</c> misses a stored <c>Error</c> on the folded
+    /// probe AND on the raw probe, and the phase-1 gate drops the segment before the (now
+    /// case-insensitive) inverted index can disagree. Folding on the WRITE side fixes nothing
+    /// for bytes already on disk. So an unfolded filter may only answer "no" for a value that
+    /// has no cased characters — a number, a punctuation-only key — where its one spelling is
+    /// the only spelling. Everything else gets "might", which costs those segments the cheap
+    /// gate and keeps their rows; the inverted index still prunes them one phase later, and
+    /// compaction retires the state as it rewrites them.</para>
+    /// </summary>
+    public bool MightContain(ReadOnlySpan<char> value)
+    {
+        char[]? foldRented = value.Length > 256
+            ? System.Buffers.ArrayPool<char>.Shared.Rent(value.Length)
+            : null;
+        Span<char> foldBuf = foldRented ?? stackalloc char[256];
+        int foldLen = value.ToLowerInvariant(foldBuf);
+        ReadOnlySpan<char> folded = foldLen < 0 ? value : foldBuf[..foldLen];
+
+        bool hit = MightContainRaw(folded);
+        if (!hit && !folded.SequenceEqual(value)) hit = MightContainRaw(value);
+        if (!hit && !_folded && HasCasedChars(value)) hit = true;   // cannot prove absence
+
+        if (foldRented is not null) System.Buffers.ArrayPool<char>.Shared.Return(foldRented);
+        return hit;
+    }
+
+    /// <summary>True when some character has a different upper/lower spelling, i.e. when a
+    /// pre-folding writer could have stored a casing this probe will not reproduce.</summary>
+    private static bool HasCasedChars(ReadOnlySpan<char> value)
+    {
+        for (int i = 0; i < value.Length; i++)
+        {
+            char c = value[i];
+            if (char.ToLowerInvariant(c) != c || char.ToUpperInvariant(c) != c) return true;
+        }
+        return false;
+    }
+
+    private bool MightContainRaw(ReadOnlySpan<char> value)
+    {
+        int max = System.Text.Encoding.UTF8.GetMaxByteCount(value.Length);
+        byte[]? rented = max > 512 ? System.Buffers.ArrayPool<byte>.Shared.Rent(max) : null;
+        Span<byte> buf = rented ?? stackalloc byte[max];
+        int n = System.Text.Encoding.UTF8.GetBytes(value, buf);
+        bool hit = MightContain(buf[..n]);
+        if (rented is not null) System.Buffers.ArrayPool<byte>.Shared.Return(rented);
+        return hit;
+    }
 
     // ── Serialisation ─────────────────────────────────────────────────────────
 
     public byte[] Serialise()
     {
         uint byteCount = _blockCount * BlockBytes;
-        var buf = new byte[4 + 4 + byteCount]; // bitCount + capacity + bits
+        var buf = new byte[4 + 4 + byteCount]; // bitCount + capacity | foldedMarker + bits
         System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(0), _blockCount * BlockBits);
-        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(4), _capacity);
+        // Only claim folded when this instance's contents really were folded — a filter that
+        // was read back from a pre-folding blob and re-serialised must keep saying so.
+        uint capacityWord = _folded ? (_capacity & ~FoldedMarker) | FoldedMarker : _capacity & ~FoldedMarker;
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(4), capacityWord);
         new Span<byte>(_bits, (int)byteCount).CopyTo(buf.AsSpan(8));
         return buf;
     }
@@ -129,14 +222,16 @@ public sealed unsafe class SegmentBloomFilter : IDisposable
             return matchAll;
         }
 
-        uint bitCount   = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(data[0..]);
-        uint capacity   = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(data[4..]);
-        uint blockCount = bitCount / BlockBits;
-        uint byteCount  = bitCount / 8;
+        uint bitCount     = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(data[0..]);
+        uint capacityWord = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(data[4..]);
+        bool folded       = (capacityWord & FoldedMarker) != 0;
+        uint capacity     = capacityWord & ~FoldedMarker;
+        uint blockCount   = bitCount / BlockBits;
+        uint byteCount    = bitCount / 8;
 
         var bits = (byte*)NativeMemory.AllocZeroed(byteCount);
         data.Slice(8, (int)byteCount).CopyTo(new Span<byte>(bits, (int)byteCount));
-        return new SegmentBloomFilter(bits, blockCount, capacity);
+        return new SegmentBloomFilter(bits, blockCount, capacity, folded);
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

@@ -163,25 +163,13 @@ public static class FilterEvaluator
 
     private static object? GetValue(LogEvent ev, string prop)
     {
-        // Built-in CLEF fields. Keys with a dot in the user grammar arrive
-        // here as PropertyPath.Separator-joined segments (e.g. "@x\u0001type").
-        switch (prop)
-        {
-            case "@l" or "Level":            return ev.Level.ToSeqString();
-            case "@mt" or "MessageTemplate": return ev.MessageTemplate;
-            case "@m" or "Message":          return ev.MessageTemplate;
-            case "@x" or "Exception":        return ev.Exception?.Type;
-            case "@x\u0001type"          or "Exception\u0001Type":          return ev.Exception?.Type;
-            case "@x\u0001message"       or "Exception\u0001Message":       return ev.Exception?.Message;
-            case "@x\u0001stack"         or "Exception\u0001StackTrace":    return ev.Exception?.StackTrace;
-            case "@x\u0001inner\u0001type"    or "Exception\u0001Inner\u0001Type":    return ev.Exception?.Inner?.Type;
-            case "@x\u0001inner\u0001message" or "Exception\u0001Inner\u0001Message": return ev.Exception?.Inner?.Message;
-            case "@t" or "Timestamp":        return ev.Timestamp.ToString("O");
-            case "@tr" or "TraceId":         return TraceIdHelper.FormatTraceId(ev.TraceIdHi, ev.TraceIdLo);
-            case "@sp" or "SpanId":          return TraceIdHelper.FormatSpanId(ev.SpanId);
-            case "@id" or "Id":              return ev.Id.RawValue;
-            case ClefFields.ServiceName:     return ev.ServiceName;
-        }
+        // Built-in CLEF fields. Which spellings count as built-in lives in BuiltinFields —
+        // the same table CompiledFilter consults to learn which index bucket a field is
+        // written to, so an alias accepted here can never be hinted under a name the index
+        // has never heard of. Keys with a dot in the user grammar arrive here as
+        // PropertyPath.Separator-joined segments (e.g. "@x\u0001type").
+        if (BuiltinFields.TryResolve(prop, out var field))
+            return ReadBuiltin(ev, field);
 
         if (ev.Properties is null) return null;
 
@@ -191,8 +179,62 @@ public static class FilterEvaluator
             return ev.Properties.TryGetValue(prop, out var v) ? v : null;
 
         // Nested path: walk dictionary tree segment-by-segment.
-        return WalkPath(ev.Properties, prop.AsSpan());
+        object? nested = WalkPath(ev.Properties, prop.AsSpan());
+        if (nested is not null) return nested;
+
+        // ...or ONE key that happens to contain dots. Every OTLP semantic-convention
+        // attribute is spelled that way (http.request.method, k8s.pod.name), and the grammar
+        // read a dotted name only as a walk, so those filters matched nothing at all unless
+        // the user knew to write ['http.request.method']. Tried second, so a genuinely nested
+        // map keeps the meaning it had.
+        return PropertyPath.MayBeFlatKey(prop) ? ReadFlatKey(ev.Properties, prop) : null;
     }
+
+    /// <summary>
+    /// Longest flat property key probed through the stack. Beyond this the walk's answer
+    /// stands; a key this long is not a name anyone types.
+    /// </summary>
+    private const int MaxFlatKeyChars = 512;
+
+    /// <summary>
+    /// Reads a property whose NAME contains the dots the parser split on. Allocation-free —
+    /// this runs per event for every dotted-attribute filter, so the flattened spelling is
+    /// built in stack scratch and probed through the dictionary's span alternate lookup.
+    /// </summary>
+    private static object? ReadFlatKey(Dictionary<string, object?> props, string prop)
+    {
+        if (prop.Length > MaxFlatKeyChars) return null;
+
+        Span<char> flat = stackalloc char[MaxFlatKeyChars];
+        int n = PropertyPath.WriteFlatKey(prop.AsSpan(), flat);
+        if (n < 0) return null;
+
+        return props.GetAlternateLookup<ReadOnlySpan<char>>().TryGetValue(flat[..n], out var v)
+            ? v
+            : null;
+    }
+
+    /// <summary>
+    /// Reads one resolved built-in field off the event. A switch over the enum compiles to a
+    /// jump table, so the per-event cost is the frozen-dictionary probe in
+    /// <see cref="BuiltinFields.TryResolve"/> plus one indirect branch — no allocation.
+    /// </summary>
+    private static object? ReadBuiltin(LogEvent ev, BuiltinField field) => field switch
+    {
+        BuiltinField.Level                 => ev.Level.ToSeqString(),
+        BuiltinField.MessageTemplate       => ev.MessageTemplate,
+        BuiltinField.ExceptionType         => ev.Exception?.Type,
+        BuiltinField.ExceptionMessage      => ev.Exception?.Message,
+        BuiltinField.ExceptionStack        => ev.Exception?.StackTrace,
+        BuiltinField.InnerExceptionType    => ev.Exception?.Inner?.Type,
+        BuiltinField.InnerExceptionMessage => ev.Exception?.Inner?.Message,
+        BuiltinField.Timestamp             => ev.Timestamp.ToString("O"),
+        BuiltinField.TraceId               => TraceIdHelper.FormatTraceId(ev.TraceIdHi, ev.TraceIdLo),
+        BuiltinField.SpanId                => TraceIdHelper.FormatSpanId(ev.SpanId),
+        BuiltinField.EventId               => ev.Id.RawValue,
+        BuiltinField.ServiceName           => ev.ServiceName,
+        _                                  => null,
+    };
 
     /// <summary>
     /// Walks a separator-delimited path through nested
@@ -244,13 +286,17 @@ public static class FilterEvaluator
     {
         // Inline MatchAny: avoids closure/delegate allocation on every event
         object? actual = GetValue(ev, node.Property);
+
+        // `A = B`: the right operand is read off the same event, not off the AST.
+        object? expected = node.RightProperty is { } rhs ? GetValue(ev, rhs) : node.Value;
+
         if (actual is IList list && actual is not byte[] && actual is not string)
         {
             for (int i = 0; i < list.Count; i++)
-                if (Compare(list[i], node.Value, node.Op)) return true;
+                if (Compare(list[i], expected, node.Op)) return true;
             return false;
         }
-        return Compare(actual, node.Value, node.Op);
+        return Compare(actual, expected, node.Op);
     }
 
     /// <summary>
