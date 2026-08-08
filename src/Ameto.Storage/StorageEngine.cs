@@ -164,7 +164,23 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
     // Monotonic segment-id allocator. Every id a segment file can ever carry comes from
     // here — flush blocks, merges, WAL-recovery segments — so an id is never reused.
+    //
+    // NEVER touch this field directly. Go through AllocateSegmentId /
+    // AllocateSegmentIdBlock / AdvanceSegmentIdFloor, which hold _segIdLock.
     private          ulong                                _nextSegmentId = 1;
+
+    /// <summary>
+    /// Guards <see cref="_nextSegmentId"/>. Its own lock rather than <c>_flushLock</c> because the
+    /// writers do not share a thread model: flush and merge reserve ids while holding the async
+    /// flush lock, but <see cref="ImportSegment"/> runs synchronously on whatever thread the
+    /// replication endpoint handed it, and making that path wait on a <c>SemaphoreSlim</c> would
+    /// either block a request thread behind a swap or force the import path to become async.
+    ///
+    /// <para>Every critical section under it is a read, an add and a store — no I/O, no await, so
+    /// the lock is never held across a suspension point and the ordering (_flushLock outside,
+    /// _segIdLock inside) is the only one that exists.</para>
+    /// </summary>
+    private readonly System.Threading.Lock                _segIdLock = new();
 
     /// <summary>
     /// First id of the block RESERVED FOR THE LIVE WAL, i.e. the ids its events will occupy
@@ -1417,6 +1433,12 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         // Reserve a segment id from the same allocator the flush path uses. Safe now only
         // because the live WAL holds a RESERVED block (see _walSegId): the allocator is
         // already past it, so a merged file can never be handed the id a WAL is named from.
+        //
+        // The flush lock is no longer what makes the reservation atomic — AllocateSegmentId
+        // holds _segIdLock for that, and has to, because the import path cannot take a
+        // SemaphoreSlim. It is still taken here because this await is the one cancellable step
+        // between opening the sources and taking ownership of them, and losing that would leak
+        // mapped views on shutdown (see the catch).
         ulong reserved;
         try
         {
@@ -1424,14 +1446,13 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         }
         catch
         {
-            // The only cancellable step between opening the sources and taking ownership of
-            // them. Unguarded, shutdown left up to MergeMaxSources mapped views alive for the
-            // life of the process — and on Windows a mapped file cannot be unlinked, so those
-            // segments could then be neither compacted nor expired.
+            // Unguarded, shutdown left up to MergeMaxSources mapped views alive for the life of
+            // the process — and on Windows a mapped file cannot be unlinked, so those segments
+            // could then be neither compacted nor expired.
             foreach (var r in readers) r.Dispose();
             throw;
         }
-        try { reserved = _nextSegmentId; _nextSegmentId++; }
+        try { reserved = AllocateSegmentId(); }
         finally { _flushLock.Release(); }
 
         var  segId        = new SegmentId(reserved);
@@ -1929,8 +1950,8 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         {
             // {nodeId}-{segId}-{minTs}-{maxTs}.seg
             var parts = Path.GetFileNameWithoutExtension(file).Split('-');
-            if (parts.Length >= 2 && ulong.TryParse(parts[1], out var segId) && segId >= _nextSegmentId)
-                _nextSegmentId = segId + 1;
+            if (parts.Length >= 2 && ulong.TryParse(parts[1], out var segId))
+                AdvanceSegmentIdFloor(segId + 1);
         }
     }
 
@@ -2109,16 +2130,80 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         try { File.Delete(FlushMarkerPath(segId)); } catch { }
     }
 
-    /// <summary>Pushes the id allocator past a WAL's reserved level block so it is never reused.</summary>
-    private void ReserveWalBlock(ulong walSegId)
+    // ── Segment-id allocator ──────────────────────────────────────────────────
+    //
+    // The three entry points below are the ONLY code allowed to read or write
+    // _nextSegmentId. They exist because the field had four writers on three thread models —
+    // startup recovery, the flush swap, the merge planner and the replication import — and
+    // only the middle two were synchronised with each other. See ImportSegment.
+    //
+    // internal, not private, so SegmentIdAllocatorTests can put them under contention directly.
+    // Driving the race through ImportSegment does not reproduce it: that path opens and reads a
+    // segment file before it touches the counter, which is thousands of times longer than the
+    // read-modify-write it has to land inside, so an end-to-end test passes with or without the
+    // lock. The property is real regardless of whether a test can hit it by luck, so it is
+    // asserted where it can be hit on purpose.
+
+    /// <summary>Reserves ONE id — the merge path's unit.</summary>
+    internal ulong AllocateSegmentId()
     {
-        ulong afterBlock = walSegId + LevelSegmentSlots;
-        if (afterBlock > _nextSegmentId) _nextSegmentId = afterBlock;
+        lock (_segIdLock) return _nextSegmentId++;
     }
+
+    /// <summary>
+    /// Reserves a whole level block and returns its first id — the flush path's unit, since a
+    /// tier writes one segment per level at <c>first + (byte)level</c>.
+    /// </summary>
+    internal ulong AllocateSegmentIdBlock()
+    {
+        lock (_segIdLock)
+        {
+            ulong first = _nextSegmentId;
+            _nextSegmentId += LevelSegmentSlots;
+            return first;
+        }
+    }
+
+    /// <summary>
+    /// Raises the allocator to at least <paramref name="floor"/>, for the callers that learn an id
+    /// is spent from somewhere other than the allocator — a file name on disk, a WAL's reserved
+    /// block, a segment received from a peer. Monotonic: it can only ever move forward, so a
+    /// caller arriving with stale information cannot hand out an id twice.
+    /// </summary>
+    internal void AdvanceSegmentIdFloor(ulong floor)
+    {
+        lock (_segIdLock)
+        {
+            if (floor > _nextSegmentId) _nextSegmentId = floor;
+        }
+    }
+
+    /// <summary>Pushes the id allocator past a WAL's reserved level block so it is never reused.</summary>
+    private void ReserveWalBlock(ulong walSegId) => AdvanceSegmentIdFloor(walSegId + LevelSegmentSlots);
 
     /// <summary>
     /// Registers a replicated segment file received from the cluster leader.
     /// The file must already reside in the segments directory.
+    ///
+    /// <para>Runs on a request thread, concurrently with everything: the flush swap reserving a
+    /// level block, the merge planner reserving a single id, another import. The allocator update
+    /// below therefore goes through <see cref="AdvanceSegmentIdFloor"/> like every other one — it
+    /// used to be a bare read-compare-write on a field whose other writers hold <c>_flushLock</c>,
+    /// which is not a lock this path can take.</para>
+    ///
+    /// <para>An imported id INSIDE the live WAL's reserved block is a separate matter and this
+    /// does not fix it. The floor update is a no-op there — the allocator is already past the
+    /// block — so the reservation itself is safe and the WAL keeps its name. What is not safe is
+    /// the catalog: <c>_segments</c> is keyed by id alone, so when that WAL's tier flushes, the
+    /// level segment landing on the same id silently replaces the imported entry. The file stays
+    /// on disk, invisible to queries and to retention (which enumerates the catalog, not the
+    /// directory), and a restart re-races the two through the same keyed assignment in
+    /// <c>LoadSegmentCatalog</c>. The mismatch is that a peer's ids and this node's ids share one
+    /// namespace; the fix is to key the catalog by (node, id) or to re-number on import, and
+    /// neither belongs in a lock change. Recovery, at least, is not fooled: the WAL is dropped
+    /// against its completion marker, and <c>SegmentFileExists</c> matches
+    /// <c>{node}-{id}-*.seg</c>, which the two-part name the replication endpoint writes cannot
+    /// satisfy. So the failure is a hidden segment, not a lost WAL.</para>
     /// </summary>
     public void ImportSegment(string filePath)
     {
@@ -2126,9 +2211,19 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         {
             using var reader = SegmentReader.Open(filePath, computeUncompressedBytes: true);
             var info = reader.Info;
+
+            // A same-id, different-file overwrite is the shape described above. Re-importing the
+            // SAME segment is legitimate (the endpoint moves with overwrite: true), so it is the
+            // differing path that is worth a word — otherwise the loss is entirely silent.
+            if (_segments.TryGetValue(info.Id.Value, out var existing) &&
+                !string.Equals(existing.FilePath, info.FilePath, StringComparison.OrdinalIgnoreCase))
+                _logger.LogWarning(
+                    "Imported segment {Id} collides with local segment {Existing}; the local one is " +
+                    "no longer served or expired. Peer and local segment ids share one namespace.",
+                    info.Id, existing.FilePath);
+
             _segments[info.Id.Value] = info;
-            if (info.Id.Value >= _nextSegmentId)
-                _nextSegmentId = info.Id.Value + 1;
+            AdvanceSegmentIdFloor(info.Id.Value + 1);
             _logger.LogInformation("Imported replicated segment {Id} ({Events} events)", info.Id, info.EventCount);
         }
         catch (Exception ex)
@@ -2156,8 +2251,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// </summary>
     private void OpenWal()
     {
-        _walSegId      = _nextSegmentId;
-        _nextSegmentId += LevelSegmentSlots;
+        _walSegId = AllocateSegmentIdBlock();
 
         var segId   = new SegmentId(_walSegId);
         var walPath = Path.Combine(_walDir, $"{_options.NodeId.Value}-{segId.Value}.wal");
