@@ -237,11 +237,15 @@ public sealed class LegacySegmentFormatTests : IDisposable
     /// and byte-identical, and the output's MinLevel equal to the sources' minimum (which is
     /// what keeps its retention deadline the same as theirs).
     ///
-    /// <para>This path is also the ONLY thing that HC-compresses legacy data now. A background
-    /// sweep used to rewrite v4/v5 envelopes in place at LZ4-HC; it was deleted because it
-    /// could not be taught v7, and the guarantee it provided moved here — a legacy segment
-    /// reaches HC by being merged. So the output's high-compression flag is asserted rather
-    /// than assumed: it is the observable end of that guarantee.</para>
+    /// <para>What this does NOT establish is the compression level. A merge is the only thing
+    /// that HC-compresses legacy data now — the background sweep that used to rewrite v4/v5
+    /// envelopes in place was deleted because it could not be taught v7 — but the writer below is
+    /// one this test constructs and hands <see cref="SegmentCompression.High"/> itself, so reading
+    /// that bit back off the file says only that <see cref="SegmentWriter"/> honours the level it
+    /// was given. It says nothing about the level <c>StorageEngine</c> picks, which is where the
+    /// guarantee actually lives and where
+    /// <c>SegmentMergeTests.Merge_PutsItsOutputOnHighCompressionAndLeavesFlushOnFast</c> pins it.
+    /// The assertion stays for the former claim; it used to be worded as the latter.</para>
     /// </summary>
     [Fact]
     public void AMixedLevelV4AndV5MergeIntoAV7FileWithoutLosingARow()
@@ -264,8 +268,9 @@ public sealed class LegacySegmentFormatTests : IDisposable
 
         var outHeader = File.ReadAllBytes(outPath);
         Assert.Equal(7, BinaryPrimitives.ReadUInt16LittleEndian(outHeader.AsSpan(4)));
-        // Flags byte: the sources came in at the fast flush level (0x01 alone); merging is what
-        // puts legacy blocks on HC, so the output must carry 0x02 as well.
+        // Flags byte. The sources were written above with 0x01 alone, and the writer this test
+        // constructed was asked for High — so this checks the level reaches the header of a file
+        // whose blocks came from LEGACY sources, not that anything in production asks for it.
         Assert.Equal(SegmentWriter.FlagCompressed | SegmentWriter.FlagHighCompression, outHeader[39]);
 
         var expected = a.Concat(b)

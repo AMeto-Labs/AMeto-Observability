@@ -138,6 +138,57 @@ public sealed class SegmentMergeTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// HC is now the merge's job and nothing else's. A background sweep used to rewrite cold
+    /// envelopes at LZ4-HC; it was deleted because it could not be taught v7, and its guarantee
+    /// moved onto this path — a segment reaches HC by being merged, or it never does.
+    ///
+    /// <para>Which means the level has to be read off the PRODUCTION merge's output. Asserting it
+    /// on a <see cref="SegmentWriter"/> the test itself constructed with
+    /// <see cref="SegmentCompression.High"/> re-states the test's own argument and leaves
+    /// <c>StorageEngine</c>'s choice unguarded: with that line changed to
+    /// <see cref="SegmentCompression.Fast"/> — every merged segment silently dropping to the flush
+    /// level, forever, with no error anywhere — Ameto.Storage.Tests and Ameto.Integration.Tests
+    /// both stayed green. Nothing in either suite read the bit off a file the engine had written.
+    ///
+    /// <para>So both ends are asserted here. The sources must carry
+    /// <see cref="SegmentWriter.FlagCompressed"/> ALONE, because a flush that had quietly started
+    /// paying for HC would make the output's 0x02 prove nothing about the merge; and the output
+    /// must carry both bits. Nothing in the read path consults the flag — an LZ4 block decodes
+    /// identically whichever level wrote it — so the header byte is the only place the decision
+    /// is observable at all.</para>
+    /// </summary>
+    [Fact]
+    public async Task Merge_PutsItsOutputOnHighCompressionAndLeavesFlushOnFast()
+    {
+        // MergeMinSources segments and then some, so the planner picks the run without the test
+        // having to reach for a sealed bucket.
+        for (int round = 0; round < 10; round++)
+            await WriteSegmentAsync(round, 120);
+
+        var sources = _engine.ListSegments();
+        Assert.Equal(10, sources.Count);
+        foreach (var src in sources)
+            Assert.Equal(SegmentWriter.FlagCompressed, ReadFlagsByte(src.FilePath));
+
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None));
+
+        var merged = Assert.Single(_engine.ListSegments());
+        Assert.Equal(1200u, merged.EventCount);
+        Assert.Equal(SegmentWriter.FlagCompressed | SegmentWriter.FlagHighCompression,
+                     ReadFlagsByte(merged.FilePath));
+    }
+
+    /// <summary>Header flags byte: magic(4) + version(2) + node(4) + id(8) + minTs(8) + maxTs(8)
+    /// + count(4) + minLevel(1) puts it at 39, in every format version this build can open.</summary>
+    private static byte ReadFlagsByte(string segmentPath)
+    {
+        using var fs = new FileStream(segmentPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        Span<byte> head = stackalloc byte[40];
+        fs.ReadExactly(head);
+        return head[39];
+    }
+
+    /// <summary>
     /// The merge cursor deduplicates templates and service names by their UTF-8 bytes, so the
     /// values worth carrying through a real merge are the ones where bytes and characters part
     /// company — Cyrillic at two bytes a character, an emoji at four bytes for two UTF-16 units,
