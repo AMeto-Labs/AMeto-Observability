@@ -424,6 +424,18 @@ public sealed class SegmentIndexBuilder : ISegmentIndexSink
     /// </summary>
     public long BloomTermCapacity => _bloom.Capacity;
 
+    /// <summary>
+    /// The three sections one at a time, for probes and tests that want to compare or size just
+    /// one of them; production takes all three at once through <see cref="Serialise"/>.
+    ///
+    /// <para>These predate the builder having a lifetime at all, and read as though it still had
+    /// none. It does: <see cref="Dispose"/> frees the bloom's bits, so
+    /// <see cref="SerialisedBloomFilter"/> after disposal is a read of freed memory. It is the
+    /// FILTER that enforces this rather than an argument check here, because the builder is not
+    /// the only door to those bytes — <see cref="SegmentBloomFilter"/> is public, the query path
+    /// deserialises and disposes its own, and a guard placed on this property would leave every
+    /// other caller reading garbage exactly as before.</para>
+    /// </summary>
     public byte[] SerialisedInvertedIndex  => _inverted.Serialise();
     public byte[] SerialisedTrigramIndex   => _trigram.Serialise();
     public byte[] SerialisedBloomFilter    => _bloom.Serialise();

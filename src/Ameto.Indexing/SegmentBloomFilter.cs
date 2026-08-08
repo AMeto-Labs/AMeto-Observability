@@ -122,7 +122,10 @@ public sealed unsafe class SegmentBloomFilter : IDisposable
     /// filter was ACTUALLY asked to hold, against the <c>expectedItems</c> it was sized for.
     ///
     /// <para>Every overload funnels through the byte one, so this is the whole write side in a
-    /// single counter, and it survives <see cref="Dispose"/> (only the bits are native). It
+    /// single counter, and it survives <see cref="Dispose"/> (only the bits are native) — the one
+    /// deliberate exception to the disposed-state guards on <see cref="Add(ReadOnlySpan{byte})"/>,
+    /// <see cref="MightContain(ReadOnlySpan{byte})"/> and <see cref="Serialise"/>, and required to
+    /// be so by <c>ISegmentIndexSink.BloomTermsAdded</c>. It
     /// exists because sizing a filter by a guessed terms-per-event is what makes the section
     /// cost what it does; a writer that can read this back sizes the next group from what the
     /// last one measured. Reading it back is also the only way to state bits-per-term, which is
@@ -144,6 +147,7 @@ public sealed unsafe class SegmentBloomFilter : IDisposable
 
     public void Add(ReadOnlySpan<byte> key)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         _added++;
         var (h0, h1, h2) = Hash3(key);
         uint blockIdx    = h0 % _blockCount;
@@ -168,6 +172,11 @@ public sealed unsafe class SegmentBloomFilter : IDisposable
     /// </summary>
     public void Add(ReadOnlySpan<char> value)
     {
+        // Guarded HERE as well as in the byte overload, and before the rent: this path takes a
+        // pooled buffer and returns it without a finally, so a throw from further in would strand
+        // it. The duplicate check is a load of an already-hot bool against three Murmur passes.
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
         char[]? foldRented = value.Length > 256
             ? System.Buffers.ArrayPool<char>.Shared.Rent(value.Length)
             : null;
@@ -194,6 +203,7 @@ public sealed unsafe class SegmentBloomFilter : IDisposable
 
     public bool MightContain(ReadOnlySpan<byte> key)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         var (h0, h1, h2) = Hash3(key);
         uint blockIdx    = h0 % _blockCount;
         byte* block      = _bits + blockIdx * BlockBytes;
@@ -221,6 +231,9 @@ public sealed unsafe class SegmentBloomFilter : IDisposable
     /// </summary>
     public bool MightContain(ReadOnlySpan<char> value)
     {
+        // Before the rent, for the reason given on Add(ReadOnlySpan{char}).
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
         char[]? foldRented = value.Length > 256
             ? System.Buffers.ArrayPool<char>.Shared.Rent(value.Length)
             : null;
@@ -261,8 +274,22 @@ public sealed unsafe class SegmentBloomFilter : IDisposable
 
     // ── Serialisation ─────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Copies the filter out as a section blob.
+    ///
+    /// <para>Guarded, because the copy is <c>new Span&lt;byte&gt;(_bits, byteCount)</c> and
+    /// <see cref="Dispose"/> hands those bytes back to the allocator without clearing
+    /// <c>_bits</c> — the pointer is <c>readonly</c> and stays valid-looking forever. Calling this
+    /// after disposal therefore READ FREED MEMORY and returned whatever had since been allocated
+    /// over it, with no exception and no null to trip over: a segment's bloom section written from
+    /// another allocation's bytes, which the query prefilter then trusts to reject segments.
+    /// Measured before this guard, on a 4096-term filter disposed and then re-serialised with 32
+    /// native allocations squatting on the block: 5120 of 5120 payload bytes came back as the
+    /// squatter's fill pattern.</para>
+    /// </summary>
     public byte[] Serialise()
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
         uint byteCount = _blockCount * BlockBytes;
         var buf = new byte[4 + 4 + byteCount]; // bitCount + capacity | foldedMarker + bits
         System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(0), _blockCount * BlockBits);
