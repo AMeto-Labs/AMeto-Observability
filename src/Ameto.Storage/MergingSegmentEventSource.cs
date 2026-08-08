@@ -190,10 +190,22 @@ internal sealed class SegmentEventCursor : IDisposable
         if (_dedupByUtf8.TryGetValue(utf8, out var pooled)) return pooled;
         if (_stringDedup.Count >= MaxDedupEntries) _stringDedup.Clear();
 
-        // Inserted through the alternate too: keyed by the bytes, the entry costs the one
-        // transcode that produced the string rather than a second one to hash it.
+        // Inserted through the STRING key, deliberately, so the entry holds one instance.
+        // Going in through _dedupByUtf8[utf8] looks like it saves work — the bucket is found
+        // by hashing the bytes where they lie — but the alternate lookup has no key to store,
+        // so it asks the comparer for one: IAlternateEqualityComparer.Create runs
+        // Encoding.UTF8.GetString a SECOND time and the entry ends up as two distinct strings
+        // with identical content, the created one as the value and the comparer's as the key.
+        // Filling the table to MaxDedupEntries with 44-char interpolated templates measured
+        // 18.49 MB retained that way against 10.50 MB this way, and 33.35 MB allocated
+        // against 25.35 MB. Per distinct value, not per event — but the table retains every
+        // entry until the cap empties it, so the duplicate is retained too.
+        //
+        // The string key costs one transcode to hash, into the comparer's 512-byte stack
+        // scratch — no allocation, and templates and service names sit far inside it. Identity
+        // is unaffected: `created` is both what the table keeps and what the caller is handed.
         string created = Encoding.UTF8.GetString(utf8);
-        _dedupByUtf8[utf8] = created;
+        _stringDedup[created] = created;
         return created;
     }
 
@@ -210,9 +222,14 @@ internal sealed class SegmentEventCursor : IDisposable
 /// not seen.
 ///
 /// <para>The two sides agree because they hash the same thing — the UTF-8 spelling. The string
-/// side pays a transcode into scratch, which happens once per DISTINCT value on insert (and not
-/// even then when the entry goes in through the alternate); the span side, the one running twice
-/// per merged event, hashes the block's bytes where they lie.</para>
+/// side pays a transcode into scratch, which happens once per DISTINCT value on insert; the span
+/// side, the one running twice per merged event, hashes the block's bytes where they lie.</para>
+///
+/// <para>Insertion goes through the string key even though the alternate would skip that
+/// transcode, because <see cref="Create"/> is how the alternate obtains a key to store and it
+/// transcodes as well — into a second heap string the entry then retains. A stack scratch buffer
+/// once per distinct value is the cheaper half of that trade; see <see cref="SegmentEventCursor.Dedup"/>
+/// for the measurement.</para>
 /// </summary>
 internal sealed class Utf8StringComparer : IEqualityComparer<string>,
                                            IAlternateEqualityComparer<ReadOnlySpan<byte>, string>

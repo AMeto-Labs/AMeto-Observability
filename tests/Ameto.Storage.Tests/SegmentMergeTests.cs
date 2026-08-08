@@ -225,6 +225,51 @@ public sealed class SegmentMergeTests : IAsyncLifetime
             "building a template and a service name per row again, for values already in the table");
     }
 
+    /// <summary>
+    /// One string per distinct value means ONE — the dedup table must not hold a separate key
+    /// and value with the same content.
+    ///
+    /// <para>Inserting through the UTF-8 alternate lookup is what produced two: the alternate
+    /// has no key to store, so it asks the comparer to <c>Create</c> one, transcoding a second
+    /// time. B/event does not catch it — the duplicate is per DISTINCT value, and these
+    /// segments have seven of them between 20 000 events — so the table is inspected directly.
+    /// Filled to the merge's own cap with interpolated templates the difference measured 18.49 MB
+    /// retained against 10.50 MB.</para>
+    /// </summary>
+    [Fact]
+    public async Task Merge_DedupTableHoldsOneInstancePerDistinctValue()
+    {
+        for (int round = 0; round < 3; round++)
+            await WriteSegmentAsync(round, 400);
+        var sources = Directory.GetFiles(Path.Combine(_dir, "segments"), "*.seg").Order().ToList();
+        Assert.Equal(3, sources.Count);
+
+        // The cursor's own table, so what the merge put in it can be read back out.
+        var dedup = new Dictionary<string, string>(Utf8StringComparer.Instance);
+        int rows = 0;
+        foreach (var path in sources)
+        {
+            using var cursor = new SegmentEventCursor(SegmentReader.Open(path), dedup);
+            while (cursor.MoveNext())
+            {
+                var ev = cursor.Current;
+                // What the writer is handed must be what the table retains, or dedup is a
+                // memory cost with no saving.
+                Assert.Same(dedup[ev.MessageTemplate], ev.MessageTemplate);
+                if (ev.ServiceName is not null) Assert.Same(dedup[ev.ServiceName], ev.ServiceName);
+                rows++;
+            }
+        }
+
+        Assert.Equal(1_200, rows);
+        Assert.NotEmpty(dedup);
+        foreach (var (key, value) in dedup)
+            Assert.True(ReferenceEquals(key, value),
+                $"the dedup entry for \"{key}\" holds two distinct instances of the same content — " +
+                "it was inserted through the UTF-8 alternate, which transcodes a second time to " +
+                "materialise the key");
+    }
+
     /// <summary>Drains a k-way merge of <paramref name="sources"/> and reports what the DRAIN
     /// allocated — opening and closing the sources sits outside the measurement.</summary>
     private static long DrainMerge(List<string> sources, out long allocatedBytes)
