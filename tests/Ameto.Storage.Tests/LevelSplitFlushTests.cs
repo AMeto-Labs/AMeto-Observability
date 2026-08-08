@@ -39,6 +39,18 @@ public sealed class LevelSplitFlushTests : IAsyncLifetime
         try { Directory.Delete(_dir, true); } catch { }
     }
 
+    /// <summary>
+    /// Segments one level-split flush produces, and the width of the id block it reserves.
+    ///
+    /// <para>Production calls this <c>StorageEngine.LevelSegmentSlots</c>, which is private and
+    /// is defined as "Verbose..Fatal" — one slot per <see cref="LogLevel"/>. Derived from the
+    /// enum rather than repeated as a literal 6: if a seventh level were added, a stale literal
+    /// would make the cleanup loop below delete six of the seven segments the shutdown flush
+    /// produced, and the survivor would fail the "flush produced nothing else" assertion with a
+    /// message pointing at the segment directory instead of at the constant.</para>
+    /// </summary>
+    private static readonly int Levels = Enum.GetValues<LogLevel>().Length;
+
     private static byte[] Props(int i)
     {
         var buf = new ArrayBufferWriter<byte>(64);
@@ -54,7 +66,7 @@ public sealed class LevelSplitFlushTests : IAsyncLifetime
         long baseTicks = DateTime.UtcNow.Ticks;
         int n = 0;
         for (int i = 0; i < perLevel; i++)
-            for (int lvl = 0; lvl < 6; lvl++)
+            for (int lvl = 0; lvl < Levels; lvl++)
             {
                 var h = new LogEventHeader
                 {
@@ -77,7 +89,7 @@ public sealed class LevelSplitFlushTests : IAsyncLifetime
         await WriteMixedAsync(PerLevel);
 
         var segs = _engine.ListSegments();
-        Assert.Equal(6, segs.Count);
+        Assert.Equal(Levels, segs.Count);
 
         // Every level present exactly once, and each segment holds only its own level.
         var levels = segs.Select(s => s.MinLevel).OrderBy(l => l).ToArray();
@@ -108,8 +120,8 @@ public sealed class LevelSplitFlushTests : IAsyncLifetime
             ids.AddRange(r.ReadAllRaw(dedup).Select(e => e.Id));
         }
 
-        Assert.Equal(PerLevel * 6, ids.Count);
-        Assert.Equal(PerLevel * 6, ids.Distinct().Count());
+        Assert.Equal(PerLevel * Levels, ids.Count);
+        Assert.Equal(PerLevel * Levels, ids.Distinct().Count());
     }
 
     /// <summary>
@@ -186,10 +198,13 @@ public sealed class LevelSplitFlushTests : IAsyncLifetime
     [Fact]
     public async Task WalRecoveryAlsoSplitsByLevel()
     {
+        const int Rounds = 12;
+        int Events = Rounds * Levels;
+
         long baseTicks = DateTime.UtcNow.Ticks;
         int n = 0;
-        for (int i = 0; i < 12; i++)
-            for (int lvl = 0; lvl < 6; lvl++)
+        for (int i = 0; i < Rounds; i++)
+            for (int lvl = 0; lvl < Levels; lvl++)
             {
                 var h = new LogEventHeader
                 {
@@ -211,13 +226,14 @@ public sealed class LevelSplitFlushTests : IAsyncLifetime
         File.Copy(wal, wal + ".crash", overwrite: true);
         if (File.Exists(wal + ".pool")) File.Copy(wal + ".pool", wal + ".pool.crash", overwrite: true);
 
-        await _engine.DisposeAsync();   // flushes the 72 events and removes the WAL
+        await _engine.DisposeAsync();   // flushes every event and removes the WAL
 
         // Undo the shutdown flush: drop every segment the WAL's own block produced...
         foreach (var f in Directory.GetFiles(segDir, "*.seg"))
         {
             var parts = Path.GetFileNameWithoutExtension(f).Split('-');
-            if (ulong.TryParse(parts[1], out var id) && id >= walId && id < walId + 6) File.Delete(f);
+            if (ulong.TryParse(parts[1], out var id) && id >= walId && id < walId + (ulong)Levels)
+                File.Delete(f);
         }
         Assert.Empty(Directory.GetFiles(segDir, "*.seg"));   // the flush produced nothing else
 
@@ -236,9 +252,9 @@ public sealed class LevelSplitFlushTests : IAsyncLifetime
             await Task.Delay(50);
 
         var segs = _engine.ListSegments();
-        // Six levels in, six level-pure segments out — recovery ran and split, rather than
-        // writing the recovered tier as one mixed file.
-        Assert.Equal(6, segs.Count);
+        // Every level in, one level-pure segment per level out — recovery ran and split, rather
+        // than writing the recovered tier as one mixed file.
+        Assert.Equal(Levels, segs.Count);
 
         var dedup = new Dictionary<string, string>(StringComparer.Ordinal);
         var ids = new List<ulong>();
@@ -252,7 +268,7 @@ public sealed class LevelSplitFlushTests : IAsyncLifetime
             }
         }
 
-        Assert.Equal(72, ids.Count);                          // nothing lost
-        Assert.Equal(72, ids.Distinct().Count());             // nothing duplicated
+        Assert.Equal(Events, ids.Count);                      // nothing lost
+        Assert.Equal(Events, ids.Distinct().Count());         // nothing duplicated
     }
 }
