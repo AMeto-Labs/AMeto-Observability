@@ -806,10 +806,24 @@ public sealed class MetricWalTests : IDisposable
         engine.Ingest(second);
 
         var periodic = Task.Run(() => engine.FlushPeriodicForTest());
-        // Before the fix the periodic flush runs to completion here — snapshot, one .mts, commit.
-        // After it, it parks on the flush gate and this simply times out, which is the point.
-        await Task.WhenAny(periodic, Task.Delay(TimeSpan.FromSeconds(5)));
+        // Before the fix the periodic flush runs to completion here — snapshot, one .mts, commit
+        // — in 52 to 56 ms, measured over five runs of a build with both halves of the fix taken
+        // out (the gate here and the WAL's one-open-flush guard, which the gate is what keeps
+        // from ever firing). After the fix the flush parks on the gate and the delay is what
+        // always wins, so this window is a margin over those 55 ms rather than a wait for
+        // anything: 500 ms is about nine times what the loss needs to show itself, where the 5 s
+        // it replaces was paid in full by every green run.
+        await Task.WhenAny(periodic, Task.Delay(TimeSpan.FromMilliseconds(500)));
 
+        // The gate, asserted directly. What stood here alone was the line below it, which is a
+        // property of the FIRST flush and is held by the seam holding it — true whether the
+        // periodic flush parked or sailed straight past, so at this point the two outcomes were
+        // indistinguishable and only the final count separated them. That count fails for many
+        // other reasons as well, which is a poor way to learn the gate is gone.
+        Assert.False(periodic.IsCompleted,
+            "the periodic flush ran to completion while a flush was still between its snapshot " +
+            "and its files: its commit moves the watermark past a generation that is still being " +
+            "written, which is the loss this test measures");
         Assert.False(writing.IsCompleted, "setup: the first flush must still be held at its seam");
         string frozen = FreezeDataDir();
 
