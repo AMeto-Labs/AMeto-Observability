@@ -76,7 +76,7 @@ public sealed class SegmentCatalogKeyTests : IAsyncLifetime
     /// which is what makes a (node, id) key able to tell it apart from a local segment at all.
     /// </summary>
     private string WritePeerSegment(NodeId node, ulong segId, long baseTicks, int events = 4,
-                                    LogLevel level = LogLevel.Information)
+                                    LogLevel level = LogLevel.Information, string? path = null)
     {
         const string Template = "peer {n}";
         var pool = new StringInternPool();
@@ -92,7 +92,7 @@ public sealed class SegmentCatalogKeyTests : IAsyncLifetime
         hot.Freeze();
 
         Directory.CreateDirectory(SegDir);
-        string path = Path.Combine(SegDir, $"{node.Value}-{segId}.seg");
+        path ??= Path.Combine(SegDir, $"{node.Value}-{segId}.seg");
         using (var writer = new SegmentWriter(path))
         {
             writer.WriteEvents(hot, pool);
@@ -433,6 +433,72 @@ public sealed class SegmentCatalogKeyTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// <summary>
+    /// The case path equality cannot see, and the reason the import owns the rename. The endpoint
+    /// names a received file from the ROUTE, so two peers misconfigured with one NodeId — each
+    /// allocating segment 3 from its own counter — push two different segments to one path. There
+    /// is no local file involved and nothing to tell them apart by name.
+    ///
+    /// <para>The refusal is asserted where it has to hold: on disk. The move used to happen in
+    /// the endpoint before the import was consulted, so by the time anything compared anything
+    /// the first peer's bytes were already overwritten, and the comparison — path against itself
+    /// — then called it a re-push and refreshed the entry. Nothing was logged and both senders
+    /// recorded success.</para>
+    /// </summary>
+    [Fact]
+    public void A_staged_segment_that_differs_from_the_one_at_its_path_is_refused_without_moving()
+    {
+        long now = DateTime.UtcNow.Ticks;
+
+        string finalPath = WritePeerSegment(Peer, 3, now, events: 4);
+        Assert.Equal(SegmentImportOutcome.Registered, _engine.ImportSegment(finalPath, finalPath));
+        byte[] served = File.ReadAllBytes(finalPath);
+
+        // A DIFFERENT peer wearing the same NodeId: same key, its own events, staged where the
+        // endpoint stages a body it has just received.
+        string staged = Path.Combine(SegDir, $"{Peer.Value}-3.seg.tmp");
+        WritePeerSegment(Peer, 3, now + TimeSpan.TicksPerHour, events: 9, path: staged);
+
+        Assert.Equal(SegmentImportOutcome.Conflict, _engine.ImportSegment(staged, finalPath));
+
+        // Untouched: the entry, the events it serves, and the bytes under it.
+        var only = Assert.Single(_engine.ListSegments());
+        Assert.Equal(4u, only.EventCount);
+        Assert.Equal(finalPath, only.FilePath);
+        Assert.Equal(served, File.ReadAllBytes(finalPath));
+
+        // And the refused body is still the caller's — the engine holds no reference to it, so
+        // unlinking it is the caller's job and cannot be done for a file that was consumed.
+        Assert.True(File.Exists(staged), "a refused import moved the body it refused");
+    }
+
+    /// <summary>
+    /// The direction that must survive the check above: the SAME segment, staged and pushed
+    /// again. Its bytes may differ — a re-compression on the sender rewrites the file without
+    /// changing what is in it — so the entry is refreshed and the body takes its place, which is
+    /// what makes a re-push normal traffic rather than a conflict.
+    /// </summary>
+    [Fact]
+    public void A_staged_re_push_of_the_same_segment_replaces_the_file_and_registers_once()
+    {
+        long now = DateTime.UtcNow.Ticks;
+
+        string finalPath = WritePeerSegment(Peer, 4, now, events: 6);
+        Assert.Equal(SegmentImportOutcome.Registered, _engine.ImportSegment(finalPath, finalPath));
+
+        string staged = Path.Combine(SegDir, $"{Peer.Value}-4.seg.tmp");
+        WritePeerSegment(Peer, 4, now, events: 6, path: staged);
+        byte[] pushed = File.ReadAllBytes(staged);
+
+        Assert.Equal(SegmentImportOutcome.Registered, _engine.ImportSegment(staged, finalPath));
+
+        var only = Assert.Single(_engine.ListSegments());
+        Assert.Equal(6u, only.EventCount);
+        Assert.Equal(finalPath, only.FilePath);
+        Assert.Equal(pushed, File.ReadAllBytes(finalPath));
+        Assert.False(File.Exists(staged), "an accepted import left its body at the staged name");
+    }
+
     /// A file that is not a segment gets its own outcome rather than an exception the caller
     /// cannot tell from success. The endpoint that wrote it needs to know: on anything but
     /// <c>Registered</c> the engine holds no reference to that file, so leaving it in the

@@ -82,16 +82,18 @@ public sealed class SegmentReplicator : IDisposable
             req.Headers.Add("X-Ameto-Replication", _opts.Secret);
             using var resp = await _http.SendAsync(req, ct);
 
-            // 409 is the peer REFUSING the segment because a different file already holds
-            // (NodeId, Id) over there, which can only mean it and this node are configured with
-            // the same NodeId. A permanent deployment fault rather than a transient push failure,
-            // and one this side can actually name: the peer only ever sees "a stranger claims to
-            // be me". Logged as an error so it is not one warning among the retryable ones.
+            // 409 is the peer REFUSING the segment because a different one already holds
+            // (NodeId, Id) over there, which can only mean some other node is pushing under this
+            // node's id — the peer itself, or a third node whose files it already carries. A
+            // permanent deployment fault rather than a transient push failure, and one this side
+            // can act on: the receiver only ever sees "a stranger claims to be node {Node}" and
+            // cannot tell which of them is the stranger. Logged as an error so it is not one
+            // warning among the retryable ones.
             if (resp.StatusCode == System.Net.HttpStatusCode.Conflict)
                 _logger.LogError(
-                    "Peer {Addr} refused segment {Id}: it already holds a different file under node id " +
-                    "{Node}, so it and this node are both configured with that NodeId. Nothing will " +
-                    "replicate between the two until one of them is renumbered.",
+                    "Peer {Addr} refused segment {Id}: it already holds a different segment under node " +
+                    "id {Node}, so this node shares that NodeId with another. Nothing will replicate " +
+                    "under it until one of them is renumbered.",
                     peer.BaseAddress, segment.Id, segment.NodeId.Value);
             else if (!resp.IsSuccessStatusCode)
                 _logger.LogWarning("Push to {Addr} returned {Status}", peer.BaseAddress, resp.StatusCode);

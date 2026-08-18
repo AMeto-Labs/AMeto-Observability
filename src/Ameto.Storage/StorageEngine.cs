@@ -227,6 +227,19 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     private readonly System.Threading.Lock                _segIdLock = new();
 
     /// <summary>
+    /// Serialises <see cref="ImportSegment(string, string)"/>: the catalog lookup that decides an
+    /// import and the rename that carries it out must be one step, or two peers pushing different
+    /// segments under one key would both find it free and both rename onto the same path, leaving
+    /// one peer's bytes gone from disk whichever entry the catalog ended up with.
+    ///
+    /// <para>Nothing is taken under it — the allocator floor is raised before it is entered — so
+    /// it participates in no ordering. The section is a dictionary lookup and a rename; the
+    /// segment's contents were read before it, and the path is only ever reached once per
+    /// replicated segment.</para>
+    /// </summary>
+    private readonly System.Threading.Lock                _importLock = new();
+
+    /// <summary>
     /// First id of the block RESERVED FOR THE LIVE WAL, i.e. the ids its events will occupy
     /// once they are flushed. The WAL file is named from it, and startup uses that name to
     /// decide whether a WAL still holds unflushed events.
@@ -2214,8 +2227,30 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     private void ReserveWalBlock(ulong walSegId) => AdvanceSegmentIdFloor(walSegId + LevelSegmentSlots);
 
     /// <summary>
-    /// Registers a replicated segment file received from the cluster leader.
-    /// The file must already reside in the segments directory.
+    /// Registers a segment file received from a peer, taking ownership of it. The file is STAGED
+    /// at <paramref name="stagedPath"/> and moves to <paramref name="finalPath"/> only once it
+    /// has been accepted; on any other outcome nothing on disk is touched and the staged file is
+    /// still the caller's to unlink. <see cref="ImportSegment(string)"/> is this same call for a
+    /// file that already sits where it belongs.
+    ///
+    /// <para>That the move is on THIS side of the verdict is the reason for the two paths. The
+    /// receiving endpoint derives the final name from the ROUTE — <c>{nodeId}-{segmentId}.seg</c>
+    /// — so two peers misconfigured with one NodeId push two different segments to one path. While
+    /// the endpoint moved first and asked afterwards, the second push had already overwritten the
+    /// first peer's bytes before anything compared anything, and the comparison then found a path
+    /// equal to itself: a re-push, refresh the entry, 204. Both senders recorded a successful
+    /// push, the receiver logged nothing, and the first peer's events existed nowhere.</para>
+    ///
+    /// <para>Which is also why a re-push is not recognised BY its path. Under a duplicated NodeId
+    /// a path says nothing about who sent it, so the file already held and the file arriving are
+    /// compared as segments: the same key, at the same path, over the same time span, with the
+    /// same event count and the same minimum level. A sender re-pushing its own segment matches
+    /// all of that and refreshes the entry — its bytes may still differ, since a re-compression
+    /// rewrites a file without changing what is in it — while a stranger's segment differs in the
+    /// span or the count and is refused, the incumbent untouched in the catalog and on disk. Two
+    /// distinct segments would have to agree on their first and last event to 100 ns and on how
+    /// many events lie between to be taken for one, and that outcome is the overwrite this method
+    /// already performs for a genuine re-push.</para>
     ///
     /// <para>Runs on a request thread, concurrently with everything: the flush swap reserving a
     /// level block, the merge planner reserving a single id, another import. The allocator update
@@ -2243,66 +2278,93 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// What happened to the file, so the caller that WROTE it can act: see
     /// <see cref="SegmentImportOutcome"/>.
     /// </returns>
-    public SegmentImportOutcome ImportSegment(string filePath)
+    public SegmentImportOutcome ImportSegment(string stagedPath, string finalPath)
     {
-        SegmentInfo info;
+        SegmentInfo staged;
         try
         {
-            using var reader = SegmentReader.Open(filePath, computeUncompressedBytes: true);
-            info = reader.Info;
+            using var reader = SegmentReader.Open(stagedPath, computeUncompressedBytes: true);
+            staged = reader.Info;
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Failed to import replicated segment {File}", filePath);
+            _logger.LogWarning(ex, "Failed to import replicated segment {File}", stagedPath);
             return SegmentImportOutcome.Unreadable;
         }
 
-        var key = SegmentKey.Of(info);
+        var key = SegmentKey.Of(staged);
 
         // Before the catalog, and unconditionally — see the remark above. Monotonic, so an
-        // import that is about to be refused can only ever move it forward.
-        AdvanceSegmentIdFloor(info.Id.Value + 1);
+        // import that is about to be refused can only ever move it forward. Taken outside
+        // _importLock so that the only lock ordering in this method is no ordering at all.
+        AdvanceSegmentIdFloor(staged.Id.Value + 1);
 
-        // First file under a key keeps it. The assignment this replaces warned about the clash
-        // and then performed it anyway, which is the same eviction the key change removed, in
-        // the one case the key cannot separate — two nodes carrying the same NodeId. The names
-        // still cannot collide, so both files sit in the segments directory either way; the
-        // overwrite was the only place one of them left the catalog, and leaving the catalog is
-        // leaving queries, retention and the merge planner at once. The refused file then held
-        // disk for the life of the install, never served, never expired, never compacted.
+        bool inPlace = string.Equals(stagedPath, finalPath, StringComparison.OrdinalIgnoreCase);
+        var  info    = inPlace ? staged : AtPath(staged, finalPath);
+
+        // First segment under a key keeps it. The assignment this replaces warned about the clash
+        // and then performed it anyway, which is the same eviction the key change removed, in the
+        // one case the key cannot separate — two nodes carrying the same NodeId. Leaving the
+        // catalog is leaving queries, retention and the merge planner at once, so the refused file
+        // held disk for the life of the install, never served, never expired, never compacted.
         //
-        // Compare-and-swap rather than a read followed by a store: two request threads importing
-        // different files under one key would both read "absent" and both assign, and the loser's
-        // file would vanish from the catalog exactly as before. Losing the CAS re-reads and is
-        // then refused by the branch above it.
-        while (true)
+        // A lock rather than a compare-and-swap on the dictionary, because the decision and the
+        // rename have to be one step: two request threads importing different segments under one
+        // key would otherwise both find it free, both rename onto the same final path, and the
+        // loser's bytes would be gone from disk whatever the catalog then said. The critical
+        // section is a dictionary lookup and a rename — no read of the file's contents, nothing
+        // awaited — and imports arrive one per replicated segment, not one per event.
+        lock (_importLock)
         {
-            if (_segments.TryGetValue(key, out var existing))
+            if (_segments.TryGetValue(key, out var existing) && !IsTheSameSegment(existing, info))
             {
-                // Re-importing the SAME file is normal traffic — the endpoint moves it into
-                // place with overwrite: true and re-imports — so it refreshes the entry (the
-                // bytes may have changed under it) instead of being refused.
-                if (!string.Equals(existing.FilePath, info.FilePath, StringComparison.OrdinalIgnoreCase))
-                {
-                    _logger.LogError(
-                        "Refused replicated segment {File}: {Key} is already held by {Existing}, which " +
-                        "carries the same node id AND the same segment id. Two nodes appear to be " +
-                        "configured as NodeId {Node} — a deployment error no id space can resolve. The " +
-                        "file already being served was kept and the incoming one was NOT registered.",
-                        info.FilePath, key, existing.FilePath, info.NodeId);
-                    return SegmentImportOutcome.Conflict;
-                }
-
-                if (!_segments.TryUpdate(key, info, existing)) continue;
+                _logger.LogError(
+                    "Refused replicated segment {File}: {Key} is already held by {Existing}, which " +
+                    "carries the same node id AND the same segment id. Two nodes appear to be " +
+                    "configured as NodeId {Node} — a deployment error no id space can resolve. The " +
+                    "segment already being served was kept and the incoming one was NOT registered.",
+                    staged.FilePath, key, existing.FilePath, info.NodeId);
+                return SegmentImportOutcome.Conflict;
             }
-            else if (!_segments.TryAdd(key, info)) continue;
 
-            break;
+            if (!inPlace) File.Move(stagedPath, finalPath, overwrite: true);
+            _segments[key] = info;
         }
 
         _logger.LogInformation("Imported replicated segment {Key} ({Events} events)", key, info.EventCount);
         return SegmentImportOutcome.Registered;
     }
+
+    /// <summary>
+    /// Registers a segment file that already sits at its final path in the segments directory.
+    /// </summary>
+    public SegmentImportOutcome ImportSegment(string filePath) => ImportSegment(filePath, filePath);
+
+    /// <summary>
+    /// Whether two catalog entries describe ONE segment rather than two that collided on a key.
+    /// Deliberately not a byte comparison: a segment re-pushed after a re-compression is the same
+    /// segment carrying different bytes, and the header holds no digest to compare instead.
+    /// </summary>
+    private static bool IsTheSameSegment(SegmentInfo a, SegmentInfo b) =>
+        string.Equals(a.FilePath, b.FilePath, StringComparison.OrdinalIgnoreCase) &&
+        a.MinTimestampTicks == b.MinTimestampTicks &&
+        a.MaxTimestampTicks == b.MaxTimestampTicks &&
+        a.EventCount        == b.EventCount        &&
+        a.MinLevel          == b.MinLevel;
+
+    /// <summary>The same segment, described at the path it is about to occupy.</summary>
+    private static SegmentInfo AtPath(SegmentInfo info, string filePath) => new()
+    {
+        Id                = info.Id,
+        NodeId            = info.NodeId,
+        FilePath          = filePath,
+        MinTimestampTicks = info.MinTimestampTicks,
+        MaxTimestampTicks = info.MaxTimestampTicks,
+        EventCount        = info.EventCount,
+        MinLevel          = info.MinLevel,
+        CompressedBytes   = info.CompressedBytes,
+        UncompressedBytes = info.UncompressedBytes,
+    };
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 

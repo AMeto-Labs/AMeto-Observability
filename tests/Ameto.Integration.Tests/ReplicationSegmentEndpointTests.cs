@@ -116,6 +116,47 @@ public sealed class ReplicationSegmentEndpointTests : IClassFixture<ReplicationW
         Assert.False(File.Exists(Path.Combine(_factory.SegDir, "9-4242.seg")));
     }
 
+    /// <summary>
+    /// The refusal, in the arrangement it was written for and the one the test above cannot
+    /// reach: TWO PEERS, neither of them this node, both configured as the same NodeId. Each
+    /// allocates segment ids from its own counter, so both produce a segment 1, and the endpoint
+    /// derives the file name from the ROUTE — so unlike a local segment (which is
+    /// <c>{node}-{id}-{min}-{max}.seg</c> and therefore cannot be landed on) the two arrive at
+    /// the SAME path.
+    ///
+    /// <para>Path equality is not what tells a re-push from an intruder here, and the move used
+    /// to run before anything decided anything: the first peer's bytes were already gone when
+    /// the import was consulted, and it then compared the path with itself and answered 204.
+    /// The second push must be refused with the first peer's file untouched — on disk and in the
+    /// catalog — because this node is the only party that can see the two are different, and
+    /// each sender otherwise records a successful push.</para>
+    /// </summary>
+    [Fact]
+    public async Task A_second_peer_carrying_the_same_node_id_does_not_overwrite_the_first()
+    {
+        var storage = _factory.Services.GetRequiredService<StorageEngine>();
+        const uint duplicated = 21;
+
+        var (first,  id)  = ForeignSegment(new NodeId(duplicated), events: 6);
+        var (second, id2) = ForeignSegment(new NodeId(duplicated), events: 11);
+        Assert.Equal(id, id2);   // setup: both peers' counters start at 1, so the ids collide
+
+        Assert.Equal(HttpStatusCode.NoContent, (await PushAsync(duplicated, id, first)).StatusCode);
+        string path = Path.Combine(_factory.SegDir, $"{duplicated}-{id}.seg");
+
+        var response = await PushAsync(duplicated, id, second);
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+
+        // The catalog still names the first peer's segment...
+        var held = Assert.Single(storage.ListSegments(), s => s.NodeId.Value == duplicated && s.Id.Value == id);
+        Assert.Equal(6u, held.EventCount);
+        Assert.Equal(path, held.FilePath);
+
+        // ...and so does the disk.
+        Assert.Equal(first, await File.ReadAllBytesAsync(path));
+        Assert.False(File.Exists(path + ".tmp"), "the refused body was left staged in the segments directory");
+    }
+
     // ── Segment bodies ────────────────────────────────────────────────────────
 
     private static byte[] Props(int i)
