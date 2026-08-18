@@ -674,13 +674,13 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         await TryFlushAsync(ct);
 
     /// <summary>
-    /// Deletes a segment written by THIS node. An id on its own cannot name a replicated peer's
-    /// segment, so this scopes to the local node rather than deleting whichever entry happened
-    /// to hold the id — which, with one keyspace shared between peers, could be a peer's.
+    /// Deletes the segment under <paramref name="key"/>, whichever node produced it.
+    ///
+    /// <para>By the pair, and with no id-only overload beside it: an id names a segment only
+    /// within one node, so a delete taking one alone would unlink whichever of the overlapping
+    /// series happened to hold it. Every caller here already has a <see cref="SegmentInfo"/> and
+    /// passes <c>SegmentKey.Of(info)</c>.</para>
     /// </summary>
-    public Task DeleteSegmentAsync(SegmentId segmentId, CancellationToken ct = default) =>
-        DeleteSegmentAsync(new SegmentKey(_options.NodeId, segmentId), ct);
-
     public Task DeleteSegmentAsync(SegmentKey key, CancellationToken ct = default)
     {
         if (_segments.TryRemove(key, out var info))

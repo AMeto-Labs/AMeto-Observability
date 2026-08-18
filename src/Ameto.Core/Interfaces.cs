@@ -131,13 +131,24 @@ public interface ISegmentManager
     Task FlushHotTierAsync(CancellationToken ct = default);
 
     /// <summary>
-    /// Deletes a segment produced by THIS node. An id on its own cannot name a replicated
-    /// peer's segment — every node's counter starts at 1 — so callers holding a
-    /// <see cref="SegmentInfo"/> should delete by <see cref="SegmentKey"/> instead.
+    /// Deletes a segment by its cluster-wide key, whichever node produced it.
+    ///
+    /// <para>There is deliberately no <see cref="SegmentId"/> overload beside this one. An id on
+    /// its own does not name a segment — every node's counter starts at 1, so the series overlap
+    /// the moment a peer replicates anything — and a method taking one could only ever mean "the
+    /// local node's", a decision its own signature does not show. That is the trap the catalog key
+    /// was introduced to remove, and keeping it as a convenience overload would reintroduce it one
+    /// call site at a time. A caller holding a bare id builds the pair, and so has to say which
+    /// node it means.</para>
+    ///
+    /// <para>Also deliberately without a default implementation, unlike
+    /// <see cref="IHotTierReader.CoveredSegmentIds"/> two paragraphs above. That one is a NEW
+    /// capability, where a do-nothing default is a truthful "this reader covers nothing". This is
+    /// a delete, where any default is either a silent no-op or a guess at the node, and it
+    /// REPLACES a member that was already required — so an implementer outside this repo changes
+    /// a parameter type rather than acquiring an obligation, and hears about it from the
+    /// compiler.</para>
     /// </summary>
-    Task DeleteSegmentAsync(SegmentId segmentId, CancellationToken ct = default);
-
-    /// <summary>Deletes a segment by its cluster-wide key, whichever node produced it.</summary>
     Task DeleteSegmentAsync(SegmentKey key, CancellationToken ct = default);
     IReadOnlyList<SegmentInfo> ListSegments();
 }
