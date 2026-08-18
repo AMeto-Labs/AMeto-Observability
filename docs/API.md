@@ -468,7 +468,7 @@ List all known peer nodes and their health status.
 
 ### `POST /api/replication/ping`
 
-Peer-to-peer presence exchange. **No auth required** (peer-to-peer).
+Peer-to-peer presence exchange. **Auth:** the `X-Ameto-Replication` header must carry the configured replication secret; a blank secret fails closed, so an enabled-but-unconfigured node accepts nothing.
 
 **Body:**
 ```json
@@ -479,11 +479,23 @@ Peer-to-peer presence exchange. **No auth required** (peer-to-peer).
 
 ### `POST /api/replication/segments/{nodeId}/{segmentId}`
 
-Receive a replicated cold-tier segment from a peer. **No auth required** (peer-to-peer).
+Receive a replicated cold-tier segment from a peer. **Auth:** the `X-Ameto-Replication` header must carry the configured replication secret (same as `/ping`).
 
 **Body:** raw `.seg` file bytes (`application/octet-stream`).
 
-**Response `204 No Content`** on success.
+| Status | Meaning | Retry? |
+|---|---|---|
+| `204 No Content` | Registered. A re-push of a segment this node already holds also returns 204: it refreshes the existing entry rather than adding a second one. | — |
+| `400 Bad Request` | The body could not be read as a segment file. Nothing was registered and the received bytes were discarded. | No — a corrupt or truncated body will not become readable on retry. |
+| `409 Conflict` | A **different** segment already holds this `(nodeId, segmentId)` on the receiver, which means two nodes are configured with the same `NodeId`. The segment already being served was kept; the pushed one was **not** registered. | No — permanent until one of the nodes is renumbered. |
+| `401 Unauthorized` | The `X-Ameto-Replication` header is missing or does not match the receiver's configured secret. | No. |
+| `500` | The receiver could not write or place the file (disk error). | Yes. |
+
+Segment ids are monotonic **per node**, so `(nodeId, segmentId)` — not `segmentId` alone —
+identifies a segment across a cluster. A 409 is a deployment fault rather than a push failure:
+the receiver cannot tell which of two senders claiming one `NodeId` is the stranger, so it
+refuses the second and reports it to the sender, which is the only party positioned to tell a
+duplicate-NodeId deployment from a healthy push.
 
 ---
 
