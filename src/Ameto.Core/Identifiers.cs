@@ -203,7 +203,11 @@ public readonly struct NodeId : IEquatable<NodeId>
 /// <see cref="NodeId"/> still collide, because then the pair really is ambiguous. That is a
 /// deployment error the id space cannot paper over.</para>
 /// </summary>
-[StructLayout(LayoutKind.Sequential)]
+// No [StructLayout] here, unlike NodeId and SegmentId above. Those two go into the segment
+// header, so their sizes are part of the on-disk format and the attribute pins them. This one is
+// never marshalled, never mapped, never serialised — it is a dictionary and set key and nothing
+// else — so an attribute here would promise a layout nothing depends on and no test could notice
+// breaking, while telling the next reader that this is part of the file format.
 public readonly struct SegmentKey : IEquatable<SegmentKey>
 {
     public readonly NodeId    Node;
