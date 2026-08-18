@@ -807,12 +807,23 @@ public sealed class MetricWalTests : IDisposable
 
         var periodic = Task.Run(() => engine.FlushPeriodicForTest());
         // Before the fix the periodic flush runs to completion here — snapshot, one .mts, commit
-        // — in 52 to 56 ms, measured over five runs of a build with both halves of the fix taken
-        // out (the gate here and the WAL's one-open-flush guard, which the gate is what keeps
-        // from ever firing). After the fix the flush parks on the gate and the delay is what
-        // always wins, so this window is a margin over those 55 ms rather than a wait for
-        // anything: 500 ms is about nine times what the loss needs to show itself, where the 5 s
-        // it replaces was paid in full by every green run.
+        // — and after it the flush parks on the gate, so this window is a MARGIN over how long
+        // that completion takes rather than a wait for anything. The margin, not the number, is
+        // what has to hold: too short and the pre-fix build looks like the fixed one, which is a
+        // control that has quietly stopped discriminating rather than a test that goes red.
+        //
+        // Two measurements of that completion, on this machine: 55–65 ms over ten runs of a build
+        // with both halves of the fix taken out (the gate here and the WAL's one-open-flush
+        // guard, which the gate is what keeps from ever firing), and 28–52 ms over ten runs of
+        // the same flush timed on its own, with no held flush to contend with — a floor, since
+        // the overlap is what the first number adds. So 500 ms is roughly eight times the
+        // observed worst case, not the nine it once claimed, and 56 ms was quoted as an upper
+        // bound while sitting inside the range. The 5 s it replaces was paid in full by every
+        // green run.
+        //
+        // Re-measure before shortening it further, and expect the margin to have moved: the flush
+        // path has since gained an fsync per file, and a loaded or slower machine spends the
+        // difference here.
         await Task.WhenAny(periodic, Task.Delay(TimeSpan.FromMilliseconds(500)));
 
         // The gate, asserted directly. What stood here alone was the line below it, which is a
