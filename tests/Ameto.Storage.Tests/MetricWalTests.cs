@@ -1231,6 +1231,69 @@ public sealed class MetricWalTests : IDisposable
     // ── The abandon contract: "the flush failed" must mean no file landed ──────
 
     /// <summary>
+    /// What the caller commits the log generation against. The writer used to rename each file as
+    /// it finished, so file 1 was visible at its final path for the whole write of files 2..N —
+    /// seconds under a large flush — while the generation carrying its points was still
+    /// replayable. A crash in there duplicated every point in every published file: served from
+    /// the file and replayed from the log, with every rollup over the range reading double.
+    ///
+    /// <para>Measured where the window actually is: at the moment the FIRST file becomes visible,
+    /// nothing may still be waiting to be written. The seam fires with each file's final path
+    /// once it is in place, so counting temp files from inside it is counting what a crash there
+    /// would strand.</para>
+    /// </summary>
+    [Fact]
+    public void No_file_is_published_until_every_file_of_the_flush_is_written()
+    {
+        long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+
+        var corpus = new List<(SeriesKey Key, HotSeries Series)>();
+        foreach (string name in new[] { "metric.one", "metric.two", "metric.three" })
+        for (int s = 0; s < 4; s++)
+        {
+            var pts = new List<MetricDataPoint>();
+            for (int p = 0; p < 20; p++)
+                pts.Add(new MetricDataPoint { TimestampUnixNano = baseNano + p * 1_000_000L, Value = p });
+            corpus.Add((new SeriesKey(name, MetricKind.Gauge, "ms", Labels(("series", name + s))),
+                        new HotSeries(pts)));
+        }
+
+        int  seen        = 0;
+        int  filesAtFirst  = 0;
+        int  pointsAtFirst = 0;
+        var infos = MetricWriter.Write(
+            _dir, corpus, MetricGranularity.Raw,
+            afterFileWritten: _ =>
+            {
+                if (Interlocked.Increment(ref seen) != 1) return;
+
+                // Read here rather than after the call: two of these are still under their temp
+                // names and will not carry them for much longer.
+                var onDisk = Directory.GetFiles(_dir, "*.mts*");
+                filesAtFirst = onDisk.Length;
+                foreach (string path in onDisk)
+                    foreach (var s in MetricReader.ReadAllSync(path))
+                        pointsAtFirst += s.Points.Count;
+            });
+
+        Assert.Equal(3, infos.Count);
+        Assert.Equal(3, seen);
+
+        // All three exist the moment the first one becomes visible — one at its final path, the
+        // other two still under their temp names with nothing left to do but be renamed. Pre-fix
+        // there was one file here and the other two had not been started.
+        Assert.Equal(3, filesAtFirst);
+
+        // Existing is not the claim: COMPLETE is. Every point of the flush reads back out of the
+        // three files at that instant, so what the log is still holding replayable is points that
+        // are already, wholly, written.
+        Assert.Equal(240, pointsAtFirst);   // 3 names × 4 series × 20 points
+
+        foreach (var info in infos) Assert.True(File.Exists(info.FilePath));
+        Assert.Empty(Directory.GetFiles(_dir, "*.mts.tmp"));
+    }
+
+    /// <summary>
     /// The writer puts one <c>.mts</c> per metric name, one after another — so a disk that fills
     /// BETWEEN two of them left every earlier file complete and discoverable by the next start's
     /// <c>LoadColdSegments</c>. The flush reads a throw as "no file carries these points",

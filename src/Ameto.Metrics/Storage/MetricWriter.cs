@@ -70,7 +70,7 @@ internal static class MetricWriter
     /// points", puts the whole snapshot back into the hot tier and leaves the log generation
     /// replayable; with a file already at a final path that is not a window but certain
     /// duplication — served twice and replayed twice, every rollup over the range reading
-    /// double. Two mechanisms make the caller's reading true, and the order matters:</para>
+    /// double. Three mechanisms make the caller's reading true, and the order matters:</para>
     /// <list type="number">
     /// <item>Each file is built at <c>.mts.tmp</c> and renamed only once its footer is written
     /// and its handle closed — the shape <c>StorageEngine.FlushToColdAsync</c> already uses.
@@ -79,9 +79,19 @@ internal static class MetricWriter
     /// written, so the file the disk died on was exactly the one the catch below could not name,
     /// and what it left behind was a footerless <c>.mts</c> that the next start deleted as
     /// "likely format v1".</item>
-    /// <item>Whole files that DID land are deleted before the exception leaves, since a later
-    /// file's failure retracts the whole call.</item>
+    /// <item>Every file's bytes reach the PLATTER before it is renamed — see the flush at the end
+    /// of <see cref="WriteFile"/> — so no route exists by which a path the scan reads can hold a
+    /// file whose contents are still in page cache.</item>
+    /// <item>Nothing is renamed until every file is written, and whole files that DID land are
+    /// deleted before the exception leaves, since a later file's failure retracts the whole
+    /// call.</item>
     /// </list>
+    ///
+    /// <para>The publish being a separate pass is what shortens the window a crash can duplicate
+    /// in. The caller commits the log generation once this returns, so a crash between the first
+    /// rename and that commit leaves published points also replayable; while each file was
+    /// renamed as it finished, that window was the whole write of every file after the first —
+    /// seconds under a large flush. It is now the renames themselves.</para>
     /// </summary>
     /// <param name="afterFileWritten">
     /// Test seam invoked with each completed file's FINAL path, once it is in place. Null in production.
@@ -101,6 +111,8 @@ internal static class MetricWriter
     {
         var byMetric = series.GroupBy(s => s.Key.Name);
         var result   = new List<MetricSegmentInfo>();
+        var staged   = new List<string>();   // temp paths, index-aligned with result
+        int published = 0;
 
         try
         {
@@ -135,12 +147,11 @@ internal static class MetricWriter
                 {
                     WriteFile(tmpPath, group.Key, granularity, items, minNano, maxNano, duringFileWrite);
 
-                    // Sized off the temp file, and registered BEFORE the rename. Both halves
-                    // are deliberate: reading the length through the final path is one more
-                    // call that can throw while a complete file sits at a path nothing knows
-                    // about, and registering afterwards leaves the same gap around the rename
-                    // itself. From here on, a file at filePath implies an entry in result, so
-                    // the retraction below is exhaustive.
+                    // Staged before it is described, so the retraction below owns the file from
+                    // the instant it exists. Sized off the temp file too: reading the length
+                    // through the final path is one more call that can throw, and it would throw
+                    // with a complete file sitting at a path nothing has recorded.
+                    staged.Add(tmpPath);
                     result.Add(new MetricSegmentInfo
                     {
                         FilePath      = filePath,
@@ -151,22 +162,27 @@ internal static class MetricWriter
                         FormatVersion = Version,
                         SizeBytes     = new FileInfo(tmpPath).Length,
                     });
-
-                    // overwrite: false keeps FileMode.CreateNew's promise across the rename —
-                    // the nonce makes a collision a bug, and clobbering someone else's segment
-                    // is not how it should surface.
-                    File.Move(tmpPath, filePath, overwrite: false);
                 }
                 catch
                 {
-                    // The half-written file, which is now the only thing this iteration can
-                    // have left anywhere. Its path is not in result — that is precisely why it
-                    // has to be deleted here and not by the retraction below.
+                    // The half-written file. Deleting it here is not redundant with the
+                    // retraction: it reaches this line before it has been staged, which is
+                    // exactly the state the retraction cannot name.
                     try { File.Delete(tmpPath); } catch { /* leave it; the throw still stands */ }
                     throw;
                 }
+            }
 
-                afterFileWritten?.Invoke(filePath);
+            // ── Publish ───────────────────────────────────────────────────────────────
+            // Every file is complete and on the platter; these renames make them visible.
+            for (int i = 0; i < result.Count; i++)
+            {
+                // overwrite: false keeps FileMode.CreateNew's promise across the rename —
+                // the nonce makes a collision a bug, and clobbering someone else's segment
+                // is not how it should surface.
+                File.Move(staged[i], result[i].FilePath, overwrite: false);
+                published = i + 1;
+                afterFileWritten?.Invoke(result[i].FilePath);
             }
         }
         catch
@@ -174,10 +190,11 @@ internal static class MetricWriter
             // Best effort by necessity — the usual cause is a disk that cannot take another
             // byte, and an unlink needs none. What a failed delete leaves behind is exactly the
             // old behaviour for that one file, not something worse, so the original exception
-            // is what the caller must see. A path registered but not yet renamed into place is
-            // simply absent, and File.Delete of a missing file is a no-op.
-            for (int i = 0; i < result.Count; i++)
+            // is what the caller must see.
+            for (int i = 0; i < published; i++)
                 try { File.Delete(result[i].FilePath); } catch { /* leave it; the throw still stands */ }
+            for (int i = published; i < staged.Count; i++)
+                try { File.Delete(staged[i]); } catch { /* leave it; the throw still stands */ }
             throw;
         }
 
@@ -258,6 +275,20 @@ internal static class MetricWriter
         // Footer
         bw.Write((ulong)nameIdxOffset);
         bw.Write(FooterMagic);
+
+        bw.Flush();
+        // To the PLATTER, not just to the OS, and before the caller renames this file into
+        // place — the same step SegmentWriter.Finalise takes on the log side, for the same
+        // reason. What the caller does the moment these files are published is commit the WAL
+        // generation carrying their points, which is a store into a memory-mapped header page;
+        // that page and these data pages are written back by independent paths with no ordering
+        // between them. Without this the two could land in either order across a power loss, and
+        // one of the orders is the watermark advancing past points whose file is still a
+        // zero-length or truncated .mts at its final path — which the next start deletes as
+        // "likely format v1", now for points that no longer exist anywhere else. Closing the
+        // handle only hands the bytes to the OS; the temp name and the rename order the
+        // PUBLISH, and this orders the DATA.
+        fs.Flush(flushToDisk: true);
     }
 
     private static void WriteSeries(

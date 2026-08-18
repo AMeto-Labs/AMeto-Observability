@@ -94,8 +94,12 @@ namespace Ameto.Metrics.Storage;
 /// class's own lock; nothing derived from the data (a point's timestamp, say) would do,
 /// because those come from the instrumented client and are not monotonic in append order.
 /// Once the caller's side of the abandon contract holds (see above), a crash landing between
-/// the file write and the commit is the only thing left that can duplicate points — a window
-/// of one <c>CommitFlush</c> call, not a state the code reaches on its own.</para>
+/// the moment the first file becomes visible and the commit is the only thing left that can
+/// duplicate points, and every point in a file published before the crash is duplicated, not
+/// some of them. That window is the writer's publish pass — one rename per file, all of them
+/// after the last byte of the last file is on the platter — plus the return and this call. It
+/// was much wider while each file was renamed as it finished: the whole write of files 2..N,
+/// seconds under a large flush, with file 1 already visible throughout.</para>
 ///
 /// <para>Generation 0 is never written by an append, so it also marks the end of real data —
 /// a zero-filled region is otherwise indistinguishable from a valid entry whose point
