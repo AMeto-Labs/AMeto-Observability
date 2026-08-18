@@ -186,6 +186,48 @@ public readonly struct NodeId : IEquatable<NodeId>
     public static readonly NodeId Local = new(0);
 }
 
+/// <summary>
+/// Identifies a segment across a cluster: the node that produced it, plus that node's own
+/// counter value.
+///
+/// <para><see cref="SegmentId"/> is monotonic PER NODE, and every node's counter starts at 1, so
+/// an id on its own does not name a segment once a second node's files are in the directory —
+/// collision is the normal state of a cluster, not an edge case. Keying anything by the id alone
+/// makes the second registration evict the first: the file stays on disk (the names cannot
+/// collide — a replica is <c>{node}-{id}.seg</c>, a locally written segment
+/// <c>{node}-{id}-{minTs}-{maxTs}.seg</c>) while disappearing from queries, from retention and
+/// from the merge planner at once, which all read the catalog rather than the directory. It then
+/// holds disk for the life of the install with nothing logged.</para>
+///
+/// <para>Note what this key cannot fix: two nodes CONFIGURED with the same
+/// <see cref="NodeId"/> still collide, because then the pair really is ambiguous. That is a
+/// deployment error the id space cannot paper over.</para>
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+public readonly struct SegmentKey : IEquatable<SegmentKey>
+{
+    public readonly NodeId    Node;
+    public readonly SegmentId Id;
+
+    public SegmentKey(NodeId node, SegmentId id) { Node = node; Id = id; }
+
+    /// <summary>The key a segment file carries in its own header — see <c>SegmentReader.Info</c>.</summary>
+    public static SegmentKey Of(SegmentInfo info) => new(info.NodeId, info.Id);
+
+    public bool Equals(SegmentKey other) => Id.Value == other.Id.Value && Node.Value == other.Node.Value;
+    public override bool Equals(object? obj) => obj is SegmentKey k && Equals(k);
+
+    // Mixed by hand rather than via HashCode.Combine: this is the key of a dictionary the merge
+    // planner walks per pass and every query filters against, and the ids are dense small
+    // integers, where Combine's randomised seed buys nothing over a multiply-xor.
+    public override int GetHashCode() => unchecked((int)(Id.Value ^ (Id.Value >> 32)) * 397) ^ (int)Node.Value;
+
+    public override string ToString() => $"{Node.Value}-{Id.Value}";
+
+    public static bool operator ==(SegmentKey a, SegmentKey b) => a.Equals(b);
+    public static bool operator !=(SegmentKey a, SegmentKey b) => !a.Equals(b);
+}
+
 /// <summary>Allows <see cref="Microsoft.Extensions.Configuration"/> to bind a YAML integer to <see cref="NodeId"/>.</summary>
 internal sealed class NodeIdTypeConverter : TypeConverter
 {

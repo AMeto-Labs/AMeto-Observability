@@ -86,7 +86,7 @@ public sealed class QueryExecutor : IQueryExecutor
         long fromTicksGlobal = from?.UtcTicks ?? long.MinValue;
         long toTicksGlobal   = to?.UtcTicks   ?? long.MaxValue;
         var segInfos = _segments.GetSegments(from, to)
-            .Where(s => !covered.Contains(s.Id.Value))
+            .Where(s => !covered.Contains(SegmentKey.Of(s)))
             .Where(s => s.MaxTimestampTicks >= fromTicksGlobal && s.MinTimestampTicks <= toTicksGlobal)
             .ToList();
 

@@ -74,19 +74,26 @@ public interface IHotTierReader : IDisposable
     }
 
     /// <summary>
-    /// IDs of cold-tier segments whose events are already returned by this hot reader.
+    /// Cold-tier segments whose events are already returned by this hot reader.
     /// When a hot-tier segment is frozen and being flushed to cold storage, its
     /// future segment id is reserved here so the query layer can skip the cold
     /// segment (which may be partially written or just-registered) to avoid
     /// either duplicates or missing-events races during flush.
+    ///
+    /// <para>Keyed by <see cref="SegmentKey"/>, not by id: the reserved block belongs to the
+    /// LOCAL node, and while it was matched on the id alone a replicated peer segment whose
+    /// own counter happened to land inside that block was skipped by every query for the
+    /// duration of a flush — events silently missing from results, on a file that was
+    /// perfectly readable.</para>
+    ///
     /// Default implementation returns an empty set for backwards compatibility.
     /// </summary>
-    IReadOnlySet<ulong> CoveredSegmentIds => EmptyCoveredSet.Instance;
+    IReadOnlySet<SegmentKey> CoveredSegmentIds => EmptyCoveredSet.Instance;
 }
 
 internal static class EmptyCoveredSet
 {
-    public static readonly IReadOnlySet<ulong> Instance = new HashSet<ulong>();
+    public static readonly IReadOnlySet<SegmentKey> Instance = new HashSet<SegmentKey>();
 }
 
 /// <summary>
@@ -122,7 +129,16 @@ public interface IQueryExecutor
 public interface ISegmentManager
 {
     Task FlushHotTierAsync(CancellationToken ct = default);
+
+    /// <summary>
+    /// Deletes a segment produced by THIS node. An id on its own cannot name a replicated
+    /// peer's segment — every node's counter starts at 1 — so callers holding a
+    /// <see cref="SegmentInfo"/> should delete by <see cref="SegmentKey"/> instead.
+    /// </summary>
     Task DeleteSegmentAsync(SegmentId segmentId, CancellationToken ct = default);
+
+    /// <summary>Deletes a segment by its cluster-wide key, whichever node produced it.</summary>
+    Task DeleteSegmentAsync(SegmentKey key, CancellationToken ct = default);
     IReadOnlyList<SegmentInfo> ListSegments();
 }
 
