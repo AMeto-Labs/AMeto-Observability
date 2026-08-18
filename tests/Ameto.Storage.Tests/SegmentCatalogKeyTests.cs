@@ -214,6 +214,68 @@ public sealed class SegmentCatalogKeyTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// The SAME covered-set defect at the other consumer, and the one that serves
+    /// <c>/api/logs</c>. There are two independent copies of this check —
+    /// <c>StorageEngine.AggregateLogVolumeAsync</c> filters the segments it aggregates, and
+    /// <c>QueryExecutor.ExecuteAsync</c> filters the segments it merges — and the test above
+    /// reaches only the first. Reverting the executor's copy to an id-only match failed nothing
+    /// at all: the storage, query and integration suites all stayed green, including the test
+    /// whose own documentation describes this defect. The search path was pinned by nothing, so
+    /// a later refactor dropping the node component from it would have been invisible.
+    ///
+    /// <para>What it costs is not a count but the rows themselves: a peer replica whose id falls
+    /// inside the block a local flush reserved is filtered out of every log search for the
+    /// duration of that flush. A perfectly readable file, events silently missing from results,
+    /// nothing logged.</para>
+    /// </summary>
+    [Fact]
+    public async Task A_peer_segment_inside_the_live_flush_block_is_returned_by_a_log_search()
+    {
+        long now = DateTime.UtcNow.Ticks;
+
+        ulong inBlock = _engine.LiveWalSegmentId + 2;
+        string peerPath = WritePeerSegment(Peer, inBlock, now, events: 4);
+        _engine.ImportSegment(peerPath);
+
+        Write(20, now);
+
+        var reached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        _engine._afterLevelPublished = _ =>
+        {
+            if (!reached.TrySetResult()) return;
+            release.Task.GetAwaiter().GetResult();
+        };
+
+        var flushing = Task.Run(() => _engine.FlushHotTierAsync());
+        await reached.Task;
+
+        // Through the executor, not the aggregator: the tier is frozen, its id block is covered,
+        // and the peer's segment shares one of those ids.
+        var query = new Ameto.Query.QueryExecutor(
+            _engine, new Ameto.Indexing.SegmentIndexReaderFactory(),
+            NullLogger<Ameto.Query.QueryExecutor>.Instance);
+
+        var hits = new List<LogEvent>();
+        await foreach (var ev in query.ExecuteAsync(new QueryRequest
+        {
+            FromUtc   = new DateTimeOffset(now, TimeSpan.Zero).AddMinutes(-5),
+            ToUtc     = new DateTimeOffset(now, TimeSpan.Zero).AddMinutes(5),
+            Count     = 500,
+            Direction = QueryDirection.Forward,
+        }))
+            hits.Add(ev);
+
+        release.SetResult();
+        await flushing;
+
+        // 20 local (in the frozen tier) + 4 peer (in the cold segment the covered set was hiding).
+        Assert.Equal(24, hits.Count);
+        Assert.Equal(4, hits.Count(e => e.MessageTemplate.StartsWith("peer ", StringComparison.Ordinal)));
+    }
+
+    /// <summary>
     /// THE ALREADY-DAMAGED INSTALL. The eviction was only ever in memory — both files were always
     /// on disk, because the names cannot collide — so a directory written by the pre-fix build is
     /// exactly this: two files sharing an id, one of them absent from the catalog. Recovery has to
