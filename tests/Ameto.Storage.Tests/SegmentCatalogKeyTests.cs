@@ -27,6 +27,7 @@ public sealed class SegmentCatalogKeyTests : IAsyncLifetime
 
     private readonly string _dir = Path.Combine(Path.GetTempPath(), "ameto-segkey-" + Guid.NewGuid().ToString("N"));
     private StorageEngine _engine = null!;
+    private CapturingLogger _log  = new();
 
     private string SegDir => Path.Combine(_dir, "segments");
 
@@ -46,7 +47,7 @@ public sealed class SegmentCatalogKeyTests : IAsyncLifetime
     private StorageEngine NewEngine() => new(
         Options.Create(new ServerOptions { DataDirectory = _dir }),
         new RetentionStore(new ServerOptions { DataDirectory = _dir }, NullLogger<RetentionStore>.Instance),
-        NullLogger<StorageEngine>.Instance);
+        _log);
 
     private static byte[] Props(int i)
     {
@@ -513,6 +514,109 @@ public sealed class SegmentCatalogKeyTests : IAsyncLifetime
 
         Assert.Equal(SegmentImportOutcome.Unreadable, _engine.ImportSegment(junk));
         Assert.Empty(_engine.ListSegments());
+    }
+
+    /// <summary>
+    /// The OTHER writer into the catalog. The import refuses a second segment under an occupied
+    /// key, but the boot scan rebuilt the catalog by assigning unconditionally, in
+    /// <c>Directory.EnumerateFiles</c> order — so a directory that ALREADY holds two files under
+    /// one key lost one of them at every start, whichever the order happened to put last, with
+    /// nothing logged. That is the whole of bug #43 reached without an import running at all, and
+    /// the directory is not exotic: a build that registered the intruder left exactly this, as
+    /// does a failed unlink of a refused body, a restore from backup, or an operator copying a
+    /// file in from another node.
+    ///
+    /// <para>Two files, no import — the state, not the route to it. What the scan must do with it
+    /// is fixed rather than incidental: keep one, keep the SAME one across restarts, and say so.
+    /// The one it keeps is the locally written segment, which this node cannot get back; the
+    /// replica's owner still holds it and can push it again.</para>
+    /// </summary>
+    [Fact]
+    public async Task A_directory_holding_two_files_under_one_key_keeps_the_local_one_and_says_so()
+    {
+        long now = DateTime.UtcNow.Ticks;
+        Write(8, now);
+        await _engine.FlushHotTierAsync();
+        var local = Assert.Single(_engine.ListSegments());
+
+        // A peer misconfigured with THIS node's id, its file already in the directory and never
+        // imported: {0}-{id}.seg beside the local {0}-{id}-{min}-{max}.seg.
+        string intruder = WritePeerSegment(NodeId.Local, local.Id.Value, now, events: 11);
+        Assert.NotEqual(local.FilePath, intruder);
+
+        for (int boot = 1; boot <= 2; boot++)
+        {
+            await RestartAndAwaitCatalogAsync();
+
+            var kept = Assert.Single(_engine.ListSegments());
+            Assert.Equal(local.FilePath, kept.FilePath);
+            Assert.Equal(8u, kept.EventCount);
+
+            // Both files are still there: refusing to serve a file is not licence to delete it,
+            // and which of the two is the wrong one is not this node's to decide.
+            Assert.True(File.Exists(local.FilePath));
+            Assert.True(File.Exists(intruder));
+
+            // And the one that is not being served is named, at every start. Silence is what made
+            // this survive for the life of an install: the file is on disk, the counts look
+            // plausible, and nothing anywhere points at what is missing.
+            Assert.Contains(_log.Entries, e =>
+                e.Message.Contains(intruder, StringComparison.Ordinal) &&
+                e.Message.Contains(local.FilePath, StringComparison.Ordinal));
+        }
+
+        // Served, not merely listed: the eight local events and none of the eleven.
+        var counts = await _engine.AggregateLogVolumeAsync(
+            new DateTimeOffset(now, TimeSpan.Zero).AddMinutes(-5),
+            new DateTimeOffset(now, TimeSpan.Zero).AddMinutes(5),
+            minBucket: 0, bucketSeconds: 60, nBuckets: 60, serviceFilter: null);
+        Assert.Equal(8, counts.Total);
+    }
+
+    /// <summary>
+    /// Restarts on the same directory and waits for the catalog scan to FINISH, rather than for a
+    /// count to be reached: what a collision costs is an entry that never appears, so a wait that
+    /// stops at the first entry would be waiting for the wrong thing. The scan's closing log line
+    /// is the only signal it has published.
+    /// </summary>
+    private async Task RestartAndAwaitCatalogAsync()
+    {
+        await _engine.DisposeAsync();
+        _log    = new CapturingLogger();
+        _engine = NewEngine();
+
+        for (int i = 0; i < 400; i++)
+        {
+            foreach (var (message, _) in _log.Entries)
+                if (message.StartsWith("Loaded ", StringComparison.Ordinal)) return;
+            await Task.Delay(25);
+        }
+        Assert.Fail("the catalog scan did not finish");
+    }
+
+    /// <summary>
+    /// What the engine logged, so "one of the two files is not being served" is OBSERVABLE. The
+    /// scan cannot resolve a duplicate NodeId — nothing on this node can — so saying which file
+    /// it stopped keying is the entire remedy available to it.
+    /// </summary>
+    private sealed class CapturingLogger : Microsoft.Extensions.Logging.ILogger<StorageEngine>
+    {
+        private readonly List<(string Message, Exception? Error)> _entries = [];
+
+        public IReadOnlyList<(string Message, Exception? Error)> Entries
+        {
+            get { lock (_entries) return _entries.ToList(); }
+        }
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel level) => true;
+
+        public void Log<TState>(Microsoft.Extensions.Logging.LogLevel level,
+                                Microsoft.Extensions.Logging.EventId eventId, TState state,
+                                Exception? error, Func<TState, Exception?, string> formatter)
+        {
+            lock (_entries) _entries.Add((formatter(state, error), error));
+        }
     }
 
     /// <summary>Restarts on the same directory and waits for the background catalog scan.</summary>

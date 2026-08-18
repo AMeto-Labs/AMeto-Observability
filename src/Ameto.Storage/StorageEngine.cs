@@ -2016,13 +2016,47 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         // deleting its sources — otherwise those events would be served twice.
         RecoverInterruptedMerges();
 
-        foreach (var file in Directory.EnumerateFiles(_segDir, "*.seg"))
+        // Sorted, and a key is claimed once. The assignment this replaces was unconditional and
+        // ran in Directory.EnumerateFiles order, so a directory already holding two files under
+        // one key dropped one of them from the catalog at every start — silently, and not
+        // necessarily the same one twice. Leaving the catalog is leaving queries, retention and
+        // the merge planner at once, since all three read it rather than the directory, so the
+        // dropped file was served by nobody, expired by nothing and compacted by no merge while
+        // holding its bytes for the life of the install. That is bug #43 in full, reached without
+        // any import running: an install upgraded from a build that registered the intruder, an
+        // endpoint whose unlink of a refused body failed, a restore from backup, an operator copy.
+        //
+        // One arrangement can produce it — a locally written {node}-{id}-{min}-{max}.seg and a
+        // replica {node}-{id}.seg — because two files can share the replica name only by being
+        // the same file. Ordinal order puts the local one first ('-' sorts below '.'), and that
+        // is the file this node cannot get back: a replica's owner still holds it and can push it
+        // again. It is also the same rule the import applies while running, which is what makes a
+        // refusal survive the restart that follows it — the segment already held keeps the key.
+        //
+        // The loser is not deleted. Which of two files is the wrong one is not this node's to
+        // decide, and the cost of being wrong is unrecoverable; the cost of keeping it is disk
+        // and an error at every start, which is how an operator finds out at all.
+        var files = Directory.GetFiles(_segDir, "*.seg");
+        Array.Sort(files, StringComparer.Ordinal);
+        foreach (var file in files)
         {
             try
             {
                 using var reader = SegmentReader.Open(file, computeUncompressedBytes: true);
                 var info = reader.Info;
-                _segments[SegmentKey.Of(info)] = info;
+                var key  = SegmentKey.Of(info);
+                if (_segments.TryAdd(key, info)) continue;
+
+                // A live flush or import may have registered this very file while the scan was
+                // running — the scan is a background task, not a barrier — so only a genuinely
+                // different segment under the key is the collision being reported.
+                if (_segments.TryGetValue(key, out var kept) && !IsTheSameSegment(kept, info))
+                    _logger.LogError(
+                        "Segment {File} carries {Key}, which is already held by {Existing}. Two nodes " +
+                        "are configured as NodeId {Node}, or a file was copied in from another node. " +
+                        "The first is served, retained and merged; this one is NOT, and holds its disk " +
+                        "until one of the two is removed or the nodes are renumbered.",
+                        file, key, kept.FilePath, info.NodeId);
             }
             catch (Exception ex)
             {
