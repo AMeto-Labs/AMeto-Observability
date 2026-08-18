@@ -1398,21 +1398,29 @@ public sealed class MetricWalTests : IDisposable
     /// a <c>.mts.tmp</c>, and <c>"*.mts"</c> does not match it — so the cold scan cannot see it,
     /// cannot delete it as unreadable, and no later pass ever visits it. It would accumulate,
     /// one per interrupted flush or rollup, until somebody wondered about the disk usage.
-    /// <c>StorageEngine.LoadSegmentCatalog</c> has swept <c>*.seg.tmp</c> for exactly this
-    /// reason since the log side gained the same rename.
+    ///
+    /// <para>Asserted before the engine has done anything else, because WHEN the sweep runs is
+    /// the whole of its correctness. A wildcard delete over a directory that has live writers
+    /// unlinks the file a concurrent flush is filling — on Linux under the open handle, so the
+    /// writer only finds out when it goes to rename an inode that has no name — and the flush
+    /// then reports a failed write for a disk that was fine. Sweeping from the constructor makes
+    /// that unreachable rather than unlikely: the engine that owns every writer of these files is
+    /// the one being constructed, so no flush, rollup or ingest exists yet to collide with.</para>
     /// </summary>
     [Fact]
-    public async Task An_interrupted_build_is_swept_by_the_cold_scan()
+    public async Task An_interrupted_build_is_swept_before_anything_can_be_writing()
     {
         string tmp = Path.Combine(_dir, "metrics-instrument_0-1-2-raw-deadbeef.mts.tmp");
         File.WriteAllBytes(tmp, [0x54, 0x4D, 0x44, 0x52, 0x03, 0x00]);   // a header and nothing else
 
         var engine = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
-        await engine.ColdLoadCompleted.WaitAsync(TimeSpan.FromSeconds(30));
-        await engine.DisposeAsync();
 
         Assert.False(File.Exists(tmp),
-            "an interrupted build survived the scan; nothing else in the process will ever look at it");
+            "an interrupted build survived the constructor, so the sweep runs somewhere a live " +
+            "flush can be holding one of these files open");
+
+        await engine.ColdLoadCompleted.WaitAsync(TimeSpan.FromSeconds(30));
+        await engine.DisposeAsync();
     }
 
     /// <summary>

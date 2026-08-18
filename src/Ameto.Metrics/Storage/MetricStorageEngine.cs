@@ -220,6 +220,28 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         _wal = MetricWriteAheadLog.Open(Path.Combine(dataDir, "metrics.wal"));
         RecoverFromWal();
 
+        // Leftover builds from a flush or rollup killed between the write and the rename. HERE,
+        // and not beside the cold scan that it was written next to: that scan runs in the flush
+        // loop, in the background, while ingest is already being accepted, and a wildcard delete
+        // over *.mts.tmp in a directory with live writers unlinks whatever a flush crossing
+        // HotFlushThreshold has open at that moment. On Linux the unlink succeeds under the open
+        // handle — the writer goes on filling an inode with no name, then FileInfo(tmpPath) or
+        // the rename throws — and the flush treats a healthy write as a failed one: the whole
+        // snapshot back into the hot tier, the generation abandoned, "Failed to flush metric hot
+        // tier" logged against a disk that was fine. The *.seg.tmp sweep this was modelled on is
+        // safe because it shares the flush lock with the path that writes those files; the metric
+        // threshold flush is scheduled off the ingest path and shares no lock with the scan.
+        //
+        // Nothing races the constructor. The engine that owns every writer of these files is the
+        // one being built, so there is no flush, no rollup and no ingest to collide with, and
+        // that is a property of WHERE this runs rather than of what it checks — no age or
+        // ownership test would give it.
+        foreach (var tmp in Directory.EnumerateFiles(dataDir, "*.mts" + MetricWriter.TempSuffix))
+        {
+            try { File.Delete(tmp); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete leftover temp metric segment {File}", tmp); }
+        }
+
         // Cold-segment discovery + catalog seeding read every .mts file — far too
         // heavy for the startup path (it ran before Kestrel bound the port). The
         // flush loop performs it as its first act in the background instead:
@@ -1309,16 +1331,9 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
 
-        // Leftover builds from a flush or rollup killed between the write and the rename,
-        // swept exactly as StorageEngine.LoadSegmentCatalog sweeps *.seg.tmp. Nothing else
-        // would: "*.mts" does not match "*.mts.tmp", so an interrupted write is invisible both
-        // to the scan below — which is the point of the temp name — and to every later pass,
-        // and it would sit in the data directory until somebody wondered about the disk usage.
-        foreach (var tmp in Directory.EnumerateFiles(_dataDir, "*.mts" + MetricWriter.TempSuffix))
-        {
-            try { File.Delete(tmp); }
-            catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete leftover temp metric segment {File}", tmp); }
-        }
+        // No *.mts.tmp sweep here, deliberately — see the constructor. This method runs in the
+        // flush loop with ingest already live, so the files a wildcard would match include the
+        // ones a concurrent flush has open.
 
         var loaded = new List<MetricSegmentInfo>();
         foreach (var file in Directory.EnumerateFiles(_dataDir, "*.mts").OrderBy(f => f))
