@@ -626,7 +626,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             IReadOnlySet<Ameto.Core.LogLevel>? levels)
             => HotTierScan.ReadSorted(current, frozen, pool, fromTicks, toTicks, afterTsTicks, afterIdRaw, forward, levels);
 
-        public IReadOnlySet<SegmentKey> CoveredSegmentIds => covered;
+        public IReadOnlySet<SegmentKey> CoveredSegmentKeys => covered;
 
         public void Dispose()
         {

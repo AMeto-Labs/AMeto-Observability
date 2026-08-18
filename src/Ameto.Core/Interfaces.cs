@@ -76,7 +76,7 @@ public interface IHotTierReader : IDisposable
     /// <summary>
     /// Cold-tier segments whose events are already returned by this hot reader.
     /// When a hot-tier segment is frozen and being flushed to cold storage, its
-    /// future segment id is reserved here so the query layer can skip the cold
+    /// future segment key is reserved here so the query layer can skip the cold
     /// segment (which may be partially written or just-registered) to avoid
     /// either duplicates or missing-events races during flush.
     ///
@@ -86,12 +86,28 @@ public interface IHotTierReader : IDisposable
     /// duration of a flush — events silently missing from results, on a file that was
     /// perfectly readable.</para>
     ///
-    /// Default implementation returns an empty set for backwards compatibility.
+    /// <para>Required, with no default implementation, and named for keys rather than ids
+    /// because BOTH halves of that are load-bearing. It carried a do-nothing default while it
+    /// returned <c>IReadOnlySet&lt;ulong&gt;</c>, which was truthful for a NEW member: an
+    /// implementer that had never heard of it covered nothing. Changing the element type turned
+    /// the same default into a trap — an implementation outside this repo that returned a set of
+    /// ids no longer implements anything, so the class compiles with no error and no warning
+    /// while the interface quietly dispatches to the empty default, and the reader's cold
+    /// segments are served twice for the duration of every flush. Its two sibling changes are
+    /// CS0535 and CS0030; this one was the member whose break a compiler could not show, which is
+    /// exactly why it may not have one. A reader that genuinely covers nothing still says so, and
+    /// says it out loud, with <see cref="EmptyCoveredSet.Instance"/>.</para>
     /// </summary>
-    IReadOnlySet<SegmentKey> CoveredSegmentIds => EmptyCoveredSet.Instance;
+    IReadOnlySet<SegmentKey> CoveredSegmentKeys { get; }
 }
 
-internal static class EmptyCoveredSet
+/// <summary>
+/// What a hot reader returns when it covers no cold segment at all. Public because
+/// <see cref="IHotTierReader.CoveredSegmentKeys"/> has no default implementation: an implementer
+/// that covers nothing has to write it down, and writing it down is what makes the compiler
+/// speak the next time the member changes shape.
+/// </summary>
+public static class EmptyCoveredSet
 {
     public static readonly IReadOnlySet<SegmentKey> Instance = new HashSet<SegmentKey>();
 }
@@ -141,13 +157,14 @@ public interface ISegmentManager
     /// call site at a time. A caller holding a bare id builds the pair, and so has to say which
     /// node it means.</para>
     ///
-    /// <para>Also deliberately without a default implementation, unlike
-    /// <see cref="IHotTierReader.CoveredSegmentIds"/> two paragraphs above. That one is a NEW
-    /// capability, where a do-nothing default is a truthful "this reader covers nothing". This is
-    /// a delete, where any default is either a silent no-op or a guess at the node, and it
-    /// REPLACES a member that was already required — so an implementer outside this repo changes
-    /// a parameter type rather than acquiring an obligation, and hears about it from the
-    /// compiler.</para>
+    /// <para>Also deliberately without a default implementation, and no longer the only member of
+    /// this change that lacks one. Any default here is either a silent no-op or a guess at the
+    /// node, and a signature that REPLACES a required member is meant to be heard about: an
+    /// implementer outside this repo changes a parameter type and the compiler says CS0535.
+    /// <see cref="IHotTierReader.CoveredSegmentKeys"/> kept a default while its element type
+    /// changed under it, which is the same break with the compiler switched off — the class goes
+    /// on compiling and the interface silently dispatches to an empty set — so it lost the
+    /// default too.</para>
     /// </summary>
     Task DeleteSegmentAsync(SegmentKey key, CancellationToken ct = default);
     IReadOnlyList<SegmentInfo> ListSegments();

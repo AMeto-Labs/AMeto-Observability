@@ -259,6 +259,14 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
 
     // ── IHotTierReader ────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// A bare tier covers no cold segment: the reservation belongs to the flush that freezes a
+    /// tier, and it is <c>StorageEngine</c>'s reader snapshot that holds it. Spelled out rather
+    /// than inherited from a default, so that the next change to this member's shape reaches this
+    /// class through the compiler instead of through a query returning everything twice.
+    /// </summary>
+    public IReadOnlySet<SegmentKey> CoveredSegmentKeys => EmptyCoveredSet.Instance;
+
     /// <inheritdoc/>
     public IEnumerable<LogEvent> ReadAll() => ReadAll(null);
 
