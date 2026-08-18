@@ -718,6 +718,15 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         await _flushGate.WaitAsync().ConfigureAwait(false);
         try
         {
+            // The pre-check above describes the tier BEFORE the wait, and the wait is exactly
+            // where it goes stale: whoever held the gate was draining the tier, so a tick that
+            // queued behind a threshold flush wakes over an empty one by construction, not by
+            // chance. Without this it went on to open a generation, bump the counter, write the
+            // new value into the mapped header, drain nothing and abandon — correct, but "there
+            // was nothing to write" is a normal outcome of crossing a flush, not the rare race
+            // the branch below reads as. Repeated per tick for as long as a large flush runs.
+            if (Volatile.Read(ref _hotPointCount) == 0) return;
+
             // Snapshot and clear hot tier. Bounds must travel with the snapshot —
             // without them cold histogram files have no bucket bounds and quantile /
             // heatmap queries over anything older than the hot tier return nothing.
@@ -760,6 +769,12 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                     {
                         // Nothing to write, so nothing to commit — hand the generation back rather
                         // than leaving it open. The empty generation is covered by the next commit.
+                        //
+                        // Genuinely rare now, which it was not before the re-check above the lock:
+                        // the counter is raised under the read lock after the point is appended, so
+                        // a non-zero count seen from inside the WRITE lock means some series holds
+                        // points. Kept because the two are separate pieces of state and this costs
+                        // one comparison.
                         _wal.AbandonFlush(flushedGeneration);
                         return;
                     }

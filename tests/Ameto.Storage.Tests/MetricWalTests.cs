@@ -824,6 +824,66 @@ public sealed class MetricWalTests : IDisposable
     }
 
     /// <summary>
+    /// What the gate turns that overlap into, and the state the code did not re-read after
+    /// waiting for it. The "is there anything to flush" check sits OUTSIDE the gate on purpose —
+    /// a tick that queued behind a long write only to find nothing would make every tick during
+    /// that write a wait — but it describes the tier BEFORE the wait, and the flush ahead is
+    /// draining exactly that tier. So a tick queued behind a threshold flush wakes over an empty
+    /// one every time, not occasionally: it opened a generation, bumped the counter, wrote the
+    /// new value into the mapped header and abandoned it one drain later, and the branch it
+    /// landed in reads as a rare race.
+    ///
+    /// <para>Held at the seam that stands INSIDE the write lock, before the drain: the tier is
+    /// still full there, so the tick passes the pre-check while the flush ahead of it has yet to
+    /// take a single point. That seam also counts every generation this engine opens, which is
+    /// the assertion.</para>
+    /// </summary>
+    [Fact]
+    public async Task A_tick_that_wakes_over_a_drained_tier_opens_no_generation()
+    {
+        var engine = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
+        long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+
+        var held    = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var reached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int opened  = 0;
+        engine.OnGenerationOpenedForTest = () =>
+        {
+            if (Interlocked.Increment(ref opened) != 1) return;   // only the first flush is held
+            reached.TrySetResult();
+            held.Task.GetAwaiter().GetResult();
+        };
+
+        // 60 000 points — over MinFlushPoints, so the periodic path is genuinely due, and well
+        // under HotFlushThreshold, so the only flushes here are the two this test schedules.
+        engine.Ingest(SlowFlushBatch(baseNano, "a", series: 400, pointsPerSeries: 150));
+        var writing = engine.ScheduleThresholdFlushForTest();
+        await reached.Task;                       // holding the gate and the write lock, pre-drain
+
+        Assert.True(engine.HotPointCount > 0, "setup: the flush ahead must not have drained yet");
+
+        var started  = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var periodic = Task.Run(async () =>
+        {
+            started.SetResult();
+            await engine.FlushPeriodicForTest();
+        });
+        await started.Task;
+        await Task.Delay(TimeSpan.FromMilliseconds(500));
+        Assert.False(periodic.IsCompleted, "setup: the tick must be parked on the gate, not past it");
+        Assert.True(engine.HotPointCount > 0, "setup: the tick read the pre-check over a full tier");
+
+        held.SetResult();
+        await writing;                            // drains everything, writes its files, commits
+        await periodic;                           // wakes over the tier that flush emptied
+        await engine.DisposeAsync();
+
+        Assert.True(Volatile.Read(ref opened) == 1,
+            $"{opened} generations were opened for one flush worth of points: the tick behind the " +
+            "gate opened one over an empty tier and abandoned it");
+    }
+
+    /// <summary>
     /// The second half, which the write-up does not name and which decides the shape of the fix:
     /// a flush whose files THREW restores its points to the hot tier without re-logging them, so
     /// from then on only its own uncommitted WAL records keep them durable. That is safe exactly
