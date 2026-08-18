@@ -1365,6 +1365,83 @@ public sealed class MetricWalTests : IDisposable
     }
 
     /// <summary>
+    /// The same tripwire seen from production, where nobody holds the task. The periodic path
+    /// was wrapped — "a tick that throws must cost one tick" — but the THRESHOLD path is
+    /// scheduled from <c>Ingest</c> with <c>_ = ScheduleThresholdFlush()</c>, because an ingest
+    /// call cannot wait on a flush. So a guard against silent loss reported itself in silence:
+    /// no log line, no rethrow, nothing but a <c>TaskScheduler.UnobservedTaskException</c> at
+    /// some later finalisation. And the state it guards is not transient — <c>CommitFlush</c>
+    /// under <c>_disposed</c> returns before clearing the open flush, so once entered it holds
+    /// for the life of the process and every later flush throws into the same void.
+    ///
+    /// <para>Driven through the real crossing rather than the test hook, since the discarded
+    /// task is <c>Ingest</c>'s: 500 000 points, which is <c>HotFlushThreshold</c> exactly.</para>
+    /// </summary>
+    [Fact]
+    public async Task A_threshold_flush_that_throws_is_not_swallowed_by_the_task_nobody_holds()
+    {
+        var logger = new RecordingLogger();
+        var engine = new MetricStorageEngine(_dir, logger);
+        long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+
+        // Armed before the crossing: the one seam standing where the drain's own allocation
+        // would fail, which is the realistic trigger and the shape BeginFlush's throw has too.
+        engine.OnGenerationOpenedForTest = static () => throw new OutOfMemoryException("drain");
+
+        const int total = 500_000;                       // == HotFlushThreshold
+        var batch = new MetricIngestItem[10_000];
+        for (int done = 0; done < total; done += batch.Length)
+        {
+            for (int i = 0; i < batch.Length; i++)
+                batch[i] = Scalar("instrument.0", baseNano + (done + i) * 1_000L, 1.0,
+                                  Labels(("series", (i & 3).ToString())));
+            engine.Ingest(batch);
+        }
+
+        // The flush runs off the ingest path, so give it its moment to report.
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (!logger.Saw(Microsoft.Extensions.Logging.LogLevel.Error, "Threshold metric flush failed", out _)
+               && sw.Elapsed < TimeSpan.FromSeconds(20))
+            await Task.Delay(10);
+
+        engine.OnGenerationOpenedForTest = null;
+        bool said = logger.Saw(Microsoft.Extensions.Logging.LogLevel.Error, "Threshold metric flush failed", out var reported);
+        await engine.DisposeAsync();
+
+        Assert.True(said,
+            "the flush threw and nothing said so: the hot tier stops draining and the log grows by doubling, " +
+            "with no line in the log to explain either");
+        Assert.IsType<OutOfMemoryException>(reported);   // the flush's own failure, not something else
+    }
+
+    /// <summary>Records every line logged, so a test can assert on the report a path makes.</summary>
+    private sealed class RecordingLogger : Microsoft.Extensions.Logging.ILogger<MetricStorageEngine>
+    {
+        private readonly System.Collections.Concurrent.ConcurrentQueue<
+            (Microsoft.Extensions.Logging.LogLevel Level, string Text, Exception? Error)> _lines = new();
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            Microsoft.Extensions.Logging.LogLevel logLevel, Microsoft.Extensions.Logging.EventId eventId,
+            TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+            => _lines.Enqueue((logLevel, formatter(state, exception), exception));
+
+        public bool Saw(Microsoft.Extensions.Logging.LogLevel level, string prefix, out Exception? error)
+        {
+            foreach (var (l, text, e) in _lines)
+                if (l == level && text.StartsWith(prefix, StringComparison.Ordinal))
+                {
+                    error = e;
+                    return true;
+                }
+            error = null;
+            return false;
+        }
+    }
+
+    /// <summary>
     /// Shutdown has to survive a flush that throws. The loop's last act is an unconditional
     /// final flush, and that await was bare: a throw there faulted <c>_flushTask</c>, and
     /// <c>DisposeAsync</c> caught only <see cref="OperationCanceledException"/> off it — so the

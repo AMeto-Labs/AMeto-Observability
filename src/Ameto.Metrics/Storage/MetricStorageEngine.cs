@@ -340,6 +340,8 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         if (total >= HotFlushThreshold
             && System.Threading.Interlocked.CompareExchange(ref _thresholdFlushScheduled, 1, 0) == 0)
         {
+            // Discarded, necessarily — an ingest call cannot wait on a flush. What the flush
+            // has to say about itself is therefore said by the continuation inside, not here.
             _ = ScheduleThresholdFlush();
         }
     }
@@ -361,11 +363,32 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
         _inFlightFlushes[flush] = 0;
         // Static lambda + state argument: no closure is captured for a path that runs on
-        // every threshold crossing. ExecuteSynchronously keeps the removal on the completing
-        // thread rather than queueing a work item just to erase a dictionary entry.
+        // every threshold crossing. ExecuteSynchronously keeps the bookkeeping on the
+        // completing thread rather than queueing a work item just to erase a dictionary entry.
+        //
+        // Reporting the failure is the second half, and it belongs here because this is the
+        // only place that HOLDS the task: the periodic path got its "a tick that throws must
+        // cost one tick" wrapper in the loop that awaits it, while the threshold path's only
+        // caller is Ingest, which discards it. A throw out of FlushHotTierAsync therefore went
+        // nowhere — no log line, no rethrow, nothing but a TaskScheduler.UnobservedTaskException
+        // at some later finalisation, which no deployment reads. The tripwire this PR added to
+        // BeginFlush is exactly such a throw, and CommitFlush under _disposed returns before
+        // clearing the open flush, so once that state is entered every later flush hits it for
+        // the life of the process. Silence was the whole cost.
+        //
+        // Reading t.Exception is also what marks it observed, so the discarded task above is no
+        // longer a finaliser-time surprise. The task is still handed back to whoever called,
+        // faulted and all — ScheduleThresholdFlushForTest depends on that.
         _ = flush.ContinueWith(
-            static (t, s) => ((ConcurrentDictionary<Task, byte>)s!).TryRemove(t, out _),
-            _inFlightFlushes, CancellationToken.None,
+            static (t, s) =>
+            {
+                var self = (MetricStorageEngine)s!;
+                self._inFlightFlushes.TryRemove(t, out _);
+                if (t.Exception is { } ex)
+                    self._logger.LogError(ex.InnerException ?? ex,
+                        "Threshold metric flush failed; the hot tier keeps its points and the next crossing schedules another");
+            },
+            this, CancellationToken.None,
             TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
 
         gate.SetResult();   // registered — the flush may start
