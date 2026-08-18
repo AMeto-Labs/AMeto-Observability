@@ -51,11 +51,25 @@ namespace Ameto.Metrics.Storage;
 /// surviving tail to the front.</item>
 /// </list>
 ///
+/// <para><b>One flush at a time, and why the log insists on it.</b> The watermark is a single
+/// u64 and <see cref="CommitFlush"/> frees everything at or below it, so committing G+1 also
+/// frees G. That is only sound if G's files were already written. With two flushes open at
+/// once it is not: the later one's commit reclaims the earlier one's records while the earlier
+/// one is still inside its file write, and a failure there leaves those points in neither a
+/// file nor the log — durable nowhere, with nothing logged and nothing thrown. The class used
+/// to leave that to its caller; it now enforces it. <see cref="BeginFlush"/> refuses to open a
+/// second flush, and <see cref="CommitFlush"/> refuses a generation that is not the open one,
+/// so the watermark can never pass a flush that has not finished writing. A flush that gives
+/// its generation back to the tier says so with <see cref="AbandonFlush"/>.</para>
+///
 /// <para>A flush that fails simply never commits: the snapshot's records still sit in the
 /// log below an unchanged watermark, so a crash before the retry replays them. This is what
 /// makes "durable before queryable" true for a point that arrives mid-flush — an earlier
 /// design zeroed the whole log after writing the files and destroyed exactly those
-/// records.</para>
+/// records. Its points are restored to the hot tier and NOT re-logged, so the abandoned
+/// generation's records are what keeps them durable until the next flush snapshots them and
+/// commits a generation above it. That coupling is why the failure path must abandon rather
+/// than simply return.</para>
 ///
 /// <para><b>Crash recovery.</b> Recovery keeps entries whose generation is ABOVE the
 /// committed watermark. The watermark is written before any bytes move, so a crash during
@@ -133,6 +147,16 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     private ulong                     _generation;
     private ulong                     _committedGeneration;
     private bool                      _disposed;
+
+    /// <summary>
+    /// The generation handed out by <see cref="BeginFlush"/> that has not yet been committed or
+    /// abandoned; 0 = none open. A scalar rather than a set, because ONE open flush is the
+    /// invariant this class enforces — see the flush-protocol remarks above. In-memory only:
+    /// a crash kills every open flush by definition, and every open generation is by
+    /// construction ABOVE the persisted watermark, so recovery replays it. Persisting it would
+    /// describe flushes that no longer exist.
+    /// </summary>
+    private ulong _openFlush;
 
     // Series registry for the CURRENT generation. Cleared on reset together with the pool
     // file, so neither grows across the life of the process.
@@ -301,13 +325,29 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// the files are written gets the next one.
     /// </summary>
     /// <returns>The generation the snapshot belongs to — pass it to <see cref="CommitFlush"/>.</returns>
+    /// <exception cref="InvalidOperationException">
+    /// A flush opened by an earlier <see cref="BeginFlush"/> has neither committed nor been
+    /// abandoned. Committing this one would reclaim that one's records while its files are
+    /// still being written, which is the loss this guard exists to make impossible; throwing
+    /// happens BEFORE the caller's snapshot is drained, so nothing is in flight to lose.
+    /// </exception>
     public ulong BeginFlush()
     {
         lock (_writeLock)
         {
             ulong flushing = _generation;
+            // Disposed: the generation is handed back WITHOUT being opened or bumped, so two
+            // callers racing a shutdown can be given the same value. Registering it would leave
+            // an open flush nothing ever closes — CommitFlush returns early here too.
             if (_disposed || _ptr is null) return flushing;
 
+            if (_openFlush != 0)
+                throw new InvalidOperationException(
+                    $"Metric WAL flush {_openFlush} is still open; a second flush cannot begin " +
+                    "until it commits or is abandoned. Committing the later one would reclaim " +
+                    "the earlier one's records while its files are still being written.");
+
+            _openFlush  = flushing;
             _generation = flushing + 1;
             Unsafe.AsRef<WalFileHeader>(_ptr).Generation = _generation;
             return flushing;
@@ -315,9 +355,35 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     }
 
     /// <summary>
+    /// Gives an opened generation back without committing it: the flush failed, its points went
+    /// back into the hot tier, and the NEXT flush's snapshot will carry them. Its records stay
+    /// in the log below an unchanged watermark, so they are what keeps those points durable
+    /// until that later generation commits and covers them.
+    ///
+    /// <para>The failure path used to signal this by calling nothing at all, which is why the
+    /// coupling was invisible. Saying it out loud is also what keeps the one-open-flush guard
+    /// from wedging the log after a failed flush.</para>
+    /// </summary>
+    public void AbandonFlush(ulong flushedGeneration)
+    {
+        lock (_writeLock)
+        {
+            // Tolerant of a generation never registered: the disposed path above hands one out
+            // without opening it, and callers must be able to abandon unconditionally.
+            if (_openFlush == flushedGeneration) _openFlush = 0;
+        }
+    }
+
+    /// <summary>
     /// Marks everything up to <paramref name="flushedGeneration"/> as durable elsewhere and
     /// reclaims its space. Call only after the files carrying those points are on disk; a
-    /// flush that failed must simply never call this, leaving its records replayable.
+    /// flush that failed must call <see cref="AbandonFlush"/> instead, leaving its records
+    /// replayable.
+    ///
+    /// <para>A generation that is not the currently open flush is REFUSED. That is the direct
+    /// statement of the watermark's rule — it may only ever name a generation whose data is
+    /// already in files — and it holds even if a caller reintroduces concurrent flushes: the
+    /// later one's commit cannot reclaim the earlier one's records.</para>
     /// </summary>
     public void CommitFlush(ulong flushedGeneration)
     {
@@ -325,7 +391,9 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
         {
             if (_disposed || _ptr is null) return;
             if (flushedGeneration <= _committedGeneration) return;   // already committed
+            if (flushedGeneration != _openFlush) return;             // not the flush that is writing
 
+            _openFlush           = 0;
             _committedGeneration = flushedGeneration;
 
             // The watermark lands before a single byte moves: a crash mid-compaction then
@@ -341,6 +409,14 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// Moves entries above the watermark to the front. Generation is non-decreasing in append
     /// order, so the committed entries are a prefix and the survivors one contiguous tail —
     /// a single move, bounded by whatever arrived while the files were being written.
+    ///
+    /// <para>That physical prefix is a property of the LAYOUT and holds for any watermark
+    /// value: the generation is stamped inside <c>_writeLock</c>, is only ever raised inside
+    /// the same lock, and the write offset advances under it too, so entries at or below any
+    /// threshold occupy a physical prefix whatever order flushes complete in. What the
+    /// one-open-flush rule adds is the SEMANTIC half — that the set of generations already in
+    /// files has no holes, so a single u64 watermark can express it. Both halves are needed;
+    /// this method's single move rests on the first, and its correctness on the second.</para>
     /// </summary>
     private void Compact(ulong committed)
     {

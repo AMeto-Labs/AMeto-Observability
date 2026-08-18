@@ -318,6 +318,160 @@ public sealed class MetricWalTests : IDisposable
         Assert.Equal(0, new FileInfo(PoolPath).Length);   // and the pool with it
     }
 
+    // ── One flush at a time, and why the watermark needs it ──────────────────
+
+    /// <summary>
+    /// The crux of the metrics-WAL loss, driven at the log with no timing at all. A flush opens
+    /// generation G and starts writing its files; a second flush opens G+1 and finishes first.
+    /// Its commit sets the watermark to G+1, and the watermark frees everything AT OR BELOW it —
+    /// so G's records left the log while G's files were still being written. From that instant
+    /// the first flush's points were in no file and no log, and its own later commit was a
+    /// no-op (<c>flushedGeneration &lt;= _committedGeneration</c>), so nothing put them back.
+    ///
+    /// <para>Asserted on the OUTCOME, not the mechanism: the log now refuses to open a second
+    /// flush while one is still writing, so the second <c>BeginFlush</c> throws rather than
+    /// returning G+1. Either way what must be true is the same — nothing a flush has not
+    /// finished writing may leave the log.</para>
+    /// </summary>
+    [Fact]
+    public void A_later_flushs_commit_cannot_reclaim_one_that_is_still_writing()
+    {
+        long baseNano = 1_700_000_000_000_000_000L;
+
+        var wal = MetricWriteAheadLog.Open(WalPath);
+        for (int i = 0; i < 5; i++) Append(wal, Scalar("m", baseNano + i, i));
+        _ = wal.BeginFlush();                                 // flush A — still writing its files
+        for (int i = 5; i < 9; i++) Append(wal, Scalar("m", baseNano + i, i));
+
+        long bytesBefore = wal.WrittenBytes;
+
+        // Flush B, exactly as an overlapping periodic flush performed it.
+        try
+        {
+            ulong second = wal.BeginFlush();
+            wal.CommitFlush(second);
+        }
+        catch (InvalidOperationException) { /* the fix refuses to open it at all */ }
+
+        Assert.Equal(bytesBefore, wal.WrittenBytes);          // not one record reclaimed
+        wal.Dispose();
+
+        var reopened = MetricWriteAheadLog.Open(WalPath);
+        var values   = reopened.ReadAll(out _).Select(r => r.Point.Value).OrderBy(v => v).ToArray();
+        reopened.Dispose();
+
+        Assert.Equal([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], values);
+    }
+
+    /// <summary>
+    /// The same rule stated where it is enforced rather than where it is caused: the watermark
+    /// may only ever name the flush that is currently open. A commit for anything else moves
+    /// nothing — which is what keeps the guarantee true even if a caller ever reintroduces
+    /// concurrent flushes by some route <see cref="MetricWriteAheadLog.BeginFlush"/> cannot see.
+    /// </summary>
+    [Fact]
+    public void A_commit_for_a_generation_that_is_not_the_open_flush_reclaims_nothing()
+    {
+        long baseNano = 1_700_000_000_000_000_000L;
+
+        var wal = MetricWriteAheadLog.Open(WalPath);
+        for (int i = 0; i < 5; i++) Append(wal, Scalar("m", baseNano + i, i));
+        ulong first = wal.BeginFlush();
+        for (int i = 5; i < 9; i++) Append(wal, Scalar("m", baseNano + i, i));
+
+        long bytesBefore = wal.WrittenBytes;
+        wal.CommitFlush(first + 1);                            // a generation nobody opened
+        Assert.Equal(bytesBefore, wal.WrittenBytes);
+
+        // And the real commit still works, reclaiming exactly its own prefix.
+        wal.CommitFlush(first);
+        Assert.True(wal.WrittenBytes < bytesBefore);
+        wal.Dispose();
+
+        var reopened = MetricWriteAheadLog.Open(WalPath);
+        var values   = reopened.ReadAll(out _).Select(r => r.Point.Value).OrderBy(v => v).ToArray();
+        reopened.Dispose();
+
+        Assert.Equal([5.0, 6.0, 7.0, 8.0], values);            // the survivors, once each
+    }
+
+    /// <summary>
+    /// A second flush cannot begin while one is open, and the refusal happens before the caller
+    /// has drained anything — the engine calls <c>BeginFlush</c> ahead of its snapshot precisely
+    /// so a throw here costs a flush rather than a tier.
+    /// </summary>
+    [Fact]
+    public void The_log_refuses_to_open_a_second_flush_while_one_is_writing()
+    {
+        var wal = MetricWriteAheadLog.Open(WalPath);
+        Append(wal, Scalar("m", 1_700_000_000_000_000_000L, 1));
+
+        ulong open = wal.BeginFlush();
+        Assert.Throws<InvalidOperationException>(() => wal.BeginFlush());
+
+        wal.CommitFlush(open);
+        wal.BeginFlush();                                      // and the next one is free to run
+        wal.Dispose();
+    }
+
+    /// <summary>
+    /// The failure path's exit. A flush whose files threw puts its points back into the hot tier
+    /// WITHOUT re-logging them, so its records are what keeps them durable until a later flush
+    /// carries them — the generation is abandoned, never committed. Without an explicit
+    /// abandon the one-open-flush rule would wedge the log after the first failed flush: no
+    /// further flush could begin, the watermark would never advance again, and every restart
+    /// would replay everything since the failure.
+    /// </summary>
+    [Fact]
+    public void An_abandoned_flush_frees_the_log_to_flush_again_and_keeps_its_records()
+    {
+        long baseNano = 1_700_000_000_000_000_000L;
+
+        var wal = MetricWriteAheadLog.Open(WalPath);
+        for (int i = 0; i < 3; i++) Append(wal, Scalar("m", baseNano + i, i));
+        long logged = wal.WrittenBytes;
+
+        ulong failed = wal.BeginFlush();
+        wal.AbandonFlush(failed);                              // the write threw; points went back
+        Assert.Equal(logged, wal.WrittenBytes);                // and its records stayed
+
+        // The retry: the restored points are re-appended by the next snapshot's own generation,
+        // and committing THAT covers the abandoned one — which is the only thing that ever
+        // reclaims it.
+        for (int i = 0; i < 3; i++) Append(wal, Scalar("m", baseNano + i, i));
+        ulong retry = wal.BeginFlush();
+        wal.CommitFlush(retry);
+        Assert.Equal(0, wal.WrittenBytes);
+        wal.Dispose();
+    }
+
+    /// <summary>
+    /// <see cref="Repeated_flush_cycles_keep_the_log_and_pool_bounded"/> with a second flush
+    /// attempted inside every cycle. A rule that held the watermark back without a way to
+    /// release it would show up here as a log that never empties.
+    /// </summary>
+    [Fact]
+    public void Interleaved_flush_attempts_keep_the_log_bounded()
+    {
+        var wal = MetricWriteAheadLog.Open(WalPath);
+        for (int cycle = 0; cycle < 50; cycle++)
+        {
+            for (int i = 0; i < 100; i++)
+                Append(wal, Scalar("m", 1_700_000_000_000_000_000L + cycle * 1000 + i, i,
+                                   Labels(("cycle", cycle.ToString()))));
+
+            ulong open = wal.BeginFlush();
+            try { wal.CommitFlush(wal.BeginFlush()); }         // the overlapping flush
+            catch (InvalidOperationException) { }
+            wal.CommitFlush(open);
+
+            Assert.Equal(0, wal.WrittenBytes);                 // still fully reclaimed each time
+        }
+        wal.Dispose();
+
+        Assert.Equal(0, new FileInfo(PoolPath).Length);
+    }
+
     [Fact]
     public void A_point_stamped_zero_does_not_truncate_the_log()
     {
@@ -560,6 +714,110 @@ public sealed class MetricWalTests : IDisposable
         durable < expected
             ? $"LOST {expected - durable} of {expected} points"
             : $"DUPLICATED {durable - expected} points ({durable} where {expected} were ingested)";
+
+    // ── A periodic flush overlapping a threshold flush ────────────────────────
+
+    /// <summary>
+    /// The production shape of the same loss, end to end, and with no race in it. The threshold
+    /// CAS gates threshold flushes against each other only; the PERIODIC flush is behind nothing,
+    /// so it could snapshot, write its (small) files and commit while a threshold flush was still
+    /// writing its own. Its commit set the watermark to G+1, and the watermark frees everything
+    /// at or below it — so the threshold flush's records left the log mid-write.
+    ///
+    /// <para>Held open at the seam rather than raced: the first flush parks between its snapshot
+    /// and its files, which is exactly the window, and the directory is frozen while it is
+    /// parked. Frozen there the first flush has written nothing at all, so the count is exact in
+    /// both directions — no partially-written file can supply a duplicate and disguise a loss.
+    /// Before the fix this reports LOST 300 000 of 350 000 on every run.</para>
+    /// </summary>
+    [Fact]
+    public async Task A_periodic_flush_cannot_commit_away_a_threshold_flush_that_is_still_writing()
+    {
+        var engine = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
+        long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+
+        var held    = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var reached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int flushes = 0;
+        engine.OnSnapshotTakenForTest = () =>
+        {
+            // Only the FIRST flush is held. A second one reaching here means the fix is absent
+            // and the periodic flush overtook — which is the state the assertions below measure.
+            if (Interlocked.Increment(ref flushes) != 1) return;
+            reached.TrySetResult();
+            held.Task.GetAwaiter().GetResult();
+        };
+
+        var first = SlowFlushBatch(baseNano);                                  // 300 000 points
+        engine.Ingest(first);
+        var writing = engine.ScheduleThresholdFlushForTest();
+        await reached.Task;                     // snapshot taken, generation opened, no file yet
+
+        // MinFlushPoints exactly — the bar the periodic path itself applies, so this drives the
+        // real due-check and not a private flush entry point.
+        var second = SlowFlushBatch(baseNano + 3_600_000_000_000L, "late", series: 200, pointsPerSeries: 250);
+        engine.Ingest(second);
+
+        var periodic = Task.Run(() => engine.FlushPeriodicForTest());
+        // Before the fix the periodic flush runs to completion here — snapshot, one .mts, commit.
+        // After it, it parks on the flush gate and this simply times out, which is the point.
+        await Task.WhenAny(periodic, Task.Delay(TimeSpan.FromSeconds(5)));
+
+        Assert.False(writing.IsCompleted, "setup: the first flush must still be held at its seam");
+        string frozen = FreezeDataDir();
+
+        held.SetResult();
+        await writing;
+        await periodic;
+        await engine.DisposeAsync();
+
+        long expected = first.Length + second.Length;
+        long durable  = await DurablePointsAsync(frozen, "instrument.0");
+        Assert.True(durable == expected, Verdict(durable, expected));
+    }
+
+    /// <summary>
+    /// The second half, which the write-up does not name and which decides the shape of the fix:
+    /// a flush whose files THREW restores its points to the hot tier without re-logging them, so
+    /// from then on only its own uncommitted WAL records keep them durable. That is safe exactly
+    /// while the next flush's snapshot is guaranteed to happen after the restore — otherwise the
+    /// next flush snapshots first, commits a generation above the failed one, and reclaims the
+    /// records of points that now exist only in memory.
+    /// </summary>
+    [Fact]
+    public async Task A_flush_that_failed_stays_durable_until_a_later_one_carries_its_points()
+    {
+        var engine = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
+        long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+
+        int attempts = 0;
+        engine.OnSnapshotTakenForTest = () =>
+        {
+            if (Interlocked.Increment(ref attempts) == 1)
+                throw new IOException("simulated disk failure while writing .mts files");
+        };
+
+        var failed = SlowFlushBatch(baseNano, series: 40, pointsPerSeries: 25);   // 1 000 points
+        engine.Ingest(failed);
+        await engine.ScheduleThresholdFlushForTest();     // snapshot → throw → restore → abandon
+
+        // Wedging is the failure mode a naive "hold the watermark until every earlier flush
+        // commits" rule produces: the failed generation stays open forever, no later flush can
+        // begin, the log grows without bound and every restart replays everything since. So the
+        // next flush must run, must commit, and must leave both batches durable EXACTLY once —
+        // a duplicate here means the failed generation's records outlived the flush that
+        // finally carried its points.
+        var after = SlowFlushBatch(baseNano + 3_600_000_000_000L, "after", series: 40, pointsPerSeries: 25);
+        engine.Ingest(after);
+        await engine.DisposeAsync();                      // the loop's final flush carries both
+
+        Assert.Equal(2, Volatile.Read(ref attempts));     // the retry really did run
+        Assert.True(TrcCount(_dir, "*.mts") > 0, "no .mts file was written after the failed flush");
+
+        long expected = failed.Length + after.Length;
+        long durable  = await DurablePointsAsync(_dir, "instrument.0");
+        Assert.True(durable == expected, Verdict(durable, expected));
+    }
 
     /// <summary>
     /// Two threshold flushes, where the one that finishes FIRST is the one whose handle is

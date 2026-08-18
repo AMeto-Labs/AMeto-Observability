@@ -64,6 +64,25 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     /// </summary>
     private readonly ReaderWriterLockSlim _snapshotLock = new();
 
+    /// <summary>
+    /// One flush at a time, from the snapshot through to the WAL commit. See the long note in
+    /// <see cref="FlushHotTierAsync"/> for what a second concurrent flush cost.
+    ///
+    /// <para>Never disposed, for the same reason <see cref="_snapshotLock"/> is not: flushes
+    /// scheduled during shutdown are turned away before they reach it, and a
+    /// <see cref="SemaphoreSlim"/> only allocates a finalizable wait handle if
+    /// <c>AvailableWaitHandle</c> is read, which nothing here does.</para>
+    /// </summary>
+    private readonly SemaphoreSlim _flushGate = new(1, 1);
+
+    /// <summary>
+    /// Test seam: invoked by <see cref="FlushHotTierAsync"/> after the snapshot and the log's
+    /// generation bump, before the .mts files are written. Blocking in it holds a flush inside
+    /// exactly the window where an overlapping flush used to reclaim its records. Null in
+    /// production. The same shape as <c>StorageEngine.OnMergeManifestWritten</c>.
+    /// </summary>
+    internal Action? OnSnapshotTakenForTest;
+
     // ── Hot tier ─────────────────────────────────────────────────────────────
     private readonly ConcurrentDictionary<SeriesKey, HotSeries> _hot = new();
     private          int _hotPointCount;
@@ -85,13 +104,18 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     //     while its file is still being written. Kill the process there and those points are
     //     in neither place. SILENT LOSS, and the bigger of the two: it is the tier that was
     //     large enough to trigger a threshold flush in the first place.
-    //   • tier EMPTY (ingest quiesced): the final flush returns at snapshot.Count == 0
-    //     before BeginFlush, so G is never superseded, stays uncommitted, and is replayed
-    //     next start beside the file the orphan did manage to write — duplicates.
+    //   • tier EMPTY (ingest quiesced): the final flush returns before opening a generation,
+    //     so G is never superseded, stays uncommitted, and is replayed next start beside the
+    //     file the orphan did manage to write — duplicates.
     // Nothing warns about either. MetricWriteAheadLog.CommitFlush returns silently once the
     // log is disposed, so the catch around it never fires; and in the more common
     // interleaving the commit is not even reached, because _coldLock.EnterWriteLock() throws
     // ObjectDisposedException first and the restore path re-enters the other disposed lock.
+    //
+    // Tracking the orphan fixed its LIFETIME — shutdown waits for it. The first bullet's loss
+    // needed the other half too, and did not stop at shutdown: any periodic flush overlapping
+    // any threshold flush reclaimed the earlier generation the same way. _flushGate closes it
+    // by making the two run one after the other; see FlushHotTierAsync.
     //
     // A set rather than one Task field: a field records only the flush published LAST, and
     // publication order is not completion order. A thread preempted between starting its
@@ -335,6 +359,14 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     /// <see cref="HotFlushThreshold"/> does, without the 500k points needed to cross it.
     /// </summary>
     internal Task ScheduleThresholdFlushForTest() => ScheduleThresholdFlush();
+
+    /// <summary>
+    /// Test hook: one tick of the PERIODIC path — the flush that is not behind the threshold
+    /// CAS, and therefore the one that could overlap a threshold flush. Goes through
+    /// <see cref="FlushIfDueAsync"/> rather than straight to the flush, so the tier still has
+    /// to earn its files exactly as it does in the loop.
+    /// </summary>
+    internal Task FlushPeriodicForTest() => FlushIfDueAsync();
 
     private async Task RunThresholdFlushAsync(Task gate)
     {
@@ -601,83 +633,140 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
     private async Task FlushHotTierAsync()
     {
-        if (_hot.IsEmpty) return;
+        // Cheap pre-check, deliberately OUTSIDE the gate: an empty tier has nothing to flush,
+        // and a periodic tick that queued behind a running flush just to discover that would
+        // turn every tick during a long write into a wait. _hot keeps its keys after a drain,
+        // so the point count — not _hot.IsEmpty — is what "nothing to flush" means here.
+        if (_hot.IsEmpty || Volatile.Read(ref _hotPointCount) == 0) return;
 
-        // Snapshot and clear hot tier. Bounds must travel with the snapshot —
-        // without them cold histogram files have no bucket bounds and quantile /
-        // heatmap queries over anything older than the hot tier return nothing.
+        // One flush at a time, from the snapshot through to the commit.
         //
-        // The drain, the counter reset and the log's generation bump are one atomic step
-        // against ingest: a point that arrives while this runs must land wholly on one side,
-        // either inside the snapshot or stamped with the next generation. Writing the files
-        // happens after the lock is released, so ingest is never blocked on disk.
-        var snapshot = new List<(SeriesKey Key, HotSeries Series)>();
-        ulong flushedGeneration;
-        _snapshotLock.EnterWriteLock();
+        // The threshold CAS gates threshold flushes against each other and nothing else, so a
+        // PERIODIC flush could take its snapshot, write its (small) files and commit while a
+        // threshold flush was still writing its own. The log's watermark is a single u64 and a
+        // commit frees everything at or below it, so the later commit reclaimed the earlier
+        // flush's records mid-write: from that instant until its last .mts closed, its points
+        // were in no file and no log, and if the write then failed they were restored to the
+        // tier in memory only. Nothing logged it.
+        //
+        // Serialising here makes the watermark a prefix boundary BY CONSTRUCTION — at most one
+        // generation is ever between Begin and Commit — instead of by an assumption spread
+        // across two classes. It also makes the failure path correct rather than accidentally
+        // correct: the next flush's drain now provably happens after the restore below, so its
+        // snapshot carries the restored points and its commit legitimately covers the
+        // abandoned generation.
+        //
+        // What this does NOT give up is the thing moving the write off the lock bought: the
+        // gate is not _snapshotLock, so ingest is still never blocked on disk. What it gives
+        // up is flush-versus-flush parallelism, of which there are only ever two candidates —
+        // one periodic and one threshold. A SemaphoreSlim rather than System.Threading.Lock
+        // because C# forbids await inside a lock body; there is no true suspension point in
+        // here (MetricWriter.Write is synchronous), so a holder always runs to completion.
+        // Acquire order is gate → _snapshotLock → _coldLock → the log's own lock, and nothing
+        // takes the gate while holding any of them.
+        await _flushGate.WaitAsync().ConfigureAwait(false);
         try
         {
-            foreach (var (k, v) in _hot)
-            {
-                var points = v.Drain();
-                if (points.Count > 0)
-                    snapshot.Add((k, new HotSeries(points, v.Bounds)));
-            }
-
-            if (snapshot.Count == 0) return;
-
-            System.Threading.Interlocked.Exchange(ref _hotPointCount, 0);
-            _hotSince = null;
-            flushedGeneration = _wal.BeginFlush();
-        }
-        finally { _snapshotLock.ExitWriteLock(); }
-
-        try
-        {
-            var infos = MetricWriter.Write(_dataDir, snapshot);
-            _coldLock.EnterWriteLock();
-            try { _coldSegments.AddRange(infos); }
-            finally { _coldLock.ExitWriteLock(); }
-
-            _logger.LogDebug("Flushed {SeriesCount} metric series to {FileCount} .mts files",
-                snapshot.Count, infos.Count);
-        }
-        catch (Exception ex)
-        {
-            // The points were drained out of _hot before the write, so a failure here used to
-            // lose them outright. Put them back: the log still holds them, but only a restart
-            // would have brought them back, and a transient disk error is not a restart.
-            int restored = 0;
+            // Snapshot and clear hot tier. Bounds must travel with the snapshot —
+            // without them cold histogram files have no bucket bounds and quantile /
+            // heatmap queries over anything older than the hot tier return nothing.
+            //
+            // The drain, the counter reset and the log's generation bump are one atomic step
+            // against ingest: a point that arrives while this runs must land wholly on one
+            // side, either inside the snapshot or stamped with the next generation. Writing
+            // the files happens after the lock is released, so ingest is never blocked on disk.
+            var snapshot = new List<(SeriesKey Key, HotSeries Series)>();
+            ulong flushedGeneration;
             _snapshotLock.EnterWriteLock();
             try
             {
-                foreach (var (key, snap) in snapshot)
+                // Opened BEFORE the drain. Order inside the lock is irrelevant to atomicity —
+                // ingest is excluded for all of it — but it decides what a tripwire costs: the
+                // log throws here if a flush is somehow still open, and throwing before the
+                // drain leaves the tier untouched instead of stranding a snapshot nobody holds.
+                flushedGeneration = _wal.BeginFlush();
+
+                foreach (var (k, v) in _hot)
                 {
-                    var live = _hot.GetOrAdd(key, static _ => new HotSeries());
-                    foreach (var p in snap.GetPoints(long.MinValue, long.MaxValue))
-                    {
-                        live.Append(p, snap.Bounds);
-                        restored++;
-                    }
+                    var points = v.Drain();
+                    if (points.Count > 0)
+                        snapshot.Add((k, new HotSeries(points, v.Bounds)));
                 }
-                System.Threading.Interlocked.Add(ref _hotPointCount, restored);
-                if (restored > 0) _hotSince ??= DateTime.UtcNow;
+
+                if (snapshot.Count == 0)
+                {
+                    // Nothing to write, so nothing to commit — hand the generation back rather
+                    // than leaving it open. The empty generation is covered by the next commit.
+                    _wal.AbandonFlush(flushedGeneration);
+                    return;
+                }
+
+                System.Threading.Interlocked.Exchange(ref _hotPointCount, 0);
+                _hotSince = null;
             }
             finally { _snapshotLock.ExitWriteLock(); }
 
-            _logger.LogError(ex,
-                "Failed to flush metric hot tier — {Count} point(s) kept in memory for the next attempt",
-                restored);
-            // No commit: the snapshot's records stay below an unchanged watermark, so a crash
-            // before the retry replays them.
-            return;
+            try
+            {
+                // Test seam, INSIDE the try on purpose: it stands where the file write does, so
+                // holding in it holds the flush in the window the loss lived in, and throwing
+                // from it is a failed write — restore, abandon, no commit. Outside the try a
+                // throw would skip both and wedge the log. Null in production: one delegate
+                // read per flush, not per point.
+                OnSnapshotTakenForTest?.Invoke();
+
+                var infos = MetricWriter.Write(_dataDir, snapshot);
+                _coldLock.EnterWriteLock();
+                try { _coldSegments.AddRange(infos); }
+                finally { _coldLock.ExitWriteLock(); }
+
+                _logger.LogDebug("Flushed {SeriesCount} metric series to {FileCount} .mts files",
+                    snapshot.Count, infos.Count);
+            }
+            catch (Exception ex)
+            {
+                // The points were drained out of _hot before the write, so a failure here used
+                // to lose them outright. Put them back: the log still holds them, but only a
+                // restart would have brought them back, and a transient disk error is not a
+                // restart.
+                int restored = 0;
+                _snapshotLock.EnterWriteLock();
+                try
+                {
+                    foreach (var (key, snap) in snapshot)
+                    {
+                        var live = _hot.GetOrAdd(key, static _ => new HotSeries());
+                        foreach (var p in snap.GetPoints(long.MinValue, long.MaxValue))
+                        {
+                            live.Append(p, snap.Bounds);
+                            restored++;
+                        }
+                    }
+                    System.Threading.Interlocked.Add(ref _hotPointCount, restored);
+                    if (restored > 0) _hotSince ??= DateTime.UtcNow;
+
+                    // Inside the same lock as the restore, and that matters: the generation is
+                    // given back only once the points it covers are visible again, so the next
+                    // flush cannot drain between the two and miss them. The restored points are
+                    // NOT re-logged — deliberately, since the usual cause is a full disk and the
+                    // log grows by doubling — so this generation's records are what keeps them
+                    // durable until a later flush snapshots them and commits above it.
+                    _wal.AbandonFlush(flushedGeneration);
+                }
+                finally { _snapshotLock.ExitWriteLock(); }
+
+                _logger.LogError(ex,
+                    "Failed to flush metric hot tier — {Count} point(s) kept in memory for the next attempt",
+                    restored);
+                return;
+            }
+
+            // Files are on disk. Committing the flushed generation reclaims its space and leaves
+            // everything appended during the write — which is durable nowhere else — untouched.
+            try { _wal.CommitFlush(flushedGeneration); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Metric WAL commit failed after flush"); }
         }
-
-        // Files are on disk. Committing the flushed generation reclaims its space and leaves
-        // everything appended during the write — which is durable nowhere else — untouched.
-        try { _wal.CommitFlush(flushedGeneration); }
-        catch (Exception ex) { _logger.LogWarning(ex, "Metric WAL commit failed after flush"); }
-
-        await Task.CompletedTask;
+        finally { _flushGate.Release(); }
     }
 
     // ── Rollup ────────────────────────────────────────────────────────────────
