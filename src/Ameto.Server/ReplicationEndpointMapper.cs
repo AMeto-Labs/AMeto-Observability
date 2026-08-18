@@ -77,10 +77,35 @@ public static class ReplicationEndpointMapper
                     return Results.Problem("Failed to write segment file.");
                 }
 
+                // Idempotent by construction: the name comes from the route, so a re-push of a
+                // segment this node already holds lands on its own path and refreshes its own
+                // catalog entry. That is normal traffic and stays a 204.
                 File.Move(tmpPath, filePath, overwrite: true);
-                storage.ImportSegment(filePath);
 
-                return Results.NoContent();
+                var outcome = storage.ImportSegment(filePath);
+                if (outcome == SegmentImportOutcome.Registered) return Results.NoContent();
+
+                // Nothing in the engine points at what we just wrote. Unlinking it is not
+                // tidiness: the catalog is rebuilt from this directory on every start, and in
+                // enumeration order, so a file left behind here would let the next boot pick the
+                // winner by chance and undo the refusal.
+                try { File.Delete(filePath); } catch { /* the boot scan skips what it cannot key */ }
+
+                return outcome == SegmentImportOutcome.Conflict
+                    // 409 rather than a log line nobody reads: a DIFFERENT file already holds
+                    // this (nodeId, segmentId), which means the sender and this node are both
+                    // configured as NodeId {nodeId}. Registering it would have dropped whatever
+                    // is being served under that key out of queries, retention and the merge
+                    // planner at once — the file staying on disk the whole time, so nothing
+                    // anywhere would look wrong. The sender is the only party positioned to tell
+                    // that from a healthy push, so the sender is told.
+                    ? Results.Problem(
+                        $"Segment {nodeId}-{segmentId} is already held by a different file on this node; " +
+                        $"two nodes appear to be configured with NodeId {nodeId}.",
+                        statusCode: StatusCodes.Status409Conflict)
+                    : Results.Problem(
+                        $"Segment {nodeId}-{segmentId} could not be read as a segment file.",
+                        statusCode: StatusCodes.Status400BadRequest);
             });
     }
 

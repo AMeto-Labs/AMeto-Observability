@@ -369,8 +369,13 @@ public sealed class SegmentCatalogKeyTests : IAsyncLifetime
         long now = DateTime.UtcNow.Ticks;
         string peerPath = WritePeerSegment(Peer, 5, now, events: 4);
 
-        _engine.ImportSegment(peerPath);
-        _engine.ImportSegment(peerPath);
+        // Both REGISTERED, not "second one refused": the refusal below is for a different file
+        // arriving at an occupied key, and a re-push is the same file. The endpoint turns
+        // anything other than Registered into an error status and deletes the file it wrote, so
+        // calling a re-push a conflict would fail every legitimate push after the first and
+        // unlink the replica it had just accepted.
+        Assert.Equal(SegmentImportOutcome.Registered, _engine.ImportSegment(peerPath));
+        Assert.Equal(SegmentImportOutcome.Registered, _engine.ImportSegment(peerPath));
 
         var only = Assert.Single(_engine.ListSegments());
         Assert.Equal(Peer.Value, only.NodeId.Value);
@@ -381,6 +386,67 @@ public sealed class SegmentCatalogKeyTests : IAsyncLifetime
             new DateTimeOffset(now, TimeSpan.Zero).AddMinutes(5),
             minBucket: 0, bucketSeconds: 60, nBuckets: 60, serviceFilter: null);
         Assert.Equal(4, counts.Total);
+    }
+
+    /// <summary>
+    /// The one ambiguity the key cannot resolve — two nodes CONFIGURED with the same NodeId — and
+    /// therefore the last place in the engine where registering a segment could still remove one.
+    /// The import used to log a warning saying, correctly, that "one of the two files will not be
+    /// served or expired", and then perform exactly that eviction one line later.
+    ///
+    /// <para>What it cost is what the key change cost everywhere else: the evicted file stays on
+    /// disk — the names cannot collide — while leaving queries, retention and the merge planner
+    /// at once, since all three read the catalog and not the directory. Never served, never
+    /// expired, never compacted, holding its bytes for the life of the install, and with the only
+    /// evidence a warning in a log nobody reads precisely because everything still looks fine.
+    /// The file being served has done nothing wrong, so it is the one that is kept.</para>
+    /// </summary>
+    [Fact]
+    public async Task A_second_file_under_one_key_is_refused_and_the_one_being_served_survives()
+    {
+        long now = DateTime.UtcNow.Ticks;
+        Write(20, now);
+        await _engine.FlushHotTierAsync();
+
+        var local = Assert.Single(_engine.ListSegments());
+
+        // Carries THIS engine's node id as well as its segment id — a peer misconfigured with
+        // our identity, which is the only way a replica can land on a key we already hold. It
+        // still cannot land on our PATH (a replica is {node}-{id}.seg, a local segment
+        // {node}-{id}-{min}-{max}.seg), so both files exist and only the catalog can lose one.
+        string intruder = WritePeerSegment(NodeId.Local, local.Id.Value, now, events: 4);
+        Assert.NotEqual(local.FilePath, intruder);
+
+        Assert.Equal(SegmentImportOutcome.Conflict, _engine.ImportSegment(intruder));
+
+        var kept = Assert.Single(_engine.ListSegments());
+        Assert.Equal(local.FilePath, kept.FilePath);
+        Assert.Equal(20u, kept.EventCount);
+
+        // Listed is not the claim — SERVED is, and the four intruding events must not appear
+        // either: refusing the import means refusing its contents, not hiding its file.
+        var counts = await _engine.AggregateLogVolumeAsync(
+            new DateTimeOffset(now, TimeSpan.Zero).AddMinutes(-5),
+            new DateTimeOffset(now, TimeSpan.Zero).AddMinutes(5),
+            minBucket: 0, bucketSeconds: 60, nBuckets: 60, serviceFilter: null);
+        Assert.Equal(20, counts.Total);
+    }
+
+    /// <summary>
+    /// A file that is not a segment gets its own outcome rather than an exception the caller
+    /// cannot tell from success. The endpoint that wrote it needs to know: on anything but
+    /// <c>Registered</c> the engine holds no reference to that file, so leaving it in the
+    /// segments directory leaves the next boot's catalog scan to decide what it is.
+    /// </summary>
+    [Fact]
+    public void A_file_that_is_not_a_segment_is_reported_as_unreadable()
+    {
+        Directory.CreateDirectory(SegDir);
+        string junk = Path.Combine(SegDir, "7-99.seg");
+        File.WriteAllBytes(junk, [0xDE, 0xAD, 0xBE, 0xEF]);
+
+        Assert.Equal(SegmentImportOutcome.Unreadable, _engine.ImportSegment(junk));
+        Assert.Empty(_engine.ListSegments());
     }
 
     /// <summary>Restarts on the same directory and waits for the background catalog scan.</summary>

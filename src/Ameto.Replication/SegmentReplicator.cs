@@ -82,7 +82,18 @@ public sealed class SegmentReplicator : IDisposable
             req.Headers.Add("X-Ameto-Replication", _opts.Secret);
             using var resp = await _http.SendAsync(req, ct);
 
-            if (!resp.IsSuccessStatusCode)
+            // 409 is the peer REFUSING the segment because a different file already holds
+            // (NodeId, Id) over there, which can only mean it and this node are configured with
+            // the same NodeId. A permanent deployment fault rather than a transient push failure,
+            // and one this side can actually name: the peer only ever sees "a stranger claims to
+            // be me". Logged as an error so it is not one warning among the retryable ones.
+            if (resp.StatusCode == System.Net.HttpStatusCode.Conflict)
+                _logger.LogError(
+                    "Peer {Addr} refused segment {Id}: it already holds a different file under node id " +
+                    "{Node}, so it and this node are both configured with that NodeId. Nothing will " +
+                    "replicate between the two until one of them is renumbered.",
+                    peer.BaseAddress, segment.Id, segment.NodeId.Value);
+            else if (!resp.IsSuccessStatusCode)
                 _logger.LogWarning("Push to {Addr} returned {Status}", peer.BaseAddress, resp.StatusCode);
             else
                 _logger.LogDebug("Replicated segment {Id} -> {Addr}", segment.Id, peer.BaseAddress);

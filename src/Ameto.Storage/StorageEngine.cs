@@ -7,6 +7,31 @@ using Ameto.Core;
 namespace Ameto.Storage;
 
 /// <summary>
+/// What <see cref="StorageEngine.ImportSegment"/> did with the file it was handed. The caller
+/// that wrote that file owns it on anything but <see cref="Registered"/> — nothing in the engine
+/// refers to it, so leaving it in the segments directory means a file no query, no retention pass
+/// and no merge will ever touch again.
+/// </summary>
+public enum SegmentImportOutcome
+{
+    /// <summary>
+    /// In the catalog: either the key was free, or the same file was re-pushed under it and the
+    /// entry was refreshed.
+    /// </summary>
+    Registered,
+
+    /// <summary>
+    /// Refused. A DIFFERENT file already holds this (node, id) and was kept; the incoming one was
+    /// not registered. Two nodes are configured with the same NodeId — the one ambiguity the key
+    /// cannot resolve, and a configuration error rather than a race.
+    /// </summary>
+    Conflict,
+
+    /// <summary>The file could not be opened as a segment. Nothing was registered.</summary>
+    Unreadable,
+}
+
+/// <summary>
 /// Manages the full lifecycle of storage segments:
 ///   - Maintains the active hot-tier segment
 ///   - Triggers flush (hot → cold) when size/age thresholds are exceeded
@@ -2205,40 +2230,78 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// queries, retention and the merge planner at once, since all three read the catalog rather
     /// than the directory, and a restart re-ran the same race in directory order.</para>
     ///
-    /// <para>The allocator floor below is kept even so. It costs nothing, it keeps the directory
-    /// readable to a human, and it still matters for the one case the key cannot separate: a peer
-    /// misconfigured with this node's own id, where <c>SegmentFileExists</c> and the WAL block
-    /// probe — both of which match <c>{localNode}-{id}-*.seg</c> — would otherwise be looking at
-    /// somebody else's file.</para>
+    /// <para>The allocator floor is raised whatever the catalog then does with the entry, and it
+    /// is load-bearing rather than tidy. It costs nothing, it keeps the directory readable to a
+    /// human, and it is what stops the OTHER writer into the catalog — a local flush, which must
+    /// always register its own segment and so cannot refuse anything — from ever being handed an
+    /// id an import already occupies. It also still matters for the one case the key cannot
+    /// separate: a peer misconfigured with this node's own id, where <c>SegmentFileExists</c> and
+    /// the WAL block probe — both of which match <c>{localNode}-{id}-*.seg</c> — would otherwise
+    /// be looking at somebody else's file.</para>
     /// </summary>
-    public void ImportSegment(string filePath)
+    /// <returns>
+    /// What happened to the file, so the caller that WROTE it can act: see
+    /// <see cref="SegmentImportOutcome"/>.
+    /// </returns>
+    public SegmentImportOutcome ImportSegment(string filePath)
     {
+        SegmentInfo info;
         try
         {
             using var reader = SegmentReader.Open(filePath, computeUncompressedBytes: true);
-            var info = reader.Info;
-            var key  = SegmentKey.Of(info);
-
-            // Re-importing the SAME segment is legitimate — the endpoint moves with
-            // overwrite: true. What is left after the key change is a genuine same-key clash,
-            // which now means two nodes carrying the same NodeId: an ambiguity no id space can
-            // resolve, and the only case still worth a warning.
-            if (_segments.TryGetValue(key, out var existing) &&
-                !string.Equals(existing.FilePath, info.FilePath, StringComparison.OrdinalIgnoreCase))
-                _logger.LogWarning(
-                    "Imported segment {Key} collides with {Existing}, which carries the same node id " +
-                    "AND the same segment id. Two nodes appear to be configured as NodeId {Node}; one " +
-                    "of the two files will not be served or expired.",
-                    key, existing.FilePath, info.NodeId);
-
-            _segments[key] = info;
-            AdvanceSegmentIdFloor(info.Id.Value + 1);
-            _logger.LogInformation("Imported replicated segment {Key} ({Events} events)", key, info.EventCount);
+            info = reader.Info;
         }
         catch (Exception ex)
         {
             _logger.LogWarning(ex, "Failed to import replicated segment {File}", filePath);
+            return SegmentImportOutcome.Unreadable;
         }
+
+        var key = SegmentKey.Of(info);
+
+        // Before the catalog, and unconditionally — see the remark above. Monotonic, so an
+        // import that is about to be refused can only ever move it forward.
+        AdvanceSegmentIdFloor(info.Id.Value + 1);
+
+        // First file under a key keeps it. The assignment this replaces warned about the clash
+        // and then performed it anyway, which is the same eviction the key change removed, in
+        // the one case the key cannot separate — two nodes carrying the same NodeId. The names
+        // still cannot collide, so both files sit in the segments directory either way; the
+        // overwrite was the only place one of them left the catalog, and leaving the catalog is
+        // leaving queries, retention and the merge planner at once. The refused file then held
+        // disk for the life of the install, never served, never expired, never compacted.
+        //
+        // Compare-and-swap rather than a read followed by a store: two request threads importing
+        // different files under one key would both read "absent" and both assign, and the loser's
+        // file would vanish from the catalog exactly as before. Losing the CAS re-reads and is
+        // then refused by the branch above it.
+        while (true)
+        {
+            if (_segments.TryGetValue(key, out var existing))
+            {
+                // Re-importing the SAME file is normal traffic — the endpoint moves it into
+                // place with overwrite: true and re-imports — so it refreshes the entry (the
+                // bytes may have changed under it) instead of being refused.
+                if (!string.Equals(existing.FilePath, info.FilePath, StringComparison.OrdinalIgnoreCase))
+                {
+                    _logger.LogError(
+                        "Refused replicated segment {File}: {Key} is already held by {Existing}, which " +
+                        "carries the same node id AND the same segment id. Two nodes appear to be " +
+                        "configured as NodeId {Node} — a deployment error no id space can resolve. The " +
+                        "file already being served was kept and the incoming one was NOT registered.",
+                        info.FilePath, key, existing.FilePath, info.NodeId);
+                    return SegmentImportOutcome.Conflict;
+                }
+
+                if (!_segments.TryUpdate(key, info, existing)) continue;
+            }
+            else if (!_segments.TryAdd(key, info)) continue;
+
+            break;
+        }
+
+        _logger.LogInformation("Imported replicated segment {Key} ({Events} events)", key, info.EventCount);
+        return SegmentImportOutcome.Registered;
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
