@@ -212,4 +212,121 @@ public sealed class SegmentCatalogKeyTests : IAsyncLifetime
         // 20 local (in the frozen tier) + 4 peer (in the cold segment the covered set was hiding).
         Assert.Equal(24, counted);
     }
+
+    /// <summary>
+    /// THE ALREADY-DAMAGED INSTALL. The eviction was only ever in memory — both files were always
+    /// on disk, because the names cannot collide — so a directory written by the pre-fix build is
+    /// exactly this: two files sharing an id, one of them absent from the catalog. Recovery has to
+    /// need nothing but a restart, since deploying the fix IS a restart, and a fix that only
+    /// stopped NEW collisions would leave every existing install's hidden file hidden forever.
+    ///
+    /// <para><c>LoadSegmentCatalog</c> re-ran the collision on every boot, and in
+    /// <c>Directory.EnumerateFiles</c> order, so the pre-fix build did not even hide the same one
+    /// each time. Nothing persists the key — the catalog is rebuilt from the files themselves, and
+    /// each file's node id comes out of its own header — so the recovery is automatic and there is
+    /// no migration to run.</para>
+    /// </summary>
+    [Fact]
+    public async Task An_existing_collided_directory_recovers_on_restart()
+    {
+        long now = DateTime.UtcNow.Ticks;
+        Write(20, now);
+        await _engine.FlushHotTierAsync();
+
+        var local = Assert.Single(_engine.ListSegments());
+        ulong shared = local.Id.Value;
+        string peerPath = WritePeerSegment(Peer, shared, now, events: 4);
+        _engine.ImportSegment(peerPath);
+
+        await RestartAsync(expectSegments: 2);
+
+        // Rebuilt from the directory, not from anything the previous process handed over.
+        var all = _engine.ListSegments();
+        Assert.Equal(2, all.Count);
+        Assert.Contains(all, s => s.NodeId.Value == Peer.Value && s.Id.Value == shared
+                                                              && s.FilePath == peerPath);
+        Assert.Contains(all, s => s.NodeId.Value == NodeId.Local.Value && s.Id.Value == shared
+                                                              && s.FilePath == local.FilePath);
+
+        // Visible is not the claim — SERVED is. Both files' events come back through the reader
+        // path, which is what the hidden file stopped doing.
+        var counts = await _engine.AggregateLogVolumeAsync(
+            new DateTimeOffset(now, TimeSpan.Zero).AddMinutes(-5),
+            new DateTimeOffset(now, TimeSpan.Zero).AddMinutes(5),
+            minBucket: 0, bucketSeconds: 60, nBuckets: 60, serviceFilter: null);
+        Assert.Equal(24, counts.Total);
+    }
+
+    /// <summary>
+    /// Retention judges each of the two on its own merits, which is the half of "both are in the
+    /// catalog" that matters: the hidden file was not merely unlisted, it was IMMORTAL, sailing
+    /// past every TTL because the only thing that expires segments enumerates the catalog.
+    ///
+    /// <para>Ten days back puts the peer's Debug replica past its 3-day TTL and leaves the local
+    /// Information segment 80 days short of its 90 — so exactly one of a pair SHARING AN ID must
+    /// go. That also pins the delete to the right path: <c>DeleteSegmentAsync</c> unlinks the file
+    /// belonging to the entry it removes, and with one keyspace the entry under an id was
+    /// whichever of the two registered last.</para>
+    /// </summary>
+    [Fact]
+    public async Task Each_segment_expires_under_its_own_policy()
+    {
+        long old = DateTime.UtcNow.AddDays(-10).Ticks;
+        Write(20, old, LogLevel.Information);
+        await _engine.FlushHotTierAsync();
+
+        var local = Assert.Single(_engine.ListSegments());
+        string peerPath = WritePeerSegment(Peer, local.Id.Value, old, events: 4, level: LogLevel.Debug);
+        _engine.ImportSegment(peerPath);
+        Assert.Equal(2, _engine.ListSegments().Count);
+
+        var result = await _engine.EnforceRetentionAsync();
+
+        Assert.Equal(1, result.DeletedSegments);
+        Assert.False(File.Exists(peerPath),
+            "the peer's Debug replica is 7 days past its TTL and should have been deleted");
+        Assert.True(File.Exists(local.FilePath),
+            "retention deleted the local Information segment, which is 80 days short of its TTL");
+
+        var kept = Assert.Single(_engine.ListSegments());
+        Assert.Equal(NodeId.Local.Value, kept.NodeId.Value);
+    }
+
+    /// <summary>
+    /// The direction that must NOT change. The replication endpoint moves a received file into
+    /// place with <c>overwrite: true</c> and re-imports it, so a re-push of a segment this node
+    /// already holds is normal traffic and has to stay a no-op. Registering it twice would mean
+    /// serving its events twice.
+    ///
+    /// <para>This is the assertion that rules out "renumber the segment on import" as a fix: a
+    /// fresh id per import turns each re-push into a permanent duplicate.</para>
+    /// </summary>
+    [Fact]
+    public async Task Re_importing_the_same_file_registers_it_once()
+    {
+        long now = DateTime.UtcNow.Ticks;
+        string peerPath = WritePeerSegment(Peer, 5, now, events: 4);
+
+        _engine.ImportSegment(peerPath);
+        _engine.ImportSegment(peerPath);
+
+        var only = Assert.Single(_engine.ListSegments());
+        Assert.Equal(Peer.Value, only.NodeId.Value);
+        Assert.Equal(peerPath, only.FilePath);
+
+        var counts = await _engine.AggregateLogVolumeAsync(
+            new DateTimeOffset(now, TimeSpan.Zero).AddMinutes(-5),
+            new DateTimeOffset(now, TimeSpan.Zero).AddMinutes(5),
+            minBucket: 0, bucketSeconds: 60, nBuckets: 60, serviceFilter: null);
+        Assert.Equal(4, counts.Total);
+    }
+
+    /// <summary>Restarts on the same directory and waits for the background catalog scan.</summary>
+    private async Task RestartAsync(int expectSegments)
+    {
+        await _engine.DisposeAsync();
+        _engine = NewEngine();
+        for (int i = 0; i < 400 && _engine.ListSegments().Count < expectSegments; i++)
+            await Task.Delay(25);
+    }
 }

@@ -1137,6 +1137,16 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         foreach (var s in _segments.Values)
         {
             if (_mergeSkip.Contains(SegmentKey.Of(s))) continue;
+            // A replicated peer's segment is a merge candidate here, the same as a local one, and
+            // MergeToColdAsync stamps its output with THIS node's id — so merging one drops the
+            // provenance that SegmentInfo.NodeId carried, and a later re-push of the same (node, id)
+            // is no longer recognised as already held: its events land a second time. That is worth
+            // stating because the composite catalog key makes it DETERMINISTIC where it used to be a
+            // coin toss — pre-fix a peer's entry was in the catalog, and so eligible, whenever it
+            // happened to be the one that won the collision. Left as-is deliberately: excluding
+            // foreign segments would strand a peer's small files uncompacted on this node forever,
+            // and the honest repair is a consumed-(node, id) record that ImportSegment consults,
+            // which needs its own tests and its own issue rather than a rider on the key change.
 
             // A maximal segment is done — it is the OUTPUT of this policy, not an input to it.
             if (SegmentPayloadBytes(s) >= maximal) continue;
