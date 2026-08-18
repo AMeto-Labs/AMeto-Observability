@@ -77,7 +77,9 @@ namespace Ameto.Metrics.Storage;
 /// not met: the writer wrote one file per metric name straight to its final path and kept
 /// whatever it had finished when a later one threw, and the flush treated every step after the
 /// write — publishing the files, logging — as a failed write too. Both are closed at the
-/// source: <c>MetricWriter.Write</c> deletes its own output before rethrowing, and
+/// source: <c>MetricWriter.Write</c> builds every file at <c>.mts.tmp</c> and renames it only
+/// once it is complete and closed, and deletes the ones it has already renamed before it
+/// rethrows — so a throw leaves nothing of its output at any path a reader scans; and
 /// <c>MetricStorageEngine.FlushHotTierAsync</c> restores and abandons only around the write
 /// itself, committing on every path where a file survives.</para>
 ///

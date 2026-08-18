@@ -58,31 +58,46 @@ internal static class MetricWriter
     /// </summary>
     private const int MaxSeriesPerFile = 512;
 
+    /// <summary>Suffix a file carries until its footer is on disk and its handle is closed.</summary>
+    internal const string TempSuffix = ".tmp";
+
     /// <summary>
     /// Writes one <c>.mts</c> file per distinct metric name found in <paramref name="series"/>
     /// (several, if a name carries more than <see cref="MaxSeriesPerFile"/> series). Returns
     /// metadata for all created files.
     ///
-    /// <para><b>All or nothing on disk.</b> The files are written one after another, each
-    /// straight to its FINAL path, so a failure partway through — a full disk, which is the
-    /// cause the flush path's own comments name — used to leave every earlier file complete and
-    /// visible to the next start's catalog scan. The caller reads a throw as "no file carries
-    /// these points", puts the whole snapshot back into the hot tier and leaves the log
-    /// generation replayable; with files already on disk that is not a window, it is certain
-    /// duplication of everything written before the failure — served twice and replayed twice,
-    /// every rollup over the range reading double. So a throw now takes its own output with it:
-    /// the files this call created are deleted before the exception leaves, and the caller's
-    /// reading is true again.</para>
+    /// <para><b>All or nothing on disk.</b> The caller reads a throw as "no file carries these
+    /// points", puts the whole snapshot back into the hot tier and leaves the log generation
+    /// replayable; with a file already at a final path that is not a window but certain
+    /// duplication — served twice and replayed twice, every rollup over the range reading
+    /// double. Two mechanisms make the caller's reading true, and the order matters:</para>
+    /// <list type="number">
+    /// <item>Each file is built at <c>.mts.tmp</c> and renamed only once its footer is written
+    /// and its handle closed — the shape <c>StorageEngine.FlushToColdAsync</c> already uses.
+    /// A failure INSIDE a file therefore leaves nothing at a path the catalog scan reads. No
+    /// after-the-fact cleanup could do that job: a file only joins the returned list once it is
+    /// written, so the file the disk died on was exactly the one the catch below could not name,
+    /// and what it left behind was a footerless <c>.mts</c> that the next start deleted as
+    /// "likely format v1".</item>
+    /// <item>Whole files that DID land are deleted before the exception leaves, since a later
+    /// file's failure retracts the whole call.</item>
+    /// </list>
     /// </summary>
     /// <param name="afterFileWritten">
-    /// Test seam invoked with each completed file's path; throwing from it is the only way to
-    /// produce a genuine partial write, since the names carry a random nonce. Null in production.
+    /// Test seam invoked with each completed file's FINAL path, once it is in place. Null in production.
+    /// </param>
+    /// <param name="duringFileWrite">
+    /// Test seam invoked with the temp path while that file is open and half written — the disk
+    /// that dies mid-file. Nothing else can produce that state: everything between the open and
+    /// the close is I/O, and the names carry a random nonce so the path cannot be booby-trapped
+    /// from outside. Null in production.
     /// </param>
     public static List<MetricSegmentInfo> Write(
         string dataDir,
         IList<(SeriesKey Key, HotSeries Series)> series,
         MetricGranularity granularity = MetricGranularity.Raw,
-        Action<string>? afterFileWritten = null)
+        Action<string>? afterFileWritten = null,
+        Action<string>? duringFileWrite  = null)
     {
         var byMetric = series.GroupBy(s => s.Key.Name);
         var result   = new List<MetricSegmentInfo>();
@@ -114,18 +129,42 @@ internal static class MetricWriter
                 string nonce    = Guid.NewGuid().ToString("N").Substring(0, 8);
                 string fileName = $"metrics-{SanitizeName(group.Key)}-{minNano}-{maxNano}-{suffix}-{nonce}.mts";
                 string filePath = Path.Combine(dataDir, fileName);
+                string tmpPath  = filePath + TempSuffix;
 
-                WriteFile(filePath, group.Key, granularity, items, minNano, maxNano);
-                result.Add(new MetricSegmentInfo
+                try
                 {
-                    FilePath      = filePath,
-                    MetricName    = group.Key,
-                    MinNano       = minNano,
-                    MaxNano       = maxNano,
-                    Granularity   = granularity,
-                    FormatVersion = Version,
-                    SizeBytes     = new FileInfo(filePath).Length,
-                });
+                    WriteFile(tmpPath, group.Key, granularity, items, minNano, maxNano, duringFileWrite);
+
+                    // Sized off the temp file, and registered BEFORE the rename. Both halves
+                    // are deliberate: reading the length through the final path is one more
+                    // call that can throw while a complete file sits at a path nothing knows
+                    // about, and registering afterwards leaves the same gap around the rename
+                    // itself. From here on, a file at filePath implies an entry in result, so
+                    // the retraction below is exhaustive.
+                    result.Add(new MetricSegmentInfo
+                    {
+                        FilePath      = filePath,
+                        MetricName    = group.Key,
+                        MinNano       = minNano,
+                        MaxNano       = maxNano,
+                        Granularity   = granularity,
+                        FormatVersion = Version,
+                        SizeBytes     = new FileInfo(tmpPath).Length,
+                    });
+
+                    // overwrite: false keeps FileMode.CreateNew's promise across the rename —
+                    // the nonce makes a collision a bug, and clobbering someone else's segment
+                    // is not how it should surface.
+                    File.Move(tmpPath, filePath, overwrite: false);
+                }
+                catch
+                {
+                    // The half-written file, which is now the only thing this iteration can
+                    // have left anywhere. Its path is not in result — that is precisely why it
+                    // has to be deleted here and not by the retraction below.
+                    try { File.Delete(tmpPath); } catch { /* leave it; the throw still stands */ }
+                    throw;
+                }
 
                 afterFileWritten?.Invoke(filePath);
             }
@@ -135,7 +174,8 @@ internal static class MetricWriter
             // Best effort by necessity — the usual cause is a disk that cannot take another
             // byte, and an unlink needs none. What a failed delete leaves behind is exactly the
             // old behaviour for that one file, not something worse, so the original exception
-            // is what the caller must see.
+            // is what the caller must see. A path registered but not yet renamed into place is
+            // simply absent, and File.Delete of a missing file is a no-op.
             for (int i = 0; i < result.Count; i++)
                 try { File.Delete(result[i].FilePath); } catch { /* leave it; the throw still stands */ }
             throw;
@@ -153,13 +193,20 @@ internal static class MetricWriter
             yield return items.GetRange(i, Math.Min(size, items.Count - i));
     }
 
+    /// <summary>
+    /// Builds one complete file at <paramref name="filePath"/>, which is a temp name: the
+    /// caller renames it. Nothing here may assume the file survives — every throw between the
+    /// open and the close leaves a file with no footer, and it is the temp name that keeps the
+    /// reader from ever meeting one.
+    /// </summary>
     private static void WriteFile(
         string filePath,
         string metricName,
         MetricGranularity granularity,
         List<(SeriesKey Key, HotSeries Series)> items,
         long minNano,
-        long maxNano)
+        long maxNano,
+        Action<string>? duringFileWrite = null)
     {
         // Serialize ALL series into one msgpack buffer, then compress it as a
         // single LZ4-HC block: repeated label keys/values across series (routes,
@@ -194,6 +241,10 @@ internal static class MetricWriter
         bw.Write((uint)raw.Length);
         bw.Write((uint)compressed.Length);
         bw.Write(compressed);
+
+        // Header and payload down, index and footer to go: the state a disk dies in. Null in
+        // production — one delegate read per file, not per series.
+        duringFileWrite?.Invoke(filePath);
 
         // Name index
         long nameIdxOffset = fs.Position;

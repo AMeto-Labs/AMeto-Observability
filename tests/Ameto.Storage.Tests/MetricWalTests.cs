@@ -1110,13 +1110,12 @@ public sealed class MetricWalTests : IDisposable
     // ── The abandon contract: "the flush failed" must mean no file landed ──────
 
     /// <summary>
-    /// The writer puts one <c>.mts</c> per metric name straight at its FINAL path, one after
-    /// another, with no temp-and-rename — so a disk that fills between two of them left every
-    /// earlier file complete and discoverable by the next start's <c>LoadColdSegments</c>. The
-    /// flush reads a throw as "no file carries these points", restores the whole snapshot to the
-    /// hot tier and leaves the generation replayable, so each landed file's points were then in
-    /// a file AND in memory AND in the log. Not a window — a certainty, and total for every
-    /// metric written before the failure.
+    /// The writer puts one <c>.mts</c> per metric name, one after another — so a disk that fills
+    /// BETWEEN two of them left every earlier file complete and discoverable by the next start's
+    /// <c>LoadColdSegments</c>. The flush reads a throw as "no file carries these points",
+    /// restores the whole snapshot to the hot tier and leaves the generation replayable, so each
+    /// landed file's points were then in a file AND in memory AND in the log. Not a window — a
+    /// certainty, and total for every metric written before the failure.
     ///
     /// <para>Driven through the writer itself rather than by planting a file beside it: the
     /// names carry a random nonce, so a partial write is not otherwise reproducible, and a
@@ -1154,6 +1153,82 @@ public sealed class MetricWalTests : IDisposable
         // The caller is about to put every one of these points back into the hot tier. That is
         // only not a duplicate if the directory holds nothing.
         Assert.Empty(Directory.GetFiles(_dir, "*.mts"));
+    }
+
+    /// <summary>
+    /// The half of that contract a cleanup pass structurally cannot keep: the disk dies INSIDE
+    /// a file rather than between two of them. The writer wrote straight to the final path and
+    /// a file only joined the returned list once it was finished, so the one file that failed
+    /// was the one name the catch did not have — it deleted files 1..k-1 and left the k-th, a
+    /// footerless <c>.mts</c> sitting where the catalog scan reads. Two outcomes, both bad: the
+    /// next start deletes it with "Unreadable metric segment … (likely format v1)", or — when
+    /// the failure lands after the last byte, on the <c>FileInfo.Length</c> that follows — a
+    /// COMPLETE file stays behind while the caller puts its points back into the hot tier and
+    /// leaves the generation replayable, which is the duplicate this PR exists to remove.
+    ///
+    /// <para>Driven through the writer with the file still open, since that is the only state
+    /// the defect lives in: a seam that fires after a successful write leaves the file in the
+    /// list, and therefore inside the cleanup that already worked. Building at <c>.mts.tmp</c>
+    /// and renaming after the close is what makes the state unreachable — there is nothing to
+    /// clean up after the fact, which is the point.</para>
+    /// </summary>
+    [Fact]
+    public void A_write_that_dies_inside_a_file_leaves_nothing_where_the_scan_reads()
+    {
+        long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+
+        var corpus = new List<(SeriesKey Key, HotSeries Series)>();
+        foreach (string name in new[] { "metric.landed", "metric.torn" })
+        for (int s = 0; s < 4; s++)
+        {
+            var pts = new List<MetricDataPoint>();
+            for (int p = 0; p < 20; p++)
+                pts.Add(new MetricDataPoint { TimestampUnixNano = baseNano + p * 1_000_000L, Value = p });
+            corpus.Add((new SeriesKey(name, MetricKind.Gauge, "ms", Labels(("series", name + s))),
+                        new HotSeries(pts)));
+        }
+
+        int reached = 0;
+        var ex = Assert.Throws<IOException>(() => MetricWriter.Write(
+            _dir, corpus, MetricGranularity.Raw,
+            duringFileWrite: _ =>
+            {
+                // The first file is written whole; the second dies with its handle open,
+                // its header and payload down and its footer still to come.
+                if (Interlocked.Increment(ref reached) == 1) return;
+                throw new IOException("disk full midway through the second metric's file");
+            }));
+
+        Assert.Equal("disk full midway through the second metric's file", ex.Message);
+        Assert.True(reached >= 2, $"setup: the writer opened {reached} file(s), so it never failed inside one");
+
+        // Nothing at a path any reader scans — neither the file that landed and was retracted,
+        // nor the torn one, which is the file the old cleanup could not name.
+        Assert.Empty(Directory.GetFiles(_dir, "*.mts"));
+        // And the build it died in does not linger under its temp name either.
+        Assert.Empty(Directory.GetFiles(_dir, "*.mts.tmp"));
+    }
+
+    /// <summary>
+    /// The other end of the temp name: a process killed between the write and the rename leaves
+    /// a <c>.mts.tmp</c>, and <c>"*.mts"</c> does not match it — so the cold scan cannot see it,
+    /// cannot delete it as unreadable, and no later pass ever visits it. It would accumulate,
+    /// one per interrupted flush or rollup, until somebody wondered about the disk usage.
+    /// <c>StorageEngine.LoadSegmentCatalog</c> has swept <c>*.seg.tmp</c> for exactly this
+    /// reason since the log side gained the same rename.
+    /// </summary>
+    [Fact]
+    public async Task An_interrupted_build_is_swept_by_the_cold_scan()
+    {
+        string tmp = Path.Combine(_dir, "metrics-instrument_0-1-2-raw-deadbeef.mts.tmp");
+        File.WriteAllBytes(tmp, [0x54, 0x4D, 0x44, 0x52, 0x03, 0x00]);   // a header and nothing else
+
+        var engine = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
+        await engine.ColdLoadCompleted.WaitAsync(TimeSpan.FromSeconds(30));
+        await engine.DisposeAsync();
+
+        Assert.False(File.Exists(tmp),
+            "an interrupted build survived the scan; nothing else in the process will ever look at it");
     }
 
     /// <summary>

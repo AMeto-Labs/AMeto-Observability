@@ -1269,7 +1269,19 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
     private void LoadColdSegments()
     {
-        var sw     = System.Diagnostics.Stopwatch.StartNew();
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+
+        // Leftover builds from a flush or rollup killed between the write and the rename,
+        // swept exactly as StorageEngine.LoadSegmentCatalog sweeps *.seg.tmp. Nothing else
+        // would: "*.mts" does not match "*.mts.tmp", so an interrupted write is invisible both
+        // to the scan below — which is the point of the temp name — and to every later pass,
+        // and it would sit in the data directory until somebody wondered about the disk usage.
+        foreach (var tmp in Directory.EnumerateFiles(_dataDir, "*.mts" + MetricWriter.TempSuffix))
+        {
+            try { File.Delete(tmp); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete leftover temp metric segment {File}", tmp); }
+        }
+
         var loaded = new List<MetricSegmentInfo>();
         foreach (var file in Directory.EnumerateFiles(_dataDir, "*.mts").OrderBy(f => f))
         {
