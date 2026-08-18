@@ -83,6 +83,24 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     /// </summary>
     internal Action? OnSnapshotTakenForTest;
 
+    /// <summary>
+    /// Test seam: handed to <see cref="MetricWriter.Write"/> and invoked with each <c>.mts</c>
+    /// path the moment that file is complete. Throwing from it is a PARTIAL write — the disk
+    /// state a full disk leaves when it fills between two of the files a flush writes — which
+    /// nothing else in the suite can produce, since the file names carry a random nonce and the
+    /// writer has no other way to fail on the second file but not the first. An instance field
+    /// rather than a static on the writer, so parallel test classes cannot see each other's.
+    /// Null in production.
+    /// </summary>
+    internal Action<string>? OnFileWrittenForTest;
+
+    /// <summary>
+    /// Test seam: invoked inside the snapshot write lock, after the log's generation is open and
+    /// before the drain — the stretch that has no other way to fail on demand. See its call site.
+    /// Null in production.
+    /// </summary>
+    internal Action? OnGenerationOpenedForTest;
+
     // ── Hot tier ─────────────────────────────────────────────────────────────
     private readonly ConcurrentDictionary<SeriesKey, HotSeries> _hot = new();
     private          int _hotPointCount;
@@ -609,10 +627,20 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         {
             try { await Task.Delay(TimeSpan.FromSeconds(FlushCheckIntervalSeconds), ct); }
             catch (OperationCanceledException) { break; }
-            await FlushIfDueAsync();
+
+            // A tick that throws must cost one tick. Bare, this await made any escaping
+            // exception terminal: the loop ended, so no periodic flush ran again for the life
+            // of the process, the final flush below never ran either, and — because
+            // DisposeAsync only catches OperationCanceledException off this task — the fault
+            // came back out of shutdown and skipped the ingest fence and the log's close. The
+            // hot tier and the log then grew without bound and nothing said why. The flush
+            // logs its own failures; this is only here so that the loop outlives them.
+            try { await FlushIfDueAsync(); }
+            catch (Exception ex) { _logger.LogError(ex, "Periodic metric flush failed; the loop continues"); }
         }
         // Final flush on shutdown — unconditional, so a clean stop leaves nothing to replay.
-        await FlushHotTierAsync();
+        try { await FlushHotTierAsync(); }
+        catch (Exception ex) { _logger.LogError(ex, "Final metric flush failed during shutdown"); }
     }
 
     /// <summary>
@@ -676,95 +704,146 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
             // side, either inside the snapshot or stamped with the next generation. Writing
             // the files happens after the lock is released, so ingest is never blocked on disk.
             var snapshot = new List<(SeriesKey Key, HotSeries Series)>();
-            ulong flushedGeneration;
-            _snapshotLock.EnterWriteLock();
+            ulong flushedGeneration = 0;
+            bool  generationOpened  = false;
             try
             {
-                // Opened BEFORE the drain. Order inside the lock is irrelevant to atomicity —
-                // ingest is excluded for all of it — but it decides what a tripwire costs: the
-                // log throws here if a flush is somehow still open, and throwing before the
-                // drain leaves the tier untouched instead of stranding a snapshot nobody holds.
-                flushedGeneration = _wal.BeginFlush();
-
-                foreach (var (k, v) in _hot)
-                {
-                    var points = v.Drain();
-                    if (points.Count > 0)
-                        snapshot.Add((k, new HotSeries(points, v.Bounds)));
-                }
-
-                if (snapshot.Count == 0)
-                {
-                    // Nothing to write, so nothing to commit — hand the generation back rather
-                    // than leaving it open. The empty generation is covered by the next commit.
-                    _wal.AbandonFlush(flushedGeneration);
-                    return;
-                }
-
-                System.Threading.Interlocked.Exchange(ref _hotPointCount, 0);
-                _hotSince = null;
-            }
-            finally { _snapshotLock.ExitWriteLock(); }
-
-            try
-            {
-                // Test seam, INSIDE the try on purpose: it stands where the file write does, so
-                // holding in it holds the flush in the window the loss lived in, and throwing
-                // from it is a failed write — restore, abandon, no commit. Outside the try a
-                // throw would skip both and wedge the log. Null in production: one delegate
-                // read per flush, not per point.
-                OnSnapshotTakenForTest?.Invoke();
-
-                var infos = MetricWriter.Write(_dataDir, snapshot);
-                _coldLock.EnterWriteLock();
-                try { _coldSegments.AddRange(infos); }
-                finally { _coldLock.ExitWriteLock(); }
-
-                _logger.LogDebug("Flushed {SeriesCount} metric series to {FileCount} .mts files",
-                    snapshot.Count, infos.Count);
-            }
-            catch (Exception ex)
-            {
-                // The points were drained out of _hot before the write, so a failure here used
-                // to lose them outright. Put them back: the log still holds them, but only a
-                // restart would have brought them back, and a transient disk error is not a
-                // restart.
-                int restored = 0;
                 _snapshotLock.EnterWriteLock();
                 try
                 {
-                    foreach (var (key, snap) in snapshot)
-                    {
-                        var live = _hot.GetOrAdd(key, static _ => new HotSeries());
-                        foreach (var p in snap.GetPoints(long.MinValue, long.MaxValue))
-                        {
-                            live.Append(p, snap.Bounds);
-                            restored++;
-                        }
-                    }
-                    System.Threading.Interlocked.Add(ref _hotPointCount, restored);
-                    if (restored > 0) _hotSince ??= DateTime.UtcNow;
+                    // Opened BEFORE the drain. Order inside the lock is irrelevant to atomicity —
+                    // ingest is excluded for all of it — but it decides what a tripwire costs: the
+                    // log throws here if a flush is somehow still open, and throwing before the
+                    // drain leaves the tier untouched instead of stranding a snapshot nobody holds.
+                    flushedGeneration = _wal.BeginFlush();
+                    generationOpened  = true;
 
-                    // Inside the same lock as the restore, and that matters: the generation is
-                    // given back only once the points it covers are visible again, so the next
-                    // flush cannot drain between the two and miss them. The restored points are
-                    // NOT re-logged — deliberately, since the usual cause is a full disk and the
-                    // log grows by doubling — so this generation's records are what keeps them
-                    // durable until a later flush snapshots them and commits above it.
-                    _wal.AbandonFlush(flushedGeneration);
+                    // Test seam standing INSIDE the write lock, between the open generation and
+                    // the drain — the one stretch of this method no catch used to reach, and the
+                    // one nothing else can throw from on demand: what throws there in production
+                    // is the drain's own allocation (a fresh List per series, at up to 500 000
+                    // points), so an OutOfMemoryException, which a test cannot ask for. Without
+                    // it the finally below would be held up by its comment alone.
+                    OnGenerationOpenedForTest?.Invoke();
+
+                    foreach (var (k, v) in _hot)
+                    {
+                        var points = v.Drain();
+                        if (points.Count > 0)
+                            snapshot.Add((k, new HotSeries(points, v.Bounds)));
+                    }
+
+                    if (snapshot.Count == 0)
+                    {
+                        // Nothing to write, so nothing to commit — hand the generation back rather
+                        // than leaving it open. The empty generation is covered by the next commit.
+                        _wal.AbandonFlush(flushedGeneration);
+                        return;
+                    }
+
+                    System.Threading.Interlocked.Exchange(ref _hotPointCount, 0);
+                    _hotSince = null;
                 }
                 finally { _snapshotLock.ExitWriteLock(); }
 
-                _logger.LogError(ex,
-                    "Failed to flush metric hot tier — {Count} point(s) kept in memory for the next attempt",
-                    restored);
-                return;
-            }
+                List<MetricSegmentInfo> infos;
+                try
+                {
+                    // Test seam, INSIDE the try on purpose: it stands where the file write does, so
+                    // holding in it holds the flush in the window the loss lived in, and throwing
+                    // from it is a failed write — restore, abandon, no commit. Outside the try a
+                    // throw would skip both and wedge the log. Null in production: one delegate
+                    // read per flush, not per point.
+                    OnSnapshotTakenForTest?.Invoke();
 
-            // Files are on disk. Committing the flushed generation reclaims its space and leaves
-            // everything appended during the write — which is durable nowhere else — untouched.
-            try { _wal.CommitFlush(flushedGeneration); }
-            catch (Exception ex) { _logger.LogWarning(ex, "Metric WAL commit failed after flush"); }
+                    // The write and NOTHING ELSE. What follows it — publishing the files to the
+                    // cold list, committing, logging — happens on the far side of the durability
+                    // boundary, and treating a failure there as a failed write is how every point
+                    // of the snapshot ended up in a complete .mts file AND back in the hot tier AND
+                    // in a generation deliberately left replayable: served twice, replayed twice,
+                    // every counter and sum over the window doubled. No crash needed.
+                    infos = MetricWriter.Write(_dataDir, snapshot, afterFileWritten: OnFileWrittenForTest);
+                }
+                catch (Exception ex)
+                {
+                    // The points were drained out of _hot before the write, so a failure here used
+                    // to lose them outright. Put them back: the log still holds them, but only a
+                    // restart would have brought them back, and a transient disk error is not a
+                    // restart. Sound only because the writer is all-or-nothing about what it
+                    // leaves on disk — it deletes the files it had already written before it
+                    // rethrows — so "the write failed" really does mean no file carries these
+                    // points and putting every one of them back cannot duplicate anything.
+                    int restored = 0;
+                    _snapshotLock.EnterWriteLock();
+                    try
+                    {
+                        foreach (var (key, snap) in snapshot)
+                        {
+                            var live = _hot.GetOrAdd(key, static _ => new HotSeries());
+                            foreach (var p in snap.GetPoints(long.MinValue, long.MaxValue))
+                            {
+                                live.Append(p, snap.Bounds);
+                                restored++;
+                            }
+                        }
+                        System.Threading.Interlocked.Add(ref _hotPointCount, restored);
+                        if (restored > 0) _hotSince ??= DateTime.UtcNow;
+
+                        // Inside the same lock as the restore, and that matters: the generation is
+                        // given back only once the points it covers are visible again, so the next
+                        // flush cannot drain between the two and miss them. The restored points are
+                        // NOT re-logged — deliberately, since the usual cause is a full disk and the
+                        // log grows by doubling — so this generation's records are what keeps them
+                        // durable until a later flush snapshots them and commits above it.
+                        _wal.AbandonFlush(flushedGeneration);
+                        generationOpened = false;
+                    }
+                    finally { _snapshotLock.ExitWriteLock(); }
+
+                    _logger.LogError(ex,
+                        "Failed to flush metric hot tier — {Count} point(s) kept in memory for the next attempt",
+                        restored);
+                    return;
+                }
+
+                // ── Past the durability boundary ─────────────────────────────────────────
+                // Every .mts file is complete at its final path. The points are durable in
+                // files from here, so nothing below may put them back into the tier, and the
+                // steps run in descending order of what they cost to skip: the commit is the
+                // only one whose omission is a correctness fault (the log would replay points
+                // that are already in a file), publishing costs visibility until the next
+                // start's LoadColdSegments finds the files anyway, and the log line costs
+                // nothing. One catch over all three, because a flush reports failure by
+                // logging it, not by throwing at whoever scheduled it.
+                try
+                {
+                    _wal.CommitFlush(flushedGeneration);
+                    generationOpened = false;
+
+                    _coldLock.EnterWriteLock();
+                    try { _coldSegments.AddRange(infos); }
+                    finally { _coldLock.ExitWriteLock(); }
+
+                    _logger.LogDebug("Flushed {SeriesCount} metric series to {FileCount} .mts files",
+                        snapshot.Count, infos.Count);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex,
+                        "Metric flush wrote {FileCount} .mts file(s) but failed afterwards; the points are " +
+                        "durable in those files and are NOT returned to the hot tier", infos.Count);
+                }
+            }
+            finally
+            {
+                // The generation does not outlive the flush that opened it, whatever happens in
+                // between — including the drain above, which allocates a copy of every series
+                // and sat outside every handler. A leaked open flush is not one lost snapshot:
+                // BeginFlush refuses every later flush, so the tier never drains again and the
+                // log grows by doubling until it cannot. AbandonFlush only releases a generation
+                // that is still the open one, so the committed and abandoned paths no-op here.
+                if (generationOpened) _wal.AbandonFlush(flushedGeneration);
+            }
         }
         finally { _flushGate.Release(); }
     }
@@ -1278,6 +1357,13 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
             _cts.Cancel();
             try { await Task.WhenAll(_flushTask, _rollupTask); }
             catch (OperationCanceledException) { }
+            // Everything below this line is the teardown itself — the ingest fence, the log's
+            // close, the locks — and a background loop that faulted must not be able to skip
+            // it. Catching only the cancellation let one exception out of the flush loop take
+            // the whole sequence with it, while the `finally` still completed _disposeCompleted:
+            // the host's other two disposers then returned believing the engine was down, with
+            // the log still mapped and the OTLP door still open.
+            catch (Exception ex) { _logger.LogError(ex, "Metric background loop faulted before shutdown"); }
 
             // Threshold flushes are scheduled off the ingest path, so they are in neither loop
             // and used to outlive shutdown entirely. Ingest keeps scheduling them throughout

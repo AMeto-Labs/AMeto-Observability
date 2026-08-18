@@ -71,6 +71,16 @@ namespace Ameto.Metrics.Storage;
 /// commits a generation above it. That coupling is why the failure path must abandon rather
 /// than simply return.</para>
 ///
+/// <para><b>What "the flush failed" has to mean for that to be true.</b> Leaving a generation
+/// replayable while its points are also in a file is a duplicate, not a rescue, so only a
+/// failure that put NO file on disk may abandon. That is a condition on the caller, and it was
+/// not met: the writer wrote one file per metric name straight to its final path and kept
+/// whatever it had finished when a later one threw, and the flush treated every step after the
+/// write — publishing the files, logging — as a failed write too. Both are closed at the
+/// source: <c>MetricWriter.Write</c> deletes its own output before rethrowing, and
+/// <c>MetricStorageEngine.FlushHotTierAsync</c> restores and abandons only around the write
+/// itself, committing on every path where a file survives.</para>
+///
 /// <para><b>Crash recovery.</b> Recovery keeps entries whose generation is ABOVE the
 /// committed watermark. The watermark is written before any bytes move, so a crash during
 /// compaction cannot resurrect cold points; the relocated tail is terminated with a
@@ -78,7 +88,9 @@ namespace Ameto.Metrics.Storage;
 /// the survivors twice either. The generation is assigned here, under this
 /// class's own lock; nothing derived from the data (a point's timestamp, say) would do,
 /// because those come from the instrumented client and are not monotonic in append order.
-/// Only a crash landing between the file write and the commit can duplicate points.</para>
+/// Once the caller's side of the abandon contract holds (see above), a crash landing between
+/// the file write and the commit is the only thing left that can duplicate points — a window
+/// of one <c>CommitFlush</c> call, not a state the code reaches on its own.</para>
 ///
 /// <para>Generation 0 is never written by an append, so it also marks the end of real data —
 /// a zero-filled region is otherwise indistinguishable from a valid entry whose point
@@ -211,9 +223,25 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
         else
         {
             _writeOffset         = Math.Max(0, hdr.WriteOffset - FileHeaderSize);
-            _generation          = hdr.Generation == 0 ? FirstGeneration : hdr.Generation;
+            _generation          = hdr.Generation;
             _committedGeneration = hdr.CommittedGeneration;
             if (_writeOffset > _capacity) _writeOffset = _capacity;
+
+            // The counter must LEAD the watermark. BeginFlush only ever hands out _generation
+            // and CommitFlush only ever names a generation it was handed, so a header where the
+            // two have crossed makes the first commit reclaim nothing and — before CommitFlush
+            // was fixed to close the flush first — wedged the log for the life of the process.
+            // Both fields sit inside the same 32-byte header, hence the same sector, so a torn
+            // write cannot separate them: this is a restored, copied or bit-rotted file. Repair
+            // it here rather than carry it, and write the repair back so a crash before the next
+            // flush does not re-read the same value. `_committedGeneration + 1` is exactly
+            // FirstGeneration when the watermark is 0, which is where the coercion this replaces
+            // (`Generation == 0 ? FirstGeneration : …`) landed for the only case it covered.
+            if (_generation <= _committedGeneration)
+            {
+                _generation    = _committedGeneration + 1;
+                hdr.Generation = _generation;
+            }
         }
 
         _poolStream = new FileStream(_poolPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
@@ -384,16 +412,38 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// statement of the watermark's rule — it may only ever name a generation whose data is
     /// already in files — and it holds even if a caller reintroduces concurrent flushes: the
     /// later one's commit cannot reclaim the earlier one's records.</para>
+    ///
+    /// <para>Refusing is not the same as leaving the flush open. Exactly one of the two
+    /// refusals belongs to somebody else's flush and must not touch it; the other belongs to
+    /// the caller's own, whose flush is over whatever the watermark says. Closing the caller's
+    /// flush therefore comes FIRST, before any test that can return — see the comment on the
+    /// order below for what happened when it did not.</para>
     /// </summary>
     public void CommitFlush(ulong flushedGeneration)
     {
         lock (_writeLock)
         {
             if (_disposed || _ptr is null) return;
-            if (flushedGeneration <= _committedGeneration) return;   // already committed
-            if (flushedGeneration != _openFlush) return;             // not the flush that is writing
 
-            _openFlush           = 0;
+            // Not the flush that is writing: reclaims nothing AND leaves the open flush alone,
+            // which is the whole point — closing somebody else's flush here is the
+            // reclaim-while-writing this class exists to refuse.
+            if (flushedGeneration != _openFlush) return;
+
+            // From here the generation is the caller's own, so its flush is over and the flag it
+            // set comes down unconditionally. This used to sit BELOW the watermark test, so a
+            // commit the watermark already covered returned with the flush still open — and
+            // BeginFlush then threw on every later flush, for the life of the process, with the
+            // throw landing in a loop that did not catch it. One unusable header cost every
+            // metric flush the process would ever do.
+            _openFlush = 0;
+
+            // Nothing left to reclaim: the watermark already names this generation or a later
+            // one. Only a header that reached this process already crossed can get here
+            // (OpenOrCreate normalises what it can see), and the counter climbs past the
+            // watermark on the next flush, so the log resumes compacting by itself.
+            if (flushedGeneration <= _committedGeneration) return;
+
             _committedGeneration = flushedGeneration;
 
             // The watermark lands before a single byte moves: a crash mid-compaction then

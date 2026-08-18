@@ -48,10 +48,6 @@ internal static class MetricWriter
     private const ushort Version     = 3;
 
     /// <summary>
-    /// Writes one <c>.mts</c> file per distinct metric name found in <paramref name="series"/>.
-    /// Returns metadata for all created files.
-    /// </summary>
-    /// <summary>
     /// Upper bound on series packed into one .mts file. The writer serialises a
     /// whole file into a single msgpack buffer before compressing it, so an
     /// unbounded series count turns into an unbounded (doubling) buffer — with
@@ -62,51 +58,87 @@ internal static class MetricWriter
     /// </summary>
     private const int MaxSeriesPerFile = 512;
 
+    /// <summary>
+    /// Writes one <c>.mts</c> file per distinct metric name found in <paramref name="series"/>
+    /// (several, if a name carries more than <see cref="MaxSeriesPerFile"/> series). Returns
+    /// metadata for all created files.
+    ///
+    /// <para><b>All or nothing on disk.</b> The files are written one after another, each
+    /// straight to its FINAL path, so a failure partway through — a full disk, which is the
+    /// cause the flush path's own comments name — used to leave every earlier file complete and
+    /// visible to the next start's catalog scan. The caller reads a throw as "no file carries
+    /// these points", puts the whole snapshot back into the hot tier and leaves the log
+    /// generation replayable; with files already on disk that is not a window, it is certain
+    /// duplication of everything written before the failure — served twice and replayed twice,
+    /// every rollup over the range reading double. So a throw now takes its own output with it:
+    /// the files this call created are deleted before the exception leaves, and the caller's
+    /// reading is true again.</para>
+    /// </summary>
+    /// <param name="afterFileWritten">
+    /// Test seam invoked with each completed file's path; throwing from it is the only way to
+    /// produce a genuine partial write, since the names carry a random nonce. Null in production.
+    /// </param>
     public static List<MetricSegmentInfo> Write(
         string dataDir,
         IList<(SeriesKey Key, HotSeries Series)> series,
-        MetricGranularity granularity = MetricGranularity.Raw)
+        MetricGranularity granularity = MetricGranularity.Raw,
+        Action<string>? afterFileWritten = null)
     {
         var byMetric = series.GroupBy(s => s.Key.Name);
         var result   = new List<MetricSegmentInfo>();
 
-        foreach (var group in byMetric)
-        foreach (var items in Chunk(group.ToList(), MaxSeriesPerFile))
+        try
         {
-            long minNano = long.MaxValue, maxNano = long.MinValue;
-            foreach (var (_, hs) in items)
+            foreach (var group in byMetric)
+            foreach (var items in Chunk(group.ToList(), MaxSeriesPerFile))
             {
-                var pts = hs.GetPoints(long.MinValue, long.MaxValue);
-                if (pts.Count > 0)
+                long minNano = long.MaxValue, maxNano = long.MinValue;
+                foreach (var (_, hs) in items)
                 {
-                    minNano = Math.Min(minNano, pts[0].TimestampUnixNano);
-                    maxNano = Math.Max(maxNano, pts[^1].TimestampUnixNano);
+                    var pts = hs.GetPoints(long.MinValue, long.MaxValue);
+                    if (pts.Count > 0)
+                    {
+                        minNano = Math.Min(minNano, pts[0].TimestampUnixNano);
+                        maxNano = Math.Max(maxNano, pts[^1].TimestampUnixNano);
+                    }
                 }
+                if (minNano == long.MaxValue) continue;
+
+                // A short nonce keeps the name unique: the (name, min, max, granularity)
+                // tuple is NOT — a v2→v3 migration re-writes the same time range, and two
+                // files of the same range can legitimately coexist until the next merge
+                // dedupes them. Without it, WriteFile's FileMode.CreateNew throws
+                // "already exists" and the compaction fails every pass. The name is never
+                // parsed back (all metadata is read from the file's own header/index).
+                string suffix   = granularity == MetricGranularity.Raw ? "raw" : granularity.ToString().ToLower();
+                string nonce    = Guid.NewGuid().ToString("N").Substring(0, 8);
+                string fileName = $"metrics-{SanitizeName(group.Key)}-{minNano}-{maxNano}-{suffix}-{nonce}.mts";
+                string filePath = Path.Combine(dataDir, fileName);
+
+                WriteFile(filePath, group.Key, granularity, items, minNano, maxNano);
+                result.Add(new MetricSegmentInfo
+                {
+                    FilePath      = filePath,
+                    MetricName    = group.Key,
+                    MinNano       = minNano,
+                    MaxNano       = maxNano,
+                    Granularity   = granularity,
+                    FormatVersion = Version,
+                    SizeBytes     = new FileInfo(filePath).Length,
+                });
+
+                afterFileWritten?.Invoke(filePath);
             }
-            if (minNano == long.MaxValue) continue;
-
-            // A short nonce keeps the name unique: the (name, min, max, granularity)
-            // tuple is NOT — a v2→v3 migration re-writes the same time range, and two
-            // files of the same range can legitimately coexist until the next merge
-            // dedupes them. Without it, WriteFile's FileMode.CreateNew throws
-            // "already exists" and the compaction fails every pass. The name is never
-            // parsed back (all metadata is read from the file's own header/index).
-            string suffix   = granularity == MetricGranularity.Raw ? "raw" : granularity.ToString().ToLower();
-            string nonce    = Guid.NewGuid().ToString("N").Substring(0, 8);
-            string fileName = $"metrics-{SanitizeName(group.Key)}-{minNano}-{maxNano}-{suffix}-{nonce}.mts";
-            string filePath = Path.Combine(dataDir, fileName);
-
-            WriteFile(filePath, group.Key, granularity, items, minNano, maxNano);
-            result.Add(new MetricSegmentInfo
-            {
-                FilePath      = filePath,
-                MetricName    = group.Key,
-                MinNano       = minNano,
-                MaxNano       = maxNano,
-                Granularity   = granularity,
-                FormatVersion = Version,
-                SizeBytes     = new FileInfo(filePath).Length,
-            });
+        }
+        catch
+        {
+            // Best effort by necessity — the usual cause is a disk that cannot take another
+            // byte, and an unlink needs none. What a failed delete leaves behind is exactly the
+            // old behaviour for that one file, not something worse, so the original exception
+            // is what the caller must see.
+            for (int i = 0; i < result.Count; i++)
+                try { File.Delete(result[i].FilePath); } catch { /* leave it; the throw still stands */ }
+            throw;
         }
 
         return result;

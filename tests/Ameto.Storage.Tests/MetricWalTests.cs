@@ -1106,4 +1106,297 @@ public sealed class MetricWalTests : IDisposable
 
         await second.DisposeAsync();
     }
+
+    // ── The abandon contract: "the flush failed" must mean no file landed ──────
+
+    /// <summary>
+    /// The writer puts one <c>.mts</c> per metric name straight at its FINAL path, one after
+    /// another, with no temp-and-rename — so a disk that fills between two of them left every
+    /// earlier file complete and discoverable by the next start's <c>LoadColdSegments</c>. The
+    /// flush reads a throw as "no file carries these points", restores the whole snapshot to the
+    /// hot tier and leaves the generation replayable, so each landed file's points were then in
+    /// a file AND in memory AND in the log. Not a window — a certainty, and total for every
+    /// metric written before the failure.
+    ///
+    /// <para>Driven through the writer itself rather than by planting a file beside it: the
+    /// names carry a random nonce, so a partial write is not otherwise reproducible, and a
+    /// fabricated file would pass whatever the writer does. Two metric names, the failure after
+    /// the first.</para>
+    /// </summary>
+    [Fact]
+    public void A_write_that_fails_partway_leaves_none_of_its_files_behind()
+    {
+        long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+
+        var corpus = new List<(SeriesKey Key, HotSeries Series)>();
+        foreach (string name in new[] { "metric.landed", "metric.pending" })
+        for (int s = 0; s < 4; s++)
+        {
+            var pts = new List<MetricDataPoint>();
+            for (int p = 0; p < 20; p++)
+                pts.Add(new MetricDataPoint { TimestampUnixNano = baseNano + p * 1_000_000L, Value = p });
+            corpus.Add((new SeriesKey(name, MetricKind.Gauge, "ms", Labels(("series", name + s))),
+                        new HotSeries(pts)));
+        }
+
+        int written = 0;
+        var ex = Assert.Throws<IOException>(() => MetricWriter.Write(
+            _dir, corpus, MetricGranularity.Raw,
+            afterFileWritten: _ =>
+            {
+                if (Interlocked.Increment(ref written) == 1) return;
+                throw new IOException("disk full while writing the second metric's file");
+            }));
+
+        Assert.Equal("disk full while writing the second metric's file", ex.Message);
+        Assert.True(written >= 2, $"setup: the writer produced {written} file(s), so it never failed partway");
+
+        // The caller is about to put every one of these points back into the hot tier. That is
+        // only not a duplicate if the directory holds nothing.
+        Assert.Empty(Directory.GetFiles(_dir, "*.mts"));
+    }
+
+    /// <summary>
+    /// The same failure one level up, measured the way it is actually paid: a partial write, the
+    /// retry that succeeds, and then a count of everything durable. The landed metric's points
+    /// must appear once — pre-fix they appeared in the abandoned attempt's surviving file and
+    /// again in the retry's, and every counter and sum in a rollup over the window read double.
+    /// </summary>
+    [Fact]
+    public async Task A_partial_write_does_not_duplicate_the_metrics_whose_file_landed()
+    {
+        var engine = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
+        long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+
+        // Two metric names, so the writer writes two files with a seam between them.
+        var landed  = SlowFlushBatch(baseNano, "a", series: 10, pointsPerSeries: 20);
+        var pending = new List<MetricIngestItem>(landed.Length);
+        for (int s = 0; s < 10; s++)
+        for (int p = 0; p < 20; p++)
+            pending.Add(Scalar("instrument.1", baseNano + p * 1_000_000L, p, Labels(("series", "b" + s))));
+
+        int written = 0;
+        engine.OnFileWrittenForTest = _ =>
+        {
+            if (Interlocked.Increment(ref written) == 1) return;
+            throw new IOException("disk full while writing the second metric's file");
+        };
+
+        engine.Ingest(landed);
+        engine.Ingest(pending.ToArray());
+        await engine.ScheduleThresholdFlushForTest();     // fails after the first file
+        Assert.True(written >= 2, "setup: the write never reached a second file");
+
+        engine.OnFileWrittenForTest = null;
+        await engine.ScheduleThresholdFlushForTest();     // the retry that carries them all
+        await engine.DisposeAsync();
+
+        long durable = await DurablePointsAsync(_dir, "instrument.0");
+        Assert.True(durable == landed.Length, Verdict(durable, landed.Length));
+    }
+
+    /// <summary>
+    /// The other half of the same contract: a failure AFTER the write returned. Everything the
+    /// snapshot held is complete on disk at that point, so restoring it and leaving the
+    /// generation replayable duplicates all of it — and the catch wrapped the publish and the
+    /// log line too, which are not the write and cannot un-write it. Killed before any retry, so
+    /// what is measured is exactly what the next start would find.
+    /// </summary>
+    [Fact]
+    public async Task A_failure_after_the_files_landed_commits_instead_of_replaying_them()
+    {
+        var logger = new ThrowOnFlushedDebugLogger();
+        var engine = new MetricStorageEngine(_dir, logger);
+        long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+
+        var one = SlowFlushBatch(baseNano, "a", series: 50, pointsPerSeries: 20);   // 1 000 points
+        engine.Ingest(one);
+        await engine.ScheduleThresholdFlushForTest();
+
+        Assert.True(logger.Threw, "setup: the post-write step never threw");
+        Assert.True(TrcCount(_dir, "*.mts") > 0, "setup: the write must have landed before the throw");
+
+        string frozen = FreezeDataDir();                 // kill here, before any retry
+
+        logger.Armed = false;
+        await engine.DisposeAsync();
+
+        long durable = await DurablePointsAsync(frozen, "instrument.0");
+        Assert.True(durable == one.Length, Verdict(durable, one.Length));
+    }
+
+    /// <summary>Throws from the flush's own post-write debug line — a step that cannot un-write a file.</summary>
+    private sealed class ThrowOnFlushedDebugLogger : Microsoft.Extensions.Logging.ILogger<MetricStorageEngine>
+    {
+        public bool Armed = true;
+        public bool Threw;
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            Microsoft.Extensions.Logging.LogLevel logLevel, Microsoft.Extensions.Logging.EventId eventId,
+            TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            if (!Armed) return;
+            if (logLevel == Microsoft.Extensions.Logging.LogLevel.Debug &&
+                formatter(state, exception).StartsWith("Flushed ", StringComparison.Ordinal))
+            {
+                Threw = true;
+                throw new InvalidOperationException("post-write step failed");
+            }
+        }
+    }
+
+    // ── The generation must not outlive the flush that opened it ──────────────
+
+    /// <summary>
+    /// <c>BeginFlush</c> refusing a second open flush is a tripwire, and a tripwire that cannot
+    /// be reset is worse than the loss it guards: nothing catches its
+    /// <see cref="InvalidOperationException"/> on the periodic path, so the first flush to hit
+    /// it takes the loop with it and no <c>.mts</c> file is written again for the life of the
+    /// process, while the log grows by doubling until <c>Grow</c> throws into ingest.
+    ///
+    /// <para>The window it was reachable through: the drain between <c>BeginFlush</c> and the
+    /// write sat outside every handler — it copies every series' point list, so an
+    /// <see cref="OutOfMemoryException"/> there is the realistic trigger — and both paths that
+    /// hand the generation back are below it. Provoked here from the drain itself, through the
+    /// only seam that stands inside the write lock.</para>
+    /// </summary>
+    [Fact]
+    public async Task A_flush_that_throws_before_its_write_leaves_the_log_able_to_flush_again()
+    {
+        var engine = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
+        long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+
+        var one = SlowFlushBatch(baseNano, "a", series: 40, pointsPerSeries: 25);   // 1 000 points
+        engine.Ingest(one);
+
+        // The generation is opened, and the flush then dies before it reaches the drain — where
+        // the only two calls that hand a generation back both live.
+        engine.OnGenerationOpenedForTest = static () => throw new OutOfMemoryException("drain");
+        var first = await Record.ExceptionAsync(() => engine.ScheduleThresholdFlushForTest());
+        Assert.IsType<OutOfMemoryException>(first);
+
+        // The tripwire must be reset. Pre-fix the next BeginFlush threw
+        // InvalidOperationException — for every flush after it, forever.
+        engine.OnGenerationOpenedForTest = null;
+        var second = await Record.ExceptionAsync(() => engine.ScheduleThresholdFlushForTest());
+        Assert.True(second is null, $"the log refused every flush after the first one threw: {second?.GetType().Name}");
+
+        await engine.DisposeAsync();
+        long durable = await DurablePointsAsync(_dir, "instrument.0");
+        Assert.True(durable == one.Length, Verdict(durable, one.Length));
+    }
+
+    /// <summary>
+    /// Shutdown has to survive a flush that throws. The loop's last act is an unconditional
+    /// final flush, and that await was bare: a throw there faulted <c>_flushTask</c>, and
+    /// <c>DisposeAsync</c> caught only <see cref="OperationCanceledException"/> off it — so the
+    /// fault came back out of dispose and skipped everything below the await, including the
+    /// ingest fence, the log's close and the locks, while the <c>finally</c> still completed
+    /// <c>_disposeCompleted</c> and told the host's other two disposers that teardown had
+    /// finished. The engine then exited with its log mapped and its OTLP door open.
+    ///
+    /// <para>What is asserted is the door, not the absence of an exception: teardown must have
+    /// run PAST the await, not merely survived it.</para>
+    /// </summary>
+    [Fact]
+    public async Task A_final_flush_that_throws_still_shuts_the_door_behind_it()
+    {
+        var engine = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
+        long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+
+        engine.Ingest(SlowFlushBatch(baseNano, "a", series: 20, pointsPerSeries: 10));
+        engine.OnGenerationOpenedForTest = static () => throw new OutOfMemoryException("final flush");
+
+        var teardown = await Record.ExceptionAsync(async () => await engine.DisposeAsync());
+        Assert.True(teardown is null, $"DisposeAsync threw {teardown?.GetType().Name}");
+        Assert.Throws<ObjectDisposedException>(() => engine.Ingest(SlowFlushBatch(baseNano, "b", 1, 1)));
+    }
+
+    /// <summary>
+    /// The same crossed header seen from the log alone, and the loss the reorder above does not
+    /// touch. Recovery keeps entries whose generation is strictly ABOVE the watermark, so a
+    /// counter that reopens at or below it stamps every new append into the range recovery
+    /// discards: the points are written, acknowledged, and then dropped by the next start.
+    /// Repairing the counter at open — to one past the watermark, which is
+    /// <c>FirstGeneration</c> exactly when the watermark is 0 — makes the first append after the
+    /// repair replayable again, and bounds the damage of a badly crossed header to nothing
+    /// instead of to one skipped compaction per flush until the counter catches up.
+    /// </summary>
+    [Fact]
+    public void A_crossed_header_reopens_with_its_counter_above_the_watermark()
+    {
+        long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+
+        using (var wal = MetricWriteAheadLog.Open(WalPath, 64 * 1024))
+        {
+            Append(wal, Scalar("m", baseNano, 1));
+            wal.CommitFlush(wal.BeginFlush());            // watermark = 1, counter = 2
+        }
+
+        using (var fs = new FileStream(WalPath, FileMode.Open, FileAccess.ReadWrite))
+        {
+            fs.Seek(16, SeekOrigin.Begin);               // WalFileHeader.Generation
+            fs.Write(new byte[8]);                       // counter behind the standing watermark
+        }
+
+        using (var reopened = MetricWriteAheadLog.Open(WalPath, 64 * 1024))
+        {
+            Assert.True(reopened.BeginFlush() > 1,
+                "the counter reopened at or below the watermark, so the flush it opens is one " +
+                "recovery already considers committed");
+            Append(reopened, Scalar("m", baseNano + 1_000_000L, 2));
+        }
+
+        // The point appended after the repair has to come back. Below the watermark it does not.
+        using var after = MetricWriteAheadLog.Open(WalPath, 64 * 1024);
+        var replayed = after.ReadAll(out _);
+        Assert.Single(replayed);
+        Assert.Equal(2, replayed[0].Point.Value);
+    }
+
+    /// <summary>
+    /// A header whose generation counter sits at or below its committed watermark. Both fields
+    /// live in the same 32-byte header — hence the same sector — so a torn write cannot separate
+    /// them: this is a restored, copied or bit-rotted <c>metrics.wal</c>. It cost one skipped
+    /// compaction before the one-open-flush guard; with it, <c>CommitFlush</c> returned on
+    /// "already committed" WITHOUT clearing the open flush, so every later <c>BeginFlush</c>
+    /// threw — the flush loop faulted, the shutdown flush never ran, and the fault came back out
+    /// of <c>DisposeAsync</c>, which skipped the ingest fence and the log's close while its
+    /// <c>finally</c> told the host's other two disposers that teardown had finished.
+    /// </summary>
+    [Fact]
+    public async Task A_header_whose_generation_is_behind_its_watermark_still_flushes_and_shuts_down()
+    {
+        long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+
+        var seed = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
+        seed.Ingest(SlowFlushBatch(baseNano, "seed", series: 10, pointsPerSeries: 10));
+        await seed.ScheduleThresholdFlushForTest();      // watermark = 1, generation = 2
+        await seed.DisposeAsync();
+
+        using (var fs = new FileStream(WalPath, FileMode.Open, FileAccess.ReadWrite))
+        {
+            fs.Seek(16, SeekOrigin.Begin);               // WalFileHeader.Generation
+            fs.Write(new byte[8]);                       // counter lost, watermark kept
+        }
+
+        var engine = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
+        var batch  = SlowFlushBatch(baseNano + 3_600_000_000_000L, "a", series: 10, pointsPerSeries: 10);
+        engine.Ingest(batch);
+        await engine.ScheduleThresholdFlushForTest();
+
+        // A second flush is the whole point: it is the one that used to throw.
+        engine.Ingest(SlowFlushBatch(baseNano + 7_200_000_000_000L, "b", series: 10, pointsPerSeries: 10));
+        var second = await Record.ExceptionAsync(() => engine.ScheduleThresholdFlushForTest());
+        Assert.True(second is null, $"the log refused a second flush: {second?.GetType().Name}");
+
+        var teardown = await Record.ExceptionAsync(async () => await engine.DisposeAsync());
+        Assert.True(teardown is null, $"DisposeAsync threw {teardown?.GetType().Name}");
+
+        // Teardown ran to the end rather than being skipped: the door is shut behind it.
+        Assert.Throws<ObjectDisposedException>(() => engine.Ingest(SlowFlushBatch(baseNano, "c", 1, 1)));
+    }
 }
