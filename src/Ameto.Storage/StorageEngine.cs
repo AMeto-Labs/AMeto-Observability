@@ -1140,13 +1140,21 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             // A replicated peer's segment is a merge candidate here, the same as a local one, and
             // MergeToColdAsync stamps its output with THIS node's id — so merging one drops the
             // provenance that SegmentInfo.NodeId carried, and a later re-push of the same (node, id)
-            // is no longer recognised as already held: its events land a second time. That is worth
-            // stating because the composite catalog key makes it DETERMINISTIC where it used to be a
-            // coin toss — pre-fix a peer's entry was in the catalog, and so eligible, whenever it
-            // happened to be the one that won the collision. Left as-is deliberately: excluding
-            // foreign segments would strand a peer's small files uncompacted on this node forever,
-            // and the honest repair is a consumed-(node, id) record that ImportSegment consults,
-            // which needs its own tests and its own issue rather than a rider on the key change.
+            // is no longer recognised as already held: its events land a second time, permanently,
+            // since nothing on this node can ever match the re-pushed pair against the merged copy.
+            //
+            // Wholly independent of the catalog key, and measured that way: a fixture with no
+            // local segment at all — hence no collision to win or lose — reproduces it identically
+            // on the single-keyspace build, at 12 events where 8 exist. EVERY replicated segment
+            // is exposed, not only one whose id happens to clash, so an id-keyed catalog does not
+            // narrow it and this key does not widen it.
+            //
+            // Left as-is deliberately: excluding foreign segments would strand a peer's small
+            // files uncompacted on this node forever, and the honest repair is a durable
+            // consumed-(node, id) record that ImportSegment consults — which needs a lifetime
+            // rule of its own (when may a pair be forgotten? retention deletes the merged output
+            // eventually, and a re-push after that is legitimate again), so it belongs to how
+            // cluster mode is meant to work overall rather than to a rider on the key change.
 
             // A maximal segment is done — it is the OUTPUT of this policy, not an input to it.
             if (SegmentPayloadBytes(s) >= maximal) continue;
