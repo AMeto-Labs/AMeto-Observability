@@ -415,6 +415,53 @@ public sealed class MetricWalTests : IDisposable
     }
 
     /// <summary>
+    /// The other way a flush could not be opened, which used to be answered with a generation
+    /// instead of a refusal: the log is alive but has no mapping. <c>Grow</c> unmaps before it
+    /// extends — Windows will not resize a mapped file — and if the extend AND the restoring
+    /// re-map both fail, which is one full disk away, the object stays alive with no mapping and
+    /// <c>_disposed</c> false for the rest of the process.
+    ///
+    /// <para>From there <c>Append</c> throws, so ingest fails honestly. <c>BeginFlush</c> did
+    /// not: it returned the current generation without registering it and without bumping the
+    /// counter, so the flush read it as a generation it owned, drained the tier, wrote the .mts
+    /// files — and <c>CommitFlush</c> then refused the same value on the same condition. The
+    /// watermark never moved, so those points were in a file AND above the watermark, and every
+    /// restart replayed them beside the file that already held them. Duplicates, not loss, and
+    /// once per start for as long as the state lasts.</para>
+    ///
+    /// <para>The state is built here by making the log file read-only: both of <c>Grow</c>'s
+    /// opens ask for write access, so both fail, which is what leaves the pointer null.</para>
+    /// </summary>
+    [Fact]
+    public void A_log_that_lost_its_mapping_refuses_to_open_a_flush()
+    {
+        long baseNano = 1_700_000_000_000_000_000L;
+
+        using var wal = MetricWriteAheadLog.Open(WalPath, 64 * 1024);   // ~1 365 entries
+        Append(wal, Scalar("m", baseNano, 1));
+
+        File.SetAttributes(WalPath, FileAttributes.ReadOnly);
+        try
+        {
+            var grew = Record.Exception(() =>
+            {
+                for (int i = 1; i < 5_000; i++) Append(wal, Scalar("m", baseNano + i, i));
+            });
+            Assert.NotNull(grew);   // setup: Grow really did fail rather than extend the file
+
+            // Alive, not disposed, and unable to log anything: this is the honest half.
+            var appended = Record.Exception(() => Append(wal, Scalar("m", baseNano, 1)));
+            Assert.IsType<InvalidOperationException>(appended);   // not ObjectDisposedException
+
+            // So a flush must fail the same way rather than be handed a generation nobody
+            // opened. Exact type: this is the unmapped log, not a disposed one.
+            var began = Record.Exception(() => wal.BeginFlush());
+            Assert.IsType<InvalidOperationException>(began);
+        }
+        finally { File.SetAttributes(WalPath, FileAttributes.Normal); }
+    }
+
+    /// <summary>
     /// The failure path's exit. A flush whose files threw puts its points back into the hot tier
     /// WITHOUT re-logging them, so its records are what keeps them durable until a later flush
     /// carries them — the generation is abandoned, never committed. Without an explicit

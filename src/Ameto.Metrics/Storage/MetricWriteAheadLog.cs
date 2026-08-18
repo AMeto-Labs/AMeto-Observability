@@ -60,7 +60,10 @@ namespace Ameto.Metrics.Storage;
 /// to leave that to its caller; it now enforces it. <see cref="BeginFlush"/> refuses to open a
 /// second flush, and <see cref="CommitFlush"/> refuses a generation that is not the open one,
 /// so the watermark can never pass a flush that has not finished writing. A flush that gives
-/// its generation back to the tier says so with <see cref="AbandonFlush"/>.</para>
+/// its generation back to the tier says so with <see cref="AbandonFlush"/>. And it refuses on
+/// the same terms when it cannot open a generation AT ALL — a closed or unmapped log — because
+/// a generation the caller believes it holds and nobody opened is not a milder failure than two
+/// open at once: it is the duplicate of everything that flush goes on to write.</para>
 ///
 /// <para>A flush that fails simply never commits: the snapshot's records still sit in the
 /// log below an unchanged watermark, so a crash before the retry replays them. This is what
@@ -169,6 +172,14 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// a crash kills every open flush by definition, and every open generation is by
     /// construction ABOVE the persisted watermark, so recovery replays it. Persisting it would
     /// describe flushes that no longer exist.
+    ///
+    /// <para>Which is why <see cref="BeginFlush"/> hands a generation out only when it records
+    /// one HERE. That "replaying it is safe" argument covers open generations, and the one
+    /// state it does not describe is a generation the caller holds that was never opened: its
+    /// records are above the watermark like any other, but its files are on disk, so replay
+    /// duplicates them instead of rescuing them. The dead-log paths used to produce exactly
+    /// that, returning <c>_generation</c> unregistered; they throw now, and every value this
+    /// method returns is a generation somebody opened.</para>
     /// </summary>
     private ulong _openFlush;
 
@@ -356,20 +367,44 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// </summary>
     /// <returns>The generation the snapshot belongs to — pass it to <see cref="CommitFlush"/>.</returns>
     /// <exception cref="InvalidOperationException">
-    /// A flush opened by an earlier <see cref="BeginFlush"/> has neither committed nor been
-    /// abandoned. Committing this one would reclaim that one's records while its files are
-    /// still being written, which is the loss this guard exists to make impossible; throwing
-    /// happens BEFORE the caller's snapshot is drained, so nothing is in flight to lose.
+    /// This call cannot open a generation, for one of two reasons, and both are the same fact
+    /// to the caller: no generation was handed out, so it must not drain. Either a flush opened
+    /// by an earlier <see cref="BeginFlush"/> has neither committed nor been abandoned —
+    /// committing this one would reclaim that one's records while its files are still being
+    /// written, the loss this guard exists to make impossible — or the log has no mapping to
+    /// stamp the new generation into (see <see cref="Grow"/>). Throwing happens BEFORE the
+    /// caller's snapshot is drained, so nothing is in flight to lose.
+    /// </exception>
+    /// <exception cref="ObjectDisposedException">
+    /// The log is closed. A subclass of <see cref="InvalidOperationException"/>, so a caller
+    /// that treats "BeginFlush threw" as "do not drain" needs no second handler.
     /// </exception>
     public ulong BeginFlush()
     {
         lock (_writeLock)
         {
+            // Neither of these may hand a generation back the way they used to — unregistered
+            // and unbumped, which reads to the caller exactly like a generation it now owns.
+            // It drains the tier, writes the files, and CommitFlush refuses the same value on
+            // the same condition, so the watermark never moves: the points are in a .mts AND
+            // above the watermark, and every restart replays them beside their own file. Not
+            // loss — duplicates, once per start, for as long as the state lasts.
+            //
+            // _disposed alone is covered by the drain in MetricStorageEngine.DisposeAsync, which
+            // is why this was survivable in practice. _ptr null WITHOUT _disposed is not: Grow
+            // unmaps before it extends, and if the extend and the restoring re-map both fail
+            // (a full disk, which is when a log grows) the object stays alive with no mapping
+            // and no disposal, for good. Append throws from there, so ingest fails honestly
+            // while a flush would have kept writing files nobody ever commits.
+            ObjectDisposedException.ThrowIf(_disposed, this);
+
+            if (_ptr is null)
+                throw new InvalidOperationException(
+                    "Metric WAL has no mapping; no generation can be opened. Grow could neither " +
+                    "extend the file nor restore the previous mapping, and appends are already " +
+                    "failing for the same reason.");
+
             ulong flushing = _generation;
-            // Disposed: the generation is handed back WITHOUT being opened or bumped, so two
-            // callers racing a shutdown can be given the same value. Registering it would leave
-            // an open flush nothing ever closes — CommitFlush returns early here too.
-            if (_disposed || _ptr is null) return flushing;
 
             if (_openFlush != 0)
                 throw new InvalidOperationException(
