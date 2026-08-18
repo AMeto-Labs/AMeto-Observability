@@ -68,9 +68,50 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     private readonly ConcurrentDictionary<SeriesKey, HotSeries> _hot = new();
     private          int _hotPointCount;
     // 1 while a threshold-triggered flush is queued/running. Without this gate, every
-    // Ingest call past the threshold spawned ANOTHER Task.Run until the flush finally
+    // Ingest call past the threshold scheduled ANOTHER flush until the first finally
     // reset the counter — a stampede of concurrent flush tasks under load.
     private          int _thresholdFlushScheduled;
+
+    // Threshold flushes in flight, so shutdown can await them: they run OFF the flush loop
+    // and were therefore invisible to it. DisposeAsync awaited _flushTask/_rollupTask and
+    // then disposed the WAL and both locks while such a flush could still be draining,
+    // writing its .mts and committing.
+    //
+    // Both failures the orphan can cause are reachable; which one you get depends on whether
+    // the hot tier is empty when the loop takes its final pass:
+    //   • tier NON-EMPTY (ingest still flowing — the OTLP case): the final flush has real
+    //     data, so it opens generation G+1 and commits it. Committing compacts everything at
+    //     or below G+1, INCLUDING the orphan's own generation G — its records leave the log
+    //     while its file is still being written. Kill the process there and those points are
+    //     in neither place. SILENT LOSS, and the bigger of the two: it is the tier that was
+    //     large enough to trigger a threshold flush in the first place.
+    //   • tier EMPTY (ingest quiesced): the final flush returns at snapshot.Count == 0
+    //     before BeginFlush, so G is never superseded, stays uncommitted, and is replayed
+    //     next start beside the file the orphan did manage to write — duplicates.
+    // Nothing warns about either. MetricWriteAheadLog.CommitFlush returns silently once the
+    // log is disposed, so the catch around it never fires; and in the more common
+    // interleaving the commit is not even reached, because _coldLock.EnterWriteLock() throws
+    // ObjectDisposedException first and the restore path re-enters the other disposed lock.
+    //
+    // A set rather than one Task field: a field records only the flush published LAST, and
+    // publication order is not completion order. A thread preempted between starting its
+    // flush and storing the handle can store an ALREADY-COMPLETED task over a live one
+    // (its own flush found an empty snapshot and returned while it was descheduled), and
+    // shutdown then awaits a completed task and walks straight past the running flush. An
+    // entry here removes itself when its flush completes and can never overwrite another.
+    private readonly ConcurrentDictionary<Task, byte> _inFlightFlushes = new();
+
+    /// <summary>
+    /// Threshold flushes currently inside <see cref="FlushHotTierAsync"/> — that is, holding
+    /// or about to hold the locks and the log. Shutdown must leave this at zero, which is
+    /// otherwise only assertable by reading the comment on <see cref="DisposeAsync"/>.
+    /// </summary>
+    private int _runningThresholdFlushes;
+
+    internal int RunningThresholdFlushes => Volatile.Read(ref _runningThresholdFlushes);
+
+    /// <summary>Test hook: hot-tier point count — 0 once a flush has taken its snapshot.</summary>
+    internal int HotPointCount => Volatile.Read(ref _hotPointCount);
 
     // ── Metadata catalog (maintained at ingestion, survives hot-tier drains) ───
     private readonly ConcurrentDictionary<string, MetricMeta> _meta =
@@ -85,6 +126,16 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     private readonly List<MetricSegmentInfo>      _coldSegments = new();
     private readonly ReaderWriterLockSlim          _coldLock     = new();
 
+    // Cold discovery is deliberately off the startup path (see the constructor), so for a
+    // window after construction a query legitimately sees no cold data at all. Without a
+    // signal there is no way to tell that window apart from "there is nothing on disk",
+    // and a caller that treats the first non-empty answer as the whole answer reads a
+    // fraction of the data and cannot know it.
+    private readonly TaskCompletionSource _coldLoaded = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>Completes once the background cold-segment scan has published its result.</summary>
+    internal Task ColdLoadCompleted => _coldLoaded.Task;
+
     private readonly string                        _dataDir;
     private readonly ILogger<MetricStorageEngine>  _logger;
 
@@ -96,6 +147,24 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     // 0 = live, 1 = disposed. Guards against the multiple DisposeAsync calls
     // that occur at host shutdown (see DisposeAsync).
     private int _disposed;
+
+    /// <summary>
+    /// Completed once the teardown has actually finished. A later caller awaits this rather
+    /// than returning on the <see cref="_disposed"/> exchange: being idempotent means not
+    /// tearing down twice, not telling the second caller that a teardown it never waited for
+    /// is over. Three call sites dispose this engine at host shutdown, and a shutdown timeout
+    /// turns that sequence into an overlap — see <see cref="DisposeAsync"/>.
+    /// </summary>
+    private readonly TaskCompletionSource _disposeCompleted =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>
+    /// 1 once the log is about to be unmapped. <see cref="Ingest"/> is gated on THIS and not
+    /// on <see cref="_disposed"/>, because everything between the two is still fully durable:
+    /// the log is open, the final flush has not run, and a point arriving there is written and
+    /// replayed like any other. Only the last step of the teardown has to turn callers away.
+    /// </summary>
+    private int _ingestClosed;
 
     public MetricStorageEngine(string dataDir, ILogger<MetricStorageEngine> logger)
     {
@@ -183,6 +252,14 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         _snapshotLock.EnterReadLock();
         try
         {
+            // The log is gone or is about to be. MetricWriteAheadLog.Append returns SILENTLY
+            // once disposed, so carrying on would file every remaining point of this batch
+            // into a hot tier nobody will flush again and then return normally — the caller is
+            // told a batch was accepted that is durable nowhere. Throwing is what an exporter
+            // reads as a failed export and retries. Checked under the read lock, which the
+            // teardown takes exclusively before it sets this: no Append can straddle the two.
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _ingestClosed) != 0, this);
+
             foreach (var item in items)
             {
                 var point = new MetricDataPoint
@@ -221,12 +298,64 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         if (total >= HotFlushThreshold
             && System.Threading.Interlocked.CompareExchange(ref _thresholdFlushScheduled, 1, 0) == 0)
         {
-            _ = Task.Run(async () =>
-            {
-                try { await FlushHotTierAsync().ConfigureAwait(false); }
-                finally { System.Threading.Interlocked.Exchange(ref _thresholdFlushScheduled, 0); }
-            });
+            _ = ScheduleThresholdFlush();
         }
+    }
+
+    /// <summary>
+    /// Fire-and-forget the threshold flush, tracked so shutdown can await it — the same shape
+    /// as <c>Ameto.Storage.StorageEngine.ScheduleFlush</c>, which solved this first.
+    ///
+    /// <para>The handle is registered BEFORE the flush can run, which <c>Task.Run</c> cannot
+    /// do: its argument is evaluated first, so a pool thread is already inside the flush while
+    /// the calling thread has yet to publish anything. The body's first act is to await a gate
+    /// completed at the end of this method, so registration is not merely likely to win that
+    /// race — it precedes the body's first instruction.</para>
+    /// </summary>
+    private Task ScheduleThresholdFlush()
+    {
+        var gate  = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var flush = RunThresholdFlushAsync(gate.Task);
+
+        _inFlightFlushes[flush] = 0;
+        // Static lambda + state argument: no closure is captured for a path that runs on
+        // every threshold crossing. ExecuteSynchronously keeps the removal on the completing
+        // thread rather than queueing a work item just to erase a dictionary entry.
+        _ = flush.ContinueWith(
+            static (t, s) => ((ConcurrentDictionary<Task, byte>)s!).TryRemove(t, out _),
+            _inFlightFlushes, CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+
+        gate.SetResult();   // registered — the flush may start
+        return flush;
+    }
+
+    /// <summary>
+    /// Test hook: schedules a threshold flush exactly as crossing
+    /// <see cref="HotFlushThreshold"/> does, without the 500k points needed to cross it.
+    /// </summary>
+    internal Task ScheduleThresholdFlushForTest() => ScheduleThresholdFlush();
+
+    private async Task RunThresholdFlushAsync(Task gate)
+    {
+        await gate.ConfigureAwait(false);
+        try
+        {
+            // Reached only after this task was registered above, and DisposeAsync sets
+            // _disposed before it drains — so the two orders are mutually exclusive. Either
+            // the drain saw this task and is awaiting it, or it did not, in which case
+            // _disposed was already set when the registration happened and this returns
+            // without touching a lock, the log or the disk. There is no third case, which is
+            // what leaves an orphan nowhere to start. The points are not lost by returning:
+            // they are in the WAL above the last committed generation, so the next start
+            // replays them.
+            if (Volatile.Read(ref _disposed) != 0) return;
+
+            System.Threading.Interlocked.Increment(ref _runningThresholdFlushes);
+            try     { await FlushHotTierAsync().ConfigureAwait(false); }
+            finally { System.Threading.Interlocked.Decrement(ref _runningThresholdFlushes); }
+        }
+        finally { System.Threading.Interlocked.Exchange(ref _thresholdFlushScheduled, 0); }
     }
 
     /// <summary>
@@ -442,6 +571,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         // Background init (see ctor comment): discover cold segments + seed catalog.
         try { LoadColdSegments(); }
         catch (Exception ex) { _logger.LogError(ex, "Cold metric segment load failed"); }
+        finally { _coldLoaded.TrySetResult(); }   // a failed scan must not leave waiters hanging
 
         while (!ct.IsCancellationRequested)
         {
@@ -1040,16 +1170,86 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         // the DI container disposes the singleton IAsyncDisposable, and
         // MetricStorageHostedService additionally calls DisposeAsync from both
         // StopAsync and its own DisposeAsync. Cancelling/disposing the CTS twice
-        // throws ObjectDisposedException, so bail out after the first pass.
-        if (System.Threading.Interlocked.Exchange(ref _disposed, 1) != 0) return;
+        // throws ObjectDisposedException, so only the first caller tears down.
+        //
+        // The others WAIT for it. Returning on the exchange made every guarantee below true
+        // for the caller that won it and for nobody else, and the three calls are not always
+        // a sequence: StopAsync discards its CancellationToken and this method has no timeout
+        // of its own, so when the host's shutdown timeout elapses it stops waiting on
+        // StopAsync and goes on to dispose the container — a second, CONCURRENT call, which
+        // returned in microseconds and let the process exit on top of a running flush.
+        if (System.Threading.Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            await _disposeCompleted.Task.ConfigureAwait(false);
+            return;
+        }
 
-        _cts.Cancel();
-        try { await Task.WhenAll(_flushTask, _rollupTask); }
-        catch (OperationCanceledException) { }
-        _cts.Dispose();
-        _coldLock.Dispose();
-        _snapshotLock.Dispose();
-        _wal.Dispose();   // after the loop's final flush, which commits it
+        try
+        {
+            _cts.Cancel();
+            try { await Task.WhenAll(_flushTask, _rollupTask); }
+            catch (OperationCanceledException) { }
+
+            // Threshold flushes are scheduled off the ingest path, so they are in neither loop
+            // and used to outlive shutdown entirely. Ingest keeps scheduling them throughout
+            // this — the engine is disposed by MetricStorageHostedService.StopAsync, hosted
+            // services stop in reverse registration order, and Kestrel can still be serving
+            // /otlp/v1/metrics for all of it — and ONE drain covers them, because _disposed
+            // was set above and a flush is registered before its body can run (see
+            // ScheduleThresholdFlush). For any flush: either this snapshot holds it and awaits
+            // it, or it was registered after the snapshot, hence after _disposed, and its body
+            // returns before reaching a lock, the log or the disk. There is no third case.
+            //
+            // StorageEngine.DisposeAsync drains twice for a reason that does not carry over:
+            // it FLUSHES between its two calls, and that flush can schedule more work. Two
+            // back-to-back calls would close only the window between them, which is empty.
+            await DrainThresholdFlushesAsync().ConfigureAwait(false);
+
+            // For threshold flushes this is now exact: one already running was awaited above,
+            // and one that registers from here on returns without touching anything.
+            //
+            // Shut the door on ingest, and wait for the callers already through it. Ingest is
+            // ungated for the whole shutdown up to this line, deliberately: the log is open
+            // until a few instructions below, so a point arriving during the final flush is
+            // still written and still replayed, and refusing it early would turn a point that
+            // survives into one that does not.
+            //
+            // What it must not do is keep accepting points once the log is gone. Ingest holds
+            // the snapshot lock shared across a WHOLE batch — an OTLP request — and taking it
+            // exclusively here is what makes "no Append is in flight" true rather than likely:
+            // ReaderWriterLockSlim.Dispose does NOT throw for a read lock held on another
+            // thread (it inspects the calling thread's counts and the global waiter counts),
+            // so without this fence the unmapping below happened underneath a live batch,
+            // every remaining Append hit `if (_disposed) return;` and the caller was told its
+            // points had landed. Measured at ~48 000 points per shutdown under load, silently.
+            _snapshotLock.EnterWriteLock();
+            try { Volatile.Write(ref _ingestClosed, 1); }
+            finally { _snapshotLock.ExitWriteLock(); }
+
+            // The log first: nothing durable depends on the locks, and disposing a
+            // ReaderWriterLockSlim throws if a thread happens to be WAITING on it, which must
+            // not be able to skip the unmap. After the loop's final flush, which commits it.
+            _wal.Dispose();
+            _cts.Dispose();
+            _coldLock.Dispose();
+
+            // _snapshotLock is deliberately NOT disposed. Its only two users are Ingest and
+            // FlushHotTierAsync; both are shut above, and the gate turns a late ingest away by
+            // itself, so disposal would buy nothing — while costing something real, because a
+            // reader released by the ExitWriteLock a few lines up is still counted as waiting
+            // until it wakes, and Dispose throws SynchronizationLockException on a waiter. Its
+            // wait handles are finalizable and this engine is a process-lifetime singleton.
+        }
+        finally { _disposeCompleted.TrySetResult(); }
+    }
+
+    /// <summary>Awaits every threshold flush registered as of this call.</summary>
+    private async ValueTask DrainThresholdFlushesAsync()
+    {
+        var pending = _inFlightFlushes.Keys.ToArray();
+        if (pending.Length == 0) return;
+        try { await Task.WhenAll(pending).ConfigureAwait(false); }
+        catch (Exception ex) { _logger.LogWarning(ex, "Metric threshold flush failed during shutdown"); }
     }
 
     // ── IRetentionTarget ──────────────────────────────────────────────────────
