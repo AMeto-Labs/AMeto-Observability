@@ -82,19 +82,32 @@ public sealed class SegmentReplicator : IDisposable
             req.Headers.Add("X-Ameto-Replication", _opts.Secret);
             using var resp = await _http.SendAsync(req, ct);
 
-            // 409 is the peer REFUSING the segment because a different one already holds
-            // (NodeId, Id) over there, which can only mean some other node is pushing under this
-            // node's id — the peer itself, or a third node whose files it already carries. A
-            // permanent deployment fault rather than a transient push failure, and one this side
-            // can act on: the receiver only ever sees "a stranger claims to be node {Node}" and
-            // cannot tell which of them is the stranger. Logged as an error so it is not one
-            // warning among the retryable ones.
+            // 409 is the peer REFUSING the segment, and the receiver has TWO distinct reasons
+            // to do it: a different segment already sits under this (NodeId, Id), or the id
+            // falls inside the span its own allocator has already handed out. Both mean a
+            // duplicated NodeId, but they name different evidence, and this method used to
+            // compose its own single story -- confidently describing the first cause when the
+            // receiver had reported the second. The receiver's body says which one it saw, so
+            // it is quoted instead of paraphrased. Error, not warning: a deployment fault, not
+            // a push failure.
             if (resp.StatusCode == System.Net.HttpStatusCode.Conflict)
                 _logger.LogError(
-                    "Peer {Addr} refused segment {Id}: it already holds a different segment under node " +
-                    "id {Node}, so this node shares that NodeId with another. Nothing will replicate " +
-                    "under it until one of them is renumbered.",
-                    peer.BaseAddress, segment.Id, segment.NodeId.Value);
+                    "Peer {Addr} refused segment {Id} under node id {Node} (409): two nodes appear " +
+                    "to share that NodeId, and nothing will replicate under it until one of them " +
+                    "is renumbered. Receiver said: {Body}",
+                    peer.BaseAddress, segment.Id, segment.NodeId.Value, await ReadBodyAsync(resp, ct));
+            // 413 is terminal for this segment: the same bytes are the same size, so a retry
+            // cannot fix it -- only raising Ameto:Replication:MaxSegmentBytes on the RECEIVER
+            // can, and the receiver's body is the one line that says so. This branch used to
+            // fall into the generic warning below, which discarded that line and made the
+            // refusal look transient.
+            else if (resp.StatusCode == System.Net.HttpStatusCode.RequestEntityTooLarge)
+                _logger.LogWarning(
+                    "Peer {Addr} refused segment {Id}: {Bytes} bytes is over the receiver's " +
+                    "request-body limit, and re-sending cannot change that. Raise " +
+                    "Ameto:Replication:MaxSegmentBytes on the receiver or this segment will never " +
+                    "replicate there. Receiver said: {Body}",
+                    peer.BaseAddress, segment.Id, data.Length, await ReadBodyAsync(resp, ct));
             else if (!resp.IsSuccessStatusCode)
                 _logger.LogWarning("Push to {Addr} returned {Status}", peer.BaseAddress, resp.StatusCode);
             else
@@ -104,6 +117,20 @@ public sealed class SegmentReplicator : IDisposable
         {
             _logger.LogWarning(ex, "Push segment {Id} to {Addr} failed", segment.Id, peer.BaseAddress);
         }
+    }
+
+    /// <summary>
+    /// The response body flattened onto one line and capped -- it is a log field, not a
+    /// payload, and a receiver's ProblemDetails fits well inside the cap.
+    /// </summary>
+    private static async Task<string> ReadBodyAsync(HttpResponseMessage resp, CancellationToken ct)
+    {
+        try
+        {
+            var body = (await resp.Content.ReadAsStringAsync(ct)).ReplaceLineEndings(" ").Trim();
+            return body.Length == 0 ? "(empty body)" : body.Length <= 500 ? body : body[..500];
+        }
+        catch { return "(unreadable body)"; }
     }
 
     public void Dispose() => _http.Dispose();
