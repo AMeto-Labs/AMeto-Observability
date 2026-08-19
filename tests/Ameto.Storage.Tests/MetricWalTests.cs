@@ -783,17 +783,22 @@ public sealed class MetricWalTests : IDisposable
         var engine = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
         long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
 
-        var held    = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var reached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        int flushes = 0;
+        var held     = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var reached  = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var overtook = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var parked   = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int flushes  = 0;
         engine.OnSnapshotTakenForTest = () =>
         {
-            // Only the FIRST flush is held. A second one reaching here means the fix is absent
-            // and the periodic flush overtook — which is the state the assertions below measure.
-            if (Interlocked.Increment(ref flushes) != 1) return;
+            // Only the FIRST flush is held. A second one reaching here IS the defect — it has
+            // snapshotted while the first is between its own snapshot and its files — so it is
+            // signalled rather than merely counted: that signal is what a build without the fix
+            // trips, and it arrives long before the flush it belongs to has finished writing.
+            if (Interlocked.Increment(ref flushes) != 1) { overtook.TrySetResult(); return; }
             reached.TrySetResult();
             held.Task.GetAwaiter().GetResult();
         };
+        engine.OnFlushGateBlockedForTest = () => parked.TrySetResult();
 
         var first = SlowFlushBatch(baseNano);                                  // 300 000 points
         engine.Ingest(first);
@@ -806,35 +811,43 @@ public sealed class MetricWalTests : IDisposable
         engine.Ingest(second);
 
         var periodic = Task.Run(() => engine.FlushPeriodicForTest());
-        // Before the fix the periodic flush runs to completion here — snapshot, one .mts, commit
-        // — and after it the flush parks on the gate, so this window is a MARGIN over how long
-        // that completion takes rather than a wait for anything. The margin, not the number, is
-        // what has to hold: too short and the pre-fix build looks like the fixed one, which is a
-        // control that has quietly stopped discriminating rather than a test that goes red.
-        //
-        // Two measurements of that completion, on this machine: 55–65 ms over ten runs of a build
-        // with both halves of the fix taken out (the gate here and the WAL's one-open-flush
-        // guard, which the gate is what keeps from ever firing), and 28–52 ms over ten runs of
-        // the same flush timed on its own, with no held flush to contend with — a floor, since
-        // the overlap is what the first number adds. So 500 ms is roughly eight times the
-        // observed worst case, not the nine it once claimed, and 56 ms was quoted as an upper
-        // bound while sitting inside the range. The 5 s it replaces was paid in full by every
-        // green run.
-        //
-        // Re-measure before shortening it further, and expect the margin to have moved: the flush
-        // path has since gained an fsync per file, and a loaded or slower machine spends the
-        // difference here.
-        await Task.WhenAny(periodic, Task.Delay(TimeSpan.FromMilliseconds(500)));
 
-        // The gate, asserted directly. What stood here alone was the line below it, which is a
-        // property of the FIRST flush and is held by the seam holding it — true whether the
-        // periodic flush parked or sailed straight past, so at this point the two outcomes were
-        // indistinguishable and only the final count separated them. That count fails for many
-        // other reasons as well, which is a poor way to learn the gate is gone.
-        Assert.False(periodic.IsCompleted,
-            "the periodic flush ran to completion while a flush was still between its snapshot " +
+        // Every outcome announces itself, so nothing below is a stopwatch standing in for a fact:
+        //
+        //   parked   — the flush found the gate held. Once it fires, the periodic flush cannot
+        //              reach its snapshot until `held` is set, so the assertions that follow
+        //              describe a settled state rather than one sampled early.
+        //   overtook — a second flush reached its snapshot: the defect itself, caught as it
+        //              happens rather than after the offending flush has finished writing.
+        //   periodic — it faulted, which is what a build with the gate gone but the log's
+        //              one-open-flush guard still standing produces.
+        //
+        // So no passing run pays the window, and the window decides nothing: it is the backstop
+        // for a build where none of the three arrive, and that build fails loudly on the `parked`
+        // assertion instead of going quietly green. What it replaces was a 500 ms window that WAS
+        // load-bearing, justified by a quoted 55–65 ms upper bound the measurement does not
+        // support — ten separate `dotnet test` processes, Debug, both halves of the fix removed,
+        // gave 159.4 ms on the cold one and 57.0–58.3 ms after it, so the real margin was 3x from
+        // the top of that spread, not the eightfold computed from its bottom. A control whose
+        // margin is guessed stops discriminating on the first machine slower than the guess, and
+        // it reports that by going green.
+        await Task.WhenAny(parked.Task, overtook.Task, periodic,
+                           Task.Delay(TimeSpan.FromSeconds(30)));
+
+        // Order matters: a FAULTED flush is a completed one, so an IsCompleted assertion standing
+        // alone fires first and blames the periodic flush for a commit it never got near. Let a
+        // flush that threw name itself.
+        Assert.False(periodic.IsFaulted,
+            "the periodic flush did not park on the gate, it threw: " +
+            periodic.Exception?.GetBaseException());
+        Assert.False(overtook.Task.IsCompleted,
+            "a second flush took its snapshot while the first was still between its own snapshot " +
             "and its files: its commit moves the watermark past a generation that is still being " +
             "written, which is the loss this test measures");
+        Assert.True(parked.Task.IsCompleted,
+            "the periodic flush never queued on the flush gate — either the gate is gone, or this " +
+            "flush was not due and the test is measuring nothing");
+        Assert.False(periodic.IsCompleted, "the periodic flush finished while the gate was held");
         Assert.False(writing.IsCompleted, "setup: the first flush must still be held at its seam");
         string frozen = FreezeDataDir();
 
@@ -871,6 +884,7 @@ public sealed class MetricWalTests : IDisposable
 
         var held    = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var reached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var parked  = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         int opened  = 0;
         engine.OnGenerationOpenedForTest = () =>
         {
@@ -878,6 +892,7 @@ public sealed class MetricWalTests : IDisposable
             reached.TrySetResult();
             held.Task.GetAwaiter().GetResult();
         };
+        engine.OnFlushGateBlockedForTest = () => parked.TrySetResult();
 
         // 60 000 points — over MinFlushPoints, so the periodic path is genuinely due, and well
         // under HotFlushThreshold, so the only flushes here are the two this test schedules.
@@ -887,15 +902,18 @@ public sealed class MetricWalTests : IDisposable
 
         Assert.True(engine.HotPointCount > 0, "setup: the flush ahead must not have drained yet");
 
-        var started  = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var periodic = Task.Run(async () =>
-        {
-            started.SetResult();
-            await engine.FlushPeriodicForTest();
-        });
-        await started.Task;
-        await Task.Delay(TimeSpan.FromMilliseconds(500));
-        Assert.False(periodic.IsCompleted, "setup: the tick must be parked on the gate, not past it");
+        var periodic = Task.Run(() => engine.FlushPeriodicForTest());
+
+        // The tick queueing on the gate is the setup this test needs, and the engine says so —
+        // where a 500 ms sleep only ever said "it has not finished YET", which is equally true of
+        // a tick that never reached the gate at all. The window here is the backstop for a build
+        // with no gate to queue on, and such a build says so through the assertion rather than by
+        // passing.
+        await Task.WhenAny(parked.Task, periodic, Task.Delay(TimeSpan.FromSeconds(30)));
+
+        Assert.False(periodic.IsFaulted,
+            "the tick did not park on the gate, it threw: " + periodic.Exception?.GetBaseException());
+        Assert.True(parked.Task.IsCompleted, "setup: the tick must be parked on the gate, not past it");
         Assert.True(engine.HotPointCount > 0, "setup: the tick read the pre-check over a full tier");
 
         held.SetResult();

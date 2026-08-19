@@ -101,6 +101,21 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     /// </summary>
     internal Action? OnGenerationOpenedForTest;
 
+    /// <summary>
+    /// Test seam: invoked when a flush finds <see cref="_flushGate"/> already held — that is, when
+    /// it is about to park rather than walk straight through. Once it has fired, the flush provably
+    /// cannot reach its snapshot until the holder releases, which is what lets a test assert the
+    /// gate is there without timing anything.
+    ///
+    /// <para>Deliberately phrased as a question about the wait rather than as a line standing above
+    /// it: the wait has to be materialised to ask whether it completed, so a build that drops the
+    /// gate drops this with it and will not compile past a test that waits on it. A seam that only
+    /// sat above <c>WaitAsync</c> would still fire in such a build, and would report a flush that
+    /// sailed straight past the gate as one parked on it. Null in production, and read only on the
+    /// contended path.</para>
+    /// </summary>
+    internal Action? OnFlushGateBlockedForTest;
+
     // ── Hot tier ─────────────────────────────────────────────────────────────
     private readonly ConcurrentDictionary<SeriesKey, HotSeries> _hot = new();
     private          int _hotPointCount;
@@ -737,7 +752,13 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         // here (MetricWriter.Write is synchronous), so a holder always runs to completion.
         // Acquire order is gate → _snapshotLock → _coldLock → the log's own lock, and nothing
         // takes the gate while holding any of them.
-        await _flushGate.WaitAsync().ConfigureAwait(false);
+        // Materialised rather than awaited inline so that "this flush had to queue" is a fact the
+        // engine can hand to a test, instead of something a test infers from a stopwatch. An
+        // uncontended wait returns the cached completed task, so this costs nothing a plain await
+        // did not already cost.
+        var gate = _flushGate.WaitAsync();
+        if (!gate.IsCompleted) OnFlushGateBlockedForTest?.Invoke();
+        await gate.ConfigureAwait(false);
         try
         {
             // The pre-check above describes the tier BEFORE the wait, and the wait is exactly
