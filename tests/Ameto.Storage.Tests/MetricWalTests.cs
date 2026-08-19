@@ -1066,13 +1066,23 @@ public sealed class MetricWalTests : IAsyncLifetime
         //
         // So no passing run pays the window, and the window decides nothing: it is the backstop
         // for a build where none of the three arrive, and that build fails loudly on the `parked`
-        // assertion instead of going quietly green. What it replaces was a 500 ms window that WAS
-        // load-bearing, justified by a quoted 55–65 ms upper bound the measurement does not
-        // support — ten separate `dotnet test` processes, Debug, both halves of the fix removed,
-        // gave 159.4 ms on the cold one and 57.0–58.3 ms after it, so the real margin was 3x from
-        // the top of that spread, not the eightfold computed from its bottom. A control whose
-        // margin is guessed stops discriminating on the first machine slower than the guess, and
-        // it reports that by going green.
+        // assertion instead of going quietly green.
+        //
+        // What it replaces was a 500 ms window that WAS load-bearing — the test slept and then
+        // judged what it found — and no figure justifies one of those, which is the only claim
+        // this comment now makes about time. It carried two successive numeric defences instead,
+        // each measured on one machine, each unreproducible on the next, and each read by the
+        // following reader as a property of this flush. They are gone rather than corrected: a
+        // margin is a guess about the slowest machine that will ever run this suite, and a
+        // control sized from a guess stops discriminating on the first machine slower than it —
+        // and reports that by going green, which is the one failure mode a control may not have.
+        //
+        // What the three signals are worth is not a measurement either, so it can be stated: each
+        // of them is the outcome itself, so the assertions below read a settled state on any
+        // machine at any speed. Both are checked against their own controls rather than argued.
+        // Gate removed, log's one-open-flush guard left standing: red in ~1 s naming
+        // `InvalidOperationException: Metric WAL flush 1 is still open` out of BeginFlush. Both
+        // removed: red in ~1 s on `overtook`.
         await Task.WhenAny(parked.Task, overtook.Task, periodic,
                            Task.Delay(TimeSpan.FromSeconds(30)));
 
