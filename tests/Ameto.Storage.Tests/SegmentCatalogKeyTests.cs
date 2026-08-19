@@ -669,6 +669,117 @@ public sealed class SegmentCatalogKeyTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// The route the compare-and-swap above does not cover, and the one that needs no race to
+    /// reach. The import decides by exchange, but the three writers that publish segments THIS
+    /// node produced — flush publication, merge publication, WAL replay — assign unconditionally,
+    /// and they must: their events are in no other file, so refusing a key is not something they
+    /// can do. An import that wins its exchange is therefore only registered until the next one
+    /// of them reaches the same key.
+    ///
+    /// <para>Which is not an instant. <c>OpenWal</c> reserves a block of six ids the moment a WAL
+    /// opens and the flush publishes into exactly that block, so the block is outstanding for the
+    /// whole life of the current hot tier; a merge's id is outstanding while it streams towards a
+    /// 512 MB target. Nothing here is timed or parked: the import lands in a live reservation and
+    /// then an ORDINARY flush follows. Before the fix that sequence returned <c>Registered</c>,
+    /// answered the peer 204, and left the peer's file on disk in no catalog — never served,
+    /// never expired, never merged — with nothing logged by either party.</para>
+    ///
+    /// <para>The remedy is the allocator, used as a verdict rather than as a note: an id it has
+    /// already handed out cannot be claimed by a segment arriving with this node's own id. So the
+    /// answer is 409 and the body stays the caller's, which is the one thing that IS true — this
+    /// node cannot serve both files under one key, and only the sender can tell a refusal from a
+    /// healthy push.</para>
+    /// </summary>
+    [Fact]
+    public async Task A_peer_wearing_our_id_cannot_take_an_id_the_allocator_has_handed_out()
+    {
+        long now = DateTime.UtcNow.Ticks;
+
+        // The id the live WAL's block will flush its Information level into — reserved, spent,
+        // and in no catalog, which is exactly what makes it look free to a probe.
+        ulong reserved = _engine.LiveWalSegmentId + (ulong)LogLevel.Information;
+
+        string staged    = Path.Combine(_dir, "pushed.body");
+        string finalPath = Path.Combine(SegDir, $"{NodeId.Local.Value}-{reserved}.seg");
+        WritePeerSegment(NodeId.Local, reserved, now, events: 4, path: staged);
+
+        Assert.Equal(SegmentImportOutcome.Conflict, _engine.ImportSegment(staged, finalPath));
+
+        // Refused means refused on disk too: the body is still the caller's to unlink, and the
+        // segments directory gains nothing for the next boot scan to pick between.
+        Assert.True(File.Exists(staged), "a refused import consumed the body it refused");
+        Assert.False(File.Exists(finalPath), "a refused import renamed its body into the segments directory");
+        Assert.Contains(_log.Entries, e =>
+            e.Message.Contains(staged, StringComparison.Ordinal) &&
+            e.Message.Contains($"{NodeId.Local.Value}-{reserved}", StringComparison.Ordinal));
+
+        // And now the flush the reservation belonged to, with no contention of any kind. This is
+        // the half that used to run second and win: the local segment lands on the same key.
+        Write(20, now + TimeSpan.TicksPerHour);
+        await _engine.FlushHotTierAsync();
+
+        var kept = Assert.Single(_engine.ListSegments());
+        Assert.Equal(reserved, kept.Id.Value);
+        Assert.Equal(20u, kept.EventCount);
+
+        // Served, which is the claim: the twenty local events and none of the peer's four. A
+        // build that accepted the import instead answered 204 for four events this assertion
+        // cannot find anywhere afterwards.
+        var counts = await _engine.AggregateLogVolumeAsync(
+            new DateTimeOffset(now, TimeSpan.Zero).AddMinutes(-5),
+            new DateTimeOffset(now, TimeSpan.Zero).AddHours(4),
+            minBucket: 0, bucketSeconds: 60, nBuckets: 600, serviceFilter: null);
+        Assert.Equal(20, counts.Total);
+    }
+
+    /// <summary>
+    /// The same displacement from the other end, through the one arrangement the allocator cannot
+    /// rule out. The catalog scan runs as a BACKGROUND task and WAL replay publishes while it is
+    /// still walking the directory, so a peer file already sitting under
+    /// <c>{localNode}-{id}.seg</c> — left by an older build, a restore, an endpoint whose unlink
+    /// of a refused body failed — can be registered by the scan and then published over by a local
+    /// writer that never asked the allocator for anything.
+    ///
+    /// <para>The local writer WINS, and that is not a compromise: it is holding the only copy of
+    /// its own events, so a version of this that kept the peer's entry would trade a silent loss
+    /// of replicated data for a silent loss of local data. What changes is that it no longer
+    /// happens in silence. Which file stopped being served is the entire remedy this node has for
+    /// two peers wearing one NodeId, and the file is left on disk because its owner still holds it
+    /// and can push it again once the ids are fixed.</para>
+    ///
+    /// <para>Both directions are pinned: an unconditional store fails the log assertion, and a
+    /// publication that stood down for the incumbent fails the entry and the count.</para>
+    /// </summary>
+    [Fact]
+    public async Task A_local_flush_that_displaces_a_peers_entry_says_which_file_it_stopped_serving()
+    {
+        long now = DateTime.UtcNow.Ticks;
+        ulong reserved = _engine.LiveWalSegmentId + (ulong)LogLevel.Information;
+
+        // In the segments directory before anything scans it, under this node's own id.
+        string peerPath = Path.Combine(SegDir, $"{NodeId.Local.Value}-{reserved}.seg");
+        WritePeerSegment(NodeId.Local, reserved, now, events: 4, path: peerPath);
+
+        _engine.LoadSegmentCatalog();
+        Assert.Contains(_engine.ListSegments(), s => s.FilePath == peerPath);
+
+        Write(20, now + TimeSpan.TicksPerHour);
+        await _engine.FlushHotTierAsync();
+
+        var kept = Assert.Single(_engine.ListSegments());
+        Assert.NotEqual(peerPath, kept.FilePath);
+        Assert.Equal(20u, kept.EventCount);
+
+        Assert.Contains(_log.Entries, e =>
+            e.Message.Contains(peerPath,      StringComparison.Ordinal) &&
+            e.Message.Contains(kept.FilePath, StringComparison.Ordinal));
+
+        // Displaced, not deleted. Which of two files is the wrong one is not this node's to
+        // decide and the cost of being wrong is unrecoverable.
+        Assert.True(File.Exists(peerPath), "the displaced file was deleted rather than reported");
+    }
+
+    /// <summary>
     /// Restarts on the same directory and waits for the catalog scan to FINISH, rather than for a
     /// count to be reached: what a collision costs is an entry that never appears, so a wait that
     /// stops at the first entry would be waiting for the wrong thing. The scan's closing log line
