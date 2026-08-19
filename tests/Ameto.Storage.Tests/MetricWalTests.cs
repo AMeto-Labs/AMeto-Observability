@@ -1099,7 +1099,10 @@ public sealed class MetricWalTests : IAsyncLifetime
         Assert.True(parked.Task.IsCompleted,
             "the periodic flush never queued on the flush gate — either the gate is gone, or this " +
             "flush was not due and the test is measuring nothing");
-        Assert.False(periodic.IsCompleted, "the periodic flush finished while the gate was held");
+        // (No assertion on periodic.IsCompleted here: with 'parked' proven and 'overtook'
+        // clear, a completed periodic flush is unreachable except through failures those two
+        // assertions name first — it could never be the one that fails, and a check that
+        // cannot fail reads as coverage it does not provide.)
         Assert.False(writing.IsCompleted, "setup: the first flush must still be held at its seam");
         string frozen = FreezeDataDir();
 

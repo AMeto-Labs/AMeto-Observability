@@ -153,13 +153,13 @@ public sealed class ReplicationSegmentEndpointTests : IClassFixture<ReplicationW
     /// Development one, and this harness is the second.</para>
     ///
     /// <para>The second assertion used to be <c>GetFiles(SegDir, "abc-*")</c>, credited in this
-    /// docstring with proving the handler never ran, and it could not fail: <c>{nodeId}</c> binds
-    /// as <c>uint</c> and the staging name is built from the BOUND value, so no execution of the
-    /// handler — before, during or after any reordering — can put the literal <c>abc</c> in that
-    /// directory. It would have gone on passing under exactly the change it was there to catch,
-    /// a binder relaxed to <c>string</c> for better diagnostics. What does catch that is the
-    /// directory as a whole: a handler that ran would stage a body under SOME name, and a total
-    /// that has not moved says none was staged whatever it would have been called.</para>
+    /// docstring with proving the handler never ran — and it could not fail, because the staging
+    /// name is built from the BOUND value. Its replacement counts the whole directory, and it
+    /// cannot fail either: this client sends no secret, so a handler that ran at all would
+    /// answer 401 on its first line and stage nothing whatever the binder allowed. The STATUS
+    /// assertion is the entire proof — an executed handler cannot answer 400 — and the count
+    /// below is a tidiness check on the shared directory, kept because it costs one line and
+    /// credited with nothing.</para>
     /// </summary>
     [Fact]
     public async Task A_route_that_does_not_bind_is_refused_before_the_secret_is_checked()
@@ -179,9 +179,12 @@ public sealed class ReplicationSegmentEndpointTests : IClassFixture<ReplicationW
 
     /// <summary>
     /// The ceiling the endpoint puts on a body, which is configuration and therefore breakable
-    /// in silence. Kestrel's default is 30 MB; a cold segment is routinely larger, and over the
-    /// limit the body read throws and used to come back as the 500 the contract marks
-    /// RETRYABLE — a peer re-pushing a merged segment forever, with nothing logged anywhere.
+    /// in silence. Kestrel's default is 30 MB; a pushed level segment can clear it (a flush
+    /// starts from a 64 MB budget with LZ4 the only thing between that and the wire), and over
+    /// the limit the body read threw and came back as the 500 the contract marks RETRYABLE —
+    /// while the sender pushes once per flush and logged a status with no reason, which made it
+    /// permanent, silent non-replication rather than the retry storm this docstring once
+    /// described.
     ///
     /// <para>What is asserted is the WIRING: that the value configured for this node reaches
     /// the request before a byte of the body is read. The enforcement itself belongs to Kestrel
@@ -526,12 +529,13 @@ public sealed class ReplicationSegmentEndpointTests : IClassFixture<ReplicationW
         finally
         {
             // The dispose used to stand inside the try, below a write and a read that can both
-            // throw. The directory delete under it was already guarded — but it cannot succeed
-            // with the engine's write-ahead log still mapped, so the guard only made the leak
-            // silent: the throw propagated, the swallowed delete failed, and the run left a
-            // directory behind. Disposing here is what makes the delete below able to work.
+            // throw — without it the delete below cannot succeed at all, the engine's
+            // write-ahead log still being mapped. Necessary is not sufficient, though: a run
+            // has left this directory behind even with the dispose in place, so the failure is
+            // now SAID rather than swallowed, and a leftover has a line to be found by.
             engine.DisposeAsync().AsTask().GetAwaiter().GetResult();
-            try { Directory.Delete(dir, true); } catch { }
+            try { Directory.Delete(dir, true); }
+            catch (Exception ex) { Console.WriteLine($"temp dir left behind: {dir} — {ex.Message}"); }
         }
     }
 
