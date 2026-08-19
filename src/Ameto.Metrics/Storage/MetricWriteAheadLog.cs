@@ -500,9 +500,11 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// <para>Refusing is not the same as leaving the flush open. Of the refusals below, exactly
     /// one belongs to somebody else's flush and must not touch it; every other one belongs to
     /// the caller's own, whose flush is over whatever the watermark says. So the ownership test
-    /// is the ONLY test above the close, and the close is above everything else — see the
-    /// comment on the order for what happened when a third refusal was allowed to slip in
-    /// front of it.</para>
+    /// is the ONLY test above the close, and the close is above everything else. That ordering
+    /// is an invariant being written down, NOT the repair of an observed wedge, and the
+    /// difference is worth stating because an earlier version of this comment claimed the
+    /// second: both states the close now stands in front of are unreachable in this class as it
+    /// is. See the comment on the order.</para>
     ///
     /// <para><b>The answer, and why it is a value and not silence.</b> The caller has files on
     /// disk holding the generation's points, and its next move depends entirely on whether the
@@ -545,20 +547,41 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
 
             // From here the generation is the caller's own, so its flush is over and the flag it
             // set comes down unconditionally — BEFORE every remaining test, none of which can
-            // now return in front of it. It used to sit below the watermark test, so a commit
-            // the watermark already covered returned with the flush still open, and BeginFlush
-            // then threw on every later flush for the life of the process, into a loop that did
-            // not catch it. One unusable header cost every metric flush the process would do.
-            // The dead-log test below sat in front of it too, and cost the same thing by the
-            // same mechanism; the difference is only that a log with no mapping refuses the
-            // next BeginFlush on its own account, so the wedge was hidden behind a wider fault.
+            // return in front of it.
+            //
+            // What this ordering is, stated plainly, because the commit that introduced it said
+            // something stronger and the something stronger is not true. NEITHER of the two tests
+            // below can be reached with a flush open, so moving the close above them repaired no
+            // wedge anybody could have had. Both were reverted and MetricWalTests +
+            // MetricFormatV3Tests + MetricChunkedRewriteTests stayed at Failed 0, Passed 61,
+            // which is the honest state of the cover: nothing pins this, and nothing can without
+            // a seam that would exist only to be pinned.
+            //
+            // The watermark test is dead here by an invariant the class enforces at both ends.
+            // OpenOrCreate normalises a crossed header to _generation = _committedGeneration + 1,
+            // BeginFlush hands out _generation and raises it, and _committedGeneration only ever
+            // moves inside this method's own success path — where it is set to the generation
+            // that is open and the flush is closed in the same critical section. So an open flush
+            // is always ABOVE the watermark. The dead-log test is dead in a different way: it can
+            // be reached (dispose or a failed Grow between BeginFlush and here), but a log in
+            // either state refuses the next BeginFlush on its own account and can never leave it
+            // — Append does not re-map and Grow is only called from Append — so a stuck flag has
+            // nothing left to wedge.
+            //
+            // It stays above them anyway, and is worth a paragraph rather than a shrug, because
+            // what it costs is one statement's position and what it buys is that the flag's
+            // lifetime does not depend on either of those arguments continuing to hold. A change
+            // to the crossed-header repair, or a caller that commits a generation it was not
+            // handed, makes the first reachable; and BeginFlush throwing forever is a failure
+            // that never surfaces as itself — the periodic loop does not catch it, no .mts is
+            // written again, and the log grows by doubling until Grow throws into ingest.
             _openFlush = 0;
 
             // Nothing left to reclaim: the watermark already names this generation or a later
-            // one. Only a header that reached this process already crossed can get here
-            // (OpenOrCreate normalises what it can see), and the counter climbs past the
-            // watermark on the next flush, so the log resumes compacting by itself. Committed,
-            // and truthfully so — the caller's points are covered.
+            // one. Unreachable from here today (see above) and kept as the definition of what
+            // the answer means rather than as a live branch: a generation the watermark covers
+            // is committed, whoever put it there. Committed, and truthfully so — the caller's
+            // points are covered.
             if (flushedGeneration <= _committedGeneration) return MetricWalCommit.Committed;
 
             // The log cannot record anything: closed, or left without a mapping by a Grow that
