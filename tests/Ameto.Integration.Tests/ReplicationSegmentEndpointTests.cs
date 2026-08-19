@@ -278,20 +278,27 @@ public sealed class ReplicationSegmentEndpointTests : IClassFixture<ReplicationW
     {
         string dir = Path.Combine(Path.GetTempPath(), "ameto-peer-" + Guid.NewGuid().ToString("N")[..8]);
         Directory.CreateDirectory(dir);
+        var opts   = new ServerOptions { NodeId = node, DataDirectory = dir };
+        var engine = new StorageEngine(
+            Options.Create(opts),
+            new RetentionStore(opts, NullLogger<RetentionStore>.Instance),
+            NullLogger<StorageEngine>.Instance);
         try
         {
-            var opts   = new ServerOptions { NodeId = node, DataDirectory = dir };
-            var engine = new StorageEngine(
-                Options.Create(opts),
-                new RetentionStore(opts, NullLogger<RetentionStore>.Instance),
-                NullLogger<StorageEngine>.Instance);
-
             var info = WriteAndFlush(engine, events);
             byte[] bytes = File.ReadAllBytes(info.FilePath);
-            engine.DisposeAsync().AsTask().GetAwaiter().GetResult();
             return (bytes, info.Id.Value);
         }
-        finally { try { Directory.Delete(dir, true); } catch { } }
+        finally
+        {
+            // The dispose used to stand inside the try, below a write and a read that can both
+            // throw. The directory delete under it was already guarded — but it cannot succeed
+            // with the engine's write-ahead log still mapped, so the guard only made the leak
+            // silent: the throw propagated, the swallowed delete failed, and the run left a
+            // directory behind. Disposing here is what makes the delete below able to work.
+            engine.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            try { Directory.Delete(dir, true); } catch { }
+        }
     }
 
     /// <summary>

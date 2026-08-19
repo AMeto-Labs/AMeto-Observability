@@ -10,19 +10,51 @@ namespace Ameto.Storage.Tests;
 /// exists to enable, namely that a trickle of points no longer costs one .mts per metric name
 /// every minute.
 /// </summary>
-public sealed class MetricWalTests : IDisposable
+public sealed class MetricWalTests : IAsyncLifetime
 {
     private readonly string _dir = Path.Combine(Path.GetTempPath(), "ameto-mwal-" + Guid.NewGuid().ToString("N"));
 
     /// <summary>Set by <see cref="FreezeDataDir"/> — see there for what it holds.</summary>
     private string? _frozen;
 
-    public MetricWalTests() => Directory.CreateDirectory(_dir);
+    /// <summary>
+    /// Every engine this class has built, so that <see cref="DisposeAsync"/> can close the ones a
+    /// test did not reach. A test that ends at a failed assertion skips whatever disposal stood
+    /// below it, an undisposed engine holds <c>metrics.wal</c> mapped, and the cleanup below then
+    /// cannot delete the directory and swallows saying so. One such run leaves 32 MB behind — the
+    /// log grows by doubling — which is litter produced EXACTLY on the days someone is debugging,
+    /// and enough of it stops runs failing on the code and starts them failing on there being
+    /// nowhere left to write.
+    /// </summary>
+    private readonly List<MetricStorageEngine> _engines = [];
 
-    public void Dispose()
+    public Task InitializeAsync()
     {
+        Directory.CreateDirectory(_dir);
+        return Task.CompletedTask;
+    }
+
+    public async Task DisposeAsync()
+    {
+        // Reverse order: a test's later engines are the ones reading what its earlier ones wrote.
+        for (int i = _engines.Count - 1; i >= 0; i--)
+            try { await _engines[i].DisposeAsync(); } catch { }
+
         try { Directory.Delete(_dir, true); } catch { }
         if (_frozen is not null) { try { Directory.Delete(_frozen, true); } catch { } }
+    }
+
+    /// <summary>
+    /// The only way this class builds an engine. Double disposal is what the registry relies on
+    /// being free: most tests close their own engine mid-body, because closing it is how the log
+    /// gets its final flush, and none of them should have to unregister it to do that.
+    /// </summary>
+    private MetricStorageEngine NewEngine(string? dir = null,
+                                          Microsoft.Extensions.Logging.ILogger<MetricStorageEngine>? logger = null)
+    {
+        var engine = new MetricStorageEngine(dir ?? _dir, logger ?? NullLogger<MetricStorageEngine>.Instance);
+        _engines.Add(engine);
+        return engine;
     }
 
     private string WalPath  => Path.Combine(_dir, "metrics.wal");
@@ -594,7 +626,7 @@ public sealed class MetricWalTests : IDisposable
     {
         // The old behaviour: the flush loop ran every 60 s regardless, and a flush writes one
         // .mts PER METRIC NAME — so 40 instruments cost 40 files a minute whatever the volume.
-        var engine = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
+        var engine = NewEngine();
 
         long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
         for (int minute = 0; minute < 30; minute++)
@@ -614,7 +646,7 @@ public sealed class MetricWalTests : IDisposable
     [Fact]
     public async Task A_real_batch_still_writes_files_and_clears_the_log()
     {
-        var engine = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
+        var engine = NewEngine();
 
         long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
         for (int minute = 0; minute < 30; minute++)                  // 30 x 2 000 = 60 000 points
@@ -641,7 +673,7 @@ public sealed class MetricWalTests : IDisposable
             Append(crashed, Scalar("cpu.utilisation", baseNano + i * 1_000_000L, i * 2.0, labels));
         crashed.Dispose();
 
-        var engine = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
+        var engine = NewEngine();
 
         var series = engine.QueryAsync("cpu.utilisation").ToBlockingEnumerable().ToList();
         Assert.Single(series);
@@ -664,7 +696,7 @@ public sealed class MetricWalTests : IDisposable
     [Fact]
     public async Task No_point_is_lost_when_ingest_races_a_flush()
     {
-        var engine = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
+        var engine = NewEngine();
 
         const int threads = 8;
         const int perThread = 80_000;              // 640 000 total, past HotFlushThreshold
@@ -685,7 +717,7 @@ public sealed class MetricWalTests : IDisposable
 
         // Every ingested point must be in a file. A logical series spans as many entries as
         // the files it was split across, so account for points and label sets, not entries.
-        var reader = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
+        var reader = NewEngine();
         var series = await QueryWhenColdLoadedAsync(reader, "race.metric");
         long total  = series.Sum(s => (long)s.Points.Count);
         int  labels = series.Select(s => s.Labels).Distinct().Count();
@@ -748,9 +780,9 @@ public sealed class MetricWalTests : IDisposable
     /// the log replayed into the hot tier plus every cold file. Short of what was ingested
     /// means points were lost, over means they came back twice.
     /// </summary>
-    private static async Task<long> DurablePointsAsync(string dir, string metric)
+    private async Task<long> DurablePointsAsync(string dir, string metric)
     {
-        var reader = new MetricStorageEngine(dir, NullLogger<MetricStorageEngine>.Instance);
+        var reader = NewEngine(dir);
         var series = await QueryWhenColdLoadedAsync(reader, metric);
         long total = series.Sum(s => (long)s.Points.Count);
         await reader.DisposeAsync();
@@ -780,10 +812,11 @@ public sealed class MetricWalTests : IDisposable
     [Fact]
     public async Task A_periodic_flush_cannot_commit_away_a_threshold_flush_that_is_still_writing()
     {
-        var engine = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
+        var engine = NewEngine();
         long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
 
         var held     = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var _  = Seam.ReleasedOnExit(held);   // a red assertion below must not strand a thread
         var reached  = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var overtook = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var parked   = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -879,10 +912,11 @@ public sealed class MetricWalTests : IDisposable
     [Fact]
     public async Task A_tick_that_wakes_over_a_drained_tier_opens_no_generation()
     {
-        var engine = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
+        var engine = NewEngine();
         long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
 
         var held    = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var _ = Seam.ReleasedOnExit(held);    // a red assertion below must not strand a thread
         var reached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var parked  = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         int opened  = 0;
@@ -937,7 +971,7 @@ public sealed class MetricWalTests : IDisposable
     [Fact]
     public async Task A_flush_that_failed_stays_durable_until_a_later_one_carries_its_points()
     {
-        var engine = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
+        var engine = NewEngine();
         long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
 
         int attempts = 0;
@@ -979,7 +1013,7 @@ public sealed class MetricWalTests : IDisposable
     [Fact]
     public async Task A_finished_flush_cannot_hide_one_that_is_still_writing()
     {
-        var engine = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
+        var engine = NewEngine();
         long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
 
         engine.Ingest(SlowFlushBatch(baseNano));
@@ -1012,7 +1046,7 @@ public sealed class MetricWalTests : IDisposable
     [Fact]
     public async Task A_flush_scheduled_after_shutdown_touches_nothing()
     {
-        var engine = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
+        var engine = NewEngine();
         long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
         engine.Ingest(Minute(baseNano, metricNames: 4, seriesPerName: 50));
 
@@ -1034,7 +1068,7 @@ public sealed class MetricWalTests : IDisposable
     [Fact]
     public async Task A_kill_the_instant_shutdown_returns_loses_nothing_when_the_tier_was_not_empty()
     {
-        var engine = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
+        var engine = NewEngine();
         long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
 
         var flushed = SlowFlushBatch(baseNano);
@@ -1065,7 +1099,7 @@ public sealed class MetricWalTests : IDisposable
     [Fact]
     public async Task A_quiesced_tier_does_not_replay_the_orphans_points_beside_its_file()
     {
-        var engine = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
+        var engine = NewEngine();
         long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
 
         var flushed = SlowFlushBatch(baseNano);
@@ -1095,7 +1129,7 @@ public sealed class MetricWalTests : IDisposable
     [Fact]
     public async Task Every_batch_ingest_returns_from_during_shutdown_is_durable()
     {
-        var engine = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
+        var engine = NewEngine();
         long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
 
         // Give the teardown real work to wait on, so the batches below straddle it rather than
@@ -1150,7 +1184,7 @@ public sealed class MetricWalTests : IDisposable
     [Fact]
     public async Task A_second_dispose_waits_for_the_first_rather_than_returning()
     {
-        var engine = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
+        var engine = NewEngine();
         long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
 
         engine.Ingest(SlowFlushBatch(baseNano));
@@ -1189,7 +1223,7 @@ public sealed class MetricWalTests : IDisposable
     [Fact]
     public async Task A_flush_scheduled_throughout_shutdown_never_touches_anything()
     {
-        var engine = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
+        var engine = NewEngine();
         long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
 
         engine.Ingest(SlowFlushBatch(baseNano));
@@ -1236,14 +1270,14 @@ public sealed class MetricWalTests : IDisposable
         // opened for the first time by an engine that now keeps a WAL beside them.
         long oldNano = DateTimeOffset.UtcNow.AddMinutes(-30).ToUnixTimeMilliseconds() * 1_000_000L;
 
-        var first = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
+        var first = NewEngine();
         first.Ingest([Scalar("legacy.metric", oldNano, 7, Labels(("host", "node0")))]);
         await first.DisposeAsync();                                   // flushes, then resets the log
 
         int filesBefore = TrcCount(_dir, "*.mts");
         Assert.True(filesBefore > 0);
 
-        var second = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
+        var second = NewEngine();
 
         // Cold-segment discovery is deliberately kept off the startup path so ingest works
         // from second zero — a query issued immediately after construction can legitimately
@@ -1442,7 +1476,7 @@ public sealed class MetricWalTests : IDisposable
         string tmp = Path.Combine(_dir, "metrics-instrument_0-1-2-raw-deadbeef.mts.tmp");
         File.WriteAllBytes(tmp, [0x54, 0x4D, 0x44, 0x52, 0x03, 0x00]);   // a header and nothing else
 
-        var engine = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
+        var engine = NewEngine();
 
         Assert.False(File.Exists(tmp),
             "an interrupted build survived the constructor, so the sweep runs somewhere a live " +
@@ -1461,7 +1495,7 @@ public sealed class MetricWalTests : IDisposable
     [Fact]
     public async Task A_partial_write_does_not_duplicate_the_metrics_whose_file_landed()
     {
-        var engine = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
+        var engine = NewEngine();
         long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
 
         // Two metric names, so the writer writes two files with a seam between them.
@@ -1502,7 +1536,7 @@ public sealed class MetricWalTests : IDisposable
     public async Task A_failure_after_the_files_landed_commits_instead_of_replaying_them()
     {
         var logger = new ThrowOnFlushedDebugLogger();
-        var engine = new MetricStorageEngine(_dir, logger);
+        var engine = NewEngine(logger: logger);
         long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
 
         var one = SlowFlushBatch(baseNano, "a", series: 50, pointsPerSeries: 20);   // 1 000 points
@@ -1562,7 +1596,7 @@ public sealed class MetricWalTests : IDisposable
     [Fact]
     public async Task A_flush_that_throws_before_its_write_leaves_the_log_able_to_flush_again()
     {
-        var engine = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
+        var engine = NewEngine();
         long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
 
         var one = SlowFlushBatch(baseNano, "a", series: 40, pointsPerSeries: 25);   // 1 000 points
@@ -1602,7 +1636,7 @@ public sealed class MetricWalTests : IDisposable
     public async Task A_threshold_flush_that_throws_is_not_swallowed_by_the_task_nobody_holds()
     {
         var logger = new RecordingLogger();
-        var engine = new MetricStorageEngine(_dir, logger);
+        var engine = NewEngine(logger: logger);
         long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
 
         // Armed before the crossing: the one seam standing where the drain's own allocation
@@ -1677,7 +1711,7 @@ public sealed class MetricWalTests : IDisposable
     [Fact]
     public async Task A_final_flush_that_throws_still_shuts_the_door_behind_it()
     {
-        var engine = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
+        var engine = NewEngine();
         long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
 
         engine.Ingest(SlowFlushBatch(baseNano, "a", series: 20, pointsPerSeries: 10));
@@ -1745,7 +1779,7 @@ public sealed class MetricWalTests : IDisposable
     {
         long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
 
-        var seed = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
+        var seed = NewEngine();
         seed.Ingest(SlowFlushBatch(baseNano, "seed", series: 10, pointsPerSeries: 10));
         await seed.ScheduleThresholdFlushForTest();      // watermark = 1, generation = 2
         await seed.DisposeAsync();
@@ -1756,7 +1790,7 @@ public sealed class MetricWalTests : IDisposable
             fs.Write(new byte[8]);                       // counter lost, watermark kept
         }
 
-        var engine = new MetricStorageEngine(_dir, NullLogger<MetricStorageEngine>.Instance);
+        var engine = NewEngine();
         var batch  = SlowFlushBatch(baseNano + 3_600_000_000_000L, "a", series: 10, pointsPerSeries: 10);
         engine.Ingest(batch);
         await engine.ScheduleThresholdFlushForTest();

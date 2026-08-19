@@ -188,6 +188,7 @@ public sealed class SegmentCatalogKeyTests : IAsyncLifetime
 
         var reached  = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var release  = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var _  = Seam.ReleasedOnExit(release);   // a throw below must not strand the flush thread
         long counted = -1;
 
         _engine._afterLevelPublished = _ =>
@@ -242,6 +243,7 @@ public sealed class SegmentCatalogKeyTests : IAsyncLifetime
 
         var reached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var _ = Seam.ReleasedOnExit(release);    // a throw below must not strand the flush thread
 
         _engine._afterLevelPublished = _ =>
         {
@@ -619,6 +621,7 @@ public sealed class SegmentCatalogKeyTests : IAsyncLifetime
 
         var probed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var landed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var _ = Seam.ReleasedOnExit(landed);     // a red assertion below must not strand the import
 
         _engine._beforeImportPublish = () =>
         {
