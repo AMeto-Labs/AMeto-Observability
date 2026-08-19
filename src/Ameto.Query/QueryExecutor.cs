@@ -61,7 +61,7 @@ public sealed class QueryExecutor : IQueryExecutor
         // inside the reader (HotTierScan) — events are materialised lazily in result
         // order, so a page query allocates ~limit events, not the whole tier.
         using var hotReader = _segments.OpenHotTierReader();
-        var covered = hotReader.CoveredSegmentIds;
+        var covered = hotReader.CoveredSegmentKeys;
         foreach (var ev in hotReader.ReadSorted(
                      from?.UtcTicks ?? long.MinValue, to?.UtcTicks ?? long.MaxValue,
                      afterTs, afterId?.RawValue, forward, levels))
@@ -86,7 +86,7 @@ public sealed class QueryExecutor : IQueryExecutor
         long fromTicksGlobal = from?.UtcTicks ?? long.MinValue;
         long toTicksGlobal   = to?.UtcTicks   ?? long.MaxValue;
         var segInfos = _segments.GetSegments(from, to)
-            .Where(s => !covered.Contains(s.Id.Value))
+            .Where(s => !covered.Contains(SegmentKey.Of(s)))
             .Where(s => s.MaxTimestampTicks >= fromTicksGlobal && s.MinTimestampTicks <= toTicksGlobal)
             .ToList();
 

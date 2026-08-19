@@ -74,19 +74,42 @@ public interface IHotTierReader : IDisposable
     }
 
     /// <summary>
-    /// IDs of cold-tier segments whose events are already returned by this hot reader.
+    /// Cold-tier segments whose events are already returned by this hot reader.
     /// When a hot-tier segment is frozen and being flushed to cold storage, its
-    /// future segment id is reserved here so the query layer can skip the cold
+    /// future segment key is reserved here so the query layer can skip the cold
     /// segment (which may be partially written or just-registered) to avoid
     /// either duplicates or missing-events races during flush.
-    /// Default implementation returns an empty set for backwards compatibility.
+    ///
+    /// <para>Keyed by <see cref="SegmentKey"/>, not by id: the reserved block belongs to the
+    /// LOCAL node, and while it was matched on the id alone a replicated peer segment whose
+    /// own counter happened to land inside that block was skipped by every query for the
+    /// duration of a flush — events silently missing from results, on a file that was
+    /// perfectly readable.</para>
+    ///
+    /// <para>Required, with no default implementation, and named for keys rather than ids
+    /// because BOTH halves of that are load-bearing. It carried a do-nothing default while it
+    /// returned <c>IReadOnlySet&lt;ulong&gt;</c>, which was truthful for a NEW member: an
+    /// implementer that had never heard of it covered nothing. Changing the element type turned
+    /// the same default into a trap — an implementation outside this repo that returned a set of
+    /// ids no longer implements anything, so the class compiles with no error and no warning
+    /// while the interface quietly dispatches to the empty default, and the reader's cold
+    /// segments are served twice for the duration of every flush. Its two sibling changes are
+    /// CS0535 and CS0030; this one was the member whose break a compiler could not show, which is
+    /// exactly why it may not have one. A reader that genuinely covers nothing still says so, and
+    /// says it out loud, with <see cref="EmptyCoveredSet.Instance"/>.</para>
     /// </summary>
-    IReadOnlySet<ulong> CoveredSegmentIds => EmptyCoveredSet.Instance;
+    IReadOnlySet<SegmentKey> CoveredSegmentKeys { get; }
 }
 
-internal static class EmptyCoveredSet
+/// <summary>
+/// What a hot reader returns when it covers no cold segment at all. Public because
+/// <see cref="IHotTierReader.CoveredSegmentKeys"/> has no default implementation: an implementer
+/// that covers nothing has to write it down, and writing it down is what makes the compiler
+/// speak the next time the member changes shape.
+/// </summary>
+public static class EmptyCoveredSet
 {
-    public static readonly IReadOnlySet<ulong> Instance = new HashSet<ulong>();
+    public static readonly IReadOnlySet<SegmentKey> Instance = new HashSet<SegmentKey>();
 }
 
 /// <summary>
@@ -122,7 +145,28 @@ public interface IQueryExecutor
 public interface ISegmentManager
 {
     Task FlushHotTierAsync(CancellationToken ct = default);
-    Task DeleteSegmentAsync(SegmentId segmentId, CancellationToken ct = default);
+
+    /// <summary>
+    /// Deletes a segment by its cluster-wide key, whichever node produced it.
+    ///
+    /// <para>There is deliberately no <see cref="SegmentId"/> overload beside this one. An id on
+    /// its own does not name a segment — every node's counter starts at 1, so the series overlap
+    /// the moment a peer replicates anything — and a method taking one could only ever mean "the
+    /// local node's", a decision its own signature does not show. That is the trap the catalog key
+    /// was introduced to remove, and keeping it as a convenience overload would reintroduce it one
+    /// call site at a time. A caller holding a bare id builds the pair, and so has to say which
+    /// node it means.</para>
+    ///
+    /// <para>Also deliberately without a default implementation, and no longer the only member of
+    /// this change that lacks one. Any default here is either a silent no-op or a guess at the
+    /// node, and a signature that REPLACES a required member is meant to be heard about: an
+    /// implementer outside this repo changes a parameter type and the compiler says CS0535.
+    /// <see cref="IHotTierReader.CoveredSegmentKeys"/> kept a default while its element type
+    /// changed under it, which is the same break with the compiler switched off — the class goes
+    /// on compiling and the interface silently dispatches to an empty set — so it lost the
+    /// default too.</para>
+    /// </summary>
+    Task DeleteSegmentAsync(SegmentKey key, CancellationToken ct = default);
     IReadOnlyList<SegmentInfo> ListSegments();
 }
 

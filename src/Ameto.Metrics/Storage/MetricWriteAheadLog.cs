@@ -8,6 +8,28 @@ using System.Text;
 namespace Ameto.Metrics.Storage;
 
 /// <summary>
+/// What <see cref="MetricWriteAheadLog.CommitFlush"/> did with a generation, told to the one
+/// caller that can still act on the answer: the flush holding the files.
+/// </summary>
+internal enum MetricWalCommit
+{
+    /// <summary>
+    /// The watermark names this generation or a later one. The log will not replay its points,
+    /// so the caller's files are now the only copy of them — publish them and say nothing.
+    /// </summary>
+    Committed,
+
+    /// <summary>
+    /// The watermark does NOT name it, and nothing was reclaimed. Its records are still in the
+    /// log, intact and uncompacted, so its points remain durable HERE — which makes the
+    /// caller's files a second copy that the next start would replay beside. The caller either
+    /// unwrites them, leaving the log the single copy, or accepts a duplicate that no restart
+    /// resolves; what it must not do is treat this like a commit, which is what silence meant.
+    /// </summary>
+    Refused,
+}
+
+/// <summary>
 /// Write-ahead log for the metric hot tier, backed by a memory-mapped file.
 /// Built along the same lines as <c>Ameto.Storage.WriteAheadLog</c> (logs tier), including
 /// its companion-file trick for data that repeats across entries.
@@ -51,11 +73,50 @@ namespace Ameto.Metrics.Storage;
 /// surviving tail to the front.</item>
 /// </list>
 ///
+/// <para><b>One flush at a time, and why the log insists on it.</b> The watermark is a single
+/// u64 and <see cref="CommitFlush"/> frees everything at or below it, so committing G+1 also
+/// frees G. That is only sound if G's files were already written. With two flushes open at
+/// once it is not: the later one's commit reclaims the earlier one's records while the earlier
+/// one is still inside its file write, and a failure there leaves those points in neither a
+/// file nor the log — durable nowhere, with nothing logged and nothing thrown. The class used
+/// to leave that to its caller; it now enforces it. <see cref="BeginFlush"/> refuses to open a
+/// second flush, and <see cref="CommitFlush"/> refuses a generation that is not the open one,
+/// so the watermark can never pass a flush that has not finished writing. A flush that gives
+/// its generation back to the tier says so with <see cref="AbandonFlush"/>. And it refuses on
+/// the same terms when it cannot open a generation AT ALL — a closed or unmapped log — because
+/// a generation the caller believes it holds and nobody opened is not a milder failure than two
+/// open at once: it is the duplicate of everything that flush goes on to write.</para>
+///
+/// <para>The same fault reaches the other end of the two phases, and there the flush is already
+/// holding files. A log that loses its mapping between <see cref="BeginFlush"/> and <see
+/// cref="CommitFlush"/> cannot move the watermark, so its records survive and its points are
+/// replayed at the next start beside the very .mts files that already hold them. That is not
+/// unavoidable and it is not silent any more: <see cref="CommitFlush"/> answers <see
+/// cref="MetricWalCommit"/> rather than nothing, so the caller learns that its files are a
+/// second copy while it is still the only party able to delete them — and a duplicate needs
+/// two copies. Deleting the files leaves the points durable exactly once, in the log, and the
+/// replay that would have duplicated them restores them instead.</para>
+///
 /// <para>A flush that fails simply never commits: the snapshot's records still sit in the
 /// log below an unchanged watermark, so a crash before the retry replays them. This is what
 /// makes "durable before queryable" true for a point that arrives mid-flush — an earlier
 /// design zeroed the whole log after writing the files and destroyed exactly those
-/// records.</para>
+/// records. Its points are restored to the hot tier and NOT re-logged, so the abandoned
+/// generation's records are what keeps them durable until the next flush snapshots them and
+/// commits a generation above it. That coupling is why the failure path must abandon rather
+/// than simply return.</para>
+///
+/// <para><b>What "the flush failed" has to mean for that to be true.</b> Leaving a generation
+/// replayable while its points are also in a file is a duplicate, not a rescue, so only a
+/// failure that put NO file on disk may abandon. That is a condition on the caller, and it was
+/// not met: the writer wrote one file per metric name straight to its final path and kept
+/// whatever it had finished when a later one threw, and the flush treated every step after the
+/// write — publishing the files, logging — as a failed write too. Both are closed at the
+/// source: <c>MetricWriter.Write</c> builds every file at <c>.mts.tmp</c> and renames it only
+/// once it is complete and closed, and deletes the ones it has already renamed before it
+/// rethrows — so a throw leaves nothing of its output at any path a reader scans; and
+/// <c>MetricStorageEngine.FlushHotTierAsync</c> restores and abandons only around the write
+/// itself, committing on every path where a file survives.</para>
 ///
 /// <para><b>Crash recovery.</b> Recovery keeps entries whose generation is ABOVE the
 /// committed watermark. The watermark is written before any bytes move, so a crash during
@@ -64,7 +125,13 @@ namespace Ameto.Metrics.Storage;
 /// the survivors twice either. The generation is assigned here, under this
 /// class's own lock; nothing derived from the data (a point's timestamp, say) would do,
 /// because those come from the instrumented client and are not monotonic in append order.
-/// Only a crash landing between the file write and the commit can duplicate points.</para>
+/// Once the caller's side of the abandon contract holds (see above), a crash landing between
+/// the moment the first file becomes visible and the commit is the only thing left that can
+/// duplicate points, and every point in a file published before the crash is duplicated, not
+/// some of them. That window is the writer's publish pass — one rename per file, all of them
+/// after the last byte of the last file is on the platter — plus the return and this call. It
+/// was much wider while each file was renamed as it finished: the whole write of files 2..N,
+/// seconds under a large flush, with file 1 already visible throughout.</para>
 ///
 /// <para>Generation 0 is never written by an append, so it also marks the end of real data —
 /// a zero-filled region is otherwise indistinguishable from a valid entry whose point
@@ -134,6 +201,24 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     private ulong                     _committedGeneration;
     private bool                      _disposed;
 
+    /// <summary>
+    /// The generation handed out by <see cref="BeginFlush"/> that has not yet been committed or
+    /// abandoned; 0 = none open. A scalar rather than a set, because ONE open flush is the
+    /// invariant this class enforces — see the flush-protocol remarks above. In-memory only:
+    /// a crash kills every open flush by definition, and every open generation is by
+    /// construction ABOVE the persisted watermark, so recovery replays it. Persisting it would
+    /// describe flushes that no longer exist.
+    ///
+    /// <para>Which is why <see cref="BeginFlush"/> hands a generation out only when it records
+    /// one HERE. That "replaying it is safe" argument covers open generations, and the one
+    /// state it does not describe is a generation the caller holds that was never opened: its
+    /// records are above the watermark like any other, but its files are on disk, so replay
+    /// duplicates them instead of rescuing them. The dead-log paths used to produce exactly
+    /// that, returning <c>_generation</c> unregistered; they throw now, and every value this
+    /// method returns is a generation somebody opened.</para>
+    /// </summary>
+    private ulong _openFlush;
+
     // Series registry for the CURRENT generation. Cleared on reset together with the pool
     // file, so neither grows across the life of the process.
     private readonly ConcurrentDictionary<SeriesKey, uint> _seriesIndex = new();
@@ -187,9 +272,25 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
         else
         {
             _writeOffset         = Math.Max(0, hdr.WriteOffset - FileHeaderSize);
-            _generation          = hdr.Generation == 0 ? FirstGeneration : hdr.Generation;
+            _generation          = hdr.Generation;
             _committedGeneration = hdr.CommittedGeneration;
             if (_writeOffset > _capacity) _writeOffset = _capacity;
+
+            // The counter must LEAD the watermark. BeginFlush only ever hands out _generation
+            // and CommitFlush only ever names a generation it was handed, so a header where the
+            // two have crossed makes the first commit reclaim nothing and — before CommitFlush
+            // was fixed to close the flush first — wedged the log for the life of the process.
+            // Both fields sit inside the same 32-byte header, hence the same sector, so a torn
+            // write cannot separate them: this is a restored, copied or bit-rotted file. Repair
+            // it here rather than carry it, and write the repair back so a crash before the next
+            // flush does not re-read the same value. `_committedGeneration + 1` is exactly
+            // FirstGeneration when the watermark is 0, which is where the coercion this replaces
+            // (`Generation == 0 ? FirstGeneration : …`) landed for the only case it covered.
+            if (_generation <= _committedGeneration)
+            {
+                _generation    = _committedGeneration + 1;
+                hdr.Generation = _generation;
+            }
         }
 
         _poolStream = new FileStream(_poolPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
@@ -301,13 +402,53 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// the files are written gets the next one.
     /// </summary>
     /// <returns>The generation the snapshot belongs to — pass it to <see cref="CommitFlush"/>.</returns>
+    /// <exception cref="InvalidOperationException">
+    /// This call cannot open a generation, for one of two reasons, and both are the same fact
+    /// to the caller: no generation was handed out, so it must not drain. Either a flush opened
+    /// by an earlier <see cref="BeginFlush"/> has neither committed nor been abandoned —
+    /// committing this one would reclaim that one's records while its files are still being
+    /// written, the loss this guard exists to make impossible — or the log has no mapping to
+    /// stamp the new generation into (see <see cref="Grow"/>). Throwing happens BEFORE the
+    /// caller's snapshot is drained, so nothing is in flight to lose.
+    /// </exception>
+    /// <exception cref="ObjectDisposedException">
+    /// The log is closed. A subclass of <see cref="InvalidOperationException"/>, so a caller
+    /// that treats "BeginFlush threw" as "do not drain" needs no second handler.
+    /// </exception>
     public ulong BeginFlush()
     {
         lock (_writeLock)
         {
-            ulong flushing = _generation;
-            if (_disposed || _ptr is null) return flushing;
+            // Neither of these may hand a generation back the way they used to — unregistered
+            // and unbumped, which reads to the caller exactly like a generation it now owns.
+            // It drains the tier, writes the files, and CommitFlush refuses the same value on
+            // the same condition, so the watermark never moves: the points are in a .mts AND
+            // above the watermark, and every restart replays them beside their own file. Not
+            // loss — duplicates, once per start, for as long as the state lasts.
+            //
+            // _disposed alone is covered by the drain in MetricStorageEngine.DisposeAsync, which
+            // is why this was survivable in practice. _ptr null WITHOUT _disposed is not: Grow
+            // unmaps before it extends, and if the extend and the restoring re-map both fail
+            // (a full disk, which is when a log grows) the object stays alive with no mapping
+            // and no disposal, for good. Append throws from there, so ingest fails honestly
+            // while a flush would have kept writing files nobody ever commits.
+            ObjectDisposedException.ThrowIf(_disposed, this);
 
+            if (_ptr is null)
+                throw new InvalidOperationException(
+                    "Metric WAL has no mapping; no generation can be opened. Grow could neither " +
+                    "extend the file nor restore the previous mapping, and appends are already " +
+                    "failing for the same reason.");
+
+            ulong flushing = _generation;
+
+            if (_openFlush != 0)
+                throw new InvalidOperationException(
+                    $"Metric WAL flush {_openFlush} is still open; a second flush cannot begin " +
+                    "until it commits or is abandoned. Committing the later one would reclaim " +
+                    "the earlier one's records while its files are still being written.");
+
+            _openFlush  = flushing;
             _generation = flushing + 1;
             Unsafe.AsRef<WalFileHeader>(_ptr).Generation = _generation;
             return flushing;
@@ -315,25 +456,153 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     }
 
     /// <summary>
-    /// Marks everything up to <paramref name="flushedGeneration"/> as durable elsewhere and
-    /// reclaims its space. Call only after the files carrying those points are on disk; a
-    /// flush that failed must simply never call this, leaving its records replayable.
+    /// Gives an opened generation back without committing it: the flush failed, its points went
+    /// back into the hot tier, and the NEXT flush's snapshot will carry them. Its records stay
+    /// in the log below an unchanged watermark, so they are what keeps those points durable
+    /// until that later generation commits and covers them.
+    ///
+    /// <para>The failure path used to signal this by calling nothing at all, which is why the
+    /// coupling was invisible. Saying it out loud is also what keeps the one-open-flush guard
+    /// from wedging the log after a failed flush.</para>
     /// </summary>
-    public void CommitFlush(ulong flushedGeneration)
+    public void AbandonFlush(ulong flushedGeneration)
     {
         lock (_writeLock)
         {
-            if (_disposed || _ptr is null) return;
-            if (flushedGeneration <= _committedGeneration) return;   // already committed
+            // Tolerant of a generation that is no longer the open one, because the caller is
+            // built to abandon unconditionally: MetricStorageEngine's `finally` releases
+            // whatever it opened whichever way the flush left, and the empty-snapshot path
+            // abandons on its way out and then reaches that same `finally`. Every such second
+            // call names a generation this method or CommitFlush has already closed, and the
+            // one thing it must not do is close a LATER flush that has since opened.
+            //
+            // It used to say the tolerance was for a generation handed out by the disposed
+            // path without being opened. There is no such path: BeginFlush throws on a closed
+            // or unmapped log, and has since the commit that deleted the sentence this
+            // replaces. A comment describing a route the code no longer has is worse than
+            // none — it says the class still produces unregistered generations, which is the
+            // exact state the throw exists to make impossible.
+            if (_openFlush == flushedGeneration) _openFlush = 0;
+        }
+    }
+
+    /// <summary>
+    /// Marks everything up to <paramref name="flushedGeneration"/> as durable elsewhere and
+    /// reclaims its space. Call only after the files carrying those points are on disk; a
+    /// flush that failed must call <see cref="AbandonFlush"/> instead, leaving its records
+    /// replayable.
+    ///
+    /// <para>A generation that is not the currently open flush is REFUSED. That is the direct
+    /// statement of the watermark's rule — it may only ever name a generation whose data is
+    /// already in files — and it holds even if a caller reintroduces concurrent flushes: the
+    /// later one's commit cannot reclaim the earlier one's records.</para>
+    ///
+    /// <para>Refusing is not the same as leaving the flush open. Of the refusals below, exactly
+    /// one belongs to somebody else's flush and must not touch it; every other one belongs to
+    /// the caller's own, whose flush is over whatever the watermark says. So the ownership test
+    /// is the ONLY test above the close, and the close is above everything else. That ordering
+    /// is an invariant being written down, NOT the repair of an observed wedge, and the
+    /// difference is worth stating because an earlier version of this comment claimed the
+    /// second: both states the close now stands in front of are unreachable in this class as it
+    /// is. See the comment on the order.</para>
+    ///
+    /// <para><b>The answer, and why it is a value and not silence.</b> The caller has files on
+    /// disk holding the generation's points, and its next move depends entirely on whether the
+    /// watermark now covers them. <see cref="MetricWalCommit.Committed"/> means it does, so the
+    /// log will not replay them and the files are the only copy. <see
+    /// cref="MetricWalCommit.Refused"/> means it does not: nothing was reclaimed, the
+    /// generation's records are intact in the log, and the caller's files are a SECOND copy of
+    /// points that are still durable here — which the next start replays beside them unless the
+    /// caller takes its files back. Returning nothing made those two states identical from the
+    /// outside, and the second was reached by a real route: a flush opens a generation, the log
+    /// loses its mapping while the files are being written (see <see cref="Grow"/>), and the
+    /// commit then returned exactly as if it had succeeded.</para>
+    ///
+    /// <para>The boundary the answer is defined at is the watermark store, and this method
+    /// throws only from BEYOND it. Everything before it — the tests, the close, the header
+    /// write — cannot throw; the reclaim after it can, in principle, and a throw there is not a
+    /// refusal. Its generation IS committed and its files ARE the durable copy, so a caller
+    /// that treated the exception as "not committed" and unwrote them would turn an un-reclaimed
+    /// log into lost points. Hence: a returned value distinguishes covered from not covered, and
+    /// an exception can only ever mean covered.</para>
+    /// </summary>
+    public MetricWalCommit CommitFlush(ulong flushedGeneration)
+    {
+        lock (_writeLock)
+        {
+            // Not the flush that is writing: reclaims nothing AND leaves the open flush alone,
+            // which is the whole point — closing somebody else's flush here is the
+            // reclaim-while-writing this class exists to refuse.
+            //
+            // Answered by the watermark rather than flatly refused, because "not the open
+            // flush" and "not covered" are different facts and the caller acts on the second.
+            // A generation the watermark already names is durable in files whoever put it
+            // there, and telling its flush otherwise would cost it the very files that carry
+            // it. Unreachable through this engine, which commits each generation once; the two
+            // lines are what stop it being a trap for the next caller.
+            if (flushedGeneration != _openFlush)
+                return flushedGeneration <= _committedGeneration
+                    ? MetricWalCommit.Committed
+                    : MetricWalCommit.Refused;
+
+            // From here the generation is the caller's own, so its flush is over and the flag it
+            // set comes down unconditionally — BEFORE every remaining test, none of which can
+            // return in front of it.
+            //
+            // What this ordering is, stated plainly, because the commit that introduced it said
+            // something stronger and the something stronger is not true. NEITHER of the two tests
+            // below can be reached with a flush open, so moving the close above them repaired no
+            // wedge anybody could have had. Both were reverted and MetricWalTests +
+            // MetricFormatV3Tests + MetricChunkedRewriteTests stayed at Failed 0, Passed 61,
+            // which is the honest state of the cover: nothing pins this, and nothing can without
+            // a seam that would exist only to be pinned.
+            //
+            // The watermark test is dead here by an invariant the class enforces at both ends.
+            // OpenOrCreate normalises a crossed header to _generation = _committedGeneration + 1,
+            // BeginFlush hands out _generation and raises it, and _committedGeneration only ever
+            // moves inside this method's own success path — where it is set to the generation
+            // that is open and the flush is closed in the same critical section. So an open flush
+            // is always ABOVE the watermark. The dead-log test is dead in a different way: it can
+            // be reached (dispose or a failed Grow between BeginFlush and here), but a log in
+            // either state refuses the next BeginFlush on its own account and can never leave it
+            // — Append does not re-map and Grow is only called from Append — so a stuck flag has
+            // nothing left to wedge.
+            //
+            // It stays above them anyway, and is worth a paragraph rather than a shrug, because
+            // what it costs is one statement's position and what it buys is that the flag's
+            // lifetime does not depend on either of those arguments continuing to hold. A change
+            // to the crossed-header repair, or a caller that commits a generation it was not
+            // handed, makes the first reachable; and BeginFlush throwing forever is a failure
+            // that never surfaces as itself — the periodic loop does not catch it, no .mts is
+            // written again, and the log grows by doubling until Grow throws into ingest.
+            _openFlush = 0;
+
+            // Nothing left to reclaim: the watermark already names this generation or a later
+            // one. Unreachable from here today (see above) and kept as the definition of what
+            // the answer means rather than as a live branch: a generation the watermark covers
+            // is committed, whoever put it there. Committed, and truthfully so — the caller's
+            // points are covered.
+            if (flushedGeneration <= _committedGeneration) return MetricWalCommit.Committed;
+
+            // The log cannot record anything: closed, or left without a mapping by a Grow that
+            // could neither extend the file nor restore what it had. Both leave the watermark
+            // where it was, so this generation's records stay in the log, uncompacted — the
+            // reclaim below is the only thing that removes them and it is not reached. The
+            // caller is told, because it is holding the only other copy and only it can decide
+            // what to do with it.
+            if (_disposed || _ptr is null) return MetricWalCommit.Refused;
 
             _committedGeneration = flushedGeneration;
 
             // The watermark lands before a single byte moves: a crash mid-compaction then
-            // still replays exactly the survivors, never the points already in files.
+            // still replays exactly the survivors, never the points already in files. It is
+            // also the line this method's answer is defined at — past it the generation is
+            // committed no matter what the reclaim does.
             ref var hdr = ref Unsafe.AsRef<WalFileHeader>(_ptr);
             hdr.CommittedGeneration = flushedGeneration;
 
             Compact(flushedGeneration);
+            return MetricWalCommit.Committed;
         }
     }
 
@@ -341,6 +610,14 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// Moves entries above the watermark to the front. Generation is non-decreasing in append
     /// order, so the committed entries are a prefix and the survivors one contiguous tail —
     /// a single move, bounded by whatever arrived while the files were being written.
+    ///
+    /// <para>That physical prefix is a property of the LAYOUT and holds for any watermark
+    /// value: the generation is stamped inside <c>_writeLock</c>, is only ever raised inside
+    /// the same lock, and the write offset advances under it too, so entries at or below any
+    /// threshold occupy a physical prefix whatever order flushes complete in. What the
+    /// one-open-flush rule adds is the SEMANTIC half — that the set of generations already in
+    /// files has no holes, so a single u64 watermark can express it. Both halves are needed;
+    /// this method's single move rests on the first, and its correctness on the second.</para>
     /// </summary>
     private void Compact(ulong committed)
     {

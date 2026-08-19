@@ -307,7 +307,9 @@ public sealed class MetricFormatV3Tests : IDisposable
     [Fact]
     public async Task EngineFlush_PreservesHistogramBounds()
     {
-        var engine = new MetricStorageEngine(_dir,
+        // await using, not a bare local: an engine this test does not reach the disposal of keeps
+        // metrics.wal mapped, and Dispose's Directory.Delete then fails and swallows saying so.
+        await using var engine = new MetricStorageEngine(_dir,
             Microsoft.Extensions.Logging.Abstractions.NullLogger<MetricStorageEngine>.Instance);
 
         var labels = new LabelSet(new Dictionary<string, string> { ["service.name"] = "T" });

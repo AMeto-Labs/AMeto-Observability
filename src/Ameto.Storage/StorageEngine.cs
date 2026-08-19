@@ -7,6 +7,31 @@ using Ameto.Core;
 namespace Ameto.Storage;
 
 /// <summary>
+/// What <see cref="StorageEngine.ImportSegment"/> did with the file it was handed. The caller
+/// that wrote that file owns it on anything but <see cref="Registered"/> — nothing in the engine
+/// refers to it, so leaving it in the segments directory means a file no query, no retention pass
+/// and no merge will ever touch again.
+/// </summary>
+public enum SegmentImportOutcome
+{
+    /// <summary>
+    /// In the catalog: either the key was free, or the same file was re-pushed under it and the
+    /// entry was refreshed.
+    /// </summary>
+    Registered,
+
+    /// <summary>
+    /// Refused. A DIFFERENT file already holds this (node, id) and was kept; the incoming one was
+    /// not registered. Two nodes are configured with the same NodeId — the one ambiguity the key
+    /// cannot resolve, and a configuration error rather than a race.
+    /// </summary>
+    Conflict,
+
+    /// <summary>The file could not be opened as a segment. Nothing was registered.</summary>
+    Unreadable,
+}
+
+/// <summary>
 /// Manages the full lifecycle of storage segments:
 ///   - Maintains the active hot-tier segment
 ///   - Triggers flush (hot → cold) when size/age thresholds are exceeded
@@ -89,6 +114,15 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// from it reproduces a source that dies mid-stream, without corrupting a file to get there.
     /// </summary>
     internal Action? _beforeMergeStream;
+    /// <summary>
+    /// Test hook: called inside <see cref="ImportSegment(string, string)"/> between reading the
+    /// catalog and writing to it — the window in which one of the four writers that know nothing
+    /// about <c>_importLock</c> can claim the key. Blocking in it lets the boot scan's
+    /// registration land there on purpose, which is the only way to tell a compare-and-swap from
+    /// a store: with a store the interleaving is silent, and a test that merely calls the two in
+    /// sequence passes either way.
+    /// </summary>
+    internal Action? _beforeImportPublish;
     /// <summary>Test hook: first id of the block reserved for the live WAL (see <see cref="_walSegId"/>).</summary>
     internal ulong LiveWalSegmentId => _walSegId;
     /// <summary>
@@ -120,8 +154,13 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
     /// <summary>Ceiling on native memory held by frozen-but-not-yet-persisted tiers.</summary>
     private const long FlushNativeBudgetBytes = 512L * 1024 * 1024;
-    /// <summary>Window anchors that produced no usable merge batch — excluded so the sweep advances (reset on restart).</summary>
-    private readonly HashSet<ulong> _mergeSkip = new();
+    /// <summary>
+    /// Window anchors that produced no usable merge batch — excluded so the sweep advances
+    /// (reset on restart). Keyed by <see cref="SegmentKey"/> for the same reason the catalog is:
+    /// an id alone names a segment on one node only, so skip-listing an unreadable local file
+    /// would also have excluded a healthy peer replica that shared its id.
+    /// </summary>
+    private readonly HashSet<SegmentKey> _mergeSkip = new();
 
     /// <summary>
     /// Segment ids reserved per flushed tier: one per <see cref="LogLevel"/>, so a tier
@@ -138,8 +177,22 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// </summary>
     private const int LevelSegmentSlots = 6;   // Verbose..Fatal
 
-    // Cold-tier catalog (thread-safe)
-    private readonly ConcurrentDictionary<ulong, SegmentInfo> _segments = new();
+    // Cold-tier catalog (thread-safe).
+    //
+    // Keyed by (node, id), not by id. Segment ids are monotonic PER NODE and every node's
+    // counter starts at 1, so once a peer replicates anything the two series overlap as a matter
+    // of course. Keyed by id alone the second registration simply evicted the first —
+    // the flush assigns unconditionally and so, then, did the import — and because the file NAMES
+    // cannot collide (a replica is {node}-{id}.seg, a locally written segment
+    // {node}-{id}-{minTs}-{maxTs}.seg) both files stayed on disk while only one was in here.
+    //
+    // All three consumers read this dictionary rather than the directory, so the evicted file
+    // left every one of them at once: queries (GetSegments/ListSegments), retention (Values
+    // where IsExpired) and the merge planner (foreach over Values). It was therefore never
+    // served, never expired and never compacted — disk held for the life of the install, with
+    // nothing logged. LoadSegmentCatalog re-ran the same collision on every restart in
+    // directory-enumeration order, so which of the two survived could change from boot to boot.
+    private readonly ConcurrentDictionary<SegmentKey, SegmentInfo> _segments = new();
     /// <summary>Background catalog scan started by the ctor (kept to observe faults).</summary>
     private readonly Task _catalogLoad;
 
@@ -181,6 +234,26 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// _segIdLock inside) is the only one that exists.</para>
     /// </summary>
     private readonly System.Threading.Lock                _segIdLock = new();
+
+    /// <summary>
+    /// Serialises <see cref="ImportSegment(string, string)"/> AGAINST OTHER IMPORTS, and nothing
+    /// else: two peers pushing different segments under one key would otherwise both find it free
+    /// and both rename onto the same path, leaving one peer's bytes gone from disk whichever entry
+    /// the catalog ended up with.
+    ///
+    /// <para>It is taken in that one method and in no other, so it excludes no other writer into
+    /// the catalog — flush publication holds <c>_frozenLock</c>, merge publication and WAL
+    /// recovery hold nothing, and the boot scan runs on a background task while the replication
+    /// endpoint is already serving. That is why the registration itself is a compare-and-swap
+    /// rather than a store: holding this lock says nothing about whether the value read at the top
+    /// of the section is still there at the bottom of it.</para>
+    ///
+    /// <para>Nothing is taken under it — the allocator floor is raised before it is entered — so
+    /// it participates in no ordering. The section is a dictionary exchange and a rename; the
+    /// segment's contents were read before it, and the path is only ever reached once per
+    /// replicated segment.</para>
+    /// </summary>
+    private readonly System.Threading.Lock                _importLock = new();
 
     /// <summary>
     /// First id of the block RESERVED FOR THE LIVE WAL, i.e. the ids its events will occupy
@@ -431,23 +504,23 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// captured tier's native memory while it is being scanned — callers <b>must</b> pair this
     /// with exactly one <see cref="OnReaderDisposed"/> when finished.
     /// </summary>
-    private (HotTierSegment Current, HotTierSegment[] Frozen, HashSet<ulong> Covered) SnapshotTiers()
+    private (HotTierSegment Current, HotTierSegment[] Frozen, HashSet<SegmentKey> Covered) SnapshotTiers()
     {
         HotTierSegment    current;
         HotTierSegment[]  frozen;
-        HashSet<ulong>    covered;
+        HashSet<SegmentKey> covered;
         lock (_frozenLock)
         {
             current = _hot;
             if (_frozenHot.Count == 0)
             {
                 frozen  = Array.Empty<HotTierSegment>();
-                covered = new HashSet<ulong>();
+                covered = new HashSet<SegmentKey>();
             }
             else
             {
                 frozen  = new HotTierSegment[_frozenHot.Count];
-                covered = new HashSet<ulong>(_frozenHot.Count * LevelSegmentSlots);
+                covered = new HashSet<SegmentKey>(_frozenHot.Count * LevelSegmentSlots);
                 for (int i = 0; i < _frozenHot.Count; i++)
                 {
                     frozen[i] = _frozenHot[i].Tier;
@@ -455,7 +528,8 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                     // reserved block is covered — otherwise a query would serve the
                     // already-registered per-level segments AND the still-frozen tier.
                     ulong first = _frozenHot[i].SegId;
-                    for (int s = 0; s < LevelSegmentSlots; s++) covered.Add(first + (ulong)s);
+                    for (int s = 0; s < LevelSegmentSlots; s++)
+                        covered.Add(new SegmentKey(_options.NodeId, new SegmentId(first + (ulong)s)));
                 }
             }
             Interlocked.Increment(ref _activeReaders);
@@ -502,7 +576,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                     foreach (var info in segInfos)
                     {
                         ct.ThrowIfCancellationRequested();
-                        if (covered.Contains(info.Id.Value)) continue;
+                        if (covered.Contains(SegmentKey.Of(info))) continue;
                         if (info.MaxTimestampTicks < fromTicks || info.MinTimestampTicks > toTicks) continue;
                         try
                         {
@@ -542,7 +616,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     private sealed class HotTierReaderSnapshot(
         HotTierSegment   current,
         HotTierSegment[] frozen,
-        HashSet<ulong>   covered,
+        HashSet<SegmentKey> covered,
         StringInternPool pool,
         StorageEngine    owner) : IHotTierReader
     {
@@ -568,7 +642,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             IReadOnlySet<Ameto.Core.LogLevel>? levels)
             => HotTierScan.ReadSorted(current, frozen, pool, fromTicks, toTicks, afterTsTicks, afterIdRaw, forward, levels);
 
-        public IReadOnlySet<ulong> CoveredSegmentIds => covered;
+        public IReadOnlySet<SegmentKey> CoveredSegmentKeys => covered;
 
         public void Dispose()
         {
@@ -628,12 +702,20 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     public async Task FlushHotTierAsync(CancellationToken ct = default) =>
         await TryFlushAsync(ct);
 
-    public Task DeleteSegmentAsync(SegmentId segmentId, CancellationToken ct = default)
+    /// <summary>
+    /// Deletes the segment under <paramref name="key"/>, whichever node produced it.
+    ///
+    /// <para>By the pair, and with no id-only overload beside it: an id names a segment only
+    /// within one node, so a delete taking one alone would unlink whichever of the overlapping
+    /// series happened to hold it. Every caller here already has a <see cref="SegmentInfo"/> and
+    /// passes <c>SegmentKey.Of(info)</c>.</para>
+    /// </summary>
+    public Task DeleteSegmentAsync(SegmentKey key, CancellationToken ct = default)
     {
-        if (_segments.TryRemove(segmentId.Value, out var info))
+        if (_segments.TryRemove(key, out var info))
         {
             try { File.Delete(info.FilePath); }
-            catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete segment {Id}", segmentId); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete segment {Key}", key); }
         }
         return Task.CompletedTask;
     }
@@ -745,7 +827,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 // Register the cold segments AND drop oldHot from the frozen list atomically.
                 lock (_frozenLock)
                 {
-                    foreach (var w in written) _segments[w.Id.Value] = w;
+                    foreach (var w in written) PublishLocalSegment(w);
                     _frozenHot.RemoveAll(f => ReferenceEquals(f.Tier, oldHot));
                 }
                 _logger.LogInformation("Flushed {Segments} level segment(s), {Count} events total",
@@ -1108,7 +1190,25 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         var buckets = new Dictionary<(Ameto.Core.LogLevel Level, long Start), List<SegmentInfo>>();
         foreach (var s in _segments.Values)
         {
-            if (_mergeSkip.Contains(s.Id.Value)) continue;
+            if (_mergeSkip.Contains(SegmentKey.Of(s))) continue;
+            // A replicated peer's segment is a merge candidate here, the same as a local one, and
+            // MergeToColdAsync stamps its output with THIS node's id — so merging one drops the
+            // provenance that SegmentInfo.NodeId carried, and a later re-push of the same (node, id)
+            // is no longer recognised as already held: its events land a second time, permanently,
+            // since nothing on this node can ever match the re-pushed pair against the merged copy.
+            //
+            // Wholly independent of the catalog key, and measured that way: a fixture with no
+            // local segment at all — hence no collision to win or lose — reproduces it identically
+            // on the single-keyspace build, at 12 events where 8 exist. EVERY replicated segment
+            // is exposed, not only one whose id happens to clash, so an id-keyed catalog does not
+            // narrow it and this key does not widen it.
+            //
+            // Left as-is deliberately: excluding foreign segments would strand a peer's small
+            // files uncompacted on this node forever, and the honest repair is a durable
+            // consumed-(node, id) record that ImportSegment consults — which needs a lifetime
+            // rule of its own (when may a pair be forgotten? retention deletes the merged output
+            // eventually, and a re-push after that is legitimate again), so it belongs to how
+            // cluster mode is meant to work overall rather than to a rider on the key change.
 
             // A maximal segment is done — it is the OUTPUT of this policy, not an input to it.
             if (SegmentPayloadBytes(s) >= maximal) continue;
@@ -1362,7 +1462,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 }
                 catch (Exception ex)
                 {
-                    _mergeSkip.Add(seg.Id.Value);
+                    _mergeSkip.Add(SegmentKey.Of(seg));
                     _logger.LogWarning(ex, "Merge: skipping unreadable segment {File}", seg.FilePath);
                 }
             }
@@ -1375,7 +1475,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             if (usable.Count < 2 || usableEvents == 0)
             {
                 foreach (var r in opened) r.Dispose();
-                _mergeSkip.Add(sources[0].Id.Value);
+                _mergeSkip.Add(SegmentKey.Of(sources[0]));
                 _logger.LogDebug("Merge: bucket anchored at {File} yields no usable batch — anchor skipped",
                     Path.GetFileName(sources[0].FilePath));
                 continue;
@@ -1507,7 +1607,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             foreach (var r in readers) r.Dispose();
             if (IsSourceCorruption(ex))
             {
-                foreach (var s in consumed) _mergeSkip.Add(s.Id.Value);
+                foreach (var s in consumed) _mergeSkip.Add(SegmentKey.Of(s));
                 _logger.LogWarning(ex,
                     "Merge: {Count} source(s) unreadable while streaming — sources left intact, batch skip-listed until restart",
                     consumed.Count);
@@ -1523,9 +1623,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         }
         finally { _flushConcurrency.Release(); }
 
-        _segments[segId.Value] = info;
+        PublishLocalSegment(info);
         foreach (var seg in consumed)
-            await DeleteSegmentAsync(seg.Id, ct);
+            await DeleteSegmentAsync(SegmentKey.Of(seg), ct);
 
         // Drop the manifest only when every source file is confirmed gone. A
         // source held open by an in-flight query survives File.Delete — the
@@ -1885,7 +1985,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
         foreach (var seg in expired)
         {
-            await DeleteSegmentAsync(seg.Id, ct);
+            await DeleteSegmentAsync(SegmentKey.Of(seg), ct);
             _logger.LogInformation("Retention: deleted segment {Id} (expires {Max})", seg.Id, seg.MaxTimestamp);
         }
 
@@ -1898,19 +1998,34 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// Seeds <see cref="_nextSegmentId"/> from segment file NAMES only — must run
     /// synchronously before the first flush so new segments never reuse an id,
     /// while the expensive per-file catalog load happens in the background.
+    ///
+    /// <para>Counts EVERY node's files, replicas included, which is deliberate rather than
+    /// left over. Since the catalog is keyed by <see cref="SegmentKey"/> a peer's id is no
+    /// longer something the local counter has to avoid, but <see cref="ImportSegment"/> raises
+    /// the floor past an imported id at run time, and a restart that did not would let the
+    /// allocator fall back behind ids it had already skipped.</para>
     /// </summary>
     private void InitNextSegmentIdFromFileNames()
     {
         foreach (var file in Directory.EnumerateFiles(_segDir, "*.seg"))
         {
-            // {nodeId}-{segId}-{minTs}-{maxTs}.seg
+            // {nodeId}-{segId}-{minTs}-{maxTs}.seg, or {nodeId}-{segId}.seg for a replica
             var parts = Path.GetFileNameWithoutExtension(file).Split('-');
             if (parts.Length >= 2 && ulong.TryParse(parts[1], out var segId))
                 AdvanceSegmentIdFloor(segId + 1);
         }
     }
 
-    private void LoadSegmentCatalog()
+    /// <summary>
+    /// Rebuilds the catalog from the segments directory. Started by the constructor as a
+    /// BACKGROUND task, so it runs with ingest and the HTTP endpoints already up.
+    ///
+    /// <para>internal, not private, so a test can put it under contention with an import
+    /// directly — the same reason the segment-id allocator's three entry points are internal.
+    /// Through the constructor there is nothing to time against: the scan is a task nobody can
+    /// step, and by the time a test holds the engine it has usually finished.</para>
+    /// </summary>
+    internal void LoadSegmentCatalog()
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
 
@@ -1926,13 +2041,47 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         // deleting its sources — otherwise those events would be served twice.
         RecoverInterruptedMerges();
 
-        foreach (var file in Directory.EnumerateFiles(_segDir, "*.seg"))
+        // Sorted, and a key is claimed once. The assignment this replaces was unconditional and
+        // ran in Directory.EnumerateFiles order, so a directory already holding two files under
+        // one key dropped one of them from the catalog at every start — silently, and not
+        // necessarily the same one twice. Leaving the catalog is leaving queries, retention and
+        // the merge planner at once, since all three read it rather than the directory, so the
+        // dropped file was served by nobody, expired by nothing and compacted by no merge while
+        // holding its bytes for the life of the install. That is bug #43 in full, reached without
+        // any import running: an install upgraded from a build that registered the intruder, an
+        // endpoint whose unlink of a refused body failed, a restore from backup, an operator copy.
+        //
+        // One arrangement can produce it — a locally written {node}-{id}-{min}-{max}.seg and a
+        // replica {node}-{id}.seg — because two files can share the replica name only by being
+        // the same file. Ordinal order puts the local one first ('-' sorts below '.'), and that
+        // is the file this node cannot get back: a replica's owner still holds it and can push it
+        // again. It is also the same rule the import applies while running, which is what makes a
+        // refusal survive the restart that follows it — the segment already held keeps the key.
+        //
+        // The loser is not deleted. Which of two files is the wrong one is not this node's to
+        // decide, and the cost of being wrong is unrecoverable; the cost of keeping it is disk
+        // and an error at every start, which is how an operator finds out at all.
+        var files = Directory.GetFiles(_segDir, "*.seg");
+        Array.Sort(files, StringComparer.Ordinal);
+        foreach (var file in files)
         {
             try
             {
                 using var reader = SegmentReader.Open(file, computeUncompressedBytes: true);
                 var info = reader.Info;
-                _segments[info.Id.Value] = info;
+                var key  = SegmentKey.Of(info);
+                if (_segments.TryAdd(key, info)) continue;
+
+                // A live flush or import may have registered this very file while the scan was
+                // running — the scan is a background task, not a barrier — so only a genuinely
+                // different segment under the key is the collision being reported.
+                if (_segments.TryGetValue(key, out var kept) && !IsTheSameSegment(kept, info))
+                    _logger.LogError(
+                        "Segment {File} carries {Key}, which is already held by {Existing}. Two nodes " +
+                        "are configured as NodeId {Node}, or a file was copied in from another node. " +
+                        "The first is served, retained and merged; this one is NOT, and holds its disk " +
+                        "until one of the two is removed or the nodes are renumbered.",
+                        file, key, kept.FilePath, info.NodeId);
             }
             catch (Exception ex)
             {
@@ -2072,7 +2221,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             long recovered = 0;
             for (int i = 0; i < written.Count; i++)
             {
-                _segments[written[i].Id.Value] = written[i];
+                PublishLocalSegment(written[i]);
                 recovered += written[i].EventCount;
             }
             _logger.LogInformation("WAL recovery: wrote {Segments} level segment(s), {Count} events",
@@ -2133,12 +2282,68 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         }
     }
 
+    /// <summary>
+    /// Claims <paramref name="id"/> for a segment that arrived carrying THIS node's own NodeId,
+    /// i.e. from a peer misconfigured with our identity — the one case
+    /// <see cref="SegmentKey"/> cannot separate. Answers false when the allocator has already
+    /// handed that id out or passed it, and raises the floor past it when it has not.
+    ///
+    /// <para>The test and the raise are one critical section because separating them is the
+    /// window itself: probe, and a flush swap takes a block containing the id before the raise
+    /// lands. Together they give the property the import path claimed from the floor alone and
+    /// never had — that the ids this node publishes under and the ids it accepts under its own
+    /// NodeId are DISJOINT, forever. The raise closes the future (nothing is handed out at or
+    /// below the imported id afterwards); the test closes the past (nothing already handed out
+    /// can be imported over).</para>
+    ///
+    /// <para>"Already handed out" is deliberately coarser than "still outstanding". An id below
+    /// the counter may be published, reserved by the live WAL's block, reserved by a frozen tier
+    /// mid-flush, reserved by a merge that is still streaming, or merely burnt — a level that
+    /// produced no file. Only the first of those is visible in the catalog, and tracking the
+    /// other four would mean a release site on every flush, merge and recovery exit, each miss
+    /// leaving a permanent phantom. The counter already separates them from what has never been
+    /// handed out, and refusing the whole span costs nothing a correct deployment can notice: a
+    /// peer with its OWN NodeId never reaches this method, and one wearing ours is the
+    /// deployment error the 409 exists to report.</para>
+    /// </summary>
+    private bool TryClaimLocalSegmentId(ulong id)
+    {
+        lock (_segIdLock)
+        {
+            if (id < _nextSegmentId) return false;
+            _nextSegmentId = id + 1;
+            return true;
+        }
+    }
+
     /// <summary>Pushes the id allocator past a WAL's reserved level block so it is never reused.</summary>
     private void ReserveWalBlock(ulong walSegId) => AdvanceSegmentIdFloor(walSegId + LevelSegmentSlots);
 
     /// <summary>
-    /// Registers a replicated segment file received from the cluster leader.
-    /// The file must already reside in the segments directory.
+    /// Registers a segment file received from a peer, taking ownership of it. The file is STAGED
+    /// at <paramref name="stagedPath"/> and moves to <paramref name="finalPath"/> only once it
+    /// has been accepted; on any other outcome nothing on disk is touched and the staged file is
+    /// still the caller's to unlink. <see cref="ImportSegment(string)"/> is this same call for a
+    /// file that already sits where it belongs.
+    ///
+    /// <para>That the move is on THIS side of the verdict is the reason for the two paths. The
+    /// receiving endpoint derives the final name from the ROUTE — <c>{nodeId}-{segmentId}.seg</c>
+    /// — so two peers misconfigured with one NodeId push two different segments to one path. While
+    /// the endpoint moved first and asked afterwards, the second push had already overwritten the
+    /// first peer's bytes before anything compared anything, and the comparison then found a path
+    /// equal to itself: a re-push, refresh the entry, 204. Both senders recorded a successful
+    /// push, the receiver logged nothing, and the first peer's events existed nowhere.</para>
+    ///
+    /// <para>Which is also why a re-push is not recognised BY its path. Under a duplicated NodeId
+    /// a path says nothing about who sent it, so the file already held and the file arriving are
+    /// compared as segments: the same key, at the same path, over the same time span, with the
+    /// same event count and the same minimum level. A sender re-pushing its own segment matches
+    /// all of that and refreshes the entry — its bytes may still differ, since a re-compression
+    /// rewrites a file without changing what is in it — while a stranger's segment differs in the
+    /// span or the count and is refused, the incumbent untouched in the catalog and on disk. Two
+    /// distinct segments would have to agree on their first and last event to 100 ns and on how
+    /// many events lie between to be taken for one, and that outcome is the overwrite this method
+    /// already performs for a genuine re-push.</para>
     ///
     /// <para>Runs on a request thread, concurrently with everything: the flush swap reserving a
     /// level block, the merge planner reserving a single id, another import. The allocator update
@@ -2146,46 +2351,275 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// used to be a bare read-compare-write on a field whose other writers hold <c>_flushLock</c>,
     /// which is not a lock this path can take.</para>
     ///
-    /// <para>An imported id INSIDE the live WAL's reserved block is a separate matter and this
-    /// does not fix it. The floor update is a no-op there — the allocator is already past the
-    /// block — so the reservation itself is safe and the WAL keeps its name. What is not safe is
-    /// the catalog: <c>_segments</c> is keyed by id alone, so when that WAL's tier flushes, the
-    /// level segment landing on the same id silently replaces the imported entry. The file stays
-    /// on disk, invisible to queries and to retention (which enumerates the catalog, not the
-    /// directory), and a restart re-races the two through the same keyed assignment in
-    /// <c>LoadSegmentCatalog</c>. The mismatch is that a peer's ids and this node's ids share one
-    /// namespace; the fix is to key the catalog by (node, id) or to re-number on import, and
-    /// neither belongs in a lock change. Recovery, at least, is not fooled: the WAL is dropped
-    /// against its completion marker, and <c>SegmentFileExists</c> matches
-    /// <c>{node}-{id}-*.seg</c>, which the two-part name the replication endpoint writes cannot
-    /// satisfy. So the failure is a hidden segment, not a lost WAL.</para>
+    /// <para>An imported id landing on one this node has already used is no longer a collision:
+    /// the catalog is keyed by <see cref="SegmentKey"/>, so the peer's segment and the local one
+    /// occupy separate slots and both stay queryable, expirable and mergeable. It used to evict
+    /// the local entry — the file surviving on disk (the names cannot collide) but leaving
+    /// queries, retention and the merge planner at once, since all three read the catalog rather
+    /// than the directory, and a restart re-ran the same race in directory order.</para>
+    ///
+    /// <para>The allocator is load-bearing here rather than tidy, and in two different ways
+    /// depending on whose NodeId is in the header. For a peer with its own id, raising the floor
+    /// costs nothing and keeps the directory readable to a human. For a peer wearing OURS it is
+    /// the verdict: <see cref="TryClaimLocalSegmentId"/> refuses an id the allocator has already
+    /// handed out. The floor by itself never gave that. It is monotonic, so it cannot retract a
+    /// reservation already made — <c>OpenWal</c> takes a block of six ids the moment a WAL opens
+    /// and the flush publishes into that block much later, a merge takes an id and publishes
+    /// after streaming towards a 512 MB target — and an import is not HANDED an id by the
+    /// allocator, it arrives carrying one. So "the floor stops a local flush being handed an id
+    /// an import occupies" was true only of ids handed out after the import; the reserved-but-
+    /// unpublished ones were exactly the window bug #43 came back through. It also still matters
+    /// for <c>SegmentFileExists</c> and the WAL block probe — both of which match
+    /// <c>{localNode}-{id}-*.seg</c> — which would otherwise be looking at somebody else's
+    /// file.</para>
     /// </summary>
-    public void ImportSegment(string filePath)
+    /// <returns>
+    /// What happened to the file, so the caller that WROTE it can act: see
+    /// <see cref="SegmentImportOutcome"/>.
+    /// </returns>
+    public SegmentImportOutcome ImportSegment(string stagedPath, string finalPath)
     {
+        SegmentInfo staged;
         try
         {
-            using var reader = SegmentReader.Open(filePath, computeUncompressedBytes: true);
-            var info = reader.Info;
-
-            // A same-id, different-file overwrite is the shape described above. Re-importing the
-            // SAME segment is legitimate (the endpoint moves with overwrite: true), so it is the
-            // differing path that is worth a word — otherwise the loss is entirely silent.
-            if (_segments.TryGetValue(info.Id.Value, out var existing) &&
-                !string.Equals(existing.FilePath, info.FilePath, StringComparison.OrdinalIgnoreCase))
-                _logger.LogWarning(
-                    "Imported segment {Id} collides with local segment {Existing}; the local one is " +
-                    "no longer served or expired. Peer and local segment ids share one namespace.",
-                    info.Id, existing.FilePath);
-
-            _segments[info.Id.Value] = info;
-            AdvanceSegmentIdFloor(info.Id.Value + 1);
-            _logger.LogInformation("Imported replicated segment {Id} ({Events} events)", info.Id, info.EventCount);
+            using var reader = SegmentReader.Open(stagedPath, computeUncompressedBytes: true);
+            staged = reader.Info;
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "Failed to import replicated segment {File}", filePath);
+            _logger.LogWarning(ex, "Failed to import replicated segment {File}", stagedPath);
+            return SegmentImportOutcome.Unreadable;
+        }
+
+        var key = SegmentKey.Of(staged);
+
+        // Before the catalog, and outside _importLock so that the only lock ordering in this
+        // method is no ordering at all.
+        //
+        // A segment from a peer with its own NodeId can never share a key with a local one, so
+        // the floor is raised for it and nothing else: monotonic, so an import that is about to
+        // be refused for some other reason can only ever move it forward, and it keeps the
+        // directory readable to a human.
+        //
+        // Our OWN NodeId on an incoming segment is the case the key cannot separate, and there
+        // the floor is not a note — it is the decision. See TryClaimLocalSegmentId: an id the
+        // allocator has already handed out belongs to a local segment that is published, or to
+        // one of the reserved blocks a flush, a merge or WAL recovery is about to publish into,
+        // and none of those three can refuse a key. Accepting such an id put the peer's entry in
+        // the catalog for exactly as long as it took the local writer to reach its own
+        // publication, which is bug #43 with the sender told 204.
+        bool claimed = true;
+        if (staged.NodeId.Value == _options.NodeId.Value)
+            claimed = TryClaimLocalSegmentId(staged.Id.Value);
+        else
+            AdvanceSegmentIdFloor(staged.Id.Value + 1);
+
+        bool inPlace = string.Equals(stagedPath, finalPath, StringComparison.OrdinalIgnoreCase);
+        var  info    = inPlace ? staged : AtPath(staged, finalPath);
+
+        // First segment under a key keeps it. The assignment this replaces warned about the clash
+        // and then performed it anyway, which is the same eviction the key change removed, in the
+        // one case the key cannot separate — two nodes carrying the same NodeId. Leaving the
+        // catalog is leaving queries, retention and the merge planner at once, so the refused file
+        // held disk for the life of the install, never served, never expired, never compacted.
+        //
+        // The lock is NOT what makes the decision safe, and the compare-and-swap below is not
+        // redundant with it. _importLock is taken here and nowhere else, while four other writers
+        // reach this dictionary knowing nothing about it: flush publication (under _frozenLock),
+        // merge publication, the boot catalog scan and WAL recovery. A probe followed by a store
+        // therefore decides on a value that another writer can replace in between — and the
+        // catalog scan is a BACKGROUND task, so a replication POST is live while it is still
+        // walking the directory. The import finds the key free because the scan has not reached
+        // the local {node}-{id}-{min}-{max}.seg yet; the scan then adds it; the store overwrites
+        // it. That is bug #43 again — the local segment out of queries, retention and the merge
+        // planner at once with its file still on disk — and silently, because the conflict branch
+        // never fired and the scan's error branch had already been passed.
+        //
+        // So the WRITE decides: TryAdd when the key looked free, TryUpdate against the exact
+        // instance that was read when it did not. Losing the exchange means somebody landed in
+        // the window, and the loop re-reads and judges again rather than assuming the worst — the
+        // interleaving is not always a conflict. A peer re-pushing a segment this node already
+        // holds on disk, while the boot scan registers that very file, loses the exchange to an
+        // entry describing the same segment, and answering 409 there would tell a healthy sender
+        // that two nodes share its id.
+        //
+        // The lock stays, and the rename stays under it, but the rename now happens only AFTER
+        // the exchange is won. It is the irreversible half of this method — overwrite: true — and
+        // deciding it on the stale probe is what let a refusal arrive with the other peer's bytes
+        // already destroyed. Registering first opens a window in the other direction, where the
+        // entry names a path the file has not reached; every reader of a segment path already
+        // treats an unreadable file as a segment that contributes nothing (QueryExecutor yields
+        // nothing for it, the aggregator logs and moves on), which is exactly how they behaved a
+        // moment earlier when the entry did not exist at all.
+        lock (_importLock)
+        {
+            SegmentInfo? displaced;
+
+            while (true)
+            {
+                // The bool is redundant: a null value is never stored, so "absent" and "null"
+                // are the same state, and one variable then carries both the answer and the
+                // value the exchange below has to be made against.
+                _segments.TryGetValue(key, out var existing);
+
+                if (existing is not null && !IsTheSameSegment(existing, info))
+                {
+                    _logger.LogError(
+                        "Refused replicated segment {File}: {Key} is already held by {Existing}, which " +
+                        "carries the same node id AND the same segment id. Two nodes appear to be " +
+                        "configured as NodeId {Node} — a deployment error no id space can resolve. The " +
+                        "segment already being served was kept and the incoming one was NOT registered.",
+                        staged.FilePath, key, existing.FilePath, info.NodeId);
+                    return SegmentImportOutcome.Conflict;
+                }
+
+                // A free key is not the same thing as an available one. The claim above failed,
+                // so this id is inside the span the local allocator has already handed out — the
+                // entry that will occupy this key has not been written yet, or its file has been
+                // written and not yet published, and either way the writer holding it cannot
+                // stand down for us. Registering here would be answered 204 and then stored over.
+                //
+                // Below the equality test on purpose: a re-push of a segment this node has
+                // already accepted fails the claim too — the first push raised the floor past it
+                // — and that is ordinary traffic, so the incumbent decides it. Only a key with
+                // nothing under it is refused on the claim alone.
+                if (existing is null && !claimed)
+                {
+                    _logger.LogError(
+                        "Refused replicated segment {File}: {Key} names a segment id this node has " +
+                        "already allocated for itself, so a local flush, merge or WAL replay either " +
+                        "holds it or is about to publish under it — and none of those can give a key " +
+                        "back. Two nodes appear to be configured as NodeId {Node}. Nothing was " +
+                        "registered and the body was left where it was staged.",
+                        staged.FilePath, key, info.NodeId);
+                    return SegmentImportOutcome.Conflict;
+                }
+
+                _beforeImportPublish?.Invoke();
+
+                // TryUpdate compares the STORED REFERENCE with the one just read — SegmentInfo is
+                // a class with no value equality — so this is a real exchange and not a test an
+                // equal-but-rebuilt entry would pass.
+                bool won = existing is null
+                    ? _segments.TryAdd(key, info)
+                    : _segments.TryUpdate(key, info, existing);
+
+                if (!won) continue;   // somebody landed in the window; read again and judge again
+
+                displaced = existing;
+                break;
+            }
+
+            if (!inPlace)
+            {
+                try { File.Move(stagedPath, finalPath, overwrite: true); }
+                catch
+                {
+                    // The entry is already published and names a file that never arrived. Nothing
+                    // else would ever take it back — the catalog is not rebuilt until the next
+                    // start — so a disk error here would leave a permanent entry for a path
+                    // holding either nothing or the previous segment. Conditional both ways: only
+                    // an entry that is still OURS is withdrawn.
+                    if (displaced is { } previous) _segments.TryUpdate(key, previous, info);
+                    else _segments.TryRemove(new KeyValuePair<SegmentKey, SegmentInfo>(key, info));
+                    throw;
+                }
+            }
+        }
+
+        _logger.LogInformation("Imported replicated segment {Key} ({Events} events)", key, info.EventCount);
+        return SegmentImportOutcome.Registered;
+    }
+
+    /// <summary>
+    /// Registers a segment file that already sits at its final path in the segments directory.
+    /// </summary>
+    public SegmentImportOutcome ImportSegment(string filePath) => ImportSegment(filePath, filePath);
+
+    /// <summary>
+    /// Whether two catalog entries describe ONE segment rather than two that collided on a key.
+    /// Deliberately not a byte comparison: a segment re-pushed after a re-compression is the same
+    /// segment carrying different bytes, and the header holds no digest to compare instead.
+    /// </summary>
+    private static bool IsTheSameSegment(SegmentInfo a, SegmentInfo b) =>
+        string.Equals(a.FilePath, b.FilePath, StringComparison.OrdinalIgnoreCase) &&
+        a.MinTimestampTicks == b.MinTimestampTicks &&
+        a.MaxTimestampTicks == b.MaxTimestampTicks &&
+        a.EventCount        == b.EventCount        &&
+        a.MinLevel          == b.MinLevel;
+
+    /// <summary>
+    /// Publishes a segment THIS node produced — a flush's level segment, a merged segment, a
+    /// segment rebuilt by WAL recovery. The three of them are the writers into the catalog that
+    /// <see cref="ImportSegment"/> cannot be: their events exist in no other file, so refusing a
+    /// key is not something they are able to do, and this method always ends with the entry
+    /// theirs.
+    ///
+    /// <para>What it does not do any more is get there in SILENCE. All three used to be a bare
+    /// <c>_segments[key] = w</c>, which is why making the import decide by compare-and-swap
+    /// closed bug #43 in one direction only: an import that found the key free, WON its exchange,
+    /// was answered <c>Registered</c> and told its peer 204 could still have its entry stored
+    /// over by any of them a moment later. The peer's <c>.seg</c> then sat in the segments
+    /// directory in no catalog — never served by a query, never expired by retention, never
+    /// picked by the merge planner — with a successful push recorded at the other end and not one
+    /// line logged at this one. That is the whole of #43, reached through the one route the
+    /// compare-and-swap does not cover, and it needed no race at all: an import into the block a
+    /// live WAL had already reserved, then an ordinary flush.</para>
+    ///
+    /// <para><see cref="TryClaimLocalSegmentId"/> is what now stops that arrangement arising —
+    /// an import may not take an id this node has already been handed. This method is the
+    /// backstop for what the claim cannot see, which is the catalog scan: it runs as a background
+    /// task while <see cref="ReplayOrphanedWals"/> is still publishing, so a peer file already in
+    /// the directory under <c>{localNode}-{id}.seg</c> can be registered by the scan and then
+    /// displaced by a recovered level segment carrying that id.</para>
+    ///
+    /// <para>So the displacement stays possible and stops being invisible. Which file left the
+    /// catalog is the only remedy this node has for two peers wearing one NodeId — it cannot
+    /// renumber either of them — so it is logged with both paths, and the file itself is left
+    /// alone: its owner still holds it and can push it again once the ids are fixed.</para>
+    /// </summary>
+    private void PublishLocalSegment(SegmentInfo written)
+    {
+        var key = SegmentKey.Of(written);
+
+        while (true)
+        {
+            if (_segments.TryAdd(key, written)) return;
+
+            // TryAdd lost, so somebody holds the key — read WHO, and exchange against that exact
+            // reference. A plain store would decide on a value another writer can replace in
+            // between, which is the defect this method exists to end rather than to repeat.
+            if (!_segments.TryGetValue(key, out var existing)) continue;   // removed under us
+
+            if (!IsTheSameSegment(existing, written))
+                // One placeholder per argument: a repeated name in a structured template is a
+                // second positional slot, not a second rendering of the first.
+                _logger.LogError(
+                    "Registering {File} under {Key} displaced {Existing}, which carries the same node id " +
+                    "AND the same segment id. Two nodes appear to be configured as NodeId {Node} — a " +
+                    "deployment error no id space can resolve. This node wrote the incoming file itself " +
+                    "and its events are in no other file, so it MUST be registered; the displaced one is " +
+                    "no longer served, expired or merged, and its bytes stay on disk until it is " +
+                    "re-pushed by its owner or removed.",
+                    written.FilePath, key, existing.FilePath, written.NodeId);
+
+            if (_segments.TryUpdate(key, written, existing)) return;
         }
     }
+
+    /// <summary>The same segment, described at the path it is about to occupy.</summary>
+    private static SegmentInfo AtPath(SegmentInfo info, string filePath) => new()
+    {
+        Id                = info.Id,
+        NodeId            = info.NodeId,
+        FilePath          = filePath,
+        MinTimestampTicks = info.MinTimestampTicks,
+        MaxTimestampTicks = info.MaxTimestampTicks,
+        EventCount        = info.EventCount,
+        MinLevel          = info.MinLevel,
+        CompressedBytes   = info.CompressedBytes,
+        UncompressedBytes = info.UncompressedBytes,
+    };
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -2202,7 +2636,14 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// <summary>
     /// Opens the next WAL, RESERVING the block of segment ids its events will flush into.
     /// The reservation is what keeps the WAL's name meaningful: nothing else — no merge, no
-    /// recovery segment — can subsequently be handed an id inside it.
+    /// recovery segment — can subsequently be HANDED an id inside it.
+    ///
+    /// <para>Handed is the exact word, and for a while it was the whole of the guarantee. A
+    /// replicated segment does not ask the allocator for an id, it arrives with one, so a peer
+    /// misconfigured with this node's NodeId could push straight into this block and be
+    /// registered — for as long as it took the flush to reach its own publication, which is the
+    /// entire life of the current hot tier. <see cref="TryClaimLocalSegmentId"/> is what closes
+    /// that half, by refusing an arriving id the allocator has already passed.</para>
     /// </summary>
     private void OpenWal()
     {

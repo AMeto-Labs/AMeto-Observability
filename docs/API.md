@@ -468,7 +468,7 @@ List all known peer nodes and their health status.
 
 ### `POST /api/replication/ping`
 
-Peer-to-peer presence exchange. **No auth required** (peer-to-peer).
+Peer-to-peer presence exchange. **Auth:** the `X-Ameto-Replication` header must carry the configured replication secret; a blank secret fails closed, so an enabled-but-unconfigured node accepts nothing.
 
 **Body:**
 ```json
@@ -479,11 +479,45 @@ Peer-to-peer presence exchange. **No auth required** (peer-to-peer).
 
 ### `POST /api/replication/segments/{nodeId}/{segmentId}`
 
-Receive a replicated cold-tier segment from a peer. **No auth required** (peer-to-peer).
+Receive a replicated cold-tier segment from a peer. **Auth:** the `X-Ameto-Replication` header must carry the configured replication secret (same as `/ping`).
 
 **Body:** raw `.seg` file bytes (`application/octet-stream`).
 
-**Response `204 No Content`** on success.
+| Status | Meaning | Retry? |
+|---|---|---|
+| `204 No Content` | Registered. A re-push of a segment this node already holds also returns 204: it refreshes the existing entry rather than adding a second one. | — |
+| `400 Bad Request` | Either the route did not bind — `{nodeId}` is a `uint` and `{segmentId}` a `ulong`, and a URL carrying anything else is rejected by model binding **before the secret is checked**, with no body of ours — or the body was read but is not a segment file, in which case nothing was registered and the received bytes were discarded. | No — neither the URL nor the bytes change on their own. |
+| `401 Unauthorized` | The `X-Ameto-Replication` header is missing or does not match the receiver's configured secret. Note the row above: an unroutable URL never reaches this check. | No. |
+| `409 Conflict` | A **different** segment already holds this `(nodeId, segmentId)` on the receiver, which means two nodes are configured with the same `NodeId`. The segment already being served was kept; the pushed one was **not** registered. | No — permanent until one of the nodes is renumbered. |
+| `413 Content Too Large` | The body is larger than `Ameto:Replication:MaxSegmentBytes` on the **receiver** (default 512 MB). Nothing was written. | No — the same bytes are the same size. Raise the limit on the receiver, or the sender will never place this segment. |
+| `500` | The receiver could not take the body: a disk error writing or placing the file, or a body that stopped arriving mid-push. | Yes — both causes are transient, and the same body over a healthy connection will land. |
+
+Segment ids are monotonic **per node**, so `(nodeId, segmentId)` — not `segmentId` alone —
+identifies a segment across a cluster. A 409 is a deployment fault rather than a push failure:
+the receiver cannot tell which of two senders claiming one `NodeId` is the stranger, so it
+refuses the second and reports it to the sender, which is the only party positioned to tell a
+duplicate-NodeId deployment from a healthy push.
+
+The pair a 409 is decided on comes from the **file header**, not from the route. The receiver
+reads the segment it was sent and takes `(nodeId, segmentId)` out of it, so a sender that
+addresses a body to a URL the body itself disagrees with gets a verdict about what it sent — and
+the message names the id in the URL, which is then not the id the receiver compared. A push
+built by `SegmentReplicator` always addresses the segment it is sending, so route and header
+agree; a hand-made push need not, and this is the one place that shows.
+
+`413` is worth setting deliberately rather than leaving to the framework, whose own default is
+30 MB. What a peer pushes is a hot-tier **level segment** — replication is triggered by a flush
+publishing and by nothing else, so merged segments are not offered to peers — and one flush
+starts from a 64 MB budget (`Ameto:HotTier:MaxSizeBytes`, configurable upward) with LZ4 the only
+thing between that and the wire, so 30 MB is cleared without anything unusual happening. The
+default ceiling of 512 MB is the merge target measured before compression: larger than anything
+this system builds, so a legitimate body is never what it refuses. The receiver raises the limit
+for this endpoint alone, and only after the secret matches.
+
+The `Retry?` column states what a sender **should** do, not what this one does. `SegmentReplicator`
+pushes each segment once per healthy peer, fire-and-forget; a non-success status is logged as a
+warning and that segment is not offered to that peer again. So `500` is retryable in the sense
+that the same bytes would land, not in the sense that this implementation will resend them.
 
 ---
 
