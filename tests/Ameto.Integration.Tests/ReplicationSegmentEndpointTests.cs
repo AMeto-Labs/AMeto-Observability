@@ -2,7 +2,10 @@ using System.Buffers;
 using System.Net;
 using System.Net.Http.Headers;
 using MessagePack;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.AspNetCore.TestHost;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
@@ -114,6 +117,84 @@ public sealed class ReplicationSegmentEndpointTests : IClassFixture<ReplicationW
 
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
         Assert.False(File.Exists(Path.Combine(_factory.SegDir, "9-4242.seg")));
+    }
+
+    // ── What the published contract says ──────────────────────────────────────
+
+    /// <summary>
+    /// The 400 above is not the only one, and the other one arrives from somewhere the handler
+    /// cannot see. <c>{nodeId}</c> binds as <c>uint</c> and <c>{segmentId}</c> as <c>ulong</c>,
+    /// so a URL carrying anything else is refused by model binding with an EMPTY body — before
+    /// the handler runs, and therefore before the secret check the 401 row promises.
+    ///
+    /// <para>Asserted with NO secret header at all, which is what makes the ordering visible:
+    /// a request that is unauthenticated AND unroutable comes back 400, not 401. Pinned because
+    /// the table in docs/API.md used to explain 400 as "the body did not read as a segment"
+    /// alone, which sends anyone debugging one of these looking at their bytes.</para>
+    ///
+    /// <para>The second assertion is what proves the handler never ran, and it is the one that
+    /// carries the ordering: the body could not have been staged, because nothing in this
+    /// process ever looked at it. The response body is NOT asserted on — binding failures are
+    /// bare under a Production host and carry a framework <c>ProblemDetails</c> under a
+    /// Development one, and this harness is the second.</para>
+    /// </summary>
+    [Fact]
+    public async Task A_route_that_does_not_bind_is_refused_before_the_secret_is_checked()
+    {
+        using var anonymous = _factory.CreateClient();   // deliberately without X-Ameto-Replication
+
+        var content = new ByteArrayContent([0xDE, 0xAD, 0xBE, 0xEF]);
+        content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+        var response = await anonymous.PostAsync("/api/replication/segments/abc/1", content);
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Empty(Directory.GetFiles(_factory.SegDir, "abc-*"));
+    }
+
+    /// <summary>
+    /// The ceiling the endpoint puts on a body, which is configuration and therefore breakable
+    /// in silence. Kestrel's default is 30 MB; a cold segment is routinely larger, and over the
+    /// limit the body read throws and used to come back as the 500 the contract marks
+    /// RETRYABLE — a peer re-pushing a merged segment forever, with nothing logged anywhere.
+    ///
+    /// <para>What is asserted is the WIRING: that the value configured for this node reaches
+    /// the request before a byte of the body is read. The enforcement itself belongs to Kestrel
+    /// and cannot be reached from here at all — <c>TestServer</c> supplies no
+    /// <c>IHttpMaxRequestBodySizeFeature</c>, so under this harness there is no limit to
+    /// exceed. Hence a stub feature and an assertion on what the endpoint wrote into it: a
+    /// build that stopped raising the limit, or raised it to the wrong number, fails here even
+    /// though no oversized body can be sent.</para>
+    /// </summary>
+    [Fact]
+    public async Task The_endpoint_raises_the_body_limit_to_the_configured_maximum()
+    {
+        long configured = _factory.Services
+            .GetRequiredService<IOptions<Ameto.Replication.ReplicationOptions>>()
+            .Value.MaxSegmentBytes;
+        Assert.Equal(ReplicationWebAppFactory.MaxSegmentBytes, configured);   // setup: bound from config
+
+        var limit = new StubBodySizeLimit();
+        await _factory.Server.SendAsync(ctx =>
+        {
+            ctx.Request.Method      = HttpMethods.Post;
+            ctx.Request.Path        = "/api/replication/segments/9/4243";
+            ctx.Request.ContentType = "application/octet-stream";
+            ctx.Request.Headers["X-Ameto-Replication"] = ReplicationWebAppFactory.Secret;
+            ctx.Request.Body = new MemoryStream([0xDE, 0xAD, 0xBE, 0xEF]);
+            ctx.Features.Set<IHttpMaxRequestBodySizeFeature>(limit);
+        });
+
+        Assert.Equal(configured, limit.MaxRequestBodySize);
+    }
+
+    /// <summary>
+    /// Stands in for the Kestrel feature the endpoint writes its ceiling into. Writable, because
+    /// a read-only feature is exactly the case the endpoint must leave alone.
+    /// </summary>
+    private sealed class StubBodySizeLimit : IHttpMaxRequestBodySizeFeature
+    {
+        public bool  IsReadOnly          => false;
+        public long? MaxRequestBodySize  { get; set; } = 30_000_000;   // the framework's own default
     }
 
     /// <summary>
@@ -335,6 +416,12 @@ public sealed class ReplicationWebAppFactory : WebApplicationFactory<Program>
 {
     public const string Secret = "replication-integration-secret";
 
+    /// <summary>
+    /// Deliberately not the default and not a round number: the assertion on it is only worth
+    /// anything if the value could have come from nowhere else.
+    /// </summary>
+    public const long MaxSegmentBytes = 123_456_789L;
+
     private readonly string _tempDir =
         Path.Combine(Path.GetTempPath(), "Ameto-repl-" + Guid.NewGuid().ToString("N")[..8]);
 
@@ -347,6 +434,7 @@ public sealed class ReplicationWebAppFactory : WebApplicationFactory<Program>
         builder.UseSetting("Ameto:Cluster:Enabled", "false");
         builder.UseSetting("Ameto:Replication:Enabled", "true");
         builder.UseSetting("Ameto:Replication:Secret", Secret);
+        builder.UseSetting("Ameto:Replication:MaxSegmentBytes", MaxSegmentBytes.ToString());
 
         string webRoot = Path.Combine(_tempDir, "wwwroot");
         Directory.CreateDirectory(webRoot);

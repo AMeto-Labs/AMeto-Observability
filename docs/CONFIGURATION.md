@@ -144,6 +144,7 @@ Symmetric replication: each node replicates its own flushed cold segments to all
 | `LocalAddress` | string | `"http://localhost:5341"` | This node's publicly reachable base URL, used by peers to push segments/pings back. Set to the real hostname when clustering. |
 | `ProbeInterval` | TimeSpan | `"00:00:10"` | How often to ping known peers. |
 | `PushTimeout` | TimeSpan | `"00:01:00"` | Per-segment HTTP push timeout. |
+| `MaxSegmentBytes` | long | `536870912` (512 MB) | Largest segment body this node **accepts** from a peer. Read on the receiving side: a body over it is answered with `413` and nothing is written. The framework default it replaces is 30 MB, which is below the size this system's own merges produce, so leaving it unset made large segments unreplicable. Raise it on every node in a cluster whose merged files can exceed it. |
 
 ### Example — two-node cluster
 
@@ -224,4 +225,5 @@ Ameto:
     SeedNodes: []             # e.g. ["http://node1:5341"]
     ProbeInterval: "00:00:10"
     PushTimeout: "00:01:00"
+    MaxSegmentBytes: 536870912  # 512 MB — largest segment body this node ACCEPTS
 ```

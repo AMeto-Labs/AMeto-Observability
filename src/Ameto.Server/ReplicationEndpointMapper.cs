@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http.Features;
 using Microsoft.Extensions.Options;
 using Ameto.Replication;
 using Ameto.Storage;
@@ -59,6 +60,27 @@ public static class ReplicationEndpointMapper
                    IOptions<Ameto.Core.ServerOptions> serverOpts) =>
             {
                 if (!PeerAuthorised(request, replicationOpts.Value)) return Results.Unauthorized();
+
+                // The body limit, decided before a byte of the body is read. Kestrel's default
+                // is 30 MB and this endpoint receives cold segments: a hot-tier flush starts
+                // from a 64 MB budget and the merge planner grows a file towards 512 MB of
+                // payload before LZ4, so the segments most worth replicating were exactly the
+                // ones that could not be. Over the limit the body read THROWS, and the catch
+                // below folded that into the 500 docs/API.md labels retryable — so a peer
+                // retried a body no retry could shrink, once per push attempt, for as long as
+                // the segment lived. Silent on both ends: the receiver reported a write it
+                // could not do, the sender saw a status its own contract told it to expect.
+                //
+                // Set per REQUEST rather than on the host, because this is the only endpoint
+                // that receives a file and MaxRequestBodySize on ConfigureKestrel would hand
+                // the same ceiling to OTLP ingest, the CLEF endpoint and the UI. Below the
+                // secret check, so an unauthenticated caller still meets the 30 MB default —
+                // the raised ceiling is something a peer authenticates for. The feature is
+                // absent under TestServer, which enforces no limit at all, hence the match.
+                if (request.HttpContext.Features.Get<IHttpMaxRequestBodySizeFeature>()
+                        is { IsReadOnly: false } bodyLimit)
+                    bodyLimit.MaxRequestBodySize = replicationOpts.Value.MaxSegmentBytes;
+
                 var segDir   = Path.Combine(serverOpts.Value.DataDirectory, "segments");
                 var fileName = $"{nodeId}-{segmentId}.seg";
                 var filePath = Path.Combine(segDir, fileName);
@@ -93,8 +115,29 @@ public static class ReplicationEndpointMapper
                     await using var file = File.Create(tmpPath);
                     await request.Body.CopyToAsync(file);
                 }
+                catch (BadHttpRequestException tooLarge)
+                    when (tooLarge.StatusCode == StatusCodes.Status413PayloadTooLarge)
+                {
+                    // Separated from the disk error below because the two ANSWERS differ, and
+                    // the answer is the whole content of a status code here. A disk error is
+                    // transient and the sender should come back; a body over the ceiling will
+                    // be over it every time, so the sender must stop and somebody must raise
+                    // MaxSegmentBytes on this node. Folded together they were one 500 marked
+                    // "retry: yes", which turned the second case into an unbounded retry of a
+                    // request that could never be accepted.
+                    try { File.Delete(tmpPath); } catch { /* ignore */ }
+                    return Results.Problem(
+                        $"Segment {nodeId}-{segmentId} is larger than this node accepts " +
+                        $"({replicationOpts.Value.MaxSegmentBytes} bytes). Retrying will not help; " +
+                        "raise Ameto:Replication:MaxSegmentBytes on the receiver.",
+                        statusCode: StatusCodes.Status413PayloadTooLarge);
+                }
                 catch
                 {
+                    // Everything else the body read can fail on IS worth another attempt: a
+                    // full or failing disk, and a body that stopped arriving — Kestrel reports
+                    // the dropped connection here too, and the same bytes over a live
+                    // connection would land.
                     try { File.Delete(tmpPath); } catch { /* ignore */ }
                     return Results.Problem("Failed to write segment file.");
                 }
