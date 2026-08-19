@@ -72,7 +72,11 @@ public static class ReplicationServiceExtensions
         if (!opts.Enabled) return services;
 
         services.AddHttpClient("replication");
-        services.AddHttpClient("replication-push");
+        // 8 KB is room for any ProblemDetails a receiver sends and three orders of magnitude
+        // under the default 2 GB buffer -- the sender only ever READS a response to quote it in
+        // a log line, and the peer address is configuration, which can point at anything.
+        services.AddHttpClient("replication-push")
+                .ConfigureHttpClient(static c => c.MaxResponseContentBufferSize = 8 * 1024);
 
         services.AddSingleton<NodeRegistry>();
         services.AddSingleton<PeerProber>();

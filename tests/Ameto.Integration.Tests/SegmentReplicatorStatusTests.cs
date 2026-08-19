@@ -99,8 +99,16 @@ public sealed class SegmentReplicatorStatusTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// A stub, and deliberately so — which makes this a PLUMBING test: it proves the body the
+    /// wire carried reaches the log verbatim, and nothing else. Whether the RECEIVER puts the
+    /// right words in that body is a property of the endpoint, pinned where the endpoint is
+    /// real: <see cref="ReplicationSegmentEndpointTests"/> asserts one 409 body per conflict
+    /// cause. The first version of this test claimed the quoting proved the sender "no longer
+    /// guesses" — with a stubbed body that claim tested the stub.
+    /// </summary>
     [Fact]
-    public async Task A_409_quotes_the_receiver_instead_of_composing_its_own_story()
+    public async Task A_409_reaches_the_log_with_whatever_body_the_wire_carried()
     {
         const string receiverSaid = "names a segment id this node has already allocated for itself";
         var (replicator, log) = Build(HttpStatusCode.Conflict, receiverSaid);
@@ -110,7 +118,7 @@ public sealed class SegmentReplicatorStatusTests : IDisposable
 
             var line = await WaitForLineAsync(log, m => m.Contains("409"));
             Assert.Equal(MelLogLevel.Error, line.Level);
-            Assert.Contains(receiverSaid, line.Message);   // the receiver names the cause; the sender no longer guesses
+            Assert.Contains(receiverSaid, line.Message);
         }
     }
 }

@@ -57,9 +57,11 @@ public sealed class SegmentMergeTests : IAsyncLifetime
     /// <summary>
     /// #52: the planner quarantined a source on ANY open failure, so a file that was simply
     /// mid-rename inside an import's publish window — or held by a reader for a moment — was
-    /// skip-listed for the life of the process: never merged again, warned about on every
-    /// pass. Quarantine is for corruption, which is a property of the bytes and will not heal;
-    /// a file that failed to OPEN keeps its place and is retried once it can be.
+    /// skip-listed for the life of the process: never merged again, and warned about exactly
+    /// once, because the skip-list also stopped the reselection. Quarantine is for corruption,
+    /// which is a property of the bytes and will not heal; a file that failed to OPEN keeps its
+    /// place and is retried once it can be — at Debug, since the retry repeats until the
+    /// circumstance clears.
     /// </summary>
     [Fact]
     public async Task A_source_that_failed_to_open_is_retried_once_it_can_be()
@@ -86,6 +88,29 @@ public sealed class SegmentMergeTests : IAsyncLifetime
             "the returned source was not retried");
         var final = Assert.Single(_engine.ListSegments());
         Assert.Equal(120u, final.EventCount);
+    }
+
+    /// <summary>
+    /// The other half of the same rule, and the half the first version of this fix got exactly
+    /// backwards: a TORN file — zero bytes, or fewer than a footer, the canonical power-cut
+    /// leftover — is corruption and must be quarantined, not retried forever. It used to dodge
+    /// the quarantine precisely by being badly torn: the reader failed before its first
+    /// structural check, with an exception the classifier did not count.
+    /// </summary>
+    [Fact]
+    public async Task A_torn_file_is_quarantined_not_retried()
+    {
+        long b0 = MergeBucketGrid.SealedBucketStart(LogLevel.Information);
+        await WriteSegmentAsync(0, 40, baseTicks: b0);
+        await WriteSegmentAsync(1, 40, baseTicks: b0 + TimeSpan.TicksPerHour);
+        await WriteSegmentAsync(2, 40, baseTicks: b0 + 2 * TimeSpan.TicksPerHour);
+
+        var victim = _engine.ListSegments().OrderBy(x => x.MinTimestampTicks).Last();
+        File.WriteAllBytes(victim.FilePath, new byte[10]);   // the canonical torn write
+
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None),
+            "setup: the two healthy sources should still merge");
+        Assert.Contains(SegmentKey.Of(victim), _engine._mergeSkip);
     }
 
 

@@ -507,6 +507,85 @@ public sealed class ReplicationSegmentEndpointTests : IClassFixture<ReplicationW
     }
 
     /// <summary>
+    /// The 409 body names WHICH of the receiver's two conflict causes fired — the sender's log
+    /// quotes that body, so before the causes were split it confidently reported the wrong one
+    /// in one case of two. This pins the different-segment body.
+    /// </summary>
+    [Fact]
+    public async Task A_409_for_a_different_segment_says_so_in_the_body()
+    {
+        // Node 71 is used by no other test in this class: the factory is shared, so a node id
+        // another test also pushes under would make this one's first push meet that test's
+        // segment and 409 before the scenario even starts.
+        var (first, id) = ForeignSegment(new NodeId(71), events: 6);
+        Assert.Equal(HttpStatusCode.NoContent, (await PushAsync(71, id, first)).StatusCode);
+
+        var (second, _) = ForeignSegment(new NodeId(71), events: 11);
+        var response = await PushAsync(71, id, second);
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+        Assert.Contains("already held by a different file", await response.Content.ReadAsStringAsync());
+    }
+
+    /// <summary>
+    /// And the allocated-locally body: an id this node's own allocator has handed out cannot be
+    /// taken by a peer wearing this node's id, and the body says that instead of the
+    /// different-file story.
+    /// </summary>
+    [Fact]
+    public async Task A_409_for_a_locally_allocated_id_says_so_in_the_body()
+    {
+        // The allocator branch needs an id that is HANDED OUT but not PUBLISHED — an id with a
+        // catalog entry takes the different-segment branch instead. A flush reserves a block of
+        // six ids, one per level, and publishes only the levels it held: WriteAndFlush writes
+        // Information only, so the Debug slot right below it (local.Id - 1) is allocated to the
+        // local writer and carries no file and no entry. A peer wearing this node's id and
+        // pushing that id hits exactly the claim refusal.
+        var storage = _factory.Services.GetRequiredService<StorageEngine>();
+        var local   = WriteAndFlush(storage, events: 8);
+        ulong reservedUnpublished = local.Id.Value - 1;
+
+        byte[] body = PeerSegmentBytes(new NodeId(0), reservedUnpublished, events: 4);
+        var response = await PushAsync(0, reservedUnpublished, body);
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+        Assert.Contains("own allocator has already handed out", await response.Content.ReadAsStringAsync());
+    }
+
+    /// <summary>
+    /// A segment body with a CHOSEN header identity — ForeignSegment cannot pick the id, its
+    /// engine's allocator does. The header is what the receiver keys on; the route only names
+    /// the file.
+    /// </summary>
+    private static byte[] PeerSegmentBytes(NodeId node, ulong segId, int events)
+    {
+        string tmp = Path.Combine(Path.GetTempPath(), "ameto-peerbytes-" + Guid.NewGuid().ToString("N")[..8] + ".seg");
+        var pool = new StringInternPool();
+        using var hot = new HotTierSegment(16, 1L << 20);
+        long baseTicks = DateTime.UtcNow.Ticks;
+        for (int i = 0; i < events; i++)
+            Assert.True(hot.TryWrite(new LogEventHeader
+            {
+                Id                       = new Ameto.Core.EventId(node.Value, (uint)i).RawValue,
+                TimestampUtcTicks        = baseTicks + i * TimeSpan.TicksPerMillisecond,
+                Level                    = Ameto.Core.LogLevel.Information,
+                MessageTemplatePoolIndex = pool.Intern("chosen {n}"),
+            }, ReadOnlySpan<byte>.Empty, "chosen {n}"));
+        hot.Freeze();
+        try
+        {
+            using (var writer = new SegmentWriter(tmp))
+            {
+                writer.WriteEvents(hot, pool);
+                writer.Finalise(node, new SegmentId(segId));
+            }
+            return File.ReadAllBytes(tmp);
+        }
+        finally { try { File.Delete(tmp); } catch { } }
+    }
+
+
+    /// <summary>
     /// A segment file produced by a DIFFERENT node, built by running a throwaway engine under
     /// that node's id — the header has to be genuine, because the receiving engine keys the
     /// catalog off what it reads out of the file and not off the route.

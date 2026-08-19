@@ -75,6 +75,16 @@ public sealed class SegmentReader : ISegmentReader
         if (!fi.Exists) throw new FileNotFoundException("Segment file not found", filePath);
 
         long fileSize = fi.Length;
+        // A file too short to hold even a footer is not a segment in any version this reader
+        // knows -- it is the torn write a power cut leaves behind. Named as corruption
+        // (InvalidDataException) so callers that quarantine on it can tell bytes from
+        // circumstance: without this guard a zero-byte file failed the MAPPING below with
+        // ArgumentException and a sub-footer file failed the footer read with
+        // ArgumentOutOfRangeException, neither of which names the file as the problem -- and
+        // the more torn the file, the more certainly it dodged the quarantine.
+        if (fileSize < 44)   // the footer is 44 bytes in every supported version
+            throw new InvalidDataException(
+                $"Segment file {filePath} is {fileSize} bytes -- too short to hold a segment footer; a torn or empty file.");
         var  mmf      = MemoryMappedFile.CreateFromFile(filePath, FileMode.Open, null, 0, MemoryMappedFileAccess.Read);
         MemoryMappedViewAccessor? view = null;
         try
