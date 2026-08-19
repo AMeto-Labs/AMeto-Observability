@@ -132,23 +132,35 @@ public sealed class ReplicationSegmentEndpointTests : IClassFixture<ReplicationW
     /// the table in docs/API.md used to explain 400 as "the body did not read as a segment"
     /// alone, which sends anyone debugging one of these looking at their bytes.</para>
     ///
-    /// <para>The second assertion is what proves the handler never ran, and it is the one that
-    /// carries the ordering: the body could not have been staged, because nothing in this
-    /// process ever looked at it. The response body is NOT asserted on — binding failures are
-    /// bare under a Production host and carry a framework <c>ProblemDetails</c> under a
+    /// <para>The STATUS is what carries the ordering, and it carries all of it: this client sends
+    /// no secret, so a handler that ran at all would answer 401 on its first line. 400 can only
+    /// mean the request never got there. The response body is NOT asserted on — binding failures
+    /// are bare under a Production host and carry a framework <c>ProblemDetails</c> under a
     /// Development one, and this harness is the second.</para>
+    ///
+    /// <para>The second assertion used to be <c>GetFiles(SegDir, "abc-*")</c>, credited in this
+    /// docstring with proving the handler never ran, and it could not fail: <c>{nodeId}</c> binds
+    /// as <c>uint</c> and the staging name is built from the BOUND value, so no execution of the
+    /// handler — before, during or after any reordering — can put the literal <c>abc</c> in that
+    /// directory. It would have gone on passing under exactly the change it was there to catch,
+    /// a binder relaxed to <c>string</c> for better diagnostics. What does catch that is the
+    /// directory as a whole: a handler that ran would stage a body under SOME name, and a total
+    /// that has not moved says none was staged whatever it would have been called.</para>
     /// </summary>
     [Fact]
     public async Task A_route_that_does_not_bind_is_refused_before_the_secret_is_checked()
     {
         using var anonymous = _factory.CreateClient();   // deliberately without X-Ameto-Replication
 
+        Directory.CreateDirectory(_factory.SegDir);
+        int before = Directory.GetFiles(_factory.SegDir).Length;
+
         var content = new ByteArrayContent([0xDE, 0xAD, 0xBE, 0xEF]);
         content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
         var response = await anonymous.PostAsync("/api/replication/segments/abc/1", content);
 
         Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
-        Assert.Empty(Directory.GetFiles(_factory.SegDir, "abc-*"));
+        Assert.Equal(before, Directory.GetFiles(_factory.SegDir).Length);
     }
 
     /// <summary>
