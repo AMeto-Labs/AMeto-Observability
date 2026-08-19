@@ -65,7 +65,29 @@ public static class ReplicationEndpointMapper
 
                 Directory.CreateDirectory(segDir);
 
-                var tmpPath = filePath + ".tmp";
+                // The final path comes from the route, because that is what identifies the
+                // segment. The STAGING path must not: two concurrent pushes to one
+                // {nodeId}/{segmentId} — a peer retrying, a peer re-pushing after a
+                // re-compression, or two peers misconfigured with one NodeId — computed the same
+                // temp name and wrote into the same file.
+                //
+                // That was survivable only while the endpoint renamed BEFORE handing the file
+                // over: the import read its metadata from the already-final path, so the catalog
+                // entry always described the bytes sitting under it. Once the rename moved into
+                // the engine, the two steps came apart. Request A finishes its body and closes
+                // the handle; A's import reads EventCount, the timestamp span and MinLevel out of
+                // the staged file and closes it; request B does File.Create on the same name —
+                // FileMode.Create, which TRUNCATES — and starts writing its own body; A then
+                // renames that file into place and registers what it read. The catalog describes
+                // A's segment and the bytes under the final path are B's partial body, and
+                // nothing looks wrong anywhere. On Windows the FileShare.None on File.Create
+                // turns the same overlap into a sharing violation instead — a 500 on a healthy
+                // push — so the failure is not even the same one on the two platforms we run on.
+                //
+                // The nonce is what MetricWriter uses for the same reason and the error handler
+                // below is the other half of it: a failing request deleted the temp name it
+                // computed, which under a shared name is another live push's staged body.
+                var tmpPath = StagingPath(segDir, nodeId, segmentId);
                 try
                 {
                     await using var file = File.Create(tmpPath);
@@ -117,6 +139,29 @@ public static class ReplicationEndpointMapper
                         $"Segment {nodeId}-{segmentId} could not be read as a segment file.",
                         statusCode: StatusCodes.Status400BadRequest);
             });
+    }
+
+    /// <summary>
+    /// Where one request stages its body: <c>{nodeId}-{segmentId}.{nonce}.seg.tmp</c>. The route
+    /// part is kept for a human reading the directory after a crash; the nonce is what makes the
+    /// name the REQUEST's rather than the route's, so concurrent pushes to one segment cannot
+    /// truncate, rename or delete each other's body.
+    ///
+    /// <para>Still ending in <c>.seg.tmp</c>, and deliberately: that is the pattern the boot
+    /// scan's sweep uses to collect bodies left behind by a process that died mid-push, and it is
+    /// also what keeps these files out of the <c>*.seg</c> enumeration that rebuilds the catalog.
+    /// Eight hex digits, as in <c>MetricWriter</c> — the names only have to be distinct among the
+    /// handful of pushes staged in one directory at one moment, and a shorter name is one a human
+    /// can still read.</para>
+    /// </summary>
+    private static string StagingPath(string segDir, uint nodeId, ulong segmentId)
+    {
+        // The nonce is formatted into the stack rather than taken through Guid.ToString("N") and
+        // a Substring, which would allocate two throwaway strings on the way to the two this
+        // builds (the name, then the combined path).
+        Span<char> nonce = stackalloc char[32];
+        Guid.NewGuid().TryFormat(nonce, out _, "N");
+        return Path.Combine(segDir, $"{nodeId}-{segmentId}.{nonce[..8]}.seg.tmp");
     }
 
     /// <summary>

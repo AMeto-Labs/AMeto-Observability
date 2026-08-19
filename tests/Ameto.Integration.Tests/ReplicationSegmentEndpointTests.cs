@@ -154,7 +154,107 @@ public sealed class ReplicationSegmentEndpointTests : IClassFixture<ReplicationW
 
         // ...and so does the disk.
         Assert.Equal(first, await File.ReadAllBytesAsync(path));
-        Assert.False(File.Exists(path + ".tmp"), "the refused body was left staged in the segments directory");
+        Assert.Empty(Directory.GetFiles(_factory.SegDir, "*.seg.tmp"));
+    }
+
+    /// <summary>
+    /// TWO PUSHES TO ONE ROUTE, AT ONCE. A peer retrying a request whose response it never saw,
+    /// or re-pushing a segment it has just re-compressed, sends the same (nodeId, segmentId)
+    /// twice with the two bodies in the air together. Both are legitimate, and the endpoint used
+    /// to give them one staging name — <c>filePath + ".tmp"</c>, derived from the route and
+    /// nothing else — so the second <c>File.Create</c> landed on the first request's file.
+    ///
+    /// <para>That was harmless while the endpoint renamed BEFORE calling the engine: the import
+    /// read its metadata from the final path, so whatever bytes ended up there were the bytes it
+    /// described. Moving the rename into the engine split the read from the rename and opened a
+    /// window between them — long enough for the other request to truncate the file that the
+    /// first one has already measured and is about to publish. What is registered then describes
+    /// one segment while the bytes under it are half of another, and nothing on either node looks
+    /// wrong. On Windows the same overlap is a sharing violation on <c>File.Create</c> instead,
+    /// which is a 500 on a healthy push; the fault is one bug with two faces, and the assertion
+    /// below — both accepted, one entry, and the file on disk equal to what was sent — is failed
+    /// by both of them.</para>
+    ///
+    /// <para>The overlap is arranged rather than hoped for: each body writes its first bytes,
+    /// waits until the other has done the same, and only then finishes. Both endpoints therefore
+    /// hold their staging file open at the same moment, which is the state a shared name cannot
+    /// survive and a per-request name does not notice.</para>
+    /// </summary>
+    [Fact]
+    public async Task Two_pushes_of_one_segment_in_flight_together_are_both_accepted()
+    {
+        var storage = _factory.Services.GetRequiredService<StorageEngine>();
+        var (bytes, id) = ForeignSegment(new NodeId(31), events: 9);
+
+        var overlap = new Rendezvous(parties: 2);
+        var first   = PushStreamedAsync(31, id, bytes, overlap);
+        var second  = PushStreamedAsync(31, id, bytes, overlap);
+
+        var responses = await Task.WhenAll(first, second);
+        Assert.All(responses, r => Assert.Equal(HttpStatusCode.NoContent, r.StatusCode));
+
+        // One entry, describing the segment that was actually sent...
+        var only = Assert.Single(storage.ListSegments(), s => s.NodeId.Value == 31 && s.Id.Value == id);
+        Assert.Equal(9u, only.EventCount);
+        Assert.Equal(Path.Combine(_factory.SegDir, $"31-{id}.seg"), only.FilePath);
+
+        // ...and the bytes under it are that segment, not a body one request truncated while the
+        // other was measuring it.
+        Assert.Equal(bytes, await File.ReadAllBytesAsync(only.FilePath));
+        Assert.Empty(Directory.GetFiles(_factory.SegDir, "*.seg.tmp"));
+    }
+
+    // ── Overlapping pushes ────────────────────────────────────────────────────
+
+    /// <summary>
+    /// A push whose body is delivered in two parts, pausing in the middle until every other
+    /// participant has reached the same point. The pause is what makes the overlap a fact instead
+    /// of a hope: a body small enough to leave in one write can be finished, imported and renamed
+    /// before the second request has opened anything, and then nothing is concurrent at all.
+    /// </summary>
+    private Task<HttpResponseMessage> PushStreamedAsync(uint node, ulong id, byte[] body, Rendezvous at)
+    {
+        var content = new HalfThenWaitContent(body, at);
+        content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+        return _client.PostAsync($"/api/replication/segments/{node}/{id}", content);
+    }
+
+    private sealed class HalfThenWaitContent(byte[] body, Rendezvous at) : HttpContent
+    {
+        protected override async Task SerializeToStreamAsync(Stream stream, TransportContext? context)
+        {
+            int head = Math.Max(1, body.Length / 8);
+            await stream.WriteAsync(body.AsMemory(0, head));
+            await stream.FlushAsync();
+
+            // The endpoint has this request's staging file open now, and will keep it open until
+            // the rest arrives.
+            await at.ArriveAsync();
+
+            await stream.WriteAsync(body.AsMemory(head));
+        }
+
+        protected override bool TryComputeLength(out long length)
+        {
+            length = body.Length;
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Releases everyone once <paramref name="parties"/> have arrived. Bounded, because a harness
+    /// that cannot overlap two requests must fail this test rather than hang it.
+    /// </summary>
+    private sealed class Rendezvous(int parties)
+    {
+        private readonly TaskCompletionSource _all = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _arrived;
+
+        public Task ArriveAsync()
+        {
+            if (Interlocked.Increment(ref _arrived) >= parties) _all.TrySetResult();
+            return _all.Task.WaitAsync(TimeSpan.FromSeconds(30));
+        }
     }
 
     // ── Segment bodies ────────────────────────────────────────────────────────
