@@ -61,15 +61,22 @@ public static class ReplicationEndpointMapper
             {
                 if (!PeerAuthorised(request, replicationOpts.Value)) return Results.Unauthorized();
 
-                // The body limit, decided before a byte of the body is read. Kestrel's default
-                // is 30 MB and this endpoint receives cold segments: a hot-tier flush starts
-                // from a 64 MB budget and the merge planner grows a file towards 512 MB of
-                // payload before LZ4, so the segments most worth replicating were exactly the
-                // ones that could not be. Over the limit the body read THROWS, and the catch
-                // below folded that into the 500 docs/API.md labels retryable — so a peer
-                // retried a body no retry could shrink, once per push attempt, for as long as
-                // the segment lived. Silent on both ends: the receiver reported a write it
-                // could not do, the sender saw a status its own contract told it to expect.
+                // The body limit, decided before a byte of the body is read. Kestrel's default is
+                // 30 MB, and what arrives here is a peer's hot-tier level segment: one flush
+                // starts from a 64 MB budget (HotTier.MaxSizeBytes, and configurable upward),
+                // writes one segment per level, and LZ4 is the only thing between that budget and
+                // this endpoint. A flush concentrated on one level, or carrying properties that
+                // do not compress, clears 30 MB without anything unusual happening.
+                //
+                // Over the limit the body read THROWS, and the catch below folded that into a
+                // 500. What that cost is not what the comment here used to say. There is no
+                // retry loop anywhere in Ameto.Replication: SegmentReplicator.OnSegmentFlushed
+                // fires once per flushed segment and does one fire-and-forget PushAsync per
+                // healthy peer, a non-success status is a LogWarning and the push is dropped.
+                // So the fault was the quieter one — a single push, one warning naming a status
+                // and no reason, and that segment never offered to that peer again. Permanent,
+                // silent non-replication of the largest segments this node produces, which the
+                // sender's contract told it to read as transient.
                 //
                 // Set per REQUEST rather than on the host, because this is the only endpoint
                 // that receives a file and MaxRequestBodySize on ConfigureKestrel would hand
@@ -118,13 +125,15 @@ public static class ReplicationEndpointMapper
                 catch (BadHttpRequestException tooLarge)
                     when (tooLarge.StatusCode == StatusCodes.Status413PayloadTooLarge)
                 {
-                    // Separated from the disk error below because the two ANSWERS differ, and
-                    // the answer is the whole content of a status code here. A disk error is
-                    // transient and the sender should come back; a body over the ceiling will
-                    // be over it every time, so the sender must stop and somebody must raise
+                    // Separated from the disk error below because the two ANSWERS differ, and the
+                    // answer is the whole content of a status code here. A disk error is
+                    // transient and the sender should come back; a body over the ceiling will be
+                    // over it every time, so the sender must stop and somebody must raise
                     // MaxSegmentBytes on this node. Folded together they were one 500 marked
-                    // "retry: yes", which turned the second case into an unbounded retry of a
-                    // request that could never be accepted.
+                    // "retry: yes", which is a published instruction to do the one thing that
+                    // cannot work — and this codebase's own sender does not retry at all, so what
+                    // it actually did with that instruction was log a status, drop the segment
+                    // and never mention it again.
                     try { File.Delete(tmpPath); } catch { /* ignore */ }
                     return Results.Problem(
                         $"Segment {nodeId}-{segmentId} is larger than this node accepts " +

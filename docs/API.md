@@ -506,9 +506,18 @@ built by `SegmentReplicator` always addresses the segment it is sending, so rout
 agree; a hand-made push need not, and this is the one place that shows.
 
 `413` is worth setting deliberately rather than leaving to the framework, whose own default is
-30 MB. A cold segment is routinely bigger: one hot-tier flush starts from a 64 MB budget and the
-merge planner grows a file towards 512 MB of payload before compression. The receiver raises the
-limit for this endpoint alone, and only after the secret matches.
+30 MB. What a peer pushes is a hot-tier **level segment** — replication is triggered by a flush
+publishing and by nothing else, so merged segments are not offered to peers — and one flush
+starts from a 64 MB budget (`Ameto:HotTier:MaxSizeBytes`, configurable upward) with LZ4 the only
+thing between that and the wire, so 30 MB is cleared without anything unusual happening. The
+default ceiling of 512 MB is the merge target measured before compression: larger than anything
+this system builds, so a legitimate body is never what it refuses. The receiver raises the limit
+for this endpoint alone, and only after the secret matches.
+
+The `Retry?` column states what a sender **should** do, not what this one does. `SegmentReplicator`
+pushes each segment once per healthy peer, fire-and-forget; a non-success status is logged as a
+warning and that segment is not offered to that peer again. So `500` is retryable in the sense
+that the same bytes would land, not in the sense that this implementation will resend them.
 
 ---
 
