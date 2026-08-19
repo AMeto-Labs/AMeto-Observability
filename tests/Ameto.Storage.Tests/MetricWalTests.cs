@@ -494,6 +494,182 @@ public sealed class MetricWalTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// The OTHER end of the same fault, and the one a refusal to begin cannot reach: the log
+    /// was healthy when the flush opened its generation and lost its mapping while the files
+    /// were being written. There is no flush to refuse by then — there is a caller holding
+    /// finished .mts files and asking whether the watermark now covers them.
+    ///
+    /// <para>The answer was NOTHING, which reads exactly like the answer a successful commit
+    /// gives. So the flush published its files, logged a debug line and moved on, while the
+    /// generation's records sat in the log above an unchanged watermark: the next start
+    /// replayed every one of those points beside the file that already held them, and the start
+    /// after that did it again. Metric points are summed, so that is not a visible artefact but
+    /// a wrong number, once per start for as long as the state lasts.</para>
+    ///
+    /// <para>Asserted here as the two facts a caller needs and could not previously tell apart:
+    /// the commit says <c>Refused</c>, and the records it refused to reclaim are still whole —
+    /// which is what makes the caller's files the deletable copy rather than the only one.</para>
+    /// </summary>
+    [Fact]
+    public void A_commit_that_cannot_move_the_watermark_refuses_and_keeps_its_records()
+    {
+        long baseNano = 1_700_000_000_000_000_000L;
+
+        using var wal = MetricWriteAheadLog.Open(WalPath, 64 * 1024);   // ~1 365 entries
+        for (int i = 0; i < 3; i++) Append(wal, Scalar("m", baseNano + i, i));
+
+        // A flush the log was perfectly able to open. Its .mts files are written from here.
+        ulong flushing = wal.BeginFlush();
+        long  logged   = wal.WrittenBytes;
+
+        File.SetAttributes(WalPath, FileAttributes.ReadOnly);
+        try
+        {
+            var grew = Record.Exception(() =>
+            {
+                for (int i = 1; i < 5_000; i++) Append(wal, Scalar("m", baseNano + i, i));
+            });
+            Assert.NotNull(grew);   // setup: the mapping is gone, mid-flush
+
+            Assert.Equal(MetricWalCommit.Refused, wal.CommitFlush(flushing));
+
+            // Nothing was reclaimed, so the generation is still replayable in full. This is the
+            // half the argument for deleting the files rests on: the log's copy is whole, so
+            // removing the flush's copy leaves the points durable exactly once rather than none.
+            Assert.True(wal.WrittenBytes >= logged,
+                "the refused commit reclaimed records it had not covered by a watermark");
+        }
+        finally { File.SetAttributes(WalPath, FileAttributes.Normal); }
+    }
+
+    /// <summary>
+    /// The same answer from a log that is closed rather than unmapped — the shape shutdown
+    /// used to produce, where a flush outlived the teardown and committed into a disposed log.
+    /// </summary>
+    [Fact]
+    public void A_commit_into_a_closed_log_refuses()
+    {
+        long baseNano = 1_700_000_000_000_000_000L;
+
+        var wal = MetricWriteAheadLog.Open(WalPath);
+        for (int i = 0; i < 3; i++) Append(wal, Scalar("m", baseNano + i, i));
+
+        ulong flushing = wal.BeginFlush();
+        wal.Dispose();
+
+        Assert.Equal(MetricWalCommit.Refused, wal.CommitFlush(flushing));
+
+        // The records went nowhere: Dispose unmaps, it does not truncate, so a reopened log
+        // still replays the generation the commit could not cover.
+        using var reopened = MetricWriteAheadLog.Open(WalPath);
+        Assert.Equal(3, reopened.ReadAll(out _).Count);
+    }
+
+    /// <summary>
+    /// The positive half, without which "Refused" carries no information: a commit that moves
+    /// the watermark says <c>Committed</c>, and so does one whose generation the watermark
+    /// already covers — the caller's points are in files either way, and the second must not be
+    /// mistaken for the failure that makes it delete them.
+    /// </summary>
+    [Fact]
+    public void A_commit_that_covers_its_generation_says_so_even_when_it_reclaims_nothing()
+    {
+        long baseNano = 1_700_000_000_000_000_000L;
+
+        using var wal = MetricWriteAheadLog.Open(WalPath);
+        for (int i = 0; i < 3; i++) Append(wal, Scalar("m", baseNano + i, i));
+
+        ulong first = wal.BeginFlush();
+        Assert.Equal(MetricWalCommit.Committed, wal.CommitFlush(first));
+        Assert.Equal(0, wal.WrittenBytes);
+
+        // Already at or below the watermark, so there is nothing to reclaim and nothing to
+        // regret. Answering Refused here would tell a flush to delete files that ARE the
+        // durable copy, which is loss rather than the duplicate the answer exists to prevent.
+        Assert.Equal(MetricWalCommit.Committed, wal.CommitFlush(first));
+    }
+
+    /// <summary>
+    /// The same fault end to end, and the reason a returned value was worth the change: a flush
+    /// that opened its generation on a healthy log, wrote its <c>.mts</c>, and found the log
+    /// unmapped by the time it came to commit. Nothing about it is a failed flush — the file is
+    /// complete at its final path — so nothing puts the points back and nothing throws.
+    ///
+    /// <para>What that used to leave is two copies of every point in it: the file, and the
+    /// generation's records sitting in the log above a watermark that never moved. The next
+    /// start replays the second beside the first, and metric points are SUMMED, so the result
+    /// is not a visible duplicate row but a counter and a sum that are both twice what was
+    /// measured — every start, for as long as those records last. It was argued to be
+    /// unavoidable. It is not: a duplicate needs two copies, the reclaim never ran, so the
+    /// log's copy is whole and the flush's is the deletable one.</para>
+    ///
+    /// <para>Driven by filling the log to within a few thousand entries of its capacity and
+    /// then, from the seam that fires once the file is in place, making <c>metrics.wal</c>
+    /// read-only and ingesting past the end of it. <c>Grow</c> unmaps before it extends and can
+    /// re-map neither, which is the production state exactly: alive, unmapped, refusing every
+    /// append, with a flush's generation still open. The count is taken from a SECOND engine
+    /// over the same directory, because the question is what a restart sees.</para>
+    /// </summary>
+    [Fact]
+    public async Task A_flush_whose_commit_is_refused_leaves_its_points_in_exactly_one_place()
+    {
+        var logger = new RecordingLogger();
+        var engine = NewEngine(logger: logger);
+        long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+
+        // 48 bytes an entry against an 8 MB log: this leaves ~14 000 entries of room, and none
+        // of it is reclaimed before the commit that never happens.
+        const int flushed = 160_000;
+        var batch = new MetricIngestItem[10_000];
+        for (int done = 0; done < flushed; done += batch.Length)
+        {
+            for (int i = 0; i < batch.Length; i++)
+                batch[i] = Scalar("flushed.metric", baseNano + (done + i) * 1_000L, 1.0,
+                                  Labels(("series", (i & 15).ToString())));
+            engine.Ingest(batch);
+        }
+
+        try
+        {
+            engine.OnFileWrittenForTest = _ =>
+            {
+                File.SetAttributes(WalPath, FileAttributes.ReadOnly);
+
+                // Past the capacity, so the append underneath has to Grow — and cannot. The
+                // throw is this batch's, not the flush's: ingest fails honestly from here,
+                // which is the loud half of the fault and not what is under test. Swallowed
+                // whatever it is (Grow rethrows the file system's own refusal), because a
+                // throw OUT of this seam is a failed write, and a failed write is the other
+                // path entirely — it restores, abandons, and never reaches a commit.
+                var poison = new MetricIngestItem[20_000];
+                for (int i = 0; i < poison.Length; i++)
+                    poison[i] = Scalar("poison.metric", baseNano + i * 1_000L, 1.0);
+                try { engine.Ingest(poison); } catch { /* the log is dead; that is the setup */ }
+            };
+
+            await engine.ScheduleThresholdFlushForTest();
+
+            // The flush's own file is gone, and it never reached the cold list either.
+            Assert.Empty(Directory.GetFiles(_dir, "*.mts"));
+            Assert.True(logger.Saw(Microsoft.Extensions.Logging.LogLevel.Error,
+                    "Metric log refused to commit generation", out _),
+                "the commit went nowhere and nothing said so");
+        }
+        finally
+        {
+            engine.OnFileWrittenForTest = null;
+            File.SetAttributes(WalPath, FileAttributes.Normal);
+        }
+
+        await engine.DisposeAsync();
+
+        // What the restart sees. Pre-fix this is 320 000 — the file the flush published plus
+        // the generation the log replays beside it.
+        long durable = await DurablePointsAsync(_dir, "flushed.metric");
+        Assert.True(durable == flushed, Verdict(durable, flushed));
+    }
+
+    /// <summary>
     /// The failure path's exit. A flush whose files threw puts its points back into the hot tier
     /// WITHOUT re-logging them, so its records are what keeps them durable until a later flush
     /// carries them — the generation is abandoned, never committed. Without an explicit
@@ -1625,9 +1801,10 @@ public sealed class MetricWalTests : IAsyncLifetime
     /// scheduled from <c>Ingest</c> with <c>_ = ScheduleThresholdFlush()</c>, because an ingest
     /// call cannot wait on a flush. So a guard against silent loss reported itself in silence:
     /// no log line, no rethrow, nothing but a <c>TaskScheduler.UnobservedTaskException</c> at
-    /// some later finalisation. And the state it guards is not transient — <c>CommitFlush</c>
-    /// under <c>_disposed</c> returns before clearing the open flush, so once entered it holds
-    /// for the life of the process and every later flush throws into the same void.
+    /// some later finalisation. And the state it guards was not transient — <c>CommitFlush</c>
+    /// tested the closed or unmapped log BEFORE clearing the open flush, so a flush that
+    /// reached it left the flag standing and every later flush threw into the same void for
+    /// the life of the process. The clear comes first now; the reporting is what this pins.
     ///
     /// <para>Driven through the real crossing rather than the test hook, since the discarded
     /// task is <c>Ingest</c>'s: 500 000 points, which is <c>HotFlushThreshold</c> exactly.</para>

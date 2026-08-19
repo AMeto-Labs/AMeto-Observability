@@ -140,10 +140,13 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     //   • tier EMPTY (ingest quiesced): the final flush returns before opening a generation,
     //     so G is never superseded, stays uncommitted, and is replayed next start beside the
     //     file the orphan did manage to write — duplicates.
-    // Nothing warns about either. MetricWriteAheadLog.CommitFlush returns silently once the
-    // log is disposed, so the catch around it never fires; and in the more common
-    // interleaving the commit is not even reached, because _coldLock.EnterWriteLock() throws
-    // ObjectDisposedException first and the restore path re-enters the other disposed lock.
+    // Nothing warned about either. MetricWriteAheadLog.CommitFlush returned NOTHING once the
+    // log was disposed — indistinguishable from a commit that moved the watermark — so the
+    // catch around it never fired; and in the more common interleaving the commit is not even
+    // reached, because _coldLock.EnterWriteLock() throws ObjectDisposedException first and the
+    // restore path re-enters the other disposed lock. The silence is gone: the commit answers
+    // MetricWalCommit, and a Refused answer takes the flush's own files back rather than
+    // leaving them to be replayed beside (see UnwriteRefusedFlush).
     //
     // Tracking the orphan fixed its LIFETIME — shutdown waits for it. The first bullet's loss
     // needed the other half too, and did not stop at shutdown: any periodic flush overlapping
@@ -409,9 +412,11 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         // caller is Ingest, which discards it. A throw out of FlushHotTierAsync therefore went
         // nowhere — no log line, no rethrow, nothing but a TaskScheduler.UnobservedTaskException
         // at some later finalisation, which no deployment reads. The tripwire this PR added to
-        // BeginFlush is exactly such a throw, and CommitFlush under _disposed returns before
-        // clearing the open flush, so once that state is entered every later flush hits it for
-        // the life of the process. Silence was the whole cost.
+        // BeginFlush is exactly such a throw, and it used to be permanent: CommitFlush tested
+        // the dead log before clearing the open flush, so a flush that reached it left the flag
+        // standing and every later flush hit the tripwire for the life of the process. The
+        // clear now comes first and only the ownership test precedes it; the reporting below
+        // is what makes either state visible at all. Silence was the whole cost.
         //
         // Reading t.Exception is also what marks it observed, so the discarded task above is no
         // longer a finaliser-time surprise. The task is still handed back to whoever called,
@@ -898,8 +903,20 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                 // logging it, not by throwing at whoever scheduled it.
                 try
                 {
-                    _wal.CommitFlush(flushedGeneration);
+                    var commit = _wal.CommitFlush(flushedGeneration);
                     generationOpened = false;
+
+                    // The commit could not move the watermark, so the sentence above stops
+                    // being true for this flush alone: the log still holds this generation,
+                    // intact and uncompacted, and the files just written are a SECOND copy of
+                    // points it will replay at the next start. Nothing below may publish them
+                    // and this one must take them back — a duplicate needs two copies, and
+                    // this is the last moment anything knows which of the two is the spare.
+                    if (commit == MetricWalCommit.Refused)
+                    {
+                        UnwriteRefusedFlush(infos, flushedGeneration);
+                        return;
+                    }
 
                     _coldLock.EnterWriteLock();
                     try { _coldSegments.AddRange(infos); }
@@ -910,6 +927,11 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                 }
                 catch (Exception ex)
                 {
+                    // A throw out of CommitFlush cannot mean "not committed" — the log throws
+                    // only from past its watermark store, and refuses by returning — so these
+                    // files ARE the durable copy and the branch above must not be reached from
+                    // here. Keeping them, unpublished, costs visibility until the next start's
+                    // LoadColdSegments picks them up off the disk.
                     _logger.LogError(ex,
                         "Metric flush wrote {FileCount} .mts file(s) but failed afterwards; the points are " +
                         "durable in those files and are NOT returned to the hot tier", infos.Count);
@@ -927,6 +949,56 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
             }
         }
         finally { _flushGate.Release(); }
+    }
+
+    /// <summary>
+    /// Removes the files of a flush whose generation the log could not commit, so the points
+    /// they hold are durable exactly ONCE — in the log, which still carries the generation's
+    /// records below an unchanged watermark and replays them at the next start.
+    ///
+    /// <para>The alternative was doing nothing, which is what used to happen and what was
+    /// argued to be unavoidable: leave the files and let the replay add the same points a
+    /// second time. It is not unavoidable, because a duplicate needs two copies and this one
+    /// is deletable — the reclaim never ran (it is on the far side of the watermark store the
+    /// commit did not reach), so the log's copy is whole. Nor is it cheap to leave: metric
+    /// points are summed, so a doubled counter is not a visible artefact but a wrong number,
+    /// and it recurs at every start for as long as the log keeps those records. Deleting a
+    /// file whose points are durable elsewhere is the move retention already makes in
+    /// <see cref="PruneAsync"/>.</para>
+    ///
+    /// <para>What it costs is visibility until that start: the points have left the hot tier,
+    /// their files are gone, and nothing reads the log except recovery. That is the right side
+    /// to err on and the window is bounded by the fault itself — a log with no mapping refuses
+    /// every append, so ingest is already failing loudly and this process is not long for the
+    /// world. Said out loud in the log line, because an operator who sees a gap needs to know
+    /// it closes on restart rather than staying a hole.</para>
+    /// </summary>
+    private void UnwriteRefusedFlush(List<MetricSegmentInfo> infos, ulong flushedGeneration)
+    {
+        int kept = 0;
+        foreach (var info in infos)
+        {
+            try { File.Delete(info.FilePath); }
+            catch (Exception ex)
+            {
+                kept++;
+                _logger.LogError(ex,
+                    "Could not remove {File}, whose points the metric log still holds under generation " +
+                    "{Generation}; they will be replayed beside it and counted twice", info.FilePath, flushedGeneration);
+            }
+        }
+
+        if (kept == 0)
+            _logger.LogError(
+                "Metric log refused to commit generation {Generation}: it is closed or has lost its mapping, " +
+                "so the watermark did not move. The {FileCount} .mts file(s) this flush wrote have been " +
+                "removed and their points stay durable in the log alone — they are replayed, and visible " +
+                "again, at the next start", flushedGeneration, infos.Count);
+        else
+            _logger.LogError(
+                "Metric log refused to commit generation {Generation} and {Kept} of {FileCount} .mts file(s) " +
+                "could not be removed; the points those files hold are also in the log and will be counted " +
+                "twice from the next start", flushedGeneration, kept, infos.Count);
     }
 
     // ── Rollup ────────────────────────────────────────────────────────────────
