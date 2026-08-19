@@ -164,6 +164,12 @@ public sealed class ReplicationSegmentEndpointTests : IClassFixture<ReplicationW
     /// exceed. Hence a stub feature and an assertion on what the endpoint wrote into it: a
     /// build that stopped raising the limit, or raised it to the wrong number, fails here even
     /// though no oversized body can be sent.</para>
+    ///
+    /// <para>The ENFORCEMENT is what is out of reach, not the answer to it. What the endpoint
+    /// replies once Kestrel has thrown is reachable and is pinned separately — see
+    /// <see cref="A_body_over_the_ceiling_is_refused_as_413_and_not_as_a_retryable_500"/>. Reading
+    /// the sentence above as covering both is what left the 413 mapping with no test for two
+    /// review rounds.</para>
     /// </summary>
     [Fact]
     public async Task The_endpoint_raises_the_body_limit_to_the_configured_maximum()
@@ -195,6 +201,74 @@ public sealed class ReplicationSegmentEndpointTests : IClassFixture<ReplicationW
     {
         public bool  IsReadOnly          => false;
         public long? MaxRequestBodySize  { get; set; } = 30_000_000;   // the framework's own default
+    }
+
+    /// <summary>
+    /// The ANSWER to an oversized body, which is a different thing from the ceiling above and was
+    /// pinned by nothing. The test above asserts the number the endpoint hands Kestrel; this one
+    /// asserts what the endpoint says when Kestrel enforces it — a distinct terminal status with
+    /// its own text and its own retry semantics, published in docs/API.md.
+    ///
+    /// <para>The comment on the test above says the enforcement "cannot be reached from here at
+    /// all", which is true of the enforcement and false of the response mapping. Kestrel signals
+    /// an over-long body by throwing <c>BadHttpRequestException</c> with status 413 OUT OF THE
+    /// BODY READ, and a body whose read throws exactly that is a body this harness can supply. So
+    /// the seam is the same one the ceiling test uses, and what it reaches is the catch filter.</para>
+    ///
+    /// <para>Worth its own test because the whole content of the fix is which status comes back:
+    /// a reordered catch clause, a dropped <c>when</c> filter, or an exception-handling middleware
+    /// that intercepts <c>BadHttpRequestException</c> first would put every oversized push back on
+    /// the 500 the contract marks RETRYABLE — the exact regression this branch exists to prevent
+    /// — with the whole suite still green. Deleting the filter (<c>when (false)</c>) leaves
+    /// Ameto.Integration.Tests at Failed 0, Passed 101 without this test, and fails here with
+    /// Expected 413 / Actual 500 with it.</para>
+    /// </summary>
+    [Fact]
+    public async Task A_body_over_the_ceiling_is_refused_as_413_and_not_as_a_retryable_500()
+    {
+        var ctx = await _factory.Server.SendAsync(ctx =>
+        {
+            ctx.Request.Method      = HttpMethods.Post;
+            ctx.Request.Path        = "/api/replication/segments/9/4244";
+            ctx.Request.ContentType = "application/octet-stream";
+            ctx.Request.Headers["X-Ameto-Replication"] = ReplicationWebAppFactory.Secret;
+            ctx.Request.Body = new RefusesToRead();
+        });
+
+        Assert.Equal(StatusCodes.Status413PayloadTooLarge, ctx.Response.StatusCode);
+
+        // The staged body is unlinked on this path too. It matters more here than on the disk-error
+        // path: the sender is being told not to come back, so nothing else will ever arrive to
+        // overwrite what a failed push left in the segments directory.
+        Assert.Empty(Directory.GetFiles(_factory.SegDir, "9-4244.*"));
+    }
+
+    /// <summary>
+    /// A request body that fails the way Kestrel fails one over <c>MaxRequestBodySize</c>: not a
+    /// short read and not an <c>IOException</c>, but <c>BadHttpRequestException</c> carrying 413,
+    /// thrown out of the read itself. That is the only shape the endpoint's catch filter matches,
+    /// so standing in for it is what makes the assertion about the real branch.
+    /// </summary>
+    private sealed class RefusesToRead : Stream
+    {
+        public override bool CanRead  => true;
+        public override bool CanSeek  => false;
+        public override bool CanWrite => false;
+        public override long Length   => throw new NotSupportedException();
+        public override long Position { get => 0; set => throw new NotSupportedException(); }
+
+        public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct = default) =>
+            throw new BadHttpRequestException(
+                "Request body too large.", StatusCodes.Status413PayloadTooLarge);
+
+        public override int Read(byte[] buffer, int offset, int count) =>
+            throw new BadHttpRequestException(
+                "Request body too large.", StatusCodes.Status413PayloadTooLarge);
+
+        public override void Flush() { }
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+        public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
     }
 
     /// <summary>
