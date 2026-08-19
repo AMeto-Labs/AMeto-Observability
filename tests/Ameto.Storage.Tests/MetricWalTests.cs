@@ -28,6 +28,19 @@ public sealed class MetricWalTests : IAsyncLifetime
     /// </summary>
     private readonly List<MetricStorageEngine> _engines = [];
 
+    /// <summary>
+    /// The same registry for the logs a test opens DIRECTLY, which the engine registry above does
+    /// not cover and which leak by exactly the same mechanism. Most tests in this class never
+    /// build an engine at all — they drive <see cref="MetricWriteAheadLog"/> itself and close it
+    /// with a bare <c>wal.Dispose()</c> standing below their assertions, so a red assertion walks
+    /// past it and leaves the log mapped. Measured: <c>Assert.Fail</c> one line above the dispose
+    /// in <see cref="An_abandoned_flush_frees_the_log_to_flush_again_and_keeps_its_records"/> and
+    /// the run leaves an 8.1 MB <c>ameto-mwal-*</c> directory behind — <c>metrics.wal</c> at its
+    /// 8 MiB default capacity, plus the pool — because <see cref="Directory.Delete(string,bool)"/>
+    /// cannot remove a mapped file and the <c>catch { }</c> below says nothing about failing.
+    /// </summary>
+    private readonly List<MetricWriteAheadLog> _wals = [];
+
     public Task InitializeAsync()
     {
         Directory.CreateDirectory(_dir);
@@ -36,6 +49,11 @@ public sealed class MetricWalTests : IAsyncLifetime
 
     public async Task DisposeAsync()
     {
+        // The raw handles first: they map the same file an engine's final flush is about to
+        // write, and a closed one cannot be in its way.
+        for (int i = _wals.Count - 1; i >= 0; i--)
+            try { _wals[i].Dispose(); } catch { }
+
         // Reverse order: a test's later engines are the ones reading what its earlier ones wrote.
         for (int i = _engines.Count - 1; i >= 0; i--)
             try { await _engines[i].DisposeAsync(); } catch { }
@@ -55,6 +73,21 @@ public sealed class MetricWalTests : IAsyncLifetime
         var engine = new MetricStorageEngine(dir ?? _dir, logger ?? NullLogger<MetricStorageEngine>.Instance);
         _engines.Add(engine);
         return engine;
+    }
+
+    /// <summary>
+    /// The only way this class opens a log, for the same reason and with the same tolerance:
+    /// <see cref="MetricWriteAheadLog.Dispose"/> returns on a closed log, so a test that closes
+    /// its own mid-body — which most of them must, since reopening the file is how they assert
+    /// what replays — pays nothing for being closed again at the end.
+    /// </summary>
+    private MetricWriteAheadLog OpenWal(long? initialCapacity = null)
+    {
+        var wal = initialCapacity is { } capacity
+            ? MetricWriteAheadLog.Open(WalPath, capacity)
+            : MetricWriteAheadLog.Open(WalPath);
+        _wals.Add(wal);
+        return wal;
     }
 
     private string WalPath  => Path.Combine(_dir, "metrics.wal");
@@ -111,12 +144,12 @@ public sealed class MetricWalTests : IAsyncLifetime
     {
         var labels = Labels(("service", "MintRoute.API"), ("route", "/api/pay"));
 
-        var wal = MetricWriteAheadLog.Open(WalPath);
+        var wal = OpenWal();
         for (int i = 0; i < 20; i++)
             Append(wal, Scalar("http.server.duration", 1_700_000_000_000_000_000L + i * 1_000_000L, i * 1.5, labels));
         wal.Dispose();
 
-        var reopened = MetricWriteAheadLog.Open(WalPath);
+        var reopened = OpenWal();
         var replayed = reopened.ReadAll(out int unresolved);
         reopened.Dispose();
 
@@ -140,7 +173,7 @@ public sealed class MetricWalTests : IAsyncLifetime
         var bounds  = new[] { 1.0, 5.0, 10.0, 50.0 };
         var buckets = new long[] { 3, 9, 4, 1, 0 };   // bounds.Length + 1
 
-        var wal = MetricWriteAheadLog.Open(WalPath);
+        var wal = OpenWal();
         Append(wal, new MetricIngestItem
         {
             Name              = "http.server.request.duration",
@@ -155,7 +188,7 @@ public sealed class MetricWalTests : IAsyncLifetime
         });
         wal.Dispose();
 
-        var reopened = MetricWriteAheadLog.Open(WalPath);
+        var reopened = OpenWal();
         var replayed = reopened.ReadAll(out _);
         reopened.Dispose();
 
@@ -175,7 +208,7 @@ public sealed class MetricWalTests : IAsyncLifetime
         // 500 points that follow reference it by index.
         var labels = Labels(("service", "MintRoute.API"), ("pod", "a-very-long-pod-name-0123456789"));
 
-        var wal = MetricWriteAheadLog.Open(WalPath);
+        var wal = OpenWal();
         for (int i = 0; i < 500; i++)
             Append(wal, Scalar("cpu.utilisation", 1_700_000_000_000_000_000L + i, i, labels));
         long walBytes = wal.WrittenBytes;
@@ -186,7 +219,7 @@ public sealed class MetricWalTests : IAsyncLifetime
         Assert.Equal(500 * 48, walBytes);      // fixed 48-byte entries, no per-point labels
         Assert.True(poolBytes < 200, $"pool should hold one record, got {poolBytes} B");
 
-        var reopened = MetricWriteAheadLog.Open(WalPath);
+        var reopened = OpenWal();
         Assert.Equal(500, reopened.ReadAll(out _).Count);
         reopened.Dispose();
     }
@@ -197,13 +230,13 @@ public sealed class MetricWalTests : IAsyncLifetime
         var a = Labels(("route", "/a"));
         var b = Labels(("route", "/b"));
 
-        var wal = MetricWriteAheadLog.Open(WalPath);
+        var wal = OpenWal();
         Append(wal, Scalar("req.count", 1_700_000_000_000_000_000L, 1, a));
         Append(wal, Scalar("req.count", 1_700_000_000_000_000_001L, 2, b));
         Append(wal, Scalar("req.count", 1_700_000_000_000_000_002L, 3, a));
         wal.Dispose();
 
-        var reopened = MetricWriteAheadLog.Open(WalPath);
+        var reopened = OpenWal();
         var replayed = reopened.ReadAll(out _);
         reopened.Dispose();
 
@@ -219,12 +252,12 @@ public sealed class MetricWalTests : IAsyncLifetime
     [Fact]
     public void A_committed_flush_drops_everything_it_covered()
     {
-        var wal = MetricWriteAheadLog.Open(WalPath);
+        var wal = OpenWal();
         for (int i = 0; i < 10; i++) Append(wal, Scalar("m", 1_700_000_000_000_000_000L + i, i));
         wal.CommitFlush(wal.BeginFlush());
         wal.Dispose();
 
-        var reopened = MetricWriteAheadLog.Open(WalPath);
+        var reopened = OpenWal();
         Assert.Empty(reopened.ReadAll(out _));
         reopened.Dispose();
 
@@ -241,7 +274,7 @@ public sealed class MetricWalTests : IAsyncLifetime
     {
         long baseNano = 1_700_000_000_000_000_000L;
 
-        var wal = MetricWriteAheadLog.Open(WalPath);
+        var wal = OpenWal();
         for (int i = 0; i < 5; i++) Append(wal, Scalar("m", baseNano + i, i));   // in the snapshot
 
         ulong flushing = wal.BeginFlush();
@@ -250,7 +283,7 @@ public sealed class MetricWalTests : IAsyncLifetime
         wal.CommitFlush(flushing);
         wal.Dispose();
 
-        var reopened = MetricWriteAheadLog.Open(WalPath);
+        var reopened = OpenWal();
         var replayed = reopened.ReadAll(out int unresolved);
         reopened.Dispose();
 
@@ -263,13 +296,13 @@ public sealed class MetricWalTests : IAsyncLifetime
     {
         long baseNano = 1_700_000_000_000_000_000L;
 
-        var wal = MetricWriteAheadLog.Open(WalPath);
+        var wal = OpenWal();
         for (int i = 0; i < 5; i++) Append(wal, Scalar("m", baseNano + i, i));
         wal.BeginFlush();                                             // files failed to write
         for (int i = 5; i < 8; i++) Append(wal, Scalar("m", baseNano + i, i));
         wal.Dispose();
 
-        var reopened = MetricWriteAheadLog.Open(WalPath);
+        var reopened = OpenWal();
         var replayed = reopened.ReadAll(out _);
         reopened.Dispose();
 
@@ -284,7 +317,7 @@ public sealed class MetricWalTests : IAsyncLifetime
         // the generation, never off the data's own clock.
         const long flushed = 1_700_000_000_000_000_000L;
 
-        var wal = MetricWriteAheadLog.Open(WalPath);
+        var wal = OpenWal();
         Append(wal, Scalar("m", flushed, 1));
         ulong gen = wal.BeginFlush();
         wal.CommitFlush(gen);
@@ -293,7 +326,7 @@ public sealed class MetricWalTests : IAsyncLifetime
         Append(wal, Scalar("m", flushed + 1_000_000_000L,  3));
         wal.Dispose();
 
-        var reopened = MetricWriteAheadLog.Open(WalPath);
+        var reopened = OpenWal();
         var values   = reopened.ReadAll(out _).Select(r => r.Point.Value).OrderBy(v => v).ToArray();
         reopened.Dispose();
 
@@ -311,7 +344,7 @@ public sealed class MetricWalTests : IAsyncLifetime
         long baseNano = 1_700_000_000_000_000_000L;
         long offsetBeforeCommit;
 
-        var wal = MetricWriteAheadLog.Open(WalPath);
+        var wal = OpenWal();
         for (int i = 0; i < 6; i++) Append(wal, Scalar("m", baseNano + i, i));      // snapshot
         ulong flushing = wal.BeginFlush();
         for (int i = 6; i < 10; i++) Append(wal, Scalar("m", baseNano + i, i));     // survivors
@@ -326,7 +359,7 @@ public sealed class MetricWalTests : IAsyncLifetime
             fs.Write(BitConverter.GetBytes(32L + offsetBeforeCommit));
         }
 
-        var reopened = MetricWriteAheadLog.Open(WalPath);
+        var reopened = OpenWal();
         var values   = reopened.ReadAll(out _).Select(r => r.Point.Value).OrderBy(v => v).ToArray();
         reopened.Dispose();
 
@@ -336,7 +369,7 @@ public sealed class MetricWalTests : IAsyncLifetime
     [Fact]
     public void Repeated_flush_cycles_keep_the_log_and_pool_bounded()
     {
-        var wal = MetricWriteAheadLog.Open(WalPath);
+        var wal = OpenWal();
         for (int cycle = 0; cycle < 50; cycle++)
         {
             for (int i = 0; i < 100; i++)
@@ -370,7 +403,7 @@ public sealed class MetricWalTests : IAsyncLifetime
     {
         long baseNano = 1_700_000_000_000_000_000L;
 
-        var wal = MetricWriteAheadLog.Open(WalPath);
+        var wal = OpenWal();
         for (int i = 0; i < 5; i++) Append(wal, Scalar("m", baseNano + i, i));
         _ = wal.BeginFlush();                                 // flush A — still writing its files
         for (int i = 5; i < 9; i++) Append(wal, Scalar("m", baseNano + i, i));
@@ -388,7 +421,7 @@ public sealed class MetricWalTests : IAsyncLifetime
         Assert.Equal(bytesBefore, wal.WrittenBytes);          // not one record reclaimed
         wal.Dispose();
 
-        var reopened = MetricWriteAheadLog.Open(WalPath);
+        var reopened = OpenWal();
         var values   = reopened.ReadAll(out _).Select(r => r.Point.Value).OrderBy(v => v).ToArray();
         reopened.Dispose();
 
@@ -406,7 +439,7 @@ public sealed class MetricWalTests : IAsyncLifetime
     {
         long baseNano = 1_700_000_000_000_000_000L;
 
-        var wal = MetricWriteAheadLog.Open(WalPath);
+        var wal = OpenWal();
         for (int i = 0; i < 5; i++) Append(wal, Scalar("m", baseNano + i, i));
         ulong first = wal.BeginFlush();
         for (int i = 5; i < 9; i++) Append(wal, Scalar("m", baseNano + i, i));
@@ -420,7 +453,7 @@ public sealed class MetricWalTests : IAsyncLifetime
         Assert.True(wal.WrittenBytes < bytesBefore);
         wal.Dispose();
 
-        var reopened = MetricWriteAheadLog.Open(WalPath);
+        var reopened = OpenWal();
         var values   = reopened.ReadAll(out _).Select(r => r.Point.Value).OrderBy(v => v).ToArray();
         reopened.Dispose();
 
@@ -435,7 +468,7 @@ public sealed class MetricWalTests : IAsyncLifetime
     [Fact]
     public void The_log_refuses_to_open_a_second_flush_while_one_is_writing()
     {
-        var wal = MetricWriteAheadLog.Open(WalPath);
+        var wal = OpenWal();
         Append(wal, Scalar("m", 1_700_000_000_000_000_000L, 1));
 
         ulong open = wal.BeginFlush();
@@ -469,7 +502,7 @@ public sealed class MetricWalTests : IAsyncLifetime
     {
         long baseNano = 1_700_000_000_000_000_000L;
 
-        using var wal = MetricWriteAheadLog.Open(WalPath, 64 * 1024);   // ~1 365 entries
+        using var wal = OpenWal(64 * 1024);   // ~1 365 entries
         Append(wal, Scalar("m", baseNano, 1));
 
         File.SetAttributes(WalPath, FileAttributes.ReadOnly);
@@ -515,7 +548,7 @@ public sealed class MetricWalTests : IAsyncLifetime
     {
         long baseNano = 1_700_000_000_000_000_000L;
 
-        using var wal = MetricWriteAheadLog.Open(WalPath, 64 * 1024);   // ~1 365 entries
+        using var wal = OpenWal(64 * 1024);   // ~1 365 entries
         for (int i = 0; i < 3; i++) Append(wal, Scalar("m", baseNano + i, i));
 
         // A flush the log was perfectly able to open. Its .mts files are written from here.
@@ -551,7 +584,7 @@ public sealed class MetricWalTests : IAsyncLifetime
     {
         long baseNano = 1_700_000_000_000_000_000L;
 
-        var wal = MetricWriteAheadLog.Open(WalPath);
+        var wal = OpenWal();
         for (int i = 0; i < 3; i++) Append(wal, Scalar("m", baseNano + i, i));
 
         ulong flushing = wal.BeginFlush();
@@ -561,7 +594,7 @@ public sealed class MetricWalTests : IAsyncLifetime
 
         // The records went nowhere: Dispose unmaps, it does not truncate, so a reopened log
         // still replays the generation the commit could not cover.
-        using var reopened = MetricWriteAheadLog.Open(WalPath);
+        using var reopened = OpenWal();
         Assert.Equal(3, reopened.ReadAll(out _).Count);
     }
 
@@ -576,7 +609,7 @@ public sealed class MetricWalTests : IAsyncLifetime
     {
         long baseNano = 1_700_000_000_000_000_000L;
 
-        using var wal = MetricWriteAheadLog.Open(WalPath);
+        using var wal = OpenWal();
         for (int i = 0; i < 3; i++) Append(wal, Scalar("m", baseNano + i, i));
 
         ulong first = wal.BeginFlush();
@@ -682,7 +715,7 @@ public sealed class MetricWalTests : IAsyncLifetime
     {
         long baseNano = 1_700_000_000_000_000_000L;
 
-        var wal = MetricWriteAheadLog.Open(WalPath);
+        var wal = OpenWal();
         for (int i = 0; i < 3; i++) Append(wal, Scalar("m", baseNano + i, i));
         long logged = wal.WrittenBytes;
 
@@ -708,7 +741,7 @@ public sealed class MetricWalTests : IAsyncLifetime
     [Fact]
     public void Interleaved_flush_attempts_keep_the_log_bounded()
     {
-        var wal = MetricWriteAheadLog.Open(WalPath);
+        var wal = OpenWal();
         for (int cycle = 0; cycle < 50; cycle++)
         {
             for (int i = 0; i < 100; i++)
@@ -732,13 +765,13 @@ public sealed class MetricWalTests : IAsyncLifetime
     {
         // A zero timestamp and a zero value are individually legal, so nothing about the
         // point itself can mark the end of data — only the generation can.
-        var wal = MetricWriteAheadLog.Open(WalPath);
+        var wal = OpenWal();
         Append(wal, Scalar("m", 1_700_000_000_000_000_000L, 1));
         Append(wal, Scalar("m", 0, 0));
         Append(wal, Scalar("m", 1_700_000_000_000_000_002L, 3));
         wal.Dispose();
 
-        var reopened = MetricWriteAheadLog.Open(WalPath);
+        var reopened = OpenWal();
         var replayed = reopened.ReadAll(out _);
         reopened.Dispose();
 
@@ -751,7 +784,7 @@ public sealed class MetricWalTests : IAsyncLifetime
     [InlineData(4096)]
     public void A_write_offset_past_the_real_data_replays_only_the_real_data(int overshoot)
     {
-        var wal = MetricWriteAheadLog.Open(WalPath);
+        var wal = OpenWal();
         for (int i = 0; i < 8; i++) Append(wal, Scalar("m", 1_700_000_000_000_000_000L + i, i));
         long real = wal.WrittenBytes;
         wal.Dispose();
@@ -762,7 +795,7 @@ public sealed class MetricWalTests : IAsyncLifetime
             fs.Write(BitConverter.GetBytes(32 + real + overshoot));
         }
 
-        var reopened = MetricWriteAheadLog.Open(WalPath);
+        var reopened = OpenWal();
         var replayed = reopened.ReadAll(out _);
         reopened.Dispose();
 
@@ -772,12 +805,12 @@ public sealed class MetricWalTests : IAsyncLifetime
     [Fact]
     public void Grows_past_the_initial_mapping_without_losing_points()
     {
-        var wal = MetricWriteAheadLog.Open(WalPath, initialCapacity: 4 * 1024);
+        var wal = OpenWal(4 * 1024);
         const int n = 2_000;
         for (int i = 0; i < n; i++) Append(wal, Scalar("m", 1_700_000_000_000_000_000L + i, i));
         wal.Dispose();
 
-        var reopened = MetricWriteAheadLog.Open(WalPath);
+        var reopened = OpenWal();
         var replayed = reopened.ReadAll(out _);
         reopened.Dispose();
 
@@ -832,7 +865,7 @@ public sealed class MetricWalTests : IAsyncLifetime
 
         Assert.True(TrcCount(_dir, "*.mts") > 0);
 
-        var wal = MetricWriteAheadLog.Open(WalPath);
+        var wal = OpenWal();
         Assert.Empty(wal.ReadAll(out _));                             // gave its points to the files
         wal.Dispose();
     }
@@ -844,7 +877,7 @@ public sealed class MetricWalTests : IAsyncLifetime
         var labels = Labels(("service", "MintRoute.API"));
 
         // A log left behind by a process that died before any flush.
-        var crashed = MetricWriteAheadLog.Open(WalPath);
+        var crashed = OpenWal();
         for (int i = 0; i < 12; i++)
             Append(crashed, Scalar("cpu.utilisation", baseNano + i * 1_000_000L, i * 2.0, labels));
         crashed.Dispose();
@@ -1914,7 +1947,7 @@ public sealed class MetricWalTests : IAsyncLifetime
     {
         long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
 
-        using (var wal = MetricWriteAheadLog.Open(WalPath, 64 * 1024))
+        using (var wal = OpenWal(64 * 1024))
         {
             Append(wal, Scalar("m", baseNano, 1));
             wal.CommitFlush(wal.BeginFlush());            // watermark = 1, counter = 2
@@ -1926,7 +1959,7 @@ public sealed class MetricWalTests : IAsyncLifetime
             fs.Write(new byte[8]);                       // counter behind the standing watermark
         }
 
-        using (var reopened = MetricWriteAheadLog.Open(WalPath, 64 * 1024))
+        using (var reopened = OpenWal(64 * 1024))
         {
             Assert.True(reopened.BeginFlush() > 1,
                 "the counter reopened at or below the watermark, so the flush it opens is one " +
@@ -1935,7 +1968,7 @@ public sealed class MetricWalTests : IAsyncLifetime
         }
 
         // The point appended after the repair has to come back. Below the watermark it does not.
-        using var after = MetricWriteAheadLog.Open(WalPath, 64 * 1024);
+        using var after = OpenWal(64 * 1024);
         var replayed = after.ReadAll(out _);
         Assert.Single(replayed);
         Assert.Equal(2, replayed[0].Point.Value);
