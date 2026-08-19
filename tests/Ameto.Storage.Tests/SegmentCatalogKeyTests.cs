@@ -574,6 +574,98 @@ public sealed class SegmentCatalogKeyTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// THE WINDOW BETWEEN THE PROBE AND THE STORE. The import holds <c>_importLock</c>, but that
+    /// lock is taken in <c>ImportSegment</c> and nowhere else — flush publication, merge
+    /// publication, WAL recovery and the boot catalog scan all write the catalog without it. So a
+    /// probe that reports the key free reports it free AS OF THE PROBE, and a store performed on
+    /// the strength of it overwrites whatever arrived in between.
+    ///
+    /// <para>Not a theoretical window. The scan is a BACKGROUND task — ingest and the HTTP
+    /// endpoints come up while it is still walking the directory — so a replication POST is live
+    /// during a boot that has thousands of segments to open. The import probes before the scan has
+    /// reached the local <c>{node}-{id}-{min}-{max}.seg</c>, the scan registers it, and the import
+    /// stores over it. The local segment leaves queries, retention and the merge planner at once
+    /// while its file stays on disk — bug #43 exactly — and SILENTLY: the import's conflict branch
+    /// never fired, because at the moment it looked there was nothing to conflict with, and the
+    /// scan's error branch had already been passed for the same reason.</para>
+    ///
+    /// <para>Driven through the seam because no arrangement of public calls can discriminate: run
+    /// the scan first and the import is refused by the probe; run it after and the scan reports
+    /// the collision itself. Only a scan landing INSIDE the import's window is silent, and the
+    /// only difference a test can see between a store and a compare-and-swap is which of the two
+    /// files the catalog is left naming.</para>
+    /// </summary>
+    [Fact]
+    public async Task A_registration_landing_inside_an_imports_window_is_not_overwritten()
+    {
+        long now = DateTime.UtcNow.Ticks;
+        const ulong Shared = 12;
+
+        // In the segments directory and in nobody's catalog: what the boot scan starts from, and
+        // what a locally written segment looks like to it.
+        string localPath = Path.Combine(SegDir,
+            $"{NodeId.Local.Value}-{Shared}-{now}-{now + 7 * TimeSpan.TicksPerMillisecond}.seg");
+        WritePeerSegment(NodeId.Local, Shared, now, events: 8, path: localPath);
+
+        // A peer misconfigured with this node's id, pushing ITS segment 12 — the one case the
+        // (node, id) key cannot separate. The endpoint names the body from the route, so it
+        // arrives as {node}-{id}.seg and cannot land on the local file's name; only the catalog
+        // can lose one of the two. Staged outside the segments directory so that the scan's
+        // *.seg.tmp sweep is not part of what is being measured (in production the body is staged
+        // after that sweep has run, and the scan below is the part that is still going).
+        string finalPath = Path.Combine(SegDir, $"{NodeId.Local.Value}-{Shared}.seg");
+        string staged    = Path.Combine(_dir, "pushed.body");
+        WritePeerSegment(NodeId.Local, Shared, now + TimeSpan.TicksPerHour, events: 4, path: staged);
+
+        var probed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var landed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        _engine._beforeImportPublish = () =>
+        {
+            if (!probed.TrySetResult()) return;   // only the first pass through the window parks
+            landed.Task.GetAwaiter().GetResult();
+        };
+
+        var importing = Task.Run(() => _engine.ImportSegment(staged, finalPath));
+        await probed.Task;                        // the import has read the catalog: the key is free
+
+        // The scan reaches the local file now, which is the whole point: it takes no lock this
+        // import holds, so nothing stops it landing here.
+        _engine.LoadSegmentCatalog();
+        Assert.Contains(_engine.ListSegments(), s => s.FilePath == localPath);
+
+        landed.SetResult();
+        var outcome = await importing;
+
+        // The write decided, so the import loses the exchange, re-reads, and finds what it is
+        // actually up against.
+        Assert.Equal(SegmentImportOutcome.Conflict, outcome);
+
+        var kept = Assert.Single(_engine.ListSegments());
+        Assert.Equal(localPath, kept.FilePath);
+        Assert.Equal(8u, kept.EventCount);
+
+        // The rename is the irreversible half and it is now gated on the exchange, not on the
+        // probe: a refused import leaves the body where the caller put it and puts nothing in the
+        // segments directory for the next boot scan to pick between.
+        Assert.True(File.Exists(staged), "a refused import consumed the body it refused");
+        Assert.False(File.Exists(finalPath), "a refused import renamed its body into the segments directory");
+
+        // And it is no longer silent. Which file stopped being served is the only thing this node
+        // can do about two peers wearing one id, so it has to be in the log.
+        Assert.Contains(_log.Entries, e =>
+            e.Message.Contains(staged,    StringComparison.Ordinal) &&
+            e.Message.Contains(localPath, StringComparison.Ordinal));
+
+        // Served, not merely listed: the eight local events, and none of the peer's four.
+        var counts = await _engine.AggregateLogVolumeAsync(
+            new DateTimeOffset(now, TimeSpan.Zero).AddMinutes(-5),
+            new DateTimeOffset(now, TimeSpan.Zero).AddHours(2),
+            minBucket: 0, bucketSeconds: 60, nBuckets: 240, serviceFilter: null);
+        Assert.Equal(8, counts.Total);
+    }
+
+    /// <summary>
     /// Restarts on the same directory and waits for the catalog scan to FINISH, rather than for a
     /// count to be reached: what a collision costs is an entry that never appears, so a wait that
     /// stops at the first entry would be waiting for the wrong thing. The scan's closing log line
