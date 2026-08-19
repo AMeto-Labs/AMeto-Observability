@@ -55,6 +55,41 @@ public sealed class SegmentMergeTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// #52: the planner quarantined a source on ANY open failure, so a file that was simply
+    /// mid-rename inside an import's publish window — or held by a reader for a moment — was
+    /// skip-listed for the life of the process: never merged again, warned about on every
+    /// pass. Quarantine is for corruption, which is a property of the bytes and will not heal;
+    /// a file that failed to OPEN keeps its place and is retried once it can be.
+    /// </summary>
+    [Fact]
+    public async Task A_source_that_failed_to_open_is_retried_once_it_can_be()
+    {
+        long b0 = MergeBucketGrid.SealedBucketStart(LogLevel.Information);
+        await WriteSegmentAsync(0, 40, baseTicks: b0);
+        await WriteSegmentAsync(1, 40, baseTicks: b0 + TimeSpan.TicksPerHour);
+        await WriteSegmentAsync(2, 40, baseTicks: b0 + 2 * TimeSpan.TicksPerHour);
+
+        // Hide a NON-anchor source: the anchor has its own skip rule and would muddy the probe.
+        var victim = _engine.ListSegments().OrderBy(x => x.MinTimestampTicks).Last();
+        string hidden = victim.FilePath + ".hidden";
+        File.Move(victim.FilePath, hidden);
+
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None),
+            "setup: the two openable sources should still merge");
+
+        Assert.DoesNotContain(SegmentKey.Of(victim), _engine._mergeSkip);
+
+        // And the retry is real, not just an empty skip-list: the file comes back, the next
+        // pass merges it into the survivor, and every event is accounted for.
+        File.Move(hidden, victim.FilePath);
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None),
+            "the returned source was not retried");
+        var final = Assert.Single(_engine.ListSegments());
+        Assert.Equal(120u, final.EventCount);
+    }
+
+
+    /// <summary>
     /// Writes <paramref name="count"/> events and flushes them into one small segment.
     ///
     /// <para>Single-level by default: a flush now writes ONE SEGMENT PER LEVEL, so a
