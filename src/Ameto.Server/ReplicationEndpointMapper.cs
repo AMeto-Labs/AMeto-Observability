@@ -175,21 +175,54 @@ public static class ReplicationEndpointMapper
                 // boot scan can only refuse in its turn.
                 try { File.Delete(tmpPath); } catch { /* swept as *.seg.tmp by the next boot scan */ }
 
-                return outcome == SegmentImportOutcome.Conflict
-                    // 409 rather than a log line nobody reads: a DIFFERENT segment already holds
-                    // this (nodeId, segmentId), which means the sender and some other node are
-                    // both configured as NodeId {nodeId}. Registering it would have dropped
-                    // whatever is being served under that key out of queries, retention and the
-                    // merge planner at once — the file staying on disk the whole time, so nothing
-                    // anywhere would look wrong. The sender is the only party positioned to tell
-                    // that from a healthy push, so the sender is told.
-                    ? Results.Problem(
+                // 409 rather than a log line nobody reads: both conflict outcomes mean the
+                // sender and some other node are configured as the same NodeId, but they rest
+                // on different evidence, and the sender's log quotes this body -- so the body
+                // names the case, or the sender confidently reports the wrong one of two.
+                // The cause travels in a HEADER, not only in the body: the sender reads the
+                // response with ResponseHeadersRead and frames its log line before it has any
+                // body -- and body text is prose for humans, which the sender must not parse.
+                // One switch decides the status AND the header, with no discard arm in either
+                // column: the first version set the header in a separate guarded switch whose
+                // discard silently labelled any future conflict "unreadable-incumbent" -- the
+                // sender would then log a Warning about a local file for a cause nobody had
+                // classified, which is the exact substitution the header was added to end.
+                // No discard arm, and CS8509 is promoted to an ERROR in this project's csproj:
+                // a new SegmentImportOutcome member without a wire mapping now fails the BUILD,
+                // which is what "a compile-time question" has to mean -- as a bare warning it
+                // scrolled past, and the runtime answer was a SwitchExpressionException out of
+                // the endpoint delegate: a bodyless 500, strictly worse than the 400 the old
+                // discard arm gave. CS8524 (an unnamed value cast into the enum) is disabled
+                // for the expression: outcome comes from ImportSegment, which returns members.
+#pragma warning disable CS8524
+                var (cause, result) = outcome switch
+                {
+                    SegmentImportOutcome.ConflictDifferentSegment => ("different-segment", Results.Problem(
                         $"Segment {nodeId}-{segmentId} is already held by a different file on this node; " +
                         $"two nodes appear to be configured with NodeId {nodeId}.",
-                        statusCode: StatusCodes.Status409Conflict)
-                    : Results.Problem(
+                        statusCode: StatusCodes.Status409Conflict)),
+                    SegmentImportOutcome.ConflictAllocatedLocally => ("allocated-locally", Results.Problem(
+                        $"Segment id {segmentId} falls inside the span this node's own allocator has " +
+                        $"already handed out under NodeId {nodeId}: a local flush, merge or WAL replay " +
+                        $"holds it or is about to publish under it. Two nodes appear to be configured " +
+                        $"with NodeId {nodeId}.",
+                        statusCode: StatusCodes.Status409Conflict)),
+                    SegmentImportOutcome.ConflictUnreadableIncumbent => ("unreadable-incumbent", Results.Problem(
+                        $"The path for segment {nodeId}-{segmentId} is occupied by a file this node " +
+                        $"could not read; it was kept and nothing was registered. This says nothing " +
+                        $"about NodeId configuration — remove or repair the file on the receiver and " +
+                        $"the push can succeed.",
+                        statusCode: StatusCodes.Status409Conflict)),
+                    SegmentImportOutcome.Unreadable => ((string?)null, Results.Problem(
                         $"Segment {nodeId}-{segmentId} could not be read as a segment file.",
-                        statusCode: StatusCodes.Status400BadRequest);
+                        statusCode: StatusCodes.Status400BadRequest)),
+                    SegmentImportOutcome.Registered => throw new System.Diagnostics.UnreachableException(
+                        "Registered returns 204 above."),
+                };
+                if (cause is not null)
+                    request.HttpContext.Response.Headers["X-Ameto-Conflict"] = cause;
+                return result;
+#pragma warning restore CS8524
             });
     }
 

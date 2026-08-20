@@ -485,15 +485,17 @@ Receive a replicated cold-tier segment from a peer. **Auth:** the `X-Ameto-Repli
 
 | Status | Meaning | Retry? |
 |---|---|---|
-| `204 No Content` | Registered. A re-push of a segment this node already holds also returns 204: it refreshes the existing entry rather than adding a second one. | — |
+| `204 No Content` | Registered. A re-push of a segment this node already holds also returns 204: the entry and the bytes already held are **kept** and the pushed body is discarded — the push is idempotent, not a refresh. The header carries no digest, so "already holds" is decided on the header fields; keeping the served copy is the safe side of that comparison. | — |
 | `400 Bad Request` | Either the route did not bind — `{nodeId}` is a `uint` and `{segmentId}` a `ulong`, and a URL carrying anything else is rejected by model binding **before the secret is checked**, with no body of ours — or the body was read but is not a segment file, in which case nothing was registered and the received bytes were discarded. | No — neither the URL nor the bytes change on their own. |
 | `401 Unauthorized` | The `X-Ameto-Replication` header is missing or does not match the receiver's configured secret. Note the row above: an unroutable URL never reaches this check. | No. |
-| `409 Conflict` | A **different** segment already holds this `(nodeId, segmentId)` on the receiver, which means two nodes are configured with the same `NodeId`. The segment already being served was kept; the pushed one was **not** registered. | No — permanent until one of the nodes is renumbered. |
+| `409 Conflict` | Three causes. The machine-readable cause is in the **`X-Ameto-Conflict`** response header — `different-segment`, `allocated-locally` or `unreadable-incumbent` — which the sender branches on (the body is prose for humans); an absent header means a pre-header receiver, whose only causes were the two NodeId ones. Two mean two nodes are configured with the same `NodeId`: a **different** segment already holds this `(nodeId, segmentId)` on the receiver, or the id falls inside the span the receiver's own allocator has handed out — a local flush, merge or WAL replay holds it or is about to publish under it. The third says nothing about NodeId: the path is occupied by a file the receiver **could not read**, so it refused to adjudicate and kept what is on disk. In every case the pushed segment was **not** registered. | For the two NodeId causes: no — permanent until one of the nodes is renumbered. For the unreadable-incumbent cause: yes, after the file on the receiver is removed or repaired. |
 | `413 Content Too Large` | The body is larger than `Ameto:Replication:MaxSegmentBytes` on the **receiver** (default 512 MB). Nothing was written. | No — the same bytes are the same size. Raise the limit on the receiver, or the sender will never place this segment. |
 | `500` | The receiver could not take the body: a disk error writing or placing the file, or a body that stopped arriving mid-push. | Yes — both causes are transient, and the same body over a healthy connection will land. |
 
 Segment ids are monotonic **per node**, so `(nodeId, segmentId)` — not `segmentId` alone —
-identifies a segment across a cluster. A 409 is a deployment fault rather than a push failure:
+identifies a segment across a cluster. A 409 carrying either NodeId cause is a deployment
+fault rather than a push failure (the `unreadable-incumbent` cause is neither — it is a local
+file problem on the receiver, and clears with the file):
 the receiver cannot tell which of two senders claiming one `NodeId` is the stranger, so it
 refuses the second and reports it to the sender, which is the only party positioned to tell a
 duplicate-NodeId deployment from a healthy push.

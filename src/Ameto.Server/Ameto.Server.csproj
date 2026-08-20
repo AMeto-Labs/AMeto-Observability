@@ -62,6 +62,10 @@
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
     <!-- We host via Kestrel, not IIS — no web.config needed. -->
     <IsTransformWebConfigDisabled>true</IsTransformWebConfigDisabled>
+      <!-- A switch expression missing a named enum member is a wire-contract hole here
+         (see ReplicationEndpointMapper): promote it from a warning that scrolls past to
+         the build failure the mapper's comment promises. -->
+    <WarningsAsErrors>$(WarningsAsErrors);CS8509</WarningsAsErrors>
   </PropertyGroup>
 
   <PropertyGroup>

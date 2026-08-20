@@ -573,8 +573,9 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
             // lifetime does not depend on either of those arguments continuing to hold. A change
             // to the crossed-header repair, or a caller that commits a generation it was not
             // handed, makes the first reachable; and BeginFlush throwing forever is a failure
-            // that never surfaces as itself — the periodic loop does not catch it, no .mts is
-            // written again, and the log grows by doubling until Grow throws into ingest.
+            // both flush paths merely LOG — the periodic loop catches it at Error once a tick,
+            // the threshold continuation once per crossing — while no .mts is written again and
+            // the log grows by doubling until Grow throws into ingest.
             _openFlush = 0;
 
             // Nothing left to reclaim: the watermark already names this generation or a later

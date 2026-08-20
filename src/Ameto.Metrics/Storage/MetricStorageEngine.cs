@@ -412,11 +412,12 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         // caller is Ingest, which discards it. A throw out of FlushHotTierAsync therefore went
         // nowhere — no log line, no rethrow, nothing but a TaskScheduler.UnobservedTaskException
         // at some later finalisation, which no deployment reads. The tripwire this PR added to
-        // BeginFlush is exactly such a throw, and it used to be permanent: CommitFlush tested
-        // the dead log before clearing the open flush, so a flush that reached it left the flag
-        // standing and every later flush hit the tripwire for the life of the process. The
-        // clear now comes first and only the ownership test precedes it; the reporting below
-        // is what makes either state visible at all. Silence was the whole cost.
+        // BeginFlush is exactly such a throw. (Not, as this comment once claimed, a permanent
+        // one: a log dead enough to be tested by CommitFlush refuses every later BeginFlush on
+        // its own account, so the order of the clear never decided anything — see the paragraph
+        // in MetricWriteAheadLog.CommitFlush, which keeps the clear first as defence, not as
+        // repair.) The reporting below is what makes either state visible at all. Silence was
+        // the whole cost.
         //
         // Reading t.Exception is also what marks it observed, so the discarded task above is no
         // longer a finaliser-time surprise. The task is still handed back to whoever called,
@@ -962,9 +963,10 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     /// is deletable — the reclaim never ran (it is on the far side of the watermark store the
     /// commit did not reach), so the log's copy is whole. Nor is it cheap to leave: metric
     /// points are summed, so a doubled counter is not a visible artefact but a wrong number,
-    /// and it recurs at every start for as long as the log keeps those records. Deleting a
-    /// file whose points are durable elsewhere is the move retention already makes in
-    /// <see cref="PruneAsync"/>.</para>
+    /// and it recurs at every start for as long as the log keeps those records. (No precedent
+    /// is claimed for the delete: retention's <see cref="PruneAsync"/> also unlinks files, but
+    /// an expired file's points are durable nowhere afterwards — expiry is the point — while
+    /// here the log still carries every record the deleted files held.)</para>
     ///
     /// <para>What it costs is visibility until that start: the points have left the hot tier,
     /// their files are gone, and nothing reads the log except recovery. That is the right side

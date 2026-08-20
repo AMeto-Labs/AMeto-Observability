@@ -77,9 +77,10 @@ public sealed class SegmentCatalogKeyTests : IAsyncLifetime
     /// which is what makes a (node, id) key able to tell it apart from a local segment at all.
     /// </summary>
     private string WritePeerSegment(NodeId node, ulong segId, long baseTicks, int events = 4,
-                                    LogLevel level = LogLevel.Information, string? path = null)
+                                    LogLevel level = LogLevel.Information, string? path = null,
+                                    string template = "peer {n}")
     {
-        const string Template = "peer {n}";
+        string Template = template;
         var pool = new StringInternPool();
         using var hot = new HotTierSegment(16, 1L << 20);
         for (int i = 0; i < events; i++)
@@ -420,7 +421,7 @@ public sealed class SegmentCatalogKeyTests : IAsyncLifetime
         string intruder = WritePeerSegment(NodeId.Local, local.Id.Value, now, events: 4);
         Assert.NotEqual(local.FilePath, intruder);
 
-        Assert.Equal(SegmentImportOutcome.Conflict, _engine.ImportSegment(intruder));
+        Assert.Equal(SegmentImportOutcome.ConflictDifferentSegment, _engine.ImportSegment(intruder));
 
         var kept = Assert.Single(_engine.ListSegments());
         Assert.Equal(local.FilePath, kept.FilePath);
@@ -462,7 +463,7 @@ public sealed class SegmentCatalogKeyTests : IAsyncLifetime
         string staged = Path.Combine(SegDir, $"{Peer.Value}-3.seg.tmp");
         WritePeerSegment(Peer, 3, now + TimeSpan.TicksPerHour, events: 9, path: staged);
 
-        Assert.Equal(SegmentImportOutcome.Conflict, _engine.ImportSegment(staged, finalPath));
+        Assert.Equal(SegmentImportOutcome.ConflictDifferentSegment, _engine.ImportSegment(staged, finalPath));
 
         // Untouched: the entry, the events it serves, and the bytes under it.
         var only = Assert.Single(_engine.ListSegments());
@@ -478,27 +479,31 @@ public sealed class SegmentCatalogKeyTests : IAsyncLifetime
     /// <summary>
     /// The direction that must survive the check above: the SAME segment, staged and pushed
     /// again. Its bytes may differ — a re-compression on the sender rewrites the file without
-    /// changing what is in it — so the entry is refreshed and the body takes its place, which is
-    /// what makes a re-push normal traffic rather than a conflict.
+    /// changing what is in it — and since #49 the held copy STAYS and the body is dropped: the
+    /// header carries no digest, so "same" is five fields, and replacing served bytes on that
+    /// comparison was the loss #49 closed. This test's previous shape asserted the replacement
+    /// with a byte-identical body, which could not tell the two behaviours apart; the staged
+    /// body here differs, so a return to replace-on-match fails it.
     /// </summary>
     [Fact]
-    public void A_staged_re_push_of_the_same_segment_replaces_the_file_and_registers_once()
+    public void A_staged_re_push_of_the_same_segment_registers_once_and_keeps_the_incumbent()
     {
         long now = DateTime.UtcNow.Ticks;
 
         string finalPath = WritePeerSegment(Peer, 4, now, events: 6);
         Assert.Equal(SegmentImportOutcome.Registered, _engine.ImportSegment(finalPath, finalPath));
+        byte[] held = File.ReadAllBytes(finalPath);
 
         string staged = Path.Combine(SegDir, $"{Peer.Value}-4.seg.tmp");
-        WritePeerSegment(Peer, 4, now, events: 6, path: staged);
-        byte[] pushed = File.ReadAllBytes(staged);
+        WritePeerSegment(Peer, 4, now, events: 6, path: staged, template: "peer RECOMPRESSED {n}");
+        Assert.NotEqual(held, File.ReadAllBytes(staged));
 
         Assert.Equal(SegmentImportOutcome.Registered, _engine.ImportSegment(staged, finalPath));
 
         var only = Assert.Single(_engine.ListSegments());
         Assert.Equal(6u, only.EventCount);
         Assert.Equal(finalPath, only.FilePath);
-        Assert.Equal(pushed, File.ReadAllBytes(finalPath));
+        Assert.Equal(held, File.ReadAllBytes(finalPath));
         Assert.False(File.Exists(staged), "an accepted import left its body at the staged name");
     }
 
@@ -642,7 +647,7 @@ public sealed class SegmentCatalogKeyTests : IAsyncLifetime
 
         // The write decided, so the import loses the exchange, re-reads, and finds what it is
         // actually up against.
-        Assert.Equal(SegmentImportOutcome.Conflict, outcome);
+        Assert.Equal(SegmentImportOutcome.ConflictDifferentSegment, outcome);
 
         var kept = Assert.Single(_engine.ListSegments());
         Assert.Equal(localPath, kept.FilePath);
@@ -703,7 +708,7 @@ public sealed class SegmentCatalogKeyTests : IAsyncLifetime
         string finalPath = Path.Combine(SegDir, $"{NodeId.Local.Value}-{reserved}.seg");
         WritePeerSegment(NodeId.Local, reserved, now, events: 4, path: staged);
 
-        Assert.Equal(SegmentImportOutcome.Conflict, _engine.ImportSegment(staged, finalPath));
+        Assert.Equal(SegmentImportOutcome.ConflictAllocatedLocally, _engine.ImportSegment(staged, finalPath));
 
         // Refused means refused on disk too: the body is still the caller's to unlink, and the
         // segments directory gains nothing for the next boot scan to pick between.
@@ -805,6 +810,271 @@ public sealed class SegmentCatalogKeyTests : IAsyncLifetime
     /// scan cannot resolve a duplicate NodeId — nothing on this node can — so saying which file
     /// it stopped keying is the entire remedy available to it.
     /// </summary>
+    /// <summary>
+    /// The restart window: a file sits at the final path with NO catalog entry — the scan is a
+    /// background task and the endpoint serves before it finishes. A push for that key finds
+    /// the key free, and the move used to run with overwrite: true, destroying the bytes on
+    /// disk on the strength of a catalog that was still being built. The move refuses now, and
+    /// the incumbent on disk is judged the way a catalog incumbent is: a different segment is a
+    /// conflict, the file is kept, the entry is withdrawn.
+    /// </summary>
+    [Fact]
+    public void A_push_landing_before_the_scan_reaches_the_file_cannot_overwrite_it()
+    {
+        long now = DateTime.UtcNow.Ticks;
+        string finalPath = WritePeerSegment(Peer, 21, now, events: 5);   // on disk, NOT imported
+        byte[] incumbent = File.ReadAllBytes(finalPath);
+
+        string staged = WritePeerSegment(Peer, 21, now + TimeSpan.TicksPerMinute, events: 7,
+            path: Path.Combine(SegDir, "7-21.55667788.seg.tmp"));
+
+        Assert.Equal(SegmentImportOutcome.ConflictDifferentSegment, _engine.ImportSegment(staged, finalPath));
+
+        Assert.Equal(incumbent, File.ReadAllBytes(finalPath));
+        Assert.True(File.Exists(staged), "a refused import moved the body it refused");
+        Assert.DoesNotContain(_engine.ListSegments(), x => x.NodeId.Value == Peer.Value && x.Id.Value == 21ul);
+    }
+
+    /// <summary>
+    /// And the half that must stay open: the same segment re-pushed into that window — after a
+    /// restart, before the scan — is ordinary traffic, answered as the catalog-incumbent branch
+    /// answers it: registered, incumbent bytes kept, body dropped.
+    /// </summary>
+    [Fact]
+    public void A_re_push_landing_before_the_scan_keeps_the_incumbent_and_registers()
+    {
+        long now = DateTime.UtcNow.Ticks;
+        string finalPath = WritePeerSegment(Peer, 22, now, events: 5);   // on disk, NOT imported
+        byte[] incumbent = File.ReadAllBytes(finalPath);
+
+        string staged = WritePeerSegment(Peer, 22, now, events: 5,
+            path: Path.Combine(SegDir, "7-22.99aabbcc.seg.tmp"),
+            template: "peer RECOMPRESSED {n}");   // same five fields, different bytes
+
+        Assert.Equal(SegmentImportOutcome.Registered, _engine.ImportSegment(staged, finalPath));
+
+        Assert.Equal(incumbent, File.ReadAllBytes(finalPath));
+        Assert.False(File.Exists(staged), "the staged body was not cleaned up");
+        var entry = Assert.Single(_engine.ListSegments(), x => x.NodeId.Value == Peer.Value && x.Id.Value == 22ul);
+        Assert.Equal(finalPath, entry.FilePath);
+        // The entry describes the file that SURVIVED, not the body that was deleted: this
+        // branch exists because the two may differ in bytes, so an entry built from the staged
+        // body carried sizes belonging to a file that no longer exists.
+        Assert.Equal(incumbent.LongLength, entry.CompressedBytes);
+        // And the honest uncompressed size, re-read OUTSIDE the import lock, replaces the
+        // file-size placeholder: understatement is the harmful direction here — the planner
+        // budgets batches by max(Uncompressed, Compressed), so a shrunken entry overfills one.
+        Assert.True(entry.UncompressedBytes > entry.CompressedBytes,
+            $"the entry still carries the placeholder ({entry.UncompressedBytes} B) instead of the block sum");
+    }
+
+    /// <summary>
+    /// An UNREADABLE file at the final path refuses the push — and says that, rather than a
+    /// diagnosis the code never made. This used to come back as ConflictDifferentSegment, and
+    /// the endpoint then told the sender "already held by a different file… two nodes appear
+    /// to be configured with NodeId N": claims about a file that could not be read and about a
+    /// second node for which there was no evidence, quoted at Error by the sender and marked
+    /// permanent by the contract — when the real cause is local and clears with the file.
+    /// </summary>
+    [Fact]
+    public void An_unreadable_incumbent_refuses_with_its_own_answer_not_a_guess()
+    {
+        long now = DateTime.UtcNow.Ticks;
+        Directory.CreateDirectory(SegDir);
+        string finalPath = Path.Combine(SegDir, $"{Peer.Value}-23.seg");
+        File.WriteAllBytes(finalPath, [0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02, 0x03]);
+
+        string staged = WritePeerSegment(Peer, 23, now,
+            path: Path.Combine(SegDir, "7-23.44556677.seg.tmp"));
+
+        Assert.Equal(SegmentImportOutcome.ConflictUnreadableIncumbent, _engine.ImportSegment(staged, finalPath));
+
+        Assert.Equal(8, new FileInfo(finalPath).Length);   // the unreadable file was kept, not replaced
+        Assert.True(File.Exists(staged), "a refused import moved the body it refused");
+        Assert.DoesNotContain(_engine.ListSegments(), x => x.NodeId.Value == Peer.Value && x.Id.Value == 23ul);
+    }
+
+
+    /// <summary>
+    /// Four torn bytes must not cost the whole segment. The boot scan's handler for an
+    /// unreadable file used to be File.Delete — written when unreadable meant a header nothing
+    /// could parse — and the frame validation added for torn blocks turned one bad 32-bit word
+    /// in an otherwise readable file into losing every event in it at the next start. The scan
+    /// now quarantines aside as *.seg.corrupt at Error: served by nobody, decided by an
+    /// operator, deleted by no one.
+    /// </summary>
+    [Fact]
+    public void A_torn_segment_is_quarantined_aside_at_boot_not_deleted()
+    {
+        long now = DateTime.UtcNow.Ticks;
+        string path = WritePeerSegment(Peer, 31, now, events: 6);
+        using (var f = File.Open(path, FileMode.Open, FileAccess.Write))
+        {
+            f.Position = 46;                       // the first block's uncompressedSize
+            f.Write([0xF9, 0xFF, 0xFF, 0xFF]);     // torn to -7
+        }
+
+        var engine2 = NewEngine();
+        try
+        {
+            engine2.LoadSegmentCatalog();          // the scan, driven to completion by hand
+
+            Assert.False(File.Exists(path), "the torn segment was left under its serving name");
+            Assert.True(File.Exists(path + ".corrupt"), "the torn segment was deleted instead of quarantined");
+            Assert.DoesNotContain(engine2.ListSegments(), x => x.NodeId.Value == Peer.Value && x.Id.Value == 31ul);
+        }
+        finally
+        {
+            engine2.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
+    }
+
+    /// <summary>
+    /// A quarantined segment must not be silent past the start that quarantined it: nothing
+    /// else ever mentions a .seg.corrupt file — the sweep, the scan and retention all look
+    /// elsewhere — so every start counts them out loud.
+    /// </summary>
+    [Fact]
+    public void Quarantined_segments_are_counted_out_loud_at_start()
+    {
+        string dir2 = Path.Combine(Path.GetTempPath(), "ameto-segkey-" + Guid.NewGuid().ToString("N"));
+        string seg2 = Path.Combine(dir2, "segments");
+        Directory.CreateDirectory(seg2);
+        File.WriteAllBytes(Path.Combine(seg2, "7-99.seg.corrupt"), new byte[128]);
+
+        var log2 = new CapturingLogger();
+        var engine2 = new StorageEngine(
+            Options.Create(new ServerOptions { DataDirectory = dir2 }),
+            new RetentionStore(new ServerOptions { DataDirectory = dir2 }, NullLogger<RetentionStore>.Instance),
+            log2);
+        try
+        {
+            Assert.Contains(log2.Entries, l => l.Message.Contains("Quarantined segments present"));
+        }
+        finally
+        {
+            engine2.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            try { Directory.Delete(dir2, true); }
+            catch (Exception ex) { Console.WriteLine($"temp dir left behind: {dir2} — {ex.Message}"); }
+        }
+    }
+
+    // ── Issues #47, #49, #52 ─────────────────────────────────────────────────
+
+    /// <summary>
+    /// #47: the temp-file sweep belongs to the constructor, where nothing can be writing yet —
+    /// the catalog scan runs in the background with the replication endpoint and WAL recovery
+    /// already live, and both stage files its masks match. Two halves pin both sides: a
+    /// leftover from a dead process is swept at construction, and a file that appears AFTER
+    /// construction (a live push's staging body) survives the scan untouched.
+    /// </summary>
+    [Fact]
+    public void The_temp_sweep_runs_at_construction_and_never_inside_the_scan()
+    {
+        Directory.CreateDirectory(SegDir);
+        string live = Path.Combine(SegDir, "9-3.aabbccdd.seg.tmp");
+        File.WriteAllBytes(live, [1, 2, 3]);
+
+        _engine.LoadSegmentCatalog();   // the background scan, driven by hand
+
+        Assert.True(File.Exists(live),
+            "the catalog scan deleted a staging file out from under its writer — the sweep is " +
+            "running inside the scan again instead of in the constructor");
+        File.Delete(live);
+
+        // And the constructor DOES sweep: a leftover from a previous process is gone before
+        // anything can race it.
+        string dir2 = Path.Combine(Path.GetTempPath(), "ameto-segkey-" + Guid.NewGuid().ToString("N"));
+        string seg2 = Path.Combine(dir2, "segments");
+        Directory.CreateDirectory(seg2);
+        string leftover = Path.Combine(seg2, "0-1.deadbeef.seg.tmp");
+        File.WriteAllBytes(leftover, [1, 2, 3]);
+        var engine2 = new StorageEngine(
+            Options.Create(new ServerOptions { DataDirectory = dir2 }),
+            new RetentionStore(new ServerOptions { DataDirectory = dir2 }, NullLogger<RetentionStore>.Instance),
+            NullLogger<StorageEngine>.Instance);
+        try
+        {
+            Assert.False(File.Exists(leftover), "a leftover temp file survived construction");
+        }
+        finally
+        {
+            engine2.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            try { Directory.Delete(dir2, true); }
+            catch (Exception ex) { Console.WriteLine($"temp dir left behind: {dir2} — {ex.Message}"); }
+        }
+    }
+
+    /// <summary>
+    /// #49: the same-segment heuristic used to fall THROUGH to File.Move(overwrite: true), so
+    /// five coinciding header fields — path, min, max, count, level, with the path route-derived
+    /// and therefore equal for every sender — replaced the bytes being served with the incoming
+    /// body. The header carries no digest, so the heuristic cannot be hardened; what it can do
+    /// is fail toward keeping the file it protects. A re-push now keeps the incumbent's bytes
+    /// and drops the staged body, and the sender still hears success, which for an idempotent
+    /// push is what success means.
+    /// </summary>
+    [Fact]
+    public void A_body_matching_every_header_field_cannot_replace_the_bytes_being_served()
+    {
+        long now = DateTime.UtcNow.Ticks;
+        string finalPath = WritePeerSegment(Peer, 12, now);
+        Assert.Equal(SegmentImportOutcome.Registered, _engine.ImportSegment(finalPath));
+        byte[] served = File.ReadAllBytes(finalPath);
+
+        // A DIFFERENT file with an identical five-tuple: same ids, same timestamps, same count,
+        // same level — different template text, therefore different bytes.
+        string staged = WritePeerSegment(Peer, 12, now,
+            path: Path.Combine(SegDir, "7-12.11223344.seg.tmp"),
+            template: "peer DIFFERENT {n}");
+        Assert.NotEqual(served, File.ReadAllBytes(staged));
+
+        Assert.Equal(SegmentImportOutcome.Registered, _engine.ImportSegment(staged, finalPath));
+
+        Assert.Equal(served, File.ReadAllBytes(finalPath));   // the incumbent's bytes survived
+        Assert.False(File.Exists(staged), "the staged body was not cleaned up");
+        Assert.Single(_engine.ListSegments(), s => s.Id.Value == 12ul && s.NodeId.Value == Peer.Value);
+    }
+
+    /// <summary>
+    /// #52: an import publishes its catalog entry BEFORE its File.Move lands the file — the
+    /// reverse order was the earlier bug — so a retention delete landing inside that window
+    /// removed the fresh entry, failed to delete a file that was not there yet, and the move
+    /// then produced a file no entry names. The delete now serialises with the import: parked
+    /// inside the import's lock, it must wait; released, it must run.
+    /// </summary>
+    [Fact]
+    public async Task A_delete_landing_inside_an_imports_window_waits_it_out()
+    {
+        long now = DateTime.UtcNow.Ticks;
+        Write(20, now);
+        await _engine.FlushHotTierAsync();
+        var local = Assert.Single(_engine.ListSegments());
+
+        var parked = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var gate   = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        _engine._beforeImportPublish = () => { parked.TrySetResult(); gate.Task.GetAwaiter().GetResult(); };
+
+        string peerPath = WritePeerSegment(Peer, 40, now);
+        var import = Task.Run(() => _engine.ImportSegment(peerPath));
+        await parked.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        var delete = Task.Run(() => _engine.DeleteSegmentAsync(SegmentKey.Of(local)));
+        Assert.False(delete.Wait(TimeSpan.FromMilliseconds(300)),
+            "the delete ran inside the import's publish window instead of waiting for its lock");
+
+        gate.TrySetResult();
+        Assert.Equal(SegmentImportOutcome.Registered, await import.WaitAsync(TimeSpan.FromSeconds(10)));
+        await delete.WaitAsync(TimeSpan.FromSeconds(10));
+
+        // Both effects, in full: the local segment is gone, file and entry together, and the
+        // imported one is present, file and entry together.
+        Assert.False(File.Exists(local.FilePath));
+        var remaining = Assert.Single(_engine.ListSegments());
+        Assert.Equal(Peer.Value, remaining.NodeId.Value);
+        Assert.True(File.Exists(remaining.FilePath));
+    }
+
     private sealed class CapturingLogger : Microsoft.Extensions.Logging.ILogger<StorageEngine>
     {
         private readonly List<(string Message, Exception? Error)> _entries = [];

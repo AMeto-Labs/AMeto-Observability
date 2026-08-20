@@ -143,8 +143,9 @@ Symmetric replication: each node replicates its own flushed cold segments to all
 | `SeedNodes` | string[] | `[]` | Peer base URLs to probe on startup. Further peers are discovered via ping exchange. |
 | `LocalAddress` | string | `"http://localhost:5341"` | This node's publicly reachable base URL, used by peers to push segments/pings back. Set to the real hostname when clustering. |
 | `ProbeInterval` | TimeSpan | `"00:00:10"` | How often to ping known peers. |
-| `PushTimeout` | TimeSpan | `"00:01:00"` | Per-segment HTTP push timeout. |
-| `MaxSegmentBytes` | long | `536870912` (512 MB) | Largest segment body this node **accepts** from a peer. Read on the receiving side: a body over it is answered with `413` and nothing is written. The framework default it replaces is 30 MB, which is below the size this system's own merges produce, so leaving it unset made large segments unreplicable. Raise it on every node in a cluster whose merged files can exceed it. |
+| `PushTimeout` | TimeSpan | `"00:01:00"` | Per-segment HTTP push timeout, applied **separately** to the request/headers exchange and to reading a failed response's body — so a single push can take up to twice this value against a stalled peer. If the body read times out, the response classification is kept and the quoted body is marked `…(body read timed out)` rather than dropped. |
+| `Secret` | string | `""` | Shared cluster secret, sent as `X-Ameto-Replication` on every ping and push and checked by every replication endpoint. **Required for any cluster:** with it empty the receiver refuses every replication request with `401`, so nodes configured without it will probe and push forever while replicating nothing. Set the same value on every node, preferably via an environment variable (`Ameto__Replication__Secret`) rather than `config.yml`. |
+| `MaxSegmentBytes` | long | `536870912` (512 MB) | Largest segment body this node **accepts** from a peer. Read on the receiving side: a body over it is answered with `413` and nothing is written. It replaces the framework's 30 MB request-body default, which a pushed body can clear: a push carries a hot-tier level segment — merged segments are never offered to peers — and one flush starts from a 64 MB budget (`Ameto:HotTier:MaxSizeBytes`) with LZ4 the only thing between that and the wire. The 512 MB default is larger than anything this system builds, so a legitimate body is never what this limit refuses. |
 
 ### Example — two-node cluster
 
@@ -155,6 +156,7 @@ Ameto:
   HttpPort: 5341
   Replication:
     Enabled: true
+    Secret: "one-shared-value-on-every-node"   # without it every ping and push is answered 401
     LocalAddress: "http://node0:5341"
     SeedNodes: ["http://node1:5341"]
 ```
@@ -166,6 +168,7 @@ Ameto:
   HttpPort: 5341
   Replication:
     Enabled: true
+    Secret: "one-shared-value-on-every-node"   # must MATCH node 0's
     LocalAddress: "http://node1:5341"
     SeedNodes: ["http://node0:5341"]
 ```

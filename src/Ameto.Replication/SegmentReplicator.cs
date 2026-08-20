@@ -80,21 +80,54 @@ public sealed class SegmentReplicator : IDisposable
             content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
             using var req = new HttpRequestMessage(HttpMethod.Post, url) { Content = content };
             req.Headers.Add("X-Ameto-Replication", _opts.Secret);
-            using var resp = await _http.SendAsync(req, ct);
+            // ResponseHeadersRead: the status decides everything below, and the body is only
+            // ever read -- bounded -- to be quoted in a log line. A buffered send with a size
+            // cap was tried here and rejected: the cap fires inside SendAsync itself, so an
+            // oversized body (a proxy's HTML error page, a ProblemDetails with a stack) took
+            // down the classified response whole, and 409/413 collapsed into a generic
+            // "push failed" with no status at all -- diagnostics erased exactly where they
+            // were needed.
+            using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
 
-            // 409 is the peer REFUSING the segment because a different one already holds
-            // (NodeId, Id) over there, which can only mean some other node is pushing under this
-            // node's id — the peer itself, or a third node whose files it already carries. A
-            // permanent deployment fault rather than a transient push failure, and one this side
-            // can act on: the receiver only ever sees "a stranger claims to be node {Node}" and
-            // cannot tell which of them is the stranger. Logged as an error so it is not one
-            // warning among the retryable ones.
+            // 409 carries its cause in X-Ameto-Conflict, because the THREE causes do not share
+            // a framing: two mean a duplicated NodeId (a deployment fault, Error, permanent
+            // until renumbering), the third means the receiver kept a local file it could not
+            // read (Warning, clears when that file is removed). One branch used to frame all
+            // three as the NodeId story at Error -- so the honest body arrived wrapped in a
+            // diagnosis nobody made, and an operator went renumbering nodes over one bad file.
+            // The header is machine-set by the receiver; body text stays prose to quote, never
+            // to parse. An absent header (an older receiver) can only mean the NodeId causes,
+            // which is what those receivers had.
             if (resp.StatusCode == System.Net.HttpStatusCode.Conflict)
-                _logger.LogError(
-                    "Peer {Addr} refused segment {Id}: it already holds a different segment under node " +
-                    "id {Node}, so this node shares that NodeId with another. Nothing will replicate " +
-                    "under it until one of them is renumbered.",
-                    peer.BaseAddress, segment.Id, segment.NodeId.Value);
+            {
+                bool unreadableIncumbent =
+                    resp.Headers.TryGetValues("X-Ameto-Conflict", out var causes)
+                    && causes.FirstOrDefault() == "unreadable-incumbent";
+                if (unreadableIncumbent)
+                    _logger.LogWarning(
+                        "Peer {Addr} refused segment {Id} (409): the path on the receiver is occupied " +
+                        "by a file it could not read, which it kept. Not a NodeId problem — the push " +
+                        "can succeed once that file is removed or repaired. Receiver said: {Body}",
+                        peer.BaseAddress, segment.Id, await ReadBodyAsync(resp, ct));
+                else
+                    _logger.LogError(
+                        "Peer {Addr} refused segment {Id} under node id {Node} (409): two nodes appear " +
+                        "to share that NodeId, and nothing will replicate under it until one of them " +
+                        "is renumbered. Receiver said: {Body}",
+                        peer.BaseAddress, segment.Id, segment.NodeId.Value, await ReadBodyAsync(resp, ct));
+            }
+            // 413 is terminal for this segment: the same bytes are the same size, so a retry
+            // cannot fix it -- only raising Ameto:Replication:MaxSegmentBytes on the RECEIVER
+            // can, and the receiver's body is the one line that says so. This branch used to
+            // fall into the generic warning below, which discarded that line and made the
+            // refusal look transient.
+            else if (resp.StatusCode == System.Net.HttpStatusCode.RequestEntityTooLarge)
+                _logger.LogWarning(
+                    "Peer {Addr} refused segment {Id}: {Bytes} bytes is over the receiver's " +
+                    "request-body limit, and re-sending cannot change that. Raise " +
+                    "Ameto:Replication:MaxSegmentBytes on the receiver or this segment will never " +
+                    "replicate there. Receiver said: {Body}",
+                    peer.BaseAddress, segment.Id, data.Length, await ReadBodyAsync(resp, ct));
             else if (!resp.IsSuccessStatusCode)
                 _logger.LogWarning("Push to {Addr} returned {Status}", peer.BaseAddress, resp.StatusCode);
             else
@@ -104,6 +137,56 @@ public sealed class SegmentReplicator : IDisposable
         {
             _logger.LogWarning(ex, "Push segment {Id} to {Addr} failed", segment.Id, peer.BaseAddress);
         }
+    }
+
+    /// <summary>
+    /// At most 4 KB of the response body, read off the stream into a pooled buffer, flattened
+    /// onto one line and capped -- a log field, not a payload. The response is never buffered
+    /// (the send uses ResponseHeadersRead), so a body of any size costs at most the 4 KB
+    /// actually read.
+    /// </summary>
+    private async Task<string> ReadBodyAsync(HttpResponseMessage resp, CancellationToken ct)
+    {
+        // ResponseHeadersRead moved the BODY read out from under HttpClient.Timeout -- the
+        // timeout covers up to the headers in that mode -- and the token that arrives here is
+        // CancellationToken.None (the push is fire-and-forget). Without its own clock this
+        // await hung for as long as a stalled peer cared to hold the socket, measured at
+        // thirty seconds against a two-second client timeout. The clock is the push timeout;
+        // on expiry the marker below preserves the classification, which is the whole point.
+        using var readCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        readCts.CancelAfter(_opts.PushTimeout);
+        try
+        {
+            await using var stream = await resp.Content.ReadAsStreamAsync(readCts.Token);
+            byte[] rented = System.Buffers.ArrayPool<byte>.Shared.Rent(4096);
+            try
+            {
+                int filled = 0;
+                bool truncated = false;
+                while (filled < 4096)
+                {
+                    int n;
+                    // The clock expiring mid-body must not discard what already arrived: a peer
+                    // that sent its ProblemDetails and then stalled has said the interesting
+                    // part, and the marker below says the rest never came.
+                    try { n = await stream.ReadAsync(rented.AsMemory(filled, 4096 - filled), readCts.Token); }
+                    catch (OperationCanceledException) when (!ct.IsCancellationRequested) { truncated = true; break; }
+                    if (n == 0) break;
+                    filled += n;
+                }
+                if (filled == 0) return truncated ? "(body read timed out)" : "(empty body)";
+                var body = System.Text.Encoding.UTF8.GetString(rented, 0, filled).ReplaceLineEndings(" ").Trim();
+                if (body.Length > 500) body = body[..500];
+                if (truncated) body += " …(body read timed out)";
+                return body.Length == 0 ? "(empty body)" : body;
+            }
+            finally { System.Buffers.ArrayPool<byte>.Shared.Return(rented); }
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            return "(body read timed out)";
+        }
+        catch { return "(unreadable body)"; }
     }
 
     public void Dispose() => _http.Dispose();

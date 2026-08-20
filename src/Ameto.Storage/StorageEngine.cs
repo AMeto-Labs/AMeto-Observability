@@ -15,17 +15,36 @@ namespace Ameto.Storage;
 public enum SegmentImportOutcome
 {
     /// <summary>
-    /// In the catalog: either the key was free, or the same file was re-pushed under it and the
-    /// entry was refreshed.
+    /// In the catalog: either the key was free, or the same segment was re-pushed under it — in
+    /// which case the entry and the bytes already held stay and the pushed body is discarded.
     /// </summary>
     Registered,
 
     /// <summary>
-    /// Refused. A DIFFERENT file already holds this (node, id) and was kept; the incoming one was
-    /// not registered. Two nodes are configured with the same NodeId — the one ambiguity the key
-    /// cannot resolve, and a configuration error rather than a race.
+    /// Refused. A DIFFERENT segment — read and compared, not guessed — already holds this
+    /// (node, id): in the catalog, or on disk at the final path the boot scan has not reached
+    /// yet. It was kept; the incoming one was not registered. Two nodes are configured with the
+    /// same NodeId — the one ambiguity the key cannot resolve, and a configuration error rather
+    /// than a race.
     /// </summary>
-    Conflict,
+    ConflictDifferentSegment,
+
+    /// <summary>
+    /// Refused. The final path is occupied by a file this node COULD NOT READ, so nothing about
+    /// "different" or "same" was established — adjudicating a torn leftover is the boot sweep's
+    /// job, not a push's. The file on disk was kept and nothing was registered. Unlike the two
+    /// conflicts above this says nothing about NodeId configuration, and it is not necessarily
+    /// permanent: it clears when the unreadable file is removed.
+    /// </summary>
+    ConflictUnreadableIncumbent,
+
+    /// <summary>
+    /// Refused. The id falls inside the span this node's own allocator has already handed out:
+    /// a local flush, merge or WAL replay holds it or is about to publish under it, and none of
+    /// those can give a key back. Same deployment fault as above, different evidence — split so
+    /// the endpoint can tell the sender which one it saw.
+    /// </summary>
+    ConflictAllocatedLocally,
 
     /// <summary>The file could not be opened as a segment. Nothing was registered.</summary>
     Unreadable,
@@ -160,7 +179,38 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// an id alone names a segment on one node only, so skip-listing an unreadable local file
     /// would also have excluded a healthy peer replica that shared its id.
     /// </summary>
-    private readonly HashSet<SegmentKey> _mergeSkip = new();
+    internal readonly HashSet<SegmentKey> _mergeSkip = new();   // internal for the quarantine test, as LoadSegmentCatalog is for the scan tests
+
+    /// <summary>
+    /// Anchors deferred for the REMAINDER OF THE CURRENT PASS, cleared at the top of every
+    /// pass. A bucket whose batch cannot assemble defers its anchor: the candidate set
+    /// strictly shrinks within the pass and re-selection falls through to the next bucket —
+    /// but a broken bucket still costs one of the pass's MergeWindowAttempts re-selections,
+    /// so deferral alone protects the catalog only from FEWER broken buckets than that.
+    /// <see cref="_mergeDeferStrikes"/> is the other half: a bucket deferred pass after pass
+    /// escalates to the skip-list and stops costing attempts. Until it does, a gone-for-good
+    /// file costs two Debug lines and one attempt per pass.
+    /// </summary>
+    private readonly HashSet<SegmentKey> _mergePassDeferred = new();
+
+    /// <summary>
+    /// Deferrals since this anchor last merged. (Not consecutive passes: a pass in which the
+    /// bucket simply was not selected does not reset it — only a merge does. Anything that
+    /// defers three times without ever merging is broken by any reading.) At
+    /// <see cref="MergeDeferEscalationPasses"/> it escalates into <see cref="_mergeSkip"/>:
+    /// per-pass deferral alone only moved the stall to the window threshold — each broken
+    /// bucket still ate one of the <see cref="MergeWindowAttempts"/> re-selections every pass,
+    /// so MergeWindowAttempts broken buckets ahead of a healthy one starved it forever. A
+    /// blink (an import mid-rename, a briefly held file) clears in a pass or two and never
+    /// reaches the limit; a bucket that is broken pass after pass stops costing attempts.
+    /// Strikes are erased when the segment merges. The sets are not disjoint — a corrupt
+    /// anchor of a two-segment bucket lands in the skip-list AND the pass deferral — and do
+    /// not need to be: the skip-list simply wins.
+    /// </summary>
+    internal readonly Dictionary<SegmentKey, int> _mergeDeferStrikes = new();   // internal for the bookkeeping test, as _mergeSkip is
+
+    /// <summary>Deferred passes before an anchor is treated as broken rather than blinking.</summary>
+    private const int MergeDeferEscalationPasses = 3;
 
     /// <summary>
     /// Segment ids reserved per flushed tier: one per <see cref="LogLevel"/>, so a tier
@@ -236,15 +286,20 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     private readonly System.Threading.Lock                _segIdLock = new();
 
     /// <summary>
-    /// Serialises <see cref="ImportSegment(string, string)"/> AGAINST OTHER IMPORTS, and nothing
-    /// else: two peers pushing different segments under one key would otherwise both find it free
-    /// and both rename onto the same path, leaving one peer's bytes gone from disk whichever entry
-    /// the catalog ended up with.
+    /// Serialises <see cref="ImportSegment(string, string)"/> against other imports AND against
+    /// <see cref="DeleteSegmentAsync(SegmentKey, CancellationToken)"/>: two peers pushing
+    /// different segments under one key would otherwise both find it free and both rename onto
+    /// the same path, and a delete landing between an import's publish and its rename would
+    /// orphan the file the rename lands. On the collision path the section also reads the
+    /// incumbent's header and footer (never its blocks) to judge it — so the hold is bounded by
+    /// metadata reads, not by file size.
     ///
-    /// <para>It is taken in that one method and in no other, so it excludes no other writer into
-    /// the catalog — flush publication holds <c>_frozenLock</c>, merge publication and WAL
-    /// recovery hold nothing, and the boot scan runs on a background task while the replication
-    /// endpoint is already serving. That is why the registration itself is a compare-and-swap
+    /// <para>Taken by <c>ImportSegment</c> and by <c>DeleteSegmentAsync</c> — a delete
+    /// landing inside an import's publish-to-rename window would otherwise orphan the file the
+    /// rename lands — and it still excludes none of the other writers into the catalog: flush
+    /// publication holds <c>_frozenLock</c>, merge publication and WAL recovery hold nothing,
+    /// and the boot scan runs on a background task while the replication endpoint is already
+    /// serving. That is why the registration itself is a compare-and-swap
     /// rather than a store: holding this lock says nothing about whether the value read at the top
     /// of the section is still there at the bottom of it.</para>
     ///
@@ -367,6 +422,27 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         // scan progresses (the catalog is a ConcurrentDictionary keyed by id, so
         // concurrent flush registrations are safe).
         InitNextSegmentIdFromFileNames();
+        // Leftover temp files are swept HERE, not in the background catalog scan, because the
+        // scan runs with everything else already up. Two live writers produce files this sweep's
+        // masks match: the replication endpoint staging a body under {node}-{id}.{nonce}.seg.tmp
+        // -- written by a request thread holding no lock -- and the WAL replay two lines down. A
+        // background sweep deleted them out from under their writers; on Linux the unlink
+        // succeeds beneath the open handle and a healthy push then fails on a file that no
+        // longer has a name. In the constructor there is nothing to race: no endpoint is bound,
+        // no recovery has started, no merge can be running. Same reasoning and same shape as the
+        // metrics engine's constructor sweep.
+        SweepLeftoverTempFiles();
+        // Quarantined segments are invisible to everything else on purpose -- the sweep walks
+        // *.seg.tmp, the scan and the planner walk *.seg, retention walks the catalog -- so
+        // without this line they would be mentioned exactly once, at the moment of quarantine,
+        // and an operator a year later would see disk usage disagree with retention with no
+        // hint as to why. One Warning per start: nothing is deleted, the silence is.
+        var corrupt = Directory.GetFiles(_segDir, "*.seg.corrupt");
+        if (corrupt.Length > 0)
+            _logger.LogWarning(
+                "Quarantined segments present: {Count} file(s), {Bytes:N0} bytes in {Dir} — " +
+                "unreadable at some earlier start, kept for an operator to inspect or remove.",
+                corrupt.Length, corrupt.Sum(static f => new FileInfo(f).Length), _segDir);
         _catalogLoad = Task.Run(LoadSegmentCatalog);
         ReplayOrphanedWals();
         OpenWal();
@@ -712,10 +788,28 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// </summary>
     public Task DeleteSegmentAsync(SegmentKey key, CancellationToken ct = default)
     {
-        if (_segments.TryRemove(key, out var info))
+        // Under _importLock, because an import PUBLISHES its entry before its File.Move lands
+        // the file -- the reverse order was the earlier bug, the rename being the irreversible
+        // half. A delete landing inside that window removed the fresh entry and failed to
+        // delete a file that was not there yet; the import's move then produced a file no
+        // entry names -- served by nobody, expired by nothing, compacted by no merge. Retention
+        // is the caller that can land there (an imported segment may already be past its TTL);
+        // the merge's source cleanup also passes through here, deleting up to a batch in
+        // sequence, so it can queue behind an import's rename -- brief and bounded, and the
+        // waiting is the point.
+        lock (_importLock)
         {
-            try { File.Delete(info.FilePath); }
-            catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete segment {Key}", key); }
+            if (_segments.TryRemove(key, out var info))
+            {
+                // The merge bookkeeping (_mergeDeferStrikes, _mergeSkip) is deliberately NOT
+                // touched here. Both are plain collections owned lock-free by the maintenance
+                // thread, and this method also runs on retention's threads — a background
+                // service and an HTTP endpoint — where a Remove would be a concurrent mutation
+                // that _importLock does not cover (the merge side never takes it). Keys the
+                // delete orphans are pruned at the top of the next merge pass, on the owner.
+                try { File.Delete(info.FilePath); }
+                catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete segment {Key}", key); }
+            }
         }
         return Task.CompletedTask;
     }
@@ -1190,7 +1284,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         var buckets = new Dictionary<(Ameto.Core.LogLevel Level, long Start), List<SegmentInfo>>();
         foreach (var s in _segments.Values)
         {
-            if (_mergeSkip.Contains(SegmentKey.Of(s))) continue;
+            if (_mergeSkip.Contains(SegmentKey.Of(s)) || _mergePassDeferred.Contains(SegmentKey.Of(s))) continue;
             // A replicated peer's segment is a merge candidate here, the same as a local one, and
             // MergeToColdAsync stamps its output with THIS node's id — so merging one drops the
             // provenance that SegmentInfo.NodeId carried, and a later re-push of the same (node, id)
@@ -1432,8 +1526,25 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         // A skipped bucket used to burn the whole maintenance pause (600 s) on a
         // single discarded anchor. Skips are rare — what remains is unreadable or
         // empty segments — so when one happens, re-select immediately. Bounded and
-        // livelock-free: every failed attempt adds to _mergeSkip first, so the
-        // candidate set strictly shrinks.
+        // livelock-free: every failed attempt either quarantines (corruption) or defers its
+        // anchor for the rest of THIS pass, so the candidate set strictly shrinks within the
+        // window loop either way. The deferral set is cleared at the top of the pass.
+        _mergePassDeferred.Clear();
+
+        // Prune bookkeeping for segments that no longer exist. Retention deletes catalog
+        // entries from its own threads, so the delete site cannot touch these two non-
+        // thread-safe collections; this is the one place that runs on the maintenance
+        // thread alone. Without it, a segment that expired carrying strikes — or sitting
+        // in the skip-list — left its key there for the life of the process. _segments is
+        // a ConcurrentDictionary, safe to read from any thread; Dictionary and HashSet
+        // both permit Remove during their own enumeration.
+        foreach (var stale in _mergeDeferStrikes)
+            if (!_segments.ContainsKey(stale.Key))
+                _mergeDeferStrikes.Remove(stale.Key);
+        foreach (var stale in _mergeSkip)
+            if (!_segments.ContainsKey(stale))
+                _mergeSkip.Remove(stale);
+
         List<SegmentInfo>?   consumed = null;
         List<SegmentReader>? readers  = null;
         for (int attempt = 0; attempt < MergeWindowAttempts && consumed is null; attempt++)
@@ -1462,20 +1573,60 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 }
                 catch (Exception ex)
                 {
-                    _mergeSkip.Add(SegmentKey.Of(seg));
-                    _logger.LogWarning(ex, "Merge: skipping unreadable segment {File}", seg.FilePath);
+                    // Quarantine is for corruption -- a property of the bytes, which will not
+                    // heal. Anything else is circumstance: a file mid-rename inside an import's
+                    // publish window, a share violation from a concurrent reader. Those keep
+                    // their place and are retried next pass -- the same rule the streaming merge
+                    // applies to a source that fails mid-stream.
+                    if (IsSourceCorruption(ex))
+                    {
+                        _mergeSkip.Add(SegmentKey.Of(seg));
+                        _logger.LogWarning(ex, "Merge: quarantining corrupt segment {File}", seg.FilePath);
+                    }
+                    else
+                        // Debug, not Warning: this repeats every pass until the circumstance
+                        // clears, and the maintenance loop walks every 15 seconds -- the old
+                        // line warned exactly once because the skip-list also stopped the
+                        // reselection, and a Warning that fires forever drowns what it carries.
+                        // There is no retry limit, deliberately: the skip-list is the only
+                        // permanent exclusion state, and it is reserved for what will not heal.
+                        _logger.LogDebug(ex, "Merge: segment {File} failed to open -- kept for the next pass", seg.FilePath);
                 }
             }
 
-            // Anti-stall: a bucket whose anchor can't produce even a 2-segment batch
-            // would be re-selected forever — exclude the anchor until restart.
+            // Anti-stall: a bucket whose anchor can't produce even a 2-segment batch would be
+            // re-selected forever — defer the anchor for the pass, and escalate to the
+            // skip-list after MergeDeferEscalationPasses (the branch below tells the story).
             // Debug, not Warning: this is the planner's EXPECTED outcome whenever there is
             // simply nothing to merge (a day's log carried 54 of these, every anchor
             // different) — at WRN it drowns the signal it was meant to be.
             if (usable.Count < 2 || usableEvents == 0)
             {
                 foreach (var r in opened) r.Dispose();
-                _mergeSkip.Add(SegmentKey.Of(sources[0]));
+                // Deferred for the PASS, with an escalation counter. Deferral alone fixed one
+                // broken bucket and moved the stall to the window threshold: each broken bucket
+                // still ate a re-selection attempt every pass, so MergeWindowAttempts of them
+                // starved everything behind. A bucket deferred MergeDeferEscalationPasses
+                // passes in a row is not blinking -- it joins the skip-list, stops costing
+                // attempts, and says so at Warning once. (Its first replacement, a batch-wide
+                // "was anything transient" flag, excluded nothing on FileNotFound and one
+                // operator-deleted file stalled the whole catalog; permanent quarantine before
+                // that made a mid-rename blink permanent. This is the middle both rounds were
+                // reaching for.) Corruption is already in the skip-list from the loop above.
+                var anchorKey = SegmentKey.Of(sources[0]);
+                int strikes = _mergeDeferStrikes.GetValueOrDefault(anchorKey) + 1;
+                if (strikes >= MergeDeferEscalationPasses)
+                {
+                    _mergeDeferStrikes.Remove(anchorKey);
+                    _mergeSkip.Add(anchorKey);
+                    _logger.LogWarning(
+                        "Merge: bucket anchored at {File} has failed to assemble a batch for {Passes} passes — " +
+                        "anchor skip-listed until restart so it stops costing re-selection attempts",
+                        Path.GetFileName(sources[0].FilePath), strikes);
+                }
+                else
+                    _mergeDeferStrikes[anchorKey] = strikes;
+                _mergePassDeferred.Add(anchorKey);
                 _logger.LogDebug("Merge: bucket anchored at {File} yields no usable batch — anchor skipped",
                     Path.GetFileName(sources[0].FilePath));
                 continue;
@@ -1614,7 +1765,13 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             }
             else
             {
-                _logger.LogWarning(ex,
+                // Debug for the same reason the planner's open loop speaks at Debug on a retry:
+                // this repeats every maintenance pass until the circumstance clears, and there
+                // is no retry limit here -- the skip-list is the only PERMANENT exclusion
+                // state, reserved for corruption and for anchors that struck out (see
+                // _mergeDeferStrikes). A Warning here fired on every pass, which is the exact
+                // noise this change-set claims to have removed.
+                _logger.LogDebug(ex,
                     "Merge: aborted while streaming {Count} source(s) — sources left intact, batch retried next pass",
                     consumed.Count);
             }
@@ -1625,7 +1782,10 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
         PublishLocalSegment(info);
         foreach (var seg in consumed)
+        {
+            _mergeDeferStrikes.Remove(SegmentKey.Of(seg));
             await DeleteSegmentAsync(SegmentKey.Of(seg), ct);
+        }
 
         // Drop the manifest only when every source file is confirmed gone. A
         // source held open by an in-flight query survives File.Delete — the
@@ -1651,10 +1811,16 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     ///
     /// <para><see cref="InvalidDataException"/> is what every structural check throws — footer
     /// and header magic, an unsupported version, a block whose stored length does not match its
-    /// frame, and the merge's own event-count verification. <see cref="EndOfStreamException"/> is
-    /// a truncated file. Both are properties of the bytes on disk and will still be true on the
-    /// next pass. Everything else — no space left, an I/O error, a file momentarily locked — is
-    /// the machine's condition rather than the segments', and gets another attempt.</para>
+    /// frame, a file too short to hold a footer, and the merge's own event-count verification.
+    /// All properties of the bytes on disk, still true on the next pass. Everything else — no
+    /// space left, an I/O error, a file momentarily locked or mid-rename — is the machine's
+    /// condition rather than the segment's, and gets another attempt.
+    /// <see cref="EndOfStreamException"/> is thrown by the MessagePack decoder on a truncated
+    /// exception column — corruption that <c>SegmentReader.Open</c> PASSES, because the file's
+    /// structure (header, footer, block index, LZ4 frames) is intact and only the column's
+    /// payload is torn. It was removed from this list once on the strength of a grep over src/,
+    /// which does not see into dependencies; the streaming merge then retried such a file
+    /// forever, warning every pass.</para>
     /// </summary>
     private static bool IsSourceCorruption(Exception ex) => ex is InvalidDataException or EndOfStreamException;
 
@@ -2017,6 +2183,22 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     }
 
     /// <summary>
+    /// Deletes temp files left behind by an interrupted flush, merge or re-compression.
+    /// Called ONCE, from the constructor, before the background catalog scan is started and
+    /// before any endpoint can stage a body -- see the constructor comment for why running
+    /// this any later races the two live writers whose files match these masks.
+    /// </summary>
+    private void SweepLeftoverTempFiles()
+    {
+        foreach (var pattern in new[] { "*.seg.tmp", "*.hctmp" })
+            foreach (var tmp in Directory.EnumerateFiles(_segDir, pattern))
+            {
+                try { File.Delete(tmp); }
+                catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete leftover temp segment {File}", tmp); }
+            }
+    }
+
+    /// <summary>
     /// Rebuilds the catalog from the segments directory. Started by the constructor as a
     /// BACKGROUND task, so it runs with ingest and the HTTP endpoints already up.
     ///
@@ -2028,14 +2210,6 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     internal void LoadSegmentCatalog()
     {
         var sw = System.Diagnostics.Stopwatch.StartNew();
-
-        // Clean up leftover temp files from interrupted flushes / re-compressions
-        foreach (var pattern in new[] { "*.seg.tmp", "*.hctmp" })
-            foreach (var tmp in Directory.EnumerateFiles(_segDir, pattern))
-            {
-                try { File.Delete(tmp); }
-                catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete leftover temp segment {File}", tmp); }
-            }
 
         // Finish merges interrupted between publishing the merged segment and
         // deleting its sources — otherwise those events would be served twice.
@@ -2075,19 +2249,43 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 // A live flush or import may have registered this very file while the scan was
                 // running — the scan is a background task, not a barrier — so only a genuinely
                 // different segment under the key is the collision being reported.
-                if (_segments.TryGetValue(key, out var kept) && !IsTheSameSegment(kept, info))
-                    _logger.LogError(
-                        "Segment {File} carries {Key}, which is already held by {Existing}. Two nodes " +
-                        "are configured as NodeId {Node}, or a file was copied in from another node. " +
-                        "The first is served, retained and merged; this one is NOT, and holds its disk " +
-                        "until one of the two is removed or the nodes are renumbered.",
-                        file, key, kept.FilePath, info.NodeId);
+                if (_segments.TryGetValue(key, out var kept))
+                {
+                    if (!IsTheSameSegment(kept, info))
+                        _logger.LogError(
+                            "Segment {File} carries {Key}, which is already held by {Existing}. Two nodes " +
+                            "are configured as NodeId {Node}, or a file was copied in from another node. " +
+                            "The first is served, retained and merged; this one is NOT, and holds its disk " +
+                            "until one of the two is removed or the nodes are renumbered.",
+                            file, key, kept.FilePath, info.NodeId);
+                    else
+                        // The same FILE: an import or a flush publication beat the scan to the
+                        // key, and the five-field comparison includes the path, so two DISTINCT
+                        // files can never land here -- they differ in path and take the error
+                        // branch above. Debug, because this is the expected overlap of a
+                        // background scan with a live writer, and nothing is lost or unserved.
+                        _logger.LogDebug(
+                            "Segment {File} was already registered under {Key} before the scan reached it.",
+                            file, key);
+                }
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "Skipping corrupt segment {File}", file);
-                try { File.Delete(file); }
-                catch (Exception delEx) { _logger.LogWarning(delEx, "Failed to delete corrupt segment {File}", file); }
+                // Renamed aside, NOT deleted. The delete was written when "unreadable" meant a
+                // header or footer that nothing could ever parse; the reader now also throws on
+                // one torn block FRAME -- four bad bytes in a file whose every other block is
+                // readable -- and an unlink here turned that into losing the whole segment at
+                // the next start. Error, not Warning: an operator must decide what a
+                // .seg.corrupt file is worth, and nothing else will ever mention it again --
+                // the catalog scan, the merge planner and retention all enumerate *.seg.
+                _logger.LogError(ex, "Quarantining unreadable segment {File} as .corrupt — kept on disk, served by nobody", file);
+                try
+                {
+                    string aside = file + ".corrupt";
+                    if (File.Exists(aside)) File.Delete(aside);   // keep one generation of quarantine
+                    File.Move(file, aside);
+                }
+                catch (Exception mvEx) { _logger.LogWarning(mvEx, "Failed to quarantine corrupt segment {File}", file); }
             }
         }
         _logger.LogInformation("Loaded {Count} segments from {Dir} in {Ms} ms", _segments.Count, _segDir, sw.ElapsedMilliseconds);
@@ -2424,8 +2622,8 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         // held disk for the life of the install, never served, never expired, never compacted.
         //
         // The lock is NOT what makes the decision safe, and the compare-and-swap below is not
-        // redundant with it. _importLock is taken here and nowhere else, while four other writers
-        // reach this dictionary knowing nothing about it: flush publication (under _frozenLock),
+        // redundant with it. _importLock is taken here and in DeleteSegmentAsync, while four
+        // other writers reach this dictionary knowing nothing about it: flush publication (under _frozenLock),
         // merge publication, the boot catalog scan and WAL recovery. A probe followed by a store
         // therefore decides on a value that another writer can replace in between — and the
         // catalog scan is a BACKGROUND task, so a replication POST is live while it is still
@@ -2447,14 +2645,18 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         // the exchange is won. It is the irreversible half of this method — overwrite: true — and
         // deciding it on the stale probe is what let a refusal arrive with the other peer's bytes
         // already destroyed. Registering first opens a window in the other direction, where the
-        // entry names a path the file has not reached; every reader of a segment path already
-        // treats an unreadable file as a segment that contributes nothing (QueryExecutor yields
-        // nothing for it, the aggregator logs and moves on), which is exactly how they behaved a
-        // moment earlier when the entry did not exist at all.
+        // entry names a path the file has not reached. For the two QUERY consumers that is
+        // harmless -- QueryExecutor yields nothing for an unreadable path, the aggregator logs
+        // and moves on -- but retention and the merge planner act on the ENTRY, not the file:
+        // retention could remove it and orphan the file the move then lands, and the planner
+        // could quarantine the not-yet-arrived path until restart. Both are held off explicitly
+        // instead of argued away: DeleteSegmentAsync takes this same lock, and the planner
+        // quarantines only corruption, never a file that failed to open.
+        SegmentInfo? refreshEntryOutsideLock = null;
+        try
+        {
         lock (_importLock)
         {
-            SegmentInfo? displaced;
-
             while (true)
             {
                 // The bool is redundant: a null value is never stored, so "absent" and "null"
@@ -2470,7 +2672,30 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                         "configured as NodeId {Node} — a deployment error no id space can resolve. The " +
                         "segment already being served was kept and the incoming one was NOT registered.",
                         staged.FilePath, key, existing.FilePath, info.NodeId);
-                    return SegmentImportOutcome.Conflict;
+                    return SegmentImportOutcome.ConflictDifferentSegment;
+                }
+
+                if (existing is not null)
+                {
+                    // Same segment, by the header five-tuple. The old path refreshed the bytes
+                    // here with File.Move(overwrite: true) -- betting the file already being
+                    // served on a heuristic its own docstring calls uncertain: the header
+                    // carries no digest, and under a duplicated NodeId the path comes from the
+                    // route, so five coinciding fields were licence to destroy the one copy
+                    // this node serves. A re-push needs no refresh -- the entry and the bytes
+                    // already held stay, the staged body is dropped, and the sender hears
+                    // success, which for an idempotent push it is. If the five fields coincided
+                    // on genuinely DIFFERENT segments, the incoming one is not stored and the
+                    // line below is the only trace -- keeping the served file is the safe side
+                    // of a bet this method cannot avoid making.
+                    if (!inPlace)
+                        try { File.Delete(stagedPath); }
+                        catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete staged body {File}", stagedPath); }
+                    _logger.LogInformation(
+                        "Re-push of {Key} matched the segment already held ({File}) by its header " +
+                        "fields; existing bytes kept, staged body discarded.",
+                        key, existing.FilePath);
+                    return SegmentImportOutcome.Registered;
                 }
 
                 // A free key is not the same thing as an available one. The claim above failed,
@@ -2483,7 +2708,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 // already accepted fails the claim too — the first push raised the floor past it
                 // — and that is ordinary traffic, so the incumbent decides it. Only a key with
                 // nothing under it is refused on the claim alone.
-                if (existing is null && !claimed)
+                if (!claimed)
                 {
                     _logger.LogError(
                         "Refused replicated segment {File}: {Key} names a segment id this node has " +
@@ -2492,27 +2717,95 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                         "back. Two nodes appear to be configured as NodeId {Node}. Nothing was " +
                         "registered and the body was left where it was staged.",
                         staged.FilePath, key, info.NodeId);
-                    return SegmentImportOutcome.Conflict;
+                    return SegmentImportOutcome.ConflictAllocatedLocally;
                 }
 
                 _beforeImportPublish?.Invoke();
 
-                // TryUpdate compares the STORED REFERENCE with the one just read — SegmentInfo is
-                // a class with no value equality — so this is a real exchange and not a test an
-                // equal-but-rebuilt entry would pass.
-                bool won = existing is null
-                    ? _segments.TryAdd(key, info)
-                    : _segments.TryUpdate(key, info, existing);
+                // Only a FREE key reaches this line -- both occupied outcomes returned above --
+                // so the publication is a plain TryAdd. Losing it means somebody landed in the
+                // window; the loop re-reads and judges again rather than assuming the worst.
+                if (!_segments.TryAdd(key, info)) continue;
 
-                if (!won) continue;   // somebody landed in the window; read again and judge again
-
-                displaced = existing;
                 break;
             }
 
             if (!inPlace)
             {
-                try { File.Move(stagedPath, finalPath, overwrite: true); }
+                // No overwrite: a free KEY is a statement about the catalog, and the catalog is
+                // still being built while the boot scan runs -- a file can sit at the final path
+                // with no entry naming it yet. overwrite: true here was a bet that a free key
+                // means a free path, and losing that bet destroyed a peer's bytes with the only
+                // trace a Debug line whose text says nothing was lost. The move now refuses, and
+                // an incumbent ON DISK is judged exactly as an incumbent in the catalog is.
+                try { File.Move(stagedPath, finalPath); }
+                catch (IOException) when (File.Exists(finalPath))
+                {
+                    SegmentInfo onDisk;
+                    try
+                    {
+                        // No block walk here: this runs under _importLock with retention and the
+                        // merge cleanup queued behind it, and the comparison below reads none of
+                        // what the walk computes. The entry stored for the incumbent then carries
+                        // the file size as its uncompressed size -- conservative until the next
+                        // start's scan reads the honest value.
+                        using var incumbent = SegmentReader.Open(finalPath);
+                        onDisk = incumbent.Info;
+                    }
+                    catch (Exception ex)
+                    {
+                        // Unreadable incumbent: refuse rather than replace -- and SAY that,
+                        // rather than a diagnosis this branch just failed to make. It used to
+                        // return ConflictDifferentSegment here, and the endpoint then told the
+                        // sender "already held by a different file... two nodes appear to be
+                        // configured with NodeId {N}" -- claims nothing established, quoted at
+                        // Error by the sender and marked permanent by the contract, when the
+                        // real cause is local and clears with the file.
+                        _segments.TryRemove(new KeyValuePair<SegmentKey, SegmentInfo>(key, info));
+                        _logger.LogError(ex,
+                            "Refused replicated segment {File}: the final path {Final} is occupied by a " +
+                            "file that could not be read, and a push does not adjudicate that. Nothing " +
+                            "was registered and the file on disk was kept.",
+                            stagedPath, finalPath);
+                        return SegmentImportOutcome.ConflictUnreadableIncumbent;
+                    }
+
+                    if (IsTheSameSegment(onDisk, info))
+                    {
+                        // A re-push landing after a restart, before the scan reached this file:
+                        // the same segment already sits at the final path, so the body is
+                        // dropped -- and the entry is exchanged for one describing the file that
+                        // SURVIVED. The published info was built from the staged body, and this
+                        // branch exists precisely because the two may differ in bytes (a
+                        // re-compression), so leaving info in place kept a catalog entry whose
+                        // sizes belonged to a file this same branch just deleted.
+                        //
+                        // onDisk was read without the block walk (this is under the import
+                        // lock), so its UncompressedBytes is the file size -- an UNDERSTATED
+                        // value, and understatement here is the harmful direction: the merge
+                        // planner takes max(Uncompressed, Compressed) into its batch budget, so
+                        // a shrunken entry lets a batch overfill. The honest value is re-read
+                        // below, outside the lock, and swapped in.
+                        _segments.TryUpdate(key, onDisk, info);
+                        try { File.Delete(stagedPath); }
+                        catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete staged body {File}", stagedPath); }
+                        _logger.LogInformation(
+                            "Re-push of {Key} matched the file already at {Final}; existing bytes kept, " +
+                            "staged body discarded.",
+                            key, finalPath);
+                        refreshEntryOutsideLock = onDisk;
+                        return SegmentImportOutcome.Registered;
+                    }
+
+                    _segments.TryRemove(new KeyValuePair<SegmentKey, SegmentInfo>(key, info));
+                    _logger.LogError(
+                        "Refused replicated segment {File}: {Key} was free in the catalog but {Final} is " +
+                        "occupied by a different segment the boot scan has not reached yet. Two nodes " +
+                        "appear to be configured as NodeId {Node}. The file on disk was kept and nothing " +
+                        "was registered.",
+                        stagedPath, key, finalPath, info.NodeId);
+                    return SegmentImportOutcome.ConflictDifferentSegment;
+                }
                 catch
                 {
                     // The entry is already published and names a file that never arrived. Nothing
@@ -2520,8 +2813,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                     // start — so a disk error here would leave a permanent entry for a path
                     // holding either nothing or the previous segment. Conditional both ways: only
                     // an entry that is still OURS is withdrawn.
-                    if (displaced is { } previous) _segments.TryUpdate(key, previous, info);
-                    else _segments.TryRemove(new KeyValuePair<SegmentKey, SegmentInfo>(key, info));
+                    _segments.TryRemove(new KeyValuePair<SegmentKey, SegmentInfo>(key, info));
                     throw;
                 }
             }
@@ -2529,6 +2821,22 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
         _logger.LogInformation("Imported replicated segment {Key} ({Events} events)", key, info.EventCount);
         return SegmentImportOutcome.Registered;
+        }
+        finally
+        {
+            // The honest uncompressed size, computed off the lock: the block walk pages in a
+            // slice of every block and has no business inside a section retention queues on.
+            // Conditional swap -- if retention deleted the entry in between, it stays deleted.
+            if (refreshEntryOutsideLock is { } placeholder)
+            {
+                try
+                {
+                    using var honest = SegmentReader.Open(placeholder.FilePath, computeUncompressedBytes: true);
+                    _segments.TryUpdate(key, honest.Info, placeholder);
+                }
+                catch { /* the file may already be gone again; the placeholder stays conservative */ }
+            }
+        }
     }
 
     /// <summary>

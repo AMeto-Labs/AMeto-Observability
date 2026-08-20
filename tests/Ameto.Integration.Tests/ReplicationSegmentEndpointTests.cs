@@ -153,13 +153,13 @@ public sealed class ReplicationSegmentEndpointTests : IClassFixture<ReplicationW
     /// Development one, and this harness is the second.</para>
     ///
     /// <para>The second assertion used to be <c>GetFiles(SegDir, "abc-*")</c>, credited in this
-    /// docstring with proving the handler never ran, and it could not fail: <c>{nodeId}</c> binds
-    /// as <c>uint</c> and the staging name is built from the BOUND value, so no execution of the
-    /// handler — before, during or after any reordering — can put the literal <c>abc</c> in that
-    /// directory. It would have gone on passing under exactly the change it was there to catch,
-    /// a binder relaxed to <c>string</c> for better diagnostics. What does catch that is the
-    /// directory as a whole: a handler that ran would stage a body under SOME name, and a total
-    /// that has not moved says none was staged whatever it would have been called.</para>
+    /// docstring with proving the handler never ran — and it could not fail, because the staging
+    /// name is built from the BOUND value. Its replacement counts the whole directory, and it
+    /// cannot fail either: this client sends no secret, so a handler that ran at all would
+    /// answer 401 on its first line and stage nothing whatever the binder allowed. The STATUS
+    /// assertion is the entire proof — an executed handler cannot answer 400 — and the count
+    /// below is a tidiness check on the shared directory, kept because it costs one line and
+    /// credited with nothing.</para>
     /// </summary>
     [Fact]
     public async Task A_route_that_does_not_bind_is_refused_before_the_secret_is_checked()
@@ -179,9 +179,12 @@ public sealed class ReplicationSegmentEndpointTests : IClassFixture<ReplicationW
 
     /// <summary>
     /// The ceiling the endpoint puts on a body, which is configuration and therefore breakable
-    /// in silence. Kestrel's default is 30 MB; a cold segment is routinely larger, and over the
-    /// limit the body read throws and used to come back as the 500 the contract marks
-    /// RETRYABLE — a peer re-pushing a merged segment forever, with nothing logged anywhere.
+    /// in silence. Kestrel's default is 30 MB; a pushed level segment can clear it (a flush
+    /// starts from a 64 MB budget with LZ4 the only thing between that and the wire), and over
+    /// the limit the body read threw and came back as the 500 the contract marks RETRYABLE —
+    /// while the sender pushes once per flush and logged a status with no reason, which made it
+    /// permanent, silent non-replication rather than the retry storm this docstring once
+    /// described.
     ///
     /// <para>What is asserted is the WIRING: that the value configured for this node reaches
     /// the request before a byte of the body is read. The enforcement itself belongs to Kestrel
@@ -504,6 +507,111 @@ public sealed class ReplicationSegmentEndpointTests : IClassFixture<ReplicationW
     }
 
     /// <summary>
+    /// The 409 body names WHICH of the receiver's two conflict causes fired — the sender's log
+    /// quotes that body, so before the causes were split it confidently reported the wrong one
+    /// in one case of two. This pins the different-segment body.
+    /// </summary>
+    [Fact]
+    public async Task A_409_for_a_different_segment_says_so_in_the_body()
+    {
+        // Node 71 is used by no other test in this class: the factory is shared, so a node id
+        // another test also pushes under would make this one's first push meet that test's
+        // segment and 409 before the scenario even starts.
+        var (first, id) = ForeignSegment(new NodeId(71), events: 6);
+        Assert.Equal(HttpStatusCode.NoContent, (await PushAsync(71, id, first)).StatusCode);
+
+        var (second, _) = ForeignSegment(new NodeId(71), events: 11);
+        var response = await PushAsync(71, id, second);
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+        Assert.Contains("already held by a different file", await response.Content.ReadAsStringAsync());
+        Assert.Equal("different-segment", Assert.Single(response.Headers.GetValues("X-Ameto-Conflict")));
+    }
+
+    /// <summary>
+    /// And the allocated-locally body: an id this node's own allocator has handed out cannot be
+    /// taken by a peer wearing this node's id, and the body says that instead of the
+    /// different-file story.
+    /// </summary>
+    [Fact]
+    public async Task A_409_for_a_locally_allocated_id_says_so_in_the_body()
+    {
+        // The allocator branch needs an id that is HANDED OUT but not PUBLISHED — an id with a
+        // catalog entry takes the different-segment branch instead. A flush reserves a block of
+        // six ids, one per level, and publishes only the levels it held: WriteAndFlush writes
+        // Information only, so the Debug slot right below it (local.Id - 1) is allocated to the
+        // local writer and carries no file and no entry. A peer wearing this node's id and
+        // pushing that id hits exactly the claim refusal.
+        var storage = _factory.Services.GetRequiredService<StorageEngine>();
+        var local   = WriteAndFlush(storage, events: 8);
+        ulong reservedUnpublished = local.Id.Value - 1;
+
+        byte[] body = PeerSegmentBytes(new NodeId(0), reservedUnpublished, events: 4);
+        var response = await PushAsync(0, reservedUnpublished, body);
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+        Assert.Contains("own allocator has already handed out", await response.Content.ReadAsStringAsync());
+        Assert.Equal("allocated-locally", Assert.Single(response.Headers.GetValues("X-Ameto-Conflict")));
+    }
+
+    /// <summary>
+    /// The third 409 cause is NOT a NodeId diagnosis, and its body says so: the path is
+    /// occupied by a file the receiver could not read, it kept the file and refused to guess.
+    /// The other two bodies both claim a duplicated NodeId — sending either here would have
+    /// the sender log a deployment fault nobody established, marked permanent by the contract
+    /// when the cause is local and clears with the file.
+    /// </summary>
+    [Fact]
+    public async Task A_409_for_an_unreadable_incumbent_does_not_claim_a_duplicated_node()
+    {
+        Directory.CreateDirectory(_factory.SegDir);
+        string finalPath = Path.Combine(_factory.SegDir, "93-5.seg");
+        await File.WriteAllBytesAsync(finalPath, [0xBA, 0xD0, 0xBA, 0xD0, 0xBA, 0xD0, 0xBA, 0xD0]);
+
+        byte[] body = PeerSegmentBytes(new NodeId(93), 5, events: 4);
+        var response = await PushAsync(93, 5, body);
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+        string text = await response.Content.ReadAsStringAsync();
+        Assert.Contains("could not read", text);
+        Assert.DoesNotContain("two nodes", text);
+        Assert.Equal("unreadable-incumbent", Assert.Single(response.Headers.GetValues("X-Ameto-Conflict")));
+    }
+
+    /// <summary>
+    /// A segment body with a CHOSEN header identity — ForeignSegment cannot pick the id, its
+    /// engine's allocator does. The header is what the receiver keys on; the route only names
+    /// the file.
+    /// </summary>
+    private static byte[] PeerSegmentBytes(NodeId node, ulong segId, int events)
+    {
+        string tmp = Path.Combine(Path.GetTempPath(), "ameto-peerbytes-" + Guid.NewGuid().ToString("N")[..8] + ".seg");
+        var pool = new StringInternPool();
+        using var hot = new HotTierSegment(16, 1L << 20);
+        long baseTicks = DateTime.UtcNow.Ticks;
+        for (int i = 0; i < events; i++)
+            Assert.True(hot.TryWrite(new LogEventHeader
+            {
+                Id                       = new Ameto.Core.EventId(node.Value, (uint)i).RawValue,
+                TimestampUtcTicks        = baseTicks + i * TimeSpan.TicksPerMillisecond,
+                Level                    = Ameto.Core.LogLevel.Information,
+                MessageTemplatePoolIndex = pool.Intern("chosen {n}"),
+            }, ReadOnlySpan<byte>.Empty, "chosen {n}"));
+        hot.Freeze();
+        try
+        {
+            using (var writer = new SegmentWriter(tmp))
+            {
+                writer.WriteEvents(hot, pool);
+                writer.Finalise(node, new SegmentId(segId));
+            }
+            return File.ReadAllBytes(tmp);
+        }
+        finally { try { File.Delete(tmp); } catch { } }
+    }
+
+
+    /// <summary>
     /// A segment file produced by a DIFFERENT node, built by running a throwaway engine under
     /// that node's id — the header has to be genuine, because the receiving engine keys the
     /// catalog off what it reads out of the file and not off the route.
@@ -526,12 +634,13 @@ public sealed class ReplicationSegmentEndpointTests : IClassFixture<ReplicationW
         finally
         {
             // The dispose used to stand inside the try, below a write and a read that can both
-            // throw. The directory delete under it was already guarded — but it cannot succeed
-            // with the engine's write-ahead log still mapped, so the guard only made the leak
-            // silent: the throw propagated, the swallowed delete failed, and the run left a
-            // directory behind. Disposing here is what makes the delete below able to work.
+            // throw — without it the delete below cannot succeed at all, the engine's
+            // write-ahead log still being mapped. Necessary is not sufficient, though: a run
+            // has left this directory behind even with the dispose in place, so the failure is
+            // now SAID rather than swallowed, and a leftover has a line to be found by.
             engine.DisposeAsync().AsTask().GetAwaiter().GetResult();
-            try { Directory.Delete(dir, true); } catch { }
+            try { Directory.Delete(dir, true); }
+            catch (Exception ex) { Console.WriteLine($"temp dir left behind: {dir} — {ex.Message}"); }
         }
     }
 
