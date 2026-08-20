@@ -801,12 +801,12 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         {
             if (_segments.TryRemove(key, out var info))
             {
-                // The merge bookkeeping goes with the entry: a segment that expired with
-                // strikes on it, or sitting in the skip-list, otherwise left its key in those
-                // structures for the life of the process — a slow, invisible growth bounded
-                // only by how many distinct keys the process ever saw.
-                _mergeDeferStrikes.Remove(key);
-                _mergeSkip.Remove(key);
+                // The merge bookkeeping (_mergeDeferStrikes, _mergeSkip) is deliberately NOT
+                // touched here. Both are plain collections owned lock-free by the maintenance
+                // thread, and this method also runs on retention's threads — a background
+                // service and an HTTP endpoint — where a Remove would be a concurrent mutation
+                // that _importLock does not cover (the merge side never takes it). Keys the
+                // delete orphans are pruned at the top of the next merge pass, on the owner.
                 try { File.Delete(info.FilePath); }
                 catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete segment {Key}", key); }
             }
@@ -1530,6 +1530,21 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         // anchor for the rest of THIS pass, so the candidate set strictly shrinks within the
         // window loop either way. The deferral set is cleared at the top of the pass.
         _mergePassDeferred.Clear();
+
+        // Prune bookkeeping for segments that no longer exist. Retention deletes catalog
+        // entries from its own threads, so the delete site cannot touch these two non-
+        // thread-safe collections; this is the one place that runs on the maintenance
+        // thread alone. Without it, a segment that expired carrying strikes — or sitting
+        // in the skip-list — left its key there for the life of the process. _segments is
+        // a ConcurrentDictionary, safe to read from any thread; Dictionary and HashSet
+        // both permit Remove during their own enumeration.
+        foreach (var stale in _mergeDeferStrikes)
+            if (!_segments.ContainsKey(stale.Key))
+                _mergeDeferStrikes.Remove(stale.Key);
+        foreach (var stale in _mergeSkip)
+            if (!_segments.ContainsKey(stale))
+                _mergeSkip.Remove(stale);
+
         List<SegmentInfo>?   consumed = null;
         List<SegmentReader>? readers  = null;
         for (int attempt = 0; attempt < MergeWindowAttempts && consumed is null; attempt++)

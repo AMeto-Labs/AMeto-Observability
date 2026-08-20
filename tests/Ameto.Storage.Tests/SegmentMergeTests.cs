@@ -176,6 +176,44 @@ public sealed class SegmentMergeTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// A deleted segment's merge bookkeeping is pruned by the next pass — not at the delete
+    /// site. The first version of this cleanup lived inside DeleteSegmentAsync, which also
+    /// runs on retention's threads (a background service, an HTTP endpoint) while the
+    /// maintenance loop reads and writes both collections with no shared lock: a concurrent
+    /// Dictionary mutation, invisible to any single-threaded test. The pruning now runs at
+    /// the top of the pass, on the owning thread — and must take only the orphaned key, not
+    /// the live one beside it.
+    /// </summary>
+    [Fact]
+    public async Task A_deleted_segments_bookkeeping_is_pruned_on_the_next_pass()
+    {
+        await WriteSegmentAsync(1, 10, fixedLevel: LogLevel.Error,
+            baseTicks: MergeBucketGrid.SealedBucketStart(LogLevel.Error));
+        await WriteSegmentAsync(2, 10, fixedLevel: LogLevel.Information,
+            baseTicks: MergeBucketGrid.SealedBucketStart(LogLevel.Information));
+        var segs  = _engine.ListSegments();
+        var live  = SegmentKey.Of(segs.Single(x => x.MinLevel == LogLevel.Error));
+        var doomed = segs.Single(x => x.MinLevel == LogLevel.Information);
+        var stale = SegmentKey.Of(doomed);
+
+        _engine._mergeDeferStrikes[live]  = 1;
+        _engine._mergeDeferStrikes[stale] = 2;
+        _engine._mergeSkip.Add(live);
+        _engine._mergeSkip.Add(stale);
+
+        await _engine.DeleteSegmentAsync(stale);   // retention's path; must not touch either
+        Assert.True(_engine._mergeDeferStrikes.ContainsKey(stale),
+            "the delete site touched the maintenance thread's bookkeeping again");
+
+        await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None);
+
+        Assert.False(_engine._mergeDeferStrikes.ContainsKey(stale), "strikes outlived the segment");
+        Assert.DoesNotContain(stale, _engine._mergeSkip);
+        Assert.True(_engine._mergeDeferStrikes.ContainsKey(live), "pruning took a live key");
+        Assert.Contains(live, _engine._mergeSkip);
+    }
+
+    /// <summary>
     /// MORE broken buckets than the window has attempts must still not starve a healthy one.
     /// Per-pass deferral alone moved the stall to the window threshold: each broken bucket ate
     /// one of the MergeWindowAttempts re-selections every pass, so four of them ahead of a
