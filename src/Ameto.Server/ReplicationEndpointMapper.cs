@@ -179,6 +179,8 @@ public static class ReplicationEndpointMapper
                 // sender and some other node are configured as the same NodeId, but they rest
                 // on different evidence, and the sender's log quotes this body -- so the body
                 // names the case, or the sender confidently reports the wrong one of two.
+                // No discard arm: the next SegmentImportOutcome member should be a compile-time
+                // question here, not a wire answer the sender has to diagnose.
                 return outcome switch
                 {
                     SegmentImportOutcome.ConflictDifferentSegment => Results.Problem(
@@ -191,9 +193,17 @@ public static class ReplicationEndpointMapper
                         $"holds it or is about to publish under it. Two nodes appear to be configured " +
                         $"with NodeId {nodeId}.",
                         statusCode: StatusCodes.Status409Conflict),
-                    _ => Results.Problem(
+                    SegmentImportOutcome.ConflictUnreadableIncumbent => Results.Problem(
+                        $"The path for segment {nodeId}-{segmentId} is occupied by a file this node " +
+                        $"could not read; it was kept and nothing was registered. This says nothing " +
+                        $"about NodeId configuration — remove or repair the file on the receiver and " +
+                        $"the push can succeed.",
+                        statusCode: StatusCodes.Status409Conflict),
+                    SegmentImportOutcome.Unreadable => Results.Problem(
                         $"Segment {nodeId}-{segmentId} could not be read as a segment file.",
                         statusCode: StatusCodes.Status400BadRequest),
+                    SegmentImportOutcome.Registered => throw new System.Diagnostics.UnreachableException(
+                        "Registered returns 204 above."),
                 };
             });
     }

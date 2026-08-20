@@ -375,6 +375,7 @@ public sealed class SegmentReader : ISegmentReader
     {
         int uncompressedSize = ReadInt32At(blockOffset);
         int compressedSize   = ReadInt32At(blockOffset + 4);
+        ValidateBlockFrame(blockOffset, uncompressedSize, compressedSize);
 
         byte[]? rentedComp   = null;
         byte[]? rentedUncomp = null;
@@ -454,6 +455,7 @@ public sealed class SegmentReader : ISegmentReader
     {
         int uncompressedSize = ReadInt32At(blockOffset);
         int compressedSize   = ReadInt32At(blockOffset + 4);
+        ValidateBlockFrame(blockOffset, uncompressedSize, compressedSize);
 
         byte[]? rentedComp   = null;
         byte[]? rentedUncomp = null;
@@ -625,6 +627,7 @@ public sealed class SegmentReader : ISegmentReader
         {
             int uncompressedSize = ReadInt32At(blockOffset);
             int compressedSize   = ReadInt32At(blockOffset + 4);
+            ValidateBlockFrame(blockOffset, uncompressedSize, compressedSize);
 
             byte[] rentedComp   = ArrayPool<byte>.Shared.Rent(compressedSize);
             byte[] rentedUncomp = ArrayPool<byte>.Shared.Rent(uncompressedSize);
@@ -650,6 +653,25 @@ public sealed class SegmentReader : ISegmentReader
     internal int BlockCount => _blocks.Length;
 
     /// <summary>
+    /// The stored block sizes are STRUCTURE and are validated as such, before either is
+    /// handed to the pool. A torn four-byte field is uniform: about half come out negative
+    /// and used to surface as ArgumentOutOfRangeException from Rent, the rest as absurd
+    /// positives that surfaced as OutOfMemoryException -- both BEFORE the LZ4 length check
+    /// that would have said InvalidDataException, so exactly the corruption the merge
+    /// classifier's docstring names ("a block whose stored length does not match its
+    /// frame") was classified as circumstance by every caller that quarantines on it.
+    /// Called at every site that reads a block frame.
+    /// </summary>
+    private void ValidateBlockFrame(long blockOffset, int uncompressedSize, int compressedSize)
+    {
+        if (uncompressedSize <= 0 || compressedSize <= 0
+            || blockOffset + 8 + compressedSize > _fileSize)
+            throw new InvalidDataException(
+                $"Block at {blockOffset} in {Info.FilePath} stores sizes " +
+                $"{uncompressedSize}/{compressedSize} that do not fit the file -- a torn block frame.");
+    }
+
+    /// <summary>
     /// Decompresses one block into <paramref name="buffer"/>, growing it from
     /// <see cref="ArrayPool{T}.Shared"/> when needed, and returns the uncompressed length.
     ///
@@ -663,6 +685,7 @@ public sealed class SegmentReader : ISegmentReader
         long blockOffset     = _blocks[index].FileOffset;
         int uncompressedSize = ReadInt32At(blockOffset);
         int compressedSize   = ReadInt32At(blockOffset + 4);
+        ValidateBlockFrame(blockOffset, uncompressedSize, compressedSize);
 
         if (buffer.Length < uncompressedSize)
         {

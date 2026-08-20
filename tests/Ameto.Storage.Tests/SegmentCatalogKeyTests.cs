@@ -857,7 +857,38 @@ public sealed class SegmentCatalogKeyTests : IAsyncLifetime
         Assert.False(File.Exists(staged), "the staged body was not cleaned up");
         var entry = Assert.Single(_engine.ListSegments(), x => x.NodeId.Value == Peer.Value && x.Id.Value == 22ul);
         Assert.Equal(finalPath, entry.FilePath);
+        // The entry describes the file that SURVIVED, not the body that was deleted: this
+        // branch exists because the two may differ in bytes, so an entry built from the staged
+        // body carried sizes belonging to a file that no longer exists.
+        Assert.Equal(incumbent.LongLength, entry.CompressedBytes);
     }
+
+    /// <summary>
+    /// An UNREADABLE file at the final path refuses the push — and says that, rather than a
+    /// diagnosis the code never made. This used to come back as ConflictDifferentSegment, and
+    /// the endpoint then told the sender "already held by a different file… two nodes appear
+    /// to be configured with NodeId N": claims about a file that could not be read and about a
+    /// second node for which there was no evidence, quoted at Error by the sender and marked
+    /// permanent by the contract — when the real cause is local and clears with the file.
+    /// </summary>
+    [Fact]
+    public void An_unreadable_incumbent_refuses_with_its_own_answer_not_a_guess()
+    {
+        long now = DateTime.UtcNow.Ticks;
+        Directory.CreateDirectory(SegDir);
+        string finalPath = Path.Combine(SegDir, $"{Peer.Value}-23.seg");
+        File.WriteAllBytes(finalPath, [0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02, 0x03]);
+
+        string staged = WritePeerSegment(Peer, 23, now,
+            path: Path.Combine(SegDir, "7-23.44556677.seg.tmp"));
+
+        Assert.Equal(SegmentImportOutcome.ConflictUnreadableIncumbent, _engine.ImportSegment(staged, finalPath));
+
+        Assert.Equal(8, new FileInfo(finalPath).Length);   // the unreadable file was kept, not replaced
+        Assert.True(File.Exists(staged), "a refused import moved the body it refused");
+        Assert.DoesNotContain(_engine.ListSegments(), x => x.NodeId.Value == Peer.Value && x.Id.Value == 23ul);
+    }
+
 
     // ── Issues #47, #49, #52 ─────────────────────────────────────────────────
 

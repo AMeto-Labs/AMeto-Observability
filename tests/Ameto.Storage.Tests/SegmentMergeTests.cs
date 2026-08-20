@@ -97,8 +97,12 @@ public sealed class SegmentMergeTests : IAsyncLifetime
     /// the quarantine precisely by being badly torn: the reader failed before its first
     /// structural check, with an exception the classifier did not count.
     /// </summary>
-    [Fact]
-    public async Task A_torn_file_is_quarantined_not_retried()
+    [Theory]
+    [InlineData(0)]    // fails inside the file MAPPING without the guard — the case the guard
+                       // sits ABOVE CreateFromFile for; a guard moved below it goes green on 10
+                       // bytes and silently loses this one
+    [InlineData(10)]   // fails in the footer read without the guard
+    public async Task A_torn_file_is_quarantined_not_retried(int tornBytes)
     {
         long b0 = MergeBucketGrid.SealedBucketStart(LogLevel.Information);
         await WriteSegmentAsync(0, 40, baseTicks: b0);
@@ -106,11 +110,65 @@ public sealed class SegmentMergeTests : IAsyncLifetime
         await WriteSegmentAsync(2, 40, baseTicks: b0 + 2 * TimeSpan.TicksPerHour);
 
         var victim = _engine.ListSegments().OrderBy(x => x.MinTimestampTicks).Last();
-        File.WriteAllBytes(victim.FilePath, new byte[10]);   // the canonical torn write
+        File.WriteAllBytes(victim.FilePath, new byte[tornBytes]);   // the canonical torn write
 
         Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None),
             "setup: the two healthy sources should still merge");
         Assert.Contains(SegmentKey.Of(victim), _engine._mergeSkip);
+    }
+
+    /// <summary>
+    /// The corruption the classifier's own docstring names — "a block whose stored length does
+    /// not match its frame" — used to surface as ArgumentOutOfRangeException (negative size,
+    /// about half of all torn four-byte fields) or OutOfMemoryException (absurd positive),
+    /// both BEFORE the LZ4 length check that would have said InvalidDataException. The reader
+    /// now validates the stored sizes as structure.
+    /// </summary>
+    [Fact]
+    public async Task A_block_whose_stored_length_lies_reads_as_corruption()
+    {
+        long b0 = MergeBucketGrid.SealedBucketStart(LogLevel.Information);
+        await WriteSegmentAsync(0, 40, baseTicks: b0);
+        var seg = Assert.Single(_engine.ListSegments());
+
+        // The first block's frame sits right after the 46-byte header:
+        // uint32 uncompressedSize, uint32 compressedSize. 0xFFFFFFFF is -1 as int32.
+        using (var f = File.Open(seg.FilePath, FileMode.Open, FileAccess.Write))
+        {
+            f.Position = 46 + 4;
+            f.Write([0xFF, 0xFF, 0xFF, 0xFF]);
+        }
+
+        using var reader = SegmentReader.Open(seg.FilePath);
+        var ex = Assert.ThrowsAny<Exception>(() => reader.ReadAllRaw(new Dictionary<string, string>(StringComparer.Ordinal)));
+        Assert.IsType<InvalidDataException>(ex);
+    }
+
+    /// <summary>
+    /// The anti-stall used to quarantine a bucket's anchor UNCONDITIONALLY when the batch came
+    /// up short — one line after the retry path promised "kept for the next pass". A bucket
+    /// starved by a transient open failure now recovers when the file returns; only a bucket
+    /// that is short with every source readable is a shape that cannot change on its own.
+    /// </summary>
+    [Fact]
+    public async Task A_bucket_whose_anchor_was_briefly_unopenable_recovers()
+    {
+        long b0 = MergeBucketGrid.SealedBucketStart(LogLevel.Information);
+        await WriteSegmentAsync(0, 40, baseTicks: b0);
+        await WriteSegmentAsync(1, 40, baseTicks: b0 + TimeSpan.TicksPerHour);
+
+        var anchor = _engine.ListSegments().OrderBy(x => x.MinTimestampTicks).First();
+        string hidden = anchor.FilePath + ".hidden";
+        File.Move(anchor.FilePath, hidden);
+
+        Assert.False(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None),
+            "setup: one openable source is not a batch");
+
+        File.Move(hidden, anchor.FilePath);
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None),
+            "the returned anchor was not retried — it was quarantined for a transient failure");
+        var final = Assert.Single(_engine.ListSegments());
+        Assert.Equal(80u, final.EventCount);
     }
 
 

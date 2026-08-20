@@ -553,6 +553,29 @@ public sealed class ReplicationSegmentEndpointTests : IClassFixture<ReplicationW
     }
 
     /// <summary>
+    /// The third 409 cause is NOT a NodeId diagnosis, and its body says so: the path is
+    /// occupied by a file the receiver could not read, it kept the file and refused to guess.
+    /// The other two bodies both claim a duplicated NodeId — sending either here would have
+    /// the sender log a deployment fault nobody established, marked permanent by the contract
+    /// when the cause is local and clears with the file.
+    /// </summary>
+    [Fact]
+    public async Task A_409_for_an_unreadable_incumbent_does_not_claim_a_duplicated_node()
+    {
+        Directory.CreateDirectory(_factory.SegDir);
+        string finalPath = Path.Combine(_factory.SegDir, "93-5.seg");
+        await File.WriteAllBytesAsync(finalPath, [0xBA, 0xD0, 0xBA, 0xD0, 0xBA, 0xD0, 0xBA, 0xD0]);
+
+        byte[] body = PeerSegmentBytes(new NodeId(93), 5, events: 4);
+        var response = await PushAsync(93, 5, body);
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+        string text = await response.Content.ReadAsStringAsync();
+        Assert.Contains("could not read", text);
+        Assert.DoesNotContain("two nodes", text);
+    }
+
+    /// <summary>
     /// A segment body with a CHOSEN header identity — ForeignSegment cannot pick the id, its
     /// engine's allocator does. The header is what the receiver keys on; the route only names
     /// the file.

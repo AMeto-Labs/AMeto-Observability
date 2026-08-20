@@ -80,7 +80,14 @@ public sealed class SegmentReplicator : IDisposable
             content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
             using var req = new HttpRequestMessage(HttpMethod.Post, url) { Content = content };
             req.Headers.Add("X-Ameto-Replication", _opts.Secret);
-            using var resp = await _http.SendAsync(req, ct);
+            // ResponseHeadersRead: the status decides everything below, and the body is only
+            // ever read -- bounded -- to be quoted in a log line. A buffered send with a size
+            // cap was tried here and rejected: the cap fires inside SendAsync itself, so an
+            // oversized body (a proxy's HTML error page, a ProblemDetails with a stack) took
+            // down the classified response whole, and 409/413 collapsed into a generic
+            // "push failed" with no status at all -- diagnostics erased exactly where they
+            // were needed.
+            using var resp = await _http.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct);
 
             // 409 is the peer REFUSING the segment, and the receiver has TWO distinct reasons
             // to do it: a different segment already sits under this (NodeId, Id), or the id
@@ -120,15 +127,31 @@ public sealed class SegmentReplicator : IDisposable
     }
 
     /// <summary>
-    /// The response body flattened onto one line and capped -- it is a log field, not a
-    /// payload, and a receiver's ProblemDetails fits well inside the cap.
+    /// At most 4 KB of the response body, read off the stream into a pooled buffer, flattened
+    /// onto one line and capped -- a log field, not a payload. The response is never buffered
+    /// (the send uses ResponseHeadersRead), so a body of any size costs at most the 4 KB
+    /// actually read.
     /// </summary>
     private static async Task<string> ReadBodyAsync(HttpResponseMessage resp, CancellationToken ct)
     {
         try
         {
-            var body = (await resp.Content.ReadAsStringAsync(ct)).ReplaceLineEndings(" ").Trim();
-            return body.Length == 0 ? "(empty body)" : body.Length <= 500 ? body : body[..500];
+            await using var stream = await resp.Content.ReadAsStreamAsync(ct);
+            byte[] rented = System.Buffers.ArrayPool<byte>.Shared.Rent(4096);
+            try
+            {
+                int filled = 0;
+                while (filled < 4096)
+                {
+                    int n = await stream.ReadAsync(rented.AsMemory(filled, 4096 - filled), ct);
+                    if (n == 0) break;
+                    filled += n;
+                }
+                if (filled == 0) return "(empty body)";
+                var body = System.Text.Encoding.UTF8.GetString(rented, 0, filled).ReplaceLineEndings(" ").Trim();
+                return body.Length == 0 ? "(empty body)" : body.Length <= 500 ? body : body[..500];
+            }
+            finally { System.Buffers.ArrayPool<byte>.Shared.Return(rented); }
         }
         catch { return "(unreadable body)"; }
     }

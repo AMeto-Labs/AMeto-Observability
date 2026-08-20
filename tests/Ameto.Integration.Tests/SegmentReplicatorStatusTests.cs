@@ -33,7 +33,12 @@ public sealed class SegmentReplicatorStatusTests : IDisposable
 
     private sealed class SingleClientFactory(HttpMessageHandler handler) : IHttpClientFactory
     {
-        public HttpClient CreateClient(string name) => new(handler, disposeHandler: false);
+        // The buffer cap is DELIBERATE and small: with ResponseHeadersRead the content is
+        // never buffered, so the cap must never fire -- while a regression back to a plain
+        // buffered SendAsync trips it on the huge-body test and collapses the classified
+        // response into the generic failure, which is the exact rejected design.
+        public HttpClient CreateClient(string name) =>
+            new(handler, disposeHandler: false) { MaxResponseContentBufferSize = 8 * 1024 };
     }
 
     private sealed class CapturingLogger : ILogger<SegmentReplicator>
@@ -81,6 +86,29 @@ public sealed class SegmentReplicatorStatusTests : IDisposable
         }
         throw new TimeoutException("expected log line never appeared; saw: " +
             string.Join(" | ", log.Lines.Select(l => l.Message)));
+    }
+
+    /// <summary>
+    /// The body is read off the STREAM, bounded — not buffered whole with a cap. A capped
+    /// buffered send was tried and rejected: the cap fires inside SendAsync itself, so an
+    /// oversized body (a proxy's HTML error page) threw before the status was ever seen and
+    /// the classified 409/413 collapsed into a generic "push failed". The marker sits inside
+    /// the first 4 KB; the megabyte behind it must cost nothing and lose nothing.
+    /// </summary>
+    [Fact]
+    public async Task A_huge_body_does_not_cost_the_classification()
+    {
+        string marker = "limit is 1024 bytes: raise Ameto:Replication:MaxSegmentBytes on the receiver";
+        var (replicator, log) = Build(HttpStatusCode.RequestEntityTooLarge, marker + new string('x', 1_000_000));
+        using (replicator)
+        {
+            replicator.OnSegmentFlushed(Segment(_file));
+
+            var line = await WaitForLineAsync(log, m => m.Contains("MaxSegmentBytes"));
+            Assert.Equal(MelLogLevel.Warning, line.Level);
+            Assert.Contains(marker, line.Message);
+            Assert.DoesNotContain(log.Lines, l => l.Message.Contains("Push segment") && l.Message.Contains("failed"));
+        }
     }
 
     [Fact]
