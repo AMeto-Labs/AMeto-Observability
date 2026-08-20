@@ -245,6 +245,9 @@ public sealed class SegmentReplicatorStatusTests : IDisposable
 
             var line = await WaitForLineAsync(log, m => m.Contains("MaxSegmentBytes"));
             Assert.Equal(MelLogLevel.Warning, line.Level);
+            // The bytes that DID arrive are kept — the interesting part of a ProblemDetails is
+            // at the front — and the marker says the rest never came.
+            Assert.Contains("limit is", line.Message);
             Assert.Contains("(body read timed out)", line.Message);
         }
     }

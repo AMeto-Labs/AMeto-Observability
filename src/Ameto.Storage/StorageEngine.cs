@@ -183,16 +183,32 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
     /// <summary>
     /// Anchors deferred for the REMAINDER OF THE CURRENT PASS, cleared at the top of every
-    /// pass. This is what keeps the window loop's invariant true without quarantining anybody:
-    /// a bucket whose batch cannot assemble defers its anchor, the candidate set strictly
-    /// shrinks within the pass, the re-selection falls through to the next bucket -- so one
-    /// unopenable non-corrupt file cannot stall compaction across the whole catalog, which is
-    /// exactly what a batch-wide "was it transient" flag did: FileNotFound is not corruption,
-    /// so nothing was ever deferred, and the same bucket ate all four window attempts of every
-    /// pass forever. Next pass, everything deferred here is a candidate again: a file that
-    /// returned merges, one that is gone for good costs one Debug line per pass.
+    /// pass. A bucket whose batch cannot assemble defers its anchor: the candidate set
+    /// strictly shrinks within the pass and re-selection falls through to the next bucket —
+    /// but a broken bucket still costs one of the pass's MergeWindowAttempts re-selections,
+    /// so deferral alone protects the catalog only from FEWER broken buckets than that.
+    /// <see cref="_mergeDeferStrikes"/> is the other half: a bucket deferred pass after pass
+    /// escalates to the skip-list and stops costing attempts. Until it does, a gone-for-good
+    /// file costs two Debug lines and one attempt per pass.
     /// </summary>
     private readonly HashSet<SegmentKey> _mergePassDeferred = new();
+
+    /// <summary>
+    /// Consecutive passes an anchor has been deferred. At
+    /// <see cref="MergeDeferEscalationPasses"/> it escalates into <see cref="_mergeSkip"/>:
+    /// per-pass deferral alone only moved the stall to the window threshold — each broken
+    /// bucket still ate one of the <see cref="MergeWindowAttempts"/> re-selections every pass,
+    /// so MergeWindowAttempts broken buckets ahead of a healthy one starved it forever. A
+    /// blink (an import mid-rename, a briefly held file) clears in a pass or two and never
+    /// reaches the limit; a bucket that is broken pass after pass stops costing attempts.
+    /// Strikes are erased when the segment merges. The sets are not disjoint — a corrupt
+    /// anchor of a two-segment bucket lands in the skip-list AND the pass deferral — and do
+    /// not need to be: the skip-list simply wins.
+    /// </summary>
+    private readonly Dictionary<SegmentKey, int> _mergeDeferStrikes = new();
+
+    /// <summary>Deferred passes before an anchor is treated as broken rather than blinking.</summary>
+    private const int MergeDeferEscalationPasses = 3;
 
     /// <summary>
     /// Segment ids reserved per flushed tier: one per <see cref="LogLevel"/>, so a tier
@@ -1544,25 +1560,39 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 }
             }
 
-            // Anti-stall: a bucket whose anchor can't produce even a 2-segment batch
-            // would be re-selected forever — exclude the anchor until restart.
+            // Anti-stall: a bucket whose anchor can't produce even a 2-segment batch would be
+            // re-selected forever — defer the anchor for the pass, and escalate to the
+            // skip-list after MergeDeferEscalationPasses (the branch below tells the story).
             // Debug, not Warning: this is the planner's EXPECTED outcome whenever there is
             // simply nothing to merge (a day's log carried 54 of these, every anchor
             // different) — at WRN it drowns the signal it was meant to be.
             if (usable.Count < 2 || usableEvents == 0)
             {
                 foreach (var r in opened) r.Dispose();
-                // Deferred for the PASS, not quarantined: permanent exclusion here made a brief
-                // failure (an import mid-rename, a reader holding the file a moment) permanent
-                // for the process -- one line after the Debug above promised "kept for the next
-                // pass". And its first replacement, a batch-wide "was anything transient" flag,
-                // was worse: FileNotFound is not corruption, so nothing was ever excluded, the
-                // same bucket won selection on all four window attempts of every pass, and one
-                // operator-deleted file stalled compaction for the whole catalog. The deferral
-                // shrinks the candidate set for this pass -- the re-selection moves on to the
-                // next bucket -- and expires with it. Corruption is already in the skip-list
-                // from the loop above.
-                _mergePassDeferred.Add(SegmentKey.Of(sources[0]));
+                // Deferred for the PASS, with an escalation counter. Deferral alone fixed one
+                // broken bucket and moved the stall to the window threshold: each broken bucket
+                // still ate a re-selection attempt every pass, so MergeWindowAttempts of them
+                // starved everything behind. A bucket deferred MergeDeferEscalationPasses
+                // passes in a row is not blinking -- it joins the skip-list, stops costing
+                // attempts, and says so at Warning once. (Its first replacement, a batch-wide
+                // "was anything transient" flag, excluded nothing on FileNotFound and one
+                // operator-deleted file stalled the whole catalog; permanent quarantine before
+                // that made a mid-rename blink permanent. This is the middle both rounds were
+                // reaching for.) Corruption is already in the skip-list from the loop above.
+                var anchorKey = SegmentKey.Of(sources[0]);
+                int strikes = _mergeDeferStrikes.GetValueOrDefault(anchorKey) + 1;
+                if (strikes >= MergeDeferEscalationPasses)
+                {
+                    _mergeDeferStrikes.Remove(anchorKey);
+                    _mergeSkip.Add(anchorKey);
+                    _logger.LogWarning(
+                        "Merge: bucket anchored at {File} has failed to assemble a batch for {Passes} passes — " +
+                        "anchor skip-listed until restart so it stops costing re-selection attempts",
+                        Path.GetFileName(sources[0].FilePath), strikes);
+                }
+                else
+                    _mergeDeferStrikes[anchorKey] = strikes;
+                _mergePassDeferred.Add(anchorKey);
                 _logger.LogDebug("Merge: bucket anchored at {File} yields no usable batch — anchor skipped",
                     Path.GetFileName(sources[0].FilePath));
                 continue;
@@ -1703,9 +1733,10 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             {
                 // Debug for the same reason the planner's open loop speaks at Debug on a retry:
                 // this repeats every maintenance pass until the circumstance clears, and there
-                // is NO retry limit -- the skip-list is the only exclusion state there is, and
-                // it is deliberately reserved for corruption. A Warning here fired on every
-                // pass, which is the exact noise this change-set claims to have removed.
+                // is no retry limit here -- the skip-list is the only PERMANENT exclusion
+                // state, reserved for corruption and for anchors that struck out (see
+                // _mergeDeferStrikes). A Warning here fired on every pass, which is the exact
+                // noise this change-set claims to have removed.
                 _logger.LogDebug(ex,
                     "Merge: aborted while streaming {Count} source(s) — sources left intact, batch retried next pass",
                     consumed.Count);
@@ -1717,7 +1748,10 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
         PublishLocalSegment(info);
         foreach (var seg in consumed)
+        {
+            _mergeDeferStrikes.Remove(SegmentKey.Of(seg));
             await DeleteSegmentAsync(SegmentKey.Of(seg), ct);
+        }
 
         // Drop the manifest only when every source file is confirmed gone. A
         // source held open by an in-flight query survives File.Delete — the
@@ -2203,9 +2237,21 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "Skipping corrupt segment {File}", file);
-                try { File.Delete(file); }
-                catch (Exception delEx) { _logger.LogWarning(delEx, "Failed to delete corrupt segment {File}", file); }
+                // Renamed aside, NOT deleted. The delete was written when "unreadable" meant a
+                // header or footer that nothing could ever parse; the reader now also throws on
+                // one torn block FRAME -- four bad bytes in a file whose every other block is
+                // readable -- and an unlink here turned that into losing the whole segment at
+                // the next start. Error, not Warning: an operator must decide what a
+                // .seg.corrupt file is worth, and nothing else will ever mention it again --
+                // the catalog scan, the merge planner and retention all enumerate *.seg.
+                _logger.LogError(ex, "Quarantining unreadable segment {File} as .corrupt — kept on disk, served by nobody", file);
+                try
+                {
+                    string aside = file + ".corrupt";
+                    if (File.Exists(aside)) File.Delete(aside);   // keep one generation of quarantine
+                    File.Move(file, aside);
+                }
+                catch (Exception mvEx) { _logger.LogWarning(mvEx, "Failed to quarantine corrupt segment {File}", file); }
             }
         }
         _logger.LogInformation("Loaded {Count} segments from {Dir} in {Ms} ms", _segments.Count, _segDir, sw.ElapsedMilliseconds);

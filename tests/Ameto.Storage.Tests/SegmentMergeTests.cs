@@ -176,6 +176,47 @@ public sealed class SegmentMergeTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// MORE broken buckets than the window has attempts must still not starve a healthy one.
+    /// Per-pass deferral alone moved the stall to the window threshold: each broken bucket ate
+    /// one of the MergeWindowAttempts re-selections every pass, so four of them ahead of a
+    /// healthy bucket starved it forever. A bucket deferred pass after pass now escalates into
+    /// the skip-list and stops costing attempts.
+    /// </summary>
+    [Fact]
+    public async Task Broken_buckets_beyond_the_window_cannot_starve_a_healthy_one()
+    {
+        // Five sealed Information buckets, each two segments, each broken the non-corrupt way;
+        // one healthy sealed Error bucket behind them all.
+        for (int b = 0; b < 5; b++)
+        {
+            long start = MergeBucketGrid.SealedBucketStart(LogLevel.Information, bucketsSpanned: b + 1);
+            await WriteSegmentAsync(b * 2,     40, fixedLevel: LogLevel.Information, baseTicks: start);
+            await WriteSegmentAsync(b * 2 + 1, 40, fixedLevel: LogLevel.Information, baseTicks: start + TimeSpan.TicksPerHour);
+        }
+        long be = MergeBucketGrid.SealedBucketStart(LogLevel.Error);
+        await WriteSegmentAsync(20, 30, fixedLevel: LogLevel.Error, baseTicks: be);
+        await WriteSegmentAsync(21, 30, fixedLevel: LogLevel.Error, baseTicks: be + TimeSpan.TicksPerHour);
+
+        // Break every Information bucket: delete the newer source of each pair.
+        var infos = _engine.ListSegments().Where(x => x.MinLevel == LogLevel.Information)
+                                          .OrderBy(x => x.MinTimestampTicks).ToList();
+        for (int i = 1; i < infos.Count; i += 2) File.Delete(infos[i].FilePath);
+
+        // Escalation takes MergeDeferEscalationPasses passes; give it that and one more.
+        bool healthyMerged = false;
+        for (int pass = 0; pass < 5 && !healthyMerged; pass++)
+        {
+            await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None);
+            healthyMerged = _engine.ListSegments().Count(x => x.MinLevel == LogLevel.Error) == 1;
+        }
+
+        Assert.True(healthyMerged,
+            "five broken buckets starved the healthy Error bucket past the escalation horizon");
+        var merged = Assert.Single(_engine.ListSegments(), x => x.MinLevel == LogLevel.Error);
+        Assert.Equal(60u, merged.EventCount);
+    }
+
+    /// <summary>
     /// One unopenable, non-corrupt file must cost its own bucket a pass — not the catalog its
     /// compaction. The per-pass deferral shrinks the candidate set so re-selection falls
     /// through to the next bucket; its predecessor, a batch-wide transient flag, excluded
@@ -202,6 +243,57 @@ public sealed class SegmentMergeTests : IAsyncLifetime
         var errors = _engine.ListSegments().Where(x => x.MinLevel == LogLevel.Error).ToList();
         var merged = Assert.Single(errors);
         Assert.Equal(60u, merged.EventCount);
+    }
+
+    /// <summary>
+    /// The ratio bound stops binding once 255 * compressedSize outgrows int.MaxValue — a block
+    /// compressed past ~8.4 MB lets ANY torn positive int through it, so a near-chunk-sized
+    /// incompressible event plus one torn word returned a silent 2 GB uncompressed sum and an
+    /// OutOfMemoryException classified as circumstance. The ceiling (twice the hot-tier chunk)
+    /// is what no honest block reaches and no torn word survives.
+    /// </summary>
+    [Fact]
+    public void A_torn_word_in_a_big_block_is_still_corruption()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "ameto-bigblock-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            // One event carrying ~9 MB of incompressible payload -> one block whose
+            // compressedSize is far past the point where the 255x ratio can bind.
+            // Exactly one chunk of payload: the largest event the hot tier admits, and the
+            // only size at which an incompressible block's compressedSize crosses the point
+            // where 255x outgrows int.MaxValue and the ratio clause goes tautological.
+            var payload = new byte[HotTierSegment.ChunkPayloadBytes];
+            new Random(20260820).NextBytes(payload);
+            var pool = new StringInternPool();
+            using var hot = new HotTierSegment(4, 32L * 1024 * 1024);
+            Assert.True(hot.TryWrite(new LogEventHeader
+            {
+                Id                       = new EventId(0u, 1u).RawValue,
+                TimestampUtcTicks        = DateTime.UtcNow.Ticks,
+                Level                    = LogLevel.Information,
+                MessageTemplatePoolIndex = pool.Intern("big {n}"),
+            }, payload, "big {n}"));
+            hot.Freeze();
+
+            string path = Path.Combine(dir, "0-1.seg");
+            using (var writer = new SegmentWriter(path))
+            {
+                writer.WriteEvents(hot, pool);
+                writer.Finalise(new NodeId(0), new SegmentId(1));
+            }
+
+            using (var f = File.Open(path, FileMode.Open, FileAccess.Write))
+            {
+                f.Position = 46;                       // the big block's uncompressedSize
+                f.Write([0xFF, 0xFF, 0xFF, 0x7F]);     // int.MaxValue
+            }
+
+            Assert.Throws<InvalidDataException>(() =>
+                SegmentReader.Open(path, computeUncompressedBytes: true));
+        }
+        finally { try { Directory.Delete(dir, true); } catch (Exception ex) { Console.WriteLine($"temp dir left behind: {dir} — {ex.Message}"); } }
     }
 
     /// <summary>

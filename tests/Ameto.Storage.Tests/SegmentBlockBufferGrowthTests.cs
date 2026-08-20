@@ -43,8 +43,14 @@ public sealed class SegmentBlockBufferGrowthTests : IDisposable
     [Fact]
     public void A_failed_grow_leaves_the_cursors_block_buffer_out_of_the_pool()
     {
+        // An HONEST file: its first block is a real ~64 KB frame the validator passes, and it
+        // is larger than the stand-in buffer below, so ReadBlockInto genuinely enters the
+        // grow. The rent inside the grow is then failed through the seam -- the only thrower
+        // left, now that the frame validator intercepts every poisoned size before the pool is
+        // consulted. (This test's previous vehicle WAS a poisoned size; when the validator
+        // arrived, the test kept passing while a return-before-rent mutation survived it --
+        // the ordering was covered by nothing.)
         string path = WriteSegment(600);
-        PatchBlockUncompressedSize(path, block: 0, value: Array.MaxLength + 1);
 
         var pool = ArrayPool<byte>.Shared;
 
@@ -62,7 +68,11 @@ public sealed class SegmentBlockBufferGrowthTests : IDisposable
         byte[] block = probe;
 
         using (var reader = SegmentReader.Open(path))
-            Assert.Throws<InvalidDataException>(() => { reader.ReadBlockInto(0, ref block); });
+        {
+            reader._rentBlockBuffer = static _ => throw new OutOfMemoryException(
+                "seam: the grow's rent fails here, as a real allocation failure would");
+            Assert.Throws<OutOfMemoryException>(() => { reader.ReadBlockInto(0, ref block); });
+        }
 
         // The grow did not complete, so ownership never moved.
         Assert.Same(probe, block);

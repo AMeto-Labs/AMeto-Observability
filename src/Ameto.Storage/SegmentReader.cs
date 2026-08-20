@@ -61,8 +61,8 @@ public sealed class SegmentReader : ISegmentReader
 
     /// <param name="computeUncompressedBytes">
     /// When true, <see cref="SegmentInfo.UncompressedBytes"/> is the real sum of the
-    /// blocks' uncompressed sizes (one 4-byte read AT each block offset — pages in a
-    /// slice of every block). The merge planner's co-fit gate needs the honest value,
+    /// blocks' uncompressed sizes (two 4-byte reads at each block offset, both in the
+    /// same page — pages in a slice of every block). The merge planner's co-fit gate needs the honest value,
     /// so the catalog-building call sites (startup scan, replication import) pass
     /// true. Query/merge-read opens keep the default: they never read the field, and
     /// paying a page-fault walk over the whole file on every query open would undo
@@ -190,9 +190,9 @@ public sealed class SegmentReader : ISegmentReader
                 int u = ReadInt32At(blockOffset);
                 int c = ReadInt32At(blockOffset + 4);
                 // The fifth frame-read site, and the one that could not even throw: the
-                // unsigned cast turned a torn negative into ~4 GB and handed it to both
-                // callers of this overload -- the classification gates -- as a healthy
-                // number the merge planner then sized batches by.
+                // unsigned cast turned a torn negative into ~4 GB and handed it to every
+                // caller of this overload -- the classification gates among them -- as a
+                // healthy number the merge planner then sized batches by.
                 ValidateBlockFrame(filePath, blockOffset, u, c);
                 uncompressedBytes += (uint)u;
             }
@@ -683,7 +683,14 @@ public sealed class SegmentReader : ISegmentReader
         // OutOfMemoryException -- classified as circumstance, retried forever.
         if (uncompressedSize <= 0 || compressedSize <= 0
             || blockOffset + 8 + compressedSize > _fileSize
-            || uncompressedSize > 255L * compressedSize)
+            || uncompressedSize > 255L * compressedSize
+            // The ratio stops binding once 255 * compressedSize outgrows int.MaxValue -- a
+            // block compressed past ~8.4 MB (one near-chunk-sized incompressible event, which
+            // Ingestion:MaxEventPayloadBytes can be configured to admit) lets ANY torn positive
+            // int through the ratio test. The writer cannot produce a block above one hot-tier
+            // chunk of payload plus framing, so twice the chunk is a ceiling no honest block
+            // reaches and no torn word survives.
+            || uncompressedSize > 2 * HotTierSegment.ChunkPayloadBytes)
             throw new InvalidDataException(
                 $"Block at {blockOffset} in {filePath} stores sizes " +
                 $"{uncompressedSize}/{compressedSize} that do not fit the file -- a torn block frame.");
@@ -698,6 +705,16 @@ public sealed class SegmentReader : ISegmentReader
     /// the caller sees the first one, so a merge's peak was ~3× its batch and the batch had to be
     /// capped at 32 MB. One block at a time is ~64 KB, whatever the segment's size.</para>
     /// </summary>
+    /// <summary>
+    /// Test seam for the grow path's rent. The rent-before-return ordering below is a real
+    /// safety property (see the comment in the grow), but the frame validator now intercepts
+    /// every poisoned size before the pool is consulted, so no FILE can drive the rent to
+    /// throw any more -- only genuine allocation failure can, and a test cannot arrange that.
+    /// The seam is the honest replacement: a validated, honest frame reaches the grow, and the
+    /// seam fails the rent there.
+    /// </summary>
+    internal Func<int, byte[]> _rentBlockBuffer = static size => ArrayPool<byte>.Shared.Rent(size);
+
     internal int ReadBlockInto(int index, ref byte[] buffer)
     {
         long blockOffset     = _blocks[index].FileOffset;
@@ -715,7 +732,7 @@ public sealed class SegmentReader : ISegmentReader
             // A double return does not fault: the pool simply stacks the array twice and hands it
             // to two renters at once, so the failure is one buffer's contents appearing in an
             // unrelated reader's block. Holding both for the length of a copy costs one block.
-            byte[] grown = ArrayPool<byte>.Shared.Rent(uncompressedSize);
+            byte[] grown = _rentBlockBuffer(uncompressedSize);
             if (buffer.Length > 0) ArrayPool<byte>.Shared.Return(buffer);
             buffer = grown;
         }

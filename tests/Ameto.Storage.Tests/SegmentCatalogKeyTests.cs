@@ -895,6 +895,40 @@ public sealed class SegmentCatalogKeyTests : IAsyncLifetime
     }
 
 
+    /// <summary>
+    /// Four torn bytes must not cost the whole segment. The boot scan's handler for an
+    /// unreadable file used to be File.Delete — written when unreadable meant a header nothing
+    /// could parse — and the frame validation added for torn blocks turned one bad 32-bit word
+    /// in an otherwise readable file into losing every event in it at the next start. The scan
+    /// now quarantines aside as *.seg.corrupt at Error: served by nobody, decided by an
+    /// operator, deleted by no one.
+    /// </summary>
+    [Fact]
+    public void A_torn_segment_is_quarantined_aside_at_boot_not_deleted()
+    {
+        long now = DateTime.UtcNow.Ticks;
+        string path = WritePeerSegment(Peer, 31, now, events: 6);
+        using (var f = File.Open(path, FileMode.Open, FileAccess.Write))
+        {
+            f.Position = 46;                       // the first block's uncompressedSize
+            f.Write([0xF9, 0xFF, 0xFF, 0xFF]);     // torn to -7
+        }
+
+        var engine2 = NewEngine();
+        try
+        {
+            engine2.LoadSegmentCatalog();          // the scan, driven to completion by hand
+
+            Assert.False(File.Exists(path), "the torn segment was left under its serving name");
+            Assert.True(File.Exists(path + ".corrupt"), "the torn segment was deleted instead of quarantined");
+            Assert.DoesNotContain(engine2.ListSegments(), x => x.NodeId.Value == Peer.Value && x.Id.Value == 31ul);
+        }
+        finally
+        {
+            engine2.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
+    }
+
     // ── Issues #47, #49, #52 ─────────────────────────────────────────────────
 
     /// <summary>

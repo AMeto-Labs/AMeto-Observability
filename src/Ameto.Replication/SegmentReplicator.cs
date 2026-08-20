@@ -162,15 +162,23 @@ public sealed class SegmentReplicator : IDisposable
             try
             {
                 int filled = 0;
+                bool truncated = false;
                 while (filled < 4096)
                 {
-                    int n = await stream.ReadAsync(rented.AsMemory(filled, 4096 - filled), readCts.Token);
+                    int n;
+                    // The clock expiring mid-body must not discard what already arrived: a peer
+                    // that sent its ProblemDetails and then stalled has said the interesting
+                    // part, and the marker below says the rest never came.
+                    try { n = await stream.ReadAsync(rented.AsMemory(filled, 4096 - filled), readCts.Token); }
+                    catch (OperationCanceledException) when (!ct.IsCancellationRequested) { truncated = true; break; }
                     if (n == 0) break;
                     filled += n;
                 }
-                if (filled == 0) return "(empty body)";
+                if (filled == 0) return truncated ? "(body read timed out)" : "(empty body)";
                 var body = System.Text.Encoding.UTF8.GetString(rented, 0, filled).ReplaceLineEndings(" ").Trim();
-                return body.Length == 0 ? "(empty body)" : body.Length <= 500 ? body : body[..500];
+                if (body.Length > 500) body = body[..500];
+                if (truncated) body += " …(body read timed out)";
+                return body.Length == 0 ? "(empty body)" : body;
             }
             finally { System.Buffers.ArrayPool<byte>.Shared.Return(rented); }
         }
