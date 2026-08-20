@@ -106,13 +106,25 @@ public sealed class LogPageJsonProbe
             _out.WriteLine($"direct transcode      : {tranMs * 1000:F0} us/page | {tranBytes / 1024.0:F0} KB allocated");
             _out.WriteLine($"gain                  : {dictMs / tranMs:F1}x faster, {(double)dictBytes / Math.Max(tranBytes, 1):F0}x less allocated");
 
-            // The JSON writing itself is only modestly faster — the transcoder decodes
-            // msgpack inline instead of walking pre-decoded values. The win being guarded
-            // is the allocation: a page used to leave ~700 KB of dictionaries, boxes and
-            // strings behind, which is what put GC polling at the top of the scroll profile.
-            Assert.True(tranMs < dictMs, $"transcoder should be faster: dict={dictMs:F3} ms, transcode={tranMs:F3} ms");
+            // The win being guarded is the ALLOCATION: a page used to leave ~700 KB of
+            // dictionaries, boxes and strings behind, which is what put GC polling at the top
+            // of the scroll profile. GC.GetAllocatedBytesForCurrentThread is deterministic —
+            // a busy machine does not change it — so this gate is stable wherever it runs,
+            // and the 50x margin is orders of magnitude clear of the real ~700x.
             Assert.True(tranBytes * 50 < dictBytes,
                 $"transcoder should allocate ~nothing: dict={dictBytes} B, transcode={tranBytes} B");
+
+            // The wall-clock comparison is REPORTED above, not asserted. It used to be
+            // `Assert.True(tranMs < dictMs)` — a strict inequality between two timings taken
+            // back to back, with no margin at all, guarding a difference the line above calls
+            // modest by construction (the transcoder decodes msgpack inline instead of walking
+            // pre-decoded values; the JSON writing itself is the same work either way). On an
+            // idle machine it passed; run after five other test projects it went red, which is
+            // how it behaved for us: 3/3 alone, 53/53 for the whole Perf suite alone, red only
+            // in the back-to-back sweep. A gate that reports the machine's load rather than the
+            // code's behaviour teaches everyone to re-run until green, which costs more than
+            // the regression it was meant to catch. The ratio stays in the output, so a real
+            // slowdown is still visible to anyone reading a failing or passing run.
         }
         finally
         {
