@@ -182,6 +182,19 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     internal readonly HashSet<SegmentKey> _mergeSkip = new();   // internal for the quarantine test, as LoadSegmentCatalog is for the scan tests
 
     /// <summary>
+    /// Anchors deferred for the REMAINDER OF THE CURRENT PASS, cleared at the top of every
+    /// pass. This is what keeps the window loop's invariant true without quarantining anybody:
+    /// a bucket whose batch cannot assemble defers its anchor, the candidate set strictly
+    /// shrinks within the pass, the re-selection falls through to the next bucket -- so one
+    /// unopenable non-corrupt file cannot stall compaction across the whole catalog, which is
+    /// exactly what a batch-wide "was it transient" flag did: FileNotFound is not corruption,
+    /// so nothing was ever deferred, and the same bucket ate all four window attempts of every
+    /// pass forever. Next pass, everything deferred here is a candidate again: a file that
+    /// returned merges, one that is gone for good costs one Debug line per pass.
+    /// </summary>
+    private readonly HashSet<SegmentKey> _mergePassDeferred = new();
+
+    /// <summary>
     /// Segment ids reserved per flushed tier: one per <see cref="LogLevel"/>, so a tier
     /// can be written as one segment PER LEVEL and the level's id is always
     /// <c>firstId + (byte)level</c>.
@@ -1236,7 +1249,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         var buckets = new Dictionary<(Ameto.Core.LogLevel Level, long Start), List<SegmentInfo>>();
         foreach (var s in _segments.Values)
         {
-            if (_mergeSkip.Contains(SegmentKey.Of(s))) continue;
+            if (_mergeSkip.Contains(SegmentKey.Of(s)) || _mergePassDeferred.Contains(SegmentKey.Of(s))) continue;
             // A replicated peer's segment is a merge candidate here, the same as a local one, and
             // MergeToColdAsync stamps its output with THIS node's id — so merging one drops the
             // provenance that SegmentInfo.NodeId carried, and a later re-push of the same (node, id)
@@ -1478,8 +1491,10 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         // A skipped bucket used to burn the whole maintenance pause (600 s) on a
         // single discarded anchor. Skips are rare — what remains is unreadable or
         // empty segments — so when one happens, re-select immediately. Bounded and
-        // livelock-free: every failed attempt adds to _mergeSkip first, so the
-        // candidate set strictly shrinks.
+        // livelock-free: every failed attempt either quarantines (corruption) or defers its
+        // anchor for the rest of THIS pass, so the candidate set strictly shrinks within the
+        // window loop either way. The deferral set is cleared at the top of the pass.
+        _mergePassDeferred.Clear();
         List<SegmentInfo>?   consumed = null;
         List<SegmentReader>? readers  = null;
         for (int attempt = 0; attempt < MergeWindowAttempts && consumed is null; attempt++)
@@ -1498,7 +1513,6 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             var opened = new List<SegmentReader>(sources.Count);
             var usable = new List<SegmentInfo>(sources.Count);
             long usableEvents = 0;
-            bool transientOpenFailure = false;
             foreach (var seg in sources)
             {
                 try
@@ -1520,16 +1534,13 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                         _logger.LogWarning(ex, "Merge: quarantining corrupt segment {File}", seg.FilePath);
                     }
                     else
-                    {
                         // Debug, not Warning: this repeats every pass until the circumstance
                         // clears, and the maintenance loop walks every 15 seconds -- the old
                         // line warned exactly once because the skip-list also stopped the
                         // reselection, and a Warning that fires forever drowns what it carries.
                         // There is no retry limit, deliberately: the skip-list is the only
-                        // exclusion state, and it is reserved for what will not heal.
-                        transientOpenFailure = true;
+                        // permanent exclusion state, and it is reserved for what will not heal.
                         _logger.LogDebug(ex, "Merge: segment {File} failed to open -- kept for the next pass", seg.FilePath);
-                    }
                 }
             }
 
@@ -1541,14 +1552,17 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             if (usable.Count < 2 || usableEvents == 0)
             {
                 foreach (var r in opened) r.Dispose();
-                // The anti-stall is for shapes that cannot change on their own -- a bucket whose
-                // anchor genuinely cannot seed a batch would be reselected forever. A batch
-                // starved by a TRANSIENT open failure is not that shape: the file can return (an
-                // import mid-rename, a reader holding it a moment), and quarantining the anchor
-                // here made a brief failure permanent for the process -- one line after the
-                // Debug above promised "kept for the next pass". Corruption is already in the
-                // skip-list from the loop above.
-                if (!transientOpenFailure) _mergeSkip.Add(SegmentKey.Of(sources[0]));
+                // Deferred for the PASS, not quarantined: permanent exclusion here made a brief
+                // failure (an import mid-rename, a reader holding the file a moment) permanent
+                // for the process -- one line after the Debug above promised "kept for the next
+                // pass". And its first replacement, a batch-wide "was anything transient" flag,
+                // was worse: FileNotFound is not corruption, so nothing was ever excluded, the
+                // same bucket won selection on all four window attempts of every pass, and one
+                // operator-deleted file stalled compaction for the whole catalog. The deferral
+                // shrinks the candidate set for this pass -- the re-selection moves on to the
+                // next bucket -- and expires with it. Corruption is already in the skip-list
+                // from the loop above.
+                _mergePassDeferred.Add(SegmentKey.Of(sources[0]));
                 _logger.LogDebug("Merge: bucket anchored at {File} yields no usable batch — anchor skipped",
                     Path.GetFileName(sources[0].FilePath));
                 continue;
@@ -2558,6 +2572,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         // could quarantine the not-yet-arrived path until restart. Both are held off explicitly
         // instead of argued away: DeleteSegmentAsync takes this same lock, and the planner
         // quarantines only corruption, never a file that failed to open.
+        SegmentInfo? refreshEntryOutsideLock = null;
+        try
+        {
         lock (_importLock)
         {
             while (true)
@@ -2682,6 +2699,13 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                         // branch exists precisely because the two may differ in bytes (a
                         // re-compression), so leaving info in place kept a catalog entry whose
                         // sizes belonged to a file this same branch just deleted.
+                        //
+                        // onDisk was read without the block walk (this is under the import
+                        // lock), so its UncompressedBytes is the file size -- an UNDERSTATED
+                        // value, and understatement here is the harmful direction: the merge
+                        // planner takes max(Uncompressed, Compressed) into its batch budget, so
+                        // a shrunken entry lets a batch overfill. The honest value is re-read
+                        // below, outside the lock, and swapped in.
                         _segments.TryUpdate(key, onDisk, info);
                         try { File.Delete(stagedPath); }
                         catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete staged body {File}", stagedPath); }
@@ -2689,6 +2713,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                             "Re-push of {Key} matched the file already at {Final}; existing bytes kept, " +
                             "staged body discarded.",
                             key, finalPath);
+                        refreshEntryOutsideLock = onDisk;
                         return SegmentImportOutcome.Registered;
                     }
 
@@ -2716,6 +2741,22 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
         _logger.LogInformation("Imported replicated segment {Key} ({Events} events)", key, info.EventCount);
         return SegmentImportOutcome.Registered;
+        }
+        finally
+        {
+            // The honest uncompressed size, computed off the lock: the block walk pages in a
+            // slice of every block and has no business inside a section retention queues on.
+            // Conditional swap -- if retention deleted the entry in between, it stays deleted.
+            if (refreshEntryOutsideLock is { } placeholder)
+            {
+                try
+                {
+                    using var honest = SegmentReader.Open(placeholder.FilePath, computeUncompressedBytes: true);
+                    _segments.TryUpdate(key, honest.Info, placeholder);
+                }
+                catch { /* the file may already be gone again; the placeholder stays conservative */ }
+            }
+        }
     }
 
     /// <summary>

@@ -525,6 +525,7 @@ public sealed class ReplicationSegmentEndpointTests : IClassFixture<ReplicationW
 
         Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
         Assert.Contains("already held by a different file", await response.Content.ReadAsStringAsync());
+        Assert.Equal("different-segment", Assert.Single(response.Headers.GetValues("X-Ameto-Conflict")));
     }
 
     /// <summary>
@@ -550,6 +551,7 @@ public sealed class ReplicationSegmentEndpointTests : IClassFixture<ReplicationW
 
         Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
         Assert.Contains("own allocator has already handed out", await response.Content.ReadAsStringAsync());
+        Assert.Equal("allocated-locally", Assert.Single(response.Headers.GetValues("X-Ameto-Conflict")));
     }
 
     /// <summary>
@@ -573,6 +575,7 @@ public sealed class ReplicationSegmentEndpointTests : IClassFixture<ReplicationW
         string text = await response.Content.ReadAsStringAsync();
         Assert.Contains("could not read", text);
         Assert.DoesNotContain("two nodes", text);
+        Assert.Equal("unreadable-incumbent", Assert.Single(response.Headers.GetValues("X-Ameto-Conflict")));
     }
 
     /// <summary>

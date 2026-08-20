@@ -861,6 +861,11 @@ public sealed class SegmentCatalogKeyTests : IAsyncLifetime
         // branch exists because the two may differ in bytes, so an entry built from the staged
         // body carried sizes belonging to a file that no longer exists.
         Assert.Equal(incumbent.LongLength, entry.CompressedBytes);
+        // And the honest uncompressed size, re-read OUTSIDE the import lock, replaces the
+        // file-size placeholder: understatement is the harmful direction here — the planner
+        // budgets batches by max(Uncompressed, Compressed), so a shrunken entry overfills one.
+        Assert.True(entry.UncompressedBytes > entry.CompressedBytes,
+            $"the entry still carries the placeholder ({entry.UncompressedBytes} B) instead of the block sum");
     }
 
     /// <summary>

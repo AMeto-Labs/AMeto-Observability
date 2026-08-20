@@ -179,8 +179,27 @@ public static class ReplicationEndpointMapper
                 // sender and some other node are configured as the same NodeId, but they rest
                 // on different evidence, and the sender's log quotes this body -- so the body
                 // names the case, or the sender confidently reports the wrong one of two.
-                // No discard arm: the next SegmentImportOutcome member should be a compile-time
-                // question here, not a wire answer the sender has to diagnose.
+                // The cause travels in a HEADER, not only in the body: the sender reads the
+                // response with ResponseHeadersRead and frames its log line before it has any
+                // body -- and body text is prose for humans, which the sender must not parse.
+                if (outcome is SegmentImportOutcome.ConflictDifferentSegment
+                            or SegmentImportOutcome.ConflictAllocatedLocally
+                            or SegmentImportOutcome.ConflictUnreadableIncumbent)
+                    request.HttpContext.Response.Headers["X-Ameto-Conflict"] = outcome switch
+                    {
+                        SegmentImportOutcome.ConflictDifferentSegment    => "different-segment",
+                        SegmentImportOutcome.ConflictAllocatedLocally    => "allocated-locally",
+                        _                                                => "unreadable-incumbent",
+                    };
+
+                // No discard arm, and CS8509 is promoted to an ERROR in this project's csproj:
+                // a new SegmentImportOutcome member without a wire mapping now fails the BUILD,
+                // which is what "a compile-time question" has to mean -- as a bare warning it
+                // scrolled past, and the runtime answer was a SwitchExpressionException out of
+                // the endpoint delegate: a bodyless 500, strictly worse than the 400 the old
+                // discard arm gave. CS8524 (an unnamed value cast into the enum) is disabled
+                // for the expression: outcome comes from ImportSegment, which returns members.
+#pragma warning disable CS8524
                 return outcome switch
                 {
                     SegmentImportOutcome.ConflictDifferentSegment => Results.Problem(
@@ -205,6 +224,7 @@ public static class ReplicationEndpointMapper
                     SegmentImportOutcome.Registered => throw new System.Diagnostics.UnreachableException(
                         "Registered returns 204 above."),
                 };
+#pragma warning restore CS8524
             });
     }
 

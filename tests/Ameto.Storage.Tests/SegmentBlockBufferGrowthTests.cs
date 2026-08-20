@@ -20,11 +20,15 @@ namespace Ameto.Storage.Tests;
 /// it is worth a test rather than a comment: the correct order was restored with no coverage at
 /// all, and reverting it left the whole solution green.</para>
 ///
-/// <para>The rent is made to throw by writing a block's uncompressed-size word past
-/// <see cref="Array.MaxLength"/>, which <c>ArrayPool.Rent</c> rejects immediately and without
-/// attempting the allocation. The identical ordering in <c>OtlpLogStreamParser.CopyStringGrow</c>
-/// cannot be probed the same way — its size comes from a JSON string token, so provoking the
-/// throw would take a single token over 2 GB — and is left resting on the shared reasoning.</para>
+/// <para>The poisoned size word that once drove <c>Rent</c> to throw is now intercepted a
+/// step earlier: <c>ValidateBlockFrame</c> names it corruption before the pool is ever
+/// consulted. What this test pins is therefore the STRONGER form of the same property — a
+/// poisoned frame reaches neither the return nor the rent, so ownership cannot move and the
+/// pool cannot be handed the caller's array. The rent-before-return ordering inside the grow
+/// remains for the one thrower validation cannot rule out (a genuine allocation failure on a
+/// frame that is large but honest) and rests on the code comment beside it — a file small
+/// enough for a test cannot carry an honest frame big enough to fail deterministically. The
+/// identical ordering in <c>OtlpLogStreamParser.CopyStringGrow</c> is in the same position.</para>
 /// </summary>
 public sealed class SegmentBlockBufferGrowthTests : IDisposable
 {
@@ -58,7 +62,7 @@ public sealed class SegmentBlockBufferGrowthTests : IDisposable
         byte[] block = probe;
 
         using (var reader = SegmentReader.Open(path))
-            Assert.Throws<OutOfMemoryException>(() => { reader.ReadBlockInto(0, ref block); });
+            Assert.Throws<InvalidDataException>(() => { reader.ReadBlockInto(0, ref block); });
 
         // The grow did not complete, so ownership never moved.
         Assert.Same(probe, block);

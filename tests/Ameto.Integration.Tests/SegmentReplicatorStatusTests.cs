@@ -25,10 +25,64 @@ public sealed class SegmentReplicatorStatusTests : IDisposable
     public SegmentReplicatorStatusTests() => File.WriteAllBytes(_file, new byte[128]);
     public void Dispose() { try { File.Delete(_file); } catch { } }
 
-    private sealed class StubHandler(HttpStatusCode code, string body) : HttpMessageHandler
+    private sealed class StubHandler(HttpStatusCode code, string body, string? conflictCause = null) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
+        {
+            var resp = new HttpResponseMessage(code) { Content = new StringContent(body) };
+            if (conflictCause is not null) resp.Headers.Add("X-Ameto-Conflict", conflictCause);
+            return Task.FromResult(resp);
+        }
+    }
+
+    /// <summary>
+    /// A body whose stream yields a first chunk and then stalls until the READER's token
+    /// cancels — the shape of a peer that sent headers and stopped. The stall must live in the
+    /// stream's ReadAsync (which honours the caller's token, as a socket read does), not in
+    /// SerializeToStreamAsync: the default ReadAsStreamAsync buffers through the latter with no
+    /// token at all, and a stall there hangs the read regardless of any clock the caller set,
+    /// which tests the mock rather than the code.
+    /// </summary>
+    private sealed class StallingContent(string prefix) : HttpContent
+    {
+        private sealed class StallingStream(byte[] head) : Stream
+        {
+            private int _served;
+            public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken ct)
+            {
+                if (_served < head.Length)
+                {
+                    int n = Math.Min(buffer.Length, head.Length - _served);
+                    head.AsMemory(_served, n).CopyTo(buffer);
+                    _served += n;
+                    return n;
+                }
+                await Task.Delay(Timeout.InfiniteTimeSpan, ct);   // stalls until the reader's clock fires
+                return 0;
+            }
+            public override bool CanRead => true;
+            public override bool CanSeek => false;
+            public override bool CanWrite => false;
+            public override long Length => throw new NotSupportedException();
+            public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+            public override void Flush() { }
+            public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+            public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+            public override void SetLength(long value) => throw new NotSupportedException();
+            public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        }
+
+        protected override Task<Stream> CreateContentReadStreamAsync() =>
+            Task.FromResult<Stream>(new StallingStream(System.Text.Encoding.UTF8.GetBytes(prefix)));
+        protected override Task SerializeToStreamAsync(Stream stream, System.Net.TransportContext? context) =>
+            throw new NotSupportedException("read via CreateContentReadStreamAsync");
+        protected override bool TryComputeLength(out long length) { length = -1; return false; }
+    }
+
+    private sealed class StallingHandler(HttpStatusCode code, string prefix) : HttpMessageHandler
     {
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct) =>
-            Task.FromResult(new HttpResponseMessage(code) { Content = new StringContent(body) });
+            Task.FromResult(new HttpResponseMessage(code) { Content = new StallingContent(prefix) });
     }
 
     private sealed class SingleClientFactory(HttpMessageHandler handler) : IHttpClientFactory
@@ -63,14 +117,15 @@ public sealed class SegmentReplicatorStatusTests : IDisposable
         UncompressedBytes = 128,
     };
 
-    private static (SegmentReplicator Replicator, CapturingLogger Log) Build(HttpStatusCode code, string body)
+    private static (SegmentReplicator Replicator, CapturingLogger Log) Build(
+        HttpStatusCode code, string body, string? conflictCause = null, HttpMessageHandler? handler = null)
     {
         var registry = new NodeRegistry();
         registry.Upsert(new PeerPayload { NodeId = 7, Address = "http://peer:5341", Timestamp = DateTimeOffset.UtcNow });
         var log = new CapturingLogger();
         var replicator = new SegmentReplicator(
-            Options.Create(new ReplicationOptions { Enabled = true, Secret = "s", PushTimeout = TimeSpan.FromSeconds(5) }),
-            registry, log, new SingleClientFactory(new StubHandler(code, body)));
+            Options.Create(new ReplicationOptions { Enabled = true, Secret = "s", PushTimeout = TimeSpan.FromSeconds(2) }),
+            registry, log, new SingleClientFactory(handler ?? new StubHandler(code, body, conflictCause)));
         return (replicator, log);
     }
 
@@ -147,6 +202,50 @@ public sealed class SegmentReplicatorStatusTests : IDisposable
             var line = await WaitForLineAsync(log, m => m.Contains("409"));
             Assert.Equal(MelLogLevel.Error, line.Level);
             Assert.Contains(receiverSaid, line.Message);
+        }
+    }
+
+    /// <summary>
+    /// The three 409 causes do not share a framing, and the receiver says which one fired in
+    /// X-Ameto-Conflict. One branch used to wrap all three in "two nodes appear to share that
+    /// NodeId" at Error — so the unreadable-incumbent body arrived inside a deployment
+    /// diagnosis nobody made, and an operator went renumbering nodes over one bad file.
+    /// </summary>
+    [Fact]
+    public async Task A_409_for_an_unreadable_incumbent_is_a_warning_about_a_file_not_an_error_about_nodes()
+    {
+        const string receiverSaid = "occupied by a file this node could not read";
+        var (replicator, log) = Build(HttpStatusCode.Conflict, receiverSaid, conflictCause: "unreadable-incumbent");
+        using (replicator)
+        {
+            replicator.OnSegmentFlushed(Segment(_file));
+
+            var line = await WaitForLineAsync(log, m => m.Contains("409"));
+            Assert.Equal(MelLogLevel.Warning, line.Level);
+            Assert.Contains(receiverSaid, line.Message);
+            Assert.DoesNotContain("two nodes", line.Message);
+        }
+    }
+
+    /// <summary>
+    /// ResponseHeadersRead moved the body read out from under HttpClient.Timeout, and the push
+    /// task's token is None — so a peer that sent headers and then held the socket kept the
+    /// read hanging for as long as it cared to (measured: thirty seconds against a two-second
+    /// client timeout). The read now carries its own clock, and expiry preserves the
+    /// classification instead of collapsing it.
+    /// </summary>
+    [Fact]
+    public async Task A_stalled_body_times_out_and_keeps_the_classification()
+    {
+        var (replicator, log) = Build(HttpStatusCode.RequestEntityTooLarge, "",
+            handler: new StallingHandler(HttpStatusCode.RequestEntityTooLarge, "limit is"));
+        using (replicator)
+        {
+            replicator.OnSegmentFlushed(Segment(_file));
+
+            var line = await WaitForLineAsync(log, m => m.Contains("MaxSegmentBytes"));
+            Assert.Equal(MelLogLevel.Warning, line.Level);
+            Assert.Contains("(body read timed out)", line.Message);
         }
     }
 }

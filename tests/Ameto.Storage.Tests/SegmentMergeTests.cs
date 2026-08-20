@@ -124,24 +124,84 @@ public sealed class SegmentMergeTests : IAsyncLifetime
     /// both BEFORE the LZ4 length check that would have said InvalidDataException. The reader
     /// now validates the stored sizes as structure.
     /// </summary>
-    [Fact]
-    public async Task A_block_whose_stored_length_lies_reads_as_corruption()
+    /// <summary>
+    /// BOTH frame fields, because the first version of the validator bounded only one: an
+    /// absurd POSITIVE uncompressedSize passed <c>&lt;= 0</c> and the file-size check (which
+    /// binds compressedSize) and reached Rent as an OutOfMemoryException — circumstance to the
+    /// classifier, retried forever, byte for byte the pre-validator behaviour.
+    /// </summary>
+    [Theory]
+    [InlineData(46, new byte[] { 0xF0, 0xFF, 0xFF, 0x7F })]   // uncompressedSize = 0x7FFFFFF0
+    [InlineData(50, new byte[] { 0xFF, 0xFF, 0xFF, 0xFF })]   // compressedSize   = -1
+    public async Task A_block_whose_stored_length_lies_reads_as_corruption(int offset, byte[] torn)
     {
         long b0 = MergeBucketGrid.SealedBucketStart(LogLevel.Information);
         await WriteSegmentAsync(0, 40, baseTicks: b0);
         var seg = Assert.Single(_engine.ListSegments());
 
         // The first block's frame sits right after the 46-byte header:
-        // uint32 uncompressedSize, uint32 compressedSize. 0xFFFFFFFF is -1 as int32.
+        // uint32 uncompressedSize, uint32 compressedSize.
         using (var f = File.Open(seg.FilePath, FileMode.Open, FileAccess.Write))
         {
-            f.Position = 46 + 4;
-            f.Write([0xFF, 0xFF, 0xFF, 0xFF]);
+            f.Position = offset;
+            f.Write(torn);
         }
 
         using var reader = SegmentReader.Open(seg.FilePath);
         var ex = Assert.ThrowsAny<Exception>(() => reader.ReadAllRaw(new Dictionary<string, string>(StringComparer.Ordinal)));
         Assert.IsType<InvalidDataException>(ex);
+    }
+
+    /// <summary>
+    /// The fifth frame-read site could not even throw: the constructor's uncompressed-bytes
+    /// sum cast a torn negative through (uint) into ~4 GB and returned it as
+    /// SegmentInfo.UncompressedBytes — no exception, a healthy-looking number handed to the
+    /// classification gates and to the merge planner's batch budget.
+    /// </summary>
+    [Fact]
+    public async Task A_torn_frame_cannot_hide_inside_the_uncompressed_sum()
+    {
+        long b0 = MergeBucketGrid.SealedBucketStart(LogLevel.Information);
+        await WriteSegmentAsync(0, 40, baseTicks: b0);
+        var seg = Assert.Single(_engine.ListSegments());
+
+        using (var f = File.Open(seg.FilePath, FileMode.Open, FileAccess.Write))
+        {
+            f.Position = 46;
+            f.Write([0xF9, 0xFF, 0xFF, 0xFF]);   // uncompressedSize = -7
+        }
+
+        Assert.Throws<InvalidDataException>(() =>
+            SegmentReader.Open(seg.FilePath, computeUncompressedBytes: true));
+    }
+
+    /// <summary>
+    /// One unopenable, non-corrupt file must cost its own bucket a pass — not the catalog its
+    /// compaction. The per-pass deferral shrinks the candidate set so re-selection falls
+    /// through to the next bucket; its predecessor, a batch-wide transient flag, excluded
+    /// nothing on FileNotFound, so the same broken bucket won all four window attempts of
+    /// every pass and the healthy bucket never merged at all.
+    /// </summary>
+    [Fact]
+    public async Task A_broken_bucket_does_not_stall_the_healthy_one()
+    {
+        long bi = MergeBucketGrid.SealedBucketStart(LogLevel.Information);
+        long be = MergeBucketGrid.SealedBucketStart(LogLevel.Error);
+        await WriteSegmentAsync(0, 40, fixedLevel: LogLevel.Information, baseTicks: bi);
+        await WriteSegmentAsync(1, 40, fixedLevel: LogLevel.Information, baseTicks: bi + TimeSpan.TicksPerHour);
+        await WriteSegmentAsync(2, 30, fixedLevel: LogLevel.Error, baseTicks: be);
+        await WriteSegmentAsync(3, 30, fixedLevel: LogLevel.Error, baseTicks: be + TimeSpan.TicksPerHour);
+
+        // Break the Information bucket the non-corrupt way: its second source vanishes.
+        var infoSegs = _engine.ListSegments().Where(x => x.MinLevel == LogLevel.Information)
+                                             .OrderBy(x => x.MinTimestampTicks).ToList();
+        File.Delete(infoSegs[1].FilePath);
+
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None),
+            "the healthy Error bucket did not merge — one unopenable file stalled the catalog");
+        var errors = _engine.ListSegments().Where(x => x.MinLevel == LogLevel.Error).ToList();
+        var merged = Assert.Single(errors);
+        Assert.Equal(60u, merged.EventCount);
     }
 
     /// <summary>

@@ -186,7 +186,16 @@ public sealed class SegmentReader : ISegmentReader
         {
             uncompressedBytes = 0;
             foreach (var (blockOffset, _) in _blocks)
-                uncompressedBytes += (uint)ReadInt32At(blockOffset);
+            {
+                int u = ReadInt32At(blockOffset);
+                int c = ReadInt32At(blockOffset + 4);
+                // The fifth frame-read site, and the one that could not even throw: the
+                // unsigned cast turned a torn negative into ~4 GB and handed it to both
+                // callers of this overload -- the classification gates -- as a healthy
+                // number the merge planner then sized batches by.
+                ValidateBlockFrame(filePath, blockOffset, u, c);
+                uncompressedBytes += (uint)u;
+            }
         }
 
         Info = new SegmentInfo
@@ -375,7 +384,7 @@ public sealed class SegmentReader : ISegmentReader
     {
         int uncompressedSize = ReadInt32At(blockOffset);
         int compressedSize   = ReadInt32At(blockOffset + 4);
-        ValidateBlockFrame(blockOffset, uncompressedSize, compressedSize);
+        ValidateBlockFrame(Info.FilePath, blockOffset, uncompressedSize, compressedSize);
 
         byte[]? rentedComp   = null;
         byte[]? rentedUncomp = null;
@@ -455,7 +464,7 @@ public sealed class SegmentReader : ISegmentReader
     {
         int uncompressedSize = ReadInt32At(blockOffset);
         int compressedSize   = ReadInt32At(blockOffset + 4);
-        ValidateBlockFrame(blockOffset, uncompressedSize, compressedSize);
+        ValidateBlockFrame(Info.FilePath, blockOffset, uncompressedSize, compressedSize);
 
         byte[]? rentedComp   = null;
         byte[]? rentedUncomp = null;
@@ -627,7 +636,7 @@ public sealed class SegmentReader : ISegmentReader
         {
             int uncompressedSize = ReadInt32At(blockOffset);
             int compressedSize   = ReadInt32At(blockOffset + 4);
-            ValidateBlockFrame(blockOffset, uncompressedSize, compressedSize);
+            ValidateBlockFrame(Info.FilePath, blockOffset, uncompressedSize, compressedSize);
 
             byte[] rentedComp   = ArrayPool<byte>.Shared.Rent(compressedSize);
             byte[] rentedUncomp = ArrayPool<byte>.Shared.Rent(uncompressedSize);
@@ -660,14 +669,23 @@ public sealed class SegmentReader : ISegmentReader
     /// that would have said InvalidDataException, so exactly the corruption the merge
     /// classifier's docstring names ("a block whose stored length does not match its
     /// frame") was classified as circumstance by every caller that quarantines on it.
-    /// Called at every site that reads a block frame.
+    /// Called at every site that reads a block frame -- five, including the constructor's
+    /// uncompressed-bytes sum, which used to cast a torn negative to a ~4 GB unsigned and
+    /// return it as SegmentInfo.UncompressedBytes without throwing at all.
     /// </summary>
-    private void ValidateBlockFrame(long blockOffset, int uncompressedSize, int compressedSize)
+    private void ValidateBlockFrame(string filePath, long blockOffset, int uncompressedSize, int compressedSize)
     {
+        // BOTH fields are bounded. compressedSize by the file that must contain the block;
+        // uncompressedSize by LZ4's own maximum expansion -- a block cannot decompress to more
+        // than 255x its compressed bytes, so a stored ratio above that is not a large block, it
+        // is a torn field. The first version of this validator bounded only compressedSize, and
+        // an absurd POSITIVE uncompressedSize sailed through to Rent as an
+        // OutOfMemoryException -- classified as circumstance, retried forever.
         if (uncompressedSize <= 0 || compressedSize <= 0
-            || blockOffset + 8 + compressedSize > _fileSize)
+            || blockOffset + 8 + compressedSize > _fileSize
+            || uncompressedSize > 255L * compressedSize)
             throw new InvalidDataException(
-                $"Block at {blockOffset} in {Info.FilePath} stores sizes " +
+                $"Block at {blockOffset} in {filePath} stores sizes " +
                 $"{uncompressedSize}/{compressedSize} that do not fit the file -- a torn block frame.");
     }
 
@@ -685,7 +703,7 @@ public sealed class SegmentReader : ISegmentReader
         long blockOffset     = _blocks[index].FileOffset;
         int uncompressedSize = ReadInt32At(blockOffset);
         int compressedSize   = ReadInt32At(blockOffset + 4);
-        ValidateBlockFrame(blockOffset, uncompressedSize, compressedSize);
+        ValidateBlockFrame(Info.FilePath, blockOffset, uncompressedSize, compressedSize);
 
         if (buffer.Length < uncompressedSize)
         {
