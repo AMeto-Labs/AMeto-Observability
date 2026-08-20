@@ -929,6 +929,60 @@ public sealed class SegmentCatalogKeyTests : IAsyncLifetime
         }
     }
 
+    /// <summary>
+    /// A quarantined segment must not be silent past the start that quarantined it: nothing
+    /// else ever mentions a .seg.corrupt file — the sweep, the scan and retention all look
+    /// elsewhere — so every start counts them out loud.
+    /// </summary>
+    [Fact]
+    public void Quarantined_segments_are_counted_out_loud_at_start()
+    {
+        string dir2 = Path.Combine(Path.GetTempPath(), "ameto-segkey-" + Guid.NewGuid().ToString("N"));
+        string seg2 = Path.Combine(dir2, "segments");
+        Directory.CreateDirectory(seg2);
+        File.WriteAllBytes(Path.Combine(seg2, "7-99.seg.corrupt"), new byte[128]);
+
+        var log2 = new CapturingLogger();
+        var engine2 = new StorageEngine(
+            Options.Create(new ServerOptions { DataDirectory = dir2 }),
+            new RetentionStore(new ServerOptions { DataDirectory = dir2 }, NullLogger<RetentionStore>.Instance),
+            log2);
+        try
+        {
+            Assert.Contains(log2.Entries, l => l.Message.Contains("Quarantined segments present"));
+        }
+        finally
+        {
+            engine2.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            try { Directory.Delete(dir2, true); }
+            catch (Exception ex) { Console.WriteLine($"temp dir left behind: {dir2} — {ex.Message}"); }
+        }
+    }
+
+    /// <summary>
+    /// Retention erases the merge bookkeeping with the entry: a segment that expired while
+    /// carrying strikes — or sitting in the skip-list — otherwise left its key there for the
+    /// life of the process.
+    /// </summary>
+    [Fact]
+    public async Task A_deleted_segment_takes_its_merge_bookkeeping_with_it()
+    {
+        long now = DateTime.UtcNow.Ticks;
+        Write(20, now);
+        await _engine.FlushHotTierAsync();
+        var local = Assert.Single(_engine.ListSegments());
+        var key = SegmentKey.Of(local);
+
+        _engine._mergeDeferStrikes[key] = 2;
+        _engine._mergeSkip.Add(key);
+
+        await _engine.DeleteSegmentAsync(key);
+
+        Assert.False(_engine._mergeDeferStrikes.ContainsKey(key), "strikes outlived the segment");
+        Assert.DoesNotContain(key, _engine._mergeSkip);
+        Assert.False(File.Exists(local.FilePath));
+    }
+
     // ── Issues #47, #49, #52 ─────────────────────────────────────────────────
 
     /// <summary>

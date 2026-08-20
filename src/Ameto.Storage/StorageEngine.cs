@@ -194,7 +194,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     private readonly HashSet<SegmentKey> _mergePassDeferred = new();
 
     /// <summary>
-    /// Consecutive passes an anchor has been deferred. At
+    /// Deferrals since this anchor last merged. (Not consecutive passes: a pass in which the
+    /// bucket simply was not selected does not reset it — only a merge does. Anything that
+    /// defers three times without ever merging is broken by any reading.) At
     /// <see cref="MergeDeferEscalationPasses"/> it escalates into <see cref="_mergeSkip"/>:
     /// per-pass deferral alone only moved the stall to the window threshold — each broken
     /// bucket still ate one of the <see cref="MergeWindowAttempts"/> re-selections every pass,
@@ -205,7 +207,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// anchor of a two-segment bucket lands in the skip-list AND the pass deferral — and do
     /// not need to be: the skip-list simply wins.
     /// </summary>
-    private readonly Dictionary<SegmentKey, int> _mergeDeferStrikes = new();
+    internal readonly Dictionary<SegmentKey, int> _mergeDeferStrikes = new();   // internal for the bookkeeping test, as _mergeSkip is
 
     /// <summary>Deferred passes before an anchor is treated as broken rather than blinking.</summary>
     private const int MergeDeferEscalationPasses = 3;
@@ -430,6 +432,17 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         // no recovery has started, no merge can be running. Same reasoning and same shape as the
         // metrics engine's constructor sweep.
         SweepLeftoverTempFiles();
+        // Quarantined segments are invisible to everything else on purpose -- the sweep walks
+        // *.seg.tmp, the scan and the planner walk *.seg, retention walks the catalog -- so
+        // without this line they would be mentioned exactly once, at the moment of quarantine,
+        // and an operator a year later would see disk usage disagree with retention with no
+        // hint as to why. One Warning per start: nothing is deleted, the silence is.
+        var corrupt = Directory.GetFiles(_segDir, "*.seg.corrupt");
+        if (corrupt.Length > 0)
+            _logger.LogWarning(
+                "Quarantined segments present: {Count} file(s), {Bytes:N0} bytes in {Dir} — " +
+                "unreadable at some earlier start, kept for an operator to inspect or remove.",
+                corrupt.Length, corrupt.Sum(static f => new FileInfo(f).Length), _segDir);
         _catalogLoad = Task.Run(LoadSegmentCatalog);
         ReplayOrphanedWals();
         OpenWal();
@@ -788,6 +801,12 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         {
             if (_segments.TryRemove(key, out var info))
             {
+                // The merge bookkeeping goes with the entry: a segment that expired with
+                // strikes on it, or sitting in the skip-list, otherwise left its key in those
+                // structures for the life of the process — a slow, invisible growth bounded
+                // only by how many distinct keys the process ever saw.
+                _mergeDeferStrikes.Remove(key);
+                _mergeSkip.Remove(key);
                 try { File.Delete(info.FilePath); }
                 catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete segment {Key}", key); }
             }
