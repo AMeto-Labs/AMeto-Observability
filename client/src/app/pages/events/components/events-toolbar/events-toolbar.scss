@@ -67,7 +67,11 @@
 .filter-hl ::ng-deep .fh-op    { color: var(--txt-dim);     }
 .filter-hl ::ng-deep .fh-num   { color: var(--lvl-w);       }
 .filter-hl ::ng-deep .fh-paren { color: var(--txt-muted);   }
-.filter-hl ::ng-deep .fh-ident { color: var(--txt); font-weight: 500; }
+/* No font-weight here: the highlight div and the transparent textarea must stay
+   glyph-for-glyph identical, and --font-mono resolves to Inter, whose weights differ
+   in advance width — a heavier identifier run widens the visible layer and parks the
+   caret on top of the glyphs. Identifiers are set apart by colour alone. */
+.filter-hl ::ng-deep .fh-ident { color: var(--txt); }
 
 .filter-input {
   position: relative;
