@@ -14,7 +14,7 @@ import {
   parseLevelsFromFilter, parseServicesFromFilter,
   setLevelsClause, setServicesClause, levelsParam,
   parseCustomDate, fmtDateInput, presetFrom,
-  collectPropPaths, msToDotNetUtcTicks,
+  collectPropPaths, isoToDotNetUtcTicksString,
 } from './events-filter.util';
 
 /** Page sizes offered next to the event counter — also the whitelist for the `size` URL param. */
@@ -345,7 +345,7 @@ export const EventsStore = signalStore(
       const last = list[list.length - 1];
       if (!last) return;
 
-      const afterTsTicks = msToDotNetUtcTicks(new Date(last['@t']).getTime());
+      const afterTsTicks = isoToDotNetUtcTicksString(last['@t']);
 
       patchState(store, { loadingMore: true, error: null });
 

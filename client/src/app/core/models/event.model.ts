@@ -30,8 +30,9 @@ export interface EventQueryParams {
   count?: number;
   dir?: 'forward' | 'backward';
   afterId?: string;
-  /** UtcTicks of the cursor event (paired with afterId). */
-  afterTs?: number;
+  /** UtcTicks of the cursor event (paired with afterId). A string carries full 100 ns
+   *  precision — ticks exceed Number.MAX_SAFE_INTEGER, so a number is only ms-accurate. */
+  afterTs?: number | string;
   /** Comma-separated level names to filter by (omit = all levels). */
   levels?: string;
 }

@@ -72,6 +72,30 @@ export function msToDotNetUtcTicks(ms: number): number {
 }
 
 /**
+ * Converts an ISO-8601 timestamp into .NET UTC ticks (100 ns since 0001-01-01) as a
+ * decimal string, preserving the full 7-digit fractional second.
+ *
+ * `new Date(iso).getTime()` floors to milliseconds, and the server's keyset cursor
+ * compares the timestamp strictly first — so every event whose ticks fell between the
+ * floored cursor and the boundary event's true ticks was silently skipped at each
+ * infinite-scroll page boundary (at high ingest rates that is dozens of events per
+ * millisecond). Ticks also exceed Number.MAX_SAFE_INTEGER (6.4e17 > 2^53), so the math
+ * runs in BigInt and the result travels as a string.
+ */
+export function isoToDotNetUtcTicksString(iso: string): string {
+  const m = /^(\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}:\d{2})(?:\.(\d+))?(.*)$/.exec(iso);
+  if (m) {
+    const baseMs = Date.parse(m[1] + m[3]); // seconds-precision part keeps its own tz suffix
+    if (!Number.isNaN(baseMs)) {
+      const fracTicks = (m[2] ?? '').padEnd(7, '0').slice(0, 7);
+      return ((BigInt(baseMs) + BigInt(DOTNET_TICKS_UNIX_EPOCH_MS)) * 10_000n + BigInt(fracTicks)).toString();
+    }
+  }
+  // Unrecognised shape — fall back to millisecond precision rather than fail the query.
+  return String(msToDotNetUtcTicks(new Date(iso).getTime()));
+}
+
+/**
  * Removes all matches of `pattern` from a filter expression, then cleans up
  * dangling `and`/`or` connectives and extra whitespace — used to splice out a
  * previous clause before inserting a new one, without erasing the user's own text.
