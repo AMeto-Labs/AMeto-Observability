@@ -20,7 +20,9 @@ namespace Ameto.Query;
 ///   4. Block decode: LZ4 decompress via <see cref="SegmentReader"/>.
 ///   5. Per-event AST evaluation via <see cref="FilterEvaluator"/>.
 ///
-/// Hot-tier events are scanned directly (no index).
+/// Hot-tier events are scanned directly (no index) and merged with the cold stream on
+/// the same (Timestamp, EventId) key — one globally ordered stream feeds the limit and
+/// the pagination cursor, whatever tier an event happens to live in.
 /// Results are emitted in the requested <see cref="QueryDirection"/> order.
 /// </summary>
 public sealed class QueryExecutor : IQueryExecutor
@@ -60,19 +62,17 @@ public sealed class QueryExecutor : IQueryExecutor
         // Window/cursor/level filtering and the (@t, id) sort happen at HEADER level
         // inside the reader (HotTierScan) — events are materialised lazily in result
         // order, so a page query allocates ~limit events, not the whole tier.
+        //
+        // The hot stream is ONE MORE ENTRANT of the k-way merge below, not a prefix
+        // of the response. Emitting it wholesale before the cold tier violated the
+        // global (ts, id) order whenever the tiers interleave in time (late-arriving
+        // events, replicated peer segments), and the violation was not cosmetic: the
+        // client's next-page keyset cursor is the last emitted (ts, id), so every
+        // not-yet-served cold event on the wrong side of a mis-ordered boundary
+        // failed the cursor on all subsequent pages — silently unreachable rows.
         using var hotReader = _segments.OpenHotTierReader();
-        var covered = hotReader.CoveredSegmentKeys;
-        foreach (var ev in hotReader.ReadSorted(
-                     from?.UtcTicks ?? long.MinValue, to?.UtcTicks ?? long.MaxValue,
-                     afterTs, afterId?.RawValue, forward, levels))
-        {
-            if (ct.IsCancellationRequested || count >= limit) yield break;
-            if (!filter.Matches(ev)) continue;
-            yield return ev;
-            count++;
-        }
-
-        if (count >= limit || ct.IsCancellationRequested) yield break;
+        var covered   = hotReader.CoveredSegmentKeys;
+        var hotStream = HotEventsAsync(hotReader, filter, from, to, afterTs, afterId, forward, levels, ct);
 
         // ── Cold-tier segments (k-way merge) ─────────────────────────────────
         // After Variant B, every segment's blocks are individually sorted by @t,
@@ -90,14 +90,40 @@ public sealed class QueryExecutor : IQueryExecutor
             .Where(s => s.MaxTimestampTicks >= fromTicksGlobal && s.MinTimestampTicks <= toTicksGlobal)
             .ToList();
 
-        if (segInfos.Count == 0) yield break;
-
-        await foreach (var ev in MergeColdSegmentsAsync(segInfos, filter, levels, from, to, afterTs, afterId, forward, ct))
+        await foreach (var ev in MergeSourcesAsync(hotStream, segInfos, filter, levels, from, to, afterTs, afterId, forward, ct))
         {
             if (ct.IsCancellationRequested || count >= limit) yield break;
             yield return ev;
             count++;
         }
+    }
+
+    /// <summary>
+    /// The hot tier as a (ts, id)-sorted async source for the merge. ReadSorted already
+    /// applies window, cursor and level filtering at header level; only the compiled
+    /// filter runs here, per materialised event — the same division of labour the cold
+    /// scan uses.
+    /// </summary>
+    private static async IAsyncEnumerable<LogEvent> HotEventsAsync(
+        IHotTierReader                hotReader,
+        CompiledFilter                filter,
+        DateTimeOffset?               from,
+        DateTimeOffset?               to,
+        long?                         afterTs,
+        Ameto.Core.EventId?           afterId,
+        bool                          forward,
+        HashSet<Ameto.Core.LogLevel>? levels,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    {
+        foreach (var ev in hotReader.ReadSorted(
+                     from?.UtcTicks ?? long.MinValue, to?.UtcTicks ?? long.MaxValue,
+                     afterTs, afterId?.RawValue, forward, levels))
+        {
+            if (ct.IsCancellationRequested) yield break;
+            if (!filter.Matches(ev)) continue;
+            yield return ev;
+        }
+        await Task.CompletedTask; // the source is synchronous; async only to fit the merge
     }
 
     // ── Cold-tier k-way merge ─────────────────────────────────────────────────
@@ -111,12 +137,13 @@ public sealed class QueryExecutor : IQueryExecutor
             a.ts != b.ts ? b.ts.CompareTo(a.ts) : b.id.CompareTo(a.id));
 
     /// <summary>
-    /// Merges events from multiple cold-tier segments preserving a global
-    /// (Timestamp, EventId) order. For sorted segments (file format v2+) we stream
-    /// blocks lazily; for unsorted legacy segments (v1) we materialise the whole
+    /// Merges the hot-tier stream and events from multiple cold-tier segments preserving
+    /// a global (Timestamp, EventId) order. For sorted segments (file format v2+) we
+    /// stream blocks lazily; for unsorted legacy segments (v1) we materialise the whole
     /// segment, sort it once, then merge with the rest.
     /// </summary>
-    private async IAsyncEnumerable<LogEvent> MergeColdSegmentsAsync(
+    private async IAsyncEnumerable<LogEvent> MergeSourcesAsync(
+        IAsyncEnumerable<LogEvent>           hotStream,
         IReadOnlyList<SegmentInfo>           segInfos,
         CompiledFilter                       filter,
         HashSet<Ameto.Core.LogLevel>?       levels,
@@ -132,9 +159,11 @@ public sealed class QueryExecutor : IQueryExecutor
         // segments — each segment opens its mmap independently and we typically
         // discard most of them via bloom. Doing this sequentially across hundreds
         // of segments was the dominant query cost (~7-10s for 217 segments).
-        var prefiltered = await PrefilterSegmentsAsync(
-            segInfos, filter,
-            from?.UtcTicks ?? long.MinValue, to?.UtcTicks ?? long.MaxValue, ct);
+        List<PrefilterResult> prefiltered = segInfos.Count == 0
+            ? []
+            : await PrefilterSegmentsAsync(
+                  segInfos, filter,
+                  from?.UtcTicks ?? long.MinValue, to?.UtcTicks ?? long.MaxValue, ct);
 
         // Priming order: the merge front moves one way through time, so segments are
         // consumed in that order too — newest MaxTs first going backward, oldest MinTs
@@ -143,7 +172,7 @@ public sealed class QueryExecutor : IQueryExecutor
             ? prefiltered.OrderBy(p => p.Info.MinTimestampTicks).ToList()
             : prefiltered.OrderByDescending(p => p.Info.MaxTimestampTicks).ToList();
 
-        var iterators = new List<IAsyncEnumerator<LogEvent>>(ordered.Count);
+        var iterators = new List<IAsyncEnumerator<LogEvent>>(ordered.Count + 1);
         try
         {
             // PriorityQueue ordered by (ts, id). For backward (newest-first) we invert
@@ -151,6 +180,20 @@ public sealed class QueryExecutor : IQueryExecutor
             var comparer = forward ? MergeAsc : MergeDesc;
             var heap = new PriorityQueue<IAsyncEnumerator<LogEvent>, (long ts, ulong id)>(comparer);
             int next = 0;
+
+            // The hot tier primes unconditionally: it is RAM-resident (priming costs a
+            // header walk, no I/O) and its time bounds are not in the catalog, so it
+            // cannot take part in the could-beat check that gates the cold segments.
+            var hotIt = hotStream.GetAsyncEnumerator(ct);
+            if (await hotIt.MoveNextAsync())
+            {
+                iterators.Add(hotIt);
+                heap.Enqueue(hotIt, (hotIt.Current.Timestamp.UtcTicks, hotIt.Current.Id.RawValue));
+            }
+            else
+            {
+                await hotIt.DisposeAsync();
+            }
 
             // Open segments LAZILY. Priming every surviving segment up front is what made a
             // page cost the whole catalog: an unfiltered `count=50` takes GetSegments(null,
