@@ -261,6 +261,7 @@ public sealed class SpanWalTests : IDisposable
         for (int i = 0; i < 600; i++)                       // over MinSegmentSpans (500)
             engine.WriteSpan(Item(i, 1_784_800_000_000_000_000L + i * 1_000L));
         engine.FlushIfDue();
+        engine.WaitForFlushForTest();                       // the segment build runs off the lock now
 
         Assert.Equal(1, TrcCount(_dir));
 
@@ -431,5 +432,100 @@ public sealed class SpanWalTests : IDisposable
         Assert.Single(spans);
         Assert.Equal(baseNano + 3 * 1_000L, spans[0].StartTimeUnixNano);
         Assert.Equal(0, TrcCount(_dir));
+    }
+
+    // ── Two-phase flush (Begin / Commit / Abandon) ───────────────────────────
+    //
+    // The protocol that lets the engine build a segment OFF its lock: Begin moves
+    // appends to the next generation while the header keeps the flushed one, so a crash
+    // mid-flush replays BOTH (the segment is not durable yet); Commit relocates the
+    // during-flush tail and kills the flushed generation; Abandon keeps everything.
+
+    private const long BaseNano = 1_784_800_000_000_000_000L;
+
+    [Fact]
+    public void Crash_between_begin_and_commit_replays_both_generations()
+    {
+        var wal = SpanWriteAheadLog.Open(WalPath);
+        for (int i = 0; i < 5; i++) wal.Append(Item(i, BaseNano + i));
+        wal.BeginFlush();
+        for (int i = 5; i < 8; i++) wal.Append(Item(i, BaseNano + i));   // arrive mid-flush
+        wal.Dispose();                                                   // crash before commit
+
+        var reopened = SpanWriteAheadLog.Open(WalPath);
+        var replayed = reopened.ReadAll();
+        reopened.Dispose();
+
+        // The segment never landed — losing either generation would be data loss.
+        Assert.Equal(8, replayed.Count);
+        Assert.Equal(Enumerable.Range(0, 8).Select(i => BaseNano + i),
+                     replayed.Select(r => r.StartTimeUnixNano));
+    }
+
+    [Fact]
+    public void Commit_kills_the_flushed_generation_and_keeps_the_tail()
+    {
+        var wal = SpanWriteAheadLog.Open(WalPath);
+        for (int i = 0; i < 5; i++) wal.Append(Item(i, BaseNano + i));
+        wal.BeginFlush();
+        for (int i = 5; i < 8; i++) wal.Append(Item(i, BaseNano + i));
+        wal.CommitFlush();                                               // segment durable
+        wal.Dispose();
+
+        var reopened = SpanWriteAheadLog.Open(WalPath);
+        var replayed = reopened.ReadAll();
+
+        Assert.Equal(3, replayed.Count);                                 // only the tail
+        Assert.Equal(new[] { BaseNano + 5, BaseNano + 6, BaseNano + 7 },
+                     replayed.Select(r => r.StartTimeUnixNano));
+
+        // And the tail keeps accepting + committing normally afterwards.
+        reopened.BeginFlush();
+        reopened.CommitFlush();
+        Assert.Empty(reopened.ReadAll());
+        reopened.Dispose();
+    }
+
+    [Fact]
+    public void Abandon_then_retry_commit_loses_nothing_and_dies_cleanly()
+    {
+        var wal = SpanWriteAheadLog.Open(WalPath);
+        for (int i = 0; i < 4; i++) wal.Append(Item(i, BaseNano + i));
+        wal.BeginFlush();
+        wal.Append(Item(4, BaseNano + 4));                               // mid first attempt
+        wal.AbandonFlush();                                              // write failed
+
+        // Crash here must still replay everything: nothing was committed.
+        Assert.Equal(5, wal.ReadAll().Count);
+
+        wal.BeginFlush();                                                // retry covers all 5
+        wal.Append(Item(5, BaseNano + 5));                               // arrives mid-retry
+        wal.CommitFlush();
+        wal.Dispose();
+
+        var reopened = SpanWriteAheadLog.Open(WalPath);
+        var replayed = reopened.ReadAll();
+        reopened.Dispose();
+
+        Assert.Single(replayed);                                         // only the retry tail
+        Assert.Equal(BaseNano + 5, replayed[0].StartTimeUnixNano);
+    }
+
+    [Fact]
+    public void Engine_flush_is_durable_and_wal_holds_only_the_tail()
+    {
+        // End-to-end through the engine's snapshot/complete path (FlushHotTier runs it
+        // synchronously): flushed spans land in a .trc, the WAL commits, and a restart
+        // replays nothing that the segment already holds.
+        var engine = new TraceStorageEngine(_dir, NullLogger<TraceStorageEngine>.Instance);
+        for (int i = 0; i < 600; i++)
+            engine.WriteSpan(Item(i, BaseNano + i * 1_000L));
+        engine.FlushHotTier();
+        Assert.Equal(1, TrcCount(_dir));
+        engine.Dispose();
+
+        var reopened = SpanWriteAheadLog.Open(WalPath);
+        Assert.Empty(reopened.ReadAll());                                // clean stop: all cold
+        reopened.Dispose();
     }
 }

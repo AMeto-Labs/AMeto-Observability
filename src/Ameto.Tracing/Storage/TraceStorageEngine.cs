@@ -18,9 +18,27 @@ namespace Ameto.Tracing.Storage;
 public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IServiceGraphProvider, ITraceSummaryProvider, IRetentionTarget, IDisposable
 {
     // ── Hot tier ─────────────────────────────────────────────────────────────
-    private readonly List<SpanRecord>                          _hotSpans  = new();
+    // _hotSpans is SWAPPED at flush start (the snapshot goes to the writer, a fresh list
+    // takes its place), so it is not readonly; _traceIdx is cleared and refilled in place.
+    private          List<SpanRecord>                          _hotSpans  = new();
     private readonly Dictionary<TraceId, List<int>>            _traceIdx  = new();
     private readonly ReaderWriterLockSlim                      _lock      = new();
+
+    // ── In-flight flush ──────────────────────────────────────────────────────
+    // The segment build (sort + LZ4-HC + four indexes + three sidecars) used to run
+    // UNDER the exclusive lock on the drainer's thread: ingest and every query stalled
+    // for its full duration — at the stand's 100k spans/s the 65k ring gave <0.7s of
+    // headroom, so each 50k-span flush overflowed it. Now the flush snapshots the tier
+    // under the lock (fast), builds the segment off it, and re-acquires only to publish
+    // and commit the WAL (see SpanWriteAheadLog.BeginFlush for the crash story).
+    private bool _flushInProgress;                                      // under _lock(write)
+    private Task? _flushTask;                                           // under _lock(write)
+    // Readers' view of the snapshot while it is being written: without it the spans
+    // would be invisible for the build's duration (they left _hotSpans, their segment
+    // is not registered yet). GetTraceAsync/SearchSpansAsync scan it; their span-id
+    // dedupe absorbs the publish overlap. The aggregate paths (stats/volume/list)
+    // accept the window's skew, as they already do for WAL-replay duplicates.
+    private volatile List<SpanRecord>? _flushingSpans;
 
     // 0 = live, 1 = disposed. Guards against multiple Dispose calls: the engine
     // is registered as several singleton interfaces, so the DI container captures
@@ -37,6 +55,16 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
 
     /// <summary>Test hook: cold segments currently registered.</summary>
     internal int ColdSegmentCountForTest => _coldSegments.Length;
+
+    /// <summary>Test hook: joins the in-flight background flush, if any.</summary>
+    internal void WaitForFlushForTest()
+    {
+        Task? t;
+        _lock.EnterReadLock();
+        try { t = _flushTask; }
+        finally { _lock.ExitReadLock(); }
+        try { t?.Wait(); } catch { /* CompleteFlush logged it */ }
+    }
     private readonly ILogger<TraceStorageEngine>               _logger;
 
     private const int HotFlushThreshold    = 50_000;  // spans before flush
@@ -141,13 +169,13 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         try
         {
             // Write-ahead: the span is durable before it is queryable. Held under the same
-            // write lock as the hot tier so a flush can never interleave with an append —
-            // that ordering is what lets Reset's watermark be trusted on recovery.
+            // write lock as the hot tier so a flush's Begin can never interleave with an
+            // append — that ordering is what makes the generation stamps trustworthy.
             _wal.Append(item);
             AddToHotTierLocked(item);
 
             if (_hotSpans.Count >= HotFlushThreshold)
-                FlushHotTierLocked();
+                TryStartFlushLocked();
         }
         finally
         {
@@ -229,6 +257,24 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                 if (!r.SpanId.IsEmpty && !seen.Add(r.SpanId.RawValue)) continue;
                 yield return r;
             }
+
+        // Spans mid-flush: they left the hot tier but their segment is not registered
+        // yet. The detached snapshot is never mutated, so a lock-free volatile read is
+        // safe to iterate; the span-id dedupe above absorbs the overlap the moment the
+        // segment publishes.
+        if (_flushingSpans is { } flushing)
+        {
+            List<SpanRecord>? mid = null;
+            foreach (var r in flushing)
+                if (r.TraceId.Equals(traceId))
+                    (mid ??= new List<SpanRecord>()).Add(r);
+            if (mid is not null)
+                foreach (var r in mid.OrderBy(s => s.StartTimeUnixNano))
+                {
+                    if (!r.SpanId.IsEmpty && !seen.Add(r.SpanId.RawValue)) continue;
+                    yield return r;
+                }
+        }
 
         // Cold tier — scan the snapshot in parallel (bounded): a by-id lookup has
         // no time bounds, so every segment must be consulted, and doing that
@@ -314,21 +360,23 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         // identity is the pair. Bounded by `limit`, which also bounds this set.
         var seen = new HashSet<(TraceId Trace, ulong Span)>();
 
+        bool Match(SpanRecord s) =>
+            s.StartTimeUnixNano >= fromNano &&
+            s.StartTimeUnixNano <= toNano   &&
+            (serviceName      is null || s.ServiceName.Equals(serviceName, StringComparison.OrdinalIgnoreCase)) &&
+            (spanName         is null || s.Name.Contains(spanName, StringComparison.OrdinalIgnoreCase)) &&
+            (status           is null || s.Status == status.Value) &&
+            (httpStatusCode   is null || s.HttpStatusCode == httpStatusCode.Value) &&
+            (minDurationNanos is null || s.DurationNanos >= minDurationNanos.Value) &&
+            (maxDurationNanos is null || s.DurationNanos <= maxDurationNanos.Value);
+
         // Hot tier (newest first)
         _lock.EnterReadLock();
         List<SpanRecord>? candidates = null;
         try
         {
             candidates = _hotSpans
-                .Where(s =>
-                    s.StartTimeUnixNano >= fromNano &&
-                    s.StartTimeUnixNano <= toNano   &&
-                    (serviceName      is null || s.ServiceName.Equals(serviceName, StringComparison.OrdinalIgnoreCase)) &&
-                    (spanName         is null || s.Name.Contains(spanName, StringComparison.OrdinalIgnoreCase)) &&
-                    (status           is null || s.Status == status.Value) &&
-                    (httpStatusCode   is null || s.HttpStatusCode == httpStatusCode.Value) &&
-                    (minDurationNanos is null || s.DurationNanos >= minDurationNanos.Value) &&
-                    (maxDurationNanos is null || s.DurationNanos <= maxDurationNanos.Value))
+                .Where(Match)
                 .OrderByDescending(s => s.StartTimeUnixNano)
                 .Take(limit)
                 .ToList();
@@ -343,6 +391,23 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             if (!r.SpanId.IsEmpty && !seen.Add((r.TraceId, r.SpanId.RawValue))) continue;
             if (yielded++ >= limit) yield break;
             yield return r;
+        }
+
+        if (yielded >= limit) yield break;
+
+        // Spans mid-flush (see GetTraceAsync): the detached snapshot is immutable and
+        // iterated lock-free; the (trace, span) dedupe absorbs the publish overlap.
+        if (_flushingSpans is { } flushing)
+        {
+            foreach (var r in flushing
+                         .Where(Match)
+                         .OrderByDescending(s => s.StartTimeUnixNano)
+                         .Take(limit))
+            {
+                if (!r.SpanId.IsEmpty && !seen.Add((r.TraceId, r.SpanId.RawValue))) continue;
+                if (yielded++ >= limit) yield break;
+                yield return r;
+            }
         }
 
         if (yielded >= limit) yield break;
@@ -389,14 +454,36 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     // ── Flush ─────────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Unconditionally flushes the in-memory hot tier to a cold segment. No-op when empty.
-    /// Used on shutdown and by tests; the periodic path is <see cref="FlushIfDue"/>.
+    /// SYNCHRONOUSLY flushes the in-memory hot tier to a cold segment — waits out any
+    /// in-flight background flush first, then runs the write on the calling thread.
+    /// No-op when empty. Used on shutdown and by tests; the periodic path is
+    /// <see cref="FlushIfDue"/>.
     /// </summary>
     internal void FlushHotTier()
     {
-        _lock.EnterWriteLock();
-        try { FlushHotTierLocked(); }
-        finally { _lock.ExitWriteLock(); }
+        while (true)
+        {
+            Task? inflight;
+            List<SpanRecord>? snapshot = null;
+            _lock.EnterWriteLock();
+            try
+            {
+                inflight = _flushTask;
+                if (!_flushInProgress)
+                {
+                    if (_hotSpans.Count == 0) return;
+                    snapshot = TakeSnapshotLocked();
+                }
+            }
+            finally { _lock.ExitWriteLock(); }
+
+            if (snapshot is not null)
+            {
+                CompleteFlush(snapshot);   // on this thread — the caller wants it durable NOW
+                return;
+            }
+            try { inflight?.Wait(); } catch { /* CompleteFlush logged it */ }
+        }
     }
 
     /// <summary>
@@ -413,38 +500,99 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             if (_hotSpans.Count == 0) return;
             bool due = _hotSpans.Count >= MinSegmentSpans
                     || (_hotSince is { } since && DateTime.UtcNow - since >= MaxHotAge);
-            if (due) FlushHotTierLocked();
+            if (due) TryStartFlushLocked();
         }
         finally { _lock.ExitWriteLock(); }
     }
 
-    private void FlushHotTierLocked()
+    /// <summary>
+    /// Detaches the hot tier for a flush: the snapshot goes to the writer, a fresh list
+    /// takes its place, and the WAL opens its two-generation window. Caller holds the
+    /// write lock and MUST hand the snapshot to <see cref="CompleteFlush"/>.
+    /// </summary>
+    private List<SpanRecord> TakeSnapshotLocked()
     {
-        if (_hotSpans.Count == 0) return;
+        var snapshot = _hotSpans;
+        _hotSpans = new List<SpanRecord>();
+        _traceIdx.Clear();
+        _hotSince = null;
+        _wal.BeginFlush();
+        _flushInProgress = true;
+        _flushingSpans   = snapshot;
+        return snapshot;
+    }
 
-        SpanSegmentInfo info;
+    /// <summary>Starts a background flush unless one is already running. Under _lock(write).</summary>
+    private void TryStartFlushLocked()
+    {
+        if (_flushInProgress || _hotSpans.Count == 0) return;
+        var snapshot = TakeSnapshotLocked();
+        _flushTask = Task.Run(() => CompleteFlush(snapshot));
+    }
+
+    /// <summary>
+    /// The heavy half of a flush, OFF the engine lock: builds the segment (sort, LZ4-HC,
+    /// indexes, sidecars, fsync — see SpanWriter), then re-acquires only to publish and
+    /// commit. On failure the snapshot returns to the hot tier — the WAL still holds
+    /// every span of it (Abandon keeps its generation live), so nothing is lost and the
+    /// next due-check retries.
+    /// </summary>
+    private void CompleteFlush(List<SpanRecord> snapshot)
+    {
         try
         {
-            info = SpanWriter.Write(_dataDir, _hotSpans);
-            _coldSegments = [.. _coldSegments, info];   // under _lock write (see callers)
-            _logger.LogInformation("Flushed {Count} spans to {File}", _hotSpans.Count, info.FilePath);
+            var info = SpanWriter.Write(_dataDir, snapshot);
+            _lock.EnterWriteLock();
+            try
+            {
+                _coldSegments = [.. _coldSegments, info];
+                _wal.CommitFlush();
+                _flushInProgress = false;
+                _flushingSpans   = null;
+                _flushTask       = null;
+            }
+            finally { _lock.ExitWriteLock(); }
+            _logger.LogInformation("Flushed {Count} spans to {File}", snapshot.Count, info.FilePath);
         }
         catch (Exception ex)
         {
-            // Keep the spans in memory AND in the log: a failed write must not be the
-            // moment we drop the only two copies we have.
-            _logger.LogError(ex, "Failed to flush hot-tier spans to cold storage");
-            return;
+            _logger.LogError(ex, "Failed to flush hot-tier spans to cold storage — spans returned to the hot tier");
+            _lock.EnterWriteLock();
+            try
+            {
+                _wal.AbandonFlush();
+                RestoreSnapshotLocked(snapshot);
+                _flushInProgress = false;
+                _flushingSpans   = null;
+                _flushTask       = null;
+            }
+            finally { _lock.ExitWriteLock(); }
         }
+    }
 
-        // Segment is on disk — the log has nothing left to protect. Opening a new generation
-        // is what lets recovery tell these now-cold entries from spans appended afterwards.
-        try { _wal.Reset(); }
-        catch (Exception ex) { _logger.LogWarning(ex, "Span WAL reset failed after flush"); }
+    /// <summary>
+    /// Puts a failed flush's snapshot back in front of whatever arrived since, and
+    /// rebuilds the trace index over the combined list. Under _lock(write). A NEW list —
+    /// never the snapshot itself: readers may still be iterating it through the
+    /// <see cref="_flushingSpans"/> reference they took lock-free, and mutating a list
+    /// under a live enumerator faults them.
+    /// </summary>
+    private void RestoreSnapshotLocked(List<SpanRecord> snapshot)
+    {
+        var combined = new List<SpanRecord>(snapshot.Count + _hotSpans.Count);
+        combined.AddRange(snapshot);
+        combined.AddRange(_hotSpans);
+        _hotSpans = combined;
 
-        _hotSpans.Clear();
         _traceIdx.Clear();
-        _hotSince = null;
+        for (int i = 0; i < _hotSpans.Count; i++)
+        {
+            var r = _hotSpans[i];
+            if (!_traceIdx.TryGetValue(r.TraceId, out var offsets))
+                _traceIdx[r.TraceId] = offsets = new List<int>(4);
+            offsets.Add(i);
+        }
+        _hotSince ??= DateTime.UtcNow;
     }
 
     // ── Cold segment discovery ─────────────────────────────────────────────────
@@ -1130,9 +1278,11 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     {
         if (System.Threading.Interlocked.Exchange(ref _disposed, 1) != 0) return;
 
-        _lock.EnterWriteLock();
-        try { FlushHotTierLocked(); }   // resets the WAL, so a clean stop leaves nothing to replay
-        finally { _lock.ExitWriteLock(); }
+        // Waits out an in-flight background flush, then drains the tier synchronously —
+        // a clean stop commits the WAL and leaves nothing to replay. If the final flush
+        // fails, the WAL still holds every span (Abandon keeps its generation live).
+        try { FlushHotTier(); }
+        catch (Exception ex) { _logger.LogError(ex, "Final span flush failed — the WAL replays the tier next start"); }
         _lock.Dispose();
         _wal.Dispose();
     }
