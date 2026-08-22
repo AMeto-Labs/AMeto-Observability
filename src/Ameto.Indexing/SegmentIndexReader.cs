@@ -52,6 +52,13 @@ public sealed class SegmentIndexReader : ISegmentIndex, IDisposable
         if (Interlocked.Exchange(ref _disposed, 1) == 0) _bloom.Dispose();
     }
 
+    /// <summary>
+    /// The group's bloom filter, for the executor's phase-1 gates when this reader comes
+    /// out of the <see cref="SegmentIndexCache"/> — a cache hit must not re-read and
+    /// re-deserialise the bloom section it already holds decoded.
+    /// </summary>
+    public SegmentBloomFilter Bloom => _bloom;
+
     // ── ISegmentIndex ─────────────────────────────────────────────────────────
 
     /// <inheritdoc/>

@@ -175,11 +175,24 @@ public sealed class UpdatesOptions
 /// <summary>
 /// Top-level server configuration.
 /// </summary>
+/// <summary>Query-path configuration.</summary>
+public sealed class QueryOptions
+{
+    /// <summary>
+    /// Budget for the cross-query cache of deserialised segment-index sections
+    /// (inverted + trigram + bloom, held decoded between queries). Zero or negative
+    /// disables it — every query then re-reads and re-decodes the sections it consults,
+    /// the pre-cache behaviour. Default: 256 MB.
+    /// </summary>
+    public long IndexCacheBytes { get; init; } = 256 * 1024 * 1024;
+}
+
 public sealed class ServerOptions
 {
     public NodeId           NodeId           { get; init; } = NodeId.Local;
     public string           DataDirectory    { get; init; } = "data";
     public HotTierOptions   HotTier          { get; init; } = new();
+    public QueryOptions     Query            { get; init; } = new();
     public IndexingOptions  Indexing         { get; init; } = new();
     public IngestionOptions Ingestion        { get; init; } = new();
     public RetentionConfig  Retention        { get; init; } = new();

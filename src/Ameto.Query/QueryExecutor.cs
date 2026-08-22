@@ -30,15 +30,18 @@ public sealed class QueryExecutor : IQueryExecutor
     private readonly ISegmentProvider         _segments;
     private readonly SegmentIndexReaderFactory _indexFactory;
     private readonly ILogger<QueryExecutor>   _logger;
+    private readonly SegmentIndexCache?       _indexCache;
 
     public QueryExecutor(
         ISegmentProvider         segments,
         SegmentIndexReaderFactory indexFactory,
-        ILogger<QueryExecutor>   logger)
+        ILogger<QueryExecutor>   logger,
+        SegmentIndexCache?       indexCache = null)
     {
         _segments     = segments;
         _indexFactory = indexFactory;
         _logger       = logger;
+        _indexCache   = indexCache is { Enabled: true } ? indexCache : null;
     }
 
     // ── IQueryExecutor ────────────────────────────────────────────────────────
@@ -407,6 +410,34 @@ public sealed class QueryExecutor : IQueryExecutor
                         // the correctness gate.
                         if (grp.MaxTs < fromTicks || grp.MinTs > toTicks) continue;
 
+                        // A cache hit skips every section read below: the group's bloom,
+                        // inverted and (when cached full) trigram indexes are already decoded.
+                        // needTrigram misses on a trigram-less entry on purpose — the full
+                        // reader built below then REPLACES it (see SegmentIndexCache).
+                        bool needTrigram = trigramHints.Count > 0;
+                        if (_indexCache?.TryAcquire(info.FilePath, g, needTrigram) is { } hit)
+                        {
+                            using (hit)
+                            {
+                                var cached = hit.Index;
+                                if (hasIndexHint && !PassesBloomGate(filter, cached.Bloom))
+                                    continue;
+                                if (levelHints is not null && !AnyLevelMaybePresent(levelHints, cached.Bloom))
+                                    continue;
+                                if (!TryNarrowWithIndex(filter, cached, levelHints, out var cachedCandidates))
+                                    continue;
+
+                                anyGroupSurvived = true;
+                                if (cachedCandidates is null) unnarrowedGroup = true;
+                                else
+                                {
+                                    candidates ??= new List<uint>(cachedCandidates.Length);
+                                    candidates.AddRange(cachedCandidates);
+                                }
+                            }
+                            continue;
+                        }
+
                         // Both phases read the bloom section, so it is rented ONCE per group and
                         // held across them. It used to be rented twice, and a section is not a
                         // small thing to rent twice: ArrayPool<byte>.Shared does not pool arrays
@@ -459,7 +490,7 @@ public sealed class QueryExecutor : IQueryExecutor
                         // an equality hint) load the big indexes for trigram offset
                         // lookup and the inverted-index definitive check.
                         uint[]? groupCandidates = null;
-                        if (trigramHints.Count > 0 || hasIndexHint || hasInvHints || levelHints is not null)
+                        if (needTrigram || hasIndexHint || hasInvHints || levelHints is not null)
                         {
                             // Pooled: sections are copied out inside the deserialisers, so the
                             // rented buffers go back to the pool as soon as the index is built.
@@ -468,15 +499,30 @@ public sealed class QueryExecutor : IQueryExecutor
                             // and every posting list is materialised into int[] on load. Only
                             // pay for it when the filter actually has a substring predicate —
                             // an `@l = 'Error'` query used to deserialise the whole thing.
-                            using var triSec = trigramHints.Count > 0
+                            using var triSec = needTrigram
                                 ? reader.RentTrigramIndexBytes(g)
                                 : default;
-                            using var idx = _indexFactory.Create(invSec.Span, triSec.Span, bloomSec.Span);
+                            long decodedSize = invSec.Span.Length + triSec.Span.Length + bloomSec.Span.Length;
+                            var built = _indexFactory.Create(invSec.Span, triSec.Span, bloomSec.Span);
 
                             // A group that is provably empty for this filter is skipped, not
                             // the whole segment — the next group may still hold matches.
-                            if (!TryNarrowWithIndex(filter, idx, levelHints, out groupCandidates))
-                                continue;
+                            if (_indexCache is { } cache)
+                            {
+                                // Insert may hand back a concurrently inserted winner for this
+                                // group and dispose `built` — use it only through the lease.
+                                using var lease = cache.Insert(info.FilePath, g, needTrigram, built, decodedSize);
+                                if (!TryNarrowWithIndex(filter, lease.Index, levelHints, out groupCandidates))
+                                    continue;
+                            }
+                            else
+                            {
+                                using (built)
+                                {
+                                    if (!TryNarrowWithIndex(filter, built, levelHints, out groupCandidates))
+                                        continue;
+                                }
+                            }
                         }
 
                         anyGroupSurvived = true;
