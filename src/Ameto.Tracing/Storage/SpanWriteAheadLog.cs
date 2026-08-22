@@ -116,6 +116,11 @@ internal sealed unsafe class SpanWriteAheadLog : IDisposable
     private readonly string _filePath;
     private readonly Lock   _writeLock = new();
 
+    // Held open for the log's whole life: the mapping is created over it, Grow extends it,
+    // and Flush issues FlushFileBuffers through it. On Windows the accessor's flush is
+    // FlushViewOfFile, which hands the pages to the filesystem but does NOT wait out the
+    // drive cache — without this handle the commit barrier would not actually be durable.
+    private FileStream?               _fileStream;
     private MemoryMappedFile?         _mmf;
     private MemoryMappedViewAccessor? _accessor;
     private byte*                     _ptr;
@@ -149,11 +154,9 @@ internal sealed unsafe class SpanWriteAheadLog : IDisposable
         bool exists   = File.Exists(_filePath);
         long fileSize = FileHeaderSize + initialCapacity;
 
-        using (var fs = new FileStream(_filePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None))
-        {
-            if (fs.Length < fileSize) fs.SetLength(fileSize);
-            else                      fileSize = fs.Length;   // reopen an already-grown log at its size
-        }
+        _fileStream = new FileStream(_filePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
+        if (_fileStream.Length < fileSize) _fileStream.SetLength(fileSize);
+        else                               fileSize = _fileStream.Length;   // reopen an already-grown log at its size
 
         _capacity = fileSize - FileHeaderSize;
         Map(fileSize);
@@ -180,10 +183,23 @@ internal sealed unsafe class SpanWriteAheadLog : IDisposable
 
     private void Map(long fileSize)
     {
-        _mmf      = MemoryMappedFile.CreateFromFile(_filePath, FileMode.Open, null, fileSize, MemoryMappedFileAccess.ReadWrite);
+        _mmf      = MemoryMappedFile.CreateFromFile(_fileStream!, null, fileSize,
+                        MemoryMappedFileAccess.ReadWrite, HandleInheritability.None, leaveOpen: true);
         _accessor = _mmf.CreateViewAccessor(0, fileSize, MemoryMappedFileAccess.ReadWrite);
         _ptr      = null;
         _accessor.SafeMemoryMappedViewHandle.AcquirePointer(ref _ptr);
+    }
+
+    /// <summary>
+    /// Persists the mapped view: msync (MS_SYNC on Linux, FlushViewOfFile on Windows) plus
+    /// FlushFileBuffers, so the bytes are on the platter and not merely handed to the
+    /// filesystem. Callers hold <see cref="_writeLock"/>.
+    /// </summary>
+    private void FlushLocked()
+    {
+        _accessor?.Flush();
+        try { _fileStream?.Flush(flushToDisk: true); }
+        catch (IOException) { /* best-effort: the commit protocol below re-flushes */ }
     }
 
     // ── Append ───────────────────────────────────────────────────────────────
@@ -310,9 +326,34 @@ internal sealed unsafe class SpanWriteAheadLog : IDisposable
             if (_writeOffset + EntryHeaderSize <= _capacity)
                 Unsafe.AsRef<SpanWalEntryHeader>(_ptr + FileHeaderSize + _writeOffset).Generation = 0;
 
+            // ── PERSISTENCE BARRIER. The relocation and the header live on different
+            //    pages, and dirty mmap pages reach the platter in whatever order the OS
+            //    chooses — program order says nothing across pages. Without this flush a
+            //    power loss could persist the committed header FIRST: it would then point
+            //    at a front region that still held the old, dead generation, while the
+            //    durable originals of the during-flush tail sat beyond the committed
+            //    offset, unreachable. Every span appended during the build — tens of
+            //    thousands at load — would be lost. Flushed here, a crash before the
+            //    header lands leaves the OLD header {flushed gen, old offset} over a front
+            //    that now holds the relocated tail followed by the generation-0 marker:
+            //    replay reads the tail and stops at the marker. Nothing lost, nothing
+            //    duplicated.
+            FlushLocked();
+
             ref var hdr = ref Unsafe.AsRef<WalFileHeader>(_ptr);
             hdr.Generation  = _generation;               // must land before the offset store
             hdr.WriteOffset = FileHeaderSize + _writeOffset;
+
+            // Commit the header itself, so the dead generation cannot come back after a
+            // power loss and be replayed into duplicates of a segment already on disk.
+            FlushLocked();
+
+            // RESIDUAL WINDOW, accepted and named: a crash INSIDE the first flush can
+            // leave the front half-relocated — some pages the new tail, some still the old
+            // generation — under the old header, where a stride can desync mid-region.
+            // Closing it needs per-entry checksums (a v2 entry layout), the same
+            // conclusion the metric WAL reached; the barrier above shrinks the exposure
+            // from "every writeback, always" to the milliseconds of one msync.
         }
     }
 
@@ -452,9 +493,7 @@ internal sealed unsafe class SpanWriteAheadLog : IDisposable
         Unmap();
         try
         {
-            using (var fs = new FileStream(_filePath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
-                fs.SetLength(newFileSize);
-
+            _fileStream!.SetLength(newFileSize);
             Map(newFileSize);
             _capacity = newCapacity;
         }
@@ -462,8 +501,7 @@ internal sealed unsafe class SpanWriteAheadLog : IDisposable
         {
             try
             {
-                using (var fs = new FileStream(_filePath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
-                    if (fs.Length < oldFileSize) fs.SetLength(oldFileSize);
+                if (_fileStream!.Length < oldFileSize) _fileStream.SetLength(oldFileSize);
                 Map(oldFileSize);
             }
             catch { /* nothing left to restore to — the throw below is the honest signal */ }
@@ -471,6 +509,7 @@ internal sealed unsafe class SpanWriteAheadLog : IDisposable
         }
     }
 
+    /// <summary>Drops the mapping only — <see cref="_fileStream"/> outlives it (Grow re-maps over the same handle).</summary>
     private void Unmap()
     {
         if (_accessor is not null)
@@ -494,7 +533,10 @@ internal sealed unsafe class SpanWriteAheadLog : IDisposable
         {
             if (_disposed) return;
             _disposed = true;
-            Unmap();
+            Unmap();   // the view flushes its dirty pages as it is disposed
+            try { _fileStream?.Flush(flushToDisk: true); } catch { /* best-effort at end of life */ }
+            try { _fileStream?.Dispose(); } catch { }
+            _fileStream = null;
         }
     }
 

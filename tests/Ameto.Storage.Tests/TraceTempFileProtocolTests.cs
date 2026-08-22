@@ -74,6 +74,30 @@ public sealed class TraceTempFileProtocolTests : IDisposable
     }
 
     [Fact]
+    public void Constructor_recovers_a_complete_segment_whose_rename_was_lost()
+    {
+        // A power loss can persist every byte of a flush (each file is fsynced) and still
+        // lose the rename itself — on Linux that needs a parent-directory fsync .NET cannot
+        // issue. Deleting the temp there would destroy the whole flush, so a temp that
+        // PARSES is renamed into place instead.
+        var info = SpanWriter.Write(_dir, Corpus(48));
+        string baseP = info.FilePath[..^".trc".Length];
+        foreach (var ext in new[] { ".stats", ".svcgraph", ".tracesum" })
+            if (File.Exists(baseP + ext)) File.Move(baseP + ext, baseP + ext + ".tmp");
+        File.Move(info.FilePath, info.FilePath + ".tmp");        // the rename that "did not survive"
+
+        var engine = new TraceStorageEngine(_dir, NullLogger<TraceStorageEngine>.Instance);
+        _engines.Add(engine);
+
+        Assert.True(File.Exists(info.FilePath));                 // recovered, not deleted
+        Assert.True(File.Exists(baseP + ".tracesum"));           // sidecars came with it
+        Assert.Empty(Directory.GetFiles(_dir, "spans-*.tmp"));
+
+        engine.LoadColdSegments();
+        Assert.Equal(1, engine.ColdSegmentCountForTest);
+    }
+
+    [Fact]
     public void Cold_scan_neither_loads_nor_deletes_an_inflight_temp_file()
     {
         SpanWriter.Write(_dir, Corpus(32)); // one real, complete segment

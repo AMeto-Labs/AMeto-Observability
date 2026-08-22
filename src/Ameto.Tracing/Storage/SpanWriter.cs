@@ -109,6 +109,9 @@ internal static class SpanWriter
         // Per-service stats accumulators (service → mutable stats)
         var svcStats    = new Dictionary<string, MutableServiceStats>(StringComparer.Ordinal);
 
+        // Finals already renamed, for rollback if a later step of the publish fails.
+        var published = new List<string>(3);
+
         try
         {
             using (var fs = new FileStream(trcTmp, FileMode.Create, FileAccess.Write, FileShare.None, 65536))
@@ -208,15 +211,18 @@ internal static class SpanWriter
 
             // ── Publish: sidecars first, the .trc last — a visible .trc implies its
             //    sidecars are complete.
-            MoveIntoPlaceIfWritten(statsFinal);
-            MoveIntoPlaceIfWritten(svcgraphFinal);
-            MoveIntoPlaceIfWritten(tracesumFinal);
+            if (MoveIntoPlaceIfWritten(statsFinal))    published.Add(statsFinal);
+            if (MoveIntoPlaceIfWritten(svcgraphFinal)) published.Add(svcgraphFinal);
+            if (MoveIntoPlaceIfWritten(tracesumFinal)) published.Add(tracesumFinal);
             File.Move(trcTmp, trcPath);
         }
         catch
         {
-            // Nothing was published (the .trc rename is last) — clear our temp files so
-            // the failure leaves no residue beyond what the constructor sweep collects.
+            // The .trc rename is last, so the segment itself was never published — but a
+            // sidecar rename that succeeded before the failure left a file at its FINAL
+            // name that nothing would ever collect (the sweep only walks .tmp). Roll those
+            // back too, so a failed flush leaves the directory exactly as it found it.
+            foreach (var f in published) TryDelete(f);
             TryDelete(trcTmp);
             TryDelete(statsFinal + ".tmp");
             TryDelete(svcgraphFinal + ".tmp");
@@ -238,11 +244,16 @@ internal static class SpanWriter
         };
     }
 
-    /// <summary>Renames <c>{finalPath}.tmp</c> into place when the sidecar actually wrote one.</summary>
-    private static void MoveIntoPlaceIfWritten(string finalPath)
+    /// <summary>
+    /// Renames <c>{finalPath}.tmp</c> into place when the sidecar actually wrote one.
+    /// Returns true when a file was published (so the caller can roll it back).
+    /// </summary>
+    private static bool MoveIntoPlaceIfWritten(string finalPath)
     {
         string tmp = finalPath + ".tmp";
-        if (File.Exists(tmp)) File.Move(tmp, finalPath);
+        if (!File.Exists(tmp)) return false;
+        File.Move(tmp, finalPath);
+        return true;
     }
 
     private static void TryDelete(string path)
