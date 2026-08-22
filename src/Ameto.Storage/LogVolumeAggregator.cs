@@ -211,6 +211,38 @@ public sealed class LogVolumeAggregator
         return id;
     }
 
+    // ── Merge ──────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Folds another aggregator into this one. Both must share the same axis, filter and
+    /// pool — the parallel cold scan gives each worker its own aggregator (keeping the
+    /// per-event path lock-free) and merges them here, once per worker, under the
+    /// caller's lock.
+    /// </summary>
+    public void MergeFrom(LogVolumeAggregator other)
+    {
+        _total   += other._total;
+        _scanned += other._scanned;
+
+        for (int l = 0; l < LevelCount; l++)
+        {
+            _levelTotals[l] += other._levelTotals[l];
+            var src = other._levelBuckets[l];
+            var dst = _levelBuckets[l];
+            for (int b = 0; b < dst.Length; b++) dst[b] += src[b];
+        }
+
+        for (int s = 0; s < other._svcNames.Count; s++)
+        {
+            int id = GetOrAddByName(other._svcNames[s]);
+            if (id < 0) continue; // both sides ran the same filter — defensive only
+            _svcTotals[id] += other._svcTotals[s];
+            var src = other._svcBuckets[s];
+            var dst = _svcBuckets[id];
+            for (int b = 0; b < dst.Length; b++) dst[b] += src[b];
+        }
+    }
+
     // ── Result ─────────────────────────────────────────────────────────────────────
 
     /// <summary>Snapshots the accumulated counts. Services come out sorted by descending total;

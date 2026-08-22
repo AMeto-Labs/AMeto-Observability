@@ -664,30 +664,41 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             current.AggregateInto(agg, fromTicks, toTicks);
 
             // Cold tier: segments overlapping the window, minus those still covered by frozen hot
-            // tiers. Offloaded to the thread pool — it is CPU-bound (mmap reads + LZ4 decode) and we
-            // do not want to occupy the request thread. Single-threaded feed keeps the aggregator
-            // lock-free; the short-TTL response cache absorbs repeated range toggles.
+            // tiers. CPU-bound (mmap reads + LZ4 decode), so it runs on the thread pool and IN
+            // PARALLEL across segments — serially, a wide dashboard window over hundreds of
+            // segments was the whole latency of /api/events/counts. Each worker feeds its OWN
+            // aggregator (the per-event path stays lock-free) and folds it into the shared one
+            // once, at worker exit. Bounded below the prefilter's parallelism: this backs a
+            // 10-second dashboard poll and must not saturate the box.
             var segInfos = GetSegments(fromUtc, toUtc);
             if (segInfos.Count > 0)
             {
+                string? svcFilter = serviceFilter;
                 await Task.Run(() =>
                 {
-                    foreach (var info in segInfos)
-                    {
-                        ct.ThrowIfCancellationRequested();
-                        if (covered.Contains(SegmentKey.Of(info))) continue;
-                        if (info.MaxTimestampTicks < fromTicks || info.MinTimestampTicks > toTicks) continue;
-                        try
+                    int degree = Math.Clamp(Environment.ProcessorCount / 2, 2, 8);
+                    Parallel.ForEach(
+                        segInfos,
+                        new ParallelOptions { MaxDegreeOfParallelism = degree, CancellationToken = ct },
+                        localInit: () => new LogVolumeAggregator(
+                            fromTicks, toTicks, minBucket, bucketSeconds, nBuckets, svcFilter, TemplatePool),
+                        body: (info, _, local) =>
                         {
-                            using var reader = SegmentReader.Open(info.FilePath);
-                            reader.AggregateHeaders(agg, fromTicks, toTicks);
-                        }
-                        catch (Exception ex)
-                        {
-                            // Never lose the whole aggregate over one bad/racing segment file.
-                            _logger.LogDebug(ex, "Header aggregation skipped segment {Id}", info.Id);
-                        }
-                    }
+                            if (covered.Contains(SegmentKey.Of(info))) return local;
+                            if (info.MaxTimestampTicks < fromTicks || info.MinTimestampTicks > toTicks) return local;
+                            try
+                            {
+                                using var reader = SegmentReader.Open(info.FilePath);
+                                reader.AggregateHeaders(local, fromTicks, toTicks);
+                            }
+                            catch (Exception ex)
+                            {
+                                // Never lose the whole aggregate over one bad/racing segment file.
+                                _logger.LogDebug(ex, "Header aggregation skipped segment {Id}", info.Id);
+                            }
+                            return local;
+                        },
+                        localFinally: local => { lock (agg) agg.MergeFrom(local); });
                 }, ct).ConfigureAwait(false);
             }
         }
