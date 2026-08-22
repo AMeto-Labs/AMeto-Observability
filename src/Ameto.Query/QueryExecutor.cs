@@ -502,16 +502,19 @@ public sealed class QueryExecutor : IQueryExecutor
                             using var triSec = needTrigram
                                 ? reader.RentTrigramIndexBytes(g)
                                 : default;
-                            long decodedSize = invSec.Span.Length + triSec.Span.Length + bloomSec.Span.Length;
                             var built = _indexFactory.Create(invSec.Span, triSec.Span, bloomSec.Span);
 
                             // A group that is provably empty for this filter is skipped, not
                             // the whole segment — the next group may still hold matches.
                             if (_indexCache is { } cache)
                             {
+                                // Charged at the reader's RETAINED size, not the section
+                                // lengths it decoded from: postings expand ~3-8x out of their
+                                // varint packing, and budgeting by the packed size pinned
+                                // several times Query.IndexCacheBytes of managed heap.
                                 // Insert may hand back a concurrently inserted winner for this
                                 // group and dispose `built` — use it only through the lease.
-                                using var lease = cache.Insert(info.FilePath, g, needTrigram, built, decodedSize);
+                                using var lease = cache.Insert(info.FilePath, g, needTrigram, built, built.ApproxRetainedBytes);
                                 if (!TryNarrowWithIndex(filter, lease.Index, levelHints, out groupCandidates))
                                     continue;
                             }

@@ -172,21 +172,22 @@ public sealed class UpdatesOptions
     public string GitHubRepository     { get; init; } = "AMeto-Labs/AMeto-Observability";
 }
 
-/// <summary>
-/// Top-level server configuration.
-/// </summary>
 /// <summary>Query-path configuration.</summary>
 public sealed class QueryOptions
 {
     /// <summary>
-    /// Budget for the cross-query cache of deserialised segment-index sections
-    /// (inverted + trigram + bloom, held decoded between queries). Zero or negative
-    /// disables it — every query then re-reads and re-decodes the sections it consults,
-    /// the pre-cache behaviour. Default: 256 MB.
+    /// Budget for the cross-query cache of decoded segment indexes, charged at each
+    /// entry's RETAINED size (expanded postings + dictionaries + bloom bits — several
+    /// times the packed sections they decode from). Zero or negative disables it —
+    /// every query then re-reads and re-decodes the sections it consults, the
+    /// pre-cache behaviour. Default: 256 MB.
     /// </summary>
     public long IndexCacheBytes { get; init; } = 256 * 1024 * 1024;
 }
 
+/// <summary>
+/// Top-level server configuration.
+/// </summary>
 public sealed class ServerOptions
 {
     public NodeId           NodeId           { get; init; } = NodeId.Local;

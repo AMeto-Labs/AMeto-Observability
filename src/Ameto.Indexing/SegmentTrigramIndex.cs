@@ -92,6 +92,19 @@ public sealed class SegmentTrigramIndex
     /// Returns local offsets that might contain <paramref name="text"/>.
     /// Intersects all trigram sets/arrays. Returns null if text is too short.
     /// </summary>
+    /// <summary>
+    /// Approximate managed bytes the deserialised index retains — see
+    /// <see cref="SegmentInvertedIndex.ApproxRetainedBytes"/> for why the cache budget
+    /// uses this instead of the (far smaller) serialized section length.
+    /// </summary>
+    internal long ApproxRetainedBytes()
+    {
+        long bytes = 64;                             // dictionary shell
+        foreach (var (_, offsets) in _loaded)
+            bytes += 48 + 24 + 4L * offsets.Length;  // entry (inline tuple key) + int[]
+        return bytes;
+    }
+
     public uint[]? Lookup(ReadOnlySpan<char> text)
     {
         // An index with no trigrams at all was never built (e.g. a WAL-recovery

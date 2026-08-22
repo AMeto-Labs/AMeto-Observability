@@ -218,6 +218,12 @@ public sealed class LogVolumeAggregator
     /// pool — the parallel cold scan gives each worker its own aggregator (keeping the
     /// per-event path lock-free) and merges them here, once per worker, under the
     /// caller's lock.
+    ///
+    /// <para>Known nondeterminism, accepted: the service map is case-insensitive and a
+    /// series keeps the FIRST casing it was added under. Workers merge in completion
+    /// order, so producers emitting the same service with inconsistent casing (and no
+    /// hot-tier occurrence to pin it first) can see the reported Name flap between
+    /// refreshes. Counts are unaffected.</para>
     /// </summary>
     public void MergeFrom(LogVolumeAggregator other)
     {

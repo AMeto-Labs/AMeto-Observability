@@ -158,6 +158,28 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
         return ToUInt(acc);
     }
 
+    /// <summary>
+    /// Approximate managed bytes this DESERIALISED index retains: postings expanded to
+    /// int[] plus dictionary-entry and string overheads. The cache budget must be
+    /// denominated in what an entry keeps alive — the varint-packed section it was decoded
+    /// from is roughly 3-8x smaller, and budgeting by that pinned several times the
+    /// configured bytes. Overheads are the CLR's typical 64-bit costs, an estimate by
+    /// design: ±20% on an estimate beats 5x on an exact count of the wrong thing.
+    /// </summary>
+    internal long ApproxRetainedBytes()
+    {
+        if (_postings is null) return 0;
+        long bytes = 64;                                     // outer dictionary shell
+        foreach (var (prop, values) in _postings)
+        {
+            bytes += 48 + 24 + 2L * prop.Length + 64;        // entry + key string + inner shell
+            foreach (var (val, offsets) in values)
+                bytes += 48 + 24 + 2L * val.Length            // entry + key string
+                       + 24 + 4L * offsets.Length;            // int[] header + payload
+        }
+        return bytes;
+    }
+
     public bool MightContain(string propertyName, object? value)
     {
         if (_postings is not null)
