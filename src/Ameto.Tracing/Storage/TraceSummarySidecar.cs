@@ -67,7 +67,7 @@ internal static class TraceSummarySidecar
 
     // ── Writer ──────────────────────────────────────────────────────────────────
 
-    public static void Write(string baseTrcPath, IList<SpanRecord> spans)
+    public static void Write(string baseTrcPath, IList<SpanRecord> spans, string? outputPath = null)
     {
         if (spans.Count == 0) return;
 
@@ -194,7 +194,7 @@ internal static class TraceSummarySidecar
 
         var compBody = LZ4Pickler.Pickle(rawBody);
 
-        string path = Path.ChangeExtension(baseTrcPath, ".tracesum");
+        string path = outputPath ?? Path.ChangeExtension(baseTrcPath, ".tracesum");
         using var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, 65536);
         using var w  = new BinaryWriter(fs);
 
@@ -214,6 +214,9 @@ internal static class TraceSummarySidecar
         w.Write((uint)rawBody.Length);
         w.Write((uint)compBody.Length);
         w.Write(compBody);
+
+        w.Flush();
+        fs.Flush(flushToDisk: true); // durable before the caller renames and resets the WAL
     }
 
     // ── Reader: volume header only (cheap) ──────────────────────────────────────

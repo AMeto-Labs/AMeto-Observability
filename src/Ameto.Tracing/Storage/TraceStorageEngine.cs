@@ -34,6 +34,9 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     // iterate without locks — a concurrent swap can never fault them, and a
     // deleted file surfaces as a per-segment skip, not a request failure.
     private volatile SpanSegmentInfo[]                         _coldSegments = [];
+
+    /// <summary>Test hook: cold segments currently registered.</summary>
+    internal int ColdSegmentCountForTest => _coldSegments.Length;
     private readonly ILogger<TraceStorageEngine>               _logger;
 
     private const int HotFlushThreshold    = 50_000;  // spans before flush
@@ -65,6 +68,15 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         _dataDir = dataDir;
         _logger  = logger;
         Directory.CreateDirectory(dataDir);
+
+        // Leftovers of flushes that died mid-write: SpanWriter builds every file of a
+        // flush at a .tmp name and renames on success, so a .tmp here is garbage by
+        // construction. Swept in the constructor for the same reason the metric engine
+        // sweeps there — no writer can be live yet, so nothing is deleted out from
+        // under one (the background cold scan must never delete, it can race a flush).
+        foreach (var tmp in Directory.EnumerateFiles(dataDir, "spans-*.tmp"))
+            try { File.Delete(tmp); } catch { /* locked/AV-scanned — retried next start */ }
+
         // Cold-segment discovery is deliberately NOT done here: the constructor
         // runs before Kestrel binds, and scanning thousands of .trc files would
         // delay ingest availability. TraceCompactionWorker calls

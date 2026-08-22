@@ -31,9 +31,11 @@ internal static class ServiceGraphSidecar
 
     /// <summary>
     /// Derives cross-service edges from <paramref name="spans"/>, writes them
-    /// to <c>{basePath}.svcgraph</c>. Returns nothing — caller uses ReadEdges.
+    /// to <c>{basePath}.svcgraph</c> — or to <paramref name="outputPath"/> when given
+    /// (SpanWriter passes a temp name it renames after ALL files of the flush landed).
+    /// Returns nothing — caller uses ReadEdges.
     /// </summary>
-    public static void Write(string baseTrcPath, IList<SpanRecord> spans)
+    public static void Write(string baseTrcPath, IList<SpanRecord> spans, string? outputPath = null)
     {
         if (spans.Count == 0) return;
 
@@ -65,8 +67,9 @@ internal static class ServiceGraphSidecar
 
         if (edges.Count == 0) return;
 
-        string path = Path.ChangeExtension(baseTrcPath, ".svcgraph");
-        using var fs = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, 4096);
+        string path = outputPath ?? Path.ChangeExtension(baseTrcPath, ".svcgraph");
+        // Create (not CreateNew): a temp name may carry the residue of a flush that died.
+        using var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, 4096);
         using var bw = new BinaryWriter(fs);
 
         bw.Write(GraphMagic);
@@ -83,6 +86,9 @@ internal static class ServiceGraphSidecar
             bw.Write(e.ErrorCount);
             foreach (var b in e.Buckets) bw.Write(b);
         }
+
+        bw.Flush();
+        fs.Flush(flushToDisk: true); // durable before the caller renames and resets the WAL
     }
 
     // ── Reader ────────────────────────────────────────────────────────────────
