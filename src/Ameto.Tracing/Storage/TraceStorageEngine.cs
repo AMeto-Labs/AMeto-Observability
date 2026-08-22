@@ -39,6 +39,9 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     // dedupe absorbs the publish overlap. The aggregate paths (stats/volume/list)
     // accept the window's skew, as they already do for WAL-replay duplicates.
     private volatile List<SpanRecord>? _flushingSpans;
+    // Path of a segment that is on disk under its final name but not yet registered — the
+    // cold scan must not adopt it while _flushingSpans still holds the same spans.
+    private volatile string? _publishingSegmentPath;
 
     // 0 = live, 1 = disposed. Guards against multiple Dispose calls: the engine
     // is registered as several singleton interfaces, so the DI container captures
@@ -562,11 +565,15 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// </summary>
     private List<SpanRecord> TakeSnapshotLocked()
     {
+        // The log opens its window FIRST: if BeginFlush throws, the tier must still be
+        // where it was — detaching first would strand the snapshot with no flush to carry
+        // it and no caller holding a reference.
+        _wal.BeginFlush();
+
         var snapshot = _hotSpans;
         _hotSpans = new List<SpanRecord>();
         _traceIdx.Clear();
         _hotSince = null;
-        _wal.BeginFlush();
         _flushInProgress = true;
         _flushingSpans   = snapshot;
         return snapshot;
@@ -605,35 +612,64 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         }
         catch (Exception ex) { failure = ex; }
 
-        _lock.EnterWriteLock();
+        _publishingSegmentPath = info?.FilePath;
         try
         {
-            if (info is { } written)
+            // ── Publish (short lock hold). _flushInProgress deliberately STAYS set: it is
+            //    what stops another flush opening a WAL cycle before this one commits.
+            _lock.EnterWriteLock();
+            try
             {
-                // Deduped by path: the segment became VISIBLE on disk (renamed) before this
-                // publish, so the background cold scan may already have registered it. Two
-                // entries for one file double-count every aggregate and let compaction merge
-                // the file with itself.
-                if (!Array.Exists(_coldSegments,
-                        s => string.Equals(s.FilePath, written.FilePath, StringComparison.Ordinal)))
-                    _coldSegments = [.. _coldSegments, written];
-                _wal.CommitFlush();
+                if (info is { } written)
+                {
+                    // Deduped by path: the segment became VISIBLE on disk (renamed) before
+                    // this publish, so the cold scan may already have registered it. Two
+                    // entries for one file double-count every aggregate and let compaction
+                    // merge the file with itself.
+                    if (!Array.Exists(_coldSegments,
+                            s => string.Equals(s.FilePath, written.FilePath, StringComparison.Ordinal)))
+                        _coldSegments = [.. _coldSegments, written];
+                }
+                else
+                {
+                    _wal.AbandonFlush();          // flag-only, no I/O — fine under the lock
+                    RestoreSnapshotLocked(snapshot);
+                }
+                _flushingSpans = null;            // the segment (or the restored tier) now carries them
             }
-            else
+            finally { _lock.ExitWriteLock(); }
+
+            // ── Commit the log OFF the lock: it relocates the tail and issues two
+            //    whole-mapping device flushes. Under the exclusive lock that would stall
+            //    every ingest and query for the duration — reinstating exactly the stall
+            //    this whole design removed. A failure here is survivable and reported: the
+            //    header keeps the flushed generation, so those spans replay next start as
+            //    duplicates of a segment that is already durable, which the read paths
+            //    dedupe by span id.
+            if (info is not null)
             {
-                _wal.AbandonFlush();
-                RestoreSnapshotLocked(snapshot);
+                try { _wal.CommitFlush(); }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex,
+                        "Span WAL commit failed after publishing {File} — its spans will replay on the next start",
+                        info.FilePath);
+                }
             }
         }
         finally
         {
-            // In the finally, not after the branches: an exception from the restore path
-            // (or from the WAL) would otherwise leave _flushInProgress wedged true — no
+            // Reopening the gate is the LAST thing and it always happens: an exception
+            // anywhere above would otherwise leave _flushInProgress wedged true — no
             // further flush would ever start, and FlushHotTier/Dispose would spin.
-            _flushInProgress = false;
-            _flushingSpans   = null;
-            _flushTask       = null;
-            _lock.ExitWriteLock();
+            _lock.EnterWriteLock();
+            try
+            {
+                _flushInProgress       = false;
+                _flushTask             = null;
+                _publishingSegmentPath = null;
+            }
+            finally { _lock.ExitWriteLock(); }
         }
 
         if (failure is null)
@@ -706,6 +742,11 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         var loaded = new List<SpanSegmentInfo>();
         foreach (var file in Directory.EnumerateFiles(_dataDir, "*.trc").OrderBy(f => f))
         {
+            // A flush that has renamed its segment into place but not yet published it owns
+            // this file: its spans are ALSO still in _flushingSpans, so registering it here
+            // would count them twice in every aggregate until the publish lands.
+            if (string.Equals(file, _publishingSegmentPath, StringComparison.Ordinal)) continue;
+
             try
             {
                 loaded.Add(SpanReader.ReadSegmentInfo(file));
@@ -859,7 +900,10 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
 
         try
         {
-            var merged = SpanWriter.Write(_dataDir, allSpans);
+            // recoverable:false — the sources are still on disk until the swap below, so a
+            // merge temp resurrected after a crash would publish a SECOND copy of every
+            // span it merged. Only a hot-tier flush's temp is worth recovering.
+            var merged = SpanWriter.Write(_dataDir, allSpans, recoverable: false);
             _logger.LogInformation("Compacted {Count} small segments → {File} ({Spans} spans)",
                 processed.Count, Path.GetFileName(merged.FilePath), allSpans.Count);
 
@@ -1394,8 +1438,15 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         // fails, the WAL still holds every span (Abandon keeps its generation live).
         try { FlushHotTier(); }
         catch (Exception ex) { _logger.LogError(ex, "Final span flush failed — the WAL replays the tier next start"); }
-        _lock.Dispose();
-        _wal.Dispose();
+
+        // The WAL's disposal carries the log's last fsync, so nothing above may be allowed
+        // to skip it. ReaderWriterLockSlim.Dispose throws if a thread still holds or waits
+        // on the lock — a retention pass, a compaction or a straggling query can — and that
+        // throw used to take the WAL's close with it. The lock's own resources are trivial;
+        // the log's durability is not.
+        try { _lock.Dispose(); }
+        catch (SynchronizationLockException ex) { _logger.LogWarning(ex, "Trace engine lock still in use at shutdown — left to the finalizer"); }
+        finally { _wal.Dispose(); }
     }
 
     // ── IRetentionTarget ───────────────────────────────────────────────────

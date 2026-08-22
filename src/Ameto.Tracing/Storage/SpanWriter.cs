@@ -65,7 +65,14 @@ internal static class SpanWriter
     private const ushort Version     = 3;
     private const int    BlockSize   = 4096;
 
-    public static SpanSegmentInfo Write(string dataDir, IList<SpanRecord> spans)
+    /// <param name="recoverable">
+    /// True for a hot-tier flush, whose temp file the engine constructor may rename into
+    /// place if a crash lost the rename — the spans exist nowhere else. FALSE for a
+    /// compaction merge: its inputs are still on disk until it finishes, so resurrecting a
+    /// merge temp would publish a second copy of everything it merged. Merge temps carry a
+    /// distinct suffix and are always swept.
+    /// </param>
+    public static SpanSegmentInfo Write(string dataDir, IList<SpanRecord> spans, bool recoverable = true)
     {
         if (spans.Count == 0) throw new InvalidOperationException("Cannot write empty span batch.");
 
@@ -98,7 +105,7 @@ internal static class SpanWriter
         // so every span of it replayed as a duplicate from the next restart. Leftover
         // .tmp files are swept by the TraceStorageEngine constructor, where no writer
         // can be live.
-        string trcTmp        = trcPath + ".tmp";
+        string trcTmp        = trcPath + (recoverable ? ".tmp" : ".mrg.tmp");
         string statsFinal    = Path.Combine(dataDir, baseName + ".stats");
         string svcgraphFinal = Path.ChangeExtension(trcPath, ".svcgraph");
         string tracesumFinal = Path.ChangeExtension(trcPath, ".tracesum");

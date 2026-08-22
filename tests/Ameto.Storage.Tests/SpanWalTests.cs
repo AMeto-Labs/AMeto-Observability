@@ -512,6 +512,69 @@ public sealed class SpanWalTests : IDisposable
     }
 
     [Fact]
+    public void Recovery_truncates_to_where_replay_stopped_so_later_appends_survive()
+    {
+        // The state a crash between the commit's data barrier and its header store leaves:
+        // the front is relocated and terminated by the generation-0 marker, but the header
+        // still carries the OLD generation and the OLD, longer offset. Replay handles that
+        // — and must also FIX the offset, or the next append lands past the terminator,
+        // where the following recovery stops before reaching it.
+        var wal = SpanWriteAheadLog.Open(WalPath);
+        for (int i = 0; i < 5; i++) wal.Append(Item(i, BaseNano + i));
+        wal.BeginFlush();
+        for (int i = 5; i < 8; i++) wal.Append(Item(i, BaseNano + i));
+
+        long oldOffset = ReadHeaderInt64(8);      // covers flushed entries + the tail
+        uint oldGen    = ReadHeaderUInt32(16);    // the generation being flushed
+
+        wal.CommitFlush();
+        wal.Dispose();
+        PatchHeader(offset: 8,  value: BitConverter.GetBytes(oldOffset));   // header store "lost"
+        PatchHeader(offset: 16, value: BitConverter.GetBytes(oldGen));
+
+        var reopened = SpanWriteAheadLog.Open(WalPath);
+        Assert.Equal(3, reopened.ReadAll().Count);            // the relocated tail, stopping at the marker
+
+        for (int i = 8; i < 10; i++) reopened.Append(Item(i, BaseNano + i));
+        reopened.Dispose();
+
+        var again    = SpanWriteAheadLog.Open(WalPath);
+        var replayed = again.ReadAll();
+        again.Dispose();
+
+        // Without the truncation the two new spans landed beyond the marker and the walk
+        // stopped before them: 3 instead of 5, silently.
+        Assert.Equal(5, replayed.Count);
+        Assert.Equal(new[] { BaseNano + 5, BaseNano + 6, BaseNano + 7, BaseNano + 8, BaseNano + 9 },
+                     replayed.Select(r => r.StartTimeUnixNano));
+    }
+
+    private long ReadHeaderInt64(int offset)
+    {
+        using var fs = new FileStream(WalPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        Span<byte> buf = stackalloc byte[8];
+        fs.Seek(offset, SeekOrigin.Begin);
+        fs.ReadExactly(buf);
+        return BitConverter.ToInt64(buf);
+    }
+
+    private uint ReadHeaderUInt32(int offset)
+    {
+        using var fs = new FileStream(WalPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        Span<byte> buf = stackalloc byte[4];
+        fs.Seek(offset, SeekOrigin.Begin);
+        fs.ReadExactly(buf);
+        return BitConverter.ToUInt32(buf);
+    }
+
+    private void PatchHeader(int offset, byte[] value)
+    {
+        using var fs = new FileStream(WalPath, FileMode.Open, FileAccess.ReadWrite);
+        fs.Seek(offset, SeekOrigin.Begin);
+        fs.Write(value);
+    }
+
+    [Fact]
     public void Engine_flush_is_durable_and_wal_holds_only_the_tail()
     {
         // End-to-end through the engine's snapshot/complete path (FlushHotTier runs it

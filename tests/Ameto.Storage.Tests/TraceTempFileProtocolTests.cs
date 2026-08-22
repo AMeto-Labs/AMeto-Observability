@@ -98,6 +98,23 @@ public sealed class TraceTempFileProtocolTests : IDisposable
     }
 
     [Fact]
+    public void A_compaction_temp_is_swept_not_recovered()
+    {
+        // A merge's inputs stay on disk until it finishes, so resurrecting its temp would
+        // publish a SECOND copy of everything it merged. Merge temps therefore carry their
+        // own suffix and are always swept, however complete they look.
+        var info = SpanWriter.Write(_dir, Corpus(32), recoverable: false);
+        string mergeTmp = info.FilePath + ".mrg.tmp";
+        File.Move(info.FilePath, mergeTmp);          // as if the crash lost the merge's rename
+
+        var engine = new TraceStorageEngine(_dir, NullLogger<TraceStorageEngine>.Instance);
+        _engines.Add(engine);
+
+        Assert.False(File.Exists(mergeTmp));         // swept…
+        Assert.False(File.Exists(info.FilePath));    // …not renamed into place
+    }
+
+    [Fact]
     public void Cold_scan_neither_loads_nor_deletes_an_inflight_temp_file()
     {
         SpanWriter.Write(_dir, Corpus(32)); // one real, complete segment
