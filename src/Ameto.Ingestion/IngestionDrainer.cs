@@ -62,54 +62,80 @@ public sealed class IngestionDrainer : IAsyncDisposable
         }
     }
 
+    /// <summary>Events abandoned after exhausting per-event write retries (see DrainLoopAsync).</summary>
+    public long ErrorDrops => Interlocked.Read(ref _errorDrops);
+    private long _errorDrops;
+
+    // Retry budget for an event whose TryWrite THREW (as opposed to returning false —
+    // back-pressure, retried forever). A deterministic per-event failure must not wedge
+    // the whole pipeline behind one poison event.
+    private const int MaxWriteAttemptsOnError = 5;
+
     private async Task DrainLoopAsync(CancellationToken ct)
     {
-        int storageBackoffMs = 0;
+        int  storageBackoffMs = 0;
+
+        // The PENDING slot. TryDequeue is destructive — the slot is recycled and the slab
+        // freed before TryWrite runs — so an event that fails to write exists only here.
+        // It used to be a local of the loop body and was silently abandoned on every
+        // TryWrite==false (which happens routinely: each flush swap has a freeze window),
+        // losing one acknowledged event per park, uncounted. The payload stays valid in
+        // _payloadBuf because nothing dequeues over it until the pending event lands.
+        bool           havePending    = false;
+        LogEventHeader pendingHeader  = default;
+        string?        pendingTmpl    = null;
+        ExceptionInfo? pendingExc     = null;
+        int            pendingLen     = 0;
+        int            pendingAttempts = 0;
 
         while (!ct.IsCancellationRequested)
         {
             int drained = 0;
+            bool parked = false;
 
             try
             {
             for (int i = 0; i < DrainBatchSize; i++)
             {
-                // Guard: stop before touching native storage if shutdown was requested.
-                // The outer while-check runs only after a full batch; this closes the window
-                // where a signal-continuation could resume after disposal.
-                if (ct.IsCancellationRequested) return;
-
-                if (!_ring.TryDequeue(
-                        out long tsTicks, out byte level, out int tmplIdx,
-                        out string? tmpl, out ExceptionInfo? exception,
-                        _payloadBuf, out int payloadLen,
-                        out ulong traceIdHi, out ulong traceIdLo,
-                        out ulong spanId, out int serviceNameIdx))
-                    break;
-
-                var payload = new ReadOnlySpan<byte>(_payloadBuf, 0, payloadLen);
-
-                var header = new LogEventHeader
+                if (!havePending)
                 {
-                    Id                       = 0,  // assigned by StorageEngine.TryWrite
-                    TimestampUtcTicks        = tsTicks,
-                    Level                    = (Ameto.Core.LogLevel)level,
-                    MessageTemplatePoolIndex = tmplIdx,
-                    PropertiesArenaOffset    = 0,  // filled by TryWrite
-                    PropertiesByteLength     = payloadLen,
-                    ServiceNamePoolIndex     = serviceNameIdx,
-                    TraceIdHi                = traceIdHi,
-                    TraceIdLo                = traceIdLo,
-                    SpanId                   = spanId,
-                    Flags                    = (byte)(exception is not null ? LogEventFlags.HasException : LogEventFlags.None),
-                };
+                    // Stop dequeuing once shutdown is requested — the final drain below
+                    // owns the remainder of the ring.
+                    if (ct.IsCancellationRequested) break;
 
-                bool written = _storage.TryWrite(header, payload, tmpl, exception);
-                if (!written)
+                    if (!_ring.TryDequeue(
+                            out long tsTicks, out byte level, out int tmplIdx,
+                            out pendingTmpl, out pendingExc,
+                            _payloadBuf, out pendingLen,
+                            out ulong traceIdHi, out ulong traceIdLo,
+                            out ulong spanId, out int serviceNameIdx))
+                        break;
+
+                    pendingHeader = new LogEventHeader
+                    {
+                        Id                       = 0,  // assigned by StorageEngine.TryWrite
+                        TimestampUtcTicks        = tsTicks,
+                        Level                    = (Ameto.Core.LogLevel)level,
+                        MessageTemplatePoolIndex = tmplIdx,
+                        PropertiesArenaOffset    = 0,  // filled by TryWrite
+                        PropertiesByteLength     = pendingLen,
+                        ServiceNamePoolIndex     = serviceNameIdx,
+                        TraceIdHi                = traceIdHi,
+                        TraceIdLo                = traceIdLo,
+                        SpanId                   = spanId,
+                        Flags                    = (byte)(pendingExc is not null ? LogEventFlags.HasException : LogEventFlags.None),
+                    };
+                    havePending     = true;
+                    pendingAttempts = 0;
+                }
+
+                if (!TryWritePending(ref havePending, ref pendingAttempts,
+                        in pendingHeader, pendingTmpl, pendingExc, pendingLen))
                 {
-                    // Hot tier full — re-enqueue is not possible without risking ordering issues,
-                    // so we park briefly and retry from ring on next iteration.
+                    // Back-pressure (or a transient write error): park and retry the SAME
+                    // event next iteration.
                     storageBackoffMs = Math.Min(storageBackoffMs + 1, 5);
+                    parked = true;
                     break;
                 }
 
@@ -117,11 +143,11 @@ public sealed class IngestionDrainer : IAsyncDisposable
                 storageBackoffMs = 0;
             }
 
-            if (storageBackoffMs > 0 && drained == 0)
+            if (parked)
             {
-                await Task.Delay(storageBackoffMs, ct).ConfigureAwait(false);
+                await Task.Delay(Math.Max(storageBackoffMs, 1), ct).ConfigureAwait(false);
             }
-            else if (drained == 0)
+            else if (drained == 0 && !ct.IsCancellationRequested)
             {
                 // Nothing in the ring — block until a producer signals. The 1 s timeout
                 // is only a missed-signal safety net: NotifyEnqueued releases the semaphore
@@ -130,8 +156,108 @@ public sealed class IngestionDrainer : IAsyncDisposable
                 await _signal.WaitAsync(1000, ct).ConfigureAwait(false);
             }
             }
-            catch (ObjectDisposedException) { return; } // ring buffer disposed during shutdown
+            catch (OperationCanceledException) { break; } // shutdown — fall through to final drain
+            catch (ObjectDisposedException) { return; }   // ring buffer disposed during shutdown
         }
+
+        // ── Final drain ──────────────────────────────────────────────────────
+        // Producers acknowledged these events with 200 the moment they entered the ring;
+        // returning on cancellation abandoned up to the ring's whole capacity of them on
+        // every clean restart. Drain until empty (the storage engine is disposed AFTER
+        // this service, so writes still land and its final flush persists them), bounded
+        // by a deadline so a wedged storage engine cannot hang host shutdown.
+        var deadline = Environment.TickCount64 + ShutdownDrainMaxMs;
+        try
+        {
+            while (Environment.TickCount64 < deadline)
+            {
+                if (!havePending)
+                {
+                    if (!_ring.TryDequeue(
+                            out long tsTicks, out byte level, out int tmplIdx,
+                            out pendingTmpl, out pendingExc,
+                            _payloadBuf, out pendingLen,
+                            out ulong traceIdHi, out ulong traceIdLo,
+                            out ulong spanId, out int serviceNameIdx))
+                        break; // ring empty — done
+
+                    pendingHeader = new LogEventHeader
+                    {
+                        Id                       = 0,
+                        TimestampUtcTicks        = tsTicks,
+                        Level                    = (Ameto.Core.LogLevel)level,
+                        MessageTemplatePoolIndex = tmplIdx,
+                        PropertiesArenaOffset    = 0,
+                        PropertiesByteLength     = pendingLen,
+                        ServiceNamePoolIndex     = serviceNameIdx,
+                        TraceIdHi                = traceIdHi,
+                        TraceIdLo                = traceIdLo,
+                        SpanId                   = spanId,
+                        Flags                    = (byte)(pendingExc is not null ? LogEventFlags.HasException : LogEventFlags.None),
+                    };
+                    havePending     = true;
+                    pendingAttempts = 0;
+                }
+
+                if (!TryWritePending(ref havePending, ref pendingAttempts,
+                        in pendingHeader, pendingTmpl, pendingExc, pendingLen))
+                    await Task.Delay(5, CancellationToken.None).ConfigureAwait(false);
+            }
+            if (havePending || _ring.ApproximateCount > 0)
+                _logger.LogWarning("Shutdown drain deadline hit — events remaining in the ingestion ring were abandoned");
+        }
+        catch (ObjectDisposedException) { }
+    }
+
+    /// <summary>Shutdown budget for writing out ring residue; must fit the host's shutdown timeout.</summary>
+    private const long ShutdownDrainMaxMs = 10_000;
+
+    /// <summary>
+    /// Attempts to write the pending event. Returns true when the slot is free again —
+    /// written, or abandoned after repeated THROWN failures (counted + logged; a thrown
+    /// error is a storage fault, and before this catch existed a single one silently
+    /// killed the drain task: ingestion stopped for the life of the process while
+    /// producers kept seeing ordinary back-pressure drops).
+    /// </summary>
+    private bool TryWritePending(
+        ref bool havePending, ref int attempts,
+        in LogEventHeader header, string? tmpl, ExceptionInfo? exception, int payloadLen)
+    {
+        // An event larger than one hot-tier chunk can NEVER be written — TryWrite returns
+        // false on a fresh chunk too, so retrying it would wedge the single drain thread
+        // behind one unwritable event forever (MaxEventPayloadBytes is not validated
+        // against the chunk size, so the ring can accept and acknowledge such an event).
+        if (payloadLen > HotTierSegment.ChunkPayloadBytes)
+        {
+            Interlocked.Increment(ref _errorDrops);
+            _logger.LogError(
+                "Event payload of {Bytes} B exceeds the hot-tier chunk capacity of {Cap} B — dropped " +
+                "(lower Ingestion.MaxEventPayloadBytes below the chunk size to reject these at the door)",
+                payloadLen, HotTierSegment.ChunkPayloadBytes);
+            havePending = false;
+            return true;
+        }
+
+        var payload = new ReadOnlySpan<byte>(_payloadBuf, 0, payloadLen);
+        try
+        {
+            if (!_storage.TryWrite(header, payload, tmpl, exception))
+                return false; // back-pressure — retry the same event after a park
+        }
+        catch (Exception ex) when (ex is not ObjectDisposedException)
+        {
+            attempts++;
+            if (attempts < MaxWriteAttemptsOnError)
+            {
+                _logger.LogWarning(ex, "Storage write failed (attempt {Attempt}) — will retry", attempts);
+                return false;
+            }
+            Interlocked.Increment(ref _errorDrops);
+            _logger.LogError(ex, "Storage write failed {Attempts} times — dropping the event ({Drops} dropped total)",
+                attempts, Interlocked.Read(ref _errorDrops));
+        }
+        havePending = false;
+        return true;
     }
 
     public async ValueTask DisposeAsync()

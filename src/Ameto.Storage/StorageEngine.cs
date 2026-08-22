@@ -94,9 +94,33 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     private readonly string                               _walDir;
     private readonly string                               _segDir;
 
-    // Hot tier
-    private          HotTierSegment                       _hot;
-    private          WriteAheadLog?                       _wal;
+    // Hot tier + WAL travel as ONE immutable triple, swapped by a single volatile store.
+    // TryWrite runs on no lock while the flush swap mutated the two old fields one at a
+    // time — which gave every rotation a window where an accepted event hit the new tier
+    // while the WAL reference was still null (never journaled, lost on crash) or already
+    // disposed (append through a released mapping: AccessViolation). A reference can't
+    // tear, so a writer always sees a tier WITH the WAL that journals it.
+    private volatile WriteState                           _write;
+
+    private sealed class WriteState(HotTierSegment hot, WriteAheadLog? wal, ulong walSegId)
+    {
+        public readonly HotTierSegment Hot = hot;
+        public readonly WriteAheadLog? Wal = wal;
+        /// <summary>
+        /// First id of the block RESERVED FOR THE LIVE WAL, i.e. the ids its events will
+        /// occupy once they are flushed. The WAL file is named from it, and startup uses
+        /// that name to decide whether a WAL still holds unflushed events.
+        ///
+        /// <para>It is a reservation, not a peek at <c>_nextSegmentId</c>, and that is the
+        /// whole point. The WAL used to be named from whatever <c>_nextSegmentId</c>
+        /// happened to be, which is also the id a MERGE takes — so the first merge after
+        /// any flush published a segment carrying the live WAL's id, the restart check
+        /// "a segment with this id exists ⇒ this WAL was already flushed" fired on it, and
+        /// every un-flushed event in that WAL was deleted. Measured before this change:
+        /// WAL id 25, merged segment id 25, 30 events written, 0 recovered, on 3 of 3 runs.</para>
+        /// </summary>
+        public readonly ulong WalSegId = walSegId;
+    }
     // Serialises only the fast hot-tier/WAL *swap* — NOT the heavy cold-segment write.
     // WaitAsync(0) drops a redundant trigger: whoever holds it swaps the whole tier.
     private readonly SemaphoreSlim                        _flushLock  = new(1, 1);
@@ -112,8 +136,16 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     // In-flight parallel cold-flush tasks, so DisposeAsync can await them before the
     // tiers they read are freed. Self-pruning via ContinueWith on completion.
     private readonly ConcurrentDictionary<Task, byte>    _inFlightFlushes = new();
+    /// <summary>Pause between attempts to persist a frozen tier whose flush failed.</summary>
+    private static readonly TimeSpan FlushRetryDelay = TimeSpan.FromSeconds(15);
+    /// <summary>True while the live WAL is refusing appends — gates the once-per-episode error log (writer thread only).</summary>
+    private bool _walFaulted;
+    /// <summary>EventWritten subscriber faults, for throttled logging (writer thread only).</summary>
+    private long _hookFaults;
     private readonly CancellationTokenSource               _cts        = new();
     private readonly Task                                  _flushLoop;
+    /// <summary>Timer msyncing the live WAL (see <see cref="RunWalFlushLoopAsync"/>).</summary>
+    private readonly Task                                  _walFlushLoop;
     /// <summary>Low-priority cold-tier loop: merge recovery, then small-segment merges.</summary>
     private readonly Task                                  _maintenanceLoop;
     /// <summary>Test hook: lets merge run without an index builder (tests verify the scan fallback).</summary>
@@ -142,8 +174,8 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// sequence passes either way.
     /// </summary>
     internal Action? _beforeImportPublish;
-    /// <summary>Test hook: first id of the block reserved for the live WAL (see <see cref="_walSegId"/>).</summary>
-    internal ulong LiveWalSegmentId => _walSegId;
+    /// <summary>Test hook: first id of the block reserved for the live WAL (see <see cref="WriteState.WalSegId"/>).</summary>
+    internal ulong LiveWalSegmentId => _write.WalSegId;
     /// <summary>
     /// Test hook: scales the merged-file target. What determines how many files a bucket ends
     /// with is the RATIO of the bucket's payload to this, so dividing both by the same factor
@@ -310,20 +342,8 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// </summary>
     private readonly System.Threading.Lock                _importLock = new();
 
-    /// <summary>
-    /// First id of the block RESERVED FOR THE LIVE WAL, i.e. the ids its events will occupy
-    /// once they are flushed. The WAL file is named from it, and startup uses that name to
-    /// decide whether a WAL still holds unflushed events.
-    ///
-    /// <para>It is a reservation, not a peek at <see cref="_nextSegmentId"/>, and that is the
-    /// whole point. The WAL used to be named from whatever <c>_nextSegmentId</c> happened to
-    /// be, which is also the id a MERGE takes — so the first merge after any flush published a
-    /// segment carrying the live WAL's id, the restart check "a segment with this id exists ⇒
-    /// this WAL was already flushed" fired on it, and every un-flushed event in that WAL was
-    /// deleted. Measured before this change: WAL id 25, merged segment id 25, 30 events
-    /// written, 0 recovered, on 3 of 3 runs.</para>
-    /// </summary>
-    private          ulong                                _walSegId;
+    // The live WAL's reserved id block lives in WriteState.WalSegId (see its doc) so it
+    // swaps atomically with the WAL it names.
 
     // Time-sortable event id generator (Snowflake layout). Assigns EventId.RawValue
     // on the write path so sorting by Id ≡ sorting by ingest time.
@@ -413,7 +433,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             "message templates are being built by interpolation (a distinct template per event) " +
             "rather than passed as structured parameters.", size);
 
-        _hot = CreateHotTier();
+        _write = new WriteState(CreateHotTier(), null, 0);
         // The next segment id MUST be known before any flush, but it lives in the
         // file NAMES ({node}-{segId}-{minTs}-{maxTs}.seg) — a cheap directory
         // listing, no file opens. The expensive part (opening every segment to
@@ -445,10 +465,13 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 corrupt.Length, corrupt.Sum(static f => new FileInfo(f).Length), _segDir);
         _catalogLoad = Task.Run(LoadSegmentCatalog);
         ReplayOrphanedWals();
-        OpenWal();
+        var (bootWal, bootSegId) = OpenWalCore();
+        _write = new WriteState(_write.Hot, bootWal, bootSegId);
 
         // Age-based flush loop
         _flushLoop = RunFlushLoopAsync(_cts.Token);
+        // Periodic WAL msync — the durability contract for acknowledged-but-unflushed events
+        _walFlushLoop = RunWalFlushLoopAsync(_cts.Token);
         // Cold-tier maintenance: interrupted-merge recovery + small-segment merges
         _maintenanceLoop = RunColdMaintenanceLoopAsync(_cts.Token);
     }
@@ -559,7 +582,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         {
             lock (_frozenLock)
             {
-                long total = _hot.AllocatedBytes;
+                long total = _write.Hot.AllocatedBytes;
                 for (int i = 0; i < _frozenHot.Count; i++)
                     total += _frozenHot[i].Tier.AllocatedBytes;
                 return total;
@@ -587,7 +610,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         HashSet<SegmentKey> covered;
         lock (_frozenLock)
         {
-            current = _hot;
+            current = _write.Hot;
             if (_frozenHot.Count == 0)
             {
                 frozen  = Array.Empty<HotTierSegment>();
@@ -747,27 +770,67 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         var h = header;
         h.Id  = _idGen.Next(header.TimestampUtcTicks);
 
-        if (!_hot.TryWrite(h, propertiesPayload, template, exception))
+        // ONE capture: tier and WAL are used from the same immutable state, so the event
+        // can never land in a tier whose WAL this call does not also hold.
+        var w = _write;
+
+        if (!w.Hot.TryWrite(h, propertiesPayload, template, exception))
         {
-            // Hot tier full — schedule async flush and signal back-pressure
+            // Hot tier full (or frozen mid-swap) — schedule async flush and signal
+            // back-pressure; the caller retries the SAME event (drainer pending slot).
             ScheduleFlush();
             return false;
         }
 
+        // ── The event is COMMITTED from here on. Nothing below may throw out of TryWrite:
+        //    the drainer treats a thrown TryWrite as "not written" and retries the same
+        //    event — which would insert another copy (fresh id) into the tier per attempt.
         ushort tmplIdx = h.MessageTemplatePoolIndex >= 0 ? (ushort)h.MessageTemplatePoolIndex : (ushort)0;
         string tmplStr = template
                          ?? (h.MessageTemplatePoolIndex >= 0 ? TemplatePool.Get(h.MessageTemplatePoolIndex) : string.Empty);
-        _wal?.Append(h.TimestampUtcTicks, h.Level, tmplIdx, tmplStr, propertiesPayload, exception);
+        try
+        {
+            w.Wal?.Append(h.TimestampUtcTicks, h.Level, tmplIdx, tmplStr, propertiesPayload, exception);
+            _walFaulted = false;
+        }
+        catch (ObjectDisposedException)
+        {
+            // Extreme descheduling only: this state was captured just before a rotation
+            // and the flush thread disposed the old WAL between our hot-tier write and
+            // this append. The event IS in the (now frozen) tier, so the flush persists
+            // it — only the crash-recovery copy of this one event is missing.
+        }
+        catch (Exception ex)
+        {
+            // Disk full growing the WAL, a wedged mapping after a failed grow, a pool-file
+            // write error. The flush persists the event regardless — only crash-durability
+            // is degraded until rotation replaces the WAL, so force one and say so once per
+            // episode (the age loop keeps re-attempting the swap until the disk recovers).
+            if (!_walFaulted)
+            {
+                _walFaulted = true;
+                _logger.LogError(ex,
+                    "WAL append failed — ingest continues with reduced crash-durability until the WAL rotates");
+                ScheduleFlush();
+            }
+        }
 
-        // Notify subscribers (e.g. alert evaluator) — must be fast
+        // Notify subscribers (e.g. alert evaluator) — must be fast, and must not be able
+        // to fault ingest: a throwing subscriber used to kill the drain task outright.
         var hook = EventWritten;
         if (hook is not null)
         {
-            hook(h, tmplStr);
+            try { hook(h, tmplStr); }
+            catch (Exception ex)
+            {
+                long n = ++_hookFaults;
+                if (n == 1 || n % 10_000 == 0)
+                    _logger.LogWarning(ex, "EventWritten subscriber threw ({Count} total) — subscriber faults are ignored", n);
+            }
         }
 
         // Check size threshold
-        if (_hot.IsFull)
+        if (w.Hot.IsFull)
             ScheduleFlush();
 
         return true;
@@ -824,7 +887,17 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         try
         {
             while (await timer.WaitForNextTickAsync(ct))
-                await TryFlushAsync(ct);
+            {
+                try { await TryFlushAsync(ct); }
+                catch (OperationCanceledException) { throw; }
+                catch (Exception ex)
+                {
+                    // A full disk fails the SWAP itself (creating the successor 64 MB WAL).
+                    // The loop must survive it: this tick is the retry mechanism for swap
+                    // failures, and a faulted loop would also detonate DisposeAsync's await.
+                    _logger.LogError(ex, "Age-based flush failed — retried next tick");
+                }
+            }
         }
         catch (OperationCanceledException) { }
     }
@@ -856,37 +929,57 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         if (!await _flushLock.WaitAsync(0, ct)) return; // a swap is already in progress
         try
         {
-            if (_hot.Count == 0) return;
+            var oldState = _write;
+            if (oldState.Hot.Count == 0) return;
 
             // Back-pressure gate: if the in-flight tier budget is exhausted, skip the swap.
             // The hot tier stays full → TryWrite returns false → the drainer parks (ring
             // back-pressure) rather than letting frozen tiers pile up unbounded in RAM.
             if (!_flushSlots.Wait(0)) return;
+            try
+            {
+                // Open the SUCCESSOR first, so the swap installs a complete (tier, WAL)
+                // pair in one store: there is never a window in which a writer sees a
+                // live tier with no WAL (the old null-then-open order silently skipped
+                // the WAL for events accepted during it, once per rotation). Opening the
+                // next WAL also reserves the next id block, so the WAL on disk always
+                // names the ids ITS events will occupy. The OLD WAL is disposed in the
+                // heavy phase, off the swap lock — disposing flushes up to 64 MB of
+                // dirty mmap pages to disk, and doing that here stalled every writer
+                // long enough to overflow the ingest ring under sustained 100k/s load.
+                var (newWal, newSegId) = OpenWalCore();
+                WriteState newState;
+                try { newState = new WriteState(CreateHotTier(), newWal, newSegId); }
+                catch { try { newWal.Delete(); } catch { } throw; }
 
-            oldHot     = _hot;
-            oldWal     = _wal;
-            oldWalPath = oldWal?.FilePath;
-            oldHot.Freeze();
+                reservedSegId = oldState.WalSegId;
+                oldState.Hot.Freeze();
 
-            // Publish oldHot under the lock queries snapshot from, so a concurrent query
-            // sees oldHot's events AND skips the reserved cold segment ids (no duplicates
-            // during the register/remove overlap). A tier flushes to ONE SEGMENT PER LEVEL,
-            // and the block of ids for exactly that was reserved when this tier's WAL was
-            // opened — the level's segment is always firstId + (byte)level. Levels absent
-            // from the tier simply never become files; a burnt id costs nothing.
-            reservedSegId = _walSegId;
-            lock (_frozenLock) { _frozenHot.Add((oldHot, reservedSegId)); }
+                // Publish oldHot AND install the successor under the lock queries snapshot
+                // from, so a concurrent query sees oldHot exactly once — as current before
+                // the store, as frozen after it, never both — and skips the reserved cold
+                // segment ids (no duplicates during the register/remove overlap). A tier
+                // flushes to ONE SEGMENT PER LEVEL, and the block of ids for exactly that
+                // was reserved when this tier's WAL was opened — the level's segment is
+                // always firstId + (byte)level. Levels absent from the tier simply never
+                // become files; a burnt id costs nothing.
+                lock (_frozenLock)
+                {
+                    _frozenHot.Add((oldState.Hot, reservedSegId));
+                    _write = newState;
+                }
 
-            _hot = CreateHotTier();
-
-            // Rotate the WAL: opening the next one reserves the next block, so the WAL on
-            // disk always names the ids ITS events will occupy. The OLD WAL is disposed in
-            // the heavy phase, off the swap lock — disposing flushes up to 64 MB of dirty
-            // mmap pages to disk, and doing that here stalled every writer (hot tier stays
-            // full for the whole swap) long enough to overflow the ingest ring under
-            // sustained 100k/s load.
-            _wal = null;
-            OpenWal();
+                oldHot     = oldState.Hot;
+                oldWal     = oldState.Wal;
+                oldWalPath = oldWal?.FilePath;
+            }
+            catch
+            {
+                // Successor could not be built (disk full creating the WAL, native OOM on
+                // the tier): nothing was swapped, so the slot must not stay consumed.
+                _flushSlots.Release();
+                throw;
+            }
         }
         finally { _flushLock.Release(); }
 
@@ -900,52 +993,144 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         //    trigram/bloom indexes, compresses and writes the cold segment. Runs off the
         //    swap lock so several segments persist at once on otherwise idle cores. The
         //    back-pressure slot (taken at swap) is held until the tier is fully persisted.
+        bool slotTransferred = false;
         try
         {
             await _flushConcurrency.WaitAsync(ct).ConfigureAwait(false);
+            List<SegmentInfo> written;
             try
             {
-                List<SegmentInfo> written;
-                try
-                {
-                    written = await FlushTierByLevelAsync(oldHot, reservedSegId, ct);
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogError(ex, "Segment flush failed");
-                    // Leave oldHot in _frozenHot so its events stay queryable; the WAL on
-                    // disk replays them on restart. Do not retire — still referenced.
-                    return;
-                }
-
-                // Register the cold segments AND drop oldHot from the frozen list atomically.
-                lock (_frozenLock)
-                {
-                    foreach (var w in written) PublishLocalSegment(w);
-                    _frozenHot.RemoveAll(f => ReferenceEquals(f.Tier, oldHot));
-                }
-                _logger.LogInformation("Flushed {Segments} level segment(s), {Count} events total",
-                    written.Count, written.Sum(w => (long)w.EventCount));
-
-                foreach (var w in written) SegmentFlushed?.Invoke(w);
-
-                if (oldWalPath is not null)
-                {
-                    try { File.Delete(oldWalPath); }
-                    catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete WAL {Path}", oldWalPath); }
-                    try { File.Delete(oldWalPath + ".pool"); } catch { /* best-effort */ }
-                    // The marker is what AUTHORISES the delete above, so it outlives it: dropping
-                    // it first would leave a WAL that recovery has to replay to find out its
-                    // levels are all published. A crash in between leaves a marker with no WAL,
-                    // which the startup sweep clears.
-                    try { File.Delete(FlushMarkerPath(reservedSegId)); } catch { /* swept at startup */ }
-                }
-
-                RetireHotTier(oldHot);
+                written = await FlushTierByLevelAsync(oldHot, reservedSegId, ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // A failed flush used to be TERMINAL: the tier stayed frozen in RAM with no
+                // retry for the life of the process, while its back-pressure slot was
+                // released — so under a full disk the engine leaked one native tier per
+                // interval, unboundedly, precisely when a log store must ride the pressure
+                // out. Now the slot's ownership moves to a background retry task (bounded
+                // RAM: slot exhaustion skips further swaps → ring back-pressure) that
+                // re-attempts until the disk recovers or the engine shuts down — in which
+                // case the tier's WAL replays it on the next start.
+                _logger.LogError(ex,
+                    "Segment flush failed — tier stays frozen and queryable; retrying in background every {Delay}s",
+                    FlushRetryDelay.TotalSeconds);
+                ScheduleFlushRetry(oldHot, oldWalPath, reservedSegId);
+                slotTransferred = true;
+                return;
             }
             finally { _flushConcurrency.Release(); }
+
+            PublishFlushedTier(written, oldHot, oldWalPath, reservedSegId);
         }
-        finally { _flushSlots.Release(); }
+        finally { if (!slotTransferred) _flushSlots.Release(); }
+    }
+
+    /// <summary>
+    /// Registers a persisted tier's cold segments, unlists the frozen tier, deletes its WAL
+    /// (authorised by the completion marker) and retires the native memory. Shared by the
+    /// normal heavy phase and the failure-retry task.
+    /// </summary>
+    private void PublishFlushedTier(List<SegmentInfo> written, HotTierSegment oldHot, string? oldWalPath, ulong reservedSegId)
+    {
+        // Register the cold segments AND drop oldHot from the frozen list atomically.
+        lock (_frozenLock)
+        {
+            foreach (var w in written) PublishLocalSegment(w);
+            _frozenHot.RemoveAll(f => ReferenceEquals(f.Tier, oldHot));
+        }
+        _logger.LogInformation("Flushed {Segments} level segment(s), {Count} events total",
+            written.Count, written.Sum(w => (long)w.EventCount));
+
+        foreach (var w in written) SegmentFlushed?.Invoke(w);
+
+        if (oldWalPath is not null)
+        {
+            try { File.Delete(oldWalPath); }
+            catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete WAL {Path}", oldWalPath); }
+            try { File.Delete(oldWalPath + ".pool"); } catch { /* best-effort */ }
+            // The marker is what AUTHORISES the delete above, so it outlives it: dropping
+            // it first would leave a WAL that recovery has to replay to find out its
+            // levels are all published. A crash in between leaves a marker with no WAL,
+            // which the startup sweep clears.
+            try { File.Delete(FlushMarkerPath(reservedSegId)); } catch { /* swept at startup */ }
+        }
+
+        RetireHotTier(oldHot);
+    }
+
+    /// <summary>
+    /// Background retry for a frozen tier whose flush failed. Owns the tier's back-pressure
+    /// slot until the tier is persisted or the engine shuts down (then the slot is released
+    /// and the tier's WAL replays it on the next start). Tracked in
+    /// <see cref="_inFlightFlushes"/> so DisposeAsync awaits it after cancelling.
+    /// </summary>
+    private void ScheduleFlushRetry(HotTierSegment oldHot, string? oldWalPath, ulong reservedSegId)
+    {
+        var t = Task.Run(async () =>
+        {
+            try
+            {
+                while (true)
+                {
+                    await Task.Delay(FlushRetryDelay, _cts.Token).ConfigureAwait(false);
+                    try
+                    {
+                        await _flushConcurrency.WaitAsync(_cts.Token).ConfigureAwait(false);
+                        List<SegmentInfo> written;
+                        try
+                        {
+                            // The failed attempt may have MOVED some level files into place
+                            // without registering them (the publish block never ran, so no
+                            // query, merge or replication can hold them). Delete the
+                            // leftovers and rewrite the whole block — simpler to prove
+                            // correct than resuming, and the block's ids are reserved to
+                            // this WAL so nothing else can have produced these files.
+                            DeleteUnpublishedLevelFiles(reservedSegId);
+                            written = await FlushTierByLevelAsync(oldHot, reservedSegId, _cts.Token);
+                        }
+                        finally { _flushConcurrency.Release(); }
+
+                        PublishFlushedTier(written, oldHot, oldWalPath, reservedSegId);
+                        _logger.LogInformation("Frozen-tier flush retry succeeded for block {Block}", reservedSegId);
+                        return;
+                    }
+                    catch (OperationCanceledException) { throw; }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex,
+                            "Frozen-tier flush retry failed for block {Block} — next attempt in {Delay}s",
+                            reservedSegId, FlushRetryDelay.TotalSeconds);
+                    }
+                }
+            }
+            catch (OperationCanceledException) { /* shutdown — WAL replays the tier next start */ }
+            catch (ObjectDisposedException)    { /* raced DisposeAsync's CTS teardown — same outcome */ }
+            finally
+            {
+                // The slot semaphore can already be disposed when this task was spawned by a
+                // late ScheduleFlush during shutdown; the release is then moot, not an error.
+                try { _flushSlots.Release(); } catch (ObjectDisposedException) { }
+            }
+        });
+        _inFlightFlushes[t] = 0;
+        _ = t.ContinueWith(
+            static (x, s) => ((ConcurrentDictionary<Task, byte>)s!).TryRemove(x, out _),
+            _inFlightFlushes, CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+    }
+
+    /// <summary>Removes level files of a reserved block that were moved into place by a flush attempt that failed before publishing.</summary>
+    private void DeleteUnpublishedLevelFiles(ulong firstSegId)
+    {
+        for (ulong s = 0; s < (ulong)LevelSegmentSlots; s++)
+        {
+            foreach (var f in Directory.EnumerateFiles(_segDir, $"{_options.NodeId.Value}-{firstSegId + s}-*.seg"))
+            {
+                try { File.Delete(f); }
+                catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete unpublished level file {File}", f); }
+            }
+        }
     }
 
     /// <summary>
@@ -2361,16 +2546,16 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             return;
         }
 
-        // Load template pool
-        var pool = WriteAheadLog.LoadPool(poolPath);
-        if (pool.Count == 0)
-        {
-            _logger.LogWarning("Orphaned WAL {File}: no template pool, discarding {Count} events",
+        // Load template pool. An empty pool (its writes are only fsynced periodically, so
+        // power loss can zero it) used to discard the ENTIRE WAL — dropping events whose
+        // payloads DID reach disk because their template strings did not. Replay them
+        // template-less instead: timestamp, level, properties and exception all survive,
+        // only @mt is lost, and the index below must not alias a live pool entry.
+        var pool         = WriteAheadLog.LoadPool(poolPath);
+        bool poolMissing = pool.Count == 0;
+        if (poolMissing)
+            _logger.LogWarning("Orphaned WAL {File}: no template pool — replaying {Count} events without templates",
                 walFile, entries.Count);
-            try { File.Delete(walFile); } catch { }
-            try { File.Delete(poolPath); } catch { }
-            return;
-        }
 
         // Restore templates into TemplatePool
         foreach (var (idx, tmpl) in pool)
@@ -2390,11 +2575,14 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 Id                       = _idGen.Next(entry.TimestampTicks),
                 TimestampUtcTicks        = entry.TimestampTicks,
                 Level                    = entry.Level,
-                MessageTemplatePoolIndex = entry.TemplateIndex,
+                // With no pool the stored index points at whatever the LIVE pool holds
+                // at that slot — resolving it would stamp a random template onto every
+                // recovered event. -1 = "no template", persisted as an empty @mt.
+                MessageTemplatePoolIndex = poolMissing ? -1 : entry.TemplateIndex,
             };
             // Resolve template via the freshly restored pool and attach it
             // to the hot tier so the recovery flush persists @mt correctly.
-            string tmpl = TemplatePool.Get(entry.TemplateIndex);
+            string tmpl = poolMissing ? string.Empty : TemplatePool.Get(entry.TemplateIndex);
             if (recoveredHot.TryWrite(header, entry.Payload, tmpl, entry.Exception))
                 replayed++;
         }
@@ -2953,13 +3141,38 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// entire life of the current hot tier. <see cref="TryClaimLocalSegmentId"/> is what closes
     /// that half, by refusing an arriving id the allocator has already passed.</para>
     /// </summary>
-    private void OpenWal()
+    private (WriteAheadLog Wal, ulong SegId) OpenWalCore()
     {
-        _walSegId = AllocateSegmentIdBlock();
+        ulong walSegId = AllocateSegmentIdBlock();
 
-        var segId   = new SegmentId(_walSegId);
+        var segId   = new SegmentId(walSegId);
         var walPath = Path.Combine(_walDir, $"{_options.NodeId.Value}-{segId.Value}.wal");
-        _wal        = WriteAheadLog.Open(walPath, _options.NodeId, segId);
+        return (WriteAheadLog.Open(walPath, _options.NodeId, segId), walSegId);
+    }
+
+    /// <summary>
+    /// Periodic WAL msync. Appends land in the OS page cache; without this the engine's
+    /// real durability contract was "whenever the OS writes back" — a power loss silently
+    /// forfeited up to a whole hot tier (5 minutes / 64 MB) of ACKNOWLEDGED events. One
+    /// msync per interval bounds that loss window at the interval, Elasticsearch-translog
+    /// style, without an fsync per event.
+    /// </summary>
+    private async Task RunWalFlushLoopAsync(CancellationToken ct)
+    {
+        var interval = _options.HotTier.WalFlushInterval;
+        if (interval <= TimeSpan.Zero) return; // explicitly disabled
+
+        using var timer = new PeriodicTimer(interval);
+        try
+        {
+            while (await timer.WaitForNextTickAsync(ct))
+            {
+                try { _write.Wal?.Flush(); }
+                catch (ObjectDisposedException) { /* raced a rotation — next tick hits the new WAL */ }
+                catch (Exception ex) { _logger.LogWarning(ex, "Periodic WAL flush failed"); }
+            }
+        }
+        catch (OperationCanceledException) { }
     }
 
     /// <param name="order">
@@ -2996,6 +3209,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         try { await _flushLoop; }
         catch (OperationCanceledException) { }
         catch (ObjectDisposedException) { }
+        try { await _walFlushLoop; }
+        catch (OperationCanceledException) { }
+        catch (ObjectDisposedException) { }
         try { await _maintenanceLoop; }
         catch (OperationCanceledException) { }
         catch (ObjectDisposedException) { }
@@ -3005,7 +3221,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         // No new flush can start: the age loop is stopped and no writes remain.
         try { await Task.WhenAll(_inFlightFlushes.Keys.ToArray()); } catch { /* best-effort */ }
 
-        if (_hot.Count > 0)
+        if (_write.Hot.Count > 0)
         {
             try { await TryFlushAsync(); } catch { /* best-effort final flush */ }
             // TryFlushAsync's heavy phase runs to completion inline here (we awaited it),
@@ -3013,7 +3229,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             try { await Task.WhenAll(_inFlightFlushes.Keys.ToArray()); } catch { }
         }
 
-        _hot.Dispose();
+        _write.Hot.Dispose();
         lock (_retireLock)
         {
             foreach (var t in _retired) t.Dispose();
@@ -3024,7 +3240,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             foreach (var (tier, _) in _frozenHot) tier.Dispose();
             _frozenHot.Clear();
         }
-        _wal?.Dispose();
+        _write.Wal?.Dispose();
         _flushConcurrency.Dispose();
         _flushSlots.Dispose();
         _flushLock.Dispose();

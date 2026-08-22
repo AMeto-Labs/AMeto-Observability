@@ -43,6 +43,14 @@ public sealed class HotTierOptions
     public TimeSpan MaxAge   { get; init; } = TimeSpan.FromMinutes(5);
 
     /// <summary>
+    /// How often the live WAL is msync'd to disk. This is the durability window for
+    /// acknowledged events: a power loss forfeits at most this much accepted ingest
+    /// (a process crash forfeits nothing — the page cache survives it). Zero or
+    /// negative disables the periodic msync, restoring page-cache-only durability.
+    /// </summary>
+    public TimeSpan WalFlushInterval { get; init; } = TimeSpan.FromSeconds(2);
+
+    /// <summary>
     /// Number of cold-segment flushes (index build + compress + write) allowed to run in
     /// parallel. Higher = more flush throughput (fewer ingest drops under burst) but more
     /// peak RAM (concurrent index builds). 0 = auto (≈ processor count / 2, capped 2–8).
