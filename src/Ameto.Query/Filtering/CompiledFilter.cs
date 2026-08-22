@@ -25,14 +25,116 @@ public sealed class CompiledFilter
 
     private CompiledFilter(FilterNode root)
     {
+        root           = RewriteTimeCompares(root);
         _root          = root;
         _trigramHints  = BuildTrigramHints(root);
         _invertedHints = BuildInvertedHints(root);
         _hasHint       = TryExtract(root, out _hintProperty, out _hintValue);
+
+        long? min = null, max = null;
+        CollectTimeBounds(root, ref min, ref max);
+        MinTimestampTicks = min;
+        MaxTimestampTicks = max;
     }
 
     public static CompiledFilter Compile(string? expression) =>
         new(FilterParser.Parse(expression));
+
+    // ── @t bounds ─────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Tightest lower/upper bound (UTC ticks, inclusive) the filter's AND-chain places on
+    /// <c>@t</c>, or null. The executor intersects these with the request window, so the
+    /// catalog filter, the zone map and the hot-tier header scan prune with them — a
+    /// <c>@t &gt;= '...'</c> filter used to be evaluated per event over the whole catalog.
+    /// The evaluator still re-checks every event (OR/NOT branches keep their own nodes),
+    /// so these may only ever SKIP work.
+    /// </summary>
+    public long? MinTimestampTicks { get; }
+
+    /// <inheritdoc cref="MinTimestampTicks"/>
+    public long? MaxTimestampTicks { get; }
+
+    /// <summary>
+    /// Rewrites <c>@t op parseable-literal</c> comparisons into <see cref="TimeCompareNode"/>
+    /// so the literal is parsed once and comparison is chronological (see the node's doc).
+    /// Nodes are rebuilt only on the paths that actually changed.
+    /// </summary>
+    private static FilterNode RewriteTimeCompares(FilterNode node)
+    {
+        switch (node)
+        {
+            case CompareNode { RightProperty: null } cmp
+                when cmp.Value is string s
+                  && BuiltinFields.TryResolve(cmp.Property, out var field)
+                  && field == BuiltinField.Timestamp
+                  && TryParseTimeLiteral(s, out long ticks):
+                return new TimeCompareNode(cmp.Op, ticks);
+
+            case AndNode and:
+            {
+                var l = RewriteTimeCompares(and.Left);
+                var r = RewriteTimeCompares(and.Right);
+                return ReferenceEquals(l, and.Left) && ReferenceEquals(r, and.Right) ? and : new AndNode(l, r);
+            }
+            case OrNode or:
+            {
+                var l = RewriteTimeCompares(or.Left);
+                var r = RewriteTimeCompares(or.Right);
+                return ReferenceEquals(l, or.Left) && ReferenceEquals(r, or.Right) ? or : new OrNode(l, r);
+            }
+            case NotNode not:
+            {
+                var inner = RewriteTimeCompares(not.Operand);
+                return ReferenceEquals(inner, not.Operand) ? not : new NotNode(inner);
+            }
+            default:
+                return node;
+        }
+    }
+
+    /// <summary>Invariant, offset-less literals assumed UTC — matching how events are stored.</summary>
+    private static bool TryParseTimeLiteral(string s, out long ticks)
+    {
+        if (DateTimeOffset.TryParse(s, System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AllowWhiteSpaces,
+                out var dto))
+        {
+            ticks = dto.UtcTicks;
+            return true;
+        }
+        ticks = 0;
+        return false;
+    }
+
+    private static void CollectTimeBounds(FilterNode node, ref long? min, ref long? max)
+    {
+        switch (node)
+        {
+            case TimeCompareNode t:
+                switch (t.Op)
+                {
+                    case CompareOp.Ge: min = Math.Max(min ?? long.MinValue, t.Ticks); break;
+                    // Ticks are integral: a > b ⇔ a >= b+1 (clamped at the type edge).
+                    case CompareOp.Gt: min = Math.Max(min ?? long.MinValue, t.Ticks == long.MaxValue ? long.MaxValue : t.Ticks + 1); break;
+                    case CompareOp.Le: max = Math.Min(max ?? long.MaxValue, t.Ticks); break;
+                    case CompareOp.Lt: max = Math.Min(max ?? long.MaxValue, t.Ticks == long.MinValue ? long.MinValue : t.Ticks - 1); break;
+                    case CompareOp.Eq:
+                        min = Math.Max(min ?? long.MinValue, t.Ticks);
+                        max = Math.Min(max ?? long.MaxValue, t.Ticks);
+                        break;
+                    // Ne bounds nothing.
+                }
+                break;
+
+            case AndNode and:
+                CollectTimeBounds(and.Left,  ref min, ref max);
+                CollectTimeBounds(and.Right, ref min, ref max);
+                break;
+
+            // OR/NOT: a bound taken from one branch would exclude the other's matches.
+        }
+    }
 
     public bool IsMatchAll => _root is MatchAllNode;
 

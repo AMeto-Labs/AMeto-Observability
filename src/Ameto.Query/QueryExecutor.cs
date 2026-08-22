@@ -82,6 +82,18 @@ public sealed class QueryExecutor : IQueryExecutor
             }
         }
 
+        // @t predicates from the filter's AND-chain are exact bounds too — folded into the
+        // window so the catalog filter, zone map and hot header scan prune with them (a
+        // `@t >= '...'` filter used to be evaluated per event over the whole catalog). The
+        // evaluator re-checks every event regardless, so this can only skip work; the
+        // DateTime-range guard mirrors the cursor's.
+        if (filter.MinTimestampTicks is long boundMin && boundMin >= 0 && boundMin <= DateTime.MaxValue.Ticks
+            && (from is null || from.Value.UtcTicks < boundMin))
+            from = new DateTimeOffset(boundMin, TimeSpan.Zero);
+        if (filter.MaxTimestampTicks is long boundMax && boundMax >= 0 && boundMax <= DateTime.MaxValue.Ticks
+            && (to is null || to.Value.UtcTicks > boundMax))
+            to = new DateTimeOffset(boundMax, TimeSpan.Zero);
+
         // ── Hot tier ──────────────────────────────────────────────────────────
         // Window/cursor/level filtering and the (@t, id) sort happen at HEADER level
         // inside the reader (HotTierScan) — events are materialised lazily in result

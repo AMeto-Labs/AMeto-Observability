@@ -63,6 +63,22 @@ public sealed class CompareNode : FilterNode
     }
 }
 
+/// <summary>
+/// A <c>@t op literal</c> comparison whose literal parsed as a date — rewritten from
+/// <see cref="CompareNode"/> at compile time (see <c>CompiledFilter</c>) so the literal
+/// is parsed ONCE and the evaluator compares ticks instead of rendering every event's
+/// timestamp to an ISO string and comparing ordinally. Ordinal comparison was also
+/// subtly wrong: a user literal ending in <c>Z</c> against the event's <c>+00:00</c>
+/// rendering ordered by the format bytes, not by time. A literal that does not parse
+/// as a date keeps its CompareNode and the old string semantics.
+/// </summary>
+public sealed class TimeCompareNode : FilterNode
+{
+    public CompareOp Op    { get; }
+    public long      Ticks { get; }
+    public TimeCompareNode(CompareOp op, long ticks) { Op = op; Ticks = ticks; }
+}
+
 // ── String predicates ─────────────────────────────────────────────────────────
 
 /// <summary>@mt like '%hello%'  or  Prop like 'prefix%'</summary>

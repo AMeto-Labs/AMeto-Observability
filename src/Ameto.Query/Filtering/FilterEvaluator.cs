@@ -29,6 +29,7 @@ public static class FilterEvaluator
             HasNode has                   => HasProperty(ev, has.Property),
             IsDefinedNode def             => HasProperty(ev, def.Property),
             CompareNode cmp               => EvalCompare(cmp, ev),
+            TimeCompareNode tc            => EvalTimeCompare(tc, ev),
             LikeNode like                 => EvalLike(like, ev),
             StartsWithNode sw             => EvalStartsWith(sw, ev),
             ContainsNode ct               => EvalContains(ct, ev),
@@ -281,6 +282,26 @@ public static class FilterEvaluator
     }
 
     // ── Comparison ────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Chronological <c>@t</c> comparison — tick math against the literal parsed once at
+    /// compile time (see <see cref="TimeCompareNode"/>), replacing a per-event ISO render
+    /// plus ordinal string compare.
+    /// </summary>
+    private static bool EvalTimeCompare(TimeCompareNode node, LogEvent ev)
+    {
+        long a = ev.Timestamp.UtcTicks, b = node.Ticks;
+        return node.Op switch
+        {
+            CompareOp.Eq => a == b,
+            CompareOp.Ne => a != b,
+            CompareOp.Lt => a <  b,
+            CompareOp.Le => a <= b,
+            CompareOp.Gt => a >  b,
+            CompareOp.Ge => a >= b,
+            _            => false,
+        };
+    }
 
     private static bool EvalCompare(CompareNode node, LogEvent ev)
     {
