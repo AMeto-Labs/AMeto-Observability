@@ -256,10 +256,11 @@ public sealed class CompiledFilter
                 CollectTrigram(and.Right, out_);
                 break;
 
-            case OrNode or:
-                CollectTrigram(or.Left,  out_);
-                CollectTrigram(or.Right, out_);
-                break;
+            // Deliberately skip OrNode — the consumer intersects every hint as a
+            // conjunct (TryNarrowWithIndex), so hints gathered across OR branches
+            // narrowed `contains(a) or contains(b)` to rows containing BOTH, and an
+            // OR branch whose term was absent from a group dropped the whole group.
+            // Same rule, same reason as CollectInvertedHints above.
         }
     }
 }
