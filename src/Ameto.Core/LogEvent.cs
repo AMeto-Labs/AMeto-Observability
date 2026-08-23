@@ -149,6 +149,21 @@ public sealed class LogEvent
         return false;
     }
 
+    /// <summary>
+    /// Whether the event carries this key with a non-null value, WITHOUT decoding it —
+    /// for callers that only need to know whether a path can start here. Decoding the
+    /// value would materialise a whole nested subtree just to throw it away.
+    /// </summary>
+    public bool HasNonNullProperty(ReadOnlySpan<char> key)
+    {
+        if (_properties is not null)
+            return _properties.GetAlternateLookup<ReadOnlySpan<char>>().TryGetValue(key, out var v) && v is not null;
+
+        return !RawProperties.IsEmpty
+            && Serialization.LogEventSerializer.HasProperty(RawProperties, key, out bool isNil)
+            && !isNil;
+    }
+
     /// <summary>High 64 bits of the 128-bit distributed TraceId (0 when absent).</summary>
     public ulong TraceIdHi   { get; init; }
 

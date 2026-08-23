@@ -67,6 +67,48 @@ public sealed class LikeAndRegexTests
         Assert.Equal(expected, Matches(WithValue(value), $"Region like '{pattern}'"));
     }
 
+    [Theory]
+    // A '%' IN THE VALUE compares equal to the pattern's '%', so testing the literal
+    // before the wildcard consumed the wildcard as an ordinary character and threw away
+    // the only backtrack point. URL-encoded paths and "100% CPU" fell out of every
+    // contains-query.
+    [InlineData("%2fapi%2fusers", "%users", true)]
+    [InlineData("%2fapi%2fusers", "%api%",  true)]
+    [InlineData("x%y%z",          "%y%",    true)]
+    [InlineData("100% CPU",       "%cpu",   true)]
+    [InlineData("100% CPU",       "100%%",  true)]
+    [InlineData("%ab",            "%b",     true)]
+    [InlineData("ba%__",          "_%a%",   true)]
+    [InlineData("%2fapi",         "%users", false)]
+    public void Like_treats_a_percent_in_the_value_as_a_character(string value, string pattern, bool expected)
+    {
+        Assert.Equal(expected, Matches(WithValue(value), $"Region like '{pattern}'"));
+    }
+
+    [Fact]
+    public void Like_folds_case_the_same_way_for_literal_and_wildcard_patterns()
+    {
+        // U+212A KELVIN SIGN lowercases to 'k' under ToLowerInvariant, which is what the
+        // pattern is folded with — OrdinalIgnoreCase does not consider them equal, so the
+        // literal path has to fold, not compare ordinally.
+        var ev = WithValue("100K");
+        Assert.True(Matches(ev, "Region like '100k'"));    // literal
+        Assert.True(Matches(ev, "Region like '100%'"));    // wildcard
+        Assert.True(Matches(ev, "Region like '%k'"));
+    }
+
+    [Fact]
+    public void Like_matches_supplementary_plane_letters_case_insensitively()
+    {
+        // DESERET CAPITAL LONG I (U+10400) lowercases to U+10428 as a surrogate PAIR.
+        // Folding one UTF-16 unit at a time cannot see that; the pattern was folded by
+        // string.ToLowerInvariant(), which can.
+        var ev = WithValue("id-\U00010400");
+        Assert.True(Matches(ev, "Region like 'id-\U00010428'"));
+        Assert.True(Matches(ev, "Region like 'id-%'"));
+        Assert.True(Matches(ev, "Region like '%\U00010428'"));
+    }
+
     [Fact]
     public void Like_survives_the_pattern_that_used_to_go_exponential()
     {

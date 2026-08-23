@@ -102,6 +102,50 @@ public sealed class PropertyProbeTests
         Assert.False(Matches(ev, "Customer = 'other'"));
     }
 
+    /// <summary>
+    /// OTLP concatenates resource attributes and record attributes into ONE flat map with
+    /// no dedup, so a key set at both levels is written twice — record last. The dictionary
+    /// keeps the last (dict[k] = v), and the probe has to agree, or the same event answers
+    /// the same predicate differently depending on whether anything had already
+    /// materialised the map.
+    /// </summary>
+    [Fact]
+    public void A_duplicate_key_resolves_to_the_last_occurrence_like_the_dictionary()
+    {
+        LogEvent Dup() => Event(static (ref MessagePackWriter w) =>
+        {
+            w.WriteMapHeader(2);
+            w.Write("deployment.environment"); w.Write("prod");      // resource attribute
+            w.Write("deployment.environment"); w.Write("staging");   // record attribute wins
+        });
+
+        var probed = Dup();
+        Assert.True(Matches(probed, "deployment.environment = 'staging'"));
+        Assert.False(Matches(probed, "deployment.environment = 'prod'"));
+        Assert.False(probed.PropertiesMaterialised);
+
+        var materialised = Dup();
+        _ = materialised.Properties;
+        Assert.True(Matches(materialised, "deployment.environment = 'staging'"));
+        Assert.False(Matches(materialised, "deployment.environment = 'prod'"));
+    }
+
+    [Fact]
+    public void A_nil_first_occurrence_does_not_hide_a_later_nested_map()
+    {
+        // Same duplicate shape, but the head of a dotted path: OTLP writes nil for an
+        // attribute with no value set, and the structured one can come after it. Taking
+        // the first occurrence made the walk give up before it started.
+        var ev = Event(static (ref MessagePackWriter w) =>
+        {
+            w.WriteMapHeader(2);
+            w.Write("db"); w.WriteNil();
+            w.Write("db"); w.WriteMapHeader(1); w.Write("name"); w.Write("orders");
+        });
+
+        Assert.True(Matches(ev, "db.name = 'orders'"));
+    }
+
     [Fact]
     public void Keys_compare_ordinally_like_the_dictionary_does()
     {

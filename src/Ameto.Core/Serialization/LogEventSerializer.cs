@@ -382,8 +382,20 @@ public static class LogEventSerializer
     /// </summary>
     /// <returns>True when the key was present; <paramref name="value"/> is then its decoded value.</returns>
     public static bool TryReadProperty(ReadOnlyMemory<byte> map, ReadOnlySpan<char> key, out object? value)
+        => Probe(map, key, decode: true, out value, out _);
+
+    /// <summary>
+    /// Presence of a key WITHOUT decoding its value — used where only "is there anything
+    /// under this name" matters, so a nested subtree is never built just to be discarded.
+    /// </summary>
+    public static bool HasProperty(ReadOnlyMemory<byte> map, ReadOnlySpan<char> key, out bool isNil)
+        => Probe(map, key, decode: false, out _, out isNil);
+
+    private static bool Probe(
+        ReadOnlyMemory<byte> map, ReadOnlySpan<char> key, bool decode, out object? value, out bool isNil)
     {
         value = null;
+        isNil = false;
         if (map.IsEmpty) return false;
 
         int byteCount = Encoding.UTF8.GetByteCount(key);
@@ -399,23 +411,40 @@ public static class LogEventSerializer
             if (reader.NextMessagePackType != MessagePackType.Map) return false;
 
             int count = reader.ReadMapHeader();
+
+            // LAST occurrence wins, which is why the walk cannot stop at the first hit:
+            // the dictionary is built with dict[key] = value, so a repeated key keeps the
+            // LAST one, and the ingest path really does repeat keys — OTLP concatenates
+            // resource attributes and record attributes into one flat map with no dedup,
+            // so anything set at both levels appears twice. Returning the first would make
+            // a probe and a lookup disagree about the same event, and which one ran would
+            // depend on whether something else had already materialised the map.
+            bool found = false;
+            MessagePackReader hit = default;   // positioned at the winning VALUE
             for (int i = 0; i < count; i++)
             {
-                bool hit;
+                bool isMatch;
                 if (reader.NextMessagePackType == MessagePackType.String)
-                    hit = ReadKey(ref reader).SequenceEqual(keyUtf8);
+                    isMatch = ReadKey(ref reader).SequenceEqual(keyUtf8);
                 else
                 {
                     reader.Skip();           // a key that is not a string cannot match
-                    hit = false;
+                    isMatch = false;
                 }
 
-                if (hit)
+                if (isMatch)
                 {
-                    value = ReadDynamic(ref reader);
-                    return true;
+                    found = true;
+                    hit   = reader;          // struct copy: a bookmark at this value
+                    isNil = reader.NextMessagePackType == MessagePackType.Nil;
                 }
                 reader.Skip();               // step over the value and try the next entry
+            }
+
+            if (found)
+            {
+                if (decode) value = ReadDynamic(ref hit);
+                return true;
             }
         }
         catch { /* malformed map — same answer as the full deserialiser: nothing */ }

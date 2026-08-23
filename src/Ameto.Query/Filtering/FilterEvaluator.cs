@@ -187,9 +187,10 @@ public static class FilterEvaluator
         if (!ev.PropertiesMaterialised)
         {
             var head = prop.AsSpan(0, sep);
+            // Presence only — decoding the head would build the very subtree this check
+            // exists to avoid building.
             if (PropertyPath.IsIndexSegment(head)
-                || !ev.TryGetProperty(PropertyPath.SegmentValue(head), out var headValue)
-                || headValue is null)
+                || !ev.HasNonNullProperty(PropertyPath.SegmentValue(head)))
                 return ReadFlatKeyOrNull(ev, prop);
         }
 
@@ -1091,8 +1092,7 @@ public static class FilterEvaluator
         // No ToLowerInvariant() copy of the value: the pattern is already lowercased, so
         // the walk lowercases one character at a time. That copy was an allocation per
         // scanned value, which is per event of every LIKE query.
-        if (node.IsLiteral)
-            return string.Equals(text, node.PatternLower, StringComparison.OrdinalIgnoreCase);
+        if (node.IsLiteral) return EqualsFolded(text.AsSpan(), node.PatternLower.AsSpan());
         return LikeMatchLower(text.AsSpan(), node.PatternLower.AsSpan());
     }
 
@@ -1102,8 +1102,53 @@ public static class FilterEvaluator
         string lp = pattern.ToLowerInvariant();
         if (lp == "%") return true;
         if (!lp.Contains('%') && !lp.Contains('_'))
-            return string.Equals(text, lp, StringComparison.OrdinalIgnoreCase);
+            return EqualsFolded(text.AsSpan(), lp.AsSpan());
         return LikeMatchLower(text.AsSpan(), lp.AsSpan());
+    }
+
+    /// <summary>
+    /// Equality under the SAME folding the wildcard matcher uses, so the literal and
+    /// wildcard paths can never disagree about which characters are equal.
+    /// <c>OrdinalIgnoreCase</c> is not that folding — it leaves the Kelvin sign and its
+    /// friends unequal to the letters <c>string.ToLowerInvariant()</c> maps them onto,
+    /// which is what the pattern was lowered with.
+    /// </summary>
+    private static bool EqualsFolded(ReadOnlySpan<char> text, ReadOnlySpan<char> patternLower)
+    {
+        int t = 0, p = 0;
+        while (t < text.Length && p < patternLower.Length)
+        {
+            if (!FoldedCharsMatch(text, ref t, patternLower, ref p)) return false;
+        }
+        return t == text.Length && p == patternLower.Length;
+    }
+
+    /// <summary>
+    /// Compares ONE folded character of the value against one of the (already folded)
+    /// pattern, advancing both. A surrogate pair is folded as the code point it forms —
+    /// <c>char.ToLowerInvariant</c> cannot see astral letters, while the pattern was
+    /// lowered by <c>string.ToLowerInvariant()</c>, which can; folding only half of a pair
+    /// would make a byte-identical pattern stop matching its own value.
+    /// </summary>
+    private static bool FoldedCharsMatch(
+        ReadOnlySpan<char> text, ref int t, ReadOnlySpan<char> pattern, ref int p)
+    {
+        if (char.IsHighSurrogate(text[t]) && t + 1 < text.Length && char.IsLowSurrogate(text[t + 1]))
+        {
+            var folded = System.Text.Rune.ToLowerInvariant(
+                new System.Text.Rune(text[t], text[t + 1]));
+            Span<char> buf = stackalloc char[2];
+            int n = folded.EncodeToUtf16(buf);
+            if (p + n > pattern.Length || !pattern.Slice(p, n).SequenceEqual(buf[..n])) return false;
+            t += 2;
+            p += n;
+            return true;
+        }
+
+        if (pattern[p] != char.ToLowerInvariant(text[t])) return false;
+        t++;
+        p++;
+        return true;
     }
 
     /// <summary>
@@ -1123,15 +1168,21 @@ public static class FilterEvaluator
 
         while (t < text.Length)
         {
-            if (p < pattern.Length &&
-                (pattern[p] == '_' || pattern[p] == char.ToLowerInvariant(text[t])))
-            {
-                t++; p++;
-            }
-            else if (p < pattern.Length && pattern[p] == '%')
+            // The WILDCARD is tested first, and that order is the whole correctness of the
+            // loop: '%' compares equal to itself, so testing the literal first let a '%'
+            // IN THE VALUE consume the pattern's wildcard as an ordinary character. The
+            // backtrack point was then never recorded and `Url like '%users'` stopped
+            // matching "%2fapi%2fusers" — a URL-encoded path, or anything with a per-cent
+            // sign in it, quietly dropped out of every contains-query.
+            if (p < pattern.Length && pattern[p] == '%')
             {
                 starP = p++;         // remember it and try to match the rest with zero chars
                 starT = t;
+            }
+            else if (p < pattern.Length &&
+                     (pattern[p] == '_' ? Advance(text, ref t, ref p) : FoldedCharsMatch(text, ref t, pattern, ref p)))
+            {
+                // consumed by the branch
             }
             else if (starP >= 0)
             {
@@ -1143,6 +1194,14 @@ public static class FilterEvaluator
 
         while (p < pattern.Length && pattern[p] == '%') p++;
         return p == pattern.Length;
+    }
+
+    /// <summary>'_' consumes exactly one UTF-16 unit, as the recursive matcher did.</summary>
+    private static bool Advance(ReadOnlySpan<char> text, ref int t, ref int p)
+    {
+        t++;
+        p++;
+        return true;
     }
 
 
@@ -1258,9 +1317,10 @@ public static class FilterEvaluator
 
     /// <summary>
     /// One value against a pre-compiled pattern. A timeout can only come from the
-    /// backtracking fallback (patterns the linear engine refuses) and means this ONE value
-    /// defeated the pattern — the value does not match, and the query goes on rather than
-    /// dying halfway through a result stream.
+    /// backtracking fallback — the linear engine is compiled without one precisely so that
+    /// a big value on a loaded box cannot go missing — and there it means this ONE value
+    /// defeated a pattern that is capable of catastrophic backtracking. Answering "no
+    /// match" for it keeps the query alive instead of killing it halfway through a stream.
     /// </summary>
     private static bool IsMatch(Regex rx, string input)
     {
