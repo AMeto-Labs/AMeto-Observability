@@ -125,6 +125,10 @@ builder.Services.AddSingleton<LogVolumeCountsCache>();
 // Per-search time budget and concurrency limit (see QueryGuard).
 builder.Services.AddSingleton<QueryGuard>();
 
+// Live tails wait on this instead of polling; LiveTailWiring hooks it to the write path.
+builder.Services.AddSingleton<LiveEventSignal>();
+builder.Services.AddHostedService<LiveTailWiring>();
+
 // ── Software-update check (Settings → Updates) ────────────────────────────────
 // Singleton holds the latest-release snapshot for the endpoints; the hosted
 // service polls GitHub hourly (no-op when Ameto:Updates:Enabled is false).

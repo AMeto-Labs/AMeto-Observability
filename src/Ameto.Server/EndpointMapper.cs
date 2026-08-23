@@ -92,17 +92,7 @@ public static class EndpointMapper
             if (!string.IsNullOrEmpty(afterId) && ulong.TryParse(afterId, out var raw))
                 cursor = new Ameto.Core.EventId(raw);
 
-            HashSet<Ameto.Core.LogLevel>? levelSet = null;
-            if (!string.IsNullOrEmpty(levels))
-            {
-                levelSet = new HashSet<Ameto.Core.LogLevel>();
-                foreach (var part in levels.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-                {
-                    if (Ameto.Core.LogLevelExtensions.TryParse(part.AsSpan(), out var lvl))
-                        levelSet.Add(lvl);
-                }
-                if (levelSet.Count == 0 || levelSet.Count == 6) levelSet = null; // empty / all = no filter
-            }
+            var levelSet = ParseLevels(levels);
 
             var request = new QueryRequest
             {
@@ -361,14 +351,26 @@ public static class EndpointMapper
 
         // ── Live tail: GET /api/events/live  (SSE) ────────────────────────────
         // Streams new events as Server-Sent Events in CLEF JSON format.
-        // Parameters: filter, from (default = now), count = 0 means unlimited.
+        // Parameters: filter, from (default = now).
+        //
+        // The tail WAITS to be told that something was written — LiveEventSignal, fed by the
+        // storage engine's write hook — instead of re-querying on a timer. The old loop ran a
+        // forward catalog scan four times a second per open tab and almost always found
+        // nothing, each attempt taking a search slot, while the writer knew the exact moment
+        // there was anything to find. What a tail may SEE is unchanged: the same query, the
+        // same filter, the same (timestamp, id) cursor. An idle tail now costs one poll per
+        // LiveTail.MaxWait instead of four a second, and a new event is delivered as soon as
+        // the coalescing floor allows rather than up to 250 ms later.
         app.MapGet("/api/events/live", async (
-            HttpContext    ctx,
-            IQueryExecutor executor,
-            QueryGuard     guard,
-            ILoggerFactory loggerFactory,
-            string?        filter  = null,
-            string?        from    = null) =>
+            HttpContext     ctx,
+            IQueryExecutor  executor,
+            QueryGuard      guard,
+            LiveEventSignal signal,
+            ServerOptions   options,
+            ILoggerFactory  loggerFactory,
+            string?         filter  = null,
+            string?         from    = null,
+            string?         levels  = null) =>
         {
             // Validated before the stream opens, for the same reason as /api/events: a
             // tail that dies on its first poll because of a typo in the filter looked
@@ -386,23 +388,79 @@ public static class EndpointMapper
             // Tail starts from 'from' or now, forward direction, unlimited.
             var fromDt = fromParsed ?? DateTimeOffset.UtcNow;
 
+            // Same parameter, same meaning as on the search: the level selector used to apply
+            // to the page's history and be dropped the moment the tail started, so switching
+            // to live silently widened the view back to every level.
+            var levelSet = ParseLevels(levels);
+
+            var tail     = options.LiveTail;
+            int pageSize = Math.Clamp(tail.PageSize, 1, 10_000);
+            var maxWait  = tail.MaxWait > TimeSpan.Zero ? tail.MaxWait : TimeSpan.FromSeconds(5);
+
             Ameto.Core.EventId? cursor = null;
             long?                cursorTs = null;
             int                  refusedInARow = 0;
+            bool                 behind        = false;   // the last poll came back full
+            // Stamped one second back so the first poll runs immediately.
+            long lastPollStamp = System.Diagnostics.Stopwatch.GetTimestamp() - System.Diagnostics.Stopwatch.Frequency;
+            long lastFrameStamp = System.Diagnostics.Stopwatch.GetTimestamp();
 
             using var sse = new SseJsonWriter(ctx.Response);
             try
             {
+                // One frame up front, so the stream proves itself open immediately. It used
+                // to fall out of the 250 ms poll; now a quiet tail says nothing until its
+                // first wait expires, and "connected" should not have to wait that long.
+                await sse.WriteKeepaliveAsync(ctx.RequestAborted);
+                lastFrameStamp = System.Diagnostics.Stopwatch.GetTimestamp();
+
                 while (!ctx.RequestAborted.IsCancellationRequested)
                 {
+                    // Coalescing floor. On a busy server the signal fires continuously, and
+                    // without this a tail would re-query as fast as searches complete —
+                    // taking a slot each time. Events arriving inside the window are simply
+                    // delivered together by the next poll.
+                    var since = System.Diagnostics.Stopwatch.GetElapsedTime(lastPollStamp);
+                    if (since < tail.MinInterval)
+                        await Task.Delay(tail.MinInterval - since, ctx.RequestAborted);
+
+                    // THE STREAM NEVER GOES QUIET FOR LONGER THAN MaxWait, whichever way the
+                    // loop went round. Tying the keepalive to the park alone was wrong: a
+                    // refused poll costs the full queue wait and a tail whose filter matches
+                    // nothing on a busy server never parks at all, so either could hold a
+                    // connection open for tens of seconds without a byte — long enough for a
+                    // proxy to tear it down, and the client has no reconnect.
+                    if (System.Diagnostics.Stopwatch.GetElapsedTime(lastFrameStamp) >= maxWait)
+                    {
+                        await sse.WriteKeepaliveAsync(ctx.RequestAborted);
+                        lastFrameStamp = System.Diagnostics.Stopwatch.GetTimestamp();
+                    }
+
+                    // Read the version BEFORE polling. An event committed while the poll runs
+                    // either appears in its own results or leaves this value behind — never
+                    // neither. Reading it afterwards would swallow exactly that window and
+                    // the tail would sit still until the next unrelated write.
+                    long seen = signal.Version;
+                    lastPollStamp = System.Diagnostics.Stopwatch.GetTimestamp();
+
+                    // A tail that is behind drains in BIGGER GULPS, not more often. The floor
+                    // above bounds how often a tail may take a search slot, so catching up by
+                    // polling faster would trade a lagging tail for starved interactive
+                    // searches; and the expensive part of a poll is per-POLL, not per-event —
+                    // the hot-tier scan walks and sorts the whole post-cursor match set to
+                    // yield one page either way. Without this the drain rate is capped at
+                    // PageSize/MinInterval however fast the machine is.
+                    int wanted = behind ? Math.Min(pageSize * CatchUpPageFactor, 10_000) : pageSize;
+
                     var request = new QueryRequest
                     {
                         Filter              = filter,
                         FromUtc             = fromDt,
-                        Count               = 500,
+                        Count               = wanted,
                         Direction           = QueryDirection.Forward,
                         AfterEventId        = cursor,
                         AfterTimestampTicks = cursorTs,
+                        Levels              = levelSet,
                     };
 
                     int newCount = 0;
@@ -413,45 +471,53 @@ public static class EndpointMapper
                     {
                         // The server is at its limit. A tail can wait — but not silently
                         // for ever, or the page shows a live view that stopped being live
-                        // without ever saying so.
+                        // without ever saying so. It does NOT park on the signal here:
+                        // nothing was read, so whatever it would announce is already waiting.
                         if (++refusedInARow >= RefusalsBeforeGivingUp)
                         {
                             await SafeErrorAsync(sse,
                                 "The server is busy and the live tail could not keep up. Reconnect in a moment.", ctx);
                             break;
                         }
+                        continue;
                     }
-                    else
+
+                    refusedInARow = 0;
+                    using (lease)
                     {
-                        refusedInARow = 0;
-                        using (lease)
+                        // Bounded like any other search: an unfiltered forward poll over
+                        // a wide window is a full-catalog scan, and without a budget it
+                        // would hold the slot it took for as long as that takes.
+                        using var deadline = guard.StartDeadline(ctx.RequestAborted);
+                        await foreach (var ev in executor.ExecuteAsync(request, deadline.Token))
                         {
-                            // Bounded like any other search: an unfiltered forward poll over
-                            // a wide window is a full-catalog scan, and without a budget it
-                            // would hold the slot it took for as long as that takes.
-                            using var deadline = guard.StartDeadline(ctx.RequestAborted);
-                            await foreach (var ev in executor.ExecuteAsync(request, deadline.Token))
-                            {
-                                await sse.WriteEventAsync(LogEventDto.From(ev), _json, deadline.Token);
-                                cursor   = (Ameto.Core.EventId?)ev.Id;
-                                cursorTs = ev.Timestamp.UtcTicks;
-                                newCount++;
-                            }
-                            if (deadline.TimedOut)
-                            {
-                                await SafeErrorAsync(sse,
-                                    $"The live tail's poll exceeded its {guard.Timeout.TotalSeconds:0}s budget — narrow the filter.", ctx);
-                                break;
-                            }
+                            await sse.WriteEventAsync(LogEventDto.From(ev), _json, deadline.Token);
+                            cursor   = (Ameto.Core.EventId?)ev.Id;
+                            cursorTs = ev.Timestamp.UtcTicks;
+                            newCount++;
+                        }
+                        if (deadline.TimedOut)
+                        {
+                            await SafeErrorAsync(sse,
+                                $"The live tail's poll exceeded its {guard.Timeout.TotalSeconds:0}s budget — narrow the filter.", ctx);
+                            break;
                         }
                     }
 
-                    if (newCount == 0)
-                    {
-                        // Send keepalive comment and wait before next poll
-                        await sse.WriteKeepaliveAsync(ctx.RequestAborted);
-                        try { await Task.Delay(250, ctx.RequestAborted); } catch (OperationCanceledException) { break; }
-                    }
+                    if (newCount > 0) lastFrameStamp = System.Diagnostics.Stopwatch.GetTimestamp();
+
+                    // A full page means the cursor stopped short of the backlog, not that the
+                    // backlog ended — go round again rather than parking on a tail that is
+                    // behind, and ask for more next time. Same for a write that landed while
+                    // this poll was reading.
+                    behind = newCount >= wanted;
+                    if (behind || signal.Version != seen)
+                        continue;
+
+                    // Caught up. Park until the writer says otherwise; the timeout is what
+                    // keeps the loop turning over for the keepalive above, and the safety net
+                    // should a wake-up ever be missed.
+                    await signal.WaitAsync(seen, maxWait, ctx.RequestAborted);
                 }
             }
             catch (OperationCanceledException) { /* client disconnected */ }
@@ -639,6 +705,25 @@ public static class EndpointMapper
         return true;
     }
 
+    /// <summary>
+    /// The <c>levels</c> query parameter — a comma-separated list — as the executor wants it.
+    /// Unparseable names are ignored rather than rejected, and both "none of them" and "all
+    /// six" mean the same thing as omitting the parameter: no constraint. Shared by the search
+    /// and the live tail so the level selector means one thing in both.
+    /// </summary>
+    private static HashSet<Ameto.Core.LogLevel>? ParseLevels(string? levels)
+    {
+        if (string.IsNullOrEmpty(levels)) return null;
+
+        var set = new HashSet<Ameto.Core.LogLevel>();
+        foreach (var part in levels.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            if (Ameto.Core.LogLevelExtensions.TryParse(part.AsSpan(), out var lvl))
+                set.Add(lvl);
+        }
+        return set.Count is 0 or 6 ? null : set;
+    }
+
     private static bool TryParseInstant(string? raw, string name, out DateTimeOffset? value, out string? error)
     {
         value = null;
@@ -712,12 +797,21 @@ public static class EndpointMapper
     private const string QueryLogCategory = "Ameto.Server.Query";
 
     /// <summary>
-    /// Consecutive refused polls after which a live tail stops pretending. At the 250 ms
-    /// poll interval plus the queue wait this is several seconds of a genuinely saturated
-    /// server — long enough not to fire on a burst, short enough that the page does not
-    /// keep showing a live view that is not live.
+    /// Consecutive refused polls after which a live tail stops pretending. A refusal costs
+    /// the full queue wait before it is reported, so this is tens of seconds of a genuinely
+    /// saturated server — long enough not to fire on a burst, short enough that the page does
+    /// not keep showing a live view that is not live.
     /// </summary>
     private const int RefusalsBeforeGivingUp = 8;
+
+    /// <summary>
+    /// How much bigger a live tail's page gets while it is behind. Catching up by polling
+    /// more often is not an option — the coalescing floor is what stops a tail from holding a
+    /// search slot continuously — so it catches up by asking for more per poll instead, which
+    /// also amortises the fixed per-poll cost (the hot-tier scan walks and sorts the whole
+    /// post-cursor match set whatever the page size).
+    /// </summary>
+    private const int CatchUpPageFactor = 8;
 
     /// <summary>504 for the non-streaming endpoints, which cannot report a partial answer.</summary>
     private static IResult TimedOutJson(QueryGuard guard) =>

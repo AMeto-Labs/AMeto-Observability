@@ -233,6 +233,10 @@ export const EventsStore = signalStore(
     // new one starts, and both are disposed on destroy (via _disposeStreams).
     let querySub: Subscription | undefined;
     let liveSub: Subscription | undefined;
+    // What the RUNNING tail was opened with — the only two things it carries. A mutation
+    // that leaves both unchanged needs no reconnect (see loadEvents).
+    let liveFilter = '';
+    let liveLevels: string | undefined;
     // Per-event timers that drop an id out of `newEventIds` ~1s after it arrived.
     let newTimers: ReturnType<typeof setTimeout>[] = [];
 
@@ -300,7 +304,20 @@ export const EventsStore = signalStore(
 
     // ── Actions ─────────────────────────────────────────────────────────────
     function loadEvents(): void {
-      if (store.live()) return;
+      // Every filter, level, time and page-size mutator ends here. While the tail is running
+      // the change used to be accepted by the UI and ignored by the connection — the tail had
+      // been opened with the OLD filter and went on streaming rows the new one excludes.
+      //
+      // Reconnect only for what the tail actually carries. It is opened with a filter and a
+      // level set and nothing else: it always starts at the server's "now" and has no upper
+      // bound, so a time-window change has nothing to apply, and the page-size cap is read
+      // per arriving event. Reconnecting for those would empty the visible list and close the
+      // open drawer to re-open a stream identical to the one it just tore down.
+      if (store.live()) {
+        if (store.filter() !== liveFilter || levelsParam(store.activeLevels()) !== liveLevels)
+          startLive();
+        return;
+      }
       querySub?.unsubscribe();
       clearNew();
       patchState(store, {
@@ -524,14 +541,38 @@ export const EventsStore = signalStore(
     }
 
     function startLive(): void {
-      patchState(store, { live: true, events: [], newEventIds: new Set() });
-      const cap = store.pageSize() * 4;
-      liveSub = api.streamLive(store.filter() || undefined).subscribe({
+      // Unsubscribe first: this is also the restart path when the filter or the level
+      // selection changes mid-tail, and leaving the old stream running would interleave
+      // rows the new filter excludes.
+      liveSub?.unsubscribe();
+      // A backward search started before the tail (toggling live off and straight back on
+      // leaves one in flight) still owns its subscription, and its completion handler
+      // replaces `events` wholesale without consulting live(). Left running it drops a page
+      // of history on top of the live rows, or sets an error banner while the live dot is on.
+      querySub?.unsubscribe();
+      querySub = undefined;
+
+      liveFilter = store.filter();
+      liveLevels = levelsParam(store.activeLevels());
+      patchState(store, {
+        live: true, error: null, events: [], newEventIds: new Set(), selectedId: null,
+      });
+      liveSub = api.streamLive({ filter: liveFilter || undefined, levels: liveLevels }).subscribe({
         next: ev => {
+          // Read per event, not captured: changing the page size then only resizes the
+          // buffer, instead of needing the connection torn down and rebuilt.
+          const cap = store.pageSize() * 4;
           patchState(store, { events: [ev, ...store.events().slice(0, cap - 1)] });
           markNew(ev.id);
         },
-        error: () => patchState(store, { live: false }),
+        error: (err: Error) => {
+          // Say WHY it stopped. The tail reports a blown poll budget or a server too busy
+          // to keep it fed through a query-error frame carrying a real sentence, and
+          // discarding it left the toggle flipping itself off for no visible reason.
+          liveSub = undefined;
+          clearNew();
+          patchState(store, { live: false, error: err?.message || 'Live tail stopped' });
+        },
       });
     }
 

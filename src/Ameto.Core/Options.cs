@@ -206,6 +206,32 @@ public sealed class QueryOptions
 }
 
 /// <summary>
+/// Live-tail (<c>GET /api/events/live</c>) pacing. A tail no longer polls on a timer: it
+/// waits to be told that something was written, so these bound how often it MAY look, not
+/// how often it does.
+/// </summary>
+public sealed class LiveTailOptions
+{
+    /// <summary>
+    /// Floor between two polls of one tail. Under load a tail is signalled continuously, and
+    /// without a floor it would re-query as fast as the searches complete — each one taking a
+    /// search slot. This is the ceiling on that cost, and it doubles as the batching window:
+    /// events arriving inside it are delivered together by the next poll. Default: 100 ms.
+    /// </summary>
+    public TimeSpan MinInterval { get; init; } = TimeSpan.FromMilliseconds(100);
+
+    /// <summary>
+    /// Longest a parked tail waits before looking anyway. It bounds the keepalive interval —
+    /// proxies drop idle connections — and is the safety net that limits how long a missed
+    /// wake-up could hide an event. Default: 5 s.
+    /// </summary>
+    public TimeSpan MaxWait { get; init; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>Events one poll may deliver before the next poll continues from its cursor. Default: 500.</summary>
+    public int PageSize { get; init; } = 500;
+}
+
+/// <summary>
 /// Top-level server configuration.
 /// </summary>
 public sealed class ServerOptions
@@ -214,6 +240,7 @@ public sealed class ServerOptions
     public string           DataDirectory    { get; init; } = "data";
     public HotTierOptions   HotTier          { get; init; } = new();
     public QueryOptions     Query            { get; init; } = new();
+    public LiveTailOptions  LiveTail         { get; init; } = new();
     public IndexingOptions  Indexing         { get; init; } = new();
     public IngestionOptions Ingestion        { get; init; } = new();
     public RetentionConfig  Retention        { get; init; } = new();

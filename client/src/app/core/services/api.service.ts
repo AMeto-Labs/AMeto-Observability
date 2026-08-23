@@ -267,10 +267,17 @@ export class ApiService {
     return this.http.post<{ message: string }>('/api/system/update/apply', {});
   }
 
-  streamLive(filter?: string): Observable<EventDto> {
+  /**
+   * Opens the live tail. `levels` is the same comma-separated list the search sends — the
+   * level selector used to apply to the history and be dropped as soon as the tail started,
+   * so switching to live quietly widened the view back to every level.
+   */
+  streamLive(params: { filter?: string; levels?: string } = {}): Observable<EventDto> {
     return new Observable<EventDto>(subscriber => {
+      const { filter, levels } = params;
       const p = new URLSearchParams();
       if (filter) p.set('filter', filter);
+      if (levels) p.set('levels', levels);
       let delivered = false;
       let explain: (() => void) | undefined;
       const teardown = this.openTicketedSse('/api/events/live', p,
