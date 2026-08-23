@@ -190,6 +190,118 @@ public sealed class CompiledFilter
         }
     }
 
+    // ── Header-only shape ─────────────────────────────────────────────────────
+
+    /// <summary>
+    /// True when this filter can be answered from event HEADERS alone — the level and the
+    /// service name — reporting which of each it selects. Null <paramref name="levels"/>
+    /// means every level; null <paramref name="service"/> means every service.
+    ///
+    /// <para>What it buys: a caller that only needs a COUNT can then use the header
+    /// aggregator, which decodes three columns per block instead of materialising every
+    /// event. That is the whole cost of the alert evaluator's most common rule — "errors
+    /// in service X over the last five minutes" — repeated for every rule every fifteen
+    /// seconds.</para>
+    ///
+    /// <para>Deliberately conservative: anything not recognised answers false and the
+    /// caller falls back to the scan. A wrong "true" here would silently change what an
+    /// alert fires on, so the shapes accepted are exactly the ones that can be proven
+    /// equivalent — an AND-chain of level constraints and one service equality, plus
+    /// OR-groups whose every leaf is a level constraint.</para>
+    /// </summary>
+    public bool TryGetHeaderOnlyShape(out HashSet<LogLevel>? levels, out string? service)
+    {
+        levels  = null;
+        service = null;
+        return CollectHeaderShape(_root, ref levels, ref service);
+    }
+
+    private static bool CollectHeaderShape(FilterNode node, ref HashSet<LogLevel>? levels, ref string? service)
+    {
+        switch (node)
+        {
+            case MatchAllNode:
+                return true;
+
+            case LevelNode lvl:
+                IntersectLevels(ref levels, [lvl.Level]);
+                return true;
+
+            case CompareNode { Op: CompareOp.Eq, RightProperty: null } cmp when cmp.Value is string s:
+                if (IsBuiltin(cmp.Property, BuiltinField.Level))
+                {
+                    if (!LogLevelExtensions.TryParse(s.AsSpan(), out var parsed)) return false;
+                    IntersectLevels(ref levels, [parsed]);
+                    return true;
+                }
+                if (IsBuiltin(cmp.Property, BuiltinField.ServiceName))
+                {
+                    // Two different services ANDed match nothing; the header aggregator
+                    // cannot express that, so hand it back to the scan.
+                    if (service is not null && !service.Equals(s, StringComparison.OrdinalIgnoreCase))
+                        return false;
+                    service = s;
+                    return true;
+                }
+                return false;
+
+            case InNode inNode when IsBuiltin(inNode.Property, BuiltinField.Level):
+            {
+                var set = new HashSet<LogLevel>();
+                foreach (var v in inNode.Values)
+                {
+                    if (v is not string sv || !LogLevelExtensions.TryParse(sv.AsSpan(), out var l)) return false;
+                    set.Add(l);
+                }
+                IntersectLevels(ref levels, set);
+                return true;
+            }
+
+            case AndNode and:
+                return CollectHeaderShape(and.Left,  ref levels, ref service)
+                    && CollectHeaderShape(and.Right, ref levels, ref service);
+
+            case OrNode or:
+            {
+                // Only a union of LEVELS: an OR that reaches any other field (or a service)
+                // is a set this shape cannot describe.
+                HashSet<LogLevel>? branch  = null;
+                string?            noSvc   = null;
+                if (!CollectLevelUnion(or, ref branch, ref noSvc) || branch is null || noSvc is not null)
+                    return false;
+                IntersectLevels(ref levels, branch);
+                return true;
+            }
+
+            default:
+                return false;
+        }
+    }
+
+    /// <summary>Collects an OR-tree whose every leaf constrains the level, as a union.</summary>
+    private static bool CollectLevelUnion(FilterNode node, ref HashSet<LogLevel>? union, ref string? service)
+    {
+        if (node is OrNode or)
+            return CollectLevelUnion(or.Left, ref union, ref service)
+                && CollectLevelUnion(or.Right, ref union, ref service);
+
+        HashSet<LogLevel>? leaf = null;
+        string?            svc  = null;
+        if (!CollectHeaderShape(node, ref leaf, ref svc) || leaf is null || svc is not null) return false;
+
+        (union ??= new HashSet<LogLevel>()).UnionWith(leaf);
+        return true;
+    }
+
+    private static void IntersectLevels(ref HashSet<LogLevel>? levels, IReadOnlyCollection<LogLevel> with)
+    {
+        if (levels is null) { levels = new HashSet<LogLevel>(with); return; }
+        levels.IntersectWith(with);
+    }
+
+    private static bool IsBuiltin(string property, BuiltinField expected) =>
+        BuiltinFields.TryResolve(property, out var f) && f == expected;
+
     // ── Filter name → index key ───────────────────────────────────────────────
 
     /// <summary>

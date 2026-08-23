@@ -2,8 +2,14 @@ using System.Collections.Concurrent;
 using Microsoft.Extensions.Logging;
 using Ameto.Core;
 using Ameto.Metrics;
+using Ameto.Query.Filtering;
+using Ameto.Storage;
 using Ameto.Tracing;
 using Ameto.Tracing.Storage;
+
+// Two LogLevels are in scope (ours and the logging framework's); in this file the level of
+// a LOG EVENT is the one that matters.
+using LogLevel = Ameto.Core.LogLevel;
 
 namespace Ameto.Alerts;
 
@@ -25,6 +31,8 @@ public sealed class AlertEvaluator : IAsyncDisposable
     private readonly AlertDispatcher       _dispatcher;
     private readonly AlertPersistence      _persist;
     private readonly IQueryExecutor        _logQuery;
+    /// <summary>For the header-only count path — see <see cref="HeaderCountAsync"/>.</summary>
+    private readonly StorageEngine         _storage;
     private readonly IMetricAggregator     _metrics;
     private readonly ITraceStatsProvider   _traceStats;
     private readonly ILogger<AlertEvaluator> _logger;
@@ -45,11 +53,12 @@ public sealed class AlertEvaluator : IAsyncDisposable
 
     public AlertEvaluator(
         AlertRuleStore store, AlertDispatcher dispatcher, AlertPersistence persist,
-        IQueryExecutor logQuery, IMetricAggregator metrics, ITraceStatsProvider traceStats,
+        IQueryExecutor logQuery, StorageEngine storage,
+        IMetricAggregator metrics, ITraceStatsProvider traceStats,
         ILogger<AlertEvaluator> logger)
     {
         _store = store; _dispatcher = dispatcher; _persist = persist;
-        _logQuery = logQuery; _metrics = metrics; _traceStats = traceStats;
+        _logQuery = logQuery; _storage = storage; _metrics = metrics; _traceStats = traceStats;
         _logger = logger;
         LoadFromDb();
         _loop = Task.Run(EvalLoopAsync);
@@ -359,21 +368,102 @@ public sealed class AlertEvaluator : IAsyncDisposable
         };
     }
 
+    /// <summary>
+    /// Safety bound for the scanning fallback. It replaces a hard 10 000 that was NOT a
+    /// safety bound but a silent ceiling: a rule counting more than that reported exactly
+    /// 10 000, so "more than 20 000 errors" could never fire, and every firing rule
+    /// reported a value that was not the count. Reaching this one is logged.
+    /// </summary>
+    private const int MaxScannedForCount = 1_000_000;
+
     private async Task<double> LogValueAsync(AlertRule rule, DateTimeOffset from, DateTimeOffset to, CancellationToken ct)
     {
+        // FAST PATH — the rule asks about levels and a service, which live in the event
+        // header. Counting those from headers decodes three columns per block instead of
+        // materialising every event, and it is what most log rules look like ("errors in
+        // checkout over five minutes"). The scan below stays for everything else.
+        if (TryHeaderShape(rule.Filter, out var levels, out var service))
+            return await HeaderCountAsync(from, to, levels, service, ct);
+
         var req = new QueryRequest
         {
-            Filter = rule.Filter,
-            FromUtc = from,
-            ToUtc = to,
-            Count = 10_000,
+            Filter    = rule.Filter,
+            FromUtc   = from,
+            ToUtc     = to,
+            Count     = MaxScannedForCount,
             Direction = QueryDirection.Backward,
         };
         int count = 0;
         await foreach (var _ in _logQuery.ExecuteAsync(req, ct))
-            if (++count >= 10_000) break;
+        {
+            if (++count >= MaxScannedForCount)
+            {
+                _logger.LogWarning(
+                    "Alert rule {Rule} matched at least {Count} events in its window — the value is a floor, not a count",
+                    rule.Id, count);
+                break;
+            }
+        }
         return count;
     }
+
+    /// <summary>
+    /// Counts straight from event headers over the whole window (one bucket). Levels null
+    /// means every level; service null means every service.
+    /// </summary>
+    private async Task<double> HeaderCountAsync(
+        DateTimeOffset from, DateTimeOffset to, HashSet<LogLevel>? levels, string? service, CancellationToken ct)
+    {
+        // One bucket spanning the window: the aggregator's axis is (bucket, service, level)
+        // and the alert wants the total, so the axis collapses to a single column.
+        int bucketSeconds = (int)Math.Max(1, Math.Ceiling((to - from).TotalSeconds));
+        long minBucket    = from.ToUnixTimeSeconds() / bucketSeconds;
+
+        var counts = await _storage.AggregateLogVolumeAsync(
+            from, to, minBucket, bucketSeconds, nBuckets: 1, serviceFilter: service, ct);
+
+        if (levels is null) return counts.Total;
+        if (levels.Count == 0) return 0;          // contradictory level constraints
+
+        double total = 0;
+        foreach (var series in counts.Levels)
+            if (LogLevelExtensions.TryParse(series.Name.AsSpan(), out var lvl) && levels.Contains(lvl))
+                total += series.Count;
+        return total;
+    }
+
+    /// <summary>
+    /// Analyses a rule's filter once and remembers the answer: the filter text of a rule
+    /// changes only when someone edits the rule, while this question is asked of every
+    /// rule on every tick.
+    /// </summary>
+    private bool TryHeaderShape(string? filter, out HashSet<LogLevel>? levels, out string? service)
+    {
+        var shape = _headerShapes.GetOrAdd(filter ?? string.Empty, static f =>
+        {
+            try
+            {
+                var compiled = CompiledFilter.Compile(f);
+                return compiled.TryGetHeaderOnlyShape(out var lv, out var svc)
+                    ? new HeaderShape(true, lv, svc)
+                    : new HeaderShape(false, null, null);
+            }
+            catch
+            {
+                // A filter that will not compile is the scan path's problem to report.
+                return new HeaderShape(false, null, null);
+            }
+        });
+
+        // A COPY of the level set: the caller must not be able to mutate the cached shape.
+        levels  = shape.Levels is null ? null : new HashSet<LogLevel>(shape.Levels);
+        service = shape.Service;
+        return shape.HeaderOnly;
+    }
+
+    private readonly ConcurrentDictionary<string, HeaderShape> _headerShapes = new();
+
+    private readonly record struct HeaderShape(bool HeaderOnly, HashSet<LogLevel>? Levels, string? Service);
 
     private async Task<double> MetricValueAsync(AlertRule rule, DateTimeOffset from, DateTimeOffset to, CancellationToken ct)
     {
