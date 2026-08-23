@@ -207,6 +207,7 @@ public sealed class IngestionEndpoint : IOtlpLogSink
             // the client sink's own oversized marker.
             string origTmpl = templateUtf8.IsEmpty ? string.Empty : System.Text.Encoding.UTF8.GetString(templateUtf8);
             EnqueueServerDropMarker(tsTicks, level, origTmpl, msgpackProps.Length, traceHi, traceLo, spanId, _pool.Intern(serviceUtf8));
+            _ring.CountOversizedDrop();   // the drop happens HERE, before the ring sees it
             return false; // original counted as dropped by the caller
         }
 
@@ -235,6 +236,7 @@ public sealed class IngestionEndpoint : IOtlpLogSink
         if (payloadLen > _maxEventPayloadBytes)
         {
             dropped++;
+            _ring.CountOversizedDrop();   // the drop happens HERE, before the ring sees it
             _logger.LogWarning(
                 "Dropped oversized log event: properties {PayloadBytes} B exceed limit {LimitBytes} B (service={Service}, template=\"{Template}\")",
                 payloadLen, _maxEventPayloadBytes, ev.ServiceName ?? "(none)", Truncate(ev.MessageTemplate, 120));

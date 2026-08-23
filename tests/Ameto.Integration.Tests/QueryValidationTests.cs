@@ -119,6 +119,7 @@ public sealed class QueryValidationTests : IClassFixture<AmetoWebAppFactory>
         foreach (var field in new[]
                  {
                      "ingestAcceptedTotal", "ingestDrainedTotal", "ingestPending", "ingestCapacity",
+                     "ingestSlabCapacity",
                      "ingestDroppedOversized", "ingestDroppedNoSlab", "ingestDroppedRingFull",
                      "ingestWriteErrorDrops",
                  })
@@ -127,6 +128,13 @@ public sealed class QueryValidationTests : IClassFixture<AmetoWebAppFactory>
             Assert.True(value.GetInt64() >= 0, $"'{field}' should be a non-negative counter");
         }
         Assert.True(json.GetProperty("ingestCapacity").GetInt64() > 0);
+
+        // Saturation is measured against the SLABS, which are what a burst runs out of —
+        // there are fewer of them than ring slots, so a full buffer must not read as idle.
+        Assert.True(json.GetProperty("ingestSlabCapacity").GetInt64() > 0);
+        Assert.True(json.GetProperty("ingestSlabCapacity").GetInt64() <= json.GetProperty("ingestCapacity").GetInt64());
+        Assert.True(json.TryGetProperty("ingestSaturationPercent", out var sat));
+        Assert.True(sat.GetDouble() >= 0);
     }
 
     // ── The validation endpoint the browser falls back to ─────────────────────

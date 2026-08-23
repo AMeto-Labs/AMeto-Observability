@@ -127,6 +127,14 @@ public static class DiagnosticsEndpointMapper
                 ingestDrainedTotal       = ring.DrainedTotal,
                 ingestPending            = ring.ApproximateCount,
                 ingestCapacity           = ring.Capacity,
+                // The binding limit, and the one to watch: a pending event holds a payload
+                // slab until the drainer copies it out, and the arena holds far fewer slabs
+                // than the ring holds slots — so the slabs run out first, and pending
+                // against the SLOT capacity made a saturated buffer look almost idle.
+                ingestSlabCapacity       = ring.SlabCapacity,
+                ingestSaturationPercent  = ring.SlabCapacity > 0
+                                             ? Math.Round(100.0 * ring.ApproximateCount / ring.SlabCapacity, 1)
+                                             : 0,
                 ingestDroppedOversized   = ring.DroppedOversized,
                 ingestDroppedNoSlab      = ring.DroppedNoSlab,
                 ingestDroppedRingFull    = ring.DroppedRingFull,

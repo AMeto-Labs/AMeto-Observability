@@ -378,12 +378,16 @@ public sealed class AlertEvaluator : IAsyncDisposable
 
     private async Task<double> LogValueAsync(AlertRule rule, DateTimeOffset from, DateTimeOffset to, CancellationToken ct)
     {
-        // FAST PATH — the rule asks about levels and a service, which live in the event
-        // header. Counting those from headers decodes three columns per block instead of
-        // materialising every event, and it is what most log rules look like ("errors in
-        // checkout over five minutes"). The scan below stays for everything else.
-        if (TryHeaderShape(rule.Filter, out var levels, out var service))
-            return await HeaderCountAsync(from, to, levels, service, ct);
+        // FAST PATH — and only where it is actually fast. The header aggregator reads three
+        // columns instead of materialising events, but it consults NO index: it decompresses
+        // every block of every segment in the window. The scan does the opposite — for a
+        // named level it gets an exact index hint, and flushes write level-pure segments, so
+        // it touches almost nothing. So the aggregator is used exactly when the scan has
+        // nothing to narrow with: when the rule constrains no level at all ("volume over the
+        // last five minutes", optionally for one service), where the scan would otherwise
+        // materialise every event it counts.
+        if (TryHeaderShape(rule.Filter, out var levels, out var service) && levels is null)
+            return await HeaderCountAsync(from, to, service, ct);
 
         var req = new QueryRequest
         {
@@ -393,43 +397,72 @@ public sealed class AlertEvaluator : IAsyncDisposable
             Count     = MaxScannedForCount,
             Direction = QueryDirection.Backward,
         };
+
+        // A budget per rule. The cap alone bounds the RESULT, not the work: a filter that
+        // matches nothing still walks the catalog, and the evaluation loop runs rules one
+        // after another, so one slow rule delays every rule behind it — and the loop waits
+        // its interval AFTER the cycle, so the delay compounds.
+        using var budget = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        budget.CancelAfter(RuleEvaluationBudget);
+
         int count = 0;
-        await foreach (var _ in _logQuery.ExecuteAsync(req, ct))
+        try
         {
-            if (++count >= MaxScannedForCount)
+            await foreach (var _ in _logQuery.ExecuteAsync(req, budget.Token))
             {
-                _logger.LogWarning(
-                    "Alert rule {Rule} matched at least {Count} events in its window — the value is a floor, not a count",
-                    rule.Id, count);
-                break;
+                if (++count >= MaxScannedForCount) break;
             }
         }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            WarnPartialCount(rule, count, "its evaluation budget expired");
+            return count;
+        }
+
+        if (count >= MaxScannedForCount) WarnPartialCount(rule, count, "the scan cap was reached");
         return count;
     }
 
     /// <summary>
-    /// Counts straight from event headers over the whole window (one bucket). Levels null
-    /// means every level; service null means every service.
+    /// Says once a minute per rule that a value is a FLOOR rather than a count — the
+    /// distinction matters for the number that reaches history and the notification, and
+    /// repeating it every tick for the life of a saturating rule would bury the log.
+    /// </summary>
+    private void WarnPartialCount(AlertRule rule, int count, string why)
+    {
+        var now = DateTimeOffset.UtcNow;
+        if (_partialWarned.TryGetValue(rule.Id, out var last) && now - last < TimeSpan.FromMinutes(1)) return;
+        _partialWarned[rule.Id] = now;
+        _logger.LogWarning(
+            "Alert rule {Rule} matched at least {Count} events — {Why}, so the value is a floor, not a count",
+            rule.Id, count, why);
+    }
+
+    private readonly ConcurrentDictionary<string, DateTimeOffset> _partialWarned = new();
+
+    /// <summary>
+    /// Wall-clock a single rule may spend scanning. Comfortably inside <see cref="EvalInterval"/>
+    /// so a cycle of several slow rules still finishes before the next one is due.
+    /// </summary>
+    private static readonly TimeSpan RuleEvaluationBudget = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// Counts straight from event headers over the whole window. <paramref name="service"/>
+    /// null means every service.
     /// </summary>
     private async Task<double> HeaderCountAsync(
-        DateTimeOffset from, DateTimeOffset to, HashSet<LogLevel>? levels, string? service, CancellationToken ct)
+        DateTimeOffset from, DateTimeOffset to, string? service, CancellationToken ct)
     {
-        // One bucket spanning the window: the aggregator's axis is (bucket, service, level)
-        // and the alert wants the total, so the axis collapses to a single column.
+        // The aggregator's axis is (bucket, service, level) and the alert wants one number,
+        // so the axis collapses to a single column spanning the window. Total already has
+        // the service filter applied, and no level is constrained on this path (see the
+        // caller), so it is the answer.
         int bucketSeconds = (int)Math.Max(1, Math.Ceiling((to - from).TotalSeconds));
         long minBucket    = from.ToUnixTimeSeconds() / bucketSeconds;
 
         var counts = await _storage.AggregateLogVolumeAsync(
             from, to, minBucket, bucketSeconds, nBuckets: 1, serviceFilter: service, ct);
-
-        if (levels is null) return counts.Total;
-        if (levels.Count == 0) return 0;          // contradictory level constraints
-
-        double total = 0;
-        foreach (var series in counts.Levels)
-            if (LogLevelExtensions.TryParse(series.Name.AsSpan(), out var lvl) && levels.Contains(lvl))
-                total += series.Count;
-        return total;
+        return counts.Total;
     }
 
     /// <summary>
@@ -439,6 +472,12 @@ public sealed class AlertEvaluator : IAsyncDisposable
     /// </summary>
     private bool TryHeaderShape(string? filter, out HashSet<LogLevel>? levels, out string? service)
     {
+        // Bounded: the key is caller-supplied filter text, and POST /api/alerts/preview
+        // lets a client mint a new one per request. Cleared wholesale rather than evicted
+        // one by one — the population that matters is the set of saved rules, which is
+        // small, and re-analysing a filter costs one parse.
+        if (_headerShapes.Count >= MaxCachedShapes) _headerShapes.Clear();
+
         var shape = _headerShapes.GetOrAdd(filter ?? string.Empty, static f =>
         {
             try
@@ -462,6 +501,7 @@ public sealed class AlertEvaluator : IAsyncDisposable
     }
 
     private readonly ConcurrentDictionary<string, HeaderShape> _headerShapes = new();
+    private const int MaxCachedShapes = 512;
 
     private readonly record struct HeaderShape(bool HeaderOnly, HashSet<LogLevel>? Levels, string? Service);
 

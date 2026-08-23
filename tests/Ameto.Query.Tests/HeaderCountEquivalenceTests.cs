@@ -135,4 +135,25 @@ public sealed class HeaderCountEquivalenceTests : IDisposable
         Assert.Equal(expected, actual);
         Assert.True(expected > 0 || filter!.Contains("gateway"), "the corpus should exercise a non-empty case");
     }
+
+    [Theory]
+    // The shapes the ALERT path actually takes to the aggregator: no level constraint, so
+    // Total (already service-filtered) is the whole answer. A level-constrained rule goes
+    // back to the scan, where the index and level-pure segments make it cheaper.
+    [InlineData(null)]
+    [InlineData("service.name = 'checkout'")]
+    [InlineData("service.name = 'gateway'")]
+    public async Task The_alert_fast_path_total_equals_the_scan_count(string? filter)
+    {
+        var shape = CompiledFilter.Compile(filter);
+        Assert.True(shape.TryGetHeaderOnlyShape(out var levels, out var service));
+        Assert.Null(levels);                       // this is what routes it to the aggregator
+
+        int bucketSeconds = (int)Math.Max(1, Math.Ceiling((To - From).TotalSeconds));
+        var counts = await _engine.AggregateLogVolumeAsync(
+            From, To, From.ToUnixTimeSeconds() / bucketSeconds, bucketSeconds, nBuckets: 1, serviceFilter: service);
+
+        Assert.Equal(await ScanCountAsync(filter), counts.Total);
+        Assert.True(counts.Total > 0);
+    }
 }

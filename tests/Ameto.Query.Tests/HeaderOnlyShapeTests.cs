@@ -72,6 +72,40 @@ public sealed class HeaderOnlyShapeTests
     }
 
     [Theory]
+    // LogLevelExtensions.TryParse accepts these aliases, but the SCAN compares the literal
+    // against Level.ToSeqString() — so 'warn' matches nothing at all. Reading it as
+    // Warning would turn a rule that has never fired into one counting the whole level.
+    [InlineData("@l = 'info'")]
+    [InlineData("@l = 'Info'")]
+    [InlineData("@l = 'warn'")]
+    [InlineData("Level = 'info'")]
+    [InlineData("@l in ['info']")]
+    [InlineData("@l in ['Error', 'warn']")]
+    public void A_level_alias_the_scan_would_not_match_is_refused(string filter)
+    {
+        Assert.False(Shape(filter).Ok);
+    }
+
+    [Fact]
+    public void Canonical_spellings_are_still_accepted_in_any_case()
+    {
+        Assert.True(Shape("@l = 'Information'").Ok);
+        Assert.True(Shape("@l = 'ERROR'").Ok);
+        Assert.True(Shape("@l = 'error'").Ok);
+    }
+
+    [Theory]
+    // The aggregator reads an empty service filter as "every service" and invents
+    // "(unknown)" for events that carry none — both mean something the scan does not.
+    [InlineData("service.name = ''")]
+    [InlineData("service.name = '(unknown)'")]
+    [InlineData("service.name = '(Unknown)'")]
+    public void A_service_literal_the_aggregator_would_misread_is_refused(string filter)
+    {
+        Assert.False(Shape(filter).Ok);
+    }
+
+    [Theory]
     // Everything below reaches past the header, or describes a set this shape cannot.
     [InlineData("Customer = 'x'")]                              // a user property
     [InlineData("contains(@mt, 'boom')")]                       // message text

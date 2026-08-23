@@ -230,12 +230,13 @@ public sealed class CompiledFilter
             case CompareNode { Op: CompareOp.Eq, RightProperty: null } cmp when cmp.Value is string s:
                 if (IsBuiltin(cmp.Property, BuiltinField.Level))
                 {
-                    if (!LogLevelExtensions.TryParse(s.AsSpan(), out var parsed)) return false;
+                    if (!TryCanonicalLevel(s, out var parsed)) return false;
                     IntersectLevels(ref levels, [parsed]);
                     return true;
                 }
                 if (IsBuiltin(cmp.Property, BuiltinField.ServiceName))
                 {
+                    if (!IsUsableServiceLiteral(s)) return false;
                     // Two different services ANDed match nothing; the header aggregator
                     // cannot express that, so hand it back to the scan.
                     if (service is not null && !service.Equals(s, StringComparison.OrdinalIgnoreCase))
@@ -250,7 +251,7 @@ public sealed class CompiledFilter
                 var set = new HashSet<LogLevel>();
                 foreach (var v in inNode.Values)
                 {
-                    if (v is not string sv || !LogLevelExtensions.TryParse(sv.AsSpan(), out var l)) return false;
+                    if (v is not string sv || !TryCanonicalLevel(sv, out var l)) return false;
                     set.Add(l);
                 }
                 IntersectLevels(ref levels, set);
@@ -292,6 +293,27 @@ public sealed class CompiledFilter
         (union ??= new HashSet<LogLevel>()).UnionWith(leaf);
         return true;
     }
+
+    /// <summary>
+    /// A level literal is usable here ONLY if it is the canonical spelling the scan would
+    /// match. <c>LogLevelExtensions.TryParse</c> also accepts aliases — 'Info', 'Warn' —
+    /// but the evaluator compares the literal against <c>Level.ToSeqString()</c>, so those
+    /// spellings match NOTHING. Reading them as their level would turn a rule that has
+    /// never fired into one that counts the entire level.
+    /// </summary>
+    private static bool TryCanonicalLevel(string literal, out LogLevel level)
+        => LogLevelExtensions.TryParse(literal.AsSpan(), out level)
+        && level.ToSeqString().Equals(literal, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Service literals the header aggregator would read as something other than "this
+    /// exact service": the empty string, which it treats as NO filter (counting every
+    /// service), and its own display name for events that carry no service, which the
+    /// scan can never match because it compares against a null.
+    /// </summary>
+    private static bool IsUsableServiceLiteral(string literal)
+        => literal.Length > 0
+        && !literal.Equals("(unknown)", StringComparison.OrdinalIgnoreCase);
 
     private static void IntersectLevels(ref HashSet<LogLevel>? levels, IReadOnlyCollection<LogLevel> with)
     {

@@ -132,6 +132,7 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
     {
         get
         {
+            if (_disposed) return 0;   // the cursors below live in freed native memory
             long e = Volatile.Read(ref _enqueuePos->Value);
             long d = Volatile.Read(ref _dequeuePos->Value);
             long diff = e - d;
@@ -147,14 +148,31 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
     // them; only the drop paths take an interlocked increment, and a drop is by
     // definition not the common case.
 
-    /// <summary>Events ever accepted into the ring (monotonic).</summary>
-    public long AcceptedTotal => Volatile.Read(ref _enqueuePos->Value);
+    /// <summary>
+    /// Slabs in the payload arena. This — not <see cref="Capacity"/> — is what a burst
+    /// actually runs out of: a slab is held from enqueue until the drainer copies the
+    /// payload out, and the arena holds far fewer slabs than the ring holds slots, so the
+    /// ring can never fill first. Reporting only the slot capacity made a fully saturated
+    /// buffer look like it was at a tenth of its limit.
+    /// </summary>
+    public int SlabCapacity => _slabCount;
 
-    /// <summary>Events ever handed to the drainer (monotonic).</summary>
-    public long DrainedTotal => Volatile.Read(ref _dequeuePos->Value);
+    /// <summary>Events ever accepted into the ring (monotonic). Zero once disposed.</summary>
+    public long AcceptedTotal => _disposed ? 0 : Volatile.Read(ref _enqueuePos->Value);
 
-    /// <summary>Rejected because the payload exceeds one slab (MaxEventPayloadBytes).</summary>
+    /// <summary>Events ever handed to the drainer (monotonic). Zero once disposed.</summary>
+    public long DrainedTotal => _disposed ? 0 : Volatile.Read(ref _dequeuePos->Value);
+
+    /// <summary>
+    /// Rejected because the payload exceeds one slab. Counted by the INGEST ENDPOINT,
+    /// which checks the same limit before it ever reaches the ring (and leaves a marker
+    /// event in the stream) — the ring's own check below is the backstop for callers that
+    /// do not, so both feed one number.
+    /// </summary>
     public long DroppedOversized => Interlocked.Read(ref _droppedOversized);
+
+    /// <summary>Records an oversized event rejected before it reached the ring.</summary>
+    public void CountOversizedDrop() => Interlocked.Increment(ref _droppedOversized);
 
     /// <summary>Rejected because the payload arena had no free slab — the real burst limit.</summary>
     public long DroppedNoSlab => Interlocked.Read(ref _droppedNoSlab);
