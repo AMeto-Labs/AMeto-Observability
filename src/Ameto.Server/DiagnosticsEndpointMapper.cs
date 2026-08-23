@@ -13,7 +13,9 @@ public static class DiagnosticsEndpointMapper
 {
     public static void MapDiagnosticsEndpoints(this WebApplication app)
     {
-        app.MapGet("/api/diagnostics", (StorageEngine storage, ServerOptions options, ProcessCpuSampler cpu) =>
+        app.MapGet("/api/diagnostics", (
+            StorageEngine storage, ServerOptions options, ProcessCpuSampler cpu,
+            Ameto.Ingestion.IngestionRingBuffer ring, Ameto.Ingestion.IngestionDrainer drainer) =>
         {
             var proc = Process.GetCurrentProcess();
 
@@ -113,6 +115,24 @@ public static class DiagnosticsEndpointMapper
                 logsSegmentCount     = segs.Count,
                 metricsSegmentCount  = metricsDir.Segments,
                 tracesSegmentCount   = tracesDir.Segments,
+
+                // ── Ingest ─────────────────────────────────────────────────────
+                // Overload used to be invisible: a client that got a 200 with a "dropped"
+                // count had no server-side counterpart, so nobody could see that the ring
+                // was filling, let alone WHY. The three drop reasons are different
+                // problems — a payload larger than one slab is a misconfigured client, an
+                // exhausted arena is a burst the buffer could not absorb, a full ring is a
+                // drainer that fell behind — and they are counted apart for that reason.
+                ingestAcceptedTotal      = ring.AcceptedTotal,
+                ingestDrainedTotal       = ring.DrainedTotal,
+                ingestPending            = ring.ApproximateCount,
+                ingestCapacity           = ring.Capacity,
+                ingestDroppedOversized   = ring.DroppedOversized,
+                ingestDroppedNoSlab      = ring.DroppedNoSlab,
+                ingestDroppedRingFull    = ring.DroppedRingFull,
+                // Events the storage write path refused repeatedly and the drainer gave up
+                // on — a different failure from a full buffer, and previously silent.
+                ingestWriteErrorDrops    = drainer.ErrorDrops,
             });
         }).RequireAuthorization();
     }

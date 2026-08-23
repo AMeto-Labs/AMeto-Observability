@@ -139,6 +139,33 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
         }
     }
 
+    // ── Counters ──────────────────────────────────────────────────────────────
+    //
+    // Overload was invisible: an operator watching drops rise had no way to see WHY, or
+    // even that the ring was the thing filling up. Accepted and drained come free from
+    // the cursors — they are monotonic totals already — so the hot path pays nothing for
+    // them; only the drop paths take an interlocked increment, and a drop is by
+    // definition not the common case.
+
+    /// <summary>Events ever accepted into the ring (monotonic).</summary>
+    public long AcceptedTotal => Volatile.Read(ref _enqueuePos->Value);
+
+    /// <summary>Events ever handed to the drainer (monotonic).</summary>
+    public long DrainedTotal => Volatile.Read(ref _dequeuePos->Value);
+
+    /// <summary>Rejected because the payload exceeds one slab (MaxEventPayloadBytes).</summary>
+    public long DroppedOversized => Interlocked.Read(ref _droppedOversized);
+
+    /// <summary>Rejected because the payload arena had no free slab — the real burst limit.</summary>
+    public long DroppedNoSlab => Interlocked.Read(ref _droppedNoSlab);
+
+    /// <summary>Rejected because every ring slot was still unread.</summary>
+    public long DroppedRingFull => Interlocked.Read(ref _droppedRingFull);
+
+    private long _droppedOversized;
+    private long _droppedNoSlab;
+    private long _droppedRingFull;
+
     // ── Slab pool (lock-free Treiber stack, ABA-safe via versioned head) ────────
 
     /// <summary>Pops a free slab index, or -1 when the payload pool is exhausted.</summary>
@@ -191,12 +218,19 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
         int     serviceNameIdx = -1)
     {
         if (payload.Length > _slabBytes)
+        {
+            Interlocked.Increment(ref _droppedOversized);
             return false; // drop oversized event
+        }
 
         // Reserve payload storage first: if the pool is full we apply back-pressure
         // without ever claiming a ring slot we couldn't fill.
         int slab = AcquireSlab();
-        if (slab < 0) return false;
+        if (slab < 0)
+        {
+            Interlocked.Increment(ref _droppedNoSlab);
+            return false;
+        }
 
         long pos;
         Slot* slot;
@@ -216,6 +250,7 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
             else if (diff < 0)
             {
                 ReleaseSlab(slab); // ring full — give the slab back
+                Interlocked.Increment(ref _droppedRingFull);
                 return false;
             }
             // diff > 0: another producer just published here, spin

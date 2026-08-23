@@ -107,6 +107,28 @@ public sealed class QueryValidationTests : IClassFixture<AmetoWebAppFactory>
         Assert.Contains("ISO-8601", await ErrorOf(resp), StringComparison.OrdinalIgnoreCase);
     }
 
+    [Fact]
+    public async Task Diagnostics_reports_what_ingest_accepted_and_why_it_dropped()
+    {
+        // Overload used to be invisible server-side: a client saw its own "dropped" count
+        // and nobody could see the ring filling, let alone which limit was hit.
+        var resp = await _client.GetAsync("/api/diagnostics");
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+
+        var json = await resp.Content.ReadFromJsonAsync<JsonElement>();
+        foreach (var field in new[]
+                 {
+                     "ingestAcceptedTotal", "ingestDrainedTotal", "ingestPending", "ingestCapacity",
+                     "ingestDroppedOversized", "ingestDroppedNoSlab", "ingestDroppedRingFull",
+                     "ingestWriteErrorDrops",
+                 })
+        {
+            Assert.True(json.TryGetProperty(field, out var value), $"missing '{field}'");
+            Assert.True(value.GetInt64() >= 0, $"'{field}' should be a non-negative counter");
+        }
+        Assert.True(json.GetProperty("ingestCapacity").GetInt64() > 0);
+    }
+
     // ── The validation endpoint the browser falls back to ─────────────────────
     // EventSource cannot read the body of a non-200, so the UI asks here when a stream
     // dies before delivering anything.
