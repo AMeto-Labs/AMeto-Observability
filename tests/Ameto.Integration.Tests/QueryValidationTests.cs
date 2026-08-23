@@ -75,6 +75,68 @@ public sealed class QueryValidationTests : IClassFixture<AmetoWebAppFactory>
         Assert.Contains("Invalid filter", await ErrorOf(resp), StringComparison.OrdinalIgnoreCase);
     }
 
+    [Theory]
+    // The parser used to stop reading at the first thing it did not understand and run what
+    // it had. Each of these was a 200 with results — for a query nobody wrote.
+    [InlineData("@l = 'Error' Region = 'eu'", "and")]           // two clauses, no 'and'
+    [InlineData("Level = ", "Expected a value")]                // became "Level is absent"
+    [InlineData("@l in [Error, Fatal]", "property name")]       // unquoted items became nulls
+    [InlineData("sum(Elapsed) > 5", "Unknown function")]        // searched the text for "sum"
+    public async Task A_filter_the_parser_can_only_guess_at_is_refused(string filter, string expected)
+    {
+        var resp = await _client.GetAsync("/api/events?filter=" + Uri.EscapeDataString(filter));
+
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+        Assert.Contains(expected, await ErrorOf(resp), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task The_level_selectors_own_filter_is_accepted()
+    {
+        // `@l <> 'Debug'` is what the events page writes when five of six levels are
+        // selected. There was no <> operator, so the server read it as an is-absent test on
+        // @l and answered with nothing — a blank page from a click in the level list.
+        var resp = await _client.GetAsync(
+            "/api/events?count=1&filter=" + Uri.EscapeDataString("@l <> 'Debug'"));
+
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+    }
+
+    [Theory]
+    // The filter box is also the search box, and the documented contract is that anything
+    // which is not an expression is free text. Refusing a half-written EXPRESSION must not
+    // turn into refusing a paste.
+    [InlineData("GET /api/orders/123")]
+    [InlineData("NullReferenceException: Object reference not set")]
+    [InlineData("could not connect to host")]
+    [InlineData("Error timeout")]
+    [InlineData("at Ameto.Query.FilterParser.Parse(String filter)")]
+    public async Task Pasted_text_is_searched_for_rather_than_refused(string filter)
+    {
+        var resp = await _client.GetAsync("/api/events?count=1&filter=" + Uri.EscapeDataString(filter));
+
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+    }
+
+    [Fact]
+    public async Task An_alert_rule_cannot_be_saved_with_a_filter_that_will_not_compile()
+    {
+        // It used to be stored happily and then fail on every tick for ever after: the
+        // evaluator logs a warning per rule and moves on, so a rule that can never fire looks
+        // exactly like one that has not fired.
+        var resp = await _client.PostAsJsonAsync("/api/alerts", new
+        {
+            name      = "unparseable",
+            source    = "Log",
+            threshold = 1.0,
+            filter    = "@l = 'Error' Region = 'eu'",
+            channels  = Array.Empty<object>(),
+        });
+
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+        Assert.Contains("Invalid filter", await ErrorOf(resp), StringComparison.OrdinalIgnoreCase);
+    }
+
     [Fact]
     public async Task A_valid_query_still_streams()
     {

@@ -16,17 +16,41 @@ payment failed          # contains BOTH "payment" AND "failed"
 Free text can't be mixed into an expression, but the expression language covers the
 same intent (`ci_contains(@mt, 'timeout')`).
 
+Punctuation is not a term: `GET /api/orders/123`, a pasted stack frame or a Windows
+path search for the words in them. Keywords are terms too when nothing around them is
+an expression — `could not connect` searches for all three words.
+
+## When a filter is refused
+
+An input that contains no comparison and no `[ … ]` list is free text, whatever else is
+in it, so a search can't fail. Once one of those appears, the expression must be
+readable **in full** — the parser used to stop at the first token it couldn't use and
+silently run the part before it, so a typo after a valid prefix widened the results and
+a half-typed comparison narrowed them to nothing. These are now 400s naming the position:
+
+```
+@l = 'Error' Region = 'eu'   # two clauses with no 'and'
+Level =                      # nothing to compare against
+@l in [Error, Fatal]         # unquoted items are property names, not values
+sum(Elapsed) > 5             # no such function
+'a' != 'b'                   # no property to test — this used to match everything
+```
+
 ## Comparison operators
 
 ```
 @l = 'Error'
 StatusCode != 200
+@l <> 'Debug'           # <> is the same operator as !=
 Elapsed > 500
 Elapsed <= 100
 UserId >= 'alice'
 ```
 
 Properties are compared case-insensitively when both sides are strings.
+
+A single quote inside a value is written either doubled or backslash-escaped:
+`Detail = 'can''t connect'` and `Detail = 'can\'t connect'` mean the same thing.
 
 ## Logical connectives
 
@@ -283,7 +307,11 @@ arrived(@id) > 0
 ```
 @l in ['Error', 'Fatal']
 StatusCode in [400, 401, 403, 404]
+@l not in ['Debug', 'Verbose']
 ```
+
+List items are values, so text has to be quoted — `@l in [Error, Fatal]` names two
+properties and is refused.
 
 ## `like` operator
 
@@ -292,6 +320,7 @@ SQL-style wildcard match. `%` matches any sequence of characters.
 ```
 @mt like '%timed out%'
 Path like '/api/users/%'
+Region not like 'eu-%'
 ```
 
 ## Examples

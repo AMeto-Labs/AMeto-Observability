@@ -103,9 +103,13 @@ export function isoToDotNetUtcTicksString(iso: string): string {
 export function stripFilterClause(expr: string, pattern: RegExp): string {
   return expr
     .replace(pattern, '')
-    .replace(/\s+and\s+and\s+/gi, ' and ')
-    .replace(/^\s*(and|or)\s+/gi, '')
-    .replace(/\s+(and|or)\s*$/gi, '')
+    // Two connectives left facing each other where the clause used to be. Only `and and`
+    // was collapsed, so a query joined with `or` — or with a mix — left `or  or` behind,
+    // which the server now refuses outright instead of quietly mis-reading. The user never
+    // typed the broken string: a checkbox click built it.
+    .replace(/\s+(?:and|or)(?:\s+(?:and|or))+\s+/gi, (m) => (/\bor\b/i.test(m) ? ' or ' : ' and '))
+    .replace(/^\s*(?:and|or|not)\s+/gi, '')
+    .replace(/\s+(?:and|or|not)\s*$/gi, '')
     .trim();
 }
 

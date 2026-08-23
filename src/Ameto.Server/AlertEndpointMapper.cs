@@ -154,6 +154,27 @@ public static class AlertEndpointMapper
         string? id, AlertRuleUpsertRequest req, AlertRule? existing,
         out AlertRule rule, out string? error)
     {
+        // A rule is only as good as the query it counts. An unparseable filter was accepted,
+        // stored, and then failed on every tick from then on — the evaluator logs a warning
+        // per rule and carries on, so a rule that can NEVER fire is indistinguishable from
+        // one that simply has not fired yet. Refuse it while someone is looking at it.
+        //
+        // Only when the filter CHANGED, though: a rule saved before this check exists and no
+        // longer compiles must still be editable, and the first thing anyone will want to do
+        // with it is turn it off. Refusing the whole upsert would leave it stuck on, firing
+        // nothing, with no way to reach it but the database.
+        bool filterChanged = !string.Equals(req.Filter ?? "", existing?.Filter ?? "", StringComparison.Ordinal);
+        if (filterChanged && !string.IsNullOrWhiteSpace(req.Filter))
+        {
+            try { Ameto.Query.Filtering.CompiledFilter.Compile(req.Filter); }
+            catch (Exception ex)
+            {
+                rule  = null!;
+                error = $"Invalid filter: {ex.Message}";
+                return false;
+            }
+        }
+
         var prev = existing?.Channels ?? [];
         var dtos = req.Channels ?? [];
         var channels = new List<AlertChannel>(dtos.Count);

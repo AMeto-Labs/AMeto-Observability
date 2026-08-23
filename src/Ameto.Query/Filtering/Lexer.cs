@@ -94,6 +94,12 @@ internal sealed class Lexer
                                 { _pos += 2; tokens.Add(new Token(TokenKind.Ne, "!=", _pos-2)); continue; }
             if (c == '<' && Peek(1) == '=')
                                 { _pos += 2; tokens.Add(new Token(TokenKind.Le, "<=", _pos-2)); continue; }
+            // The SQL spelling of !=. Its absence was not a missing convenience: the events
+            // page writes `@l <> 'Debug'` itself whenever five of six levels are selected,
+            // and without this the parser read `<` then `>`, ending with an is-absent test on
+            // @l that matches no event at all — deselect one level and the page went blank.
+            if (c == '<' && Peek(1) == '>')
+                                { _pos += 2; tokens.Add(new Token(TokenKind.Ne, "<>", _pos-2)); continue; }
             if (c == '<' )      { tokens.Add(Punct(TokenKind.Lt));      continue; }
             if (c == '>' && Peek(1) == '=')
                                 { _pos += 2; tokens.Add(new Token(TokenKind.Ge, ">=", _pos-2)); continue; }
@@ -105,7 +111,14 @@ internal sealed class Lexer
             if (c == '@' || c == '_' || char.IsLetter(c))
                                 { tokens.Add(ReadIdent());               continue; }
 
-            // Unknown char — skip with error tolerance
+            // A character the language has no meaning for, skipped. This looks like the same
+            // silent tolerance the parser no longer practises, and it is deliberate: this box
+            // is also the search box, and the documented contract is that anything which is
+            // not an expression is free text. People paste `GET /api/orders/123`, a stack
+            // frame, a Windows path, `{"orderId":42}` — all of which are punctuation around
+            // words, and all of which searched correctly by being split here. Refusing them
+            // broke the more common of the box's two jobs. FilterParser decides which job it
+            // is looking at (see StructuralTokenPresent) and only then refuses.
             _pos++;
         }
         return tokens;
@@ -140,6 +153,13 @@ internal sealed class Lexer
                 sb.Append(_src[_pos++]);
                 continue;
             }
+            // '' is one quote, the SQL spelling — and the one the client actually writes.
+            // json-viewer.actions.ts doubles quotes when it builds "filter by this value", so
+            // a value carrying an apostrophe (`can't connect`, an O'Brien, half of Italian)
+            // closed the string early: the predicate compared against the text up to the
+            // apostrophe and the remainder was dropped. Both escapes are accepted, so filters
+            // already saved either way keep working.
+            if (c == '\'' && Peek(1) == '\'') { sb.Append('\''); _pos += 2; continue; }
             if (c == '\'') { _pos++; break; }
             sb.Append(c);
             _pos++;
