@@ -20,9 +20,12 @@ namespace Ameto.Storage;
 /// <see cref="ChunkPayloadBytes"/> bytes of payload. Both limits must be respected
 /// because <see cref="LogEventHeader.PropertiesArenaOffset"/> is chunk-local.
 ///
-/// Thread safety: single writer + multiple readers.
+/// Thread safety: single writer + multiple readers, plus the flush thread's
+/// <see cref="Freeze"/>.
 ///   Readers snapshot <c>_count</c> via a volatile read; writes to headers/payload
 ///   are always completed before <see cref="Interlocked.Increment"/> publishes them.
+///   <see cref="Freeze"/> runs on the flush thread and hands over from the writer:
+///   when it returns, <c>Count</c> is final. See the handshake in both methods.
 /// </summary>
 public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
 {
@@ -120,6 +123,14 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
     private volatile int  _count;
     private volatile bool _frozen;
 
+    /// <summary>
+    /// 1 while a <see cref="TryWrite"/> call has passed the frozen check and has not yet
+    /// published its event. <see cref="Freeze"/> waits for it to reach 0, which is what
+    /// makes "frozen" mean <i>no further event can appear</i> rather than the weaker
+    /// <i>no further write may start</i>.
+    /// </summary>
+    private          int  _writeInProgress;
+
     // ── Public properties ─────────────────────────────────────────────────────
 
     public int  Count    => _count;
@@ -173,8 +184,41 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
     /// </summary>
     public bool TryWrite(in LogEventHeader header, ReadOnlySpan<byte> propertiesPayload, string? template = null, ExceptionInfo? exception = null)
     {
+        // Unsynchronised fast reject. Purely an optimisation — a tier that is already
+        // frozen or full says so without paying for the claim below, which matters because
+        // every rotation ends with the drainer retrying against a full tier. The
+        // authoritative check is the one inside the claim.
         if (_frozen || _count >= _maxEvents)
             return false;
+
+        // CLAIM, then re-read _frozen — one half of a handshake with Freeze(), and the
+        // reason the claim is an interlocked exchange rather than a plain store: a release
+        // store may sink below the load that follows it, and then both sides could miss
+        // each other. Without this the flush could freeze the tier and read Count while
+        // this call — already past the check above — went on to publish one more event into
+        // a tier that is about to be written out, unlisted and freed. TryWrite had returned
+        // true, the drainer had counted the event as stored and dropped it from the ring,
+        // and queries served it for the length of the flush before it disappeared for good;
+        // the WAL copy went with it, since that WAL is deleted when the flush publishes.
+        Interlocked.Exchange(ref _writeInProgress, 1);
+        try
+        {
+            return TryWriteClaimed(in header, propertiesPayload, template, exception);
+        }
+        finally
+        {
+            // Release: everything above — the count publish included — is visible to a
+            // Freeze() that then observes the 0. Load-bearing on the throwing path too:
+            // AllocChunk raises OutOfMemoryException, and a claim left standing would park
+            // the flush thread in Freeze() for good.
+            Volatile.Write(ref _writeInProgress, 0);
+        }
+    }
+
+    private bool TryWriteClaimed(in LogEventHeader header, ReadOnlySpan<byte> propertiesPayload, string? template, ExceptionInfo? exception)
+    {
+        if (_frozen || _count >= _maxEvents)
+            return false;   // Freeze() won the race — the caller retries into the successor tier
 
         int payloadLen = propertiesPayload.Length;
         int eventIdx   = _count;                          // this event's global index
@@ -299,8 +343,28 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
 
     // ── Flush helpers ─────────────────────────────────────────────────────────
 
-    /// <summary>Prevents further writes. Must be called before reading for flush.</summary>
-    public void Freeze() => _frozen = true;
+    /// <summary>
+    /// Prevents further writes and waits for the one that may already be in flight, so that
+    /// the <see cref="Count"/> its caller reads next is final. Must be called before reading
+    /// for flush: everything the flush does afterwards — sort order, segment contents, the
+    /// decision to delete this tier's WAL — is derived from that one count, so an event that
+    /// arrived after it was read would be persisted nowhere.
+    ///
+    /// <para>The wait is bounded by a single <see cref="TryWrite"/> call, which cannot block:
+    /// worst case it is copying a payload or allocating one chunk.</para>
+    /// </summary>
+    public void Freeze()
+    {
+        _frozen = true;
+        // The store above must not sink below the load below it, or a writer that claimed
+        // just now and a freezer that published just now could each miss the other. Neither
+        // volatile write nor volatile read orders that pair — only a full fence does.
+        Interlocked.MemoryBarrier();
+
+        var spin = new SpinWait();
+        while (Volatile.Read(ref _writeInProgress) != 0)
+            spin.SpinOnce();
+    }
 
     /// <summary>Returns the header of event at <paramref name="eventIndex"/> by ref.</summary>
     public ref LogEventHeader GetHeader(int eventIndex)
