@@ -117,6 +117,38 @@ public sealed class LogEvent
     /// <summary>Raw msgpack bytes of the properties map (for re-serialization without re-deserializing).</summary>
     public ReadOnlyMemory<byte> RawProperties            { get; init; }
 
+    /// <summary>
+    /// Reads ONE top-level property without building <see cref="Properties"/>.
+    ///
+    /// <para>This is what a filter needs per scanned event, and building the whole map for
+    /// it was the single largest per-event cost of any property predicate: a dictionary, a
+    /// string per key and a box per value, recursively, for every event the scan touched —
+    /// to answer a question about one of them. The raw bytes are walked in place instead
+    /// (see <c>LogEventSerializer.TryReadProperty</c>). Once something else has materialised
+    /// the map — delivery, a nested-path filter — the dictionary is the cheaper answer and
+    /// is used as-is.</para>
+    ///
+    /// <para>Both paths compare keys ORDINALLY, so they cannot disagree.</para>
+    /// </summary>
+    /// <summary>
+    /// True when <see cref="Properties"/> is already built, so reading it costs nothing
+    /// more. Callers use it to decide between a probe and the dictionary WITHOUT forcing
+    /// the materialisation the question is about.
+    /// </summary>
+    public bool PropertiesMaterialised => _properties is not null;
+
+    public bool TryGetProperty(ReadOnlySpan<char> key, out object? value)
+    {
+        if (_properties is not null)
+            return _properties.GetAlternateLookup<ReadOnlySpan<char>>().TryGetValue(key, out value);
+
+        if (!RawProperties.IsEmpty)
+            return Serialization.LogEventSerializer.TryReadProperty(RawProperties, key, out value);
+
+        value = null;
+        return false;
+    }
+
     /// <summary>High 64 bits of the 128-bit distributed TraceId (0 when absent).</summary>
     public ulong TraceIdHi   { get; init; }
 

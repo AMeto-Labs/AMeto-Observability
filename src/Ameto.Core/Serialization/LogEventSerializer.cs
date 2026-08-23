@@ -366,6 +366,73 @@ public static class LogEventSerializer
         }
     }
 
+    /// <summary>
+    /// Finds ONE top-level key in a properties map and decodes only its value, leaving
+    /// every other entry untouched.
+    ///
+    /// <para>This is the filter's per-event property read. Going through
+    /// <see cref="DeserializePropertiesMap"/> built the WHOLE map for it — a dictionary, a
+    /// string per key, a box per value, recursively through nested maps and arrays — for
+    /// every event a scan touches, when the predicate wanted one value. Here the map is
+    /// walked in place over the event's own buffer (no copy: the reader takes the memory
+    /// directly), keys are compared as UTF-8 bytes, and values are skipped until the match.</para>
+    ///
+    /// <para>Ordinal comparison, matching the dictionary's default comparer, so a probe and
+    /// a lookup can never disagree about which key is which.</para>
+    /// </summary>
+    /// <returns>True when the key was present; <paramref name="value"/> is then its decoded value.</returns>
+    public static bool TryReadProperty(ReadOnlyMemory<byte> map, ReadOnlySpan<char> key, out object? value)
+    {
+        value = null;
+        if (map.IsEmpty) return false;
+
+        int byteCount = Encoding.UTF8.GetByteCount(key);
+        // Stack for the names anyone actually writes; heap only for absurd ones, so the
+        // probe always runs and the caller never needs a second code path.
+        Span<byte> keyUtf8 = byteCount <= 256 ? stackalloc byte[256] : new byte[byteCount];
+        keyUtf8 = keyUtf8[..byteCount];
+        Encoding.UTF8.GetBytes(key, keyUtf8);
+
+        try
+        {
+            var reader = new MessagePackReader(map);
+            if (reader.NextMessagePackType != MessagePackType.Map) return false;
+
+            int count = reader.ReadMapHeader();
+            for (int i = 0; i < count; i++)
+            {
+                bool hit;
+                if (reader.NextMessagePackType == MessagePackType.String)
+                    hit = ReadKey(ref reader).SequenceEqual(keyUtf8);
+                else
+                {
+                    reader.Skip();           // a key that is not a string cannot match
+                    hit = false;
+                }
+
+                if (hit)
+                {
+                    value = ReadDynamic(ref reader);
+                    return true;
+                }
+                reader.Skip();               // step over the value and try the next entry
+            }
+        }
+        catch { /* malformed map — same answer as the full deserialiser: nothing */ }
+        return false;
+    }
+
+    private static readonly byte[] EmptyKey = [];
+
+    private static ReadOnlySpan<byte> ReadKey(ref MessagePackReader reader)
+    {
+        if (reader.TryReadStringSpan(out ReadOnlySpan<byte> span)) return span;
+        // Rare: the string spans buffer segments. Properties arrive as one contiguous
+        // buffer, so this is defensive rather than reachable.
+        var seq = reader.ReadStringSequence();
+        return seq.HasValue ? seq.Value.ToArray() : EmptyKey;
+    }
+
     private static Dictionary<string, object?> ReadMap(ref MessagePackReader reader)
     {
         int count = reader.ReadMapHeader();

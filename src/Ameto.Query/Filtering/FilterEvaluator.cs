@@ -172,12 +172,28 @@ public static class FilterEvaluator
         if (BuiltinFields.TryResolve(prop, out var field))
             return ReadBuiltin(ev, field);
 
-        if (ev.Properties is null) return null;
-
-        // Fast path: top-level key (no nested path)
+        // Fast path: top-level key (no nested path). Probed straight off the event's
+        // msgpack — the dictionary is never built for it, which is the difference between
+        // one value decoded and the whole property map materialised, per scanned event.
         int sep = prop.IndexOf(PropertyPath.Separator);
         if (sep < 0)
-            return ev.Properties.TryGetValue(prop, out var v) ? v : null;
+            return ev.TryGetProperty(prop, out var v) ? v : null;
+
+        // A dotted path has two readings, and the order between them is load-bearing (see
+        // the flat-key note below). But the walk can only succeed if its FIRST segment is
+        // present, and that is one probe — so when it is absent the map still never
+        // materialises, which is the common case for OTLP attributes (http.request.method
+        // is one flat key, not a three-level tree).
+        if (!ev.PropertiesMaterialised)
+        {
+            var head = prop.AsSpan(0, sep);
+            if (PropertyPath.IsIndexSegment(head)
+                || !ev.TryGetProperty(PropertyPath.SegmentValue(head), out var headValue)
+                || headValue is null)
+                return ReadFlatKeyOrNull(ev, prop);
+        }
+
+        if (ev.Properties is null) return null;
 
         // Nested path: walk dictionary tree segment-by-segment.
         object? nested = WalkPath(ev.Properties, prop.AsSpan());
@@ -188,8 +204,12 @@ public static class FilterEvaluator
         // read a dotted name only as a walk, so those filters matched nothing at all unless
         // the user knew to write ['http.request.method']. Tried second, so a genuinely nested
         // map keeps the meaning it had.
-        return PropertyPath.MayBeFlatKey(prop) ? ReadFlatKey(ev.Properties, prop) : null;
+        return ReadFlatKeyOrNull(ev, prop);
     }
+
+    /// <summary>The dotted name read as ONE key, when the grammar allows that reading.</summary>
+    private static object? ReadFlatKeyOrNull(LogEvent ev, string prop) =>
+        PropertyPath.MayBeFlatKey(prop) ? ReadFlatKey(ev, prop) : null;
 
     /// <summary>
     /// Longest flat property key probed through the stack. Beyond this the walk's answer
@@ -202,7 +222,7 @@ public static class FilterEvaluator
     /// this runs per event for every dotted-attribute filter, so the flattened spelling is
     /// built in stack scratch and probed through the dictionary's span alternate lookup.
     /// </summary>
-    private static object? ReadFlatKey(Dictionary<string, object?> props, string prop)
+    private static object? ReadFlatKey(LogEvent ev, string prop)
     {
         if (prop.Length > MaxFlatKeyChars) return null;
 
@@ -210,9 +230,9 @@ public static class FilterEvaluator
         int n = PropertyPath.WriteFlatKey(prop.AsSpan(), flat);
         if (n < 0) return null;
 
-        return props.GetAlternateLookup<ReadOnlySpan<char>>().TryGetValue(flat[..n], out var v)
-            ? v
-            : null;
+        // Through the event, so an unmaterialised map is probed rather than built — the
+        // dotted OTLP spelling is the case that reaches here on every scanned event.
+        return ev.TryGetProperty(flat[..n], out var v) ? v : null;
     }
 
     /// <summary>
