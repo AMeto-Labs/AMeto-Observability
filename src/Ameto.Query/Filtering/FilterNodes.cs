@@ -756,11 +756,16 @@ public sealed class RegexMatchNode : FilterNode
     public string Property { get; }
     public string Pattern  { get; }
     public bool   IgnoreCase { get; }
+
+    /// <summary>Compiled once here rather than per event — see <see cref="FilterRegex"/>.</summary>
+    public System.Text.RegularExpressions.Regex Compiled { get; }
+
     public RegexMatchNode(string property, string pattern, bool ignoreCase = false)
     {
         Property   = property;
         Pattern    = pattern;
         IgnoreCase = ignoreCase;
+        Compiled   = FilterRegex.Compile(pattern, ignoreCase);
     }
 }
 
@@ -773,6 +778,10 @@ public sealed class RegexExtractCompareNode : FilterNode
     public bool      IgnoreCase { get; }
     public CompareOp Op       { get; }
     public object?   Value    { get; }
+
+    /// <summary>Compiled once here rather than per event — see <see cref="FilterRegex"/>.</summary>
+    public System.Text.RegularExpressions.Regex Compiled { get; }
+
     public RegexExtractCompareNode(string property, string pattern, int group, bool ignoreCase, CompareOp op, object? value)
     {
         Property   = property;
@@ -781,5 +790,6 @@ public sealed class RegexExtractCompareNode : FilterNode
         IgnoreCase = ignoreCase;
         Op         = op;
         Value      = value;
+        Compiled   = FilterRegex.Compile(pattern, ignoreCase);
     }
 }

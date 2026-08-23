@@ -1088,47 +1088,63 @@ public static class FilterEvaluator
     private static bool LikeMatchFast(string text, LikeNode node)
     {
         if (node.IsMatchAll) return true;
-        text = text.ToLowerInvariant();
-        if (node.IsLiteral) return text == node.PatternLower;
-        return LikeMatchRecursive(text.AsSpan(), node.PatternLower.AsSpan());
+        // No ToLowerInvariant() copy of the value: the pattern is already lowercased, so
+        // the walk lowercases one character at a time. That copy was an allocation per
+        // scanned value, which is per event of every LIKE query.
+        if (node.IsLiteral)
+            return string.Equals(text, node.PatternLower, StringComparison.OrdinalIgnoreCase);
+        return LikeMatchLower(text.AsSpan(), node.PatternLower.AsSpan());
     }
 
     // Kept for callers outside of LikeNode context (e.g. fromJson path LIKE).
     private static bool LikeMatch(string text, string pattern)
     {
-        text = text.ToLowerInvariant();
         string lp = pattern.ToLowerInvariant();
         if (lp == "%") return true;
-        if (!lp.Contains('%') && !lp.Contains('_')) return text == lp;
-        return LikeMatchRecursive(text.AsSpan(), lp.AsSpan());
+        if (!lp.Contains('%') && !lp.Contains('_'))
+            return string.Equals(text, lp, StringComparison.OrdinalIgnoreCase);
+        return LikeMatchLower(text.AsSpan(), lp.AsSpan());
     }
 
-    private static bool LikeMatchRecursive(ReadOnlySpan<char> text, ReadOnlySpan<char> pattern)
+    /// <summary>
+    /// SQL LIKE over a value against an already-lowercased pattern.
+    ///
+    /// <para>Iterative with a single backtrack point per <c>%</c>, so it is O(text × pattern)
+    /// at worst and linear in practice. The recursive version it replaces branched at every
+    /// position after every wildcard, which is exponential in the number of <c>%</c>: a
+    /// pattern like <c>'%a%a%a%a%a%'</c> against a long non-matching value could occupy a
+    /// core for the rest of the query — and a filter box is exactly where such a pattern
+    /// gets typed by accident.</para>
+    /// </summary>
+    private static bool LikeMatchLower(ReadOnlySpan<char> text, ReadOnlySpan<char> pattern)
     {
-        while (!pattern.IsEmpty)
+        int t = 0, p = 0;
+        int starP = -1, starT = 0;   // last '%' seen, and where it started consuming
+
+        while (t < text.Length)
         {
-            char pc = pattern[0];
-
-            if (pc == '%')
+            if (p < pattern.Length &&
+                (pattern[p] == '_' || pattern[p] == char.ToLowerInvariant(text[t])))
             {
-                pattern = pattern[1..];
-                if (pattern.IsEmpty) return true;
-                for (int i = 0; i <= text.Length; i++)
-                {
-                    if (LikeMatchRecursive(text[i..], pattern)) return true;
-                }
-                return false;
+                t++; p++;
             }
-
-            if (text.IsEmpty) return false;
-
-            if (pc != '_' && pc != text[0]) return false;
-
-            text    = text[1..];
-            pattern = pattern[1..];
+            else if (p < pattern.Length && pattern[p] == '%')
+            {
+                starP = p++;         // remember it and try to match the rest with zero chars
+                starT = t;
+            }
+            else if (starP >= 0)
+            {
+                p = starP + 1;       // let the last '%' swallow one more character
+                t = ++starT;
+            }
+            else return false;
         }
-        return text.IsEmpty;
+
+        while (p < pattern.Length && pattern[p] == '%') p++;
+        return p == pattern.Length;
     }
+
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -1230,29 +1246,37 @@ public static class FilterEvaluator
 
     private static bool EvalRegexMatch(RegexMatchNode node, LogEvent ev)
     {
-        var options = node.IgnoreCase
-            ? RegexOptions.IgnoreCase | RegexOptions.CultureInvariant
-            : RegexOptions.CultureInvariant;
         object? val = GetValue(ev, node.Property);
         if (val is IList list && val is not byte[] && val is not string)
         {
             for (int i = 0; i < list.Count; i++)
-                if (list[i]?.ToString() is { } s && Regex.IsMatch(s, node.Pattern, options)) return true;
+                if (list[i]?.ToString() is { } s && IsMatch(node.Compiled, s)) return true;
             return false;
         }
-        return val?.ToString() is { } sv && Regex.IsMatch(sv, node.Pattern, options);
+        return val?.ToString() is { } sv && IsMatch(node.Compiled, sv);
+    }
+
+    /// <summary>
+    /// One value against a pre-compiled pattern. A timeout can only come from the
+    /// backtracking fallback (patterns the linear engine refuses) and means this ONE value
+    /// defeated the pattern — the value does not match, and the query goes on rather than
+    /// dying halfway through a result stream.
+    /// </summary>
+    private static bool IsMatch(Regex rx, string input)
+    {
+        try { return rx.IsMatch(input); }
+        catch (RegexMatchTimeoutException) { return false; }
     }
 
     private static bool EvalRegexExtract(RegexExtractCompareNode node, LogEvent ev)
     {
-        var options = node.IgnoreCase
-            ? RegexOptions.IgnoreCase | RegexOptions.CultureInvariant
-            : RegexOptions.CultureInvariant;
         object? val = GetValue(ev, node.Property);
         return MatchAny(val, e =>
         {
             if (e?.ToString() is not { } s) return false;
-            var m = Regex.Match(s, node.Pattern, options);
+            Match m;
+            try { m = node.Compiled.Match(s); }
+            catch (RegexMatchTimeoutException) { return false; }
             if (!m.Success || node.Group >= m.Groups.Count) return false;
             return Compare(m.Groups[node.Group].Value, node.Value, node.Op);
         });
