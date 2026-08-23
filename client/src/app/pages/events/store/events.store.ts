@@ -327,8 +327,16 @@ export const EventsStore = signalStore(
           syncRoute();
         },
         error: err => {
+          // Keep what arrived. A search stopped by the server's time budget reports an
+          // error AFTER streaming real rows, and throwing them away leaves the user with
+          // an empty screen and a message, instead of a partial answer and a message
+          // explaining why it is partial. hasMore stays false so infinite scroll does not
+          // immediately re-fire the same doomed query.
           patchState(store, {
-            error: (err as Error).message ?? 'Failed to load events', loading: false,
+            events: [...acc],
+            hasMore: false,
+            error: (err as Error).message ?? 'Failed to load events',
+            loading: false,
           });
         },
       });
@@ -376,9 +384,21 @@ export const EventsStore = signalStore(
           patchState(store, patch);
         },
         error: err => {
-          patchState(store, {
-            error: (err as Error).message ?? 'Failed to load more events', loadingMore: false,
-          });
+          // Same reasoning as loadEvents: append whatever the page delivered before it
+          // failed, and stop paging so a budget-stopped query is not re-issued on the
+          // next scroll.
+          const patch: Partial<EventsState> = {
+            error: (err as Error).message ?? 'Failed to load more events',
+            loadingMore: false,
+            hasMore: false,
+          };
+          if (acc.length > 0) {
+            const evs = store.events();
+            const seen = new Set(evs.map(e => e.id));
+            const fresh = acc.filter(e => !seen.has(e.id));
+            if (fresh.length > 0) patch.events = [...evs, ...fresh];
+          }
+          patchState(store, patch);
         },
       });
     }

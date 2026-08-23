@@ -84,6 +84,29 @@ public sealed class QueryValidationTests : IClassFixture<AmetoWebAppFactory>
         Assert.Equal("text/event-stream", resp.Content.Headers.ContentType?.MediaType);
     }
 
+    [Fact]
+    public async Task The_counts_chart_rejects_an_inverted_window_like_every_other_endpoint()
+    {
+        // It used to swap them silently, answering a different question than the one asked.
+        var resp = await _client.GetAsync(
+            "/api/events/counts?from=2026-08-02T00:00:00Z&to=2026-08-01T00:00:00Z");
+
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+        Assert.Contains("later than", await ErrorOf(resp), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("/api/spans/00000000000000ff/logs?from=not-a-date")]
+    [InlineData("/api/traces/000000000000000000000000000000ff/logs?to=whenever")]
+    [InlineData("/api/events/counts?from=nope")]
+    public async Task Every_query_endpoint_names_a_malformed_timestamp(string url)
+    {
+        var resp = await _client.GetAsync(url);
+
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+        Assert.Contains("ISO-8601", await ErrorOf(resp), StringComparison.OrdinalIgnoreCase);
+    }
+
     // ── The validation endpoint the browser falls back to ─────────────────────
     // EventSource cannot read the body of a non-200, so the UI asks here when a stream
     // dies before delivering anything.

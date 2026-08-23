@@ -65,6 +65,7 @@ public static class EndpointMapper
             HttpContext           ctx,
             IQueryExecutor        executor,
             QueryGuard            guard,
+            ILoggerFactory        loggerFactory,
             string?               filter   = null,
             string?               from     = null,
             string?               to       = null,
@@ -116,37 +117,48 @@ public static class EndpointMapper
                 Levels              = levelSet,
             };
 
-            using var lease = await guard.TryEnterAsync(ctx.RequestAborted);
+            QueryGuard.Lease? lease;
+            try { lease = await guard.TryEnterAsync(ctx.RequestAborted); }
+            catch (OperationCanceledException) { return Results.Empty; }   // client left the queue
             if (lease is null)
-            {
-                ctx.Response.Headers.RetryAfter = "5";
-                return Results.Json(new { error = "Too many searches are running. Try again in a moment." },
-                                    statusCode: StatusCodes.Status503ServiceUnavailable);
-            }
+                return Refused(ctx);
 
-            ctx.Response.ContentType = "text/event-stream";
-            ctx.Response.Headers.CacheControl = "no-cache";
-            ctx.Response.Headers.Connection   = "keep-alive";
-            await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+            using (lease)
+            {
+                ctx.Response.ContentType = "text/event-stream";
+                ctx.Response.Headers.CacheControl = "no-cache";
+                ctx.Response.Headers.Connection   = "keep-alive";
+                await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
 
-            using var deadline = guard.StartDeadline(ctx.RequestAborted);
-            using var sse      = new SseJsonWriter(ctx.Response);
-            try
-            {
-                await foreach (var ev in executor.ExecuteAsync(request, deadline.Token))
-                    await sse.WriteEventAsync(LogEventDto.From(ev), _json, deadline.Token);
-                await sse.WriteDoneAsync(ctx.RequestAborted);
-            }
-            catch (OperationCanceledException) when (deadline.TimedOut)
-            {
-                // The budget, not the client. Say so: a truncated result set that looks
-                // complete is worse than a short one that admits it.
-                await SafeErrorAsync(sse, $"Search exceeded its {guard.Timeout.TotalSeconds:0}s budget — narrow the time range or the filter.", ctx);
-            }
-            catch (OperationCanceledException) { /* client disconnected */ }
-            catch (Exception ex)
-            {
-                await SafeErrorAsync(sse, ex.Message, ctx);
+                using var deadline = guard.StartDeadline(ctx.RequestAborted);
+                using var sse      = new SseJsonWriter(ctx.Response);
+                try
+                {
+                    await foreach (var ev in executor.ExecuteAsync(request, deadline.Token))
+                        await sse.WriteEventAsync(LogEventDto.From(ev), _json, deadline.Token);
+
+                    // CHECKED AFTER THE LOOP, not only in a catch filter: the executor turns
+                    // cancellation into a normal end-of-stream on its hot paths (a
+                    // `yield break` per event and per merge step), so a budget that expires
+                    // while rows are actually flowing raises nothing at all — and writing
+                    // `done` there would report a truncated result as a complete one, which
+                    // is the exact failure this budget exists to make visible.
+                    if (deadline.TimedOut) await TimedOutAsync(sse, guard, ctx);
+                    else                   await sse.WriteDoneAsync(ctx.RequestAborted);
+                }
+                catch (OperationCanceledException) when (deadline.TimedOut)
+                {
+                    await TimedOutAsync(sse, guard, ctx);
+                }
+                catch (OperationCanceledException) { /* client disconnected */ }
+                catch (Exception ex)
+                {
+                    loggerFactory.CreateLogger(QueryLogCategory)
+                                 .LogError(ex, "Search failed after the stream had opened");
+                    // The client gets a stable sentence; the exception text can name segment
+                    // paths and internals, and it is already in the log where it belongs.
+                    await SafeErrorAsync(sse, "The search failed while streaming results. See the server log for details.", ctx);
+                }
             }
             return Results.Empty;
         }).RequireAuthorization(AuthServiceExtensions.PolicyViewLogs);
@@ -171,7 +183,7 @@ public static class EndpointMapper
 
         // ── Distinct property names: GET /api/events/props ───────────────────
         // Returns sorted unique property keys from the last 24 h (up to 5 000 events sampled).
-        app.MapGet("/api/events/props", async (HttpContext ctx, IQueryExecutor executor) =>
+        app.MapGet("/api/events/props", async (HttpContext ctx, IQueryExecutor executor, QueryGuard guard) =>
         {
             var request = new QueryRequest
             {
@@ -179,20 +191,37 @@ public static class EndpointMapper
                 Count     = 5_000,
                 Direction = QueryDirection.Backward,
             };
-            var props = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
-            await foreach (var ev in executor.ExecuteAsync(request, ctx.RequestAborted))
+
+            // Guarded like the search it is: this scans up to 5 000 events over a day and
+            // competes for exactly the mmap and decompression the limit exists to ration.
+            QueryGuard.Lease? lease;
+            try { lease = await guard.TryEnterAsync(ctx.RequestAborted); }
+            catch (OperationCanceledException) { return Results.Empty; }
+            if (lease is null) return Refused(ctx);
+
+            using (lease)
             {
-                if (ev.Properties is null) continue;
-                foreach (var key in ev.Properties.Keys)
-                    props.Add(key);
+                using var deadline = guard.StartDeadline(ctx.RequestAborted);
+                var props = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+                try
+                {
+                    await foreach (var ev in executor.ExecuteAsync(request, deadline.Token))
+                    {
+                        if (ev.Properties is null) continue;
+                        foreach (var key in ev.Properties.Keys)
+                            props.Add(key);
+                    }
+                }
+                catch (OperationCanceledException) when (deadline.TimedOut) { return TimedOutJson(guard); }
+                if (deadline.TimedOut) return TimedOutJson(guard);
+                return Results.Ok(props.ToArray());
             }
-            return Results.Ok(props.ToArray());
         }).RequireAuthorization(AuthServiceExtensions.PolicyViewLogs);
 
         // ── Distinct services: GET /api/events/services ───────────────────────
         // Returns sorted unique values of ApplicationContext / service.name properties
         // from the last 7 days (up to 10 000 events sampled) — fast index-friendly scan.
-        app.MapGet("/api/events/services", async (HttpContext ctx, IQueryExecutor executor,
+        app.MapGet("/api/events/services", async (HttpContext ctx, IQueryExecutor executor, QueryGuard guard,
             int days = 7) =>
         {
             var request = new QueryRequest
@@ -201,17 +230,32 @@ public static class EndpointMapper
                 Count     = 10_000,
                 Direction = QueryDirection.Backward,
             };
-            var services = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
-            await foreach (var ev in executor.ExecuteAsync(request, ctx.RequestAborted))
+
+            QueryGuard.Lease? lease;
+            try { lease = await guard.TryEnterAsync(ctx.RequestAborted); }
+            catch (OperationCanceledException) { return Results.Empty; }
+            if (lease is null) return Refused(ctx);
+
+            using (lease)
             {
-                // Prefer service.name (OTLP), fall back to ApplicationContext (Serilog)
-                var svc = ev.ServiceName
-                    ?? (ev.Properties?.TryGetValue("ApplicationContext", out var v) == true
-                        ? v?.ToString() : null);
-                if (!string.IsNullOrWhiteSpace(svc))
-                    services.Add(svc);
+                using var deadline = guard.StartDeadline(ctx.RequestAborted);
+                var services = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+                try
+                {
+                    await foreach (var ev in executor.ExecuteAsync(request, deadline.Token))
+                    {
+                        // Prefer service.name (OTLP), fall back to ApplicationContext (Serilog)
+                        var svc = ev.ServiceName
+                            ?? (ev.Properties?.TryGetValue("ApplicationContext", out var v) == true
+                                ? v?.ToString() : null);
+                        if (!string.IsNullOrWhiteSpace(svc))
+                            services.Add(svc);
+                    }
+                }
+                catch (OperationCanceledException) when (deadline.TimedOut) { return TimedOutJson(guard); }
+                if (deadline.TimedOut) return TimedOutJson(guard);
+                return Results.Ok(services.ToArray());
             }
-            return Results.Ok(services.ToArray());
         }).RequireAuthorization(AuthServiceExtensions.PolicyViewLogs);
 
         // ── Event counts by service + level over time: GET /api/events/counts ─
@@ -245,7 +289,11 @@ public static class EndpointMapper
             var now     = DateTimeOffset.UtcNow;
             var toUtc   = toParsed   ?? now;
             var fromUtc = fromParsed ?? toUtc.AddDays(-1);
-            if (fromUtc > toUtc) (fromUtc, toUtc) = (toUtc, fromUtc);
+            // Rejected rather than silently swapped, like every other query endpoint: a
+            // chart that quietly answers a different question than the one asked is the
+            // harder bug to notice.
+            if (fromUtc > toUtc)
+                return Results.BadRequest(new { error = "'from' is later than 'to'." });
 
             double rangeSec = Math.Max(1, (toUtc - fromUtc).TotalSeconds);
             int bucketSeconds = bucket is > 0 ? bucket.Value : AutoBucketSeconds(rangeSec);
@@ -318,6 +366,7 @@ public static class EndpointMapper
             HttpContext    ctx,
             IQueryExecutor executor,
             QueryGuard     guard,
+            ILoggerFactory loggerFactory,
             string?        filter  = null,
             string?        from    = null) =>
         {
@@ -339,6 +388,7 @@ public static class EndpointMapper
 
             Ameto.Core.EventId? cursor = null;
             long?                cursorTs = null;
+            int                  refusedInARow = 0;
 
             using var sse = new SseJsonWriter(ctx.Response);
             try
@@ -357,18 +407,41 @@ public static class EndpointMapper
 
                     int newCount = 0;
                     // A slot per POLL, never for the life of the connection: a tail is open
-                    // for hours and would otherwise hold a search slot the whole time. A
-                    // saturated server simply makes the tail wait its turn.
-                    using (var lease = await guard.TryEnterAsync(ctx.RequestAborted))
+                    // for hours and would otherwise hold a search slot the whole time.
+                    var lease = await guard.TryEnterAsync(ctx.RequestAborted);
+                    if (lease is null)
                     {
-                        if (lease is not null)
+                        // The server is at its limit. A tail can wait — but not silently
+                        // for ever, or the page shows a live view that stopped being live
+                        // without ever saying so.
+                        if (++refusedInARow >= RefusalsBeforeGivingUp)
                         {
-                            await foreach (var ev in executor.ExecuteAsync(request, ctx.RequestAborted))
+                            await SafeErrorAsync(sse,
+                                "The server is busy and the live tail could not keep up. Reconnect in a moment.", ctx);
+                            break;
+                        }
+                    }
+                    else
+                    {
+                        refusedInARow = 0;
+                        using (lease)
+                        {
+                            // Bounded like any other search: an unfiltered forward poll over
+                            // a wide window is a full-catalog scan, and without a budget it
+                            // would hold the slot it took for as long as that takes.
+                            using var deadline = guard.StartDeadline(ctx.RequestAborted);
+                            await foreach (var ev in executor.ExecuteAsync(request, deadline.Token))
                             {
-                                await sse.WriteEventAsync(LogEventDto.From(ev), _json, ctx.RequestAborted);
+                                await sse.WriteEventAsync(LogEventDto.From(ev), _json, deadline.Token);
                                 cursor   = (Ameto.Core.EventId?)ev.Id;
                                 cursorTs = ev.Timestamp.UtcTicks;
                                 newCount++;
+                            }
+                            if (deadline.TimedOut)
+                            {
+                                await SafeErrorAsync(sse,
+                                    $"The live tail's poll exceeded its {guard.Timeout.TotalSeconds:0}s budget — narrow the filter.", ctx);
+                                break;
                             }
                         }
                     }
@@ -384,7 +457,9 @@ public static class EndpointMapper
             catch (OperationCanceledException) { /* client disconnected */ }
             catch (Exception ex)
             {
-                await SafeErrorAsync(sse, ex.Message, ctx);
+                loggerFactory.CreateLogger(QueryLogCategory)
+                             .LogError(ex, "Live tail failed after the stream had opened");
+                await SafeErrorAsync(sse, "The live tail failed. See the server log for details.", ctx);
             }
             return Results.Empty;
         }).RequireAuthorization(AuthServiceExtensions.PolicyViewLogs);
@@ -395,6 +470,7 @@ public static class EndpointMapper
         app.MapGet("/api/spans/{spanId}/logs", async (
             HttpContext    ctx,
             IQueryExecutor executor,
+            QueryGuard     guard,
             string         spanId,
             string?        from  = null,
             string?        to    = null,
@@ -426,11 +502,9 @@ public static class EndpointMapper
                 Direction = QueryDirection.Forward,
             };
 
-            var results = new List<LogEventDto>();
-            await foreach (var ev in executor.ExecuteAsync(request, ctx.RequestAborted))
-                results.Add(LogEventDto.From(ev));
-
-            await ctx.Response.WriteAsJsonAsync(results, _json, ctx.RequestAborted);
+            // Guarded and bounded: from/to are optional here, so this is routinely an
+            // unbounded-window scan — the shape the budget exists for.
+            await WriteGuardedListAsync(ctx, executor, guard, request);
         }).RequireAuthorization(AuthServiceExtensions.PolicyViewLogs);
 
         // ── Trace logs: GET /api/traces/{traceId}/logs ────────────────────────
@@ -442,6 +516,7 @@ public static class EndpointMapper
         app.MapGet("/api/traces/{traceId}/logs", async (
             HttpContext    ctx,
             IQueryExecutor executor,
+            QueryGuard     guard,
             string         traceId,
             string?        from  = null,
             string?        to    = null,
@@ -473,12 +548,53 @@ public static class EndpointMapper
                 Direction = QueryDirection.Forward,
             };
 
+            await WriteGuardedListAsync(ctx, executor, guard, request);
+        }).RequireAuthorization(AuthServiceExtensions.PolicyViewLogs);
+    }
+
+    /// <summary>
+    /// Runs a bounded query under the search limit and the time budget, and writes the
+    /// result as a JSON array. Refusal is 503, an expired budget is 504 — a JSON list
+    /// cannot admit to being partial the way a stream can, so it does not pretend.
+    /// </summary>
+    private static async Task WriteGuardedListAsync(
+        HttpContext ctx, IQueryExecutor executor, QueryGuard guard, QueryRequest request)
+    {
+        QueryGuard.Lease? lease;
+        try { lease = await guard.TryEnterAsync(ctx.RequestAborted); }
+        catch (OperationCanceledException) { return; }
+        if (lease is null)
+        {
+            ctx.Response.StatusCode         = StatusCodes.Status503ServiceUnavailable;
+            ctx.Response.Headers.RetryAfter = "5";
+            await ctx.Response.WriteAsJsonAsync(
+                new { error = "Too many searches are running. Try again in a moment." }, ctx.RequestAborted);
+            return;
+        }
+
+        using (lease)
+        {
+            using var deadline = guard.StartDeadline(ctx.RequestAborted);
             var results = new List<LogEventDto>();
-            await foreach (var ev in executor.ExecuteAsync(request, ctx.RequestAborted))
-                results.Add(LogEventDto.From(ev));
+            try
+            {
+                await foreach (var ev in executor.ExecuteAsync(request, deadline.Token))
+                    results.Add(LogEventDto.From(ev));
+            }
+            catch (OperationCanceledException) when (deadline.TimedOut) { }
+            catch (OperationCanceledException) { return; }   // client disconnected
+
+            if (deadline.TimedOut)
+            {
+                ctx.Response.StatusCode = StatusCodes.Status504GatewayTimeout;
+                await ctx.Response.WriteAsJsonAsync(
+                    new { error = $"The query exceeded its {guard.Timeout.TotalSeconds:0}s budget. Narrow the time range." },
+                    ctx.RequestAborted);
+                return;
+            }
 
             await ctx.Response.WriteAsJsonAsync(results, _json, ctx.RequestAborted);
-        }).RequireAuthorization(AuthServiceExtensions.PolicyViewLogs);
+        }
     }
 
     // ── API-key extraction (ingest path only) ─────────────────────────────────
@@ -563,12 +679,51 @@ public static class EndpointMapper
     /// <summary>
     /// Best-effort error frame. The stream may already be half-written or the socket gone;
     /// failing to report a failure must not itself throw out of the handler.
+    ///
+    /// <para>Bounded by its own short deadline, not by the request token alone: the write
+    /// goes to a socket the search may have just timed out ON, and a caller that parks
+    /// here goes on holding its search slot for as long as the stuck client lives.</para>
     /// </summary>
     private static async Task SafeErrorAsync(SseJsonWriter sse, string message, HttpContext ctx)
     {
-        try { await sse.WriteErrorAsync(message, ctx.RequestAborted); }
-        catch { /* the client is gone — nothing left to tell */ }
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ctx.RequestAborted);
+        cts.CancelAfter(TimeSpan.FromSeconds(5));
+        try { await sse.WriteErrorAsync(message, cts.Token); }
+        catch { /* the client is gone, or will not read — nothing left to tell */ }
     }
+
+    /// <summary>The terminal frame for a search stopped by its budget.</summary>
+    private static Task TimedOutAsync(SseJsonWriter sse, QueryGuard guard, HttpContext ctx) =>
+        SafeErrorAsync(
+            sse,
+            $"Search exceeded its {guard.Timeout.TotalSeconds:0}s budget — narrow the time range or the filter. Results shown are partial.",
+            ctx);
+
+    /// <summary>503 with Retry-After: the server is at its search limit right now.</summary>
+    private static IResult Refused(HttpContext ctx)
+    {
+        ctx.Response.Headers.RetryAfter = "5";
+        return Results.Json(
+            new { error = "Too many searches are running. Try again in a moment." },
+            statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+
+    /// <summary>Log category for query-path failures reported to clients only in summary.</summary>
+    private const string QueryLogCategory = "Ameto.Server.Query";
+
+    /// <summary>
+    /// Consecutive refused polls after which a live tail stops pretending. At the 250 ms
+    /// poll interval plus the queue wait this is several seconds of a genuinely saturated
+    /// server — long enough not to fire on a burst, short enough that the page does not
+    /// keep showing a live view that is not live.
+    /// </summary>
+    private const int RefusalsBeforeGivingUp = 8;
+
+    /// <summary>504 for the non-streaming endpoints, which cannot report a partial answer.</summary>
+    private static IResult TimedOutJson(QueryGuard guard) =>
+        Results.Json(
+            new { error = $"The query exceeded its {guard.Timeout.TotalSeconds:0}s budget. Narrow the time range." },
+            statusCode: StatusCodes.Status504GatewayTimeout);
 }
 
 // ── Dynamic object converter ──────────────────────────────────────────────────
