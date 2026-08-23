@@ -122,6 +122,9 @@ builder.Services
 // Short-TTL cache for GET /api/events/counts header-scan responses.
 builder.Services.AddSingleton<LogVolumeCountsCache>();
 
+// Per-search time budget and concurrency limit (see QueryGuard).
+builder.Services.AddSingleton<QueryGuard>();
+
 // ── Software-update check (Settings → Updates) ────────────────────────────────
 // Singleton holds the latest-release snapshot for the endpoints; the hosted
 // service polls GitHub hourly (no-op when Ameto:Updates:Enabled is false).

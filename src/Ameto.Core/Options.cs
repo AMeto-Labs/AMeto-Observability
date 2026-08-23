@@ -183,6 +183,26 @@ public sealed class QueryOptions
     /// pre-cache behaviour. Default: 256 MB.
     /// </summary>
     public long IndexCacheBytes { get; init; } = 256 * 1024 * 1024;
+
+    /// <summary>
+    /// Wall-clock budget for one search. A query that exceeds it is stopped and the client
+    /// is told so — rather than the request occupying a core until the browser tab is
+    /// closed, which is what an unbounded scan over an unbounded window did. Zero or
+    /// negative removes the budget. Default: 60 s.
+    /// </summary>
+    public TimeSpan Timeout { get; init; } = TimeSpan.FromSeconds(60);
+
+    /// <summary>
+    /// How many searches may run at once. Each one memory-maps segments and decompresses
+    /// blocks in parallel, so a handful of dashboards refreshing together could take the
+    /// whole box; past this limit a request is refused quickly (503 + Retry-After) instead
+    /// of everything crawling. 0 = auto (processor count, clamped 2..16), negative =
+    /// unlimited.
+    /// </summary>
+    public int MaxConcurrent { get; init; }
+
+    /// <summary>How long a request waits for a slot before it is refused. Default: 5 s.</summary>
+    public TimeSpan QueueWait { get; init; } = TimeSpan.FromSeconds(5);
 }
 
 /// <summary>

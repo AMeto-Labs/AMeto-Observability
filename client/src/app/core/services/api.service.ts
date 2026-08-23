@@ -61,20 +61,66 @@ export class ApiService {
       if (params.afterId) p.set('afterId', params.afterId);
       if (params.afterTs !== undefined) p.set('afterTs', String(params.afterTs));
       if (params.levels)  p.set('levels', params.levels);
+      let delivered = false;
       return this.openTicketedSse('/api/events', p,
         es => {
           es.onmessage = event => {
+            delivered = true;
             try { subscriber.next(JSON.parse(event.data) as EventDto); } catch { /* ignore */ }
           };
           es.addEventListener('done', () => { es.close(); subscriber.complete(); });
+          // Sent by the server when a query fails AFTER the stream opened (its budget ran
+          // out, a segment could not be read). Not named 'error': EventSource dispatches
+          // its own connection failures under that name.
+          es.addEventListener('query-error', event => {
+            es.close();
+            subscriber.error(new Error(this.sseErrorMessage(event, 'Search failed')));
+          });
           es.onerror = () => {
             es.close();
             // SSE bypasses authInterceptor — re-check the session so a stale token logs out.
             this.auth.verifySession();
-            subscriber.error(new Error('Failed to load events'));
+            if (delivered) { subscriber.error(new Error('Failed to load events')); return; }
+            // Nothing arrived: most likely the request was REFUSED (bad filter, bad date,
+            // server saturated) — and EventSource cannot read the body of a non-200, so
+            // ask the validation endpoint what was wrong instead of guessing.
+            this.explainQueryFailure(params).subscribe(msg => subscriber.error(new Error(msg)));
           };
         },
         () => subscriber.error(new Error('Failed to load events')));
+    });
+  }
+
+  /** Reads the server's message out of a `query-error` frame, falling back to a default. */
+  private sseErrorMessage(event: Event, fallback: string): string {
+    const data = (event as MessageEvent).data;
+    if (typeof data !== 'string') return fallback;
+    try {
+      const parsed = JSON.parse(data) as { error?: string };
+      return parsed.error?.trim() || fallback;
+    } catch {
+      return fallback;
+    }
+  }
+
+  /**
+   * Asks why a stream that delivered nothing failed. Returns the server's diagnostic
+   * ("Invalid filter: …", "'from' is not a valid ISO-8601 timestamp…") or a generic
+   * message when the query itself was fine.
+   */
+  private explainQueryFailure(params: EventQueryParams): Observable<string> {
+    const p = new URLSearchParams();
+    if (params.filter) p.set('filter', params.filter);
+    if (params.from)   p.set('from', params.from);
+    if (params.to)     p.set('to', params.to);
+    return new Observable<string>(sub => {
+      this.http.get(`/api/events/validate?${p.toString()}`).subscribe({
+        next: () => { sub.next('Failed to load events'); sub.complete(); },
+        error: (err: { error?: { error?: string } }) => {
+          sub.next(err?.error?.error?.trim() || 'Failed to load events');
+          sub.complete();
+        },
+      });
     });
   }
 

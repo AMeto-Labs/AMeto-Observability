@@ -64,6 +64,7 @@ public static class EndpointMapper
         app.MapGet("/api/events", async (
             HttpContext           ctx,
             IQueryExecutor        executor,
+            QueryGuard            guard,
             string?               filter   = null,
             string?               from     = null,
             string?               to       = null,
@@ -73,10 +74,16 @@ public static class EndpointMapper
             long?                 afterTs  = null,
             string?               levels   = null) =>
         {
-            ctx.Response.ContentType = "text/event-stream";
-            ctx.Response.Headers.CacheControl = "no-cache";
-            ctx.Response.Headers.Connection   = "keep-alive";
-            await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+            // EVERYTHING THAT CAN BE REJECTED IS CHECKED BEFORE THE RESPONSE IS COMMITTED.
+            // The stream used to open first and parse afterwards, so a malformed date or a
+            // filter with a syntax error produced 200 OK followed by a stream that just
+            // died — no status, no message, indistinguishable from "no results" — while a
+            // 400 with the parser's own diagnostic was sitting right there.
+            if (!TryParseWindow(from, to, out var fromUtc, out var toUtc, out string? windowError))
+                return Results.BadRequest(new { error = windowError });
+
+            if (!TryCompileFilter(filter, out string? filterError))
+                return Results.BadRequest(new { error = filterError });
 
             // afterId is the raw 64-bit Snowflake EventId; combined with afterTs it forms
             // the (ts, id) cursor used by the keyset pagination in QueryExecutor.
@@ -99,8 +106,8 @@ public static class EndpointMapper
             var request = new QueryRequest
             {
                 Filter              = filter,
-                FromUtc             = from is null ? null : DateTimeOffset.Parse(from, null, System.Globalization.DateTimeStyles.RoundtripKind).ToUniversalTime(),
-                ToUtc               = to   is null ? null : DateTimeOffset.Parse(to,   null, System.Globalization.DateTimeStyles.RoundtripKind).ToUniversalTime(),
+                FromUtc             = fromUtc,
+                ToUtc               = toUtc,
                 Count               = Math.Clamp(count, 1, 10_000),
                 Direction           = "forward".Equals(dir, StringComparison.OrdinalIgnoreCase)
                                           ? QueryDirection.Forward : QueryDirection.Backward,
@@ -109,14 +116,57 @@ public static class EndpointMapper
                 Levels              = levelSet,
             };
 
+            using var lease = await guard.TryEnterAsync(ctx.RequestAborted);
+            if (lease is null)
+            {
+                ctx.Response.Headers.RetryAfter = "5";
+                return Results.Json(new { error = "Too many searches are running. Try again in a moment." },
+                                    statusCode: StatusCodes.Status503ServiceUnavailable);
+            }
+
+            ctx.Response.ContentType = "text/event-stream";
+            ctx.Response.Headers.CacheControl = "no-cache";
+            ctx.Response.Headers.Connection   = "keep-alive";
+            await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
+
+            using var deadline = guard.StartDeadline(ctx.RequestAborted);
+            using var sse      = new SseJsonWriter(ctx.Response);
             try
             {
-                using var sse = new SseJsonWriter(ctx.Response);
-                await foreach (var ev in executor.ExecuteAsync(request, ctx.RequestAborted))
-                    await sse.WriteEventAsync(LogEventDto.From(ev), _json, ctx.RequestAborted);
+                await foreach (var ev in executor.ExecuteAsync(request, deadline.Token))
+                    await sse.WriteEventAsync(LogEventDto.From(ev), _json, deadline.Token);
                 await sse.WriteDoneAsync(ctx.RequestAborted);
             }
+            catch (OperationCanceledException) when (deadline.TimedOut)
+            {
+                // The budget, not the client. Say so: a truncated result set that looks
+                // complete is worse than a short one that admits it.
+                await SafeErrorAsync(sse, $"Search exceeded its {guard.Timeout.TotalSeconds:0}s budget — narrow the time range or the filter.", ctx);
+            }
             catch (OperationCanceledException) { /* client disconnected */ }
+            catch (Exception ex)
+            {
+                await SafeErrorAsync(sse, ex.Message, ctx);
+            }
+            return Results.Empty;
+        }).RequireAuthorization(AuthServiceExtensions.PolicyViewLogs);
+
+        // ── Query validation: GET /api/events/validate ────────────────────────
+        // Why this exists: EventSource cannot read the BODY of a non-200 response — a
+        // browser sees only "connection failed" — so the 400 the stream endpoints now
+        // return is invisible to the one client that most needs the message. The UI asks
+        // here when a stream dies before delivering anything, and gets the diagnostic the
+        // stream could not hand it. Any other HTTP client just reads the 400 directly.
+        app.MapGet("/api/events/validate", (
+            string? filter = null,
+            string? from   = null,
+            string? to     = null) =>
+        {
+            if (!TryParseWindow(from, to, out _, out _, out string? windowError))
+                return Results.BadRequest(new { error = windowError });
+            if (!TryCompileFilter(filter, out string? filterError))
+                return Results.BadRequest(new { error = filterError });
+            return Results.Ok(new { ok = true });
         }).RequireAuthorization(AuthServiceExtensions.PolicyViewLogs);
 
         // ── Distinct property names: GET /api/events/props ───────────────────
@@ -187,11 +237,14 @@ public static class EndpointMapper
         {
             _ = limit; // retained for API compatibility; no longer caps the scan.
 
-            var now   = DateTimeOffset.UtcNow;
-            var toUtc = to is null ? now
-                                   : DateTimeOffset.Parse(to, null, DateTimeStyles.RoundtripKind).ToUniversalTime();
-            var fromUtc = from is null ? toUtc.AddDays(-1)
-                                       : DateTimeOffset.Parse(from, null, DateTimeStyles.RoundtripKind).ToUniversalTime();
+            // A malformed date is a 400 with the parameter named, not an unhandled parse
+            // exception surfacing as a 500 on a dashboard poll.
+            if (!TryParseInstant(to,   "to",   out var toParsed,   out string? toError))   return Results.BadRequest(new { error = toError });
+            if (!TryParseInstant(from, "from", out var fromParsed, out string? fromError)) return Results.BadRequest(new { error = fromError });
+
+            var now     = DateTimeOffset.UtcNow;
+            var toUtc   = toParsed   ?? now;
+            var fromUtc = fromParsed ?? toUtc.AddDays(-1);
             if (fromUtc > toUtc) (fromUtc, toUtc) = (toUtc, fromUtc);
 
             double rangeSec = Math.Max(1, (toUtc - fromUtc).TotalSeconds);
@@ -264,51 +317,76 @@ public static class EndpointMapper
         app.MapGet("/api/events/live", async (
             HttpContext    ctx,
             IQueryExecutor executor,
+            QueryGuard     guard,
             string?        filter  = null,
             string?        from    = null) =>
         {
+            // Validated before the stream opens, for the same reason as /api/events: a
+            // tail that dies on its first poll because of a typo in the filter looked
+            // exactly like a tail with nothing to show.
+            if (!TryParseInstant(from, "from", out var fromParsed, out string? windowError))
+                return Results.BadRequest(new { error = windowError });
+            if (!TryCompileFilter(filter, out string? filterError))
+                return Results.BadRequest(new { error = filterError });
+
             ctx.Response.ContentType = "text/event-stream";
             ctx.Response.Headers.CacheControl = "no-cache";
             ctx.Response.Headers.Connection    = "keep-alive";
             await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
 
             // Tail starts from 'from' or now, forward direction, unlimited.
-            var fromDt = from is not null
-                ? DateTimeOffset.Parse(from, null, System.Globalization.DateTimeStyles.RoundtripKind)
-                : DateTimeOffset.UtcNow;
+            var fromDt = fromParsed ?? DateTimeOffset.UtcNow;
 
             Ameto.Core.EventId? cursor = null;
             long?                cursorTs = null;
 
             using var sse = new SseJsonWriter(ctx.Response);
-            while (!ctx.RequestAborted.IsCancellationRequested)
+            try
             {
-                var request = new QueryRequest
+                while (!ctx.RequestAborted.IsCancellationRequested)
                 {
-                    Filter              = filter,
-                    FromUtc             = fromDt,
-                    Count               = 500,
-                    Direction           = QueryDirection.Forward,
-                    AfterEventId        = cursor,
-                    AfterTimestampTicks = cursorTs,
-                };
+                    var request = new QueryRequest
+                    {
+                        Filter              = filter,
+                        FromUtc             = fromDt,
+                        Count               = 500,
+                        Direction           = QueryDirection.Forward,
+                        AfterEventId        = cursor,
+                        AfterTimestampTicks = cursorTs,
+                    };
 
-                int newCount = 0;
-                await foreach (var ev in executor.ExecuteAsync(request, ctx.RequestAborted))
-                {
-                    await sse.WriteEventAsync(LogEventDto.From(ev), _json, ctx.RequestAborted);
-                    cursor   = (Ameto.Core.EventId?)ev.Id;
-                    cursorTs = ev.Timestamp.UtcTicks;
-                    newCount++;
-                }
+                    int newCount = 0;
+                    // A slot per POLL, never for the life of the connection: a tail is open
+                    // for hours and would otherwise hold a search slot the whole time. A
+                    // saturated server simply makes the tail wait its turn.
+                    using (var lease = await guard.TryEnterAsync(ctx.RequestAborted))
+                    {
+                        if (lease is not null)
+                        {
+                            await foreach (var ev in executor.ExecuteAsync(request, ctx.RequestAborted))
+                            {
+                                await sse.WriteEventAsync(LogEventDto.From(ev), _json, ctx.RequestAborted);
+                                cursor   = (Ameto.Core.EventId?)ev.Id;
+                                cursorTs = ev.Timestamp.UtcTicks;
+                                newCount++;
+                            }
+                        }
+                    }
 
-                if (newCount == 0)
-                {
-                    // Send keepalive comment and wait before next poll
-                    await sse.WriteKeepaliveAsync(ctx.RequestAborted);
-                    try { await Task.Delay(250, ctx.RequestAborted); } catch (OperationCanceledException) { break; }
+                    if (newCount == 0)
+                    {
+                        // Send keepalive comment and wait before next poll
+                        await sse.WriteKeepaliveAsync(ctx.RequestAborted);
+                        try { await Task.Delay(250, ctx.RequestAborted); } catch (OperationCanceledException) { break; }
+                    }
                 }
             }
+            catch (OperationCanceledException) { /* client disconnected */ }
+            catch (Exception ex)
+            {
+                await SafeErrorAsync(sse, ex.Message, ctx);
+            }
+            return Results.Empty;
         }).RequireAuthorization(AuthServiceExtensions.PolicyViewLogs);
 
         // ── Span logs: GET /api/spans/{spanId}/logs ───────────────────────────
@@ -329,18 +407,21 @@ public static class EndpointMapper
                 return;
             }
 
+            if (!TryParseWindow(from, to, out var fromUtc, out var toUtc, out string? windowError))
+            {
+                ctx.Response.StatusCode = 400;
+                await ctx.Response.WriteAsJsonAsync(new { error = windowError }, ctx.RequestAborted);
+                return;
+            }
+
             // Build filter that hits the inverted index on @sp
             string spanFilter = $"@sp = '{spanId}'";
 
             var request = new QueryRequest
             {
                 Filter    = spanFilter,
-                FromUtc   = from is null ? null
-                            : DateTimeOffset.Parse(from, null,
-                                System.Globalization.DateTimeStyles.RoundtripKind).ToUniversalTime(),
-                ToUtc     = to is null ? null
-                            : DateTimeOffset.Parse(to, null,
-                                System.Globalization.DateTimeStyles.RoundtripKind).ToUniversalTime(),
+                FromUtc   = fromUtc,
+                ToUtc     = toUtc,
                 Count     = Math.Clamp(count, 1, 5_000),
                 Direction = QueryDirection.Forward,
             };
@@ -373,18 +454,21 @@ public static class EndpointMapper
                 return;
             }
 
+            if (!TryParseWindow(from, to, out var fromUtc, out var toUtc, out string? windowError))
+            {
+                ctx.Response.StatusCode = 400;
+                await ctx.Response.WriteAsJsonAsync(new { error = windowError }, ctx.RequestAborted);
+                return;
+            }
+
             // Build filter that hits the inverted index on @tr
             string traceFilter = $"@tr = '{traceId}'";
 
             var request = new QueryRequest
             {
                 Filter    = traceFilter,
-                FromUtc   = from is null ? null
-                            : DateTimeOffset.Parse(from, null,
-                                System.Globalization.DateTimeStyles.RoundtripKind).ToUniversalTime(),
-                ToUtc     = to is null ? null
-                            : DateTimeOffset.Parse(to, null,
-                                System.Globalization.DateTimeStyles.RoundtripKind).ToUniversalTime(),
+                FromUtc   = fromUtc,
+                ToUtc     = toUtc,
                 Count     = Math.Clamp(count, 1, 5_000),
                 Direction = QueryDirection.Forward,
             };
@@ -414,6 +498,77 @@ public static class EndpointMapper
         return (int)Math.Ceiling(raw / 604_800.0) * 604_800;
     }
 
+    // ── Request validation (runs BEFORE the response is committed) ─────────────
+
+    /// <summary>
+    /// Parses the time window, naming the offending parameter. <c>DateTimeOffset.Parse</c>
+    /// threw straight out of the handler, which — after the SSE headers had been flushed —
+    /// the client saw as a stream that stopped for no reason.
+    /// </summary>
+    private static bool TryParseWindow(
+        string? from, string? to,
+        out DateTimeOffset? fromUtc, out DateTimeOffset? toUtc, out string? error)
+    {
+        fromUtc = toUtc = null;
+        error   = null;
+
+        if (!TryParseInstant(from, "from", out fromUtc, out error)) return false;
+        if (!TryParseInstant(to,   "to",   out toUtc,   out error)) return false;
+
+        if (fromUtc is { } f && toUtc is { } t && f > t)
+        {
+            error = "'from' is later than 'to'.";
+            return false;
+        }
+        return true;
+    }
+
+    private static bool TryParseInstant(string? raw, string name, out DateTimeOffset? value, out string? error)
+    {
+        value = null;
+        error = null;
+        if (string.IsNullOrEmpty(raw)) return true;
+
+        if (!DateTimeOffset.TryParse(raw, null, System.Globalization.DateTimeStyles.RoundtripKind, out var parsed))
+        {
+            error = $"'{name}' is not a valid ISO-8601 timestamp: '{raw}'.";
+            return false;
+        }
+        value = parsed.ToUniversalTime();
+        return true;
+    }
+
+    /// <summary>
+    /// Compiles the filter here so a syntax error is a 400 with the parser's own message,
+    /// rather than an exception thrown from inside the result stream. The compiled form is
+    /// discarded — the executor compiles it again — which costs one parse of a short string
+    /// per query and buys the client an answer it can act on.
+    /// </summary>
+    private static bool TryCompileFilter(string? filter, out string? error)
+    {
+        error = null;
+        if (string.IsNullOrWhiteSpace(filter)) return true;
+        try
+        {
+            Ameto.Query.Filtering.CompiledFilter.Compile(filter);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = $"Invalid filter: {ex.Message}";
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Best-effort error frame. The stream may already be half-written or the socket gone;
+    /// failing to report a failure must not itself throw out of the handler.
+    /// </summary>
+    private static async Task SafeErrorAsync(SseJsonWriter sse, string message, HttpContext ctx)
+    {
+        try { await sse.WriteErrorAsync(message, ctx.RequestAborted); }
+        catch { /* the client is gone — nothing left to tell */ }
+    }
 }
 
 // ── Dynamic object converter ──────────────────────────────────────────────────
