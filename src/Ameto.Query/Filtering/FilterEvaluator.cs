@@ -162,6 +162,15 @@ public static class FilterEvaluator
     private static bool HasProperty(LogEvent ev, string prop) =>
         GetValue(ev, prop) is not null;
 
+    /// <summary>
+    /// Reads one property the way a predicate reads it — built-in aliases, dotted paths, the
+    /// flat-key reading of an OTLP attribute, all of it. Aggregation group keys go through
+    /// here so that <c>group by @l</c> and <c>@l = 'Error'</c> can never disagree about what
+    /// <c>@l</c> names.
+    /// </summary>
+    /// <param name="prop">An encoded path — <see cref="PropertyPath.Separator"/>-joined.</param>
+    public static object? ReadProperty(LogEvent ev, string prop) => GetValue(ev, prop);
+
     private static object? GetValue(LogEvent ev, string prop)
     {
         // Built-in CLEF fields. Which spellings count as built-in lives in BuiltinFields —

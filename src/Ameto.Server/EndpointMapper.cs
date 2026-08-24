@@ -153,6 +153,85 @@ public static class EndpointMapper
             return Results.Empty;
         }).RequireAuthorization(AuthServiceExtensions.PolicyViewLogs);
 
+        // ── Aggregation: GET /api/events/aggregate ────────────────────────────
+        // `select count(*) where @l = 'Error' group by ['service.name'] limit 20`.
+        //
+        // A separate endpoint because the answer is a different SHAPE: a table with its own
+        // columns, not a stream of events, so it cannot arrive on the SSE channel the search
+        // uses. The scan underneath is the ordinary one — same compilation of the where-clause,
+        // same index hints, same tier merge — and it is guarded like any other search.
+        app.MapGet("/api/events/aggregate", async (
+            HttpContext    ctx,
+            IQueryExecutor executor,
+            QueryGuard     guard,
+            ILoggerFactory loggerFactory,
+            string?        filter = null,
+            string?        from   = null,
+            string?        to     = null) =>
+        {
+            if (!TryParseWindow(from, to, out var fromUtc, out var toUtc, out string? windowError))
+                return Results.BadRequest(new { error = windowError });
+
+            // Parse, not TryParse: the caller came to THIS endpoint, so anything that is not an
+            // aggregation is their mistake and deserves to be named. TryParse's job is the
+            // opposite — to decline quietly so free text stays free text — and it belongs on
+            // the search path, not here.
+            Ameto.Query.Filtering.AggregationQuery query;
+            try
+            {
+                query = Ameto.Query.Filtering.AggregationParser.Parse(filter);
+            }
+            catch (Exception ex)
+            {
+                return Results.BadRequest(new { error = $"Invalid aggregation: {ex.Message}" });
+            }
+
+            QueryGuard.Lease? lease;
+            try { lease = await guard.TryEnterAsync(ctx.RequestAborted); }
+            catch (OperationCanceledException) { return Results.Empty; }
+            if (lease is null) return Refused(ctx);
+
+            var now     = DateTimeOffset.UtcNow;
+            var toBound = toUtc   ?? now;
+            var fromBnd = fromUtc ?? toBound.AddDays(-1);
+
+            using (lease)
+            {
+                using var deadline = guard.StartDeadline(ctx.RequestAborted);
+                try
+                {
+                    var result = await new Ameto.Query.AggregationExecutor(executor)
+                        .ExecuteAsync(query, fromBnd, toBound, deadline.Token);
+
+                    var rows = new AggregationRowDto[result.Rows.Count];
+                    for (int i = 0; i < rows.Length; i++)
+                        rows[i] = new AggregationRowDto { Key = result.Rows[i].Key, Values = result.Rows[i].Values };
+
+                    return Results.Json(new AggregationResponse
+                    {
+                        From          = fromBnd.ToString("O"),
+                        To            = toBound.ToString("O"),
+                        KeyColumns    = [.. result.KeyColumns],
+                        ValueColumns  = [.. result.ValueColumns],
+                        Rows          = rows,
+                        Scanned       = result.Scanned,
+                        GroupsFound   = result.GroupsFound,
+                        Partial       = result.Partial,
+                        PartialReason = result.PartialReason,
+                    }, AggregationJsonContext.Default.AggregationResponse);
+                }
+                catch (OperationCanceledException) when (deadline.TimedOut) { return TimedOutJson(guard); }
+                catch (OperationCanceledException) { return Results.Empty; }   // client left
+                catch (Exception ex)
+                {
+                    loggerFactory.CreateLogger(QueryLogCategory).LogError(ex, "Aggregation failed");
+                    return Results.Json(
+                        new { error = "The aggregation failed. See the server log for details." },
+                        statusCode: StatusCodes.Status500InternalServerError);
+                }
+            }
+        }).RequireAuthorization(AuthServiceExtensions.PolicyViewLogs);
+
         // ── Query validation: GET /api/events/validate ────────────────────────
         // Why this exists: EventSource cannot read the BODY of a non-200 response — a
         // browser sees only "connection failed" — so the 400 the stream endpoints now
@@ -749,6 +828,24 @@ public static class EndpointMapper
     {
         error = null;
         if (string.IsNullOrWhiteSpace(filter)) return true;
+
+        // An aggregation is a valid query, just not one this endpoint can answer: its result
+        // is a table and this channel carries events. Saying so beats the parser's own report,
+        // which would be about a `select` it has never heard of.
+        try
+        {
+            if (Ameto.Query.Filtering.AggregationParser.TryParse(filter, out _))
+            {
+                error = "This is an aggregation — ask GET /api/events/aggregate for it.";
+                return false;
+            }
+        }
+        catch (Exception ex)
+        {
+            error = $"Invalid aggregation: {ex.Message}";
+            return false;
+        }
+
         try
         {
             Ameto.Query.Filtering.CompiledFilter.Compile(filter);

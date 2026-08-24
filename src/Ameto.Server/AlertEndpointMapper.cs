@@ -164,6 +164,16 @@ public static class AlertEndpointMapper
         // with it is turn it off. Refusing the whole upsert would leave it stuck on, firing
         // nothing, with no way to reach it but the database.
         bool filterChanged = !string.Equals(req.Filter ?? "", existing?.Filter ?? "", StringComparison.Ordinal);
+        if (filterChanged && Ameto.Query.Filtering.AggregationParser.LooksLikeAggregation(req.Filter))
+        {
+            // An aggregation is a table, and a rule counts events against a threshold. The
+            // evaluator would read this as free text, match nothing, and give back a rule that
+            // can never fire — which looks exactly like one that has not fired yet.
+            rule  = null!;
+            error = "An alert rule counts events, so its filter cannot be an aggregation. " +
+                    "Use the filter alone — the rule's own threshold does the counting.";
+            return false;
+        }
         if (filterChanged && !string.IsNullOrWhiteSpace(req.Filter))
         {
             try { Ameto.Query.Filtering.CompiledFilter.Compile(req.Filter); }

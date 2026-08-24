@@ -1008,6 +1008,20 @@ public sealed class FilterParser
         _                => null,
     };
 
+    /// <summary>
+    /// Reads one property path out of an already-lexed stream, advancing <paramref name="pos"/>.
+    /// Exists so the aggregation grammar spells a property EXACTLY as a predicate does —
+    /// dot-splitting, bracket segments, index markers and all — instead of growing a second
+    /// reading of the same syntax that would drift from this one.
+    /// </summary>
+    internal static string ReadPathAt(List<Token> tokens, ref int pos)
+    {
+        var p = new FilterParser(tokens) { _pos = pos };
+        string path = p.ReadPropertyPath();
+        pos = p._pos;
+        return path;
+    }
+
     private string ReadProperty() => ReadPropertyPath();
 
     /// <summary>

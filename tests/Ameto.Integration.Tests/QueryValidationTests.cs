@@ -111,6 +111,11 @@ public sealed class QueryValidationTests : IClassFixture<AmetoWebAppFactory>
     [InlineData("could not connect to host")]
     [InlineData("Error timeout")]
     [InlineData("at Ameto.Query.FilterParser.Parse(String filter)")]
+    // `select` is not a keyword either. Claiming every query that starts with the word for the
+    // aggregation grammar would turn an ordinary search into a parse error — only `select`
+    // followed by an aggregate name and its parenthesis is unmistakable enough to claim.
+    [InlineData("select the cheapest plan")]
+    [InlineData("select count")]
     public async Task Pasted_text_is_searched_for_rather_than_refused(string filter)
     {
         var resp = await _client.GetAsync("/api/events?count=1&filter=" + Uri.EscapeDataString(filter));
@@ -135,6 +140,25 @@ public sealed class QueryValidationTests : IClassFixture<AmetoWebAppFactory>
 
         Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
         Assert.Contains("Invalid filter", await ErrorOf(resp), StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task An_alert_rule_cannot_count_an_aggregation()
+    {
+        // A rule counts events against a threshold; an aggregation is a table. The evaluator
+        // would read this as free text, match nothing, and leave a rule that can never fire —
+        // which looks exactly like one that has not fired yet.
+        var resp = await _client.PostAsJsonAsync("/api/alerts", new
+        {
+            name      = "aggregating-rule",
+            source    = "Log",
+            threshold = 1.0,
+            filter    = "select count(*) group by ['service.name']",
+            channels  = Array.Empty<object>(),
+        });
+
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+        Assert.Contains("aggregation", await ErrorOf(resp), StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]

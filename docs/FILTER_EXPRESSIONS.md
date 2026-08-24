@@ -36,6 +36,36 @@ sum(Elapsed) > 5             # no such function
 'a' != 'b'                   # no property to test — this used to match everything
 ```
 
+## Aggregation
+
+A query that starts with `select` answers with a **table** instead of a list of events,
+and is asked of `GET /api/events/aggregate` rather than the search endpoint.
+
+```
+select count(*)
+select count(*) where @l = 'Error' group by ['service.name']
+select count(*) as events, avg(Elapsed), max(Elapsed) group by @l limit 20
+select count(*) group by ['service.name'] as service, @l as level
+```
+
+Aggregates: `count(*)`, `count(P)` (events that carry `P`), `sum(P)`, `min(P)`, `max(P)`,
+`avg(P)`. Clauses: `where <filter>`, `group by <property>[, …]`, `limit <n>`, and `as <name>`
+after any column. Rows come back largest-first by the first value column.
+
+A few things it says out loud rather than guessing:
+
+- A group with no numbers to work on reports **null**, not `0` — an average over nothing is
+  not zero.
+- An event that does not carry the group key forms its own group with a **null** key; it is
+  not dropped and not merged with the empty string.
+- If the scan runs out of time, reads more than 2,000,000 events, or finds more than 10,000
+  distinct groups, `partial` is true and `partialReason` says which. The numbers are then
+  floors, not totals.
+- `groupsFound` counts the groups that existed, which can exceed the rows a `limit` returned.
+
+`count`, `min`, `max`, `sum`, `avg`, `select`, `where`, `group`, `by`, `as` and `limit` are
+recognised by position, not reserved — a property may still be called `Count` or `Limit`.
+
 ## Comparison operators
 
 ```
