@@ -73,6 +73,11 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
     private PaddedLong* _enqueuePos;
     private PaddedLong* _dequeuePos;
 
+    /// Read without the lock by the diagnostics counters below, so the reads have to be
+    /// ordered: a plain field can be hoisted into a register by the reading thread and never
+    /// observe the store at all. Volatile does not make check-then-read atomic against the
+    /// Free() that follows it — that would need a refcount on a path whose whole point is not
+    /// to have one — but it removes the failure that actually happens.
     private bool _disposed;
 
     // ── Construction ─────────────────────────────────────────────────────────
@@ -132,7 +137,7 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
     {
         get
         {
-            if (_disposed) return 0;   // the cursors below live in freed native memory
+            if (Volatile.Read(ref _disposed)) return 0;   // the cursors below live in freed native memory
             long e = Volatile.Read(ref _enqueuePos->Value);
             long d = Volatile.Read(ref _dequeuePos->Value);
             long diff = e - d;
@@ -158,10 +163,10 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
     public int SlabCapacity => _slabCount;
 
     /// <summary>Events ever accepted into the ring (monotonic). Zero once disposed.</summary>
-    public long AcceptedTotal => _disposed ? 0 : Volatile.Read(ref _enqueuePos->Value);
+    public long AcceptedTotal => Volatile.Read(ref _disposed) ? 0 : Volatile.Read(ref _enqueuePos->Value);
 
     /// <summary>Events ever handed to the drainer (monotonic). Zero once disposed.</summary>
-    public long DrainedTotal => _disposed ? 0 : Volatile.Read(ref _dequeuePos->Value);
+    public long DrainedTotal => Volatile.Read(ref _disposed) ? 0 : Volatile.Read(ref _dequeuePos->Value);
 
     /// <summary>
     /// Rejected because the payload exceeds one slab. Counted by the INGEST ENDPOINT,
@@ -393,7 +398,7 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
     public void Dispose()
     {
         if (_disposed) return;
-        _disposed = true;
+        Volatile.Write(ref _disposed, true);
 
         NativeMemory.Free(_payloadArena);
         NativeMemory.Free(_slabNext);

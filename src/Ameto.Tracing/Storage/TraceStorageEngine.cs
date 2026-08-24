@@ -1059,12 +1059,19 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             graphSegs = _coldSegments;
             if (UnflushedCountLocked() > 0)
             {
-                var spanSvc = new Dictionary<SpanId, string>(UnflushedCountLocked());
-                foreach (var s in UnflushedSpansLocked())
+                // Materialised ONCE. The graph needs two passes — parents have to be known
+                // before edges can be drawn — and calling the iterator twice allocated a second
+                // one for no reason, inside the read lock, in the window that is effectively
+                // permanent when flushes run back to back.
+                var unflushed = new List<SpanRecord>(UnflushedCountLocked());
+                unflushed.AddRange(UnflushedSpansLocked());
+
+                var spanSvc = new Dictionary<SpanId, string>(unflushed.Count);
+                foreach (var s in unflushed)
                     if (s.StartTimeUnixNano >= fromNano && s.StartTimeUnixNano <= toNano)
                         spanSvc[s.SpanId] = s.ServiceName;
 
-                foreach (var s in UnflushedSpansLocked())
+                foreach (var s in unflushed)
                 {
                     if (s.StartTimeUnixNano < fromNano || s.StartTimeUnixNano > toNano) continue;
                     if (s.ParentSpanId.IsEmpty) continue;
