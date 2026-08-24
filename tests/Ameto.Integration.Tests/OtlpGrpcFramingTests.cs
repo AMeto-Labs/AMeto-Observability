@@ -132,6 +132,19 @@ public sealed class OtlpGrpcFramingTests
         Assert.Equal(UnframeResult.TooLarge, Unframe(framed, "gzip", out _));
     }
 
+    [Theory]
+    // ArrayPool rounds a rent up to the next power of two, so the cap has to be measured
+    // against the LIMIT and not against the buffer that was handed back — otherwise every
+    // non-power-of-two limit is silently nearly doubled, and only the 8 MiB default means what
+    // it says.
+    [InlineData(1_000_000)]
+    [InlineData(10_000_001)]
+    public void The_limit_is_the_limit_not_the_pool_bucket(int limit)
+    {
+        var bomb = new byte[limit * 4L > int.MaxValue ? int.MaxValue / 2 : limit * 4];
+        Assert.Equal(UnframeResult.TooLarge, Unframe(Frame(bomb, gzip: true), "gzip", out _, limit));
+    }
+
     [Fact]
     public void A_message_exactly_at_the_limit_is_accepted()
     {

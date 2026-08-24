@@ -79,7 +79,7 @@ public sealed class FilterParser
         // writing an expression — where the input contains a comparison, a set or pattern
         // test, or a bracket. Without one of those, whatever the parser could not use becomes
         // search terms, exactly as before.
-        bool structural = StructuralTokenPresent(tokens);
+        bool structural = StructuralTokenPresent(tokens, filter!);
 
         try
         {
@@ -109,36 +109,67 @@ public sealed class FilterParser
         }
     }
 
+
     /// <summary>
-    /// Does anything in this input claim to be an expression? A comparison operator or a
-    /// bracket — and nothing else, because everything else people also write by accident:
+    /// Was somebody demonstrably writing an EXPRESSION? This decides one thing only: whether an
+    /// input the parser cannot read to the end is refused, or falls back to a text search. A
+    /// filter that parses cleanly is honoured either way, which is what lets this be strict.
+    ///
+    /// <para>Three signals, each narrowed by what people paste:</para>
     /// <list type="bullet">
-    /// <item><c>and</c>, <c>or</c>, <c>not</c>, <c>in</c>, <c>like</c> are ordinary English
-    /// and sit inside the phrases people search for — <c>could not connect</c>,
-    /// <c>crash in checkout</c>, <c>failures like this</c>.</item>
-    /// <item>A bare parenthesis is what a pasted stack frame is full of:
-    /// <c>at Ameto.Query.FilterParser.Parse(String filter)</c>. One that follows a function
-    /// NAME the language knows does count — <c>regexMatch(</c> cannot be an accident.</item>
+    /// <item>A comparison operator <b>with whitespace on both sides</b>. Bare punctuation is not
+    /// enough — a pasted URL carries <c>?status=active</c>, a logfmt line carries
+    /// <c>retries=3</c>, a stack frame carries <c>List&lt;String&gt;</c>, and refusing those
+    /// would break the search box for exactly the text people most often paste into it.
+    /// <c>Elapsed&gt;5</c> is unaffected: it parses, so it never reaches this question.</item>
+    /// <item>A <c>[</c> <b>immediately after <c>in</c></b> — the shape of a set test, where a
+    /// missing pair of quotes is worth naming. A bracket on its own is just JSON:
+    /// <c>{"tags":["eu"]}</c>.</item>
+    /// <item>A <c>(</c> after a function name the language knows. <c>regexMatch(</c> cannot be an
+    /// accident; a bare parenthesis is what a stack frame is full of.</item>
     /// </list>
-    /// A bracket is the one piece of punctuation that survives on its own, because it is rare
-    /// in prose and it is the shape of an <c>in [ … ]</c> list, where a missing pair of quotes
-    /// is worth refusing. Note this only decides whether an UNREADABLE input is refused — a
-    /// filter that parses cleanly is honoured either way.
+    /// <c>and</c>, <c>or</c>, <c>not</c>, <c>in</c> and <c>like</c> never count on their own —
+    /// they are ordinary English inside the phrases people search for.
     /// </summary>
-    private static bool StructuralTokenPresent(List<Token> tokens)
+    private static bool StructuralTokenPresent(List<Token> tokens, string source)
     {
         for (int i = 0; i < tokens.Count; i++)
         {
-            var k = tokens[i].Kind;
-            if (k is TokenKind.Eq or TokenKind.Ne or TokenKind.Lt or TokenKind.Le
-                  or TokenKind.Gt or TokenKind.Ge
-                  or TokenKind.LBracket)
-                return true;
+            var t = tokens[i];
+            switch (t.Kind)
+            {
+                case TokenKind.Eq or TokenKind.Ne or TokenKind.Lt or TokenKind.Le
+                  or TokenKind.Gt or TokenKind.Ge:
+                    if (SpacedInSource(source, t)) return true;
+                    break;
 
-            if (IsFunctionKeyword(k) && i + 1 < tokens.Count && tokens[i + 1].Kind == TokenKind.LParen)
-                return true;
+                case TokenKind.LBracket:
+                    if (i > 0 && tokens[i - 1].Kind == TokenKind.In) return true;
+                    break;
+
+                default:
+                    if (IsFunctionKeyword(t.Kind) && i + 1 < tokens.Count
+                        && tokens[i + 1].Kind == TokenKind.LParen)
+                        return true;
+                    break;
+            }
         }
         return false;
+    }
+
+    /// <summary>
+    /// True when the operator has whitespace on both sides in the ORIGINAL text — the difference
+    /// between <c>@l = 'Error'</c> and the <c>=</c> inside a pasted query string.
+    /// </summary>
+    private static bool SpacedInSource(string source, Token t)
+    {
+        int start = t.Pos;
+        int end   = start + Math.Max(t.Raw.Length, 1);
+        if (start <= 0 || !char.IsWhiteSpace(source[start - 1])) return false;
+
+        // End of input counts as the space after it: an operator with nothing following is a
+        // half-written comparison, never prose — `where Level =` has to keep being refused.
+        return end >= source.Length || char.IsWhiteSpace(source[end]);
     }
 
     /// <summary>One of the named functions — i.e. every keyword kind that is not a connective,

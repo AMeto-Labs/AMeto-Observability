@@ -282,6 +282,11 @@ public static class EndpointMapper
                     }
                 }
                 catch (OperationCanceledException) when (deadline.TimedOut) { return TimedOutJson(guard); }
+                // The unfiltered partner the other guarded endpoints all have. A closed tab
+                // cancels the linked token while TimedOut stays FALSE — it is a disconnect, not
+                // a budget — so the filter above does not match and there was nothing left to
+                // catch it: an ordinary client going away threw out of the delegate.
+                catch (OperationCanceledException) { return Results.Empty; }
                 if (deadline.TimedOut) return TimedOutJson(guard);
                 return Results.Ok(props.ToArray());
             }
@@ -322,6 +327,11 @@ public static class EndpointMapper
                     }
                 }
                 catch (OperationCanceledException) when (deadline.TimedOut) { return TimedOutJson(guard); }
+                // The unfiltered partner the other guarded endpoints all have. A closed tab
+                // cancels the linked token while TimedOut stays FALSE — it is a disconnect, not
+                // a budget — so the filter above does not match and there was nothing left to
+                // catch it: an ordinary client going away threw out of the delegate.
+                catch (OperationCanceledException) { return Results.Empty; }
                 if (deadline.TimedOut) return TimedOutJson(guard);
                 return Results.Ok(services.ToArray());
             }

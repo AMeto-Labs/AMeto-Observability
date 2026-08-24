@@ -105,10 +105,14 @@ internal static class OtlpGrpcFraming
             int total = 0;
             while (true)
             {
-                if (total == rented.Length)
+                // Against the LIMIT, never against the buffer. ArrayPool rounds a rent up to the
+                // next power of two, so Rent(10_000_000) hands back 16 MiB — measuring against
+                // that would silently raise every non-power-of-two limit to nearly double what
+                // the operator configured, and only the 8 MiB default would mean what it says.
+                if (total == maxInflatedBytes)
                 {
-                    // The buffer is full and the stream still has bytes: over the limit. Read one
-                    // more byte rather than growing, so nothing beyond the cap is ever committed.
+                    // Full, and the stream still has bytes: over the limit. One more byte rather
+                    // than growing, so nothing past the cap is ever committed.
                     if (gzip.ReadByte() >= 0)
                     {
                         ArrayPool<byte>.Shared.Return(rented);
@@ -118,7 +122,7 @@ internal static class OtlpGrpcFraming
                     break;
                 }
 
-                int read = gzip.Read(rented, total, rented.Length - total);
+                int read = gzip.Read(rented, total, maxInflatedBytes - total);
                 if (read == 0) break;
                 total += read;
             }

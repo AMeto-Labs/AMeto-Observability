@@ -130,18 +130,9 @@ public static class OtlpTraceMapper
             if (key is not ("url.full" or "url.path" or "http.url" or "http.target")) continue;
             var val = kv.Value?.StringValue;
             if (val is null) continue;
-            // Every spelling of every receiver, or an exporter starts tracing its own exports:
-            // one span per batch, exported, producing another. The spec paths were added later
-            // than this list and evaded it — and the docs now tell everyone to use them. Matched
-            // in full rather than as a "/v1/" prefix, which would swallow any customer span
-            // whose own API happens to be versioned that way.
-            if (val.Contains("/api/events",  StringComparison.OrdinalIgnoreCase) ||
-                val.Contains("/otlp/v1/",    StringComparison.OrdinalIgnoreCase) ||
-                val.Contains("/v1/logs",     StringComparison.OrdinalIgnoreCase) ||
-                val.Contains("/v1/traces",   StringComparison.OrdinalIgnoreCase) ||
-                val.Contains("/v1/metrics",  StringComparison.OrdinalIgnoreCase) ||
-                val.Contains("opentelemetry.proto.collector", StringComparison.OrdinalIgnoreCase))
-                return true;
+            // One list, shared with the streaming parser, matched as a whole path — see
+            // AmetoIngestEndpoints for why both of those matter.
+            if (AmetoIngestEndpoints.Matches(val.AsSpan())) return true;
         }
         return false;
     }

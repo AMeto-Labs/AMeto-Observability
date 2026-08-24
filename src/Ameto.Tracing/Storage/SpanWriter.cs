@@ -72,7 +72,15 @@ internal static class SpanWriter
     /// merge temp would publish a second copy of everything it merged. Merge temps carry a
     /// distinct suffix and are always swept.
     /// </param>
-    public static SpanSegmentInfo Write(string dataDir, IList<SpanRecord> spans, bool recoverable = true)
+    /// <param name="onNamed">
+    /// Invoked with the final .trc path as soon as the name exists, BEFORE any file is created.
+    /// The caller needs the name before the rename, not after: the rename is what makes the
+    /// segment visible to the background cold scan, and a guard published afterwards leaves a
+    /// window in which the scan adopts the segment while the flushing tier still holds the same
+    /// spans — counting them twice in the stats, service graph and volume paths.
+    /// </param>
+    public static SpanSegmentInfo Write(string dataDir, IList<SpanRecord> spans, bool recoverable = true,
+                                        Action<string>? onNamed = null)
     {
         if (spans.Count == 0) throw new InvalidOperationException("Cannot write empty span batch.");
 
@@ -92,6 +100,7 @@ internal static class SpanWriter
         string nonce    = Guid.NewGuid().ToString("N").Substring(0, 8);
         string baseName = $"spans-{minNano}-{maxNano}-{spans.Count}-{nonce}";
         string trcPath  = Path.Combine(dataDir, baseName + ".trc");
+        onNamed?.Invoke(trcPath);
 
         // TEMP-NAME PROTOCOL. All four files are built at .tmp names, fsynced, and only
         // then renamed into place — sidecars first, the .trc LAST: its appearance is the

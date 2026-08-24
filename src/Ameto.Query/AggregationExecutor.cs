@@ -98,6 +98,14 @@ public sealed class AggregationExecutor(IQueryExecutor executor, int scanBudget 
             Direction = QueryDirection.Backward,
         };
 
+        // The scan is wrapped because cancellation does NOT arrive uniformly. Most of the
+        // executor turns an expired token into a quiet `yield break`, but the cold prefilter
+        // runs under Parallel.ForEachAsync with the token in ParallelOptions, and that THROWS.
+        // Unwrapped, a timeout landing during the prefilter escaped to the endpoint and became
+        // a bare 504 — losing the groups already counted and, worse, replacing the documented
+        // `partial: true` answer with something that looks like a different failure entirely.
+        try
+        {
         await foreach (var ev in executor.ExecuteAsync(request, ct).ConfigureAwait(false))
         {
             // Checked BEFORE accounting for this event, so `scanned` ends at the budget rather
@@ -117,6 +125,8 @@ public sealed class AggregationExecutor(IQueryExecutor executor, int scanBudget 
             }
             acc.Add(ev, aggs);
         }
+        }
+        catch (OperationCanceledException) { /* reported as partial below, like every other stop */ }
 
         bool timedOut = ct.IsCancellationRequested;
 

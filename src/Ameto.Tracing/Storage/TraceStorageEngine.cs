@@ -608,11 +608,18 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         try
         {
             _beforeSegmentWrite?.Invoke();   // test seam: parks a flush mid-build
-            info = SpanWriter.Write(_dataDir, snapshot);
+            // The guard is published as soon as the NAME exists, before the rename that makes
+            // the file visible. Setting it from the return value happened after that rename, so
+            // the startup cold scan could adopt the segment in between — while _flushingSpans
+            // still held the same spans, which the stats, service-graph and volume paths add to
+            // the cold tiers without de-duplicating. Narrow (microseconds, once per process) and
+            // free to close.
+            info = SpanWriter.Write(_dataDir, snapshot,
+                                    onNamed: path => _publishingSegmentPath = path);
         }
         catch (Exception ex) { failure = ex; }
 
-        _publishingSegmentPath = info?.FilePath;
+        _publishingSegmentPath = info?.FilePath ?? _publishingSegmentPath;
         try
         {
             // ── Publish (short lock hold). _flushInProgress deliberately STAYS set: it is

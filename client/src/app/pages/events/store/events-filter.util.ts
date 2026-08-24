@@ -101,16 +101,29 @@ export function isoToDotNetUtcTicksString(iso: string): string {
  * previous clause before inserting a new one, without erasing the user's own text.
  */
 export function stripFilterClause(expr: string, pattern: RegExp): string {
-  return expr
+  let out = expr
     .replace(pattern, '')
     // Two connectives left facing each other where the clause used to be. Only `and and`
     // was collapsed, so a query joined with `or` — or with a mix — left `or  or` behind,
     // which the server now refuses outright instead of quietly mis-reading. The user never
     // typed the broken string: a checkbox click built it.
-    .replace(/\s+(?:and|or)(?:\s+(?:and|or))+\s+/gi, (m) => (/\bor\b/i.test(m) ? ' or ' : ' and '))
-    .replace(/^\s*(?:and|or|not)\s+/gi, '')
-    .replace(/\s+(?:and|or|not)\s*$/gi, '')
-    .trim();
+    .replace(/\s+(?:and|or)(?:\s+(?:and|or))+\s+/gi, (m) => (/\bor\b/i.test(m) ? ' or ' : ' and '));
+
+  // Until it settles. One pass was not enough: stripping the level clause out of
+  // `not @l = 'Error' and X` leaves `not  and X`, where the collapse above does not fire — it
+  // wants two connectives side by side — so removing the leading `not` left `and X`, a filter
+  // opening with a dangling connective, patched straight in and sent. A checkbox click built
+  // that string; the user never typed it.
+  let previous: string;
+  do {
+    previous = out;
+    out = out
+      .replace(/^\s*(?:and|or|not)\s+/i, '')
+      .replace(/\s+(?:and|or|not)\s*$/i, '')
+      .trim();
+  } while (out !== previous);
+
+  return out;
 }
 
 /** Active log levels in a filter expression. Full set when there's no `@l` clause. */

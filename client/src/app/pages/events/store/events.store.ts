@@ -338,7 +338,12 @@ export const EventsStore = signalStore(
       // Reconnect only for what the tail actually carries. It is opened with a filter and a
       // level set and nothing else, so a time-window or page-size change has nothing to apply.
       if (store.live()) {
-        if (store.filter() !== liveFilter || levelsParam(store.activeLevels()) !== liveLevels)
+        // BOTH halves read the APPLIED query. `activeLevels` is parsed from the draft, so
+        // comparing it against liveLevels mixed an applied filter with an unapplied level set:
+        // edit the text without pressing Enter, then change the page size, and the tail
+        // silently reopened with the OLD filter and the NEW levels — a combination the user
+        // never asked for, with the live dot still lit and nothing on screen to say so.
+        if (store.filter() !== liveFilter || levelsParam(parseLevelsFromFilter(store.filter())) !== liveLevels)
           startLive();
         return;
       }
@@ -571,7 +576,13 @@ export const EventsStore = signalStore(
      * query that produces a sentence in neither language, so every route into them stops here,
      * not only the toolbar buttons the template disables.
      */
-    function clauseEditingBlocked(): boolean { return store.isAggregation(); }
+    /**
+     * The level and service pickers rewrite the filter STRING by regex, and they rewrite the
+     * DRAFT — so the question is what the draft is, not what was last applied. Reading the
+     * applied query let a chip clicked while an aggregation was half-typed splice
+     * `@l = 'Error' and ` onto the front of it and send that, un-asked.
+     */
+    function clauseEditingBlocked(): boolean { return isAggregationQuery(store.filterInput()); }
 
     function toggleLevel(level: string): void {
       if (clauseEditingBlocked()) return;
@@ -628,7 +639,7 @@ export const EventsStore = signalStore(
       querySub = undefined;
 
       liveFilter = store.filter();
-      liveLevels = levelsParam(store.activeLevels());
+      liveLevels = levelsParam(parseLevelsFromFilter(liveFilter));
       patchState(store, {
         live: true, error: null, events: [], newEventIds: new Set(), selectedId: null,
         // The table belongs to the query it came from. Leaving it up while a tail runs put a

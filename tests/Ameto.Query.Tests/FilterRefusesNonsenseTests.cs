@@ -164,6 +164,14 @@ public sealed class FilterRefusesNonsenseTests
     [InlineData("at Ameto.Query.FilterParser.Parse(String filter)")]
     [InlineData("50% failed")]
     [InlineData("order#4711")]
+    // Punctuation that happens to BE an operator. A comparison only claims the input when it
+    // has whitespace on both sides — otherwise a pasted query string, a logfmt line and a
+    // generic type would each be refused, which is the search box's commonest input.
+    [InlineData("GET /api/orders?status=active")]
+    [InlineData("level=error msg=timeout retries=3")]
+    [InlineData("List<String> at Program.cs:42")]
+    [InlineData("{\"tags\":[\"eu\",\"west\"]}")]
+    [InlineData("a<b and b>c")]
     public void A_paste_still_compiles(string filter)
         => CompiledFilter.Compile(filter);
 
