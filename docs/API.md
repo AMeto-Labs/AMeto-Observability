@@ -147,9 +147,11 @@ Ingest a batch of log events.
 **Response `413 Payload Too Large`:** body > 4 MB.  
 **Response `400 Bad Request`:** invalid MessagePack.
 
-### `POST /otlp/v1/logs`, `POST /otlp/v1/traces`, `POST /otlp/v1/metrics`
+### `POST /v1/logs`, `POST /v1/traces`, `POST /v1/metrics`
 
-Native OpenTelemetry ingestion — point any OTLP exporter here (no collector required).
+Native OpenTelemetry ingestion over HTTP — point any OTLP exporter here (no collector required).
+These are the paths the OTLP specification names, which is what an exporter builds by appending
+to its configured endpoint. The older `/otlp/v1/…` spellings still work and are the same handler.
 
 **Auth:** API key (same as `/api/events`).  
 **Content-Type:** `application/json` (OTLP/JSON) or `application/x-protobuf` (OTLP/Protobuf).  
@@ -157,6 +159,35 @@ Native OpenTelemetry ingestion — point any OTLP exporter here (no collector re
 
 **Response `200 OK`:** `{ "ingested": N, "dropped": M }`.  
 `resource.attributes["service.name"]` becomes the event's service; `traceId` / `spanId` are indexed for log↔trace correlation.
+
+### OTLP over gRPC
+
+Same three signals, same API key, on a **separate port** — set `OtlpGrpcPort: 4317` in
+`config.yml` (or `Ameto__OtlpGrpcPort=4317`). It is **off by default**.
+
+```
+OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
+OTEL_EXPORTER_OTLP_PROTOCOL=grpc
+OTEL_EXPORTER_OTLP_HEADERS=x-seq-apikey=<your key>
+```
+
+The port is separate because gRPC requires HTTP/2, and without TLS there is no ALPN to negotiate
+it — a plaintext listener must be told to speak HTTP/2 and then speaks nothing else. Putting that
+on the main port would stop the UI, every `/api` call, the live tail and the container health
+check from working, since no browser does HTTP/2 without TLS.
+
+**Encodings:** uncompressed and `gzip`. Anything else is answered `UNIMPLEMENTED` (12) with
+`grpc-accept-encoding: identity,gzip`, which is what makes an exporter retry uncompressed.
+
+**Status is in the trailers, not the HTTP status line** — every call answers HTTP 200:
+
+| `grpc-status` | when |
+|---|---|
+| `0` OK | accepted; the response carries `partial_success.rejected_…` when the ingest buffer dropped records |
+| `3` INVALID_ARGUMENT | wrong content type, malformed frame, undecodable payload |
+| `8` RESOURCE_EXHAUSTED | batch over `Ingestion.MaxOtlpBatchBytes` |
+| `12` UNIMPLEMENTED | unsupported compression |
+| `16` UNAUTHENTICATED | missing or insufficient API key |
 
 ---
 

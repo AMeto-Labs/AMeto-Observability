@@ -3,6 +3,13 @@ Ameto:
   DataDirectory: data
   HttpPort: 5341
 
+  # OTLP over gRPC. 0 = off. 4317 is the OTLP convention.
+  #
+  # It has to be its own port: gRPC needs HTTP/2, and without TLS there is no ALPN to negotiate
+  # it, so a plaintext listener that accepts HTTP/2 accepts nothing else. On the main port that
+  # would stop the UI, /api, the live tail and the health check from answering.
+  OtlpGrpcPort: 0
+
   # TLS — leave empty for plain HTTP
   SslCertPath: ""
   SslCertPassword: ""

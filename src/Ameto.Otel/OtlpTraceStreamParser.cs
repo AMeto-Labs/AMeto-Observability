@@ -462,9 +462,19 @@ public static class OtlpTraceStreamParser
         else if (!httpFromNew)                { httpStatus = (short)value; }
     }
 
+    /// <summary>
+    /// Every spelling of every receiver — kept in step with <c>OtlpTraceMapper</c>'s copy, and
+    /// with the routes in <c>OtlpEndpointMapper</c>. Miss one and an exporter traces its own
+    /// exports: a span per batch, exported, producing another. Matched in full rather than as a
+    /// <c>/v1/</c> prefix, which would swallow any customer span whose own API is versioned so.
+    /// </summary>
     private static bool ContainsAmetoEndpoint(ReadOnlySpan<byte> url) =>
         ContainsAsciiIgnoreCase(url, "/api/events"u8) ||
-        ContainsAsciiIgnoreCase(url, "/otlp/v1/"u8);
+        ContainsAsciiIgnoreCase(url, "/otlp/v1/"u8)   ||
+        ContainsAsciiIgnoreCase(url, "/v1/logs"u8)    ||
+        ContainsAsciiIgnoreCase(url, "/v1/traces"u8)  ||
+        ContainsAsciiIgnoreCase(url, "/v1/metrics"u8) ||
+        ContainsAsciiIgnoreCase(url, "opentelemetry.proto.collector"u8);
 
     /// <summary>ASCII case-insensitive substring search (needle must be lowercase ASCII).</summary>
     private static bool ContainsAsciiIgnoreCase(ReadOnlySpan<byte> haystack, ReadOnlySpan<byte> needleLower)

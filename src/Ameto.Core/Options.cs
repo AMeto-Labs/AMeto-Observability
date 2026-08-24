@@ -251,6 +251,18 @@ public sealed class ServerOptions
     public string           SslCertPassword  { get; init; } = "";
 
     /// <summary>
+    /// Port for OTLP over gRPC — 4317 is the convention. <b>0 disables it</b>, which is the
+    /// default: gRPC needs HTTP/2, and without TLS there is no ALPN to negotiate it, so a
+    /// plaintext listener has to be told to speak HTTP/2 and then speaks nothing else. That
+    /// cannot be the main port — no browser does HTTP/2 without TLS, so the UI, every /api call,
+    /// the SSE tail and the container health check would all stop working on it. A second
+    /// listener is therefore the only shape this can take, and opening one on every existing
+    /// install because the binary was upgraded is not a decision to make on the operator's
+    /// behalf. Set it to 4317 to accept collectors.
+    /// </summary>
+    public int              OtlpGrpcPort     { get; init; }
+
+    /// <summary>
     /// Trust X-Forwarded-Proto/Host/For from a reverse proxy (nginx, traefik).
     /// Required for correct OAuth redirect URIs and generated links when TLS
     /// terminates on the proxy and Kestrel itself serves plain HTTP. Enable
