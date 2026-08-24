@@ -16,7 +16,7 @@ import {
   Loader, LoaderCircle, LogOut, Mail, Maximize2, Network, Pause, Pencil,
   Pin, PinOff, Play, Plus, RefreshCw, Regex, Save, ScrollText, Search, Send,
   Settings, Share2, Sigma, SlidersHorizontal, Sparkles, Terminal, TextWrap, ToggleLeft,
-  ToggleRight, Trash2, Type, User, UserPlus, Users, X, ZoomOut,
+  ToggleRight, Trash2, TriangleAlert, Type, User, UserPlus, Users, X, ZoomOut,
 } from 'lucide-angular';
 import { authInterceptor } from './core/interceptors/auth.interceptor';
 
@@ -32,7 +32,7 @@ const APP_ICONS = {
   Loader, LoaderCircle, LogOut, Mail, Maximize2, Network, Pause, Pencil,
   Pin, PinOff, Play, Plus, RefreshCw, Regex, Save, ScrollText, Search, Send,
   Settings, Share2, Sigma, SlidersHorizontal, Sparkles, Terminal, TextWrap, ToggleLeft,
-  ToggleRight, Trash2, Type, User, UserPlus, Users, X, ZoomOut,
+  ToggleRight, Trash2, TriangleAlert, Type, User, UserPlus, Users, X, ZoomOut,
 };
 
 /**

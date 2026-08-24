@@ -6,7 +6,9 @@
   <!-- ── Main body ────────────────────────────────────────────────────── -->
   <div class="events-body">
     <div class="events-list-wrap">
-      <!-- Column headers -->
+      <!-- Column headers — for the EVENT list. An aggregation's columns are whatever its
+           query asked for, so it brings its own header. -->
+      @if (!store.aggregation()) {
       <div class="events-header">
         <span class="ev-h-stripe"></span>
         <span class="ev-h-col ev-h-ts">TIME <lucide-icon name="arrow-up" [size]="10" /></span>
@@ -19,6 +21,7 @@
           </button>
         </span>
       </div>
+      }
 
       @if (store.loading()) {
         <div class="loading-bar"></div>
@@ -30,6 +33,13 @@
           <button class="err-retry" (click)="store.loadEvents()">Retry</button>
         </div>
       }
+
+      @if (store.aggregation(); as agg) {
+        <!-- A table of totals, not a list of events. Nothing below applies to it: no virtual
+             scroller (the rows are bounded by the query's own limit), no infinite scroll, no
+             detail drawer — an aggregate row is not an event to open. -->
+        <app-aggregation-table [result]="agg" />
+      } @else {
 
       <!-- List: fixed-height virtual (default) or natural-height wrapped rows -->
       <div #eventsScroll class="events-list" (scroll)="onEventsScroll($event)">
@@ -88,6 +98,7 @@
           Jump to live <lucide-icon name="arrow-right" [size]="12" />
         </button>
       </div>
+      }
     </div>
 
     <!-- Detail drawer — resizable; width persisted in localStorage -->

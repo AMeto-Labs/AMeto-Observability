@@ -9,6 +9,7 @@ import { EventsToolbarComponent } from './components/events-toolbar/events-toolb
 import { EventsFilterBarComponent } from './components/events-filter-bar/events-filter-bar';
 import { EventListRowComponent } from './components/event-list-row/event-list-row';
 import { EventDetailComponent } from './components/event-detail/event-detail';
+import { AggregationTableComponent } from './components/aggregation-table/aggregation-table';
 import { SignalsPanelComponent } from './signals-panel/signals-panel';
 import { EventsStore } from './store/events.store';
 import { UserPreferencesService } from '../../core/services/user-preferences.service';
@@ -25,6 +26,7 @@ import { UserPreferencesService } from '../../core/services/user-preferences.ser
     LucideAngularModule, EmptyStateComponent,
     EventsToolbarComponent, EventsFilterBarComponent,
     EventListRowComponent, EventDetailComponent, SignalsPanelComponent,
+    AggregationTableComponent,
   ],
   templateUrl: './events.html',
   styleUrl: './events.scss',

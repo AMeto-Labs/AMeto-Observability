@@ -49,8 +49,9 @@
     <button
       class="tb-live-btn"
       [class.live-on]="store.live()"
+      [disabled]="!store.live() && store.isAggregation()"
       (click)="store.toggleLive()"
-      title="Live tail">
+      [title]="!store.live() && store.isAggregation() ? 'An aggregation is a snapshot of a window — there is nothing for a tail to append' : 'Live tail'">
       <span class="live-dot" [class.on]="store.live()"></span>
       <span>Live</span>
     </button>

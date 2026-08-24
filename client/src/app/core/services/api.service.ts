@@ -1,7 +1,7 @@
 import { Injectable, inject } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { Observable } from 'rxjs';
-import { EventDto, EventQueryParams, StatsDto, EventCountsDto } from '../models/event.model';
+import { EventDto, EventQueryParams, StatsDto, EventCountsDto, AggregationDto } from '../models/event.model';
 import {
   AlertRule, AlertRuleUpsertRequest, AlertStateSnapshot, AlertHistoryEntry,
   AlertSilence, AlertPreviewResult, MaintenanceWindow,
@@ -165,6 +165,18 @@ export class ApiService {
     if (params.bucket)  p.set('bucket',  String(params.bucket));
     if (params.service) p.set('service', params.service);
     return this.http.get<EventCountsDto>(`/api/events/counts?${p.toString()}`);
+  }
+
+  /**
+   * Runs a `select … group by …` query. Plain JSON rather than SSE: the answer is a table with
+   * its own columns, which cannot arrive one event at a time.
+   */
+  aggregate(params: { filter: string; from?: string; to?: string }): Observable<AggregationDto> {
+    const p = new URLSearchParams();
+    p.set('filter', params.filter);
+    if (params.from) p.set('from', params.from);
+    if (params.to)   p.set('to',   params.to);
+    return this.http.get<AggregationDto>(`/api/events/aggregate?${p.toString()}`);
   }
 
   // ── Alerts ───────────────────────────────────────────────────────────────

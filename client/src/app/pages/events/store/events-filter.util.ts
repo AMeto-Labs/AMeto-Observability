@@ -188,6 +188,23 @@ export function setServicesClause(expr: string, svcs: Set<string>): string {
   return stripped.trim() ? `${clause} and ${stripped.trim()}` : clause;
 }
 
+/**
+ * Does this query LOOK like it asks for an aggregation table rather than a list of events?
+ *
+ * A conservative hint, not the definition. The server decides, by tokenising: its lexer drops
+ * any character it has no meaning for, so `select "count"(*)` — quoting an identifier out of
+ * SQL habit — is an aggregation to it and not to this regex. The divergence is deliberately
+ * ONE-WAY. Under-detecting costs a wasted round trip that `loadEvents` then corrects, because
+ * the search endpoint answers such a query by naming the aggregate endpoint. Over-detecting
+ * would send an ordinary search to the wrong endpoint and turn it into an error — and `select`
+ * is not a reserved word, so `select the cheapest plan` has to stay a text search.
+ *
+ * Keep this narrower than the server, never wider.
+ */
+export function isAggregationQuery(expr: string): boolean {
+  return /^\s*select\s+(count|sum|min|max|avg)\s*\(/i.test(expr);
+}
+
 /** Comma-separated active levels for the `levels=` query param (undefined = all). */
 export function levelsParam(levels: Set<string>): string | undefined {
   return levels.size === LEVELS.length ? undefined : [...levels].join(',');

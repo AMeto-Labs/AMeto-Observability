@@ -258,7 +258,7 @@ export class EventDetailComponent {
 
         if (!numericKeys.length) { this.metricsLoading.set(false); return; }
 
-        const ts   = new Date(this.event()['@t'] as unknown as string).getTime();
+        const ts   = new Date(this.event()['@t']).getTime();
         const from = new Date(ts - 10 * 60_000).toISOString();
         const to   = new Date(ts + 10 * 60_000).toISOString();
 
@@ -319,7 +319,7 @@ export class EventDetailComponent {
   }
 
   eventTsMs = computed(() =>
-    new Date(this.event()['@t'] as unknown as string).getTime()
+    new Date(this.event()['@t']).getTime()
   );
 
   // ── Derived ───────────────────────────────────────────────────────────
