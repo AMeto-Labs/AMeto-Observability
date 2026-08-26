@@ -15,7 +15,7 @@ RUN --mount=type=cache,target=/root/.npm \
 
 # Build production bundle
 COPY client/ ./
-RUN npx ng build --configuration production --base-href /ameto/ --output-path /build/wwwroot
+RUN npx ng build --configuration production --output-path /build/wwwroot
 
 # Angular 17+ outputs assets to browser/ — flatten to wwwroot root
 RUN if [ -d /build/wwwroot/browser ]; then \

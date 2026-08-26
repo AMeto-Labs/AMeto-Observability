@@ -15,6 +15,7 @@ import { MetricSeriesDto, MetricCatalogDto, MetricQueryRequest, HeatmapDto, Exem
 import { SearchHistoryDto } from '../models/search-history.model';
 import { UpdateStatusDto } from '../models/update.model';
 import { AuthService } from './auth.service';
+import { appPath } from '../../shared/utils/app-url';
 
 @Injectable({ providedIn: 'root' })
 export class ApiService {
@@ -40,11 +41,10 @@ export class ApiService {
       next: ({ ticket }) => {
         if (cancelled) return;
         params.set('ticket', ticket);
-        
-        const url = new URL(`.${path}`, document.baseURI);
-        url.search = params.toString();
-
-        es = new EventSource(url.toString()); wire(es);
+        // EventSource is not an HttpClient call, so the interceptor never sees it — and a
+        // relative URL would resolve against the current route, not against <base>.
+        es = new EventSource(`${appPath(path)}?${params.toString()}`);
+        wire(es);
       },
       error: () => { this.auth.verifySession(); onError(); },
     });

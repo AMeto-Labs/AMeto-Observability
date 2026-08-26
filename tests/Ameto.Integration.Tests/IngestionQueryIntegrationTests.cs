@@ -111,7 +111,7 @@ public sealed class IngestionQueryIntegrationTests
 ///   • a known API key (<see cref="TestApiKey"/>) is seeded into the auth store and
 ///     attached as the <c>X-Seq-ApiKey</c> header on every client (covers ingest).
 /// </summary>
-public sealed class AmetoWebAppFactory : WebApplicationFactory<Program>
+public class AmetoWebAppFactory : WebApplicationFactory<Program>
 {
     /// <summary>API key seeded into the auth store and sent by every test client.</summary>
     public const string TestApiKey = "rdl_integration_test_key";
@@ -120,11 +120,18 @@ public sealed class AmetoWebAppFactory : WebApplicationFactory<Program>
     private readonly Lock   _seedGate = new();
     private bool _apiKeySeeded;
 
+    /// <summary>
+    /// The Ameto:BasePath this host runs under. Empty — every path at the root — for every
+    /// suite but the one that exists to exercise a prefix; see BasePathTests.
+    /// </summary>
+    protected virtual string ConfiguredBasePath => "";
+
     protected override void ConfigureWebHost(Microsoft.AspNetCore.Hosting.IWebHostBuilder builder)
     {
         builder.UseSetting("Ameto:DataDirectory", _tempDir);
         builder.UseSetting("Ameto:HttpPort", "0");       // random port
         builder.UseSetting("Ameto:Cluster:Enabled", "false");
+        builder.UseSetting("Ameto:BasePath", ConfiguredBasePath);
 
         // Stub web root. The SPA-fallback test asserts that an unmapped /api/* GET falls
         // through to index.html, but the real wwwroot is emitted by `npm run build` and
@@ -135,8 +142,12 @@ public sealed class AmetoWebAppFactory : WebApplicationFactory<Program>
         // it is disposed with it and never touches the repo.
         string webRoot = Path.Combine(_tempDir, "wwwroot");
         Directory.CreateDirectory(webRoot);
+        // Shaped like the real client/src/index.html — a <base> tag inside <head> — because
+        // the server rewrites that tag as it serves the file. Against a stub without one, a
+        // rewriter that quietly did nothing would look exactly like one that worked.
         File.WriteAllText(Path.Combine(webRoot, "index.html"),
-            "<!doctype html><title>Ameto test SPA stub</title>");
+            "<!doctype html><html><head><base href=\"/\"><title>Ameto test SPA stub</title>" +
+            "</head><body><app-root></app-root></body></html>");
         builder.UseSetting(Microsoft.AspNetCore.Hosting.WebHostDefaults.WebRootKey, webRoot);
 
         // Override the ServerOptions with test-specific settings

@@ -19,10 +19,9 @@ import {
   ToggleRight, Trash2, Type, User, UserPlus, Users, X, ZoomOut,
 } from 'lucide-angular';
 import { authInterceptor } from './core/interceptors/auth.interceptor';
+import { baseHrefInterceptor } from './core/interceptors/base-href.interceptor';
 
 import { routes } from './app.routes';
-
-import { HttpInterceptorFn } from '@angular/common/http';
 
 const APP_ICONS = {
   Activity, AlertCircle, ArrowDown, ArrowLeft, ArrowRight, ArrowUp, Asterisk, Ban,
@@ -55,30 +54,6 @@ class FilteringErrorHandler extends ErrorHandler {
   }
 }
 
-export const baseHrefInterceptor: HttpInterceptorFn = (req, next) => {
-  // 1. Проверяем только относительные запросы (не внешние ссылки)
-  if (!req.url.startsWith('http://') && !req.url.startsWith('https://')) {
-    
-    // 2. Достаем актуальный baseHref из тега <base> (например, "/ameto/")
-    const baseElement = document.querySelector('base');
-    let baseHref = baseElement ? baseElement.getAttribute('href') || '/' : '/';
-
-    // 3. Форматируем baseHref, чтобы он всегда заканчивался на слэш
-    if (!baseHref.endsWith('/')) {
-      baseHref += '/';
-    }
-
-    // 4. Очищаем начало оригинального URL от лишних слэшей
-    const cleanUrl = req.url.startsWith('/') ? req.url.substring(1) : req.url;
-
-    // 5. Собираем итоговый путь (например, /ameto/ + users)
-    const apiReq = req.clone({ url: `${baseHref}${cleanUrl}` });
-    return next(apiReq);
-  }
-
-  return next(req);
-};
-
 export const appConfig: ApplicationConfig = {
   providers: [
     provideBrowserGlobalErrorListeners(),
@@ -88,5 +63,4 @@ export const appConfig: ApplicationConfig = {
     { provide: LUCIDE_ICONS, multi: true, useValue: new LucideIconProvider(APP_ICONS) },
   ],
 };
-
 

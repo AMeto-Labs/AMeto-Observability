@@ -25,6 +25,7 @@ import {
   JsonViewerActions, JvMenuRequest, jvLiteral, jvWildcard,
 } from '../../../../shared/components/json-viewer/json-viewer.actions';
 import { ContextMenuService, OverlayPanelRef } from '../../../../shared/services/overlay';
+import { appPath } from '../../../../shared/utils/app-url';
 
 export interface PropEntry {
   /** Full dot-path usable in filter expressions, e.g. "Payload.Customer.Id" */
@@ -682,7 +683,7 @@ export class EventDetailComponent {
     if (!m) return;
     this.propMenu.set(null);
     const v = /^-?\d+(\.\d+)?$/.test(m.entry.value) ? m.entry.value : `"${m.entry.value.replaceAll('"', '')}"`;
-    window.open(`/traces?ql=${encodeURIComponent(`{ .${m.entry.label} = ${v} }`)}`, '_blank');
+    window.open(appPath(`/traces?ql=${encodeURIComponent(`{ .${m.entry.label} = ${v} }`)}`), '_blank');
   }
 
   private async writeClipboard(text: string): Promise<void> {
@@ -786,7 +787,7 @@ export class EventDetailComponent {
   openTraceExternal(): void {
     const tid = this.traceId();
     if (!tid) return;
-    window.open(`/traces?trace=${encodeURIComponent(tid)}`, '_blank');
+    window.open(appPath(`/traces?trace=${encodeURIComponent(tid)}`), '_blank');
     this.menuType.set(null);
   }
 
