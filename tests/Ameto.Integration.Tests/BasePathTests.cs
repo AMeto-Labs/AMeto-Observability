@@ -100,7 +100,65 @@ public sealed class PrefixedBasePathTests : IClassFixture<PrefixedBasePathTests.
         Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
     }
 
+    // ── Ingest: reachable under the prefix AND still at the root ──────────────
+
+    /// <summary>
+    /// Invalid msgpack. Enough to prove the ingest endpoint was REACHED — the discriminator
+    /// that matters is not the status code but that this is not a 200 <c>text/html</c>, which
+    /// is what the SPA fallback answers when routing has gone wrong.
+    /// </summary>
+    private static ByteArrayContent BadClefBatch()
+    {
+        var content = new ByteArrayContent([0xFF, 0xFE, 0x00, 0x01]);
+        content.Headers.ContentType =
+            new System.Net.Http.Headers.MediaTypeHeaderValue("application/octet-stream");
+        return content;
+    }
+
+    [Theory]
+    [InlineData("/ameto/api/events")]
+    [InlineData("/api/events")]
+    public async Task ClefIngest_IsReachable_UnderThePrefixAndAtTheRoot(string path)
+    {
+        var response = await _client.PostAsync(path, BadClefBatch());
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+    }
+
+    [Theory]
+    [InlineData("/ameto/otlp/v1/logs")]
+    [InlineData("/ameto/otlp/v1/traces")]
+    [InlineData("/ameto/otlp/v1/metrics")]
+    [InlineData("/otlp/v1/logs")]
+    [InlineData("/otlp/v1/traces")]
+    [InlineData("/otlp/v1/metrics")]
+    public async Task OtlpIngest_IsReachable_UnderThePrefixAndAtTheRoot(string path)
+    {
+        // Both addresses matter, for different people. Under the prefix is what an agent behind
+        // the reverse proxy must use; at the root is what every agent configured before the
+        // prefix existed is still using, and it must not break on upgrade.
+        var content = new ByteArrayContent([0xFF, 0xFE, 0x00, 0x01]);
+        content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/x-protobuf");
+
+        var response = await _client.PostAsync(path, content);
+
+        Assert.NotEqual("text/html", response.Content.Headers.ContentType?.MediaType);
+    }
+
     // ── What the prefix deliberately does NOT do ──────────────────────────────
+
+    [Fact]
+    public async Task StrippingProxy_StillGetsTheEntryDocumentWithThePrefix()
+    {
+        // The other deployment shape, and a common one: nginx `location /ameto/` with
+        // `proxy_pass http://host:8555/` — the trailing slash strips the prefix, so requests
+        // arrive here bare. The browser is still under /ameto/, so the base href must come from
+        // configuration and not from the request that happened to arrive. It does: this asks
+        // for "/" the way a stripping proxy would, and must still be told "/ameto/".
+        var html = await _client.GetStringAsync("/");
+
+        Assert.Contains("<base href=\"/ameto/\">", html);
+    }
 
     [Fact]
     public async Task Root_StillAnswers_BecauseThePrefixIsAdditive()

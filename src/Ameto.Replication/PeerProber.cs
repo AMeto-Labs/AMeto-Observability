@@ -98,7 +98,9 @@ public sealed class PeerProber : IHostedService, IDisposable
             using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             cts.CancelAfter(TimeSpan.FromSeconds(5));
 
-            using var req = new HttpRequestMessage(HttpMethod.Post, $"{baseAddress}/api/replication/ping")
+            // TrimEnd, as in SegmentReplicator: a peer address carrying a BasePath may well be
+            // written with a trailing slash, and a non-2xx here returns without logging anything.
+            using var req = new HttpRequestMessage(HttpMethod.Post, $"{baseAddress.TrimEnd('/')}/api/replication/ping")
             {
                 Content = System.Net.Http.Json.JsonContent.Create(payload),
             };

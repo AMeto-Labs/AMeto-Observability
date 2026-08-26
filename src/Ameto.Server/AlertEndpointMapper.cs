@@ -59,12 +59,14 @@ public static class AlertEndpointMapper
         // ── Maintenance windows (scheduled recurring silences) ──────────────────
         group.MapGet("/maintenance", (AlertEvaluator ev) => Results.Ok(ev.GetMaintenance()));
 
-        ops.MapPost("/maintenance", (MaintenanceRequest req, AlertEvaluator ev) =>
+        ops.MapPost("/maintenance", (HttpContext ctx, MaintenanceRequest req, AlertEvaluator ev) =>
         {
             if (string.IsNullOrWhiteSpace(req.Name)) return Results.BadRequest("name is required");
             var w = BuildMaintenance(null, req);
             ev.UpsertMaintenance(w);
-            return Results.Created($"/api/alerts/maintenance/{w.Id}", w);
+            // Location is an address the caller may follow, so it needs the deployment prefix;
+            // Results.Created takes the string as given. PathBase is empty at the root.
+            return Results.Created($"{ctx.Request.PathBase}/api/alerts/maintenance/{w.Id}", w);
         });
 
         ops.MapPut("/maintenance/{id}", (string id, MaintenanceRequest req, AlertEvaluator ev) =>
@@ -116,12 +118,12 @@ public static class AlertEndpointMapper
         group.MapGet("/{id}", (string id, AlertRuleStore store) =>
             store.GetById(id) is { } r ? Results.Ok(Redact(r)) : Results.NotFound());
 
-        manage.MapPost("/", (AlertRuleUpsertRequest req, AlertRuleStore store) =>
+        manage.MapPost("/", (HttpContext ctx, AlertRuleUpsertRequest req, AlertRuleStore store) =>
         {
             if (!TryBuildRule(null, req, null, out var rule, out var error))
                 return Results.BadRequest(new { error });
             store.Upsert(rule);
-            return Results.Created($"/api/alerts/{rule.Id}", Redact(rule));
+            return Results.Created($"{ctx.Request.PathBase}/api/alerts/{rule.Id}", Redact(rule));
         });
 
         manage.MapPut("/{id}", (string id, AlertRuleUpsertRequest req, AlertRuleStore store) =>

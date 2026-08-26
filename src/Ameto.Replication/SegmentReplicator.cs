@@ -73,7 +73,10 @@ public sealed class SegmentReplicator : IDisposable
         byte[]            data,
         CancellationToken ct)
     {
-        var url = $"{peer.BaseAddress}/api/replication/segments/{segment.NodeId.Value}/{segment.Id.Value}";
+        // TrimEnd: the address is operator-supplied and may carry a peer BasePath. With a
+        // trailing slash this would build "…/ameto//api/replication/…", which matches no route —
+        // and a failed push is one LogWarning and a segment that is never offered again.
+        var url = $"{peer.BaseAddress.TrimEnd('/')}/api/replication/segments/{segment.NodeId.Value}/{segment.Id.Value}";
         try
         {
             using var content = new ByteArrayContent(data);

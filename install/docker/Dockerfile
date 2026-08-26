@@ -148,9 +148,12 @@ ENV Ameto__DataDirectory=/data \
 
 EXPOSE 5341
 
-# BusyBox wget; shell form expands ${Ameto__HttpPort} so a runtime port override is honoured.
+# BusyBox wget; shell form, so ${Ameto__HttpPort} and ${Ameto__BasePath} are expanded at
+# runtime and an override of either is honoured. An unset BasePath expands to empty, which is
+# the default and leaves this byte-identical. /health answers at the root under a prefix too,
+# but probing the address the operator actually configured is what makes this a test.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD wget -q -O /dev/null "http://localhost:${Ameto__HttpPort:-5341}/health" || exit 1
+    CMD wget -q -O /dev/null "http://localhost:${Ameto__HttpPort:-5341}${Ameto__BasePath}/health" || exit 1
 
 USER ameto
 
