@@ -216,6 +216,36 @@ public sealed class DefaultBasePathTests : IClassFixture<AmetoWebAppFactory>
         Assert.Contains("<base href=\"/\">", html);
     }
 
+    [Theory]
+    [InlineData("/v1/logs")]        // the OTLP spec paths — this server maps them under /otlp/,
+    [InlineData("/v1/traces")]      // so a stock exporter pointed at the bare address lands here
+    [InlineData("/v1/metrics")]
+    [InlineData("/api/event")]      // the CLEF endpoint, mistyped
+    [InlineData("/api/stats")]      // a real route, wrong verb
+    [InlineData("/health")]
+    public async Task UnmatchedPost_Is405_NotTheSpaDocument(string path)
+    {
+        // The SPA fallback must not answer a POST. A sender that gets 200 with an HTML body reads
+        // it as delivery and drops the batch — silently, and far from anything that would explain
+        // it. MapFallbackToFile carried GET/HEAD metadata and so returned 405 here; a bare
+        // MapFallback carries none, which is what this pins.
+        var response = await _client.PostAsync(path, new StringContent(""));
+
+        Assert.Equal(HttpStatusCode.MethodNotAllowed, response.StatusCode);
+        Assert.NotEqual("text/html", response.Content.Headers.ContentType?.MediaType);
+    }
+
+    [Fact]
+    public async Task DeepRoute_StillServesTheSpa_OnGet()
+    {
+        // The other half of the same constraint: restricting the fallback must not break the
+        // deep-link case it exists for.
+        var response = await _client.GetAsync("/events/some/client/route");
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        Assert.Equal("text/html", response.Content.Headers.ContentType?.MediaType);
+    }
+
     [Fact]
     public async Task EntryDocument_RevalidatesRatherThanCaching()
     {

@@ -103,9 +103,9 @@ services:
       # Ameto__Updates__CheckIntervalMinutes: "60"
 
     # No healthcheck here on purpose: a compose-level one REPLACES the image’s entirely.
-    # The image’s (install/docker/Dockerfile) is shell form and expands Ameto__HttpPort and
-    # Ameto__BasePath at runtime, so it follows your configuration. The block that used to sit
-    # here was exec form with a hard-coded port and root path, which silently ignored both.
+    # The image’s (install/docker/Dockerfile) is shell form and expands Ameto__HttpPort, so it
+    # follows a port override. The block that used to sit here was exec form with a hard-coded
+    # port, which silently ignored one.
 
     # Only containers carrying this label are touched by the Watchtower service below.
     # labels:

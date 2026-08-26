@@ -268,13 +268,19 @@ if (enableMetrics)
 if (enableTracing)
     app.MapTraceEndpoints();
 
-// SPA fallback — Angular handles client-side routing
-// "{*path:nonfile}" is what MapFallbackToFile used: a request for a missing asset should 404,
-// not be answered with an HTML page that the browser was told to parse as a script.
+// SPA fallback — Angular handles client-side routing.
+//
+// Both halves of this are copied from MapFallbackToFile, which is what it replaces:
+//   * "{*path:nonfile}" — a request for a missing ASSET should 404, not be answered with an HTML
+//     page the browser was told to parse as a script.
+//   * GET/HEAD only — the helper attached this metadata, a bare MapFallback does not, and without
+//     it every unmatched POST answers 200 text/html instead of 405. That reads as success to a
+//     sender: an OTLP exporter pointed at the spec paths /v1/logs and friends (this server maps
+//     them under /otlp/, so they are unmatched) would report delivery and drop the batch.
 app.MapFallback("{*path:nonfile}", async (HttpContext ctx) =>
 {
     if (!await spaIndex.TryWriteAsync(ctx)) ctx.Response.StatusCode = StatusCodes.Status404NotFound;
-});
+}).WithMetadata(new HttpMethodMetadata(["GET", "HEAD"]));
 
 // ── Startup banner ────────────────────────────────────────────────────────────
 app.Lifetime.ApplicationStarted.Register(() =>

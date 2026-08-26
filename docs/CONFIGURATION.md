@@ -23,6 +23,7 @@ Ameto__DataDirectory=/mnt/logs Ameto__HttpPort=5342 ./Ameto.Server
 | `SslCertPath` | string | `""` | Path to a `.pfx` TLS certificate. Empty = plain HTTP. |
 | `SslCertPassword` | string | `""` | Password for the `.pfx` certificate. |
 | `TrustForwardedHeaders` | bool | `false` | Trust `X-Forwarded-Proto/Host/For` from a reverse proxy that terminates TLS. Required for correct OAuth redirect URIs behind nginx/traefik. Enable only when the server is reachable exclusively through the proxy. |
+| `KnownProxies` | string[] | `[]` | IPs of the reverse proxies whose forwarded headers are trusted. Empty trusts any source and logs a startup warning — list your proxy here whenever `TrustForwardedHeaders` is on. |
 | `RamTargetPercent` | int | `85` | When host/container RAM load exceeds this, the hot tier is flushed to disk to release the write buffer. |
 
 ---
@@ -69,6 +70,11 @@ location /ameto/ {
     # tail looks frozen, then arrives in bursts.
     proxy_buffering off;
     proxy_read_timeout 900;
+
+    # Ingest batches are up to 4 MB (Ameto:Ingestion:MaxBodyBytes). nginx defaults to 1 MB and
+    # answers 413 — and a Serilog sink treats that as delivered and drops the batch.
+    client_max_body_size 8m;
+    proxy_request_buffering off;   # stream large batches rather than spooling them to disk
 }
 ```
 
