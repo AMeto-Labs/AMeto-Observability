@@ -578,13 +578,25 @@ public static class EndpointMapper
                         // a wide window is a full-catalog scan, and without a budget it
                         // would hold the slot it took for as long as that takes.
                         using var deadline = guard.StartDeadline(ctx.RequestAborted);
-                        await foreach (var ev in executor.ExecuteAsync(request, deadline.Token))
+                        try
                         {
-                            await sse.WriteEventAsync(LogEventDto.From(ev), _json, deadline.Token);
-                            cursor   = (Ameto.Core.EventId?)ev.Id;
-                            cursorTs = ev.Timestamp.UtcTicks;
-                            newCount++;
+                            await foreach (var ev in executor.ExecuteAsync(request, deadline.Token))
+                            {
+                                await sse.WriteEventAsync(LogEventDto.From(ev), _json, deadline.Token);
+                                cursor   = (Ameto.Core.EventId?)ev.Id;
+                                cursorTs = ev.Timestamp.UtcTicks;
+                                newCount++;
+                            }
                         }
+                        // The executor ends its own scan by yielding when the budget expires,
+                        // so the check below is normally reached with no exception at all. The
+                        // write does not end that way: the same token is handed to
+                        // Body.WriteAsync, and a client too slow to drain one frame turns the
+                        // expiry into a throw from the middle of the loop. Both endings are the
+                        // same timeout and both owe the client the terminal query-error below —
+                        // without this the throw would carry on out to the outer catch written
+                        // for a plain disconnect, and the stream would simply stop instead.
+                        catch (OperationCanceledException) when (deadline.TimedOut) { }
                         if (deadline.TimedOut)
                         {
                             await SafeErrorAsync(sse,
