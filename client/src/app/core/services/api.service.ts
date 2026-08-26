@@ -1,4 +1,4 @@
-import { Injectable, inject } from '@angular/core';
+import { Inject, Injectable, inject } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { Observable } from 'rxjs';
 import { EventDto, EventQueryParams, StatsDto, EventCountsDto } from '../models/event.model';
@@ -15,11 +15,14 @@ import { MetricSeriesDto, MetricCatalogDto, MetricQueryRequest, HeatmapDto, Exem
 import { SearchHistoryDto } from '../models/search-history.model';
 import { UpdateStatusDto } from '../models/update.model';
 import { AuthService } from './auth.service';
+import { Location } from '@angular/common'; // <-- Добавить этот импорт
 
 @Injectable({ providedIn: 'root' })
 export class ApiService {
   private http = inject(HttpClient);
   private auth = inject(AuthService);
+  private location = inject(Location); // <-- Внедряем сервис локации через inject()
+
 
   /**
    * Opens an SSE stream authorised by a single-use ticket instead of putting the
@@ -36,15 +39,24 @@ export class ApiService {
   ): () => void {
     let es: EventSource | undefined;
     let cancelled = false;
-    const sub = this.http.post<{ ticket: string }>('/api/auth/sse-ticket', {}).subscribe({
+
+    // Превращает '/api/...' в '/ameto/api/...' с учетом baseHref
+    const apiPath = this.location.prepareExternalUrl('/api/auth/sse-ticket');
+
+    const sub = this.http.post<{ ticket: string }>(apiPath, {}).subscribe({
       next: ({ ticket }) => {
         if (cancelled) return;
         params.set('ticket', ticket);
-        es = new EventSource(`${path}?${params.toString()}`);
+        
+        // Превращает относительный path в '/ameto/path' для нативного EventSource
+        const ssePath = this.location.prepareExternalUrl(path);
+        es = new EventSource(`${ssePath}?${params.toString()}`);
+        
         wire(es);
       },
       error: () => { this.auth.verifySession(); onError(); },
     });
+    
     return () => { cancelled = true; sub.unsubscribe(); es?.close(); };
   }
 
