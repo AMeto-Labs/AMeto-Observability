@@ -126,6 +126,20 @@ public class AmetoWebAppFactory : WebApplicationFactory<Program>
     /// </summary>
     protected virtual string ConfiguredBasePath => "";
 
+    /// <summary>
+    /// False leaves wwwroot empty, for the suite that checks the server copes with a UI that is
+    /// not there yet. Everything else wants the stub.
+    /// </summary>
+    protected virtual bool SeedSpaStub => true;
+
+    /// <summary>The per-run wwwroot, so a test can populate it after the host has started.</summary>
+    public string WebRootPath { get; private set; } = "";
+
+    /// <summary>The stub itself, so a test that starts without one can write the same bytes later.</summary>
+    public const string SpaStubHtml =
+        "<!doctype html><html><head><base href=\"/\"><title>Ameto test SPA stub</title>" +
+        "</head><body><app-root></app-root></body></html>";
+
     protected override void ConfigureWebHost(Microsoft.AspNetCore.Hosting.IWebHostBuilder builder)
     {
         builder.UseSetting("Ameto:DataDirectory", _tempDir);
@@ -142,12 +156,13 @@ public class AmetoWebAppFactory : WebApplicationFactory<Program>
         // it is disposed with it and never touches the repo.
         string webRoot = Path.Combine(_tempDir, "wwwroot");
         Directory.CreateDirectory(webRoot);
+        WebRootPath = webRoot;
+
         // Shaped like the real client/src/index.html — a <base> tag inside <head> — because
         // the server rewrites that tag as it serves the file. Against a stub without one, a
         // rewriter that quietly did nothing would look exactly like one that worked.
-        File.WriteAllText(Path.Combine(webRoot, "index.html"),
-            "<!doctype html><html><head><base href=\"/\"><title>Ameto test SPA stub</title>" +
-            "</head><body><app-root></app-root></body></html>");
+        if (SeedSpaStub)
+            File.WriteAllText(Path.Combine(webRoot, "index.html"), SpaStubHtml);
         builder.UseSetting(Microsoft.AspNetCore.Hosting.WebHostDefaults.WebRootKey, webRoot);
 
         // Override the ServerOptions with test-specific settings
@@ -159,6 +174,11 @@ public class AmetoWebAppFactory : WebApplicationFactory<Program>
                 NodeId        = NodeId.Local,
                 DataDirectory = _tempDir,
                 HttpPort      = 0,
+                // Kept in step with the UseSetting above. The pipeline reads the prefix from
+                // IConfiguration, not from here, so nothing today notices the difference — but a
+                // future DI consumer of ServerOptions would read "" under PrefixedFactory and
+                // pass for the wrong reason.
+                BasePath      = ConfiguredBasePath,
                 HotTier = new HotTierOptions
                 {
                     MaxSizeBytes = 8 * 1024 * 1024, // 8 MB — small for tests

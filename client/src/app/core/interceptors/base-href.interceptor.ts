@@ -11,6 +11,9 @@ import { appPath } from '../../shared/utils/app-url';
  * Rewriting once here beats prefixing several hundred call sites, and keeps the prefix a
  * deployment concern rather than something every service has to remember.
  *
+ * Deciding what is app-relative belongs in {@link appPath}, not here: a URL that names its own
+ * destination comes back unchanged, and `req.clone` with an identical URL is inert.
+ *
  * Must run before {@link authInterceptor}: that one only reads the URL, but an interceptor
  * that ever decides *whether* to attach the token by looking at the path should see the final
  * one.
@@ -18,11 +21,4 @@ import { appPath } from '../../shared/utils/app-url';
 export const baseHrefInterceptor: HttpInterceptorFn = (
   req: HttpRequest<unknown>,
   next: HttpHandlerFn,
-) => {
-  // Anything carrying its own scheme (`https:`, `blob:`, `data:`) or protocol-relative
-  // (`//cdn/x`) already names where it is going. A `startsWith('http://')` test would miss
-  // both of the latter and turn a cross-origin request into a same-origin path.
-  if (/^[a-z][a-z0-9+.-]*:/i.test(req.url) || req.url.startsWith('//')) return next(req);
-
-  return next(req.clone({ url: appPath(req.url) }));
-};
+) => next(req.clone({ url: appPath(req.url) }));

@@ -70,7 +70,7 @@ internal static class AuthEndpoints
             // It still carries PathBase: inert is not the same as correct, and the day someone
             // lets OnTicketReceived fall through, a bare "/" would drop the deployment prefix.
             await ctx.ChallengeAsync(scheme,
-                new AuthenticationProperties { RedirectUri = ctx.Request.PathBase + "/" });
+                new AuthenticationProperties { RedirectUri = ctx.AppUrl("/") });
             return Results.Empty;
         });
 

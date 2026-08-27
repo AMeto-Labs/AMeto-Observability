@@ -177,6 +177,42 @@ public sealed class PrefixedBasePathTests : IClassFixture<PrefixedBasePathTests.
 }
 
 /// <summary>
+/// The entry document is cached, but the absence of one must not be. wwwroot is filled by a
+/// separate build step, and the request that finds it empty is routinely earlier than the step
+/// that fills it — a checkout whose <c>npm run build</c> is still running, a slow volume mount,
+/// an installer that starts the service before it finishes copying files.
+/// </summary>
+public sealed class MissingSpaTests : IClassFixture<MissingSpaTests.NoStubFactory>
+{
+    public sealed class NoStubFactory : AmetoWebAppFactory
+    {
+        protected override bool SeedSpaStub => false;
+    }
+
+    private readonly NoStubFactory _factory;
+
+    public MissingSpaTests(NoStubFactory factory) => _factory = factory;
+
+    [Fact]
+    public async Task AnIndexThatArrivesAfterTheFirstRequest_IsPickedUpWithoutARestart()
+    {
+        var client = _factory.CreateClient();
+
+        // A readiness probe, a health checker, anything at all — one request is enough to make
+        // the server look, and looking must not be a decision it remembers.
+        var beforeBuild = await client.GetAsync("/");
+        Assert.Equal(HttpStatusCode.NotFound, beforeBuild.StatusCode);
+
+        File.WriteAllText(Path.Combine(_factory.WebRootPath, "index.html"),
+                          AmetoWebAppFactory.SpaStubHtml);
+
+        var afterBuild = await client.GetAsync("/");
+        Assert.Equal(HttpStatusCode.OK, afterBuild.StatusCode);
+        Assert.Contains("<base href=\"/\">", await afterBuild.Content.ReadAsStringAsync());
+    }
+}
+
+/// <summary>
 /// The default. Everything here asserts that nothing moved, because every deployment that
 /// upgrades into this change is running with no prefix configured.
 /// </summary>

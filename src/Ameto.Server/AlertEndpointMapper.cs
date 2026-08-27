@@ -66,7 +66,7 @@ public static class AlertEndpointMapper
             ev.UpsertMaintenance(w);
             // Location is an address the caller may follow, so it needs the deployment prefix;
             // Results.Created takes the string as given. PathBase is empty at the root.
-            return Results.Created($"{ctx.Request.PathBase}/api/alerts/maintenance/{w.Id}", w);
+            return Results.Created(ctx.AppUrl($"/api/alerts/maintenance/{w.Id}"), w);
         });
 
         ops.MapPut("/maintenance/{id}", (string id, MaintenanceRequest req, AlertEvaluator ev) =>
@@ -123,7 +123,7 @@ public static class AlertEndpointMapper
             if (!TryBuildRule(null, req, null, out var rule, out var error))
                 return Results.BadRequest(new { error });
             store.Upsert(rule);
-            return Results.Created($"{ctx.Request.PathBase}/api/alerts/{rule.Id}", Redact(rule));
+            return Results.Created(ctx.AppUrl($"/api/alerts/{rule.Id}"), Redact(rule));
         });
 
         manage.MapPut("/{id}", (string id, AlertRuleUpsertRequest req, AlertRuleStore store) =>

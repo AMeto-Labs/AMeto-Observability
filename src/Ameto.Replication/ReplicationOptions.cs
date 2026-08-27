@@ -21,12 +21,17 @@ public sealed class ReplicationOptions
 
     /// <summary>
     /// Peer addresses to contact on startup for initial discovery.
-    /// Format: "http://host:port".
+    /// Format: <c>"http://host:port"</c>, or <c>"http://host:port/ameto"</c> for a peer served
+    /// under a deployment prefix. A trailing slash is trimmed here so that no consumer has to
+    /// remember to — see <see cref="ReplicationNode.BaseAddress"/> for what forgetting costs.
     /// </summary>
-    public string[] SeedNodes     { get; init; } = [];
+    public string[] SeedNodes     { get => field; init => field = (value ?? []).Select(static s => (s ?? "").Trim().TrimEnd('/')).ToArray(); } = [];
 
-    /// <summary>Publicly reachable base URL of THIS node (sent to peers in probes).</summary>
-    public string   LocalAddress  { get; init; } = "http://localhost:5341";
+    /// <summary>
+    /// Publicly reachable base URL of THIS node (sent to peers in probes). Include the
+    /// deployment prefix if this node is served under one; a trailing slash is trimmed.
+    /// </summary>
+    public string   LocalAddress  { get => field; init => field = (value ?? "").Trim().TrimEnd('/'); } = "http://localhost:5341";
 
     /// <summary>Per-segment HTTP push timeout.</summary>
     public TimeSpan PushTimeout   { get; init; } = TimeSpan.FromSeconds(60);

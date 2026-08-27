@@ -71,7 +71,7 @@ location /ameto/ {
     proxy_buffering off;
     proxy_read_timeout 900;
 
-    # Ingest batches are up to 4 MB (Ameto:Ingestion:MaxBodyBytes). nginx defaults to 1 MB and
+    # Ingest batches are up to 4 MB (Ameto:Ingestion:MaxBatchBytes). nginx defaults to 1 MB and
     # answers 413 — and a Serilog sink treats that as delivered and drops the batch.
     client_max_body_size 8m;
     proxy_request_buffering off;   # stream large batches rather than spooling them to disk

@@ -22,17 +22,20 @@ namespace Ameto.Server;
 /// installer of the same version disagreed about where they were hosted. Rewriting the one tag
 /// as the document is served costs a single cached string and makes one build work anywhere.</para>
 ///
-/// <para>The document is read once and cached, deliberately. It is the only file whose bytes
-/// depend on configuration, and configuration is bound once at startup — re-reading it per
-/// request would buy nothing and put a file read on every page load.</para>
+/// <para>The document is read on first use and cached from then on, deliberately: it is the
+/// only file whose bytes depend on configuration, configuration is bound once at startup, and
+/// re-reading it per request would buy nothing while putting a file read on every page load. A
+/// miss is not cached — see <see cref="Load"/> for why that asymmetry matters.</para>
 /// </summary>
 internal sealed class SpaIndex(IWebHostEnvironment environment, UrlBasePath basePath, ILogger<SpaIndex> logger)
 {
     private readonly Lock _gate = new();
 
-    private byte[]? _bytes;
-    private string? _etag;
-    private bool    _loaded;
+    /// <summary>The rewritten document and its validator, published together or not at all.</summary>
+    private sealed record Cached(byte[] Bytes, string ETag);
+
+    private Cached? _cached;
+    private bool    _warnedMissing;
 
     /// <summary>
     /// Writes the entry document, or returns false when there is nothing to serve — a source
@@ -41,8 +44,9 @@ internal sealed class SpaIndex(IWebHostEnvironment environment, UrlBasePath base
     /// </summary>
     public async ValueTask<bool> TryWriteAsync(HttpContext ctx)
     {
-        var (bytes, etag) = Load();
-        if (bytes is null || etag is null) return false;
+        var cached = Load();
+        if (cached is null) return false;
+        var (bytes, etag) = (cached.Bytes, cached.ETag);
 
         var response = ctx.Response;
         response.Headers.ETag = etag;
@@ -75,35 +79,51 @@ internal sealed class SpaIndex(IWebHostEnvironment environment, UrlBasePath base
         return true;
     }
 
-    private (byte[]? Bytes, string? ETag) Load()
+    /// <summary>
+    /// The document, read and rewritten on first use and cached from then on. Null while there
+    /// is nothing to read.
+    ///
+    /// <para>A MISS is deliberately not cached, and that asymmetry is the point. wwwroot is
+    /// populated by a separate build step, and the request that finds it empty is often earlier
+    /// than the step that fills it — a source checkout whose `npm run build` is still running, a
+    /// slow volume mount, an installer that starts the service before it finishes copying. Latch
+    /// the miss and a single early probe turns the UI off until someone restarts the process.
+    /// Retrying costs one File.Exists per request, and only while there is no UI to serve.</para>
+    /// </summary>
+    private Cached? Load()
     {
-        if (Volatile.Read(ref _loaded)) return (_bytes, _etag);
+        var cached = Volatile.Read(ref _cached);
+        if (cached is not null) return cached;
 
         lock (_gate)
         {
-            if (_loaded) return (_bytes, _etag);
+            if (_cached is not null) return _cached;
 
             var root = environment.WebRootPath;
             var path = string.IsNullOrEmpty(root) ? null : Path.Combine(root, "index.html");
 
-            if (path is not null && File.Exists(path))
+            if (path is null || !File.Exists(path))
             {
-                var html    = Rewrite(File.ReadAllText(path), basePath.BaseHref, logger);
-                var bytes   = Encoding.UTF8.GetBytes(html);
-                _bytes = bytes;
-                _etag  = $"\"{Convert.ToHexStringLower(SHA256.HashData(bytes).AsSpan(0, 16))}\"";
-            }
-            else if (!basePath.IsRoot)
-            {
-                // Worth saying out loud: a prefix was configured and there is no SPA to apply
-                // it to, which usually means the client build never ran.
-                logger.LogWarning("BasePath is set to {BasePath} but no index.html was found under {WebRoot} — " +
-                                  "the API answers under the prefix, but there is no UI to serve.",
-                                  basePath.PathBase, root);
+                // Once, not on every retry — a missing UI should be one line in the log, not a
+                // line per request for the life of the process.
+                if (!basePath.IsRoot && !_warnedMissing)
+                {
+                    _warnedMissing = true;
+                    logger.LogWarning("BasePath is set to {BasePath} but no index.html was found under {WebRoot} — " +
+                                      "the API answers under the prefix, but there is no UI to serve.",
+                                      basePath.PathBase, root);
+                }
+                return null;
             }
 
-            Volatile.Write(ref _loaded, true);
-            return (_bytes, _etag);
+            var html  = Rewrite(File.ReadAllText(path), basePath.BaseHref, logger);
+            var bytes = Encoding.UTF8.GetBytes(html);
+            var fresh = new Cached(bytes, $"\"{Convert.ToHexStringLower(SHA256.HashData(bytes).AsSpan(0, 16))}\"");
+
+            // One publication of one fully-built object: a reader can never see the bytes
+            // without the validator that matches them.
+            Volatile.Write(ref _cached, fresh);
+            return fresh;
         }
     }
 
