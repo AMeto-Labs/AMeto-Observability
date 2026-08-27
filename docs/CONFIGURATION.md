@@ -19,10 +19,109 @@ Ameto__DataDirectory=/mnt/logs Ameto__HttpPort=5342 ./Ameto.Server
 | `NodeId` | uint | `0` | Node identifier. Must be unique per node in a multi-node setup. |
 | `DataDirectory` | string | `"data"` | Root directory for WAL files, cold segments, and the auth/retention SQLite database (`Ameto.db`). |
 | `HttpPort` | int | `5341` | Kestrel listen port (serves the API, SSE, OTLP, and the SPA). |
+| `BasePath` | string | `""` | URL prefix the whole server is served under, e.g. `"/ameto"`, for hosting behind a reverse proxy at `https://host/ameto`. Empty = served at `/`. Applied at runtime, so one build works under any prefix — see [Serving under a URL prefix](#serving-under-a-url-prefix). |
 | `SslCertPath` | string | `""` | Path to a `.pfx` TLS certificate. Empty = plain HTTP. |
 | `SslCertPassword` | string | `""` | Password for the `.pfx` certificate. |
 | `TrustForwardedHeaders` | bool | `false` | Trust `X-Forwarded-Proto/Host/For` from a reverse proxy that terminates TLS. Required for correct OAuth redirect URIs behind nginx/traefik. Enable only when the server is reachable exclusively through the proxy. |
+| `KnownProxies` | string[] | `[]` | IPs of the reverse proxies whose forwarded headers are trusted. Empty trusts any source and logs a startup warning — list your proxy here whenever `TrustForwardedHeaders` is on. |
 | `RamTargetPercent` | int | `85` | When host/container RAM load exceeds this, the hot tier is flushed to disk to release the write buffer. |
+
+---
+
+## Serving under a URL prefix
+
+To host Ameto at `https://logs.example.com/ameto` rather than at the root of a host, set:
+
+```yaml
+Ameto:
+  BasePath: "/ameto"
+```
+
+`ameto`, `/ameto` and `/ameto/` all mean the same thing. The value is read once at startup, so
+changing it needs a restart. A value that cannot be a path prefix — a whole URL, a query string,
+a `..` segment — stops the server at startup with a message naming the setting, rather than
+half-configuring a pipeline that then serves the UI from the wrong place.
+
+The prefix is applied at **runtime**, not at build time: the SPA's `<base href>` is rewritten as
+`index.html` is served. One build and one container image therefore work under any prefix, and
+the Windows installer and the Docker image of the same version no longer disagree about where
+they are hosted.
+
+### The proxy must pass the prefix through
+
+This is the one thing that has to be right. In nginx that means `proxy_pass` with **no trailing
+slash** and no URI part:
+
+```nginx
+# Bare /ameto does not match `location /ameto/`, so send it to the canonical form.
+location = /ameto { return 301 /ameto/; }
+
+location /ameto/ {
+    proxy_pass http://127.0.0.1:5341;      # NO trailing slash — the prefix reaches the server
+    proxy_http_version 1.1;
+
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Host  $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+
+    # Ameto streams the live tail over SSE. Without this, nginx buffers the response and the
+    # tail looks frozen, then arrives in bursts.
+    proxy_buffering off;
+    proxy_read_timeout 900;
+
+    # Ingest batches are up to 4 MB (Ameto:Ingestion:MaxBatchBytes). nginx defaults to 1 MB and
+    # answers 413 — and a Serilog sink treats that as delivered and drops the batch.
+    client_max_body_size 8m;
+    proxy_request_buffering off;   # stream large batches rather than spooling them to disk
+}
+```
+
+Add `TrustForwardedHeaders: true` with your proxy's IP in `KnownProxies` so the server builds
+links and OAuth redirects with the public scheme and host rather than Kestrel's own.
+
+A trailing slash on `proxy_pass` (`proxy_pass http://127.0.0.1:5341/;`) **strips** the prefix
+instead. The UI, the API, SSE and ingest all still work that way — the `<base href>` comes from
+configuration, not from the request — but everything the server *generates* loses the prefix,
+because the request no longer carries it:
+
+* the OAuth `redirect_uri` sent to Google/Microsoft, so sign-in fails at the provider;
+* the post-sign-in redirects, which land outside the app and discard the freshly issued token;
+* the `Location` header on `POST /api/alerts` and `POST /api/alerts/maintenance`.
+
+If you only use local username/password sign-in, a stripping proxy is a workable setup. If you
+use OAuth, pass the prefix through.
+
+`X-Forwarded-Prefix` is deliberately **not** honoured. With `TrustForwardedHeaders` on and no
+`KnownProxies`, any client could set it — and a path base of `//evil.com` is a valid one, which
+would turn the post-sign-in redirect into a token handed to another host.
+
+### What changes for callers
+
+Nothing is moved; an address is added. `UsePathBase` strips the prefix when it is present and
+passes every other request through untouched, so **every endpoint answers both at the root and
+under the prefix**. That is what lets the container health check and any agent already pointed at
+the bare address survive the change with no coordination — the upgrade is safe to do first and
+reconfigure afterwards.
+
+The consequence to be clear about: the prefix is **not an access boundary**. With
+`BasePath: "/ameto"` set, `POST /api/auth/login` is still fully live at the origin root. If you
+need the prefix to actually restrict what is reachable, enforce that at the proxy.
+
+Callers that reach Kestrel directly (agents on the same host, the container health check) need no
+change. Callers that go through a proxy scoped to the prefix must use it:
+
+| | direct | through the proxy |
+|---|---|---|
+| UI | `http://host:5341/` | `https://host/ameto/` |
+| Logs (CLEF) | `http://host:5341/api/events` | `https://host/ameto/api/events` |
+| OTLP logs / traces / metrics | `http://host:5341/otlp/v1/…` | `https://host/ameto/otlp/v1/…` |
+| Health | `http://host:5341/health` | `https://host/ameto/health` |
+| OAuth callback to register | — | `https://host/ameto/api/auth/oauth/{provider}/callback` |
+
+Replication `LocalAddress` and `SeedNodes` may carry a peer's prefix
+(`http://node1:5341/ameto`), with or without a trailing slash.
 
 ---
 
@@ -33,8 +132,8 @@ Local username/password login is on by default. Google / Microsoft OAuth buttons
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `LocalEnabled` | bool | `true` | Allow local username/password login. |
-| `Google:ClientId` / `Google:ClientSecret` | string | `""` | OAuth client (Google Cloud Console → Credentials → *Web application*). Redirect URI to register: `https://<host>/api/auth/oauth/google/callback` — Google requires **https** for any non-localhost host. |
-| `Microsoft:ClientId` / `Microsoft:ClientSecret` | string | `""` | Azure AD app registration. Redirect URI: `https://<host>/api/auth/oauth/microsoft/callback`. |
+| `Google:ClientId` / `Google:ClientSecret` | string | `""` | OAuth client (Google Cloud Console → Credentials → *Web application*). Redirect URI to register: `https://<host><BasePath>/api/auth/oauth/google/callback` — Google requires **https** for any non-localhost host. |
+| `Microsoft:ClientId` / `Microsoft:ClientSecret` | string | `""` | Azure AD app registration. Redirect URI: `https://<host><BasePath>/api/auth/oauth/microsoft/callback`. |
 | `Microsoft:TenantId` | string | `""` | **Required** for Microsoft sign-in: your Entra tenant id. Blank or a tenant-agnostic value (`common` / `organizations` / `consumers`) leaves the provider disabled unless `AllowMultiTenant` is set — see below. |
 | `Microsoft:AllowMultiTenant` | bool | `false` | Accept a tenant-agnostic endpoint anyway. |
 
@@ -195,6 +294,7 @@ Ameto:
   NodeId: 0
   DataDirectory: data
   HttpPort: 5341
+  BasePath: ""              # URL prefix, e.g. "/ameto"; empty = served at /
   SslCertPath: ""
   SslCertPassword: ""
   RamTargetPercent: 85

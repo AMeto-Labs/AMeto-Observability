@@ -73,6 +73,8 @@ public sealed class SegmentReplicator : IDisposable
         byte[]            data,
         CancellationToken ct)
     {
+        // BaseAddress arrives already trimmed; see ReplicationNode.BaseAddress for why that is
+        // the property's job and not this line's.
         var url = $"{peer.BaseAddress}/api/replication/segments/{segment.NodeId.Value}/{segment.Id.Value}";
         try
         {

@@ -59,6 +59,10 @@ var AmetoSection = builder.Configuration.GetSection("Ameto");
 // Auto-bind the entire Ameto section to ServerOptions; class defaults are the fallback.
 var serverOptions = AmetoSection.Get<ServerOptions>() ?? new ServerOptions();
 
+// Parsed here rather than at the point of use: a malformed prefix should stop the server with
+// one clear line, not half-configure a pipeline that then serves the UI from the wrong place.
+var basePath = UrlBasePath.Parse(serverOptions.BasePath);
+
 // ── File log ──────────────────────────────────────────────────────────────────
 // Needed because the Windows Event Log provider that AddWindowsService installs
 // applies its own Warning minimum: as a service, every Information diagnostic
@@ -217,6 +221,7 @@ builder.WebHost.ConfigureKestrel(k =>
 });
 var app = builder.Build();
 
+
 // ── Middleware ─────────────────────────────────────────────────────────────────
 // PORT ISOLATION for the OTLP/gRPC listener. A second Kestrel endpoint does not scope routing:
 // without this, port 4317 served the entire application — the Angular UI through the SPA
@@ -264,10 +269,39 @@ if (serverOptions.TrustForwardedHeaders)
             fwd.KnownProxies.Add(addr);
     app.UseForwardedHeaders(fwd);
 }
+// ── Deployment prefix ─────────────────────────────────────────────────────────
+// Everything below sees the path with the prefix already stripped, so not one route has to
+// know about it. Below UseForwardedHeaders so a proxy-corrected scheme and host are already
+// in place; above everything else for the reasons in the next paragraph.
+//
+// The explicit UseRouting() is load-bearing and must stay directly under UsePathBase. Without
+// it, WebApplication inserts its own at the very front of the pipeline — ahead of UsePathBase —
+// and matching then happens against the UN-stripped path. Nothing errors: "/ameto/api/events"
+// simply matches the SPA catch-all below instead, so every prefixed API call returns 200
+// text/html, and because the selected endpoint is the fallback it carries no metadata, which
+// silently drops .RequireAuthorization() and the login brute-force limiter with it. Measured,
+// not assumed. Unconditional, so both deployment shapes run the same pipeline.
+if (!basePath.IsRoot) app.UsePathBase(basePath.PathBase);
+app.UseRouting();
+
 app.UseRateLimiter();
 app.UseAuthentication();
 app.UseAuthorization();
-app.UseDefaultFiles();
+// The SPA entry document is the one file whose bytes depend on configuration, so it does not
+// come from the static-file middleware — see SpaIndex. This also replaces UseDefaultFiles,
+// whose only job here was mapping "/" to it.
+var spaIndex = new SpaIndex(app.Environment, basePath,
+                            app.Services.GetRequiredService<ILoggerFactory>().CreateLogger<SpaIndex>());
+app.Use(async (ctx, next) =>
+{
+    var path = ctx.Request.Path;
+    bool isEntryDocument = !path.HasValue || path == "/" ||
+                           path.Equals("/index.html", StringComparison.OrdinalIgnoreCase);
+    if (isEntryDocument && (HttpMethods.IsGet(ctx.Request.Method) || HttpMethods.IsHead(ctx.Request.Method))
+        && await spaIndex.TryWriteAsync(ctx))
+        return;
+    await next();
+});
 app.UseStaticFiles();
 
 // ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -280,7 +314,7 @@ app.MapRetentionEndpoints();
 app.MapDiagnosticsEndpoints();
 app.MapUpdateEndpoints();
 app.MapReplicationEndpoints();
-app.MapOtlpEndpoints(enableTracing, enableMetrics);
+app.MapOtlpEndpoints(enableTracing, enableMetrics, basePath.PathBase);
 // Only when a port is configured. Kestrel endpoints do not scope routing — every route on this
 // WebApplication answers on every listener — so mapping these unconditionally put the Export
 // methods on the main port as well, where a plain HTTP/1.1 POST reached them. The middleware
@@ -293,8 +327,19 @@ if (enableMetrics)
 if (enableTracing)
     app.MapTraceEndpoints();
 
-// SPA fallback — Angular handles client-side routing
-app.MapFallbackToFile("index.html");
+// SPA fallback — Angular handles client-side routing.
+//
+// Both halves of this are copied from MapFallbackToFile, which is what it replaces:
+//   * "{*path:nonfile}" — a request for a missing ASSET should 404, not be answered with an HTML
+//     page the browser was told to parse as a script.
+//   * GET/HEAD only — the helper attached this metadata, a bare MapFallback does not, and without
+//     it every unmatched POST answers 200 text/html instead of 405. That reads as success to a
+//     sender: an OTLP exporter pointed at the spec paths /v1/logs and friends (this server maps
+//     them under /otlp/, so they are unmatched) would report delivery and drop the batch.
+app.MapFallback("{*path:nonfile}", async (HttpContext ctx) =>
+{
+    if (!await spaIndex.TryWriteAsync(ctx)) ctx.Response.StatusCode = StatusCodes.Status404NotFound;
+}).WithMetadata(new HttpMethodMetadata(["GET", "HEAD"]));
 
 // ── Startup banner ────────────────────────────────────────────────────────────
 app.Lifetime.ApplicationStarted.Register(() =>
@@ -305,6 +350,11 @@ app.Lifetime.ApplicationStarted.Register(() =>
                        ?.Addresses;
     logger.LogInformation("Ameto version: {Version}", UpdateChecker.CurrentVersion);
     logger.LogInformation("Content root: {ContentRoot}", app.Environment.ContentRootPath);
+    if (!basePath.IsRoot)
+        logger.LogInformation(
+            "Base path: {BasePath} — the UI and every endpoint also answer under this prefix. " +
+            "Paths at the root keep working, so health checks and existing senders are unaffected.",
+            basePath.PathBase);
     if (repOpts.Enabled && string.IsNullOrEmpty(repOpts.Secret))
         logger.LogWarning(
             "Replication is enabled but Ameto:Replication:Secret is not set — peer endpoints " +

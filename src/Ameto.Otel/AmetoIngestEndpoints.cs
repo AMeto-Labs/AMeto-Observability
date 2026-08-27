@@ -34,11 +34,37 @@ internal static class AmetoIngestEndpoints
     /// </summary>
     public static bool Matches(ReadOnlySpan<char> url)
     {
-        var path = PathOf(url);
+        var path = StripBasePath(PathOf(url));
         foreach (var candidate in Paths)
             if (path.Equals(candidate, StringComparison.OrdinalIgnoreCase))
                 return true;
         return false;
+    }
+
+    /// <summary>
+    /// The deployment prefix (<c>Ameto:BasePath</c>), as a leading-slash,
+    /// no-trailing-slash string, or empty at the root.
+    ///
+    /// <para>Set once from Program.cs before the server accepts a request, and never again — the
+    /// option is bound at startup, and the two callers of <see cref="Matches"/> are hot-path span
+    /// parsers with no DI to reach through. It is here at all because the prefix and this guard
+    /// arrived from different directions: with a prefix configured, an exporter is pointed at
+    /// <c>https://host/ameto/otlp/v1/traces</c>, and the whole-path comparison below would not
+    /// have recognised its own receiver. The feedback loop this class exists to break would then
+    /// be back, and it is the kind that leaves nothing in the log to explain itself.</para>
+    /// </summary>
+    public static string BasePath { get; set; } = "";
+
+    /// <summary>Removes the deployment prefix, if the path carries one.</summary>
+    private static ReadOnlySpan<char> StripBasePath(ReadOnlySpan<char> path)
+    {
+        var prefix = BasePath;
+        if (prefix.Length == 0 || path.Length <= prefix.Length) return path;
+
+        // Only on a segment boundary: "/ametoX/otlp/v1/logs" is a different server's path.
+        return path.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) && path[prefix.Length] == '/'
+                   ? path[prefix.Length..]
+                   : path;
     }
 
     /// <summary>UTF-8 overload for the streaming parser, which never builds a string.</summary>

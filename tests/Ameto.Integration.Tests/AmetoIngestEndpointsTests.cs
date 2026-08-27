@@ -69,4 +69,63 @@ public sealed class AmetoIngestEndpointsTests
             Assert.Equal(AmetoIngestEndpoints.Matches(u.AsSpan()),
                          AmetoIngestEndpoints.Matches(System.Text.Encoding.ASCII.GetBytes(u)));
     }
+
+    // ── Under a deployment prefix ─────────────────────────────────────────────
+
+    [Theory]
+    [InlineData("https://host/ameto/otlp/v1/traces")]
+    [InlineData("https://host/ameto/v1/traces")]
+    [InlineData("http://host:5341/ameto/api/events")]
+    [InlineData("/ameto/otlp/v1/logs")]
+    [InlineData("https://host/AMETO/otlp/v1/traces")]   // UsePathBase matches case-insensitively
+    public void Prefixed_receiver_urls_are_recognised(string url)
+    {
+        // With Ameto:BasePath set, an exporter is configured against the prefixed address — and
+        // this guard compares whole paths, so without stripping the prefix it would not recognise
+        // its own receiver. The feedback loop it exists to break would then be back, and that one
+        // leaves nothing in the log to explain itself.
+        WithBasePath("/ameto", () =>
+        {
+            Assert.True(AmetoIngestEndpoints.Matches(url.AsSpan()));
+            Assert.True(AmetoIngestEndpoints.Matches(System.Text.Encoding.ASCII.GetBytes(url)));
+        });
+    }
+
+    [Theory]
+    [InlineData("https://host/ametoX/otlp/v1/traces")]  // not a segment boundary
+    [InlineData("https://host/other/otlp/v1/traces")]   // somebody else's prefix
+    [InlineData("https://host/ameto/api/v1/traces/search")]
+    public void A_prefix_does_not_widen_the_match(string url)
+    {
+        // Dropping a customer's real client span is the more expensive mistake of the two, so the
+        // prefix is stripped only on a segment boundary and only when it is ours.
+        WithBasePath("/ameto", () =>
+        {
+            Assert.False(AmetoIngestEndpoints.Matches(url.AsSpan()));
+            Assert.False(AmetoIngestEndpoints.Matches(System.Text.Encoding.ASCII.GetBytes(url)));
+        });
+    }
+
+    [Fact]
+    public void Unprefixed_urls_still_match_under_a_prefix()
+    {
+        // The prefix is additive: the receivers keep answering at the root, so an agent still
+        // pointed at the bare address is still talking to us.
+        WithBasePath("/ameto", () =>
+            Assert.True(AmetoIngestEndpoints.Matches("http://host:5341/otlp/v1/logs".AsSpan())));
+    }
+
+    /// <summary>
+    /// Runs <paramref name="body"/> with the prefix set, restoring it afterwards. The property is
+    /// process-wide because the option is bound once at startup and read from hot-path parsers
+    /// that have no DI to reach through; here it has to be put back or it would leak into the
+    /// other tests in this assembly.
+    /// </summary>
+    private static void WithBasePath(string basePath, Action body)
+    {
+        var previous = AmetoIngestEndpoints.BasePath;
+        AmetoIngestEndpoints.BasePath = basePath;
+        try { body(); }
+        finally { AmetoIngestEndpoints.BasePath = previous; }
+    }
 }

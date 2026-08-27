@@ -149,6 +149,14 @@ ENV Ameto__DataDirectory=/data \
 EXPOSE 5341
 
 # BusyBox wget; shell form expands ${Ameto__HttpPort} so a runtime port override is honoured.
+#
+# Deliberately probes the ROOT /health, not ${Ameto__BasePath}/health. Two reasons. The prefix is
+# additive — /health keeps answering at the root under any prefix — and this is exactly the
+# caller the docs say needs no change: localhost, straight to Kestrel, never through the proxy.
+# And the setting is not normalised out here: the server accepts "ameto", "/ameto" and
+# "/ameto/" as the same prefix, but pasted raw into a URL the first yields
+# "localhost:5341ameto/health" and the last a doubled slash. A health check that breaks on two
+# of the three documented spellings is worse than one that tests a slightly different address.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD wget -q -O /dev/null "http://localhost:${Ameto__HttpPort:-5341}/health" || exit 1
 

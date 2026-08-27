@@ -19,6 +19,7 @@ import {
   ToggleRight, Trash2, TriangleAlert, Type, User, UserPlus, Users, X, ZoomOut,
 } from 'lucide-angular';
 import { authInterceptor } from './core/interceptors/auth.interceptor';
+import { baseHrefInterceptor } from './core/interceptors/base-href.interceptor';
 
 import { routes } from './app.routes';
 
@@ -58,7 +59,8 @@ export const appConfig: ApplicationConfig = {
     provideBrowserGlobalErrorListeners(),
     { provide: ErrorHandler, useClass: FilteringErrorHandler },
     provideRouter(routes, withPreloading(IdlePreloadStrategy)),
-    provideHttpClient(withInterceptors([authInterceptor])),
+    provideHttpClient(withInterceptors([baseHrefInterceptor, authInterceptor])),
     { provide: LUCIDE_ICONS, multi: true, useValue: new LucideIconProvider(APP_ICONS) },
   ],
 };
+

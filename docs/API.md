@@ -1,6 +1,11 @@
 # REST API Reference
 
-Base URL: `http://localhost:5341` (configurable via `Ameto.HttpPort`).
+Base URL: `http://localhost:5341` — port from `Ameto.HttpPort`, plus the prefix from
+`Ameto.BasePath` when one is configured (default: none). **Every path below is relative to
+that prefix**, so with `BasePath: "/ameto"` the ingest endpoint is `POST /ameto/api/events`.
+The prefix is additive — the un-prefixed paths keep answering as well — but a reverse proxy
+scoped to the prefix will only forward the prefixed form. See
+[CONFIGURATION.md](CONFIGURATION.md#serving-under-a-url-prefix).
 
 All responses are JSON unless noted.
 

@@ -3,6 +3,26 @@ Ameto:
   DataDirectory: data
   HttpPort: 5341
 
+  # ── URL prefix ───────────────────────────────────────────────────────────────
+  # Serve the whole server under a path, for hosting behind a reverse proxy at
+  # https://host/ameto. Blank (the default) serves everything at the root.
+  #
+  # Applied at RUNTIME — the UI's <base href> is rewritten as index.html is served —
+  # so one build and one container image work under any prefix. Requires a restart.
+  # "ameto", "/ameto" and "/ameto/" all mean the same thing.
+  #
+  # Two things to know before turning it on:
+  #   * The prefix is ADDITIVE, not a boundary. Every path keeps answering at the
+  #     root as well, which is what lets the container health check and any agent
+  #     already pointed at the bare address keep working. If you need the prefix to
+  #     actually restrict access, enforce that at the proxy.
+  #   * The OAuth redirect URI moves with it. Re-register
+  #     https://<host>/ameto/api/auth/oauth/google/callback with the provider.
+  #
+  # The proxy must PASS the prefix through — do not strip it. In nginx that means
+  # `proxy_pass http://ameto:5341;` with NO trailing slash.
+  # BasePath: "/ameto"
+
   # OTLP over gRPC. 0 = off. 4317 is the OTLP convention.
   #
   # It has to be its own port: gRPC needs HTTP/2, and without TLS there is no ALPN to negotiate

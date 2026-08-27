@@ -149,6 +149,9 @@ Ameto:
 
 See [docs/API.md](docs/API.md) for the full reference and [docs/FILTER_EXPRESSIONS.md](docs/FILTER_EXPRESSIONS.md) for the query syntax. Core surface:
 
+Paths are relative to `Ameto:BasePath` when one is configured (default: none) — see
+[docs/CONFIGURATION.md](docs/CONFIGURATION.md#serving-under-a-url-prefix).
+
 | Area | Endpoints |
 |------|-----------|
 | Ingest (CLEF) | `POST /api/events` |

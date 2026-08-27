@@ -273,6 +273,12 @@ internal static class AuthServiceExtensions
         Microsoft.AspNetCore.Authentication.TicketReceivedContext ctx,
         string provider)
     {
+        // Every redirect below targets a route in the SPA, so it goes through AppUrl.
+        // Response.Redirect does not add it: under Ameto:BasePath the prefix has already been
+        // stripped from Request.Path by the time this runs, and a bare "/login" would send the
+        // browser to the host root — where the SPA loads but its router sees a path that does
+        // not start with its own base href. PathBase is empty at the default root, so this is
+        // the same string it always was there.
         var store  = ctx.HttpContext.RequestServices.GetRequiredService<AuthStore>();
         var issuer = ctx.HttpContext.RequestServices.GetRequiredService<JwtIssuer>();
 
@@ -281,7 +287,7 @@ internal static class AuthServiceExtensions
 
         if (string.IsNullOrWhiteSpace(email))
         {
-            ctx.Response.Redirect("/login?error=no_email");
+            ctx.Response.Redirect(ctx.HttpContext.AppUrl("/login?error=no_email"));
             ctx.HandleResponse();
             return Task.CompletedTask;
         }
@@ -292,7 +298,7 @@ internal static class AuthServiceExtensions
         if (provider == "google" && !string.Equals(
                 ctx.Principal?.FindFirst(VerifiedEmailClaim)?.Value, "true", StringComparison.OrdinalIgnoreCase))
         {
-            ctx.Response.Redirect("/login?error=email_unverified");
+            ctx.Response.Redirect(ctx.HttpContext.AppUrl("/login?error=email_unverified"));
             ctx.HandleResponse();
             return Task.CompletedTask;
         }
@@ -301,7 +307,7 @@ internal static class AuthServiceExtensions
         var subject = ctx.Principal?.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
         if (string.IsNullOrWhiteSpace(subject))
         {
-            ctx.Response.Redirect("/login?error=no_subject");
+            ctx.Response.Redirect(ctx.HttpContext.AppUrl("/login?error=no_subject"));
             ctx.HandleResponse();
             return Task.CompletedTask;
         }
@@ -311,15 +317,16 @@ internal static class AuthServiceExtensions
         var user = store.FindOrCreateOAuthUser(email, displayName, provider, subject);
         if (user is null)
         {
-            ctx.Response.Redirect($"/login?error=access_denied&email={Uri.EscapeDataString(email)}");
+            ctx.Response.Redirect(ctx.HttpContext.AppUrl($"/login?error=access_denied&email={Uri.EscapeDataString(email)}"));
             ctx.HandleResponse();
             return Task.CompletedTask;
         }
 
         var token = issuer.Issue(user.Username, user.Role, email, displayName, user.Permissions);
 
-        ctx.Response.Redirect(
-            $"/oauth-callback?token={Uri.EscapeDataString(token)}&expiresIn={JwtIssuer.ExpiresInSeconds}&role={user.Role}");
+        ctx.Response.Redirect(ctx.HttpContext.AppUrl(
+            $"/oauth-callback?token={Uri.EscapeDataString(token)}" +
+            $"&expiresIn={JwtIssuer.ExpiresInSeconds}&role={user.Role}"));
         ctx.HandleResponse();
         return Task.CompletedTask;
     }
@@ -327,7 +334,7 @@ internal static class AuthServiceExtensions
     private static Task HandleOAuthFailure(
         Microsoft.AspNetCore.Authentication.RemoteFailureContext ctx)
     {
-        ctx.Response.Redirect("/login?error=oauth_failed");
+        ctx.Response.Redirect(ctx.HttpContext.AppUrl("/login?error=oauth_failed"));
         ctx.HandleResponse();
         return Task.CompletedTask;
     }

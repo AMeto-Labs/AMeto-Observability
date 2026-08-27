@@ -2,6 +2,7 @@ import { Injectable, signal, computed, inject } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { Router } from '@angular/router';
 import { tap } from 'rxjs';
+import { appPath } from '../../shared/utils/app-url';
 import {
   ALL_VIEW_PERMISSIONS, AuthProvidersDto, LoginResponseDto, UserRole, ViewPermission,
 } from '../models/auth.model';
@@ -51,7 +52,9 @@ export class AuthService {
     // Full-page redirect drops component state, so persist the return target.
     if (returnUrl) sessionStorage.setItem(RETURN_KEY, returnUrl);
     else sessionStorage.removeItem(RETURN_KEY);
-    window.location.href = `/api/auth/oauth/${provider}`;
+    // Full-page navigation, so it bypasses the HttpClient interceptor that would
+    // otherwise apply the deployment prefix — resolve it here instead.
+    window.location.href = appPath(`/api/auth/oauth/${provider}`);
   }
 
   /** Called by the OAuth callback route — stores the token from the URL fragment. */

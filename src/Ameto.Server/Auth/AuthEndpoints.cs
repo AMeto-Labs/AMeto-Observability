@@ -65,9 +65,12 @@ internal static class AuthEndpoints
             if (scheme is null)
                 return Results.BadRequest(new { error = $"OAuth provider '{provider}' is not configured." });
 
-            // RedirectUri here is the ASP.NET Core post-auth destination, but
-            // it is overridden by HandleResponse() in the OnTicketReceived event.
-            await ctx.ChallengeAsync(scheme, new AuthenticationProperties { RedirectUri = "/" });
+            // RedirectUri here is the ASP.NET Core post-auth destination, but it is overridden
+            // by HandleResponse() in the OnTicketReceived event — so this value is inert today.
+            // It still carries PathBase: inert is not the same as correct, and the day someone
+            // lets OnTicketReceived fall through, a bare "/" would drop the deployment prefix.
+            await ctx.ChallengeAsync(scheme,
+                new AuthenticationProperties { RedirectUri = ctx.AppUrl("/") });
             return Results.Empty;
         });
 

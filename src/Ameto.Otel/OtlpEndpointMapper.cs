@@ -36,8 +36,17 @@ public static class OtlpEndpointMapper
         AllowTrailingCommas  = true,
     };
 
-    public static void MapOtlpEndpoints(this WebApplication app, bool enableTraces = true, bool enableMetrics = true)
+    /// <param name="basePath">
+    /// The deployment prefix, leading slash and no trailing one ("/ameto"), or empty at the root.
+    /// Passed on to <see cref="AmetoIngestEndpoints"/>: with a prefix configured an exporter is
+    /// pointed at <c>https://host/ameto/otlp/v1/traces</c>, and the self-ingest guard has to
+    /// recognise that as its own receiver or the feedback loop it exists to break comes back.
+    /// </param>
+    public static void MapOtlpEndpoints(this WebApplication app, bool enableTraces = true, bool enableMetrics = true,
+                                        string basePath = "")
     {
+        AmetoIngestEndpoints.BasePath = basePath;
+
         // ── Traces ────────────────────────────────────────────────────────────
         var traces = async (HttpContext ctx, ISpanIngester ingester, ILoggerFactory logFactory) =>
         {
