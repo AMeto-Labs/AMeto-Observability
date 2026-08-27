@@ -178,6 +178,29 @@ public sealed class ServerOptions
     public UpdatesOptions   Updates          { get; init; } = new();
     public LoggingOptions   Logging          { get; init; } = new();
     public int              HttpPort         { get; init; } = 5341;
+
+    /// <summary>
+    /// URL prefix this server is served under — <c>"/ameto"</c> for a deployment reachable at
+    /// <c>https://host/ameto</c>. Blank (the default) serves everything at the root, exactly
+    /// as before.
+    ///
+    /// <para>This is applied at <b>runtime</b>, not baked into the client build: the SPA's
+    /// <c>&lt;base href&gt;</c> is rewritten as index.html is served, so one build and one
+    /// container image work under any prefix. It used to be an <c>ng build --base-href</c>
+    /// flag in the Dockerfile, which meant the image and the Windows installer of the same
+    /// version disagreed about where they were hosted.</para>
+    ///
+    /// <para>Accepts <c>ameto</c>, <c>/ameto</c> and <c>/ameto/</c> alike; see
+    /// <see cref="UrlBasePath"/> for what is refused and why. Bound once at startup, so a
+    /// change needs a restart.</para>
+    ///
+    /// <para>The prefix is <b>additive</b>: every path keeps answering at the root as well,
+    /// because that is what <c>UsePathBase</c> does — a request that does not start with the
+    /// prefix is passed through untouched. That is deliberate and load-bearing: the container
+    /// health check and any OTLP agent already pointed at the bare address keep working.</para>
+    /// </summary>
+    public string           BasePath         { get; init; } = "";
+
     public string           SslCertPath      { get; init; } = "";
     public string           SslCertPassword  { get; init; } = "";
 

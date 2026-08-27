@@ -50,6 +50,11 @@ services:
       Ameto__HttpPort: "5341"
       Ameto__NodeId: "0"                    # unique per node when replicating
       Ameto__RamTargetPercent: "75"         # default 85; flush the hot tier when host RAM load exceeds this
+      # Serve under a URL prefix, for a reverse proxy at https://host/ameto. Blank/absent = "/".
+      # Leave COMMENTED unless you want it: environment beats the config file, so an empty-but-set
+      # value here would silently override a BasePath in a mounted config.yml.
+      # The proxy must PASS the prefix through, not strip it — see docs/CONFIGURATION.md.
+      # Ameto__BasePath: "/ameto"
 
       # ── TLS (optional — serves HTTPS instead of HTTP when set) ────────────
       # Ameto__SslCertPath: /certs/ameto.pfx
@@ -97,12 +102,10 @@ services:
       # Ameto__Updates__Enabled: "true"             # set "false" for air-gapped hosts
       # Ameto__Updates__CheckIntervalMinutes: "60"
 
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:5341/health"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
+    # No healthcheck here on purpose: a compose-level one REPLACES the image’s entirely.
+    # The image’s (install/docker/Dockerfile) is shell form and expands Ameto__HttpPort, so it
+    # follows a port override. The block that used to sit here was exec form with a hard-coded
+    # port, which silently ignored one.
 
     # Only containers carrying this label are touched by the Watchtower service below.
     # labels:

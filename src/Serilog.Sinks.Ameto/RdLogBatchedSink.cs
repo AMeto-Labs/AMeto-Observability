@@ -29,7 +29,11 @@ internal sealed class AmetoBatchedSink : IBatchedLogEventSink, IDisposable
         int eventBodyLimitBytes = 65_536)
     {
         _eventBodyLimitBytes = eventBodyLimitBytes;
-        var baseUri      = new Uri(serverUrl, UriKind.Absolute);
+        // The trailing slash is not cosmetic. Uri resolution replaces the last path SEGMENT, so
+        // "http://host/ameto" + "api/events" silently becomes "http://host/api/events" — the
+        // prefix is dropped and, because Serilog swallows transport failures, the operator sees
+        // no logs and no error. Normalising here makes both forms behave the same.
+        var baseUri      = new Uri(serverUrl.TrimEnd('/') + "/", UriKind.Absolute);
         _endpoint        = new Uri(baseUri, "api/events");
         _apiKey          = apiKey;
         _serviceNameUtf8 = serviceName is not null

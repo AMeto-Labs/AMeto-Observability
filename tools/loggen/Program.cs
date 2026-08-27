@@ -54,7 +54,9 @@ if (string.IsNullOrWhiteSpace(apiKey))
 }
 
 var gen = new EventGenerator(new Random(seed));
-using var http = new HttpClient { BaseAddress = new Uri(baseUrl), Timeout = TimeSpan.FromSeconds(30) };
+// Trailing slash + relative request path below, so a --url carrying a BasePath ("http://host/ameto")
+// keeps it. A leading "/" on the request would discard the base address's path entirely.
+using var http = new HttpClient { BaseAddress = new Uri(baseUrl.TrimEnd('/') + "/"), Timeout = TimeSpan.FromSeconds(30) };
 http.DefaultRequestHeaders.Add("X-Seq-ApiKey", apiKey);
 
 int totalBatches  = Math.Max(1, (int)(rate * durationSec) / batchSize);
@@ -113,7 +115,7 @@ async Task SendAsync(byte[] payload, int batchIndex)
     {
         using var content = new ByteArrayContent(payload);
         content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/x-msgpack");
-        using var res = await http.PostAsync("/api/events", content);
+        using var res = await http.PostAsync("api/events", content);
         reqSw.Stop();
         stats.LatenciesMs[batchIndex] = reqSw.Elapsed.TotalMilliseconds;
 

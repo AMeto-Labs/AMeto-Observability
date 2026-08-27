@@ -111,7 +111,7 @@ public sealed class IngestionQueryIntegrationTests
 ///   • a known API key (<see cref="TestApiKey"/>) is seeded into the auth store and
 ///     attached as the <c>X-Seq-ApiKey</c> header on every client (covers ingest).
 /// </summary>
-public sealed class AmetoWebAppFactory : WebApplicationFactory<Program>
+public class AmetoWebAppFactory : WebApplicationFactory<Program>
 {
     /// <summary>API key seeded into the auth store and sent by every test client.</summary>
     public const string TestApiKey = "rdl_integration_test_key";
@@ -120,11 +120,32 @@ public sealed class AmetoWebAppFactory : WebApplicationFactory<Program>
     private readonly Lock   _seedGate = new();
     private bool _apiKeySeeded;
 
+    /// <summary>
+    /// The Ameto:BasePath this host runs under. Empty — every path at the root — for every
+    /// suite but the one that exists to exercise a prefix; see BasePathTests.
+    /// </summary>
+    protected virtual string ConfiguredBasePath => "";
+
+    /// <summary>
+    /// False leaves wwwroot empty, for the suite that checks the server copes with a UI that is
+    /// not there yet. Everything else wants the stub.
+    /// </summary>
+    protected virtual bool SeedSpaStub => true;
+
+    /// <summary>The per-run wwwroot, so a test can populate it after the host has started.</summary>
+    public string WebRootPath { get; private set; } = "";
+
+    /// <summary>The stub itself, so a test that starts without one can write the same bytes later.</summary>
+    public const string SpaStubHtml =
+        "<!doctype html><html><head><base href=\"/\"><title>Ameto test SPA stub</title>" +
+        "</head><body><app-root></app-root></body></html>";
+
     protected override void ConfigureWebHost(Microsoft.AspNetCore.Hosting.IWebHostBuilder builder)
     {
         builder.UseSetting("Ameto:DataDirectory", _tempDir);
         builder.UseSetting("Ameto:HttpPort", "0");       // random port
         builder.UseSetting("Ameto:Cluster:Enabled", "false");
+        builder.UseSetting("Ameto:BasePath", ConfiguredBasePath);
 
         // Stub web root. The SPA-fallback test asserts that an unmapped /api/* GET falls
         // through to index.html, but the real wwwroot is emitted by `npm run build` and
@@ -135,8 +156,13 @@ public sealed class AmetoWebAppFactory : WebApplicationFactory<Program>
         // it is disposed with it and never touches the repo.
         string webRoot = Path.Combine(_tempDir, "wwwroot");
         Directory.CreateDirectory(webRoot);
-        File.WriteAllText(Path.Combine(webRoot, "index.html"),
-            "<!doctype html><title>Ameto test SPA stub</title>");
+        WebRootPath = webRoot;
+
+        // Shaped like the real client/src/index.html — a <base> tag inside <head> — because
+        // the server rewrites that tag as it serves the file. Against a stub without one, a
+        // rewriter that quietly did nothing would look exactly like one that worked.
+        if (SeedSpaStub)
+            File.WriteAllText(Path.Combine(webRoot, "index.html"), SpaStubHtml);
         builder.UseSetting(Microsoft.AspNetCore.Hosting.WebHostDefaults.WebRootKey, webRoot);
 
         // Override the ServerOptions with test-specific settings
@@ -148,6 +174,11 @@ public sealed class AmetoWebAppFactory : WebApplicationFactory<Program>
                 NodeId        = NodeId.Local,
                 DataDirectory = _tempDir,
                 HttpPort      = 0,
+                // Kept in step with the UseSetting above. The pipeline reads the prefix from
+                // IConfiguration, not from here, so nothing today notices the difference — but a
+                // future DI consumer of ServerOptions would read "" under PrefixedFactory and
+                // pass for the wrong reason.
+                BasePath      = ConfiguredBasePath,
                 HotTier = new HotTierOptions
                 {
                     MaxSizeBytes = 8 * 1024 * 1024, // 8 MB — small for tests

@@ -138,4 +138,9 @@ docker compose -f install/docker/docker-compose.example.yml up -d --build
    - **Serilog:** `WriteTo.Ameto("http://localhost:5341", apiKey: "…")` (or any Seq sink — the CLEF endpoint is Seq-compatible).
    - **OpenTelemetry:** OTLP exporter → `http://localhost:5341/otlp/v1/{logs,traces,metrics}`.
 
+   If you set `BasePath` to host the server under a URL prefix, every address above gains that
+   prefix when reached through the reverse proxy — the UI, `/api/events`, `/otlp/v1/*` and
+   `/health`. Senders that talk to the server directly are unaffected: the un-prefixed paths
+   keep answering. See [docs/CONFIGURATION.md](../docs/CONFIGURATION.md#serving-under-a-url-prefix).
+
 See [`../README.md`](../README.md) and [`../docs/API.md`](../docs/API.md) for details.
