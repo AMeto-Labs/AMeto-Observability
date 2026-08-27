@@ -116,12 +116,24 @@ internal sealed unsafe class SpanWriteAheadLog : IDisposable
     private readonly string _filePath;
     private readonly Lock   _writeLock = new();
 
+    // Held open for the log's whole life: the mapping is created over it, Grow extends it,
+    // and Flush issues FlushFileBuffers through it. On Windows the accessor's flush is
+    // FlushViewOfFile, which hands the pages to the filesystem but does NOT wait out the
+    // drive cache — without this handle the commit barrier would not actually be durable.
+    private FileStream?               _fileStream;
     private MemoryMappedFile?         _mmf;
     private MemoryMappedViewAccessor? _accessor;
     private byte*                     _ptr;
     private long                      _capacity;
     private long                      _writeOffset;        // logical, excludes the file header
     private uint                      _generation;
+
+    // ── Open-flush state (see BeginFlush/CommitFlush) ────────────────────────
+    private bool _flushOpen;          // one flush at a time — the engine serialises them
+    private long _flushBoundary;      // bytes belonging to the generation being flushed
+    private bool _generationBumped;   // bump once per COMMIT cycle, not per Begin (retries)
+
+    private static uint Next(uint g) => g == uint.MaxValue ? FirstGeneration : g + 1;
 
     public string FilePath => _filePath;
 
@@ -142,11 +154,9 @@ internal sealed unsafe class SpanWriteAheadLog : IDisposable
         bool exists   = File.Exists(_filePath);
         long fileSize = FileHeaderSize + initialCapacity;
 
-        using (var fs = new FileStream(_filePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None))
-        {
-            if (fs.Length < fileSize) fs.SetLength(fileSize);
-            else                      fileSize = fs.Length;   // reopen an already-grown log at its size
-        }
+        _fileStream = new FileStream(_filePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
+        if (_fileStream.Length < fileSize) _fileStream.SetLength(fileSize);
+        else                               fileSize = _fileStream.Length;   // reopen an already-grown log at its size
 
         _capacity = fileSize - FileHeaderSize;
         Map(fileSize);
@@ -173,10 +183,28 @@ internal sealed unsafe class SpanWriteAheadLog : IDisposable
 
     private void Map(long fileSize)
     {
-        _mmf      = MemoryMappedFile.CreateFromFile(_filePath, FileMode.Open, null, fileSize, MemoryMappedFileAccess.ReadWrite);
+        _mmf      = MemoryMappedFile.CreateFromFile(_fileStream!, null, fileSize,
+                        MemoryMappedFileAccess.ReadWrite, HandleInheritability.None, leaveOpen: true);
         _accessor = _mmf.CreateViewAccessor(0, fileSize, MemoryMappedFileAccess.ReadWrite);
         _ptr      = null;
         _accessor.SafeMemoryMappedViewHandle.AcquirePointer(ref _ptr);
+    }
+
+    /// <summary>
+    /// Persists the mapped view: msync (MS_SYNC on Linux, FlushViewOfFile on Windows) plus
+    /// FlushFileBuffers, so the bytes are on the platter and not merely handed to the
+    /// filesystem. Callers hold <see cref="_writeLock"/>.
+    /// </summary>
+    /// <exception cref="IOException">
+    /// Propagated on purpose. A swallowed barrier is worse than none: the commit would go
+    /// on to stamp a header whose only justification was the flush that just failed, and on
+    /// Linux a failed fsync also DROPS the dirty pages, so the relocation could stay
+    /// unwritten while the header claimed it. The caller aborts the commit instead.
+    /// </exception>
+    private void FlushLocked()
+    {
+        _accessor?.Flush();
+        _fileStream?.Flush(flushToDisk: true);
     }
 
     // ── Append ───────────────────────────────────────────────────────────────
@@ -241,13 +269,155 @@ internal sealed unsafe class SpanWriteAheadLog : IDisposable
         }
     }
 
+    // ── Two-phase flush (Begin / Commit / Abandon) ───────────────────────────
+    //
+    // The engine used to hold its exclusive lock across the WHOLE segment build and reset
+    // the log afterwards — correct, and the reason ingest and every query stalled for the
+    // build's full duration. The two-phase protocol is what lets the build run OFF the
+    // lock: Begin moves in-memory appends to the next generation while the header keeps
+    // the one being flushed, so BOTH generations replay after a crash mid-flush (the
+    // segment is not durable yet — losing either would be data loss). Commit relocates
+    // the new generation's tail to the front and stamps the header, killing the flushed
+    // generation; Abandon leaves everything replayable for the retry.
+
+    /// <summary>
+    /// Opens a flush: appends from here on carry the NEXT generation; the entries being
+    /// flushed keep the current one, and recovery accepts both until <see cref="CommitFlush"/>.
+    /// The generation is bumped once per commit CYCLE — a Begin after an Abandon reuses the
+    /// bumped one, so the replay window never spans more than two generations.
+    /// </summary>
+    public void BeginFlush()
+    {
+        lock (_writeLock)
+        {
+            if (_flushOpen)
+                throw new InvalidOperationException("A span-WAL flush is already open.");
+            _flushOpen     = true;
+            _flushBoundary = _writeOffset;
+            if (!_generationBumped)
+            {
+                _generation       = Next(_generation);
+                _generationBumped = true;
+                // The HEADER deliberately keeps the flushed generation until the commit.
+            }
+        }
+    }
+
+    /// <summary>
+    /// Ends the open flush: the flushed generation's entries die, the entries appended
+    /// during the flush move to the front, and the header commits the new generation.
+    /// Call only after the segment carrying the flushed spans is DURABLE on disk.
+    /// </summary>
+    public void CommitFlush()
+    {
+        lock (_writeLock)
+        {
+            if (!_flushOpen) return;
+            if (_disposed || _ptr is null)
+            {
+                // The log is gone (shutdown). Close the cycle but leave _generationBumped
+                // set: the header still carries the flushed generation, and a Begin that
+                // bumped again would stamp appends two generations ahead of it — which
+                // ReadAll drops, silently, with no segment carrying them.
+                _flushOpen     = false;
+                _flushBoundary = 0;
+                return;
+            }
+
+            long boundary = _flushBoundary;
+            long tail     = _writeOffset - boundary;     // appended while the segment was written
+            if (tail > 0 && boundary > 0)
+                Buffer.MemoryCopy(_ptr + FileHeaderSize + boundary,
+                                  _ptr + FileHeaderSize, _capacity, tail);
+
+            // The move does not erase its source, and a crash between the stores below
+            // would leave the old offset covering both the relocated tail and the stale
+            // originals. A generation-0 marker at the new end stops any replay exactly
+            // where the data now ends — the same trick the metric WAL's Compact uses.
+            // It is not optional: without room for it the commit has no terminator, so
+            // rather than proceed unterminated the log grows to make room.
+            while (tail + EntryHeaderSize > _capacity) Grow();
+            Unsafe.AsRef<SpanWalEntryHeader>(_ptr + FileHeaderSize + tail).Generation = 0;
+
+            // ── PERSISTENCE BARRIER. The relocation and the header live on different
+            //    pages, and dirty mmap pages reach the platter in whatever order the OS
+            //    chooses — program order says nothing across pages. Without this flush a
+            //    power loss could persist the committed header FIRST: it would then point
+            //    at a front region that still held the old, dead generation, while the
+            //    durable originals of the during-flush tail sat beyond the committed
+            //    offset, unreachable. Every span appended during the build — tens of
+            //    thousands at load — would be lost. Flushed here, a crash before the
+            //    header lands leaves the OLD header {flushed gen, old offset} over a front
+            //    that now holds the relocated tail followed by the generation-0 marker:
+            //    replay reads the tail and stops at the marker. Nothing lost, nothing
+            //    duplicated.
+            try
+            {
+                FlushLocked();
+            }
+            catch (Exception ex)
+            {
+                // The barrier failed, so the header must NOT claim data we could not
+                // persist. Close the cycle the way AbandonFlush does — the flushed
+                // generation stays alive in the header, so replay still returns those
+                // spans (duplicates of a segment that is already durable, which the read
+                // paths dedupe) — and let the next commit relocate over the copy this
+                // attempt left at the front. _generationBumped stays set, so the retry
+                // reuses the same append generation and the window never widens.
+                _flushOpen     = false;
+                _flushBoundary = 0;
+                throw new IOException(
+                    "span WAL commit barrier failed; the log keeps replaying the flushed spans", ex);
+            }
+
+            ref var hdr = ref Unsafe.AsRef<WalFileHeader>(_ptr);
+            hdr.Generation  = _generation;               // must land before the offset store
+            hdr.WriteOffset = FileHeaderSize + tail;
+
+            // Only now is the cycle over: every step that can throw is behind us, so the
+            // in-memory generation and the header can no longer drift apart (a Begin that
+            // bumped a second time would stamp appends the header's acceptance window does
+            // not cover, and ReadAll would drop them).
+            _writeOffset      = tail;
+            _flushBoundary    = 0;
+            _flushOpen        = false;
+            _generationBumped = false;
+
+            // Commit the header itself, so the dead generation cannot come back after a
+            // power loss and be replayed into duplicates of a segment already on disk.
+            // A failure here leaves consistent state — the old header simply replays both
+            // generations — so it is reported, not repaired.
+            FlushLocked();
+
+            // RESIDUAL WINDOW, accepted and named: a crash INSIDE the first flush can
+            // leave the front half-relocated — some pages the new tail, some still the old
+            // generation — under the old header, where a stride can desync mid-region.
+            // Closing it needs per-entry checksums (a v2 entry layout), the same
+            // conclusion the metric WAL reached; the barrier above shrinks the exposure
+            // from "every writeback, always" to the milliseconds of one msync.
+        }
+    }
+
+    /// <summary>
+    /// Closes the open flush WITHOUT killing its generation — the segment write failed,
+    /// so the log remains the only durable copy. Both generations keep replaying; the
+    /// retry's Begin reuses the already-bumped append generation.
+    /// </summary>
+    public void AbandonFlush()
+    {
+        lock (_writeLock)
+        {
+            _flushOpen     = false;
+            _flushBoundary = 0;
+        }
+    }
+
     // ── Reset ────────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Drops every logged span by opening a new generation. The generation is stored before
-    /// the write offset, so a crash between the two stores leaves entries that recovery can
-    /// still recognise as belonging to the flushed generation and skip. Call only after the
-    /// segment carrying these spans is on disk.
+    /// Drops every logged span by opening a new generation — an atomic Begin+Commit with
+    /// an empty tail. Only safe when no append can run concurrently (tests, teardown);
+    /// the engine's flush path uses the two-phase protocol above instead.
     /// </summary>
     public void Reset()
     {
@@ -256,7 +426,10 @@ internal sealed unsafe class SpanWriteAheadLog : IDisposable
             if (_disposed || _ptr is null) return;
 
             // Wrap past 0 — it is the "never written" marker recovery relies on.
-            _generation = _generation == uint.MaxValue ? FirstGeneration : _generation + 1;
+            _generation       = Next(_generation);
+            _generationBumped = false;
+            _flushOpen        = false;
+            _flushBoundary    = 0;
 
             ref var hdr = ref Unsafe.AsRef<WalFileHeader>(_ptr);
             hdr.Generation  = _generation;                // must land before the offset
@@ -297,9 +470,15 @@ internal sealed unsafe class SpanWriteAheadLog : IDisposable
                 // legal, which makes a zero-filled region look like a valid entry.
                 if (eh.Generation == 0) break;
 
-                // A surviving entry from a flushed generation — the segment already holds it.
-                // Skip the entry, not the rest of the log.
-                if (eh.Generation == _generation)
+                // TWO generations are live, not one: the HEADER's (committed — or, after
+                // a crash mid-flush, the generation whose segment never landed) and its
+                // successor (appends made while that flush ran). The header, not the
+                // in-memory counter, is the truth: on a live log mid-flush the counter
+                // already runs one ahead, and judging by it would hide the very entries
+                // an abandoned flush needs replayed. Entries from older, committed
+                // generations are skipped — their segments hold them.
+                uint committed = Unsafe.AsRef<WalFileHeader>(_ptr).Generation;
+                if (eh.Generation == committed || eh.Generation == Next(committed))
                 {
                     byte* p = src + EntryHeaderSize;
                     string name = eh.NameLength    > 0 ? Encoding.UTF8.GetString(p, eh.NameLength)    : string.Empty;
@@ -332,6 +511,21 @@ internal sealed unsafe class SpanWriteAheadLog : IDisposable
 
                 pos += total;
             }
+
+            // THE WALK, NOT THE HEADER, IS WHERE THE LOG ENDS. The header's offset can be
+            // stale by design: a crash after a commit relocated the tail but before its
+            // header store leaves an offset covering the region the relocation shortened.
+            // Replay handles that correctly — it stops at the generation-0 terminator — but
+            // Append starts from _writeOffset, so adopting the stale value would place every
+            // new entry PAST that terminator, where the NEXT recovery stops before reaching
+            // it: everything ingested since this restart, silently dropped, with no segment
+            // carrying it. Truncating here is what makes the first append after a recovery
+            // land where the data actually ends.
+            if (pos < _writeOffset)
+            {
+                _writeOffset = pos;
+                Unsafe.AsRef<WalFileHeader>(_ptr).WriteOffset = FileHeaderSize + pos;
+            }
         }
 
         return result;
@@ -355,9 +549,7 @@ internal sealed unsafe class SpanWriteAheadLog : IDisposable
         Unmap();
         try
         {
-            using (var fs = new FileStream(_filePath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
-                fs.SetLength(newFileSize);
-
+            _fileStream!.SetLength(newFileSize);
             Map(newFileSize);
             _capacity = newCapacity;
         }
@@ -365,8 +557,7 @@ internal sealed unsafe class SpanWriteAheadLog : IDisposable
         {
             try
             {
-                using (var fs = new FileStream(_filePath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
-                    if (fs.Length < oldFileSize) fs.SetLength(oldFileSize);
+                if (_fileStream!.Length < oldFileSize) _fileStream.SetLength(oldFileSize);
                 Map(oldFileSize);
             }
             catch { /* nothing left to restore to — the throw below is the honest signal */ }
@@ -374,6 +565,7 @@ internal sealed unsafe class SpanWriteAheadLog : IDisposable
         }
     }
 
+    /// <summary>Drops the mapping only — <see cref="_fileStream"/> outlives it (Grow re-maps over the same handle).</summary>
     private void Unmap()
     {
         if (_accessor is not null)
@@ -397,7 +589,10 @@ internal sealed unsafe class SpanWriteAheadLog : IDisposable
         {
             if (_disposed) return;
             _disposed = true;
-            Unmap();
+            Unmap();   // the view flushes its dirty pages as it is disposed
+            try { _fileStream?.Flush(flushToDisk: true); } catch { /* best-effort at end of life */ }
+            try { _fileStream?.Dispose(); } catch { }
+            _fileStream = null;
         }
     }
 

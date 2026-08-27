@@ -28,7 +28,18 @@ public sealed class SegmentIndexReader : ISegmentIndex, IDisposable
         _inverted = inverted;
         _trigram  = trigram;
         _bloom    = bloom;
+        ApproxRetainedBytes = inverted.ApproxRetainedBytes()
+                            + trigram.ApproxRetainedBytes()
+                            + bloom.RetainedBytes;
     }
+
+    /// <summary>
+    /// Approximate bytes this reader keeps alive (decoded postings + dictionaries + the
+    /// native bloom bits), computed once at load. This — not the varint-packed section
+    /// length it was decoded from, which is 3-8x smaller — is what the
+    /// <see cref="SegmentIndexCache"/> budget charges per entry.
+    /// </summary>
+    public long ApproxRetainedBytes { get; }
 
     /// <summary>
     /// Loads indexes from the raw byte sections read out of a .seg file.
@@ -51,6 +62,13 @@ public sealed class SegmentIndexReader : ISegmentIndex, IDisposable
     {
         if (Interlocked.Exchange(ref _disposed, 1) == 0) _bloom.Dispose();
     }
+
+    /// <summary>
+    /// The group's bloom filter, for the executor's phase-1 gates when this reader comes
+    /// out of the <see cref="SegmentIndexCache"/> — a cache hit must not re-read and
+    /// re-deserialise the bloom section it already holds decoded.
+    /// </summary>
+    public SegmentBloomFilter Bloom => _bloom;
 
     // ── ISegmentIndex ─────────────────────────────────────────────────────────
 

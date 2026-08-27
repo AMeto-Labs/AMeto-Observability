@@ -25,14 +25,116 @@ public sealed class CompiledFilter
 
     private CompiledFilter(FilterNode root)
     {
+        root           = RewriteTimeCompares(root);
         _root          = root;
         _trigramHints  = BuildTrigramHints(root);
         _invertedHints = BuildInvertedHints(root);
         _hasHint       = TryExtract(root, out _hintProperty, out _hintValue);
+
+        long? min = null, max = null;
+        CollectTimeBounds(root, ref min, ref max);
+        MinTimestampTicks = min;
+        MaxTimestampTicks = max;
     }
 
     public static CompiledFilter Compile(string? expression) =>
         new(FilterParser.Parse(expression));
+
+    // ── @t bounds ─────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Tightest lower/upper bound (UTC ticks, inclusive) the filter's AND-chain places on
+    /// <c>@t</c>, or null. The executor intersects these with the request window, so the
+    /// catalog filter, the zone map and the hot-tier header scan prune with them — a
+    /// <c>@t &gt;= '...'</c> filter used to be evaluated per event over the whole catalog.
+    /// The evaluator still re-checks every event (OR/NOT branches keep their own nodes),
+    /// so these may only ever SKIP work.
+    /// </summary>
+    public long? MinTimestampTicks { get; }
+
+    /// <inheritdoc cref="MinTimestampTicks"/>
+    public long? MaxTimestampTicks { get; }
+
+    /// <summary>
+    /// Rewrites <c>@t op parseable-literal</c> comparisons into <see cref="TimeCompareNode"/>
+    /// so the literal is parsed once and comparison is chronological (see the node's doc).
+    /// Nodes are rebuilt only on the paths that actually changed.
+    /// </summary>
+    private static FilterNode RewriteTimeCompares(FilterNode node)
+    {
+        switch (node)
+        {
+            case CompareNode { RightProperty: null } cmp
+                when cmp.Value is string s
+                  && BuiltinFields.TryResolve(cmp.Property, out var field)
+                  && field == BuiltinField.Timestamp
+                  && TryParseTimeLiteral(s, out long ticks):
+                return new TimeCompareNode(cmp.Op, ticks);
+
+            case AndNode and:
+            {
+                var l = RewriteTimeCompares(and.Left);
+                var r = RewriteTimeCompares(and.Right);
+                return ReferenceEquals(l, and.Left) && ReferenceEquals(r, and.Right) ? and : new AndNode(l, r);
+            }
+            case OrNode or:
+            {
+                var l = RewriteTimeCompares(or.Left);
+                var r = RewriteTimeCompares(or.Right);
+                return ReferenceEquals(l, or.Left) && ReferenceEquals(r, or.Right) ? or : new OrNode(l, r);
+            }
+            case NotNode not:
+            {
+                var inner = RewriteTimeCompares(not.Operand);
+                return ReferenceEquals(inner, not.Operand) ? not : new NotNode(inner);
+            }
+            default:
+                return node;
+        }
+    }
+
+    /// <summary>Invariant, offset-less literals assumed UTC — matching how events are stored.</summary>
+    private static bool TryParseTimeLiteral(string s, out long ticks)
+    {
+        if (DateTimeOffset.TryParse(s, System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.AssumeUniversal | System.Globalization.DateTimeStyles.AllowWhiteSpaces,
+                out var dto))
+        {
+            ticks = dto.UtcTicks;
+            return true;
+        }
+        ticks = 0;
+        return false;
+    }
+
+    private static void CollectTimeBounds(FilterNode node, ref long? min, ref long? max)
+    {
+        switch (node)
+        {
+            case TimeCompareNode t:
+                switch (t.Op)
+                {
+                    case CompareOp.Ge: min = Math.Max(min ?? long.MinValue, t.Ticks); break;
+                    // Ticks are integral: a > b ⇔ a >= b+1 (clamped at the type edge).
+                    case CompareOp.Gt: min = Math.Max(min ?? long.MinValue, t.Ticks == long.MaxValue ? long.MaxValue : t.Ticks + 1); break;
+                    case CompareOp.Le: max = Math.Min(max ?? long.MaxValue, t.Ticks); break;
+                    case CompareOp.Lt: max = Math.Min(max ?? long.MaxValue, t.Ticks == long.MinValue ? long.MinValue : t.Ticks - 1); break;
+                    case CompareOp.Eq:
+                        min = Math.Max(min ?? long.MinValue, t.Ticks);
+                        max = Math.Min(max ?? long.MaxValue, t.Ticks);
+                        break;
+                    // Ne bounds nothing.
+                }
+                break;
+
+            case AndNode and:
+                CollectTimeBounds(and.Left,  ref min, ref max);
+                CollectTimeBounds(and.Right, ref min, ref max);
+                break;
+
+            // OR/NOT: a bound taken from one branch would exclude the other's matches.
+        }
+    }
 
     public bool IsMatchAll => _root is MatchAllNode;
 
@@ -87,6 +189,140 @@ public sealed class CompiledFilter
                 return false;
         }
     }
+
+    // ── Header-only shape ─────────────────────────────────────────────────────
+
+    /// <summary>
+    /// True when this filter can be answered from event HEADERS alone — the level and the
+    /// service name — reporting which of each it selects. Null <paramref name="levels"/>
+    /// means every level; null <paramref name="service"/> means every service.
+    ///
+    /// <para>What it buys: a caller that only needs a COUNT can then use the header
+    /// aggregator, which decodes three columns per block instead of materialising every
+    /// event. That is the whole cost of the alert evaluator's most common rule — "errors
+    /// in service X over the last five minutes" — repeated for every rule every fifteen
+    /// seconds.</para>
+    ///
+    /// <para>Deliberately conservative: anything not recognised answers false and the
+    /// caller falls back to the scan. A wrong "true" here would silently change what an
+    /// alert fires on, so the shapes accepted are exactly the ones that can be proven
+    /// equivalent — an AND-chain of level constraints and one service equality, plus
+    /// OR-groups whose every leaf is a level constraint.</para>
+    /// </summary>
+    public bool TryGetHeaderOnlyShape(out HashSet<LogLevel>? levels, out string? service)
+    {
+        levels  = null;
+        service = null;
+        return CollectHeaderShape(_root, ref levels, ref service);
+    }
+
+    private static bool CollectHeaderShape(FilterNode node, ref HashSet<LogLevel>? levels, ref string? service)
+    {
+        switch (node)
+        {
+            case MatchAllNode:
+                return true;
+
+            case LevelNode lvl:
+                IntersectLevels(ref levels, [lvl.Level]);
+                return true;
+
+            case CompareNode { Op: CompareOp.Eq, RightProperty: null } cmp when cmp.Value is string s:
+                if (IsBuiltin(cmp.Property, BuiltinField.Level))
+                {
+                    if (!TryCanonicalLevel(s, out var parsed)) return false;
+                    IntersectLevels(ref levels, [parsed]);
+                    return true;
+                }
+                if (IsBuiltin(cmp.Property, BuiltinField.ServiceName))
+                {
+                    if (!IsUsableServiceLiteral(s)) return false;
+                    // Two different services ANDed match nothing; the header aggregator
+                    // cannot express that, so hand it back to the scan.
+                    if (service is not null && !service.Equals(s, StringComparison.OrdinalIgnoreCase))
+                        return false;
+                    service = s;
+                    return true;
+                }
+                return false;
+
+            case InNode inNode when IsBuiltin(inNode.Property, BuiltinField.Level):
+            {
+                var set = new HashSet<LogLevel>();
+                foreach (var v in inNode.Values)
+                {
+                    if (v is not string sv || !TryCanonicalLevel(sv, out var l)) return false;
+                    set.Add(l);
+                }
+                IntersectLevels(ref levels, set);
+                return true;
+            }
+
+            case AndNode and:
+                return CollectHeaderShape(and.Left,  ref levels, ref service)
+                    && CollectHeaderShape(and.Right, ref levels, ref service);
+
+            case OrNode or:
+            {
+                // Only a union of LEVELS: an OR that reaches any other field (or a service)
+                // is a set this shape cannot describe.
+                HashSet<LogLevel>? branch  = null;
+                string?            noSvc   = null;
+                if (!CollectLevelUnion(or, ref branch, ref noSvc) || branch is null || noSvc is not null)
+                    return false;
+                IntersectLevels(ref levels, branch);
+                return true;
+            }
+
+            default:
+                return false;
+        }
+    }
+
+    /// <summary>Collects an OR-tree whose every leaf constrains the level, as a union.</summary>
+    private static bool CollectLevelUnion(FilterNode node, ref HashSet<LogLevel>? union, ref string? service)
+    {
+        if (node is OrNode or)
+            return CollectLevelUnion(or.Left, ref union, ref service)
+                && CollectLevelUnion(or.Right, ref union, ref service);
+
+        HashSet<LogLevel>? leaf = null;
+        string?            svc  = null;
+        if (!CollectHeaderShape(node, ref leaf, ref svc) || leaf is null || svc is not null) return false;
+
+        (union ??= new HashSet<LogLevel>()).UnionWith(leaf);
+        return true;
+    }
+
+    /// <summary>
+    /// A level literal is usable here ONLY if it is the canonical spelling the scan would
+    /// match. <c>LogLevelExtensions.TryParse</c> also accepts aliases — 'Info', 'Warn' —
+    /// but the evaluator compares the literal against <c>Level.ToSeqString()</c>, so those
+    /// spellings match NOTHING. Reading them as their level would turn a rule that has
+    /// never fired into one that counts the entire level.
+    /// </summary>
+    private static bool TryCanonicalLevel(string literal, out LogLevel level)
+        => LogLevelExtensions.TryParse(literal.AsSpan(), out level)
+        && level.ToSeqString().Equals(literal, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Service literals the header aggregator would read as something other than "this
+    /// exact service": the empty string, which it treats as NO filter (counting every
+    /// service), and its own display name for events that carry no service, which the
+    /// scan can never match because it compares against a null.
+    /// </summary>
+    private static bool IsUsableServiceLiteral(string literal)
+        => literal.Length > 0
+        && !literal.Equals("(unknown)", StringComparison.OrdinalIgnoreCase);
+
+    private static void IntersectLevels(ref HashSet<LogLevel>? levels, IReadOnlyCollection<LogLevel> with)
+    {
+        if (levels is null) { levels = new HashSet<LogLevel>(with); return; }
+        levels.IntersectWith(with);
+    }
+
+    private static bool IsBuiltin(string property, BuiltinField expected) =>
+        BuiltinFields.TryResolve(property, out var f) && f == expected;
 
     // ── Filter name → index key ───────────────────────────────────────────────
 
@@ -256,10 +492,11 @@ public sealed class CompiledFilter
                 CollectTrigram(and.Right, out_);
                 break;
 
-            case OrNode or:
-                CollectTrigram(or.Left,  out_);
-                CollectTrigram(or.Right, out_);
-                break;
+            // Deliberately skip OrNode — the consumer intersects every hint as a
+            // conjunct (TryNarrowWithIndex), so hints gathered across OR branches
+            // narrowed `contains(a) or contains(b)` to rows containing BOTH, and an
+            // OR branch whose term was absent from a group dropped the whole group.
+            // Same rule, same reason as CollectInvertedHints above.
         }
     }
 }

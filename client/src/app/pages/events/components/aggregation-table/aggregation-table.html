@@ -1,0 +1,45 @@
+<div class="agg">
+  @if (result().partial) {
+    <!-- The scan stopped early, so every number below is a floor. A truncated LIST is visibly
+         short; a truncated TOTAL looks exactly like a complete one, which is why this is a
+         banner and not a footnote. -->
+    <div class="agg-partial">
+      <lucide-icon name="triangle-alert" [size]="14" />
+      <span>Partial result — {{ result().partialReason }}. The numbers below are lower bounds.</span>
+    </div>
+  }
+
+  @if (hasRows()) {
+    <div class="agg-scroll">
+      <div class="agg-head" [style.grid-template-columns]="gridTemplate()">
+        @for (col of result().keyColumns; track col) {
+          <span class="agg-h agg-h-key">{{ col }}</span>
+        }
+        @for (col of result().valueColumns; track col) {
+          <span class="agg-h agg-h-val">{{ col }}</span>
+        }
+      </div>
+
+      <div class="agg-body">
+        @for (row of result().rows; track $index) {
+          <div class="agg-row" [style.grid-template-columns]="gridTemplate()">
+            @for (k of row.key; track $index) {
+              <span class="agg-cell agg-cell-key" [class.absent]="isAbsent(k)" [title]="k ?? ''">{{ key(k) }}</span>
+            }
+            @for (v of row.values; track $index) {
+              <span class="agg-cell agg-cell-val" [class.absent]="v === null">{{ value(v) }}</span>
+            }
+          </div>
+        }
+      </div>
+    </div>
+
+    <div class="agg-foot">
+      <span>{{ rowSummary() }}</span>
+      <span class="agg-foot-sep">·</span>
+      <span>{{ result().scanned.toLocaleString() }} events read</span>
+    </div>
+  } @else {
+    <app-empty-state icon="sigma" text="No events matched, so there is nothing to group." />
+  }
+</div>

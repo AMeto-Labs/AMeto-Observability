@@ -16,17 +16,71 @@ payment failed          # contains BOTH "payment" AND "failed"
 Free text can't be mixed into an expression, but the expression language covers the
 same intent (`ci_contains(@mt, 'timeout')`).
 
+Punctuation is not a term: `GET /api/orders/123`, a pasted stack frame or a Windows
+path search for the words in them. Keywords are terms too when nothing around them is
+an expression — `could not connect` searches for all three words.
+
+## When a filter is refused
+
+An input that contains no comparison and no `[ … ]` list is free text, whatever else is
+in it, so a search can't fail. Once one of those appears, the expression must be
+readable **in full** — the parser used to stop at the first token it couldn't use and
+silently run the part before it, so a typo after a valid prefix widened the results and
+a half-typed comparison narrowed them to nothing. These are now 400s naming the position:
+
+```
+@l = 'Error' Region = 'eu'   # two clauses with no 'and'
+Level =                      # nothing to compare against
+@l in [Error, Fatal]         # unquoted items are property names, not values
+sum(Elapsed) > 5             # no such function
+'a' != 'b'                   # no property to test — this used to match everything
+```
+
+## Aggregation
+
+A query that starts with `select` answers with a **table** instead of a list of events,
+and is asked of `GET /api/events/aggregate` rather than the search endpoint.
+
+```
+select count(*)
+select count(*) where @l = 'Error' group by ['service.name']
+select count(*) as events, avg(Elapsed), max(Elapsed) group by @l limit 20
+select count(*) group by ['service.name'] as service, @l as level
+```
+
+Aggregates: `count(*)`, `count(P)` (events that carry `P`), `sum(P)`, `min(P)`, `max(P)`,
+`avg(P)`. Clauses: `where <filter>`, `group by <property>[, …]`, `limit <n>`, and `as <name>`
+after any column. Rows come back largest-first by the first value column.
+
+A few things it says out loud rather than guessing:
+
+- A group with no numbers to work on reports **null**, not `0` — an average over nothing is
+  not zero.
+- An event that does not carry the group key forms its own group with a **null** key; it is
+  not dropped and not merged with the empty string.
+- If the scan runs out of time, reads more than 2,000,000 events, or finds more than 10,000
+  distinct groups, `partial` is true and `partialReason` says which. The numbers are then
+  floors, not totals.
+- `groupsFound` counts the groups that existed, which can exceed the rows a `limit` returned.
+
+`count`, `min`, `max`, `sum`, `avg`, `select`, `where`, `group`, `by`, `as` and `limit` are
+recognised by position, not reserved — a property may still be called `Count` or `Limit`.
+
 ## Comparison operators
 
 ```
 @l = 'Error'
 StatusCode != 200
+@l <> 'Debug'           # <> is the same operator as !=
 Elapsed > 500
 Elapsed <= 100
 UserId >= 'alice'
 ```
 
 Properties are compared case-insensitively when both sides are strings.
+
+A single quote inside a value is written either doubled or backslash-escaped:
+`Detail = 'can''t connect'` and `Detail = 'can\'t connect'` mean the same thing.
 
 ## Logical connectives
 
@@ -283,7 +337,11 @@ arrived(@id) > 0
 ```
 @l in ['Error', 'Fatal']
 StatusCode in [400, 401, 403, 404]
+@l not in ['Debug', 'Verbose']
 ```
+
+List items are values, so text has to be quoted — `@l in [Error, Fatal]` names two
+properties and is refused.
 
 ## `like` operator
 
@@ -292,6 +350,7 @@ SQL-style wildcard match. `%` matches any sequence of characters.
 ```
 @mt like '%timed out%'
 Path like '/api/users/%'
+Region not like 'eu-%'
 ```
 
 ## Examples

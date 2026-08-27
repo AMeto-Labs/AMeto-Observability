@@ -253,12 +253,10 @@ public sealed class DefaultBasePathTests : IClassFixture<AmetoWebAppFactory>
     }
 
     [Theory]
-    [InlineData("/v1/logs")]        // the OTLP spec paths — this server maps them under /otlp/,
-    [InlineData("/v1/traces")]      // so a stock exporter pointed at the bare address lands here
-    [InlineData("/v1/metrics")]
     [InlineData("/api/event")]      // the CLEF endpoint, mistyped
     [InlineData("/api/stats")]      // a real route, wrong verb
     [InlineData("/health")]
+    [InlineData("/otlp/v1/log")]    // an OTLP receiver, mistyped
     public async Task UnmatchedPost_Is405_NotTheSpaDocument(string path)
     {
         // The SPA fallback must not answer a POST. A sender that gets 200 with an HTML body reads
@@ -268,6 +266,27 @@ public sealed class DefaultBasePathTests : IClassFixture<AmetoWebAppFactory>
         var response = await _client.PostAsync(path, new StringContent(""));
 
         Assert.Equal(HttpStatusCode.MethodNotAllowed, response.StatusCode);
+        Assert.NotEqual("text/html", response.Content.Headers.ContentType?.MediaType);
+    }
+
+    [Theory]
+    [InlineData("/v1/logs")]
+    [InlineData("/v1/traces")]
+    [InlineData("/v1/metrics")]
+    public async Task OtlpSpecPaths_AreRealEndpoints_NotTheFallback(string path)
+    {
+        // These are the paths a stock OTLP exporter appends to its configured endpoint, and this
+        // server maps them alongside its own /otlp/v1/* spellings. That is a better answer than
+        // the 405 above: an exporter pointed at the bare address is not misconfigured, it is
+        // using the spec. A 400 on a deliberately malformed body is the evidence the receiver
+        // itself answered — the SPA fallback would have returned 200 text/html, and an unmapped
+        // path would have returned 405.
+        var content = new ByteArrayContent([0xFF, 0xFE, 0x00, 0x01]);
+        content.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/x-protobuf");
+
+        var response = await _client.PostAsync(path, content);
+
+        Assert.NotEqual(HttpStatusCode.MethodNotAllowed, response.StatusCode);
         Assert.NotEqual("text/html", response.Content.Headers.ContentType?.MediaType);
     }
 

@@ -1,0 +1,108 @@
+:host {
+  display: block;
+  flex: 1;
+  min-height: 0;
+}
+
+.agg {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+
+// The numbers are floors, not totals — said before the table, not after it.
+.agg-partial {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 14px;
+  font-size: 12px;
+  color: var(--warning);
+  background: var(--warning-soft);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+// The header scrolls with the body: the column count comes from the query, so a wide
+// aggregation has to be able to scroll sideways without the two halves drifting apart.
+.agg-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+
+.agg-head {
+  display: grid;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--bg-elevated);
+  border-bottom: 1px solid var(--border);
+  padding: 5px 14px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  color: var(--text-muted);
+  min-width: fit-content;
+}
+
+.agg-h {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agg-h-val { text-align: right; padding-right: 8px; }
+
+.agg-body { min-width: fit-content; }
+
+.agg-row {
+  display: grid;
+  align-items: center;
+  padding: 6px 14px;
+  border-bottom: 1px solid var(--border);
+
+  &:last-child { border-bottom: none; }
+  &:hover { background: var(--bg-elevated); }
+}
+
+.agg-cell {
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agg-cell-key {
+  color: var(--text-primary);
+  padding-right: 12px;
+}
+
+.agg-cell-val {
+  // Tabular figures so digits line up down the column — the whole point of a column of numbers.
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  padding-right: 8px;
+  color: var(--text-secondary);
+}
+
+// "No value here" must not read as a value.
+.absent {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.agg-foot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.agg-foot-sep { opacity: .5; }

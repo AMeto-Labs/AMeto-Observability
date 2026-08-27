@@ -130,9 +130,9 @@ public static class OtlpTraceMapper
             if (key is not ("url.full" or "url.path" or "http.url" or "http.target")) continue;
             var val = kv.Value?.StringValue;
             if (val is null) continue;
-            if (val.Contains("/api/events", StringComparison.OrdinalIgnoreCase) ||
-                val.Contains("/otlp/v1/",   StringComparison.OrdinalIgnoreCase))
-                return true;
+            // One list, shared with the streaming parser, matched as a whole path — see
+            // AmetoIngestEndpoints for why both of those matter.
+            if (AmetoIngestEndpoints.Matches(val.AsSpan())) return true;
         }
         return false;
     }

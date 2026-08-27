@@ -376,8 +376,14 @@ public sealed class SegmentReader : ISegmentReader
         // Whole-segment fast reject on the file header's min/max timestamps.
         if (Info.MaxTimestampTicks < fromTicks || Info.MinTimestampTicks > toTicks) return;
 
-        foreach (var (blockOffset, _) in _blocks)
-            AggregateBlockHeaders(blockOffset, agg, fromTicks, toTicks);
+        // The same zone map the event scan prunes with: a narrow histogram window over a
+        // wide segment used to decompress every block only for the per-event window check
+        // to reject them all. Pre-v6 blocks report no MinTs and are never skipped.
+        for (int i = 0; i < _blocks.Length; i++)
+        {
+            if (SkipByWindow(i, fromTicks, toTicks)) continue;
+            AggregateBlockHeaders(_blocks[i].FileOffset, agg, fromTicks, toTicks);
+        }
     }
 
     private void AggregateBlockHeaders(long blockOffset, LogVolumeAggregator agg, long fromTicks, long toTicks)

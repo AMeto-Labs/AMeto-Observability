@@ -72,17 +72,58 @@ export function msToDotNetUtcTicks(ms: number): number {
 }
 
 /**
+ * Converts an ISO-8601 timestamp into .NET UTC ticks (100 ns since 0001-01-01) as a
+ * decimal string, preserving the full 7-digit fractional second.
+ *
+ * `new Date(iso).getTime()` floors to milliseconds, and the server's keyset cursor
+ * compares the timestamp strictly first — so every event whose ticks fell between the
+ * floored cursor and the boundary event's true ticks was silently skipped at each
+ * infinite-scroll page boundary (at high ingest rates that is dozens of events per
+ * millisecond). Ticks also exceed Number.MAX_SAFE_INTEGER (6.4e17 > 2^53), so the math
+ * runs in BigInt and the result travels as a string.
+ */
+export function isoToDotNetUtcTicksString(iso: string): string {
+  const m = /^(\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}:\d{2})(?:\.(\d+))?(.*)$/.exec(iso);
+  if (m) {
+    const baseMs = Date.parse(m[1] + m[3]); // seconds-precision part keeps its own tz suffix
+    if (!Number.isNaN(baseMs)) {
+      const fracTicks = (m[2] ?? '').padEnd(7, '0').slice(0, 7);
+      return ((BigInt(baseMs) + BigInt(DOTNET_TICKS_UNIX_EPOCH_MS)) * 10_000n + BigInt(fracTicks)).toString();
+    }
+  }
+  // Unrecognised shape — fall back to millisecond precision rather than fail the query.
+  return String(msToDotNetUtcTicks(new Date(iso).getTime()));
+}
+
+/**
  * Removes all matches of `pattern` from a filter expression, then cleans up
  * dangling `and`/`or` connectives and extra whitespace — used to splice out a
  * previous clause before inserting a new one, without erasing the user's own text.
  */
 export function stripFilterClause(expr: string, pattern: RegExp): string {
-  return expr
+  let out = expr
     .replace(pattern, '')
-    .replace(/\s+and\s+and\s+/gi, ' and ')
-    .replace(/^\s*(and|or)\s+/gi, '')
-    .replace(/\s+(and|or)\s*$/gi, '')
-    .trim();
+    // Two connectives left facing each other where the clause used to be. Only `and and`
+    // was collapsed, so a query joined with `or` — or with a mix — left `or  or` behind,
+    // which the server now refuses outright instead of quietly mis-reading. The user never
+    // typed the broken string: a checkbox click built it.
+    .replace(/\s+(?:and|or)(?:\s+(?:and|or))+\s+/gi, (m) => (/\bor\b/i.test(m) ? ' or ' : ' and '));
+
+  // Until it settles. One pass was not enough: stripping the level clause out of
+  // `not @l = 'Error' and X` leaves `not  and X`, where the collapse above does not fire — it
+  // wants two connectives side by side — so removing the leading `not` left `and X`, a filter
+  // opening with a dangling connective, patched straight in and sent. A checkbox click built
+  // that string; the user never typed it.
+  let previous: string;
+  do {
+    previous = out;
+    out = out
+      .replace(/^\s*(?:and|or|not)\s+/i, '')
+      .replace(/\s+(?:and|or|not)\s*$/i, '')
+      .trim();
+  } while (out !== previous);
+
+  return out;
 }
 
 /** Active log levels in a filter expression. Full set when there's no `@l` clause. */
@@ -158,6 +199,23 @@ export function setServicesClause(expr: string, svcs: Set<string>): string {
     return rest ? `${lvlMatch[1]} and ${clause} and ${rest}` : `${lvlMatch[1]} and ${clause}`;
   }
   return stripped.trim() ? `${clause} and ${stripped.trim()}` : clause;
+}
+
+/**
+ * Does this query LOOK like it asks for an aggregation table rather than a list of events?
+ *
+ * A conservative hint, not the definition. The server decides, by tokenising: its lexer drops
+ * any character it has no meaning for, so `select "count"(*)` — quoting an identifier out of
+ * SQL habit — is an aggregation to it and not to this regex. The divergence is deliberately
+ * ONE-WAY. Under-detecting costs a wasted round trip that `loadEvents` then corrects, because
+ * the search endpoint answers such a query by naming the aggregate endpoint. Over-detecting
+ * would send an ordinary search to the wrong endpoint and turn it into an error — and `select`
+ * is not a reserved word, so `select the cheapest plan` has to stay a text search.
+ *
+ * Keep this narrower than the server, never wider.
+ */
+export function isAggregationQuery(expr: string): boolean {
+  return /^\s*select\s+(count|sum|min|max|avg)\s*\(/i.test(expr);
 }
 
 /** Comma-separated active levels for the `levels=` query param (undefined = all). */

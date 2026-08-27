@@ -2029,4 +2029,41 @@ public sealed class MetricWalTests : IAsyncLifetime
         // Teardown ran to the end rather than being skipped: the door is shut behind it.
         Assert.Throws<ObjectDisposedException>(() => engine.Ingest(SlowFlushBatch(baseNano, "c", 1, 1)));
     }
+
+    /// <summary>
+    /// A torn first entry whose Generation field decodes to a huge value — the production
+    /// incident verbatim (gen ≈ 155e9, 8 GiB WAL). No append can stamp a generation above
+    /// the header counter, so both replay and compaction must treat such an entry as
+    /// end-of-data: replay must not push its garbage fields into the hot tier, and a
+    /// commit must be able to empty the log instead of keeping the entry "above the
+    /// watermark" forever while the file doubles without bound.
+    /// </summary>
+    [Fact]
+    public void Corrupt_generation_entry_ends_replay_and_compacts_away()
+    {
+        var wal = OpenWal();
+        Append(wal, Scalar("cpu", 1_000, 1.0));
+        Append(wal, Scalar("cpu", 2_000, 2.0));
+        wal.Dispose();
+
+        using (var fs = new FileStream(WalPath, FileMode.Open, FileAccess.ReadWrite))
+        {
+            fs.Seek(32, SeekOrigin.Begin);               // first entry's Generation field
+            fs.Write(BitConverter.GetBytes(155_000_000_000UL));
+        }
+
+        var reopened = OpenWal();
+        var replayed = reopened.ReadAll(out int unresolved);
+        Assert.Empty(replayed);                          // garbage fields must not replay
+        Assert.Equal(0, unresolved);
+
+        reopened.CommitFlush(reopened.BeginFlush());     // Compact must not strand the entry
+        reopened.Dispose();
+
+        using var check = new FileStream(WalPath, FileMode.Open, FileAccess.Read);
+        Span<byte> off = stackalloc byte[8];
+        check.Seek(8, SeekOrigin.Begin);                 // WalFileHeader.WriteOffset
+        check.ReadExactly(off);
+        Assert.Equal(32L, BitConverter.ToInt64(off));    // the log is empty again
+    }
 }

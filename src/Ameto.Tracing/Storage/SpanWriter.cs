@@ -65,7 +65,22 @@ internal static class SpanWriter
     private const ushort Version     = 3;
     private const int    BlockSize   = 4096;
 
-    public static SpanSegmentInfo Write(string dataDir, IList<SpanRecord> spans)
+    /// <param name="recoverable">
+    /// True for a hot-tier flush, whose temp file the engine constructor may rename into
+    /// place if a crash lost the rename — the spans exist nowhere else. FALSE for a
+    /// compaction merge: its inputs are still on disk until it finishes, so resurrecting a
+    /// merge temp would publish a second copy of everything it merged. Merge temps carry a
+    /// distinct suffix and are always swept.
+    /// </param>
+    /// <param name="onNamed">
+    /// Invoked with the final .trc path as soon as the name exists, BEFORE any file is created.
+    /// The caller needs the name before the rename, not after: the rename is what makes the
+    /// segment visible to the background cold scan, and a guard published afterwards leaves a
+    /// window in which the scan adopts the segment while the flushing tier still holds the same
+    /// spans — counting them twice in the stats, service graph and volume paths.
+    /// </param>
+    public static SpanSegmentInfo Write(string dataDir, IList<SpanRecord> spans, bool recoverable = true,
+                                        Action<string>? onNamed = null)
     {
         if (spans.Count == 0) throw new InvalidOperationException("Cannot write empty span batch.");
 
@@ -79,12 +94,30 @@ internal static class SpanWriter
         long maxNano = spans[^1].StartTimeUnixNano;
 
         // Nonce keeps the name unique across a v2→v3 rewrite of the same span
-        // batch (same min/max/count → same name) — otherwise the CreateNew below
-        // throws "already exists" and compaction fails every pass. The name is
-        // never parsed back; sidecars share this base so they stay grouped.
+        // batch (same min/max/count → same name) — otherwise two flushes would
+        // collide on one path. The name is never parsed back; sidecars share this
+        // base so they stay grouped.
         string nonce    = Guid.NewGuid().ToString("N").Substring(0, 8);
         string baseName = $"spans-{minNano}-{maxNano}-{spans.Count}-{nonce}";
         string trcPath  = Path.Combine(dataDir, baseName + ".trc");
+        onNamed?.Invoke(trcPath);
+
+        // TEMP-NAME PROTOCOL. All four files are built at .tmp names, fsynced, and only
+        // then renamed into place — sidecars first, the .trc LAST: its appearance is the
+        // commit the background cold scan keys on. Building at the final path had three
+        // failure modes, all closed here: a power loss after the caller's WAL reset left
+        // a truncated .trc as the only copy of the flush (the next start deleted it as
+        // unreadable, and the WAL had nothing to replay — ~50k spans gone); the cold
+        // scan could open a half-written file and, failing on the missing footer,
+        // DELETE it — on Linux even under the writer's live handle; and a failed
+        // sidecar left a complete-looking .trc behind while the flush reported failure,
+        // so every span of it replayed as a duplicate from the next restart. Leftover
+        // .tmp files are swept by the TraceStorageEngine constructor, where no writer
+        // can be live.
+        string trcTmp        = trcPath + (recoverable ? ".tmp" : ".mrg.tmp");
+        string statsFinal    = Path.Combine(dataDir, baseName + ".stats");
+        string svcgraphFinal = Path.ChangeExtension(trcPath, ".svcgraph");
+        string tracesumFinal = Path.ChangeExtension(trcPath, ".tracesum");
 
         // Accumulate service→block mapping and stats in a single pass through WriteBlock
         var traceIndex  = new Dictionary<TraceId, List<uint>>(capacity: spans.Count / 4);
@@ -92,98 +125,126 @@ internal static class SpanWriter
         // Per-service stats accumulators (service → mutable stats)
         var svcStats    = new Dictionary<string, MutableServiceStats>(StringComparer.Ordinal);
 
-        using var fs = new FileStream(trcPath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 65536);
-        using var bw = new BinaryWriter(fs);
+        // Finals already renamed, for rollback if a later step of the publish fails.
+        var published = new List<string>(3);
 
-        // ── Header ─────────────────────────────────────────────────────────────
-        bw.Write(Magic);
-        bw.Write(Version);
-        bw.Write((uint)spans.Count);
-        bw.Write(minNano);
-        bw.Write(maxNano);
-        bw.Write((byte)0); // flags
-
-        // ── Span blocks ────────────────────────────────────────────────────────
-        // One block buffer for the whole file, reset (not reallocated) per block.
-        // The old shape allocated a fresh 1 MB ArrayBufferWriter per block, grew it
-        // by Array.Resize under large attributes, then copied the whole thing again
-        // with WrittenSpan.ToArray() — three LOH-sized allocations per 4096 spans,
-        // ~145 MB of flush-path LOH churn in a 7-minute allocation trace.
-        int written  = 0;
-        var blockBuf = new ArrayBufferWriter<byte>(1024 * 1024);
-        var blooms   = new List<byte[]>();
-
-        while (written < spans.Count)
+        try
         {
-            int batchCount = Math.Min(BlockSize, spans.Count - written);
-            uint blockIdx  = (uint)(written / BlockSize);
-            var block      = WriteBlock(spans, written, batchCount, blockBuf, blockIdx,
-                                        traceIndex, svcBlockMap, svcStats, blooms);
-            bw.Write((uint)block.UncompressedSize);
-            bw.Write((uint)block.CompressedBytes.Length);
-            bw.Write(block.CompressedBytes);
-            written += batchCount;
-        }
-
-        // ── TraceId index (one LZ4 block) ──────────────────────────────────────
-        long traceIdxOffset = fs.Position;
-        {
-            var idxBuf = new MemoryStream(traceIndex.Count * 32);
-            var idxBw  = new BinaryWriter(idxBuf);
-            Span<byte> traceIdBuf = stackalloc byte[16];
-            idxBw.Write((uint)traceIndex.Count);
-            foreach (var (traceId, offsets) in traceIndex)
+            using (var fs = new FileStream(trcTmp, FileMode.Create, FileAccess.Write, FileShare.None, 65536))
+            using (var bw = new BinaryWriter(fs))
             {
-                traceId.WriteTo(traceIdBuf);
-                idxBw.Write(traceIdBuf);
-                idxBw.Write((uint)offsets.Count);
-                foreach (var o in offsets) idxBw.Write(o);
+                // ── Header ─────────────────────────────────────────────────────
+                bw.Write(Magic);
+                bw.Write(Version);
+                bw.Write((uint)spans.Count);
+                bw.Write(minNano);
+                bw.Write(maxNano);
+                bw.Write((byte)0); // flags
+
+                // ── Span blocks ────────────────────────────────────────────────
+                // One block buffer for the whole file, reset (not reallocated) per block.
+                // The old shape allocated a fresh 1 MB ArrayBufferWriter per block, grew it
+                // by Array.Resize under large attributes, then copied the whole thing again
+                // with WrittenSpan.ToArray() — three LOH-sized allocations per 4096 spans,
+                // ~145 MB of flush-path LOH churn in a 7-minute allocation trace.
+                int written  = 0;
+                var blockBuf = new ArrayBufferWriter<byte>(1024 * 1024);
+                var blooms   = new List<byte[]>();
+
+                while (written < spans.Count)
+                {
+                    int batchCount = Math.Min(BlockSize, spans.Count - written);
+                    uint blockIdx  = (uint)(written / BlockSize);
+                    var block      = WriteBlock(spans, written, batchCount, blockBuf, blockIdx,
+                                                traceIndex, svcBlockMap, svcStats, blooms);
+                    bw.Write((uint)block.UncompressedSize);
+                    bw.Write((uint)block.CompressedBytes.Length);
+                    bw.Write(block.CompressedBytes);
+                    written += batchCount;
+                }
+
+                // ── TraceId index (one LZ4 block) ──────────────────────────────
+                long traceIdxOffset = fs.Position;
+                {
+                    var idxBuf = new MemoryStream(traceIndex.Count * 32);
+                    var idxBw  = new BinaryWriter(idxBuf);
+                    Span<byte> traceIdBuf = stackalloc byte[16];
+                    idxBw.Write((uint)traceIndex.Count);
+                    foreach (var (traceId, offsets) in traceIndex)
+                    {
+                        traceId.WriteTo(traceIdBuf);
+                        idxBw.Write(traceIdBuf);
+                        idxBw.Write((uint)offsets.Count);
+                        foreach (var o in offsets) idxBw.Write(o);
+                    }
+                    // Compress from the stream's own backing array — ToArray() duplicated the
+                    // whole index (LOH-sized on a busy segment) for nothing.
+                    var raw        = idxBuf.GetBuffer().AsSpan(0, (int)idxBuf.Length);
+                    var compressed = LZ4Pickler.Pickle(raw, LZ4Level.L09_HC);
+                    bw.Write((uint)raw.Length);
+                    bw.Write((uint)compressed.Length);
+                    bw.Write(compressed);
+                }
+
+                // ── Service index ──────────────────────────────────────────────
+                long svcIdxOffset = fs.Position;
+                bw.Write((uint)svcBlockMap.Count);
+                foreach (var (svcName, blocks) in svcBlockMap)
+                {
+                    var nameBytes = Encoding.UTF8.GetBytes(svcName);
+                    bw.Write((ushort)nameBytes.Length);
+                    bw.Write(nameBytes);
+                    bw.Write((uint)blocks.Count);
+                    foreach (var b in blocks) bw.Write(b);
+                }
+
+                // ── Bloom index ────────────────────────────────────────────────
+                long bloomIdxOffset = fs.Position;
+                bw.Write((uint)blooms.Count);
+                foreach (var b in blooms)
+                {
+                    bw.Write((uint)b.Length);
+                    bw.Write(b);
+                }
+
+                // ── Footer (28 bytes) ──────────────────────────────────────────
+                bw.Write((ulong)traceIdxOffset);
+                bw.Write((ulong)svcIdxOffset);
+                bw.Write((ulong)bloomIdxOffset);
+                bw.Write(FooterMagic);
+
+                bw.Flush();
+                // To the platter, not the page cache: the caller resets the WAL on our
+                // success, so from that moment these bytes are the only copy.
+                fs.Flush(flushToDisk: true);
             }
-            // Compress from the stream's own backing array — ToArray() duplicated the
-            // whole index (LOH-sized on a busy segment) for nothing.
-            var raw        = idxBuf.GetBuffer().AsSpan(0, (int)idxBuf.Length);
-            var compressed = LZ4Pickler.Pickle(raw, LZ4Level.L09_HC);
-            bw.Write((uint)raw.Length);
-            bw.Write((uint)compressed.Length);
-            bw.Write(compressed);
-        }
 
-        // ── Service index ──────────────────────────────────────────────────────
-        long svcIdxOffset = fs.Position;
-        bw.Write((uint)svcBlockMap.Count);
-        foreach (var (svcName, blocks) in svcBlockMap)
+            // ── Sidecars, at temp names (each fsyncs itself). Some legitimately write
+            //    nothing — an empty stats/edge set produces no file at all.
+            WriteStatsSidecar(statsFinal + ".tmp", svcStats);
+            ServiceGraphSidecar.Write(trcPath, spans, svcgraphFinal + ".tmp");
+            TraceSummarySidecar.Write(trcPath, spans, tracesumFinal + ".tmp");
+
+            // ── Publish: sidecars first, the .trc last — a visible .trc implies its
+            //    sidecars are complete.
+            if (MoveIntoPlaceIfWritten(statsFinal))    published.Add(statsFinal);
+            if (MoveIntoPlaceIfWritten(svcgraphFinal)) published.Add(svcgraphFinal);
+            if (MoveIntoPlaceIfWritten(tracesumFinal)) published.Add(tracesumFinal);
+            File.Move(trcTmp, trcPath);
+        }
+        catch
         {
-            var nameBytes = Encoding.UTF8.GetBytes(svcName);
-            bw.Write((ushort)nameBytes.Length);
-            bw.Write(nameBytes);
-            bw.Write((uint)blocks.Count);
-            foreach (var b in blocks) bw.Write(b);
+            // The .trc rename is last, so the segment itself was never published — but a
+            // sidecar rename that succeeded before the failure left a file at its FINAL
+            // name that nothing would ever collect (the sweep only walks .tmp). Roll those
+            // back too, so a failed flush leaves the directory exactly as it found it.
+            foreach (var f in published) TryDelete(f);
+            TryDelete(trcTmp);
+            TryDelete(statsFinal + ".tmp");
+            TryDelete(svcgraphFinal + ".tmp");
+            TryDelete(tracesumFinal + ".tmp");
+            throw;
         }
-
-        // ── Bloom index ────────────────────────────────────────────────────────
-        long bloomIdxOffset = fs.Position;
-        bw.Write((uint)blooms.Count);
-        foreach (var b in blooms)
-        {
-            bw.Write((uint)b.Length);
-            bw.Write(b);
-        }
-
-        // ── Footer (28 bytes) ──────────────────────────────────────────────────
-        bw.Write((ulong)traceIdxOffset);
-        bw.Write((ulong)svcIdxOffset);
-        bw.Write((ulong)bloomIdxOffset);
-        bw.Write(FooterMagic);
-
-        // ── .stats sidecar ─────────────────────────────────────────────────────
-        string statsPath = Path.Combine(dataDir, baseName + ".stats");
-        WriteStatsSidecar(statsPath, svcStats);
-
-        // ── .svcgraph sidecar ──────────────────────────────────────────────────
-        ServiceGraphSidecar.Write(trcPath, spans);
-
-        // ── .tracesum sidecar (volume header + per-trace rows) ──────────────────
-        TraceSummarySidecar.Write(trcPath, spans);
 
         var services = new string[svcBlockMap.Count];
         svcBlockMap.Keys.CopyTo(services, 0);
@@ -197,6 +258,23 @@ internal static class SpanWriter
             Services      = services,
             FormatVersion = Version,
         };
+    }
+
+    /// <summary>
+    /// Renames <c>{finalPath}.tmp</c> into place when the sidecar actually wrote one.
+    /// Returns true when a file was published (so the caller can roll it back).
+    /// </summary>
+    private static bool MoveIntoPlaceIfWritten(string finalPath)
+    {
+        string tmp = finalPath + ".tmp";
+        if (!File.Exists(tmp)) return false;
+        File.Move(tmp, finalPath);
+        return true;
+    }
+
+    private static void TryDelete(string path)
+    {
+        try { if (File.Exists(path)) File.Delete(path); } catch { /* constructor sweep collects it */ }
     }
 
     // ── Block serialisation ────────────────────────────────────────────────────
@@ -344,7 +422,8 @@ internal static class SpanWriter
         if (stats.Count == 0) return;
         const uint StatsMagic = 0x52_44_54_53; // "RDTS"
 
-        using var fs = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None, 4096);
+        // Create (not CreateNew): a temp name may carry the residue of a flush that died.
+        using var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None, 4096);
         using var bw = new BinaryWriter(fs);
 
         bw.Write(StatsMagic);
@@ -362,6 +441,9 @@ internal static class SpanWriter
             bw.Write(st.MaxDuration == long.MinValue ? 0L : st.MaxDuration);
             foreach (var b in st.Buckets) bw.Write(b);
         }
+
+        bw.Flush();
+        fs.Flush(flushToDisk: true); // durable before the caller renames and resets the WAL
     }
 
     // ── Mutable accumulator (not exposed outside this class) ──────────────────

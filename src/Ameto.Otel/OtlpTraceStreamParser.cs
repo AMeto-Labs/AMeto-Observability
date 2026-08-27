@@ -462,9 +462,11 @@ public static class OtlpTraceStreamParser
         else if (!httpFromNew)                { httpStatus = (short)value; }
     }
 
+    /// <summary>
+    /// One list, shared with <c>OtlpTraceMapper</c> — see <see cref="AmetoIngestEndpoints"/>.
+    /// </summary>
     private static bool ContainsAmetoEndpoint(ReadOnlySpan<byte> url) =>
-        ContainsAsciiIgnoreCase(url, "/api/events"u8) ||
-        ContainsAsciiIgnoreCase(url, "/otlp/v1/"u8);
+        AmetoIngestEndpoints.Matches(url);
 
     /// <summary>ASCII case-insensitive substring search (needle must be lowercase ASCII).</summary>
     private static bool ContainsAsciiIgnoreCase(ReadOnlySpan<byte> haystack, ReadOnlySpan<byte> needleLower)

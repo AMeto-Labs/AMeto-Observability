@@ -20,9 +20,10 @@ namespace Ameto.Otel;
 ///   POST /otlp/v1/metrics  — accepts ExportMetricsServiceRequest JSON
 ///   POST /otlp/v1/logs     — accepts ExportLogsServiceRequest JSON
 ///
-/// Content-Type: application/json (OTLP/HTTP JSON encoding).
-/// Protobuf (application/x-protobuf) is not yet supported — clients must
-/// configure the exporter to use HTTP/JSON.
+/// Both encodings are accepted: application/json and application/x-protobuf. Anything else
+/// is read as JSON.
+///
+/// OTLP over gRPC lives in OtlpGrpcEndpointMapper.
 /// </summary>
 public static class OtlpEndpointMapper
 {
@@ -35,11 +36,19 @@ public static class OtlpEndpointMapper
         AllowTrailingCommas  = true,
     };
 
-    public static void MapOtlpEndpoints(this WebApplication app, bool enableTraces = true, bool enableMetrics = true)
+    /// <param name="basePath">
+    /// The deployment prefix, leading slash and no trailing one ("/ameto"), or empty at the root.
+    /// Passed on to <see cref="AmetoIngestEndpoints"/>: with a prefix configured an exporter is
+    /// pointed at <c>https://host/ameto/otlp/v1/traces</c>, and the self-ingest guard has to
+    /// recognise that as its own receiver or the feedback loop it exists to break comes back.
+    /// </param>
+    public static void MapOtlpEndpoints(this WebApplication app, bool enableTraces = true, bool enableMetrics = true,
+                                        string basePath = "")
     {
+        AmetoIngestEndpoints.BasePath = basePath;
+
         // ── Traces ────────────────────────────────────────────────────────────
-        if (enableTraces)
-        app.MapPost("/otlp/v1/traces", async (HttpContext ctx, ISpanIngester ingester, ILoggerFactory logFactory) =>
+        var traces = async (HttpContext ctx, ISpanIngester ingester, ILoggerFactory logFactory) =>
         {
             if (!Authorized(ctx, ApiKeyPermissions.Traces)) return;
             var logger = logFactory.CreateLogger("Ameto.Otel.Traces");
@@ -85,11 +94,10 @@ public static class OtlpEndpointMapper
             {
                 await WriteJsonOk(ctx, 0, 0);
             }
-        });
+        };
 
         // ── Metrics ───────────────────────────────────────────────────────────
-        if (enableMetrics)
-        app.MapPost("/otlp/v1/metrics", async (HttpContext ctx) =>
+        var metrics = async (HttpContext ctx) =>
         {
             if (!Authorized(ctx, ApiKeyPermissions.Metrics)) return;
             var ingester = ctx.RequestServices.GetRequiredService<IMetricIngester>();
@@ -121,10 +129,10 @@ public static class OtlpEndpointMapper
 
             ingester.Ingest(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(points));
             await WriteJsonOk(ctx, points.Count, 0);
-        });
+        };
 
         // ── Logs ──────────────────────────────────────────────────────────────
-        app.MapPost("/otlp/v1/logs", async (HttpContext ctx) =>
+        var logs = async (HttpContext ctx) =>
         {
             if (!Authorized(ctx, ApiKeyPermissions.Logs)) return;
             var endpoint = ctx.RequestServices.GetRequiredService<IngestionEndpoint>();
@@ -155,7 +163,29 @@ public static class OtlpEndpointMapper
             finally { ArrayPool<byte>.Shared.Return(body); }
 
             await WriteJsonOk(ctx, ingested, dropped);
-        });
+        };
+
+        // ── Routes ────────────────────────────────────────────────────────────
+        // Each handler is mapped at BOTH spellings. `/v1/…` is what the specification names and
+        // what every exporter builds by appending to its configured endpoint, so a collector
+        // pointed at this server with default settings asked for `/v1/logs` and got a 404 — the
+        // receiver was reachable only by someone who had read this file. The `/otlp/v1/…` paths
+        // stay because deployments are already configured with them; one handler serves both, so
+        // the two cannot drift.
+        app.MapPost("/otlp/v1/logs", logs);
+        app.MapPost("/v1/logs",      logs);
+
+        if (enableTraces)
+        {
+            app.MapPost("/otlp/v1/traces", traces);
+            app.MapPost("/v1/traces",      traces);
+        }
+
+        if (enableMetrics)
+        {
+            app.MapPost("/otlp/v1/metrics", metrics);
+            app.MapPost("/v1/metrics",      metrics);
+        }
 
         // Metric query endpoints live in Ameto.Metrics.MetricQueryEndpointMapper
         // (mapped via app.MapMetricEndpoints()).

@@ -1,7 +1,7 @@
 import { Injectable, inject } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
 import { Observable } from 'rxjs';
-import { EventDto, EventQueryParams, StatsDto, EventCountsDto } from '../models/event.model';
+import { EventDto, EventQueryParams, StatsDto, EventCountsDto, AggregationDto } from '../models/event.model';
 import {
   AlertRule, AlertRuleUpsertRequest, AlertStateSnapshot, AlertHistoryEntry,
   AlertSilence, AlertPreviewResult, MaintenanceWindow,
@@ -64,21 +64,84 @@ export class ApiService {
       if (params.afterId) p.set('afterId', params.afterId);
       if (params.afterTs !== undefined) p.set('afterTs', String(params.afterTs));
       if (params.levels) p.set('levels', params.levels);
-      return this.openTicketedSse('/api/events', p,
+      let delivered = false;
+      let explain: (() => void) | undefined;
+      const teardown = this.openTicketedSse('/api/events', p,
         es => {
           es.onmessage = event => {
+            delivered = true;
             try { subscriber.next(JSON.parse(event.data) as EventDto); } catch { /* ignore */ }
           };
           es.addEventListener('done', () => { es.close(); subscriber.complete(); });
+          // Sent by the server when a query fails AFTER the stream opened (its budget ran
+          // out, a segment could not be read). Not named 'error': EventSource dispatches
+          // its own connection failures under that name.
+          es.addEventListener('query-error', event => {
+            es.close();
+            subscriber.error(new Error(this.sseErrorMessage(event, 'Search failed')));
+          });
           es.onerror = () => {
             es.close();
             // SSE bypasses authInterceptor — re-check the session so a stale token logs out.
             this.auth.verifySession();
-            subscriber.error(new Error('Failed to load events'));
+            if (delivered) { subscriber.error(new Error('Failed to load events')); return; }
+            // Nothing arrived: most likely the request was REFUSED (bad filter, bad date,
+            // server saturated) — and EventSource cannot read the body of a non-200, so
+            // ask the validation endpoint what was wrong instead of guessing.
+            explain = this.explainQueryFailure(params, 'Failed to load events',
+                                               msg => subscriber.error(new Error(msg)));
           };
         },
         () => subscriber.error(new Error('Failed to load events')));
+      return () => { explain?.(); teardown(); };
     });
+  }
+
+  /** Reads the server's message out of a `query-error` frame, falling back to a default. */
+  private sseErrorMessage(event: Event, fallback: string): string {
+    const data = (event as MessageEvent).data;
+    if (typeof data !== 'string') return fallback;
+    try {
+      const parsed = JSON.parse(data) as { error?: string };
+      return parsed.error?.trim() || fallback;
+    } catch {
+      return fallback;
+    }
+  }
+
+  /**
+   * Asks why a stream that delivered nothing failed. A browser cannot read the body of a
+   * non-200 SSE response, so the reason — a filter typo, a bad date — is only reachable
+   * by asking again over a normal request. When the query itself is fine the failure was
+   * operational (the server refused it while at its search limit, or the connection
+   * broke), and the message says so instead of blaming the query.
+   *
+   * <p>Skipped entirely once the session is gone: the GET would be a guaranteed 401 and
+   * would trigger a second logout on top of the one verifySession already started.</p>
+   *
+   * @returns a canceller for the in-flight request, so a torn-down stream leaves nothing running.
+   */
+  private explainQueryFailure(
+    params: { filter?: string; from?: string; to?: string },
+    connectionMessage: string,
+    report: (message: string) => void,
+  ): () => void {
+    if (!this.auth.isAuthenticated()) { report(connectionMessage); return () => {}; }
+
+    const p = new URLSearchParams();
+    if (params.filter) p.set('filter', params.filter);
+    if (params.from)   p.set('from', params.from);
+    if (params.to)     p.set('to', params.to);
+
+    const busy = 'The server is busy or unreachable. Try again in a moment.';
+    const sub = this.http.get(`/api/events/validate?${p.toString()}`).subscribe({
+      next:  () => report(busy),
+      error: (err: { status?: number; error?: { error?: string } }) =>
+        report(err?.status === 400
+          ? (err.error?.error?.trim() || connectionMessage)
+          : busy),
+    });
+    return () => sub.unsubscribe();
   }
 
   getStats(): Observable<StatsDto> {
@@ -105,6 +168,18 @@ export class ApiService {
     if (params.bucket) p.set('bucket', String(params.bucket));
     if (params.service) p.set('service', params.service);
     return this.http.get<EventCountsDto>(`/api/events/counts?${p.toString()}`);
+  }
+
+  /**
+   * Runs a `select … group by …` query. Plain JSON rather than SSE: the answer is a table with
+   * its own columns, which cannot arrive one event at a time.
+   */
+  aggregate(params: { filter: string; from?: string; to?: string }): Observable<AggregationDto> {
+    const p = new URLSearchParams();
+    p.set('filter', params.filter);
+    if (params.from) p.set('from', params.from);
+    if (params.to)   p.set('to',   params.to);
+    return this.http.get<AggregationDto>(`/api/events/aggregate?${p.toString()}`);
   }
 
   // ── Alerts ───────────────────────────────────────────────────────────────
@@ -207,23 +282,42 @@ export class ApiService {
     return this.http.post<{ message: string }>('/api/system/update/apply', {});
   }
 
-  streamLive(filter?: string): Observable<EventDto> {
+  /**
+   * Opens the live tail. `levels` is the same comma-separated list the search sends — the
+   * level selector used to apply to the history and be dropped as soon as the tail started,
+   * so switching to live quietly widened the view back to every level.
+   */
+  streamLive(params: { filter?: string; levels?: string } = {}): Observable<EventDto> {
     return new Observable<EventDto>(subscriber => {
+      const { filter, levels } = params;
       const p = new URLSearchParams();
       if (filter) p.set('filter', filter);
-      return this.openTicketedSse('/api/events/live', p,
+      if (levels) p.set('levels', levels);
+      let delivered = false;
+      let explain: (() => void) | undefined;
+      const teardown = this.openTicketedSse('/api/events/live', p,
         es => {
           es.onmessage = event => {
+            delivered = true;
             try { subscriber.next(JSON.parse(event.data) as EventDto); } catch { /* ignore parse errors */ }
           };
+          // The tail reports the same way the search does: a poll that blew its budget, a
+          // server too busy to keep the tail fed, a failure after the stream opened.
+          es.addEventListener('query-error', event => {
+            es.close();
+            subscriber.error(new Error(this.sseErrorMessage(event, 'Live tail stopped')));
+          });
           es.onerror = () => {
             es.close();
             // SSE bypasses authInterceptor — re-check the session so a stale token logs out.
             this.auth.verifySession();
-            subscriber.error(new Error('SSE connection lost'));
+            if (delivered) { subscriber.error(new Error('SSE connection lost')); return; }
+            explain = this.explainQueryFailure({ filter }, 'SSE connection lost',
+                                               msg => subscriber.error(new Error(msg)));
           };
         },
         () => subscriber.error(new Error('SSE connection lost')));
+      return () => { explain?.(); teardown(); };
     });
   }
 

@@ -43,6 +43,14 @@ public sealed class HotTierOptions
     public TimeSpan MaxAge   { get; init; } = TimeSpan.FromMinutes(5);
 
     /// <summary>
+    /// How often the live WAL is msync'd to disk. This is the durability window for
+    /// acknowledged events: a power loss forfeits at most this much accepted ingest
+    /// (a process crash forfeits nothing — the page cache survives it). Zero or
+    /// negative disables the periodic msync, restoring page-cache-only durability.
+    /// </summary>
+    public TimeSpan WalFlushInterval { get; init; } = TimeSpan.FromSeconds(2);
+
+    /// <summary>
     /// Number of cold-segment flushes (index build + compress + write) allowed to run in
     /// parallel. Higher = more flush throughput (fewer ingest drops under burst) but more
     /// peak RAM (concurrent index builds). 0 = auto (≈ processor count / 2, capped 2–8).
@@ -164,6 +172,65 @@ public sealed class UpdatesOptions
     public string GitHubRepository     { get; init; } = "AMeto-Labs/AMeto-Observability";
 }
 
+/// <summary>Query-path configuration.</summary>
+public sealed class QueryOptions
+{
+    /// <summary>
+    /// Budget for the cross-query cache of decoded segment indexes, charged at each
+    /// entry's RETAINED size (expanded postings + dictionaries + bloom bits — several
+    /// times the packed sections they decode from). Zero or negative disables it —
+    /// every query then re-reads and re-decodes the sections it consults, the
+    /// pre-cache behaviour. Default: 256 MB.
+    /// </summary>
+    public long IndexCacheBytes { get; init; } = 256 * 1024 * 1024;
+
+    /// <summary>
+    /// Wall-clock budget for one search. A query that exceeds it is stopped and the client
+    /// is told so — rather than the request occupying a core until the browser tab is
+    /// closed, which is what an unbounded scan over an unbounded window did. Zero or
+    /// negative removes the budget. Default: 60 s.
+    /// </summary>
+    public TimeSpan Timeout { get; init; } = TimeSpan.FromSeconds(60);
+
+    /// <summary>
+    /// How many searches may run at once. Each one memory-maps segments and decompresses
+    /// blocks in parallel, so a handful of dashboards refreshing together could take the
+    /// whole box; past this limit a request is refused quickly (503 + Retry-After) instead
+    /// of everything crawling. 0 = auto (processor count, clamped 2..16), negative =
+    /// unlimited.
+    /// </summary>
+    public int MaxConcurrent { get; init; }
+
+    /// <summary>How long a request waits for a slot before it is refused. Default: 5 s.</summary>
+    public TimeSpan QueueWait { get; init; } = TimeSpan.FromSeconds(5);
+}
+
+/// <summary>
+/// Live-tail (<c>GET /api/events/live</c>) pacing. A tail no longer polls on a timer: it
+/// waits to be told that something was written, so these bound how often it MAY look, not
+/// how often it does.
+/// </summary>
+public sealed class LiveTailOptions
+{
+    /// <summary>
+    /// Floor between two polls of one tail. Under load a tail is signalled continuously, and
+    /// without a floor it would re-query as fast as the searches complete — each one taking a
+    /// search slot. This is the ceiling on that cost, and it doubles as the batching window:
+    /// events arriving inside it are delivered together by the next poll. Default: 100 ms.
+    /// </summary>
+    public TimeSpan MinInterval { get; init; } = TimeSpan.FromMilliseconds(100);
+
+    /// <summary>
+    /// Longest a parked tail waits before looking anyway. It bounds the keepalive interval —
+    /// proxies drop idle connections — and is the safety net that limits how long a missed
+    /// wake-up could hide an event. Default: 5 s.
+    /// </summary>
+    public TimeSpan MaxWait { get; init; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>Events one poll may deliver before the next poll continues from its cursor. Default: 500.</summary>
+    public int PageSize { get; init; } = 500;
+}
+
 /// <summary>
 /// Top-level server configuration.
 /// </summary>
@@ -172,6 +239,8 @@ public sealed class ServerOptions
     public NodeId           NodeId           { get; init; } = NodeId.Local;
     public string           DataDirectory    { get; init; } = "data";
     public HotTierOptions   HotTier          { get; init; } = new();
+    public QueryOptions     Query            { get; init; } = new();
+    public LiveTailOptions  LiveTail         { get; init; } = new();
     public IndexingOptions  Indexing         { get; init; } = new();
     public IngestionOptions Ingestion        { get; init; } = new();
     public RetentionConfig  Retention        { get; init; } = new();
@@ -203,6 +272,18 @@ public sealed class ServerOptions
 
     public string           SslCertPath      { get; init; } = "";
     public string           SslCertPassword  { get; init; } = "";
+
+    /// <summary>
+    /// Port for OTLP over gRPC — 4317 is the convention. <b>0 disables it</b>, which is the
+    /// default: gRPC needs HTTP/2, and without TLS there is no ALPN to negotiate it, so a
+    /// plaintext listener has to be told to speak HTTP/2 and then speaks nothing else. That
+    /// cannot be the main port — no browser does HTTP/2 without TLS, so the UI, every /api call,
+    /// the SSE tail and the container health check would all stop working on it. A second
+    /// listener is therefore the only shape this can take, and opening one on every existing
+    /// install because the binary was upgraded is not a decision to make on the operator's
+    /// behalf. Set it to 4317 to accept collectors.
+    /// </summary>
+    public int              OtlpGrpcPort     { get; init; }
 
     /// <summary>
     /// Trust X-Forwarded-Proto/Host/For from a reverse proxy (nginx, traefik).

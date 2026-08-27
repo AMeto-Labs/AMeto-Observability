@@ -29,6 +29,7 @@ public static class FilterEvaluator
             HasNode has                   => HasProperty(ev, has.Property),
             IsDefinedNode def             => HasProperty(ev, def.Property),
             CompareNode cmp               => EvalCompare(cmp, ev),
+            TimeCompareNode tc            => EvalTimeCompare(tc, ev),
             LikeNode like                 => EvalLike(like, ev),
             StartsWithNode sw             => EvalStartsWith(sw, ev),
             ContainsNode ct               => EvalContains(ct, ev),
@@ -161,6 +162,15 @@ public static class FilterEvaluator
     private static bool HasProperty(LogEvent ev, string prop) =>
         GetValue(ev, prop) is not null;
 
+    /// <summary>
+    /// Reads one property the way a predicate reads it — built-in aliases, dotted paths, the
+    /// flat-key reading of an OTLP attribute, all of it. Aggregation group keys go through
+    /// here so that <c>group by @l</c> and <c>@l = 'Error'</c> can never disagree about what
+    /// <c>@l</c> names.
+    /// </summary>
+    /// <param name="prop">An encoded path — <see cref="PropertyPath.Separator"/>-joined.</param>
+    public static object? ReadProperty(LogEvent ev, string prop) => GetValue(ev, prop);
+
     private static object? GetValue(LogEvent ev, string prop)
     {
         // Built-in CLEF fields. Which spellings count as built-in lives in BuiltinFields —
@@ -171,12 +181,29 @@ public static class FilterEvaluator
         if (BuiltinFields.TryResolve(prop, out var field))
             return ReadBuiltin(ev, field);
 
-        if (ev.Properties is null) return null;
-
-        // Fast path: top-level key (no nested path)
+        // Fast path: top-level key (no nested path). Probed straight off the event's
+        // msgpack — the dictionary is never built for it, which is the difference between
+        // one value decoded and the whole property map materialised, per scanned event.
         int sep = prop.IndexOf(PropertyPath.Separator);
         if (sep < 0)
-            return ev.Properties.TryGetValue(prop, out var v) ? v : null;
+            return ev.TryGetProperty(prop, out var v) ? v : null;
+
+        // A dotted path has two readings, and the order between them is load-bearing (see
+        // the flat-key note below). But the walk can only succeed if its FIRST segment is
+        // present, and that is one probe — so when it is absent the map still never
+        // materialises, which is the common case for OTLP attributes (http.request.method
+        // is one flat key, not a three-level tree).
+        if (!ev.PropertiesMaterialised)
+        {
+            var head = prop.AsSpan(0, sep);
+            // Presence only — decoding the head would build the very subtree this check
+            // exists to avoid building.
+            if (PropertyPath.IsIndexSegment(head)
+                || !ev.HasNonNullProperty(PropertyPath.SegmentValue(head)))
+                return ReadFlatKeyOrNull(ev, prop);
+        }
+
+        if (ev.Properties is null) return null;
 
         // Nested path: walk dictionary tree segment-by-segment.
         object? nested = WalkPath(ev.Properties, prop.AsSpan());
@@ -187,8 +214,12 @@ public static class FilterEvaluator
         // read a dotted name only as a walk, so those filters matched nothing at all unless
         // the user knew to write ['http.request.method']. Tried second, so a genuinely nested
         // map keeps the meaning it had.
-        return PropertyPath.MayBeFlatKey(prop) ? ReadFlatKey(ev.Properties, prop) : null;
+        return ReadFlatKeyOrNull(ev, prop);
     }
+
+    /// <summary>The dotted name read as ONE key, when the grammar allows that reading.</summary>
+    private static object? ReadFlatKeyOrNull(LogEvent ev, string prop) =>
+        PropertyPath.MayBeFlatKey(prop) ? ReadFlatKey(ev, prop) : null;
 
     /// <summary>
     /// Longest flat property key probed through the stack. Beyond this the walk's answer
@@ -201,7 +232,7 @@ public static class FilterEvaluator
     /// this runs per event for every dotted-attribute filter, so the flattened spelling is
     /// built in stack scratch and probed through the dictionary's span alternate lookup.
     /// </summary>
-    private static object? ReadFlatKey(Dictionary<string, object?> props, string prop)
+    private static object? ReadFlatKey(LogEvent ev, string prop)
     {
         if (prop.Length > MaxFlatKeyChars) return null;
 
@@ -209,9 +240,9 @@ public static class FilterEvaluator
         int n = PropertyPath.WriteFlatKey(prop.AsSpan(), flat);
         if (n < 0) return null;
 
-        return props.GetAlternateLookup<ReadOnlySpan<char>>().TryGetValue(flat[..n], out var v)
-            ? v
-            : null;
+        // Through the event, so an unmaterialised map is probed rather than built — the
+        // dotted OTLP spelling is the case that reaches here on every scanned event.
+        return ev.TryGetProperty(flat[..n], out var v) ? v : null;
     }
 
     /// <summary>
@@ -281,6 +312,26 @@ public static class FilterEvaluator
     }
 
     // ── Comparison ────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Chronological <c>@t</c> comparison — tick math against the literal parsed once at
+    /// compile time (see <see cref="TimeCompareNode"/>), replacing a per-event ISO render
+    /// plus ordinal string compare.
+    /// </summary>
+    private static bool EvalTimeCompare(TimeCompareNode node, LogEvent ev)
+    {
+        long a = ev.Timestamp.UtcTicks, b = node.Ticks;
+        return node.Op switch
+        {
+            CompareOp.Eq => a == b,
+            CompareOp.Ne => a != b,
+            CompareOp.Lt => a <  b,
+            CompareOp.Le => a <= b,
+            CompareOp.Gt => a >  b,
+            CompareOp.Ge => a >= b,
+            _            => false,
+        };
+    }
 
     private static bool EvalCompare(CompareNode node, LogEvent ev)
     {
@@ -1047,47 +1098,121 @@ public static class FilterEvaluator
     private static bool LikeMatchFast(string text, LikeNode node)
     {
         if (node.IsMatchAll) return true;
-        text = text.ToLowerInvariant();
-        if (node.IsLiteral) return text == node.PatternLower;
-        return LikeMatchRecursive(text.AsSpan(), node.PatternLower.AsSpan());
+        // No ToLowerInvariant() copy of the value: the pattern is already lowercased, so
+        // the walk lowercases one character at a time. That copy was an allocation per
+        // scanned value, which is per event of every LIKE query.
+        if (node.IsLiteral) return EqualsFolded(text.AsSpan(), node.PatternLower.AsSpan());
+        return LikeMatchLower(text.AsSpan(), node.PatternLower.AsSpan());
     }
 
     // Kept for callers outside of LikeNode context (e.g. fromJson path LIKE).
     private static bool LikeMatch(string text, string pattern)
     {
-        text = text.ToLowerInvariant();
         string lp = pattern.ToLowerInvariant();
         if (lp == "%") return true;
-        if (!lp.Contains('%') && !lp.Contains('_')) return text == lp;
-        return LikeMatchRecursive(text.AsSpan(), lp.AsSpan());
+        if (!lp.Contains('%') && !lp.Contains('_'))
+            return EqualsFolded(text.AsSpan(), lp.AsSpan());
+        return LikeMatchLower(text.AsSpan(), lp.AsSpan());
     }
 
-    private static bool LikeMatchRecursive(ReadOnlySpan<char> text, ReadOnlySpan<char> pattern)
+    /// <summary>
+    /// Equality under the SAME folding the wildcard matcher uses, so the literal and
+    /// wildcard paths can never disagree about which characters are equal.
+    /// <c>OrdinalIgnoreCase</c> is not that folding — it leaves the Kelvin sign and its
+    /// friends unequal to the letters <c>string.ToLowerInvariant()</c> maps them onto,
+    /// which is what the pattern was lowered with.
+    /// </summary>
+    private static bool EqualsFolded(ReadOnlySpan<char> text, ReadOnlySpan<char> patternLower)
     {
-        while (!pattern.IsEmpty)
+        int t = 0, p = 0;
+        while (t < text.Length && p < patternLower.Length)
         {
-            char pc = pattern[0];
-
-            if (pc == '%')
-            {
-                pattern = pattern[1..];
-                if (pattern.IsEmpty) return true;
-                for (int i = 0; i <= text.Length; i++)
-                {
-                    if (LikeMatchRecursive(text[i..], pattern)) return true;
-                }
-                return false;
-            }
-
-            if (text.IsEmpty) return false;
-
-            if (pc != '_' && pc != text[0]) return false;
-
-            text    = text[1..];
-            pattern = pattern[1..];
+            if (!FoldedCharsMatch(text, ref t, patternLower, ref p)) return false;
         }
-        return text.IsEmpty;
+        return t == text.Length && p == patternLower.Length;
     }
+
+    /// <summary>
+    /// Compares ONE folded character of the value against one of the (already folded)
+    /// pattern, advancing both. A surrogate pair is folded as the code point it forms —
+    /// <c>char.ToLowerInvariant</c> cannot see astral letters, while the pattern was
+    /// lowered by <c>string.ToLowerInvariant()</c>, which can; folding only half of a pair
+    /// would make a byte-identical pattern stop matching its own value.
+    /// </summary>
+    private static bool FoldedCharsMatch(
+        ReadOnlySpan<char> text, ref int t, ReadOnlySpan<char> pattern, ref int p)
+    {
+        if (char.IsHighSurrogate(text[t]) && t + 1 < text.Length && char.IsLowSurrogate(text[t + 1]))
+        {
+            var folded = System.Text.Rune.ToLowerInvariant(
+                new System.Text.Rune(text[t], text[t + 1]));
+            Span<char> buf = stackalloc char[2];
+            int n = folded.EncodeToUtf16(buf);
+            if (p + n > pattern.Length || !pattern.Slice(p, n).SequenceEqual(buf[..n])) return false;
+            t += 2;
+            p += n;
+            return true;
+        }
+
+        if (pattern[p] != char.ToLowerInvariant(text[t])) return false;
+        t++;
+        p++;
+        return true;
+    }
+
+    /// <summary>
+    /// SQL LIKE over a value against an already-lowercased pattern.
+    ///
+    /// <para>Iterative with a single backtrack point per <c>%</c>, so it is O(text × pattern)
+    /// at worst and linear in practice. The recursive version it replaces branched at every
+    /// position after every wildcard, which is exponential in the number of <c>%</c>: a
+    /// pattern like <c>'%a%a%a%a%a%'</c> against a long non-matching value could occupy a
+    /// core for the rest of the query — and a filter box is exactly where such a pattern
+    /// gets typed by accident.</para>
+    /// </summary>
+    private static bool LikeMatchLower(ReadOnlySpan<char> text, ReadOnlySpan<char> pattern)
+    {
+        int t = 0, p = 0;
+        int starP = -1, starT = 0;   // last '%' seen, and where it started consuming
+
+        while (t < text.Length)
+        {
+            // The WILDCARD is tested first, and that order is the whole correctness of the
+            // loop: '%' compares equal to itself, so testing the literal first let a '%'
+            // IN THE VALUE consume the pattern's wildcard as an ordinary character. The
+            // backtrack point was then never recorded and `Url like '%users'` stopped
+            // matching "%2fapi%2fusers" — a URL-encoded path, or anything with a per-cent
+            // sign in it, quietly dropped out of every contains-query.
+            if (p < pattern.Length && pattern[p] == '%')
+            {
+                starP = p++;         // remember it and try to match the rest with zero chars
+                starT = t;
+            }
+            else if (p < pattern.Length &&
+                     (pattern[p] == '_' ? Advance(text, ref t, ref p) : FoldedCharsMatch(text, ref t, pattern, ref p)))
+            {
+                // consumed by the branch
+            }
+            else if (starP >= 0)
+            {
+                p = starP + 1;       // let the last '%' swallow one more character
+                t = ++starT;
+            }
+            else return false;
+        }
+
+        while (p < pattern.Length && pattern[p] == '%') p++;
+        return p == pattern.Length;
+    }
+
+    /// <summary>'_' consumes exactly one UTF-16 unit, as the recursive matcher did.</summary>
+    private static bool Advance(ReadOnlySpan<char> text, ref int t, ref int p)
+    {
+        t++;
+        p++;
+        return true;
+    }
+
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -1189,29 +1314,38 @@ public static class FilterEvaluator
 
     private static bool EvalRegexMatch(RegexMatchNode node, LogEvent ev)
     {
-        var options = node.IgnoreCase
-            ? RegexOptions.IgnoreCase | RegexOptions.CultureInvariant
-            : RegexOptions.CultureInvariant;
         object? val = GetValue(ev, node.Property);
         if (val is IList list && val is not byte[] && val is not string)
         {
             for (int i = 0; i < list.Count; i++)
-                if (list[i]?.ToString() is { } s && Regex.IsMatch(s, node.Pattern, options)) return true;
+                if (list[i]?.ToString() is { } s && IsMatch(node.Compiled, s)) return true;
             return false;
         }
-        return val?.ToString() is { } sv && Regex.IsMatch(sv, node.Pattern, options);
+        return val?.ToString() is { } sv && IsMatch(node.Compiled, sv);
+    }
+
+    /// <summary>
+    /// One value against a pre-compiled pattern. A timeout can only come from the
+    /// backtracking fallback — the linear engine is compiled without one precisely so that
+    /// a big value on a loaded box cannot go missing — and there it means this ONE value
+    /// defeated a pattern that is capable of catastrophic backtracking. Answering "no
+    /// match" for it keeps the query alive instead of killing it halfway through a stream.
+    /// </summary>
+    private static bool IsMatch(Regex rx, string input)
+    {
+        try { return rx.IsMatch(input); }
+        catch (RegexMatchTimeoutException) { return false; }
     }
 
     private static bool EvalRegexExtract(RegexExtractCompareNode node, LogEvent ev)
     {
-        var options = node.IgnoreCase
-            ? RegexOptions.IgnoreCase | RegexOptions.CultureInvariant
-            : RegexOptions.CultureInvariant;
         object? val = GetValue(ev, node.Property);
         return MatchAny(val, e =>
         {
             if (e?.ToString() is not { } s) return false;
-            var m = Regex.Match(s, node.Pattern, options);
+            Match m;
+            try { m = node.Compiled.Match(s); }
+            catch (RegexMatchTimeoutException) { return false; }
             if (!m.Success || node.Group >= m.Groups.Count) return false;
             return Compare(m.Groups[node.Group].Value, node.Value, node.Op);
         });

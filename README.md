@@ -6,7 +6,7 @@ A high-performance, self-hosted observability server — **logs, traces and metr
 
 - **150,000 events/second** measured sustained ingestion on a single node (99.97 % accepted; 100k/s runs with **zero drops**, graceful degradation up to a measured **456k/s** peak — see [tools/loadtest](tools/loadtest/README.md))
 - **Three signals, one server** — structured logs, distributed traces and metrics share the same storage and query primitives
-- **OTLP ingestion** — native `POST /otlp/v1/{logs,traces,metrics}` (protobuf), no collector required
+- **OTLP ingestion** — native `POST /v1/{logs,traces,metrics}` over HTTP (JSON or protobuf) and OTLP/gRPC on an optional port, no collector required
 - **Seq-compatible Filter Expressions** — use the same query syntax you know
 - **Off-heap storage** — ring buffer + hot-tier arena in `NativeMemory`, LZ4-compressed cold segments
 - **Inverted index + Bloom filters** — fast segment-skip without decompressing blocks
@@ -75,10 +75,13 @@ The Seq-compatible endpoint also works with any Seq sink (`WriteTo.Seq(...)`).
 **Logs / traces / metrics via OpenTelemetry** — point your OTLP exporter at:
 
 ```
-POST http://localhost:5341/otlp/v1/logs
-POST http://localhost:5341/otlp/v1/traces
-POST http://localhost:5341/otlp/v1/metrics
+POST http://localhost:5341/v1/logs
+POST http://localhost:5341/v1/traces
+POST http://localhost:5341/v1/metrics
 ```
+
+For gRPC instead of HTTP, set `OtlpGrpcPort: 4317` in `config.yml` (off by default — it needs a
+separate listener, see docs/API.md) and point the exporter at `http://localhost:4317`.
 
 Create an API key first via **Settings → API Keys** (or `POST /api/auth/keys`).
 
@@ -152,7 +155,7 @@ Paths are relative to `Ameto:BasePath` when one is configured (default: none) �
 | Area | Endpoints |
 |------|-----------|
 | Ingest (CLEF) | `POST /api/events` |
-| Ingest (OTLP) | `POST /otlp/v1/logs`, `/otlp/v1/traces`, `/otlp/v1/metrics` |
+| Ingest (OTLP) | `POST /v1/logs`, `/v1/traces`, `/v1/metrics` (HTTP) · OTLP/gRPC on `OtlpGrpcPort` |
 | Logs | `GET /api/events`, `/api/events/live` (SSE), `/api/events/props`, `/api/events/services` |
 | Traces | `GET /api/traces`, `/api/traces/stats`, `/api/traces/{traceId}` |
 | Metrics | `GET /api/metrics`, `/api/metrics/names`, `/api/metrics/{name}` |

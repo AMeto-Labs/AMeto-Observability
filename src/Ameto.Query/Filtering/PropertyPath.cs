@@ -63,6 +63,31 @@ public static class PropertyPath
         return path.Length;
     }
 
+    /// <summary>
+    /// The path as the person who typed it would write it — <c>Headers.Foo</c>,
+    /// <c>Items[0].Name</c>. The encoded form carries control characters, so anything that
+    /// puts a property name in front of a user (an aggregation's column heading, a parser
+    /// diagnostic) has to come back through here first.
+    /// </summary>
+    public static string ToDisplay(string path)
+    {
+        if (path.IndexOf(Separator) < 0 && path.IndexOf(IndexMarker) < 0) return path;
+
+        var sb   = new System.Text.StringBuilder(path.Length + 4);
+        var rest = path.AsSpan();
+        while (!rest.IsEmpty)
+        {
+            int sep = rest.IndexOf(Separator);
+            var seg = sep < 0 ? rest : rest[..sep];
+            rest    = sep < 0 ? default : rest[(sep + 1)..];
+
+            if (IsIndexSegment(seg))      sb.Append('[').Append(SegmentValue(seg)).Append(']');
+            else if (sb.Length > 0)       sb.Append('.').Append(seg);
+            else                          sb.Append(seg);
+        }
+        return sb.ToString();
+    }
+
     /// <summary>Number of segments in an encoded path (always at least one).</summary>
     public static int SegmentCount(string path)
     {

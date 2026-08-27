@@ -8,13 +8,13 @@ import {
 
 import { ApiService } from '../../../core/services/api.service';
 import { SearchHistoryService } from '../../../core/services/search-history.service';
-import { EventDto, LEVELS } from '../../../core/models/event.model';
+import { EventDto, LEVELS, AggregationDto } from '../../../core/models/event.model';
 import {
   TimePreset,
   parseLevelsFromFilter, parseServicesFromFilter,
   setLevelsClause, setServicesClause, levelsParam,
   parseCustomDate, fmtDateInput, presetFrom,
-  collectPropPaths, msToDotNetUtcTicks,
+  collectPropPaths, isoToDotNetUtcTicksString, isAggregationQuery,
 } from './events-filter.util';
 
 /** Page sizes offered next to the event counter — also the whitelist for the `size` URL param. */
@@ -58,6 +58,8 @@ interface EventsState {
   selectedId: string | null;
   /** Ids of events that just arrived on the live tail — highlighted for ~1s, then dropped. */
   newEventIds: Set<string>;
+  /** The table a `select … group by …` query answered with; null whenever the page lists events. */
+  aggregation: AggregationDto | null;
 }
 
 /**
@@ -92,6 +94,7 @@ export const EventsStore = signalStore(
     calPickingEnd: false,
     selectedId: null,
     newEventIds: new Set<string>(),
+    aggregation: null,
   })),
 
   withComputed((store) => {
@@ -100,6 +103,15 @@ export const EventsStore = signalStore(
     // state to desync.
     const activeLevels = computed(() => parseLevelsFromFilter(store.filterInput()));
     const selectedServices = computed(() => parseServicesFromFilter(store.filterInput()));
+
+    /**
+     * True while the APPLIED query is an aggregation — deliberately the applied query and not
+     * the draft. Reading the draft made the page disagree with itself: the mode note appeared
+     * while a list of events was still on screen, the Live button greyed out mid-stream with
+     * rows visibly arriving, and a table could outlive the query that produced it. What is
+     * displayed came from `filter`, so what the controls say about it has to come from `filter`.
+     */
+    const isAggregation = computed(() => isAggregationQuery(store.filter()));
 
     /** Events list — optionally narrowed client-side by service and quick-search. */
     const displayedEvents = computed(() => {
@@ -219,6 +231,7 @@ export const EventsStore = signalStore(
       levelCounts, serviceCounts, totalCount, allLevelsActive,
       levelsLabel, serviceLabel, dateRangeLabel, calendarMonthLabel, calendarDays,
       customFromValid, customToValid, canSearch, knownPropPaths, selectedEvent,
+      isAggregation,
     };
   }),
 
@@ -233,6 +246,10 @@ export const EventsStore = signalStore(
     // new one starts, and both are disposed on destroy (via _disposeStreams).
     let querySub: Subscription | undefined;
     let liveSub: Subscription | undefined;
+    // What the RUNNING tail was opened with — the only two things it carries. A mutation
+    // that leaves both unchanged needs no reconnect (see loadEvents).
+    let liveFilter = '';
+    let liveLevels: string | undefined;
     // Per-event timers that drop an id out of `newEventIds` ~1s after it arrived.
     let newTimers: ReturnType<typeof setTimeout>[] = [];
 
@@ -300,11 +317,41 @@ export const EventsStore = signalStore(
 
     // ── Actions ─────────────────────────────────────────────────────────────
     function loadEvents(): void {
-      if (store.live()) return;
+      // Every filter, level, time and page-size mutator ends here.
+      // `select count(*) …` asks a different question and gets a different answer: a table,
+      // over plain JSON. Checked BEFORE the live branch, not after it: a tail running when the
+      // user applies an aggregation would otherwise swallow it as a filter change and open
+      // /api/events/live?filter=select…, which the server refuses by design — the page then
+      // showed a banner telling the user to make an HTTP call themselves. An aggregation is a
+      // snapshot, so it ends the tail rather than competing with it.
+      const query = store.filter();
+      if (isAggregationQuery(query)) {
+        liveSub?.unsubscribe();
+        liveSub = undefined;
+        querySub?.unsubscribe();
+        clearNew();
+        patchState(store, { live: false });
+        loadAggregation(query);
+        return;
+      }
+
+      // Reconnect only for what the tail actually carries. It is opened with a filter and a
+      // level set and nothing else, so a time-window or page-size change has nothing to apply.
+      if (store.live()) {
+        // BOTH halves read the APPLIED query. `activeLevels` is parsed from the draft, so
+        // comparing it against liveLevels mixed an applied filter with an unapplied level set:
+        // edit the text without pressing Enter, then change the page size, and the tail
+        // silently reopened with the OLD filter and the NEW levels — a combination the user
+        // never asked for, with the live dot still lit and nothing on screen to say so.
+        if (store.filter() !== liveFilter || levelsParam(parseLevelsFromFilter(store.filter())) !== liveLevels)
+          startLive();
+        return;
+      }
       querySub?.unsubscribe();
       clearNew();
+
       patchState(store, {
-        loading: true, error: null, events: [], hasMore: true, selectedId: null,
+        loading: true, error: null, events: [], aggregation: null, hasMore: true, selectedId: null,
       });
 
       const acc: EventDto[] = [];
@@ -327,10 +374,56 @@ export const EventsStore = signalStore(
           syncRoute();
         },
         error: err => {
+          const message = (err as Error).message ?? 'Failed to load events';
+
+          // The server tokenises where this client pattern-matches, so it recognises
+          // aggregations the regex declines — `select "count"(*)`, anything with a stray
+          // character the lexer drops. It answers those by naming the aggregate endpoint, so
+          // take it at its word and run the query where it belongs instead of showing the
+          // user a banner telling them to make an HTTP call. That makes the server's
+          // tokeniser the single definition and the regex merely a fast path.
+          if (message.includes('/api/events/aggregate')) { loadAggregation(query); return; }
+
+          // Keep what arrived. A search stopped by the server's time budget reports an
+          // error AFTER streaming real rows, and throwing them away leaves the user with
+          // an empty screen and a message, instead of a partial answer and a message
+          // explaining why it is partial. hasMore stays false so infinite scroll does not
+          // immediately re-fire the same doomed query.
           patchState(store, {
-            error: (err as Error).message ?? 'Failed to load events', loading: false,
+            events: [...acc],
+            hasMore: false,
+            error: message,
+            loading: false,
           });
         },
+      });
+    }
+
+    /**
+     * Runs an aggregation and keeps the table. The event list is emptied on purpose: nothing
+     * on screen may belong to a query other than the one in the box.
+     */
+    function loadAggregation(query: string): void {
+      patchState(store, {
+        loading: true, error: null, events: [], aggregation: null, hasMore: false, selectedId: null,
+      });
+
+      querySub = api.aggregate({
+        filter: query,
+        from:   getFromDate().toISOString(),
+        to:     getToDate(),
+      }).subscribe({
+        next: agg => {
+          patchState(store, { aggregation: agg, loading: false });
+          syncRoute();
+        },
+        error: (err: { error?: { error?: string } }) =>
+          patchState(store, {
+            loading: false,
+            // The server's own sentence — it names the position of a syntax error and the
+            // reason a scan stopped, both of which are worth more than "request failed".
+            error: err?.error?.error?.trim() || 'The aggregation failed.',
+          }),
       });
     }
 
@@ -345,7 +438,7 @@ export const EventsStore = signalStore(
       const last = list[list.length - 1];
       if (!last) return;
 
-      const afterTsTicks = msToDotNetUtcTicks(new Date(last['@t']).getTime());
+      const afterTsTicks = isoToDotNetUtcTicksString(last['@t']);
 
       patchState(store, { loadingMore: true, error: null });
 
@@ -376,9 +469,21 @@ export const EventsStore = signalStore(
           patchState(store, patch);
         },
         error: err => {
-          patchState(store, {
-            error: (err as Error).message ?? 'Failed to load more events', loadingMore: false,
-          });
+          // Same reasoning as loadEvents: append whatever the page delivered before it
+          // failed, and stop paging so a budget-stopped query is not re-issued on the
+          // next scroll.
+          const patch: Partial<EventsState> = {
+            error: (err as Error).message ?? 'Failed to load more events',
+            loadingMore: false,
+            hasMore: false,
+          };
+          if (acc.length > 0) {
+            const evs = store.events();
+            const seen = new Set(evs.map(e => e.id));
+            const fresh = acc.filter(e => !seen.has(e.id));
+            if (fresh.length > 0) patch.events = [...evs, ...fresh];
+          }
+          patchState(store, patch);
         },
       });
     }
@@ -465,7 +570,22 @@ export const EventsStore = signalStore(
       });
     }
 
+    /**
+     * The level and service pickers rewrite the filter STRING by regex — `setLevelsClause`
+     * splices `@l = 'Error' and ` onto the front of whatever is there. Against a `select …`
+     * query that produces a sentence in neither language, so every route into them stops here,
+     * not only the toolbar buttons the template disables.
+     */
+    /**
+     * The level and service pickers rewrite the filter STRING by regex, and they rewrite the
+     * DRAFT — so the question is what the draft is, not what was last applied. Reading the
+     * applied query let a chip clicked while an aggregation was half-typed splice
+     * `@l = 'Error' and ` onto the front of it and send that, un-asked.
+     */
+    function clauseEditingBlocked(): boolean { return isAggregationQuery(store.filterInput()); }
+
     function toggleLevel(level: string): void {
+      if (clauseEditingBlocked()) return;
       const next = new Set(store.activeLevels());
       if (next.has(level)) next.delete(level); else next.add(level);
       const filterInput = setLevelsClause(store.filterInput(), next);
@@ -474,6 +594,7 @@ export const EventsStore = signalStore(
     }
 
     function toggleAllLevels(): void {
+      if (clauseEditingBlocked()) return;
       // No @l clause ⇒ all levels; setLevelsClause with the full set strips the clause.
       const filterInput = setLevelsClause(store.filterInput(), new Set<string>(LEVELS));
       patchState(store, { filterInput, filter: filterInput });
@@ -481,12 +602,14 @@ export const EventsStore = signalStore(
     }
 
     function setLevels(levels: Set<string>): void {
+      if (clauseEditingBlocked()) return;
       const filterInput = setLevelsClause(store.filterInput(), levels);
       patchState(store, { filterInput, filter: filterInput });
       loadEvents();
     }
 
     function setServices(svcs: Set<string>): void {
+      if (clauseEditingBlocked()) return;
       const filterInput = setServicesClause(store.filterInput(), svcs);
       patchState(store, { filterInput, filter: filterInput });
       loadEvents();
@@ -504,14 +627,41 @@ export const EventsStore = signalStore(
     }
 
     function startLive(): void {
-      patchState(store, { live: true, events: [], newEventIds: new Set() });
-      const cap = store.pageSize() * 4;
-      liveSub = api.streamLive(store.filter() || undefined).subscribe({
+      // Unsubscribe first: this is also the restart path when the filter or the level
+      // selection changes mid-tail, and leaving the old stream running would interleave
+      // rows the new filter excludes.
+      liveSub?.unsubscribe();
+      // A backward search started before the tail (toggling live off and straight back on
+      // leaves one in flight) still owns its subscription, and its completion handler
+      // replaces `events` wholesale without consulting live(). Left running it drops a page
+      // of history on top of the live rows, or sets an error banner while the live dot is on.
+      querySub?.unsubscribe();
+      querySub = undefined;
+
+      liveFilter = store.filter();
+      liveLevels = levelsParam(parseLevelsFromFilter(liveFilter));
+      patchState(store, {
+        live: true, error: null, events: [], newEventIds: new Set(), selectedId: null,
+        // The table belongs to the query it came from. Leaving it up while a tail runs put a
+        // snapshot of totals on screen with the live dot lit beside it.
+        aggregation: null,
+      });
+      liveSub = api.streamLive({ filter: liveFilter || undefined, levels: liveLevels }).subscribe({
         next: ev => {
+          // Read per event, not captured: changing the page size then only resizes the
+          // buffer, instead of needing the connection torn down and rebuilt.
+          const cap = store.pageSize() * 4;
           patchState(store, { events: [ev, ...store.events().slice(0, cap - 1)] });
           markNew(ev.id);
         },
-        error: () => patchState(store, { live: false }),
+        error: (err: Error) => {
+          // Say WHY it stopped. The tail reports a blown poll budget or a server too busy
+          // to keep it fed through a query-error frame carrying a real sentence, and
+          // discarding it left the toggle flipping itself off for no visible reason.
+          liveSub = undefined;
+          clearNew();
+          patchState(store, { live: false, error: err?.message || 'Live tail stopped' });
+        },
       });
     }
 
@@ -524,6 +674,9 @@ export const EventsStore = signalStore(
     }
 
     function toggleLive(): void {
+      // An aggregation is a snapshot of a window, not a stream: there is nothing for a tail to
+      // append to a table of totals.
+      if (!store.live() && store.isAggregation()) return;
       if (store.live()) stopLive(); else startLive();
     }
 

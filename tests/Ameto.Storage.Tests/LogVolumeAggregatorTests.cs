@@ -1,3 +1,4 @@
+using System.Text;
 using Ameto.Core;
 using Ameto.Storage;
 
@@ -309,5 +310,57 @@ public sealed class LogVolumeAggregatorTests
         Assert.Equal(0, result.Scanned);
         Assert.Empty(result.Services);
         Assert.Empty(result.Levels);
+    }
+
+    /// <summary>
+    /// MergeFrom must make N per-worker aggregators indistinguishable from one aggregator
+    /// fed everything — the contract the parallel cold scan rests on. Services deliberately
+    /// overlap and differ across the parts so the id spaces cannot line up by accident.
+    /// </summary>
+    [Fact]
+    public void MergeFrom_MatchesSingleAggregatorOverTheSameEvents()
+    {
+        const int nBuckets = 4;
+        var pool = new StringInternPool();
+        long minB = (Base.ToUnixTimeSeconds()) / BucketSeconds;
+
+        LogVolumeAggregator New() =>
+            new(Base.UtcTicks, Base.AddMinutes(nBuckets).UtcTicks, minB, BucketSeconds, nBuckets, null, pool);
+
+        var events = new List<(long Ticks, LogLevel Level, string Svc)>();
+        for (int i = 0; i < 240; i++)
+            events.Add((
+                Base.AddSeconds(i * (nBuckets * 60.0 / 240)).UtcTicks,
+                (LogLevel)(i % 6),
+                "svc-" + i % 5));
+
+        var single = New();
+        foreach (var (t, l, s) in events)
+            single.AddByServiceUtf8(t, l, Encoding.UTF8.GetBytes(s));
+
+        var partA = New();
+        var partB = New();
+        var partC = New(); // stays empty — merging an empty part must be a no-op
+        for (int i = 0; i < events.Count; i++)
+        {
+            var (t, l, s) = events[i];
+            (i % 2 == 0 ? partA : partB).AddByServiceUtf8(t, l, Encoding.UTF8.GetBytes(s));
+        }
+        var merged = New();
+        merged.MergeFrom(partB);
+        merged.MergeFrom(partC);
+        merged.MergeFrom(partA);
+
+        var expect = single.Build();
+        var got    = merged.Build();
+
+        Assert.Equal(expect.Total,   got.Total);
+        Assert.Equal(expect.Scanned, got.Scanned);
+        Assert.Equal(
+            expect.Levels.Select(l => (l.Name, l.Count, string.Join(',', l.Points))),
+            got.Levels.Select(l => (l.Name, l.Count, string.Join(',', l.Points))));
+        Assert.Equal(
+            expect.Services.OrderBy(s => s.Name).Select(s => (s.Name, s.Count, string.Join(',', s.Points))),
+            got.Services.OrderBy(s => s.Name).Select(s => (s.Name, s.Count, string.Join(',', s.Points))));
     }
 }

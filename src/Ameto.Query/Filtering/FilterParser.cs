@@ -14,7 +14,8 @@ namespace Ameto.Query.Filtering;
 ///   atom     := '(' expr ')'
 ///             | func_call
 ///             | comparison
-///             | property 'in' '[' value_list ']'
+///             | property 'not'? 'in' '[' value_list ']'
+///             | property 'not'? 'like' string
 ///   func_call := ('has' | 'isDefined' | 'startsWith' | 'contains' | 'endsWith'
 ///                | 'ci_startsWith' | 'ci_contains' | 'ci_endsWith') '(' property ',' value ')'
 ///             | ('has' | 'isDefined') '(' property ')'
@@ -45,7 +46,12 @@ namespace Ameto.Query.Filtering;
 ///   value    := property | string | number | 'true' | 'false' | 'null'
 ///   property := (ident | bracket_seg) ('.' ident | bracket_seg)*
 ///   bracket_seg := '[' (string | number) ']'
-///   op       := '=' | '!=' | '<' | '<=' | '>' | '>='
+///   op       := '=' | '!=' | '<>' | '<' | '<=' | '>' | '>='
+///
+/// The parser reads the WHOLE expression or refuses it. Every diagnostic is a
+/// <see cref="FormatException"/>, which both stream endpoints turn into a 400 carrying the
+/// message — so a filter that cannot be read says why, instead of being silently truncated
+/// to the part that happened to parse and answering a different question.
 ///
 /// Internally property paths are stored as their segments joined by
 /// <see cref="PropertyPath.Separator"/> (U+0001), so segments may contain
@@ -64,11 +70,139 @@ public sealed class FilterParser
         if (string.IsNullOrWhiteSpace(filter))
             return new MatchAllNode();
 
-        var lexer  = new Lexer(filter);
-        var tokens = lexer.Tokenise();
-        var parser = new FilterParser(tokens);
-        return parser.ParseExpr();
+        var tokens = new Lexer(filter).Tokenise();
+
+        // THIS BOX IS ALSO THE SEARCH BOX. The documented contract is that anything which is
+        // not an expression is free text, and people lean on it: they paste
+        // `GET /api/orders/123`, a stack frame, a Windows path, and they type phrases like
+        // `user not found`. So the refusals below apply only where somebody was demonstrably
+        // writing an expression — where the input contains a comparison, a set or pattern
+        // test, or a bracket. Without one of those, whatever the parser could not use becomes
+        // search terms, exactly as before.
+        bool structural = StructuralTokenPresent(tokens, filter!);
+
+        try
+        {
+            var parser = new FilterParser(tokens);
+            var root   = parser.ParseExpr();
+            if (parser.PeekKind() == TokenKind.Eof)
+                return root;
+
+            // THE WHOLE FILTER, or none of it. ParseOr stops at the first token it cannot use
+            // and Parse used to return whatever it had built, so everything past that point
+            // vanished without a word: `@l = 'Error' and` searched for errors, `Region = 'x'
+            // Country = 'y'` applied only the first clause, and a typo after a valid prefix
+            // silently WIDENED the result set.
+            if (!structural)
+                return AllTermsAsFreeText(tokens);
+
+            var t = parser.Peek();
+            throw new FormatException(
+                $"Unexpected '{Describe(t)}' at pos {t.Pos} — the filter was already complete here. " +
+                "Join clauses with 'and' / 'or'.");
+        }
+        catch (FormatException) when (!structural)
+        {
+            // Prose that happens to trip a grammar rule — a trailing `not`, a word the lexer
+            // knows as a keyword. Still just words.
+            return AllTermsAsFreeText(tokens);
+        }
     }
+
+
+    /// <summary>
+    /// Was somebody demonstrably writing an EXPRESSION? This decides one thing only: whether an
+    /// input the parser cannot read to the end is refused, or falls back to a text search. A
+    /// filter that parses cleanly is honoured either way, which is what lets this be strict.
+    ///
+    /// <para>Three signals, each narrowed by what people paste:</para>
+    /// <list type="bullet">
+    /// <item>A comparison operator <b>with whitespace on both sides</b>. Bare punctuation is not
+    /// enough — a pasted URL carries <c>?status=active</c>, a logfmt line carries
+    /// <c>retries=3</c>, a stack frame carries <c>List&lt;String&gt;</c>, and refusing those
+    /// would break the search box for exactly the text people most often paste into it.
+    /// <c>Elapsed&gt;5</c> is unaffected: it parses, so it never reaches this question.</item>
+    /// <item>A <c>[</c> <b>immediately after <c>in</c></b> — the shape of a set test, where a
+    /// missing pair of quotes is worth naming. A bracket on its own is just JSON:
+    /// <c>{"tags":["eu"]}</c>.</item>
+    /// <item>A <c>(</c> after a function name the language knows. <c>regexMatch(</c> cannot be an
+    /// accident; a bare parenthesis is what a stack frame is full of.</item>
+    /// </list>
+    /// <c>and</c>, <c>or</c>, <c>not</c>, <c>in</c> and <c>like</c> never count on their own —
+    /// they are ordinary English inside the phrases people search for.
+    /// </summary>
+    private static bool StructuralTokenPresent(List<Token> tokens, string source)
+    {
+        for (int i = 0; i < tokens.Count; i++)
+        {
+            var t = tokens[i];
+            switch (t.Kind)
+            {
+                case TokenKind.Eq or TokenKind.Ne or TokenKind.Lt or TokenKind.Le
+                  or TokenKind.Gt or TokenKind.Ge:
+                    if (SpacedInSource(source, t)) return true;
+                    break;
+
+                case TokenKind.LBracket:
+                    if (i > 0 && tokens[i - 1].Kind == TokenKind.In) return true;
+                    break;
+
+                default:
+                    if (IsFunctionKeyword(t.Kind) && i + 1 < tokens.Count
+                        && tokens[i + 1].Kind == TokenKind.LParen)
+                        return true;
+                    break;
+            }
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// True when the operator has whitespace on both sides in the ORIGINAL text — the difference
+    /// between <c>@l = 'Error'</c> and the <c>=</c> inside a pasted query string.
+    /// </summary>
+    private static bool SpacedInSource(string source, Token t)
+    {
+        int start = t.Pos;
+        int end   = start + Math.Max(t.Raw.Length, 1);
+        if (start <= 0 || !char.IsWhiteSpace(source[start - 1])) return false;
+
+        // End of input counts as the space after it: an operator with nothing following is a
+        // half-written comparison, never prose — `where Level =` has to keep being refused.
+        return end >= source.Length || char.IsWhiteSpace(source[end]);
+    }
+
+    /// <summary>One of the named functions — i.e. every keyword kind that is not a connective,
+    /// a set/pattern test, a literal, an operator or punctuation.</summary>
+    private static bool IsFunctionKeyword(TokenKind k) => k is not (
+        TokenKind.Ident or TokenKind.String or TokenKind.Number
+        or TokenKind.True or TokenKind.False or TokenKind.Null
+        or TokenKind.And or TokenKind.Or or TokenKind.Not or TokenKind.In or TokenKind.Like
+        or TokenKind.Eq or TokenKind.Ne or TokenKind.Lt or TokenKind.Le or TokenKind.Gt or TokenKind.Ge
+        or TokenKind.LParen or TokenKind.RParen or TokenKind.LBracket or TokenKind.RBracket
+        or TokenKind.Comma or TokenKind.Dot or TokenKind.Eof);
+
+    /// <summary>
+    /// Every token as a search term, keywords included — reached only when the input holds
+    /// nothing structural, so <c>not</c> here is the word, not the operator.
+    /// </summary>
+    private static FilterNode AllTermsAsFreeText(List<Token> tokens)
+    {
+        var terms = new List<string>(tokens.Count);
+        foreach (var t in tokens)
+            if (t.Kind != TokenKind.Eof && t.Raw.Length > 0)
+                terms.Add(t.Raw);
+
+        return terms.Count == 0 ? new MatchAllNode() : new FreeTextNode(terms.ToArray());
+    }
+
+    /// <summary>A token as the person who typed it would recognise it.</summary>
+    private static string Describe(Token t) => t.Kind switch
+    {
+        TokenKind.Eof    => "end of filter",
+        TokenKind.String => $"'{t.Raw}'",
+        _                => t.Raw.Length > 0 ? t.Raw : t.Kind.ToString(),
+    };
 
     // ── Grammar rules ─────────────────────────────────────────────────────────
 
@@ -226,15 +360,7 @@ public sealed class FilterParser
                 {
                     Consume(TokenKind.In);
                     Consume(TokenKind.LBracket);
-                    var items = new List<object?>();
-                    while (PeekKind() != TokenKind.RBracket && PeekKind() != TokenKind.Eof)
-                    {
-                        ParseValue(out _);
-                        items.Add(ParseLiteral(_tokens[_pos - 1]));
-                        if (PeekKind() == TokenKind.Comma) Consume(TokenKind.Comma);
-                    }
-                    Consume(TokenKind.RBracket);
-                    return new FromJsonPathInNode(prop, jsonPath, items.ToArray());
+                    return new FromJsonPathInNode(prop, jsonPath, ReadValueList());
                 }
 
                 if (!TryConsumeOp(out var pathOp))
@@ -672,21 +798,34 @@ public sealed class FilterParser
         // Parse the left-hand value first
         object? lhv = ParseValue(out string? lhProp);
 
+        // `not in` / `not like`: the infix negation. Only 'not (X in [...])' existed, and the
+        // form everyone reaches for first fell through to the free-text branch — `@l not in
+        // ['Debug']` searched the message text for "@l" and threw the list away.
+        // A 'not' in this position can only be one of those two: a leading 'not' is consumed
+        // by ParseNot before an atom is ever reached, so reaching here means the value is
+        // already read and the negation belongs to what follows it.
+        bool negated = false;
+        if (PeekKind() == TokenKind.Not)
+        {
+            Consume(TokenKind.Not);
+            negated = true;
+            if (PeekKind() is not (TokenKind.In or TokenKind.Like))
+                throw new FormatException($"Expected 'in' or 'like' after 'not' at pos {Peek().Pos}.");
+        }
+
         // Check for 'in'
         if (PeekKind() == TokenKind.In)
         {
             Consume(TokenKind.In);
             Consume(TokenKind.LBracket);
-            var items = new List<object?>();
-            while (PeekKind() != TokenKind.RBracket && PeekKind() != TokenKind.Eof)
-            {
-                ParseValue(out _);
-                items.Add(ParseLiteral(_tokens[_pos - 1]));
-                if (PeekKind() == TokenKind.Comma) Consume(TokenKind.Comma);
-            }
-            Consume(TokenKind.RBracket);
-            string inProp = lhProp ?? "@l";
-            return new InNode(inProp, items.ToArray());
+            var items = ReadValueList();
+            // Was `lhProp ?? "@l"`. A literal on the left is a mistake, not a request to
+            // filter on the level: `'Error' in ['a','b']` silently became `@l in ['a','b']`.
+            if (lhProp is null)
+                throw new FormatException(
+                    $"'in' needs a property on its left at pos {t.Pos}, not {Describe(t)}.");
+            var inNode = new InNode(lhProp, items);
+            return negated ? new NotNode(inNode) : inNode;
         }
 
         // 'like'
@@ -694,8 +833,21 @@ public sealed class FilterParser
         {
             Consume(TokenKind.Like);
             string pattern = ConsumeString();
-            return new LikeNode(lhProp ?? string.Empty, pattern);
+            // Was `lhProp ?? string.Empty` — a pattern matched against a property with no
+            // name, which resolves to nothing on every event.
+            if (lhProp is null)
+                throw new FormatException(
+                    $"'like' needs a property on its left at pos {t.Pos}, not {Describe(t)}.");
+            var likeNode = new LikeNode(lhProp, pattern);
+            return negated ? new NotNode(likeNode) : likeNode;
         }
+
+        // An identifier the lexer did not recognise as a function, applied like one. It used
+        // to become a free-text search for the function's OWN NAME with the arguments thrown
+        // away: `sum(Elapsed) > 5` searched the text for "sum".
+        if (lhProp is not null && PeekKind() == TokenKind.LParen)
+            throw new FormatException(
+                $"Unknown function '{lhProp.Replace(ClefFields.PropertyPathSeparator, '.')}' at pos {t.Pos}.");
 
         // Comparison operator
         if (TryConsumeOp(out var op))
@@ -723,14 +875,25 @@ public sealed class FilterParser
             if (rhProp is not null)
                 return new CompareNode(rhProp, FlipOp(op), lhv);
 
-            // Two literals — there is no property to filter on. Preserved as-is: the
-            // left-hand text resolves to nothing and the comparison is simply false.
-            return new CompareNode(lhv?.ToString() ?? "", FlipOp(op), rhv);
+            // Two literals — there is no property to filter on, so there is no question here
+            // to answer. It used to be kept on the theory that it was "simply false", which is
+            // only true of '='; Compare() answers `op is Ne` when an operand resolves to
+            // nothing, so `'a' != 'b'` and `'Error' <> 'Debug'` matched EVERY event in the
+            // window. A filter cannot be allowed to mean "everything" by accident.
+            throw new FormatException(
+                $"Comparison at pos {t.Pos} has a value on both sides and no property to test. " +
+                "Did you mean to leave one of them unquoted?");
         }
 
-        // Bare level keyword: Error, Fatal, etc. → level filter (single word only).
-        if (lhProp is not null &&
-            LogLevelExtensions.TryParse(lhProp.AsSpan(), out var level))
+        // Bare level keyword: Error, Fatal, etc. → level filter — but only when the word
+        // stands alone as the whole clause. It used to win over the free-text run on sight,
+        // consuming one token and abandoning the rest, so `Error timeout` filtered by level
+        // and threw "timeout" away; most of the vocabulary a log search STARTS with is a
+        // level name (error, warn, info, fatal, debug). A following bare term means the user
+        // is typing a phrase, and the run below is the correct reading of it.
+        if (lhProp is not null
+            && PeekKind() is not (TokenKind.Ident or TokenKind.Number or TokenKind.String)
+            && LogLevelExtensions.TryParse(lhProp.AsSpan(), out var level))
             return new LevelNode(level);
 
         // Bare word / quoted string / number with no operator → free-text search.
@@ -826,9 +989,45 @@ public sealed class FilterParser
             case TokenKind.Null:  _pos++; return null;
 
             default:
-                _pos++;
-                return null;
+                // Was `_pos++; return null;` — a shrug that produced a node meaning something
+                // else entirely. `Level = ` became CompareNode("Level", Eq, null), which the
+                // evaluator reads as "Level is absent" and which therefore matches nothing;
+                // the user saw an empty page, not a half-typed query.
+                throw new FormatException(
+                    $"Expected a value at pos {t.Pos} but found {Describe(t)}.");
         }
+    }
+
+    /// <summary>
+    /// The <c>[ … ]</c> of an <c>in</c> test, up to and including the closing bracket.
+    ///
+    /// <para>The old loop threw away what <see cref="ParseValue"/> had already produced and
+    /// re-read the token through <c>ParseLiteral</c>, which has no identifier case and
+    /// answered null for every bare word — so <c>@l in [Error, Fatal]</c> compiled to a list
+    /// of two nulls. It matched no Error and no Fatal, and, because a null item stringifies
+    /// to the empty string, it DID match anything whose property was empty. Quotes are the
+    /// difference between a value and a property name, so a missing pair is now said out
+    /// loud. Reusing ParseValue's own result also fixes decimals: ParseLiteral only tried
+    /// long, so <c>1.5</c> entered the list as the string "1.5" and never equalled 1.5.</para>
+    /// </summary>
+    private object?[] ReadValueList()
+    {
+        var items = new List<object?>();
+        while (PeekKind() != TokenKind.RBracket && PeekKind() != TokenKind.Eof)
+        {
+            var tok   = Peek();
+            object? v = ParseValue(out string? asProperty);
+            if (asProperty is not null)
+                throw new FormatException(
+                    $"'{tok.Raw}' at pos {tok.Pos} is read as a property name. " +
+                    $"Quote it — '{tok.Raw}' — to use it as a value.");
+            items.Add(v);
+
+            if (PeekKind() == TokenKind.Comma) { Consume(TokenKind.Comma); continue; }
+            break;   // no separator: the bracket below reports whatever is actually here
+        }
+        Consume(TokenKind.RBracket);
+        return items.ToArray();
     }
 
     private object? ParseLiteral(Token t) => t.Kind switch
@@ -839,6 +1038,20 @@ public sealed class FilterParser
         TokenKind.False  => false,
         _                => null,
     };
+
+    /// <summary>
+    /// Reads one property path out of an already-lexed stream, advancing <paramref name="pos"/>.
+    /// Exists so the aggregation grammar spells a property EXACTLY as a predicate does —
+    /// dot-splitting, bracket segments, index markers and all — instead of growing a second
+    /// reading of the same syntax that would drift from this one.
+    /// </summary>
+    internal static string ReadPathAt(List<Token> tokens, ref int pos)
+    {
+        var p = new FilterParser(tokens) { _pos = pos };
+        string path = p.ReadPropertyPath();
+        pos = p._pos;
+        return path;
+    }
 
     private string ReadProperty() => ReadPropertyPath();
 

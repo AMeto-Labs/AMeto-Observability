@@ -149,6 +149,15 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     private const int    EntryHeaderSize = 48;
     private const ulong  FirstGeneration = 1;
 
+    /// <summary>
+    /// How far above the recovered header counter an entry's generation may run and still
+    /// count as real data (the header page can lag the data pages across a power loss —
+    /// nothing msyncs this log). Torn entries decode to effectively random u64 values, so
+    /// the margin rejects them while a legitimately lagging header stays replayable; the
+    /// airtight fix is a per-entry CRC in a v2 entry layout.
+    /// </summary>
+    private const ulong  GenerationSanityMargin = 1_000_000;
+
     /// <summary>8 MB holds ~150k scalar points; the log is reset on every flush.</summary>
     private const long DefaultCapacity = 8 * 1024 * 1024;
 
@@ -632,6 +641,18 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
             long total = (long)EntryHeaderSize + eh.BucketCount * sizeof(long);
             if (total <= 0 || pos + total > _writeOffset) break;
             if (eh.Generation == 0) break;
+            // A generation FAR above the header counter cannot have been stamped by any
+            // append. It is a torn/corrupt entry, and everything past it parses off garbage
+            // lengths: treat it as end-of-data so it truncates away. Without this, one such
+            // entry (a real incident: a torn first entry decoding to generation ~155e9) is
+            // forever "above the watermark" — never compacted, the log never empties, and
+            // the mmap doubles without bound (8 GiB observed). The margin, not a strict
+            // `> _generation`: nothing msyncs this log, so after power loss the header page
+            // can LAG the data pages — compaction relocates gen-(G+1) survivors below
+            // offsets an older header snapshot (Generation = G) already covers, and a
+            // strict guard would truncate that legitimate replay to nothing. Torn entries
+            // decode to effectively random 64-bit values, which the margin still rejects.
+            if (eh.Generation > _generation + GenerationSanityMargin) break;
             if (eh.Generation > committed) { firstSurvivor = pos; break; }
             pos += total;
         }
@@ -698,6 +719,11 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
                 long total = (long)EntryHeaderSize + eh.BucketCount * sizeof(long);
                 if (total <= 0 || pos + total > end) break;   // torn tail
                 if (eh.Generation == 0) break;                // end of real data
+                // No append can stamp a generation far above the header counter — such an
+                // entry is torn/corrupt, and its fields are garbage: stop instead of
+                // replaying them into the hot tier (from where a flush writes them into
+                // permanent files). Margin semantics: see Compact.
+                if (eh.Generation > _generation + GenerationSanityMargin) break;
 
                 if (eh.Generation > _committedGeneration)
                 {

@@ -40,40 +40,84 @@ public static class HotTierScan
         long? afterTsTicks, ulong? afterIdRaw, bool forward,
         IReadOnlySet<Ameto.Core.LogLevel>? levels)
     {
-        // Pre-size to the upper bound (all events pass the header filter): one exact
-        // allocation instead of List growth churn — with tens of thousands of hot events
-        // the doubling re-allocations were the scan's dominant remaining allocation.
-        int upperBound = current.Count;
-        for (int t = 0; t < frozen.Count; t++) upperBound += frozen[t].Count;
-
-        var candidates = new List<Candidate>(upperBound);
-        for (int t = 0; t < frozen.Count; t++)
-            Collect(frozen[t], candidates, fromTicks, toTicks, afterTsTicks, afterIdRaw, forward, levels);
-        Collect(current, candidates, fromTicks, toTicks, afterTsTicks, afterIdRaw, forward, levels);
-
+        var candidates = CollectAll(current, frozen, fromTicks, toTicks, afterTsTicks, afterIdRaw, forward, levels);
         candidates.Sort(forward ? Asc : Desc);
 
         foreach (var c in candidates)
             yield return c.Tier.Materialise(c.Index, pool);
     }
 
-    private static void Collect(
-        HotTierSegment tier, List<Candidate> into,
+    /// <summary>
+    /// Two passes over the fixed-size headers: count the matches, then fill an
+    /// exactly-sized list. Pre-sizing to the WHOLE tier was one multi-MB LOH allocation
+    /// per query and per 250 ms live-tail tick regardless of selectivity; the extra
+    /// header walk is cheap (sequential native reads, nothing materialised) next to the
+    /// growth churn the exact sizing was introduced against. Counts are snapshotted per
+    /// tier once, so a publish landing between the passes cannot desynchronise them —
+    /// writers publish an event by incrementing Count after the slot is fully written,
+    /// so every index below the snapshot is safe to read.
+    /// </summary>
+    private static List<Candidate> CollectAll(
+        HotTierSegment current,
+        IReadOnlyList<HotTierSegment> frozen,
         long fromTicks, long toTicks,
         long? afterTs, ulong? afterId, bool forward,
         IReadOnlySet<Ameto.Core.LogLevel>? levels)
     {
-        // Snapshot the count once: writers publish an event by incrementing Count after
-        // the slot is fully written, so every index below the snapshot is safe to read.
-        int n = tier.Count;
+        int nTiers = frozen.Count + 1;
+        var caps   = new int[nTiers];
+        for (int t = 0; t < frozen.Count; t++) caps[t] = frozen[t].Count;
+        caps[nTiers - 1] = current.Count;
+
+        int matched = 0;
+        for (int t = 0; t < frozen.Count; t++)
+            matched += CountMatches(frozen[t], caps[t], fromTicks, toTicks, afterTs, afterId, forward, levels);
+        matched += CountMatches(current, caps[nTiers - 1], fromTicks, toTicks, afterTs, afterId, forward, levels);
+
+        var candidates = new List<Candidate>(matched);
+        for (int t = 0; t < frozen.Count; t++)
+            Collect(frozen[t], caps[t], candidates, fromTicks, toTicks, afterTs, afterId, forward, levels);
+        Collect(current, caps[nTiers - 1], candidates, fromTicks, toTicks, afterTs, afterId, forward, levels);
+        return candidates;
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+    private static bool Matches(
+        in LogEventHeader h,
+        long fromTicks, long toTicks,
+        long? afterTs, ulong? afterId, bool forward,
+        IReadOnlySet<Ameto.Core.LogLevel>? levels)
+    {
+        long ts = h.TimestampUtcTicks;
+        if (ts < fromTicks || ts > toTicks) return false;
+        if (levels is not null && !levels.Contains(h.Level)) return false;
+        return QueryCursor.After(ts, h.Id, afterTs, afterId, forward);
+    }
+
+    private static int CountMatches(
+        HotTierSegment tier, int n,
+        long fromTicks, long toTicks,
+        long? afterTs, ulong? afterId, bool forward,
+        IReadOnlySet<Ameto.Core.LogLevel>? levels)
+    {
+        int matched = 0;
+        for (int i = 0; i < n; i++)
+            if (Matches(in tier.GetHeader(i), fromTicks, toTicks, afterTs, afterId, forward, levels))
+                matched++;
+        return matched;
+    }
+
+    private static void Collect(
+        HotTierSegment tier, int n, List<Candidate> into,
+        long fromTicks, long toTicks,
+        long? afterTs, ulong? afterId, bool forward,
+        IReadOnlySet<Ameto.Core.LogLevel>? levels)
+    {
         for (int i = 0; i < n; i++)
         {
             ref readonly var h = ref tier.GetHeader(i);
-            long ts = h.TimestampUtcTicks;
-            if (ts < fromTicks || ts > toTicks) continue;
-            if (levels is not null && !levels.Contains(h.Level)) continue;
-            if (!QueryCursor.After(ts, h.Id, afterTs, afterId, forward)) continue;
-            into.Add(new Candidate(tier, i, ts, h.Id));
+            if (Matches(in h, fromTicks, toTicks, afterTs, afterId, forward, levels))
+                into.Add(new Candidate(tier, i, h.TimestampUtcTicks, h.Id));
         }
     }
 }

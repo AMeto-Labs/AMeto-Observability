@@ -125,3 +125,13 @@
 }
 .page-size-select:hover { color: var(--txt); border-color: var(--accent); }
 .page-size-select:focus { border-color: var(--accent); }
+
+// Says what the mode is, where the controls it replaces used to be.
+.fb-agg-note {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}

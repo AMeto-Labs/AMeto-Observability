@@ -10,6 +10,18 @@
     </button>
   </div>
 
+  <!-- Everything from here to the page size edits or counts the EVENT LIST. An aggregation
+       has neither: the level and service pickers would splice `@l = 'Error' and ` onto the
+       front of the query, the chips count rows that no longer exist, and the row count comes
+       from the query's own `limit`. The date range stays — the window does apply. -->
+  @if (store.isAggregation()) {
+    <div class="sep-v"></div>
+    <span class="fb-agg-note">
+      <lucide-icon name="sigma" [size]="12" />
+      Aggregation — levels, services and page size come from the query itself
+    </span>
+  } @else {
+
   <!-- All levels -->
   <div class="fb-group" (click)="$event.stopPropagation()">
     <button #levelsBtn class="fb-btn" [class.open]="levelsDropdownOpen()" [class.filtered]="!store.allLevelsActive()" (click)="openLevels(levelsBtn)">
@@ -55,5 +67,6 @@
       <option [value]="n" [selected]="n === store.pageSize()">{{ n }}</option>
     }
   </select>
+  }
 </div>
 </div>

@@ -15,6 +15,9 @@ internal sealed class SseJsonWriter : IDisposable
     private static readonly byte[] DataPrefix     = "data: "u8.ToArray();
     private static readonly byte[] FrameSuffix    = "\n\n"u8.ToArray();
     private static readonly byte[] DoneFrame      = "event: done\ndata: {}\n\n"u8.ToArray();
+    // NOT "event: error": EventSource dispatches its own connection failures under that
+    // name, so a client listening for one would receive the other.
+    private static readonly byte[] ErrorPrefix    = "event: query-error\ndata: "u8.ToArray();
     private static readonly byte[] KeepaliveFrame = ": keepalive\n\n"u8.ToArray();
 
     private readonly ArrayBufferWriter<byte> _buffer = new(4096);
@@ -43,6 +46,25 @@ internal sealed class SseJsonWriter : IDisposable
     public async Task WriteDoneAsync(CancellationToken ct)
     {
         await _response.Body.WriteAsync(DoneFrame, ct).ConfigureAwait(false);
+        await _response.Body.FlushAsync(ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Terminal <c>event: error</c> frame. The status line is long gone by the time a query
+    /// fails mid-stream, so this is the only way to tell the client something went wrong —
+    /// without it the stream simply stopped, indistinguishable from "no more results".
+    /// </summary>
+    public async Task WriteErrorAsync(string message, CancellationToken ct)
+    {
+        _buffer.ResetWrittenCount();
+        _buffer.Write(ErrorPrefix);
+        _json.Reset(_buffer);
+        _json.WriteStartObject();
+        _json.WriteString("error", message);
+        _json.WriteEndObject();
+        _json.Flush();
+        _buffer.Write(FrameSuffix);
+        await _response.Body.WriteAsync(_buffer.WrittenMemory, ct).ConfigureAwait(false);
         await _response.Body.FlushAsync(ct).ConfigureAwait(false);
     }
 

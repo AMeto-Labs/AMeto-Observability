@@ -126,6 +126,13 @@ builder.Services
 // Short-TTL cache for GET /api/events/counts header-scan responses.
 builder.Services.AddSingleton<LogVolumeCountsCache>();
 
+// Per-search time budget and concurrency limit (see QueryGuard).
+builder.Services.AddSingleton<QueryGuard>();
+
+// Live tails wait on this instead of polling; LiveTailWiring hooks it to the write path.
+builder.Services.AddSingleton<LiveEventSignal>();
+builder.Services.AddHostedService<LiveTailWiring>();
+
 // ── Software-update check (Settings → Updates) ────────────────────────────────
 // Singleton holds the latest-release snapshot for the endpoints; the hosted
 // service polls GitHub hourly (no-op when Ameto:Updates:Enabled is false).
@@ -173,30 +180,75 @@ var repOpts = builder.Configuration.GetSection("Ameto:Replication").Get<Replicat
 builder.Services.AddAmetoReplication(repOpts);
 
 // ── Kestrel ───────────────────────────────────────────────────────────────────
-if (!string.IsNullOrEmpty(serverOptions.SslCertPath))
+// Listeners are configured explicitly rather than through UseUrls, because UseUrls has no
+// per-endpoint control over the HTTP version and the OTLP/gRPC listener needs HTTP/2 while the
+// main port must keep HTTP/1.1. Mixing the two APIs is ambiguous — the coded endpoints win and
+// the URLs are silently ignored — so both branches moved together.
+bool useTls = !string.IsNullOrEmpty(serverOptions.SslCertPath);
+HotReloadCertificate? certReloader = null;
+if (useTls)
 {
-  builder.WebHost.UseUrls($"https://*:{serverOptions.HttpPort}");
-
-  // Hot-reloadable certificate: Kestrel invokes the selector on every TLS
-  // handshake, so replacing the .pfx file on disk causes new connections to
-  // use the new cert without restarting the process.
-  var certReloader = new HotReloadCertificate(
-      serverOptions.SslCertPath, serverOptions.SslCertPassword,
-      LoggerFactory.Create(b => b.AddConsole()).CreateLogger<HotReloadCertificate>());
-  builder.Services.AddSingleton(certReloader);
-
-  builder.WebHost.ConfigureKestrel(k =>
-      k.ConfigureHttpsDefaults(h =>
-          h.ServerCertificateSelector = (_, _) => certReloader.Current));
+    // Hot-reloadable certificate: Kestrel invokes the selector on every TLS handshake, so
+    // replacing the .pfx file on disk causes new connections to use the new cert without
+    // restarting the process.
+    certReloader = new HotReloadCertificate(
+        serverOptions.SslCertPath, serverOptions.SslCertPassword,
+        LoggerFactory.Create(b => b.AddConsole()).CreateLogger<HotReloadCertificate>());
+    builder.Services.AddSingleton(certReloader);
 }
-else
+
+builder.WebHost.ConfigureKestrel(k =>
 {
-  builder.WebHost.UseUrls($"http://*:{serverOptions.HttpPort}");
-}
+    if (useTls)
+        k.ConfigureHttpsDefaults(h => h.ServerCertificateSelector = (_, _) => certReloader!.Current);
+
+    // The everything port: UI, /api, SSE, the OTLP/HTTP receivers. Left on the framework
+    // default (Http1AndHttp2), which under TLS negotiates h2 by ALPN and in plaintext is
+    // HTTP/1.1 — exactly what a browser needs.
+    k.ListenAnyIP(serverOptions.HttpPort, l => { if (useTls) l.UseHttps(); });
+
+    // OTLP/gRPC, off unless a port is configured. It is a SEPARATE listener because without
+    // TLS there is no ALPN, so a plaintext endpoint that accepts HTTP/2 accepts nothing else —
+    // put that on the main port and the UI, /api, the live tail and the health check all stop
+    // answering. Under TLS one port could serve both, but keeping the shape identical either
+    // way means the documented address does not change when someone turns TLS on.
+    if (serverOptions.OtlpGrpcPort > 0)
+        k.ListenAnyIP(serverOptions.OtlpGrpcPort, l =>
+        {
+            l.Protocols = Microsoft.AspNetCore.Server.Kestrel.Core.HttpProtocols.Http2;
+            if (useTls) l.UseHttps();
+        });
+});
 var app = builder.Build();
 
 
 // ── Middleware ─────────────────────────────────────────────────────────────────
+// PORT ISOLATION for the OTLP/gRPC listener. A second Kestrel endpoint does not scope routing:
+// without this, port 4317 served the entire application — the Angular UI through the SPA
+// fallback, /api/auth/login, the whole query surface, replication — to anything that speaks
+// HTTP/2 with prior knowledge. That port is conventionally opened to a telemetry network the UI
+// port is not. The check runs both ways, so the ingest port carries only ingest and the Export
+// methods are unreachable anywhere else.
+if (serverOptions.OtlpGrpcPort > 0)
+{
+    app.Use(async (ctx, next) =>
+    {
+        bool onGrpcPort = ctx.Connection.LocalPort == serverOptions.OtlpGrpcPort;
+        // A plain prefix, NOT StartsWithSegments: a gRPC method path is one long segment —
+        // "/opentelemetry.proto.collector.logs.v1.LogsService/Export" — so segment matching
+        // never fired, which silently inverted this check and let the Export methods answer on
+        // the main port while refusing them on their own.
+        bool isGrpcRoute = ctx.Request.Path.HasValue
+                        && ctx.Request.Path.Value!.StartsWith("/opentelemetry.proto.collector", StringComparison.Ordinal);
+        if (onGrpcPort != isGrpcRoute)
+        {
+            ctx.Response.StatusCode = StatusCodes.Status404NotFound;
+            return;
+        }
+        await next();
+    });
+}
+
 // Reverse-proxy support (opt-in): when TLS terminates on nginx/traefik, Kestrel
 // sees plain http and OAuth redirect URIs would be built with the wrong scheme.
 // The config flag is the trust gate, so accept the headers from any proxy address.
@@ -262,7 +314,14 @@ app.MapRetentionEndpoints();
 app.MapDiagnosticsEndpoints();
 app.MapUpdateEndpoints();
 app.MapReplicationEndpoints();
-app.MapOtlpEndpoints(enableTracing, enableMetrics);
+app.MapOtlpEndpoints(enableTracing, enableMetrics, basePath.PathBase);
+// Only when a port is configured. Kestrel endpoints do not scope routing — every route on this
+// WebApplication answers on every listener — so mapping these unconditionally put the Export
+// methods on the main port as well, where a plain HTTP/1.1 POST reached them. The middleware
+// above is the other half: it keeps the gRPC port to the gRPC methods and the gRPC methods to
+// the gRPC port, which is what the two comments here used to merely assert.
+if (serverOptions.OtlpGrpcPort > 0)
+    app.MapOtlpGrpcEndpoints(enableTracing, enableMetrics);
 if (enableMetrics)
     app.MapMetricEndpoints();
 if (enableTracing)

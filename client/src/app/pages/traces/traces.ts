@@ -721,10 +721,10 @@ export class TracesComponent implements OnInit, OnDestroy {
   }
 
   logTs(log: EventDto): string {
+    // `@t` is the ISO string the server sent; the old `typeof` fork existed only because the
+    // model claimed it might be a Date.
     const t = log['@t'];
-    if (!t) return '';
-    const s = typeof t === 'string' ? t : t.toISOString();
-    return s.substring(11, 23);
+    return t ? t.substring(11, 23) : '';
   }
 
   logLevelCls(log: EventDto): string {

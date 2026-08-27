@@ -20,7 +20,9 @@ namespace Ameto.Query;
 ///   4. Block decode: LZ4 decompress via <see cref="SegmentReader"/>.
 ///   5. Per-event AST evaluation via <see cref="FilterEvaluator"/>.
 ///
-/// Hot-tier events are scanned directly (no index).
+/// Hot-tier events are scanned directly (no index) and merged with the cold stream on
+/// the same (Timestamp, EventId) key — one globally ordered stream feeds the limit and
+/// the pagination cursor, whatever tier an event happens to live in.
 /// Results are emitted in the requested <see cref="QueryDirection"/> order.
 /// </summary>
 public sealed class QueryExecutor : IQueryExecutor
@@ -28,15 +30,18 @@ public sealed class QueryExecutor : IQueryExecutor
     private readonly ISegmentProvider         _segments;
     private readonly SegmentIndexReaderFactory _indexFactory;
     private readonly ILogger<QueryExecutor>   _logger;
+    private readonly SegmentIndexCache?       _indexCache;
 
     public QueryExecutor(
         ISegmentProvider         segments,
         SegmentIndexReaderFactory indexFactory,
-        ILogger<QueryExecutor>   logger)
+        ILogger<QueryExecutor>   logger,
+        SegmentIndexCache?       indexCache = null)
     {
         _segments     = segments;
         _indexFactory = indexFactory;
         _logger       = logger;
+        _indexCache   = indexCache is { Enabled: true } ? indexCache : null;
     }
 
     // ── IQueryExecutor ────────────────────────────────────────────────────────
@@ -56,23 +61,54 @@ public sealed class QueryExecutor : IQueryExecutor
         var  afterTs  = request.AfterTimestampTicks;
         var  levels   = request.Levels;
 
+        // The cursor is the tightest time bound the request carries: everything strictly
+        // past it in the query direction was already served, so page k must not re-open
+        // and re-decode the segments and blocks page k-1 already walked. Clamp INCLUSIVE
+        // at the cursor tick — events sharing the timestamp are tie-broken by id inside
+        // the cursor check, and the window checks are themselves inclusive. Guarded to
+        // the DateTime range: the cursor comes off the wire, and a garbage value should
+        // keep matching nothing (as before) rather than throw from the ctor.
+        if (afterTs is long cursorTicks && cursorTicks >= 0 && cursorTicks <= DateTime.MaxValue.Ticks)
+        {
+            if (forward)
+            {
+                if (from is null || from.Value.UtcTicks < cursorTicks)
+                    from = new DateTimeOffset(cursorTicks, TimeSpan.Zero);
+            }
+            else
+            {
+                if (to is null || to.Value.UtcTicks > cursorTicks)
+                    to = new DateTimeOffset(cursorTicks, TimeSpan.Zero);
+            }
+        }
+
+        // @t predicates from the filter's AND-chain are exact bounds too — folded into the
+        // window so the catalog filter, zone map and hot header scan prune with them (a
+        // `@t >= '...'` filter used to be evaluated per event over the whole catalog). The
+        // evaluator re-checks every event regardless, so this can only skip work; the
+        // DateTime-range guard mirrors the cursor's.
+        if (filter.MinTimestampTicks is long boundMin && boundMin >= 0 && boundMin <= DateTime.MaxValue.Ticks
+            && (from is null || from.Value.UtcTicks < boundMin))
+            from = new DateTimeOffset(boundMin, TimeSpan.Zero);
+        if (filter.MaxTimestampTicks is long boundMax && boundMax >= 0 && boundMax <= DateTime.MaxValue.Ticks
+            && (to is null || to.Value.UtcTicks > boundMax))
+            to = new DateTimeOffset(boundMax, TimeSpan.Zero);
+
         // ── Hot tier ──────────────────────────────────────────────────────────
         // Window/cursor/level filtering and the (@t, id) sort happen at HEADER level
         // inside the reader (HotTierScan) — events are materialised lazily in result
         // order, so a page query allocates ~limit events, not the whole tier.
+        //
+        // The hot stream is ONE MORE ENTRANT of the k-way merge below, not a prefix
+        // of the response. Emitting it wholesale before the cold tier violated the
+        // global (ts, id) order whenever the tiers interleave in time (late-arriving
+        // events, replicated peer segments), and the violation was not cosmetic: the
+        // client's next-page keyset cursor is the last emitted (ts, id), so every
+        // not-yet-served cold event on the wrong side of a mis-ordered boundary
+        // failed the cursor on all subsequent pages — silently unreachable rows.
         using var hotReader = _segments.OpenHotTierReader();
-        var covered = hotReader.CoveredSegmentKeys;
-        foreach (var ev in hotReader.ReadSorted(
-                     from?.UtcTicks ?? long.MinValue, to?.UtcTicks ?? long.MaxValue,
-                     afterTs, afterId?.RawValue, forward, levels))
-        {
-            if (ct.IsCancellationRequested || count >= limit) yield break;
-            if (!filter.Matches(ev)) continue;
-            yield return ev;
-            count++;
-        }
-
-        if (count >= limit || ct.IsCancellationRequested) yield break;
+        var covered   = hotReader.CoveredSegmentKeys;
+        var hotStream = HotEventsAsync(hotReader, filter, from, to, afterTs, afterId, forward, levels, ct);
 
         // ── Cold-tier segments (k-way merge) ─────────────────────────────────
         // After Variant B, every segment's blocks are individually sorted by @t,
@@ -90,14 +126,40 @@ public sealed class QueryExecutor : IQueryExecutor
             .Where(s => s.MaxTimestampTicks >= fromTicksGlobal && s.MinTimestampTicks <= toTicksGlobal)
             .ToList();
 
-        if (segInfos.Count == 0) yield break;
-
-        await foreach (var ev in MergeColdSegmentsAsync(segInfos, filter, levels, from, to, afterTs, afterId, forward, ct))
+        await foreach (var ev in MergeSourcesAsync(hotStream, segInfos, filter, levels, from, to, afterTs, afterId, forward, ct))
         {
             if (ct.IsCancellationRequested || count >= limit) yield break;
             yield return ev;
             count++;
         }
+    }
+
+    /// <summary>
+    /// The hot tier as a (ts, id)-sorted async source for the merge. ReadSorted already
+    /// applies window, cursor and level filtering at header level; only the compiled
+    /// filter runs here, per materialised event — the same division of labour the cold
+    /// scan uses.
+    /// </summary>
+    private static async IAsyncEnumerable<LogEvent> HotEventsAsync(
+        IHotTierReader                hotReader,
+        CompiledFilter                filter,
+        DateTimeOffset?               from,
+        DateTimeOffset?               to,
+        long?                         afterTs,
+        Ameto.Core.EventId?           afterId,
+        bool                          forward,
+        HashSet<Ameto.Core.LogLevel>? levels,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    {
+        foreach (var ev in hotReader.ReadSorted(
+                     from?.UtcTicks ?? long.MinValue, to?.UtcTicks ?? long.MaxValue,
+                     afterTs, afterId?.RawValue, forward, levels))
+        {
+            if (ct.IsCancellationRequested) yield break;
+            if (!filter.Matches(ev)) continue;
+            yield return ev;
+        }
+        await Task.CompletedTask; // the source is synchronous; async only to fit the merge
     }
 
     // ── Cold-tier k-way merge ─────────────────────────────────────────────────
@@ -111,12 +173,13 @@ public sealed class QueryExecutor : IQueryExecutor
             a.ts != b.ts ? b.ts.CompareTo(a.ts) : b.id.CompareTo(a.id));
 
     /// <summary>
-    /// Merges events from multiple cold-tier segments preserving a global
-    /// (Timestamp, EventId) order. For sorted segments (file format v2+) we stream
-    /// blocks lazily; for unsorted legacy segments (v1) we materialise the whole
+    /// Merges the hot-tier stream and events from multiple cold-tier segments preserving
+    /// a global (Timestamp, EventId) order. For sorted segments (file format v2+) we
+    /// stream blocks lazily; for unsorted legacy segments (v1) we materialise the whole
     /// segment, sort it once, then merge with the rest.
     /// </summary>
-    private async IAsyncEnumerable<LogEvent> MergeColdSegmentsAsync(
+    private async IAsyncEnumerable<LogEvent> MergeSourcesAsync(
+        IAsyncEnumerable<LogEvent>           hotStream,
         IReadOnlyList<SegmentInfo>           segInfos,
         CompiledFilter                       filter,
         HashSet<Ameto.Core.LogLevel>?       levels,
@@ -132,9 +195,11 @@ public sealed class QueryExecutor : IQueryExecutor
         // segments — each segment opens its mmap independently and we typically
         // discard most of them via bloom. Doing this sequentially across hundreds
         // of segments was the dominant query cost (~7-10s for 217 segments).
-        var prefiltered = await PrefilterSegmentsAsync(
-            segInfos, filter,
-            from?.UtcTicks ?? long.MinValue, to?.UtcTicks ?? long.MaxValue, ct);
+        List<PrefilterResult> prefiltered = segInfos.Count == 0
+            ? []
+            : await PrefilterSegmentsAsync(
+                  segInfos, filter, levels,
+                  from?.UtcTicks ?? long.MinValue, to?.UtcTicks ?? long.MaxValue, ct);
 
         // Priming order: the merge front moves one way through time, so segments are
         // consumed in that order too — newest MaxTs first going backward, oldest MinTs
@@ -143,7 +208,7 @@ public sealed class QueryExecutor : IQueryExecutor
             ? prefiltered.OrderBy(p => p.Info.MinTimestampTicks).ToList()
             : prefiltered.OrderByDescending(p => p.Info.MaxTimestampTicks).ToList();
 
-        var iterators = new List<IAsyncEnumerator<LogEvent>>(ordered.Count);
+        var iterators = new List<IAsyncEnumerator<LogEvent>>(ordered.Count + 1);
         try
         {
             // PriorityQueue ordered by (ts, id). For backward (newest-first) we invert
@@ -151,6 +216,20 @@ public sealed class QueryExecutor : IQueryExecutor
             var comparer = forward ? MergeAsc : MergeDesc;
             var heap = new PriorityQueue<IAsyncEnumerator<LogEvent>, (long ts, ulong id)>(comparer);
             int next = 0;
+
+            // The hot tier primes unconditionally: it is RAM-resident (priming costs a
+            // header walk, no I/O) and its time bounds are not in the catalog, so it
+            // cannot take part in the could-beat check that gates the cold segments.
+            var hotIt = hotStream.GetAsyncEnumerator(ct);
+            if (await hotIt.MoveNextAsync())
+            {
+                iterators.Add(hotIt);
+                heap.Enqueue(hotIt, (hotIt.Current.Timestamp.UtcTicks, hotIt.Current.Id.RawValue));
+            }
+            else
+            {
+                await hotIt.DisposeAsync();
+            }
 
             // Open segments LAZILY. Priming every surviving segment up front is what made a
             // page cost the whole catalog: an unfiltered `count=50` takes GetSegments(null,
@@ -246,11 +325,12 @@ public sealed class QueryExecutor : IQueryExecutor
     /// one group, so they take the same path with the same result as before.</para>
     /// </summary>
     private async Task<List<PrefilterResult>> PrefilterSegmentsAsync(
-        IReadOnlyList<SegmentInfo> segInfos,
-        CompiledFilter             filter,
-        long                       fromTicks,
-        long                       toTicks,
-        CancellationToken          ct)
+        IReadOnlyList<SegmentInfo>    segInfos,
+        CompiledFilter                filter,
+        HashSet<Ameto.Core.LogLevel>? levels,
+        long                          fromTicks,
+        long                          toTicks,
+        CancellationToken             ct)
     {
         // GetTrigramHints() returns a pre-computed list — no .ToList() allocation needed.
         var trigramHints   = filter.GetTrigramHints();
@@ -258,8 +338,23 @@ public sealed class QueryExecutor : IQueryExecutor
         bool hasIndexHint  = !filter.IsMatchAll && filter.TryGetIndexHint(out _, out _);
         bool hasInvHints   = invertedHints.Count > 0;
 
+        // The levels PARAMETER prunes through the same index the `@l = '...'` FILTER
+        // uses. It used to prune nothing: an errors-only dashboard query decoded every
+        // block of every surviving segment only for the per-event level check to reject
+        // nearly all of it. Per group, each level of the set either has a posting list,
+        // is provably absent, or answers "no information" (a pre-index segment) — the
+        // union across the set is definitive unless any level answers the latter.
+        (string, object?)[][]? levelHints = null;
+        if (levels is { Count: > 0 })
+        {
+            levelHints = new (string, object?)[levels.Count][];
+            int li = 0;
+            foreach (var l in levels)
+                levelHints[li++] = [(ClefFields.Level, l.ToSeqString())];
+        }
+
         // Fast path: nothing to prefilter — pass every segment through.
-        if (!hasIndexHint && !hasInvHints && trigramHints.Count == 0)
+        if (!hasIndexHint && !hasInvHints && trigramHints.Count == 0 && levelHints is null)
         {
             var passthrough = new List<PrefilterResult>(segInfos.Count);
             foreach (var info in segInfos)
@@ -327,6 +422,34 @@ public sealed class QueryExecutor : IQueryExecutor
                         // the correctness gate.
                         if (grp.MaxTs < fromTicks || grp.MinTs > toTicks) continue;
 
+                        // A cache hit skips every section read below: the group's bloom,
+                        // inverted and (when cached full) trigram indexes are already decoded.
+                        // needTrigram misses on a trigram-less entry on purpose — the full
+                        // reader built below then REPLACES it (see SegmentIndexCache).
+                        bool needTrigram = trigramHints.Count > 0;
+                        if (_indexCache?.TryAcquire(info.FilePath, g, needTrigram) is { } hit)
+                        {
+                            using (hit)
+                            {
+                                var cached = hit.Index;
+                                if (hasIndexHint && !PassesBloomGate(filter, cached.Bloom))
+                                    continue;
+                                if (levelHints is not null && !AnyLevelMaybePresent(levelHints, cached.Bloom))
+                                    continue;
+                                if (!TryNarrowWithIndex(filter, cached, levelHints, out var cachedCandidates))
+                                    continue;
+
+                                anyGroupSurvived = true;
+                                if (cachedCandidates is null) unnarrowedGroup = true;
+                                else
+                                {
+                                    candidates ??= new List<uint>(cachedCandidates.Length);
+                                    candidates.AddRange(cachedCandidates);
+                                }
+                            }
+                            continue;
+                        }
+
                         // Both phases read the bloom section, so it is rented ONCE per group and
                         // held across them. It used to be rented twice, and a section is not a
                         // small thing to rent twice: ArrayPool<byte>.Shared does not pool arrays
@@ -364,10 +487,14 @@ public sealed class QueryExecutor : IQueryExecutor
                         // to fold case and probe every value form the scan would accept, and
                         // an inline copy of that decision is exactly what let the index prune
                         // rows a scan would have matched.
-                        if (hasIndexHint)
+                        if (hasIndexHint || levelHints is not null)
                         {
                             using var bloom = SegmentBloomFilter.Deserialise(bloomSec.Span);
-                            if (!PassesBloomGate(filter, bloom))
+                            if (hasIndexHint && !PassesBloomGate(filter, bloom))
+                                continue;
+                            // No level of the set can be present in this group (no false
+                            // negatives in the bloom) — skip it before the big sections.
+                            if (levelHints is not null && !AnyLevelMaybePresent(levelHints, bloom))
                                 continue;
                         }
 
@@ -375,7 +502,7 @@ public sealed class QueryExecutor : IQueryExecutor
                         // an equality hint) load the big indexes for trigram offset
                         // lookup and the inverted-index definitive check.
                         uint[]? groupCandidates = null;
-                        if (trigramHints.Count > 0 || hasIndexHint || hasInvHints)
+                        if (needTrigram || hasIndexHint || hasInvHints || levelHints is not null)
                         {
                             // Pooled: sections are copied out inside the deserialisers, so the
                             // rented buffers go back to the pool as soon as the index is built.
@@ -384,15 +511,33 @@ public sealed class QueryExecutor : IQueryExecutor
                             // and every posting list is materialised into int[] on load. Only
                             // pay for it when the filter actually has a substring predicate —
                             // an `@l = 'Error'` query used to deserialise the whole thing.
-                            using var triSec = trigramHints.Count > 0
+                            using var triSec = needTrigram
                                 ? reader.RentTrigramIndexBytes(g)
                                 : default;
-                            using var idx = _indexFactory.Create(invSec.Span, triSec.Span, bloomSec.Span);
+                            var built = _indexFactory.Create(invSec.Span, triSec.Span, bloomSec.Span);
 
                             // A group that is provably empty for this filter is skipped, not
                             // the whole segment — the next group may still hold matches.
-                            if (!TryNarrowWithIndex(filter, idx, out groupCandidates))
-                                continue;
+                            if (_indexCache is { } cache)
+                            {
+                                // Charged at the reader's RETAINED size, not the section
+                                // lengths it decoded from: postings expand ~3-8x out of their
+                                // varint packing, and budgeting by the packed size pinned
+                                // several times Query.IndexCacheBytes of managed heap.
+                                // Insert may hand back a concurrently inserted winner for this
+                                // group and dispose `built` — use it only through the lease.
+                                using var lease = cache.Insert(info.FilePath, g, needTrigram, built, built.ApproxRetainedBytes);
+                                if (!TryNarrowWithIndex(filter, lease.Index, levelHints, out groupCandidates))
+                                    continue;
+                            }
+                            else
+                            {
+                                using (built)
+                                {
+                                    if (!TryNarrowWithIndex(filter, built, levelHints, out groupCandidates))
+                                        continue;
+                                }
+                            }
                         }
 
                         anyGroupSurvived = true;
@@ -451,6 +596,19 @@ public sealed class QueryExecutor : IQueryExecutor
     /// otherwise the exact local offsets worth deserialising.</para>
     /// </summary>
     internal static bool TryNarrowWithIndex(CompiledFilter filter, ISegmentIndex idx, out uint[]? candidates)
+        => TryNarrowWithIndex(filter, idx, levelHints: null, out candidates);
+
+    /// <summary>True when at least one level of the set might be present per the bloom filter.</summary>
+    private static bool AnyLevelMaybePresent((string, object?)[][] levelHints, SegmentBloomFilter bloom)
+    {
+        for (int i = 0; i < levelHints.Length; i++)
+            if (SegmentIndexReader.MightContainValue(bloom, levelHints[i][0].Item2))
+                return true;
+        return false;
+    }
+
+    internal static bool TryNarrowWithIndex(
+        CompiledFilter filter, ISegmentIndex idx, (string, object?)[][]? levelHints, out uint[]? candidates)
     {
         candidates = null;
 
@@ -498,6 +656,42 @@ public sealed class QueryExecutor : IQueryExecutor
                     var merged = new List<uint>(Math.Min(candidates.Length, invOffsets.Length));
                     foreach (var o in candidates)
                         if (invSet.Contains(o)) merged.Add(o);
+                    if (merged.Count == 0) return false;
+                    candidates = [.. merged];
+                }
+            }
+        }
+
+        // The levels parameter, through the same posting lists a `@l = '...'` filter
+        // uses. Union across the set — an event matches ANY allowed level — and only
+        // definitive when every level answered (null = the group predates the index or
+        // the bucket is unknown: no information, scan). An empty union proves the group
+        // holds none of the allowed levels. The per-event level re-check in the scan
+        // stays the correctness gate, as with every other narrowing here.
+        if (levelHints is not null)
+        {
+            List<uint>? union    = null;
+            bool       definitive = true;
+            foreach (var hint in levelHints)
+            {
+                var offs = idx.LookupIntersect(hint);
+                if (offs is null) { definitive = false; break; }
+                if (offs.Length > 0) (union ??= new List<uint>(offs.Length)).AddRange(offs);
+            }
+            if (definitive)
+            {
+                if (union is null) return false;
+
+                if (candidates is null)
+                {
+                    candidates = [.. union];
+                }
+                else
+                {
+                    var lvlSet = new HashSet<uint>(union);
+                    var merged = new List<uint>(Math.Min(candidates.Length, union.Count));
+                    foreach (var o in candidates)
+                        if (lvlSet.Contains(o)) merged.Add(o);
                     if (merged.Count == 0) return false;
                     candidates = [.. merged];
                 }
