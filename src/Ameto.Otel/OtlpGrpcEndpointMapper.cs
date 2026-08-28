@@ -26,6 +26,9 @@ namespace Ameto.Otel;
 /// </summary>
 public static class OtlpGrpcEndpointMapper
 {
+    /// <summary>One string for the one reason logs and traces refuse: TryIngest's bounded ring was full.</summary>
+    private const string BufferFullReason = "the ingest buffer was full";
+
     private const string GrpcContentType = "application/grpc";
 
     // The few canonical gRPC status codes this receiver can produce.
@@ -44,7 +47,7 @@ public static class OtlpGrpcEndpointMapper
                 if (request is null) return (false, 0, null);
                 var events = OtlpLogMapper.Map(request, Ameto.Core.NodeId.Local.Value);
                 var (_, dropped) = c.RequestServices.GetRequiredService<IngestionEndpoint>().IngestEvents(events);
-                return (true, dropped, "the ingest buffer was full");
+                return (true, dropped, BufferFullReason);
             }));
 
         if (enableTraces)
@@ -57,7 +60,7 @@ public static class OtlpGrpcEndpointMapper
                     if (spans.Count == 0) return (true, 0, null);
                     c.RequestServices.GetRequiredService<ISpanIngester>()
                      .TryIngest(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(spans), out int accepted);
-                    return (true, spans.Count - accepted, "the ingest buffer was full");
+                    return (true, spans.Count - accepted, BufferFullReason);
                 }));
 
         if (enableMetrics)

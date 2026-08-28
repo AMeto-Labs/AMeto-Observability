@@ -60,6 +60,14 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
     private long _futureDroppedTotal;      // lifetime count, carried in every warning
     private long _futureDropLastLogTicks;  // Environment.TickCount64 of the last warning; 0 = never
+
+    /// <summary>
+    /// The refusal boundary, computed in one place: ingest and WAL recovery must agree on it to
+    /// the nanosecond, and two hand-expanded copies of the formula were one edited unit away
+    /// from quietly disagreeing.
+    /// </summary>
+    private static long FutureLimitNanos()
+        => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L + MaxFutureSkewNanos;
     private static readonly TimeSpan MaxHotAge = TimeSpan.FromHours(1);
 
     /// <summary>When the hot tier last went from empty to holding points. Null = empty.</summary>
@@ -308,9 +316,8 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                 unresolved);
         if (recovered.Count == 0) return;
 
-        long oldestNano  = long.MaxValue;
-        long futureLimit = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L
-                         + MaxFutureSkewNanos;
+        long oldestNano    = long.MaxValue;
+        long futureLimit   = FutureLimitNanos();
         int  droppedFuture = 0;
 
         foreach (var r in recovered)
@@ -380,8 +387,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     {
         int total = 0;
 
-        long futureLimit = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L
-                         + MaxFutureSkewNanos;
+        long futureLimit   = FutureLimitNanos();
         int  droppedFuture = 0;
 
         // Logging a point and making it visible must be one step with respect to a flush's
@@ -434,6 +440,12 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
             if (item.Exemplars is not { Length: > 0 } exs) continue;
             var ring = _exemplars.GetOrAdd(item.Name, static _ => new ExemplarRing(ExemplarsPerMetric));
             foreach (var ex in exs)
+            {
+                // The exemplar's OWN clock, not the point's: OTLP parses time_unix_nano per
+                // exemplar, so a sane point can carry a 2116-stamped exemplar — and the skip
+                // above, keyed on the point, would wave it straight through to the top of
+                // every newest-first answer.
+                if (ex.TimestampUnixNano > futureLimit) continue;
                 ring.Add(new ExemplarSample
                 {
                     TimestampUnixNano = ex.TimestampUnixNano,
@@ -442,6 +454,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                     SpanId            = ex.SpanId,
                     Labels            = item.Labels,
                 });
+            }
         }
 
         if (total >= HotFlushThreshold

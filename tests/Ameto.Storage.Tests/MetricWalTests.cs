@@ -2218,6 +2218,177 @@ public sealed class MetricWalTests : IAsyncLifetime
         Assert.Contains(replayed, r => r.Name == "charlie" && r.Point.Value == 3.0);
     }
 
+    // ── PR #59 review: the second pass of blockers ──
+
+    /// <summary>
+    /// A grown file whose Magic or Version rotted lands in the fresh-header branch, and that
+    /// branch used to keep the grown capacity forever — a multi-GiB corpse with a zeroed write
+    /// offset that no empty-commit would ever come along to shrink on a trickle deployment.
+    /// The same "grown file stays grown" disease this PR cures for a lying WriteOffset, through
+    /// the other door.
+    /// </summary>
+    [Fact]
+    public void A_grown_file_with_a_rotted_magic_shrinks_at_reopen()
+    {
+        var wal = OpenWal(4 * 1024);
+        for (int i = 0; i < 300; i++)                       // grows 4 → 16 KiB
+            Append(wal, Scalar("cpu", 1_000 + i, i));
+        wal.Dispose();
+        Assert.Equal(32 + 16 * 1024, new FileInfo(WalPath).Length);
+
+        using (var fs = new FileStream(WalPath, FileMode.Open, FileAccess.ReadWrite))
+        {
+            fs.Seek(0, SeekOrigin.Begin);                   // the Magic field
+            fs.Write(BitConverter.GetBytes(0xDEADBEEFu));
+        }
+
+        var reopened = OpenWal(4 * 1024);
+
+        Assert.Equal(0, reopened.WrittenBytes);             // fresh header, as before
+        Assert.Equal(32 + 4 * 1024, new FileInfo(WalPath).Length);   // and no longer a corpse
+    }
+
+    /// <summary>
+    /// A torn entry can land a PLAUSIBLE generation and garbage in the very next field. Before
+    /// this guard, a series index near uint.MaxValue flowed into the survivor seed, the clamp
+    /// parked the counter at the ceiling — and the counter is an unchecked increment, so the
+    /// second registration after the restart wrapped to zero and collided with index 0's
+    /// legitimate owner: the misattribution bug again, through the other field. No registration
+    /// has ever issued an index within orders of magnitude of the cap, so stopping the walk
+    /// there is the same judgement the generation margin makes.
+    /// </summary>
+    [Fact]
+    public void A_garbage_series_index_ends_the_walk_instead_of_poisoning_the_seed()
+    {
+        var wal = OpenWal();
+        Append(wal, Scalar("cpu", 1_000, 1.0));
+        wal.Dispose();
+
+        using (var fs = new FileStream(WalPath, FileMode.Open, FileAccess.ReadWrite))
+        {
+            fs.Seek(32 + 8, SeekOrigin.Begin);              // entry 0's SeriesIndex field
+            fs.Write(BitConverter.GetBytes(uint.MaxValue - 3));
+        }
+
+        var logger   = new RecordingLogger();
+        var reopened = OpenWal(logger: logger);
+
+        Assert.True(logger.Saw(Microsoft.Extensions.Logging.LogLevel.Error,
+            "Metric WAL header claims", out _));
+        Assert.Equal(0, reopened.WrittenBytes);             // the entry is garbage, not data
+
+        // The counter was NOT parked at the ceiling: a series registered now gets a small
+        // index, and a second one the next — no wrap, no collision.
+        Append(reopened, Scalar("alpha", 2_000, 1.0));
+        Append(reopened, Scalar("beta",  3_000, 2.0));
+        reopened.Dispose();
+
+        var third    = OpenWal();
+        var replayed = third.ReadAll(out int unresolved);
+        Assert.Equal(0, unresolved);
+        Assert.Contains(replayed, r => r.Name == "alpha");
+        Assert.Contains(replayed, r => r.Name == "beta");
+    }
+
+    /// <summary>
+    /// Corruption that is about to be truncated leaves a capped forensic copy behind.
+    /// Reconciliation is judgement, not proof — the header's own counter is the margin's
+    /// reference — so the head of what it discards is kept where a person can look at it,
+    /// without copying gigabytes onto the very disk the growth may be filling.
+    /// </summary>
+    [Fact]
+    public void Corrupt_truncation_leaves_a_quarantine_file()
+    {
+        var wal = OpenWal();
+        Append(wal, Scalar("cpu", 1_000, 1.0));
+        wal.Dispose();
+
+        using (var fs = new FileStream(WalPath, FileMode.Open, FileAccess.ReadWrite))
+        {
+            fs.Seek(32, SeekOrigin.Begin);                  // entry 0's Generation field
+            fs.Write(BitConverter.GetBytes(155_000_000_000UL));
+        }
+
+        OpenWal(logger: new RecordingLogger());
+
+        string quarantine = WalPath + ".quarantine";
+        Assert.True(File.Exists(quarantine));
+        // It holds the discarded head verbatim — the torn generation is its first field.
+        var head = File.ReadAllBytes(quarantine);
+        Assert.Equal(155_000_000_000UL, BitConverter.ToUInt64(head, 0));
+    }
+
+    /// <summary>
+    /// The open-time shrink swallowing a DOUBLE failure (the resize and its restore) used to
+    /// hand the engine a log with no mapping: the host came up, accepted traffic, recovered
+    /// nothing, and threw from every append until someone restarted it. A log that cannot
+    /// hold one entry does not get to open — one clear line at startup instead.
+    /// </summary>
+    [Fact]
+    public void A_log_that_cannot_map_after_an_open_shrink_refuses_to_open()
+    {
+        var wal = OpenWal(4 * 1024);
+        for (int i = 0; i < 300; i++)                       // grow it, so reopen WANTS to shrink
+            Append(wal, Scalar("cpu", 1_000 + i, i));
+        ulong gen = wal.BeginFlush();
+        wal.CommitFlush(gen);                               // empty — but capacity stays 16 KiB…
+        wal.Dispose();
+
+        // …because the commit-time shrink is also a resize, so the seam must only arm at OPEN.
+        // Grow the file back by hand to guarantee the reopen attempts a shrink.
+        using (var fs = new FileStream(WalPath, FileMode.Open, FileAccess.ReadWrite))
+            fs.SetLength(32 + 16 * 1024);
+
+        MetricWriteAheadLog? opened = null;
+        var thrown = Record.Exception(() =>
+            opened = MetricWriteAheadLog.Open(WalPath, 4 * 1024,
+                beforeResize: static _ => throw new IOException("disk error (test seam)")));
+        try
+        {
+            Assert.IsType<IOException>(thrown);
+            Assert.Null(opened);
+        }
+        finally { opened?.Dispose(); }   // only on a red assertion — Open must not return
+    }
+
+    /// <summary>
+    /// An exemplar carries its OWN time_unix_nano, parsed independently of its parent point's —
+    /// so a sane point can arrive wearing a 2116-stamped exemplar, and a guard keyed on the
+    /// point waves it through. Exemplar queries sort newest-first with an open upper bound, so
+    /// one admitted far-future exemplar sits on top of every answer until the ring rotates it
+    /// out. The guard reads the exemplar's clock.
+    /// </summary>
+    [Fact]
+    public void An_exemplar_from_the_deep_future_is_refused_even_on_a_sane_point()
+    {
+        long nowNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+        long century = nowNano + 100L * 365 * 24 * 3_600_000_000_000L;
+
+        var engine = NewEngine();
+        engine.Ingest(new[]
+        {
+            new MetricIngestItem
+            {
+                Name              = "http.latency",
+                Kind              = MetricKind.Gauge,
+                Unit              = "ms",
+                Labels            = LabelSet.Empty,
+                TimestampUnixNano = nowNano,                // the point itself is fine
+                ScalarValue       = 12.5,
+                Exemplars         =
+                [
+                    new MetricExemplar { TimestampUnixNano = century, Value = 666.0 },
+                    new MetricExemplar { TimestampUnixNano = nowNano, Value = 12.5 },
+                ],
+            },
+        });
+
+        var served = engine.GetExemplars("http.latency", null, null, null);
+
+        Assert.Single(served);
+        Assert.Equal(nowNano, served[0].TimestampUnixNano);
+    }
+
     private sealed class RecordingLogger : Microsoft.Extensions.Logging.ILogger<MetricStorageEngine>
     {
         private readonly System.Collections.Concurrent.ConcurrentQueue<

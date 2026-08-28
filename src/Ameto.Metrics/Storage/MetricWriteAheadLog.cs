@@ -159,6 +159,17 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// </summary>
     private const ulong  GenerationSanityMargin = 1_000_000;
 
+    /// <summary>
+    /// A series index at or above this is garbage, not data: indices are issued sequentially
+    /// from zero, one per distinct series, and the largest catalog ever observed is five
+    /// thousand times smaller. The open-time walk stops on one the way it stops on an
+    /// impossible generation — a torn entry's generation can land on a plausible value while
+    /// the NEXT field decodes to junk, and that junk would otherwise flow into the seed,
+    /// park the counter at uint.MaxValue, and hand the wrap-to-zero collision to the second
+    /// registration after the restart.
+    /// </summary>
+    private const uint   SeriesIndexSanityCap = 1u << 30;
+
     /// <summary>8 MB holds ~150k scalar points; the log is reset on every flush.</summary>
     private const long DefaultCapacity = 8 * 1024 * 1024;
 
@@ -270,9 +281,12 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     }
 
     public static MetricWriteAheadLog Open(string filePath, long initialCapacity = DefaultCapacity,
-                                           ILogger? logger = null)
+                                           ILogger? logger = null, Action<long>? beforeResize = null)
     {
         var wal = new MetricWriteAheadLog(filePath, logger);
+        // Armed before OpenOrCreate, or the open-time shrink would be the one resize the seam
+        // cannot reach — and its double-failure path is exactly what needs the coverage.
+        wal.BeforeResize = beforeResize;
         wal.OpenOrCreate(initialCapacity);
         return wal;
     }
@@ -338,14 +352,28 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
             // the data itself say where it ends.
             ReconcileDataEndLocked(ref hdr);
 
-            // A file that grew stays grown across restarts otherwise ("reopen an already-grown
-            // log" above) — the incident's 8 GiB corpse outlived both its cause and the fix for
-            // it. Shrinking is safe here for the same reason the walk above is: everything past
-            // the reconciled offset is by definition not data.
-            long target = FitCapacity(_writeOffset);
-            if (_capacity > target)
-                ShrinkLocked(target, "open");
         }
+
+        // A file that grew stays grown across restarts otherwise ("reopen an already-grown log"
+        // above) — the incident's 8 GiB corpse outlived both its cause and the fix for it.
+        // OUTSIDE the header branch, deliberately: a grown file whose Magic or Version rotted
+        // lands in the fresh-header branch above, and it needs the shrink MORE, not less — its
+        // write offset is zero, so nothing later would ever empty-and-shrink it on a trickle
+        // deployment. Shrinking is safe for the same reason the walk is: everything past the
+        // reconciled offset is by definition not data.
+        long target = FitCapacity(_writeOffset);
+        if (_capacity > target)
+            ShrinkLocked(target, "open");
+
+        // ShrinkLocked swallows failures because mid-run a log at the old size is exactly as
+        // correct — but at OPEN a double failure (the resize and its restore both refused)
+        // leaves no mapping at all, and an engine built over that would come up, accept
+        // traffic, recover nothing, and throw from every single append. A log that cannot
+        // hold one entry does not get to open; better one clear line at startup.
+        if (_ptr is null)
+            throw new IOException(
+                "Metric WAL could not restore its mapping after a failed shrink at open — " +
+                "refusing to open a log that cannot accept an append. See the shrink error above.");
 
         _poolStream = new FileStream(_poolPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
         _poolStream.Seek(0, SeekOrigin.End);
@@ -447,6 +475,12 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
                 corrupt = true;
                 break;
             }
+            if (eh.SeriesIndex >= SeriesIndexSanityCap)
+            {
+                reason  = $"an entry whose series index ({eh.SeriesIndex}) no registration could have issued";
+                corrupt = true;
+                break;
+            }
 
             // Every entry the walk accepts pins its series index, committed ones included: a
             // committed entry that is still physically here is replayed by nothing, but the
@@ -476,11 +510,30 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
         // have stamped is the incident: outright corruption, and the bytes behind it grow the
         // file until someone notices by disk usage.
         if (corrupt)
+        {
+            // Forensics before repair, capped. The discarded region is unreachable by any
+            // replay, so a full copy would be safety theatre — at 8 GiB, on a disk the growth
+            // may already be filling, actively harmful theatre. But reconciliation is
+            // judgement, not proof (the header's own counter is the margin's reference, and
+            // nothing bounds it from above), so the head of what is about to be cut is kept
+            // where a person can look at it. Best-effort, like everything else that must not
+            // stand between a damaged log and a working one.
+            string quarantine = _filePath + ".quarantine";
+            long   kept       = Math.Min(orphaned, 4 * 1024 * 1024);
+            try
+            {
+                var snapshot = new byte[kept];
+                new ReadOnlySpan<byte>(data + pos, (int)kept).CopyTo(snapshot);
+                File.WriteAllBytes(quarantine, snapshot);
+            }
+            catch { kept = 0; }
+
             _logger?.LogError(
                 "Metric WAL header claims {Claimed} bytes of data but the walk stopped at {Actual} on {Reason} — " +
                 "truncating the {Orphaned} unreachable byte(s). This is corruption being repaired, not data loss: " +
-                "nothing could replay those bytes either.",
-                _writeOffset, pos, reason, orphaned);
+                "nothing could replay those bytes either. The first {Kept} of them are preserved at {Quarantine}.",
+                _writeOffset, pos, reason, orphaned, kept, quarantine);
+        }
         else
             _logger?.LogWarning(
                 "Metric WAL: discarding {Orphaned} byte(s) of {Reason} left by an unclean shutdown " +
@@ -1046,14 +1099,20 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
             using var fs = new FileStream(_poolPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
             Span<byte> head = stackalloc byte[8];
 
-            while (fs.Read(head) == 8)
+            // ReadAtLeast/ReadExactly, never a bare Read: Stream.Read may legally return fewer
+            // bytes than asked for reasons that are not end-of-file, and this loop's stop is no
+            // longer just "give up on the map" — OpenOrCreate TRUNCATES the pool to where it
+            // stops. A bare Read turned one under-filled buffer on a slow volume into a
+            // permanent cut through real records. Only an actual end-of-stream ends the walk.
+            while (fs.ReadAtLeast(head, 8, throwOnEndOfStream: false) == 8)
             {
                 uint index = BinaryPrimitives.ReadUInt32LittleEndian(head);
                 uint len   = BinaryPrimitives.ReadUInt32LittleEndian(head[4..]);
                 if (len == 0 || len > 8 * 1024 * 1024) break;    // torn or bogus record
 
                 var body = new byte[len];
-                if (fs.Read(body) != len) break;                 // truncated tail
+                try { fs.ReadExactly(body); }
+                catch (EndOfStreamException) { break; }          // genuinely truncated tail
 
                 var r = new SpanCursor(body);
                 var kind = (MetricKind)r.ReadByte();
