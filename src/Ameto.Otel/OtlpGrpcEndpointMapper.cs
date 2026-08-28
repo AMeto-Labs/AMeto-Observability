@@ -41,10 +41,10 @@ public static class OtlpGrpcEndpointMapper
             (HttpContext ctx) => HandleAsync(ctx, ApiKeyPermissions.Logs, static (c, msg) =>
             {
                 var request = OtlpProtoDecoder.DecodeLogs(msg.Array!, msg.Offset + msg.Count);
-                if (request is null) return (false, 0);
+                if (request is null) return (false, 0, null);
                 var events = OtlpLogMapper.Map(request, Ameto.Core.NodeId.Local.Value);
                 var (_, dropped) = c.RequestServices.GetRequiredService<IngestionEndpoint>().IngestEvents(events);
-                return (true, dropped);
+                return (true, dropped, "the ingest buffer was full");
             }));
 
         if (enableTraces)
@@ -52,22 +52,22 @@ public static class OtlpGrpcEndpointMapper
                 (HttpContext ctx) => HandleAsync(ctx, ApiKeyPermissions.Traces, static (c, msg) =>
                 {
                     var request = OtlpProtoDecoder.DecodeTraces(msg.Array!, msg.Offset + msg.Count);
-                    if (request is null) return (false, 0);
+                    if (request is null) return (false, 0, null);
                     var spans = OtlpTraceMapper.Map(request);
-                    if (spans.Count == 0) return (true, 0);
+                    if (spans.Count == 0) return (true, 0, null);
                     c.RequestServices.GetRequiredService<ISpanIngester>()
                      .TryIngest(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(spans), out int accepted);
-                    return (true, spans.Count - accepted);
+                    return (true, spans.Count - accepted, "the ingest buffer was full");
                 }));
 
         if (enableMetrics)
             app.MapPost("/opentelemetry.proto.collector.metrics.v1.MetricsService/Export",
                 (HttpContext ctx) => HandleAsync(ctx, ApiKeyPermissions.Metrics, static (c, msg) =>
                 {
-                    var points = OtlpMetricProtoParser.Parse(msg.AsSpan());
-                    c.RequestServices.GetRequiredService<IMetricIngester>()
+                    var points  = OtlpMetricProtoParser.Parse(msg.AsSpan());
+                    int refused = c.RequestServices.GetRequiredService<IMetricIngester>()
                      .Ingest(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(points));
-                    return (true, 0);
+                    return (true, refused, "points stamped more than 24 h in the future were refused");
                 }));
     }
 
@@ -78,7 +78,7 @@ public static class OtlpGrpcEndpointMapper
     private static async Task HandleAsync(
         HttpContext ctx,
         ApiKeyPermissions required,
-        Func<HttpContext, ArraySegment<byte>, (bool Ok, int Rejected)> decode)
+        Func<HttpContext, ArraySegment<byte>, (bool Ok, int Rejected, string? Why)> decode)
     {
         // Committed up front: gRPC needs the headers out before trailers can be written, and a
         // client that never sees 200 + application/grpc treats the call as a transport failure
@@ -169,9 +169,10 @@ public static class OtlpGrpcEndpointMapper
 
             bool ok;
             int rejected;
+            string? why;
             try
             {
-                (ok, rejected) = decode(ctx, segment);
+                (ok, rejected, why) = decode(ctx, segment);
             }
             catch (Exception ex)
             {
@@ -188,10 +189,12 @@ public static class OtlpGrpcEndpointMapper
                 return;
             }
 
-            // Accepted — and it says how much was dropped. Reporting a clean success while the
-            // ingest ring was full is exactly the silence this whole branch of work removes.
+            // Accepted — and it says how much was dropped, and why: each signal's decode lambda
+            // supplies its own reason (traces/logs: the ingest buffer was full; metrics: a
+            // far-future timestamp), so this no longer reports a clean success — or the wrong
+            // reason — while points were silently refused.
             await WriteMessageAsync(ctx, OtlpGrpcFraming.ExportResponse(
-                rejected, rejected > 0 ? "the ingest buffer was full" : null));
+                rejected, rejected > 0 ? why : null));
             await FinishAsync(ctx, StatusOk, null);
         }
         finally

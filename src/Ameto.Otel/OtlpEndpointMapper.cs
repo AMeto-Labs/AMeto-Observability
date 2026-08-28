@@ -127,8 +127,8 @@ public static class OtlpEndpointMapper
             catch { ctx.Response.StatusCode = 400; return; }
             finally { ArrayPool<byte>.Shared.Return(body); }
 
-            ingester.Ingest(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(points));
-            await WriteJsonOk(ctx, points.Count, 0);
+            int refused = ingester.Ingest(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(points));
+            await WriteJsonOk(ctx, points.Count - refused, refused);
         };
 
         // ── Logs ──────────────────────────────────────────────────────────────

@@ -81,11 +81,12 @@ public sealed class MetricWalTests : IAsyncLifetime
     /// its own mid-body — which most of them must, since reopening the file is how they assert
     /// what replays — pays nothing for being closed again at the end.
     /// </summary>
-    private MetricWriteAheadLog OpenWal(long? initialCapacity = null)
+    private MetricWriteAheadLog OpenWal(long? initialCapacity = null,
+                                        Microsoft.Extensions.Logging.ILogger? logger = null)
     {
         var wal = initialCapacity is { } capacity
-            ? MetricWriteAheadLog.Open(WalPath, capacity)
-            : MetricWriteAheadLog.Open(WalPath);
+            ? MetricWriteAheadLog.Open(WalPath, capacity, logger)
+            : MetricWriteAheadLog.Open(WalPath, logger: logger);
         _wals.Add(wal);
         return wal;
     }
@@ -505,7 +506,10 @@ public sealed class MetricWalTests : IAsyncLifetime
         using var wal = OpenWal(64 * 1024);   // ~1 365 entries
         Append(wal, Scalar("m", baseNano, 1));
 
-        File.SetAttributes(WalPath, FileAttributes.ReadOnly);
+        // The disk that fills mid-run, injected through the seam: the ReadOnly-attribute trick
+        // this used died with the lifetime handle (Windows enforces the attribute at CreateFile
+        // time, and resizes no longer reopen the file).
+        wal.BeforeResize = static _ => throw new IOException("disk full (test seam)");
         try
         {
             var grew = Record.Exception(() =>
@@ -523,7 +527,7 @@ public sealed class MetricWalTests : IAsyncLifetime
             var began = Record.Exception(() => wal.BeginFlush());
             Assert.IsType<InvalidOperationException>(began);
         }
-        finally { File.SetAttributes(WalPath, FileAttributes.Normal); }
+        finally { wal.BeforeResize = null; }
     }
 
     /// <summary>
@@ -555,7 +559,8 @@ public sealed class MetricWalTests : IAsyncLifetime
         ulong flushing = wal.BeginFlush();
         long  logged   = wal.WrittenBytes;
 
-        File.SetAttributes(WalPath, FileAttributes.ReadOnly);
+        // Same seam-injected disk-full as above; see A_log_that_lost_its_mapping.
+        wal.BeforeResize = static _ => throw new IOException("disk full (test seam)");
         try
         {
             var grew = Record.Exception(() =>
@@ -572,7 +577,7 @@ public sealed class MetricWalTests : IAsyncLifetime
             Assert.True(wal.WrittenBytes >= logged,
                 "the refused commit reclaimed records it had not covered by a watermark");
         }
-        finally { File.SetAttributes(WalPath, FileAttributes.Normal); }
+        finally { wal.BeforeResize = null; }
     }
 
     /// <summary>
@@ -637,8 +642,8 @@ public sealed class MetricWalTests : IAsyncLifetime
     /// log's copy is whole and the flush's is the deletable one.</para>
     ///
     /// <para>Driven by filling the log to within a few thousand entries of its capacity and
-    /// then, from the seam that fires once the file is in place, making <c>metrics.wal</c>
-    /// read-only and ingesting past the end of it. <c>Grow</c> unmaps before it extends and can
+    /// then, from the seam that fires once the file is in place, arming the WAL's resize seam
+    /// to throw and ingesting past the end of it. <c>Grow</c> unmaps before it extends and can
     /// re-map neither, which is the production state exactly: alive, unmapped, refusing every
     /// append, with a flush's generation still open. The count is taken from a SECOND engine
     /// over the same directory, because the question is what a restart sees.</para>
@@ -666,7 +671,9 @@ public sealed class MetricWalTests : IAsyncLifetime
         {
             engine.OnFileWrittenForTest = _ =>
             {
-                File.SetAttributes(WalPath, FileAttributes.ReadOnly);
+                // Seam-injected: the ReadOnly trick died with the lifetime handle (see
+                // A_log_that_lost_its_mapping for the mechanics).
+                engine.WalForTest.BeforeResize = static _ => throw new IOException("disk full (test seam)");
 
                 // Past the capacity, so the append underneath has to Grow — and cannot. The
                 // throw is this batch's, not the flush's: ingest fails honestly from here,
@@ -691,7 +698,7 @@ public sealed class MetricWalTests : IAsyncLifetime
         finally
         {
             engine.OnFileWrittenForTest = null;
-            File.SetAttributes(WalPath, FileAttributes.Normal);
+            engine.WalForTest.BeforeResize = null;
         }
 
         await engine.DisposeAsync();
@@ -1893,6 +1900,324 @@ public sealed class MetricWalTests : IAsyncLifetime
     }
 
     /// <summary>Records every line logged, so a test can assert on the report a path makes.</summary>
+    // ── Issue #56: the poisoned log is repaired at OPEN, and the file gives space back ──
+
+    /// <summary>
+    /// The incident end to end, at the moment it matters: a torn head reconciled when the log
+    /// OPENS, not when the first flush commits. The distinction is the whole bug — on a trickle
+    /// deployment below the flush thresholds a commit can be arbitrarily far away, and until
+    /// one runs, every point appended after a poisoned open lands PAST the unreachable region,
+    /// where no replay will ever find it. Acknowledged, logged, unreplayable from birth.
+    /// </summary>
+    [Fact]
+    public void Poisoned_head_is_reconciled_and_shrunk_at_open()
+    {
+        var wal = OpenWal(4 * 1024);
+        for (int i = 0; i < 300; i++)                       // ~14 KB of entries: grows 4 → 16 KiB
+            Append(wal, Scalar("cpu", 1_000 + i, i));
+        wal.Dispose();
+        Assert.Equal(32 + 16 * 1024, new FileInfo(WalPath).Length);
+
+        using (var fs = new FileStream(WalPath, FileMode.Open, FileAccess.ReadWrite))
+        {
+            fs.Seek(32, SeekOrigin.Begin);                  // first entry's Generation field
+            fs.Write(BitConverter.GetBytes(155_000_000_000UL));
+        }
+
+        var logger   = new RecordingLogger();
+        var reopened = OpenWal(4 * 1024, logger);
+
+        Assert.True(logger.Saw(Microsoft.Extensions.Logging.LogLevel.Error,
+                "Metric WAL header claims", out _),
+            "corruption was repaired without being reported");
+        Assert.Empty(reopened.ReadAll(out _));
+        Assert.Equal(0, reopened.WrittenBytes);
+        // The grown corpse gave its space back instead of surviving its own cause.
+        Assert.Equal(32 + 4 * 1024, new FileInfo(WalPath).Length);
+
+        // And the repair is real, not cosmetic: a point appended now is REACHABLE — before the
+        // fix it would have landed beyond gigabytes of claimed garbage no scan could cross.
+        Append(reopened, Scalar("cpu", 9_000, 42.0));
+        reopened.Dispose();
+
+        var third    = OpenWal(4 * 1024);
+        var replayed = third.ReadAll(out _);
+        Assert.Single(replayed);
+        Assert.Equal(42.0, replayed[0].Point.Value);
+    }
+
+    /// <summary>
+    /// The incident's second signature, isolated: a header claiming data far past the end
+    /// marker (the stand: 8.45 GiB claimed over 128 real bytes, and the 8.4 GiB in between
+    /// never mentioned by anyone). Warning, not Error — a lost data page under a persisted
+    /// header, or a crash between Compact's marker and its header store, present the same way
+    /// legitimately. What matters is that the claim is trimmed and SAID.
+    /// </summary>
+    [Fact]
+    public void Data_claimed_beyond_the_end_marker_is_discarded_with_a_warning()
+    {
+        var wal = OpenWal();
+        Append(wal, Scalar("cpu", 1_000, 1.0));
+        Append(wal, Scalar("cpu", 2_000, 2.0));
+        wal.Dispose();
+
+        using (var fs = new FileStream(WalPath, FileMode.Open, FileAccess.ReadWrite))
+        {
+            fs.Seek(8, SeekOrigin.Begin);                   // header WriteOffset
+            fs.Write(BitConverter.GetBytes((long)(32 + 4096)));
+        }
+
+        var logger   = new RecordingLogger();
+        var reopened = OpenWal(logger: logger);
+
+        Assert.True(logger.Saw(Microsoft.Extensions.Logging.LogLevel.Warning,
+            "Metric WAL: discarding", out _));
+        var replayed = reopened.ReadAll(out _);
+        Assert.Equal(2, replayed.Count);                    // the real points are untouched
+        Assert.Equal(96, reopened.WrittenBytes);            // the phantom 4 000 bytes are gone
+    }
+
+    /// <summary>
+    /// A log that grew under load returns the space the moment a commit empties it — not at
+    /// the next restart. The incident machine ran for weeks growing 1.3 GB a day; a shrink
+    /// that fires only at open would have watched all of it.
+    /// </summary>
+    [Fact]
+    public void A_grown_log_shrinks_back_when_a_commit_empties_it()
+    {
+        var wal = OpenWal(4 * 1024);
+        for (int i = 0; i < 120; i++)                       // ~5.8 KB: grows 4 → 8 KiB
+            Append(wal, Scalar("cpu", 1_000 + i, i));
+        Assert.Equal(32 + 8 * 1024, new FileInfo(WalPath).Length);
+
+        ulong gen = wal.BeginFlush();
+        Assert.Equal(MetricWalCommit.Committed, wal.CommitFlush(gen));
+
+        Assert.Equal(0, wal.WrittenBytes);
+        Assert.Equal(32 + 4 * 1024, new FileInfo(WalPath).Length);
+
+        // Still a working log at the smaller size — the shrink remapped, it did not disable.
+        Append(wal, Scalar("cpu", 9_000, 7.0));
+        Assert.Equal(48, wal.WrittenBytes);
+    }
+
+    /// <summary>
+    /// Reopening with survivors must not hand out pool indices the survivors already use. The
+    /// in-memory registry restarts empty, so before the fix the first new series took index 0
+    /// again, and LoadPool's later-records-win then attributed the SURVIVING entries to the
+    /// new series on the next replay — wrong name, wrong labels, and nothing anywhere said so.
+    /// </summary>
+    [Fact]
+    public void Pool_indices_continue_past_survivors_after_a_reopen()
+    {
+        var wal = OpenWal();
+        Append(wal, Scalar("alpha", 1_000, 1.0));
+        wal.Dispose();
+
+        var second = OpenWal();
+        Append(second, Scalar("beta", 2_000, 2.0));
+        second.Dispose();
+
+        var third    = OpenWal();
+        var replayed = third.ReadAll(out int unresolved);
+
+        Assert.Equal(0, unresolved);
+        Assert.Equal(2, replayed.Count);
+        Assert.Contains(replayed, r => r.Name == "alpha" && r.Point.Value == 1.0);
+        Assert.Contains(replayed, r => r.Name == "beta"  && r.Point.Value == 2.0);
+    }
+
+    /// <summary>
+    /// A pool that outlived its log is dead weight (the stand carried 29.5 MB of it, because
+    /// truncation only ever ran on a flush that emptied the log — which the poisoning made
+    /// unreachable). An empty log references nothing, so opening one resets the pool.
+    /// </summary>
+    [Fact]
+    public void A_stale_pool_is_truncated_when_the_log_opens_empty()
+    {
+        var wal = OpenWal();
+        Append(wal, Scalar("cpu", 1_000, 1.0));
+        wal.Dispose();
+        Assert.True(new FileInfo(PoolPath).Length > 0);
+
+        using (var fs = new FileStream(WalPath, FileMode.Open, FileAccess.ReadWrite))
+        {
+            fs.Seek(8, SeekOrigin.Begin);
+            fs.Write(BitConverter.GetBytes((long)32));      // header: no data at all
+        }
+
+        OpenWal();
+        Assert.Equal(0, new FileInfo(PoolPath).Length);
+    }
+
+    // ── Issue #56, the comment: one far-future point makes its cold file immortal ──
+
+    /// <summary>
+    /// A point stamped a century ahead is refused at ingest — before the WAL, before the hot
+    /// tier — because once flushed it becomes its file's MaxNano, and that file is then never
+    /// selected by rollup, never expired by retention, and scanned by every query until 2116.
+    /// A point HALF A DAY ahead must keep flowing: that is real clock trouble (a client
+    /// stamping local time as UTC), and this suite's own fixtures ingest up to +12 h.
+    /// </summary>
+    [Fact]
+    public async Task A_far_future_point_is_refused_at_ingest()
+    {
+        long nowNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+        long century = nowNano + 100L * 365 * 24 * 3_600_000_000_000L;
+        long halfDay = nowNano + 12L * 3_600_000_000_000L;
+
+        var logger = new RecordingLogger();
+        var engine = NewEngine(logger: logger);
+
+        engine.Ingest(new[]
+        {
+            Scalar("cpu", century, 666.0),
+            Scalar("cpu", halfDay, 2.0),
+            Scalar("cpu", nowNano, 1.0),
+        });
+
+        Assert.True(logger.Saw(Microsoft.Extensions.Logging.LogLevel.Warning,
+                "Dropped 1 metric point(s) at ingest", out _),
+            "the drop happened silently");
+
+        await engine.DisposeAsync();                        // final flush writes the survivors
+
+        var files = Directory.GetFiles(_dir, "metrics-cpu-*.mts");
+        Assert.NotEmpty(files);
+        // File names carry {min}-{max}: the century must appear in nothing, and the
+        // skewed-but-sane half-day point must be exactly the max of the file it landed in.
+        Assert.DoesNotContain(files, f => f.Contains(century.ToString()));
+        Assert.Contains(files, f => f.Contains("-" + halfDay + "-"));
+    }
+
+    /// <summary>
+    /// The same guard at the hot tier's other entrance. The incident's garbage point came from
+    /// the LOG: every restart replayed it into the hot tier, and every flush from there minted
+    /// another immortal file — ten of them on the stand. Dropping (not clamping) is what keeps
+    /// a crash-restart loop deterministic: a clamp would re-stamp the same WAL entry to a
+    /// different "now" each start, and exact-timestamp dedupe would see them all as distinct.
+    /// </summary>
+    [Fact]
+    public async Task A_far_future_point_in_the_wal_is_dropped_at_recovery()
+    {
+        long nowNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+        long century = nowNano + 100L * 365 * 24 * 3_600_000_000_000L;
+
+        var wal = OpenWal();
+        Append(wal, Scalar("cpu", century, 666.0));
+        Append(wal, Scalar("cpu", nowNano, 1.0));
+        wal.Dispose();
+
+        var logger = new RecordingLogger();
+        var engine = NewEngine(logger: logger);
+
+        Assert.True(logger.Saw(Microsoft.Extensions.Logging.LogLevel.Warning,
+            "Dropped 1 metric point(s) at WAL recovery", out _));
+        Assert.True(logger.Saw(Microsoft.Extensions.Logging.LogLevel.Information,
+            "Recovered 1 metric point", out _));
+
+        await engine.DisposeAsync();
+
+        var files = Directory.GetFiles(_dir, "metrics-cpu-*.mts");
+        Assert.NotEmpty(files);
+        Assert.DoesNotContain(files, f => f.Contains(century.ToString()));
+    }
+
+    /// <summary>
+    /// Mutation-proven: deleting <c>_capacity = targetCapacity</c> in <c>ShrinkLocked</c> left
+    /// the suite green, and in production that is raw-pointer writes past the mapped view —
+    /// the file and the mapping shrink to the floor, but every later <see cref="MetricWriteAheadLog.Append"/>
+    /// would still bound itself against the pre-shrink capacity. Grow back past a commit-time
+    /// shrink and check both the field and the file, so a mismatch between the two cannot hide
+    /// behind either alone.
+    /// </summary>
+    [Fact]
+    public void Grow_after_a_commit_shrink_climbs_the_ladder_again()
+    {
+        var wal = OpenWal(4 * 1024);
+        for (int i = 0; i < 120; i++)                       // ~5.8 KB: grows 4 → 8 KiB
+            Append(wal, Scalar("cpu", 1_000 + i, i));
+        Assert.Equal(32 + 8 * 1024, new FileInfo(WalPath).Length);
+
+        ulong gen = wal.BeginFlush();
+        Assert.Equal(MetricWalCommit.Committed, wal.CommitFlush(gen));
+        Assert.Equal(0, wal.WrittenBytes);
+        Assert.Equal(32 + 4 * 1024, new FileInfo(WalPath).Length);      // shrunk back to the floor
+
+        for (int i = 0; i < 120; i++)                       // must re-Grow to 8 KiB, not overrun 4
+            Append(wal, Scalar("cpu", 2_000 + i, i));
+        Assert.Equal(120 * 48, wal.WrittenBytes);
+        Assert.Equal(32 + 8 * 1024, new FileInfo(WalPath).Length);
+        wal.Dispose();
+
+        var reopened = OpenWal(4 * 1024);
+        Assert.Equal(120, reopened.ReadAll(out _).Count);
+        reopened.Dispose();
+    }
+
+    /// <summary>
+    /// <see cref="MetricStorageEngine.ReportFutureDrops"/> exists precisely so that a client
+    /// with a broken clock — which sends every batch broken — costs one warning a minute, not
+    /// one per <see cref="MetricStorageEngine.Ingest"/> call. Two calls close together must
+    /// therefore log exactly once between them.
+    /// </summary>
+    [Fact]
+    public void Future_drop_warnings_are_rate_limited()
+    {
+        long nowNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+        long century = nowNano + 100L * 365 * 24 * 3_600_000_000_000L;
+
+        var logger = new RecordingLogger();
+        var engine = NewEngine(logger: logger);
+
+        engine.Ingest(new[] { Scalar("cpu", century, 666.0), Scalar("cpu", nowNano,     1.0) });
+        engine.Ingest(new[] { Scalar("cpu", century, 667.0), Scalar("cpu", nowNano + 1, 2.0) });
+
+        Assert.Equal(1, logger.Count(Microsoft.Extensions.Logging.LogLevel.Warning, "Dropped "));
+    }
+
+    /// <summary>
+    /// The pool and the log persist independently — the pool goes out through a FileStream to
+    /// the OS cache, one flushed record per series; the entries are un-msynced stores into a
+    /// mapped page — so a torn pool tail with intact log entries is a real crash shape, not a
+    /// contrived one. Before the fix, the next new series re-took the torn record's index and
+    /// the survivor whose record was lost then replayed under the new series' name and value
+    /// instead of its own: silent misattribution, not loss. Seeding the next index from the
+    /// log's own entries as well as the pool is what stops the index being handed out twice.
+    /// </summary>
+    [Fact]
+    public void A_torn_pool_tail_does_not_misattribute_survivors()
+    {
+        var wal = OpenWal();
+        Append(wal, Scalar("alpha", 1_000, 1.0));   // pool index 0
+        Append(wal, Scalar("beta",  2_000, 2.0));   // pool index 1 — its record is torn off next
+        wal.Dispose();
+
+        byte[] poolBytes        = File.ReadAllBytes(PoolPath);
+        uint   firstBodyLen     = BitConverter.ToUInt32(poolBytes, 4);
+        int    firstRecordTotal = 8 + (int)firstBodyLen;
+        using (var fs = new FileStream(PoolPath, FileMode.Open, FileAccess.ReadWrite))
+            fs.SetLength(firstRecordTotal + 4);      // alpha intact, 4 bytes of beta's head only
+
+        var reopened = OpenWal();
+        Append(reopened, Scalar("charlie", 3_000, 3.0));   // must NOT take beta's old index
+        reopened.Dispose();
+
+        var third    = OpenWal();
+        var replayed = third.ReadAll(out int unresolved);
+        third.Dispose();
+
+        // beta's point is gone honestly — its pool record did not survive the tear — not
+        // silently folded into whichever series next took its slot.
+        Assert.Equal(1, unresolved);
+        Assert.Equal(2, replayed.Count);
+        Assert.All(replayed, r => Assert.False(string.IsNullOrEmpty(r.Name)));
+        Assert.All(replayed, r => Assert.True(r.Name is "alpha" or "charlie",
+            $"a recovered point carried an unexpected identity: {r.Name}"));
+        Assert.Contains(replayed, r => r.Name == "alpha"   && r.Point.Value == 1.0);
+        Assert.Contains(replayed, r => r.Name == "charlie" && r.Point.Value == 3.0);
+    }
+
     private sealed class RecordingLogger : Microsoft.Extensions.Logging.ILogger<MetricStorageEngine>
     {
         private readonly System.Collections.Concurrent.ConcurrentQueue<
@@ -1916,6 +2241,16 @@ public sealed class MetricWalTests : IAsyncLifetime
                 }
             error = null;
             return false;
+        }
+
+        /// <summary>How many lines at <paramref name="level"/> start with <paramref name="prefix"/> — for asserting a count, not just presence (e.g. rate-limiting).</summary>
+        public int Count(Microsoft.Extensions.Logging.LogLevel level, string prefix)
+        {
+            int count = 0;
+            foreach (var (l, text, _) in _lines)
+                if (l == level && text.StartsWith(prefix, StringComparison.Ordinal))
+                    count++;
+            return count;
         }
     }
 

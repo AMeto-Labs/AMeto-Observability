@@ -6,10 +6,17 @@ namespace Ameto.Metrics;
 public interface IMetricIngester
 {
     /// <summary>
-    /// Enqueue a batch of metric data points.
-    /// Always succeeds — metrics use a bounded channel with drop-oldest policy.
+    /// Enqueue a batch of metric data points. Never blocks. A point may be refused for a
+    /// far-future timestamp, with the count returned (see <c>returns</c> below); throws
+    /// <see cref="ObjectDisposedException"/> once the engine has been shut down.
     /// </summary>
-    void Ingest(ReadOnlySpan<MetricIngestItem> points);
+    /// <returns>
+    /// How many points were REFUSED — today only for a timestamp so far in the future it would
+    /// make its cold file immortal for rollup and retention. Zero on the normal path. Returned
+    /// rather than swallowed so the OTLP endpoints can answer with <c>partial_success</c>
+    /// instead of acknowledging data they dropped.
+    /// </returns>
+    int Ingest(ReadOnlySpan<MetricIngestItem> points);
 }
 
 /// <summary>
