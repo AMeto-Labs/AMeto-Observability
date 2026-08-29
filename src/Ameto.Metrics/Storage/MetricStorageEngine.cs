@@ -44,6 +44,30 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     // lands a trickle on disk so it becomes eligible for rollup and retention — one hour
     // matches the rollup's own first cutoff, so nothing waits longer because of this.
     private const int MinFlushPoints = 50_000;
+
+    /// <summary>
+    /// How far into the future a point's client-supplied timestamp may reach before it is
+    /// dropped instead of stored. Generous on purpose: real clock trouble — NTP drift, a
+    /// client stamping local time as UTC — stays under a day, and such points must keep
+    /// flowing. What this exists to stop is garbage: the poisoned-WAL incident replayed a
+    /// torn entry whose timestamp decoded to the year 2116, and once flushed it became a
+    /// cold file's MaxNano — a file the rollup never selects (`MaxNano < cutoff` false for
+    /// ninety years), retention never expires (same comparison), and every query scans (its
+    /// range overlaps every window). One bad point, three immortalities. The guard sits at
+    /// the hot tier's two entrances, because MaxNano is computed from whatever got in.
+    /// </summary>
+    private static readonly long MaxFutureSkewNanos = (long)TimeSpan.FromHours(24).TotalSeconds * 1_000_000_000L;
+
+    private long _futureDroppedTotal;      // lifetime count, carried in every warning
+    private long _futureDropLastLogTicks;  // Environment.TickCount64 of the last warning; 0 = never
+
+    /// <summary>
+    /// The refusal boundary, computed in one place: ingest and WAL recovery must agree on it to
+    /// the nanosecond, and two hand-expanded copies of the formula were one edited unit away
+    /// from quietly disagreeing.
+    /// </summary>
+    private static long FutureLimitNanos()
+        => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L + MaxFutureSkewNanos;
     private static readonly TimeSpan MaxHotAge = TimeSpan.FromHours(1);
 
     /// <summary>When the hot tier last went from empty to holding points. Null = empty.</summary>
@@ -54,6 +78,9 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     /// query, so an unflushed tier survives a crash without a file per metric per minute.
     /// </summary>
     private readonly MetricWriteAheadLog _wal;
+
+    /// <summary>The log itself, for tests that need its fault-injection seam. See BeforeResize.</summary>
+    internal MetricWriteAheadLog WalForTest => _wal;
 
     /// <summary>
     /// Makes "log the point, then publish it" atomic against a flush taking its snapshot.
@@ -235,7 +262,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         // The WAL, unlike cold-segment discovery, must be open and replayed before the first
         // point is accepted, or a restart would interleave recovered and live data. Replay is
         // a sequential walk of one mmap'd file bounded by the flush thresholds.
-        _wal = MetricWriteAheadLog.Open(Path.Combine(dataDir, "metrics.wal"));
+        _wal = MetricWriteAheadLog.Open(Path.Combine(dataDir, "metrics.wal"), logger: logger);
         RecoverFromWal();
 
         // Leftover builds from a flush or rollup killed between the write and the rename. HERE,
@@ -289,9 +316,17 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                 unresolved);
         if (recovered.Count == 0) return;
 
-        long oldestNano = long.MaxValue;
+        long oldestNano    = long.MaxValue;
+        long futureLimit   = FutureLimitNanos();
+        int  droppedFuture = 0;
+
         foreach (var r in recovered)
         {
+            // See MaxFutureSkewNanos. Recovery replays whatever the log holds, and the log is
+            // exactly where the incident's year-2116 point came from — every restart pushed it
+            // back into the hot tier, and every flush from there minted another immortal file.
+            if (r.Point.TimestampUnixNano > futureLimit) { droppedFuture++; continue; }
+
             var item = new MetricIngestItem
             {
                 Name              = r.Name,
@@ -318,14 +353,42 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
             _hotSince = at < DateTime.UtcNow ? at : DateTime.UtcNow;
         }
 
-        _logger.LogInformation("Recovered {Count} metric point(s) from the write-ahead log", recovered.Count);
+        if (droppedFuture > 0) ReportFutureDrops(droppedFuture, "WAL recovery");
+
+        _logger.LogInformation("Recovered {Count} metric point(s) from the write-ahead log",
+            recovered.Count - droppedFuture);
+    }
+
+    /// <summary>
+    /// Says that far-future points were refused, without saying it once per batch: a client
+    /// with a broken clock sends every batch broken, and ingest handles many batches a second.
+    /// One warning a minute, carrying both the increment and the lifetime total, reads the
+    /// same and costs nothing.
+    /// </summary>
+    private void ReportFutureDrops(int dropped, string where)
+    {
+        long total = Interlocked.Add(ref _futureDroppedTotal, dropped);
+
+        long now  = Environment.TickCount64;
+        long last = Volatile.Read(ref _futureDropLastLogTicks);
+        if (last != 0 && now - last < 60_000) return;
+        if (Interlocked.CompareExchange(ref _futureDropLastLogTicks, now, last) != last) return;
+
+        _logger.LogWarning(
+            "Dropped {Dropped} metric point(s) at {Where} with timestamps more than 24 h in the future " +
+            "({Total} since start). A point that far ahead makes its cold file immortal for rollup and " +
+            "retention; real clock skew stays well under the margin.",
+            dropped, where, total);
     }
 
     // ── IMetricIngester ───────────────────────────────────────────────────────
 
-    public void Ingest(ReadOnlySpan<MetricIngestItem> items)
+    public int Ingest(ReadOnlySpan<MetricIngestItem> items)
     {
         int total = 0;
+
+        long futureLimit   = FutureLimitNanos();
+        int  droppedFuture = 0;
 
         // Logging a point and making it visible must be one step with respect to a flush's
         // snapshot, or a point that lands between the two would be in neither the files nor
@@ -344,6 +407,10 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
             foreach (var item in items)
             {
+                // See MaxFutureSkewNanos. Before the WAL append, so garbage never becomes the
+                // durable copy of anything; counted here, reported once outside the lock.
+                if (item.TimestampUnixNano > futureLimit) { droppedFuture++; continue; }
+
                 var point = new MetricDataPoint
                 {
                     TimestampUnixNano = item.TimestampUnixNano,
@@ -361,12 +428,24 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         }
         finally { _snapshotLock.ExitReadLock(); }
 
+        if (droppedFuture > 0) ReportFutureDrops(droppedFuture, "ingest");
+
         // Exemplars live in their own ring and are not logged, so they stay off that path.
         foreach (var item in items)
         {
+            // See MaxFutureSkewNanos. A refused point's exemplars are stamped by the same
+            // broken clock, and GetExemplars sorts newest-first — an admitted far-future
+            // exemplar would sort to the TOP of every answer until the ring rotates it out.
+            if (item.TimestampUnixNano > futureLimit) continue;
             if (item.Exemplars is not { Length: > 0 } exs) continue;
             var ring = _exemplars.GetOrAdd(item.Name, static _ => new ExemplarRing(ExemplarsPerMetric));
             foreach (var ex in exs)
+            {
+                // The exemplar's OWN clock, not the point's: OTLP parses time_unix_nano per
+                // exemplar, so a sane point can carry a 2116-stamped exemplar — and the skip
+                // above, keyed on the point, would wave it straight through to the top of
+                // every newest-first answer.
+                if (ex.TimestampUnixNano > futureLimit) continue;
                 ring.Add(new ExemplarSample
                 {
                     TimestampUnixNano = ex.TimestampUnixNano,
@@ -375,6 +454,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                     SpanId            = ex.SpanId,
                     Labels            = item.Labels,
                 });
+            }
         }
 
         if (total >= HotFlushThreshold
@@ -384,6 +464,8 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
             // has to say about itself is therefore said by the continuation inside, not here.
             _ = ScheduleThresholdFlush();
         }
+
+        return droppedFuture;
     }
 
     /// <summary>

@@ -4,6 +4,7 @@ using System.IO.MemoryMappedFiles;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
+using Microsoft.Extensions.Logging;
 
 namespace Ameto.Metrics.Storage;
 
@@ -158,6 +159,17 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// </summary>
     private const ulong  GenerationSanityMargin = 1_000_000;
 
+    /// <summary>
+    /// A series index at or above this is garbage, not data: indices are issued sequentially
+    /// from zero, one per distinct series, and the largest catalog ever observed is five
+    /// thousand times smaller. The open-time walk stops on one the way it stops on an
+    /// impossible generation — a torn entry's generation can land on a plausible value while
+    /// the NEXT field decodes to junk, and that junk would otherwise flow into the seed,
+    /// park the counter at uint.MaxValue, and hand the wrap-to-zero collision to the second
+    /// registration after the restart.
+    /// </summary>
+    private const uint   SeriesIndexSanityCap = 1u << 30;
+
     /// <summary>8 MB holds ~150k scalar points; the log is reset on every flush.</summary>
     private const long DefaultCapacity = 8 * 1024 * 1024;
 
@@ -197,14 +209,27 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
         string Name, MetricKind Kind, string Unit, LabelSet Labels,
         double[]? Bounds, MetricDataPoint Point);
 
-    private readonly string _filePath;
-    private readonly string _poolPath;
-    private readonly Lock   _writeLock = new();
+    private readonly string   _filePath;
+    private readonly string   _poolPath;
+    private readonly Lock     _writeLock = new();
+    private readonly ILogger? _logger;
 
+    private FileStream?               _file;   // held for the log's whole life; see Map
+
+    /// <summary>
+    /// Test seam invoked with the target file size just before a resize touches the file — the
+    /// disk that fills at exactly the wrong moment. Fired on BOTH legs of Grow and ShrinkLocked
+    /// (the resize and its restore), because the state under test is the log that could do
+    /// neither. It exists because the fault the tests used to inject died with the lifetime
+    /// handle: marking the file read-only no longer bites, since Windows enforces the attribute
+    /// at CreateFile time and resizes no longer reopen the file. Null in production.
+    /// </summary>
+    internal Action<long>? BeforeResize;
     private MemoryMappedFile?         _mmf;
     private MemoryMappedViewAccessor? _accessor;
     private byte*                     _ptr;
     private long                      _capacity;
+    private long                      _floorCapacity = DefaultCapacity;   // never shrink below what Open asked for
     private long                      _writeOffset;   // logical, excludes the file header
     private ulong                     _generation;
     private ulong                     _committedGeneration;
@@ -234,34 +259,54 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     private uint        _nextSeriesIndex;
     private FileStream? _poolStream;
 
+    /// <summary>
+    /// One past the highest <c>SeriesIndex</c> the reopen walk saw in the log's OWN entries;
+    /// 0 when the walk saw none. Held in u64 so that an index of <c>uint.MaxValue</c> cannot
+    /// wrap it back to 0 — a wrapped seed is the collision the seeding exists to prevent.
+    /// The pool file cannot supply this on its own: see the seeding in
+    /// <see cref="OpenOrCreate"/> for why both sources are needed.
+    /// </summary>
+    private ulong _survivorSeriesSeed;
+
     public string FilePath => _filePath;
 
     /// <summary>Bytes of point data currently held. Diagnostics and tests only.</summary>
     public long WrittenBytes { get { lock (_writeLock) return _writeOffset; } }
 
-    private MetricWriteAheadLog(string filePath)
+    private MetricWriteAheadLog(string filePath, ILogger? logger)
     {
         _filePath = filePath;
         _poolPath = filePath + ".pool";
+        _logger   = logger;
     }
 
-    public static MetricWriteAheadLog Open(string filePath, long initialCapacity = DefaultCapacity)
+    public static MetricWriteAheadLog Open(string filePath, long initialCapacity = DefaultCapacity,
+                                           ILogger? logger = null, Action<long>? beforeResize = null)
     {
-        var wal = new MetricWriteAheadLog(filePath);
+        var wal = new MetricWriteAheadLog(filePath, logger);
+        // Armed before OpenOrCreate, or the open-time shrink would be the one resize the seam
+        // cannot reach — and its double-failure path is exactly what needs the coverage.
+        wal.BeforeResize = beforeResize;
         wal.OpenOrCreate(initialCapacity);
         return wal;
     }
 
     private void OpenOrCreate(long initialCapacity)
     {
+        _floorCapacity = Math.Max(initialCapacity, 1);
         bool exists   = File.Exists(_filePath);
         long fileSize = FileHeaderSize + initialCapacity;
 
-        using (var fs = new FileStream(_filePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None))
-        {
-            if (fs.Length < fileSize) fs.SetLength(fileSize);
-            else                      fileSize = fs.Length;   // reopen an already-grown log
-        }
+        // ONE handle, held until Dispose, and every mapping is created over it. Reopening by
+        // path on each resize is a race with anything that reads the file — and "anything"
+        // includes every naive reader on the machine, because FileShare.Read is FileStream's
+        // default. A reader landing inside the unmapped window made the reopen throw a sharing
+        // violation, the restore reopen throw the same one, and the log go permanently dark on
+        // what was a routine resize. Measured, not imagined: a retrying reader killed it on its
+        // first attempt. Resizes now run against this handle, which nothing can contend.
+        _file = new FileStream(_filePath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
+        if (_file.Length < fileSize) _file.SetLength(fileSize);
+        else                         fileSize = _file.Length;   // reopen an already-grown log
 
         _capacity = fileSize - FileHeaderSize;
         Map(fileSize);
@@ -300,15 +345,273 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
                 _generation    = _committedGeneration + 1;
                 hdr.Generation = _generation;
             }
+
+            // The header's WriteOffset is a CLAIM, and the poisoned-log incident is what
+            // believing it uncritically costs: 8.45 GiB claimed, real data ending at byte 128,
+            // and the 8.4 GiB in between never mentioned by anyone. Walk the entries and let
+            // the data itself say where it ends.
+            ReconcileDataEndLocked(ref hdr);
+
         }
+
+        // A file that grew stays grown across restarts otherwise ("reopen an already-grown log"
+        // above) — the incident's 8 GiB corpse outlived both its cause and the fix for it.
+        // OUTSIDE the header branch, deliberately: a grown file whose Magic or Version rotted
+        // lands in the fresh-header branch above, and it needs the shrink MORE, not less — its
+        // write offset is zero, so nothing later would ever empty-and-shrink it on a trickle
+        // deployment. Shrinking is safe for the same reason the walk is: everything past the
+        // reconciled offset is by definition not data.
+        long target = FitCapacity(_writeOffset);
+        if (_capacity > target)
+            ShrinkLocked(target, "open");
+
+        // ShrinkLocked swallows failures because mid-run a log at the old size is exactly as
+        // correct — but at OPEN a double failure (the resize and its restore both refused)
+        // leaves no mapping at all, and an engine built over that would come up, accept
+        // traffic, recover nothing, and throw from every single append. A log that cannot
+        // hold one entry does not get to open; better one clear line at startup.
+        if (_ptr is null)
+            throw new IOException(
+                "Metric WAL could not restore its mapping after a failed shrink at open — " +
+                "refusing to open a log that cannot accept an append. See the shrink error above.");
 
         _poolStream = new FileStream(_poolPath, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
         _poolStream.Seek(0, SeekOrigin.End);
+
+        // An empty log references nothing, so a pool carried over from before it emptied is
+        // pure weight — the stand's was 29.5 MB, kept alive because truncation only ever ran
+        // on a flush that emptied the log, which the poisoning prevented from ever happening.
+        if (_writeOffset == 0 && _poolStream.Length > 0)
+        {
+            try
+            {
+                _poolStream.SetLength(0);
+                _poolStream.Flush();
+            }
+            catch { /* best-effort, exactly like the truncation in Compact */ }
+        }
+
+        // Survivors remain, so their pool records must keep their indices — and the in-memory
+        // registry restarts empty, so without this the next new series would take index 0
+        // again. LoadPool resolves collisions later-records-win, which then attributes the
+        // SURVIVING entries to the new series on the next replay: wrong name, wrong labels,
+        // wrong bounds, and nothing anywhere says so.
+        //
+        // BOTH sources are consulted because either can survive the crash without the other,
+        // and each alone leaves a survivor's index re-issuable. The pool goes out through a
+        // FileStream to the OS cache, one flushed record per series; the entries are un-msynced
+        // stores into a mapped page. So a lost pool tail hides the index of a survivor whose
+        // entry is perfectly intact — seeding from the pool alone then hands that index straight
+        // back out — and a lost data page hides an entry whose pool record is on disk. Taking
+        // the max of the two makes a collision impossible rather than merely unlikely.
+        //
+        // All of it in u64: a survivor at index uint.MaxValue makes "+1" wrap to 0 in uint,
+        // which is the collision again, in the one case where it is guaranteed rather than
+        // possible. The saturating cast parks the counter at uint.MaxValue instead, where the
+        // next registration reuses that index — a log with 4 billion live series has run out of
+        // index space by any route, and reuse at the ceiling beats reuse from zero.
+        if (_writeOffset > 0)
+        {
+            ulong poolMaxPlusOne = 0;
+            var   pool           = LoadPool(out long cleanPoolEnd);
+            foreach (var index in pool.Keys)
+                if (index + 1UL > poolMaxPlusOne)
+                    poolMaxPlusOne = index + 1UL;
+
+            _nextSeriesIndex = (uint)Math.Min(uint.MaxValue,
+                                              Math.Max(poolMaxPlusOne, _survivorSeriesSeed));
+
+            // A torn pool tail is not just a lost record: the next WritePoolRecord appends
+            // AFTER the garbage, so every record from then on is read at the wrong offset and
+            // the whole pool decodes into nonsense. Cutting the file back to the last clean
+            // boundary costs one already-unreadable record and keeps the file parseable.
+            if (cleanPoolEnd < _poolStream.Length)
+            {
+                try
+                {
+                    _poolStream.SetLength(cleanPoolEnd);
+                    _poolStream.Flush();
+                    _poolStream.Seek(0, SeekOrigin.End);
+                }
+                catch { /* best-effort, exactly like the truncation in Compact */ }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Walks the entries from the front and truncates the logical end of data to where the walk
+    /// stops, when the header claims more. The stop conditions are the same three every other
+    /// scan in this class uses — a torn length, the generation-0 end marker, a generation no
+    /// append could have stamped — so after this the header, the scans and the data agree.
+    ///
+    /// <para>Also plants the end marker at the reconciled offset. Without it the truncation
+    /// exists only in the header, and the header page is the one nothing msyncs: a crash could
+    /// resurrect the old claim and re-orphan the same bytes on the next start.</para>
+    /// </summary>
+    private void ReconcileDataEndLocked(ref WalFileHeader hdr)
+    {
+        byte* data = _ptr + FileHeaderSize;
+
+        long    pos    = 0;
+        string? reason = null;
+        bool    corrupt = false;
+        ulong   seed    = 0;
+
+        while (pos + EntryHeaderSize <= _writeOffset)
+        {
+            ref var eh = ref Unsafe.AsRef<MetricWalEntryHeader>(data + pos);
+            long total = (long)EntryHeaderSize + eh.BucketCount * sizeof(long);
+
+            if (total <= 0 || pos + total > _writeOffset) { reason = "a torn final entry"; break; }
+            // NOT flagged as corruption: two legitimate crash shapes present exactly this way.
+            // Compact plants the marker and stores the header afterwards, so a crash between
+            // the two reopens with the old, larger claim over the survivors' originals; and
+            // nothing msyncs this log, so a lost data page under a persisted header reads as
+            // zeros — the marker — below the claimed end.
+            if (eh.Generation == 0) { reason = "an end-of-data marker"; break; }
+            if (eh.Generation > _generation + GenerationSanityMargin)
+            {
+                reason  = $"an entry whose generation ({eh.Generation}) no append could have stamped";
+                corrupt = true;
+                break;
+            }
+            if (eh.SeriesIndex >= SeriesIndexSanityCap)
+            {
+                reason  = $"an entry whose series index ({eh.SeriesIndex}) no registration could have issued";
+                corrupt = true;
+                break;
+            }
+
+            // Every entry the walk accepts pins its series index, committed ones included: a
+            // committed entry that is still physically here is replayed by nothing, but the
+            // NEXT compaction reads it, and either way handing its index to a new series while
+            // the bytes carrying it are still in the file costs nothing to avoid. A gap in the
+            // indices is harmless — the pool is a map, not an array — a collision is not.
+            if (eh.SeriesIndex + 1UL > seed) seed = eh.SeriesIndex + 1UL;
+
+            pos += total;
+        }
+
+        // Before every return below, including the one that finds the header's claim intact:
+        // that walk saw the survivors too, and its seed is the only record of their indices
+        // when the pool tail was lost.
+        _survivorSeriesSeed = seed;
+
+        if (reason is null)
+        {
+            if (pos == _writeOffset) return;   // the claim checks out — the normal case
+            reason = "a partial entry shorter than a header";
+        }
+
+        long orphaned = _writeOffset - pos;
+
+        // A torn tail or an early end marker is what an ordinary crash leaves, and replay has
+        // always discarded both — worth a line, not an alarm. A generation no append could
+        // have stamped is the incident: outright corruption, and the bytes behind it grow the
+        // file until someone notices by disk usage.
+        if (corrupt)
+        {
+            // Forensics before repair, capped. The discarded region is unreachable by any
+            // replay, so a full copy would be safety theatre — at 8 GiB, on a disk the growth
+            // may already be filling, actively harmful theatre. But reconciliation is
+            // judgement, not proof (the header's own counter is the margin's reference, and
+            // nothing bounds it from above), so the head of what is about to be cut is kept
+            // where a person can look at it. Best-effort, like everything else that must not
+            // stand between a damaged log and a working one.
+            string quarantine = _filePath + ".quarantine";
+            long   kept       = Math.Min(orphaned, 4 * 1024 * 1024);
+            try
+            {
+                var snapshot = new byte[kept];
+                new ReadOnlySpan<byte>(data + pos, (int)kept).CopyTo(snapshot);
+                File.WriteAllBytes(quarantine, snapshot);
+            }
+            catch { kept = 0; }
+
+            _logger?.LogError(
+                "Metric WAL header claims {Claimed} bytes of data but the walk stopped at {Actual} on {Reason} — " +
+                "truncating the {Orphaned} unreachable byte(s). This is corruption being repaired, not data loss: " +
+                "nothing could replay those bytes either. The first {Kept} of them are preserved at {Quarantine}.",
+                _writeOffset, pos, reason, orphaned, kept, quarantine);
+        }
+        else
+            _logger?.LogWarning(
+                "Metric WAL: discarding {Orphaned} byte(s) of {Reason} left by an unclean shutdown " +
+                "(data ends at {Actual}, header claimed {Claimed}).",
+                orphaned, reason, pos, _writeOffset);
+
+        _writeOffset    = pos;
+        hdr.WriteOffset = FileHeaderSize + pos;
+
+        if (pos + EntryHeaderSize <= _capacity)
+            Unsafe.AsRef<MetricWalEntryHeader>(data + pos).Generation = 0;
+    }
+
+    /// <summary>
+    /// The capacity a log holding <paramref name="dataBytes"/> needs: what <see cref="Open"/>
+    /// was asked for, doubled until it fits — the same ladder <see cref="Grow"/> climbs, so
+    /// shrink and growth move along one set of sizes instead of two.
+    /// </summary>
+    private long FitCapacity(long dataBytes)
+    {
+        long capacity = _floorCapacity;
+        while (capacity < dataBytes) capacity *= 2;
+        return capacity;
+    }
+
+    /// <summary>
+    /// Shrinks the file to <paramref name="targetCapacity"/> — <see cref="Grow"/> run downward,
+    /// with one deliberate difference: a failure here is swallowed, not thrown. Growth failing
+    /// means an append cannot proceed and the caller must hear it; a shrink is reclamation of
+    /// space nothing references, and the log is exactly as correct at the old size.
+    /// </summary>
+    private void ShrinkLocked(long targetCapacity, string when)
+    {
+        long oldCapacity = _capacity;
+        long newFileSize = FileHeaderSize + targetCapacity;
+
+        Unmap();
+        try
+        {
+            BeforeResize?.Invoke(newFileSize);
+            _file!.SetLength(newFileSize);
+            Map(newFileSize);
+            _capacity = targetCapacity;
+            _logger?.LogInformation(
+                "Metric WAL shrunk from {OldMiB:F0} MiB to {NewMiB:F0} MiB at {When} — the grown capacity was " +
+                "no longer backed by data.",
+                oldCapacity / 1048576.0, targetCapacity / 1048576.0, when);
+        }
+        catch (Exception ex)
+        {
+            // Re-derive from the file rather than assuming which step failed: SetLength may or
+            // may not have happened. If even the restore fails, the log is left unmapped and
+            // Append/BeginFlush already refuse that state honestly.
+            try
+            {
+                BeforeResize?.Invoke(oldCapacity + FileHeaderSize);
+                long actual = _file!.Length;
+                Map(actual);
+                _capacity = actual - FileHeaderSize;
+                _logger?.LogWarning(ex,
+                    "Metric WAL shrink at {When} failed; continuing at {MiB:F0} MiB.",
+                    when, _capacity / 1048576.0);
+            }
+            catch (Exception restoreEx)
+            {
+                _logger?.LogError(restoreEx,
+                    "Metric WAL shrink at {When} failed and the mapping could not be restored — " +
+                    "the log is no longer accepting appends.", when);
+            }
+        }
     }
 
     private void Map(long fileSize)
     {
-        _mmf      = MemoryMappedFile.CreateFromFile(_filePath, FileMode.Open, null, fileSize, MemoryMappedFileAccess.ReadWrite);
+        // Over the lifetime handle, never by path — see OpenOrCreate. leaveOpen: the mapping
+        // comes and goes on every resize; the handle outlives them all.
+        _mmf      = MemoryMappedFile.CreateFromFile(_file!, null, fileSize, MemoryMappedFileAccess.ReadWrite,
+                                                    HandleInheritability.None, leaveOpen: true);
         _accessor = _mmf.CreateViewAccessor(0, fileSize, MemoryMappedFileAccess.ReadWrite);
         _ptr      = null;
         _accessor.SafeMemoryMappedViewHandle.AcquirePointer(ref _ptr);
@@ -687,6 +990,14 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
                 _poolStream?.Flush();
             }
             catch { /* best-effort: stale records are tolerated by replay */ }
+
+            // A log that grew and then emptied gives the space back NOW, not at the next
+            // restart: the incident machine ran for weeks growing 1.3 GB a day, and a shrink
+            // that only fires at open would have waited for all of them. Last in this method,
+            // deliberately — ShrinkLocked remaps, so every pointer taken above (`data`, the
+            // header ref) is dead past this line, and nothing may follow it.
+            if (_capacity > _floorCapacity)
+                ShrinkLocked(_floorCapacity, "commit");
         }
     }
 
@@ -764,9 +1075,22 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// Reads the companion pool. Later records win for a given index, which is what makes a
     /// reset that failed to truncate the file harmless.
     /// </summary>
-    private Dictionary<uint, PoolEntry> LoadPool()
+    private Dictionary<uint, PoolEntry> LoadPool() => LoadPool(out _);
+
+    /// <summary>
+    /// <see cref="LoadPool()"/>, and also reports where the clean records stop:
+    /// <paramref name="cleanEnd"/> is the offset just past the LAST record that parsed whole,
+    /// which is 0 for a pool whose very first record is torn and the file length for an intact
+    /// one. The loop already stops at a torn head or body; this only says WHERE it stopped, so
+    /// that <see cref="OpenOrCreate"/> can append the next record at that boundary instead of
+    /// after the torn bytes — appending past them leaves every later record misaligned by the
+    /// width of the garbage, which breaks pool parsing for every series registered afterwards,
+    /// not just the one that was lost.
+    /// </summary>
+    private Dictionary<uint, PoolEntry> LoadPool(out long cleanEnd)
     {
         var map = new Dictionary<uint, PoolEntry>();
+        cleanEnd = 0;
         if (!File.Exists(_poolPath)) return map;
 
         try
@@ -775,14 +1099,20 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
             using var fs = new FileStream(_poolPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
             Span<byte> head = stackalloc byte[8];
 
-            while (fs.Read(head) == 8)
+            // ReadAtLeast/ReadExactly, never a bare Read: Stream.Read may legally return fewer
+            // bytes than asked for reasons that are not end-of-file, and this loop's stop is no
+            // longer just "give up on the map" — OpenOrCreate TRUNCATES the pool to where it
+            // stops. A bare Read turned one under-filled buffer on a slow volume into a
+            // permanent cut through real records. Only an actual end-of-stream ends the walk.
+            while (fs.ReadAtLeast(head, 8, throwOnEndOfStream: false) == 8)
             {
                 uint index = BinaryPrimitives.ReadUInt32LittleEndian(head);
                 uint len   = BinaryPrimitives.ReadUInt32LittleEndian(head[4..]);
                 if (len == 0 || len > 8 * 1024 * 1024) break;    // torn or bogus record
 
                 var body = new byte[len];
-                if (fs.Read(body) != len) break;                 // truncated tail
+                try { fs.ReadExactly(body); }
+                catch (EndOfStreamException) { break; }          // genuinely truncated tail
 
                 var r = new SpanCursor(body);
                 var kind = (MetricKind)r.ReadByte();
@@ -806,7 +1136,8 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
                     for (int i = 0; i < boundsLen; i++) bounds[i] = r.ReadDouble();
                 }
 
-                map[index] = new PoolEntry(name, kind, unit, new LabelSet(pairs), bounds);
+                map[index]  = new PoolEntry(name, kind, unit, new LabelSet(pairs), bounds);
+                cleanEnd    = fs.Position;   // this record parsed whole; the boundary is here
             }
         }
         catch { /* best-effort: whatever resolved stays usable, the rest is reported */ }
@@ -831,9 +1162,8 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
         Unmap();
         try
         {
-            using (var fs = new FileStream(_filePath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
-                fs.SetLength(newFileSize);
-
+            BeforeResize?.Invoke(newFileSize);
+            _file!.SetLength(newFileSize);
             Map(newFileSize);
             _capacity = newCapacity;
         }
@@ -841,8 +1171,8 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
         {
             try
             {
-                using (var fs = new FileStream(_filePath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
-                    if (fs.Length < oldFileSize) fs.SetLength(oldFileSize);
+                BeforeResize?.Invoke(oldFileSize);
+                if (_file!.Length < oldFileSize) _file.SetLength(oldFileSize);
                 Map(oldFileSize);
             }
             catch { /* nothing left to restore to — the throw below is the honest signal */ }
@@ -874,6 +1204,8 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
             try { _poolStream?.Flush(); _poolStream?.Dispose(); } catch { }
             _poolStream = null;
             Unmap();
+            try { _file?.Dispose(); } catch { }
+            _file = null;
         }
     }
 
