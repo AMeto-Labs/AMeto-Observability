@@ -80,6 +80,29 @@ internal sealed class SearchHistoryStore
         cmd.Parameters.AddWithValue("@p", pinned ? 1 : 0);
         cmd.Parameters.AddWithValue("@t", DateTimeOffset.UtcNow.ToString("O"));
         cmd.ExecuteNonQuery();
+
+        // The cap used to live only in Get's LIMIT, which made it a display trick: the sixth
+        // pin was stored pinned=1 forever, shown in neither list (pinned is capped, recent
+        // filters pinned=0), and reachable by no route — invisible and immortal. Enforce it at
+        // the write instead, the way the client's optimistic view already behaves: the pin
+        // that falls off the end is DEMOTED to recent, not hidden — still visible, still
+        // deletable, and subject to the ordinary recent prune from then on.
+        if (pinned)
+        {
+            using var demote = conn.CreateCommand();
+            demote.CommandText = """
+                UPDATE search_history_v2 SET pinned = 0
+                WHERE username = @u AND scope = @s AND pinned = 1 AND query NOT IN (
+                    SELECT query FROM search_history_v2
+                    WHERE username = @u AND scope = @s AND pinned = 1
+                    ORDER BY updated_at DESC
+                    LIMIT @lim)
+                """;
+            demote.Parameters.AddWithValue("@u", username);
+            demote.Parameters.AddWithValue("@s", scope);
+            demote.Parameters.AddWithValue("@lim", PinnedLimit);
+            demote.ExecuteNonQuery();
+        }
     }
 
     public void Delete(string username, string scope, string query)

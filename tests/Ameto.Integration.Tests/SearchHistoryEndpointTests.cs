@@ -129,6 +129,36 @@ public sealed class SearchHistoryEndpointTests : IClassFixture<AmetoWebAppFactor
         Assert.DoesNotContain(query, traces.Pinned);
     }
 
+    /// <summary>
+    /// The pinned cap is enforced at the WRITE, by demotion. It used to be only a LIMIT in
+    /// the read: a sixth pin was stored pinned=1 forever, shown in neither list (pinned is
+    /// capped, recent filters pinned=0) and reachable by no route — invisible and immortal.
+    /// Now the pin that falls off the end returns to recent: still visible, still deletable.
+    /// </summary>
+    [Fact]
+    public async Task A_SixthPin_DemotesTheOldestPinToRecent_NothingGoesInvisible()
+    {
+        var client  = ClientAs("viewer");   // own user, same reasoning as the pin test above
+        var queries = Enumerable.Range(0, 6).Select(i => Unique($"cap-{i}")).ToArray();
+
+        foreach (var q in queries)
+        {
+            await RecordAsync(client, q, "metrics");
+            await PinAsync(client, q, pinned: true, scope: "metrics");
+        }
+
+        var snap = await GetAsync(client, "metrics");
+
+        Assert.Equal(5, snap.Pinned.Length);
+        // The five NEWEST pins survive; the first one pinned was demoted, not hidden.
+        Assert.DoesNotContain(queries[0], snap.Pinned);
+        Assert.Contains(queries[0],       snap.Recent);
+        // Every one of the six is visible SOMEWHERE — the invariant the old code broke.
+        foreach (var q in queries)
+            Assert.True(snap.Pinned.Contains(q) || snap.Recent.Contains(q),
+                $"'{q}' is in neither list — invisible and undeletable");
+    }
+
     [Fact]
     public async Task Delete_RemovesTheEntryFromOneScopeAndLeavesTheOther()
     {

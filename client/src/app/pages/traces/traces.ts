@@ -314,14 +314,11 @@ export class TracesComponent implements OnInit, OnDestroy {
    * through the same user-run path (runTraceQLUser records + syncs the URL). The panel
    * itself stays open, same as the Events Signals panel.
    */
+  // applyTraceql already does everything a history apply needs — including landing on the
+  // Traces tab so the results render where the user can see them; the attrMenu close it
+  // also performs is a harmless no-op from the panel.
   applyHistoryQuery(query: string): void {
-    // The panel is reachable from every main tab, but the results render into the trace
-    // list — without this, applying from Graph/Latency/Compare runs the query invisibly.
-    this.activeMainTab = 'traces';
-    this.traceqlMode.set(true);
-    this.traceqlInput = query;
-    this.traceqlError.set('');
-    this.runTraceQLUser();
+    this.applyTraceql(query);
   }
 
   ngOnDestroy() {
@@ -413,21 +410,22 @@ export class TracesComponent implements OnInit, OnDestroy {
    * applyFilters) records nothing.
    */
   private synthesizeTraceql(): string {
+    // Two fields have no honest TraceQL form, and their treatment is ALL-or-nothing: the
+    // span-name box matches by case-insensitive SUBSTRING server-side while the grammar's
+    // `=` is exact, and the HTTP bucket picks ('2xx'/'4xx'/'5xx') have no single-value
+    // form. Dropping just the offending field from a COMBINED search would record a
+    // strictly WIDER query than the one that ran — replayed, it silently returns more
+    // than the user saw. A search touching either field is therefore not recorded at
+    // all: no entry beats an entry that lies about what it will find, in either direction.
+    if (this.filterName) return '';
+    if (this.filterHttpStatus && !/^d+$/.test(this.filterHttpStatus)) return '';
+
     const parts: string[] = [];
-    // The span-name box matches by case-insensitive SUBSTRING server-side, and the only
-    // name operator the grammar has is exact `=` — recording `name = "ord"` for a search
-    // that actually matched "GET /orders" would replay as a DIFFERENT, likely empty,
-    // search. Left out of the predicate for the same reason the HTTP buckets below are:
-    // a history entry that lies about what it will find is worse than a narrower one.
     if (this.filterService) parts.push(this.tqlPredicate('service', this.filterService, false));
     if (this.filterStatus)  parts.push(`status = ${this.filterStatus.toLowerCase()}`);
     if (this.filterMinDurationMs != null) parts.push(`duration >= ${this.filterMinDurationMs}ms`);
     if (this.filterMaxDurationMs != null) parts.push(`duration <= ${this.filterMaxDurationMs}ms`);
-    // The HTTP select also offers bucket picks ('2xx'/'4xx'/'5xx') that aren't a single
-    // value the "= N" grammar can express — recording one verbatim would save a query
-    // that fails to parse the moment it's replayed from history. Only an exact code
-    // (a plain '404', '500', …) round-trips, so buckets are left out of the predicate.
-    if (/^\d+$/.test(this.filterHttpStatus)) parts.push(this.tqlPredicate('.http.status_code', this.filterHttpStatus, false));
+    if (this.filterHttpStatus) parts.push(this.tqlPredicate('.http.status_code', this.filterHttpStatus, false));
     return parts.length ? `{ ${parts.join(' && ')} }` : '';
   }
 
@@ -630,6 +628,7 @@ export class TracesComponent implements OnInit, OnDestroy {
   @HostListener('document:keydown.escape')
   onEscape(): void {
     if (this.attrMenu()) { this.attrMenu.set(null); return; }
+    if (this.historyOpen()) { this.historyOpen.set(false); return; }
     if (this.logModalEvent()) return;
     if (this.selectedSpan()) this.selectedSpan.set(null);
   }

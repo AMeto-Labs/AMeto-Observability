@@ -225,7 +225,7 @@
           </button>
         </div>
         <div class="hist-body">
-          <app-search-history scope="metrics" [display]="historyDisplay" [emptyHint]="'Run a query to see it here'"
+          <app-search-history [scope]="historyScope" [display]="historyDisplay" [emptyHint]="'Run a query to see it here'"
                                (querySelected)="applyHistoryQuery($event)" />
         </div>
       </aside>

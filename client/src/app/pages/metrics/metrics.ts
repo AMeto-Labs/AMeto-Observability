@@ -21,6 +21,7 @@ import { HeatmapComponent } from './heatmap/heatmap';
 import { SuggestInputDirective } from '../../shared/suggest/suggest-input.directive';
 import { SearchHistoryComponent } from '../../shared/components/search-history/search-history';
 import { ScopedSearchHistory, SearchHistoryService } from '../../core/services/search-history.service';
+import { SearchScope } from '../../core/models/search-history.model';
 
 const PRESETS: readonly [string, number][] = [
   ['15m', 0.25], ['30m', 0.5], ['1h', 1], ['3h', 3], ['6h', 6], ['12h', 12], ['24h', 24],
@@ -54,9 +55,12 @@ export class MetricsComponent implements OnInit, OnDestroy {
   private router         = inject(Router);
   private route          = inject(ActivatedRoute);
   private historyService = inject(SearchHistoryService);
+  /** The one place this page names its scope; the template binds [scope]="historyScope",
+   *  so the component and the panel cannot quietly disagree. */
+  readonly historyScope: SearchScope = 'metrics';
   /** This page's slice of search history — the same cached view <app-search-history>
    *  reads, so a Run/Enter recorded here shows up in the open panel with no reload. */
-  private readonly history: ScopedSearchHistory = this.historyService.forScope('metrics');
+  private readonly history: ScopedSearchHistory = this.historyService.forScope(this.historyScope);
 
   private readonly chartCanvas = viewChild<ElementRef<HTMLCanvasElement>>('chartCanvas');
   private chart: ChartJs | null = null;
@@ -114,6 +118,11 @@ export class MetricsComponent implements OnInit, OnDestroy {
   historyMetricMissing = signal<string | null>(null);
 
   private pending: { agg: MetricAggregation; q: number; gb: string[]; filters: string } | null = null;
+
+  /** True once loadCatalog's answer (even an empty one) has arrived. */
+  private catalogLoaded = false;
+  /** A history apply that arrived before the catalog did; replayed when it lands. */
+  private pendingHistory: string | null = null;
 
   filteredCatalog = computed(() => {
     const q = this.search().trim().toLowerCase();
@@ -203,6 +212,19 @@ export class MetricsComponent implements OnInit, OnDestroy {
         || histByRecent.find(m => /http\.server\.request\.duration/i.test(m.name) && recent(m))
         || histByRecent[0]
         || c[0];
+      this.catalogLoaded = true;
+
+      // A history apply beat the catalog here; replay it INSTEAD of auto-picking — the
+      // auto-pick below would silently override the user's explicit choice, and judging
+      // "metric missing" against a catalog that had not answered yet reported a lie.
+      const ph = this.pendingHistory;
+      this.pendingHistory = null;
+      if (ph) {
+        this.applyHistoryQuery(ph);
+        this.cdr.markForCheck();
+        return;
+      }
+
       if (pick) {
         const p = this.pending;
         this.pending = null;
@@ -385,6 +407,8 @@ export class MetricsComponent implements OnInit, OnDestroy {
     const parsed = parseQuery(raw);
     if (!parsed) return; // malformed row — every row this page wrote parses
 
+    if (!this.catalogLoaded) { this.pendingHistory = raw; return; }
+
     const m = this.catalog().find(c => c.name === parsed.metric);
     if (!m) {
       this.selected.set(null);
@@ -404,7 +428,10 @@ export class MetricsComponent implements OnInit, OnDestroy {
     this.quantile.set(parsed.quantile);
     this.groupBy.set(parsed.groupBy);
     this.filtersRaw.set(parsed.filters);
-    if (m.type !== 'Histogram') this.viewMode.set('lines');
+    // A heatmap cannot represent grouped series: runQuery's heatmap branch requires an
+    // empty group-by, so restoring a grouped entry while the view is in heatmap mode
+    // rendered a permanently null heatmap over data that was arriving fine.
+    if (m.type !== 'Histogram' || parsed.groupBy.length) this.viewMode.set('lines');
     this.runQuery();
   }
 

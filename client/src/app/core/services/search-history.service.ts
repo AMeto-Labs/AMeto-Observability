@@ -49,6 +49,10 @@ export class SearchHistoryService {
     const _pinned = signal<string[]>([]);
     const _recent = signal<string[]>([]);
 
+    /** Move-to-front with dedupe and cap — the one shape every optimistic list edit here takes. */
+    const bump = (list: string[], q: string, max: number): string[] =>
+      [q, ...list.filter(x => x !== q)].slice(0, max);
+
     const load = (): void => {
       api.getSearchHistory(scope).subscribe({
         next: h => { _pinned.set(h.pinned ?? []); _recent.set(h.recent ?? []); },
@@ -67,9 +71,12 @@ export class SearchHistoryService {
         const q = query.trim();
         if (!q) return;
         if (!_pinned().includes(q)) {
-          _recent.update(r => [q, ...r.filter(x => x !== q)].slice(0, RECENT_MAX));
+          _recent.update(r => bump(r, q, RECENT_MAX));
         }
-        api.recordSearch(q, scope).subscribe({ error: () => { /* best-effort */ } });
+        // Reconcile on failure, exactly like setPinned/remove below: this is the only
+        // mutation that inserts a NEW row optimistically, so a swallowed error left a
+        // phantom entry — clickable, pinnable — that quietly vanished on the next mount.
+        api.recordSearch(q, scope).subscribe({ error: () => load() });
       },
 
       setPinned(query: string, pinned: boolean): void {
@@ -77,10 +84,10 @@ export class SearchHistoryService {
         if (!q) return;
         if (pinned) {
           _recent.update(r => r.filter(x => x !== q));
-          _pinned.update(p => [q, ...p.filter(x => x !== q)].slice(0, PINNED_MAX));
+          _pinned.update(p => bump(p, q, PINNED_MAX));
         } else {
           _pinned.update(p => p.filter(x => x !== q));
-          _recent.update(r => [q, ...r.filter(x => x !== q)].slice(0, RECENT_MAX));
+          _recent.update(r => bump(r, q, RECENT_MAX));
         }
         api.pinSearch(q, pinned, scope).subscribe({ error: () => load() });
       },

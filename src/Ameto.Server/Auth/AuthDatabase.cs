@@ -32,7 +32,11 @@ internal sealed class AuthDatabase
     {
         var conn = new SqliteConnection(ConnectionString);
         conn.Open();
-        Exec(conn, "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;");
+        // busy_timeout: the same 5 s grace AlertRuleStore gives itself on this shared file.
+        // Without it a transient writer elsewhere makes any statement throw "database is
+        // locked" instantly — and the v1→v2 copy in MigrateSchema is deliberately un-caught,
+        // so that instant throw would fail a boot a five-second wait would have saved.
+        Exec(conn, "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;");
         return conn;
     }
 
@@ -191,11 +195,15 @@ internal sealed class AuthDatabase
         // loudly, exactly like the unguarded statements above it, and is retry-safe.
         if (!MigrationDone(conn, "search_history_v2_copy"))
         {
+            // One transaction: the marker must never persist without the rows it vouches for.
+            // (The reverse — rows without a marker — is already harmless: OR IGNORE re-copies.)
+            using var tx = conn.BeginTransaction();
             Exec(conn, """
                 INSERT OR IGNORE INTO search_history_v2 (username, scope, query, pinned, updated_at)
                     SELECT username, 'logs', query, pinned, updated_at FROM search_history
                 """);
             Exec(conn, "INSERT OR IGNORE INTO schema_migrations (name) VALUES ('search_history_v2_copy')");
+            tx.Commit();
         }
     }
 
