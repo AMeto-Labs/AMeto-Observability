@@ -19,6 +19,8 @@ import { TraceRowDto } from '../../core/models/span.model';
 import { serviceColor } from '../../shared/utils/service-color';
 import { HeatmapComponent } from './heatmap/heatmap';
 import { SuggestInputDirective } from '../../shared/suggest/suggest-input.directive';
+import { SearchHistoryComponent } from '../../shared/components/search-history/search-history';
+import { ScopedSearchHistory, SearchHistoryService } from '../../core/services/search-history.service';
 
 const PRESETS: readonly [string, number][] = [
   ['15m', 0.25], ['30m', 0.5], ['1h', 1], ['3h', 3], ['6h', 6], ['12h', 12], ['24h', 24],
@@ -41,16 +43,20 @@ interface ExprSide { metric: string; agg: MetricAggregation; filters: string; }
  */
 @Component({
   selector: 'app-metrics',
-  imports: [FormsModule, LucideAngularModule, HeatmapComponent, SuggestInputDirective],
+  imports: [FormsModule, LucideAngularModule, HeatmapComponent, SuggestInputDirective, SearchHistoryComponent],
   templateUrl: './metrics.html',
   styleUrl: './metrics.scss',
   changeDetection: ChangeDetectionStrategy.OnPush,
 })
 export class MetricsComponent implements OnInit, OnDestroy {
-  private api    = inject(ApiService);
-  private cdr    = inject(ChangeDetectorRef);
-  private router = inject(Router);
-  private route  = inject(ActivatedRoute);
+  private api            = inject(ApiService);
+  private cdr            = inject(ChangeDetectorRef);
+  private router         = inject(Router);
+  private route          = inject(ActivatedRoute);
+  private historyService = inject(SearchHistoryService);
+  /** This page's slice of search history — the same cached view <app-search-history>
+   *  reads, so a Run/Enter recorded here shows up in the open panel with no reload. */
+  private readonly history: ScopedSearchHistory = this.historyService.forScope('metrics');
 
   private readonly chartCanvas = viewChild<ElementRef<HTMLCanvasElement>>('chartCanvas');
   private chart: ChartJs | null = null;
@@ -99,6 +105,13 @@ export class MetricsComponent implements OnInit, OnDestroy {
   corrTitle   = signal('');
   corrSub     = signal('');
   corrTraces  = signal<TraceRowDto[]>([]);
+
+  // Search history panel (right-hand, same idea as the Events page's Signals panel).
+  historyPanelOpen = signal(false);
+  /** Set when a clicked history row names a metric no longer in the catalog; cleared
+   *  by any real selection. Surfaced through the "no metric" empty state below —
+   *  the closest thing this page has to an error affordance. */
+  historyMetricMissing = signal<string | null>(null);
 
   private pending: { agg: MetricAggregation; q: number; gb: string[]; filters: string } | null = null;
 
@@ -209,6 +222,7 @@ export class MetricsComponent implements OnInit, OnDestroy {
   // ── Selection & controls ──────────────────────────────────────────────────
   selectMetric(m: MetricCatalogDto) {
     if (this.selected()?.name === m.name && this.mode() === 'query') return;
+    this.historyMetricMissing.set(null);
     this.mode.set('query');
     this.selected.set(m);
     this.groupBy.set([]);
@@ -229,6 +243,7 @@ export class MetricsComponent implements OnInit, OnDestroy {
   setMode(m: 'query' | 'expr')       { this.mode.set(m); this.runQuery(); }
   setViewMode(v: 'lines' | 'heatmap') { this.viewMode.set(v); this.runQuery(); }
   toggleExemplars()                   { this.showExemplars.update(x => !x); this.runQuery(); }
+  toggleHistoryPanel()                { this.historyPanelOpen.update(v => !v); }
 
   setPreset(p: string) {
     this.preset.set(p);
@@ -316,6 +331,81 @@ export class MetricsComponent implements OnInit, OnDestroy {
       this.loading.set(false);
       this.cdr.markForCheck();
     });
+  }
+
+  // ── Search history ───────────────────────────────────────────────────────
+  /**
+   * Run button / Enter in the filters field — the only two gestures that count as
+   * "the user deliberately committed a query". runQuery() itself is also the 30 s
+   * poll, the visibilitychange refresh, and every control mutation — agg, quantile,
+   * top-K, group-by, metric pick (metrics.ts:60,133-134,210-246) — so recording
+   * inside runQuery() would write a history row every 30 s forever.
+   */
+  runAndRecord(): void {
+    this.recordHistory();
+    this.runQuery();
+  }
+
+  private recordHistory(): void {
+    if (this.mode() !== 'query') return; // expr mode has no canonical form — see serialiseQuery
+    const m = this.selected();
+    if (!m) return;
+    this.history.record(serialiseQuery(m.name, this.aggregation(), this.quantile(), this.groupBy(), this.filtersRaw()));
+  }
+
+  /** Compact one-line rendering of a saved query for the history panel, e.g.
+   *  "http.server.request.duration · p95 by service.name · env=prod". Falls back to
+   *  the raw string on anything that doesn't parse (defensive only — every row here
+   *  was written by serialiseQuery below). */
+  historyDisplay = (raw: string): string => {
+    const p = parseQuery(raw);
+    if (!p) return raw;
+    const agg = p.agg === 'quantile' ? `p${Math.round(p.quantile * 100)}` : p.agg;
+    let s = `${p.metric} · ${agg}`;
+    if (p.groupBy.length) s += ` by ${p.groupBy.join(',')}`;
+    if (p.filters)        s += ` · ${p.filters}`;
+    return s;
+  };
+
+  /**
+   * Apply a saved search from the history panel. Replicates loadCatalog()'s
+   * pending-application order directly onto the signals — mode → selected →
+   * aggregation → quantile → groupBy → filtersRaw (metrics.ts:193-204) — rather
+   * than routing through selectMetric(), which unconditionally wipes
+   * filters/groupBy (metrics.ts:213-216) and would discard the very fields this
+   * is restoring.
+   *
+   * A metric that has aged out of the catalog since it was recorded is reported
+   * through historyMetricMissing / the page's "no metric" empty state, instead of
+   * silently running whatever loadCatalog()'s own fallback would have picked — a
+   * different metric running under a history entry the user didn't choose would
+   * be worse than nothing.
+   */
+  applyHistoryQuery(raw: string): void {
+    const parsed = parseQuery(raw);
+    if (!parsed) return; // malformed row — every row this page wrote parses
+
+    const m = this.catalog().find(c => c.name === parsed.metric);
+    if (!m) {
+      this.selected.set(null);
+      this.historyMetricMissing.set(parsed.metric);
+      return;
+    }
+
+    this.historyMetricMissing.set(null);
+    // Re-record, as Events and Traces both do on a history click: the server prunes
+    // unpinned rows past the 10 most recent on every record, so an entry reused only
+    // by clicking would otherwise never refresh its recency and be evicted while in
+    // active use.
+    this.history.record(raw);
+    this.mode.set('query');
+    this.selected.set(m);
+    this.aggregation.set(parsed.agg);
+    this.quantile.set(parsed.quantile);
+    this.groupBy.set(parsed.groupBy);
+    this.filtersRaw.set(parsed.filters);
+    if (m.type !== 'Histogram') this.viewMode.set('lines');
+    this.runQuery();
   }
 
   // ── Correlation: heatmap cell → traces in that bucket ──────────────────────
@@ -441,6 +531,48 @@ export class MetricsComponent implements OnInit, OnDestroy {
 // ── Module helpers ────────────────────────────────────────────────────────────
 function defaultAgg(m: MetricCatalogDto): MetricAggregation {
   return m.type === 'Histogram' ? 'quantile' : m.type === 'Counter' ? 'rate' : 'avg';
+}
+
+/**
+ * The committed builder tuple, serialised as a canonical query string in a fixed key
+ * order — the same param names and omission rules syncUrl already uses for the URL
+ * (metric/agg/q/gb/filters, metrics.ts:162-178), minus the time range: a saved search
+ * is a saved *query*, not a saved *window*, exactly like the page's own URL contract
+ * keeps them separate. URLSearchParams gives matching, symmetric percent-encoding in
+ * both directions instead of a hand-rolled join/split that would break on a filter
+ * value containing '&' or '='.
+ *
+ * Expr A∘B mode has no canonical form here — syncUrl itself nulls every builder param
+ * while in expr mode (nothing to serialise), so expr runs are deliberately never
+ * recorded; see the mode guard in MetricsComponent.recordHistory.
+ */
+function serialiseQuery(metric: string, agg: MetricAggregation, quantile: number, groupBy: string[], filters: string): string {
+  const p = new URLSearchParams();
+  p.set('metric', metric);
+  p.set('agg', agg);
+  if (agg === 'quantile') p.set('q', String(quantile));
+  if (groupBy.length) p.set('gb', groupBy.join(','));
+  const f = filters.trim();
+  if (f) p.set('filters', f);
+  return p.toString();
+}
+
+interface ParsedQuery { metric: string; agg: MetricAggregation; quantile: number; groupBy: string[]; filters: string; }
+
+/** Inverse of {@link serialiseQuery}. Tolerant of unknown keys — a param added to the
+ *  grammar later shouldn't break rows an older version of this page already wrote —
+ *  and returns null only when the one required field, metric, is missing. */
+function parseQuery(s: string): ParsedQuery | null {
+  const p = new URLSearchParams(s);
+  const metric = p.get('metric');
+  if (!metric) return null;
+  return {
+    metric,
+    agg:      (p.get('agg') as MetricAggregation) || 'rate',
+    quantile: p.get('q') ? +p.get('q')! : 0.95,
+    groupBy:  p.get('gb') ? p.get('gb')!.split(',').filter(Boolean) : [],
+    filters:  p.get('filters') ?? '',
+  };
 }
 
 function niceStepSec(rangeSec: number, target = 200): number {

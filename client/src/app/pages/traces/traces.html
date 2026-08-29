@@ -26,6 +26,9 @@
       <div class="live-badge">
         <span class="live-dot"></span>Live
       </div>
+      <button class="icon-btn" [class.active]="historyOpen()" (click)="toggleHistory()" title="Search history">
+        <lucide-icon name="history" [size]="14" />
+      </button>
     </div>
   </div>
 
@@ -103,7 +106,7 @@
           <input class="tql-input"
                  [(ngModel)]="traceqlInput"
                  [appSuggestInput]="traceqlSuggestions"
-                 (suggestSubmit)="runTraceQL()"
+                 (suggestSubmit)="runTraceQLUser()"
                  placeholder='{ .http.status_code = 500 && duration > 500ms }'
                  spellcheck="false"
                  autocomplete="off" />
@@ -113,7 +116,7 @@
             </button>
           }
         </div>
-        <button class="btn-apply" (click)="runTraceQL()">
+        <button class="btn-apply" (click)="runTraceQLUser()">
           <lucide-icon name="play" [size]="12" />
           Run
         </button>
@@ -224,7 +227,9 @@
     </button>
   </div>
 
-  <!-- ── Main content ──────────────────────────────────────────────────────── -->
+  <!-- ── Main content + History panel ────────────────────────────────────── -->
+  <div class="body-row">
+  <div class="body-main">
   @if (activeMainTab === 'graph') {
     <app-service-graph class="graph-panel" [from]="winFrom()" [to]="winTo()" />
   } @else if (activeMainTab === 'latency') {
@@ -593,6 +598,29 @@
       </div>
     }
 
+  </div>
+  </div>
+
+  <!-- Search history — mounted under @if so opening reloads (server round trip on
+       every open, same as the Events Signals panel). Chrome copied from the Events
+       Signals panel (signals-panel.html); the section markup itself is shared. -->
+  @if (historyOpen()) {
+    <div class="history-panel">
+      <div class="history-hdr">
+        <span class="history-title">
+          <lucide-icon name="history" [size]="13" [strokeWidth]="1.8" />
+          History
+        </span>
+        <button class="icon-btn" (click)="toggleHistory()" title="Close">
+          <lucide-icon name="x" [size]="14" />
+        </button>
+      </div>
+      <div class="history-body">
+        <app-search-history scope="traces" emptyHint="Run a search to see it here"
+                             (querySelected)="applyHistoryQuery($event)" />
+      </div>
+    </div>
+  }
   </div>
 </div>
 

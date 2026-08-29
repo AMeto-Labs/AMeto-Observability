@@ -12,7 +12,7 @@ import { DiagnosticsDto } from '../models/diagnostics.model';
 import { ApiKeyDto, CreatedApiKeyDto, OAuthDomainDto, UserDto } from '../models/auth.model';
 import { CompareTracesDto, LatencyServiceDto, SpanDto, SpanQueryParams, TraceQueryRequest, TraceRowDto, TraceStatsDto } from '../models/span.model';
 import { MetricSeriesDto, MetricCatalogDto, MetricQueryRequest, HeatmapDto, ExemplarDto, MetricExprRequest } from '../models/metric.model';
-import { SearchHistoryDto } from '../models/search-history.model';
+import { SearchHistoryDto, SearchScope } from '../models/search-history.model';
 import { UpdateStatusDto } from '../models/update.model';
 import { AuthService } from './auth.service';
 import { appPath } from '../../shared/utils/app-url';
@@ -233,17 +233,17 @@ export class ApiService {
   }
 
   // ── Search history (per-user) ───────────────────────────────────────────────
-  getSearchHistory(): Observable<SearchHistoryDto> {
-    return this.http.get<SearchHistoryDto>('/api/search-history');
+  getSearchHistory(scope: SearchScope): Observable<SearchHistoryDto> {
+    return this.http.get<SearchHistoryDto>(`/api/search-history?scope=${scope}`);
   }
-  recordSearch(query: string): Observable<void> {
-    return this.http.post<void>('/api/search-history', { query });
+  recordSearch(query: string, scope: SearchScope): Observable<void> {
+    return this.http.post<void>('/api/search-history', { query, scope });
   }
-  pinSearch(query: string, pinned: boolean): Observable<void> {
-    return this.http.put<void>('/api/search-history/pin', { query, pinned });
+  pinSearch(query: string, pinned: boolean, scope: SearchScope): Observable<void> {
+    return this.http.put<void>('/api/search-history/pin', { query, pinned, scope });
   }
-  deleteSearch(query: string): Observable<void> {
-    return this.http.delete<void>(`/api/search-history?query=${encodeURIComponent(query)}`);
+  deleteSearch(query: string, scope: SearchScope): Observable<void> {
+    return this.http.delete<void>(`/api/search-history?query=${encodeURIComponent(query)}&scope=${scope}`);
   }
 
   getNodes(): Observable<NodeDto[]> {

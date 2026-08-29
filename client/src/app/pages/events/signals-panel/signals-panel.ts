@@ -5,7 +5,7 @@ import {
 import { LucideAngularModule } from 'lucide-angular';
 import { forkJoin } from 'rxjs';
 import { ApiService } from '../../../core/services/api.service';
-import { SearchHistoryService } from '../../../core/services/search-history.service';
+import { SearchHistoryComponent } from '../../../shared/components/search-history/search-history';
 import { AlertSeverity } from '../../../core/models/alert.model';
 
 interface FiringAlert {
@@ -23,7 +23,7 @@ interface FiringAlert {
  */
 @Component({
   selector: 'app-signals-panel',
-  imports: [LucideAngularModule],
+  imports: [LucideAngularModule, SearchHistoryComponent],
   templateUrl: './signals-panel.html',
   styleUrl: './signals-panel.scss',
   changeDetection: ChangeDetectionStrategy.OnPush,
@@ -31,7 +31,6 @@ interface FiringAlert {
 export class SignalsPanelComponent implements OnInit {
   private api = inject(ApiService);
   private cdr = inject(ChangeDetectorRef);
-  readonly history = inject(SearchHistoryService);
 
   /** Current filter — kept for wiring compatibility with the events page. */
   readonly currentFilter = input<string>('');
@@ -41,7 +40,6 @@ export class SignalsPanelComponent implements OnInit {
   readonly firing = signal<FiringAlert[]>([]);
 
   ngOnInit(): void {
-    this.history.load();
     this.loadFiring();
   }
 
@@ -63,15 +61,5 @@ export class SignalsPanelComponent implements OnInit {
 
   apply(filter: string | undefined): void {
     if (filter) this.filterSelected.emit(filter);
-  }
-
-  pin(query: string, pinned: boolean, e: MouseEvent): void {
-    e.stopPropagation();
-    this.history.setPinned(query, pinned);
-  }
-
-  remove(query: string, e: MouseEvent): void {
-    e.stopPropagation();
-    this.history.remove(query);
   }
 }

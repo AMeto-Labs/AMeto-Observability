@@ -29,46 +29,6 @@
     }
   }
 
-  <!-- ── Search history ──────────────────────────────────────────────────── -->
-  <div class="sig-section-label">
-    <lucide-icon name="history" [size]="12" [strokeWidth]="1.9" />
-    Search history
-  </div>
-
-  @if (history.pinned().length === 0 && history.recent().length === 0) {
-    <div class="sig-empty">
-      <lucide-icon name="search" [size]="20" [strokeWidth]="1.5" />
-      <span>No searches yet</span>
-      <span class="sig-hint">Run a filter to see it here</span>
-    </div>
-  } @else {
-    @for (q of history.pinned(); track q) {
-      <div class="sig-item sig-hist" (click)="apply(q)" [title]="q">
-        <lucide-icon name="pin" [size]="12" [strokeWidth]="1.8" class="sig-lead sig-lead--pinned" />
-        <span class="sig-query">{{ q }}</span>
-        <div class="sig-item-actions">
-          <button class="sig-icon-btn" (click)="pin(q, false, $event)" title="Unpin">
-            <lucide-icon name="pin-off" [size]="12" [strokeWidth]="1.8" />
-          </button>
-          <button class="sig-icon-btn danger" (click)="remove(q, $event)" title="Remove">
-            <lucide-icon name="x" [size]="12" [strokeWidth]="1.8" />
-          </button>
-        </div>
-      </div>
-    }
-    @for (q of history.recent(); track q) {
-      <div class="sig-item sig-hist" (click)="apply(q)" [title]="q">
-        <lucide-icon name="clock" [size]="12" [strokeWidth]="1.8" class="sig-lead" />
-        <span class="sig-query">{{ q }}</span>
-        <div class="sig-item-actions">
-          <button class="sig-icon-btn" (click)="pin(q, true, $event)" title="Pin">
-            <lucide-icon name="pin" [size]="12" [strokeWidth]="1.8" />
-          </button>
-          <button class="sig-icon-btn danger" (click)="remove(q, $event)" title="Remove">
-            <lucide-icon name="x" [size]="12" [strokeWidth]="1.8" />
-          </button>
-        </div>
-      </div>
-    }
-  }
+  <!-- ── Search history (shared with the Traces/Metrics panels) ──────────── -->
+  <app-search-history scope="logs" (querySelected)="apply($event)" />
 </div>

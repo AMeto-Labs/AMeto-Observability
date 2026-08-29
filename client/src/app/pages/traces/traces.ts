@@ -20,6 +20,8 @@ import { ModalComponent } from '../../shared/components/ui';
 import { EventDetailComponent } from '../events/components/event-detail/event-detail';
 import { EventListRowComponent } from '../events/components/event-list-row/event-list-row';
 import { PropertyMenuComponent } from '../../shared/components/property-menu/property-menu';
+import { SearchHistoryComponent } from '../../shared/components/search-history/search-history';
+import { SearchHistoryService } from '../../core/services/search-history.service';
 
 /** TraceQL vocabulary offered by the Ctrl+Space autocomplete: intrinsics, common OTel span
  *  attributes (dotted), status/kind enum values, and the comparison/boolean operators. */
@@ -39,7 +41,7 @@ const TRACEQL_TOKENS: readonly string[] = [
 
 @Component({
   selector: 'app-traces',
-  imports: [FormsModule, LucideAngularModule, ServiceGraphComponent, FlamegraphComponent, LatencyComponent, CompareTraceComponent, SuggestInputDirective, ModalComponent, EventDetailComponent, EventListRowComponent, PropertyMenuComponent],
+  imports: [FormsModule, LucideAngularModule, ServiceGraphComponent, FlamegraphComponent, LatencyComponent, CompareTraceComponent, SuggestInputDirective, ModalComponent, EventDetailComponent, EventListRowComponent, PropertyMenuComponent, SearchHistoryComponent],
   templateUrl: './traces.html',
   styleUrl: './traces.scss',
   changeDetection: ChangeDetectionStrategy.OnPush,
@@ -49,6 +51,9 @@ export class TracesComponent implements OnInit, OnDestroy {
   private cdr    = inject(ChangeDetectorRef);
   private router = inject(Router);
   private route  = inject(ActivatedRoute);
+  /** This page's slice of the shared per-user search history (scope keeps it apart
+   *  from the Events/Metrics lists — see SearchHistoryService.forScope). */
+  private history = inject(SearchHistoryService).forScope('traces');
 
   // ── Loading / data ────────────────────────────────────────────────────────
   statsLoading  = signal(false);
@@ -117,6 +122,9 @@ export class TracesComponent implements OnInit, OnDestroy {
   traceqlError   = signal('');
   /** Candidates for the TraceQL Ctrl+Space autocomplete. */
   readonly traceqlSuggestions = TRACEQL_TOKENS as string[];
+
+  /** Right-hand search-history panel — mounted under @if so opening reloads. */
+  historyOpen = signal(false);
 
   private _poll: ReturnType<typeof setInterval> | null = null;
   /** Refresh immediately when the tab is re-shown after being hidden. */
@@ -296,6 +304,26 @@ export class TracesComponent implements OnInit, OnDestroy {
     this.syncUrl();
   }
 
+  toggleHistory(): void {
+    this.historyOpen.update(v => !v);
+  }
+
+  /**
+   * A click in the History panel — lands exactly like a hand-typed TraceQL search:
+   * switch to TraceQL mode, drop the query in, clear any stale error, then run it
+   * through the same user-run path (runTraceQLUser records + syncs the URL). The panel
+   * itself stays open, same as the Events Signals panel.
+   */
+  applyHistoryQuery(query: string): void {
+    // The panel is reachable from every main tab, but the results render into the trace
+    // list — without this, applying from Graph/Latency/Compare runs the query invisibly.
+    this.activeMainTab = 'traces';
+    this.traceqlMode.set(true);
+    this.traceqlInput = query;
+    this.traceqlError.set('');
+    this.runTraceQLUser();
+  }
+
   ngOnDestroy() {
     if (this._poll) clearInterval(this._poll);
     document.removeEventListener('visibilitychange', this._onVisibility);
@@ -355,7 +383,53 @@ export class TracesComponent implements OnInit, OnDestroy {
     });
   }
 
-  applyFilters() { this.syncUrl(); this.loadAll(); }
+  /**
+   * The only two user-initiated ways to run a TraceQL query (Run button, Enter in the
+   * box) — wired here instead of inside runTraceQL() itself, which is ALSO the 15 s
+   * live-poll path (loadTraces → runTraceQL when a query is already active) and the
+   * ?ql= deep-link auto-run path (restoreFromUrl → openTrace doesn't touch it, but the
+   * initial loadAll does). Recording inside runTraceQL() would re-record on every poll
+   * tick and every cross-page jump that lands here with ?ql= set.
+   */
+  runTraceQLUser(): void {
+    this.history.record(this.traceqlInput);
+    this.runTraceQL();
+  }
+
+  applyFilters() {
+    const q = this.synthesizeTraceql();
+    if (q) this.history.record(q);
+    this.syncUrl();
+    this.loadAll();
+  }
+
+  /**
+   * Builds the TraceQL predicate the populated filter-bar fields would mean, so a
+   * filter-mode Apply can be recorded in the same TraceQL vocabulary the history panel
+   * (and the manual TraceQL box) already speaks — same grammar tqlPredicate below
+   * targets (TraceQLParser.BuildIntrinsicPredicate / BuildAttrPredicate). Field order
+   * follows the bar's own left-to-right layout; empty fields are skipped, and '' comes
+   * back when nothing is set — a plain Clear (which blanks every field before calling
+   * applyFilters) records nothing.
+   */
+  private synthesizeTraceql(): string {
+    const parts: string[] = [];
+    // The span-name box matches by case-insensitive SUBSTRING server-side, and the only
+    // name operator the grammar has is exact `=` — recording `name = "ord"` for a search
+    // that actually matched "GET /orders" would replay as a DIFFERENT, likely empty,
+    // search. Left out of the predicate for the same reason the HTTP buckets below are:
+    // a history entry that lies about what it will find is worse than a narrower one.
+    if (this.filterService) parts.push(this.tqlPredicate('service', this.filterService, false));
+    if (this.filterStatus)  parts.push(`status = ${this.filterStatus.toLowerCase()}`);
+    if (this.filterMinDurationMs != null) parts.push(`duration >= ${this.filterMinDurationMs}ms`);
+    if (this.filterMaxDurationMs != null) parts.push(`duration <= ${this.filterMaxDurationMs}ms`);
+    // The HTTP select also offers bucket picks ('2xx'/'4xx'/'5xx') that aren't a single
+    // value the "= N" grammar can express — recording one verbatim would save a query
+    // that fails to parse the moment it's replayed from history. Only an exact code
+    // (a plain '404', '500', …) round-trips, so buckets are left out of the predicate.
+    if (/^\d+$/.test(this.filterHttpStatus)) parts.push(this.tqlPredicate('.http.status_code', this.filterHttpStatus, false));
+    return parts.length ? `{ ${parts.join(' && ')} }` : '';
+  }
 
   toggleTraceQL() {
     this.traceqlMode.update(v => !v);
@@ -534,7 +608,7 @@ export class TracesComponent implements OnInit, OnDestroy {
     this.traceqlError.set('');
     this.traceqlInput = query;
     this.activeMainTab = 'traces';
-    this.runTraceQL();
+    this.runTraceQLUser();
   }
 
   selectSpan(span: SpanDto) {
