@@ -54,7 +54,10 @@
   display: grid; grid-template-columns: 300px 1fr; gap: 12px;
   flex: 1; min-height: 0;
 }
-@media (max-width: 900px) { .explore { grid-template-columns: 1fr; } }
+// A third column, only while the history panel is open — the same var(--panel-w)
+// track the Events page's Signals panel uses, so both right-hand panels match.
+.explore.with-history { grid-template-columns: 300px 1fr var(--panel-w); }
+@media (max-width: 900px) { .explore, .explore.with-history { grid-template-columns: 1fr; } }
 
 // Catalog
 .catalog-panel {
@@ -164,6 +167,35 @@
   flex: 1;
   &.sm { padding: 20px; background: none; border: none; flex: none; }
 }
+
+// ── History panel ─────────────────────────────────────────────────────────────
+// Same minimal chrome as the Events page's Signals panel (header, close X, width
+// var(--panel-w)) — <app-search-history> owns its own row styling; this file only
+// owns the surrounding shell.
+.hist-toggle-btn {
+  display: inline-flex; align-items: center; justify-content: center; height: 30px; width: 32px;
+  background: none; border: 1px solid var(--border); border-radius: 6px; color: var(--text-muted);
+  cursor: pointer;
+  &:hover { border-color: var(--accent); color: var(--accent); }
+  &.on { border-color: var(--accent); color: var(--accent); background: color-mix(in srgb, var(--accent) 15%, transparent); }
+}
+
+.history-panel {
+  display: flex; flex-direction: column; min-height: 0;
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; overflow: hidden;
+}
+.hist-hdr {
+  display: flex; align-items: center; justify-content: space-between;
+  height: var(--toolbar-h); padding: 0 10px; border-bottom: 1px solid var(--border); flex-shrink: 0;
+}
+.hist-title { display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; color: var(--text-muted); }
+.hist-close {
+  display: flex; align-items: center; justify-content: center; width: 26px; height: 26px;
+  background: none; border: none; border-radius: 4px; color: var(--text-muted); cursor: pointer;
+  transition: color .12s, background .12s;
+  &:hover { color: var(--text-primary); background: var(--bg-elevated); }
+}
+.hist-body { flex: 1; overflow-y: auto; padding: 4px 0; }
 
 // ── Mode / view switches ────────────────────────────────────────────────────
 .b-modebar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }

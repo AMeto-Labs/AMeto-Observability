@@ -32,7 +32,11 @@ internal sealed class AuthDatabase
     {
         var conn = new SqliteConnection(ConnectionString);
         conn.Open();
-        Exec(conn, "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;");
+        // busy_timeout: the same 5 s grace AlertRuleStore gives itself on this shared file.
+        // Without it a transient writer elsewhere makes any statement throw "database is
+        // locked" instantly — and the v1→v2 copy in MigrateSchema is deliberately un-caught,
+        // so that instant throw would fail a boot a five-second wait would have saved.
+        Exec(conn, "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;");
         return conn;
     }
 
@@ -85,6 +89,28 @@ internal sealed class AuthDatabase
             );
             CREATE INDEX IF NOT EXISTS ix_search_history_user
                 ON search_history(username, pinned, updated_at DESC);
+
+            -- One row per completed one-time migration. Emptiness of a target table is
+            -- NOT a substitute (a user can legitimately empty it again); see MigrateSchema.
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                name TEXT PRIMARY KEY
+            );
+
+            -- The same history, now split per page (`scope`: logs|traces|metrics).
+            -- A new table rather than an ALTER because scope belongs in the primary
+            -- key — the same text is a legitimate separate entry on Traces and on
+            -- Metrics — and SQLite cannot alter a key in place. The v1 table above
+            -- stays where it is; see MigrateSchema for the one-time copy.
+            CREATE TABLE IF NOT EXISTS search_history_v2 (
+                username   TEXT    NOT NULL,
+                scope      TEXT    NOT NULL,
+                query      TEXT    NOT NULL,
+                pinned     INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT    NOT NULL,
+                PRIMARY KEY (username, scope, query)
+            );
+            CREATE INDEX IF NOT EXISTS ix_search_history_v2_user
+                ON search_history_v2(username, scope, pinned, updated_at DESC);
             """);
     }
 
@@ -149,6 +175,45 @@ internal sealed class AuthDatabase
         // See AuthStore.FindOrCreateOAuthUser — an email alone is not an identity.
         try { Exec(conn, "ALTER TABLE users ADD COLUMN provider_subject TEXT NOT NULL DEFAULT ''"); }
         catch { /* column already exists */ }
+
+        // Carry an old un-scoped history into search_history_v2. Every row in the v1
+        // table was written by the Events page — events.store.ts is the only recorder
+        // that has ever existed — so 'logs' is the true retroactive scope, not a guess.
+        //
+        // Copied ONCE, gated on a marker rather than on v2 being empty. Emptiness is not
+        // the same fact as "already copied": v1 is frozen (the store writes only v2), so a
+        // user who deleted their whole history left v2 empty — and an emptiness-gated copy
+        // then resurrected every one of those deleted entries on the next restart, which is
+        // precisely the outcome a privacy-motivated delete must not have. The marker is
+        // written in the same connection only after the copy succeeds, so a failed copy is
+        // retried at the next boot instead of being skipped forever.
+        //
+        // No try/catch, deliberately: the old table provably exists here (InitSchema created
+        // it two statements ago, IF NOT EXISTS), so the only things a catch could swallow
+        // are real failures — and this class has no logger, which made a swallowed copy a
+        // permanent, unexplained loss of every pre-upgrade pin. A throw fails the boot
+        // loudly, exactly like the unguarded statements above it, and is retry-safe.
+        if (!MigrationDone(conn, "search_history_v2_copy"))
+        {
+            // One transaction: the marker must never persist without the rows it vouches for.
+            // (The reverse — rows without a marker — is already harmless: OR IGNORE re-copies.)
+            using var tx = conn.BeginTransaction();
+            Exec(conn, """
+                INSERT OR IGNORE INTO search_history_v2 (username, scope, query, pinned, updated_at)
+                    SELECT username, 'logs', query, pinned, updated_at FROM search_history
+                """);
+            Exec(conn, "INSERT OR IGNORE INTO schema_migrations (name) VALUES ('search_history_v2_copy')");
+            tx.Commit();
+        }
+    }
+
+    /// <summary>True when the named one-time migration has already been recorded.</summary>
+    private static bool MigrationDone(SqliteConnection conn, string name)
+    {
+        using var cmd = conn.CreateCommand();
+        cmd.CommandText = "SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE name = @n)";
+        cmd.Parameters.AddWithValue("@n", name);
+        return Convert.ToInt64(cmd.ExecuteScalar()) == 1;
     }
 
     private static void Exec(SqliteConnection conn, string sql)

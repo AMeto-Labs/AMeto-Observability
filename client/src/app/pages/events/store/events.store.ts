@@ -240,7 +240,7 @@ export const EventsStore = signalStore(
     api = inject(ApiService),
     router = inject(Router),
     route = inject(ActivatedRoute),
-    history = inject(SearchHistoryService),
+    history = inject(SearchHistoryService).forScope('logs'),
   ) => {
     // Streaming subscriptions live in the closure: the previous is torn down before a
     // new one starts, and both are disposed on destroy (via _disposeStreams).

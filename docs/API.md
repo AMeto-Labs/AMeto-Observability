@@ -260,19 +260,30 @@ Header-only log-volume aggregation: bucketed `(time, level[, service])` counts o
 
 ## Search history
 
-Per-user recent + pinned filter queries (shown in the events Signals panel).
+Per-user recent (10) + pinned (5) queries, kept separately per page: the events Signals panel,
+the Traces history panel and the Metrics history panel each see only their own scope. Every
+route takes a `scope` — one of `logs`, `traces`, `metrics` — as a query parameter on GET/DELETE
+and a body field on POST/PUT. An **absent or empty** scope means `logs` (the pre-scope contract,
+so older clients keep working); an **unknown** value is a `400`, not a silent default — a typo
+that landed history in the wrong bucket would be invisible. Limits and eviction apply per
+(user, scope).
 
-### `GET /api/search-history`
-Returns `{ pinned: string[], recent: string[] }` for the caller.
+### `GET /api/search-history?scope=traces`
+Returns `{ pinned: string[], recent: string[] }` for the caller in that scope.
 
 ### `POST /api/search-history`
-Record a query — body `{ "query": "@l='Error'" }`. → `204`.
+Record a query — body `{ "query": "@l='Error'", "scope": "logs" }`. → `204`.
 
 ### `PUT /api/search-history/pin`
-Pin/unpin — body `{ "query": "…", "pinned": true }`. → `204`.
+Pin/unpin — body `{ "query": "…", "pinned": true, "scope": "traces" }`. → `204`.
 
-### `DELETE /api/search-history?query=…`
-Remove one entry. → `204`.
+### `DELETE /api/search-history?query=…&scope=metrics`
+Remove one entry from that scope. → `204`.
+
+What each page stores: **logs** — the filter expression as typed; **traces** — a TraceQL string
+(filter-bar searches are recorded as their synthesised TraceQL equivalent, so any entry replays
+through the TraceQL box); **metrics** — the committed builder tuple as
+`metric=…&agg=…[&q=…][&gb=…][&filters=…]`, the same encoding the page's own URL uses.
 
 All require JWT Bearer.
 

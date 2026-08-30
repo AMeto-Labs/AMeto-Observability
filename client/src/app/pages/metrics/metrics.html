@@ -28,11 +28,15 @@
           <button class="b-run" (click)="applyCustom()">Apply</button>
         </div>
       }
+
+      <button class="hist-toggle-btn" [class.on]="historyPanelOpen()" (click)="toggleHistoryPanel()" title="Search history">
+        <lucide-icon name="history" [size]="14" [strokeWidth]="1.8" />
+      </button>
     </div>
   </header>
 
   <!-- ── Explore body ───────────────────────────────────────────────────── -->
-  <div class="explore">
+  <div class="explore" [class.with-history]="historyPanelOpen()">
     <!-- Catalog -->
     <aside class="catalog-panel">
       <div class="catalog-search">
@@ -127,10 +131,10 @@
                 <input class="b-input" placeholder="service.name=api, http.route=/orders"
                        [appSuggestInput]="filterKeys()"
                        [ngModel]="filtersRaw()" (ngModelChange)="filtersRaw.set($event)"
-                       (suggestSubmit)="runQuery()" (blur)="runQuery()">
+                       (suggestSubmit)="runAndRecord()" (blur)="runQuery()">
               </label>
 
-              <button class="b-run" (click)="runQuery()">
+              <button class="b-run" (click)="runAndRecord()">
                 <lucide-icon name="play" [size]="13" /> Run
               </button>
               <button class="ex-reset" (click)="resetZoom()" title="Reset zoom">
@@ -198,9 +202,34 @@
           }
         </div>
       } @else {
-        <div class="panel-empty">Select a metric from the catalog to start exploring.</div>
+        <div class="panel-empty">
+          @if (historyMetricMissing(); as name) {
+            "{{ name }}" is no longer in the catalog — it may have aged out or stopped reporting.
+          } @else {
+            Select a metric from the catalog to start exploring.
+          }
+        </div>
       }
     </section>
+
+    <!-- Search history — same minimal chrome as the Events page's Signals panel -->
+    @if (historyPanelOpen()) {
+      <aside class="history-panel">
+        <div class="hist-hdr">
+          <span class="hist-title">
+            <lucide-icon name="history" [size]="13" [strokeWidth]="1.8" />
+            History
+          </span>
+          <button class="hist-close" (click)="toggleHistoryPanel()" title="Close">
+            <lucide-icon name="x" [size]="14" [strokeWidth]="1.8" />
+          </button>
+        </div>
+        <div class="hist-body">
+          <app-search-history [scope]="historyScope" [display]="historyDisplay" [emptyHint]="'Run a query to see it here'"
+                               (querySelected)="applyHistoryQuery($event)" />
+        </div>
+      </aside>
+    }
   </div>
 
   <!-- ── Correlation drawer (heatmap cell → traces) ─────────────────────── -->
