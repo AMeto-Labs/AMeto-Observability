@@ -245,7 +245,10 @@
 
       <div class="list-header">
         <span class="list-title">
-          @if (!loading()) { <strong>{{ filteredTraces().length }}</strong> traces }
+          @if (!loading()) {
+            <strong>{{ filteredTraces().length }}{{ hasMore() ? '+' : '' }}</strong> traces
+            @if (hasMore()) { <span class="list-more-hint">· scroll for more</span> }
+          }
           @else { Loading… }
         </span>
         <button class="icon-btn" (click)="loadAll()" title="Refresh">
