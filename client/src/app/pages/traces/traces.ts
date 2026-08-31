@@ -517,8 +517,14 @@ export class TracesComponent implements OnInit, OnDestroy {
     this.loading.set(true);
     this.traceqlError.set('');
     const from  = this.fromIso();
+    // The custom range's END, which this path used to drop on the floor: only `from` was
+    // ever sent, so the server fell back to its "to = now" default and a query over, say,
+    // last week silently ran to the present. Invisible whenever the end IS now — which is
+    // why it survived — and wrong for every other custom window. The filter-bar path has
+    // always sent it; TraceQL simply never did.
+    const to    = this.toIso();
     const epoch = ++this.queryEpoch;
-    this.api.queryTraces({ query: q, from, limit: TracesComponent.QlPageSize })
+    this.api.queryTraces({ query: q, from, to, limit: TracesComponent.QlPageSize })
       .pipe(takeUntilDestroyed(this.destroyRef)).subscribe({
       next: rows => {
         if (epoch !== this.queryEpoch) return;   // a newer search owns the list now
