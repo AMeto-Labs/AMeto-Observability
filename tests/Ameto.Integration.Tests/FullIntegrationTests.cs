@@ -94,6 +94,104 @@ internal static class TestHelpers
     }
 
     /// <summary>
+    /// The full result of consuming an SSE endpoint: the status line, the <c>data:</c> payloads
+    /// of the untagged row frames, and — what <see cref="StreamEventsAsync"/> throws away — WHICH
+    /// terminal frame ended the stream and how many arrived.
+    ///
+    /// <para>The trace streams report a failed query as <c>event: query-error</c> on a 200, so a
+    /// helper that stops at <c>done</c> and returns rows alone cannot tell a query that failed
+    /// from one that matched nothing.</para>
+    /// </summary>
+    /// <param name="TerminalPayload">
+    /// The <c>data:</c> object of the FIRST terminal frame. The trace streams say in it which
+    /// ending a <c>done</c> was — window exhausted, or the caller's row ceiling — and a test that
+    /// only reads the event name cannot tell those apart.
+    /// </param>
+    /// <param name="Keepalives">
+    /// <c>: keepalive</c> comment frames seen anywhere in the body.
+    /// </param>
+    /// <param name="KeepalivesBeforeFirstRow">
+    /// Keepalives that arrived BEFORE the first row frame. This is the number that matters: the
+    /// silence a proxy kills the connection over is the first page's fetch, and a keepalive that
+    /// only ever appears after rows have started flowing proves nothing about it.
+    /// </param>
+    internal sealed record SseCapture(
+        HttpStatusCode    Status,
+        List<JsonElement> Rows,
+        string?           Terminal,
+        string?           Error,
+        int               TerminalCount,
+        JsonElement?      TerminalPayload         = null,
+        int               Keepalives              = 0,
+        int               KeepalivesBeforeFirstRow = 0);
+
+    /// <summary>
+    /// Consumes an SSE endpoint to the end of the response body. The read is bounded by
+    /// <paramref name="timeout"/>: a stream that never terminates is the failure mode of a
+    /// paging loop whose cursor stops moving, and it must surface as a failed test rather than
+    /// as a run that hangs.
+    /// </summary>
+    public static async Task<SseCapture> CaptureSseAsync(
+        HttpClient client, string url, TimeSpan? timeout = null)
+    {
+        using var cts      = new CancellationTokenSource(timeout ?? TimeSpan.FromSeconds(30));
+        using var request  = new HttpRequestMessage(HttpMethod.Get, url);
+        using var response = await client.SendAsync(
+            request, HttpCompletionOption.ResponseHeadersRead, cts.Token);
+
+        var          rows            = new List<JsonElement>();
+        string?      terminal        = null;
+        string?      error           = null;
+        int          terminals       = 0;
+        JsonElement? terminalPayload = null;
+        int          keepalives      = 0;
+        int          keepalivesFirst = 0;
+
+        if (response.IsSuccessStatusCode)
+        {
+            await using var stream = await response.Content.ReadAsStreamAsync(cts.Token);
+            using var reader = new System.IO.StreamReader(stream);
+
+            string? pendingEvent = null;
+            string? line;
+            while ((line = await reader.ReadLineAsync(cts.Token)) is not null)
+            {
+                if (line.Length == 0) { pendingEvent = null; continue; }
+                if (line.StartsWith(": keepalive", StringComparison.Ordinal))
+                {
+                    keepalives++;
+                    if (rows.Count == 0) keepalivesFirst++;
+                    continue;
+                }
+                if (line.StartsWith("event: ", StringComparison.Ordinal))
+                { pendingEvent = line["event: ".Length..]; continue; }
+                if (!line.StartsWith("data: ", StringComparison.Ordinal)) continue;  // other comments
+
+                var payload = line["data: ".Length..];
+                if (pendingEvent is null)
+                {
+                    using var row = JsonDocument.Parse(payload);
+                    rows.Add(row.RootElement.Clone());
+                    continue;
+                }
+
+                terminals++;
+                terminal ??= pendingEvent;
+                using (var doc = JsonDocument.Parse(payload))
+                {
+                    terminalPayload ??= doc.RootElement.Clone();
+                    if (pendingEvent == "query-error")
+                        error ??= doc.RootElement.TryGetProperty("error", out var e) ? e.GetString() : null;
+                }
+                pendingEvent = null;
+            }
+        }
+
+        return new SseCapture(response.StatusCode, rows, terminal, error, terminals,
+                              terminalPayload, keepalives, keepalivesFirst);
+    }
+
+    /// <summary>
     /// Polls GET /api/events (SSE) until at least <paramref name="expectedCount"/> events
     /// are streamed, or throws <see cref="TimeoutException"/>. Returns the streamed events.
     /// </summary>

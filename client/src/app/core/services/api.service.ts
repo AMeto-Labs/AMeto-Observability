@@ -51,49 +51,85 @@ export class ApiService {
     return () => { cancelled = true; sub.unsubscribe(); es?.close(); };
   }
 
-  /** Stream historical events via SSE. Emits each EventDto as it arrives,
-   *  completes when the server sends "event: done". */
-  streamEvents(params: EventQueryParams = {}): Observable<EventDto> {
-    return new Observable<EventDto>(subscriber => {
-      const p = new URLSearchParams();
-      if (params.filter) p.set('filter', params.filter);
-      if (params.from) p.set('from', params.from);
-      if (params.to) p.set('to', params.to);
-      if (params.count) p.set('count', String(params.count));
-      if (params.dir) p.set('dir', params.dir);
-      if (params.afterId) p.set('afterId', params.afterId);
-      if (params.afterTs !== undefined) p.set('afterTs', String(params.afterTs));
-      if (params.levels) p.set('levels', params.levels);
+  /**
+   * The shape every SSE-backed list on this client has: a ticketed EventSource, one JSON
+   * object per `message` frame, a terminal `done`, and a terminal `query-error` carrying the
+   * server's own sentence. Written once because the fourth copy is where copies start to
+   * disagree — the third already differed only in its strings.
+   *
+   * @param opts.completeOnDone  false for an endless stream (the live tail never sends `done`).
+   * @param opts.explainSilentFailure
+   *        Optional: consulted when the stream failed having delivered NOTHING, where the real
+   *        reason is unreadable to the browser. Returns a canceller. Only the log streams have
+   *        somewhere to ask.
+   */
+  private streamJson<T>(
+    path: string,
+    params: URLSearchParams,
+    opts: {
+      completeOnDone?: boolean;
+      queryErrorMessage: string;
+      connectionMessage: string;
+      explainSilentFailure?: (report: (message: string) => void) => () => void;
+    },
+  ): Observable<T> {
+    return new Observable<T>(subscriber => {
+      // Copied per subscription: openTicketedSse writes `ticket` into it, and two
+      // subscriptions to the same Observable must not share (or overwrite) one ticket.
+      const p = new URLSearchParams(params);
       let delivered = false;
       let explain: (() => void) | undefined;
-      const teardown = this.openTicketedSse('/api/events', p,
+      const teardown = this.openTicketedSse(path, p,
         es => {
           es.onmessage = event => {
             delivered = true;
-            try { subscriber.next(JSON.parse(event.data) as EventDto); } catch { /* ignore */ }
+            try { subscriber.next(JSON.parse(event.data) as T); } catch { /* ignore parse errors */ }
           };
-          es.addEventListener('done', () => { es.close(); subscriber.complete(); });
+          if (opts.completeOnDone !== false)
+            es.addEventListener('done', () => { es.close(); subscriber.complete(); });
           // Sent by the server when a query fails AFTER the stream opened (its budget ran
           // out, a segment could not be read). Not named 'error': EventSource dispatches
           // its own connection failures under that name.
           es.addEventListener('query-error', event => {
             es.close();
-            subscriber.error(new Error(this.sseErrorMessage(event, 'Search failed')));
+            subscriber.error(new Error(this.sseErrorMessage(event, opts.queryErrorMessage)));
           });
           es.onerror = () => {
             es.close();
             // SSE bypasses authInterceptor — re-check the session so a stale token logs out.
             this.auth.verifySession();
-            if (delivered) { subscriber.error(new Error('Failed to load events')); return; }
+            if (delivered || !opts.explainSilentFailure) {
+              subscriber.error(new Error(opts.connectionMessage));
+              return;
+            }
             // Nothing arrived: most likely the request was REFUSED (bad filter, bad date,
             // server saturated) — and EventSource cannot read the body of a non-200, so
-            // ask the validation endpoint what was wrong instead of guessing.
-            explain = this.explainQueryFailure(params, 'Failed to load events',
-                                               msg => subscriber.error(new Error(msg)));
+            // ask instead of guessing.
+            explain = opts.explainSilentFailure(msg => subscriber.error(new Error(msg)));
           };
         },
-        () => subscriber.error(new Error('Failed to load events')));
+        () => subscriber.error(new Error(opts.connectionMessage)));
       return () => { explain?.(); teardown(); };
+    });
+  }
+
+  /** Stream historical events via SSE. Emits each EventDto as it arrives,
+   *  completes when the server sends "event: done". */
+  streamEvents(params: EventQueryParams = {}): Observable<EventDto> {
+    const p = new URLSearchParams();
+    if (params.filter) p.set('filter', params.filter);
+    if (params.from) p.set('from', params.from);
+    if (params.to) p.set('to', params.to);
+    if (params.count) p.set('count', String(params.count));
+    if (params.dir) p.set('dir', params.dir);
+    if (params.afterId) p.set('afterId', params.afterId);
+    if (params.afterTs !== undefined) p.set('afterTs', String(params.afterTs));
+    if (params.levels) p.set('levels', params.levels);
+    return this.streamJson<EventDto>('/api/events', p, {
+      queryErrorMessage:  'Search failed',
+      connectionMessage:  'Failed to load events',
+      explainSilentFailure: report =>
+        this.explainQueryFailure(params, 'Failed to load events', report),
     });
   }
 
@@ -288,36 +324,19 @@ export class ApiService {
    * so switching to live quietly widened the view back to every level.
    */
   streamLive(params: { filter?: string; levels?: string } = {}): Observable<EventDto> {
-    return new Observable<EventDto>(subscriber => {
-      const { filter, levels } = params;
-      const p = new URLSearchParams();
-      if (filter) p.set('filter', filter);
-      if (levels) p.set('levels', levels);
-      let delivered = false;
-      let explain: (() => void) | undefined;
-      const teardown = this.openTicketedSse('/api/events/live', p,
-        es => {
-          es.onmessage = event => {
-            delivered = true;
-            try { subscriber.next(JSON.parse(event.data) as EventDto); } catch { /* ignore parse errors */ }
-          };
-          // The tail reports the same way the search does: a poll that blew its budget, a
-          // server too busy to keep the tail fed, a failure after the stream opened.
-          es.addEventListener('query-error', event => {
-            es.close();
-            subscriber.error(new Error(this.sseErrorMessage(event, 'Live tail stopped')));
-          });
-          es.onerror = () => {
-            es.close();
-            // SSE bypasses authInterceptor — re-check the session so a stale token logs out.
-            this.auth.verifySession();
-            if (delivered) { subscriber.error(new Error('SSE connection lost')); return; }
-            explain = this.explainQueryFailure({ filter }, 'SSE connection lost',
-                                               msg => subscriber.error(new Error(msg)));
-          };
-        },
-        () => subscriber.error(new Error('SSE connection lost')));
-      return () => { explain?.(); teardown(); };
+    const { filter, levels } = params;
+    const p = new URLSearchParams();
+    if (filter) p.set('filter', filter);
+    if (levels) p.set('levels', levels);
+    return this.streamJson<EventDto>('/api/events/live', p, {
+      // The tail has no end: it never sends `done`, and must never complete on its own.
+      completeOnDone:     false,
+      // It reports failure the same way the search does: a poll that blew its budget, a
+      // server too busy to keep the tail fed, a failure after the stream opened.
+      queryErrorMessage:  'Live tail stopped',
+      connectionMessage:  'SSE connection lost',
+      explainSilentFailure: report =>
+        this.explainQueryFailure({ filter }, 'SSE connection lost', report),
     });
   }
 
@@ -374,7 +393,14 @@ export class ApiService {
     return this.http.get<TraceStatsDto>(`/api/traces/stats?${p.toString()}`);
   }
 
-  searchTraces(params: SpanQueryParams = {}): Observable<TraceRowDto[]> {
+  /**
+   * The filter-bar query string, shared by the buffered GET and the SSE stream so the two
+   * cannot drift into disagreeing about what the same filter bar means. Note that `spanName`
+   * goes over the wire as `name`, and that the falsy guards drop a literal 0 for the duration
+   * bounds — kept deliberately: a 0 ms floor selects everything, so sending it changes nothing.
+   * The row limit is NOT set here; the two endpoints spell it differently (`limit` vs `max`).
+   */
+  private traceListParams(params: SpanQueryParams): URLSearchParams {
     const p = new URLSearchParams();
     if (params.from) p.set('from', params.from);
     if (params.to) p.set('to', params.to);
@@ -384,8 +410,45 @@ export class ApiService {
     if (params.minDurationMs) p.set('minDurationMs', String(params.minDurationMs));
     if (params.maxDurationMs) p.set('maxDurationMs', String(params.maxDurationMs));
     if (params.httpStatus) p.set('httpStatus', params.httpStatus);
+    return p;
+  }
+
+  searchTraces(params: SpanQueryParams = {}): Observable<TraceRowDto[]> {
+    const p = this.traceListParams(params);
     if (params.limit) p.set('limit', String(params.limit));
     return this.http.get<TraceRowDto[]>(`/api/traces?${p.toString()}`);
+  }
+
+  /**
+   * The filter-bar trace list, streamed row by row (newest first) instead of buffered into one
+   * response. Same filters, same order, same rows as searchTraces — the list simply fills as
+   * the server finds them rather than after it has found them all.
+   */
+  streamTraceList(params: SpanQueryParams & { max?: number } = {}): Observable<TraceRowDto> {
+    const p = this.traceListParams(params);
+    if (params.max) p.set('max', String(params.max));
+    return this.streamJson<TraceRowDto>('/api/traces/stream', p, {
+      queryErrorMessage: 'Search failed',
+      connectionMessage: 'Failed to load traces',
+    });
+  }
+
+  /**
+   * Streams the rows of a TraceQL query. GET, with the query text in `?ql=`: EventSource
+   * cannot POST and cannot carry a body, so the POST /api/traces/query shape is not available
+   * here. A parse error arrives as a `query-error` frame on a 200 — a 400 would reach the
+   * browser as an information-free connection failure with nothing to show the user.
+   */
+  streamTraceQuery(req: { query: string; from?: string; to?: string; max?: number }): Observable<TraceRowDto> {
+    const p = new URLSearchParams();
+    p.set('ql', req.query);
+    if (req.from) p.set('from', req.from);
+    if (req.to) p.set('to', req.to);
+    if (req.max) p.set('max', String(req.max));
+    return this.streamJson<TraceRowDto>('/api/traces/query/stream', p, {
+      queryErrorMessage: 'Query error',
+      connectionMessage: 'Failed to run query',
+    });
   }
 
   getTrace(traceId: string): Observable<SpanDto[]> {

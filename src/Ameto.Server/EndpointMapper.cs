@@ -121,7 +121,7 @@ public static class EndpointMapper
                 await ctx.Response.Body.FlushAsync(ctx.RequestAborted);
 
                 using var deadline = guard.StartDeadline(ctx.RequestAborted);
-                using var sse      = new SseJsonWriter(ctx.Response);
+                using var sse      = new SseJsonWriter(ctx.Response.Body);
                 try
                 {
                     await foreach (var ev in executor.ExecuteAsync(request, deadline.Token))
@@ -494,7 +494,7 @@ public static class EndpointMapper
             long lastPollStamp = System.Diagnostics.Stopwatch.GetTimestamp() - System.Diagnostics.Stopwatch.Frequency;
             long lastFrameStamp = System.Diagnostics.Stopwatch.GetTimestamp();
 
-            using var sse = new SseJsonWriter(ctx.Response);
+            using var sse = new SseJsonWriter(ctx.Response.Body);
             try
             {
                 // One frame up front, so the stream proves itself open immediately. It used

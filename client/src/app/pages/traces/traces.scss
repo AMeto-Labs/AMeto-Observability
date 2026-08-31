@@ -480,6 +480,22 @@
   overflow-y: auto;
 }
 
+// ── Virtual list scaffolding ───────────────────────────────────────────────
+// The spacer carries the full measured height of all rows so the scrollbar is honest about
+// how much list there is; each rendered row is lifted out of flow onto its own offset.
+.trace-vspace {
+  position: relative;
+  width: 100%;
+}
+
+.trace-vrow {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  will-change: transform;
+}
+
 // ── Trace row ──────────────────────────────────────────────────────────────
 .trace-row {
   display: flex;
@@ -490,9 +506,12 @@
   cursor: pointer;
   transition: background 0.1s;
 
-  &:last-child { border-bottom: none; }
-  &:hover      { background: var(--bg-elevated); }
-  &.active     { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+  // No `&:last-child { border-bottom: none }`: every row is now the only child of its own
+  // .trace-vrow, so that rule would match all of them and erase every separator. The rule it
+  // replaced only ever tidied the final row, which sits at the bottom of a scroll container
+  // where its border reads as the container's edge anyway.
+  &:hover  { background: var(--bg-elevated); }
+  &.active { background: color-mix(in srgb, var(--accent) 8%, transparent); }
 }
 
 .status-dot {
@@ -1732,30 +1751,38 @@
   color: var(--text-muted);
 }
 
-// ── Load more (pagination sentinel at the bottom of the trace list) ────────
-.load-more {
+// ── Trace list header (live count + the stream's Stop control) ─────────────
+.list-actions {
   display: flex;
-  justify-content: center;
-  padding: 10px 0 14px;
-  color: var(--text-dim);
+  align-items: center;
+  gap: 6px;
 }
 
-.load-more-btn {
+.stream-stop {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 24px;
+  padding: 0 9px;
   background: none;
   border: 1px solid var(--border);
   border-radius: 6px;
   color: var(--text-dim);
   font-size: 11px;
-  padding: 4px 14px;
   cursor: pointer;
 
-  &:hover { color: var(--text); border-color: var(--text-dim); }
+  &:hover { color: var(--error); border-color: var(--error); }
 }
-.load-capped {
-  font-size: 11px;
-  color: var(--text-dim);
-}
+
 .list-more-hint {
   color: var(--text-dim);
   font-weight: 400;
+}
+
+// Warmer than .list-more-hint on purpose: the other suffixes describe an answer that is
+// merely short, this one says the list has stopped keeping itself up to date.
+.list-stale-hint {
+  color: var(--warning);
+  font-weight: 400;
+  cursor: help;
 }

@@ -67,6 +67,19 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// </summary>
     internal Action? _beforeSegmentWrite;
 
+    /// <summary>
+    /// Test hook: called at the top of <see cref="GetTraceListAsync"/>, BLOCKING, with the
+    /// caller's cancellation token — before any await, so it runs synchronously on whatever
+    /// thread invoked the fetch.
+    ///
+    /// <para>That is deliberately the real shape of this path: <c>SpanReader</c> contains no
+    /// await tokens at all, the <c>.tracesum</c> sidecar read is a blocking FileStream plus LZ4
+    /// plus parse, and the async iterators hand back synchronously-completed ValueTasks. A slow
+    /// page fetch therefore does not YIELD, it OCCUPIES — which is exactly what made the SSE
+    /// keepalive inert, and what a test cannot reproduce with <c>Task.Delay</c>.</para>
+    /// </summary>
+    internal Action<CancellationToken>? _beforeTraceListScan;
+
     /// <summary>Test hook: joins the in-flight background flush, if any.</summary>
     internal void WaitForFlushForTest()
     {
@@ -409,6 +422,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         short?            httpStatusCode   = null,
         int               limit            = 200,
         IReadOnlyList<AttrHint>? attrHints = null,
+        SpanScanFloor?    scanFloor        = null,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
         long fromNano = from.HasValue ? from.Value.ToUnixTimeMilliseconds() * 1_000_000L : long.MinValue;
@@ -422,6 +436,51 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         // count back into memory through this set after the segment buffer stopped doing it.
         var seen = new HashSet<(TraceId Trace, ulong Span)>();
 
+        // Offers one span to a bounded top-K heap. `present` is the identity of what is IN that
+        // heap right now.
+        //
+        // A DUPLICATE MUST NOT COST A SLOT. The dedupe check used to happen on the way in
+        // (against `seen`) while the recording happened on the way out, so two copies of one
+        // (TraceId, SpanId) arriving inside a single tier or segment both entered the heap —
+        // neither was in `seen` yet — and together evicted a distinct older span to make room.
+        // The second copy was then discarded at the drain, and the tier yielded fewer than
+        // `limit` DISTINCT spans although more existed. Both duplicate sources are ordinary:
+        // UnflushedSpansLocked concatenates the hot tier with the in-flight flush snapshot, and
+        // a segment can hold spans a WAL replay put back.
+        //
+        // `present` is bounded by the heap it mirrors (at most `limit`), never by what was read
+        // — that is the unbounded growth 3fc5472 removed and it must not come back through here.
+        //
+        // RETURNS TRUE WHEN IT DROPPED A MATCH, which is the one thing a caller paging behind
+        // this scan has to be told. A tier that evicted has decided nothing about anything below
+        // the oldest span still in its heap, and a pager that is not told treats "the newest
+        // `limit`" as "all of them".
+        bool Admit(PriorityQueue<SpanRecord, long> top, HashSet<(TraceId Trace, ulong Span)> present, SpanRecord r)
+        {
+            var  id         = (r.TraceId, r.SpanId.RawValue);
+            bool identified = !r.SpanId.IsEmpty;
+
+            if (identified)
+            {
+                if (seen.Contains(id)) return false;   // already yielded by an earlier tier or segment
+                if (!present.Add(id))  return false;   // a second copy of something already in the heap
+            }
+
+            if (top.Count < limit) { top.Enqueue(r, r.StartTimeUnixNano); return false; }
+
+            if (!top.TryPeek(out _, out long oldestKept) || r.StartTimeUnixNano <= oldestKept)
+            {
+                // Too old to make the cut — take the identity back out, or `present` would
+                // outgrow the heap and start rejecting spans that are not in it.
+                if (identified) present.Remove(id);
+                return true;
+            }
+
+            var evicted = top.EnqueueDequeue(r, r.StartTimeUnixNano);
+            if (!evicted.SpanId.IsEmpty) present.Remove((evicted.TraceId, evicted.SpanId.RawValue));
+            return true;
+        }
+
         bool Match(SpanRecord s) =>
             s.StartTimeUnixNano >= fromNano &&
             s.StartTimeUnixNano <= toNano   &&
@@ -434,38 +493,91 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
 
         // Hot tier plus any in-flight flush snapshot (newest first), in ONE lock hold —
         // see GetTraceAsync for why the pair must not be read separately.
+        //
+        // Bounded top-K, exactly as the cold segment scan below: a min-heap on start time that
+        // evicts its oldest once full. The lock hold is what makes it matter here rather than
+        // just the allocation — `Where().OrderByDescending().Take(limit)` materialised an
+        // ordering buffer over every MATCH in a tier that holds ~100k spans and then sorted all
+        // of it to keep `limit`, all of it inside the READ lock that WriteSpan needs the write
+        // side of for every ingested span. The SSE list runs these searches back to back with
+        // no pacing — max/pageSize of them per stream — where the old client paced them by
+        // human scrolling, so the same per-page cost that was invisible now lands as a stall on
+        // the ingest path dozens of times per connection.
+        var hotTop     = new PriorityQueue<SpanRecord, long>();
+        var hotPresent = new HashSet<(TraceId Trace, ulong Span)>();
+        bool hotEvicted = false;
         _lock.EnterReadLock();
-        List<SpanRecord> candidates;
         try
         {
-            candidates = UnflushedSpansLocked()
-                .Where(Match)
-                .OrderByDescending(s => s.StartTimeUnixNano)
-                .Take(limit)
-                .ToList();
+            foreach (var s in UnflushedSpansLocked())
+            {
+                if (!Match(s)) continue;
+                hotEvicted |= Admit(hotTop, hotPresent, s);
+            }
         }
         finally
         {
             _lock.ExitReadLock();
         }
 
+        // The cold list, ordered ONCE and by index, because the floor below has to name the
+        // segment the walk stopped BEFORE — which `OrderByDescending` in a foreach cannot say.
+        // Sorted by MaxStartNano descending, so nothing in segments [i..] starts above
+        // ordered[i].MaxStartNano: that is the whole basis of the floor.
+        var ordered = (SpanSegmentInfo[])_coldSegments.Clone();
+        Array.Sort(ordered, static (a, b) => b.MaxStartNano.CompareTo(a.MaxStartNano));
+
+        bool Relevant(SpanSegmentInfo s) =>
+            s.MaxStartNano >= fromNano && s.MinStartNano <= toNano &&
+            (serviceName is null || s.Services.Length == 0 ||
+             Array.Exists(s.Services, x => x.Equals(serviceName, StringComparison.OrdinalIgnoreCase)));
+
+        // The highest start time a segment the walk never opened could still hold inside the
+        // window. Segments out of range, or without the requested service, are DECIDED rather
+        // than skipped — they provably hold nothing this call would have returned.
+        long UnvisitedCeiling(int fromIndex)
+        {
+            for (int j = fromIndex; j < ordered.Length; j++)
+                if (Relevant(ordered[j])) return Math.Min(ordered[j].MaxStartNano, toNano);
+            return long.MinValue;
+        }
+
+        // The heap drains oldest-first; the caller wants newest-first.
+        var candidates = new List<SpanRecord>(hotTop.Count);
+        while (hotTop.TryDequeue(out var kept, out _)) candidates.Add(kept);
+        candidates.Reverse();
+
+        // The tier held more matches than a page can carry, so everything below the oldest one
+        // it kept is undecided — including spans the cold walk will never be reached to read.
+        if (hotEvicted && candidates.Count > 0)
+            scanFloor?.StoppedAbove(candidates[^1].StartTimeUnixNano);
+
         foreach (var r in candidates)
         {
             if (!r.SpanId.IsEmpty && !seen.Add((r.TraceId, r.SpanId.RawValue))) continue;
-            if (yielded++ >= limit) yield break;
+            if (yielded >= limit)
+            {
+                // Stopped ON this span: everything strictly above it was handed over, it was not.
+                scanFloor?.StoppedAbove(r.StartTimeUnixNano);
+                scanFloor?.StoppedAbove(UnvisitedCeiling(0));
+                yield break;
+            }
+            yielded++;
             yield return r;
         }
 
-        if (yielded >= limit) yield break;
+        if (yielded >= limit)
+        {
+            // The page filled exactly at the end of the tier — every cold segment is unread.
+            scanFloor?.StoppedAbove(UnvisitedCeiling(0));
+            yield break;
+        }
 
         // Cold tier — segment-level service pre-filter, then block-level skip inside SpanReader
-        foreach (var seg in _coldSegments.OrderByDescending(s => s.MaxStartNano))
+        for (int i = 0; i < ordered.Length; i++)
         {
-            if (seg.MaxStartNano < fromNano || seg.MinStartNano > toNano) continue;
-            // Skip entire segment if it doesn't contain the requested service
-            if (serviceName is not null && seg.Services.Length > 0 &&
-                !Array.Exists(seg.Services, s => s.Equals(serviceName, StringComparison.OrdinalIgnoreCase)))
-                continue;
+            var seg = ordered[i];
+            if (!Relevant(seg)) continue;
 
             ct.ThrowIfCancellationRequested();
 
@@ -487,7 +599,10 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             // Only the newest `limit` of this segment can ever be yielded, so that is all
             // this keeps: a min-heap on start time, evicting its oldest once full. Memory
             // is O(limit) again — the ordering the fix was for, without the buffer it cost.
-            var top = new PriorityQueue<SpanRecord, long>();
+            var top      = new PriorityQueue<SpanRecord, long>();
+            var present  = new HashSet<(TraceId Trace, ulong Span)>();
+            bool evicted = false;
+            bool partial = false;
             await using var e = SpanReader.SearchAsync(
                 seg.FilePath, fromNano, toNano,
                 serviceName, spanName, status, httpStatusCode,
@@ -501,21 +616,19 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                     r = e.Current;
                 }
                 catch (OperationCanceledException) { throw; }
-                catch (FileNotFoundException) { RemoveColdSegment(seg); break; }
+                catch (FileNotFoundException) { RemoveColdSegment(seg); partial = true; break; }
                 catch (Exception ex)
                 {
                     _logger.LogWarning(ex, "Span search: skipping unreadable segment {File}", seg.FilePath);
+                    partial = true;
                     break;
                 }
-                // Checked here, ADDED at the yield below: a span that loses its place in the
-                // heap is never returned, and recording it would grow `seen` with the match
-                // count rather than with the result — the same unbounded growth in the other
-                // structure.
-                if (!r.SpanId.IsEmpty && seen.Contains((r.TraceId, r.SpanId.RawValue))) continue;
-
-                if (top.Count < limit) top.Enqueue(r, r.StartTimeUnixNano);
-                else if (top.TryPeek(out _, out long oldestKept) && r.StartTimeUnixNano > oldestKept)
-                    top.EnqueueDequeue(r, r.StartTimeUnixNano);
+                // `seen` is still ADDED to at the yield below, never here: a span that loses its
+                // place in the heap is never returned, and recording it would grow `seen` with
+                // the match count rather than with the result — the same unbounded growth in the
+                // other structure. Duplicates within THIS segment are held off by `present`,
+                // which is bounded by the heap; see Admit.
+                evicted |= Admit(top, present, r);
             }
 
             // The heap drains oldest-first; the caller wants newest-first.
@@ -523,11 +636,30 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             while (top.TryDequeue(out var kept, out _)) segMatches.Add(kept);
             segMatches.Reverse();
 
+            // A file that vanished or would not parse was abandoned part-read, so nothing in it
+            // was decided. Reported as truncation rather than swallowed: results missing because
+            // a segment is corrupt are still results missing.
+            if (partial) scanFloor?.StoppedAbove(Math.Min(seg.MaxStartNano, toNano));
+            else if (evicted && segMatches.Count > 0)
+                scanFloor?.StoppedAbove(segMatches[^1].StartTimeUnixNano);
+
             foreach (var r in segMatches)
             {
                 if (!r.SpanId.IsEmpty && !seen.Add((r.TraceId, r.SpanId.RawValue))) continue;
-                if (yielded++ >= limit) yield break;
+                if (yielded >= limit)
+                {
+                    scanFloor?.StoppedAbove(r.StartTimeUnixNano);
+                    scanFloor?.StoppedAbove(UnvisitedCeiling(i + 1));
+                    yield break;
+                }
+                yielded++;
                 yield return r;
+            }
+
+            if (yielded >= limit)
+            {
+                scanFloor?.StoppedAbove(UnvisitedCeiling(i + 1));
+                yield break;
             }
         }
     }
@@ -1273,7 +1405,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// (no span deserialisation); the hot tier is grouped live. Traces are merged by id across
     /// tiers, then the cheap filters are applied and the newest <paramref name="limit"/> kept.
     /// </summary>
-    public async Task<IReadOnlyList<TraceSummary>> GetTraceListAsync(
+    public async Task<TraceListPage> GetTraceListAsync(
         DateTimeOffset   from,
         DateTimeOffset   to,
         string?          serviceName,
@@ -1284,6 +1416,8 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         int              limit,
         CancellationToken ct = default)
     {
+        _beforeTraceListScan?.Invoke(ct);
+
         long fromNano = from.ToUnixTimeMilliseconds() * 1_000_000L;
         long toNano   = to.ToUnixTimeMilliseconds()   * 1_000_000L;
         int  scanCap  = Math.Max(limit * 5, 500);
@@ -1308,13 +1442,60 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
 
         // Cold — newest-first. .tracesum bodies where present, else legacy span read.
         Array.Sort(segs, static (a, b) => b.MaxStartNano.CompareTo(a.MaxStartNano));
-        foreach (var seg in segs)
+
+        // WHERE THE WALK STOPPED — never a minimum over what it merged, and the difference is
+        // the whole finding. Cold segments OVERLAP in time, so one WIDE segment walked first
+        // (it sorts first: the order is by MaxStartNano) can trip the cap all by itself while a
+        // NARROWER segment nested entirely inside its range is still unread. The wide segment's
+        // own oldest row is then far below anything the walk actually decided about, and a
+        // caller paging to it lands UNDER the nested segment — where `MinStartNano > toNano`
+        // skips it on this page and on every later one, permanently.
+        //
+        // The sound statement is the one the walk can actually make: the list is ordered by
+        // MaxStartNano DESCENDING, so nothing in an unvisited segment starts above the FIRST
+        // unvisited segment's MaxStartNano. Everything strictly above that was examined.
+        long scanFloor = long.MinValue;
+        bool visitedAny = false;
+
+        for (int i = 0; i < segs.Length; i++)
         {
-            if (merged.Count >= scanCap) break;
+            var seg = segs[i];
+
+            // Both skips come BEFORE the cap test on purpose. A segment holding nothing in
+            // [from, to], or provably nothing for this service, is DECIDED rather than skipped
+            // — walking past it costs two comparisons and leaves nothing owed. Testing the cap
+            // first (as this loop used to) stopped on whichever segment happened to come next,
+            // so "the walk was capped" could be recorded over a segment that was irrelevant
+            // anyway, and the floor derived from it claimed less than the walk had earned.
             if (seg.MaxStartNano < fromNano || seg.MinStartNano > toNano) continue;
+            // NOTE: this treats "the segment does not list the service" as "holds nothing this
+            // query wants", which is exactly what the ROWS below already assume — a trace whose
+            // only spans in the window live in a service-skipped segment is invisible to this
+            // method with or without a floor. The floor is therefore precisely as sound as the
+            // page it describes, which is the property that matters to a pager.
             if (serviceName is not null && seg.Services.Length > 0 &&
                 !Array.Exists(seg.Services, x => x.Equals(serviceName, StringComparison.OrdinalIgnoreCase)))
                 continue;
+
+            // Out of room, with a segment in front of us that had something to contribute.
+            // Clamped to `to` because nothing above the window's own ceiling is at stake.
+            //
+            // `visitedAny` buys the caller FORWARD PROGRESS, and it is not an optimisation. The
+            // hot tier is merged before this loop and is not subject to the cap, so on a busy
+            // server it can fill the budget by itself — and then the very first cold segment
+            // trips this break untouched. Its MaxStartNano is at or above the window ceiling
+            // (it is the newest segment), the floor clamps to `to`, and a pager whose cursor is
+            // already `to` cannot move: one page of hot rows and a truthful but useless "these
+            // results are truncated" over a month of cold data nobody looked at. Reading one
+            // segment costs one segment's worth of summaries — bounded, and the same order as
+            // the budget itself — and it puts the floor below the hot tier where the cursor can
+            // get a grip.
+            if (visitedAny && merged.Count >= scanCap)
+            {
+                scanFloor = Math.Min(seg.MaxStartNano, toNano);
+                break;
+            }
+            visitedAny = true;
 
             ct.ThrowIfCancellationRequested();
 
@@ -1350,9 +1531,25 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         }
 
         list.Sort(static (a, b) => b.RootStartNano.CompareTo(a.RootStartNano));
-        if (list.Count > limit) list.RemoveRange(limit, list.Count - limit);
 
-        return list;
+        if (list.Count > limit)
+        {
+            // The `limit` cut is a SECOND place this call stopped short, and floors compose by
+            // MAXIMUM: each names a height above which everything was dealt with, so the highest
+            // is the only one all the others sit below. Rows under the cut were merged and then
+            // thrown away without ever being handed to the caller, so this page cannot claim to
+            // speak for them — claiming otherwise is how a caller that post-filters what it gets
+            // back (the endpoint's ?httpStatus=) would page straight past matches it never saw.
+            scanFloor = Math.Max(scanFloor, list[Math.Max(0, limit - 1)].RootStartNano);
+            list.RemoveRange(limit, list.Count - limit);
+        }
+
+        // CAPPED and "there is a floor" are the same statement, so they are computed once from
+        // one another. A floor above long.MinValue is exactly a region of [from, to] this page
+        // does not speak for; no floor is exactly "the window was read out". Deriving one from
+        // the other is what stops a caller ever seeing the contradictory pair — capped, no rows,
+        // and a floor claiming nothing is left — which has no honest ending at all.
+        return new TraceListPage(list, scanFloor != long.MinValue, scanFloor);
     }
 
     private static MergedTrace GetOrAdd(Dictionary<TraceId, MergedTrace> merged, TraceId id)

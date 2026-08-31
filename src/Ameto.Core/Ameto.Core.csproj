@@ -8,6 +8,10 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- NO <FrameworkReference Include="Microsoft.AspNetCore.App" /> here. It is transitive:
+         it lands in the runtimeconfig.json of every console tool that links Core (tools/loggen),
+         which then refuses to start on a host that has only the .NET runtime installed.
+         SseJsonWriter lives here and takes a Stream for exactly that reason. -->
     <PackageReference Include="MessagePack" Version="3.1.7" />
     <PackageReference Include="MessagePack.Annotations" Version="3.1.7" />
   </ItemGroup>
