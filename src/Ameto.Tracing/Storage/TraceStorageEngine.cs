@@ -417,7 +417,9 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         int yielded = 0;
 
         // Same duplicate sources as GetTraceAsync, but results here cross traces, so the
-        // identity is the pair. Bounded by `limit`, which also bounds this set.
+        // identity is the pair. Every Add below sits on a path that yields, so this stays
+        // bounded by `limit` — recording spans that were merely READ would put the match
+        // count back into memory through this set after the segment buffer stopped doing it.
         var seen = new HashSet<(TraceId Trace, ulong Span)>();
 
         bool Match(SpanRecord s) =>
@@ -469,13 +471,23 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
 
             // Manual enumeration so a segment deleted/corrupted mid-scan skips the
             // segment (yield inside try-catch is not allowed by the language).
-            // Buffer the segment's matches and sort them newest-first BEFORE the cap bites.
             // A segment's file is written oldest-first, so streaming it under a global span
             // cap kept the OLD side of whichever segment the cap landed in and dropped its
             // new side — the caller then sorted and truncated an already old-shifted pool,
-            // and its "newest page" quietly was not. The buffer holds only this segment's
-            // MATCHES (range plus every pushed-down filter), not the segment.
-            var segMatches = new List<SpanRecord>();
+            // and its "newest page" quietly was not.
+            //
+            // Fixed by ordering, but the first version of that fix buffered EVERY match in
+            // the segment before yielding any — and a month-wide query on a busy service
+            // matches far more than a page. A SpanRecord carries two strings and, whenever
+            // the query touches an attribute (`.db.system = "mssql"`), a decoded attribute
+            // dictionary: on the order of a kilobyte each. Several hundred thousand matches
+            // is therefore several hundred megabytes, and a 512 MB server died on exactly
+            // that shape of query.
+            //
+            // Only the newest `limit` of this segment can ever be yielded, so that is all
+            // this keeps: a min-heap on start time, evicting its oldest once full. Memory
+            // is O(limit) again — the ordering the fix was for, without the buffer it cost.
+            var top = new PriorityQueue<SpanRecord, long>();
             await using var e = SpanReader.SearchAsync(
                 seg.FilePath, fromNano, toNano,
                 serviceName, spanName, status, httpStatusCode,
@@ -495,13 +507,25 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                     _logger.LogWarning(ex, "Span search: skipping unreadable segment {File}", seg.FilePath);
                     break;
                 }
-                if (!r.SpanId.IsEmpty && !seen.Add((r.TraceId, r.SpanId.RawValue))) continue;
-                segMatches.Add(r);
+                // Checked here, ADDED at the yield below: a span that loses its place in the
+                // heap is never returned, and recording it would grow `seen` with the match
+                // count rather than with the result — the same unbounded growth in the other
+                // structure.
+                if (!r.SpanId.IsEmpty && seen.Contains((r.TraceId, r.SpanId.RawValue))) continue;
+
+                if (top.Count < limit) top.Enqueue(r, r.StartTimeUnixNano);
+                else if (top.TryPeek(out _, out long oldestKept) && r.StartTimeUnixNano > oldestKept)
+                    top.EnqueueDequeue(r, r.StartTimeUnixNano);
             }
 
-            segMatches.Sort(static (a, b) => b.StartTimeUnixNano.CompareTo(a.StartTimeUnixNano));
+            // The heap drains oldest-first; the caller wants newest-first.
+            var segMatches = new List<SpanRecord>(top.Count);
+            while (top.TryDequeue(out var kept, out _)) segMatches.Add(kept);
+            segMatches.Reverse();
+
             foreach (var r in segMatches)
             {
+                if (!r.SpanId.IsEmpty && !seen.Add((r.TraceId, r.SpanId.RawValue))) continue;
                 if (yielded++ >= limit) yield break;
                 yield return r;
             }
