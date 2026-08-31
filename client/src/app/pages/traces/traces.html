@@ -303,6 +303,16 @@
               </div>
             </div>
           }
+
+          @if (hasMore()) {
+            <div class="load-more" #loadMoreSentinel>
+              @if (loadingMore()) {
+                <lucide-icon name="loader" [size]="14" class="spin" />
+              } @else {
+                <button class="load-more-btn" (click)="loadMore()">Load more</button>
+              }
+            </div>
+          }
         </div>
       }
     </div>

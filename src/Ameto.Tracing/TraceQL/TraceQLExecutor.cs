@@ -149,15 +149,17 @@ public static class TraceQLExecutor
             list.Add(s);
         }
 
-        var result = new List<TraceRowDto>(Math.Min(limit, traces.Count));
+        var result = new List<TraceRowDto>(traces.Count);
         foreach (var (_, traceSpans) in traces)
-        {
-            if (result.Count >= limit) break;
             result.Add(BuildRow(traceSpans));
-        }
 
-        // Sort newest-first
+        // Sort newest-first BEFORE truncating. The old order — take the first `limit` traces
+        // in dictionary-encounter order, then sort — returned a page whose oldest row was the
+        // boundary of nothing: encounter order is only roughly newest-first (grouping by trace
+        // shuffles it), so a caller paging on "everything older than my oldest row" skipped
+        // real traces, and the visible page itself was not the newest `limit` it claimed to be.
         result.Sort(static (a, b) => b.StartTimeUnixNano.CompareTo(a.StartTimeUnixNano));
+        if (result.Count > limit) result.RemoveRange(limit, result.Count - limit);
         return result;
     }
 

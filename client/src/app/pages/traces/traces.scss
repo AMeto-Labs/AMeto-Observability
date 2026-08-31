@@ -1731,3 +1731,23 @@
   text-align: right;
   color: var(--text-muted);
 }
+
+// ── Load more (pagination sentinel at the bottom of the trace list) ────────
+.load-more {
+  display: flex;
+  justify-content: center;
+  padding: 10px 0 14px;
+  color: var(--text-dim);
+}
+
+.load-more-btn {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-dim);
+  font-size: 11px;
+  padding: 4px 14px;
+  cursor: pointer;
+
+  &:hover { color: var(--text); border-color: var(--text-dim); }
+}

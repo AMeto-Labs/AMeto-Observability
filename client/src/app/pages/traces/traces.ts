@@ -1,6 +1,6 @@
 import {
-  Component, signal, computed, inject, OnInit, OnDestroy, HostListener,
-  ChangeDetectionStrategy, ChangeDetectorRef,
+  Component, signal, computed, effect, inject, viewChild, ElementRef, OnInit, OnDestroy,
+  HostListener, ChangeDetectionStrategy, ChangeDetectorRef,
 } from '@angular/core';
 import { Router, ActivatedRoute } from '@angular/router';
 import { FormsModule } from '@angular/forms';
@@ -9,7 +9,7 @@ import { format } from 'date-fns';
 import { ApiService } from '../../core/services/api.service';
 import { serviceColor } from '../../shared/utils/service-color';
 import { EventDto } from '../../core/models/event.model';
-import { SpanDto, TraceRowDto, TraceStatsDto } from '../../core/models/span.model';
+import { SpanDto, SpanQueryParams, TraceRowDto, TraceStatsDto } from '../../core/models/span.model';
 import { subHours, formatISO } from 'date-fns';
 import { ServiceGraphComponent } from './service-graph/service-graph';
 import { FlamegraphComponent } from './flame-graph/flame-graph';
@@ -127,6 +127,43 @@ export class TracesComponent implements OnInit, OnDestroy {
   historyOpen = signal(false);
 
   private _poll: ReturnType<typeof setInterval> | null = null;
+  private _io: IntersectionObserver | null = null;
+  private readonly loadMoreSentinel = viewChild<ElementRef<HTMLElement>>('loadMoreSentinel');
+
+  constructor() {
+    // The sentinel lives under an @if, so it appears and disappears with hasMore; the
+    // effect re-observes whichever element currently exists. rootMargin starts the fetch
+    // a screen early, so scrolling feels continuous rather than stop-and-wait.
+    effect(() => {
+      const el = this.loadMoreSentinel()?.nativeElement;
+      this._io?.disconnect();
+      if (!el) return;
+      this._io ??= null;
+      this._io = new IntersectionObserver(
+        entries => { if (entries.some(e => e.isIntersecting)) this.loadMore(); },
+        { rootMargin: '400px' });
+      this._io.observe(el);
+    });
+  }
+
+  // ── Pagination ────────────────────────────────────────────────────────────
+  // A search shows the NEWEST page of its window, so widening 1 h → 24 h without paging
+  // shows the SAME rows whenever the newest hour already fills the page — which reads as
+  // "the range does nothing". These drive the load-more sentinel at the list's bottom.
+  readonly hasMore     = signal(false);
+  readonly loadingMore = signal(false);
+  private static readonly QlPageSize     = 200;
+  private static readonly FilterPageSize = 500;
+  /** The query a continuation must repeat — frozen at run time, so edits to the inputs
+   *  after a search do not silently change what "more of the same" means. */
+  private pageCtx:
+    | { mode: 'ql'; ql: string; from: string }
+    | { mode: 'filter'; params: SpanQueryParams }
+    | null = null;
+  /** True once the list holds more than the first page; the live poll then leaves the
+   *  list alone — a refresh that replaced it with page one would throw away everything
+   *  the user scrolled to. A fresh explicit search resets it. */
+  private paginated = false;
   /** Refresh immediately when the tab is re-shown after being hidden. */
   private _onVisibility = () => { if (!document.hidden) this.poll(); };
 
@@ -202,7 +239,50 @@ export class TracesComponent implements OnInit, OnDestroy {
     const from = this.fromIso();
     const to   = this.toIso();
     this.loadStats(from, to);
-    if (this.activeMainTab === 'traces') this.loadTraces(from, to);
+    // A paginated list is the user's scroll position made of data; the poll replacing it
+    // with page one would discard every loaded page mid-read. They get fresh rows on the
+    // next explicit search — which also re-arms the poll.
+    if (this.activeMainTab === 'traces' && !this.paginated) this.loadTraces(from, to);
+  }
+
+  /**
+   * Fetches the next page of the CURRENT search — the frozen one in pageCtx, not whatever
+   * the inputs say now — as everything strictly older than the oldest loaded row. Keyset
+   * continuation on start time; the 1 ms cursor overlap that nano→ms truncation can cause
+   * is closed by the traceId dedupe on append.
+   */
+  loadMore(): void {
+    const ctx = this.pageCtx;
+    if (!ctx || this.loadingMore() || this.loading() || !this.hasMore()) return;
+    const rows = this.traces();
+    if (rows.length === 0) { this.hasMore.set(false); return; }
+
+    let oldest = rows[0].startTimeUnixNano;
+    for (const r of rows) if (r.startTimeUnixNano < oldest) oldest = r.startTimeUnixNano;
+    const to = new Date(Math.floor(oldest / 1_000_000) - 1).toISOString();
+
+    const pageSize = ctx.mode === 'ql' ? TracesComponent.QlPageSize : TracesComponent.FilterPageSize;
+    const request  = ctx.mode === 'ql'
+      ? this.api.queryTraces({ query: ctx.ql, from: ctx.from, to, limit: pageSize })
+      : this.api.searchTraces({ ...ctx.params, to });
+
+    this.loadingMore.set(true);
+    request.subscribe({
+      next: page => {
+        const known = new Set(this.traces().map(r => r.traceId));
+        const fresh = page.filter(r => !known.has(r.traceId));
+        if (fresh.length) {
+          this.traces.update(t => [...t, ...fresh]);
+          this.paginated = true;
+        }
+        // A full page means the window probably holds more; a short one means we reached
+        // the range's far edge. A page of pure duplicates also stops — retrying the same
+        // cursor forever is the only other option, and it is not a good one.
+        this.hasMore.set(page.length >= pageSize && fresh.length > 0);
+        this.loadingMore.set(false); this.cdr.markForCheck();
+      },
+      error: () => { this.loadingMore.set(false); this.cdr.markForCheck(); },
+    });
   }
 
   private loadAllServices() {
@@ -322,6 +402,7 @@ export class TracesComponent implements OnInit, OnDestroy {
   }
 
   ngOnDestroy() {
+    this._io?.disconnect();
     if (this._poll) clearInterval(this._poll);
     document.removeEventListener('visibilitychange', this._onVisibility);
   }
@@ -348,7 +429,7 @@ export class TracesComponent implements OnInit, OnDestroy {
       return;
     }
     this.loading.set(true);
-    this.api.searchTraces({
+    const params: SpanQueryParams = {
       from,
       to,
       service:        this.filterService        || undefined,
@@ -357,9 +438,16 @@ export class TracesComponent implements OnInit, OnDestroy {
       minDurationMs:  this.filterMinDurationMs  ?? undefined,
       maxDurationMs:  this.filterMaxDurationMs  ?? undefined,
       httpStatus:     this.filterHttpStatus     || undefined,
-      limit:          500,
-    }).subscribe({
-      next: rows => { this.traces.set(rows); this.loading.set(false); this.cdr.markForCheck(); },
+      limit:          TracesComponent.FilterPageSize,
+    };
+    this.api.searchTraces(params).subscribe({
+      next: rows => {
+        this.traces.set(rows);
+        this.paginated = false;
+        this.pageCtx   = { mode: 'filter', params };
+        this.hasMore.set(rows.length >= TracesComponent.FilterPageSize);
+        this.loading.set(false); this.cdr.markForCheck();
+      },
       error: () =>  { this.loading.set(false); this.cdr.markForCheck(); },
     });
   }
@@ -370,8 +458,15 @@ export class TracesComponent implements OnInit, OnDestroy {
     this.syncUrl();
     this.loading.set(true);
     this.traceqlError.set('');
-    this.api.queryTraces({ query: q, from: this.fromIso(), limit: 200 }).subscribe({
-      next: rows => { this.traces.set(rows); this.loading.set(false); this.cdr.markForCheck(); },
+    const from = this.fromIso();
+    this.api.queryTraces({ query: q, from, limit: TracesComponent.QlPageSize }).subscribe({
+      next: rows => {
+        this.traces.set(rows);
+        this.paginated = false;
+        this.pageCtx   = { mode: 'ql', ql: q, from };
+        this.hasMore.set(rows.length >= TracesComponent.QlPageSize);
+        this.loading.set(false); this.cdr.markForCheck();
+      },
       error: (err) => {
         this.loading.set(false);
         this.traceqlError.set(err?.error?.message ?? 'Query error');
