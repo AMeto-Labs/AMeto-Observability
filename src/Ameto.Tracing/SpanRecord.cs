@@ -16,6 +16,17 @@ public readonly struct TraceId : IEquatable<TraceId>
 
     public bool IsEmpty => _hi == 0 && _lo == 0;
 
+    /// <summary>
+    /// A total order over trace ids. The ordering itself means nothing — it exists so a
+    /// sort that ties on timestamp has a deterministic winner, which is what keeps a
+    /// paginated boundary stable from one page request to the next.
+    /// </summary>
+    public int CompareTo(TraceId other)
+    {
+        int byHi = _hi.CompareTo(other._hi);
+        return byHi != 0 ? byHi : _lo.CompareTo(other._lo);
+    }
+
     public static TraceId Parse(ReadOnlySpan<byte> bytes)
     {
         if (bytes.Length < 16) return default;

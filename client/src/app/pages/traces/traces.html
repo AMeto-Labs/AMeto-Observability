@@ -303,6 +303,20 @@
               </div>
             </div>
           }
+
+          @if (hasMore()) {
+            <div class="load-more" #loadMoreSentinel>
+              @if (loadingMore()) {
+                <lucide-icon name="loader" [size]="14" class="spin" />
+              } @else {
+                <button class="load-more-btn" (click)="loadMore()">Load more</button>
+              }
+            </div>
+          } @else if (loadCapped()) {
+            <div class="load-more load-capped">
+              Showing the newest {{ traces().length }} — narrow the range or the query to see older traces
+            </div>
+          }
         </div>
       }
     </div>

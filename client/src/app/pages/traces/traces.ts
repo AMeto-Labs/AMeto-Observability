@@ -1,7 +1,8 @@
 import {
-  Component, signal, computed, inject, OnInit, OnDestroy, HostListener,
-  ChangeDetectionStrategy, ChangeDetectorRef,
+  Component, signal, computed, effect, inject, viewChild, DestroyRef, ElementRef, OnInit,
+  OnDestroy, HostListener, ChangeDetectionStrategy, ChangeDetectorRef,
 } from '@angular/core';
+import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { Router, ActivatedRoute } from '@angular/router';
 import { FormsModule } from '@angular/forms';
 import { LucideAngularModule } from 'lucide-angular';
@@ -9,7 +10,7 @@ import { format } from 'date-fns';
 import { ApiService } from '../../core/services/api.service';
 import { serviceColor } from '../../shared/utils/service-color';
 import { EventDto } from '../../core/models/event.model';
-import { SpanDto, TraceRowDto, TraceStatsDto } from '../../core/models/span.model';
+import { SpanDto, SpanQueryParams, TraceRowDto, TraceStatsDto } from '../../core/models/span.model';
 import { subHours, formatISO } from 'date-fns';
 import { ServiceGraphComponent } from './service-graph/service-graph';
 import { FlamegraphComponent } from './flame-graph/flame-graph';
@@ -127,6 +128,60 @@ export class TracesComponent implements OnInit, OnDestroy {
   historyOpen = signal(false);
 
   private _poll: ReturnType<typeof setInterval> | null = null;
+  private _io: IntersectionObserver | null = null;
+  private readonly loadMoreSentinel = viewChild<ElementRef<HTMLElement>>('loadMoreSentinel');
+
+  constructor() {
+    // The sentinel lives under an @if, so it appears and disappears with hasMore; the
+    // effect re-observes whichever element currently exists. rootMargin starts the fetch
+    // a screen early, so scrolling feels continuous rather than stop-and-wait.
+    effect(() => {
+      const el = this.loadMoreSentinel()?.nativeElement;
+      this._io?.disconnect();
+      if (!el) return;
+      this._io ??= null;
+      // root must be the element that actually scrolls (.trace-rows, overflow-y: auto):
+      // with the default viewport root, the clipping ancestor trims the sentinel to its
+      // own UNexpanded bounds before rootMargin is even considered, so the "fetch a
+      // screen early" margin quietly did nothing.
+      this._io = new IntersectionObserver(
+        entries => { if (entries.some(e => e.isIntersecting)) this.loadMore(); },
+        { root: el.closest('.trace-rows'), rootMargin: '400px' });
+      this._io.observe(el);
+    });
+  }
+
+  // ── Pagination ────────────────────────────────────────────────────────────
+  // A search shows the NEWEST page of its window, so widening 1 h → 24 h without paging
+  // shows the SAME rows whenever the newest hour already fills the page — which reads as
+  // "the range does nothing". These drive the load-more sentinel at the list's bottom.
+  readonly hasMore     = signal(false);
+  readonly loadingMore = signal(false);
+  private static readonly QlPageSize     = 200;
+  private static readonly FilterPageSize = 500;
+  /** The query a continuation must repeat — frozen at run time, so edits to the inputs
+   *  after a search do not silently change what "more of the same" means. */
+  private pageCtx:
+    | { mode: 'ql'; ql: string; from: string }
+    | { mode: 'filter'; params: SpanQueryParams }
+    | null = null;
+  /** True once the list holds more than the first page; the live poll then leaves the
+   *  list alone — a refresh that replaced it with page one would throw away everything
+   *  the user scrolled to. A fresh explicit search resets it. */
+  private paginated = false;
+  /** Bumped by every fresh search; every response carries the epoch it was sent under and
+   *  is dropped if the world moved on — a slow page 2 of an abandoned search must not
+   *  splice itself into the list of the search that replaced it, and a slow FIRST page
+   *  must not overwrite the results of the search issued after it. */
+  private queryEpoch = 0;
+  /** TraceIds already in the list — kept incrementally: rebuilt from scratch per page it
+   *  made every scroll step pay for the whole history. Reset by every fresh search. */
+  private knownIds = new Set<string>();
+  /** The old flat 200/500 cap bounded list, DOM and memory; paging removed it, this puts
+   *  an explicit ceiling back. The sentinel says so when it is reached. */
+  private static readonly MaxLoadedRows = 2000;
+  readonly loadCapped = signal(false);
+  private destroyRef = inject(DestroyRef);
   /** Refresh immediately when the tab is re-shown after being hidden. */
   private _onVisibility = () => { if (!document.hidden) this.poll(); };
 
@@ -202,7 +257,77 @@ export class TracesComponent implements OnInit, OnDestroy {
     const from = this.fromIso();
     const to   = this.toIso();
     this.loadStats(from, to);
-    if (this.activeMainTab === 'traces') this.loadTraces(from, to);
+    // A paginated list is the user's scroll position made of data; the poll replacing it
+    // with page one would discard every loaded page mid-read. loadingMore() covers the
+    // window where page two is REQUESTED but not yet landed — paginated only flips on
+    // arrival, and a poll firing inside that window raced the append with a full replace.
+    // They get fresh rows on the next explicit search — which also re-arms the poll.
+    if (this.activeMainTab === 'traces' && !this.paginated && !this.loadingMore())
+      this.loadTraces(from, to);
+  }
+
+  /**
+   * Fetches the next page of the CURRENT search — the frozen one in pageCtx, not whatever
+   * the inputs say now — as everything strictly older than the oldest loaded row. Keyset
+   * continuation on start time; the 1 ms cursor overlap that nano→ms truncation can cause
+   * is closed by the traceId dedupe on append.
+   */
+  loadMore(): void {
+    const ctx = this.pageCtx;
+    if (!ctx || this.loadingMore() || this.loading() || !this.hasMore()) return;
+    const rows = this.traces();
+    if (rows.length === 0) { this.hasMore.set(false); return; }
+
+    // Pages arrive sorted newest-first and strictly older than what preceded them, so the
+    // oldest loaded row is always the last one — no scan.
+    //
+    // The cursor rounds UP to the enclosing millisecond, with no decrement. The previous
+    // form — floor minus one — did not create the "safe overlap" its comment promised; it
+    // created a 1-2 ms HOLE: a trace at ...122.5 ms sat strictly between the cursor
+    // (...122 ms) and the oldest loaded row (...123.9 ms), was excluded by the server's
+    // <= comparison, and could never be reached by any later page either, because every
+    // later cursor derives from what actually loaded. Rounding up makes the boundary
+    // millisecond overlap instead — and overlap is the failure mode the traceId dedupe
+    // below genuinely handles.
+    const oldest = rows[rows.length - 1].startTimeUnixNano;
+    const to = new Date(Math.ceil(oldest / 1_000_000)).toISOString();
+
+    const pageSize = ctx.mode === 'ql' ? TracesComponent.QlPageSize : TracesComponent.FilterPageSize;
+    const request  = ctx.mode === 'ql'
+      ? this.api.queryTraces({ query: ctx.ql, from: ctx.from, to, limit: pageSize })
+      : this.api.searchTraces({ ...ctx.params, to });
+
+    const epoch = this.queryEpoch;   // the search this continuation belongs to
+    this.loadingMore.set(true);
+    request.pipe(takeUntilDestroyed(this.destroyRef)).subscribe({
+      next: page => {
+        // A fresh search may have replaced the list while this page was in flight; its
+        // rows belong to a world that no longer exists on screen. Appending them would
+        // silently interleave two different searches in one list.
+        if (epoch !== this.queryEpoch) return;
+
+        const fresh = page.filter(r => !this.knownIds.has(r.traceId));
+        if (fresh.length) {
+          for (const r of fresh) this.knownIds.add(r.traceId);
+          this.traces.update(t => [...t, ...fresh]);
+          this.paginated = true;
+        }
+
+        // A full page means the window probably holds more; a short one means we reached
+        // the range's far edge. A page of pure duplicates also stops — retrying the same
+        // cursor forever is the only other option, and it is not a good one. And the
+        // explicit ceiling stops the list from growing without bound: the flat cap this
+        // feature removed was also the only thing bounding DOM and memory.
+        const capped = this.traces().length >= TracesComponent.MaxLoadedRows;
+        this.loadCapped.set(capped);
+        this.hasMore.set(!capped && page.length >= pageSize && fresh.length > 0);
+        this.loadingMore.set(false); this.cdr.markForCheck();
+      },
+      error: () => {
+        if (epoch !== this.queryEpoch) return;
+        this.loadingMore.set(false); this.cdr.markForCheck();
+      },
+    });
   }
 
   private loadAllServices() {
@@ -274,8 +399,12 @@ export class TracesComponent implements OnInit, OnDestroy {
   setMainTab(tab: 'traces' | 'graph' | 'latency' | 'compare') {
     this.activeMainTab = tab;
     this.syncUrl();
-    // Returning to the list refreshes it (polling leaves it alone while off-screen).
-    if (tab === 'traces') this.loadTraces(this.fromIso(), this.toIso());
+    // Returning to the list refreshes it (polling leaves it alone while off-screen) —
+    // unless the user has paged it deeper: a glance at Service Graph and back must not
+    // throw away three pages of scroll position, for exactly the reason the poll holds
+    // off. The list they left is still there; a fresh search is one click away.
+    if (tab === 'traces' && !this.paginated && !this.loadingMore())
+      this.loadTraces(this.fromIso(), this.toIso());
   }
 
   setTraceTab(tab: 'timeline' | 'flamegraph' | 'details') {
@@ -322,6 +451,7 @@ export class TracesComponent implements OnInit, OnDestroy {
   }
 
   ngOnDestroy() {
+    this._io?.disconnect();
     if (this._poll) clearInterval(this._poll);
     document.removeEventListener('visibilitychange', this._onVisibility);
   }
@@ -348,7 +478,8 @@ export class TracesComponent implements OnInit, OnDestroy {
       return;
     }
     this.loading.set(true);
-    this.api.searchTraces({
+    const epoch = ++this.queryEpoch;
+    const params: SpanQueryParams = {
       from,
       to,
       service:        this.filterService        || undefined,
@@ -357,11 +488,26 @@ export class TracesComponent implements OnInit, OnDestroy {
       minDurationMs:  this.filterMinDurationMs  ?? undefined,
       maxDurationMs:  this.filterMaxDurationMs  ?? undefined,
       httpStatus:     this.filterHttpStatus     || undefined,
-      limit:          500,
-    }).subscribe({
-      next: rows => { this.traces.set(rows); this.loading.set(false); this.cdr.markForCheck(); },
-      error: () =>  { this.loading.set(false); this.cdr.markForCheck(); },
+      limit:          TracesComponent.FilterPageSize,
+    };
+    this.api.searchTraces(params).pipe(takeUntilDestroyed(this.destroyRef)).subscribe({
+      next: rows => {
+        if (epoch !== this.queryEpoch) return;   // a newer search owns the list now
+        this.beginFirstPage(rows, { mode: 'filter', params }, TracesComponent.FilterPageSize);
+      },
+      error: () =>  { if (epoch === this.queryEpoch) { this.loading.set(false); this.cdr.markForCheck(); } },
     });
+  }
+
+  /** The one way a fresh search takes over the list: page one in, pagination state reset. */
+  private beginFirstPage(rows: TraceRowDto[], ctx: NonNullable<typeof this.pageCtx>, pageSize: number): void {
+    this.traces.set(rows);
+    this.paginated = false;
+    this.pageCtx   = ctx;
+    this.knownIds  = new Set(rows.map(r => r.traceId));
+    this.loadCapped.set(false);
+    this.hasMore.set(rows.length >= pageSize);
+    this.loading.set(false); this.cdr.markForCheck();
   }
 
   runTraceQL() {
@@ -370,9 +516,16 @@ export class TracesComponent implements OnInit, OnDestroy {
     this.syncUrl();
     this.loading.set(true);
     this.traceqlError.set('');
-    this.api.queryTraces({ query: q, from: this.fromIso(), limit: 200 }).subscribe({
-      next: rows => { this.traces.set(rows); this.loading.set(false); this.cdr.markForCheck(); },
+    const from  = this.fromIso();
+    const epoch = ++this.queryEpoch;
+    this.api.queryTraces({ query: q, from, limit: TracesComponent.QlPageSize })
+      .pipe(takeUntilDestroyed(this.destroyRef)).subscribe({
+      next: rows => {
+        if (epoch !== this.queryEpoch) return;   // a newer search owns the list now
+        this.beginFirstPage(rows, { mode: 'ql', ql: q, from }, TracesComponent.QlPageSize);
+      },
       error: (err) => {
+        if (epoch !== this.queryEpoch) return;
         this.loading.set(false);
         this.traceqlError.set(err?.error?.message ?? 'Query error');
         this.cdr.markForCheck();

@@ -149,15 +149,36 @@ public static class TraceQLExecutor
             list.Add(s);
         }
 
-        var result = new List<TraceRowDto>(Math.Min(limit, traces.Count));
-        foreach (var (_, traceSpans) in traces)
+        // Sort newest-first BEFORE truncating, on the cheap key, and only then build rows.
+        // The old order — take the first `limit` traces in dictionary-encounter order, then
+        // sort — returned a page whose oldest row was the boundary of nothing: encounter
+        // order is only roughly newest-first (grouping by trace shuffles it), so a caller
+        // paging on "everything older than my oldest row" skipped real traces. Building rows
+        // after the cut also keeps BuildRow's allocations (a HashSet, id strings, an array)
+        // to the `limit` survivors instead of every matching trace in the window — the
+        // difference compounds page by page under the client's load-more.
+        //
+        // The trace-id tiebreak makes equal-millisecond boundaries deterministic: without it,
+        // which of several same-timestamp traces survive the cut is unstable sort luck, and
+        // the client's overlapping cursor could then see a different winner on every page.
+        var groups = new List<(long StartNano, TraceId Id, List<SpanRecord> Spans)>(traces.Count);
+        foreach (var (id, traceSpans) in traces)
         {
-            if (result.Count >= limit) break;
-            result.Add(BuildRow(traceSpans));
+            long start = long.MaxValue;
+            foreach (var sp in traceSpans)
+                if (sp.StartTimeUnixNano < start) start = sp.StartTimeUnixNano;
+            groups.Add((start, id, traceSpans));
         }
+        groups.Sort(static (a, b) =>
+        {
+            int byTime = b.StartNano.CompareTo(a.StartNano);
+            return byTime != 0 ? byTime : b.Id.CompareTo(a.Id);
+        });
+        if (groups.Count > limit) groups.RemoveRange(limit, groups.Count - limit);
 
-        // Sort newest-first
-        result.Sort(static (a, b) => b.StartTimeUnixNano.CompareTo(a.StartTimeUnixNano));
+        var result = new List<TraceRowDto>(groups.Count);
+        foreach (var (_, _, traceSpans) in groups)
+            result.Add(BuildRow(traceSpans));
         return result;
     }
 
