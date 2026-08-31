@@ -469,6 +469,13 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
 
             // Manual enumeration so a segment deleted/corrupted mid-scan skips the
             // segment (yield inside try-catch is not allowed by the language).
+            // Buffer the segment's matches and sort them newest-first BEFORE the cap bites.
+            // A segment's file is written oldest-first, so streaming it under a global span
+            // cap kept the OLD side of whichever segment the cap landed in and dropped its
+            // new side — the caller then sorted and truncated an already old-shifted pool,
+            // and its "newest page" quietly was not. The buffer holds only this segment's
+            // MATCHES (range plus every pushed-down filter), not the segment.
+            var segMatches = new List<SpanRecord>();
             await using var e = SpanReader.SearchAsync(
                 seg.FilePath, fromNano, toNano,
                 serviceName, spanName, status, httpStatusCode,
@@ -489,6 +496,12 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                     break;
                 }
                 if (!r.SpanId.IsEmpty && !seen.Add((r.TraceId, r.SpanId.RawValue))) continue;
+                segMatches.Add(r);
+            }
+
+            segMatches.Sort(static (a, b) => b.StartTimeUnixNano.CompareTo(a.StartTimeUnixNano));
+            foreach (var r in segMatches)
+            {
                 if (yielded++ >= limit) yield break;
                 yield return r;
             }
