@@ -95,6 +95,40 @@ internal sealed class VanishedRegionLog
     /// hold spans from after the moment it was lost, so the ceiling is real rather than arbitrary,
     /// and clamping to it keeps the record inside the only band retention can reach.</para>
     /// </summary>
+    /// <summary>
+    /// The paths of segments already established as lost. Kept SEPARATELY from the ranges because
+    /// the two answer different questions, and conflating them cost a healthy server a red banner:
+    /// a range says "this window is missing something", which is what a reader needs; a path says
+    /// "this exact file is gone", which is what a CLASSIFIER needs. Asking the ranges instead —
+    /// does this segment's time span overlap a recorded loss? — cannot tell the file somebody just
+    /// lost from a different file in the same hour, and cold segments overlap in time by design.
+    /// Measured: after one real loss, the next ordinary compaction handover in that band came back
+    /// Lost, so an untouched server reported deleted-or-damaged for the whole retention TTL.
+    ///
+    /// <para>Bounded like the ranges, by the same argument: dropping the oldest entry only means a
+    /// later reader falls back to Handover for a file nobody is going to meet again.</para>
+    /// </summary>
+    private const int MaxPaths = 64;
+    private readonly Queue<string> _lostPathOrder = new();
+    private readonly HashSet<string> _lostPaths = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Remembers that this exact file is the one that went missing.</summary>
+    public void RecordPath(string filePath)
+    {
+        lock (_gate)
+        {
+            if (!_lostPaths.Add(filePath)) return;
+            _lostPathOrder.Enqueue(filePath);
+            while (_lostPathOrder.Count > MaxPaths) _lostPaths.Remove(_lostPathOrder.Dequeue());
+        }
+    }
+
+    /// <summary>Whether THIS file has already been established as lost by an earlier reader.</summary>
+    public bool WasLost(string filePath)
+    {
+        lock (_gate) return _lostPaths.Contains(filePath);
+    }
+
     public void Record(long minNano, long maxNano, long ceilingNano)
     {
         if (minNano > maxNano) (minNano, maxNano) = (maxNano, minNano);
@@ -110,19 +144,25 @@ internal sealed class VanishedRegionLog
         // A file is written after the spans in it arrived, so its mtime is a real upper bound on
         // what it could have held, and it is the only evidence still available once the file
         // itself is gone.
-        // TWO CEILINGS, AND THE LOWER WINS. The caller's is evidence about this particular file;
-        // `now` is the structural one that holds however this method is reached, so no range whose
-        // Max is in the future is storable and no record is ever unforgettable by Forget.
-        long ceiling = Math.Min(ceilingNano, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L);
+        // TWO CEILINGS, AND THE LOWER USABLE ONE WINS. `now` is the structural one and it always
+        // holds: no range whose Max is in the future is storable, so no record is unforgettable by
+        // Forget. The caller's is evidence about this particular file — its own write time, which
+        // bounds what it could have held.
+        //
+        // BUT ONLY WHILE IT IS EVIDENCE. A mtime BELOW the segment's own Min is not a statement
+        // about the data, it is a statement that the mtime is unusable: files restored by rsync -at,
+        // tar -xp or a filesystem snapshot carry a write time older than everything in them. An
+        // earlier version clamped to it anyway and then floored the result at Min — which did stop
+        // the range inverting, by collapsing it to the single point [Min, Min]. Measured: a 4.75-hour
+        // segment lost with a five-day-old mtime recorded the point [-6h, -6h], and the very next
+        // query over the LAST THREE HOURS came back Unreadable=False Capped=False over a window that
+        // had just lost eight of that segment's twenty traces. A silent complete:true over lost
+        // data, produced by the guard against silent completes, in the direction this class's own
+        // docstring calls impossible.
+        long nowNano  = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+        long ceiling  = ceilingNano >= minNano ? Math.Min(ceilingNano, nowNano) : nowNano;
 
-        // AND NEVER BELOW Min, which is the direction that would turn this guard into the bug it
-        // guards against. A file restored with an older mtime (rsync -at, tar -xp, a snapshot) has
-        // a ceiling UNDER its own spans; clamping to it blindly pulls Max below Min, the region
-        // collapses to a point outside the data, and the window that lost the segment is told
-        // nothing — a silent complete over lost data, which is the one answer this whole mechanism
-        // exists to prevent. The segment demonstrably held a span at Min, so Min is a floor the
-        // ceiling may not cross.
-        if (maxNano > ceiling) maxNano = Math.Max(ceiling, minNano);
+        if (maxNano > ceiling) maxNano = ceiling;
         if (minNano < 0)       minNano = 0;
         if (minNano > maxNano) minNano = maxNano;   // the whole claim was in the future
 
@@ -193,10 +233,19 @@ internal sealed class VanishedRegionLog
     {
         lock (_gate)
         {
-            int dropped = _regions.RemoveAll(r => r.Max < cutoffNano);
-            if (_regions.Count > 0 && _regions[0].Min < cutoffNano)
-                _regions[0] = (cutoffNano, _regions[0].Max);
-            return dropped;
+            // DROPPED WHOLE OR KEPT WHOLE. Trimming a straddler's Min up to the cutoff was the
+            // second narrowing path in a class whose contract is that it only ever widens, and it
+            // was wrong for a reason the trim's own justification missed: retention deletes a
+            // segment only when its MaxStartNano is below the cutoff, so a segment STRADDLING the
+            // cutoff keeps every span it holds below that line, on disk and queryable. Measured
+            // with a seven-day TTL and a region [cutoff-12h, cutoff+12h]: Overlaps(min, cutoff-1h)
+            // was true before Forget and false after, while neighbouring segments went on serving
+            // exactly that band — so a user querying it got a short list with done{complete:true}
+            // where a minute earlier they got a truncation banner.
+            //
+            // "The part below the cutoff describes spans retention deleted on purpose" is true only
+            // of ranges ENTIRELY below it, and those are precisely the ones dropped here.
+            return _regions.RemoveAll(r => r.Max < cutoffNano);
         }
     }
 

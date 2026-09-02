@@ -67,7 +67,8 @@ internal static class SpanReader
 
     /// <summary>
     /// Test seam: called once per block <see cref="ReadTraceAsync"/> actually DECODES, with that
-    /// block's buffers already back in the pool. A trace read holds no reference the caller can
+    /// block's buffers still rented and its decoded span list still alive. A trace read holds no
+    /// reference the caller can
     /// suspend on — the walk runs to completion before the first span is yielded — so this is the
     /// only place a test can sample the live set WHILE the walk is in it, which is the whole
     /// difference between a reader that costs a block and one that costs a segment. Never
@@ -131,9 +132,30 @@ internal static class SpanReader
             LastWriteNano  = LastWriteNanos(filePath),
             // OBSERVED, never acted on. The range is believed as written because it decides what
             // gets opened; this only lets the engine name the file for an operator.
-            HeaderRangeSuspect = minNano < 0 || maxNano < minNano,
+            //
+            // THE THIRD TEST IS THE ONE THAT MATTERS. Negative and inverted were the easy two, and
+            // between them they miss the only tear this whole change is about: a maxNano torn to
+            // long.MaxValue is neither. Measured before it was added — a segment written an hour
+            // ago with the eight bytes at offset 18 overwritten came back
+            // max=9223372036854775807 against a write time of 1788324033349000000, a claim 86 054
+            // days later than the file itself, and the flag was FALSE. The warning that exists to
+            // name the volume never fired for the fault that motivated it.
+            //
+            // A file is written after the spans in it arrived, so its own last-write time is an
+            // upper bound on what it can honestly claim. Compared with slack, because a producer
+            // whose clock runs ahead is ordinary and is not what this is looking for.
+            HeaderRangeSuspect = minNano < 0
+                              || maxNano < minNano
+                              || maxNano > LastWriteNanos(filePath) + SuspectFutureSlackNanos,
         };
     }
+
+    /// <summary>
+    /// How far past a file's own write time a header may claim before it is called suspect. A day
+    /// absorbs an exporter clocked ahead and a host that drifted; it is nowhere near the 86 054
+    /// days a torn field produces.
+    /// </summary>
+    private const long SuspectFutureSlackNanos = 24L * 3600 * 1_000_000_000;
 
     /// <summary>
     /// The file's last-write time in Unix nanoseconds, never later than now, falling back to now
@@ -307,14 +329,22 @@ internal static class SpanReader
                 spansInBlock = PickTraceSpansFromBlock(
                     rawBuf.AsMemory(0, rawLen), version, traceId, offsets, blockFirst,
                     strict: useBlockGeometry, ref want, result);
+
+                // SAMPLED HERE, INSIDE THE try, WHILE THIS BLOCK IS STILL RENTED. It used to fire
+                // after the finally below, which is to say after comp and rawBuf were already back
+                // in the pool and after PickTraceSpansFromBlock had returned — so the probe saw
+                // only what survives BETWEEN blocks, and reported 0.08 MB against a 20 MB budget
+                // for a walk whose whole point is what it holds DURING one. Proven rather than
+                // argued: PickTraceSpansFromBlock was changed to materialise every span of the
+                // block and select from it — the exact defect just removed from SearchAsync — and
+                // the test stayed green.
+                _afterTraceBlockForTest?.Invoke();
             }
             finally
             {
                 ArrayPool<byte>.Shared.Return(comp);
                 if (rawBuf is not null) ArrayPool<byte>.Shared.Return(rawBuf);
             }
-
-            _afterTraceBlockForTest?.Invoke();
 
             if (spansInBlock < 0) return null;               // a span was not the trace's — geometry wrong
             if (!useBlockGeometry) blockFirst += spansInBlock;
@@ -635,7 +665,16 @@ internal static class SpanReader
             try
             {
                 fs.ReadExactly(comp, 0, (int)compSize);
+                // The third of the three places this length is taken, and the one the sweep missed
+                // even though the reason was already written down two methods away: the size lives
+                // INSIDE the compressed payload, so the compSize test above never saw it and a short,
+                // well-formed block can still ask for gigabytes. A negative value is worse than a
+                // large one — Rent throws ArgumentOutOfRangeException, which sails straight past the
+                // OutOfMemoryException catch this method relies on.
                 int rawLen = LZ4Pickler.UnpickledSize(comp.AsSpan(0, (int)compSize));
+                if (rawLen is < 0 or > MaxBlockBytes)
+                    throw new InvalidDataException(
+                        $"A block decompresses to {rawLen} bytes in {filePath}");
                 rawBuf = ArrayPool<byte>.Shared.Rent(rawLen);
                 LZ4Pickler.Unpickle(comp.AsSpan(0, (int)compSize), rawBuf.AsSpan(0, rawLen));
 
@@ -950,11 +989,24 @@ internal static class SpanReader
                 : SpanBloom.HashKeyValue(h.Key, h.LowerValue);
         }
 
+        // BOUNDED BY THE BYTES THAT COULD HOLD IT. This runs on every TraceQL query carrying an
+        // attribute hint — that is, on { .db.system = "mssql" }, the query this branch exists for —
+        // and a HashSet<uint> of capacity N costs 16N bytes, so one flipped high byte turning 12
+        // into 0x4000000C asks for about seventeen gigabytes. Each block writes at least its own
+        // four-byte length, so more blocks than a quarter of what is left is a torn count.
         uint blockCount = br.ReadUInt32();
+        long bloomRoom  = fs.Length - fs.Position;
+        if (blockCount > bloomRoom / 4)
+            throw new InvalidDataException(
+                $"Bloom index declares {blockCount} blocks but {bloomRoom} bytes remain in {filePath}");
+
         var allowed = new HashSet<uint>((int)blockCount);
         for (uint b = 0; b < blockCount; b++)
         {
             uint len = br.ReadUInt32();
+            if (len > fs.Length - fs.Position)
+                throw new InvalidDataException(
+                    $"Bloom bitset for block {b} claims {len} bytes past the end of {filePath}");
             var bitset = len > 0 ? br.ReadBytes((int)len) : [];
             bool pass = true;
             for (int i = 0; i < nHints && pass; i++)
@@ -974,12 +1026,21 @@ internal static class SpanReader
         var (_, svcIdxOffset, _) = ReadFooter(fs, br, version);
         fs.Seek(svcIdxOffset, SeekOrigin.Begin);
 
+        // Same rule as the bloom index: a service costs at least six bytes here (its length prefix
+        // and its block count), and a block index costs four.
         uint svcCount = br.ReadUInt32();
+        if (svcCount > (fs.Length - fs.Position) / 6)
+            throw new InvalidDataException(
+                $"Service index declares {svcCount} services past the end of {filePath}");
+
         for (uint i = 0; i < svcCount; i++)
         {
             ushort nameLen = br.ReadUInt16();
             var    name    = Encoding.UTF8.GetString(br.ReadBytes(nameLen));
             uint   blkCnt  = br.ReadUInt32();
+            if (blkCnt > (fs.Length - fs.Position) / 4)
+                throw new InvalidDataException(
+                    $"Service '{name}' claims {blkCnt} block indices past the end of {filePath}");
 
             if (name.Equals(serviceName, StringComparison.OrdinalIgnoreCase))
             {
@@ -992,19 +1053,53 @@ internal static class SpanReader
         return [];
     }
 
+    /// <summary>
+    /// The service names a segment declares, or an EMPTY LIST if the index cannot be believed.
+    ///
+    /// <para>Empty rather than an exception, and that is the whole point of this method's shape.
+    /// It is called from <see cref="ReadSegmentInfo"/>, which runs for every .trc at startup —
+    /// and whose caller answers ANY throw with <c>DeleteSegmentFiles(file)</c>. So a torn
+    /// four-byte count here used to cost two things at once: 1 600 074 528 bytes allocated by
+    /// <c>new string[count]</c> from a 517-byte file, measured, and then the destruction of a
+    /// perfectly readable segment along with its .stats, .svcgraph and .tracesum.</para>
+    ///
+    /// <para>Neither is necessary. This index is an OPTIMISATION — it lets a search skip segments
+    /// and blocks that cannot hold the service it wants. Without it every block is read, which is
+    /// slower and completely correct. Degrading to "I do not know which services are in here" is
+    /// therefore the honest answer to a damaged index, and the spans behind it stay queryable.
+    /// <c>SpanSegmentInfo.Services</c> is already documented as advisory: an empty array means no
+    /// segment-level service skip, never "this segment has no services".</para>
+    /// </summary>
     private static string[] ReadServicesFromIndex(FileStream fs, BinaryReader br, long svcIdxOffset)
     {
-        fs.Seek(svcIdxOffset, SeekOrigin.Begin);
-        uint count    = br.ReadUInt32();
-        var  services = new string[count];
-        for (uint i = 0; i < count; i++)
+        try
         {
-            ushort nameLen = br.ReadUInt16();
-            services[i]   = Encoding.UTF8.GetString(br.ReadBytes(nameLen));
-            uint blkCnt   = br.ReadUInt32();
-            fs.Seek(blkCnt * 4L, SeekOrigin.Current);
+            if (svcIdxOffset <= 0 || svcIdxOffset >= fs.Length) return [];
+            fs.Seek(svcIdxOffset, SeekOrigin.Begin);
+
+            // A service costs at least six bytes here: a two-byte name length and a four-byte
+            // block count. More than that many is a number no writer produced.
+            uint count = br.ReadUInt32();
+            if (count > (fs.Length - fs.Position) / 6) return [];
+
+            var services = new string[count];
+            for (uint i = 0; i < count; i++)
+            {
+                ushort nameLen = br.ReadUInt16();
+                if (nameLen > fs.Length - fs.Position) return [];
+                services[i] = Encoding.UTF8.GetString(br.ReadBytes(nameLen));
+
+                uint blkCnt = br.ReadUInt32();
+                if (blkCnt > (fs.Length - fs.Position) / 4) return [];
+                fs.Seek(blkCnt * 4L, SeekOrigin.Current);
+            }
+            return services;
         }
-        return services;
+        catch (Exception ex) when (ex is EndOfStreamException or IOException or InvalidDataException
+                                      or ArgumentException or OutOfMemoryException)
+        {
+            return [];
+        }
     }
 
     // ── Footer (v2: 20 bytes, v3: 28 bytes — extra bloom-index offset) ────────

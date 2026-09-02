@@ -229,11 +229,15 @@ describe('the trace list header claims only what it was told', () => {
       };
 
       // ── The `query-error` road: the same file, the same loss, the server's own sentence. ──
+      // Carrying `truncatedBy`, because the server now attributes the error frame too. That is
+      // what makes one treatment possible at all: before it, this road offered nothing but an
+      // English sentence, so the page could not tell a lost segment from a spent deadline and
+      // had to treat every error alike.
       fixture.componentInstance.loadAll();
       fixture.detectChanges();
       for (let i = 0; i < 300; i++) streams.live.next(row('t' + i));
       fixture.detectChanges();
-      streams.live.error(new Error(UNREADABLE));
+      streams.live.error(Object.assign(new Error(UNREADABLE), { truncatedBy: 'unreadable-segment' }));
       fixture.detectChanges();
       await fixture.whenStable();
       const viaError = {
@@ -244,10 +248,14 @@ describe('the trace list header claims only what it was told', () => {
       // carried the loss had nowhere to put one.
       expect(viaDone.banner).toBe(UNREADABLE);
       expect(viaError.banner).toBe(UNREADABLE);
-      // Same treatment: standing warning, list off the poll, a suffix that calls the rows
-      // partial and points at the sentence.
-      expect(viaDone.held).toBe(true);
-      expect(viaError.held).toBe(true);
+      // Same treatment: a standing warning and a suffix that calls the rows partial — and a list
+      // that KEEPS REFRESHING, on both roads. Holding was the old answer and it was a deadlock:
+      // the poll returned early, the staleness hint was suppressed precisely while held, and the
+      // failure counter could not grow behind the early return, so rows went stale for the life
+      // of the page with nothing on screen saying so. A permanent hole is re-reported by the
+      // server on every request, so the warning comes back on its own for as long as it is true.
+      expect(viaDone.held).toBe(false);
+      expect(viaError.held).toBe(false);
       expect(viaDone.suffix).toContain('partial list — see the message above');
       expect(viaError.suffix).toContain('partial list — see the message above');
       // The one thing that may still differ is DETAIL only one road has: the `done` road knows
@@ -535,7 +543,12 @@ describe('the trace list header claims only what it was told', () => {
       expect(c.listEnding()).toEqual({ kind: 'read-out' });  // …and so is its account of itself
       expect(c.listLoss()).toBe('unreadable-segment');       // …but the hole is not its to close
       expect(bannerText(fixture)).toBe(UNREADABLE);
-      expect(c.listHeld()).toBe(true);
+      // The loss stands, and the list stays LIVE. Freezing it here was the old answer and it was
+      // a deadlock with no indicator: the poll returned early, the staleness hint was suppressed
+      // exactly while held, and the failure counter could not grow behind the early return. What
+      // keeps the warning honest instead is the server, which re-reports a permanent hole on
+      // every request — so it persists while it is true and lifts when it stops being.
+      expect(c.listHeld()).toBe(false);
       expect(suffix(fixture)).toBe('· partial list — see the message above');
     });
 
@@ -600,6 +613,11 @@ describe('the trace list header claims only what it was told', () => {
 
     expect(c.listLoss()).toBe('unreadable-segment');
     expect(bannerText(fixture)).toBe(UNREADABLE);
-    expect(c.listHeld()).toBe(true);
+    // The loss stands, and the list stays LIVE. Freezing it here was the old answer and it was
+    // a deadlock with no indicator: the poll returned early, the staleness hint was suppressed
+    // exactly while held, and the failure counter could not grow behind the early return. What
+    // keeps the warning honest instead is the server, which re-reports a permanent hole on
+    // every request — so it persists while it is true and lifts when it stops being.
+    expect(c.listHeld()).toBe(false);
   });
 });

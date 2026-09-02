@@ -410,17 +410,29 @@ export class TracesComponent implements OnInit, OnDestroy {
    *  and the reason the list is frozen cannot drift apart: whatever clears the banner is exactly
    *  what thaws the list.
    *
-   *  THE LOSS IS THE THIRD HALF, and it is here because of what the alternative costs. The same
-   *  vanished segment reaches the page as a `query-error` (which sets the banner, and so freezes
-   *  the list) or as `truncatedBy` on a `done` frame (which did not), so one dead file gave the
-   *  operator a blocking red banner over a frozen list or a grey count suffix over a live one,
-   *  decided by how many rows fitted above it. Converging on the LOUD side is not a preference:
-   *  the quiet side is unreachable. Demoting the `query-error` road would mean deciding, from an
-   *  English sentence and nothing else, whether it is a lost segment or a spent deadline — and
-   *  getting that wrong turns a search that died into a footnote. Only one road carries a
-   *  machine-readable cause, so the treatment has to be the one that road can raise. */
+   *  A LOSS IS NOT ONE OF THE HALVES, and it was, which cost the page its refresh. Both halves
+   *  above are things the USER did — they stopped the stream, or a search they ran ended badly —
+   *  and holding protects that from being overwritten unread. A lost or skipped segment is neither:
+   *  it is a fact about the storage, and freezing the list over it stopped the rows updating for
+   *  the life of the page with nothing on screen saying so, because the staleness hint is itself
+   *  suppressed while held and the failure counter cannot grow behind an early return. It bit
+   *  hardest where it mattered least: `unread-segment` is not even permanent — the server's own
+   *  sentence for it is that the search ran out of room before it had to move on, which the very
+   *  next refresh may well get past.
+   *
+   *  Nothing is lost by letting the list stay live. A permanent hole is re-reported by the server
+   *  on every request — that is exactly what the engine-level memory of vanished segments
+   *  guarantees — so the banner comes back on its own for as long as it is true, and stops when it
+   *  stops being true. That is a better contract than a page that froze once and could not tell
+   *  the difference afterwards.
+   *
+   *  The reason this could be demoted now and not before: the treatment used to have to be decided
+   *  from an English sentence, because only the `done` road carried a machine-readable cause. Both
+   *  roads carry it now (see `truncatedBy` on the error frame), so one fault gets one treatment
+   *  whichever frame it arrived on — which is also what stopped the same dead file rendering as a
+   *  blocking banner or a grey suffix depending on how many rows fitted above it. */
   private readonly listHeld = computed(() =>
-    this.streamStopped() || this.listBanner() !== '');
+    this.streamStopped() || this.traceqlError() !== '');
   /** Rows one stream will deliver before the server stops — sent as `?max=` (which the server
    *  clamps to 1…5000 and enforces by ending the stream), and the number the header names.
    *
@@ -1101,10 +1113,25 @@ export class TracesComponent implements OnInit, OnDestroy {
             + TracesComponent.PollMs * Math.min(8, 2 ** (this.bgFailures() - 1));
         } else {
           // A search the user ran keeps whatever arrived and gets the reason beside it — the
-          // half-answer plus its explanation, not an empty list and a banner. The banner is
-          // also what holds the list (see listHeld) and what the header reads to say the
-          // search ended in an error rather than a plain count.
-          this.traceqlError.set((err as Error)?.message?.trim() || 'Query error');
+          // half-answer plus its explanation, not an empty list and a banner.
+          //
+          // WHICH OF THE TWO IT IS, decided by the cause the server named rather than by the
+          // frame the news came out on. A lost segment can end a stream either way — as this
+          // error frame, or as a done frame carrying truncatedBy — and the two used to get
+          // different screens: a blocking banner over a frozen list one way, a grey count suffix
+          // over a live one the other, chosen by nothing more principled than how many rows
+          // happened to fit above the loss.
+          //
+          // So a named loss is recorded AS A LOSS on this road too, and deliberately does not set
+          // traceqlError: the banner is the same sentence either way (LOSS_SENTENCE is the
+          // server's own), while traceqlError is what holds the list, and a fact about the
+          // storage is not a reason to stop refreshing. Anything the server did NOT attribute —
+          // a TraceQL parse error, a spent deadline, a dropped connection — is a failure of the
+          // search itself, and that does hold: those rows are the user's half-answer and the
+          // poll must not take them away unread.
+          const cause = (err as { truncatedBy?: unknown })?.truncatedBy;
+          if (cause === 'unread-segment' || cause === 'unreadable-segment') this.listLoss.set(cause);
+          else this.traceqlError.set((err as Error)?.message?.trim() || 'Query error');
         }
         this.endStream();
       },

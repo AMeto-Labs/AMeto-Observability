@@ -582,6 +582,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         }
 
         _vanished.Record(seg.MinStartNano, seg.MaxStartNano, seg.LastWriteNano);
+        _vanished.RecordPath(seg.FilePath);
         _logger.LogWarning(
             "Cold span segment {File} vanished from disk — removed from the segment list; reads " +
             "over [{MinNano}, {MaxNano}] will report truncation until retention passes that range",
@@ -673,13 +674,20 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         // behaves. Erring to Transient here cannot hide anything either: the segments STAY in the
         // snapshot, so a directory that really is empty for ever keeps faulting and keeps
         // reporting, which is "ask me again", never "it is gone".
-        // The test is EMPTY, not "our file is gone". A deletion leaves the rest of the engine's
-        // furniture behind — the WAL, the other segments, the sidecars — so a directory that has
-        // been emptied to nothing was not deleted from, it was replaced. "Every listed segment is
-        // missing" was the first draft of this and it is too wide: with a single cold segment that
-        // is the same observation as its deletion, and it turned every one-segment loss into a
-        // mount. An entry count of zero is the narrowest evidence that separates the two.
-        if (DirectoryIsEmpty(_dataDir))
+        // TWO SEGMENTS GONE AT ONCE, AND NO SEGMENT FILE LEFT ANYWHERE.
+        //
+        // Two earlier drafts were wrong in opposite directions. "Every listed segment is missing" is
+        // too wide: with a single cold segment that is the same observation as its deletion, and it
+        // turned every one-segment loss into a mount. "The directory holds no entries at all" is too
+        // narrow — defeated by one lost+found on ext4, a System Volume Information on NTFS, and
+        // above all by THE ENGINE'S OWN spans.wal, which lives in this very directory, so in a real
+        // installation it essentially never fired.
+        //
+        // What separates the two is plurality plus absence: files do not disappear two at a time,
+        // and a volume that re-attached unpopulated has no .trc anywhere. With a single listed
+        // segment the two are genuinely indistinguishable, so that case stays a deletion — the
+        // honest limit, and the one the loss tests pin.
+        if (_coldSegments.Length >= 2 && NoSegmentFilesLeft(_dataDir))
         {
             _logger.LogWarning(
                 "The data directory {Dir} is present but completely empty while cold segments are " +
@@ -693,24 +701,34 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         // NOT LISTED — which usually means the engine retired it itself, and a compaction handover
         // is a healthy server's own work rather than a loss. But two readers can meet the same
         // genuinely deleted file, and RemoveColdSegment is atomic, so exactly one of them wins the
-        // removal and the loser lands here. Asking the memory settles which case this is: if the
-        // range is already recorded, the winner has classified it as a loss and this is the same
-        // loss, not a handover. Without this the two cold walks give two verdicts for one fault —
-        // one says "gone", the other says "narrow the window and retry" for data no window will
-        // return.
-        if (_vanished.Overlaps(seg.MinStartNano, seg.MaxStartNano)) return ColdReadFault.Lost;
+        // removal and the loser lands here. The memory settles which case this is.
+        //
+        // BY PATH, NOT BY TIME RANGE. The first version asked whether the segment's span OVERLAPPED
+        // a recorded loss — and cold segments overlap in time by design, as comments throughout this
+        // file say, so it could not tell the file somebody just lost from a different file in the
+        // same hour. Measured: after one real loss, the very next ordinary handover in that band
+        // came back Lost instead of Handover, and a completely healthy server showed a red
+        // deleted-or-damaged banner for the whole retention TTL.
+        if (_vanished.WasLost(seg.FilePath)) return ColdReadFault.Lost;
 
         return ColdReadFault.Handover;
     }
 
     /// <summary>
-    /// Whether the directory holds nothing at all. Probe failures answer FALSE — an I/O error is
-    /// not evidence that a directory is empty, and answering TRUE would turn every unreadable
-    /// mount into "keep retrying for ever" on data that may really be gone.
+    /// Whether the directory holds no segment file at all. Probe failures answer FALSE — an I/O
+    /// error is not evidence of absence, and answering TRUE would turn an unreadable mount into
+    /// "keep retrying for ever" over data that may really be gone.
     /// </summary>
-    private static bool DirectoryIsEmpty(string dir)
+    private static bool NoSegmentFilesLeft(string dir)
     {
-        try   { return !Directory.EnumerateFileSystemEntries(dir).GetEnumerator().MoveNext(); }
+        try
+        {
+            // Disposed, unlike the first version: FileSystemEnumerator holds a native find handle
+            // that only the finaliser would release, on a path that runs once per faulted segment
+            // per page — exactly the sick-storage moment when handles are scarce.
+            using var it = Directory.EnumerateFiles(dir, "*.trc").GetEnumerator();
+            return !it.MoveNext();
+        }
         catch { return false; }
     }
 
@@ -720,6 +738,43 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// is a healthy server's own compaction; a transient fault is answered by the next request.
     /// Both of those are floors: "ask me again", not "it is gone".
     /// </summary>
+    /// <summary>
+    /// WHAT THE EXCEPTION ACTUALLY SAYS, rather than "anything I did not name is corruption".
+    ///
+    /// <para>Both cold walks used to end their catch chain by calling everything left
+    /// <see cref="ColdReadFault.Corrupt"/>, which <see cref="IsPermanentFault"/> treats as
+    /// permanent — so a red "deleted or damaged" claim, for the life of the record, was the answer
+    /// to: a Windows sharing violation while an antivirus or a File.Move holds the .trc open; an
+    /// <c>IOException "The specified network name is no longer available"</c> from an SMB or iSCSI
+    /// blip, which is how a mount blip presents AT THE FILE LEVEL and therefore never reaches the
+    /// directory probe; handle exhaustion under GetTraceAsync's eight-way fan-out; and an
+    /// <c>UnauthorizedAccessException</c> while a container volume remounts. Before the fault bit
+    /// existed all of these were reported as truncation, which is what they are.</para>
+    ///
+    /// <para>Corruption is a claim about CONTENT, so only the exceptions that describe content
+    /// earn it. Note the in-repo trigger for getting this wrong: SpanReader's own MaxBlockBytes
+    /// throws <see cref="InvalidDataException"/> on a segment holding a block over 64 MB — a file
+    /// this engine could have written — so that one really is about the file, and really is
+    /// permanent until someone rewrites it.</para>
+    /// </summary>
+    private ColdReadFault ClassifyReadFailure(Exception ex, string what, string filePath)
+    {
+        bool content = ex is InvalidDataException or EndOfStreamException
+                    or System.Text.DecoderFallbackException
+                    or IndexOutOfRangeException or ArgumentOutOfRangeException;
+
+        if (content)
+        {
+            _logger.LogWarning(ex, "{What}: segment {File} will not parse — treated as damaged", what, filePath);
+            return ColdReadFault.Corrupt;
+        }
+
+        _logger.LogWarning(ex,
+            "{What}: segment {File} could not be read right now — treated as transient, the segment " +
+            "stays in the snapshot and the next request retries it", what, filePath);
+        return ColdReadFault.Transient;
+    }
+
     private static bool IsPermanentFault(ColdReadFault fault) =>
         fault is ColdReadFault.Lost or ColdReadFault.Corrupt;
 
@@ -981,8 +1036,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                 }
                 catch (Exception ex)
                 {
-                    _logger.LogWarning(ex, "Span search: skipping unreadable segment {File}", seg.FilePath);
-                    segFault = ColdReadFault.Corrupt;
+                    segFault = ClassifyReadFailure(ex, "Span search", seg.FilePath);
                     break;
                 }
                 // `seen` is still ADDED to at the yield below, never here: a span that loses its
@@ -1971,8 +2025,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             }
             catch (Exception ex)
             {
-                _logger.LogWarning(ex, "Trace list: skipping unreadable segment {File}", seg.FilePath);
-                segFault = ColdReadFault.Corrupt;
+                segFault = ClassifyReadFailure(ex, "Trace list", seg.FilePath);
             }
 
             // Abandoned part-read, so nothing in it was decided. Reported as truncation rather
@@ -2282,6 +2335,13 @@ public sealed class SpanSegmentInfo
     /// a door the data is behind — silently, because the skip leaves no fault and no floor. The
     /// range is believed as written; the hazard a torn field really creates is bounded where it
     /// does damage, in <c>VanishedRegionLog.Record</c>.</para>
+    ///
+    /// <para>So <c>Min</c> and <c>Max</c> ARE NOT SANITISED before use, and nothing downstream may
+    /// assume they are — this flag reports, it does not repair. It is true when the range is
+    /// negative, inverted, or later than the file's own last-write time by more than a day of
+    /// clock slack; that third test is the one that catches a <c>Max</c> torn to
+    /// <c>long.MaxValue</c>, which is neither of the first two and is the tear that motivated all
+    /// of this.</para>
     /// </summary>
     public bool     HeaderRangeSuspect { get; init; }
 

@@ -469,40 +469,48 @@ public sealed class SegmentHeaderRangeTests : IDisposable
     }
 
     [Fact]
-    public void Forget_trims_the_range_that_straddles_the_cutoff()
+    public void Forget_keeps_a_straddling_range_WHOLE()
     {
-        // The asymmetry answered at its source. Forget looked only at the TOP of a range, so the
-        // part of a survivor lying BELOW the cutoff — spans retention has now deleted on purpose —
-        // went on being reported as a loss.
+        // This test used to assert the opposite, on the reasoning that the part of a survivor below
+        // the cutoff describes spans retention has deleted on purpose. That reasoning is only true
+        // of ranges ENTIRELY below the cutoff — which Forget drops outright — and it is false for a
+        // straddler, because retention deletes a segment only when its MaxStartNano is below the
+        // cutoff. A segment straddling the line keeps every span it holds beneath that line, on
+        // disk and queryable, and so do all its neighbours.
+        //
+        // So trimming the Min up was the second narrowing path in a class whose contract is that it
+        // only widens: measured, Overlaps(min, cutoff-1h) went from true to false while other
+        // segments went on serving exactly that band, turning a truncation banner into a short list
+        // with done{complete:true}.
         var log = new VanishedRegionLog();
         log.Record(1_000, 9_000, long.MaxValue);
 
-        Assert.Equal(0, log.Forget(5_000));      // straddles: kept, not dropped
+        Assert.Equal(0, log.Forget(5_000));      // straddles: kept, and kept whole
         Assert.Equal(1, log.CountForTest);
 
-        Assert.False(log.Overlaps(1_000, 4_999),
-            "a band retention has already deleted is still being reported as a lost segment");
-        Assert.True(log.Overlaps(5_000, 9_000), "the part still inside retention stopped being reported");
+        Assert.True(log.Overlaps(1_000, 4_999),
+            "the band below the cutoff stopped being reported, but retention did not delete it");
+        Assert.True(log.Overlaps(5_000, 9_000));
     }
 
     [Fact]
-    public void Trimming_keeps_the_list_disjoint_and_sorted()
+    public void Forget_drops_whole_ranges_and_leaves_the_rest_untouched()
     {
-        // The invariant the trim could plausibly break, asserted rather than argued: only the
-        // FIRST surviving range can have a Min below the cutoff, because every later one starts
-        // above its predecessor's Max, which is itself at or above the cutoff.
+        // Whole-or-nothing, and the gaps between survivors stay gaps. A range entirely below the
+        // cutoff is the one case where retention really has deleted the data, so it goes; anything
+        // reaching above the line stays exactly as it was.
         var log = new VanishedRegionLog();
-        log.Record(1_000, 6_000, long.MaxValue);
-        log.Record(8_000, 9_000, long.MaxValue);
-        log.Record(11_000, 12_000, long.MaxValue);
+        log.Record(1_000, 2_000, long.MaxValue);      // entirely below — dropped
+        log.Record(4_000, 6_000, long.MaxValue);      // straddles     — kept whole
+        log.Record(11_000, 12_000, long.MaxValue);    // entirely above — untouched
 
-        Assert.Equal(0, log.Forget(5_000));
-        Assert.Equal(3, log.CountForTest);
+        Assert.Equal(1, log.Forget(5_000));
+        Assert.Equal(2, log.CountForTest);
 
-        Assert.False(log.Overlaps(0, 4_999));
+        Assert.False(log.Overlaps(1_000, 2_000), "a range retention really did age out is still reported");
+        Assert.True(log.Overlaps(4_000, 4_999), "the straddler was trimmed instead of kept");
         Assert.True(log.Overlaps(5_000, 6_000));
-        Assert.False(log.Overlaps(6_001, 7_999));   // the gap between the first two is still a gap
-        Assert.True(log.Overlaps(8_000, 9_000));
+        Assert.False(log.Overlaps(6_001, 10_999));    // the gap between survivors is still a gap
         Assert.True(log.Overlaps(11_000, 12_000));
     }
 }

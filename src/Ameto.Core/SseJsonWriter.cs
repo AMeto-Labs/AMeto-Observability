@@ -109,13 +109,22 @@ public sealed class SseJsonWriter : IDisposable
     /// fails mid-stream, so this is the only way to tell the client something went wrong —
     /// without it the stream simply stopped, indistinguishable from "no more results".
     /// </summary>
-    public async Task WriteErrorAsync(string message, CancellationToken ct)
+    /// <param name="truncatedBy">
+    /// Optional machine-readable cause, written beside the sentence. A client that reads only
+    /// <c>error</c> is unaffected; one that reads this can treat the same fault the same way
+    /// whichever terminal frame carried it. Without it the error road offered nothing but English,
+    /// so a page could not tell a lost segment from a spent deadline and had to treat every error
+    /// alike — which is how one dead file became a blocking banner on one row ceiling and a grey
+    /// suffix on another.
+    /// </param>
+    public async Task WriteErrorAsync(string message, CancellationToken ct, string? truncatedBy = null)
     {
         _buffer.ResetWrittenCount();
         _buffer.Write(ErrorPrefix);
         _json.Reset(_buffer);
         _json.WriteStartObject();
         _json.WriteString("error", message);
+        if (truncatedBy is not null) _json.WriteString("truncatedBy", truncatedBy);
         _json.WriteEndObject();
         _json.Flush();
         _buffer.Write(FrameSuffix);

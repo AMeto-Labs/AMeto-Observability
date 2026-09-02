@@ -112,7 +112,7 @@ export class ApiService {
           // its own connection failures under that name.
           es.addEventListener('query-error', event => {
             es.close();
-            subscriber.error(new Error(this.sseErrorMessage(event, opts.queryErrorMessage)));
+            subscriber.error(this.sseError(event, opts.queryErrorMessage));
           });
           es.onerror = () => {
             es.close();
@@ -200,6 +200,29 @@ export class ApiService {
     } catch {
       return fallback;
     }
+  }
+
+  /**
+   * The error a `query-error` frame describes, with the server's machine-readable cause attached
+   * when it sent one.
+   *
+   * The cause is what lets a page give one fault one treatment. Without it the error road offered
+   * nothing but an English sentence, so every error had to be handled alike — and the same lost
+   * segment arrived as a blocking banner or as a grey count suffix depending only on which
+   * terminal frame it happened to come out on, which is to say on how many rows fitted above it.
+   * Absent on older servers and on failures that genuinely have no cause to name, and every reader
+   * treats absence as "no specific cause".
+   */
+  private sseError(event: Event, fallback: string): Error {
+    const err = new Error(this.sseErrorMessage(event, fallback)) as Error & { truncatedBy?: string };
+    const data = (event as MessageEvent).data;
+    if (typeof data === 'string') {
+      try {
+        const parsed = JSON.parse(data) as { truncatedBy?: unknown };
+        if (typeof parsed.truncatedBy === 'string') err.truncatedBy = parsed.truncatedBy;
+      } catch { /* no cause to attach */ }
+    }
+    return err;
   }
 
   /**

@@ -199,13 +199,22 @@ public sealed class SpanTraceReadBoundTests : IClassFixture<TraceLookupSegmentFi
             $"the walk decoded {samples} block(s) for a trace with one span in each of "
           + $"{TraceLookupSegmentFixture.Blocks} — the trace read is not walking blocks at all");
 
-        // THE SHAPE ASSERTION, in this fixture's own bytes: under a small multiple of ONE BLOCK,
-        // not "under N megabytes". A reader that materialises the file peaks at
+        // THE SHAPE ASSERTION, in this fixture's own bytes: under what ONE BLOCK of decoded spans
+        // costs, not "under N megabytes". A reader that materialises the file peaks at
         // Spans/BlockSize = 12.2 blocks and fails here.
-        Assert.True(peak < 3 * oneBlock,
+        //
+        // The multiplier was 3 and that was too loose to do its job. The walk legitimately holds
+        // the block's raw bytes, which are far cheaper than the same block's SpanRecords — measured
+        // here at 2.69 MB against a 6.84 MB block, so 0.39 blocks — while the defect this guards
+        // against, materialising the block's spans and selecting from them, adds a whole block and
+        // lands at about 1.4. A budget of three blocks passed both, which is how the earlier
+        // version of this test stayed green under exactly that mutation. One block sits between
+        // them with room on either side: two and a half times the honest peak, and well under the
+        // defect's.
+        Assert.True(peak < oneBlock,
             $"peak retention was {peak / 1048576.0:N2} MB = {(double)peak / oneBlock:N2} blocks "
           + $"({peak * 100.0 / materialised:N1}% of the whole file) — a trace read is holding "
-          + "more than one block at a time");
+          + "a whole block's worth of decoded spans, not just the block");
 
         Assert.True(peak < materialised / 4,
             $"peak retention was {peak * 100.0 / materialised:N1}% of the whole file");

@@ -890,25 +890,63 @@ public static class TraceQueryEndpointMapper
           + "was deleted or damaged — so the traces it held are missing from this list. Narrowing "
           + "the time window will not bring them back; the server log names the file.", ctx),
 
-        StreamEnd.NoProgress => SafeErrorAsync(sse,
-            "Results are truncated: the search could not be advanced past a part of this window "
-          + "it was unable to read — a storage segment that would not open, or a scan that got no "
-          + "further than the window's own edge. Narrow the time window (or the filter) to see the rest.", ctx),
-
-        StreamEnd.TimestampCollision => SafeErrorAsync(sse,
-            "Results are truncated: more traces share the oldest timestamp than one page can carry, "
-          + "and the search cannot page past a millisecond it cannot move off. "
-          + "Narrow the time window (or the filter) to see the rest.", ctx),
-
-        StreamEnd.UnusableTimestamp => SafeErrorAsync(sse,
-            "Results are truncated: a trace in this window carries a start time that cannot be turned "
-          + "into a search boundary, and the search cannot page past it. "
-          + "Narrow the time window (or the filter) to see the rest.", ctx),
-
-        _ => SafeErrorAsync(sse,
-            $"Results are partial: the search hit its {DescribeDeadline(StreamDeadline)} limit "
-          + "before reaching the end of the window. Narrow the time window (or the filter) to see the rest.", ctx),
+        // EVERY OTHER ENDING ASKS ABOUT THE LOSS FIRST, and that ordering is the fix, not a
+        // flourish. These four used to read o.End alone, so they dropped Skipped and Unreadable
+        // entirely — while StreamOutcome's own docstring promised the terminal frame prints both.
+        //
+        // It was not a corner. A CORRUPT segment is deliberately kept in the snapshot so it fails
+        // again on every page, which means it supplies its ceiling to every page too — and that
+        // value lands exactly ON the page ceiling as soon as the cursor descends to it, so the
+        // no-progress test fires BEFORE the end-of-window test can apply its unreadable-over-
+        // skipped-over-complete priority. RegionUnreadable was therefore reachable only for a
+        // VANISHED segment, which is removed from the snapshot and so contributes its bit without
+        // a ceiling. The user of a damaged file got "narrow the time window" — the one piece of
+        // advice that state exists to avoid giving.
+        // The cause travels with the sentence. Both terminal roads now carry it, so a page can give
+        // one fault one treatment instead of deciding from English prose which fault it was —
+        // decided, before this, by nothing more principled than how many rows happened to fit above
+        // the loss.
+        _ => SafeErrorAsync(sse, LossAwareSentence(o), ctx, o.TruncatedBy),
     };
+
+    /// <summary>
+    /// The sentence for an ending that is not a <c>done</c>. A loss outranks the mechanics: which
+    /// of the pager's stopping conditions tripped is interesting, but "a segment could not be read"
+    /// is what the reader has to act on, and its advice is the opposite of the mechanical one.
+    /// </summary>
+    private static string LossAwareSentence(StreamOutcome o)
+    {
+        if (o.Unreadable)
+            return "Results are truncated: a storage segment inside this window could not be read — it "
+                 + "was deleted or damaged — so the traces it held are missing from this list. Narrowing "
+                 + "the time window will not bring them back; the server log names the file.";
+
+        if (o.Skipped)
+            return "Results are truncated: part of this window sits inside a storage segment the search "
+                 + "ran out of room to open before it had to move on, so the traces it holds are missing "
+                 + "from this list. Narrow the time window to bring them back into reach.";
+
+        return o.End switch
+        {
+            StreamEnd.NoProgress =>
+                "Results are truncated: the search could not be advanced past a part of this window "
+              + "it was unable to read — a storage segment that would not open, or a scan that got no "
+              + "further than the window's own edge. Narrow the time window (or the filter) to see the rest.",
+
+            StreamEnd.TimestampCollision =>
+                "Results are truncated: more traces share the oldest timestamp than one page can carry, "
+              + "and the search cannot page past a millisecond it cannot move off. "
+              + "Narrow the time window (or the filter) to see the rest.",
+
+            StreamEnd.UnusableTimestamp =>
+                "Results are truncated: a trace in this window carries a start time that cannot be turned "
+              + "into a search boundary, and the search cannot page past it. "
+              + "Narrow the time window (or the filter) to see the rest.",
+
+            _ => $"Results are partial: the search hit its {DescribeDeadline(StreamDeadline)} limit "
+               + "before reaching the end of the window. Narrow the time window (or the filter) to see the rest.",
+        };
+    }
 
     /// <summary>
     /// The deadline in the largest unit that does not round it to zero. <c>{X:N0}-second</c> alone
@@ -971,11 +1009,12 @@ public static class TraceQueryEndpointMapper
     /// its own short deadline rather than by the request token alone, because a client that has
     /// stopped reading would otherwise pin this handler open for as long as it lives.
     /// </summary>
-    private static async Task SafeErrorAsync(SseJsonWriter sse, string message, HttpContext ctx)
+    private static async Task SafeErrorAsync(
+        SseJsonWriter sse, string message, HttpContext ctx, string? truncatedBy = null)
     {
         using var cts = CancellationTokenSource.CreateLinkedTokenSource(ctx.RequestAborted);
         cts.CancelAfter(TimeSpan.FromSeconds(5));
-        try { await sse.WriteErrorAsync(message, cts.Token); }
+        try { await sse.WriteErrorAsync(message, cts.Token, truncatedBy); }
         catch { /* the client is gone, or will not read — nothing left to tell */ }
     }
 

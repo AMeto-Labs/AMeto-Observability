@@ -59,6 +59,20 @@ internal static class TraceSummarySidecar
     private const uint   Magic     = 0x52_44_54_56; // "RDTV"
     private const ushort Version   = 1;
 
+    /// <summary>
+    /// The largest decompressed body this reader will build. Every number below is copied out of a
+    /// file, and a length prefix that has been torn is a request for that many bytes BEFORE anything
+    /// discovers the file is shorter — <c>BinaryReader.ReadBytes</c> allocates `new byte[count]` and
+    /// only then copies whatever it actually found. Measured on this reader before it was bounded: a
+    /// 359-byte sidecar with its compressed-size field overwritten allocated 700 294 448 bytes, the
+    /// read SUCCEEDED, the page came back rows=20 with no fault of any kind — and the same 668 MB was
+    /// paid again on every page of every stream, because this runs once per segment per page.
+    ///
+    /// <para>256 MB is far above any body this writer produces (a segment's summaries compress to
+    /// kilobytes) and far below the point where a torn field costs the process.</para>
+    /// </summary>
+    private const int MaxBodyBytes = 256 * 1024 * 1024;
+
     /// <summary>Volume grid resolution — 10 s. Sparse, so idle gaps cost nothing.</summary>
     public const long GridNanos = 10_000_000_000L;
 
@@ -307,13 +321,28 @@ internal static class TraceSummarySidecar
             br.ReadInt64();  // min
             br.ReadInt64();  // max
 
+            // EVERY LENGTH BELOW IS BOUNDED BY EVIDENCE THE FILE CANNOT FORGE — the bytes actually
+            // left in it, and the ceiling above. Returning false rather than throwing keeps the
+            // caller's own classification intact: a sidecar that will not parse is a corrupt
+            // sidecar, which it already knows how to say.
             uint volCount = br.ReadUInt32();
-            fs.Seek(volCount * 16L, SeekOrigin.Current); // skip volume header
+            long afterVol = fs.Position + volCount * 16L;
+            if (volCount > (fs.Length - fs.Position) / 16) { rows = []; return false; }
+            fs.Seek(afterVol, SeekOrigin.Begin); // skip volume header
 
-            uint   uncompSize = br.ReadUInt32();
-            uint   compSize   = br.ReadUInt32();
-            byte[] comp       = br.ReadBytes((int)compSize);
-            byte[] raw        = LZ4Pickler.Unpickle(comp);
+            uint uncompSize = br.ReadUInt32();
+            uint compSize   = br.ReadUInt32();
+            if (compSize > fs.Length - fs.Position || uncompSize > MaxBodyBytes) { rows = []; return false; }
+
+            byte[] comp = br.ReadBytes((int)compSize);
+            if (comp.Length != compSize) { rows = []; return false; }
+
+            // The size INSIDE the payload, which the check above never saw: LZ4 carries the
+            // decompressed length in its own header, so a short well-formed block can still ask for
+            // gigabytes. Same reasoning as SpanReader's MaxBlockBytes guard, same failure without it.
+            if (LZ4Pickler.UnpickledSize(comp) is < 0 or > MaxBodyBytes) { rows = []; return false; }
+
+            byte[] raw = LZ4Pickler.Unpickle(comp);
             if (raw.Length != uncompSize) { /* tolerate — trust actual length */ }
 
             rows = ParseBody(raw, fromNano, toNano);
@@ -327,8 +356,12 @@ internal static class TraceSummarySidecar
         var ms = new MemoryStream(raw, writable: false);
         using var br = new BinaryReader(ms);
 
+        // A string here costs at least its two-byte length prefix, so a pool larger than half the
+        // body is a torn count and nothing else.
         uint poolCount = br.ReadUInt32();
-        var  pool      = new string[poolCount];
+        if (poolCount > (raw.Length - ms.Position) / 2) throw new InvalidDataException(
+            $"Trace-summary pool count {poolCount} cannot fit in {raw.Length - ms.Position} bytes");
+        var pool = new string[poolCount];
         for (uint i = 0; i < poolCount; i++)
         {
             ushort len = br.ReadUInt16();

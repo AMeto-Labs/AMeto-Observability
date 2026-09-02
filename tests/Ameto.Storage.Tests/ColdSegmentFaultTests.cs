@@ -324,16 +324,36 @@ public sealed class ColdSegmentFaultTests : IDisposable
         // at once, and classifying that as loss drops the whole cold tier and writes a permanent
         // claim that outlives the data coming back — measured before this guard: three consecutive
         // requests after the remount still returned rows=0 Unreadable=True with every .trc present.
+        //
+        // TWO THINGS THIS FIXTURE PINS THAT AN EARLIER VERSION DID NOT.
+        //
+        // Two segments, because one is not evidence: with a single cold segment "every listed
+        // segment is missing" is the same observation as its deletion, and a guard that fired there
+        // turned every one-segment loss into a mount. The rule needs plurality, and this is where
+        // that is asserted.
+        //
+        // And a stub that is NOT EMPTY. The first guard asked for zero directory entries of any
+        // kind, which a single lost+found on ext4 or System Volume Information on NTFS defeats —
+        // and, decisively, so does the engine's own spans.wal, which lives in this very directory.
+        // Measured on the earlier version: adding one directory to the stub was enough to get
+        // rows=0 Unreadable=True regions=5, unrecoverable after the files came back. So the stub
+        // here carries both an unrelated entry and a file, and the guard must still fire.
         string real = Path.Combine(_root, "realvol");
         string stub = Path.Combine(_root, "emptyvol");
         string link = Path.Combine(_root, "mount");
         Directory.CreateDirectory(real);
         Directory.CreateDirectory(stub);
+        Directory.CreateDirectory(Path.Combine(stub, "lost+found"));
+        File.WriteAllText(Path.Combine(stub, "spans.wal"), "not a segment");
         if (!TryJunction(link, real)) return;   // needs a junction; skipped where it cannot be made
 
         using var e = new TraceStorageEngine(link, NullLogger<TraceStorageEngine>.Instance);
-        for (int k = 0; k < 20; k++) Write(e, 6_000 + (ulong)k, _baseNano + k * Ms);
+        for (int k = 0; k < 10; k++) Write(e, 6_000 + (ulong)k, _baseNano + k * Ms);
         e.FlushHotTier();
+        for (int k = 10; k < 20; k++) Write(e, 6_000 + (ulong)k, _baseNano + k * Ms);
+        e.FlushHotTier();
+        Assert.True(e.ColdSegmentsForTest.Length >= 2,
+            "the fixture needs more than one segment — one is indistinguishable from a deletion");
 
         long from = _baseNano - 1000 * Ms, to = _baseNano + 1000 * Ms;
         Assert.Equal(20, (await ListAsync(e, from, to)).Rows.Count);
