@@ -264,12 +264,12 @@ public sealed class VanishedRegionLogTests
     {
         var log = new VanishedRegionLog();
 
-        log.Record(100, 200, long.MaxValue);
-        log.Record(150, 300, long.MaxValue);          // overlaps the first
-        log.Record(301, 400, long.MaxValue);          // adjacent but disjoint — a separate hole
+        log.Record(100, 200);
+        log.Record(150, 300);          // overlaps the first
+        log.Record(301, 400);          // adjacent but disjoint — a separate hole
         Assert.Equal(2, log.CountForTest);
 
-        log.Record(250, 350, long.MaxValue);          // bridges the two
+        log.Record(250, 350);          // bridges the two
         Assert.Equal(1, log.CountForTest);
 
         Assert.True(log.Overlaps(100, 100));
@@ -282,7 +282,7 @@ public sealed class VanishedRegionLogTests
     public void The_window_test_is_an_overlap_not_a_containment()
     {
         var log = new VanishedRegionLog();
-        log.Record(1_000, 2_000, long.MaxValue);
+        log.Record(1_000, 2_000);
 
         Assert.True(log.Overlaps(0, 1_000));            // touches the bottom edge
         Assert.True(log.Overlaps(2_000, 9_000));        // touches the top edge
@@ -301,7 +301,7 @@ public sealed class VanishedRegionLogTests
         // that nothing merges on its own.
         const int Losses = 400;
         for (int i = 0; i < Losses; i++)
-            log.Record(i * 3600 * Gb, i * 3600 * Gb + 60 * Gb, long.MaxValue);
+            log.Record(i * 3600 * Gb, i * 3600 * Gb + 60 * Gb);
 
         Assert.True(log.CountForTest <= 32,
             $"the record grew to {log.CountForTest} ranges — it is a leak, not a bound");
@@ -317,9 +317,9 @@ public sealed class VanishedRegionLogTests
     public void Forget_drops_only_what_lies_entirely_below_the_cutoff()
     {
         var log = new VanishedRegionLog();
-        log.Record(1_000, 2_000, long.MaxValue);
-        log.Record(5_000, 6_000, long.MaxValue);
-        log.Record(9_000, 10_000, long.MaxValue);
+        log.Record(1_000, 2_000);
+        log.Record(5_000, 6_000);
+        log.Record(9_000, 10_000);
 
         Assert.Equal(1, log.Forget(5_000));             // the first only
         Assert.Equal(2, log.CountForTest);

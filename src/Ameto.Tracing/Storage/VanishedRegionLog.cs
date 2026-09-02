@@ -83,6 +83,11 @@ internal sealed class VanishedRegionLog
     /// <summary>Test hook: how many disjoint ranges are currently remembered.</summary>
     internal int CountForTest { get { lock (_gate) return _regions.Count; } }
 
+    /// <summary>How many lost paths are remembered. See <see cref="RecordPath"/>.</summary>
+    private const int MaxPaths = 64;
+    private readonly Queue<string> _lostPathOrder = new();
+    private readonly HashSet<string> _lostPaths = new(StringComparer.OrdinalIgnoreCase);
+
     /// <summary>
     /// Remembers that a segment covering <c>[minNano, maxNano]</c> is gone. Merges into any range
     /// it touches, so repeatedly losing files in one part of the timeline costs one entry.
@@ -108,11 +113,6 @@ internal sealed class VanishedRegionLog
     /// <para>Bounded like the ranges, by the same argument: dropping the oldest entry only means a
     /// later reader falls back to Handover for a file nobody is going to meet again.</para>
     /// </summary>
-    private const int MaxPaths = 64;
-    private readonly Queue<string> _lostPathOrder = new();
-    private readonly HashSet<string> _lostPaths = new(StringComparer.OrdinalIgnoreCase);
-
-    /// <summary>Remembers that this exact file is the one that went missing.</summary>
     public void RecordPath(string filePath)
     {
         lock (_gate)
@@ -129,42 +129,49 @@ internal sealed class VanishedRegionLog
         lock (_gate) return _lostPaths.Contains(filePath);
     }
 
-    public void Record(long minNano, long maxNano, long ceilingNano)
+    /// <summary>
+    /// Remembers that a segment covering <c>[minNano, maxNano]</c> is gone. Merges into any range
+    /// it touches, so repeatedly losing files in one part of the timeline costs one entry.
+    ///
+    /// <para>The range is bounded before it is believed, because these numbers come from a file
+    /// header and a torn field arrives here as a claim about the year 2262 — which
+    /// <see cref="Forget"/> could never age out, since it keys on Max. The clamp and the reasoning
+    /// behind choosing the clock over every other candidate are in the body.</para>
+    /// </summary>
+    public void Record(long minNano, long maxNano)
     {
         if (minNano > maxNano) (minNano, maxNano) = (maxNano, minNano);
 
-        // THE CEILING IS THE CALLER'S, AND IT IS THE FILE'S OWN LAST-WRITE TIME. Two weaker
-        // choices were tried and both are wrong in a way a test now pins:
-        //   * "now plus a day of clock slack" — the slack BECAME the recorded Max, so one torn
-        //     header plus one lost file answered every LIVE window with "a storage segment inside
-        //     this window could not be read" for the next twenty-four hours, over windows holding
-        //     none of the lost data, and Forget could not reach it because Forget keys on Max;
-        //   * "now" — better, but a segment written a month ago and lost today still stretches its
-        //     region across the whole month up to live traffic.
-        // A file is written after the spans in it arrived, so its mtime is a real upper bound on
-        // what it could have held, and it is the only evidence still available once the file
-        // itself is gone.
-        // TWO CEILINGS, AND THE LOWER USABLE ONE WINS. `now` is the structural one and it always
-        // holds: no range whose Max is in the future is storable, so no record is unforgettable by
-        // Forget. The caller's is evidence about this particular file — its own write time, which
-        // bounds what it could have held.
+        // ONE LINE, AND NO EVIDENCE BUT THE CLOCK. Three ceilings were tried here and every one of
+        // them NARROWED the record off the loss it described — in a class whose whole contract is
+        // that it only ever widens:
+        //   * the mtime, floored at Min, collapsed a restored backup to the point [Min, Min];
+        //   * the mtime when at or above Min still clamps whenever the mtime falls BETWEEN Min and
+        //     Max, which is ordinary for any segment written over a span of time;
+        //   * the mtime gated on a suspect header is the same mistake once more, because a file
+        //     restored with an older write time IS a suspect header by that test.
+        // Each was a three-state input answered by a two-state test, and each answer cost real
+        // reported loss: measured, Overlaps over a band the segment demonstrably held came back
+        // False after every one of them.
         //
-        // BUT ONLY WHILE IT IS EVIDENCE. A mtime BELOW the segment's own Min is not a statement
-        // about the data, it is a statement that the mtime is unusable: files restored by rsync -at,
-        // tar -xp or a filesystem snapshot carry a write time older than everything in them. An
-        // earlier version clamped to it anyway and then floored the result at Min — which did stop
-        // the range inverting, by collapsing it to the single point [Min, Min]. Measured: a 4.75-hour
-        // segment lost with a five-day-old mtime recorded the point [-6h, -6h], and the very next
-        // query over the LAST THREE HOURS came back Unreadable=False Capped=False over a window that
-        // had just lost eight of that segment's twenty traces. A silent complete:true over lost
-        // data, produced by the guard against silent completes, in the direction this class's own
-        // docstring calls impossible.
-        long nowNano  = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
-        long ceiling  = ceilingNano >= minNano ? Math.Min(ceilingNano, nowNano) : nowNano;
+        // The only thing a ceiling has to prevent is a Max that Forget can never reach — Forget
+        // drops a range when its Max is below retention cutoff, so a Max torn to long.MaxValue
+        // answers every query on the install for the life of the process. That is decidable from
+        // the clock alone: a time in the FUTURE is not a time a segment can hold spans at.
+        //
+        // Never below Min, because a segment that reached Min demonstrably held something there,
+        // and a point inside the lost band still reports part of the loss while a point outside it
+        // reports none. A producer clocked minutes ahead lands here and keeps the inside point.
+        //
+        // The cost, stated rather than hidden: a torn Max on a segment lost a month ago now
+        // records up to NOW, so a live window can carry a truncation banner for data it never
+        // held, until retention ages the range out. That is over-reporting, and this class exists
+        // because the other direction — a window quietly told it is whole — is the one that cannot
+        // be recovered from. The header that caused it is separately logged by name.
+        long nowNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+        maxNano = Math.Min(maxNano, Math.Max(nowNano, minNano));
 
-        if (maxNano > ceiling) maxNano = ceiling;
-        if (minNano < 0)       minNano = 0;
-        if (minNano > maxNano) minNano = maxNano;   // the whole claim was in the future
+        if (minNano < 0) minNano = 0;
 
         lock (_gate)
         {
@@ -206,29 +213,25 @@ internal sealed class VanishedRegionLog
     }
 
     /// <summary>
-    /// Drops every range that lies entirely below <paramref name="cutoffNano"/>, and TRIMS the one
-    /// range that can still straddle it. Called with retention's own cutoff: the segments in that
-    /// band have been deleted deliberately, so a query reaching there is asking about data the
-    /// operator chose not to keep, and answering it with "a file was lost" would be describing the
-    /// wrong event for ever.
+    /// Drops every range that lies ENTIRELY below <paramref name="cutoffNano"/>, and leaves every
+    /// other range exactly as it is. Called with retention's own cutoff: the segments in that band
+    /// were deleted deliberately, so a query reaching there is asking about data the operator chose
+    /// not to keep, and answering it with "a file was lost" would describe the wrong event for ever.
     ///
-    /// <para>WHY THE TRIM, which is the asymmetry the drop alone leaves behind. The condition is
-    /// <c>Max &lt; cutoff</c>, so this method keys entirely on the TOP of a range and never looks
-    /// at the bottom — which is why a torn <c>Min</c> was always harmless (the real <c>Max</c>
-    /// still ages out; measured, <c>regions</c> went 1 → 0 on the next pass) and a torn <c>Max</c>
-    /// was fatal. Trimming makes retention act on both ends: the part of a surviving range that
-    /// lies below the cutoff describes spans retention has now deleted on purpose, so continuing
-    /// to report it is the same wrong sentence, just about less of the timeline. It also drains
-    /// the over-report that coalescing and a repaired-to-zero <c>Min</c> both create, instead of
-    /// leaving it to sit until the whole range finally expires.</para>
+    /// <para>WHOLE OR NOTHING, and an earlier version of this method trimmed a straddler's Min up
+    /// to the cutoff instead. Its justification — the part below the cutoff describes spans
+    /// retention has now deleted — is true only of ranges entirely below it, which are exactly the
+    /// ones dropped here. Retention removes a SEGMENT only when its MaxStartNano is below the
+    /// cutoff, so a segment straddling the line keeps every span it holds beneath that line, on
+    /// disk and queryable, and so do its neighbours. Measured: Overlaps(min, cutoff-1h) went from
+    /// true to false after a trim while other segments went on serving exactly that band — a
+    /// truncation banner replaced by a short list calling itself complete, which is the one
+    /// direction this class must never move in.</para>
     ///
-    /// <para>AT MOST ONE RANGE NEEDS IT, and the invariants prove it rather than the loop assuming
-    /// it: the list is sorted ascending by <c>Min</c> and disjoint, so every survivor past the
-    /// first has <c>Min[i] &gt; Max[i-1] ≥ cutoff</c>. Trimming only ever RAISES a <c>Min</c>
-    /// toward a <c>Max</c> that is already at or above the cutoff, so the range stays non-empty,
-    /// stays sorted and cannot grow into its neighbour.</para>
+    /// <para>The condition keys entirely on the TOP of a range, which is why a torn Min was always
+    /// harmless (the real Max still ages out) and a torn Max was fatal until Record bounded it.</para>
     /// </summary>
-    /// <returns>How many ranges were dropped outright. A trim is not a drop.</returns>
+    /// <returns>How many ranges were dropped.</returns>
     public int Forget(long cutoffNano)
     {
         lock (_gate)

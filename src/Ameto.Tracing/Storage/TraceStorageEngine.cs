@@ -77,6 +77,10 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// <summary>Test hook: how many vanished-segment ranges the engine currently remembers.</summary>
     internal int VanishedRegionCountForTest => _vanished.CountForTest;
 
+    /// <summary>Retention's own call, reachable from a test: the wall clock cannot be moved, so
+    /// proving a record is forgettable means handing Forget a cutoff past it.</summary>
+    internal int ForgetVanishedForTest(long cutoffNano) => _vanished.Forget(cutoffNano);
+
     /// <summary>
     /// Test hook: does what a reader does when it opens a segment its own snapshot names and finds
     /// no file there. Compaction and retention both publish their snapshot change BEFORE unlinking
@@ -581,7 +585,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             return false;
         }
 
-        _vanished.Record(seg.MinStartNano, seg.MaxStartNano, seg.LastWriteNano);
+        _vanished.Record(seg.MinStartNano, seg.MaxStartNano);
         _vanished.RecordPath(seg.FilePath);
         _logger.LogWarning(
             "Cold span segment {File} vanished from disk — removed from the segment list; reads " +
@@ -674,28 +678,22 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         // behaves. Erring to Transient here cannot hide anything either: the segments STAY in the
         // snapshot, so a directory that really is empty for ever keeps faulting and keeps
         // reporting, which is "ask me again", never "it is gone".
-        // TWO SEGMENTS GONE AT ONCE, AND NO SEGMENT FILE LEFT ANYWHERE.
+        // THERE IS NO GUARD HERE ANY MORE, AND THAT IS THE DECISION.
         //
-        // Two earlier drafts were wrong in opposite directions. "Every listed segment is missing" is
-        // too wide: with a single cold segment that is the same observation as its deletion, and it
-        // turned every one-segment loss into a mount. "The directory holds no entries at all" is too
-        // narrow — defeated by one lost+found on ext4, a System Volume Information on NTFS, and
-        // above all by THE ENGINE'S OWN spans.wal, which lives in this very directory, so in a real
-        // installation it essentially never fired.
+        // Three attempts tried to recognise "the volume came back unpopulated" from the filesystem
+        // and each was defeated by this engine's own files. "No directory entries at all" is beaten
+        // by spans.wal, which lives in this very directory. "Two segments gone and no .trc left" is
+        // beaten within seconds by CompleteFlush, which writes a fresh .trc into whatever the data
+        // directory currently is — so on the busy install this whole branch exists for, the guard
+        // was false almost immediately. And each one bought its rare true positive by SUPPRESSING
+        // the ordinary true negative: with the last guard in place, a wholesale delete on an install with
+        // two or more segments measured Unreadable=False on three consecutive requests, for ever.
         //
-        // What separates the two is plurality plus absence: files do not disappear two at a time,
-        // and a volume that re-attached unpopulated has no .trc anywhere. With a single listed
-        // segment the two are genuinely indistinguishable, so that case stays a deletion — the
-        // honest limit, and the one the loss tests pin.
-        if (_coldSegments.Length >= 2 && NoSegmentFilesLeft(_dataDir))
-        {
-            _logger.LogWarning(
-                "The data directory {Dir} is present but completely empty while cold segments are " +
-                "still listed — treating {File} as an unpopulated volume rather than a deletion; " +
-                "the snapshot is kept and the next request retries", _dataDir, seg.FilePath);
-            return ColdReadFault.Transient;
-        }
-
+        // A directory that is GONE is still transient — that is a different question, decided by
+        // the DirectoryNotFoundException branch above, where the evidence is real. A file that is
+        // missing while its directory is intact is a loss, and reporting it as one over-reports
+        // when a volume remounts empty. That is the recoverable direction: the region is bounded
+        // and retention ages it out, whereas a suppressed loss is a window quietly called whole.
         if (RemoveColdSegment(seg)) return ColdReadFault.Lost;
 
         // NOT LISTED — which usually means the engine retired it itself, and a compaction handover
@@ -714,30 +712,6 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         return ColdReadFault.Handover;
     }
 
-    /// <summary>
-    /// Whether the directory holds no segment file at all. Probe failures answer FALSE — an I/O
-    /// error is not evidence of absence, and answering TRUE would turn an unreadable mount into
-    /// "keep retrying for ever" over data that may really be gone.
-    /// </summary>
-    private static bool NoSegmentFilesLeft(string dir)
-    {
-        try
-        {
-            // Disposed, unlike the first version: FileSystemEnumerator holds a native find handle
-            // that only the finaliser would release, on a path that runs once per faulted segment
-            // per page — exactly the sick-storage moment when handles are scarce.
-            using var it = Directory.EnumerateFiles(dir, "*.trc").GetEnumerator();
-            return !it.MoveNext();
-        }
-        catch { return false; }
-    }
-
-    /// <summary>
-    /// True when this verdict means rows are MISSING AND NOTHING WILL BRING THEM BACK — the only
-    /// two that may raise a page's <c>Unreadable</c> bit and the red banner behind it. A handover
-    /// is a healthy server's own compaction; a transient fault is answered by the next request.
-    /// Both of those are floors: "ask me again", not "it is gone".
-    /// </summary>
     /// <summary>
     /// WHAT THE EXCEPTION ACTUALLY SAYS, rather than "anything I did not name is corruption".
     ///
@@ -759,9 +733,14 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// </summary>
     private ColdReadFault ClassifyReadFailure(Exception ex, string what, string filePath)
     {
+        // MessagePackSerializationException belongs here and its absence was a hole pointing the
+        // dangerous way: a block that decompressed cleanly and holds rubbish is the ORDINARY shape
+        // of corruption, and it was being answered with "ask me again", for ever. Measured on this
+        // branch: 13 of 200 single-byte flips in a 561 855-byte segment raise exactly this type.
         bool content = ex is InvalidDataException or EndOfStreamException
                     or System.Text.DecoderFallbackException
-                    or IndexOutOfRangeException or ArgumentOutOfRangeException;
+                    or IndexOutOfRangeException or ArgumentOutOfRangeException
+                    or MessagePack.MessagePackSerializationException;
 
         if (content)
         {
@@ -775,6 +754,12 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         return ColdReadFault.Transient;
     }
 
+    /// <summary>
+    /// True when this verdict means rows are MISSING AND NOTHING WILL BRING THEM BACK — the only
+    /// two that may raise a page's <c>Unreadable</c> bit and the red banner behind it. A handover
+    /// is a healthy server's own compaction; a transient fault is answered by the next request.
+    /// Both of those are floors: "ask me again", not "it is gone".
+    /// </summary>
     private static bool IsPermanentFault(ColdReadFault fault) =>
         fault is ColdReadFault.Lost or ColdReadFault.Corrupt;
 
@@ -1366,6 +1351,24 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                       + "[{MinNano}, {MaxNano}] — it stays queryable on that range as written; "
                       + "suspect the volume it was written to",
                         file, info.MinStartNano, info.MaxStartNano);
+            }
+            catch (Exception ex) when (ClassifyReadFailure(ex, "Cold segment load", file) is not ColdReadFault.Corrupt)
+            {
+                // NOT EVERY FAILURE TO OPEN IS A REASON TO DESTROY. This catch answered anything at
+                // all with DeleteSegmentFiles, so a segment held open by an antivirus, a backup
+                // agent or the compactor's own File.Move was deleted at startup along with its
+                // .stats, .svcgraph and .tracesum — measured, and on Linux, where File.Delete
+                // succeeds against an open handle, the .trc goes too. The query path was taught in
+                // this same change that a sharing violation is not damage; the startup path was
+                // still answering it with destruction.
+                //
+                // Skipped rather than loaded: the file is not readable NOW, and nothing rescans, so
+                // the next restart is what picks it up. That is a cold-tier gap until then, which
+                // is strictly better than a deletion that cannot be undone.
+                _logger.LogWarning(ex,
+                    "Cold segment {File} could not be read at startup — left on disk and skipped for "
+                  + "this run; it is not damaged, it is unreadable right now", file);
+                continue;
             }
             catch (Exception ex)
             {
@@ -1996,6 +1999,11 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                         // Re-probing is what tells the two apart: a sidecar that is no longer there
                         // is the missing-file question, a sidecar that is there and will not read
                         // is corrupt.
+                        // Reached only when the sidecar itself said "this will not parse" — every
+                        // other failure now propagates and lands in the catch chain below, where
+                        // ClassifyReadFailure can tell a damaged file from a locked one. It used to
+                        // be hardcoded here, so a lock that clears in seconds was a permanent
+                        // deleted-or-damaged claim with nothing in the log.
                         segFault = TraceSummarySidecar.Exists(seg.FilePath)
                                  ? ColdReadFault.Corrupt
                                  : MeetMissingSegmentFile(seg);

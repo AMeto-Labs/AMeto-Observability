@@ -254,7 +254,17 @@ internal static class TraceSummarySidecar
             long min = br.ReadInt64();
             long max = br.ReadInt64();
 
+            // Bounded like every other count in this file. The same field is read by
+            // TryReadSummaries a few methods down, where it was bounded and here it was not —
+            // and this is the WORSE path of the two: /api/traces/stats is polled every fifteen
+            // seconds independently of the list, so it runs even while the list is frozen.
+            // Measured on a real 2532-byte .tracesum with the volume count set to 0x02000000:
+            // 512.2 MB allocated on one stats refresh, and 0x40000000 asks for 17.2 GB.
             uint volCount = br.ReadUInt32();
+            if (volCount > (fs.Length - fs.Position) / 16)
+                throw new InvalidDataException(
+                    $"Volume header declares {volCount} buckets past the end of {path}");
+
             var buckets = new List<TraceVolumeEntry>((int)volCount);
             for (uint i = 0; i < volCount; i++)
             {
@@ -348,8 +358,39 @@ internal static class TraceSummarySidecar
             rows = ParseBody(raw, fromNano, toNano);
             return true;
         }
-        catch { rows = []; return false; }
+        catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
+        {
+            // ABSENCE IS NOT A READ FAILURE, and this method has always answered it with false —
+            // the caller re-probes Exists precisely to tell "the file is gone" from "the file will
+            // not parse", which is what separates a compaction handover from a loss. Letting it
+            // propagate would hand that question to an exception classifier that cannot answer it.
+            rows = [];
+            return false;
+        }
+        catch (Exception ex) when (IsMalformed(ex))
+        {
+            // Only the exceptions that describe CONTENT are answered here, and answered as false —
+            // "this sidecar will not parse". Everything else is left to propagate, because the
+            // caller is the only place that can tell a damaged file from a locked one and it was
+            // reduced to guessing: a bare catch here meant a sharing violation, an SMB blip or a
+            // remount arrived at the caller as "the file exists but would not read", which it
+            // hardcoded to Corrupt — a permanent claim over a lock that clears in seconds, with
+            // nothing in the log, because this branch logged nothing either.
+            rows = [];
+            return false;
+        }
     }
+
+    /// <summary>
+    /// Whether the failure describes the FILE's contents rather than the machine's ability to read
+    /// it. The same split the engine's own classifier makes; kept here so a sidecar cannot report a
+    /// transient condition as damage before the classifier ever sees it.
+    /// </summary>
+    private static bool IsMalformed(Exception ex) =>
+        ex is InvalidDataException or EndOfStreamException
+           or System.Text.DecoderFallbackException
+           or IndexOutOfRangeException or ArgumentOutOfRangeException
+           or MessagePack.MessagePackSerializationException;
 
     private static List<TraceSummary> ParseBody(byte[] raw, long fromNano, long toNano)
     {

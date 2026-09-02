@@ -316,35 +316,32 @@ public sealed class ColdSegmentFaultTests : IDisposable
     }
 
     [Fact]
-    public async Task A_volume_that_came_back_EMPTY_is_a_mount_and_not_a_hundred_deletions()
+    public async Task A_volume_that_came_back_EMPTY_is_reported_as_loss_ON_PURPOSE()
     {
-        // The blip test above covers a directory that is not THERE. This is the other half, and it
-        // is the shape a container actually meets: the volume has re-attached and is not populated
-        // yet, so Directory.Exists answers yes over an empty stub. Every listed segment is missing
-        // at once, and classifying that as loss drops the whole cold tier and writes a permanent
-        // claim that outlives the data coming back — measured before this guard: three consecutive
-        // requests after the remount still returned rows=0 Unreadable=True with every .trc present.
+        // THE GUARD THAT USED TO BE HERE IS GONE, and this test is where that decision is pinned.
         //
-        // TWO THINGS THIS FIXTURE PINS THAT AN EARLIER VERSION DID NOT.
+        // Three attempts tried to recognise an unpopulated volume from the filesystem, and each
+        // was defeated by this engine's own files: 'no directory entries at all' by spans.wal,
+        // which lives in the data directory; 'two segments gone and no .trc left' by CompleteFlush,
+        // which writes a fresh .trc into whatever the data directory currently is, within seconds
+        // on the busy install the whole branch exists for. And each bought its rare true positive
+        // by suppressing the ordinary true negative — measured with the last guard in place, a
+        // wholesale delete on an install with two segments reported Unreadable=False on three
+        // consecutive requests, permanently.
         //
-        // Two segments, because one is not evidence: with a single cold segment "every listed
-        // segment is missing" is the same observation as its deletion, and a guard that fired there
-        // turned every one-segment loss into a mount. The rule needs plurality, and this is where
-        // that is asserted.
+        // So an empty remount is now reported as what it looks like from inside a query: the files
+        // this window needed are not there. That over-reports for a volume that later comes back —
+        // and over-reporting is the recoverable direction, because the region is bounded and
+        // retention ages it out, while a suppressed loss is a window quietly called whole.
         //
-        // And a stub that is NOT EMPTY. The first guard asked for zero directory entries of any
-        // kind, which a single lost+found on ext4 or System Volume Information on NTFS defeats —
-        // and, decisively, so does the engine's own spans.wal, which lives in this very directory.
-        // Measured on the earlier version: adding one directory to the stub was enough to get
-        // rows=0 Unreadable=True regions=5, unrecoverable after the files came back. So the stub
-        // here carries both an unrelated entry and a file, and the guard must still fire.
+        // The BLIP is a different question with real evidence behind it, and it is still answered
+        // transiently — see A_directory_that_blips_costs_ONE_REQUEST_and_not_the_cold_tier, where
+        // the directory itself is gone rather than merely empty.
         string real = Path.Combine(_root, "realvol");
         string stub = Path.Combine(_root, "emptyvol");
         string link = Path.Combine(_root, "mount");
         Directory.CreateDirectory(real);
         Directory.CreateDirectory(stub);
-        Directory.CreateDirectory(Path.Combine(stub, "lost+found"));
-        File.WriteAllText(Path.Combine(stub, "spans.wal"), "not a segment");
         if (!TryJunction(link, real)) return;   // needs a junction; skipped where it cannot be made
 
         using var e = new TraceStorageEngine(link, NullLogger<TraceStorageEngine>.Instance);
@@ -352,8 +349,6 @@ public sealed class ColdSegmentFaultTests : IDisposable
         e.FlushHotTier();
         for (int k = 10; k < 20; k++) Write(e, 6_000 + (ulong)k, _baseNano + k * Ms);
         e.FlushHotTier();
-        Assert.True(e.ColdSegmentsForTest.Length >= 2,
-            "the fixture needs more than one segment — one is indistinguishable from a deletion");
 
         long from = _baseNano - 1000 * Ms, to = _baseNano + 1000 * Ms;
         Assert.Equal(20, (await ListAsync(e, from, to)).Rows.Count);
@@ -363,18 +358,16 @@ public sealed class ColdSegmentFaultTests : IDisposable
 
         var during = await ListAsync(e, from, to);
         _out.WriteLine($"empty mount rows={during.Rows.Count} Unreadable={during.Unreadable} "
-                     + $"Capped={during.Capped} regions={e.VanishedRegionCountForTest}");
-        Assert.False(during.Unreadable, "an unpopulated volume was reported as permanent data loss");
-        Assert.Equal(0, e.VanishedRegionCountForTest);
+                     + $"regions={e.VanishedRegionCountForTest}");
 
-        Directory.Delete(link);
-        Assert.True(TryJunction(link, real));
+        // Reported, not swallowed. The window really cannot be served, and saying so is the whole
+        // contract — the alternative that was tried here said nothing and meant it permanently.
+        Assert.True(during.Unreadable,
+            "a window whose segments are all unreachable came back without a fault");
 
-        var after = await ListAsync(e, from, to);
-        _out.WriteLine($"after remount rows={after.Rows.Count} Unreadable={after.Unreadable}");
-        Assert.Equal(20, after.Rows.Count);
-        Assert.False(after.Unreadable);
-        Assert.Equal(0, e.VanishedRegionCountForTest);
+        // And bounded: what is recorded is the range those segments covered, nothing wider, so
+        // retention can age it out.
+        Assert.True(e.VanishedRegionCountForTest >= 1);
     }
 
     [Fact]

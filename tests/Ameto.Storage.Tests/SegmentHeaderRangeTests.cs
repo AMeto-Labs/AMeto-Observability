@@ -295,13 +295,22 @@ public sealed class SegmentHeaderRangeTests : IDisposable
     }
 
     [Fact]
-    public async Task The_range_recorded_for_a_lost_segment_stops_at_the_file_it_came_from()
+    public async Task The_range_recorded_for_a_lost_segment_stops_at_NOW()
     {
-        // THE CONSEQUENCE OF MOVING THE BOUND, and the reason the recorded ceiling is the FILE's
-        // own last-write time rather than "now" or "now plus a day". A segment written a month ago
-        // with a torn max, then lost, must not put a region over LIVE traffic: measured with a
-        // now-anchored ceiling, a now-15m window holding none of the lost data still came back
-        // rows=0 Unreadable=True, and Forget could not reach it because it keys on Max.
+        // THE CEILING IS THE CLOCK, AND THIS TEST IS ALSO WHERE ITS COST IS WRITTEN DOWN.
+        //
+        // This used to assert that the recorded range stopped at the FILE's own write time, so a
+        // segment lost a month ago could not claim a hole in the last fifteen minutes. That was a
+        // nicer answer and it was unsound: every mtime-based ceiling tried here narrowed the record
+        // off real loss in some ordinary case — a restored backup, a segment written across a span
+        // of hours, a producer clocked ahead — and this class exists because a window quietly told
+        // it is whole is the one failure that cannot be recovered from.
+        //
+        // So the ceiling is now the only thing that is always evidence: a segment cannot hold spans
+        // at a time that has not happened. A torn Max is bounded to now, which is what makes the
+        // record forgettable at all (Forget keys on Max), and the price is that a live window can
+        // carry a truncation banner for data it never held until retention ages the range out.
+        // Over-reporting a hole is recoverable; missing one is not.
         string dir = Path.Combine(_root, "livewindow");
         Directory.CreateDirectory(dir);
 
@@ -313,9 +322,6 @@ public sealed class SegmentHeaderRangeTests : IDisposable
             trc = e.ColdSegmentsForTest.Single().FilePath;
         }
         Tear(trc, MaxNanoOffset, long.MaxValue);
-        // The file was written when its spans were — a month ago — which is the ordinary case and
-        // the only honest ceiling available once the file itself is gone.
-        BackdateEveryFile(dir, Base.UtcDateTime.AddMinutes(1));
 
         using var e2 = new TraceStorageEngine(dir, NullLogger<TraceStorageEngine>.Instance);
         e2.LoadColdSegments();
@@ -324,11 +330,13 @@ public sealed class SegmentHeaderRangeTests : IDisposable
         Assert.True((await ListAsync(e2, _baseNano - 1000 * Ms, _baseNano + 1000 * Ms)).Unreadable);
         Assert.Equal(1, e2.VanishedRegionCountForTest);
 
-        long now  = NowNano();
-        var  live = await ListAsync(e2, now - 15 * 60L * 1_000_000_000L, now);
-        _out.WriteLine($"live 15m window rows={live.Rows.Count} Unreadable={live.Unreadable}");
-        Assert.False(live.Unreadable,
-            "a segment lost a month ago is claiming a hole in the last fifteen minutes");
+        // Bounded at now: a window that starts AFTER this moment is untouched, which is what
+        // stops the torn value being a claim over the rest of time.
+        long now = NowNano();
+        var  future = await ListAsync(e2, now + Hour, now + 2 * Hour);
+        _out.WriteLine($"future window rows={future.Rows.Count} Unreadable={future.Unreadable}");
+        Assert.False(future.Unreadable,
+            "a torn Max is still reaching past now — Forget can never pass it");
     }
 
     [Fact]
@@ -371,10 +379,17 @@ public sealed class SegmentHeaderRangeTests : IDisposable
     }
 
     [Fact]
-    public async Task Retention_can_reach_a_range_recorded_from_a_torn_header()
+    public async Task A_range_from_a_torn_header_is_bounded_and_therefore_forgettable()
     {
         // The half PruneAsync was structurally unable to do: with an unforgettable Max the pass
-        // reported "pruned=0, regions=1" for ever.
+        // reported pruned=0, regions=1 for ever.
+        //
+        // Asserted as BOUNDEDNESS rather than by running retention, because the ceiling is now the
+        // clock: the recorded Max is this instant, so no TTL a test can pass to PruneAsync has a
+        // cutoff above it — the wall clock has to move, not the parameter. What the record owes is
+        // that a cutoff past its Max drops it, and that is what Forget is asked here directly.
+        // Record_clamps_an_impossible_range_so_retention_can_always_reach_it pins the same property
+        // on the log alone.
         string dir = Path.Combine(_root, "forgettable");
         Directory.CreateDirectory(dir);
 
@@ -386,11 +401,6 @@ public sealed class SegmentHeaderRangeTests : IDisposable
             trc = e.ColdSegmentsForTest.Single().FilePath;
         }
         Tear(trc, MaxNanoOffset, long.MaxValue);
-        // The premise this test is about: a segment written in the PAST. Without backdating, the
-        // file's write time is this instant, the recorded ceiling is this instant, and no TTL
-        // shorter than the test's own runtime could ever pass it — the assertion below would be
-        // demanding that retention age out a loss that just happened.
-        BackdateEveryFile(dir, DateTime.UtcNow.AddHours(-1));
 
         using var e2 = new TraceStorageEngine(dir, NullLogger<TraceStorageEngine>.Instance);
         e2.LoadColdSegments();
@@ -398,11 +408,8 @@ public sealed class SegmentHeaderRangeTests : IDisposable
         Assert.True((await ListAsync(e2, _baseNano - 1000 * Ms, _baseNano + 1000 * Ms)).Unreadable);
         Assert.Equal(1, e2.VanishedRegionCountForTest);
 
-        // One minute of TTL is enough: the recorded ceiling is the file's own last-write time, so
-        // it is in the PAST. That is the whole difference between a record retention can age out
-        // and one it can never pass at all.
-        await e2.PruneAsync(TimeSpan.FromMinutes(1));
-
+        // A cutoff an hour past now clears it — which it could never do against long.MaxValue.
+        Assert.Equal(1, e2.ForgetVanishedForTest(NowNano() + Hour));
         Assert.Equal(0, e2.VanishedRegionCountForTest);
     }
 
@@ -443,7 +450,7 @@ public sealed class SegmentHeaderRangeTests : IDisposable
         // The structural guard, and the one that holds however a caller reaches this method: no
         // range whose Max is above NOW is storable, so no record is ever unforgettable.
         var log = new VanishedRegionLog();
-        log.Record(0, long.MaxValue, long.MaxValue);
+        log.Record(0, long.MaxValue);
 
         Assert.Equal(1, log.CountForTest);
 
@@ -460,7 +467,7 @@ public sealed class SegmentHeaderRangeTests : IDisposable
         // Slack belongs in what is BELIEVED about a live file, not in what is remembered about a
         // dead one: nothing was ingested after the moment the loss was noticed.
         var log = new VanishedRegionLog();
-        log.Record(0, long.MaxValue, long.MaxValue);
+        log.Record(0, long.MaxValue);
 
         long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * Ms;
         Assert.False(log.Overlaps(now + Hour, now + 25 * Hour),
@@ -483,7 +490,7 @@ public sealed class SegmentHeaderRangeTests : IDisposable
         // segments went on serving exactly that band, turning a truncation banner into a short list
         // with done{complete:true}.
         var log = new VanishedRegionLog();
-        log.Record(1_000, 9_000, long.MaxValue);
+        log.Record(1_000, 9_000);
 
         Assert.Equal(0, log.Forget(5_000));      // straddles: kept, and kept whole
         Assert.Equal(1, log.CountForTest);
@@ -500,9 +507,9 @@ public sealed class SegmentHeaderRangeTests : IDisposable
         // cutoff is the one case where retention really has deleted the data, so it goes; anything
         // reaching above the line stays exactly as it was.
         var log = new VanishedRegionLog();
-        log.Record(1_000, 2_000, long.MaxValue);      // entirely below — dropped
-        log.Record(4_000, 6_000, long.MaxValue);      // straddles     — kept whole
-        log.Record(11_000, 12_000, long.MaxValue);    // entirely above — untouched
+        log.Record(1_000, 2_000);      // entirely below — dropped
+        log.Record(4_000, 6_000);      // straddles     — kept whole
+        log.Record(11_000, 12_000);    // entirely above — untouched
 
         Assert.Equal(1, log.Forget(5_000));
         Assert.Equal(2, log.CountForTest);

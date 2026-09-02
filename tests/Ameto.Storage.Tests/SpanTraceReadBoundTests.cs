@@ -211,7 +211,14 @@ public sealed class SpanTraceReadBoundTests : IClassFixture<TraceLookupSegmentFi
         // version of this test stayed green under exactly that mutation. One block sits between
         // them with room on either side: two and a half times the honest peak, and well under the
         // defect's.
-        Assert.True(peak < oneBlock,
+        // HALF A BLOCK, and the halving is what the two measurements demand rather than taste.
+        // A budget of one whole block sat ABOVE the defect it exists to catch — measured, the
+        // honest walk peaks at 2.69 MB and materialising the block peaks at 6.71 MB against a
+        // 6.84 MB block, so the test only went red by about one percent, and the block figure
+        // itself drifts a few percent with pool warmth and xUnit ordering. Half a block sits at
+        // 3.4 MB: a quarter above the honest peak and half of the defect, so neither drift can
+        // decide the outcome.
+        Assert.True(peak < oneBlock / 2,
             $"peak retention was {peak / 1048576.0:N2} MB = {(double)peak / oneBlock:N2} blocks "
           + $"({peak * 100.0 / materialised:N1}% of the whole file) — a trace read is holding "
           + "a whole block's worth of decoded spans, not just the block");

@@ -67,7 +67,8 @@ internal static class SpanReader
 
     /// <summary>
     /// Test seam: called once per block <see cref="ReadTraceAsync"/> actually DECODES, with that
-    /// block's buffers still rented and its decoded span list still alive. A trace read holds no
+    /// block still being decoded — inside the method that decodes it, before its frame is gone.
+    /// A trace read holds no
     /// reference the caller can
     /// suspend on — the walk runs to completion before the first span is yielded — so this is the
     /// only place a test can sample the live set WHILE the walk is in it, which is the whole
@@ -329,16 +330,6 @@ internal static class SpanReader
                 spansInBlock = PickTraceSpansFromBlock(
                     rawBuf.AsMemory(0, rawLen), version, traceId, offsets, blockFirst,
                     strict: useBlockGeometry, ref want, result);
-
-                // SAMPLED HERE, INSIDE THE try, WHILE THIS BLOCK IS STILL RENTED. It used to fire
-                // after the finally below, which is to say after comp and rawBuf were already back
-                // in the pool and after PickTraceSpansFromBlock had returned — so the probe saw
-                // only what survives BETWEEN blocks, and reported 0.08 MB against a 20 MB budget
-                // for a walk whose whole point is what it holds DURING one. Proven rather than
-                // argued: PickTraceSpansFromBlock was changed to materialise every span of the
-                // block and select from it — the exact defect just removed from SearchAsync — and
-                // the test stayed green.
-                _afterTraceBlockForTest?.Invoke();
             }
             finally
             {
@@ -402,6 +393,15 @@ internal static class SpanReader
             if (version >= 3) SkipSpanV3(ref reader, i == 0, ref prevTs);
             else              SkipSpanV2(ref reader);
         }
+
+        // SAMPLED HERE, AND NOWHERE ELSE WILL DO. This decodes the block, so anything a defective
+        // version of this method materialised is alive only while this frame is. Two earlier
+        // placements missed by exactly that much: after the pool return, and then inside the
+        // caller after this method had already RETURNED. Both reported 0.08 MB — the same number
+        // in three review rounds — because a forced full collection at either point reclaims
+        // whatever this frame was holding before the probe reads the heap. Measured with the
+        // defect present at the correct placement: 9.29 MB.
+        _afterTraceBlockForTest?.Invoke();
 
         return cnt;
     }
@@ -1024,6 +1024,11 @@ internal static class SpanReader
 
         ushort version = ReadVersion(fs, br);
         var (_, svcIdxOffset, _) = ReadFooter(fs, br, version);
+        // Same as the bloom index, and this one had no offset check at all — every bound below is
+        // measured from where this lands, so an offset past the end makes the bytes that remain a
+        // number the file never limited. Measured: a 33 554 508-byte .trc with a torn footer
+        // offset admitted a service count costing 136 470 344 bytes, four times the file.
+        if (svcIdxOffset <= 0 || svcIdxOffset >= fs.Length) return [];
         fs.Seek(svcIdxOffset, SeekOrigin.Begin);
 
         // Same rule as the bloom index: a service costs at least six bytes here (its length prefix

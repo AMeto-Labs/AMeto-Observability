@@ -513,43 +513,59 @@ describe('the trace list header claims only what it was told', () => {
   // being re-reported are the two that prove nothing: the process restarts and forgets, or
   // retention walks past the range. Both leave the hole exactly where it was.
 
-  it('C6: a background tick may replace the rows; it may not retire a loss it did not disprove',
+  it('C6: the loss marker describes the rows on screen, and follows them when they change',
     async () => {
+      // THIS TEST USED TO ASSERT THE OPPOSITE, and the reversal is deliberate.
+      //
+      // The old rule was raise-only: a background tick could add a loss but never retire one,
+      // because the server's memory of a vanished segment was a field in a process and a restart
+      // made the next tick call the window whole while the traces were still missing. That rule
+      // came with a HOLD — nothing under the banner could change — so the marker always described
+      // what was on screen.
+      //
+      // The hold is gone: freezing a live list over a fact about storage was a deadlock with no
+      // indicator. Raise-only without the hold is worse than either rule on its own, because the
+      // page then holds the server's positive claim that the window was read out AND a banner
+      // calling the rows partial — over rows the claim is not even about.
+      //
+      // What protects the warning now is the server rather than the page: the engine remembers a
+      // vanished segment, so a real hole is re-reported on the very next request. A marker that
+      // outlives its rows is a lie on screen immediately; one that waits a poll interval for the
+      // server to repeat itself is not.
       const fixture = await boot();
       const c = fixture.componentInstance as any;
 
-      // A search the USER ran over a window with a dead segment in it.
-      await search(fixture, 50, {
+      await search(fixture, 300, {
         complete: false, reason: 'max-rows', truncatedBy: 'unreadable-segment',
       });
       expect(c.listLoss()).toBe('unreadable-segment');
       expect(bannerText(fixture)).toBe(UNREADABLE);
 
-      // The server restarts. Its memory of the vanished segment is a plain field, so the very
-      // same window now comes back claiming it was read out — and this tick is nobody's ask.
-      // Reached directly rather than through the poll: the hold means the poll declines today,
-      // and the guarantee is a property of the completion handler, not of its callers.
+      // A tick that brings different rows brings its own account of them.
       c.loadTraces('2026-01-01T00:00:00Z', undefined, 'background');
       fixture.detectChanges();
-      for (let i = 0; i < 50; i++) streams.live.next(row('b' + i));
+      for (let i = 0; i < 12; i++) streams.live.next(row('b' + i));
       streams.live.complete({ complete: true, reason: 'exhausted' });
       fixture.detectChanges();
       await fixture.whenStable();
 
-      // Measured before the fix: ending={"kind":"read-out"}, hint="" — the warning cleared
-      // itself on an open page over rows that are still permanently missing.
-      expect(c.traces().length).toBe(50);                    // the rows ARE the tick's…
+      expect(c.traces().length).toBe(12);
       expect(c.traces()[0].traceId).toBe('b0');
-      expect(c.listEnding()).toEqual({ kind: 'read-out' });  // …and so is its account of itself
-      expect(c.listLoss()).toBe('unreadable-segment');       // …but the hole is not its to close
+      expect(c.listLoss()).toBeNull();          // …and no warning left over the rows it replaced
+      expect(bannerUp(fixture)).toBe(false);
+
+      // And the server saying it again is what brings it back — which is the protection the page
+      // gave up, relocated to where the fact actually lives.
+      c.loadTraces('2026-01-01T00:00:00Z', undefined, 'background');
+      fixture.detectChanges();
+      for (let i = 0; i < 12; i++) streams.live.next(row('c' + i));
+      streams.live.complete({
+        complete: false, reason: 'max-rows', truncatedBy: 'unreadable-segment',
+      });
+      fixture.detectChanges();
+      await fixture.whenStable();
+      expect(c.listLoss()).toBe('unreadable-segment');
       expect(bannerText(fixture)).toBe(UNREADABLE);
-      // The loss stands, and the list stays LIVE. Freezing it here was the old answer and it was
-      // a deadlock with no indicator: the poll returned early, the staleness hint was suppressed
-      // exactly while held, and the failure counter could not grow behind the early return. What
-      // keeps the warning honest instead is the server, which re-reports a permanent hole on
-      // every request — so it persists while it is true and lifts when it stops being.
-      expect(c.listHeld()).toBe(false);
-      expect(suffix(fixture)).toBe('· partial list — see the message above');
     });
 
   it('C6: the user asking again is what retires it — and a recovered window comes back clean',

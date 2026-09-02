@@ -883,12 +883,12 @@ public static class TraceQueryEndpointMapper
         StreamEnd.RegionSkipped => SafeErrorAsync(sse,
             "Results are truncated: part of this window sits inside a storage segment the search "
           + "ran out of room to open before it had to move on, so the traces it holds are missing "
-          + "from this list. Narrow the time window to bring them back into reach.", ctx),
+          + "from this list. Narrow the time window to bring them back into reach.", ctx, o.TruncatedBy),
 
         StreamEnd.RegionUnreadable => SafeErrorAsync(sse,
             "Results are truncated: a storage segment inside this window could not be read — it "
           + "was deleted or damaged — so the traces it held are missing from this list. Narrowing "
-          + "the time window will not bring them back; the server log names the file.", ctx),
+          + "the time window will not bring them back; the server log names the file.", ctx, o.TruncatedBy),
 
         // EVERY OTHER ENDING ASKS ABOUT THE LOSS FIRST, and that ordering is the fix, not a
         // flourish. These four used to read o.End alone, so they dropped Skipped and Unreadable

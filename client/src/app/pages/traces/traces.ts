@@ -1081,8 +1081,28 @@ export class TracesComponent implements OnInit, OnDestroy {
         // So confidence only ever travels one way here. A stream may add a loss the page did
         // not know about, whoever asked for it; taking one away is the user's to ask for, in
         // startStream, where the rows it describes are emptied in the same step.
-        const loss = this.lossOf(ended);
-        if (loss) this.listLoss.set(loss);
+        // THE MARKER BELONGS TO THE ROWS IT ARRIVED WITH, so it is set unconditionally — including
+        // to null — by whichever stream published what is now on screen.
+        //
+        // It used to be raise-only, on the reasoning that a background tick must not retire a
+        // warning it did not disprove: the server's memory of a vanished segment was a field in a
+        // process, so a restart made the next tick report the window as whole while the traces were
+        // still missing. That reasoning came with a hold — nothing under the banner could change,
+        // so the marker always described what was on screen.
+        //
+        // The hold is gone, because freezing a live list over a fact about storage was a deadlock
+        // with no indicator. Raise-only without it is worse than either: measured, a user search
+        // ending in `unreadable-segment` over 300 rows, then one background tick returning twelve
+        // fresh rows and `{complete:true, exhausted}`, leaves the page holding the server's
+        // positive claim that the window was read out AND a red banner calling those twelve rows
+        // partial — describing 300 rows that are no longer there.
+        //
+        // What replaced the old protection is the server, not the page: a permanent hole is
+        // re-reported on every request now that the engine remembers vanished segments, so a real
+        // loss comes back with the very next tick. A marker that outlives its rows is a lie on
+        // screen immediately; a marker that waits one poll interval for the server to say it again
+        // is not.
+        this.listLoss.set(this.lossOf(ended));
         // The list holds a whole answer as of now, and the refresh behind it is working.
         this.listLoadedAt.set(Date.now());
         this.bgFailures.set(0);
