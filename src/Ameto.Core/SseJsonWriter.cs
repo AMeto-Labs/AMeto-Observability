@@ -79,7 +79,16 @@ public sealed class SseJsonWriter : IDisposable
     /// </summary>
     /// <param name="complete">True when the whole requested window was read out.</param>
     /// <param name="reason">Machine-readable ending: <c>exhausted</c> or <c>max-rows</c>.</param>
-    public async Task WriteDoneAsync(bool complete, string reason, CancellationToken ct)
+    /// <param name="truncatedBy">
+    /// What ELSE went wrong on the way to that ending, or null when nothing did — written as
+    /// <c>truncatedBy</c> and omitted entirely when null.
+    ///
+    /// <para>It exists because "your row ceiling stopped me" and "I could not read part of the
+    /// window" are both true at once, routinely, and a caller told only the first has no way to
+    /// discover the second: it looks exactly like the ordinary, healthy ending. Its absence is
+    /// therefore a positive claim — this page ceiling is the ONLY reason the list is short.</para>
+    /// </param>
+    public async Task WriteDoneAsync(bool complete, string reason, string? truncatedBy, CancellationToken ct)
     {
         _buffer.ResetWrittenCount();
         _buffer.Write(DonePrefix);
@@ -87,6 +96,7 @@ public sealed class SseJsonWriter : IDisposable
         _json.WriteStartObject();
         _json.WriteBoolean("complete", complete);
         _json.WriteString("reason", reason);
+        if (truncatedBy is not null) _json.WriteString("truncatedBy", truncatedBy);
         _json.WriteEndObject();
         _json.Flush();
         _buffer.Write(FrameSuffix);

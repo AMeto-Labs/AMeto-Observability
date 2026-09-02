@@ -200,7 +200,7 @@ public static class TraceQueryEndpointMapper
                     async (pageTo, size, ct) =>
                     {
                         var p = await TraceQLExecutor.ExecuteAsync(provider, predicate, from, pageTo, size, ct);
-                        return new TracePage(p.Rows, p.ScanFloorNano);
+                        return new TracePage(p.Rows, p.ScanFloorNano, p.Unreadable);
                     });
 
                 await FinishStreamAsync(sse, end, ctx);
@@ -359,16 +359,24 @@ public static class TraceQueryEndpointMapper
     /// window it actually looked.
     /// </summary>
     /// <param name="ScanFloorNano">
-    /// The height above which this fetch speaks for the window: every match STRICTLY ABOVE it
-    /// was emitted or deliberately filtered out, and nothing at or below it was necessarily
-    /// looked at. <c>long.MinValue</c> means the fetch read the window out to its floor.
+    /// THE HEIGHT ABOVE WHICH THIS FETCH SETTLED ITS WINDOW: every match STRICTLY ABOVE it was
+    /// emitted or deliberately filtered out, and nothing at or below it was necessarily looked
+    /// at. <c>long.MinValue</c> means the fetch read the window out to its floor.
     ///
     /// Floors compose by MAXIMUM, never by minimum. Each one names a height above which some
-    /// part of the work is settled, so only the highest is a claim all the others sit under —
-    /// and it is the direction that matters, because a floor placed too LOW is a licence for
-    /// the pager to jump over rows nobody read.
+    /// part of the work is settled, so only the highest is a claim all the others sit under.
+    ///
+    /// IT IS NOT THE CURSOR. See <see cref="StreamTracePagesAsync"/> for what it is instead.
     /// </param>
-    private readonly record struct TracePage(List<TraceRowDto> Rows, long ScanFloorNano)
+    /// <param name="Unreadable">
+    /// True when the fetch met a segment inside its window it COULD NOT READ, rather than one it
+    /// had no room left to open. Carried separately from the floor because the engine heals a
+    /// vanished segment out of its snapshot on the page that discovers it — see
+    /// <see cref="TraceListPage.Unreadable"/>. The paging loop makes it STICKY for the life of the
+    /// stream, which is the only thing that stops a later page reporting the window exhausted.
+    /// </param>
+    private readonly record struct TracePage(
+        List<TraceRowDto> Rows, long ScanFloorNano, bool Unreadable)
     {
         /// <summary>
         /// Derived rather than passed, so the contradictory pair cannot be constructed: capped
@@ -385,8 +393,26 @@ public static class TraceQueryEndpointMapper
         Complete,
         /// <summary>The caller's <c>max</c> was reached with window left — <c>done</c>, but not complete.</summary>
         MaxRows,
+        /// <summary>
+        /// The loop reached the bottom of the window, but a page had settled its window only
+        /// down to a height ABOVE where the cursor then went — the band between was never read
+        /// and never will be. Results are truncated.
+        /// </summary>
+        RegionSkipped,
+        /// <summary>
+        /// A page met a segment it COULD NOT READ. Separate from <see cref="RegionSkipped"/>
+        /// because the advice is the opposite: a budget skip comes back with a narrower window,
+        /// a file that will not open does not — see <see cref="FinishStreamAsync"/>.
+        /// </summary>
+        RegionUnreadable,
         /// <summary>The cursor could not move off a millisecond — results are truncated.</summary>
         TimestampCollision,
+        /// <summary>
+        /// A page produced neither a row to page from nor a floor below the cursor — a segment
+        /// that would not open, or a scan that got no further than the window's own ceiling.
+        /// Results are truncated, and NOT for a reason that has anything to do with milliseconds.
+        /// </summary>
+        NoProgress,
         /// <summary>A row's start time cannot be turned into a cursor at all — results are truncated.</summary>
         UnusableTimestamp,
         /// <summary>The wall clock ran out — results are partial.</summary>
@@ -403,10 +429,29 @@ public static class TraceQueryEndpointMapper
     /// not the answer — the spans of one trace are spread in time, so a row emitted before its
     /// scan window closes can be emitted incomplete.</para>
     ///
-    /// <para>Total work does not multiply by the page count: as the cursor moves back, segments
-    /// newer than it fail the existing segment-level range check and are never opened.</para>
+    /// <para>WHAT THE PAGING COSTS, honestly. Each page re-enters the fetch over a narrower
+    /// window, and only ONE of the three costs actually falls as the cursor descends:</para>
+    /// <list type="bullet">
+    ///   <item>cold segments ENTIRELY newer than the cursor fail the segment-level range check
+    ///   and are never opened again. This is the saving, and it is real;</item>
+    ///   <item>a segment that STRADDLES the cursor is reopened, its body decompressed and its
+    ///   rows re-parsed, on every page it straddles — and <c>SelectCompactionBatch</c> groups
+    ///   sources within a 24-hour window, so a compacted segment can straddle a whole day of
+    ///   pagination. The <c>[from, to]</c> bound now pushed into
+    ///   <c>TraceSummarySidecar.TryReadSummaries</c> cuts the per-row allocation but not the
+    ///   decompression: the body is one LZ4 blob with no index;</item>
+    ///   <item>the HOT TIER is walked in full on every page, by both fetchers. A descending
+    ///   cursor does not shorten that walk at all — it only makes more spans fail the range test
+    ///   inside it, and on the list path each surviving span still costs a MergeSpanInto
+    ///   (dictionary probe, HashSet add, field writes) inside the read lock.</item>
+    /// </list>
+    /// <para>So the cost is bounded by the number of pages, not independent of it, and the
+    /// per-page scan budget (<c>max(limit*5, 500)</c> merged summaries) is a budget on the MERGE,
+    /// not on the reading: <c>MaxSpansPerPass</c> lets one compacted segment hold 200 000 spans,
+    /// which is tens of thousands of summary rows read to fill 2 500 slots. <c>visitedAny</c>
+    /// makes reading the first relevant segment unconditional on top of that.</para>
     /// </summary>
-    private static async Task<StreamEnd> StreamTracePagesAsync(
+    private static async Task<StreamOutcome> StreamTracePagesAsync(
         HttpContext       ctx,
         SseJsonWriter     sse,
         int               max,
@@ -429,9 +474,56 @@ public static class TraceQueryEndpointMapper
         // the shape that killed a 512 MB server when a collection was allowed to track matches
         // instead of results (see 3fc5472).
         var  seen      = new HashSet<string>(StringComparer.Ordinal);
-        var  cursor    = to;
         int  emitted   = 0;
         long startedAt = System.Diagnostics.Stopwatch.GetTimestamp();
+
+        // THE CURSOR IS A NANOSECOND, and the millisecond it rounds up to is only how the fetch
+        // is ASKED. The providers take a millisecond-resolution ceiling — GetTraceListAsync and
+        // SearchSpansAsync both open with `to.ToUnixTimeMilliseconds() * 1_000_000` — and
+        // rounding a nanosecond cursor DOWN to reach one opens a hole that no later page can
+        // close, so the ask is rounded UP and the boundary millisecond deliberately OVERLAPS.
+        //
+        // Doing the ARITHMETIC in that rounded millisecond as well is what put rows out of order.
+        // A row inside the overlap band that the previous page did not return — because a segment
+        // was budget-skipped — arrived on the next page AFTER rows older than it, and the dedupe
+        // set cannot help: it stops the SAME trace recurring, not a DIFFERENT one. Found by a
+        // 40-shape property fuzz, minimised to 0.5 ms, and it is exactly the invariant
+        // AssertNewestFirstAcrossPages claims. Below, `cursorNano` is the real boundary: the
+        // fetch is still asked for the enclosing millisecond, and the rows that come back above
+        // the cursor are the overlap — duplicates, or rows in a band this stream has already
+        // reported it jumped.
+        long fromNano   = from.ToUnixTimeMilliseconds() * 1_000_000L;
+        long cursorNano = to.ToUnixTimeMilliseconds()   * 1_000_000L;
+
+        // STICKY, and it is the whole honesty story of this loop. Set the moment a page's cursor
+        // lands BELOW the height that page settled its window down to: the band between them was
+        // examined by nobody, and every later ceiling is lower still, so nobody ever will. Once
+        // set it can never be unset — a later page reading ITS window out says nothing about the
+        // band an earlier one jumped, and treating it as if it did is exactly the false `done`
+        // this endpoint exists to stop.
+        bool skippedRegion = false;
+
+        // STICKY FOR A SECOND, STRONGER REASON. A page that could not READ a segment does not
+        // merely leave a band for a later page: the engine REMOVES a vanished segment from its
+        // snapshot on the page that discovers it, so no later page can find it, fail on it, or
+        // report its floor. The fault is therefore recorded exactly once, and if the cursor never
+        // had to descend past that one floor the flag above never fired either — every later page
+        // saw a clean window and the stream ended `done {"complete":true}` over half of it.
+        // Measured through this route: two segments of 40 traces, the OLDER one unlinked, 40 rows
+        // delivered and a positive claim of completeness. Note the shape of the bug — the SAME
+        // fault with the segment NEWER, or with the file corrupt but still PRESENT, was reported
+        // correctly, because those two keep re-arriving on later pages. This flag is what a
+        // healed snapshot costs.
+        //
+        // THIS FLAG IS NOT THE MEMORY, and it must not be mistaken for one. It is a LOCAL: it
+        // dies with the stream, while the removal it compensates for is process-wide and
+        // permanent. On its own it therefore only ever moved the bug one request along — the
+        // stream that discovered the fault reported it and the IDENTICAL request behind it, which
+        // in the product is the refresh button next to the banner, got a clean `done`. The record
+        // that survives a request lives in the engine (VanishedRegionLog), reaches this loop as
+        // `page.Unreadable` like any other, and is why a page can arrive here NOT capped and still
+        // carrying the bit. What this flag does is keep it once it has arrived.
+        bool unreadableRegion = false;
 
         while (true)
         {
@@ -440,7 +532,12 @@ public static class TraceQueryEndpointMapper
             // already running, this one catches a loop whose pages keep completing, each of
             // them cheap, long after the stream as a whole should have given up.
             if (System.Diagnostics.Stopwatch.GetElapsedTime(startedAt) >= StreamDeadline)
-                return StreamEnd.Deadline;
+                return new StreamOutcome(StreamEnd.Deadline, skippedRegion, unreadableRegion);
+
+            // The millisecond the fetch is asked for: the lowest boundary the cursor does not sit
+            // above, so nothing between the cursor and it can be missed by the ask.
+            if (!TryCeilToMillisecond(cursorNano, out var pageTo))
+                return new StreamOutcome(StreamEnd.UnusableTimestamp, skippedRegion, unreadableRegion);
 
             TracePage page;
             try
@@ -459,27 +556,86 @@ public static class TraceQueryEndpointMapper
                 //
                 // Task.Run is therefore the fix and not a workaround: the scan is blocking work,
                 // and blocking work belongs on the pool while the handler stays free to write.
-                var pageCursor = cursor;
+                var pageCursor = pageTo;
                 page = await AwaitWithKeepaliveAsync(
                     Task.Run(() => fetchPage(pageCursor, pageSize, scanCt), scanCt),
                     sse, StreamKeepalive, ct);
             }
             catch (OperationCanceledException) when (!ct.IsCancellationRequested)
             {
-                return StreamEnd.Deadline;   // ours, not the client's
+                // Ours, not the client's.
+                return new StreamOutcome(StreamEnd.Deadline, skippedRegion, unreadableRegion);
             }
+
+            // Once true, always true: nothing later makes a file that would not open readable,
+            // and the engine has already dropped a vanished one from the snapshot so no later
+            // page will even try.
+            unreadableRegion |= page.Unreadable;
 
             // Data frames are written HERE and keepalives only inside the await above, so the two
             // can never interleave: one thread of control, and the helper has returned before the
             // first `data:` byte of this page is written.
+            //
+            // The oldest row the page RETURNED, which is not the oldest it EMITTED: a row an
+            // earlier page already sent still bounds where this fetch looked, and it is the
+            // bound, not the novelty, that the cursor is made of. Taken as a minimum rather than
+            // as `Rows[^1]` because "the fetch sorts newest-first" is a property of two separate
+            // implementations and a cursor that silently depends on it is a cursor waiting to be
+            // wrong.
+            long oldestReturned = long.MaxValue;
+            long oldestEmitted  = long.MaxValue;   // how deep this stream has actually delivered
             foreach (var row in page.Rows)
             {
+                if (row.StartTimeUnixNano < oldestReturned) oldestReturned = row.StartTimeUnixNano;
+
+                // THE OVERLAP BAND, and the only place rows are held back. `pageTo` is the cursor
+                // rounded UP, so this page was asked for up to a millisecond MORE than the cursor
+                // allows. A row in that sliver is one of two things:
+                //   * one an earlier page already sent — the ordinary case, and the reason the
+                //     rounding is safe at all;
+                //   * one no page has sent, because the segment holding it was skipped. Emitting
+                //     THAT is the sub-millisecond inversion: a row newer than one the client has
+                //     already appended, in a list it renders in arrival order and never re-sorts.
+                // Neither may be emitted here. The second is a row this stream will never deliver
+                // — every later ceiling is lower — so it is reported, exactly as any other jumped
+                // band is. In practice the floor test below has already set the flag whenever a
+                // skipped segment is the cause; what this catches on its own is a row INGESTED
+                // between two pages, which no floor knows about.
+                if (row.StartTimeUnixNano > cursorNano)
+                {
+                    if (!seen.Contains(row.TraceId)) skippedRegion = true;
+                    continue;
+                }
+
                 if (!seen.Add(row.TraceId)) continue;
                 await sse.WriteEventAsync(row, StreamJson, ct);
+                if (row.StartTimeUnixNano < oldestEmitted) oldestEmitted = row.StartTimeUnixNano;
                 // Not Complete: the window was NOT read out, the ceiling was hit. Saying `done`
                 // for both makes a truncated list indistinguishable from an exhausted one for
                 // every consumer that cannot count its own rows against the max it asked for.
-                if (++emitted >= max) return StreamEnd.MaxRows;
+                //
+                // Nor is it RegionSkipped, even when a region WAS skipped: `max-rows` already
+                // carries `complete: false`, so it makes no positive claim to withdraw, and
+                // turning the ordinary "I asked for 100 rows and got them" ending into an error
+                // frame would be a regression for every well-behaved query. What it must NOT do
+                // is stay SILENT about the skip, which is what returning a bare MaxRows did: the
+                // same lost segment reached the user as `done {"reason":"max-rows"}` at one row
+                // ceiling and as a red truncation banner at another, purely because of which
+                // test the loop reached first. The outcome carries both facts and the terminal
+                // frame prints both.
+                //
+                // AND THE SKIP IS TESTED HERE TOO, not only where the cursor moves. `max` can be
+                // reached on the FIRST page, before the cursor has moved at all, so `skippedRegion`
+                // may still be false while this page's own floor sits ABOVE everything the stream
+                // has delivered — which is exactly a band of unsettled window sitting among the
+                // rows the client is looking at. Measured on the M1 fixture: at max=1000 the
+                // unopened segment was reported, and at max=50 the identical skip came back as a
+                // bare `done {"reason":"max-rows"}` because the loop never reached the cursor test.
+                if (++emitted >= max)
+                    return new StreamOutcome(
+                        StreamEnd.MaxRows,
+                        skippedRegion || page.ScanFloorNano > oldestEmitted,
+                        unreadableRegion);
             }
 
             // A SHORT PAGE IS NOT AN ENDING, and `page.Rows.Count < pageSize` must never be
@@ -497,7 +653,7 @@ public static class TraceQueryEndpointMapper
             // 20 of the 2000 error traces the user asked for, which is the exact complaint this
             // feature exists to answer. The honest signal is Capped: the fetch itself says
             // whether it stopped for want of room or for want of data.
-            if (!page.Capped) return StreamEnd.Complete;
+            if (!page.Capped) return EndOfWindow();
 
             // AN EMPTY PAGE IS NOT AN ENDING EITHER — zero is just the limiting case of short,
             // and it arrives for exactly the reasons the essay above lists. `?httpStatus=5xx`
@@ -509,65 +665,117 @@ public static class TraceQueryEndpointMapper
             // `done` with zero rows over a window full of matches, and the page rendered
             // "No traces found" for an incident three weeks back.
             //
-            // What blocked the fix was that an empty page has no Rows[^1] to page on — so the
-            // cursor comes from the fetch's own SCAN FLOOR, the height above which it speaks for
-            // the window.
+            // ── THE CURSOR IS THE OLDEST ROW THE PAGE RETURNED ────────────────────────────
             //
-            // AND THE FLOOR IS THE WHOLE CURSOR. An earlier version took
-            // `Math.Min(scanFloor, oldest emitted row)`, reasoning that a capped scan had
-            // considered everything down to its floor so the lower of the two was safe and
-            // jumped further. That reasoning is false in both tiers and it cost 100 of 103 rows
-            // on a measured fixture — while still sending `done {"complete":true}`:
-            //   * cold segments OVERLAP, and the walk sorts them by MaxStartNano DESCENDING,
-            //     which this codebase documents as non-monotonic. A WIDE segment walked first
-            //     can fill the scan budget alone while a NARROWER segment nested inside its
-            //     range is still unopened. Paging to the wide segment's oldest row lands UNDER
-            //     the nested one, where the range check then skips it on this page and on every
-            //     later one, permanently;
-            //   * the hot tier is merged unconditionally and is not subject to the budget, so a
-            //     single late-arriving span — a backfill, a batch exporter, clock skew, a WAL
-            //     replay after restart — drags the oldest returned row an hour below anything
-            //     the scan reached.
-            // Both make the lower bound a licence to skip. The floor is the only height the
-            // fetch can actually vouch for, so it is the only cursor, and it moves the window
-            // ceiling DOWN to it rather than past it. Re-reading a band costs a fetch; the
-            // dedupe set absorbs the repeats. Skipping one loses rows silently, which is the
-            // failure this whole endpoint exists to end.
-            if (!TryCeilToMillisecond(page.ScanFloorNano, out var next)) return StreamEnd.UnusableTimestamp;
+            // It is the only candidate that does the two things a cursor must do. It DESCENDS
+            // STRICTLY, so the loop progresses; and the next page's ceiling is a row already
+            // sent, so nothing can arrive NEWER than something the client has already appended —
+            // which matters because the client appends and re-emits, it does not re-sort, so an
+            // out-of-order row renders at the top of a list the UI labels newest-first.
+            //
+            // The SCAN FLOOR is not the cursor, and the version that made it one failed in three
+            // independent ways, all of them measured:
+            //   * NO FORWARD PROGRESS. The floor is an unvisited segment's ceiling. A wide
+            //     segment holding more than the scan budget BELOW that ceiling refills the budget
+            //     on every page, breaks on the same nested segment, reports the same floor, and
+            //     the cursor lands where it already was — for ever, over a shape as ordinary as
+            //     a compacted week-wide segment with an hour-long one inside it;
+            //   * ROWS OUT OF ORDER ACROSS PAGES. A floor ABOVE the page's own oldest row makes
+            //     the next page's ceiling higher than a row already sent, so that page emits
+            //     newer rows behind older ones;
+            //   * the floor is clamped to the window ceiling, which is already millisecond
+            //     aligned, so an unread segment reaching above `to` collapsed the floor onto the
+            //     cursor and stalled the FIRST page — with a message about milliseconds.
+            //
+            // What the floor is good for is everything below.
+            //
+            // ALL OF IT IN NANOSECONDS. It used to run on `TryCeilToMillisecond` of both sides,
+            // which quietly changed the answers in BOTH directions: a floor 0.1 ms above the
+            // cursor rounded to the same millisecond and the skip went unreported, and a floor
+            // 0.1 ms below one rounded apart and a skip was reported that had not happened. The
+            // rounding belongs on the ASK — `pageTo`, above — and nowhere else.
+            long nextNano = oldestReturned;
+            bool haveNext = page.Rows.Count > 0 && nextNano < cursorNano;
 
-            // THE CURSOR CANNOT MOVE, and this is tested BEFORE the window floor below. The
-            // cursor is a scanned start rounded up to its millisecond while rows carry
-            // nanoseconds, so a page that falls entirely inside ONE millisecond asks the next
-            // fetch the identical question and gets the identical page, for ever. What is
-            // unreachable is not just the rest of that millisecond but everything older than it
-            // in the window.
-            //
-            // The ORDER matters because the two endings overlap. Both are true at once whenever
-            // the cursor has reached the window's floor millisecond — `ceil(floor) <= from` and
-            // `ceil(floor) >= cursor` together — and with the floor tested first that was
-            // reported as `done`: a positive claim of completeness over rows demonstrably still
-            // unread inside that millisecond. The shape reaches it on the very first page of a
-            // zero-width window, which ParseFromTo accepts without a word of validation, and it
-            // needs ceil(floor) to land exactly ON `from` rather than a millisecond above it —
-            // rare with true nanosecond starts, ORDINARY for the many exporters that emit
-            // millisecond precision converted to nanos, where every start is an exact multiple
-            // of 1e6. A stall must never be dressed up as completion.
-            //
-            // A nanosecond cursor would remove the stall outright, but the whole fetch path is
-            // millisecond-bounded (ParseFromTo, SearchSpansAsync) — a deeper change than this.
-            // Until then the failure is at least honest.
-            //
-            // This one condition also subsumes the old "the page was entirely duplicates" guard:
-            // a page whose rows are ALL already seen came out of an earlier page, so its floor is
-            // no older than the one the current cursor was derived from, and `next` lands right
-            // back on `cursor`. There is no second case to distinguish.
-            if (next >= cursor) return StreamEnd.TimestampCollision;
+            if (!haveNext)
+            {
+                // FLOOR JOB ONE: THE PAGE WITH NO ROW TO PAGE FROM. Either it came back empty, or
+                // every row in it was one an earlier page already sent (or sat in the overlap
+                // band above the cursor) — the same situation, and the old "the page was entirely
+                // duplicates" guard is this branch, not a separate one. The floor is sound HERE
+                // and only here: everything above it was examined by this very page, so moving
+                // the ceiling down to it skips nothing. INCLUSIVE, because the floor is an
+                // exclusive lower bound on what was settled — a row sitting exactly on it was not
+                // necessarily returned.
+                if (page.ScanFloorNano >= cursorNano)
+                    // Two different failures, and they used to share one message about
+                    // milliseconds. With rows in hand it really is the timestamp: the page could
+                    // not be advanced off the instant it started from. With no rows it is the scan
+                    // that could not be advanced — a segment that would not open, or a floor
+                    // clamped to the window's own ceiling — and telling that user to narrow their
+                    // window is advice about the wrong thing.
+                    return new StreamOutcome(
+                        page.Rows.Count > 0 ? StreamEnd.TimestampCollision : StreamEnd.NoProgress,
+                        skippedRegion, unreadableRegion);
+                nextNano = page.ScanFloorNano;
+            }
+            else if (nextNano < page.ScanFloorNano)
+            {
+                // FLOOR JOB TWO: HONESTY. The cursor is about to move BELOW the height this page
+                // settled down to, so the band between them is read by no page: this one did not
+                // reach it, and every later ceiling is lower.
+                //
+                // THIS IS A REAL AND ACCEPTED LOSS, not a theoretical one. It is what the fixture
+                // in TraceStreamPagingFloorTests measures: a hundred matches in a cold segment
+                // that a single late-arriving hot span pages the stream straight past. The cure
+                // is not a cleverer cursor — the alternatives are the three failures listed above
+                // — it is provider work: a scan budget one segment cannot monopolise, plus range
+                // pushdown deep enough that a straddling segment costs what it contributes.
+                // Deliberately not attempted here. What IS done here is refusing to hide it: the
+                // stream can no longer end with `done {"complete":true}` after jumping a gap.
+                skippedRegion = true;
+            }
 
-            // Walked back to the floor of the window; there is nothing older to ask for.
-            if (next <= from) return StreamEnd.Complete;
+            // Walked back to the floor of the window; there is nothing older to ask for. Tested
+            // AFTER the stall above, because the two overlap — both hold once the cursor reaches
+            // the window's own floor millisecond, which a zero-width window (ParseFromTo
+            // validates nothing) reaches on its first page — and a stall reported as `done` is a
+            // positive claim of completeness over rows demonstrably still unread.
+            if (nextNano <= fromNano) return EndOfWindow();
 
-            cursor = next;
+            cursorNano = nextNano;
         }
+
+        // The three ways a stream can reach the bottom of its window, in the order of what they
+        // withdraw. An unreadable segment is the strongest: it is the only one narrowing the
+        // window does not fix, so it must not be reported as if it were the budget.
+        StreamOutcome EndOfWindow() => new(
+            unreadableRegion ? StreamEnd.RegionUnreadable
+          : skippedRegion    ? StreamEnd.RegionSkipped
+          :                    StreamEnd.Complete,
+            skippedRegion, unreadableRegion);
+    }
+
+    /// <summary>
+    /// How the paging loop ended, plus the two facts that outlive any single page.
+    ///
+    /// <para>They are carried BESIDE the ending rather than folded into it because they are not
+    /// alternatives to it. "I reached your row ceiling" and "I skipped part of the window" are
+    /// both true at once, routinely, and the loop used to report whichever test it reached first
+    /// — so the SAME lost segment came back as <c>done {"reason":"max-rows"}</c> at one row
+    /// ceiling and as a truncation banner at another.</para>
+    /// </summary>
+    private readonly record struct StreamOutcome(StreamEnd End, bool Skipped, bool Unreadable)
+    {
+        /// <summary>
+        /// Machine-readable cause for the <c>done</c> payload, or null when nothing was lost.
+        /// Only meaningful on an ending that is still a <c>done</c>; the error endings say it in
+        /// their sentence instead.
+        /// </summary>
+        public string? TruncatedBy =>
+            Unreadable ? "unreadable-segment"
+          : Skipped    ? "unread-segment"
+          :              null;
     }
 
     /// <summary>
@@ -657,13 +865,35 @@ public static class TraceQueryEndpointMapper
     /// is complete, so anything that stopped early says so instead — on a 200, as a
     /// <c>query-error</c> frame, because EventSource cannot read the body of anything else.
     /// </summary>
-    private static Task FinishStreamAsync(SseJsonWriter sse, StreamEnd end, HttpContext ctx) => end switch
+    private static Task FinishStreamAsync(SseJsonWriter sse, StreamOutcome o, HttpContext ctx) => o.End switch
     {
         // Both are `done`, and a client that only listens for the event name (which is what the
         // Angular client does) keeps treating either as a normal completion. The payload is what
-        // separates "the window was read out" from "your row ceiling stopped it".
-        StreamEnd.Complete => sse.WriteDoneAsync(complete: true,  "exhausted", ctx.RequestAborted),
-        StreamEnd.MaxRows  => sse.WriteDoneAsync(complete: false, "max-rows",  ctx.RequestAborted),
+        // separates "the window was read out" from "your row ceiling stopped it" — and, on the
+        // second, whether something was lost on the way there. `truncatedBy` is the field that
+        // stops the same skipped segment being invisible at one row ceiling and a red banner at
+        // another; Complete cannot carry it, because Complete is only reachable with neither flag.
+        StreamEnd.Complete => sse.WriteDoneAsync(complete: true,  "exhausted", null,          ctx.RequestAborted),
+        StreamEnd.MaxRows  => sse.WriteDoneAsync(complete: false, "max-rows",  o.TruncatedBy,  ctx.RequestAborted),
+
+        // The two skip causes are deliberately different sentences, because the ADVICE is
+        // opposite. A segment the walk had no budget left to open comes back when the window is
+        // narrower; a segment that will not open does not come back at all, and telling that user
+        // to narrow their window sends them round a loop that cannot help them.
+        StreamEnd.RegionSkipped => SafeErrorAsync(sse,
+            "Results are truncated: part of this window sits inside a storage segment the search "
+          + "ran out of room to open before it had to move on, so the traces it holds are missing "
+          + "from this list. Narrow the time window to bring them back into reach.", ctx),
+
+        StreamEnd.RegionUnreadable => SafeErrorAsync(sse,
+            "Results are truncated: a storage segment inside this window could not be read — it "
+          + "was deleted or damaged — so the traces it held are missing from this list. Narrowing "
+          + "the time window will not bring them back; the server log names the file.", ctx),
+
+        StreamEnd.NoProgress => SafeErrorAsync(sse,
+            "Results are truncated: the search could not be advanced past a part of this window "
+          + "it was unable to read — a storage segment that would not open, or a scan that got no "
+          + "further than the window's own edge. Narrow the time window (or the filter) to see the rest.", ctx),
 
         StreamEnd.TimestampCollision => SafeErrorAsync(sse,
             "Results are truncated: more traces share the oldest timestamp than one page can carry, "
@@ -691,17 +921,21 @@ public static class TraceQueryEndpointMapper
       :                        $"{d.TotalMilliseconds:0.##}-millisecond";
 
     /// <summary>
-    /// A scanned start time rounded UP to the enclosing millisecond — the next page's upper
-    /// bound. False when the value cannot be turned into one at all.
+    /// A nanosecond cursor rounded UP to the enclosing millisecond — the window the next page is
+    /// ASKED for. False when the value cannot be turned into one at all.
     ///
-    /// <para>The endpoints take millisecond-resolution timestamps while rows carry nanoseconds.
-    /// Rounding DOWN would put the cursor at or below the boundary row's own millisecond, and
-    /// since the bound is inclusive that row comes back for ever. Rounding up instead makes the
-    /// boundary millisecond OVERLAP — which is the whole reason the caller's dedupe set exists,
-    /// and the only variant that cannot open a hole: a trace at ...122.5 ms sitting between a
-    /// floor-rounded cursor and the oldest loaded row would be excluded by every later page too,
-    /// because every later cursor derives from what actually loaded. Identical to the rule the
-    /// client already used.</para>
+    /// <para>The providers take millisecond-resolution timestamps while rows carry nanoseconds.
+    /// Rounding DOWN would put the ask at or below the boundary row's own millisecond, and since
+    /// the bound is inclusive, a trace at ...122.5 ms sitting between a floor-rounded ask and the
+    /// oldest loaded row would be excluded by that page and by every later one — a hole no dedupe
+    /// can close. Rounding up instead makes the boundary millisecond OVERLAP, which is the whole
+    /// reason the caller's dedupe set exists. Identical to the rule the client already used.</para>
+    ///
+    /// <para>THE OVERLAP IS NOT THE CURSOR, and conflating the two is what put rows out of order.
+    /// The caller keeps its cursor in exact nanoseconds and uses this only to widen the ask;
+    /// what comes back inside the sliver above the cursor is either a duplicate or a row from a
+    /// band the stream has already reported it jumped, and neither may be emitted. See
+    /// <see cref="StreamTracePagesAsync"/>.</para>
     ///
     /// <para>The guards are for data the ingest path never validated. A start within a
     /// millisecond of <see cref="long.MaxValue"/> — a corrupt field, or a nanosecond column fed
@@ -798,7 +1032,10 @@ public static class TraceQueryEndpointMapper
             filter.MinDurationNanos, filter.MaxDurationNanos, fetch, ct);
 
         var summaries = page.Rows;
-        bool capped   = page.Capped;
+
+        // The post-filter's OWN stopping point, tracked separately from the provider's. The two
+        // are different facts and the raise below depends on which one happened.
+        bool postFilterStoppedEarly = false;
 
         var traces = new List<TraceRowDto>(Math.Min(summaries.Count, limit));
         foreach (var s in summaries)
@@ -822,19 +1059,28 @@ public static class TraceQueryEndpointMapper
                 SpanCount         = (int)s.SpanCount,
             });
             // Stopped with summaries still unexamined — whatever is in them is behind this page.
-            if (traces.Count >= limit) { capped = true; break; }
+            if (traces.Count >= limit) { postFilterStoppedEarly = true; break; }
         }
 
-        // The provider's floor, RAISED to the last row this method actually emitted whenever its
-        // own post-filter broke early. Summaries below that break were never shown to the
-        // httpStatus filter, so the page cannot claim to have decided anything about them — and
-        // a floor that claims otherwise is a floor the pager would jump straight past. This is
-        // the SECOND place the fetch can stop short, and floors compose by maximum.
+        // The provider's floor, RAISED to the last row this method emitted — but ONLY when this
+        // method's own post-filter is what stopped early. That is the condition the raise has
+        // always been justified by, and it was not the condition it fired on: `capped` was
+        // seeded from the provider's own answer, so the raise ALSO fired when the PROVIDER hit
+        // its cap while the post-filter here ran clean to the end of the summaries. It then
+        // discarded the provider's deeper, honest floor in favour of a shallower one derived
+        // from rows, and threw away real matches doing it: 3 000 traces one per millisecond with
+        // an httpStatus match on the first and the 2 501st, asked for at ?max=100, had the floor
+        // pushed from trace 2 000 up to trace 2 500 — page two then found only the match it had
+        // already sent, and the one at the bottom of the window was never delivered at all.
+        //
+        // When the post-filter DID break early, the raise is right and necessary: summaries below
+        // the break were never shown to the httpStatus filter, so this page decided nothing about
+        // them. Floors compose by maximum.
         long scanFloor = page.ScanFloorNano;
-        if (capped && traces.Count > 0)
+        if (postFilterStoppedEarly && traces.Count > 0)
             scanFloor = Math.Max(scanFloor, traces[^1].StartTimeUnixNano);
 
-        return new TracePage(traces, scanFloor);
+        return new TracePage(traces, scanFloor, page.Unreadable);
     }
 
     private static (DateTimeOffset from, DateTimeOffset to) ParseFromTo(HttpContext ctx, double defaultHours = 1)

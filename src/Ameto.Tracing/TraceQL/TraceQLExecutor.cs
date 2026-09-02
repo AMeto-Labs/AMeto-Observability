@@ -1,18 +1,14 @@
 namespace Ameto.Tracing.TraceQL;
 
 /// <summary>
-/// One page of TraceQL results, plus whether the scan behind it was cut short.
+/// One page of TraceQL results, plus how deep into the window the work behind it speaks for.
 /// </summary>
 /// <param name="Rows">Newest-first, at most the requested limit.</param>
-/// <param name="Capped">
-/// True when the span scan stopped short of the window, or when more traces matched than the
-/// limit let through. False means the whole window was read and this is all of it.
-/// </param>
 /// <param name="ScanFloorNano">
-/// Where the work behind this page STOPPED, as an EXCLUSIVE lower bound: every trace whose start
-/// is STRICTLY GREATER than this was decided — grouped into <see cref="Rows"/>, rejected by the
-/// predicate, or cut by the limit. <c>long.MinValue</c> means the window was read out, which is
-/// exactly when <see cref="Capped"/> is false.
+/// THE HEIGHT ABOVE WHICH THIS PAGE SETTLED ITS WINDOW, as an EXCLUSIVE lower bound: every trace
+/// in <c>(ScanFloorNano, to]</c> was decided — grouped into <see cref="Rows"/>, rejected by the
+/// predicate, or read and dropped by neither. <c>long.MinValue</c> means the settled band is the
+/// whole window, which is exactly when <see cref="Capped"/> is false.
 ///
 /// <para>NOT a minimum over the spans that came back. <c>SearchSpansAsync</c> serves the hot tier
 /// first and yield-breaks on a GLOBAL <c>yielded &gt;= limit</c> while walking segments ordered by
@@ -21,12 +17,30 @@ namespace Ameto.Tracing.TraceQL;
 /// anyone actually read. It comes from <see cref="SpanScanFloor"/>, which the scan fills in as it
 /// stops.</para>
 ///
-/// <para>What it is FOR is the page with no rows at all: an OR-chain extracts no hints, so the
-/// scan returns the newest <c>limit*10</c> spans whatever the query says and the predicate can
-/// reject every one of them. That page has no row to derive a cursor from, and this is the only
-/// cursor it has.</para>
+/// <para>NOR IS IT THE CURSOR — see <see cref="TraceListPage.ScanFloorNano"/>, which carries the
+/// same contract for the filter list and the argument for why. Its two jobs here are the page
+/// with no usable row (an OR-chain extracts no hints, so the scan returns the newest
+/// <c>limit*10</c> spans whatever the query says and the predicate can reject every one of them)
+/// and telling the caller when its own cursor has jumped below this height, which is the one
+/// thing that turns a short list into a wrong one.</para>
 /// </param>
-public readonly record struct TraceQueryPage(List<TraceRowDto> Rows, bool Capped, long ScanFloorNano);
+/// <param name="Unreadable">
+/// True when the scan met a segment it COULD NOT READ rather than one it had no room to open —
+/// the same bit, for the same reason, as <see cref="TraceListPage.Unreadable"/>: the engine heals
+/// a vanished segment out of its snapshot on the page that discovers it, so the floor is recorded
+/// once and a stream that treats it as an ordinary budget floor ends by calling a half-read
+/// window exhausted.
+/// </param>
+public readonly record struct TraceQueryPage(
+    List<TraceRowDto> Rows, long ScanFloorNano, bool Unreadable = false)
+{
+    /// <summary>
+    /// True when the scan stopped short of the window, or more traces matched than the limit let
+    /// through. DERIVED, so the contradictory pair cannot be constructed: "capped with no floor"
+    /// has no honest ending and "a floor with not capped" invites a caller to page past it.
+    /// </summary>
+    public bool Capped => ScanFloorNano != long.MinValue;
+}
 
 /// <summary>Hints extracted from the AST to accelerate <see cref="ITraceProvider.SearchSpansAsync"/>.</summary>
 public sealed class SearchHints
@@ -156,7 +170,24 @@ public static class TraceQLExecutor
     {
         var hints = ExtractHints(predicate);
 
-        // Fetch spans using indexed filters; multiply limit for grouping headroom
+        // Fetch spans using indexed filters; multiply limit for grouping headroom.
+        //
+        // WHAT THIS RETAINS, MEASURED, because ten times a caller-supplied number is worth
+        // writing down. A SpanRecord with an ordinary eight-attribute OTel attribute map weighs
+        // about 1,800 bytes once decoded (SpanSearchBoundTests measures 1,749 B on its fixture),
+        // so this list peaks at spanLimit × ~1.8 KB:
+        //   * the SSE route (GET /api/traces/query/stream) pages at QlStreamPageSize = 200, so
+        //     2 000 spans ≈ 3.6 MB per connected client, and the stream is one page at a time;
+        //   * POST /api/traces/query clamps limit to 1 000, so 10 000 spans ≈ 17 MB — PER
+        //     CONCURRENT REQUEST, and the trace endpoints take no slot from QueryGuard by
+        //     design, so nothing serialises them.
+        //
+        // LEFT AS IT IS, deliberately. The peak is proportional to what the caller asked for and
+        // bounded by it — this is not the unbounded-in-the-match-count shape that killed the
+        // server — and cutting the multiplier would silently return fewer TRACES than the caller
+        // asked for on any span-rich service, which is the failure the multiplier exists to
+        // prevent. If concurrent TraceQL POSTs ever need bounding, the honest place is admission
+        // control over the endpoint, not a quieter answer here.
         int spanLimit = limit * 10;
         var spans     = new List<SpanRecord>();
 
@@ -183,7 +214,6 @@ public static class TraceQLExecutor
         // can evict a thousand matches and still hand back fewer than spanLimit spans once the
         // dedupe has had them. The scan says which it was.
         long scanFloorNano = scanFloor.FloorNano;
-        bool capped        = scanFloor.Truncated;
 
         // Post-filter + group by trace
         var traces = new Dictionary<TraceId, List<SpanRecord>>(capacity: spans.Count / 4);
@@ -225,12 +255,15 @@ public static class TraceQLExecutor
         });
         if (groups.Count > limit)
         {
-            capped = true;
             // The cut is a SECOND place this page stopped short, and floors compose by MAXIMUM:
             // each names a height above which everything was dealt with, so the highest is the
             // only one all the others sit below. Taken on the group key the sort ran on, not on
             // the row's root start — the two can differ when a matching span predates its own
             // root, and it is the key that decided which side of the cut a trace landed.
+            //
+            // Unlike the scan's own floors, this one costs the caller nothing: a pager whose
+            // cursor is its oldest returned row lands exactly on it, so the groups under the cut
+            // come back on the next page.
             scanFloorNano = Math.Max(scanFloorNano, groups[Math.Max(0, limit - 1)].StartNano);
             groups.RemoveRange(limit, groups.Count - limit);
         }
@@ -238,7 +271,7 @@ public static class TraceQLExecutor
         var result = new List<TraceRowDto>(groups.Count);
         foreach (var (_, _, traceSpans) in groups)
             result.Add(BuildRow(traceSpans));
-        return new TraceQueryPage(result, capped, scanFloorNano);
+        return new TraceQueryPage(result, scanFloorNano, scanFloor.Unreadable);
     }
 
     // ── Helpers ────────────────────────────────────────────────────────────────

@@ -260,17 +260,29 @@ public sealed class TraceStreamEndpointTests : IClassFixture<AmetoWebAppFactory>
         // THE FINDING THIS TEST EXISTS FOR: a short page is not an exhausted window.
         //
         // ?httpStatus= is not a parameter of GetTraceListAsync at all — the endpoint fetches the
-        // newest min(1000, limit*3) traces and filters them afterwards. Twelve of these 1200
-        // traces carry a 500, evenly spread, so the first fetch of 1000 finds ten of them and
-        // fills ten rows of a 500-row page. Reading that as "the window is exhausted" ends the
-        // stream two rows short and says `done` — a positive claim that the list is complete.
-        const string Service = "stream-sparse";
-        const int    Count   = 1200;
-        const int    Every   = 100;                       // → 12 matching traces
+        // newest min(1000, limit*3) traces and filters them afterwards. Reading a page that came
+        // back short of its 500 rows as "the window is exhausted" ends the stream early and says
+        // `done` — a positive claim that the list is complete.
+        //
+        // THE FIXTURE IS THE TEST. Matches spread evenly through the window placed the oldest
+        // ROW EXACTLY ON the provider's own floor row, so every cursor rule anyone could write
+        // produced the same number and the test passed against all of them — including against
+        // the raise that was added with it, which was a no-op on this shape. So they are grouped
+        // instead:
+        //   * twelve at the NEWEST end, so the oldest returned row sits a thousand traces ABOVE
+        //     the floor. A cursor raised to the floor stalls on page 2 against the boundary row
+        //     and the stream stops there;
+        //   * two at the OLDEST end, below the first fetch's reach and below the SECOND page's
+        //     as well — page 2 comes back with no rows at all, and only the floor can move the
+        //     cursor off it.
+        const string Service  = "stream-sparse";
+        const int    Count    = 1200;
+        const int    NewestHits = 12;                     // k = 1188..1199
         long baseNano = BaseOf(6);
+        bool IsHit(int k) => k >= Count - NewestHits || k == 0 || k == 100;
         for (int k = 0; k < Count; k++)
             WriteRootSpan(6_000_000 + (ulong)k, baseNano + k * Ms, Service,
-                          httpStatus: k % Every == 0 ? (short)500 : (short)200);
+                          httpStatus: IsHit(k) ? (short)500 : (short)200);
 
         var capture = await TestHelpers.CaptureSseAsync(_client,
             $"/api/traces/stream?service={Service}&httpStatus=500&max=100" +
@@ -280,11 +292,15 @@ public sealed class TraceStreamEndpointTests : IClassFixture<AmetoWebAppFactory>
         Assert.Equal(1, capture.TerminalCount);
 
         var starts = capture.Rows.Select(r => r.GetProperty("startTimeUnixNano").GetInt64()).ToList();
-        Assert.Equal(Count / Every, starts.Count);         // all twelve, not the first ten
+        Assert.Equal(NewestHits + 2, starts.Count);        // all fourteen
 
-        // Specifically: the two that live BELOW the first fetch's reach.
+        // Named individually: the twelve the cursor must not stall above, and the two the empty
+        // page's floor cursor is the only way to reach.
+        for (int k = Count - NewestHits; k < Count; k++)
+            Assert.Contains(baseNano + k * Ms, starts);
         Assert.Contains(baseNano,             starts);
         Assert.Contains(baseNano + 100 * Ms,  starts);
+
         Assert.Equal(starts.Count, starts.Distinct().Count());
         for (int i = 1; i < starts.Count; i++)
             Assert.True(starts[i] < starts[i - 1], "rows must still arrive newest-first");

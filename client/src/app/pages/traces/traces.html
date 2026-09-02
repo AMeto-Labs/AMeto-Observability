@@ -132,11 +132,19 @@
 
     <!-- Outside the mode branch: a stream can die halfway in EITHER mode (spent time budget,
          unreadable segment), and inside the @else the filter bar's failures had nowhere to
-         appear — the rows it managed to load sat there looking complete. -->
-    @if (traceqlError()) {
+         appear — the rows it managed to load sat there looking complete.
+
+         listBanner(), not traceqlError(): the same vanished segment is reported by the server
+         as a `query-error` sentence when the walk reached the end of the window and as a bare
+         `truncatedBy` code when the row ceiling bit first, and only the first of those used to
+         reach this strip. One dead file was a red banner over a frozen list at max=1000 and a
+         grey count suffix over a live one at max=50 — which of the two the operator saw decided
+         by how many rows happened to fit. The banner now follows the LOSS; the frame that
+         carried it decides nothing. -->
+    @if (listBanner(); as banner) {
       <div class="tql-error">
         <lucide-icon name="alert-circle" [size]="12" />
-        {{ traceqlError() }}
+        {{ banner }}
       </div>
     }
 
@@ -249,28 +257,26 @@
 
       <!-- The count is the plain truth so far and climbs on its own as rows arrive — the
            old "N+ · scroll for more" could not say whether anything was still coming. The
-           four suffixes are the four ways a list can be short of the whole answer: still
-           arriving, cut off by the user, cut off by an error, cut off by the ceiling. The
-           error arm exists because without it a query that died on its deadline left the
-           header reading a bare "300 traces" — the server's sentence was on screen, but as
-           a banner up in the filter area, nowhere near the list it describes. -->
+           three suffixes are the ways a list can be short of the whole answer: still arriving,
+           cut off by the user, and everything the ENDING says (see ListEnding / listEndHint).
+
+           That last arm used to be several, split by how the news arrived rather than by what
+           the news was: a query-error got "stopped by an error", a `truncatedBy` code got the
+           "narrow the range" hint, and those are the same vanished segment at two different row
+           ceilings. The suffix now comes from one computed that reads the LOSS, the ceiling and
+           the server's sentence together, so a fact cannot change category by changing frame.
+           A bare count still means one thing only: the server said it read the whole window
+           out. It is not what this page says when it does not know. -->
       <div class="list-header">
         <span class="list-title">
+          @let endHint = listEndHint();
           <strong>{{ filteredTraces().length }}</strong> traces
           @if (streamPublishing()) {
             <span class="list-more-hint">· streaming…</span>
           } @else if (streamStopped()) {
             <span class="list-more-hint">· stopped early — partial list, refresh to run it again</span>
-          } @else if (traceqlError()) {
-            @if (filteredTraces().length) {
-              <span class="list-more-hint">· stopped by an error — partial list, see the message above</span>
-            } @else {
-              <!-- Nothing arrived at all (a parse error, or a refusal before the first row):
-                   an empty list is not a "partial" one, so this arm does not call it that. -->
-              <span class="list-more-hint">· the search failed — see the message above</span>
-            }
-          } @else if (streamCapped()) {
-            <span class="list-more-hint">· newest {{ streamMax }} — narrow the range or the query for older traces</span>
+          } @else if (endHint) {
+            <span class="list-more-hint" [title]="endHint.title">{{ endHint.text }}</span>
           }
           <!-- Separate from the four above, and deliberately so: those describe the rows, this
                describes the REFRESH behind them. The rows here are complete — a background
@@ -304,8 +310,12 @@
         </div>
       } @else if (filteredTraces().length === 0) {
         <!-- "No traces found" is an answer, and a search that failed did not give one. Saying
-             it anyway is the same lie the header used to tell with a bare count. -->
-        @if (traceqlError()) {
+             it anyway is the same lie the header used to tell with a bare count. Keyed on the
+             BANNER rather than on traceqlError, so any standing sentence reaches it — a loss
+             cannot be the one on screen here (truncatedBy only ever rides a `max-rows` ending,
+             which by definition delivered rows), and a strip that is up over "No traces found"
+             would be the two halves of the page disagreeing. -->
+        @if (listBanner()) {
           <div class="panel-empty">The search failed — see the message above</div>
         } @else {
           <div class="panel-empty">No traces found</div>

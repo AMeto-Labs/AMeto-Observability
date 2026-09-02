@@ -257,17 +257,52 @@ internal static class TraceSummarySidecar
 
     // ── Reader: full per-trace rows ─────────────────────────────────────────────
 
-    public static List<TraceSummary> ReadSummaries(string trcFilePath)
+    /// <summary>
+    /// Every row in the sidecar, unbounded in time, with "could not read" flattened into "no
+    /// rows".
+    ///
+    /// <para>NOT ON ANY SCAN PATH ANY MORE — its only remaining caller is
+    /// <c>TraceSummarySidecarTests</c>, which round-trips a file it has just written and for
+    /// which the two answers really are the same. Every production reader goes through
+    /// <see cref="TryReadSummaries"/>, because flattening them is what let a segment fall out of
+    /// a window and the stream above it still report <c>done {"complete":true}</c>. Kept as the
+    /// round-trip's front door and nothing else; a new caller here is almost certainly a bug.</para>
+    /// </summary>
+    public static List<TraceSummary> ReadSummaries(string trcFilePath) =>
+        TryReadSummaries(trcFilePath, long.MinValue, long.MaxValue, out var rows) ? rows : [];
+
+    /// <summary>
+    /// The rows whose representative start falls in <c>[fromNano, toNano]</c>, or FALSE when the
+    /// sidecar could not be read at all.
+    ///
+    /// <para>THE RETURN VALUE IS THE POINT. This used to end in <c>catch { return []; }</c>, so a
+    /// file that vanished between the <see cref="Exists"/> probe and the open — which compaction
+    /// produces by design, publishing its merged output before unlinking its sources — or one a
+    /// power cut left truncated, merged as an EMPTY LIST. The walk then ran to the end of the
+    /// window, recorded no floor, reported itself uncapped, and the stream above it sent
+    /// <c>done {"complete":true}</c> over a window a whole segment had just fallen out of.</para>
+    ///
+    /// <para>THE RANGE IS PUSHED DOWN, and only that far. The body is one LZ4 blob with no index,
+    /// so the whole of it is still decompressed to reach any row — what the bound removes is the
+    /// per-row cost the caller used to pay and then throw away: the <see cref="TraceSummary"/>
+    /// itself, its <c>Services</c> array, and the three UTF-8 strings, for every trace in a
+    /// segment that compaction may have grown to 200 000 spans while the caller's whole budget is
+    /// 2 500 rows. A segment nested inside a wider one stays below the cursor for up to the 24 h
+    /// <c>SelectCompactionBatch</c> groups within, and is reopened on every page of every stream
+    /// for as long as it does.</para>
+    /// </summary>
+    public static bool TryReadSummaries(
+        string trcFilePath, long fromNano, long toNano, out List<TraceSummary> rows)
     {
+        rows = [];
         var path = Path.ChangeExtension(trcFilePath, ".tracesum");
-        if (!File.Exists(path)) return [];
 
         try
         {
             using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 65536, FileOptions.SequentialScan);
             using var br = new BinaryReader(fs);
 
-            if (br.ReadUInt32() != Magic) return [];
+            if (br.ReadUInt32() != Magic) return false;
             br.ReadUInt16(); // version
             br.ReadInt64();  // min
             br.ReadInt64();  // max
@@ -281,12 +316,13 @@ internal static class TraceSummarySidecar
             byte[] raw        = LZ4Pickler.Unpickle(comp);
             if (raw.Length != uncompSize) { /* tolerate — trust actual length */ }
 
-            return ParseBody(raw);
+            rows = ParseBody(raw, fromNano, toNano);
+            return true;
         }
-        catch { return []; }
+        catch { rows = []; return false; }
     }
 
-    private static List<TraceSummary> ParseBody(byte[] raw)
+    private static List<TraceSummary> ParseBody(byte[] raw, long fromNano, long toNano)
     {
         var ms = new MemoryStream(raw, writable: false);
         using var br = new BinaryReader(ms);
@@ -302,7 +338,9 @@ internal static class TraceSummarySidecar
         string PoolAt(int idx) => idx >= 0 && idx < pool.Length ? pool[idx] : string.Empty;
 
         uint traceCount = br.ReadUInt32();
-        var  result     = new List<TraceSummary>((int)traceCount);
+        // Capacity on the TRACE COUNT would allocate the whole segment's worth of slots for a
+        // window that may want none of them, which is half of what the bound is here to stop.
+        var  result     = new List<TraceSummary>();
         Span<byte> tidBuf = stackalloc byte[16];
 
         for (uint i = 0; i < traceCount; i++)
@@ -311,6 +349,25 @@ internal static class TraceSummarySidecar
             var    tid       = TraceId.Parse(tidBuf);
             var    rootSid   = new SpanId(br.ReadUInt64());
             long   startNano = br.ReadInt64();
+
+            // The row is variable-length, so an out-of-range row still has to be WALKED past —
+            // but nothing of it needs to be decoded or allocated.
+            if (startNano < fromNano || startNano > toNano)
+            {
+                ms.Position += 8 + 4 + 1 + 1 + 2 + 4;   // dur, spanCount, flags, status, http, svc
+                SkipStr16(br, ms);                      // name
+                SkipStr8 (br, ms);                      // method
+                SkipStr16(br, ms);                      // path
+                // The read is its OWN statement, and it has to be. `ms.Position += Read...()`
+                // evaluates the Position GETTER before the right-hand side, so the two bytes the
+                // read consumes are then written back out of the total — every following row
+                // parses two bytes early, and the body desynchronises into an exception the
+                // caller reports as an unreadable segment.
+                long svcIndexBytes = br.ReadUInt16() * 4L;
+                ms.Position += svcIndexBytes;
+                continue;
+            }
+
             long   durNanos  = br.ReadInt64();
             uint   spanCount = br.ReadUInt32();
             byte   flags     = br.ReadByte();
@@ -346,6 +403,11 @@ internal static class TraceSummarySidecar
 
         return result;
     }
+
+    // Length first, seek second — see the note at the call site: as one expression the Position
+    // getter is evaluated before the read, and the length prefix is then un-consumed.
+    private static void SkipStr8 (BinaryReader r, MemoryStream ms) { int n = r.ReadByte();   ms.Position += n; }
+    private static void SkipStr16(BinaryReader r, MemoryStream ms) { int n = r.ReadUInt16(); ms.Position += n; }
 
     // ── Helpers ─────────────────────────────────────────────────────────────────
 

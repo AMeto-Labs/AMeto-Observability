@@ -13,6 +13,7 @@ import { ApiService } from '../../core/services/api.service';
 import { serviceColor } from '../../shared/utils/service-color';
 import { EventDto } from '../../core/models/event.model';
 import { SpanDto, TraceRowDto, TraceStatsDto } from '../../core/models/span.model';
+import { StreamEndDto, StreamFrame } from '../../core/models/stream.model';
 import { subHours, formatISO } from 'date-fns';
 import { ServiceGraphComponent } from './service-graph/service-graph';
 import { FlamegraphComponent } from './flame-graph/flame-graph';
@@ -41,6 +42,74 @@ import { SearchHistoryService } from '../../core/services/search-history.service
  * range chip, a seek from the property menu, and the page's first load.
  */
 export type LoadOrigin = 'user' | 'background';
+
+/**
+ * How the last stream that owned the list ended, in the only vocabulary the header speaks.
+ *
+ * <p>It is the SERVER's account, normalised — not a re-derivation of it. The client used to
+ * decide this by counting its own rows against the `max` it had asked for, which can answer
+ * exactly one of the cases below and answers it by coincidence: a list of exactly `max` rows is
+ * capped, and everything else is silently called complete.</p>
+ *
+ * <p>THE ENDING IS THE CEILING AXIS ONLY. Whether part of the window went missing on the way is
+ * a SEPARATE fact ({@link SegmentLoss}), held in a separate signal, because the server holds it
+ * separately too — `reason` and `truncatedBy` are two fields precisely because "your row ceiling
+ * stopped me" and "I could not read part of the window" are both true at once, routinely. This
+ * page used to fold them into one `capped-lost` value, and folding is what let the frame that
+ * happened to carry the loss decide how loud it was: the loss rides `truncatedBy` when the
+ * ceiling bit first and rides a `query-error` sentence when the walk reached the end of the
+ * window, and the two produced two different screens for one dead file. Unfolded, the loss is
+ * rendered by the loss and the ceiling by the ceiling.</p>
+ *
+ * <p>`null` is the absence of an ending — no stream has finished yet, or the list was emptied —
+ * and is deliberately NOT the same value as `read-out`, which is a positive claim by the server
+ * that the whole window was read. The header renders both as a bare count; only one of them
+ * means it.</p>
+ */
+export type ListEnding =
+  /** `complete: true` — the whole requested window was read out. */
+  | { kind: 'read-out' }
+  /** `max-rows` — the row ceiling stopped it. */
+  | { kind: 'capped' }
+  /** The server denied completeness for a reason this client cannot name. */
+  | { kind: 'short' };
+
+/**
+ * Part of the queried window is not in the answer, and never was — the `truncatedBy` vocabulary.
+ *
+ * <p>The two differ in ONE thing that matters to the reader, and it is not severity: it is
+ * whether asking again differently can help. A segment the search ran out of room to open comes
+ * back when the window is narrower; a segment that will not open does not come back at all.</p>
+ */
+export type SegmentLoss = 'unread-segment' | 'unreadable-segment';
+
+/**
+ * WHAT THE SERVER WOULD HAVE SAID, held here for the frame that cannot say it.
+ *
+ * <p>These are the server's own two truncation sentences, copied verbatim from
+ * `TraceQueryEndpointMapper.FinishStreamAsync`. They exist on this side because the server can
+ * only spell a loss out in prose on the ending where it has prose to spell: a `query-error`.
+ * When the row ceiling bites first the SAME loss rides the terminal `done` frame as a
+ * `truncatedBy` code with no sentence attached — and a code the page renders as a grey footnote
+ * while the sentence gets a banner is one dead file wearing two faces.</p>
+ *
+ * <p>So the page writes the sentence itself in that case, and writes the SAME one, so that what
+ * the operator sees is decided by which segment vanished and not by how many rows happened to
+ * fit above it. The copy is the cost: a re-worded sentence on the server drifts from this one
+ * until someone copies it across. That is a wording drift, not a treatment drift — the loud
+ * screen is raised by the `truncatedBy` code either way — and the only thing that would remove
+ * it is a machine-readable cause on the `query-error` frame, which is server work.</p>
+ */
+const LOSS_SENTENCE: Readonly<Record<SegmentLoss, string>> = {
+  'unreadable-segment':
+    'Results are truncated: a storage segment inside this window could not be read — it was '
+    + 'deleted or damaged — so the traces it held are missing from this list. Narrowing the time '
+    + 'window will not bring them back; the server log names the file.',
+  'unread-segment':
+    'Results are truncated: part of this window sits inside a storage segment the search ran out '
+    + 'of room to open before it had to move on, so the traces it holds are missing from this '
+    + 'list. Narrow the time window to bring them back into reach.',
+};
 
 /** TraceQL vocabulary offered by the Ctrl+Space autocomplete: intrinsics, common OTel span
  *  attributes (dotted), status/kind enum values, and the comparison/boolean operators. */
@@ -138,13 +207,18 @@ export class TracesComponent implements OnInit, OnDestroy {
   // TraceQL
   traceqlInput   = '';
   traceqlMode    = signal(false);
-  /** Why the last search the USER ran ended in an error — '' when it did not. Despite the
-   *  name it is not TraceQL-specific: the filter-bar path streams too, and dies the same ways.
-   *  It does three jobs at once, and that is the point — one signal cannot contradict itself.
-   *  It is the banner text above the filter bar; it is the list-header suffix that stops a
-   *  half-delivered answer reading as a finished one; and it is half of listHeld, so the list
-   *  thaws exactly when the explanation for freezing it leaves the screen. A failing BACKGROUND
-   *  refresh must never set it: see the error branch of startStream. */
+  /** The SERVER'S OWN SENTENCE for a search the USER ran that ended in an error — '' when none
+   *  did. Despite the name it is not TraceQL-specific: the filter-bar path streams too, and dies
+   *  the same ways. A failing BACKGROUND refresh must never set it: see the error branch of
+   *  startStream.
+   *
+   *  It is no longer read directly by anything that RENDERS. Everything downstream — the banner
+   *  strip, the header suffix, the hold — goes through {@link listBanner}, because this is only
+   *  one of the two ways the same news arrives: a vanished segment reported at the end of the
+   *  window lands here as a sentence, and the identical segment reported at the row ceiling
+   *  lands in {@link listLoss} as a code with no sentence at all. Anything reading this signal
+   *  alone renders one of those and not the other, which is exactly how one dead file came to
+   *  look like an error at max=1000 and like a footnote at max=50. */
   traceqlError   = signal('');
   /** Candidates for the TraceQL Ctrl+Space autocomplete. */
   readonly traceqlSuggestions = TRACEQL_TOKENS as string[];
@@ -182,9 +256,142 @@ export class TracesComponent implements OnInit, OnDestroy {
    *  a stream that was painting can leave a PARTIAL list behind, and only then may the header
    *  call it partial. Not a signal: nothing renders it, it only qualifies the stamp. */
   private streamPaints = false;
-  /** True when the last stream ended because it hit `streamMax`, so older traces exist
-   *  beyond what is on screen and the header must say so rather than imply completeness. */
-  readonly streamCapped = signal(false);
+  /** How the last stream to own the list ended — the server's own account of it, normalised by
+   *  {@link endingOf}. Null until a stream has finished, and again whenever the list is emptied:
+   *  an ending describes rows, and outlives nothing else. */
+  readonly listEnding = signal<ListEnding | null>(null);
+  /**
+   * Part of the window on screen is MISSING, and which kind of missing — null when nothing is.
+   *
+   * <p>Separate from {@link listEnding} because it has a different lifetime, and that difference
+   * is the whole of it. An ending describes ONE READ: the next read replaces it, and a read that
+   * runs to the bottom of the window genuinely disproves the last one that did not. A lost
+   * segment describes the STORAGE, and no read can disprove it — nothing re-reads a file that is
+   * gone. The server says as much where it remembers them (VanishedRegionLog: "the consumer may
+   * never decide a later page has made the fault good").</p>
+   *
+   * <p>Which is why nothing in the streaming path ever CLEARS this. A stream may only set it
+   * (see the `complete` handler); it goes back to null in exactly one place — a search the USER
+   * ran, emptying the list. Before that rule existed, a background tick was enough to retire the
+   * warning: end a user search with `{max-rows, unreadable-segment}`, restart the server so the
+   * in-process memory of the dead segment is gone, and the 15 s poll came back
+   * `{complete:true, exhausted}` and quietly relabelled a window with a permanent hole in it as
+   * whole — the same lie the server-side memory was built to kill, reached by waiting instead of
+   * by clicking. An unattended refresh may replace rows and may make the page LESS confident; it
+   * may not make it more confident than the user left it.</p>
+   */
+  readonly listLoss = signal<SegmentLoss | null>(null);
+  /** The `max` the request behind the rows on screen actually carried, so the header names the
+   *  ceiling that was asked for rather than the one this page would ask for next. Identical
+   *  today (every caller sends {@link streamMax}); it stops being identical the first time a
+   *  caller passes anything else, and a hint that reads "newest 2000" over a 500-row ask is a
+   *  wrong number, not a stale one. */
+  readonly listMax = signal(2000);
+  /** True when the last stream ended because it hit its row ceiling, so older traces exist
+   *  beyond what is on screen and the header must say so rather than imply completeness.
+   *  Derived rather than stored, so it cannot disagree with the ending it is a fact about. */
+  readonly streamCapped = computed(() => this.listEnding()?.kind === 'capped');
+  /**
+   * The one sentence that goes above the filter bar — '' when there is none.
+   *
+   * <p>Two sources, one strip, and deliberately so. The server sends its own sentence when the
+   * ending it reached has one (a `query-error`); when the row ceiling bit first, the very same
+   * loss arrives as a `truncatedBy` code on a `done` frame with no sentence at all, and the page
+   * supplies the one the server would have sent ({@link LOSS_SENTENCE}). Rendering only the
+   * first of those is how one vanished segment came to look like an error at max=1000 and like a
+   * footnote at max=50.</p>
+   *
+   * <p>A failure the page could not classify wins over a loss it could: `traceqlError` means a
+   * search the user ran did not finish, which is a bigger claim about the rows than a hole in
+   * them, and the server's own words are always the better sentence when there are any. In
+   * practice the two never coexist — a stream that ends in an error reports no `truncatedBy`,
+   * and a user's stream clears both before it starts.</p>
+   */
+  readonly listBanner = computed<string>(() => {
+    const spoke = this.traceqlError();
+    if (spoke) return spoke;
+    const loss = this.listLoss();
+    return loss ? LOSS_SENTENCE[loss] : '';
+  });
+  /**
+   * The list header's account of an ending, with the long version in its tooltip — or null when
+   * there is nothing to add to the count (nothing has ended, or the server said it read the
+   * whole window out).
+   *
+   * <p>The two losses keep different ADVICE, which is the whole reason `truncatedBy` is carried
+   * this far: a segment the search ran out of room to open comes back when the window is
+   * narrower, and a segment that will not open does not come back at all — telling the second
+   * user to narrow their window sends them round a loop that cannot help them. That advice now
+   * leads with {@link listBanner}, where it is a sentence rather than a tooltip, and the suffix
+   * echoes it in its `title`. The suffix itself says only what every road to it can support.</p>
+   */
+  readonly listEndHint = computed<{ text: string; title: string } | null>(() => {
+    const loss   = this.listLoss();
+    const spoke  = this.listBanner() !== '';
+    const end    = this.listEnding();
+    const capped = end?.kind === 'capped';
+
+    // ── THE FRAME CATEGORY DOES NOT APPEAR IN THIS BRANCH, AND THAT IS THE POINT ───────────
+    //
+    // One vanished segment reaches this page down two different roads. Walk the window to its
+    // floor with a hole in it and the server ends the stream with a `query-error` sentence;
+    // reach the row ceiling on the way and the SAME hole rides the terminal `done` frame as
+    // `truncatedBy`. streamJson routes the first to `subscriber.error` and the second to an
+    // ending value — two categories, and the page used to read the category as the severity:
+    // red banner and a frozen list at max=1000, a grey count suffix and a live list at max=50,
+    // for one and the same dead file, chosen by how many rows happened to fit above it.
+    //
+    // So the LOSS picks the treatment and the ceiling is only ever a clause on top of it. Both
+    // roads now end here: a standing sentence above the filter bar, a list held off the poll,
+    // and a suffix that calls the rows partial and points at the sentence. What the two roads
+    // still do not share is DETAIL — only one of them knows the ceiling also bit — and detail
+    // the page has is not a reason to withhold it. Detail it does NOT have is the other half:
+    // a `query-error` arrives as prose, so this page cannot tell a lost segment from a spent
+    // deadline there, and refuses to guess by pattern-matching an English sentence. Saying
+    // "partial, and the message says why" is true of every ending that reaches this branch.
+    if (loss || spoke) {
+      if (!this.traces().length)
+        // No rows at all — a parse error, or a refusal before the first one. An empty list is
+        // not a partial one, so this does not call it that.
+        return {
+          text:  '· the search failed — see the message above',
+          title: 'The message above the filter bar is the server\'s own account of why nothing '
+               + 'came back.',
+        };
+      return {
+        text:  capped
+          ? `· newest ${this.listMax()}, partial list — see the message above`
+          : '· partial list — see the message above',
+        title: loss
+          ? (loss === 'unreadable-segment'
+              ? 'Part of this window sits in a storage segment that would not open — the traces '
+              + 'it held are missing from the list entirely, and narrowing the time window will '
+              + 'NOT bring them back. The message above the filter bar says so in full.'
+              : 'Part of this window sits in a storage segment the search ran out of room to '
+              + 'open before it had to move on — the traces it holds are missing from the list '
+              + 'entirely. Narrow the time window to bring them back into reach.')
+          : 'The rows below are a prefix of the answer. The message above the filter bar is the '
+          + 'server\'s own account of why it is short.',
+      };
+    }
+
+    switch (end?.kind) {
+      case 'capped':
+        return {
+          text:  `· newest ${this.listMax()} — narrow the range or the query for older traces`,
+          title: 'The search stopped at the row ceiling it was given. Older traces inside this '
+               + 'window exist and are not in the list.',
+        };
+      case 'short':
+        return {
+          text:  '· partial list — the server stopped before the end of the window',
+          title: 'The server reported that it did not read the whole window out, for a reason '
+               + 'this page does not recognise. The rows below are a prefix of the answer.',
+        };
+      default:
+        return null;
+    }
+  });
   /** True when the last stream was cut short — Stop, or leaving the list mid-flight. The rows
    *  on screen are then a PREFIX of the answer, and the header has to say so: stopped at 300
    *  of a window holding 2000 must not read like a search that genuinely found 300. */
@@ -196,13 +403,24 @@ export class TracesComponent implements OnInit, OnDestroy {
    *
    *  Both halves are things the user did and can see. A BACKGROUND refresh that fails is
    *  neither, and deliberately does not reach here: it would freeze the list over a query the
-   *  user never ran, with nothing on screen saying so. It backs off instead (bgSkipTicks) and
+   *  user never ran, with nothing on screen saying so. It backs off instead (nextBgListAt) and
    *  says so in the list header (bgRefreshFailing).
    *
-   *  The failure half reads the BANNER rather than a flag of its own (nothing else ever sets
-   *  traceqlError), so the reason on screen and the reason the list is frozen cannot drift
-   *  apart: whatever clears the banner is exactly what thaws the list. */
-  private readonly listHeld = computed(() => this.streamStopped() || this.traceqlError() !== '');
+   *  The failure half reads the BANNER rather than a flag of its own, so the reason on screen
+   *  and the reason the list is frozen cannot drift apart: whatever clears the banner is exactly
+   *  what thaws the list.
+   *
+   *  THE LOSS IS THE THIRD HALF, and it is here because of what the alternative costs. The same
+   *  vanished segment reaches the page as a `query-error` (which sets the banner, and so freezes
+   *  the list) or as `truncatedBy` on a `done` frame (which did not), so one dead file gave the
+   *  operator a blocking red banner over a frozen list or a grey count suffix over a live one,
+   *  decided by how many rows fitted above it. Converging on the LOUD side is not a preference:
+   *  the quiet side is unreachable. Demoting the `query-error` road would mean deciding, from an
+   *  English sentence and nothing else, whether it is a lost segment or a spent deadline — and
+   *  getting that wrong turns a search that died into a footnote. Only one road carries a
+   *  machine-readable cause, so the treatment has to be the one that road can raise. */
+  private readonly listHeld = computed(() =>
+    this.streamStopped() || this.listBanner() !== '');
   /** Rows one stream will deliver before the server stops — sent as `?max=` (which the server
    *  clamps to 1…5000 and enforces by ending the stream), and the number the header names.
    *
@@ -218,10 +436,42 @@ export class TracesComponent implements OnInit, OnDestroy {
    *  never lands here — it gets the banner instead. Zeroed by any complete stream and by any
    *  search the user runs, so it only ever counts an unbroken run. */
   private readonly bgFailures = signal(0);
-  /** Poll ticks still to be skipped before the next background refresh is attempted. Grows
-   *  1 → 2 → 4 → 8 with the failure count (15 s → 2 min): re-firing a doomed query every
-   *  15 s for as long as the page is open is not a retry policy. */
-  private bgSkipTicks = 0;
+  /** The live-refresh cadence, and the unit the background backoff is measured in. */
+  private static readonly PollMs = 15_000;
+  /** No two background refreshes closer together than this, whoever asked. poll() has TWO
+   *  callers and only one of them is a clock: the 15 s timer paces itself, the visibility
+   *  handler fires as fast as the user alt-tabs. Well under PollMs, so the scheduled cadence
+   *  never trips it — this is a floor on bursts, not a second schedule. Without it, eight
+   *  returns to the tab in five seconds were eight stats queries. */
+  private static readonly BgFloorMs = 5_000;
+  /** Earliest epoch-ms at which poll() may do any background work at all (see BgFloorMs). */
+  private nextBgPollAt = 0;
+  /** A load the USER asked for that the list could not run, because the list was not the panel
+   *  on screen — the range chips and the filter bar render above the tab strip, so both stay
+   *  live while Service Graph / Latency / Compare is showing.
+   *
+   *  It is what lets {@link loadAll} stop retiring a held list's warning in advance of an
+   *  outcome. The old code released the hold there and then, so that returning to the tab would
+   *  find an unheld list and refresh it; the cost was a banner cleared by a click that started
+   *  no query. Remembering the ASK instead keeps both: the banner stands over the rows it
+   *  describes until something replaces them, and {@link setMainTab} runs the load on return as
+   *  what it always was — the user's own search, which empties the list and retires the marker
+   *  in the same step. */
+  private pendingUserLoad = false;
+  /** Earliest epoch-ms at which the background LIST refresh may be attempted again after a
+   *  failure. Grows 1 → 2 → 4 → 8 poll intervals with the failure count (15 s → 2 min):
+   *  re-firing a doomed query every 15 s for as long as the page is open is not a retry
+   *  policy.
+   *
+   *  A TIMESTAMP, not a countdown of ticks, and that is the whole point. A counter spent one
+   *  unit per CALL to poll(), and poll() has two callers — so every hidden→visible transition
+   *  burned a tick of a backoff it never waited out. Alt-tab eight times in five seconds and
+   *  the ninth return re-ran the same doomed month-wide scan immediately: a backoff that made
+   *  the failing query arrive FASTER than no backoff at all. Wall time cannot be spent by
+   *  being asked, so it no longer matters who calls poll(), or how often.
+   *
+   *  Gates the list only. Stats are a different query, and the one that failed is the list's. */
+  private nextBgListAt = 0;
   /** When the list last took delivery of a COMPLETE answer. Read only by bgRefreshHint(), to
    *  date the rows on screen when the refresh behind them has stopped working. */
   private readonly listLoadedAt = signal<number | null>(null);
@@ -234,7 +484,8 @@ export class TracesComponent implements OnInit, OnDestroy {
    *  count visibly moving without the churn (the Events store does the same at 10). */
   private static readonly FlushEvery = 25;
 
-  /** Refresh immediately when the tab is re-shown after being hidden. */
+  /** Refresh when the tab is re-shown after being hidden. poll() decides whether anything is
+   *  actually due — this handler is one more caller, not a privileged one. */
   private _onVisibility = () => { if (!document.hidden) this.poll(); };
 
   // ── Computed ──────────────────────────────────────────────────────────────
@@ -350,7 +601,7 @@ export class TracesComponent implements OnInit, OnDestroy {
     this.setWindow();
     this.loadAllServices();
     this.loadAll();
-    this._poll = setInterval(() => this.poll(), 15_000);
+    this._poll = setInterval(() => this.poll(), TracesComponent.PollMs);
     document.addEventListener('visibilitychange', this._onVisibility);
   }
 
@@ -358,10 +609,17 @@ export class TracesComponent implements OnInit, OnDestroy {
    *  (heavier) trace list while the Traces tab is actually on screen. */
   private poll() {
     if (document.hidden) return;
+    // One clock for both callers. Everything below this line is background work, and how much
+    // of it is due is a question about elapsed TIME — never about how many times poll() was
+    // asked. A run of hidden→visible transitions is one refresh, not eight.
+    const now = Date.now();
+    if (now < this.nextBgPollAt) return;
+    this.nextBgPollAt = now + TracesComponent.BgFloorMs;
     const from = this.fromIso();
     const to   = this.toIso();
     this.loadStats(from, to);
-    // Stats always refresh; the list does not while a stream is still delivering into it —
+    // Stats refresh on every tick that gets this far; the list does not while a stream is
+    // still delivering into it —
     // restarting mid-stream would throw away the rows already on screen and re-run the same
     // query from the top every 15 s, a list that never finishes arriving — and not while the
     // list is HELD, i.e. the user stopped it or it failed. 'background' is what makes the rest
@@ -373,7 +631,8 @@ export class TracesComponent implements OnInit, OnDestroy {
     // the user owns it; a failing background refresh keeps trying, because the failure may be
     // a passing one (a spent budget on a busy server) and nobody asked for the list to go
     // stale — but it tries at a widening interval instead of hammering the same query.
-    if (this.bgSkipTicks > 0) { this.bgSkipTicks--; return; }
+    // The window is a deadline, so coming back to the tab does not shorten it.
+    if (now < this.nextBgListAt) return;
     this.loadTraces(from, to, 'background');
   }
 
@@ -444,6 +703,15 @@ export class TracesComponent implements OnInit, OnDestroy {
 
   // ── State setters that also persist to URL ────────────────────────────────
   setMainTab(tab: 'traces' | 'graph' | 'latency' | 'compare') {
+    // Selecting the tab that is ALREADY selected is not navigation, and must not be mistaken
+    // for it. The template binds every tab button unconditionally, so a click on the active
+    // one used to fall straight through to the "returning to the list" branch below and re-run
+    // the query — which goes through startStream, whose first act is to cancel whatever is
+    // streaming. A user watching 437 rows of their own month-wide search arrive lost the rest
+    // of it to a click on the tab they were already on, and the replacement was a BACKGROUND
+    // stream, so nothing on screen said the rows had been cut short. Nothing below has any
+    // effect when the tab does not change, so the guard costs a click and closes the path.
+    if (tab === this.activeMainTab) return;
     this.activeMainTab = tab;
     this.syncUrl();
     // Leaving the list cancels its stream: nobody is watching the rows land, and an open
@@ -456,6 +724,17 @@ export class TracesComponent implements OnInit, OnDestroy {
     // reason: the panel is only class-hidden, never unmounted, so the list is still scrolled
     // where they left it and a glance at Service Graph must not cost them that place — nor
     // hand them a banner about a query they did not run, if the re-run happens to fail.
+    //
+    // Except when the user asked for a load while the list was off screen (a range chip, a
+    // filter Clear — both live above the tab strip). That is not a poll tick and must not be
+    // disguised as one: it outranks the hold, exactly as it would have if the list had been on
+    // screen when they clicked, and it owns its own failure. Running it as the user's is also
+    // what retires a held list's marker honestly — by replacing the rows the marker is about,
+    // rather than by clearing it back when the click happened and hoping something followed.
+    if (this.pendingUserLoad) {
+      this.loadTraces(this.fromIso(), this.toIso(), 'user');
+      return;
+    }
     if (!this.listHeld()) this.loadTraces(this.fromIso(), this.toIso(), 'background');
   }
 
@@ -514,16 +793,35 @@ export class TracesComponent implements OnInit, OnDestroy {
   }
 
   // ── Data loading ──────────────────────────────────────────────────────────
-  /** Every caller is a user action — Refresh, Apply, Clear, a range chip, Apply-custom, a
-   *  seek from the property menu — plus the initial load. That is exactly what releases a
-   *  held list, and it must happen even when loadTraces declines to run (another tab is
-   *  showing): the release is what lets the list refresh once the user comes back to it. */
+  /**
+   * Every caller is a user action — Refresh, Apply, Clear, a range chip, Apply-custom, a seek
+   * from the property menu — plus the initial load.
+   *
+   * <p>It does NOT release the held list here, and that is the fix to a warning that could be
+   * retired by a click that replaced nothing. `releaseList()` used to run on this line,
+   * unconditionally, ahead of a load that {@link loadTraces} may decline outright: the range
+   * chips and the filter bar render ABOVE the tab strip, so they are live while Service Graph
+   * is showing, and the list refuses to stream into a panel that is off screen. Measured: a
+   * truncation banner up over 300 rows, one click on Service Graph, one click on a range chip
+   * — and the banner was gone, the hold was gone, the same 300 truncated rows were still on
+   * screen, and the background refresh that ran when the user came back could not raise a
+   * banner even when it failed for the very same reason. A warning retired by a click that
+   * started no query and changed no row.</p>
+   *
+   * <p>Releasing is now the job of the stream that makes the marker untrue — {@link startStream}
+   * for a search the user ran, the `complete` handler for any stream that replaces the rows —
+   * so the banner is REPLACED by the new outcome instead of being cleared in advance of it. The
+   * load a hidden list could not run is remembered instead, and {@link setMainTab} runs it as
+   * the user's own the moment the list is back on screen: the refresh the old release was there
+   * to enable still happens, and it arrives as an answer rather than as an absence.</p>
+   */
   loadAll() {
     const from = this.fromIso();
     const to   = this.toIso();
-    this.releaseList();
     this.loadStats(from, to);
-    this.loadTraces(from, to);
+    // Assignment, not |=: a load that DID run has already cleared the flag through startStream,
+    // and a stale pending load must not survive the search that satisfied it.
+    this.pendingUserLoad = !this.loadTraces(from, to);
   }
 
   loadStats(from: string, to?: string) {
@@ -541,12 +839,15 @@ export class TracesComponent implements OnInit, OnDestroy {
    * click there (or a deep link like /traces?tab=graph&ql=…) opened a 2000-row EventSource
    * into a hidden panel — the very connection setMainTab cancels on the way out. The stats
    * above the tabs still refresh; only the list waits, and setMainTab loads it on return.
+   *
+   * @returns whether the load actually ran. Its one caller that cares is {@link loadAll}, which
+   *   has a held list's warning to answer for: a load that never ran cannot be what retires it.
    */
-  loadTraces(from: string, to?: string, origin: LoadOrigin = 'user') {
-    if (this.activeMainTab !== 'traces') return;
+  loadTraces(from: string, to?: string, origin: LoadOrigin = 'user'): boolean {
+    if (this.activeMainTab !== 'traces') return false;
     if (this.traceqlMode() && this.traceqlInput.trim()) {
       this.runTraceQL(origin);
-      return;
+      return true;
     }
     this.startStream(this.api.streamTraceList({
       from,
@@ -558,7 +859,8 @@ export class TracesComponent implements OnInit, OnDestroy {
       maxDurationMs:  this.filterMaxDurationMs  ?? undefined,
       httpStatus:     this.filterHttpStatus     || undefined,
       max:            this.streamMax,
-    }), origin);
+    }), origin, this.streamMax);
+    return true;
   }
 
   /** Reached two ways: the user pressing Run (through runTraceQLUser) and the 15 s poll,
@@ -575,7 +877,7 @@ export class TracesComponent implements OnInit, OnDestroy {
     // always sent it; TraceQL simply never did.
     this.startStream(this.api.streamTraceQuery({
       query: q, from: this.fromIso(), to: this.toIso(), max: this.streamMax,
-    }), origin);
+    }), origin, this.streamMax);
   }
 
   /**
@@ -605,12 +907,26 @@ export class TracesComponent implements OnInit, OnDestroy {
    *   where there is no position left to protect. That last case is why `origin` exists as a
    *   parameter rather than being inferred from the row count: an empty list makes a poll
    *   tick paint like a search, and it must still not fail like one.
+   * @param askedMax  The row ceiling THIS request carried, so the header names the number that
+   *   produced the rows rather than the number the page would ask for next. Passed rather than
+   *   read off {@link streamMax} at render time: the two agree today and would silently stop
+   *   agreeing the first time a caller asks for anything else.
    */
-  private startStream(source: Observable<TraceRowDto>, origin: LoadOrigin = 'user'): void {
+  private startStream(
+    source: Observable<StreamFrame<TraceRowDto>>,
+    origin: LoadOrigin = 'user',
+    askedMax: number = this.streamMax,
+  ): void {
+    // A background refresh NEVER supersedes a live stream. Both of its callers already decline
+    // to ask for one while a stream is open — the poll checks `streaming()`, and leaving the
+    // list cancels its stream before another tab can return to it — but "no caller currently
+    // does this" is not the same guarantee as "this cannot happen", and the difference cost a
+    // user their search: re-selecting the active Traces tab reached here with 'background',
+    // and the first thing below would have been stopStream() on 437 rows the server was still
+    // sending. Nobody asked for the refresh, so it has nothing to offer that is worth ending a
+    // search the user is watching arrive; the stream in flight is already the better answer.
+    if (origin === 'background' && this.streamSub) return;
     this.stopStream();
-    // The stream about to open supersedes whatever the cancelled one left behind — including
-    // the "stopped early" stopStream() just stamped on it, and the banner of the query before.
-    this.releaseList();
     this.loading.set(true);
     this.streaming.set(true);
 
@@ -637,19 +953,45 @@ export class TracesComponent implements OnInit, OnDestroy {
     // Everything below belongs to a stream the USER asked for; a background refresh touches
     // none of it, which is what makes it invisible.
     if (userAsked) {
-      // The old answer goes out with the question that produced it (see the doc comment).
+      // The old answer goes out with the question that produced it (see the doc comment) —
+      // and the sentence describing it goes at the same moment, in the same branch. Retiring
+      // "stopped early — partial list" and the banner is only honest for a stream that is
+      // REPLACING those rows, which is exactly this one and exactly why the two lines are
+      // adjacent. This used to run above, unconditionally, for every stream: stopStream()
+      // stamps the partial marker on the rows it flushes, so a stream that inherited them
+      // rather than producing them could rub the marker out and leave a truncated list
+      // reading as a finished answer. A stream may only retire a marker it is about to make
+      // untrue — and, the other way round, a stream that HAS made one untrue must retire it,
+      // which is the same rule read from the other end and lives in the `complete` handler.
+      // Together they are the whole guarantee: a marker stands exactly as long as the rows it
+      // describes. Here is where a USER's stream keeps it, because emptying the list is the
+      // next line; a background stream reaches its half later, having nothing to empty.
+      this.releaseList();
       if (this.traces().length) this.traces.set([]);
-      // `streamCapped` describes the list on screen, so a background refresh leaves the hint
-      // standing until it completes with an answer of its own — otherwise "newest 2000 ·
-      // narrow the range" blinked out and back twice a minute under a list that never moved.
-      // The one background stream that DOES replace the list — the empty-list case — cannot
-      // want this either: a capped list is 2000 rows, so it is never the empty one.
-      this.streamCapped.set(false);
+      // The one place a user's load is known to have actually STARTED, so the one place a
+      // remembered one is known to be satisfied. Whatever a hidden list could not run, this
+      // stream is running now.
+      this.pendingUserLoad = false;
+      // The ending describes the list on screen, so a background refresh leaves it standing
+      // until it completes with an answer of its own — otherwise "newest 2000 · narrow the
+      // range" blinked out and back twice a minute under a list that never moved. The one
+      // background stream that DOES replace the list — the empty-list case — cannot want this
+      // either: a capped list is 2000 rows, so it is never the empty one.
+      this.listEnding.set(null);
+      // THE ONLY PLACE A LOSS IS EVER RETIRED, and the reason it is this place. A lost segment
+      // is not a claim a later read can test — nothing re-reads a file that is gone — so no
+      // stream is allowed to withdraw it by simply not mentioning it, which is exactly what a
+      // background tick does after the server has been restarted or retention has passed the
+      // range. What CAN retire it is the user asking again: this line runs beside the one that
+      // empties the list, so the warning leaves with the rows it was about and the next answer
+      // says for itself whether the hole is still there. That is also the whole recovery story
+      // for a window that genuinely came back — Refresh, Apply, or any range chip.
+      this.listLoss.set(null);
       // The user is driving again, so the background refresh starts from a clean slate: its
       // failure count and its backoff both describe a run of unattended ticks, and this is
       // not one. Whatever the poll could not fetch, this query is about to fetch itself.
       this.bgFailures.set(0);
-      this.bgSkipTicks = 0;
+      this.nextBgListAt = 0;
     }
 
     // Rows land in a plain array and reach the signal in batches. Pushing a new array per
@@ -661,6 +1003,10 @@ export class TracesComponent implements OnInit, OnDestroy {
     // a future edit ever starts a stream without stopping the previous one, a frame from the
     // old stream reading the field would publish the NEW stream's buffer.
     const acc: TraceRowDto[] = [];
+    // The server's terminal frame, held next to the rows it ended and captured in the same
+    // closure for the same reason: an ending belongs to exactly one stream, and a field would
+    // let a stream read the ending of the one that replaced it.
+    let ended: StreamEndDto | null = null;
     const flush = () => {
       this.traces.set([...acc]);
       this.loading.set(false);
@@ -669,9 +1015,13 @@ export class TracesComponent implements OnInit, OnDestroy {
     // silent refresh, which has nothing worth handing over until it is complete.
     this.flushPending = silent ? null : flush;
 
-    this.streamSub = source.subscribe({
-      next: row => {
-        acc.push(row);
+    const sub = source.subscribe({
+      next: frame => {
+        // The terminal frame is not a row: it is the server saying how this stream ended, and
+        // it arrives immediately before the completion that consumes it. Held rather than
+        // acted on here, because what it means depends on how many rows came with it.
+        if (frame.kind === 'end') { ended = frame.end; return; }
+        acc.push(frame.row);
         // The FIRST row flushes immediately so the empty-state spinner is replaced the
         // moment there is anything to show; after that, one flush per batch.
         if (!silent && (acc.length === 1 || acc.length % TracesComponent.FlushEvery === 0)) {
@@ -683,13 +1033,48 @@ export class TracesComponent implements OnInit, OnDestroy {
         // Complete: a silent refresh now HAS the whole answer, so it hands it over the same
         // way a publishing stream hands over its tail — through endStream, in one array.
         this.flushPending = flush;
-        // A stream that delivered exactly its ceiling was cut off, not finished: older
-        // traces exist that the list does not contain, and the header has to say so.
-        this.streamCapped.set(acc.length >= this.streamMax);
+        // …which is also the moment this stream owns every row on screen, whoever asked for
+        // it — so the markers describing the rows it just replaced go out with them. A user's
+        // search retires them up front (see above) because it empties the list up front; a
+        // background stream cannot retire anything there, because until it completes it may
+        // still die and hand the old rows back, and a stream that may yet restore rows must
+        // not rub out their marker. Completing is exactly when that stops being possible.
+        //
+        // Without this, a background stream that ran to COMPLETE over a stopped list published
+        // its own twelve-row answer under a header still reading "stopped early — partial
+        // list" — a whole answer labelled a fragment, the mirror of the bug that moved
+        // releaseList() up into the userAsked branch. Both halves go together, because both
+        // are sentences about rows that are gone: the banner would otherwise explain a failed
+        // search over rows that search never produced, and it is half of listHeld, so it would
+        // freeze a list that is complete and current with nothing on screen saying why.
+        this.releaseList();
+        // …and the same moment the ending becomes a fact about the rows now on screen. The
+        // server said how this stream ended; what the header may claim is decided from that,
+        // not from counting rows (see endingOf).
+        this.listEnding.set(this.endingOf(ended, acc.length, askedMax));
+        this.listMax.set(askedMax);
+        // The loss is SET, never cleared — the asymmetry is the guard, and it is written as an
+        // `if` with no `else` on purpose.
+        //
+        // An ending describes one read and is replaced by the next read's own account of
+        // itself. A lost segment describes the storage under every read, and the server says so
+        // where it remembers them: nothing re-reads a file that is gone, so no later page may
+        // decide the fault has been made good. But that memory is a field in a process and a
+        // range retention will eventually walk past — so the server does stop re-reporting a
+        // real, permanent hole, by restarting or by ageing out, and a background tick then
+        // arrives saying `{complete:true, exhausted}` over a window that is still missing its
+        // traces. Measured: user search ends `{max-rows, unreadable-segment}`, restart, 15 s
+        // later the poll cleared the warning and left the count reading as a whole answer.
+        //
+        // So confidence only ever travels one way here. A stream may add a loss the page did
+        // not know about, whoever asked for it; taking one away is the user's to ask for, in
+        // startStream, where the rows it describes are emptied in the same step.
+        const loss = this.lossOf(ended);
+        if (loss) this.listLoss.set(loss);
         // The list holds a whole answer as of now, and the refresh behind it is working.
         this.listLoadedAt.set(Date.now());
         this.bgFailures.set(0);
-        this.bgSkipTicks = 0;
+        this.nextBgListAt = 0;
         this.endStream();
       },
       error: (err: unknown) => {
@@ -712,7 +1097,8 @@ export class TracesComponent implements OnInit, OnDestroy {
           this.flushPending = null;
           this.traces.set(before);
           this.bgFailures.update(n => n + 1);
-          this.bgSkipTicks = Math.min(8, 2 ** (this.bgFailures() - 1));
+          this.nextBgListAt = Date.now()
+            + TracesComponent.PollMs * Math.min(8, 2 ** (this.bgFailures() - 1));
         } else {
           // A search the user ran keeps whatever arrived and gets the reason beside it — the
           // half-answer plus its explanation, not an empty list and a banner. The banner is
@@ -723,6 +1109,16 @@ export class TracesComponent implements OnInit, OnDestroy {
         this.endStream();
       },
     });
+    // Assigned AFTER subscribe returns, and only if the stream is still open. A source that
+    // terminates synchronously has already run its complete/error handler — and endStream()
+    // with it, which nulls this field — before subscribe() returns, so assigning the result
+    // unconditionally would resurrect a finished stream as a permanently non-null `streamSub`.
+    // Every "is a stream open?" test reads this field: stopStream() would stamp the list
+    // partial over nothing, and the guard at the top of this method would refuse every
+    // background refresh for the life of the page. Today's SSE source always goes through an
+    // HTTP round trip for its ticket first, so it cannot terminate synchronously — this is the
+    // field keeping its meaning rather than a bug being fixed.
+    if (!sub.closed) this.streamSub = sub;
   }
 
   /**
@@ -754,12 +1150,69 @@ export class TracesComponent implements OnInit, OnDestroy {
     this.cdr.markForCheck();
   }
 
-  /** Hands the list back to the poll: whatever held it — a Stop, a failed stream and the
-   *  banner it left — the user has now asked for something new, and the something new is what
-   *  the list should show. Clearing the banner here is not cosmetic: it IS half the hold. */
+  /** Hands the list back to the poll by dropping the two markers a NEW READ can disprove — a
+   *  Stop, and a failed stream's banner. Clearing the banner here is not cosmetic: it IS part of
+   *  the hold.
+   *
+   *  Called at the two moments such a marker stops being true, which are the two moments a
+   *  stream takes the described rows away: when a search the USER ran is about to empty the
+   *  list, and when any stream COMPLETES and publishes an answer of its own. Never anywhere
+   *  else — a marker outlives everything except the rows it is about.
+   *
+   *  IT DOES NOT TOUCH {@link listLoss}, and the omission is the guard. Both markers here are
+   *  statements about ONE READ: "the user stopped this one" and "this one died", each replaced
+   *  wholesale by the next read's account of itself. A lost segment is a statement about the
+   *  storage, which no read re-examines, so a stream that merely fails to mention it has
+   *  disproved nothing — and this method is reached by background streams, which is how a poll
+   *  tick after a server restart came to retire a permanent hole. Its retirement lives in
+   *  {@link startStream}, on the user's branch only. */
   private releaseList(): void {
     this.streamStopped.set(false);
     this.traceqlError.set('');
+  }
+
+  /**
+   * Turns the server's terminal `done` payload into the one thing the header needs from it.
+   *
+   * <p>Two rules, and the second is the one that matters. FIRST: when the server used a word
+   * this client knows, that word decides — `max-rows` is the ceiling (plus whatever
+   * `truncatedBy` names), `complete: true` is the whole window read out. SECOND: when it did
+   * not, the answer degrades to what this page could always work out for itself — its own row
+   * count against the ceiling it asked for — and NEVER to "complete".</p>
+   *
+   * <p>That second rule is why the row count survives at all. Both log streams still end with a
+   * bare <c>data: {}</c>, and a future server may say something new; reading an unrecognised
+   * ending as an endorsement would turn every such frame into a silent claim that the list is
+   * whole. So an unknown ending can still be capped (the count says so), and an ending that
+   * explicitly denies completeness is reported as short even when this client cannot say why —
+   * a reason it cannot name is not a reason to repeat the server's denial back as consent.</p>
+   *
+   * <p>The CEILING AXIS ONLY — whether anything was lost on the way is {@link lossOf}, kept
+   * apart for the reason {@link ListEnding} gives.</p>
+   */
+  private endingOf(end: StreamEndDto | null, rows: number, askedMax: number): ListEnding | null {
+    if (end?.reason === 'max-rows') return { kind: 'capped' };
+    if (end?.complete === true)     return { kind: 'read-out' };
+    if (rows >= askedMax)           return { kind: 'capped' };
+    if (end?.complete === false)    return { kind: 'short' };
+    // An ending that said nothing this client can use, over a list short of the ceiling. Not
+    // `read-out`: that is the SERVER's claim to make, and it did not make it here.
+    return null;
+  }
+
+  /**
+   * The other half of the terminal frame: whether part of the window is missing from the answer.
+   *
+   * <p>An unrecognised `truncatedBy` reads as no loss, which is the same rule the ending obeys
+   * and for the same reason — saying less is available, saying something else is not. It is a
+   * genuine under-report and worth naming: a future server that invents a third cause would go
+   * unmentioned here until this page learns the word. The alternative is a loud, standing,
+   * list-freezing warning whose sentence this page would have to make up, over a fault it cannot
+   * describe, and that is the worse of the two.</p>
+   */
+  private lossOf(end: StreamEndDto | null): SegmentLoss | null {
+    const by = end?.truncatedBy;
+    return by === 'unread-segment' || by === 'unreadable-segment' ? by : null;
   }
 
   /** The TraceQL box's ✕: drops the query, the results it produced, and the `?ql=` in the
@@ -768,12 +1221,16 @@ export class TracesComponent implements OnInit, OnDestroy {
     this.traceqlInput = '';
     this.stopStream();
     this.traces.set([]);
-    this.streamCapped.set(false);
+    this.listEnding.set(null);
+    // The ✕ empties the list, so it is a user action of exactly the kind that may retire a loss
+    // — the rows the warning was about are gone in the same step, and the next load (the
+    // filter-bar path, with no query) reports the hole again if it is still there.
+    this.listLoss.set(null);
     // Nothing on screen for a stale "rows from 14:32" to be about, and the next tick is a
     // fresh start rather than the continuation of a failing run.
     this.listLoadedAt.set(null);
     this.bgFailures.set(0);
-    this.bgSkipTicks = 0;
+    this.nextBgListAt = 0;
     // An emptied list is nobody's to keep: the next tick may refill it (with no query, the
     // filter-bar path), which is what clearing the box asks for. Also drops the banner.
     this.releaseList();

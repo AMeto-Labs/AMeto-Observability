@@ -361,7 +361,12 @@ public sealed class SpanFormatV3Tests : IDisposable
 
     // ── Legacy v2 writer (copied from the pre-v3 SpanWriter, indices trimmed) ──
 
-    private static void WriteV2File(string filePath, IList<SpanRecord> spans)
+    /// <summary>
+    /// Internal rather than private: <c>SpanTraceReadBoundTests</c> needs a v2 segment too — the
+    /// legacy format is the one a trace read cannot resolve by block arithmetic — and a second
+    /// copy of a format writer is a second thing to keep in step with the reader.
+    /// </summary>
+    internal static void WriteV2File(string filePath, IList<SpanRecord> spans)
     {
         const int BlockSize = 4096;
         using var fs = new FileStream(filePath, FileMode.CreateNew, FileAccess.Write, FileShare.None, 65536);

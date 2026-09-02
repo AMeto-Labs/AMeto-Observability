@@ -1,6 +1,6 @@
 import { Injectable, inject } from '@angular/core';
 import { HttpClient } from '@angular/common/http';
-import { Observable } from 'rxjs';
+import { Observable, filter, map } from 'rxjs';
 import { EventDto, EventQueryParams, StatsDto, EventCountsDto, AggregationDto } from '../models/event.model';
 import {
   AlertRule, AlertRuleUpsertRequest, AlertStateSnapshot, AlertHistoryEntry,
@@ -13,6 +13,7 @@ import { ApiKeyDto, CreatedApiKeyDto, OAuthDomainDto, UserDto } from '../models/
 import { CompareTracesDto, LatencyServiceDto, SpanDto, SpanQueryParams, TraceQueryRequest, TraceRowDto, TraceStatsDto } from '../models/span.model';
 import { MetricSeriesDto, MetricCatalogDto, MetricQueryRequest, HeatmapDto, ExemplarDto, MetricExprRequest } from '../models/metric.model';
 import { SearchHistoryDto, SearchScope } from '../models/search-history.model';
+import { StreamEndDto, StreamFrame } from '../models/stream.model';
 import { UpdateStatusDto } from '../models/update.model';
 import { AuthService } from './auth.service';
 import { appPath } from '../../shared/utils/app-url';
@@ -57,7 +58,16 @@ export class ApiService {
    * server's own sentence. Written once because the fourth copy is where copies start to
    * disagree — the third already differed only in its strings.
    *
+   * <p>Emits {@link StreamFrame}s, not bare rows, because `done` is not only a signal to stop
+   * listening: it carries WHY the stream ended (read out, or stopped at the row ceiling, and
+   * whether part of the window was lost on the way). That payload used to be discarded here —
+   * the `done` handler took no argument — so the same truncated window reached the user as a
+   * red banner at one row ceiling and as nothing at all at another, purely because of which
+   * limit the request happened to carry. A caller that only wants rows says so with
+   * {@link rowsOnly}; a caller that must explain itself reads the ending frame.</p>
+   *
    * @param opts.completeOnDone  false for an endless stream (the live tail never sends `done`).
+   *        Such a stream never emits an `end` frame either — there is no ending to describe.
    * @param opts.explainSilentFailure
    *        Optional: consulted when the stream failed having delivered NOTHING, where the real
    *        reason is unreadable to the browser. Returns a canceller. Only the log streams have
@@ -72,8 +82,8 @@ export class ApiService {
       connectionMessage: string;
       explainSilentFailure?: (report: (message: string) => void) => () => void;
     },
-  ): Observable<T> {
-    return new Observable<T>(subscriber => {
+  ): Observable<StreamFrame<T>> {
+    return new Observable<StreamFrame<T>>(subscriber => {
       // Copied per subscription: openTicketedSse writes `ticket` into it, and two
       // subscriptions to the same Observable must not share (or overwrite) one ticket.
       const p = new URLSearchParams(params);
@@ -83,10 +93,20 @@ export class ApiService {
         es => {
           es.onmessage = event => {
             delivered = true;
-            try { subscriber.next(JSON.parse(event.data) as T); } catch { /* ignore parse errors */ }
+            try {
+              subscriber.next({ kind: 'row', row: JSON.parse(event.data) as T });
+            } catch { /* ignore parse errors */ }
           };
           if (opts.completeOnDone !== false)
-            es.addEventListener('done', () => { es.close(); subscriber.complete(); });
+            es.addEventListener('done', event => {
+              es.close();
+              // The ending goes out BEFORE the completion, so a subscriber reading it in its
+              // `complete` handler has already been given it. Never inside a try around the
+              // parse: a payload this client cannot read is an ending it cannot describe, not
+              // an ending that did not happen, and the stream must still complete normally.
+              subscriber.next({ kind: 'end', end: this.sseEndPayload(event) });
+              subscriber.complete();
+            });
           // Sent by the server when a query fails AFTER the stream opened (its budget ran
           // out, a segment could not be read). Not named 'error': EventSource dispatches
           // its own connection failures under that name.
@@ -125,12 +145,49 @@ export class ApiService {
     if (params.afterId) p.set('afterId', params.afterId);
     if (params.afterTs !== undefined) p.set('afterTs', String(params.afterTs));
     if (params.levels) p.set('levels', params.levels);
-    return this.streamJson<EventDto>('/api/events', p, {
+    return this.rowsOnly(this.streamJson<EventDto>('/api/events', p, {
       queryErrorMessage:  'Search failed',
       connectionMessage:  'Failed to load events',
       explainSilentFailure: report =>
         this.explainQueryFailure(params, 'Failed to load events', report),
-    });
+    }));
+  }
+
+  /**
+   * Reads the terminal `done` frame's payload. An empty object is the honest answer to every
+   * way of not knowing — a frame with no data, a server old enough to send a bare `data: {}`
+   * (which both log streams still do), a payload that is not JSON, or one that is JSON but not
+   * an object. All four mean the same thing to a caller: this ending did not explain itself,
+   * and every field is therefore absent rather than false.
+   *
+   * <p>An ARRAY is rejected with the rest, and not because reading one would throw — it would
+   * not. `[1,2,3].reason` is simply undefined, so it would behave like an empty account while
+   * being typed as something it is not, which is the kind of near-miss that survives until
+   * someone adds a field and it stops being a near-miss.</p>
+   */
+  private sseEndPayload(event: Event): StreamEndDto {
+    const data = (event as MessageEvent).data;
+    if (typeof data !== 'string') return {};
+    try {
+      const parsed: unknown = JSON.parse(data);
+      return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+        ? parsed as StreamEndDto
+        : {};
+    } catch {
+      return {};
+    }
+  }
+
+  /**
+   * Drops the ending frame, leaving the rows. For the two log streams, whose callers have
+   * nowhere to put an ending: `streamEvents` still emits rows and completes on `done`, and
+   * `streamLive` — which registers no `done` handler at all — still never completes.
+   */
+  private rowsOnly<T>(source: Observable<StreamFrame<T>>): Observable<T> {
+    return source.pipe(
+      filter((f): f is { kind: 'row'; row: T } => f.kind === 'row'),
+      map(f => f.row),
+    );
   }
 
   /** Reads the server's message out of a `query-error` frame, falling back to a default. */
@@ -328,7 +385,7 @@ export class ApiService {
     const p = new URLSearchParams();
     if (filter) p.set('filter', filter);
     if (levels) p.set('levels', levels);
-    return this.streamJson<EventDto>('/api/events/live', p, {
+    return this.rowsOnly(this.streamJson<EventDto>('/api/events/live', p, {
       // The tail has no end: it never sends `done`, and must never complete on its own.
       completeOnDone:     false,
       // It reports failure the same way the search does: a poll that blew its budget, a
@@ -337,7 +394,7 @@ export class ApiService {
       connectionMessage:  'SSE connection lost',
       explainSilentFailure: report =>
         this.explainQueryFailure({ filter }, 'SSE connection lost', report),
-    });
+    }));
   }
 
   // ── Users ──────────────────────────────────────────────────────────────────
@@ -423,8 +480,13 @@ export class ApiService {
    * The filter-bar trace list, streamed row by row (newest first) instead of buffered into one
    * response. Same filters, same order, same rows as searchTraces — the list simply fills as
    * the server finds them rather than after it has found them all.
+   *
+   * <p>Keeps the ending frame (unlike the log streams): the list header has to say WHY it
+   * stopped, and counting rows against the `max` it asked for cannot tell "I read the whole
+   * window" from "your ceiling stopped me" from "your ceiling stopped me AND I could not read
+   * part of the window".</p>
    */
-  streamTraceList(params: SpanQueryParams & { max?: number } = {}): Observable<TraceRowDto> {
+  streamTraceList(params: SpanQueryParams & { max?: number } = {}): Observable<StreamFrame<TraceRowDto>> {
     const p = this.traceListParams(params);
     if (params.max) p.set('max', String(params.max));
     return this.streamJson<TraceRowDto>('/api/traces/stream', p, {
@@ -439,7 +501,8 @@ export class ApiService {
    * here. A parse error arrives as a `query-error` frame on a 200 — a 400 would reach the
    * browser as an information-free connection failure with nothing to show the user.
    */
-  streamTraceQuery(req: { query: string; from?: string; to?: string; max?: number }): Observable<TraceRowDto> {
+  streamTraceQuery(req: { query: string; from?: string; to?: string; max?: number })
+    : Observable<StreamFrame<TraceRowDto>> {
     const p = new URLSearchParams();
     p.set('ql', req.query);
     if (req.from) p.set('from', req.from);
