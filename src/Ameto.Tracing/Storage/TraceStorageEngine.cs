@@ -75,6 +75,24 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     internal int ColdSegmentCountForTest => _coldSegments.Length;
 
     /// <summary>Test hook: how many vanished-segment ranges the engine currently remembers.</summary>
+    /// <summary>
+    /// A cold segment that could not be loaded at startup and is therefore not in the snapshot at
+    /// all — so, unlike a vanished segment, there is no range to remember and no window this can be
+    /// narrowed to. Every read has to say so.
+    ///
+    /// <para>The alternative was measured and is the failure this endpoint exists to prevent: a
+    /// .trc held open by an antivirus or a backup agent during load left segments=0, rows=0 and
+    /// Unreadable=FALSE — a positive claim that the window was read out, for the life of the
+    /// process, over a file sitting on the disk. The same lock met on a REQUEST reports Capped, so
+    /// one fault was loud at one door and silent at the other.</para>
+    ///
+    /// <para>Process-wide and never cleared, because nothing rescans: LoadColdSegments runs once.
+    /// A restart is the recovery, and that is what the log line says.</para>
+    /// </summary>
+    private volatile bool _coldTierIncomplete;
+
+    internal bool ColdTierIncompleteForTest => _coldTierIncomplete;
+
     internal int VanishedRegionCountForTest => _vanished.CountForTest;
 
     /// <summary>Retention's own call, reachable from a test: the wall clock cannot be moved, so
@@ -678,22 +696,40 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         // behaves. Erring to Transient here cannot hide anything either: the segments STAY in the
         // snapshot, so a directory that really is empty for ever keeps faulting and keeps
         // reporting, which is "ask me again", never "it is gone".
-        // THERE IS NO GUARD HERE ANY MORE, AND THAT IS THE DECISION.
+        // TWO SEGMENTS GONE AT ONCE AND NO SEGMENT FILE LEFT ANYWHERE — restored, after removing it
+        // proved far worse than keeping it.
         //
-        // Three attempts tried to recognise "the volume came back unpopulated" from the filesystem
-        // and each was defeated by this engine's own files. "No directory entries at all" is beaten
-        // by spans.wal, which lives in this very directory. "Two segments gone and no .trc left" is
-        // beaten within seconds by CompleteFlush, which writes a fresh .trc into whatever the data
-        // directory currently is — so on the busy install this whole branch exists for, the guard
-        // was false almost immediately. And each one bought its rare true positive by SUPPRESSING
-        // the ordinary true negative: with the last guard in place, a wholesale delete on an install with
-        // two or more segments measured Unreadable=False on three consecutive requests, for ever.
+        // I took it out on the reasoning that over-reporting a loss is the recoverable direction.
+        // That reasoning does not hold HERE, and the measurement is what settles it: nothing
+        // rescans the data directory (LoadColdSegments runs once, at startup), and retention ages
+        // out the recorded REGION, not the removal from the snapshot. So a mount that flickers for
+        // a tenth of a second — long enough for one request to trip over it — costs every segment
+        // that request touched, permanently, and the only recovery is a process restart. Measured
+        // against the previous commit: with the guard, rows=20 and a whole cold tier once the files
+        // came back; without it, rows=0 Unreadable=True segs=0 across every later request and two
+        // PruneAsync passes. On a forty-segment install one blip also blows straight through the
+        // thirty-two-region cap, and coalescing then calls about four fifths of healthy time
+        // unreadable — a banner that is always on is a banner nobody reads.
         //
-        // A directory that is GONE is still transient — that is a different question, decided by
-        // the DirectoryNotFoundException branch above, where the evidence is real. A file that is
-        // missing while its directory is intact is a loss, and reporting it as one over-reports
-        // when a volume remounts empty. That is the recoverable direction: the region is bounded
-        // and retention ages it out, whereas a suppressed loss is a window quietly called whole.
+        // So this errs rarely and the alternative errs constantly. What it costs is named rather
+        // than hidden: a genuine wholesale delete on an install with two or more segments is
+        // reported as truncation (Capped, "ask me again") instead of loss, until a restart finds
+        // the files really gone. That is a worse SENTENCE for a rare event; the removal was a
+        // worse OUTCOME for a common one.
+        //
+        // The known hole in it is CompleteFlush, which writes a fresh .trc into whatever the data
+        // directory currently is and can therefore make this false within seconds on a busy
+        // install. It is a hole in a guard, not a hole in the data: when it closes, the fault is
+        // classified as loss and reported, which is the direction that at least says something.
+        if (_coldSegments.Length >= 2 && NoSegmentFilesLeft(_dataDir))
+        {
+            _logger.LogWarning(
+                "No segment file is left under {Dir} while {Count} cold segments are still listed — " +
+                "treating {File} as an unpopulated volume rather than a deletion; the snapshot is " +
+                "kept and the next request retries", _dataDir, _coldSegments.Length, seg.FilePath);
+            return ColdReadFault.Transient;
+        }
+
         if (RemoveColdSegment(seg)) return ColdReadFault.Lost;
 
         // NOT LISTED — which usually means the engine retired it itself, and a compaction handover
@@ -710,6 +746,45 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         if (_vanished.WasLost(seg.FilePath)) return ColdReadFault.Lost;
 
         return ColdReadFault.Handover;
+    }
+
+    /// <summary>
+    /// One more chance for a segment whose file was busy rather than broken. Returns null when it
+    /// is still unreadable; the caller then has to admit the cold tier is short.
+    /// </summary>
+    private SpanSegmentInfo? RetryReadSegmentInfo(string file)
+    {
+        for (int attempt = 1; attempt <= 3; attempt++)
+        {
+            Thread.Sleep(100 * attempt);
+            try
+            {
+                var info = SpanReader.ReadSegmentInfo(file);
+                _logger.LogWarning(
+                    "Cold segment {File} was busy at startup and read on attempt {Attempt}", file, attempt + 1);
+                return info;
+            }
+            catch { /* still busy, or now broken — the caller decides */ }
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Whether the directory holds no segment file at all. Probe failures answer FALSE — an I/O
+    /// error is not evidence of absence, and answering TRUE would turn an unreadable mount into
+    /// "keep retrying for ever" over data that may really be gone.
+    /// </summary>
+    private static bool NoSegmentFilesLeft(string dir)
+    {
+        try
+        {
+            // Disposed: FileSystemEnumerator holds a native find handle that only the finaliser
+            // would release, on a path that runs once per faulted segment per page — exactly the
+            // sick-storage moment when handles are scarce.
+            using var it = Directory.EnumerateFiles(dir, "*.trc").GetEnumerator();
+            return !it.MoveNext();
+        }
+        catch { return false; }
     }
 
     /// <summary>
@@ -733,14 +808,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// </summary>
     private ColdReadFault ClassifyReadFailure(Exception ex, string what, string filePath)
     {
-        // MessagePackSerializationException belongs here and its absence was a hole pointing the
-        // dangerous way: a block that decompressed cleanly and holds rubbish is the ORDINARY shape
-        // of corruption, and it was being answered with "ask me again", for ever. Measured on this
-        // branch: 13 of 200 single-byte flips in a 561 855-byte segment raise exactly this type.
-        bool content = ex is InvalidDataException or EndOfStreamException
-                    or System.Text.DecoderFallbackException
-                    or IndexOutOfRangeException or ArgumentOutOfRangeException
-                    or MessagePack.MessagePackSerializationException;
+        bool content = FileBounds.DescribesContent(ex);
 
         if (content)
         {
@@ -786,7 +854,11 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         // the fault. Asserted HERE, at the top, because this method leaves through half a dozen
         // `yield break`s and the statement is true on all of them. Bit only, no floor: see
         // SpanScanFloor.MetUnreadableRegion.
-        if (_vanished.Overlaps(fromNano, toNano)) scanFloor?.MetUnreadableRegion();
+        // A segment this window lost on an earlier request, OR a segment startup could not load at
+        // all. The second has no range to test against — it never reached the snapshot — so it
+        // answers for every window there is, which is the honest reading of "part of the cold tier
+        // is not here".
+        if (_coldTierIncomplete || _vanished.Overlaps(fromNano, toNano)) scanFloor?.MetUnreadableRegion();
 
         int yielded = 0;
 
@@ -1354,6 +1426,17 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             }
             catch (Exception ex) when (ClassifyReadFailure(ex, "Cold segment load", file) is not ColdReadFault.Corrupt)
             {
+                // Retried first, because most of what lands here clears by itself: an antivirus
+                // scanning a freshly written file, a backup agent's handle, the compactor's own
+                // File.Move. A few hundred milliseconds is the difference between a segment that
+                // is missing for this process and one that was never really unavailable.
+                var recovered = RetryReadSegmentInfo(file);
+                if (recovered is not null) { loaded.Add(recovered); continue; }
+
+                // Still not readable. It is NOT deleted — that was the old answer and it took the
+                // sidecars with it — but it is also not in the snapshot, so no read can honestly
+                // call a window complete until a restart picks it up.
+                _coldTierIncomplete = true;
                 // NOT EVERY FAILURE TO OPEN IS A REASON TO DESTROY. This catch answered anything at
                 // all with DeleteSegmentFiles, so a segment held open by an antivirus, a backup
                 // agent or the compactor's own File.Move was deleted at startup along with its
@@ -1365,9 +1448,10 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                 // Skipped rather than loaded: the file is not readable NOW, and nothing rescans, so
                 // the next restart is what picks it up. That is a cold-tier gap until then, which
                 // is strictly better than a deletion that cannot be undone.
-                _logger.LogWarning(ex,
-                    "Cold segment {File} could not be read at startup — left on disk and skipped for "
-                  + "this run; it is not damaged, it is unreadable right now", file);
+                _logger.LogError(ex,
+                    "Cold segment {File} could not be read at startup and is left on disk, not deleted — "
+                  + "but it is missing from this run's cold tier, so every trace query will report an "
+                  + "unreadable region until the service is restarted", file);
                 continue;
             }
             catch (Exception ex)
@@ -2077,7 +2161,9 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         // sentence and the wrong advice for a file that is simply gone. The BIT is the whole
         // statement: part of this window is on no disk, and no width of window will help.
         // TraceListPage.Unreadable exists precisely because those two are not the same fact.
-        unreadable |= _vanished.Overlaps(fromNano, toNano);
+        // See SearchSpansAsync: a segment startup could not load has no range, so it makes every
+        // window unreadable rather than a narrower one.
+        unreadable |= _coldTierIncomplete || _vanished.Overlaps(fromNano, toNano);
 
         // Filter + sort newest-first + take limit.
         var list = new List<TraceSummary>(merged.Count);

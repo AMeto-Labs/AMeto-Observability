@@ -151,9 +151,34 @@ public sealed class SpanTraceReadBoundTests : IClassFixture<TraceLookupSegmentFi
 
     // ── The bound ─────────────────────────────────────────────────────────────
 
+    /// <summary>Whether this assembly was built unoptimised — the only configuration in which a
+    /// live-bytes probe measures what it claims to.</summary>
+    private static bool IsDebugBuild()
+    {
+        var attrs = typeof(SpanTraceReadBoundTests).Assembly
+            .GetCustomAttributes(typeof(System.Diagnostics.DebuggableAttribute), false);
+        return attrs.Length > 0
+            && ((System.Diagnostics.DebuggableAttribute)attrs[0]).IsJITOptimizerDisabled;
+    }
     [Fact]
     public async Task The_peak_of_a_trace_read_is_one_block_not_the_segment()
     {
+        // THIS PROBE ONLY WORKS UNOPTIMISED, so it says so rather than reporting a healthy number
+        // over defective code. Measured against the round-three mutation: Debug caught it 5 runs of
+        // 5; Release caught 2 of 8, at 1.45-2.21 MB against a 3.3 MB budget. The cause is not the
+        // seam's placement but LIVENESS — the decoded list is dead after its last use, an optimising
+        // JIT stops reporting it as a root, and the forced collection inside the probe then reclaims
+        // the very allocation the probe exists to see. Debug and tier-0 keep every local alive for
+        // the whole frame; the bimodality within Release is tiering, since the walk decodes thirteen
+        // blocks per read and sits on the promotion boundary.
+        //
+        // dotnet test builds Debug, so this runs by default and in CI. Under Release it skips,
+        // because a green result there would mean nothing at all.
+        if (!IsDebugBuild())
+        {
+            _out.WriteLine("skipped: this measurement is only sound in an unoptimised build");
+            return;
+        }
         // Warm-up: JIT, and the ArrayPool block buffers, which are rented on the first decode and
         // stay in the pool afterwards — an unwarmed first pass reports the pool's growth as the
         // reader's live set.

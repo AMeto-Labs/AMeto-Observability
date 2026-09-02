@@ -39,6 +39,10 @@ internal static class SpanReader
     /// they are a known asymmetry. <c>SpanSearchFatBlockTests</c> pins both halves so neither can
     /// drift without the other being noticed.</para>
     /// </summary>
+    /// <summary>What COMPACTION will buffer for one block — tighter than a search, because a merge
+    /// rewrites the whole file rather than streaming past it.</summary>
+    private const int MergeBlockBytes = 10_000_000;
+
     private const int MaxBlockBytes = 64 * 1024 * 1024;
 
     /// <summary>
@@ -126,10 +130,14 @@ internal static class SpanReader
             SpanCount      = (int)spanCount,
             Services       = services,
             FormatVersion  = version,
-            // Captured HERE because this is the last moment it exists. A segment that vanishes
-            // needs a ceiling for the region it hands to VanishedRegionLog, and by then the file
-            // — and its mtime — are gone; reading it at that point silently falls back to `now`
-            // and stretches a month-old loss across live traffic.
+            // Captured HERE because this is the last moment it exists: once a segment vanishes,
+            // its file and its write time are gone together. Read by HeaderRangeSuspect below to
+            // tell a header claiming a time later than its own file from an honest one.
+            //
+            // NOT a ceiling for VanishedRegionLog any more — that took the mtime for three
+            // versions and every one of them clamped a recorded region off real loss in some
+            // ordinary case. Record bounds by the clock alone now, and the reasoning is in its
+            // body rather than here.
             LastWriteNano  = LastWriteNanos(filePath),
             // OBSERVED, never acted on. The range is believed as written because it decides what
             // gets opened; this only lets the engine name the file for an operator.
@@ -309,9 +317,15 @@ internal static class SpanReader
                 if (offsets[want] < blockFirst) return null; // an offset no block can hold
             }
 
-            if (uncompSize > MaxBlockBytes || compSize > MaxBlockBytes)
-                throw new InvalidDataException(
-                    $"Block {blockIdx} size too large in {filePath}: uncompressed={uncompSize}, compressed={compSize}");
+            // AGAINST THE FILE, NOT AGAINST A CONSTANT. MaxBlockBytes stopped a garbage prefix from
+            // asking for gigabytes; it did nothing about a 3.5 KB file asking for 64 MB, which one
+            // flipped byte inside a real compSize produces. This shape sits on the trace lookup, the
+            // detail view and the SSE list, and GetTraceAsync fans it eight ways — half a gigabyte
+            // from one click on the 512 MB box this branch exists to keep alive. The bytes actually
+            // left in the file are the bound the file cannot forge; the uncompressed size still
+            // needs the constant, because nothing on disk bounds what a payload decompresses to.
+            FileBounds.RequireLengthFits(compSize, fs.Length - fs.Position, $"Block {blockIdx}", filePath);
+            FileBounds.RequireLengthFits(uncompSize, MaxBlockBytes, $"Block {blockIdx}" + " uncompressed", filePath);
 
             byte[]  comp   = ArrayPool<byte>.Shared.Rent((int)compSize);
             byte[]? rawBuf = null;
@@ -586,11 +600,10 @@ internal static class SpanReader
             // turns into an empty list — so the sidecar reported "no stats" and the box reported
             // four gigabytes. Every entry costs at least this many bytes, so a count past what the
             // file can hold describes entries that are not there.
-            long minEntryBytes = 2 + 4 + 4 + 8 + 8 + 4L * HistogramBuckets.Count;
-            long leftInFile    = fs.Length - fs.Position;
-            if (count > leftInFile / minEntryBytes)
-                throw new InvalidDataException(
-                    $"Stats sidecar claims {count} services but only {leftInFile} bytes remain in {statsPath}");
+            int minEntryBytes = 2 + 4 + 4 + 8 + 8 + 4 * HistogramBuckets.Count;
+            FileBounds.RequireCountFits(count, fs.Length - fs.Position,
+                fileBytesPerElement: minEntryBytes, heapBytesPerElement: minEntryBytes,
+                "Stats sidecar", statsPath);
 
             var result = new List<ServiceSegmentStats>((int)count);
             for (uint i = 0; i < count; i++)
@@ -650,8 +663,20 @@ internal static class SpanReader
             uint uncompSize = br.ReadUInt32();
             uint compSize = br.ReadUInt32();
 
-            if (uncompSize > 10_000_000 || compSize > 10_000_000) // 10MB per block limit
-                throw new InvalidDataException($"Block {blockIdx} size too large: uncompressed={uncompSize}, compressed={compSize}");
+            // AGAINST THE FILE, NOT AGAINST A CONSTANT. MaxBlockBytes stopped a garbage prefix from
+            // asking for gigabytes; it did nothing about a 3.5 KB file asking for 64 MB, which one
+            // flipped byte inside a real compSize produces. This shape sits on the trace lookup, the
+            // detail view and the SSE list, and GetTraceAsync fans it eight ways — half a gigabyte
+            // from one click on the 512 MB box this branch exists to keep alive. The bytes actually
+            // left in the file are the bound the file cannot forge; the uncompressed size still
+            // needs the constant, because nothing on disk bounds what a payload decompresses to.
+            // ReadAll keeps its OWN, tighter budget on top of the file bound, and the asymmetry is
+            // deliberate: compaction rewrites whole files, so a block search will happily stream
+            // past is one compaction must refuse rather than buffer. Losing that limit here made a
+            // 16 MB block merge silently.
+            FileBounds.RequireLengthFits(compSize, Math.Min(fs.Length - fs.Position, MergeBlockBytes),
+                                         $"Block {blockIdx}", filePath);
+            FileBounds.RequireLengthFits(uncompSize, MergeBlockBytes, $"Block {blockIdx} uncompressed", filePath);
 
             if (totalBytesRead + compSize > MaxTotalBytes)
                 throw new InvalidDataException($"Total data exceeds {MaxTotalBytes} bytes limit");
@@ -767,9 +792,15 @@ internal static class SpanReader
                 continue;
             }
 
-            if (uncompSize > MaxBlockBytes || compSize > MaxBlockBytes)
-                throw new InvalidDataException(
-                    $"Block {blockIdx} size too large in {filePath}: uncompressed={uncompSize}, compressed={compSize}");
+            // AGAINST THE FILE, NOT AGAINST A CONSTANT. MaxBlockBytes stopped a garbage prefix from
+            // asking for gigabytes; it did nothing about a 3.5 KB file asking for 64 MB, which one
+            // flipped byte inside a real compSize produces. This shape sits on the trace lookup, the
+            // detail view and the SSE list, and GetTraceAsync fans it eight ways — half a gigabyte
+            // from one click on the 512 MB box this branch exists to keep alive. The bytes actually
+            // left in the file are the bound the file cannot forge; the uncompressed size still
+            // needs the constant, because nothing on disk bounds what a payload decompresses to.
+            FileBounds.RequireLengthFits(compSize, fs.Length - fs.Position, $"Block {blockIdx}", filePath);
+            FileBounds.RequireLengthFits(uncompSize, MaxBlockBytes, $"Block {blockIdx}" + " uncompressed", filePath);
 
             // Cleared BEFORE the decode, so the previous block's records are unrooted while
             // this one is being built rather than on top of it.
@@ -859,9 +890,15 @@ internal static class SpanReader
             // values in between are the problem — a corrupt prefix of a few hundred MB is a
             // few hundred MB actually rented, per lookup, on a box the rest of this file exists
             // to keep inside one block.
-            if (uncompSize > MaxBlockBytes || compSize > MaxBlockBytes)
-                throw new InvalidDataException(
-                    $"Trace index size too large in {filePath}: uncompressed={uncompSize}, compressed={compSize}");
+            // AGAINST THE FILE, NOT AGAINST A CONSTANT. MaxBlockBytes stopped a garbage prefix from
+            // asking for gigabytes; it did nothing about a 3.5 KB file asking for 64 MB, which one
+            // flipped byte inside a real compSize produces. This shape sits on the trace lookup, the
+            // detail view and the SSE list, and GetTraceAsync fans it eight ways — half a gigabyte
+            // from one click on the 512 MB box this branch exists to keep alive. The bytes actually
+            // left in the file are the bound the file cannot forge; the uncompressed size still
+            // needs the constant, because nothing on disk bounds what a payload decompresses to.
+            FileBounds.RequireLengthFits(compSize, fs.Length - fs.Position, $"Trace index", filePath);
+            FileBounds.RequireLengthFits(uncompSize, MaxBlockBytes, $"Trace index" + " uncompressed", filePath);
 
             // Pooled on both sides of the decompress. This runs once per file on EVERY
             // trace lookup, and both arrays are index-of-the-whole-file sized (hundreds
@@ -908,10 +945,8 @@ internal static class SpanReader
                     // MaxBlockBytes, so a count past what is LEFT of this block describes a file
                     // that cannot exist. It also removes the int overflow in the skip below, where
                     // `(int)offsetCnt * 4` wraps negative for a large count.
-                    if (offsetCnt > (uint)(raw.Length - pos) / 4)
-                        throw new InvalidDataException(
-                            $"Trace index offset count {offsetCnt} exceeds the {raw.Length - pos} bytes "
-                          + $"left in the index block in {filePath}");
+                        FileBounds.RequireCountFits(offsetCnt, raw.Length - pos,
+                            fileBytesPerElement: 4, heapBytesPerElement: 4, "Trace index", filePath);
 
                     if (candidate.Equals(traceId))
                     {
@@ -948,9 +983,8 @@ internal static class SpanReader
             // read by exactly the same lookup and would otherwise keep the hole open for every
             // install that has not finished migrating.
             long leftInFile = fs.Length - fs.Position;
-            if (offsetCnt > leftInFile / 4)
-                throw new InvalidDataException(
-                    $"Trace index offset count {offsetCnt} exceeds the {leftInFile} bytes left in {filePath}");
+            FileBounds.RequireCountFits(offsetCnt, leftInFile,
+                fileBytesPerElement: 4, heapBytesPerElement: 4, "Trace index", filePath);
 
             if (candidate.Equals(traceId))
             {
@@ -975,7 +1009,11 @@ internal static class SpanReader
         ushort version = ReadVersion(fs, br);
         if (version < 3) return null;
         var (_, _, bloomIdxOffset) = ReadFooter(fs, br, version);
-        if (bloomIdxOffset <= 0) return null;
+        // null here means "this file has no usable bloom index", which the caller treats as "skip
+        // nothing" — the safe direction, and why this one may answer rather than throw. The offset
+        // still has to be inside the file, because every bound below is measured from where it
+        // lands: a torn offset makes "the bytes that remain" a number the file never limited.
+        if (bloomIdxOffset <= 0 || bloomIdxOffset >= fs.Length) return null;
         fs.Seek(bloomIdxOffset, SeekOrigin.Begin);
 
         // Pre-hash the hints once.
@@ -994,11 +1032,13 @@ internal static class SpanReader
         // and a HashSet<uint> of capacity N costs 16N bytes, so one flipped high byte turning 12
         // into 0x4000000C asks for about seventeen gigabytes. Each block writes at least its own
         // four-byte length, so more blocks than a quarter of what is left is a torn count.
+        // FOUR BYTES ON DISK, ABOUT SIXTEEN IN A HashSet<uint> — which is why the bound takes both
+        // and uses the larger. Dividing the remaining bytes by four permitted four times the file:
+        // measured at 5.17x on a 361 KB segment whose bloom offset was torn to a value still inside
+        // the file, so the offset check above cannot see it.
         uint blockCount = br.ReadUInt32();
-        long bloomRoom  = fs.Length - fs.Position;
-        if (blockCount > bloomRoom / 4)
-            throw new InvalidDataException(
-                $"Bloom index declares {blockCount} blocks but {bloomRoom} bytes remain in {filePath}");
+        FileBounds.RequireCountFits(blockCount, fs.Length - fs.Position,
+            fileBytesPerElement: 4, heapBytesPerElement: 16, "Bloom index", filePath);
 
         var allowed = new HashSet<uint>((int)blockCount);
         for (uint b = 0; b < blockCount; b++)
@@ -1024,28 +1064,37 @@ internal static class SpanReader
 
         ushort version = ReadVersion(fs, br);
         var (_, svcIdxOffset, _) = ReadFooter(fs, br, version);
-        // Same as the bloom index, and this one had no offset check at all — every bound below is
-        // measured from where this lands, so an offset past the end makes the bytes that remain a
-        // number the file never limited. Measured: a 33 554 508-byte .trc with a torn footer
-        // offset admitted a service count costing 136 470 344 bytes, four times the file.
-        if (svcIdxOffset <= 0 || svcIdxOffset >= fs.Length) return [];
+        // THROWN, NOT ANSWERED WITH AN EMPTY SET, and the difference is the whole finding. An empty
+        // set here does NOT mean "no service index"; the caller reads it as the list of blocks worth
+        // opening, so [] means SKIP THE WHOLE SEGMENT. Returning it on a torn offset turned four
+        // shapes of corruption — past EOF, at EOF, zero, negative — from loud exceptions that
+        // reached the classifier and raised a banner into a service-filtered search that quietly
+        // answered zero spans while an unfiltered one returned all forty. That is silent data loss
+        // manufactured by a bounds check, which is worse than the unbounded read it replaced.
+        //
+        // The empty return in ReadServicesFromIndex is correct for the opposite reason: there it
+        // means "I do not know which services are here" and the caller degrades openly, testing
+        // Services.Length > 0 before it skips anything. Same literal, opposite meaning, one file.
+        if (svcIdxOffset <= 0 || svcIdxOffset >= fs.Length)
+            throw new InvalidDataException(
+                $"Service index offset {svcIdxOffset} is outside {filePath} ({fs.Length} bytes)");
         fs.Seek(svcIdxOffset, SeekOrigin.Begin);
 
         // Same rule as the bloom index: a service costs at least six bytes here (its length prefix
         // and its block count), and a block index costs four.
         uint svcCount = br.ReadUInt32();
-        if (svcCount > (fs.Length - fs.Position) / 6)
-            throw new InvalidDataException(
-                $"Service index declares {svcCount} services past the end of {filePath}");
+        FileBounds.RequireCountFits(svcCount, fs.Length - fs.Position,
+            fileBytesPerElement: 6, heapBytesPerElement: 6, "Service index", filePath);
 
         for (uint i = 0; i < svcCount; i++)
         {
             ushort nameLen = br.ReadUInt16();
             var    name    = Encoding.UTF8.GetString(br.ReadBytes(nameLen));
             uint   blkCnt  = br.ReadUInt32();
-            if (blkCnt > (fs.Length - fs.Position) / 4)
-                throw new InvalidDataException(
-                    $"Service '{name}' claims {blkCnt} block indices past the end of {filePath}");
+            // Same asymmetry as the bloom index: the set costs far more than the four bytes each
+            // index occupies on disk.
+            FileBounds.RequireCountFits(blkCnt, fs.Length - fs.Position,
+                fileBytesPerElement: 4, heapBytesPerElement: 16, $"Service '{name}'", filePath);
 
             if (name.Equals(serviceName, StringComparison.OrdinalIgnoreCase))
             {
@@ -1085,7 +1134,7 @@ internal static class SpanReader
             // A service costs at least six bytes here: a two-byte name length and a four-byte
             // block count. More than that many is a number no writer produced.
             uint count = br.ReadUInt32();
-            if (count > (fs.Length - fs.Position) / 6) return [];
+            if (count > FileBounds.MaxCountThatFits(fs.Length - fs.Position, 6, 6)) return [];
 
             var services = new string[count];
             for (uint i = 0; i < count; i++)

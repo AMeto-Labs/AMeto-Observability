@@ -57,7 +57,9 @@ namespace Ameto.Tracing.Storage;
 /// <see cref="Forget"/> is structurally unable to drop, because its test is <c>Max &lt;
 /// cutoff</c>. Measured: after that, EVERY window on the install reported unreadable, for the life
 /// of the process, and <c>PruneAsync</c> reported <c>pruned=0, regions=1</c> for ever. The reader
-/// now repairs such a header, and <see cref="Record"/> clamps regardless — one guard is a fix, two
+/// reader deliberately does NOT repair such a header — correcting a range at load hid readable
+/// spans, because these two fields decide which segments a walk opens — so this clamp is the
+/// only guard, and it is written to be sufficient on its own.
 /// are a property.</para>
 ///
 /// <para>Every method takes one lock. The list holds at most <see cref="MaxRegions"/> intervals,
@@ -84,6 +86,10 @@ internal sealed class VanishedRegionLog
     internal int CountForTest { get { lock (_gate) return _regions.Count; } }
 
     /// <summary>How many lost paths are remembered. See <see cref="RecordPath"/>.</summary>
+    /// <summary>How far ahead of this clock a producer may legitimately be. Beyond it, a start
+    /// time is not a claim about when spans arrived.</summary>
+    private const long OrdinarySkewNanos = 24L * 3600 * 1_000_000_000;
+
     private const int MaxPaths = 64;
     private readonly Queue<string> _lostPathOrder = new();
     private readonly HashSet<string> _lostPaths = new(StringComparer.OrdinalIgnoreCase);
@@ -169,7 +175,18 @@ internal sealed class VanishedRegionLog
         // because the other direction — a window quietly told it is whole — is the one that cannot
         // be recovered from. The header that caused it is separately logged by name.
         long nowNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
-        maxNano = Math.Min(maxNano, Math.Max(nowNano, minNano));
+
+        // A Min IN THE FUTURE IS NOT A FLOOR — and Math.Max let it become the ceiling, which put the
+        // stored Max in the future and made the record unforgettable all over again: Forget tests
+        // Max < cutoff, and no retention cutoff can be past a date a century out. Measured:
+        // Record(now + 100 years, ...) survived Forget(now) and Forget(now + 1 year).
+        //
+        // The floor exists for the near case — a producer clocked minutes ahead is ordinary, and
+        // keeping its point INSIDE the lost band is why Math.Max is here at all. Beyond ordinary
+        // skew the header is not describing a time at all, so the whole claim collapses to now,
+        // where retention can reach it.
+        if (minNano > nowNano + OrdinarySkewNanos) minNano = maxNano = nowNano;
+        else maxNano = Math.Min(maxNano, Math.Max(nowNano, minNano));
 
         if (minNano < 0) minNano = 0;
 

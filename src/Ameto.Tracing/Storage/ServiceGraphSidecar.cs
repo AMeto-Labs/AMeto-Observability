@@ -118,11 +118,10 @@ internal static class ServiceGraphSidecar
             // catch below then turned the EOF into an empty list, so the sidecar reported "no
             // edges" and the box reported nearly four gigabytes.
             uint count = br.ReadUInt32();
-            long room  = fs.Length - fs.Position;
-            long perEdge = 2 + 2 + 4 + 4 + 4L * HistogramBuckets.Count;
-            if (count > room / perEdge)
-                throw new InvalidDataException(
-                    $"Service-graph sidecar declares {count} edges but {room} bytes remain in {path}");
+            int perEdge = 2 + 2 + 4 + 4 + 4 * HistogramBuckets.Count;
+            FileBounds.RequireCountFits(count, fs.Length - fs.Position,
+                fileBytesPerElement: perEdge, heapBytesPerElement: perEdge,
+                "Service-graph sidecar", path);
 
             var result = new List<ServiceEdgeRecord>((int)count);
             for (uint i = 0; i < count; i++)

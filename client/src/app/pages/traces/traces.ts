@@ -1065,22 +1065,6 @@ export class TracesComponent implements OnInit, OnDestroy {
         // not from counting rows (see endingOf).
         this.listEnding.set(this.endingOf(ended, acc.length, askedMax));
         this.listMax.set(askedMax);
-        // The loss is SET, never cleared — the asymmetry is the guard, and it is written as an
-        // `if` with no `else` on purpose.
-        //
-        // An ending describes one read and is replaced by the next read's own account of
-        // itself. A lost segment describes the storage under every read, and the server says so
-        // where it remembers them: nothing re-reads a file that is gone, so no later page may
-        // decide the fault has been made good. But that memory is a field in a process and a
-        // range retention will eventually walk past — so the server does stop re-reporting a
-        // real, permanent hole, by restarting or by ageing out, and a background tick then
-        // arrives saying `{complete:true, exhausted}` over a window that is still missing its
-        // traces. Measured: user search ends `{max-rows, unreadable-segment}`, restart, 15 s
-        // later the poll cleared the warning and left the count reading as a whole answer.
-        //
-        // So confidence only ever travels one way here. A stream may add a loss the page did
-        // not know about, whoever asked for it; taking one away is the user's to ask for, in
-        // startStream, where the rows it describes are emptied in the same step.
         // THE MARKER BELONGS TO THE ROWS IT ARRIVED WITH, so it is set unconditionally — including
         // to null — by whichever stream published what is now on screen.
         //

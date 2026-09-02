@@ -73,6 +73,10 @@ internal static class TraceSummarySidecar
     /// </summary>
     private const int MaxBodyBytes = 256 * 1024 * 1024;
 
+    /// <summary>Paths already reported as having an unreadable volume header, so a poll every
+    /// fifteen seconds does not become a log every fifteen seconds.</summary>
+    private static HashSet<string>? _volumeWarned;
+
     /// <summary>Volume grid resolution — 10 s. Sparse, so idle gaps cost nothing.</summary>
     public const long GridNanos = 10_000_000_000L;
 
@@ -261,9 +265,8 @@ internal static class TraceSummarySidecar
             // Measured on a real 2532-byte .tracesum with the volume count set to 0x02000000:
             // 512.2 MB allocated on one stats refresh, and 0x40000000 asks for 17.2 GB.
             uint volCount = br.ReadUInt32();
-            if (volCount > (fs.Length - fs.Position) / 16)
-                throw new InvalidDataException(
-                    $"Volume header declares {volCount} buckets past the end of {path}");
+            FileBounds.RequireCountFits(volCount, fs.Length - fs.Position,
+                fileBytesPerElement: 16, heapBytesPerElement: 16, "Volume header", path);
 
             var buckets = new List<TraceVolumeEntry>((int)volCount);
             for (uint i = 0; i < volCount; i++)
@@ -276,7 +279,17 @@ internal static class TraceSummarySidecar
 
             return new TraceVolumeSegment { MinStartNano = min, MaxStartNano = max, Buckets = buckets };
         }
-        catch { return null; }
+        catch (Exception ex) when (FileBounds.DescribesContent(ex))
+        {
+            // Damaged volume header. null sends the caller down its legacy fallback, which rescans
+            // EVERY span of the segment — measured at 6 156 760 bytes against 19 280 for the healthy
+            // read, 319x, on a path /api/traces/stats polls every fifteen seconds. Worth saying once
+            // rather than paying silently for ever.
+            _volumeWarned ??= new();
+            if (_volumeWarned.Add(path))
+                Console.Error.WriteLine($"[ameto] trace-volume header in {path} will not parse: {ex.Message}");
+            return null;
+        }
     }
 
     // ── Reader: full per-trace rows ─────────────────────────────────────────────
@@ -367,7 +380,7 @@ internal static class TraceSummarySidecar
             rows = [];
             return false;
         }
-        catch (Exception ex) when (IsMalformed(ex))
+        catch (Exception ex) when (FileBounds.DescribesContent(ex))
         {
             // Only the exceptions that describe CONTENT are answered here, and answered as false —
             // "this sidecar will not parse". Everything else is left to propagate, because the
@@ -380,17 +393,6 @@ internal static class TraceSummarySidecar
             return false;
         }
     }
-
-    /// <summary>
-    /// Whether the failure describes the FILE's contents rather than the machine's ability to read
-    /// it. The same split the engine's own classifier makes; kept here so a sidecar cannot report a
-    /// transient condition as damage before the classifier ever sees it.
-    /// </summary>
-    private static bool IsMalformed(Exception ex) =>
-        ex is InvalidDataException or EndOfStreamException
-           or System.Text.DecoderFallbackException
-           or IndexOutOfRangeException or ArgumentOutOfRangeException
-           or MessagePack.MessagePackSerializationException;
 
     private static List<TraceSummary> ParseBody(byte[] raw, long fromNano, long toNano)
     {
