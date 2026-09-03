@@ -358,39 +358,55 @@ internal static class TraceSummarySidecar
             if (!FileBounds.LengthFits(compSize, fs.Length - fs.Position)
              || !FileBounds.LengthFits(uncompSize, MaxBodyBytes)) { rows = []; return false; }
 
-            byte[] comp = br.ReadBytes((int)compSize);
-            if (comp.Length != compSize) { rows = []; return false; }
-
-            // The size INSIDE the payload, which the check above never saw: LZ4 carries the
-            // decompressed length in its own header, so a short well-formed block can still ask for
-            // gigabytes. Same reasoning as SpanReader's MaxBlockBytes guard, same failure without it.
-            int rawLen = LZ4Pickler.UnpickledSize(comp);
-            if (rawLen is < 0 or > MaxBodyBytes) { rows = []; return false; }
-
-            // RENTED, because this is the big one. The doc above says a compacted segment can hold
-            // two hundred thousand traces' worth of summaries, so the decompressed body routinely
-            // clears the 85 KB LOH threshold — one large-object allocation per cold segment per
-            // page of every stream, on the 512 MB box this branch exists to protect. It never
-            // escapes: ParseBody reads it and returns decoded rows and strings, keeping no
-            // reference to the buffer.
-            //
-            // Only this array. The compressed one stays an exactly-sized ReadBytes, because
-            // LZ4Pickler derives the payload length from source.Length — hand it a rented buffer
-            // rounded up to a pool bucket and it decodes pool garbage past the real end.
-            byte[] raw = ArrayPool<byte>.Shared.Rent(rawLen);
+            // BOTH ARRAYS ARE RENTED — the compressed one too, which I left
+            // allocating last round.
+            byte[] comp = ArrayPool<byte>.Shared.Rent((int)compSize);
             try
             {
-                LZ4Pickler.Unpickle(comp.AsSpan(0, (int)compSize), raw.AsSpan(0, rawLen));
-                if (rawLen != uncompSize) { /* tolerate — trust actual length */ }
+                // ReadExactly, not ReadBytes: a short read raises EndOfStreamException, which
+                // DescribesContent lists and the filter below answers with the same "will not
+                // parse" false that the length check gives.
+                fs.ReadExactly(comp, 0, (int)compSize);
 
-                // rawLen, NOT raw.Length: a rent of 90 000 bytes hands back 131 072, and the string
-                // pool bound inside ParseBody measures the body's remaining bytes. Measured against
-                // the capacity it would admit a pool a third larger than the file can describe,
-                // which is the guard this branch just installed, loosened by the fix beside it.
-                rows = ParseBody(raw, rawLen, fromNano, toNano);
-                return true;
+                // The size INSIDE the payload, which the checks above never saw: LZ4 carries the
+                // decompressed length in its own header, so a short well-formed block can still
+                // ask for gigabytes. Same reasoning as SpanReader's MaxBlockBytes guard, same
+                // failure without it.
+                //
+                // SLICED, and that slice is what makes the rental above safe. LZ4Pickler takes the
+                // payload length from source.Length, so handing the whole rental to the array-form
+                // overload would measure a pool bucket instead of the body — which is why I left
+                // this array allocating last round and wrote a comment defending it. The span form
+                // was three lines further down the whole time, and SpanReader has used it at four
+                // sites all along.
+                int rawLen = LZ4Pickler.UnpickledSize(comp.AsSpan(0, (int)compSize));
+                if (rawLen is < 0 or > MaxBodyBytes) { rows = []; return false; }
+
+                // Both arrays clear the large-object threshold on an ordinary segment. Sixteen
+                // incompressible bytes of trace id per row put a floor near 16 B/row, so the
+                // compressed body passes 85 KB at about three thousand rows and reaches 3.5 MB at
+                // the two hundred thousand SPANS the doc above says compaction may grow a segment
+                // to; the decompressed one is larger again. That is a large-object allocation per
+                // cold segment per page of every stream, on the 512 MB box this branch exists to
+                // protect. Neither escapes: ParseBody returns decoded rows and strings and keeps
+                // no reference to the buffer.
+                byte[] raw = ArrayPool<byte>.Shared.Rent(rawLen);
+                try
+                {
+                    LZ4Pickler.Unpickle(comp.AsSpan(0, (int)compSize), raw.AsSpan(0, rawLen));
+                    if (rawLen != uncompSize) { /* tolerate — trust actual length */ }
+
+                    // rawLen, NOT raw.Length: a rent of 90 000 bytes hands back 131 072, and the
+                    // string-pool bound inside ParseBody measures the body's remaining bytes.
+                    // Against the rental's capacity it would admit a pool a third larger than the
+                    // file can describe — the guard this branch installed, loosened by the fix
+                    // standing next to it.
+                    rows = ParseBody(raw, rawLen, fromNano, toNano);
+                    return true;
+                }
+                finally { ArrayPool<byte>.Shared.Return(raw); }
             }
-            finally { ArrayPool<byte>.Shared.Return(raw); }
+            finally { ArrayPool<byte>.Shared.Return(comp); }
         }
         catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
         {

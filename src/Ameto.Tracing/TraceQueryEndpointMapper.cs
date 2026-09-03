@@ -1,4 +1,3 @@
-using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
@@ -287,13 +286,6 @@ public static class TraceQueryEndpointMapper
     /// <summary>Log category for trace-stream failures reported to clients only in summary.</summary>
     private const string TraceStreamLogCategory = "Ameto.Tracing.Stream";
 
-    /// <summary>camelCase, and deliberately WITHOUT <c>WhenWritingNull</c>.</summary>
-    /// <remarks>
-    /// The client reads <c>httpStatusCode: null</c> on every row that carries no HTTP status
-    /// and distinguishes it from a row that was never asked. Dropping the property — which is
-    /// exactly what EndpointMapper's own options do, so they must not be borrowed here —
-    /// would turn "no status" into "field missing" on the wire.
-    /// </remarks>
     /// <summary>
     /// Commits the response as an event stream BEFORE any framing: headers first, then an
     /// empty-body flush, so the client's EventSource opens on the status line rather than on
@@ -1230,16 +1222,24 @@ public static class TraceQueryEndpointMapper
 
 }
 
-/// <summary>One row per trace (root span) for the trace list view.</summary>
 /// <summary>
 /// The generated contract for the row type the trace stream emits. Source-generated rather than
 /// reflected: this runs once per ROW, and a stream is the one place in the codebase where the
 /// per-item serialisation cost is paid thousands of times for a single request.
 /// </summary>
+/// <remarks>
+/// camelCase, and deliberately WITHOUT <c>WhenWritingNull</c>: the client reads
+/// <c>httpStatusCode: null</c> on every row that carries no HTTP status and distinguishes it from
+/// a row that was never asked. Dropping the property — which is exactly what EndpointMapper's own
+/// options do, so they must not be borrowed here — would turn "no status" into "field missing" on
+/// the wire. JsonSourceGenerationOptions leaves DefaultIgnoreCondition at Never, so the property
+/// stays; TraceStreamEndpointTests pins it.
+/// </remarks>
 [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase)]
 [JsonSerializable(typeof(TraceRowDto))]
 internal partial class TraceStreamJson : JsonSerializerContext;
 
+/// <summary>One row per trace (root span) for the trace list view.</summary>
 public sealed class TraceRowDto
 {
     public string   TraceId           { get; init; } = string.Empty;
