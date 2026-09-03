@@ -877,10 +877,24 @@ public sealed class SegmentCatalogKeyTests : IAsyncLifetime
     /// permanent by the contract — when the real cause is local and clears with the file.
     /// </summary>
     [Fact]
-    public void An_unreadable_incumbent_refuses_with_its_own_answer_not_a_guess()
+    public async Task An_unreadable_incumbent_refuses_with_its_own_answer_not_a_guess()
     {
         long now = DateTime.UtcNow.Ticks;
         Directory.CreateDirectory(SegDir);
+
+        // THE SCAN FIRST, THEN THE UNREADABLE FILE. This is not the barrier problem the other
+        // tests had — there is only one scan here, the background one the fixture's constructor
+        // queued, and nothing in this test called for a second. The race is between that scan and
+        // THIS TEST creating the file: under thread-pool starvation the scan reaches
+        // Directory.GetFiles after the eight junk bytes land, opens them, fails, and quarantines
+        // the file to .corrupt — so ImportSegment finds the final path free and answers Registered
+        // instead of ConflictUnreadableIncumbent. Measured at roughly 0.7% of executions on a
+        // loaded box, which is exactly the rate that makes it look like an unrelated failure.
+        //
+        // Waiting for the scan to finish before writing puts the file beyond its reach: the
+        // incumbent this test is about must exist for ImportSegment, not for the boot scan.
+        await _engine.CatalogLoaded;
+
         string finalPath = Path.Combine(SegDir, $"{Peer.Value}-23.seg");
         File.WriteAllBytes(finalPath, [0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02, 0x03]);
 
@@ -917,7 +931,10 @@ public sealed class SegmentCatalogKeyTests : IAsyncLifetime
         var engine2 = NewEngine();
         try
         {
-            engine2.LoadSegmentCatalog();          // the scan, driven to completion by hand
+            // The scan the CONSTRUCTOR started, waited for. Calling LoadSegmentCatalog() here did
+            // not drive that scan to completion — it started a second one over the same directory,
+            // and the two raced to rename the torn file to .corrupt.
+            engine2.CatalogLoaded.GetAwaiter().GetResult();
 
             Assert.False(File.Exists(path), "the torn segment was left under its serving name");
             Assert.True(File.Exists(path + ".corrupt"), "the torn segment was deleted instead of quarantined");

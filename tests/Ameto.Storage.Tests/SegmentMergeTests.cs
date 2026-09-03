@@ -1194,10 +1194,6 @@ public sealed class SegmentMergeTests : IAsyncLifetime
         Assert.Equal(600, ReadEverything().Count); // no duplicates, nothing lost
     }
 
-    /// <summary>The catalog loads in the background — poll until segments appear.</summary>
-    private async Task WaitForCatalogAsync()
-    {
-        for (int i = 0; i < 100 && _engine.ListSegments().Count == 0; i++)
-            await Task.Delay(50);
-    }
+    /// <summary>The catalog loads in the background — wait for the scan to finish.</summary>
+    private Task WaitForCatalogAsync() => _engine.CatalogLoaded;
 }

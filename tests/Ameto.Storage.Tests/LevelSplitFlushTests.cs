@@ -248,8 +248,7 @@ public sealed class LevelSplitFlushTests : IAsyncLifetime
             NullLogger<StorageEngine>.Instance)
         { _allowIndexlessMerge = true };
 
-        for (int i = 0; i < 100 && _engine.ListSegments().Count == 0; i++)
-            await Task.Delay(50);
+        await _engine.CatalogLoaded;
 
         var segs = _engine.ListSegments();
         // Every level in, one level-pure segment per level out — recovery ran and split, rather

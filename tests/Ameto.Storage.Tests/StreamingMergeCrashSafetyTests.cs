@@ -181,8 +181,12 @@ public sealed class StreamingMergeCrashSafetyTests : IAsyncLifetime
     {
         await _engine.DisposeAsync();
         _engine = NewEngine();
-        for (int i = 0; i < 200 && _engine.ListSegments().Count == 0; i++)
-            await Task.Delay(25);
+
+        // THE WHOLE SCAN, not the first file out of it. Polling until ListSegments() was non-empty
+        // returned as soon as the constructor's background scan had published one of ten, and the
+        // callers below assert on all ten — green on an idle machine, 4/6/8-of-10 on a loaded CI
+        // runner. The count was never the signal; the scan finishing is.
+        await _engine.CatalogLoaded;
     }
 
     // ── Byte parity ───────────────────────────────────────────────────────────
