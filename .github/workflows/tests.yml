@@ -27,8 +27,32 @@ jobs:
       # local the moment it is dead, so a forced collection inside a probe can reclaim the very
       # allocation the probe exists to see. Those tests skip themselves under Release rather than
       # report a healthy number over defective code; see SpanTraceReadBoundTests.
+      # All five test projects are in Ameto.slnx, so this is the whole suite, integration
+      # included. It runs once: the integration suite is run three times locally because of a
+      # known flake, and a flake that only ever shows up on a developer's third attempt is
+      # precisely what CI should be allowed to go red on.
       - name: Test (Debug)
-        run: dotnet test -c Debug --nologo -v minimal
+        shell: pwsh
+        run: |
+          dotnet test -c Debug --nologo -v minimal 2>&1 | Tee-Object -FilePath test-output.txt
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          # A SKIPPED TEST READS AS A PASSING ONE. The memory probes skip themselves under an
+          # optimising JIT rather than report a healthy number over defective code, which is the
+          # right call and also a quiet one: nothing in a green report distinguishes "the probe
+          # ran and the peak was flat" from "the probe declined to run". This job is Debug, so
+          # the expected skip count is zero, and anything else means a test stopped running
+          # without anyone deciding it should.
+          $skipped = (Select-String -Path test-output.txt -Pattern 'Skipped:\s+(\d+)' -AllMatches |
+                      ForEach-Object { $_.Matches } |
+                      ForEach-Object { [int]$_.Groups[1].Value } |
+                      Measure-Object -Sum).Sum
+          if ($skipped -gt 0) {
+            Write-Host "::error::$skipped test(s) skipped under Debug, where nothing should skip."
+            Select-String -Path test-output.txt -Pattern 'Skipped:\s+[1-9]'
+            exit 1
+          }
+          Write-Host "no skipped tests"
 
   client:
     runs-on: ubuntu-latest

@@ -349,12 +349,13 @@ internal static class TraceSummarySidecar
             // sidecar, which it already knows how to say.
             uint volCount = br.ReadUInt32();
             long afterVol = fs.Position + volCount * 16L;
-            if (volCount > (fs.Length - fs.Position) / 16) { rows = []; return false; }
+            if (!FileBounds.CountFits(volCount, fs.Length - fs.Position, 16)) { rows = []; return false; }
             fs.Seek(afterVol, SeekOrigin.Begin); // skip volume header
 
             uint uncompSize = br.ReadUInt32();
             uint compSize   = br.ReadUInt32();
-            if (compSize > fs.Length - fs.Position || uncompSize > MaxBodyBytes) { rows = []; return false; }
+            if (!FileBounds.LengthFits(compSize, fs.Length - fs.Position)
+             || !FileBounds.LengthFits(uncompSize, MaxBodyBytes)) { rows = []; return false; }
 
             byte[] comp = br.ReadBytes((int)compSize);
             if (comp.Length != compSize) { rows = []; return false; }

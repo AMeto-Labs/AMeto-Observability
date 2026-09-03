@@ -218,7 +218,8 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         // accepted, or a restart would interleave recovered and live spans. Replay is a
         // sequential walk of one mmap'd file bounded by the flush thresholds, so it costs
         // milliseconds even at the 50k ceiling.
-        _wal = SpanWriteAheadLog.Open(Path.Combine(dataDir, "spans.wal"));
+        _walPath = Path.Combine(dataDir, "spans.wal");
+        _wal = SpanWriteAheadLog.Open(_walPath);
         RecoverFromWal();
     }
 
@@ -719,21 +720,33 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         // unreadable — a banner that is always on is a banner nobody reads.
         //
         // So this errs rarely and the alternative errs constantly. What it costs is named rather
-        // than hidden: a genuine wholesale delete on an install with two or more segments is
-        // reported as truncation (Capped, "ask me again") instead of loss, until a restart finds
-        // the files really gone. That is a worse SENTENCE for a rare event; the removal was a
-        // worse OUTCOME for a common one.
+        // than hidden: a genuine wholesale delete is reported as truncation (Capped, "ask me
+        // again") instead of loss, until a restart finds the files really gone. That is a worse
+        // SENTENCE for a rare event; the removal was a worse OUTCOME for a common one.
         //
-        // The known hole in it is CompleteFlush, which writes a fresh .trc into whatever the data
-        // directory currently is and can therefore make this false within seconds on a busy
-        // install. It is a hole in a guard, not a hole in the data: when it closes, the fault is
-        // classified as loss and reported, which is the direction that at least says something.
-        if (_coldSegments.Length >= 2 && NoSegmentFilesLeft(_dataDir))
+        // WHAT SEPARATES THE TWO CASES IS THE WAL, NOT A SEGMENT COUNT. The first version asked
+        // for two or more listed segments, on the reasoning that losing everything at once is not
+        // how deletion behaves — but with ONE cold segment "everything at once" and "that file was
+        // deleted" are the same observation, so the guard simply did not apply. Measured on a
+        // single-segment install, which is what a quiet stand plus the hourly CompactSmallSegments
+        // converges to: a 0.1s mount blip gave rows=0 Unreadable=True permanently, and after one
+        // retention pass rows=0 Unreadable=FALSE regions=0 over twenty rows still on the disk —
+        // the exact silent under-report this branch is named for, reachable by a flickering mount.
+        //
+        // spans.wal answers the question the count was standing in for. It is opened at
+        // construction and removed only by an explicit reset, so this process holding a handle to
+        // it means the file is in the directory; if the directory no longer has it, the directory
+        // is not the one we opened. Nothing ordinary — retention, compaction, an operator deleting
+        // a segment — can take it away. And erring here is still the recoverable direction: the
+        // segments STAY in the snapshot, so a directory that really is empty keeps faulting and
+        // keeps reporting, which is "ask me again", never "it is gone".
+        if (NoSegmentFilesLeft(_dataDir) && !WalFileStillThere())
         {
             _logger.LogWarning(
-                "No segment file is left under {Dir} while {Count} cold segments are still listed — " +
-                "treating {File} as an unpopulated volume rather than a deletion; the snapshot is " +
-                "kept and the next request retries", _dataDir, _coldSegments.Length, seg.FilePath);
+                "Neither a segment file nor the engine's own spans.wal is left under {Dir} while " +
+                "{Count} cold segment(s) are still listed — treating {File} as an unpopulated " +
+                "volume rather than a deletion; the snapshot is kept and the next request retries",
+                _dataDir, _coldSegments.Length, seg.FilePath);
             return ColdReadFault.Transient;
         }
 
@@ -754,6 +767,14 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
 
         return ColdReadFault.Handover;
     }
+
+    /// <summary>
+    /// The engine's own write-ahead log, inside the data directory. It is opened OpenOrCreate at
+    /// construction and removed only by an explicit reset, so while this process is alive the file
+    /// IS THERE — which makes its absence evidence about the directory rather than about any
+    /// segment. See <see cref="MeetMissingSegmentFile"/>.
+    /// </summary>
+    private readonly string _walPath;
 
     /// <summary>
     /// One more chance for a segment whose file was busy rather than broken. Returns null when it
@@ -792,6 +813,18 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// error is not evidence of absence, and answering TRUE would turn an unreadable mount into
     /// "keep retrying for ever" over data that may really be gone.
     /// </summary>
+    /// <summary>
+    /// Whether the log this engine opened is still in the data directory. A probe failure answers
+    /// TRUE — the same direction as <see cref="NoSegmentFilesLeft"/>, because an I/O error is not
+    /// evidence that the volume was swapped, and answering otherwise would turn a busy disk into a
+    /// permanent loss claim.
+    /// </summary>
+    private bool WalFileStillThere()
+    {
+        try { return File.Exists(_walPath); }
+        catch { return true; }
+    }
+
     private static bool NoSegmentFilesLeft(string dir)
     {
         try

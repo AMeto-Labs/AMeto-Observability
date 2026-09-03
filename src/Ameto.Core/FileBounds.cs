@@ -73,6 +73,20 @@ public static class FileBounds
     }
 
     /// <summary>
+    /// The same question as <see cref="RequireCountFits"/>, asked where the answer is not an
+    /// exception. A sidecar that will not parse returns false so the caller's own classification
+    /// stays intact, and that is a legitimate shape — but written out by hand it is the rule
+    /// living in a second place, which is how the divisor in this very class went wrong in one
+    /// copy and not the other.
+    /// </summary>
+    public static bool CountFits(long count, long bytesRemaining, int fileBytesPerElement) =>
+        count >= 0 && count <= MaxCountThatFits(bytesRemaining, fileBytesPerElement);
+
+    /// <summary>Non-throwing <see cref="RequireLengthFits"/>, for the same callers.</summary>
+    public static bool LengthFits(long length, long bytesRemaining) =>
+        length >= 0 && length <= bytesRemaining;
+
+    /// <summary>
     /// Throws unless <paramref name="count"/> is a number this many bytes could describe.
     /// </summary>
     public static void RequireCountFits(

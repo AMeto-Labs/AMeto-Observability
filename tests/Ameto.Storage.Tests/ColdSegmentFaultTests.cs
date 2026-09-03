@@ -377,6 +377,88 @@ public sealed class ColdSegmentFaultTests : IDisposable
     }
 
     [Fact]
+    public async Task ONE_cold_segment_gets_THE_SAME_answer_to_a_mount_blip_as_forty()
+    {
+        // The hole the segment count left. The guard used to require two or more listed segments,
+        // on the reasoning that losing everything at once is not how deletion behaves — but with
+        // ONE segment "everything at once" and "that file was deleted" are the same observation,
+        // so the guard simply did not run. And one segment is not an edge case: a quiet stand plus
+        // the hourly CompactSmallSegments converges to exactly that.
+        //
+        // Measured before the fix, on this fixture: during the blip rows=0 Unreadable=True; after
+        // the files came back rows=0 Unreadable=True, permanently, restart the only cure; and
+        // after one retention pass rows=0 Unreadable=FALSE regions=0 over ten rows still on the
+        // disk — the silent under-report this branch is named for, from a flickering mount.
+        string real = Path.Combine(_root, "onerealvol");
+        string stub = Path.Combine(_root, "oneemptyvol");
+        string link = Path.Combine(_root, "onemount");
+        Directory.CreateDirectory(real);
+        Directory.CreateDirectory(stub);
+        Directory.CreateDirectory(Path.Combine(stub, "lost+found"));
+        if (!TryJunction(link, real)) return;
+
+        using var e = new TraceStorageEngine(link, NullLogger<TraceStorageEngine>.Instance);
+        for (int k = 0; k < 10; k++) Write(e, 7_000 + (ulong)k, _baseNano + k * Ms);
+        e.FlushHotTier();
+        Assert.Single(e.ColdSegmentsForTest);            // the point of the test
+
+        long from = _baseNano - 1000 * Ms, to = _baseNano + 1000 * Ms;
+        Assert.Equal(10, (await ListAsync(e, from, to)).Rows.Count);
+
+        Directory.Delete(link);
+        if (!TryJunction(link, stub)) return;
+
+        var during = await ListAsync(e, from, to);
+        _out.WriteLine($"one-segment blip rows={during.Rows.Count} Unreadable={during.Unreadable} "
+                     + $"segs={e.ColdSegmentsForTest.Length} regions={e.VanishedRegionCountForTest}");
+        Assert.False(during.Unreadable, "a one-segment install still called a mount blip a deletion");
+        Assert.Equal(0, e.VanishedRegionCountForTest);
+        Assert.Single(e.ColdSegmentsForTest);
+
+        Directory.Delete(link);
+        Assert.True(TryJunction(link, real));
+
+        var after = await ListAsync(e, from, to);
+        _out.WriteLine($"after remount rows={after.Rows.Count} Unreadable={after.Unreadable}");
+        Assert.Equal(10, after.Rows.Count);
+        Assert.False(after.Unreadable);
+        Assert.Equal(0, e.VanishedRegionCountForTest);
+    }
+
+    [Fact]
+    public async Task A_segment_deleted_while_the_WAL_STAYS_is_still_reported_as_loss()
+    {
+        // The other side of the same guard, and the reason it is spans.wal that decides rather
+        // than a segment count. Dropping the count could have turned every ordinary deletion on a
+        // one-segment install into "ask me again" for ever. It does not: the directory the engine
+        // opened is still there, and so is the log it holds open, so a missing .trc is a missing
+        // .trc — reported, not explained away.
+        string dir = Path.Combine(_root, "realdelete");
+        Directory.CreateDirectory(dir);
+
+        using var e = new TraceStorageEngine(dir, NullLogger<TraceStorageEngine>.Instance);
+        for (int k = 0; k < 10; k++) Write(e, 8_000 + (ulong)k, _baseNano + k * Ms);
+        e.FlushHotTier();
+        Assert.Single(e.ColdSegmentsForTest);
+
+        long from = _baseNano - 1000 * Ms, to = _baseNano + 1000 * Ms;
+        Assert.Equal(10, (await ListAsync(e, from, to)).Rows.Count);
+
+        // The whole set, the way an operator or a stray script removes a segment: the trace LIST is
+        // served from .tracesum and never opens the .trc, so deleting the data file alone leaves the
+        // list answering correctly out of the sidecar — a real deletion the list path cannot see.
+        string doomed = e.ColdSegmentsForTest[0].FilePath;
+        foreach (string f in Directory.EnumerateFiles(dir, Path.GetFileNameWithoutExtension(doomed) + ".*"))
+            File.Delete(f);
+        Assert.True(File.Exists(Path.Combine(dir, "spans.wal")), "the fixture needs the WAL in place");
+
+        var after = await ListAsync(e, from, to);
+        _out.WriteLine($"real delete rows={after.Rows.Count} Unreadable={after.Unreadable} "
+                     + $"regions={e.VanishedRegionCountForTest}");
+        Assert.True(after.Unreadable, "a genuinely deleted segment was explained away as a mount");
+        Assert.Equal(1, e.VanishedRegionCountForTest);
+    }
+    [Fact]
     public async Task Two_walks_that_meet_ONE_lost_file_give_ONE_verdict()
     {
         // RemoveColdSegment is atomic, so of two readers meeting the same genuinely deleted file
