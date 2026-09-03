@@ -1,3 +1,4 @@
+using Ameto.Core;
 using System.Text;
 
 namespace Ameto.Tracing.Storage;
@@ -120,7 +121,7 @@ internal static class ServiceGraphSidecar
             uint count = br.ReadUInt32();
             int perEdge = 2 + 2 + 4 + 4 + 4 * HistogramBuckets.Count;
             FileBounds.RequireCountFits(count, fs.Length - fs.Position,
-                fileBytesPerElement: perEdge, heapBytesPerElement: perEdge,
+                fileBytesPerElement: perEdge,
                 "Service-graph sidecar", path);
 
             var result = new List<ServiceEdgeRecord>((int)count);

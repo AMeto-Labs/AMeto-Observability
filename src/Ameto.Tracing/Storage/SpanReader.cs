@@ -1,3 +1,4 @@
+using Ameto.Core;
 using System.Buffers;
 using System.Buffers.Binary;
 using System.Text;
@@ -602,7 +603,7 @@ internal static class SpanReader
             // file can hold describes entries that are not there.
             int minEntryBytes = 2 + 4 + 4 + 8 + 8 + 4 * HistogramBuckets.Count;
             FileBounds.RequireCountFits(count, fs.Length - fs.Position,
-                fileBytesPerElement: minEntryBytes, heapBytesPerElement: minEntryBytes,
+                fileBytesPerElement: minEntryBytes,
                 "Stats sidecar", statsPath);
 
             var result = new List<ServiceSegmentStats>((int)count);
@@ -946,7 +947,7 @@ internal static class SpanReader
                     // that cannot exist. It also removes the int overflow in the skip below, where
                     // `(int)offsetCnt * 4` wraps negative for a large count.
                         FileBounds.RequireCountFits(offsetCnt, raw.Length - pos,
-                            fileBytesPerElement: 4, heapBytesPerElement: 4, "Trace index", filePath);
+                            fileBytesPerElement: 4, "Trace index", filePath);
 
                     if (candidate.Equals(traceId))
                     {
@@ -984,7 +985,7 @@ internal static class SpanReader
             // install that has not finished migrating.
             long leftInFile = fs.Length - fs.Position;
             FileBounds.RequireCountFits(offsetCnt, leftInFile,
-                fileBytesPerElement: 4, heapBytesPerElement: 4, "Trace index", filePath);
+                fileBytesPerElement: 4, "Trace index", filePath);
 
             if (candidate.Equals(traceId))
             {
@@ -1038,15 +1039,13 @@ internal static class SpanReader
         // the file, so the offset check above cannot see it.
         uint blockCount = br.ReadUInt32();
         FileBounds.RequireCountFits(blockCount, fs.Length - fs.Position,
-            fileBytesPerElement: 4, heapBytesPerElement: 16, "Bloom index", filePath);
+            fileBytesPerElement: 4, "Bloom index", filePath);
 
-        var allowed = new HashSet<uint>((int)blockCount);
+        var allowed = new HashSet<uint>(FileBounds.PreallocFor(blockCount, heapBytesPerElement: 16));
         for (uint b = 0; b < blockCount; b++)
         {
             uint len = br.ReadUInt32();
-            if (len > fs.Length - fs.Position)
-                throw new InvalidDataException(
-                    $"Bloom bitset for block {b} claims {len} bytes past the end of {filePath}");
+            FileBounds.RequireLengthFits(len, fs.Length - fs.Position, $"Bloom bitset for block {b}", filePath);
             var bitset = len > 0 ? br.ReadBytes((int)len) : [];
             bool pass = true;
             for (int i = 0; i < nHints && pass; i++)
@@ -1084,7 +1083,7 @@ internal static class SpanReader
         // and its block count), and a block index costs four.
         uint svcCount = br.ReadUInt32();
         FileBounds.RequireCountFits(svcCount, fs.Length - fs.Position,
-            fileBytesPerElement: 6, heapBytesPerElement: 6, "Service index", filePath);
+            fileBytesPerElement: 6, "Service index", filePath);
 
         for (uint i = 0; i < svcCount; i++)
         {
@@ -1094,11 +1093,11 @@ internal static class SpanReader
             // Same asymmetry as the bloom index: the set costs far more than the four bytes each
             // index occupies on disk.
             FileBounds.RequireCountFits(blkCnt, fs.Length - fs.Position,
-                fileBytesPerElement: 4, heapBytesPerElement: 16, $"Service '{name}'", filePath);
+                fileBytesPerElement: 4, $"Service '{name}'", filePath);
 
             if (name.Equals(serviceName, StringComparison.OrdinalIgnoreCase))
             {
-                var set = new HashSet<uint>((int)blkCnt);
+                var set = new HashSet<uint>(FileBounds.PreallocFor(blkCnt, heapBytesPerElement: 16));
                 for (uint b = 0; b < blkCnt; b++) set.Add(br.ReadUInt32());
                 return set;
             }
@@ -1134,7 +1133,7 @@ internal static class SpanReader
             // A service costs at least six bytes here: a two-byte name length and a four-byte
             // block count. More than that many is a number no writer produced.
             uint count = br.ReadUInt32();
-            if (count > FileBounds.MaxCountThatFits(fs.Length - fs.Position, 6, 6)) return [];
+            if (count > FileBounds.MaxCountThatFits(fs.Length - fs.Position, 6)) return [];
 
             var services = new string[count];
             for (uint i = 0; i < count; i++)

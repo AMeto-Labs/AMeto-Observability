@@ -1,3 +1,4 @@
+using Ameto.Core;
 using System.Text;
 using K4os.Compression.LZ4;
 
@@ -72,10 +73,6 @@ internal static class TraceSummarySidecar
     /// kilobytes) and far below the point where a torn field costs the process.</para>
     /// </summary>
     private const int MaxBodyBytes = 256 * 1024 * 1024;
-
-    /// <summary>Paths already reported as having an unreadable volume header, so a poll every
-    /// fifteen seconds does not become a log every fifteen seconds.</summary>
-    private static HashSet<string>? _volumeWarned;
 
     /// <summary>Volume grid resolution — 10 s. Sparse, so idle gaps cost nothing.</summary>
     public const long GridNanos = 10_000_000_000L;
@@ -266,7 +263,7 @@ internal static class TraceSummarySidecar
             // 512.2 MB allocated on one stats refresh, and 0x40000000 asks for 17.2 GB.
             uint volCount = br.ReadUInt32();
             FileBounds.RequireCountFits(volCount, fs.Length - fs.Position,
-                fileBytesPerElement: 16, heapBytesPerElement: 16, "Volume header", path);
+                fileBytesPerElement: 16, "Volume header", path);
 
             var buckets = new List<TraceVolumeEntry>((int)volCount);
             for (uint i = 0; i < volCount; i++)
@@ -279,15 +276,17 @@ internal static class TraceSummarySidecar
 
             return new TraceVolumeSegment { MinStartNano = min, MaxStartNano = max, Buckets = buckets };
         }
-        catch (Exception ex) when (FileBounds.DescribesContent(ex))
+        catch
         {
-            // Damaged volume header. null sends the caller down its legacy fallback, which rescans
-            // EVERY span of the segment — measured at 6 156 760 bytes against 19 280 for the healthy
-            // read, 319x, on a path /api/traces/stats polls every fifteen seconds. Worth saying once
-            // rather than paying silently for ever.
-            _volumeWarned ??= new();
-            if (_volumeWarned.Add(path))
-                Console.Error.WriteLine($"[ameto] trace-volume header in {path} will not parse: {ex.Message}");
+            // NULL FOR EVERYTHING, and narrowing this was a mistake worth writing down. Restricting
+            // the catch to content failures let an IOException out of a method whose only caller has
+            // no handler and whose endpoint has none either — so an antivirus or a backup agent
+            // holding one .tracesum open turned the whole fifteen-second stats poll into a 500,
+            // where before it fell back to the documented legacy recount. null is this method's
+            // way of saying "use the other path", and a transient lock is exactly when it should.
+            //
+            // The caller distinguishes damage from a lock and says so; see GetTraceVolumeAsync,
+            // which has the logger this static does not.
             return null;
         }
     }
@@ -401,9 +400,10 @@ internal static class TraceSummarySidecar
 
         // A string here costs at least its two-byte length prefix, so a pool larger than half the
         // body is a torn count and nothing else.
+        // Two bytes on disk is the least a string can cost (an empty one, length prefix only).
         uint poolCount = br.ReadUInt32();
-        if (poolCount > (raw.Length - ms.Position) / 2) throw new InvalidDataException(
-            $"Trace-summary pool count {poolCount} cannot fit in {raw.Length - ms.Position} bytes");
+        FileBounds.RequireCountFits(poolCount, raw.Length - ms.Position,
+            fileBytesPerElement: 2, "Trace-summary string pool", "the summary body");
         var pool = new string[poolCount];
         for (uint i = 0; i < poolCount; i++)
         {

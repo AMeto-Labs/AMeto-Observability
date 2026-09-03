@@ -86,6 +86,13 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// process, over a file sitting on the disk. The same lock met on a REQUEST reports Capped, so
     /// one fault was loud at one door and silent at the other.</para>
     ///
+    /// <para>WHICH READS SAY SO, precisely: the trace LIST and the span SEARCH, which are the two
+    /// that have somewhere to put it. <c>GetTraceAsync</c>, <c>GetTraceVolumeAsync</c> and
+    /// <c>GetAggregateStatsAsync</c> return plain data with no channel for a fault, so a trace
+    /// detail view still renders a truncated trace as a whole one — the same gap those three have
+    /// for a vanished region, and not one this flag introduced. Naming it here because an earlier
+    /// version of this comment claimed every read reports it, which was not true.</para>
+    ///
     /// <para>Process-wide and never cleared, because nothing rescans: LoadColdSegments runs once.
     /// A restart is the recovery, and that is what the log line says.</para>
     /// </summary>
@@ -752,11 +759,22 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// One more chance for a segment whose file was busy rather than broken. Returns null when it
     /// is still unreadable; the caller then has to admit the cold tier is short.
     /// </summary>
+    /// <summary>
+    /// Time the whole load may spend waiting on busy files, TOTAL. Per-file retries looked cheap
+    /// and are not: at six hundred milliseconds each, forty segments inside a backup window parks
+    /// startup for twenty-four seconds with the cold tier unavailable throughout.
+    /// </summary>
+    private static readonly TimeSpan LoadRetryBudget = TimeSpan.FromSeconds(2);
+    private long _loadRetryUsedTicks;
+
     private SpanSegmentInfo? RetryReadSegmentInfo(string file)
     {
         for (int attempt = 1; attempt <= 3; attempt++)
         {
-            Thread.Sleep(100 * attempt);
+            if (_loadRetryUsedTicks >= LoadRetryBudget.Ticks) return null;
+            var waited = TimeSpan.FromMilliseconds(100 * attempt);
+            _loadRetryUsedTicks += waited.Ticks;
+            Thread.Sleep(waited);
             try
             {
                 var info = SpanReader.ReadSegmentInfo(file);
@@ -1424,6 +1442,18 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                       + "suspect the volume it was written to",
                         file, info.MinStartNano, info.MaxStartNano);
             }
+            catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
+            {
+                // GONE IS NOT BUSY. Between EnumerateFiles above and ReadSegmentInfo here, a
+                // compaction can publish its merged output and unlink the sources — the ordinary
+                // race this engine is built around, and the one RemoveColdSegment, MeetMissingSegment
+                // File and ColdReadFault.Handover exist to classify. Treating it as a busy file spent
+                // six hundred milliseconds retrying a path that does not exist and then raised the
+                // process-wide incomplete flag, so every later query answered Unreadable for the
+                // life of the process over a handover that lost nothing.
+                _logger.LogDebug("Cold segment {File} vanished while loading — retired by the engine", file);
+                continue;
+            }
             catch (Exception ex) when (ClassifyReadFailure(ex, "Cold segment load", file) is not ColdReadFault.Corrupt)
             {
                 // Retried first, because most of what lands here clears by itself: an antivirus
@@ -1451,7 +1481,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                 _logger.LogError(ex,
                     "Cold segment {File} could not be read at startup and is left on disk, not deleted — "
                   + "but it is missing from this run's cold tier, so every trace query will report an "
-                  + "unreadable region until the service is restarted", file);
+                  + "unreadable region on the list and span-search paths until the service is restarted", file);
                 continue;
             }
             catch (Exception ex)
