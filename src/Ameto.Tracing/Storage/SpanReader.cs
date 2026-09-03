@@ -526,8 +526,10 @@ internal static class SpanReader
         HashSet<uint>? allowedBlocks = null;
         if (serviceName is not null)
         {
+            // Null means "the index could not tell me" — read every block rather than answer a
+            // filtered search with a confident zero.
             allowedBlocks = ReadServiceBlockIndices(filePath, serviceName);
-            if (allowedBlocks.Count == 0) yield break;
+            if (allowedBlocks is { Count: 0 }) yield break;
         }
 
         // v3 per-block attribute blooms: drop blocks that cannot satisfy every
@@ -1056,7 +1058,7 @@ internal static class SpanReader
     }
 
     /// <returns>0-based block indices containing at least one span from <paramref name="serviceName"/>.</returns>
-    private static HashSet<uint> ReadServiceBlockIndices(string filePath, string serviceName)
+    private static HashSet<uint>? ReadServiceBlockIndices(string filePath, string serviceName)
     {
         using var fs = OpenRead(filePath);
         using var br = new BinaryReader(fs);
@@ -1103,7 +1105,22 @@ internal static class SpanReader
             }
             fs.Seek(blkCnt * 4L, SeekOrigin.Current);
         }
-        return [];
+
+        // NOT FOUND IS NOT ABSENCE, and the empty set said both. A one-bit flip of the index offset
+        // that lands INSIDE the file is quiet by construction: the read succeeds, a small service
+        // count comes back, no name matches, and an empty set told the caller "no block here holds
+        // this service" — a positive statement about the data, made from a number the file no
+        // longer agrees with. Measured: 2 of the 40 single-bit flips of this field (real=90762,
+        // ^16, ^32) answered a service-filtered search with zero spans, Unreadable=False, over a
+        // hundred the unfiltered search returned.
+        //
+        // Null is the honest answer, and it costs nothing on healthy data: a segment that really
+        // lacks the service is dropped one level up, where the engine tests SpanSegmentInfo.Services
+        // (TraceStorageEngine:1038, :2077). Reaching this method at all means the service is
+        // believed present or unknown — so failing to find it here is evidence about the INDEX, and
+        // the index is an optimisation. Skipping nothing is slower and completely correct, which is
+        // the same trade ReadServicesFromIndex and BloomFilterBlocks already make.
+        return null;
     }
 
     /// <summary>
