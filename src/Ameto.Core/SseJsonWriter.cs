@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Text.Json;
+using System.Text.Json.Serialization.Metadata;
 
 namespace Ameto.Core;
 
@@ -43,7 +44,32 @@ public sealed class SseJsonWriter : IDisposable
         _json = new Utf8JsonWriter(_buffer);
     }
 
-    /// <summary>Writes one <c>data:</c> frame with the DTO serialised as JSON, then flushes.</summary>
+    /// <summary>
+    /// Writes one <c>data:</c> frame with the DTO serialised through a SOURCE-GENERATED contract,
+    /// then flushes. Prefer this overload: it is the one that keeps the reflection-based metadata
+    /// resolver out of the per-row path, and out of the trimmed output.
+    /// </summary>
+    public async Task WriteEventAsync<T>(T dto, JsonTypeInfo<T> typeInfo, CancellationToken ct)
+    {
+        _buffer.ResetWrittenCount();          // keep capacity — one buffer per connection
+        _buffer.Write(DataPrefix);
+        _json.Reset(_buffer);
+        JsonSerializer.Serialize(_json, dto, typeInfo);
+        _buffer.Write(FrameSuffix);
+        await _body.WriteAsync(_buffer.WrittenMemory, ct).ConfigureAwait(false);
+        await _body.FlushAsync(ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The reflection door, kept for callers that genuinely have no contract to hand over.
+    ///
+    /// <para>One does: the log streams serialise a DTO whose attribute values are <c>object</c>,
+    /// through a DynamicObjectConverter — a shape a generated contract does not describe, and
+    /// converting it is a change to the log path rather than to this one. Everything else should
+    /// take the <see cref="JsonTypeInfo{T}"/> overload above, which is why that one exists: when
+    /// this writer moved into Core it became the repo-wide SSE contract, and it offered no door
+    /// but this one, so every stream was structurally on the reflection resolver.</para>
+    /// </summary>
     public async Task WriteEventAsync<T>(T dto, JsonSerializerOptions options, CancellationToken ct)
     {
         _buffer.ResetWrittenCount();          // keep capacity — one buffer per connection

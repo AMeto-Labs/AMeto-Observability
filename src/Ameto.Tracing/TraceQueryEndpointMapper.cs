@@ -1,4 +1,5 @@
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
@@ -293,12 +294,6 @@ public static class TraceQueryEndpointMapper
     /// exactly what EndpointMapper's own options do, so they must not be borrowed here —
     /// would turn "no status" into "field missing" on the wire.
     /// </remarks>
-    private static readonly JsonSerializerOptions StreamJson = new()
-    {
-        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-        WriteIndented        = false,
-    };
-
     /// <summary>
     /// Commits the response as an event stream BEFORE any framing: headers first, then an
     /// empty-body flush, so the client's EventSource opens on the status line rather than on
@@ -608,7 +603,7 @@ public static class TraceQueryEndpointMapper
                 }
 
                 if (!seen.Add(row.TraceId)) continue;
-                await sse.WriteEventAsync(row, StreamJson, ct);
+                await sse.WriteEventAsync(row, TraceStreamJson.Default.TraceRowDto, ct);
                 if (row.StartTimeUnixNano < oldestEmitted) oldestEmitted = row.StartTimeUnixNano;
                 // Not Complete: the window was NOT read out, the ceiling was hit. Saying `done`
                 // for both makes a truncated list indistinguishable from an exhausted one for
@@ -1236,6 +1231,15 @@ public static class TraceQueryEndpointMapper
 }
 
 /// <summary>One row per trace (root span) for the trace list view.</summary>
+/// <summary>
+/// The generated contract for the row type the trace stream emits. Source-generated rather than
+/// reflected: this runs once per ROW, and a stream is the one place in the codebase where the
+/// per-item serialisation cost is paid thousands of times for a single request.
+/// </summary>
+[JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase)]
+[JsonSerializable(typeof(TraceRowDto))]
+internal partial class TraceStreamJson : JsonSerializerContext;
+
 public sealed class TraceRowDto
 {
     public string   TraceId           { get; init; } = string.Empty;

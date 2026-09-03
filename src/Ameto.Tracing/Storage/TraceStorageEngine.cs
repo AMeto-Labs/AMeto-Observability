@@ -526,7 +526,18 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         // this method built (hotResults or cold), never a caller's.
         ordered.RemoveAll(r => !r.SpanId.IsEmpty && !seen.Add(r.SpanId.RawValue));
 
-        foreach (var r in ordered.OrderBy(static s => s.StartTimeUnixNano))
+        // SORTED IN PLACE, because OrderBy cannot. Enumerating an OrderedEnumerable copies the
+        // whole list into a Buffer<T>, builds a long[] of keys and an int[] index map, and hands
+        // back an iterator — three throwaway arrays per request, and past about ten thousand spans
+        // the key array alone clears the 85 KB LOH threshold. That is the exact allocation shape
+        // the rest of this branch exists to remove; leaving it on the detail-view path while
+        // rewriting the list path for it would be answering the measurement selectively.
+        //
+        // The list is a list this method built (hotResults or cold, never a caller's), so it can
+        // be reordered. Stability is not lost either: the RemoveAll above already left one record
+        // per span id, and two records with different start times were never equal keys.
+        ordered.Sort(static (a, b) => a.StartTimeUnixNano.CompareTo(b.StartTimeUnixNano));
+        foreach (var r in ordered)
             yield return r;
     }
 

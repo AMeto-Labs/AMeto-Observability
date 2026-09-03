@@ -1,4 +1,5 @@
 using Ameto.Core;
+using System.Buffers;
 using System.Text;
 using K4os.Compression.LZ4;
 
@@ -363,13 +364,33 @@ internal static class TraceSummarySidecar
             // The size INSIDE the payload, which the check above never saw: LZ4 carries the
             // decompressed length in its own header, so a short well-formed block can still ask for
             // gigabytes. Same reasoning as SpanReader's MaxBlockBytes guard, same failure without it.
-            if (LZ4Pickler.UnpickledSize(comp) is < 0 or > MaxBodyBytes) { rows = []; return false; }
+            int rawLen = LZ4Pickler.UnpickledSize(comp);
+            if (rawLen is < 0 or > MaxBodyBytes) { rows = []; return false; }
 
-            byte[] raw = LZ4Pickler.Unpickle(comp);
-            if (raw.Length != uncompSize) { /* tolerate — trust actual length */ }
+            // RENTED, because this is the big one. The doc above says a compacted segment can hold
+            // two hundred thousand traces' worth of summaries, so the decompressed body routinely
+            // clears the 85 KB LOH threshold — one large-object allocation per cold segment per
+            // page of every stream, on the 512 MB box this branch exists to protect. It never
+            // escapes: ParseBody reads it and returns decoded rows and strings, keeping no
+            // reference to the buffer.
+            //
+            // Only this array. The compressed one stays an exactly-sized ReadBytes, because
+            // LZ4Pickler derives the payload length from source.Length — hand it a rented buffer
+            // rounded up to a pool bucket and it decodes pool garbage past the real end.
+            byte[] raw = ArrayPool<byte>.Shared.Rent(rawLen);
+            try
+            {
+                LZ4Pickler.Unpickle(comp.AsSpan(0, (int)compSize), raw.AsSpan(0, rawLen));
+                if (rawLen != uncompSize) { /* tolerate — trust actual length */ }
 
-            rows = ParseBody(raw, fromNano, toNano);
-            return true;
+                // rawLen, NOT raw.Length: a rent of 90 000 bytes hands back 131 072, and the string
+                // pool bound inside ParseBody measures the body's remaining bytes. Measured against
+                // the capacity it would admit a pool a third larger than the file can describe,
+                // which is the guard this branch just installed, loosened by the fix beside it.
+                rows = ParseBody(raw, rawLen, fromNano, toNano);
+                return true;
+            }
+            finally { ArrayPool<byte>.Shared.Return(raw); }
         }
         catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
         {
@@ -394,16 +415,20 @@ internal static class TraceSummarySidecar
         }
     }
 
-    private static List<TraceSummary> ParseBody(byte[] raw, long fromNano, long toNano)
+    /// <param name="rawLen">
+    /// The body's REAL length. <paramref name="raw"/> may be a pooled buffer larger than the body,
+    /// and every bound below is measured from what is left of the body, not of the rental.
+    /// </param>
+    private static List<TraceSummary> ParseBody(byte[] raw, int rawLen, long fromNano, long toNano)
     {
-        var ms = new MemoryStream(raw, writable: false);
+        var ms = new MemoryStream(raw, 0, rawLen, writable: false);
         using var br = new BinaryReader(ms);
 
         // A string here costs at least its two-byte length prefix, so a pool larger than half the
         // body is a torn count and nothing else.
         // Two bytes on disk is the least a string can cost (an empty one, length prefix only).
         uint poolCount = br.ReadUInt32();
-        FileBounds.RequireCountFits(poolCount, raw.Length - ms.Position,
+        FileBounds.RequireCountFits(poolCount, rawLen - ms.Position,
             fileBytesPerElement: 2, "Trace-summary string pool", "the summary body");
         var pool = new string[poolCount];
         for (uint i = 0; i < poolCount; i++)

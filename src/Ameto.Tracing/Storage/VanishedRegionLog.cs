@@ -75,7 +75,10 @@ internal sealed class VanishedRegionLog
     /// </summary>
     private const int MaxRegions = 32;
 
-    private readonly object _gate = new();
+    // System.Threading.Lock, not an object: this type is new here, so there is no legacy reason
+    // to take the Monitor path through an object header. Every each lock (_gate) below compiles
+    // unchanged onto Lock.EnterScope().
+    private readonly System.Threading.Lock _gate = new();
 
     /// <summary>Disjoint, non-adjacent, sorted ascending by <c>Min</c>. Both invariants are
     /// re-established by <see cref="Record"/> on every insert, and <see cref="Forget"/> preserves

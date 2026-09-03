@@ -326,7 +326,7 @@ internal static class SpanReader
             // left in the file are the bound the file cannot forge; the uncompressed size still
             // needs the constant, because nothing on disk bounds what a payload decompresses to.
             FileBounds.RequireLengthFits(compSize, fs.Length - fs.Position, $"Block {blockIdx}", filePath);
-            FileBounds.RequireLengthFits(uncompSize, MaxBlockBytes, $"Block {blockIdx}" + " uncompressed", filePath);
+            FileBounds.RequireLengthFits(uncompSize, MaxBlockBytes, $"Block {blockIdx} uncompressed", filePath);
 
             byte[]  comp   = ArrayPool<byte>.Shared.Rent((int)compSize);
             byte[]? rawBuf = null;
@@ -803,7 +803,7 @@ internal static class SpanReader
             // left in the file are the bound the file cannot forge; the uncompressed size still
             // needs the constant, because nothing on disk bounds what a payload decompresses to.
             FileBounds.RequireLengthFits(compSize, fs.Length - fs.Position, $"Block {blockIdx}", filePath);
-            FileBounds.RequireLengthFits(uncompSize, MaxBlockBytes, $"Block {blockIdx}" + " uncompressed", filePath);
+            FileBounds.RequireLengthFits(uncompSize, MaxBlockBytes, $"Block {blockIdx} uncompressed", filePath);
 
             // Cleared BEFORE the decode, so the previous block's records are unrooted while
             // this one is being built rather than on top of it.
