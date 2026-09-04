@@ -71,6 +71,17 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     // race it deliberately does NOT record.
     private readonly VanishedRegionLog                         _vanished = new();
 
+    /// <summary>
+    /// Segment identity, and the record of what a trace-id index may answer for. Loaded once in
+    /// the constructor and never replaced; an unreadable or absent manifest loads as an empty
+    /// catalog, which is why nothing below has to handle its failure — see
+    /// <see cref="TraceManifest.Load"/>.
+    /// </summary>
+    private readonly TraceManifest                             _manifest;
+
+    /// <summary>Test hook: how many segments the catalog names, and how many the index vouches for.</summary>
+    internal (int Segments, int Covered) CatalogCountsForTest => (_manifest.Segments.Count, _manifest.CoveredCount);
+
     /// <summary>Test hook: cold segments currently registered.</summary>
     internal int ColdSegmentCountForTest => _coldSegments.Length;
 
@@ -202,6 +213,12 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         _dataDir = dataDir;
         _logger  = logger;
         Directory.CreateDirectory(dataDir);
+
+        // Before anything else touches the directory: the catalog is what names the segments the
+        // sweep and the WAL replay are about to work over. It cannot fail — every damaged form
+        // loads as an empty catalog, and an empty catalog is exactly how this engine behaved
+        // before there was one.
+        _manifest = TraceManifest.Load(dataDir, logger);
 
         // Residue of flushes that died mid-write, plus segments whose RENAME did not
         // survive a power loss. Handled in the constructor for the same reason the metric
@@ -1336,6 +1353,33 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         catch (Exception ex) { failure = ex; }
 
         _publishingSegmentPath = info?.FilePath ?? _publishingSegmentPath;
+
+        // NAMED AFTER THE RENAME, BEFORE THE SNAPSHOT SWAP. The file is durable by this point, so
+        // an id recorded here always describes something that exists; and it is recorded before
+        // any reader can see the segment, so no reader ever meets a segment the catalog has not
+        // heard of. A crash between the two leaves a file the catalog does not name, which is the
+        // ordinary adopt-on-load case that LoadColdSegments already has to handle for any segment
+        // written before this catalog existed.
+        //
+        // Nothing here can fail the flush: the catalog is a convenience over the directory, and a
+        // segment without an id is a segment read exactly as it was read before ids existed.
+        if (info is { } named)
+        {
+            try
+            {
+                ulong segId = _manifest.AllocateSegmentId();
+                _manifest.AddSegment(new TraceSegmentEntry(
+                    segId, named.FilePath, named.MinStartNano, named.MaxStartNano, named.SpanCount));
+                info = named.WithSegmentId(segId);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "Could not record {File} in the trace catalog — the segment is published and "
+                  + "queryable, and will be adopted on the next start", named.FilePath);
+            }
+        }
+
         try
         {
             // ── Publish (short lock hold). _flushInProgress deliberately STAYS set: it is
@@ -1574,6 +1618,8 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             }
         }
 
+        loaded = ReconcileCatalog(loaded);
+
         _lock.EnterWriteLock();
         try
         {
@@ -1589,6 +1635,72 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
 
         _logger.LogInformation("Loaded {Count} cold span segments in {Ms} ms",
             _coldSegments.Length, sw.ElapsedMilliseconds);
+    }
+
+    /// <summary>
+    /// Reconciles the catalog against what is actually on disk, and hands back the discovered
+    /// segments carrying their ids.
+    ///
+    /// <para>THE DIRECTORY WINS, ALWAYS. That is the whole shape of this method and the reason the
+    /// catalog can never become the single point of truth the scan is today. A file with no entry
+    /// is ADOPTED — it gets an id, which is how every segment written before this catalog existed
+    /// enters it, and how a segment survives a crash between its rename and its manifest write. An
+    /// entry with no file is DROPPED, and with it any claim that the index covers it, because an
+    /// index vouching for a file that is not there is the silent under-report this engine keeps
+    /// closing.</para>
+    ///
+    /// <para>"No file" means <c>File.Exists</c> said so, not merely "absent from this scan". The
+    /// scan deliberately skips the segment a flush is publishing, and a flush that lands while the
+    /// scan runs is already in the snapshot — neither is gone, and dropping either would retire an
+    /// id that something may already have recorded against.</para>
+    /// </summary>
+    private List<SpanSegmentInfo> ReconcileCatalog(List<SpanSegmentInfo> loaded)
+    {
+        try
+        {
+            var byPath = new Dictionary<string, ulong>(StringComparer.Ordinal);
+            foreach (var (id, entry) in _manifest.Segments) byPath[entry.FilePath] = id;
+
+            var named   = new List<SpanSegmentInfo>(loaded.Count);
+            int adopted = 0;
+            foreach (var seg in loaded)
+            {
+                if (byPath.TryGetValue(seg.FilePath, out ulong known))
+                {
+                    named.Add(seg.WithSegmentId(known));
+                    continue;
+                }
+                ulong fresh = _manifest.AllocateSegmentId();
+                _manifest.AddSegment(new TraceSegmentEntry(
+                    fresh, seg.FilePath, seg.MinStartNano, seg.MaxStartNano, seg.SpanCount));
+                named.Add(seg.WithSegmentId(fresh));
+                adopted++;
+            }
+
+            var vanished = _manifest.Segments
+                .Where(kv => !File.Exists(kv.Value.FilePath))
+                .Select(kv => kv.Key)
+                .ToList();
+            if (vanished.Count > 0) _manifest.RemoveSegments(vanished);
+
+            if (adopted > 0 || vanished.Count > 0)
+                _logger.LogInformation(
+                    "Trace catalog reconciled: {Adopted} segment(s) adopted, {Dropped} entry(ies) "
+                  + "dropped for files that are gone; {Total} named, {Covered} covered by the index",
+                    adopted, vanished.Count, _manifest.Segments.Count, _manifest.CoveredCount);
+
+            return named;
+        }
+        catch (Exception ex)
+        {
+            // The catalog is a convenience. Failing to keep it is worth a log line and nothing
+            // more — every segment below simply carries id 0, which every read path already reads
+            // as "not covered", which is the scan this engine did before ids existed.
+            _logger.LogWarning(ex,
+                "Trace catalog could not be reconciled — segments are queryable and unnamed for "
+              + "this run, and the trace-id index will not be consulted");
+            return loaded;
+        }
     }
 
     /// <summary>
@@ -1725,6 +1837,27 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             // Swap the snapshot first (readers stop picking the old files up),
             // delete the merged-away files after. An in-flight reader that still
             // holds the old snapshot skips the deleted file gracefully.
+            // The catalog moves in ONE generation: the sources leave, the merged file arrives.
+            // Done before the snapshot swap for the same reason the flush does it — a reader must
+            // never see a segment the catalog has not heard of — and it takes the sources' coverage
+            // with them, because an index vouching for a file that is about to be unlinked is the
+            // silent-loss shape this whole design exists to prevent.
+            try
+            {
+                ulong mergedId = _manifest.AllocateSegmentId();
+                _manifest.ReplaceSegments(
+                    processed.Select(static s => s.SegmentId).Where(static id => id != 0).ToList(),
+                    new TraceSegmentEntry(mergedId, merged.FilePath,
+                                          merged.MinStartNano, merged.MaxStartNano, merged.SpanCount));
+                merged = merged.WithSegmentId(mergedId);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "Could not record the merged segment {File} in the trace catalog — it is "
+                  + "published and queryable, and will be adopted on the next start", merged.FilePath);
+            }
+
             _lock.EnterWriteLock();
             try
             {
@@ -2479,6 +2612,20 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         }
         finally { _lock.ExitWriteLock(); }
 
+        // The catalog first, then the files. A catalog entry outliving its file would have the
+        // index vouching for data that is gone; a file outliving its entry is only a file nobody
+        // has a name for yet, which the next load adopts.
+        try
+        {
+            _manifest.RemoveSegments(
+                toDelete.Select(static s => s.SegmentId).Where(static id => id != 0).ToList());
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Could not update the trace catalog while pruning — "
+                                 + "the stale entries are dropped on the next start");
+        }
+
         foreach (var s in toDelete)
             DeleteSegmentFiles(s.FilePath);
 
@@ -2557,4 +2704,34 @@ public sealed class SpanSegmentInfo
     /// no longer be read. The ceiling for the range handed to <c>VanishedRegionLog</c>.
     /// </summary>
     public long     LastWriteNano { get; init; }
+
+    /// <summary>
+    /// The catalog's name for this segment, or 0 when it has none.
+    ///
+    /// <para>A FILE PATH IS NOT AN IDENTITY. Compaction writes a merged file and unlinks its
+    /// sources, so a path names something that stops existing; anything wanting to record "trace X
+    /// is in segment Y" needs a Y that survives that. Allocated once by
+    /// <see cref="TraceManifest"/> and carried here so the read paths can ask whether the trace-id
+    /// index vouches for this segment.</para>
+    ///
+    /// <para>0 IS A FIRST-CLASS ANSWER, not a missing value: it means this segment is outside the
+    /// catalog — no manifest, a manifest that would not parse, or a file adopted since the last
+    /// reconcile. Every read path treats 0 as "not covered", which is the full scan it does today.
+    /// The catalog is a convenience over the directory, never a replacement for it.</para>
+    /// </summary>
+    public ulong    SegmentId { get; init; }
+
+    /// <summary>The same segment, named. Used where the id is learned after the file was read.</summary>
+    public SpanSegmentInfo WithSegmentId(ulong id) => new()
+    {
+        FilePath           = FilePath,
+        MinStartNano       = MinStartNano,
+        MaxStartNano       = MaxStartNano,
+        SpanCount          = SpanCount,
+        Services           = Services,
+        FormatVersion      = FormatVersion,
+        HeaderRangeSuspect = HeaderRangeSuspect,
+        LastWriteNano      = LastWriteNano,
+        SegmentId          = id,
+    };
 }
