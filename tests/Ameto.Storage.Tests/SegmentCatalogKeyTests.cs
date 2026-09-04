@@ -918,8 +918,23 @@ public sealed class SegmentCatalogKeyTests : IAsyncLifetime
     /// operator, deleted by no one.
     /// </summary>
     [Fact]
-    public void A_torn_segment_is_quarantined_aside_at_boot_not_deleted()
+    public async Task A_torn_segment_is_quarantined_aside_at_boot_not_deleted()
     {
+        // THE FIXTURE'S SCAN FIRST, AND IT IS NOT engine2's. Two engines look at this directory:
+        // the fixture's _engine, whose ctor queued Task.Run(LoadSegmentCatalog) in InitializeAsync,
+        // and engine2 below. Waiting only for the second one leaves the first racing the write two
+        // lines down, which is the same scan-vs-test-write shape as
+        // An_unreadable_incumbent_refuses_with_its_own_answer_not_a_guess — and it is worse here,
+        // because the loser of a two-scan race does not merely misread the file. The quarantine
+        // handler is Delete-then-Move over one generation, and SegmentReader.Open answers a file
+        // that is already gone with FileNotFoundException, which lands in the same catch: the
+        // second scan therefore deletes the .corrupt the first one just made and then fails its
+        // own Move. Neither name survives, and the assertion below is the one that reports it.
+        //
+        // Taking the fixture's snapshot while the directory is still empty puts the torn file
+        // beyond its reach, so only engine2's scan can ever see it.
+        await _engine.CatalogLoaded;
+
         long now = DateTime.UtcNow.Ticks;
         string path = WritePeerSegment(Peer, 31, now, events: 6);
         using (var f = File.Open(path, FileMode.Open, FileAccess.Write))
@@ -934,7 +949,7 @@ public sealed class SegmentCatalogKeyTests : IAsyncLifetime
             // The scan the CONSTRUCTOR started, waited for. Calling LoadSegmentCatalog() here did
             // not drive that scan to completion — it started a second one over the same directory,
             // and the two raced to rename the torn file to .corrupt.
-            engine2.CatalogLoaded.GetAwaiter().GetResult();
+            await engine2.CatalogLoaded;
 
             Assert.False(File.Exists(path), "the torn segment was left under its serving name");
             Assert.True(File.Exists(path + ".corrupt"), "the torn segment was deleted instead of quarantined");
@@ -942,7 +957,7 @@ public sealed class SegmentCatalogKeyTests : IAsyncLifetime
         }
         finally
         {
-            engine2.DisposeAsync().AsTask().GetAwaiter().GetResult();
+            await engine2.DisposeAsync();
         }
     }
 
