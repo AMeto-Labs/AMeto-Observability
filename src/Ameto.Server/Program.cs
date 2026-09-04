@@ -170,7 +170,16 @@ if (enableAlerts)
 
 // Distributed tracing
 if (enableTracing)
-    builder.Services.AddAmetoTracing(serverOptions.DataDirectory);
+{
+    // An unparseable value falls back to the default rather than failing the start: this is a
+    // performance switch, and no setting of it can make an answer wrong — an unindexed segment is
+    // read the way every segment was read before the index existed.
+    if (!Enum.TryParse<TraceIndexBackfillMode>(serverOptions.Traces.IndexBackfill, ignoreCase: true,
+                                               out var backfillMode))
+        backfillMode = TraceIndexBackfillMode.Idle;
+
+    builder.Services.AddAmetoTracing(serverOptions.DataDirectory, backfillMode);
+}
 
 // Metrics
 if (enableMetrics)

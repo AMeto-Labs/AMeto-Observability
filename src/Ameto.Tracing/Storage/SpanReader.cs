@@ -955,6 +955,80 @@ internal static class SpanReader
 
     // ── Index readers ──────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// The segment's ENTIRE trace index: every trace it holds and where. For the backfill, which
+    /// builds a <c>.tix</c> for a segment written before the index existed.
+    ///
+    /// <para>This is the expensive read the index exists to abolish — the whole index block, read
+    /// and inflated — and doing it here is the point rather than an oversight: paid ONCE per
+    /// segment, in the background, it stops being paid on every lookup of every trace for the rest
+    /// of that segment's life. Only v3 segments carry an index this can read; v2 returns empty and
+    /// the segment simply stays uncovered until compaction migrates it.</para>
+    /// </summary>
+    public static Dictionary<TraceId, List<uint>> ReadTraceIndex(string filePath)
+    {
+        var map = new Dictionary<TraceId, List<uint>>();
+
+        using var fs = OpenRead(filePath);
+        using var br = new BinaryReader(fs);
+
+        ushort version = ReadVersion(fs, br);
+        if (version < 3) return map;
+
+        var (traceIdxOffset, _, _) = ReadFooter(fs, br, version);
+        fs.Seek(traceIdxOffset, SeekOrigin.Begin);
+
+        uint uncompSize = br.ReadUInt32();
+        uint compSize   = br.ReadUInt32();
+        FileBounds.RequireLengthFits(compSize, fs.Length - fs.Position, "Trace index", filePath);
+        FileBounds.RequireLengthFits(uncompSize, MaxBlockBytes, "Trace index uncompressed", filePath);
+
+        byte[]  comp   = ArrayPool<byte>.Shared.Rent((int)compSize);
+        byte[]? rawBuf = null;
+        try
+        {
+            fs.ReadExactly(comp, 0, (int)compSize);
+            int rawLen = LZ4Pickler.UnpickledSize(comp.AsSpan(0, (int)compSize));
+            if (rawLen > MaxBlockBytes)
+                throw new InvalidDataException($"Trace index decompresses to {rawLen} bytes in {filePath}");
+
+            rawBuf = ArrayPool<byte>.Shared.Rent(rawLen);
+            LZ4Pickler.Unpickle(comp.AsSpan(0, (int)compSize), rawBuf.AsSpan(0, rawLen));
+            ReadOnlySpan<byte> raw = rawBuf.AsSpan(0, rawLen);
+
+            int pos = 0;
+            uint traceCount = BinaryPrimitives.ReadUInt32LittleEndian(raw[pos..]); pos += 4;
+            // A trace costs 16 bytes of id plus a 4-byte count at the very least, so the block
+            // cannot honestly describe more than it has room for.
+            FileBounds.RequireCountFits(traceCount, raw.Length - pos, 20, "Trace index", filePath);
+
+            for (uint i = 0; i < traceCount; i++)
+            {
+                var candidate = TraceId.Parse(raw.Slice(pos, 16)); pos += 16;
+                uint offsetCnt = BinaryPrimitives.ReadUInt32LittleEndian(raw[pos..]); pos += 4;
+                FileBounds.RequireCountFits(offsetCnt, raw.Length - pos, 4, "Trace index", filePath);
+
+                var offsets = new List<uint>(FileBounds.PreallocFor(offsetCnt, sizeof(uint)));
+                for (uint j = 0; j < offsetCnt; j++)
+                {
+                    offsets.Add(BinaryPrimitives.ReadUInt32LittleEndian(raw[pos..]));
+                    pos += 4;
+                }
+                // A trace id repeated in one index is not expected, but merging rather than
+                // overwriting is the only version that cannot lose spans if it ever happens.
+                if (map.TryGetValue(candidate, out var already)) already.AddRange(offsets);
+                else map[candidate] = offsets;
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(comp);
+            if (rawBuf is not null) ArrayPool<byte>.Shared.Return(rawBuf);
+        }
+
+        return map;
+    }
+
     private static List<uint> ReadTraceOffsets(string filePath, TraceId traceId)
     {
         using var fs = OpenRead(filePath);

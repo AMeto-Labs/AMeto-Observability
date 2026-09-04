@@ -93,6 +93,18 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     internal (int Runs, long RetainedBytes) IndexStatsForTest => _index.Stats;
 
     /// <summary>
+    /// The rollback, exercised: withdraw every claim of coverage and close every run. Costs speed
+    /// and nothing else — no span is rewritten, no <c>.trc</c> is opened, and the next lookup is
+    /// the scan this engine did before the index existed.
+    /// </summary>
+    internal void DisableTraceIndexForTest()
+    {
+        var paths = _manifest.Runs.Select(r => r.FilePath).ToList();
+        _manifest.ClearCoverage();
+        _index.Remove(paths);
+    }
+
+    /// <summary>
     /// Counts what the last trace lookup actually did, so a test can prove the index SAVED the
     /// work rather than merely returned the right answer. A correct-but-still-scanning index is
     /// the failure this whole branch exists to avoid, and it is invisible from the result.
@@ -1719,6 +1731,88 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
 
     /// <summary>The <c>.tix</c> that sits beside a segment: same base name, different extension.</summary>
     private static string IndexPathFor(string trcPath) => Path.ChangeExtension(trcPath, ".tix");
+
+    /// <summary>
+    /// Segments the backfill has tried and failed on. Without it a segment whose index cannot be
+    /// read is picked again on every pass, for ever, at whatever rate the worker runs.
+    /// </summary>
+    private readonly HashSet<ulong> _backfillFailed = new();
+
+    /// <summary>How much of the cold tier the trace-id index answers for.</summary>
+    internal (int Covered, int Total) IndexCoverage
+    {
+        get
+        {
+            var segs = _coldSegments;
+            int covered = 0;
+            foreach (var s in segs)
+                if (s.SegmentId != 0 && _manifest.IsCovered(s.SegmentId)) covered++;
+            return (covered, segs.Length);
+        }
+    }
+
+    /// <summary>
+    /// Indexes ONE segment that has no run yet, and returns whether it did any work.
+    ///
+    /// <para>ONE AT A TIME, ON PURPOSE. Building a run means reading a segment's whole trace index
+    /// — the expensive read this feature exists to abolish — so the backfill is the one place that
+    /// still pays it. Paid once per segment in the background it buys every later lookup; paid for
+    /// forty segments in a row on a 512 MB box it competes with ingest. The caller decides the
+    /// pace; this method decides nothing but which segment is next.</para>
+    ///
+    /// <para>The order is: build the run, fsync it, rename it, and only THEN claim coverage. A
+    /// crash anywhere before the last step costs a rebuilt run. The other order would leave a
+    /// segment the index is trusted for with nothing behind the trust.</para>
+    /// </summary>
+    internal bool BackfillNextSegment(CancellationToken ct = default)
+    {
+        var segs = _coldSegments;
+        SpanSegmentInfo? next = null;
+        foreach (var s in segs)
+        {
+            if (s.SegmentId == 0 || _manifest.IsCovered(s.SegmentId)) continue;
+            lock (_backfillFailed) { if (_backfillFailed.Contains(s.SegmentId)) continue; }
+            next = s;
+            break;
+        }
+        if (next is null) return false;
+
+        ct.ThrowIfCancellationRequested();
+        try
+        {
+            var map = SpanReader.ReadTraceIndex(next.FilePath);
+            if (map.Count == 0)
+            {
+                // A v2 segment, or one with no traces. Nothing to index and nothing to retry —
+                // compaction migrates v2 to v3 in the background and it becomes eligible then.
+                lock (_backfillFailed) _backfillFailed.Add(next.SegmentId);
+                return true;
+            }
+
+            var run = WriteIndexRun(next, next.SegmentId, map);
+            if (run is not { } r)
+            {
+                lock (_backfillFailed) _backfillFailed.Add(next.SegmentId);
+                return true;
+            }
+
+            _manifest.MarkCovered(next.SegmentId, r);
+            _index.Add(r);
+            _logger.LogDebug("Trace index backfilled {File}: {Traces} traces",
+                Path.GetFileName(next.FilePath), map.Count);
+            return true;
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            // Nothing here may cost the engine anything. The segment stays readable and uncovered,
+            // and is not tried again — a file whose index will not parse will not parse next time.
+            lock (_backfillFailed) _backfillFailed.Add(next.SegmentId);
+            _logger.LogWarning(ex,
+                "Trace index backfill skipped {File} — it stays queryable by scanning", next.FilePath);
+            return true;
+        }
+    }
 
     /// <summary>
     /// Writes the per-segment index run, or returns null when it cannot be written.

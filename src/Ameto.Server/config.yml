@@ -30,6 +30,27 @@ Ameto:
   # would stop the UI, /api, the live tail and the health check from answering.
   OtlpGrpcPort: 0
 
+  # ── Traces ───────────────────────────────────────────────────────────────────
+  Traces:
+    # Opening a trace has to find which segment holds it, and a trace id carries no time
+    # bounds — so before the trace-id index every segment was consulted, and consulting one
+    # meant reading and inflating its whole trace index (38% of the .trc). Measured on 168
+    # segments: 9 MB read and 12 MB inflated to return five spans.
+    #
+    # Segments written from now on are indexed as they are flushed, at no cost worth naming.
+    # This setting is only about the segments you ALREADY have:
+    #
+    #   Idle   (default) one segment at a time with a pause between. A week of hourly
+    #          segments finishes in a few minutes and never competes with a query.
+    #   Eager  as fast as the disk allows. Choose it if you want the fast path now and have
+    #          the headroom — indexing a segment reads that same 38%, once.
+    #   Off    leave existing segments alone.
+    #
+    # No value here can make an answer wrong. An unindexed segment is read exactly the way
+    # every segment was read before the index existed; the only difference is speed. An
+    # unrecognised value falls back to Idle rather than failing the start.
+    IndexBackfill: Idle
+
   # TLS — leave empty for plain HTTP
   SslCertPath: ""
   SslCertPassword: ""

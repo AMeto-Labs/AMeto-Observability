@@ -234,6 +234,20 @@ public sealed class LiveTailOptions
 /// <summary>
 /// Top-level server configuration.
 /// </summary>
+/// <summary>Distributed-tracing settings that an operator may want to touch.</summary>
+public sealed class TracesOptions
+{
+    /// <summary>
+    /// What to do about segments written before the trace-id index existed:
+    /// <c>Off</c>, <c>Idle</c> (default) or <c>Eager</c>.
+    ///
+    /// <para>A string rather than the enum itself so the YAML stays readable and an unknown value
+    /// degrades to the default instead of failing to bind — this is a performance switch, and a
+    /// typo in it must not stop the server from starting.</para>
+    /// </summary>
+    public string IndexBackfill { get; init; } = "Idle";
+}
+
 public sealed class ServerOptions
 {
     public NodeId           NodeId           { get; init; } = NodeId.Local;
@@ -246,6 +260,7 @@ public sealed class ServerOptions
     public RetentionConfig  Retention        { get; init; } = new();
     public UpdatesOptions   Updates          { get; init; } = new();
     public LoggingOptions   Logging          { get; init; } = new();
+    public TracesOptions    Traces           { get; init; } = new();
     public int              HttpPort         { get; init; } = 5341;
 
     /// <summary>
