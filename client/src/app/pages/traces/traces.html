@@ -23,8 +23,21 @@
           <button class="btn-apply" (click)="applyCustom()" [disabled]="!customFrom">Apply</button>
         </div>
       }
-      <div class="live-badge">
-        <span class="live-dot"></span>Live
+      <!-- One signal, two controls: the badge is a switch (pause / resume) and the menu beside
+           it picks the cadence. Its Off entry and the switch's off are the same state — both are
+           liveMs === 0 — so the two can never show different things. -->
+      <div class="live-group" [class.off]="!liveOn()">
+        <button type="button" class="live-toggle" role="switch"
+                [attr.aria-checked]="liveOn()" [title]="liveTitle()" (click)="toggleLive()">
+          <span class="live-dot"></span>{{ liveOn() ? 'Live' : 'Paused' }}
+        </button>
+        <select class="live-select" aria-label="Auto-refresh interval"
+                [title]="liveTitle()"
+                [ngModel]="liveMs()" (ngModelChange)="setLiveMs($event)">
+          @for (o of liveIntervals; track o.ms) {
+            <option [ngValue]="o.ms">{{ o.label }}</option>
+          }
+        </select>
       </div>
       <button class="icon-btn" [class.active]="historyOpen()" (click)="toggleHistory()" title="Search history">
         <lucide-icon name="history" [size]="14" />
@@ -283,8 +296,7 @@
                refresh that failed kept its half-answer to itself — so this may not be folded
                into a suffix that would call them partial. -->
           @if (bgRefreshFailing()) {
-            <span class="list-stale-hint"
-                  title="The 15-second live refresh keeps failing. The rows below are the last complete answer; Refresh runs the query again and will show the error if it fails.">
+            <span class="list-stale-hint" [title]="bgRefreshFailingTitle()">
               {{ bgRefreshHint() }}
             </span>
           }
@@ -323,9 +335,10 @@
       } @else {
         <!-- Virtualized (@tanstack/angular-virtual, the same one the Events list uses): only
              the rows in view plus a little overscan exist as elements, so a 2000-row answer
-             is ~25 rows of DOM and the 15 s refresh re-diffs the array without repainting a
-             list. `#traceRowEl` + `data-index` are what the component hands to
-             rowVirtualizer.measureElement — heights here are measured, not assumed. -->
+             is ~25 rows of DOM and the live refresh re-diffs the array without repainting a
+             list — which is also what makes a 1 s cadence affordable at all. `#traceRowEl` +
+             `data-index` are what the component hands to rowVirtualizer.measureElement —
+             heights here are measured, not assumed. -->
         <div #traceScroll class="trace-rows">
           <div class="trace-vspace" [style.height.px]="rowVirtualizer.getTotalSize()">
             @for (vRow of rowVirtualizer.getVirtualItems(); track vRow.key) {

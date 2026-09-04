@@ -92,13 +92,33 @@
 }
 .custom-sep { color: var(--text-muted); font-size: 12px; }
 
-.live-badge {
+/* Live switch + cadence menu. One bordered group, like .preset-group, because they are one
+   control: the state the switch shows is the state the menu selects. */
+.live-group {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 2px;
+}
+
+.live-toggle {
   display: flex;
   align-items: center;
   gap: 5px;
+  background: none;
+  border: none;
+  border-radius: 4px;
+  padding: 4px 8px;
   font-size: 12px;
-  color: var(--success);
   font-weight: 600;
+  color: var(--success);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+
+  &:hover { background: var(--bg-card); }
 }
 
 .live-dot {
@@ -107,6 +127,34 @@
   border-radius: 50%;
   background: var(--success);
   animation: live-pulse 1.6s ease-in-out infinite;
+  flex-shrink: 0;
+}
+
+.live-select {
+  height: 22px;
+  padding: 0 17px 0 6px;
+  background: transparent;
+  border: none;
+  border-left: 1px solid var(--border);
+  border-radius: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  outline: none;
+  cursor: pointer;
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%2394a3b8'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 4px center;
+
+  &:hover, &:focus { color: var(--text-primary); }
+  option { background: var(--bg-elevated); }
+}
+
+/* Paused. The dot stops MOVING as well as changing colour: an animation is what the eye reads
+   as "something is still arriving", and a grey pulse would go on saying it. */
+.live-group.off {
+  .live-toggle { color: var(--text-muted); }
+  .live-dot    { background: var(--text-muted); animation: none; }
 }
 
 @keyframes live-pulse {

@@ -281,7 +281,21 @@ internal static class MetricReader
     private static LabelSet ReadLabels(ref MessagePackReader r)
     {
         int count = r.ReadMapHeader();
-        var pairs = new List<KeyValuePair<string, string>>(count);
+        // THE SAME RULE AS EVERY OTHER READER HERE, and this site went four rounds without it for a
+        // reason worth naming: the convention test that enforces the rule could not SEE this line.
+        // Its pattern read a generic argument list with `[^>]*`, which stops at the first `>`, so
+        // `List<KeyValuePair<string, string>>` matched nothing at all — the file was scanned, the
+        // shape was there, and the scanner walked past it. That blindness is fixed in
+        // FileBoundsConventionTests; this is the allocation it was hiding.
+        //
+        // Two bounds, two questions. Could the file hold this many pairs — a pair is two msgpack
+        // strings and the shortest legal one is a byte each, so two bytes on disk. And what may be
+        // reserved up front for a count that passes: a map header torn to int.MaxValue was believed
+        // whole and asked for 2.1 billion slots, 34 GB of references, before one pair was read.
+        FileBounds.RequireCountFits(count, r.Sequence.Length - r.Consumed,
+            fileBytesPerElement: 2, "Label set", "the series block");
+        int cap   = FileBounds.PreallocFor(count, heapBytesPerElement: 16);
+        var pairs = new List<KeyValuePair<string, string>>(cap);
         for (int i = 0; i < count; i++)
         {
             var k = r.ReadString() ?? string.Empty;

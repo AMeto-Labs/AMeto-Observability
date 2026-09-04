@@ -1530,9 +1530,47 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             }
             catch (Exception ex)
             {
-                // v1 files (12-byte footer) will fail with wrong footer magic — delete them.
-                _logger.LogWarning(ex, "Unreadable segment {File} — deleting (likely format v1)", file);
-                DeleteSegmentFiles(file);
+                // CONTENT-SHAPED DAMAGE — the catch above has already ruled out everything that is
+                // about the MACHINE rather than the file. v1 segments (12-byte footer) land here on
+                // the footer magic, and deleting them is the migration path they have always had.
+                //
+                // WHAT WAS MISSING IS THE RECORD. Deleting is a decision about disk; it is also, and
+                // silently, a decision about every answer this process will ever give. The window
+                // the file covered is now on no disk at all, so every later page over that band
+                // reads out every file that still exists and makes the strong positive claim that
+                // it read the window — `done {"complete":true}`. That claim is exactly what
+                // VanishedRegionLog was added in this same branch to make impossible, and the query
+                // path was taught it while the startup path went on destroying data behind its back.
+                //
+                // The range comes from the 27-byte header, which is intact in every version this
+                // engine has written and is readable even when the rest of the file is not — see
+                // SpanReader.TryReadHeaderRange. Recorded BEFORE the delete, because after it there
+                // is nothing left to ask.
+                if (SpanReader.TryReadHeaderRange(file, out long minNano, out long maxNano))
+                {
+                    _vanished.Record(minNano, maxNano);
+                    _vanished.RecordPath(file);
+                    _logger.LogWarning(ex,
+                        "Unreadable segment {File} — deleting (likely format v1). The window "
+                      + "[{MinNano}, {MaxNano}] it covered is recorded as unreadable, so queries over "
+                      + "that range will report truncation rather than claim to be complete",
+                        file, minNano, maxNano);
+                    DeleteSegmentFiles(file);
+                }
+                else
+                {
+                    // NOT BEING ABLE TO RECORD A LOSS IS NOT A LICENCE TO CAUSE ONE. Without a range
+                    // the deletion would be unreportable: no region to overlap, no path to classify,
+                    // and every later window silently whole. The file stays, and the process-wide
+                    // flag says the cold tier is short — which is loud, recoverable by a restart
+                    // once someone moves the file, and true.
+                    _coldTierIncomplete = true;
+                    _logger.LogError(ex,
+                        "Segment {File} is unreadable AND its header range cannot be read, so deleting "
+                      + "it would lose a window nothing could report. It is left on disk and excluded "
+                      + "from this run's cold tier; every trace query will report an unreadable region "
+                      + "until the file is moved aside and the service restarted", file);
+                }
             }
         }
 

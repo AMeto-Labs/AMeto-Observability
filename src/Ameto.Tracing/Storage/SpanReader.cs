@@ -161,6 +161,51 @@ internal static class SpanReader
     }
 
     /// <summary>
+    /// The declared time range of a segment whose FULL read has already failed — the last thing
+    /// worth asking a file that is about to be destroyed.
+    ///
+    /// <para>WHY IT IS NOT <see cref="ReadSegmentInfo"/>. That method answers "can this segment be
+    /// served?", and everything it reads after the header — the footer magic, the service index —
+    /// is part of that answer. This one answers a different and much smaller question: "what band
+    /// of time am I about to delete?", and the only bytes that bear on it are the two fields at
+    /// offsets 10 and 18. A v1 file fails <c>ReadSegmentInfo</c> at the VERSION CHECK, four bytes
+    /// before it would have read them, which is exactly the case that mattered — the caller was
+    /// deleting v1 segments with no idea what they held.</para>
+    ///
+    /// <para>Version is deliberately not checked. The 27-byte header has had this layout in every
+    /// version this engine has ever written (v1 differed in the footer), so the range is readable
+    /// from a file whose version this build refuses to serve — which is the point. The magic IS
+    /// checked: without it there is no reason to believe offset 10 is a timestamp at all, and a
+    /// range invented from arbitrary bytes is worse than admitting ignorance.</para>
+    /// </summary>
+    /// <returns>
+    /// False when the file cannot be read, is too short, or is not a <c>.trc</c> at all — the
+    /// caller must then treat the loss as unquantifiable, NOT as nothing.
+    /// </returns>
+    public static bool TryReadHeaderRange(string filePath, out long minNano, out long maxNano)
+    {
+        minNano = maxNano = 0;
+        try
+        {
+            using var fs = OpenRead(filePath);
+            Span<byte> head = stackalloc byte[26];   // magic..maxNano; flags is not needed
+            fs.ReadExactly(head);
+
+            if (BinaryPrimitives.ReadUInt32LittleEndian(head) != Magic) return false;
+
+            minNano = BinaryPrimitives.ReadInt64LittleEndian(head[10..]);
+            maxNano = BinaryPrimitives.ReadInt64LittleEndian(head[18..]);
+            return true;
+        }
+        catch
+        {
+            // Every reason this can fail — gone, locked, truncated, not a segment — means the same
+            // thing to the caller, and it is the caller that decides what to do about it.
+            return false;
+        }
+    }
+
+    /// <summary>
     /// How far past a file's own write time a header may claim before it is called suspect. A day
     /// absorbs an exporter clocked ahead and a host that drifted; it is nowhere near the 86 054
     /// days a torn field produces.
@@ -306,6 +351,23 @@ internal static class SpanReader
             uint uncompSize = br.ReadUInt32();
             uint compSize   = br.ReadUInt32();
 
+            // BEFORE THE FORK, NOT AFTER IT, and that placement is the whole guard. compSize is the
+            // stride of BOTH exits from this header: the read below rents it, and the skip below
+            // SEEKS it. Checked only on the read path, a torn compSize in a block the geometry pass
+            // steps over lands the position past the end of the file or in the middle of a
+            // neighbour — the `fs.Position < traceIdxOffset` test then ends the walk early and the
+            // caller gets a SHORT ANSWER reported as a whole one, which is the silent-loss shape
+            // this file has been closing all along, arrived at through the one door that skips.
+            // One check above the fork also cannot be walked around by a branch added later.
+            //
+            // AGAINST THE FILE, NOT AGAINST A CONSTANT. MaxBlockBytes stopped a garbage prefix from
+            // asking for gigabytes; it did nothing about a 3.5 KB file asking for 64 MB, which one
+            // flipped byte inside a real compSize produces. This shape sits on the trace lookup, the
+            // detail view and the SSE list, and GetTraceAsync fans it eight ways — half a gigabyte
+            // from one click on the 512 MB box this branch exists to keep alive. The bytes actually
+            // left in the file are the bound the file cannot forge.
+            FileBounds.RequireLengthFits(compSize, fs.Length - fs.Position, $"Block {blockIdx}", filePath);
+
             if (useBlockGeometry)
             {
                 blockFirst = (long)blockIdx * V3BlockSpans;
@@ -318,14 +380,8 @@ internal static class SpanReader
                 if (offsets[want] < blockFirst) return null; // an offset no block can hold
             }
 
-            // AGAINST THE FILE, NOT AGAINST A CONSTANT. MaxBlockBytes stopped a garbage prefix from
-            // asking for gigabytes; it did nothing about a 3.5 KB file asking for 64 MB, which one
-            // flipped byte inside a real compSize produces. This shape sits on the trace lookup, the
-            // detail view and the SSE list, and GetTraceAsync fans it eight ways — half a gigabyte
-            // from one click on the 512 MB box this branch exists to keep alive. The bytes actually
-            // left in the file are the bound the file cannot forge; the uncompressed size still
-            // needs the constant, because nothing on disk bounds what a payload decompresses to.
-            FileBounds.RequireLengthFits(compSize, fs.Length - fs.Position, $"Block {blockIdx}", filePath);
+            // Stays on the read path: nothing on disk bounds what a payload decompresses to, so this
+            // one needs the constant — and a block nobody decompresses cannot spend that memory.
             FileBounds.RequireLengthFits(uncompSize, MaxBlockBytes, $"Block {blockIdx} uncompressed", filePath);
 
             byte[]  comp   = ArrayPool<byte>.Shared.Rent((int)compSize);
@@ -786,6 +842,21 @@ internal static class SpanReader
             uint uncompSize = br.ReadUInt32();
             uint compSize   = br.ReadUInt32();
 
+            // BEFORE THE FORK, NOT AFTER IT — see the twin loop above for the argument in full.
+            // The skip is not the cheap path here, it is the MAIN path: `allowedBlocks` is what the
+            // bloom filter produces, so on a selective TraceQL search almost every block goes past
+            // the seek and almost none go past the read. A bound that only stands on the read path
+            // is therefore a bound on the rare case; the filtered search this whole index exists
+            // for ran unchecked.
+            //
+            // AGAINST THE FILE, NOT AGAINST A CONSTANT. MaxBlockBytes stopped a garbage prefix from
+            // asking for gigabytes; it did nothing about a 3.5 KB file asking for 64 MB, which one
+            // flipped byte inside a real compSize produces. This shape sits on the trace lookup, the
+            // detail view and the SSE list, and GetTraceAsync fans it eight ways — half a gigabyte
+            // from one click on the 512 MB box this branch exists to keep alive. The bytes actually
+            // left in the file are the bound the file cannot forge.
+            FileBounds.RequireLengthFits(compSize, fs.Length - fs.Position, $"Block {blockIdx}", filePath);
+
             if (allowedBlocks is not null && !allowedBlocks.Contains(blockIdx))
             {
                 // Skip decompression + deserialization — pure seek, O(1).
@@ -795,14 +866,8 @@ internal static class SpanReader
                 continue;
             }
 
-            // AGAINST THE FILE, NOT AGAINST A CONSTANT. MaxBlockBytes stopped a garbage prefix from
-            // asking for gigabytes; it did nothing about a 3.5 KB file asking for 64 MB, which one
-            // flipped byte inside a real compSize produces. This shape sits on the trace lookup, the
-            // detail view and the SSE list, and GetTraceAsync fans it eight ways — half a gigabyte
-            // from one click on the 512 MB box this branch exists to keep alive. The bytes actually
-            // left in the file are the bound the file cannot forge; the uncompressed size still
-            // needs the constant, because nothing on disk bounds what a payload decompresses to.
-            FileBounds.RequireLengthFits(compSize, fs.Length - fs.Position, $"Block {blockIdx}", filePath);
+            // Stays on the read path: nothing on disk bounds what a payload decompresses to, so this
+            // one needs the constant — and a block nobody decompresses cannot spend that memory.
             FileBounds.RequireLengthFits(uncompSize, MaxBlockBytes, $"Block {blockIdx} uncompressed", filePath);
 
             // Cleared BEFORE the decode, so the previous block's records are unrooted while

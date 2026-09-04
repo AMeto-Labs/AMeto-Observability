@@ -87,6 +87,13 @@ public sealed class FileBoundsConventionTests
             "len is refused above 8 MiB two lines above, and one record is read at a time",
         ["MetricStorageEngine.cs:: new HashSet<SeriesKey>(keys.GetRange(off, take))"] =
             "a slice of an in-memory list",
+        // Found the moment the scan learned to read nested generics — the SECOND site that shape
+        // was hiding, after MetricReader.ReadLabels, which is the reason the blindness mattered.
+        // This one turns out to be sound; the point is that nobody could have said so before.
+        ["MetricStorageEngine.cs:var acc = new Dictionary<SeriesKey, List<MetricDataPoint>>(take)"] =
+            "take is Math.Min(SeriesChunk, keys.Count - off) on the line above — the chunk size "
+          + "this process chose, over an in-memory key list; the HashSet exempted just above is "
+          + "the same `take`",
         ["MetricStorageEngine.cs:var copy = new List<MetricDataPoint>(_points)"] =
             "a copy of an in-memory list",
     };
@@ -101,13 +108,42 @@ public sealed class FileBoundsConventionTests
         "MaxTotalBytes",
     ];
 
-    /// <summary>Where an allocation's size argument STARTS. The argument itself is read with a
-    /// bracket counter rather than a regex, because a greedy pattern swallowed past the closing
-    /// bracket and a lazy one stopped inside a cast — both reported nonsense as the size.</summary>
-    private static readonly Regex AllocOpen = new(
-        @"(?:ArrayPool<\w+>\.Shared\.Rent|new\s+(?:\w+\.)*(?!(?:Span|ReadOnlySpan|Memory|ReadOnlyMemory|ArraySegment|KeyValuePair|MessagePackReader|SequenceReader|Nullable)\b)\w+<[^>]*>|\.ReadBytes)\s*\(" +
-        @"|new\s+\w+(?:<[^>]*>)?\s*\[",
+    /// <summary>
+    /// The HEAD of an allocation — up to but not including the bracket its size sits in. Both the
+    /// generic argument list and the size argument are then read with counters, not patterns.
+    ///
+    /// <para>THE GENERIC LIST USED TO BE PART OF THIS PATTERN, AS <c>&lt;[^&gt;]*&gt;</c>, AND
+    /// THAT IS A HOLE WITH A NAME. <c>[^&gt;]*</c> stops at the first <c>&gt;</c>: given
+    /// <c>new List&lt;KeyValuePair&lt;string, string&gt;&gt;(count)</c> it consumed
+    /// <c>KeyValuePair&lt;string, string</c>, matched the first <c>&gt;</c>, then demanded a
+    /// <c>(</c> and found the second <c>&gt;</c> — so an allocation whose type argument is itself
+    /// generic did not match AT ALL. Not a corner case: it is the exact shape of
+    /// <c>MetricReader.ReadLabels</c>, whose capacity came straight off a msgpack map header, in a
+    /// directory <see cref="ScannedDirs"/> walks. The file was read, the shape was in it, and this
+    /// scan reported nothing — for four rounds, while its own doc comment claimed the coverage.
+    /// The lesson is the one already written above <see cref="BracketedArgument"/>: nesting is not
+    /// a regular language, and every attempt to spell it as one has missed a real allocation.</para>
+    /// </summary>
+    private static readonly Regex AllocHead = new(
+        @"\bArrayPool<\w+>\.Shared\.Rent(?=\s*\()"
+      + @"|\.ReadBytes(?=\s*\()"
+      + @"|\bnew\s+(?:\w+\.)*(?<type>\w+)",
         RegexOptions.Compiled);
+
+    /// <summary>
+    /// Types whose CONSTRUCTOR allocates nothing — a view over memory that already exists, or a
+    /// value type built from its parts.
+    ///
+    /// <para>Consulted at the constructor case only, never in the pattern, which is where it used
+    /// to live. <c>new Span&lt;byte&gt;(ptr, 16)</c> is a view; <c>new KeyValuePair&lt;string,
+    /// string&gt;[n]</c> is still an array of n, and excluding the type outright would have waved
+    /// it through.</para>
+    /// </summary>
+    private static readonly HashSet<string> ViewNotAllocation = new(StringComparer.Ordinal)
+    {
+        "Span", "ReadOnlySpan", "Memory", "ReadOnlyMemory", "ArraySegment",
+        "KeyValuePair", "MessagePackReader", "SequenceReader", "Nullable",
+    };
 
     /// <summary>A size read straight out of the file on the same line — unbounded by construction.</summary>
     private static readonly Regex InlineRead = new(
@@ -177,6 +213,69 @@ public sealed class FileBoundsConventionTests
             $"{offenders.Count} allocation(s) are sized by something that may have come out of a file, "
           + "with no bound naming it. Bound it with FileBounds, or add it to ExemptSite WITH A "
           + "REASON:" + Environment.NewLine + string.Join(Environment.NewLine, offenders));
+    }
+
+    /// <summary>
+    /// Every allocation on this line, given as the index of the bracket its size sits in — a
+    /// <c>(</c> for a constructor or a <c>Rent</c>, a <c>[</c> for an array.
+    /// </summary>
+    private static IEnumerable<int> AllocationSizeBrackets(string line)
+    {
+        foreach (Match m in AllocHead.Matches(line))
+        {
+            int  at      = SkipSpace(line, m.Index + m.Length);
+            bool generic = false;
+
+            // The generic argument list, COUNTED. This is the step the old pattern could not take.
+            if (at < line.Length && line[at] == '<')
+            {
+                int close = MatchingAngle(line, at);
+                if (close < 0) continue;            // not a type list, or it wraps — say nothing
+                at      = SkipSpace(line, close + 1);
+                generic = true;
+            }
+
+            if (at >= line.Length) continue;
+            if (line[at] == '[') { yield return at; continue; }   // an array is an allocation, always
+            if (line[at] != '(') continue;                        // `new Foo { … }`, a bare `new Foo`, …
+
+            var type = m.Groups["type"];
+            if (!type.Success) { yield return at; continue; }     // a Rent or a ReadBytes
+
+            // A CONSTRUCTOR COUNTS ONLY WHEN IT IS GENERIC, which is the one restriction the old
+            // pattern got right and worth keeping deliberately rather than by accident: the
+            // collections that take a capacity — List<T>, Dictionary<K,V>, HashSet<T> — are
+            // generic, and everything else with a first argument is a `new BinaryReader(fs)` or a
+            // `new InvalidDataException($"…")`. Dropping this turned 102 constructors into
+            // "allocations sized by something from a file" and buried the two that were.
+            if (!generic) continue;
+            if (ViewNotAllocation.Contains(type.Value)) continue;
+            yield return at;
+        }
+    }
+
+    private static int SkipSpace(string s, int i)
+    {
+        while (i < s.Length && char.IsWhiteSpace(s[i])) i++;
+        return i;
+    }
+
+    /// <summary>
+    /// The <c>&gt;</c> closing the <c>&lt;</c> at <paramref name="open"/>, or -1 when there is
+    /// none on this line. Bails out on a character no type argument list contains, so a stray
+    /// <c>&lt;</c> cannot make the walk run to the end of the line and report nonsense.
+    /// </summary>
+    private static int MatchingAngle(string s, int open)
+    {
+        int depth = 0;
+        for (int k = open; k < s.Length; k++)
+        {
+            char c = s[k];
+            if (c == '<') depth++;
+            else if (c == '>') { if (--depth == 0) return k; }
+            else if (c is '(' or ')' or ';' or '{' or '}' or '=') return -1;
+        }
+        return -1;
     }
 
     /// <summary>The text between a bracket at <paramref name="open"/> and its match.</summary>
@@ -254,9 +353,9 @@ public sealed class FileBoundsConventionTests
             foreach (Match nm in NarrowLocal.Matches(line))
                 narrow.Add(nm.Groups[1].Success ? nm.Groups[1].Value : nm.Groups[2].Value);
 
-            foreach (Match m in AllocOpen.Matches(line))
+            foreach (int open in AllocationSizeBrackets(line))
             {
-                string? arg = BracketedArgument(line, m.Index + m.Length - 1);
+                string? arg = BracketedArgument(line, open);
                 if (arg is null) continue;
                 arg = arg.Trim();
                 if (arg.Length == 0) continue;              // no size argument at all
@@ -289,11 +388,14 @@ public sealed class FileBoundsConventionTests
     }
 
     /// <summary>
-    /// The six shapes an unbounded allocation actually takes in this codebase. Five of them used
-    /// to walk straight through: the scan could not see array allocations AT ALL (the pattern
-    /// consumed the bracket and then demanded a second one), a qualified type name hid a List,
-    /// and a bound was accepted for merely sharing a line with the identifier it never covered.
-    /// Each entry is a line the scan MUST report; the paired negatives are lines it must not.
+    /// The shapes an unbounded allocation actually takes in this codebase. Most of them used to
+    /// walk straight through: the scan could not see array allocations AT ALL (the pattern
+    /// consumed the bracket and then demanded a second one), a qualified type name hid a List, a
+    /// bound was accepted for merely sharing a line with the identifier it never covered — and, up
+    /// to this round, a NESTED GENERIC was invisible, which is how the metric reader's
+    /// <c>List&lt;KeyValuePair&lt;string, string&gt;&gt;(count)</c> sat inside a scanned directory
+    /// being reported by nobody. Each entry is a line the scan MUST report; the paired negatives
+    /// are lines it must not.
     /// </summary>
     [Fact]
     public void The_scan_still_sees_the_shapes_that_once_walked_past_it()
@@ -307,6 +409,17 @@ public sealed class FileBoundsConventionTests
           + "        var d = new System.Collections.Generic.List<uint>((int)n);",
             "        uint cnt = br.ReadUInt32();\n        var e = new string[cnt];",
             "        int m = br.ReadInt32();\n        var f = new Dictionary<string, int>(m);",
+            // The nested generic. Exactly MetricReader.ReadLabels as it stood, and invisible to
+            // every version of this scan before the angle brackets were counted.
+            "        int count = r.ReadMapHeader();\n"
+          + "        var pairs = new List<KeyValuePair<string, string>>(count);",
+            // Two levels down, and qualified: the counter has to hold for both.
+            "        int c2 = r.ReadMapHeader();\n"
+          + "        var deep = new System.Collections.Generic.List<Dictionary<string, List<int>>>(c2);",
+            // An ARRAY of a type the constructor exclusions name. `new KeyValuePair<..>(k, v)`
+            // allocates nothing; `new KeyValuePair<..>[n]` allocates n of them, and folding the
+            // exclusion into the pattern (where it used to live) waved this through.
+            "        uint kn = br.ReadUInt32();\n        var kvs = new KeyValuePair<string, string>[kn];",
         ];
 
         string[] mustNotFlag =
@@ -322,6 +435,14 @@ public sealed class FileBoundsConventionTests
           + "        var l = new string[q];",
             "        var m2 = new double[FileBounds.PreallocFor(cnt, heapBytesPerElement: 8)];",
             "        var n2 = new Span<byte>(ptr, 16);",
+            // The nested generic, bounded — the fix for the flagged shape above must be accepted,
+            // or the scan has only moved the problem from silence to noise.
+            "        int count = r.ReadMapHeader();\n"
+          + "        FileBounds.RequireCountFits(count, r.Sequence.Length - r.Consumed, 2, \"x\", \"y\");\n"
+          + "        int cap = FileBounds.PreallocFor(count, heapBytesPerElement: 16);\n"
+          + "        var pairs = new List<KeyValuePair<string, string>>(cap);",
+            // Building one pair is not allocating a collection of them.
+            "        pairs.Add(new KeyValuePair<string, string>(k, v));",
         ];
 
         foreach (string shape in mustFlag)

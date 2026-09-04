@@ -3,7 +3,7 @@ import {
   OnDestroy, HostListener, ChangeDetectionStrategy, ChangeDetectorRef,
   viewChild, viewChildren, afterRenderEffect,
 } from '@angular/core';
-import { injectVirtualizer } from '@tanstack/angular-virtual';
+import { injectVirtualizer, measureElement as measureRenderedElement, type Virtualizer } from '@tanstack/angular-virtual';
 import { Observable, Subscription } from 'rxjs';
 import { Router, ActivatedRoute } from '@angular/router';
 import { FormsModule } from '@angular/forms';
@@ -42,6 +42,25 @@ import { SearchHistoryService } from '../../core/services/search-history.service
  * range chip, a seek from the property menu, and the page's first load.
  */
 export type LoadOrigin = 'user' | 'background';
+
+/**
+ * The cadences the Live control offers, in milliseconds — 0 is off.
+ *
+ * <p>One list, used three ways: it fills the menu, it is what a restored URL or a stored
+ * preference is checked against, and it is the only place a new cadence has to be added. A
+ * value that is not on it never reaches {@link TracesComponent.liveMs} — the page would poll
+ * happily at ?live=7000 from a hand-edited URL, but the menu could not show what it was doing,
+ * and a control that cannot describe its own state is worse than a fixed cadence.</p>
+ */
+export const LIVE_INTERVALS: readonly { ms: number; label: string }[] = [
+  { ms: 0,      label: 'Off' },
+  { ms: 1_000,  label: '1s'  },
+  { ms: 3_000,  label: '3s'  },
+  { ms: 5_000,  label: '5s'  },
+  { ms: 10_000, label: '10s' },
+  { ms: 15_000, label: '15s' },
+  { ms: 30_000, label: '30s' },
+];
 
 /**
  * How the last stream that owned the list ended, in the only vocabulary the header speaks.
@@ -198,7 +217,7 @@ export class TracesComponent implements OnInit, OnDestroy {
   customTo           = '';
 
   /** Stable query window driving the Graph / Latency panels. Set on user action only, so the
-   *  15 s live poll never changes it → those panels don't re-fetch/re-layout (no jumping). */
+   *  live poll never changes it → those panels don't re-fetch/re-layout (no jumping). */
   readonly winFrom     = signal<string>('');
   readonly winTo       = signal<string | undefined>(undefined);
   /** Full service list from the backend (not just services present in loaded traces). */
@@ -444,18 +463,50 @@ export class TracesComponent implements OnInit, OnDestroy {
    *  refresh affordable: re-streaming 2000 rows re-diffs 2000 array entries but touches ~200
    *  elements. Raising this costs memory and wire time, not paint. */
   readonly streamMax = 2000;
-  /** Consecutive failures of the BACKGROUND refresh (the 15 s poll). A user-initiated search
+  /** Consecutive failures of the BACKGROUND refresh (the live poll). A user-initiated search
    *  never lands here — it gets the banner instead. Zeroed by any complete stream and by any
    *  search the user runs, so it only ever counts an unbroken run. */
   private readonly bgFailures = signal(0);
-  /** The live-refresh cadence, and the unit the background backoff is measured in. */
-  private static readonly PollMs = 15_000;
+  /** The cadence the page falls back to when nothing has been chosen — what the poll ran at
+   *  unconditionally before the Live control existed, so an untouched page behaves exactly as
+   *  it always did (and the two poll specs still tick at 15 s). */
+  private static readonly DefaultLiveMs = 15_000;
+  /** Where the chosen cadence outlives the URL. The URL stays the authority — a link may hand
+   *  someone a paused page on purpose — and this is only what a URL that says nothing falls
+   *  back to, so a 30 s choice survives clicking Traces in the sidebar again. */
+  private static readonly LiveKey = 'ameto-traces-live-ms';
+  /**
+   * The live-refresh cadence in ms, and the WHOLE of the Live control's state: 0 is off.
+   *
+   * <p>One signal, not a boolean beside a number, because the pair can hold states the page has
+   * no behaviour for: "live on at 0 ms" and "live off at 15 s" are both expressible and neither
+   * means anything. The toggle is therefore a shortcut between two values of this one signal
+   * (see {@link toggleLive}), and the menu's Off entry IS the toggle's off — two controls over
+   * one signal cannot drift apart, which is the only reason it is safe to ship both.</p>
+   */
+  readonly liveMs = signal(TracesComponent.DefaultLiveMs);
+  /** Whether anything refreshes itself at all. Read by poll() — both its callers land there —
+   *  and by the header, which may not say the refresh is failing when there is no refresh. */
+  readonly liveOn = computed(() => this.liveMs() > 0);
+  /** The cadence the toggle switches back ON to: the last one that was actually live. Kept off
+   *  {@link liveMs} because pausing must not destroy the choice underneath it — resuming a 30 s
+   *  page at 15 s would be the control changing a setting the user never touched. */
+  private lastLiveMs = TracesComponent.DefaultLiveMs;
   /** No two background refreshes closer together than this, whoever asked. poll() has TWO
-   *  callers and only one of them is a clock: the 15 s timer paces itself, the visibility
-   *  handler fires as fast as the user alt-tabs. Well under PollMs, so the scheduled cadence
-   *  never trips it — this is a floor on bursts, not a second schedule. Without it, eight
-   *  returns to the tab in five seconds were eight stats queries. */
+   *  callers and only one of them is a clock: the timer paces itself, the visibility handler
+   *  fires as fast as the user alt-tabs. A floor on BURSTS, not a second schedule — which is
+   *  exactly why {@link bgFloorMs} caps it by the cadence in force: a fixed 5 s floor over a
+   *  1 s cadence is not a burst guard, it is a 1 s menu entry that quietly runs at 5 s, i.e. a
+   *  page lying about what it is doing. Without any floor, eight returns to the tab in five
+   *  seconds were eight stats queries. */
   private static readonly BgFloorMs = 5_000;
+  /** The burst floor as it applies to the cadence in force — never longer than the interval
+   *  the user asked for, so every scheduled tick gets through and only the EXTRA callers are
+   *  throttled. (Live off: no tick to let through, and the constant is as good as any.) */
+  private bgFloorMs(): number {
+    const live = this.liveMs();
+    return live > 0 ? Math.min(TracesComponent.BgFloorMs, live) : TracesComponent.BgFloorMs;
+  }
   /** Earliest epoch-ms at which poll() may do any background work at all (see BgFloorMs). */
   private nextBgPollAt = 0;
   /** A load the USER asked for that the list could not run, because the list was not the panel
@@ -471,9 +522,9 @@ export class TracesComponent implements OnInit, OnDestroy {
    *  in the same step. */
   private pendingUserLoad = false;
   /** Earliest epoch-ms at which the background LIST refresh may be attempted again after a
-   *  failure. Grows 1 → 2 → 4 → 8 poll intervals with the failure count (15 s → 2 min):
-   *  re-firing a doomed query every 15 s for as long as the page is open is not a retry
-   *  policy.
+   *  failure. Grows 1 → 2 → 4 → 8 backoff units with the failure count (see
+   *  {@link backoffUnitMs} — 15 s → 2 min at the default cadence): re-firing a doomed query
+   *  every tick for as long as the page is open is not a retry policy.
    *
    *  A TIMESTAMP, not a countdown of ticks, and that is the whole point. A counter spent one
    *  unit per CALL to poll(), and poll() has two callers — so every hidden→visible transition
@@ -487,10 +538,22 @@ export class TracesComponent implements OnInit, OnDestroy {
   /** When the list last took delivery of a COMPLETE answer. Read only by bgRefreshHint(), to
    *  date the rows on screen when the refresh behind them has stopped working. */
   private readonly listLoadedAt = signal<number | null>(null);
-  /** A background refresh has failed three times running (~45 s), so the list is no longer
-   *  live and the user is owed that fact. Three, not one: a single dropped tick is noise.
-   *  Suppressed while the list is held, where the header is already explaining itself. */
-  readonly bgRefreshFailing = computed(() => this.bgFailures() >= 3 && !this.listHeld());
+  /** The unit the backoff above is counted in: the cadence in force, but never shorter than
+   *  the default. Counting purely in poll intervals was right while there was only one
+   *  interval; at 1 s it becomes a 1 → 8 s ladder, i.e. a doomed query re-fired eight times a
+   *  minute for as long as the page is open — the hammering the backoff exists to stop.
+   *  Flooring it at 15 s leaves the shipped 15 s → 2 min ladder untouched and lets the slower
+   *  cadences go on counting in their own intervals. */
+  private backoffUnitMs(): number {
+    return Math.max(this.liveMs(), TracesComponent.DefaultLiveMs);
+  }
+  /** A background refresh has failed three times running (~45 s at the default cadence), so
+   *  the list is no longer live and the user is owed that fact. Three, not one: a single
+   *  dropped tick is noise. Suppressed while the list is held, where the header is already
+   *  explaining itself — and while Live is off, where there is no refresh to be failing and
+   *  the rows are frozen because the user froze them. */
+  readonly bgRefreshFailing = computed(() =>
+    this.bgFailures() >= 3 && !this.listHeld() && this.liveOn());
   /** Rows buffered before a new array is pushed into `traces`. One array per frame would
    *  re-render the whole list a thousand times over a full stream; one per 25 keeps the
    *  count visibly moving without the churn (the Events store does the same at 10). */
@@ -533,12 +596,52 @@ export class TracesComponent implements OnInit, OnDestroy {
    * page. `estimateSize` is the common case (one line each) and every rendered row corrects
    * itself; the correction is a no-op once measured, since resizeItem ignores a zero delta.
    */
+  /**
+   * A measurement, unless there is nothing to measure — in which case KEEP WHAT WE KNEW.
+   *
+   * The list lives inside `.main-content`, which the Graph / Latency / Compare tabs hide with
+   * `display: none` (see setMainTab). A `display: none` subtree has no CSS box at all, so every
+   * measurement inside it is exactly 0 — not approximately, 0 — and @tanstack/virtual has no
+   * guard of its own: `resizeItem` writes whatever it is handed into `itemSizeCache`, keyed by
+   * traceId. A row measured at 0 and then scrolled out of the rendered window keeps that 0 until
+   * it is rendered again, and `getTotalSize()` sums the cache — so every row after it is placed
+   * at the wrong offset, and the list comes back collapsed or showing the wrong slice.
+   *
+   * THIS HOOK AND NOT THE afterRender PASS BELOW, because our call is not the only writer:
+   * ResizeObserver fires with a 0×0 box the instant the panel is hidden, for every row already
+   * being observed, so guarding the call would leave that path writing zeros. Both paths route
+   * through `options.measureElement`, so one override covers them — and it self-heals, because
+   * showing the panel fires the observer again with the real box.
+   *
+   * NOT `@if` instead of `display: none`, which would make the question moot by unmounting the
+   * subtree: `.trace-rows` IS the scroll container, and unmounting it returns the user to
+   * scrollTop 0 every time they glance at the Graph tab. That is the trade already reasoned out
+   * for the spinner on `listLoading` above, and it comes out the same way here.
+   *
+   * Declared BEFORE rowVirtualizer, and an arrow property rather than a method: field
+   * initialisers run in source order, and the virtualizer stores the option and calls it unbound.
+   */
+  private readonly measureOnlyWhenRendered = (
+    el:       Element,
+    entry:    ResizeObserverEntry | undefined,
+    instance: Virtualizer<HTMLElement, Element>,
+  ): number => {
+    // getClientRects() is empty exactly when the element has no CSS box — the direct test, where
+    // `offsetHeight === 0` would also be true of a row that is merely empty.
+    if (el.getClientRects().length > 0) return measureRenderedElement(el, entry, instance);
+
+    const i = instance.indexFromElement(el);
+    return instance.itemSizeCache.get(instance.options.getItemKey(i))
+        ?? instance.options.estimateSize(i);
+  };
+
   readonly rowVirtualizer = injectVirtualizer(() => ({
-    count:         this.filteredTraces().length,
-    scrollElement: this.traceScroll(),
-    estimateSize:  () => 82,
-    overscan:      8,
-    getItemKey:    (i: number) => this.filteredTraces()[i]?.traceId ?? i,
+    count:          this.filteredTraces().length,
+    scrollElement:  this.traceScroll(),
+    estimateSize:   () => 82,
+    overscan:       8,
+    getItemKey:     (i: number) => this.filteredTraces()[i]?.traceId ?? i,
+    measureElement: this.measureOnlyWhenRendered,
   }));
 
   constructor() {
@@ -613,20 +716,22 @@ export class TracesComponent implements OnInit, OnDestroy {
     this.setWindow();
     this.loadAllServices();
     this.loadAll();
-    this._poll = setInterval(() => this.poll(), TracesComponent.PollMs);
+    this.restartLive();
     document.addEventListener('visibilitychange', this._onVisibility);
   }
 
-  /** Periodic live refresh. Skips work when the tab is hidden, and only restarts the
-   *  (heavier) trace list while the Traces tab is actually on screen. */
+  /** Periodic live refresh. Does nothing while Live is off or the tab is hidden, and only
+   *  restarts the (heavier) trace list while the Traces tab is actually on screen. */
   private poll() {
-    if (document.hidden) return;
+    // Live off means nothing refreshes itself. The timer is already gone by then — but the
+    // visibility handler is the other caller, and it has no timer to be gone.
+    if (!this.liveOn() || document.hidden) return;
     // One clock for both callers. Everything below this line is background work, and how much
     // of it is due is a question about elapsed TIME — never about how many times poll() was
     // asked. A run of hidden→visible transitions is one refresh, not eight.
     const now = Date.now();
     if (now < this.nextBgPollAt) return;
-    this.nextBgPollAt = now + TracesComponent.BgFloorMs;
+    this.nextBgPollAt = now + this.bgFloorMs();
     const from = this.fromIso();
     const to   = this.toIso();
     this.loadStats(from, to);
@@ -684,8 +789,27 @@ export class TracesComponent implements OnInit, OnDestroy {
     const ql = q.get('ql');
     if (ql) { this.traceqlInput = ql; this.traceqlMode.set(true); }
 
+    // The Live cadence, in the order of who is entitled to decide it: this URL (a link can
+    // hand someone a paused page, or a 1 s one, on purpose), then what this browser last
+    // chose, then the cadence the page has always had. Anything not on the menu is ignored
+    // rather than honoured — see LIVE_INTERVALS.
+    const live = q.get('live') ?? this.storedLiveMs();
+    if (live !== null) {
+      const ms = Number(live);
+      if (LIVE_INTERVALS.some(o => o.ms === ms)) {
+        this.liveMs.set(ms);
+        if (ms > 0) this.lastLiveMs = ms;
+      }
+    }
+
     const trace = q.get('trace');
     if (trace) this.openTrace(trace);
+  }
+
+  /** The stored cadence, or null when there is none / storage is unavailable. */
+  private storedLiveMs(): string | null {
+    try { return localStorage.getItem(TracesComponent.LiveKey); }
+    catch { return null; }
   }
 
   /** Reflect the current page state into the URL query string (replaceUrl — no history spam). */
@@ -704,6 +828,9 @@ export class TracesComponent implements OnInit, OnDestroy {
       min:    this.filterMinDurationMs != null ? String(this.filterMinDurationMs) : null,
       max:    this.filterMaxDurationMs != null ? String(this.filterMaxDurationMs) : null,
       ql:     this.traceqlMode() && this.traceqlInput.trim() ? this.traceqlInput.trim() : null,
+      // Omitted at the default so the common URL stays clean, and so a shared link only
+      // imposes a cadence when its sender actually chose one.
+      live:   this.liveMs() === TracesComponent.DefaultLiveMs ? null : String(this.liveMs()),
     };
     this.router.navigate([], {
       relativeTo:          this.route,
@@ -778,6 +905,75 @@ export class TracesComponent implements OnInit, OnDestroy {
 
   toggleHistory(): void {
     this.historyOpen.update(v => !v);
+  }
+
+  // ── Live refresh ──────────────────────────────────────────────────────────
+  /** The cadence menu's contents — the module list, unfiltered. */
+  readonly liveIntervals = LIVE_INTERVALS;
+
+  /** The Live badge is a switch now: pause the auto-refresh, and resume it at the cadence it
+   *  was paused at — never at the default (see {@link lastLiveMs}). */
+  toggleLive(): void {
+    this.applyLive(this.liveOn() ? 0 : this.lastLiveMs);
+  }
+
+  /** The cadence menu, Off entry included: that entry and the switch's off are the same state
+   *  by construction, because both are `liveMs === 0`. */
+  setLiveMs(ms: number): void {
+    this.applyLive(ms);
+  }
+
+  /**
+   * Everything a cadence change has to do, in one place, so the two controls cannot do it
+   * differently.
+   *
+   * <p>Off clears the background failure counter and its backoff deadline, and that is not
+   * housekeeping: both describe a run of UNATTENDED ticks, and there are about to be none. Left
+   * standing, the header would go on saying the live refresh is failing over rows the user
+   * knowingly froze, and a quarantine set before the pause would still be running down when
+   * they resumed — a resume that visibly did nothing for up to two minutes.</p>
+   */
+  private applyLive(ms: number): void {
+    const next = LIVE_INTERVALS.some(o => o.ms === ms) ? ms : TracesComponent.DefaultLiveMs;
+    if (next === this.liveMs()) return;
+    const resuming = next > 0 && !this.liveOn();
+    if (next > 0) this.lastLiveMs = next;
+    else { this.bgFailures.set(0); this.nextBgListAt = 0; }
+    this.liveMs.set(next);
+    this.restartLive();
+    this.persistLive(next);
+    this.syncUrl();
+    // Resuming asks for fresh rows, not for a wait of up to 30 s to find out whether resuming
+    // worked. It goes through poll() like every other caller, so the burst floor, the tab guard
+    // and the hold all apply — resume is not a privileged refresh, and a paused list that was
+    // stopped or failing stays the user's.
+    if (resuming) this.poll();
+  }
+
+  /** (Re)arms the timer at the cadence in force, and leaves none running when Live is off —
+   *  a paused page holds no interval, so it costs nothing while it is paused. */
+  private restartLive(): void {
+    if (this._poll) { clearInterval(this._poll); this._poll = null; }
+    const ms = this.liveMs();
+    if (ms > 0) this._poll = setInterval(() => this.poll(), ms);
+  }
+
+  private persistLive(ms: number): void {
+    try { localStorage.setItem(TracesComponent.LiveKey, String(ms)); }
+    catch { /* quota / private mode — the URL still carries it for this page */ }
+  }
+
+  /** The current cadence as the menu spells it ('Off' when paused). */
+  liveLabel(): string {
+    return LIVE_INTERVALS.find(o => o.ms === this.liveMs())?.label ?? 'Off';
+  }
+
+  /** What the switch says it will do, rather than what it is — a tooltip that repeats the
+   *  label it sits on tells the user nothing they cannot already see. */
+  liveTitle(): string {
+    return this.liveOn()
+      ? `Auto-refreshing every ${this.liveLabel()} — click to pause`
+      : 'Auto-refresh is off — click to resume';
   }
 
   /**
@@ -1114,7 +1310,7 @@ export class TracesComponent implements OnInit, OnDestroy {
           this.traces.set(before);
           this.bgFailures.update(n => n + 1);
           this.nextBgListAt = Date.now()
-            + TracesComponent.PollMs * Math.min(8, 2 ** (this.bgFailures() - 1));
+            + this.backoffUnitMs() * Math.min(8, 2 ** (this.bgFailures() - 1));
         } else {
           // A search the user ran keeps whatever arrived and gets the reason beside it — the
           // half-answer plus its explanation, not an empty list and a banner.
@@ -1658,6 +1854,14 @@ export class TracesComponent implements OnInit, OnDestroy {
     return ms == null
       ? '· live refresh failing — this list is not updating'
       : `· live refresh failing — rows as of ${format(new Date(ms), 'HH:mm:ss')}`;
+  }
+
+  /** The tooltip behind that hint. It names the cadence actually in force: the string used to
+   *  read "the 15-second live refresh", which is a wrong number rather than a stale one the
+   *  moment the page can refresh at 1 s. */
+  bgRefreshFailingTitle(): string {
+    return `The ${this.liveLabel()} live refresh keeps failing. The rows below are the last `
+      + 'complete answer; Refresh runs the query again and will show the error if it fails.';
   }
 
   // ── Formatting ────────────────────────────────────────────────────────────
