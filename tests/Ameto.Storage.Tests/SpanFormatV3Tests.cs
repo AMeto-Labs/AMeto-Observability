@@ -276,9 +276,20 @@ public sealed class SpanFormatV3Tests : IDisposable
             [Seg("old", 0, 1, ver: 2), Seg("new", 90, 91)]);
         Assert.Equal(["old"], lone.Select(s => s.FilePath));
 
-        // Big v3 files are never candidates.
+        // THE SEGMENT AN ORDINARY FLUSH WRITES IS A CANDIDATE, and this assertion used to say the
+        // opposite: "big v3 files are never candidates", expecting an empty batch for two 50 000-
+        // span segments. That was the bug written down as intent. HotFlushThreshold is 50 000 and
+        // CompactionThreshold was 10 000, so the file every flush produces was never a seed, never
+        // in a batch, and never merged with anything until retention deleted it — segment count
+        // grew with ingest and never fell, and a trace lookup consults every cold segment.
+        var ordinary = TraceStorageEngine.SelectCompactionBatch(
+            [Seg("big1", 0, 1, spans: 50_000), Seg("big2", 1, 2, spans: 50_000)]);
+        Assert.Equal(["big1", "big2"], ordinary.Select(s => s.FilePath));
+
+        // What is still never a candidate is the RESULT of merging them: 200 000 spans is above
+        // the threshold, so a merged file settles instead of being rewritten for ever.
         Assert.Empty(TraceStorageEngine.SelectCompactionBatch(
-            [Seg("big1", 0, 1, spans: 50_000), Seg("big2", 1, 2, spans: 50_000)]));
+            [Seg("merged1", 0, 1, spans: 200_000), Seg("merged2", 1, 2, spans: 200_000)]));
     }
 
     /// <summary>

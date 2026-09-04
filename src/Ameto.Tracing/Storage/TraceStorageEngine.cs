@@ -221,9 +221,47 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     private readonly ILogger<TraceStorageEngine>               _logger;
 
     private const int HotFlushThreshold    = 50_000;  // spans before flush
-    private const int CompactionThreshold  = 10_000;  // merge cold segments smaller than this
+
+    /// <summary>
+    /// A cold segment smaller than this is a compaction candidate.
+    ///
+    /// <para>IT HAS TO BE ABOVE <see cref="HotFlushThreshold"/>, AND FOR MOST OF THIS ENGINE'S LIFE
+    /// IT WAS BELOW IT. At 10 000 against a flush that writes 50 000, the segment an ordinary flush
+    /// produces was never a candidate: never a seed, never in a batch, never merged with anything
+    /// until retention deleted it. Segment count therefore grew with ingest and never fell, and
+    /// since a trace lookup consults every cold segment, that count is the multiplier on the cost
+    /// of opening any trace. On a quiet install <see cref="MaxHotAge"/> alone put a floor of
+    /// twenty-four new segments a day under it.</para>
+    ///
+    /// <para>PEAK MEMORY DOES NOT MOVE WITH THIS NUMBER — but only because raising it exposed that
+    /// the cap was in the wrong place, and the cap was moved. <see cref="MaxSpansPerPass"/> was
+    /// enforced by the LOADER, which stopped once it had ALREADY read that many spans and so
+    /// overshot by whatever the last segment held: at most 10 000 before, at most 50 000 after.
+    /// <see cref="SelectCompactionBatch"/> now applies it while it plans, so a batch of four
+    /// fifty-thousand-span segments holds exactly the two hundred thousand a batch of twenty
+    /// ten-thousand-span ones did.</para>
+    ///
+    /// <para>That cap is also the real ceiling on how much this buys: four ordinary segments become
+    /// one, and the result — a hundred and fifty to two hundred thousand spans — is above this
+    /// threshold and stops merging. So it is roughly a fourfold cut in segment count, not more.
+    /// Going further means a merge that streams instead of materialising every span, which is a
+    /// change to a crash-safety-critical path and belongs in its own piece of work.</para>
+    /// </summary>
+    private const int CompactionThreshold  = 60_000;
+
     private const int MaxSegmentsPerPass   = 20;       // merge at most N oldest small segments per run
-    private const int MaxSpansPerPass      = 200_000;  // hard cap on spans loaded into memory per run
+
+    /// <summary>
+    /// Hard cap on spans loaded into memory per merge pass — the whole memory story of compaction,
+    /// since <c>CompactOnePass</c> materialises every span it merges.
+    ///
+    /// <para>Worth knowing rather than only obeying: <c>SpanSearchBoundTests</c> measures an
+    /// ordinary eight-attribute OTel span at about 1 749 bytes live, so this cap is roughly 350 MB
+    /// at its limit. On the 512 MB deployment this branch exists to keep alive that is most of the
+    /// process, and it is reachable today. Not changed here — raising the compaction threshold does
+    /// not move it — but it is the number to look at before anyone tries to merge harder.</para>
+    /// </summary>
+    private const int MaxSpansPerPass      = 200_000;
 
     // ── Flush policy ──────────────────────────────────────────────────────────
     // Durability belongs to the WAL, not to the segment writer, so a timed flush no
@@ -2055,6 +2093,14 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             long windowStart = seed.MinStartNano;
 
             var batch = new List<SpanSegmentInfo>(MaxSegmentsPerPass) { seed };
+
+            // THE PLAN CARRIES THE MEMORY BOUND, not the loader. CompactOnePass stopped adding
+            // once it had ALREADY read MaxSpansPerPass, which overshoots by whatever the last
+            // segment held — invisible while candidates were capped at 10 000 spans, and a quarter
+            // of the budget once they can be 50 000. A batch that describes more than a pass may
+            // hold is not a plan; it is a number the loader has to argue with.
+            long batchSpans = seed.SpanCount;
+
             for (int j = i + 1; j < candidates.Count && batch.Count < MaxSegmentsPerPass; j++)
             {
                 var s = candidates[j];
@@ -2070,7 +2116,9 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                 // selecting nothing at all.
                 if (s.MaxStartNano - windowStart > MaxSpanNanos) continue;
                 if (TierOf(s.SpanCount) != tier) continue;                // wrong magnitude
+                if (batchSpans + s.SpanCount > MaxSpansPerPass) break;    // past what a pass may hold
                 batch.Add(s);
+                batchSpans += s.SpanCount;
             }
 
             if (batch.Count >= 2) return batch;
