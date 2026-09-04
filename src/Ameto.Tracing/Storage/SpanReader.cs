@@ -269,12 +269,33 @@ internal static class SpanReader
     /// controls, and still the difference between that and eight copies of the whole-file read
     /// this replaced (measured at 164.97 MB per call on a 100 000-span segment).</para>
     /// </summary>
-    public static async IAsyncEnumerable<SpanRecord> ReadTraceAsync(
-        string    filePath,
-        TraceId   traceId,
+    public static IAsyncEnumerable<SpanRecord> ReadTraceAsync(
+        string filePath, TraceId traceId, CancellationToken ct)
+        => ReadTraceCoreAsync(filePath, traceId, knownOffsets: null, ct);
+
+    /// <summary>
+    /// The same walk, told where to look instead of finding out.
+    ///
+    /// <para>The offsets come from the trace-id index, which is the entire point of having one:
+    /// <see cref="ReadTraceOffsets"/> reads and inflates the segment's WHOLE trace index — 38% of
+    /// the file — to answer one question, and this skips it. What it does not skip is the
+    /// verification. The index keys on the first eight bytes of the trace id, so a hit can be a
+    /// collision; the walk below still builds each span and checks its FULL id, and a mismatch
+    /// makes the geometry pass return null exactly as a bad block-size assumption does. A wrong
+    /// hint therefore costs a read and yields nothing — it can never yield another trace's
+    /// spans.</para>
+    /// </summary>
+    public static IAsyncEnumerable<SpanRecord> ReadTraceAtAsync(
+        string filePath, TraceId traceId, List<uint> offsets, CancellationToken ct)
+        => ReadTraceCoreAsync(filePath, traceId, offsets, ct);
+
+    private static async IAsyncEnumerable<SpanRecord> ReadTraceCoreAsync(
+        string     filePath,
+        TraceId    traceId,
+        List<uint>? knownOffsets,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct)
     {
-        var offsets = ReadTraceOffsets(filePath, traceId);
+        var offsets = knownOffsets ?? ReadTraceOffsets(filePath, traceId);
         if (offsets.Count == 0) yield break;
 
         // Ascending, which is also file order: the writer appends each offset as it writes the

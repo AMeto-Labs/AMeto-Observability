@@ -79,8 +79,16 @@ internal static class SpanWriter
     /// window in which the scan adopts the segment while the flushing tier still holds the same
     /// spans — counting them twice in the stats, service graph and volume paths.
     /// </param>
+    /// <param name="onTraceIndex">
+    /// Invoked with the trace-to-offsets map this method already built, AFTER the .trc is
+    /// published and only if it was. The trace-id index needs exactly this map, and building it
+    /// here rather than reading it back out of the finished file is not merely cheaper: an index
+    /// derived from a second, independent pass is an index that can disagree with the segment it
+    /// describes. Handing over the writer's own is the only version that cannot.
+    /// </param>
     public static SpanSegmentInfo Write(string dataDir, IList<SpanRecord> spans, bool recoverable = true,
-                                        Action<string>? onNamed = null)
+                                        Action<string>? onNamed = null,
+                                        Action<Dictionary<TraceId, List<uint>>>? onTraceIndex = null)
     {
         if (spans.Count == 0) throw new InvalidOperationException("Cannot write empty span batch.");
 
@@ -245,6 +253,9 @@ internal static class SpanWriter
             TryDelete(tracesumFinal + ".tmp");
             throw;
         }
+
+        // After the publish, so a map only ever describes a segment that exists on disk.
+        onTraceIndex?.Invoke(traceIndex);
 
         var services = new string[svcBlockMap.Count];
         svcBlockMap.Keys.CopyTo(services, 0);

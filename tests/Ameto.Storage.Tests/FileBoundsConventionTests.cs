@@ -120,6 +120,8 @@ public sealed class FileBoundsConventionTests
             "max is LZ4Codec.MaximumOutputSize of a buffer this process just filled",
         ["TraceIndexFile.cs:private byte[] _buf = new byte[capacity]"] =
             "capacity is TargetBlockBytes * 2, a constant, at the one call site",
+        ["TraceIndexStore.cs:private Dictionary<string, TraceIndexReader> CopyOpen() => new(_open, StringComparer.Ordinal)"] =
+            "copies the open-run map already in memory; not a capacity",
     };
 
     /// <summary>What "a bound is in view" looks like.</summary>

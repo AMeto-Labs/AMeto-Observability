@@ -415,24 +415,39 @@ internal sealed class TraceIndexReader : IDisposable
     {
         if (!MightContain(key)) return false;
 
-        // The last block whose first key is <= the wanted one. Duplicates never straddle a block
-        // boundary in a way that hides one: a block break happens between entries, so equal keys
-        // can span two blocks — hence the walk into the next block below.
-        int b = UpperBound(key);
+        int b = FirstBlockThatCouldHold(key);
         if (b < 0) return false;
 
+        // FORWARD UNTIL A KEY STRICTLY GREATER IS SEEN, not until a block happens to end on the
+        // key. One key can occupy many consecutive blocks (see FirstBlockThatCouldHold), and a
+        // block in the middle of such a run contains nothing else — so "did this block end on the
+        // key" is not the question. "Have we gone past it yet" is.
         int before = into.Count;
         while (b < _blockFirstKey.Length)
         {
-            if (!ScanBlock(b, key, into, out bool mayContinue)) break;
-            if (!mayContinue) break;
-            b++;   // the key ran to the end of that block; its twins may open the next one
+            if (!ScanBlock(b, key, into, out bool wentPast)) break;
+            if (wentPast) break;
+            b++;
         }
         return into.Count > before;
     }
 
-    /// <summary>Index of the last block whose first key is at or below <paramref name="key"/>.</summary>
-    private int UpperBound(ulong key)
+    /// <summary>
+    /// The lowest block that could hold <paramref name="key"/>, or -1 when none can.
+    ///
+    /// <para>NOT SIMPLY "THE LAST BLOCK WHOSE FIRST KEY IS AT OR BELOW IT", which is only right
+    /// while keys are distinct. They need not be: a key is the first eight bytes of a trace id, and
+    /// a producer that varies only the low half — or a plain collision — puts many entries under
+    /// one key, enough to fill several consecutive blocks whose first key is all the same value.
+    /// Landing on the last of them and walking forward finds the tail of the run and misses
+    /// everything before it. Measured on a fixture where 300 traces shared a high half: two spans
+    /// expected, zero returned, silently.</para>
+    ///
+    /// <para>So: step back off any block whose first key IS the wanted one, and then one more, to
+    /// the block whose first key is below it — that block can still hold the start of the run in
+    /// its tail. At most one block is scanned that turns out to hold nothing.</para>
+    /// </summary>
+    private int FirstBlockThatCouldHold(ulong key)
     {
         int lo = 0, hi = _blockFirstKey.Length - 1, ans = -1;
         while (lo <= hi)
@@ -441,19 +456,23 @@ internal sealed class TraceIndexReader : IDisposable
             if (_blockFirstKey[mid] <= key) { ans = mid; lo = mid + 1; }
             else hi = mid - 1;
         }
+        if (ans < 0) return -1;
+
+        while (ans > 0 && _blockFirstKey[ans] == key) ans--;
         return ans;
     }
 
     /// <summary>
     /// Decodes one block and appends every entry matching <paramref name="key"/>.
     /// </summary>
-    /// <param name="mayContinue">
-    /// True when the block ENDED on the wanted key, so the next block may hold more of it.
+    /// <param name="wentPast">
+    /// True when this block held a key strictly greater than the wanted one — the sorted order
+    /// then guarantees no later block can hold it either, so the walk stops.
     /// </param>
     /// <returns>False when the block could not be read — the caller stops rather than guesses.</returns>
-    private bool ScanBlock(int index, ulong key, List<TraceIndexHit> into, out bool mayContinue)
+    private bool ScanBlock(int index, ulong key, List<TraceIndexHit> into, out bool wentPast)
     {
-        mayContinue = false;
+        wentPast = false;
         byte[]? raw = null;
         int rawLen  = 0;
         try
@@ -498,8 +517,8 @@ internal sealed class TraceIndexReader : IDisposable
 
                 if (k > key)
                 {
-                    mayContinue = false;
-                    return true;                      // sorted: nothing further can match
+                    wentPast = true;                  // sorted: nothing further can match
+                    return true;
                 }
 
                 var offs = k == key ? new uint[(int)n] : null;
@@ -511,7 +530,6 @@ internal sealed class TraceIndexReader : IDisposable
                     if (offs is not null) offs[j] = prev;
                 }
                 if (offs is not null) into.Add(new TraceIndexHit(segId, offs));
-                mayContinue = k == key;               // ended on the key? the next block may follow on
             }
             return true;
         }

@@ -136,6 +136,43 @@ public sealed class TraceIndexFileTests : IDisposable
     }
 
     [Fact]
+    public void One_key_spanning_many_whole_blocks_is_found_from_its_first_entry()
+    {
+        // THE SHAPE THAT BROKE IT, and it is not exotic: the key is the first eight bytes of a
+        // trace id, so a producer that varies only the low half — or a plain collision — puts
+        // thousands of entries under one key, filling many consecutive blocks whose FIRST key is
+        // all the same value. A search that lands on the last such block and walks forward finds
+        // the tail of the run and misses everything before it.
+        //
+        // Measured against that version on a real fixture (TraceFlushVisibilityTests, 300 traces
+        // sharing a high half): two spans expected, ZERO returned, with no error anywhere.
+        const int Copies = 3_000;
+        var w = new TraceIndexWriter();
+        for (int i = 0; i < 500; i++) w.Add(Id(i), segmentId: 1, Offsets(i, 2));   // ordinary keys
+        var shared = new TraceId(0x9E3779B97F4A7C15UL, 0);
+        for (int c = 0; c < Copies; c++)
+            w.Add(new TraceId(0x9E3779B97F4A7C15UL, (ulong)(c + 1)), segmentId: 2, [(uint)c]);
+        for (int i = 500; i < 1_000; i++) w.Add(Id(i), segmentId: 1, Offsets(i, 2));
+
+        var run = w.Write(Path_("shared.tix"), level: 2, coversSegment: null);
+
+        using var r = TraceIndexReader.Open(run.FilePath)!;
+        var hits = new List<TraceIndexHit>();
+        Assert.True(r.Lookup(TraceIndexFileTestsAccess.Key(shared), hits));
+
+        _out.WriteLine($"{hits.Count} of {Copies} entries recovered under one shared key");
+        Assert.Equal(Copies, hits.Count);
+
+        // The neighbours on either side are still reachable — the widened walk must not have
+        // swallowed the boundaries.
+        foreach (int i in new[] { 0, 499, 500, 999 })
+        {
+            hits.Clear();
+            Assert.True(r.Lookup(TraceIndexFileTestsAccess.Key(Id(i)), hits), $"lost ordinary key {i}");
+        }
+    }
+
+    [Fact]
     public void An_empty_run_is_a_run_that_answers_no_to_everything()
     {
         var run = new TraceIndexWriter().Write(Path_("empty.tix"), level: 1, coversSegment: 5);

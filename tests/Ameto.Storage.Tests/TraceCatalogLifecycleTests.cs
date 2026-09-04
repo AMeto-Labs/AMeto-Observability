@@ -67,7 +67,8 @@ public sealed class TraceCatalogLifecycleTests : IDisposable
         // The id is on the snapshot entry itself, not merely in the file: a reader holding the
         // snapshot is what asks whether the index covers this segment.
         Assert.NotEqual(0UL, seg.SegmentId);
-        Assert.Equal((1, 0), e.CatalogCountsForTest);   // named, and vouched for by nothing yet
+        // Named AND vouched for: the flush writes the segment's index run in the same step.
+        Assert.Equal((1, 1), e.CatalogCountsForTest);
     }
 
     [Fact]
@@ -176,7 +177,7 @@ public sealed class TraceCatalogLifecycleTests : IDisposable
         // A RETIRED ID IS NEVER REUSED. Reissuing 1 for the merged file would silently repoint
         // every index entry that named the source.
         Assert.DoesNotContain(mergedId, before);
-        Assert.Equal((1, 0), e.CatalogCountsForTest);
+        Assert.Equal((1, 1), e.CatalogCountsForTest);
     }
 
     [Fact]
@@ -189,7 +190,7 @@ public sealed class TraceCatalogLifecycleTests : IDisposable
         long oldNano = DateTimeOffset.UtcNow.AddDays(-30).ToUnixTimeMilliseconds() * Ms;
         for (int k = 0; k < 20; k++) Write(e, 7_000 + (ulong)k, oldNano + k * Ms);
         e.FlushHotTier();
-        Assert.Equal((1, 0), e.CatalogCountsForTest);
+        Assert.Equal((1, 1), e.CatalogCountsForTest);
 
         int pruned = await e.PruneAsync(TimeSpan.FromDays(7));
 

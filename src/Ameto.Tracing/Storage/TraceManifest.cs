@@ -292,6 +292,27 @@ internal sealed class TraceManifest
     }
 
     /// <summary>
+    /// Takes back the claim that the index answers for one segment, and drops the per-segment run
+    /// that made it. For the discovery that a run will not open: the segment is still there and
+    /// still readable, it simply goes back to being scanned.
+    /// </summary>
+    public void WithdrawCoverage(ulong segmentId)
+    {
+        lock (_gate)
+        {
+            var s = _state;
+            if (!s.Covered.Contains(segmentId)) return;
+            var cov = s.CopyCovered();
+            cov.Remove(segmentId);
+            Commit(s with
+            {
+                Runs    = s.Runs.Where(r => r.CoversSegment != segmentId).ToList(),
+                Covered = cov,
+            });
+        }
+    }
+
+    /// <summary>
     /// Drops every claim of coverage, keeping the catalog. The switch that turns the fast path off
     /// without turning identity off — for an operator who suspects the index, and for the config
     /// flag that disables it.
