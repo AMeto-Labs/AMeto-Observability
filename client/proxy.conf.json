@@ -1,17 +1,17 @@
 {
   "/api": {
-    "target": "https://console.ntpayments.net/ameto",
-    "secure": true,
+    "target": "http://localhost:8555",
+    "secure": false,
     "changeOrigin": true
   },
   "/auth": {
-    "target": "https://console.ntpayments.net/ameto",
-    "secure": true,
+    "target": "http://localhost:8555",
+    "secure": false,
     "changeOrigin": true
   },
   "/health": {
-    "target": "https://console.ntpayments.net/ameto",
-    "secure": true,
+    "target": "http://localhost:8555",
+    "secure": false,
     "changeOrigin": true
   }
 }
