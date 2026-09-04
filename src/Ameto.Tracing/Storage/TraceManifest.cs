@@ -5,6 +5,31 @@ using Microsoft.Extensions.Logging;
 
 namespace Ameto.Tracing.Storage;
 
+/// <summary>
+/// What the trace-id index is doing right now, for the diagnostics endpoint.
+///
+/// <para>Exists because these numbers were invisible, and their invisibility is most of why the
+/// problem lasted: nobody could see how many cold segments an install had or what their indexes
+/// weighed, so nobody could see that a trace lookup was reading all of them.</para>
+/// </summary>
+public sealed class TraceIndexReport
+{
+    /// <summary>Cold segments in the current snapshot — the fan-out width before the index.</summary>
+    public int  ColdSegments       { get; init; }
+    /// <summary>How many of them the index answers for. Equal to the above means the migration is done.</summary>
+    public int  CoveredSegments    { get; init; }
+    public long ColdSpans          { get; init; }
+    /// <summary>Index runs currently open.</summary>
+    public int  OpenRuns           { get; init; }
+    /// <summary>What the runs weigh on disk.</summary>
+    public long IndexBytesOnDisk   { get; init; }
+    /// <summary>What they keep in RAM — the bloom bits and the sparse block maps, and the number
+    /// that decides when per-segment runs stop scaling and levelled compaction has to start.</summary>
+    public long IndexBytesInMemory { get; init; }
+    /// <summary>Catalog generation, so two samples can be told apart.</summary>
+    public ulong CatalogGeneration { get; init; }
+}
+
 /// <summary>One trace segment as the catalog knows it — the identity a file path cannot provide.</summary>
 internal readonly record struct TraceSegmentEntry(
     ulong  SegmentId,

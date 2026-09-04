@@ -1738,6 +1738,45 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// </summary>
     private readonly HashSet<ulong> _backfillFailed = new();
 
+    /// <summary>
+    /// What the trace-id index is currently worth, in the numbers an operator needs to answer two
+    /// questions: is the migration finished, and what is it costing.
+    ///
+    /// <para>These were the numbers nobody had. The whole reason the fan-out went unnoticed is
+    /// that the segment count and the size of their indexes were invisible from outside — so the
+    /// first thing this feature owes anyone is a way to see them, before and after.</para>
+    /// </summary>
+    public TraceIndexReport DescribeIndex()
+    {
+        var segs = _coldSegments;
+        int covered = 0;
+        long spans = 0;
+        foreach (var s in segs)
+        {
+            spans += s.SpanCount;
+            if (s.SegmentId != 0 && _manifest.IsCovered(s.SegmentId)) covered++;
+        }
+
+        long runBytes = 0;
+        foreach (var run in _manifest.Runs)
+        {
+            try { runBytes += new FileInfo(run.FilePath).Length; }
+            catch { /* a run being replaced right now; the total is a report, not an invariant */ }
+        }
+
+        var (runs, retained) = _index.Stats;
+        return new TraceIndexReport
+        {
+            ColdSegments      = segs.Length,
+            CoveredSegments   = covered,
+            ColdSpans         = spans,
+            OpenRuns          = runs,
+            IndexBytesOnDisk  = runBytes,
+            IndexBytesInMemory= retained,
+            CatalogGeneration = _manifest.Generation,
+        };
+    }
+
     /// <summary>How much of the cold tier the trace-id index answers for.</summary>
     internal (int Covered, int Total) IndexCoverage
     {
