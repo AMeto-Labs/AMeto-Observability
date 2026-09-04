@@ -380,6 +380,28 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         // recoverable segment, and .trc temps the loop above could not rename.
         foreach (var tmp in Directory.EnumerateFiles(dataDir, "spans-*.tmp"))
             try { File.Delete(tmp); } catch { /* retried next start */ }
+
+        // MERGED INDEX RUNS ARE NOT NAMED "spans-…", so the sweep above never saw them. A
+        // per-segment run is spans-….tix and its temp spans-….tix.tmp, both caught by the pattern;
+        // index compaction writes tix-L{level}-{guid}.tix, which is not. A crash between that
+        // rename and the manifest write leaves a file nothing names and nothing deletes — harmless
+        // to correctness, because TraceIndexStore only ever opens runs the manifest names, and a
+        // slow disk leak all the same.
+        //
+        // Deleted against the manifest rather than by age: the catalog is loaded by now, so "is
+        // this run named?" is a question with an answer, and the alternative — a heuristic on
+        // write time — would eventually delete a live run on a machine whose clock moved.
+        var namedRuns = new HashSet<string>(
+            _manifest.Runs.Select(static r => Path.GetFullPath(r.FilePath)), StringComparer.OrdinalIgnoreCase);
+        int orphans = 0;
+        foreach (var run in Directory.EnumerateFiles(dataDir, "tix-L*.tix")
+                                     .Concat(Directory.EnumerateFiles(dataDir, "tix-L*.tix.tmp")))
+        {
+            if (namedRuns.Contains(Path.GetFullPath(run))) continue;
+            try { File.Delete(run); orphans++; } catch { /* retried next start */ }
+        }
+        if (orphans > 0)
+            _logger.LogInformation("Swept {Count} orphaned trace-index run(s) no manifest names", orphans);
     }
 
     /// <summary>

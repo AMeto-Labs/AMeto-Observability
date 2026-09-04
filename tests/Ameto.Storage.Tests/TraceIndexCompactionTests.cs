@@ -226,6 +226,42 @@ public sealed class TraceIndexCompactionTests : IDisposable
     }
 
     [Fact]
+    public void An_orphaned_merged_run_is_swept_at_startup_and_a_live_one_is_not()
+    {
+        // Merged runs are named tix-L{level}-{guid}.tix, which the startup sweep's "spans-*.tmp"
+        // pattern never matched — a per-segment run is spans-….tix and IS caught, a merged one is
+        // not. A crash between the merge's rename and its manifest write therefore left a file
+        // nothing names and nothing deletes: harmless to correctness, since only runs the manifest
+        // names are ever opened, and a slow disk leak all the same.
+        string dir = Dir("orphans");
+        string liveRun;
+        using (var e = Engine(dir))
+        {
+            Build(e, segments: 10);
+            Assert.True(e.CompactIndexOnce());
+            liveRun = Directory.EnumerateFiles(dir, "tix-L*.tix").Single();
+        }
+
+        // Exactly what a killed merge leaves behind.
+        string orphan    = Path.Combine(dir, $"tix-L9-{Guid.NewGuid():N}.tix");
+        string orphanTmp = Path.Combine(dir, $"tix-L9-{Guid.NewGuid():N}.tix.tmp");
+        File.WriteAllBytes(orphan,    new byte[128]);
+        File.WriteAllBytes(orphanTmp, new byte[64]);
+
+        using var reopened = Engine(dir);
+
+        _out.WriteLine($"after restart: {Directory.EnumerateFiles(dir, "tix-L*").Count()} tix-L* file(s) left");
+        Assert.False(File.Exists(orphan),    "an orphaned merged run survived the sweep");
+        Assert.False(File.Exists(orphanTmp), "an orphaned merge temp survived the sweep");
+
+        // AND THE LIVE ONE IS UNTOUCHED, which is the half a sweep gets wrong. Deleting by name
+        // pattern or by age would have taken this too.
+        Assert.True(File.Exists(liveRun), "the sweep deleted a run the manifest still names");
+        reopened.LoadColdSegments();
+        Assert.Equal((10, 10), reopened.IndexCoverage);
+    }
+
+    [Fact]
     public async Task A_merged_index_survives_a_restart()
     {
         string dir = Dir("restart");
