@@ -109,7 +109,7 @@ public sealed class WalSegmentIdTests : IAsyncLifetime
     {
         await _engine.DisposeAsync();
         _engine = NewEngine();
-        for (int i = 0; i < 200 && _engine.ListSegments().Count == 0; i++) await Task.Delay(25);
+        await _engine.CatalogLoaded;   // the scan, not the first file it publishes
     }
 
     // ── Tests ─────────────────────────────────────────────────────────────────
@@ -170,7 +170,7 @@ public sealed class WalSegmentIdTests : IAsyncLifetime
         RestoreWal(snap);
 
         _engine = NewEngine();
-        for (int i = 0; i < 200 && _engine.ListSegments().Count == 0; i++) await Task.Delay(25);
+        await _engine.CatalogLoaded;   // the scan, not the first file it publishes
 
         Assert.Equal(230, ColdEventCount());
     }
