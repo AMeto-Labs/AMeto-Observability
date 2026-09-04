@@ -23,8 +23,21 @@
           <button class="btn-apply" (click)="applyCustom()" [disabled]="!customFrom">Apply</button>
         </div>
       }
-      <div class="live-badge">
-        <span class="live-dot"></span>Live
+      <!-- One signal, two controls: the badge is a switch (pause / resume) and the menu beside
+           it picks the cadence. Its Off entry and the switch's off are the same state — both are
+           liveMs === 0 — so the two can never show different things. -->
+      <div class="live-group" [class.off]="!liveOn()">
+        <button type="button" class="live-toggle" role="switch"
+                [attr.aria-checked]="liveOn()" [title]="liveTitle()" (click)="toggleLive()">
+          <span class="live-dot"></span>{{ liveOn() ? 'Live' : 'Paused' }}
+        </button>
+        <select class="live-select" aria-label="Auto-refresh interval"
+                [title]="liveTitle()"
+                [ngModel]="liveMs()" (ngModelChange)="setLiveMs($event)">
+          @for (o of liveIntervals; track o.ms) {
+            <option [ngValue]="o.ms">{{ o.label }}</option>
+          }
+        </select>
       </div>
       <button class="icon-btn" [class.active]="historyOpen()" (click)="toggleHistory()" title="Search history">
         <lucide-icon name="history" [size]="14" />
@@ -93,7 +106,7 @@
         </select>
 
         <button class="btn-apply" (click)="applyFilters()">Apply</button>
-        <button class="btn-clear" (click)="filterName=''; filterService=''; filterStatus=''; filterMinDurationMs=null; filterMaxDurationMs=null; filterHttpStatus=''; applyFilters()">
+        <button class="btn-clear" (click)="clearFilters()">
           Clear
         </button>
       </div>
@@ -111,7 +124,7 @@
                  spellcheck="false"
                  autocomplete="off" />
           @if (traceqlInput) {
-            <button class="tql-clear" (click)="traceqlInput = ''; traces.set([])" title="Clear">
+            <button class="tql-clear" (click)="clearTraceql()" title="Clear">
               <lucide-icon name="x" [size]="11" />
             </button>
           }
@@ -121,18 +134,30 @@
           Run
         </button>
       </div>
-      @if (traceqlError()) {
-        <div class="tql-error">
-          <lucide-icon name="alert-circle" [size]="12" />
-          {{ traceqlError() }}
-        </div>
-      }
       <div class="tql-hints">
         <span class="tql-hint-label">Press <kbd>Ctrl</kbd>+<kbd>Space</kbd> for suggestions · Examples:</span>
         <button class="tql-hint-chip" (click)="traceqlInput = '{ status = error }'">&#123; status = error &#125;</button>
         <button class="tql-hint-chip" (click)="traceqlInput = '{ duration > 500ms }'">&#123; duration > 500ms &#125;</button>
         <button class="tql-hint-chip" (click)="traceqlInput = '{ .http.status_code = 500 }'">&#123; .http.status_code = 500 &#125;</button>
         <button class="tql-hint-chip" (click)="traceqlInput = '{ service = \'api\' && duration > 200ms }'">&#123; service = "api" &amp;&amp; duration > 200ms &#125;</button>
+      </div>
+    }
+
+    <!-- Outside the mode branch: a stream can die halfway in EITHER mode (spent time budget,
+         unreadable segment), and inside the @else the filter bar's failures had nowhere to
+         appear — the rows it managed to load sat there looking complete.
+
+         listBanner(), not traceqlError(): the same vanished segment is reported by the server
+         as a `query-error` sentence when the walk reached the end of the window and as a bare
+         `truncatedBy` code when the row ceiling bit first, and only the first of those used to
+         reach this strip. One dead file was a red banner over a frozen list at max=1000 and a
+         grey count suffix over a live one at max=50 — which of the two the operator saw decided
+         by how many rows happened to fit. The banner now follows the LOSS; the frame that
+         carried it decides nothing. -->
+    @if (listBanner(); as banner) {
+      <div class="tql-error">
+        <lucide-icon name="alert-circle" [size]="12" />
+        {{ banner }}
       </div>
     }
 
@@ -243,83 +268,129 @@
     <!-- Left: trace list -->
     <div class="trace-list-panel" [class.narrow]="selectedTraceId()">
 
+      <!-- The count is the plain truth so far and climbs on its own as rows arrive — the
+           old "N+ · scroll for more" could not say whether anything was still coming. The
+           three suffixes are the ways a list can be short of the whole answer: still arriving,
+           cut off by the user, and everything the ENDING says (see ListEnding / listEndHint).
+
+           That last arm used to be several, split by how the news arrived rather than by what
+           the news was: a query-error got "stopped by an error", a `truncatedBy` code got the
+           "narrow the range" hint, and those are the same vanished segment at two different row
+           ceilings. The suffix now comes from one computed that reads the LOSS, the ceiling and
+           the server's sentence together, so a fact cannot change category by changing frame.
+           A bare count still means one thing only: the server said it read the whole window
+           out. It is not what this page says when it does not know. -->
       <div class="list-header">
         <span class="list-title">
-          @if (!loading()) {
-            <strong>{{ filteredTraces().length }}{{ hasMore() ? '+' : '' }}</strong> traces
-            @if (hasMore()) { <span class="list-more-hint">· scroll for more</span> }
+          @let endHint = listEndHint();
+          <strong>{{ filteredTraces().length }}</strong> traces
+          @if (streamPublishing()) {
+            <span class="list-more-hint">· streaming…</span>
+          } @else if (streamStopped()) {
+            <span class="list-more-hint">· stopped early — partial list, refresh to run it again</span>
+          } @else if (endHint) {
+            <span class="list-more-hint" [title]="endHint.title">{{ endHint.text }}</span>
           }
-          @else { Loading… }
+          <!-- Separate from the four above, and deliberately so: those describe the rows, this
+               describes the REFRESH behind them. The rows here are complete — a background
+               refresh that failed kept its half-answer to itself — so this may not be folded
+               into a suffix that would call them partial. -->
+          @if (bgRefreshFailing()) {
+            <span class="list-stale-hint" [title]="bgRefreshFailingTitle()">
+              {{ bgRefreshHint() }}
+            </span>
+          }
         </span>
-        <button class="icon-btn" (click)="loadAll()" title="Refresh">
-          <lucide-icon name="refresh-cw" [size]="13" [class.spin]="loading()" />
-        </button>
+        <div class="list-actions">
+          @if (streamPublishing()) {
+            <button class="stream-stop" (click)="stopStream()" title="Stop streaming — keeps the rows already loaded">
+              <lucide-icon name="pause" [size]="11" />
+              Stop
+            </button>
+          }
+          <!-- Spins for the background refresh too: that is the whole visible footprint of a
+               poll tick, which otherwise buffers silently and swaps the rows in one go. -->
+          <button class="icon-btn" (click)="loadAll()" title="Refresh">
+            <lucide-icon name="refresh-cw" [size]="13" [class.spin]="streaming()" />
+          </button>
+        </div>
       </div>
 
-      @if (loading() && traces().length === 0) {
+      @if (listLoading()) {
         <div class="panel-empty">
           <lucide-icon name="loader" [size]="18" class="spin" />
         </div>
       } @else if (filteredTraces().length === 0) {
-        <div class="panel-empty">No traces found</div>
+        <!-- "No traces found" is an answer, and a search that failed did not give one. Saying
+             it anyway is the same lie the header used to tell with a bare count. Keyed on the
+             BANNER rather than on traceqlError, so any standing sentence reaches it — a loss
+             cannot be the one on screen here (truncatedBy only ever rides a `max-rows` ending,
+             which by definition delivered rows), and a strip that is up over "No traces found"
+             would be the two halves of the page disagreeing. -->
+        @if (listBanner()) {
+          <div class="panel-empty">The search failed — see the message above</div>
+        } @else {
+          <div class="panel-empty">No traces found</div>
+        }
       } @else {
-        <div class="trace-rows">
-          @for (trace of filteredTraces(); track trace.traceId) {
-            <div class="trace-row"
-                 [class.active]="selectedTraceId() === trace.traceId"
-                 (click)="openTrace(trace.traceId)">
+        <!-- Virtualized (@tanstack/angular-virtual, the same one the Events list uses): only
+             the rows in view plus a little overscan exist as elements, so a 2000-row answer
+             is ~25 rows of DOM and the live refresh re-diffs the array without repainting a
+             list — which is also what makes a 1 s cadence affordable at all. `#traceRowEl` +
+             `data-index` are what the component hands to rowVirtualizer.measureElement —
+             heights here are measured, not assumed. -->
+        <div #traceScroll class="trace-rows">
+          <div class="trace-vspace" [style.height.px]="rowVirtualizer.getTotalSize()">
+            @for (vRow of rowVirtualizer.getVirtualItems(); track vRow.key) {
+              @let trace = filteredTraces()[vRow.index];
+              <div #traceRowEl class="trace-vrow"
+                   [attr.data-index]="vRow.index"
+                   [style.transform]="'translateY(' + vRow.start + 'px)'">
+                @if (trace) {
+                  <div class="trace-row"
+                       [class.active]="selectedTraceId() === trace.traceId"
+                       (click)="openTrace(trace.traceId)">
 
-              <span class="status-dot" [class]="statusCls(trace.status)"></span>
+                    <span class="status-dot" [class]="statusCls(trace.status)"></span>
 
-              <div class="trace-row-body">
-                <div class="trace-ts">{{ fmtTraceTime(trace.startTimeUnixNano) }}</div>
-                <div class="trace-path-line">
-                  @if (trace.httpMethod) {
-                    <span class="http-method" [class]="'m-' + trace.httpMethod.toLowerCase()">
-                      {{ trace.httpMethod }}
-                    </span>
-                  }
-                  <span class="trace-path">{{ trace.httpPath || trace.name }}</span>
-                </div>
+                    <div class="trace-row-body">
+                      <div class="trace-ts">{{ fmtTraceTime(trace.startTimeUnixNano) }}</div>
+                      <div class="trace-path-line">
+                        @if (trace.httpMethod) {
+                          <span class="http-method" [class]="'m-' + trace.httpMethod.toLowerCase()">
+                            {{ trace.httpMethod }}
+                          </span>
+                        }
+                        <span class="trace-path">{{ trace.httpPath || trace.name }}</span>
+                      </div>
 
-                <!-- Service chips -->
-                <div class="trace-svc-chips">
-                  @for (svc of traceServicesLabel(trace); track svc) {
-                    <span class="trace-svc-chip"
-                          [style.background]="svcColor(svc) + '18'"
-                          [style.color]="svcColor(svc)"
-                          [style.border-color]="svcColor(svc) + '44'">
-                      {{ svc }}
-                    </span>
-                  }
-                </div>
-              </div>
+                      <!-- Service chips -->
+                      <div class="trace-svc-chips">
+                        @for (svc of traceServicesLabel(trace); track svc) {
+                          <span class="trace-svc-chip"
+                                [style.background]="svcColor(svc) + '18'"
+                                [style.color]="svcColor(svc)"
+                                [style.border-color]="svcColor(svc) + '44'">
+                            {{ svc }}
+                          </span>
+                        }
+                      </div>
+                    </div>
 
-              <div class="trace-row-right">
-                <span class="status-badge" [class]="statusBadgeCls(trace.httpStatusCode, trace.status)">
-                  {{ statusBadgeLabel(trace.httpStatusCode, trace.status) }}
-                </span>
-                <span class="trace-dur mono">{{ fmtDurNs(trace.durationNanos) }}</span>
-                @if (trace.spanCount > 1) {
-                  <span class="span-count">{{ trace.spanCount }} spans</span>
+                    <div class="trace-row-right">
+                      <span class="status-badge" [class]="statusBadgeCls(trace.httpStatusCode, trace.status)">
+                        {{ statusBadgeLabel(trace.httpStatusCode, trace.status) }}
+                      </span>
+                      <span class="trace-dur mono">{{ fmtDurNs(trace.durationNanos) }}</span>
+                      @if (trace.spanCount > 1) {
+                        <span class="span-count">{{ trace.spanCount }} spans</span>
+                      }
+                    </div>
+                  </div>
                 }
               </div>
-            </div>
-          }
-
-          @if (hasMore()) {
-            <div class="load-more" #loadMoreSentinel>
-              @if (loadingMore()) {
-                <lucide-icon name="loader" [size]="14" class="spin" />
-              } @else {
-                <button class="load-more-btn" (click)="loadMore()">Load more</button>
-              }
-            </div>
-          } @else if (loadCapped()) {
-            <div class="load-more load-capped">
-              Showing the newest {{ traces().length }} — narrow the range or the query to see older traces
-            </div>
-          }
+            }
+          </div>
         </div>
       }
     </div>

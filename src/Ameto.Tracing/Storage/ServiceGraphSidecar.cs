@@ -1,3 +1,4 @@
+using Ameto.Core;
 using System.Text;
 
 namespace Ameto.Tracing.Storage;
@@ -106,7 +107,22 @@ internal static class ServiceGraphSidecar
 
             if (br.ReadUInt32() != GraphMagic) return [];
             br.ReadUInt16(); // version
+            // THE RULE, AND IT IS THE SAME RULE EVERYWHERE: a count read out of a file is bounded
+            // by the bytes of that file which could hold what it counts. An edge costs at least its
+            // two length prefixes, its call and error counts, and one uint per histogram bucket, so
+            // anything past that quotient is a number no writer produced.
+            //
+            // This is the tenth site of a shape whose ninth was fixed one file over, with the
+            // measurement written into its comment — and it is why the sweep is now a rule applied
+            // to every reader rather than a fix applied to a reported one. Measured here: a 10-byte
+            // .svcgraph whose count field says 500 000 000 allocated 4 000 005 632 bytes, and the
+            // catch below then turned the EOF into an empty list, so the sidecar reported "no
+            // edges" and the box reported nearly four gigabytes.
             uint count = br.ReadUInt32();
+            int perEdge = 2 + 2 + 4 + 4 + 4 * HistogramBuckets.Count;
+            FileBounds.RequireCountFits(count, fs.Length - fs.Position,
+                fileBytesPerElement: perEdge,
+                "Service-graph sidecar", path);
 
             var result = new List<ServiceEdgeRecord>((int)count);
             for (uint i = 0; i < count; i++)

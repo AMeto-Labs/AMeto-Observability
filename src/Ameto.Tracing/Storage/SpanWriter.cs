@@ -257,6 +257,11 @@ internal static class SpanWriter
             SpanCount     = spans.Count,
             Services      = services,
             FormatVersion = Version,
+            // The file was published a moment ago, so its write time is now — and it has to be
+            // carried like the reader carries it, or a segment that is flushed and then lost in
+            // the same process has no ceiling for the region it hands to VanishedRegionLog and
+            // the whole claim is clamped away.
+            LastWriteNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L,
         };
     }
 

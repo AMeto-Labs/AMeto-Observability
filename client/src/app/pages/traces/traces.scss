@@ -92,13 +92,33 @@
 }
 .custom-sep { color: var(--text-muted); font-size: 12px; }
 
-.live-badge {
+/* Live switch + cadence menu. One bordered group, like .preset-group, because they are one
+   control: the state the switch shows is the state the menu selects. */
+.live-group {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 2px;
+}
+
+.live-toggle {
   display: flex;
   align-items: center;
   gap: 5px;
+  background: none;
+  border: none;
+  border-radius: 4px;
+  padding: 4px 8px;
   font-size: 12px;
-  color: var(--success);
   font-weight: 600;
+  color: var(--success);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+
+  &:hover { background: var(--bg-card); }
 }
 
 .live-dot {
@@ -107,6 +127,34 @@
   border-radius: 50%;
   background: var(--success);
   animation: live-pulse 1.6s ease-in-out infinite;
+  flex-shrink: 0;
+}
+
+.live-select {
+  height: 22px;
+  padding: 0 17px 0 6px;
+  background: transparent;
+  border: none;
+  border-left: 1px solid var(--border);
+  border-radius: 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  outline: none;
+  cursor: pointer;
+  appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%2394a3b8'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 4px center;
+
+  &:hover, &:focus { color: var(--text-primary); }
+  option { background: var(--bg-elevated); }
+}
+
+/* Paused. The dot stops MOVING as well as changing colour: an animation is what the eye reads
+   as "something is still arriving", and a grey pulse would go on saying it. */
+.live-group.off {
+  .live-toggle { color: var(--text-muted); }
+  .live-dot    { background: var(--text-muted); animation: none; }
 }
 
 @keyframes live-pulse {
@@ -480,6 +528,22 @@
   overflow-y: auto;
 }
 
+// ── Virtual list scaffolding ───────────────────────────────────────────────
+// The spacer carries the full measured height of all rows so the scrollbar is honest about
+// how much list there is; each rendered row is lifted out of flow onto its own offset.
+.trace-vspace {
+  position: relative;
+  width: 100%;
+}
+
+.trace-vrow {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  will-change: transform;
+}
+
 // ── Trace row ──────────────────────────────────────────────────────────────
 .trace-row {
   display: flex;
@@ -490,9 +554,12 @@
   cursor: pointer;
   transition: background 0.1s;
 
-  &:last-child { border-bottom: none; }
-  &:hover      { background: var(--bg-elevated); }
-  &.active     { background: color-mix(in srgb, var(--accent) 8%, transparent); }
+  // No `&:last-child { border-bottom: none }`: every row is now the only child of its own
+  // .trace-vrow, so that rule would match all of them and erase every separator. The rule it
+  // replaced only ever tidied the final row, which sits at the bottom of a scroll container
+  // where its border reads as the container's edge anyway.
+  &:hover  { background: var(--bg-elevated); }
+  &.active { background: color-mix(in srgb, var(--accent) 8%, transparent); }
 }
 
 .status-dot {
@@ -1732,30 +1799,38 @@
   color: var(--text-muted);
 }
 
-// ── Load more (pagination sentinel at the bottom of the trace list) ────────
-.load-more {
+// ── Trace list header (live count + the stream's Stop control) ─────────────
+.list-actions {
   display: flex;
-  justify-content: center;
-  padding: 10px 0 14px;
-  color: var(--text-dim);
+  align-items: center;
+  gap: 6px;
 }
 
-.load-more-btn {
+.stream-stop {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 24px;
+  padding: 0 9px;
   background: none;
   border: 1px solid var(--border);
   border-radius: 6px;
   color: var(--text-dim);
   font-size: 11px;
-  padding: 4px 14px;
   cursor: pointer;
 
-  &:hover { color: var(--text); border-color: var(--text-dim); }
+  &:hover { color: var(--error); border-color: var(--error); }
 }
-.load-capped {
-  font-size: 11px;
-  color: var(--text-dim);
-}
+
 .list-more-hint {
   color: var(--text-dim);
   font-weight: 400;
+}
+
+// Warmer than .list-more-hint on purpose: the other suffixes describe an answer that is
+// merely short, this one says the list has stopped keeping itself up to date.
+.list-stale-hint {
+  color: var(--warning);
+  font-weight: 400;
+  cursor: help;
 }

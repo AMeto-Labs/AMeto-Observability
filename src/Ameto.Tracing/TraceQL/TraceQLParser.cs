@@ -19,9 +19,29 @@ namespace Ameto.Tracing.TraceQL;
 /// </summary>
 public static class TraceQLParser
 {
+    /// <summary>
+    /// The longest query text this parser will look at.
+    ///
+    /// <para>A ceiling on the LEXER, which the depth counter below cannot bound: tokenising is
+    /// iterative and safe at any length, but it materialises one <c>Token</c> — a kind, a string
+    /// and a double — per symbol, so a 30 MB <c>POST /api/traces/query</c> body is hundreds of
+    /// megabytes of token list before the parser is handed anything to refuse. On the 512 MB box
+    /// this branch exists to keep alive that is the whole machine.</para>
+    ///
+    /// <para>8 KB is far past any real filter — the longest one in this repo's tests is under
+    /// 200 characters — and it is roughly what Kestrel's default 8192-byte request line already
+    /// imposes on the <c>?ql=</c> form. This makes the POST form obey the same bound rather than
+    /// inheriting a 30 MB one.</para>
+    /// </summary>
+    public const int MaxQueryChars = 8 * 1024;
+
     /// <exception cref="TraceQLException">On syntax error.</exception>
     public static SpanPredicate Parse(string query)
     {
+        if (query.Length > MaxQueryChars)
+            throw new TraceQLException(
+                $"Query is {query.Length} characters; the limit is {MaxQueryChars}");
+
         var tokens = TraceQLLexer.Tokenize(query.AsSpan());
         var p = new ParserState(tokens);
         p.Expect(TokenKind.LBrace);
@@ -41,8 +61,29 @@ public static class TraceQLParser
 
     private sealed class ParserState
     {
+        /// <summary>
+        /// How deeply the grammar may nest before the query is refused.
+        ///
+        /// <para>THIS IS NOT A TASTE LIMIT, IT IS THE ONLY THING BETWEEN A QUERY STRING AND THE
+        /// PROCESS. <c>StackOverflowException</c> cannot be caught in .NET: the runtime kills the
+        /// whole process, taking every other in-flight request, the ingest pipeline and every
+        /// unwritten WAL buffer with it. Measured against the parent commit: <c>{((((…))))}</c>
+        /// survives 1500 levels and dies at 1700 — <b>a 3406-character query</b>, which fits
+        /// comfortably inside Kestrel's default 8192-byte request line, so one
+        /// <c>GET /api/traces/query/stream?ql=</c> from a browser address bar was enough. The
+        /// <c>!</c> form needs ~20 000 characters and so is only reachable through the POST body,
+        /// which this bounds too.</para>
+        ///
+        /// <para>64 against a real query's 2 or 3. Anything deeper is not a filter somebody wrote;
+        /// and the refusal is a <see cref="TraceQLException"/>, which both entry points already
+        /// turn into a 400 (or a <c>query-error</c> frame on the stream), so a mistake here costs a
+        /// message and not a connection.</para>
+        /// </summary>
+        private const int MaxDepth = 64;
+
         private readonly List<Token> _tokens;
         private int _pos;
+        private int _depth;
 
         public ParserState(List<Token> tokens) => _tokens = tokens;
 
@@ -91,14 +132,33 @@ public static class TraceQLParser
         }
 
         // unary = '!' unary | primary
+        //
+        // THE ONE CHOKE POINT, which is why the counter lives here and nowhere else. Every
+        // recursive edge in this grammar passes through this method exactly once per level of
+        // nesting: '!' recurses straight back into it, and '(' goes ParsePrimary → ParseExpr →
+        // ParseOr → ParseAnd → here. A counter in each recursive method would be three places to
+        // keep in step; this is one, and a rule added later inherits the bound as long as it
+        // reaches its operand through unary — which every operand in this grammar does.
+        //
+        // The decrement is in a `finally` because SIBLINGS ARE NOT NESTING. `{(a=1) && (b=2) &&
+        // …}` opens and closes one level at a time; without the restore a flat query of 65 terms
+        // would be refused as if it were 65 deep, which is a working query rejected in the name of
+        // a crash it cannot cause.
         private SpanPredicate ParseUnary()
         {
-            if (Peek().Kind == TokenKind.Not)
+            if (++_depth > MaxDepth)
+                throw new TraceQLException(
+                    $"Query nests more than {MaxDepth} levels deep at position {_pos}");
+            try
             {
-                Consume();
-                return new NotPredicate(ParseUnary());
+                if (Peek().Kind == TokenKind.Not)
+                {
+                    Consume();
+                    return new NotPredicate(ParseUnary());
+                }
+                return ParsePrimary();
             }
-            return ParsePrimary();
+            finally { _depth--; }
         }
 
         // primary = '(' expr ')' | attr_pred | intrinsic_pred

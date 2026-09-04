@@ -296,7 +296,7 @@ public sealed class SpanWalTests : IDisposable
             DateTimeOffset.UtcNow.AddHours(-1), DateTimeOffset.UtcNow.AddHours(1),
             serviceName: null, spanName: null, status: null,
             minDurationNanos: null, maxDurationNanos: null, limit: 100);
-        Assert.Equal(40, list.Count);                       // one trace per span in the corpus
+        Assert.Equal(40, list.Rows.Count);                  // one trace per span in the corpus
     }
 
     [Fact]

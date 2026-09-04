@@ -1,8 +1,10 @@
 import {
-  Component, signal, computed, effect, inject, viewChild, DestroyRef, ElementRef, OnInit,
+  Component, signal, computed, inject, OnInit, ElementRef,
   OnDestroy, HostListener, ChangeDetectionStrategy, ChangeDetectorRef,
+  viewChild, viewChildren, afterRenderEffect,
 } from '@angular/core';
-import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
+import { injectVirtualizer, measureElement as measureRenderedElement, type Virtualizer } from '@tanstack/angular-virtual';
+import { Observable, Subscription } from 'rxjs';
 import { Router, ActivatedRoute } from '@angular/router';
 import { FormsModule } from '@angular/forms';
 import { LucideAngularModule } from 'lucide-angular';
@@ -10,7 +12,8 @@ import { format } from 'date-fns';
 import { ApiService } from '../../core/services/api.service';
 import { serviceColor } from '../../shared/utils/service-color';
 import { EventDto } from '../../core/models/event.model';
-import { SpanDto, SpanQueryParams, TraceRowDto, TraceStatsDto } from '../../core/models/span.model';
+import { SpanDto, TraceRowDto, TraceStatsDto } from '../../core/models/span.model';
+import { StreamEndDto, StreamFrame } from '../../core/models/stream.model';
 import { subHours, formatISO } from 'date-fns';
 import { ServiceGraphComponent } from './service-graph/service-graph';
 import { FlamegraphComponent } from './flame-graph/flame-graph';
@@ -23,6 +26,109 @@ import { EventListRowComponent } from '../events/components/event-list-row/event
 import { PropertyMenuComponent } from '../../shared/components/property-menu/property-menu';
 import { SearchHistoryComponent } from '../../shared/components/search-history/search-history';
 import { SearchHistoryService } from '../../core/services/search-history.service';
+
+/**
+ * Who asked for a load of the trace list.
+ *
+ * It answers ONE question — may this stream own the failure? — and it is deliberately not the
+ * answer to "may this stream paint as it goes?", which is a question about the rows on screen.
+ * The two were once the same expression (`inPlace && traces().length > 0`), and an empty list
+ * made them disagree: the 15 s poll took the user's branch, so one flaky tick raised a banner
+ * for a search nobody ran, offered Stop on an unattended refresh, kept the background failure
+ * counter (and its backoff) at zero, and froze the list for the life of the page.
+ *
+ * 'background' is the poll's silent refresh and the return to the Traces tab — both re-run the
+ * query the list is ALREADY showing. Everything else is 'user': Apply, Run, Refresh, Clear, a
+ * range chip, a seek from the property menu, and the page's first load.
+ */
+export type LoadOrigin = 'user' | 'background';
+
+/**
+ * The cadences the Live control offers, in milliseconds — 0 is off.
+ *
+ * <p>One list, used three ways: it fills the menu, it is what a restored URL or a stored
+ * preference is checked against, and it is the only place a new cadence has to be added. A
+ * value that is not on it never reaches {@link TracesComponent.liveMs} — the page would poll
+ * happily at ?live=7000 from a hand-edited URL, but the menu could not show what it was doing,
+ * and a control that cannot describe its own state is worse than a fixed cadence.</p>
+ */
+export const LIVE_INTERVALS: readonly { ms: number; label: string }[] = [
+  { ms: 0,      label: 'Off' },
+  { ms: 1_000,  label: '1s'  },
+  { ms: 3_000,  label: '3s'  },
+  { ms: 5_000,  label: '5s'  },
+  { ms: 10_000, label: '10s' },
+  { ms: 15_000, label: '15s' },
+  { ms: 30_000, label: '30s' },
+];
+
+/**
+ * How the last stream that owned the list ended, in the only vocabulary the header speaks.
+ *
+ * <p>It is the SERVER's account, normalised — not a re-derivation of it. The client used to
+ * decide this by counting its own rows against the `max` it had asked for, which can answer
+ * exactly one of the cases below and answers it by coincidence: a list of exactly `max` rows is
+ * capped, and everything else is silently called complete.</p>
+ *
+ * <p>THE ENDING IS THE CEILING AXIS ONLY. Whether part of the window went missing on the way is
+ * a SEPARATE fact ({@link SegmentLoss}), held in a separate signal, because the server holds it
+ * separately too — `reason` and `truncatedBy` are two fields precisely because "your row ceiling
+ * stopped me" and "I could not read part of the window" are both true at once, routinely. This
+ * page used to fold them into one `capped-lost` value, and folding is what let the frame that
+ * happened to carry the loss decide how loud it was: the loss rides `truncatedBy` when the
+ * ceiling bit first and rides a `query-error` sentence when the walk reached the end of the
+ * window, and the two produced two different screens for one dead file. Unfolded, the loss is
+ * rendered by the loss and the ceiling by the ceiling.</p>
+ *
+ * <p>`null` is the absence of an ending — no stream has finished yet, or the list was emptied —
+ * and is deliberately NOT the same value as `read-out`, which is a positive claim by the server
+ * that the whole window was read. The header renders both as a bare count; only one of them
+ * means it.</p>
+ */
+export type ListEnding =
+  /** `complete: true` — the whole requested window was read out. */
+  | { kind: 'read-out' }
+  /** `max-rows` — the row ceiling stopped it. */
+  | { kind: 'capped' }
+  /** The server denied completeness for a reason this client cannot name. */
+  | { kind: 'short' };
+
+/**
+ * Part of the queried window is not in the answer, and never was — the `truncatedBy` vocabulary.
+ *
+ * <p>The two differ in ONE thing that matters to the reader, and it is not severity: it is
+ * whether asking again differently can help. A segment the search ran out of room to open comes
+ * back when the window is narrower; a segment that will not open does not come back at all.</p>
+ */
+export type SegmentLoss = 'unread-segment' | 'unreadable-segment';
+
+/**
+ * WHAT THE SERVER WOULD HAVE SAID, held here for the frame that cannot say it.
+ *
+ * <p>These are the server's own two truncation sentences, copied verbatim from
+ * `TraceQueryEndpointMapper.FinishStreamAsync`. They exist on this side because the server can
+ * only spell a loss out in prose on the ending where it has prose to spell: a `query-error`.
+ * When the row ceiling bites first the SAME loss rides the terminal `done` frame as a
+ * `truncatedBy` code with no sentence attached — and a code the page renders as a grey footnote
+ * while the sentence gets a banner is one dead file wearing two faces.</p>
+ *
+ * <p>So the page writes the sentence itself in that case, and writes the SAME one, so that what
+ * the operator sees is decided by which segment vanished and not by how many rows happened to
+ * fit above it. The copy is the cost: a re-worded sentence on the server drifts from this one
+ * until someone copies it across. That is a wording drift, not a treatment drift — the loud
+ * screen is raised by the `truncatedBy` code either way — and the only thing that would remove
+ * it is a machine-readable cause on the `query-error` frame, which is server work.</p>
+ */
+const LOSS_SENTENCE: Readonly<Record<SegmentLoss, string>> = {
+  'unreadable-segment':
+    'Results are truncated: a storage segment inside this window could not be read — it was '
+    + 'deleted or damaged — so the traces it held are missing from this list. Narrowing the time '
+    + 'window will not bring them back; the server log names the file.',
+  'unread-segment':
+    'Results are truncated: part of this window sits inside a storage segment the search ran out '
+    + 'of room to open before it had to move on, so the traces it holds are missing from this '
+    + 'list. Narrow the time window to bring them back into reach.',
+};
 
 /** TraceQL vocabulary offered by the Ctrl+Space autocomplete: intrinsics, common OTel span
  *  attributes (dotted), status/kind enum values, and the comparison/boolean operators. */
@@ -111,7 +217,7 @@ export class TracesComponent implements OnInit, OnDestroy {
   customTo           = '';
 
   /** Stable query window driving the Graph / Latency panels. Set on user action only, so the
-   *  15 s live poll never changes it → those panels don't re-fetch/re-layout (no jumping). */
+   *  live poll never changes it → those panels don't re-fetch/re-layout (no jumping). */
   readonly winFrom     = signal<string>('');
   readonly winTo       = signal<string | undefined>(undefined);
   /** Full service list from the backend (not just services present in loaded traces). */
@@ -120,6 +226,18 @@ export class TracesComponent implements OnInit, OnDestroy {
   // TraceQL
   traceqlInput   = '';
   traceqlMode    = signal(false);
+  /** The SERVER'S OWN SENTENCE for a search the USER ran that ended in an error — '' when none
+   *  did. Despite the name it is not TraceQL-specific: the filter-bar path streams too, and dies
+   *  the same ways. A failing BACKGROUND refresh must never set it: see the error branch of
+   *  startStream.
+   *
+   *  It is no longer read directly by anything that RENDERS. Everything downstream — the banner
+   *  strip, the header suffix, the hold — goes through {@link listBanner}, because this is only
+   *  one of the two ways the same news arrives: a vanished segment reported at the end of the
+   *  window lands here as a sentence, and the identical segment reported at the row ceiling
+   *  lands in {@link listLoss} as a code with no sentence at all. Anything reading this signal
+   *  alone renders one of those and not the other, which is exactly how one dead file came to
+   *  look like an error at max=1000 and like a footnote at max=50. */
   traceqlError   = signal('');
   /** Candidates for the TraceQL Ctrl+Space autocomplete. */
   readonly traceqlSuggestions = TRACEQL_TOKENS as string[];
@@ -128,61 +246,321 @@ export class TracesComponent implements OnInit, OnDestroy {
   historyOpen = signal(false);
 
   private _poll: ReturnType<typeof setInterval> | null = null;
-  private _io: IntersectionObserver | null = null;
-  private readonly loadMoreSentinel = viewChild<ElementRef<HTMLElement>>('loadMoreSentinel');
 
-  constructor() {
-    // The sentinel lives under an @if, so it appears and disappears with hasMore; the
-    // effect re-observes whichever element currently exists. rootMargin starts the fetch
-    // a screen early, so scrolling feels continuous rather than stop-and-wait.
-    effect(() => {
-      const el = this.loadMoreSentinel()?.nativeElement;
-      this._io?.disconnect();
-      if (!el) return;
-      this._io ??= null;
-      // root must be the element that actually scrolls (.trace-rows, overflow-y: auto):
-      // with the default viewport root, the clipping ancestor trims the sentinel to its
-      // own UNexpanded bounds before rootMargin is even considered, so the "fetch a
-      // screen early" margin quietly did nothing.
-      this._io = new IntersectionObserver(
-        entries => { if (entries.some(e => e.isIntersecting)) this.loadMore(); },
-        { root: el.closest('.trace-rows'), rootMargin: '400px' });
-      this._io.observe(el);
-    });
+  // ── Streaming ─────────────────────────────────────────────────────────────
+  // The list arrives over SSE, one row at a time. There is no request epoch here and no
+  // page bookkeeping: the epoch counter existed only because a slow response from an
+  // ABANDONED search could splice itself into the list of the search that replaced it, and
+  // unsubscribing the previous stream before starting the next one is that same guarantee
+  // made structural — a cancelled EventSource has no callbacks left to fire. Deleted, not
+  // forgotten.
+
+  /** The one stream that may own the list. Non-null exactly while rows can still arrive. */
+  private streamSub: Subscription | null = null;
+  /** Publishes the current stream's buffer into `traces`, or null while the stream has
+   *  nothing it may hand over yet (a silent refresh — see startStream). */
+  private flushPending: (() => void) | null = null;
+  /** True while ANY stream is open: the poll stands back (never two at once) and the Refresh
+   *  icon spins, which is the whole visible footprint of a background refresh. */
+  readonly streaming = signal(false);
+  /** True while the open stream is one the USER asked for. The "streaming…" hint and the Stop
+   *  button belong to this one: a background refresh has nothing the user needs to interrupt,
+   *  and offering Stop twice a minute is just flicker — including over an empty list, which is
+   *  a fact about the rows and never about who asked. What it is NOT is "this stream reaches
+   *  the rows": a background refresh of an empty list does paint into it (streamPaints), and
+   *  that is the flag stopStream reads. */
+  readonly streamPublishing = signal(false);
+  /** Whether the open stream may put rows on screen at all — true for every user-initiated
+   *  search and for a background refresh that found the list empty. Read by stopStream: only
+   *  a stream that was painting can leave a PARTIAL list behind, and only then may the header
+   *  call it partial. Not a signal: nothing renders it, it only qualifies the stamp. */
+  private streamPaints = false;
+  /** How the last stream to own the list ended — the server's own account of it, normalised by
+   *  {@link endingOf}. Null until a stream has finished, and again whenever the list is emptied:
+   *  an ending describes rows, and outlives nothing else. */
+  readonly listEnding = signal<ListEnding | null>(null);
+  /**
+   * Part of the window on screen is MISSING, and which kind of missing — null when nothing is.
+   *
+   * <p>Separate from {@link listEnding} because it has a different lifetime, and that difference
+   * is the whole of it. An ending describes ONE READ: the next read replaces it, and a read that
+   * runs to the bottom of the window genuinely disproves the last one that did not. A lost
+   * segment describes the STORAGE, and no read can disprove it — nothing re-reads a file that is
+   * gone. The server says as much where it remembers them (VanishedRegionLog: "the consumer may
+   * never decide a later page has made the fault good").</p>
+   *
+   * <p>Which is why nothing in the streaming path ever CLEARS this. A stream may only set it
+   * (see the `complete` handler); it goes back to null in exactly one place — a search the USER
+   * ran, emptying the list. Before that rule existed, a background tick was enough to retire the
+   * warning: end a user search with `{max-rows, unreadable-segment}`, restart the server so the
+   * in-process memory of the dead segment is gone, and the 15 s poll came back
+   * `{complete:true, exhausted}` and quietly relabelled a window with a permanent hole in it as
+   * whole — the same lie the server-side memory was built to kill, reached by waiting instead of
+   * by clicking. An unattended refresh may replace rows and may make the page LESS confident; it
+   * may not make it more confident than the user left it.</p>
+   */
+  readonly listLoss = signal<SegmentLoss | null>(null);
+  /** The `max` the request behind the rows on screen actually carried, so the header names the
+   *  ceiling that was asked for rather than the one this page would ask for next. Identical
+   *  today (every caller sends {@link streamMax}); it stops being identical the first time a
+   *  caller passes anything else, and a hint that reads "newest 2000" over a 500-row ask is a
+   *  wrong number, not a stale one. */
+  readonly listMax = signal(2000);
+  /** True when the last stream ended because it hit its row ceiling, so older traces exist
+   *  beyond what is on screen and the header must say so rather than imply completeness.
+   *  Derived rather than stored, so it cannot disagree with the ending it is a fact about. */
+  readonly streamCapped = computed(() => this.listEnding()?.kind === 'capped');
+  /**
+   * The one sentence that goes above the filter bar — '' when there is none.
+   *
+   * <p>Two sources, one strip, and deliberately so. The server sends its own sentence when the
+   * ending it reached has one (a `query-error`); when the row ceiling bit first, the very same
+   * loss arrives as a `truncatedBy` code on a `done` frame with no sentence at all, and the page
+   * supplies the one the server would have sent ({@link LOSS_SENTENCE}). Rendering only the
+   * first of those is how one vanished segment came to look like an error at max=1000 and like a
+   * footnote at max=50.</p>
+   *
+   * <p>A failure the page could not classify wins over a loss it could: `traceqlError` means a
+   * search the user ran did not finish, which is a bigger claim about the rows than a hole in
+   * them, and the server's own words are always the better sentence when there are any. In
+   * practice the two never coexist — a stream that ends in an error reports no `truncatedBy`,
+   * and a user's stream clears both before it starts.</p>
+   */
+  readonly listBanner = computed<string>(() => {
+    const spoke = this.traceqlError();
+    if (spoke) return spoke;
+    const loss = this.listLoss();
+    return loss ? LOSS_SENTENCE[loss] : '';
+  });
+  /**
+   * The list header's account of an ending, with the long version in its tooltip — or null when
+   * there is nothing to add to the count (nothing has ended, or the server said it read the
+   * whole window out).
+   *
+   * <p>The two losses keep different ADVICE, which is the whole reason `truncatedBy` is carried
+   * this far: a segment the search ran out of room to open comes back when the window is
+   * narrower, and a segment that will not open does not come back at all — telling the second
+   * user to narrow their window sends them round a loop that cannot help them. That advice now
+   * leads with {@link listBanner}, where it is a sentence rather than a tooltip, and the suffix
+   * echoes it in its `title`. The suffix itself says only what every road to it can support.</p>
+   */
+  readonly listEndHint = computed<{ text: string; title: string } | null>(() => {
+    const loss   = this.listLoss();
+    const spoke  = this.listBanner() !== '';
+    const end    = this.listEnding();
+    const capped = end?.kind === 'capped';
+
+    // ── THE FRAME CATEGORY DOES NOT APPEAR IN THIS BRANCH, AND THAT IS THE POINT ───────────
+    //
+    // One vanished segment reaches this page down two different roads. Walk the window to its
+    // floor with a hole in it and the server ends the stream with a `query-error` sentence;
+    // reach the row ceiling on the way and the SAME hole rides the terminal `done` frame as
+    // `truncatedBy`. streamJson routes the first to `subscriber.error` and the second to an
+    // ending value — two categories, and the page used to read the category as the severity:
+    // red banner and a frozen list at max=1000, a grey count suffix and a live list at max=50,
+    // for one and the same dead file, chosen by how many rows happened to fit above it.
+    //
+    // So the LOSS picks the treatment and the ceiling is only ever a clause on top of it. Both
+    // roads now end here: a standing sentence above the filter bar, a list held off the poll,
+    // and a suffix that calls the rows partial and points at the sentence. What the two roads
+    // still do not share is DETAIL — only one of them knows the ceiling also bit — and detail
+    // the page has is not a reason to withhold it. Detail it does NOT have is the other half:
+    // a `query-error` arrives as prose, so this page cannot tell a lost segment from a spent
+    // deadline there, and refuses to guess by pattern-matching an English sentence. Saying
+    // "partial, and the message says why" is true of every ending that reaches this branch.
+    if (loss || spoke) {
+      if (!this.traces().length)
+        // No rows at all — a parse error, or a refusal before the first one. An empty list is
+        // not a partial one, so this does not call it that.
+        return {
+          text:  '· the search failed — see the message above',
+          title: 'The message above the filter bar is the server\'s own account of why nothing '
+               + 'came back.',
+        };
+      return {
+        text:  capped
+          ? `· newest ${this.listMax()}, partial list — see the message above`
+          : '· partial list — see the message above',
+        title: loss
+          ? (loss === 'unreadable-segment'
+              ? 'Part of this window sits in a storage segment that would not open — the traces '
+              + 'it held are missing from the list entirely, and narrowing the time window will '
+              + 'NOT bring them back. The message above the filter bar says so in full.'
+              : 'Part of this window sits in a storage segment the search ran out of room to '
+              + 'open before it had to move on — the traces it holds are missing from the list '
+              + 'entirely. Narrow the time window to bring them back into reach.')
+          : 'The rows below are a prefix of the answer. The message above the filter bar is the '
+          + 'server\'s own account of why it is short.',
+      };
+    }
+
+    switch (end?.kind) {
+      case 'capped':
+        return {
+          text:  `· newest ${this.listMax()} — narrow the range or the query for older traces`,
+          title: 'The search stopped at the row ceiling it was given. Older traces inside this '
+               + 'window exist and are not in the list.',
+        };
+      case 'short':
+        return {
+          text:  '· partial list — the server stopped before the end of the window',
+          title: 'The server reported that it did not read the whole window out, for a reason '
+               + 'this page does not recognise. The rows below are a prefix of the answer.',
+        };
+      default:
+        return null;
+    }
+  });
+  /** True when the last stream was cut short — Stop, or leaving the list mid-flight. The rows
+   *  on screen are then a PREFIX of the answer, and the header has to say so: stopped at 300
+   *  of a window holding 2000 must not read like a search that genuinely found 300. */
+  readonly streamStopped = signal(false);
+  /** The list is the user's, not the poll's: they stopped it, or a search THEY ran died and
+   *  left them the rows it found plus the banner explaining why that is all there is. Either
+   *  way the 15 s refresh leaves both alone until the user runs something — taking the rows
+   *  back mid-read is the same theft whichever way the stream ended.
+   *
+   *  Both halves are things the user did and can see. A BACKGROUND refresh that fails is
+   *  neither, and deliberately does not reach here: it would freeze the list over a query the
+   *  user never ran, with nothing on screen saying so. It backs off instead (nextBgListAt) and
+   *  says so in the list header (bgRefreshFailing).
+   *
+   *  The failure half reads the BANNER rather than a flag of its own, so the reason on screen
+   *  and the reason the list is frozen cannot drift apart: whatever clears the banner is exactly
+   *  what thaws the list.
+   *
+   *  A LOSS IS NOT ONE OF THE HALVES, and it was, which cost the page its refresh. Both halves
+   *  above are things the USER did — they stopped the stream, or a search they ran ended badly —
+   *  and holding protects that from being overwritten unread. A lost or skipped segment is neither:
+   *  it is a fact about the storage, and freezing the list over it stopped the rows updating for
+   *  the life of the page with nothing on screen saying so, because the staleness hint is itself
+   *  suppressed while held and the failure counter cannot grow behind an early return. It bit
+   *  hardest where it mattered least: `unread-segment` is not even permanent — the server's own
+   *  sentence for it is that the search ran out of room before it had to move on, which the very
+   *  next refresh may well get past.
+   *
+   *  Nothing is lost by letting the list stay live. A permanent hole is re-reported by the server
+   *  on every request — that is exactly what the engine-level memory of vanished segments
+   *  guarantees — so the banner comes back on its own for as long as it is true, and stops when it
+   *  stops being true. That is a better contract than a page that froze once and could not tell
+   *  the difference afterwards.
+   *
+   *  The reason this could be demoted now and not before: the treatment used to have to be decided
+   *  from an English sentence, because only the `done` road carried a machine-readable cause. Both
+   *  roads carry it now (see `truncatedBy` on the error frame), so one fault gets one treatment
+   *  whichever frame it arrived on — which is also what stopped the same dead file rendering as a
+   *  blocking banner or a grey suffix depending on how many rows fitted above it. */
+  private readonly listHeld = computed(() =>
+    this.streamStopped() || this.traceqlError() !== '');
+  /** Rows one stream will deliver before the server stops — sent as `?max=` (which the server
+   *  clamps to 1…5000 and enforces by ending the stream), and the number the header names.
+   *
+   *  It bounds the ARRAY, not the DOM. A trace row is 13 elements before its second service
+   *  chip, so 2000 of them rendered flat is ~26k — a bill the old 200-row page cap never sent
+   *  the browser. What bounds the DOM is the virtualizer below: at a 600px viewport and ~82px
+   *  a row, a 2000-row answer stands at 16 rendered rows / 209 elements behind a spacer 2000
+   *  rows tall (measured, traces.background-intent.spec.ts). That is also what makes the 15 s
+   *  refresh affordable: re-streaming 2000 rows re-diffs 2000 array entries but touches ~200
+   *  elements. Raising this costs memory and wire time, not paint. */
+  readonly streamMax = 2000;
+  /** Consecutive failures of the BACKGROUND refresh (the live poll). A user-initiated search
+   *  never lands here — it gets the banner instead. Zeroed by any complete stream and by any
+   *  search the user runs, so it only ever counts an unbroken run. */
+  private readonly bgFailures = signal(0);
+  /** The cadence the page falls back to when nothing has been chosen — what the poll ran at
+   *  unconditionally before the Live control existed, so an untouched page behaves exactly as
+   *  it always did (and the two poll specs still tick at 15 s). */
+  private static readonly DefaultLiveMs = 15_000;
+  /** Where the chosen cadence outlives the URL. The URL stays the authority — a link may hand
+   *  someone a paused page on purpose — and this is only what a URL that says nothing falls
+   *  back to, so a 30 s choice survives clicking Traces in the sidebar again. */
+  private static readonly LiveKey = 'ameto-traces-live-ms';
+  /**
+   * The live-refresh cadence in ms, and the WHOLE of the Live control's state: 0 is off.
+   *
+   * <p>One signal, not a boolean beside a number, because the pair can hold states the page has
+   * no behaviour for: "live on at 0 ms" and "live off at 15 s" are both expressible and neither
+   * means anything. The toggle is therefore a shortcut between two values of this one signal
+   * (see {@link toggleLive}), and the menu's Off entry IS the toggle's off — two controls over
+   * one signal cannot drift apart, which is the only reason it is safe to ship both.</p>
+   */
+  readonly liveMs = signal(TracesComponent.DefaultLiveMs);
+  /** Whether anything refreshes itself at all. Read by poll() — both its callers land there —
+   *  and by the header, which may not say the refresh is failing when there is no refresh. */
+  readonly liveOn = computed(() => this.liveMs() > 0);
+  /** The cadence the toggle switches back ON to: the last one that was actually live. Kept off
+   *  {@link liveMs} because pausing must not destroy the choice underneath it — resuming a 30 s
+   *  page at 15 s would be the control changing a setting the user never touched. */
+  private lastLiveMs = TracesComponent.DefaultLiveMs;
+  /** No two background refreshes closer together than this, whoever asked. poll() has TWO
+   *  callers and only one of them is a clock: the timer paces itself, the visibility handler
+   *  fires as fast as the user alt-tabs. A floor on BURSTS, not a second schedule — which is
+   *  exactly why {@link bgFloorMs} caps it by the cadence in force: a fixed 5 s floor over a
+   *  1 s cadence is not a burst guard, it is a 1 s menu entry that quietly runs at 5 s, i.e. a
+   *  page lying about what it is doing. Without any floor, eight returns to the tab in five
+   *  seconds were eight stats queries. */
+  private static readonly BgFloorMs = 5_000;
+  /** The burst floor as it applies to the cadence in force — never longer than the interval
+   *  the user asked for, so every scheduled tick gets through and only the EXTRA callers are
+   *  throttled. (Live off: no tick to let through, and the constant is as good as any.) */
+  private bgFloorMs(): number {
+    const live = this.liveMs();
+    return live > 0 ? Math.min(TracesComponent.BgFloorMs, live) : TracesComponent.BgFloorMs;
   }
+  /** Earliest epoch-ms at which poll() may do any background work at all (see BgFloorMs). */
+  private nextBgPollAt = 0;
+  /** A load the USER asked for that the list could not run, because the list was not the panel
+   *  on screen — the range chips and the filter bar render above the tab strip, so both stay
+   *  live while Service Graph / Latency / Compare is showing.
+   *
+   *  It is what lets {@link loadAll} stop retiring a held list's warning in advance of an
+   *  outcome. The old code released the hold there and then, so that returning to the tab would
+   *  find an unheld list and refresh it; the cost was a banner cleared by a click that started
+   *  no query. Remembering the ASK instead keeps both: the banner stands over the rows it
+   *  describes until something replaces them, and {@link setMainTab} runs the load on return as
+   *  what it always was — the user's own search, which empties the list and retires the marker
+   *  in the same step. */
+  private pendingUserLoad = false;
+  /** Earliest epoch-ms at which the background LIST refresh may be attempted again after a
+   *  failure. Grows 1 → 2 → 4 → 8 backoff units with the failure count (see
+   *  {@link backoffUnitMs} — 15 s → 2 min at the default cadence): re-firing a doomed query
+   *  every tick for as long as the page is open is not a retry policy.
+   *
+   *  A TIMESTAMP, not a countdown of ticks, and that is the whole point. A counter spent one
+   *  unit per CALL to poll(), and poll() has two callers — so every hidden→visible transition
+   *  burned a tick of a backoff it never waited out. Alt-tab eight times in five seconds and
+   *  the ninth return re-ran the same doomed month-wide scan immediately: a backoff that made
+   *  the failing query arrive FASTER than no backoff at all. Wall time cannot be spent by
+   *  being asked, so it no longer matters who calls poll(), or how often.
+   *
+   *  Gates the list only. Stats are a different query, and the one that failed is the list's. */
+  private nextBgListAt = 0;
+  /** When the list last took delivery of a COMPLETE answer. Read only by bgRefreshHint(), to
+   *  date the rows on screen when the refresh behind them has stopped working. */
+  private readonly listLoadedAt = signal<number | null>(null);
+  /** The unit the backoff above is counted in: the cadence in force, but never shorter than
+   *  the default. Counting purely in poll intervals was right while there was only one
+   *  interval; at 1 s it becomes a 1 → 8 s ladder, i.e. a doomed query re-fired eight times a
+   *  minute for as long as the page is open — the hammering the backoff exists to stop.
+   *  Flooring it at 15 s leaves the shipped 15 s → 2 min ladder untouched and lets the slower
+   *  cadences go on counting in their own intervals. */
+  private backoffUnitMs(): number {
+    return Math.max(this.liveMs(), TracesComponent.DefaultLiveMs);
+  }
+  /** A background refresh has failed three times running (~45 s at the default cadence), so
+   *  the list is no longer live and the user is owed that fact. Three, not one: a single
+   *  dropped tick is noise. Suppressed while the list is held, where the header is already
+   *  explaining itself — and while Live is off, where there is no refresh to be failing and
+   *  the rows are frozen because the user froze them. */
+  readonly bgRefreshFailing = computed(() =>
+    this.bgFailures() >= 3 && !this.listHeld() && this.liveOn());
+  /** Rows buffered before a new array is pushed into `traces`. One array per frame would
+   *  re-render the whole list a thousand times over a full stream; one per 25 keeps the
+   *  count visibly moving without the churn (the Events store does the same at 10). */
+  private static readonly FlushEvery = 25;
 
-  // ── Pagination ────────────────────────────────────────────────────────────
-  // A search shows the NEWEST page of its window, so widening 1 h → 24 h without paging
-  // shows the SAME rows whenever the newest hour already fills the page — which reads as
-  // "the range does nothing". These drive the load-more sentinel at the list's bottom.
-  readonly hasMore     = signal(false);
-  readonly loadingMore = signal(false);
-  private static readonly QlPageSize     = 200;
-  private static readonly FilterPageSize = 500;
-  /** The query a continuation must repeat — frozen at run time, so edits to the inputs
-   *  after a search do not silently change what "more of the same" means. */
-  private pageCtx:
-    | { mode: 'ql'; ql: string; from: string }
-    | { mode: 'filter'; params: SpanQueryParams }
-    | null = null;
-  /** True once the list holds more than the first page; the live poll then leaves the
-   *  list alone — a refresh that replaced it with page one would throw away everything
-   *  the user scrolled to. A fresh explicit search resets it. */
-  private paginated = false;
-  /** Bumped by every fresh search; every response carries the epoch it was sent under and
-   *  is dropped if the world moved on — a slow page 2 of an abandoned search must not
-   *  splice itself into the list of the search that replaced it, and a slow FIRST page
-   *  must not overwrite the results of the search issued after it. */
-  private queryEpoch = 0;
-  /** TraceIds already in the list — kept incrementally: rebuilt from scratch per page it
-   *  made every scroll step pay for the whole history. Reset by every fresh search. */
-  private knownIds = new Set<string>();
-  /** The old flat 200/500 cap bounded list, DOM and memory; paging removed it, this puts
-   *  an explicit ceiling back. The sentinel says so when it is reached. */
-  private static readonly MaxLoadedRows = 2000;
-  readonly loadCapped = signal(false);
-  private destroyRef = inject(DestroyRef);
-  /** Refresh immediately when the tab is re-shown after being hidden. */
+  /** Refresh when the tab is re-shown after being hidden. poll() decides whether anything is
+   *  actually due — this handler is one more caller, not a privileged one. */
   private _onVisibility = () => { if (!document.hidden) this.poll(); };
 
   // ── Computed ──────────────────────────────────────────────────────────────
@@ -192,6 +570,98 @@ export class TracesComponent implements OnInit, OnDestroy {
   });
 
   filteredTraces = computed(() => this.traces());
+
+  /** The list spinner may only show when there is no list. The spinner and the rows are the
+   *  two arms of one @if, so letting it win while rows are on screen UNMOUNTS the scroll
+   *  container — and the rows come back in a brand-new element at scrollTop 0. */
+  readonly listLoading = computed(() => this.loading() && this.traces().length === 0);
+
+  // ── Virtual list ──────────────────────────────────────────────────────────
+  // `.trace-rows` is the scroll element; it only exists in the rows arm of the list's @if, so
+  // both queries are legitimately empty while the spinner or the empty state is showing and
+  // the virtualizer takes `undefined` for its scroll element until the arm mounts.
+  private readonly traceScroll = viewChild<ElementRef<HTMLElement>>('traceScroll');
+  private readonly traceRowEls = viewChildren<ElementRef<HTMLElement>>('traceRowEl');
+
+  /**
+   * Renders only the rows in view. @tanstack/angular-virtual is already a dependency and
+   * already drives the Events list, so this is the house pattern rather than a new one.
+   *
+   * MEASURED, not fixed-height, which is where it differs from Events: a trace row is a
+   * timestamp, a path that wraps to a second line when the method badge crowds it, and a
+   * service-chip row that wraps once per ~3 services — in a panel that itself narrows from
+   * 400px to 320px when a trace is open. Events could pin 29px because its rows are one line
+   * by construction; pinning a height here would mean clipping the service chips, and hiding
+   * which services a trace touched to save a measurement is not a trade worth making on this
+   * page. `estimateSize` is the common case (one line each) and every rendered row corrects
+   * itself; the correction is a no-op once measured, since resizeItem ignores a zero delta.
+   */
+  /**
+   * A measurement, unless there is nothing to measure — in which case KEEP WHAT WE KNEW.
+   *
+   * The list lives inside `.main-content`, which the Graph / Latency / Compare tabs hide with
+   * `display: none` (see setMainTab). A `display: none` subtree has no CSS box at all, so every
+   * measurement inside it is exactly 0 — not approximately, 0 — and @tanstack/virtual has no
+   * guard of its own: `resizeItem` writes whatever it is handed into `itemSizeCache`, keyed by
+   * traceId. A row measured at 0 and then scrolled out of the rendered window keeps that 0 until
+   * it is rendered again, and `getTotalSize()` sums the cache — so every row after it is placed
+   * at the wrong offset, and the list comes back collapsed or showing the wrong slice.
+   *
+   * THIS HOOK AND NOT THE afterRender PASS BELOW, because our call is not the only writer:
+   * ResizeObserver fires with a 0×0 box the instant the panel is hidden, for every row already
+   * being observed, so guarding the call would leave that path writing zeros. Both paths route
+   * through `options.measureElement`, so one override covers them — and it self-heals, because
+   * showing the panel fires the observer again with the real box.
+   *
+   * NOT `@if` instead of `display: none`, which would make the question moot by unmounting the
+   * subtree: `.trace-rows` IS the scroll container, and unmounting it returns the user to
+   * scrollTop 0 every time they glance at the Graph tab. That is the trade already reasoned out
+   * for the spinner on `listLoading` above, and it comes out the same way here.
+   *
+   * Declared BEFORE rowVirtualizer, and an arrow property rather than a method: field
+   * initialisers run in source order, and the virtualizer stores the option and calls it unbound.
+   */
+  private readonly measureOnlyWhenRendered = (
+    el:       Element,
+    entry:    ResizeObserverEntry | undefined,
+    instance: Virtualizer<HTMLElement, Element>,
+  ): number => {
+    // getClientRects() is empty exactly when the element has no CSS box — the direct test, where
+    // `offsetHeight === 0` would also be true of a row that is merely empty.
+    if (el.getClientRects().length > 0) return measureRenderedElement(el, entry, instance);
+
+    const i = instance.indexFromElement(el);
+    return instance.itemSizeCache.get(instance.options.getItemKey(i))
+        ?? instance.options.estimateSize(i);
+  };
+
+  readonly rowVirtualizer = injectVirtualizer(() => ({
+    count:          this.filteredTraces().length,
+    scrollElement:  this.traceScroll(),
+    estimateSize:   () => 82,
+    overscan:       8,
+    getItemKey:     (i: number) => this.filteredTraces()[i]?.traceId ?? i,
+    measureElement: this.measureOnlyWhenRendered,
+  }));
+
+  constructor() {
+    // Drops the row elements the virtualizer still holds by key but that are no longer in the
+    // document — what measureElement(null) is for. Keyed on traceId, those entries survive the
+    // answer that produced them, so without this a page left open across many searches keeps a
+    // detached node alive for every trace it has ever rendered. Tracks the ROW ARRAY, not the
+    // rendered elements, so scrolling does not pay for a sweep on every frame.
+    afterRenderEffect(() => {
+      this.filteredTraces();
+      this.rowVirtualizer.measureElement(null);
+    });
+    // Hands each rendered row to the virtualizer to be measured and observed. afterRender, not
+    // effect: the elements have to exist and be laid out before their height means anything.
+    // measureElement is idempotent per node — it re-observes only when the element behind a
+    // key changed, and notifies only when the height actually moved — so this cannot spin.
+    afterRenderEffect(() => {
+      for (const el of this.traceRowEls()) this.rowVirtualizer.measureElement(el.nativeElement);
+    });
+  }
 
   /** Services offered in the filter — backend list ∪ services seen in loaded traces. */
   serviceOptions = computed(() => {
@@ -246,88 +716,41 @@ export class TracesComponent implements OnInit, OnDestroy {
     this.setWindow();
     this.loadAllServices();
     this.loadAll();
-    this._poll = setInterval(() => this.poll(), 15_000);
+    this.restartLive();
     document.addEventListener('visibilitychange', this._onVisibility);
   }
 
-  /** Periodic live refresh. Skips work when the tab is hidden, and only refetches the
-   *  (heavier) trace list while the Traces tab is actually on screen. */
+  /** Periodic live refresh. Does nothing while Live is off or the tab is hidden, and only
+   *  restarts the (heavier) trace list while the Traces tab is actually on screen. */
   private poll() {
-    if (document.hidden) return;
+    // Live off means nothing refreshes itself. The timer is already gone by then — but the
+    // visibility handler is the other caller, and it has no timer to be gone.
+    if (!this.liveOn() || document.hidden) return;
+    // One clock for both callers. Everything below this line is background work, and how much
+    // of it is due is a question about elapsed TIME — never about how many times poll() was
+    // asked. A run of hidden→visible transitions is one refresh, not eight.
+    const now = Date.now();
+    if (now < this.nextBgPollAt) return;
+    this.nextBgPollAt = now + this.bgFloorMs();
     const from = this.fromIso();
     const to   = this.toIso();
     this.loadStats(from, to);
-    // A paginated list is the user's scroll position made of data; the poll replacing it
-    // with page one would discard every loaded page mid-read. loadingMore() covers the
-    // window where page two is REQUESTED but not yet landed — paginated only flips on
-    // arrival, and a poll firing inside that window raced the append with a full replace.
-    // They get fresh rows on the next explicit search — which also re-arms the poll.
-    if (this.activeMainTab === 'traces' && !this.paginated && !this.loadingMore())
-      this.loadTraces(from, to);
-  }
-
-  /**
-   * Fetches the next page of the CURRENT search — the frozen one in pageCtx, not whatever
-   * the inputs say now — as everything strictly older than the oldest loaded row. Keyset
-   * continuation on start time; the 1 ms cursor overlap that nano→ms truncation can cause
-   * is closed by the traceId dedupe on append.
-   */
-  loadMore(): void {
-    const ctx = this.pageCtx;
-    if (!ctx || this.loadingMore() || this.loading() || !this.hasMore()) return;
-    const rows = this.traces();
-    if (rows.length === 0) { this.hasMore.set(false); return; }
-
-    // Pages arrive sorted newest-first and strictly older than what preceded them, so the
-    // oldest loaded row is always the last one — no scan.
-    //
-    // The cursor rounds UP to the enclosing millisecond, with no decrement. The previous
-    // form — floor minus one — did not create the "safe overlap" its comment promised; it
-    // created a 1-2 ms HOLE: a trace at ...122.5 ms sat strictly between the cursor
-    // (...122 ms) and the oldest loaded row (...123.9 ms), was excluded by the server's
-    // <= comparison, and could never be reached by any later page either, because every
-    // later cursor derives from what actually loaded. Rounding up makes the boundary
-    // millisecond overlap instead — and overlap is the failure mode the traceId dedupe
-    // below genuinely handles.
-    const oldest = rows[rows.length - 1].startTimeUnixNano;
-    const to = new Date(Math.ceil(oldest / 1_000_000)).toISOString();
-
-    const pageSize = ctx.mode === 'ql' ? TracesComponent.QlPageSize : TracesComponent.FilterPageSize;
-    const request  = ctx.mode === 'ql'
-      ? this.api.queryTraces({ query: ctx.ql, from: ctx.from, to, limit: pageSize })
-      : this.api.searchTraces({ ...ctx.params, to });
-
-    const epoch = this.queryEpoch;   // the search this continuation belongs to
-    this.loadingMore.set(true);
-    request.pipe(takeUntilDestroyed(this.destroyRef)).subscribe({
-      next: page => {
-        // A fresh search may have replaced the list while this page was in flight; its
-        // rows belong to a world that no longer exists on screen. Appending them would
-        // silently interleave two different searches in one list.
-        if (epoch !== this.queryEpoch) return;
-
-        const fresh = page.filter(r => !this.knownIds.has(r.traceId));
-        if (fresh.length) {
-          for (const r of fresh) this.knownIds.add(r.traceId);
-          this.traces.update(t => [...t, ...fresh]);
-          this.paginated = true;
-        }
-
-        // A full page means the window probably holds more; a short one means we reached
-        // the range's far edge. A page of pure duplicates also stops — retrying the same
-        // cursor forever is the only other option, and it is not a good one. And the
-        // explicit ceiling stops the list from growing without bound: the flat cap this
-        // feature removed was also the only thing bounding DOM and memory.
-        const capped = this.traces().length >= TracesComponent.MaxLoadedRows;
-        this.loadCapped.set(capped);
-        this.hasMore.set(!capped && page.length >= pageSize && fresh.length > 0);
-        this.loadingMore.set(false); this.cdr.markForCheck();
-      },
-      error: () => {
-        if (epoch !== this.queryEpoch) return;
-        this.loadingMore.set(false); this.cdr.markForCheck();
-      },
-    });
+    // Stats refresh on every tick that gets this far; the list does not while a stream is
+    // still delivering into it —
+    // restarting mid-stream would throw away the rows already on screen and re-run the same
+    // query from the top every 15 s, a list that never finishes arriving — and not while the
+    // list is HELD, i.e. the user stopped it or it failed. 'background' is what makes the rest
+    // of this tick invisible: nobody asked, so it may not raise a banner, may not offer Stop,
+    // and — when there are rows to protect — buffers and swaps once so nothing the user is
+    // reading moves under them.
+    if (this.activeMainTab !== 'traces' || this.streaming() || this.listHeld()) return;
+    // Back off after a background refresh fails. A held list stops polling outright because
+    // the user owns it; a failing background refresh keeps trying, because the failure may be
+    // a passing one (a spent budget on a busy server) and nobody asked for the list to go
+    // stale — but it tries at a widening interval instead of hammering the same query.
+    // The window is a deadline, so coming back to the tab does not shorten it.
+    if (now < this.nextBgListAt) return;
+    this.loadTraces(from, to, 'background');
   }
 
   private loadAllServices() {
@@ -366,8 +789,27 @@ export class TracesComponent implements OnInit, OnDestroy {
     const ql = q.get('ql');
     if (ql) { this.traceqlInput = ql; this.traceqlMode.set(true); }
 
+    // The Live cadence, in the order of who is entitled to decide it: this URL (a link can
+    // hand someone a paused page, or a 1 s one, on purpose), then what this browser last
+    // chose, then the cadence the page has always had. Anything not on the menu is ignored
+    // rather than honoured — see LIVE_INTERVALS.
+    const live = q.get('live') ?? this.storedLiveMs();
+    if (live !== null) {
+      const ms = Number(live);
+      if (LIVE_INTERVALS.some(o => o.ms === ms)) {
+        this.liveMs.set(ms);
+        if (ms > 0) this.lastLiveMs = ms;
+      }
+    }
+
     const trace = q.get('trace');
     if (trace) this.openTrace(trace);
+  }
+
+  /** The stored cadence, or null when there is none / storage is unavailable. */
+  private storedLiveMs(): string | null {
+    try { return localStorage.getItem(TracesComponent.LiveKey); }
+    catch { return null; }
   }
 
   /** Reflect the current page state into the URL query string (replaceUrl — no history spam). */
@@ -386,6 +828,9 @@ export class TracesComponent implements OnInit, OnDestroy {
       min:    this.filterMinDurationMs != null ? String(this.filterMinDurationMs) : null,
       max:    this.filterMaxDurationMs != null ? String(this.filterMaxDurationMs) : null,
       ql:     this.traceqlMode() && this.traceqlInput.trim() ? this.traceqlInput.trim() : null,
+      // Omitted at the default so the common URL stays clean, and so a shared link only
+      // imposes a cadence when its sender actually chose one.
+      live:   this.liveMs() === TracesComponent.DefaultLiveMs ? null : String(this.liveMs()),
     };
     this.router.navigate([], {
       relativeTo:          this.route,
@@ -397,14 +842,39 @@ export class TracesComponent implements OnInit, OnDestroy {
 
   // ── State setters that also persist to URL ────────────────────────────────
   setMainTab(tab: 'traces' | 'graph' | 'latency' | 'compare') {
+    // Selecting the tab that is ALREADY selected is not navigation, and must not be mistaken
+    // for it. The template binds every tab button unconditionally, so a click on the active
+    // one used to fall straight through to the "returning to the list" branch below and re-run
+    // the query — which goes through startStream, whose first act is to cancel whatever is
+    // streaming. A user watching 437 rows of their own month-wide search arrive lost the rest
+    // of it to a click on the tab they were already on, and the replacement was a BACKGROUND
+    // stream, so nothing on screen said the rows had been cut short. Nothing below has any
+    // effect when the tab does not change, so the guard costs a click and closes the path.
+    if (tab === this.activeMainTab) return;
     this.activeMainTab = tab;
     this.syncUrl();
-    // Returning to the list refreshes it (polling leaves it alone while off-screen) —
-    // unless the user has paged it deeper: a glance at Service Graph and back must not
-    // throw away three pages of scroll position, for exactly the reason the poll holds
-    // off. The list they left is still there; a fresh search is one click away.
-    if (tab === 'traces' && !this.paginated && !this.loadingMore())
-      this.loadTraces(this.fromIso(), this.toIso());
+    // Leaving the list cancels its stream: nobody is watching the rows land, and an open
+    // EventSource holds a server connection open for a panel that is off screen.
+    if (tab !== 'traces') { this.stopStream(); return; }
+    // Returning refreshes it — the poll leaves the list alone while it is off screen — unless
+    // the list is held. Coming back to a tab is navigation, not a new search: the rows a Stop
+    // (or a failure) left behind are still the answer the user was reading, and Refresh sits
+    // right next to the header that says the list is partial. 'background' for the same
+    // reason: the panel is only class-hidden, never unmounted, so the list is still scrolled
+    // where they left it and a glance at Service Graph must not cost them that place — nor
+    // hand them a banner about a query they did not run, if the re-run happens to fail.
+    //
+    // Except when the user asked for a load while the list was off screen (a range chip, a
+    // filter Clear — both live above the tab strip). That is not a poll tick and must not be
+    // disguised as one: it outranks the hold, exactly as it would have if the list had been on
+    // screen when they clicked, and it owns its own failure. Running it as the user's is also
+    // what retires a held list's marker honestly — by replacing the rows the marker is about,
+    // rather than by clearing it back when the click happened and hoping something followed.
+    if (this.pendingUserLoad) {
+      this.loadTraces(this.fromIso(), this.toIso(), 'user');
+      return;
+    }
+    if (!this.listHeld()) this.loadTraces(this.fromIso(), this.toIso(), 'background');
   }
 
   setTraceTab(tab: 'timeline' | 'flamegraph' | 'details') {
@@ -437,6 +907,75 @@ export class TracesComponent implements OnInit, OnDestroy {
     this.historyOpen.update(v => !v);
   }
 
+  // ── Live refresh ──────────────────────────────────────────────────────────
+  /** The cadence menu's contents — the module list, unfiltered. */
+  readonly liveIntervals = LIVE_INTERVALS;
+
+  /** The Live badge is a switch now: pause the auto-refresh, and resume it at the cadence it
+   *  was paused at — never at the default (see {@link lastLiveMs}). */
+  toggleLive(): void {
+    this.applyLive(this.liveOn() ? 0 : this.lastLiveMs);
+  }
+
+  /** The cadence menu, Off entry included: that entry and the switch's off are the same state
+   *  by construction, because both are `liveMs === 0`. */
+  setLiveMs(ms: number): void {
+    this.applyLive(ms);
+  }
+
+  /**
+   * Everything a cadence change has to do, in one place, so the two controls cannot do it
+   * differently.
+   *
+   * <p>Off clears the background failure counter and its backoff deadline, and that is not
+   * housekeeping: both describe a run of UNATTENDED ticks, and there are about to be none. Left
+   * standing, the header would go on saying the live refresh is failing over rows the user
+   * knowingly froze, and a quarantine set before the pause would still be running down when
+   * they resumed — a resume that visibly did nothing for up to two minutes.</p>
+   */
+  private applyLive(ms: number): void {
+    const next = LIVE_INTERVALS.some(o => o.ms === ms) ? ms : TracesComponent.DefaultLiveMs;
+    if (next === this.liveMs()) return;
+    const resuming = next > 0 && !this.liveOn();
+    if (next > 0) this.lastLiveMs = next;
+    else { this.bgFailures.set(0); this.nextBgListAt = 0; }
+    this.liveMs.set(next);
+    this.restartLive();
+    this.persistLive(next);
+    this.syncUrl();
+    // Resuming asks for fresh rows, not for a wait of up to 30 s to find out whether resuming
+    // worked. It goes through poll() like every other caller, so the burst floor, the tab guard
+    // and the hold all apply — resume is not a privileged refresh, and a paused list that was
+    // stopped or failing stays the user's.
+    if (resuming) this.poll();
+  }
+
+  /** (Re)arms the timer at the cadence in force, and leaves none running when Live is off —
+   *  a paused page holds no interval, so it costs nothing while it is paused. */
+  private restartLive(): void {
+    if (this._poll) { clearInterval(this._poll); this._poll = null; }
+    const ms = this.liveMs();
+    if (ms > 0) this._poll = setInterval(() => this.poll(), ms);
+  }
+
+  private persistLive(ms: number): void {
+    try { localStorage.setItem(TracesComponent.LiveKey, String(ms)); }
+    catch { /* quota / private mode — the URL still carries it for this page */ }
+  }
+
+  /** The current cadence as the menu spells it ('Off' when paused). */
+  liveLabel(): string {
+    return LIVE_INTERVALS.find(o => o.ms === this.liveMs())?.label ?? 'Off';
+  }
+
+  /** What the switch says it will do, rather than what it is — a tooltip that repeats the
+   *  label it sits on tells the user nothing they cannot already see. */
+  liveTitle(): string {
+    return this.liveOn()
+      ? `Auto-refreshing every ${this.liveLabel()} — click to pause`
+      : 'Auto-refresh is off — click to resume';
+  }
+
   /**
    * A click in the History panel — lands exactly like a hand-typed TraceQL search:
    * switch to TraceQL mode, drop the query in, clear any stale error, then run it
@@ -451,17 +990,46 @@ export class TracesComponent implements OnInit, OnDestroy {
   }
 
   ngOnDestroy() {
-    this._io?.disconnect();
+    // Unsubscribed directly rather than through stopStream(): the view is going away, so
+    // there is nothing left to flush into it and nothing left to mark for check.
+    this.streamSub?.unsubscribe();
+    this.streamSub = null;
+    this.flushPending = null;
+    this.streamPaints = false;
     if (this._poll) clearInterval(this._poll);
     document.removeEventListener('visibilitychange', this._onVisibility);
   }
 
   // ── Data loading ──────────────────────────────────────────────────────────
+  /**
+   * Every caller is a user action — Refresh, Apply, Clear, a range chip, Apply-custom, a seek
+   * from the property menu — plus the initial load.
+   *
+   * <p>It does NOT release the held list here, and that is the fix to a warning that could be
+   * retired by a click that replaced nothing. `releaseList()` used to run on this line,
+   * unconditionally, ahead of a load that {@link loadTraces} may decline outright: the range
+   * chips and the filter bar render ABOVE the tab strip, so they are live while Service Graph
+   * is showing, and the list refuses to stream into a panel that is off screen. Measured: a
+   * truncation banner up over 300 rows, one click on Service Graph, one click on a range chip
+   * — and the banner was gone, the hold was gone, the same 300 truncated rows were still on
+   * screen, and the background refresh that ran when the user came back could not raise a
+   * banner even when it failed for the very same reason. A warning retired by a click that
+   * started no query and changed no row.</p>
+   *
+   * <p>Releasing is now the job of the stream that makes the marker untrue — {@link startStream}
+   * for a search the user ran, the `complete` handler for any stream that replaces the rows —
+   * so the banner is REPLACED by the new outcome instead of being cleared in advance of it. The
+   * load a hidden list could not run is remembered instead, and {@link setMainTab} runs it as
+   * the user's own the moment the list is back on screen: the refresh the old release was there
+   * to enable still happens, and it arrives as an answer rather than as an absence.</p>
+   */
   loadAll() {
     const from = this.fromIso();
     const to   = this.toIso();
     this.loadStats(from, to);
-    this.loadTraces(from, to);
+    // Assignment, not |=: a load that DID run has already cleared the flag through startStream,
+    // and a stale pending load must not survive the search that satisfied it.
+    this.pendingUserLoad = !this.loadTraces(from, to);
   }
 
   loadStats(from: string, to?: string) {
@@ -472,14 +1040,24 @@ export class TracesComponent implements OnInit, OnDestroy {
     });
   }
 
-  loadTraces(from: string, to?: string) {
+  /**
+   * Opens the list's stream — but only while the list is the panel on screen. The range
+   * chips, the filter bar and the TraceQL box all render ABOVE the tab strip, so they stay
+   * live while Service Graph / Latency / Compare is showing, and without this guard a chip
+   * click there (or a deep link like /traces?tab=graph&ql=…) opened a 2000-row EventSource
+   * into a hidden panel — the very connection setMainTab cancels on the way out. The stats
+   * above the tabs still refresh; only the list waits, and setMainTab loads it on return.
+   *
+   * @returns whether the load actually ran. Its one caller that cares is {@link loadAll}, which
+   *   has a held list's warning to answer for: a load that never ran cannot be what retires it.
+   */
+  loadTraces(from: string, to?: string, origin: LoadOrigin = 'user'): boolean {
+    if (this.activeMainTab !== 'traces') return false;
     if (this.traceqlMode() && this.traceqlInput.trim()) {
-      this.runTraceQL();
-      return;
+      this.runTraceQL(origin);
+      return true;
     }
-    this.loading.set(true);
-    const epoch = ++this.queryEpoch;
-    const params: SpanQueryParams = {
+    this.startStream(this.api.streamTraceList({
       from,
       to,
       service:        this.filterService        || undefined,
@@ -488,55 +1066,402 @@ export class TracesComponent implements OnInit, OnDestroy {
       minDurationMs:  this.filterMinDurationMs  ?? undefined,
       maxDurationMs:  this.filterMaxDurationMs  ?? undefined,
       httpStatus:     this.filterHttpStatus     || undefined,
-      limit:          TracesComponent.FilterPageSize,
-    };
-    this.api.searchTraces(params).pipe(takeUntilDestroyed(this.destroyRef)).subscribe({
-      next: rows => {
-        if (epoch !== this.queryEpoch) return;   // a newer search owns the list now
-        this.beginFirstPage(rows, { mode: 'filter', params }, TracesComponent.FilterPageSize);
-      },
-      error: () =>  { if (epoch === this.queryEpoch) { this.loading.set(false); this.cdr.markForCheck(); } },
-    });
+      max:            this.streamMax,
+    }), origin, this.streamMax);
+    return true;
   }
 
-  /** The one way a fresh search takes over the list: page one in, pagination state reset. */
-  private beginFirstPage(rows: TraceRowDto[], ctx: NonNullable<typeof this.pageCtx>, pageSize: number): void {
-    this.traces.set(rows);
-    this.paginated = false;
-    this.pageCtx   = ctx;
-    this.knownIds  = new Set(rows.map(r => r.traceId));
-    this.loadCapped.set(false);
-    this.hasMore.set(rows.length >= pageSize);
-    this.loading.set(false); this.cdr.markForCheck();
-  }
-
-  runTraceQL() {
+  /** Reached two ways: the user pressing Run (through runTraceQLUser) and the 15 s poll,
+   *  when a TraceQL query is the thing the list is currently showing — hence `origin`, which
+   *  the poll's tick must carry all the way down or its failures become the user's. */
+  runTraceQL(origin: LoadOrigin = 'user') {
     const q = this.traceqlInput.trim();
     if (!q) return;
     this.syncUrl();
-    this.loading.set(true);
-    this.traceqlError.set('');
-    const from  = this.fromIso();
     // The custom range's END, which this path used to drop on the floor: only `from` was
     // ever sent, so the server fell back to its "to = now" default and a query over, say,
     // last week silently ran to the present. Invisible whenever the end IS now — which is
     // why it survived — and wrong for every other custom window. The filter-bar path has
     // always sent it; TraceQL simply never did.
-    const to    = this.toIso();
-    const epoch = ++this.queryEpoch;
-    this.api.queryTraces({ query: q, from, to, limit: TracesComponent.QlPageSize })
-      .pipe(takeUntilDestroyed(this.destroyRef)).subscribe({
-      next: rows => {
-        if (epoch !== this.queryEpoch) return;   // a newer search owns the list now
-        this.beginFirstPage(rows, { mode: 'ql', ql: q, from }, TracesComponent.QlPageSize);
+    this.startStream(this.api.streamTraceQuery({
+      query: q, from: this.fromIso(), to: this.toIso(), max: this.streamMax,
+    }), origin, this.streamMax);
+  }
+
+  /**
+   * The one way a search takes over the list. Cancelling the previous stream FIRST is what
+   * makes "one search owns the list" true: the old EventSource is closed before the new one
+   * is even asked for, so an abandoned search has no live callback that could interleave its
+   * rows with the search that replaced it.
+   *
+   * Whether the list is emptied here depends on WHO asked, and the two answers are opposite.
+   * A background refresh must not empty it: clearing synchronously destroyed the scroll
+   * container — spinner in, rows out — so the 15 s poll handed the user a fresh empty element
+   * at scrollTop 0 twice a minute, whatever they were reading. A search the USER ran must
+   * empty it, for the mirror-image reason: its rows answer a different question, and leaving
+   * them up means the header counts and describes the PREVIOUS result while the new one
+   * streams — change service=A to service=B, press Apply, and "342 traces" sits over 342 rows
+   * of service A until the first B row lands, a window bounded only by the stream deadline.
+   *
+   * @param origin  Who asked (see {@link LoadOrigin}) — and ONLY who asked. A 'background'
+   *   refresh of a list that already has rows buffers them silently and swaps in ONE array
+   *   when the stream completes: paint a partial batch and the list shrinks to 1 row before
+   *   growing back, and a scroll container whose content collapses is clamped to scrollTop 0
+   *   by the browser — the same lost place, reached the other way. Cancelled half way it
+   *   publishes NOTHING, because a half-arrived refresh is not a better answer than the
+   *   complete list already on screen. A user's own search pays nothing for progressive
+   *   paint: they asked for different rows, and the top is where they want to be — so it
+   *   keeps flushing per batch, and so does a background refresh that finds the list EMPTY,
+   *   where there is no position left to protect. That last case is why `origin` exists as a
+   *   parameter rather than being inferred from the row count: an empty list makes a poll
+   *   tick paint like a search, and it must still not fail like one.
+   * @param askedMax  The row ceiling THIS request carried, so the header names the number that
+   *   produced the rows rather than the number the page would ask for next. Passed rather than
+   *   read off {@link streamMax} at render time: the two agree today and would silently stop
+   *   agreeing the first time a caller asks for anything else.
+   */
+  private startStream(
+    source: Observable<StreamFrame<TraceRowDto>>,
+    origin: LoadOrigin = 'user',
+    askedMax: number = this.streamMax,
+  ): void {
+    // A background refresh NEVER supersedes a live stream. Both of its callers already decline
+    // to ask for one while a stream is open — the poll checks `streaming()`, and leaving the
+    // list cancels its stream before another tab can return to it — but "no caller currently
+    // does this" is not the same guarantee as "this cannot happen", and the difference cost a
+    // user their search: re-selecting the active Traces tab reached here with 'background',
+    // and the first thing below would have been stopStream() on 437 rows the server was still
+    // sending. Nobody asked for the refresh, so it has nothing to offer that is worth ending a
+    // search the user is watching arrive; the stream in flight is already the better answer.
+    if (origin === 'background' && this.streamSub) return;
+    this.stopStream();
+    this.loading.set(true);
+    this.streaming.set(true);
+
+    // Two questions, two answers, and they are allowed to disagree.
+    //
+    // May I OWN THE FAILURE? — decided by who asked, and by nothing else. The row count is a
+    // fact about the screen; it cannot make an unattended tick into a search the user ran.
+    const userAsked = origin === 'user';
+    // May I PAINT AS I GO? — decided by what is on screen, which is what the row count was
+    // always for. Only a refresh that finds rows must hold them back; an empty list has no
+    // scroll position to protect and nothing to lose, so the tick fills it as rows arrive.
+    const silent = !userAsked && this.traces().length > 0;
+    // The list exactly as this stream found it. A background refresh that fails puts it back
+    // (see the error branch): for `silent` that is the array it never touched, and for the
+    // empty case it is the empty list, so the prefix a dying tick painted is not left behind
+    // to read as a finished answer that nothing on screen would call partial.
+    const before = this.traces();
+
+    // Stop and the "streaming…" hint are for a search the user is watching arrive. An
+    // unattended tick has nothing they need to interrupt, whatever the list looked like when
+    // it started.
+    this.streamPublishing.set(userAsked);
+    this.streamPaints = !silent;
+    // Everything below belongs to a stream the USER asked for; a background refresh touches
+    // none of it, which is what makes it invisible.
+    if (userAsked) {
+      // The old answer goes out with the question that produced it (see the doc comment) —
+      // and the sentence describing it goes at the same moment, in the same branch. Retiring
+      // "stopped early — partial list" and the banner is only honest for a stream that is
+      // REPLACING those rows, which is exactly this one and exactly why the two lines are
+      // adjacent. This used to run above, unconditionally, for every stream: stopStream()
+      // stamps the partial marker on the rows it flushes, so a stream that inherited them
+      // rather than producing them could rub the marker out and leave a truncated list
+      // reading as a finished answer. A stream may only retire a marker it is about to make
+      // untrue — and, the other way round, a stream that HAS made one untrue must retire it,
+      // which is the same rule read from the other end and lives in the `complete` handler.
+      // Together they are the whole guarantee: a marker stands exactly as long as the rows it
+      // describes. Here is where a USER's stream keeps it, because emptying the list is the
+      // next line; a background stream reaches its half later, having nothing to empty.
+      this.releaseList();
+      if (this.traces().length) this.traces.set([]);
+      // The one place a user's load is known to have actually STARTED, so the one place a
+      // remembered one is known to be satisfied. Whatever a hidden list could not run, this
+      // stream is running now.
+      this.pendingUserLoad = false;
+      // The ending describes the list on screen, so a background refresh leaves it standing
+      // until it completes with an answer of its own — otherwise "newest 2000 · narrow the
+      // range" blinked out and back twice a minute under a list that never moved. The one
+      // background stream that DOES replace the list — the empty-list case — cannot want this
+      // either: a capped list is 2000 rows, so it is never the empty one.
+      this.listEnding.set(null);
+      // THE ONLY PLACE A LOSS IS EVER RETIRED, and the reason it is this place. A lost segment
+      // is not a claim a later read can test — nothing re-reads a file that is gone — so no
+      // stream is allowed to withdraw it by simply not mentioning it, which is exactly what a
+      // background tick does after the server has been restarted or retention has passed the
+      // range. What CAN retire it is the user asking again: this line runs beside the one that
+      // empties the list, so the warning leaves with the rows it was about and the next answer
+      // says for itself whether the hole is still there. That is also the whole recovery story
+      // for a window that genuinely came back — Refresh, Apply, or any range chip.
+      this.listLoss.set(null);
+      // The user is driving again, so the background refresh starts from a clean slate: its
+      // failure count and its backoff both describe a run of unattended ticks, and this is
+      // not one. Whatever the poll could not fetch, this query is about to fetch itself.
+      this.bgFailures.set(0);
+      this.nextBgListAt = 0;
+    }
+
+    // Rows land in a plain array and reach the signal in batches. Pushing a new array per
+    // frame would re-render the entire list once per row — 2000 renders for one search.
+    //
+    // `flush` is captured in a local and the frame handler calls THAT, not the field: the
+    // accumulator and the publisher that empties it are then one object, paired by closure
+    // rather than by the unsubscribe-before-subscribe discipline holding. It holds today; if
+    // a future edit ever starts a stream without stopping the previous one, a frame from the
+    // old stream reading the field would publish the NEW stream's buffer.
+    const acc: TraceRowDto[] = [];
+    // The server's terminal frame, held next to the rows it ended and captured in the same
+    // closure for the same reason: an ending belongs to exactly one stream, and a field would
+    // let a stream read the ending of the one that replaced it.
+    let ended: StreamEndDto | null = null;
+    const flush = () => {
+      this.traces.set([...acc]);
+      this.loading.set(false);
+    };
+    // The field means "what this stream may hand over if it ends right now" — null for a
+    // silent refresh, which has nothing worth handing over until it is complete.
+    this.flushPending = silent ? null : flush;
+
+    const sub = source.subscribe({
+      next: frame => {
+        // The terminal frame is not a row: it is the server saying how this stream ended, and
+        // it arrives immediately before the completion that consumes it. Held rather than
+        // acted on here, because what it means depends on how many rows came with it.
+        if (frame.kind === 'end') { ended = frame.end; return; }
+        acc.push(frame.row);
+        // The FIRST row flushes immediately so the empty-state spinner is replaced the
+        // moment there is anything to show; after that, one flush per batch.
+        if (!silent && (acc.length === 1 || acc.length % TracesComponent.FlushEvery === 0)) {
+          flush();
+          this.cdr.markForCheck();
+        }
       },
-      error: (err) => {
-        if (epoch !== this.queryEpoch) return;
-        this.loading.set(false);
-        this.traceqlError.set(err?.error?.message ?? 'Query error');
-        this.cdr.markForCheck();
+      complete: () => {
+        // Complete: a silent refresh now HAS the whole answer, so it hands it over the same
+        // way a publishing stream hands over its tail — through endStream, in one array.
+        this.flushPending = flush;
+        // …which is also the moment this stream owns every row on screen, whoever asked for
+        // it — so the markers describing the rows it just replaced go out with them. A user's
+        // search retires them up front (see above) because it empties the list up front; a
+        // background stream cannot retire anything there, because until it completes it may
+        // still die and hand the old rows back, and a stream that may yet restore rows must
+        // not rub out their marker. Completing is exactly when that stops being possible.
+        //
+        // Without this, a background stream that ran to COMPLETE over a stopped list published
+        // its own twelve-row answer under a header still reading "stopped early — partial
+        // list" — a whole answer labelled a fragment, the mirror of the bug that moved
+        // releaseList() up into the userAsked branch. Both halves go together, because both
+        // are sentences about rows that are gone: the banner would otherwise explain a failed
+        // search over rows that search never produced, and it is half of listHeld, so it would
+        // freeze a list that is complete and current with nothing on screen saying why.
+        this.releaseList();
+        // …and the same moment the ending becomes a fact about the rows now on screen. The
+        // server said how this stream ended; what the header may claim is decided from that,
+        // not from counting rows (see endingOf).
+        this.listEnding.set(this.endingOf(ended, acc.length, askedMax));
+        this.listMax.set(askedMax);
+        // THE MARKER BELONGS TO THE ROWS IT ARRIVED WITH, so it is set unconditionally — including
+        // to null — by whichever stream published what is now on screen.
+        //
+        // It used to be raise-only, on the reasoning that a background tick must not retire a
+        // warning it did not disprove: the server's memory of a vanished segment was a field in a
+        // process, so a restart made the next tick report the window as whole while the traces were
+        // still missing. That reasoning came with a hold — nothing under the banner could change,
+        // so the marker always described what was on screen.
+        //
+        // The hold is gone, because freezing a live list over a fact about storage was a deadlock
+        // with no indicator. Raise-only without it is worse than either: measured, a user search
+        // ending in `unreadable-segment` over 300 rows, then one background tick returning twelve
+        // fresh rows and `{complete:true, exhausted}`, leaves the page holding the server's
+        // positive claim that the window was read out AND a red banner calling those twelve rows
+        // partial — describing 300 rows that are no longer there.
+        //
+        // What replaced the old protection is the server, not the page: a permanent hole is
+        // re-reported on every request now that the engine remembers vanished segments, so a real
+        // loss comes back with the very next tick. A marker that outlives its rows is a lie on
+        // screen immediately; a marker that waits one poll interval for the server to say it again
+        // is not.
+        this.listLoss.set(this.lossOf(ended));
+        // The list holds a whole answer as of now, and the refresh behind it is working.
+        this.listLoadedAt.set(Date.now());
+        this.bgFailures.set(0);
+        this.nextBgListAt = 0;
+        this.endStream();
+      },
+      error: (err: unknown) => {
+        // Two different failures land here: a TraceQL parse error, which arrives before any
+        // row (as a query-error FRAME — that is why the server does not answer it with a 400
+        // the browser could not read), and a query that dies halfway through on a spent time
+        // budget or an unreadable segment.
+        if (!userAsked) {
+          // A background refresh that fails leaves the visible state EXACTLY as it found it,
+          // and that is a promise about BOTH halves of what it could have touched. Its rows
+          // are withheld: the buffered ones were never published, and the ones it painted into
+          // an empty list go back to `before` — the complete answer on screen, even when that
+          // answer was "none", beats the half one this tick managed to fetch. The banner is
+          // withheld too: the user never ran this query, the rows under it are not partial,
+          // and the banner is half of listHeld, so planting it would also freeze the list with
+          // nothing on screen saying so. What they do learn is that the list stopped being
+          // live — said in the list header, next to the count, once the failure has repeated
+          // (see bgRefreshFailing), and phrased as the age of the rows rather than a claim
+          // about them.
+          this.flushPending = null;
+          this.traces.set(before);
+          this.bgFailures.update(n => n + 1);
+          this.nextBgListAt = Date.now()
+            + this.backoffUnitMs() * Math.min(8, 2 ** (this.bgFailures() - 1));
+        } else {
+          // A search the user ran keeps whatever arrived and gets the reason beside it — the
+          // half-answer plus its explanation, not an empty list and a banner.
+          //
+          // WHICH OF THE TWO IT IS, decided by the cause the server named rather than by the
+          // frame the news came out on. A lost segment can end a stream either way — as this
+          // error frame, or as a done frame carrying truncatedBy — and the two used to get
+          // different screens: a blocking banner over a frozen list one way, a grey count suffix
+          // over a live one the other, chosen by nothing more principled than how many rows
+          // happened to fit above the loss.
+          //
+          // So a named loss is recorded AS A LOSS on this road too, and deliberately does not set
+          // traceqlError: the banner is the same sentence either way (LOSS_SENTENCE is the
+          // server's own), while traceqlError is what holds the list, and a fact about the
+          // storage is not a reason to stop refreshing. Anything the server did NOT attribute —
+          // a TraceQL parse error, a spent deadline, a dropped connection — is a failure of the
+          // search itself, and that does hold: those rows are the user's half-answer and the
+          // poll must not take them away unread.
+          const cause = (err as { truncatedBy?: unknown })?.truncatedBy;
+          if (cause === 'unread-segment' || cause === 'unreadable-segment') this.listLoss.set(cause);
+          else this.traceqlError.set((err as Error)?.message?.trim() || 'Query error');
+        }
+        this.endStream();
       },
     });
+    // Assigned AFTER subscribe returns, and only if the stream is still open. A source that
+    // terminates synchronously has already run its complete/error handler — and endStream()
+    // with it, which nulls this field — before subscribe() returns, so assigning the result
+    // unconditionally would resurrect a finished stream as a permanently non-null `streamSub`.
+    // Every "is a stream open?" test reads this field: stopStream() would stamp the list
+    // partial over nothing, and the guard at the top of this method would refuse every
+    // background refresh for the life of the page. Today's SSE source always goes through an
+    // HTTP round trip for its ticket first, so it cannot terminate synchronously — this is the
+    // field keeping its meaning rather than a bug being fixed.
+    if (!sub.closed) this.streamSub = sub;
+  }
+
+  /**
+   * Stops the active stream and keeps every row it already delivered. Reached from the
+   * header's Stop button, from leaving the Traces tab, and from the start of the next search.
+   */
+  stopStream(): void {
+    // Only a stream that was PAINTING leaves a partial list behind, and only then may the
+    // header call it partial: called with nothing open (a second Stop, leaving the tab after
+    // the stream finished) or over a silent refresh that never touched the rows, this must
+    // not stamp "stopped early" on a list that is complete. `streamPaints`, not
+    // `streamPublishing`: a background refresh of an EMPTY list does put rows on screen while
+    // offering no Stop, and cancelling it half way still leaves a prefix that has to say so.
+    if (this.streamSub && this.streamPaints) this.streamStopped.set(true);
+    this.streamSub?.unsubscribe();
+    this.endStream();
+  }
+
+  /** Settles the list after a stream ends, however it ended: the partial final batch is
+   *  flushed here so the last rows are never stranded in the buffer. */
+  private endStream(): void {
+    this.flushPending?.();
+    this.flushPending = null;
+    this.streamSub    = null;
+    this.streamPaints = false;
+    this.streaming.set(false);
+    this.streamPublishing.set(false);
+    this.loading.set(false);
+    this.cdr.markForCheck();
+  }
+
+  /** Hands the list back to the poll by dropping the two markers a NEW READ can disprove — a
+   *  Stop, and a failed stream's banner. Clearing the banner here is not cosmetic: it IS part of
+   *  the hold.
+   *
+   *  Called at the two moments such a marker stops being true, which are the two moments a
+   *  stream takes the described rows away: when a search the USER ran is about to empty the
+   *  list, and when any stream COMPLETES and publishes an answer of its own. Never anywhere
+   *  else — a marker outlives everything except the rows it is about.
+   *
+   *  IT DOES NOT TOUCH {@link listLoss}, and the omission is the guard. Both markers here are
+   *  statements about ONE READ: "the user stopped this one" and "this one died", each replaced
+   *  wholesale by the next read's account of itself. A lost segment is a statement about the
+   *  storage, which no read re-examines, so a stream that merely fails to mention it has
+   *  disproved nothing — and this method is reached by background streams, which is how a poll
+   *  tick after a server restart came to retire a permanent hole. Its retirement lives in
+   *  {@link startStream}, on the user's branch only. */
+  private releaseList(): void {
+    this.streamStopped.set(false);
+    this.traceqlError.set('');
+  }
+
+  /**
+   * Turns the server's terminal `done` payload into the one thing the header needs from it.
+   *
+   * <p>Two rules, and the second is the one that matters. FIRST: when the server used a word
+   * this client knows, that word decides — `max-rows` is the ceiling (plus whatever
+   * `truncatedBy` names), `complete: true` is the whole window read out. SECOND: when it did
+   * not, the answer degrades to what this page could always work out for itself — its own row
+   * count against the ceiling it asked for — and NEVER to "complete".</p>
+   *
+   * <p>That second rule is why the row count survives at all. Both log streams still end with a
+   * bare <c>data: {}</c>, and a future server may say something new; reading an unrecognised
+   * ending as an endorsement would turn every such frame into a silent claim that the list is
+   * whole. So an unknown ending can still be capped (the count says so), and an ending that
+   * explicitly denies completeness is reported as short even when this client cannot say why —
+   * a reason it cannot name is not a reason to repeat the server's denial back as consent.</p>
+   *
+   * <p>The CEILING AXIS ONLY — whether anything was lost on the way is {@link lossOf}, kept
+   * apart for the reason {@link ListEnding} gives.</p>
+   */
+  private endingOf(end: StreamEndDto | null, rows: number, askedMax: number): ListEnding | null {
+    if (end?.reason === 'max-rows') return { kind: 'capped' };
+    if (end?.complete === true)     return { kind: 'read-out' };
+    if (rows >= askedMax)           return { kind: 'capped' };
+    if (end?.complete === false)    return { kind: 'short' };
+    // An ending that said nothing this client can use, over a list short of the ceiling. Not
+    // `read-out`: that is the SERVER's claim to make, and it did not make it here.
+    return null;
+  }
+
+  /**
+   * The other half of the terminal frame: whether part of the window is missing from the answer.
+   *
+   * <p>An unrecognised `truncatedBy` reads as no loss, which is the same rule the ending obeys
+   * and for the same reason — saying less is available, saying something else is not. It is a
+   * genuine under-report and worth naming: a future server that invents a third cause would go
+   * unmentioned here until this page learns the word. The alternative is a loud, standing,
+   * list-freezing warning whose sentence this page would have to make up, over a fault it cannot
+   * describe, and that is the worse of the two.</p>
+   */
+  private lossOf(end: StreamEndDto | null): SegmentLoss | null {
+    const by = end?.truncatedBy;
+    return by === 'unread-segment' || by === 'unreadable-segment' ? by : null;
+  }
+
+  /** The TraceQL box's ✕: drops the query, the results it produced, and the `?ql=` in the
+   *  URL — which the old version left behind, so F5 resurrected the query just cleared. */
+  clearTraceql(): void {
+    this.traceqlInput = '';
+    this.stopStream();
+    this.traces.set([]);
+    this.listEnding.set(null);
+    // The ✕ empties the list, so it is a user action of exactly the kind that may retire a loss
+    // — the rows the warning was about are gone in the same step, and the next load (the
+    // filter-bar path, with no query) reports the hole again if it is still there.
+    this.listLoss.set(null);
+    // Nothing on screen for a stale "rows from 14:32" to be about, and the next tick is a
+    // fresh start rather than the continuation of a failing run.
+    this.listLoadedAt.set(null);
+    this.bgFailures.set(0);
+    this.nextBgListAt = 0;
+    // An emptied list is nobody's to keep: the next tick may refill it (with no query, the
+    // filter-bar path), which is what clearing the box asks for. Also drops the banner.
+    this.releaseList();
+    this.syncUrl();
   }
 
   /**
@@ -548,13 +1473,39 @@ export class TracesComponent implements OnInit, OnDestroy {
    * tick and every cross-page jump that lands here with ?ql= set.
    */
   runTraceQLUser(): void {
+    if (!this.traceqlInput.trim()) return;
     this.history.record(this.traceqlInput);
+    // The box renders above the tab strip, so Run can be pressed with Service Graph on
+    // screen — and loadTraces refuses to stream into a hidden list, which would make the
+    // button look dead. Take the user to the results instead; runTraceQL's own syncUrl()
+    // then writes the tab it just landed on.
+    this.activeMainTab = 'traces';
+    // A search the user asked for outranks whatever was holding the list.
+    this.releaseList();
     this.runTraceQL();
   }
 
   applyFilters() {
     const q = this.synthesizeTraceql();
     if (q) this.history.record(q);
+    // Same reason Run switches tabs: the filter bar renders above the tab strip, so Apply is
+    // clickable with Service Graph on screen, and loadTraces refuses to stream into a hidden
+    // list. A search the user ran has to land where its results are.
+    this.activeMainTab = 'traces';
+    this.syncUrl();
+    this.loadAll();
+  }
+
+  /** The filter bar's Clear: blank every field and re-run. Deliberately NOT applyFilters() —
+   *  a reset is not a request to see results, so it does not drag the user off the panel they
+   *  are on. (Also why it is a method: this was eight assignments in a template expression.) */
+  clearFilters() {
+    this.filterName          = '';
+    this.filterService       = '';
+    this.filterStatus        = '';
+    this.filterMinDurationMs = null;
+    this.filterMaxDurationMs = null;
+    this.filterHttpStatus    = '';
     this.syncUrl();
     this.loadAll();
   }
@@ -890,6 +1841,27 @@ export class TracesComponent implements OnInit, OnDestroy {
 
   traceServicesLabel(trace: TraceRowDto): string[] {
     return trace.services?.length ? trace.services : [trace.serviceName].filter(Boolean);
+  }
+
+  /**
+   * What a repeatedly failing background refresh is allowed to say. It names the thing that
+   * actually broke — the live refresh — and dates the rows; it says nothing about whether the
+   * rows are partial, because they are not: they are the last COMPLETE answer, which is
+   * exactly why they were kept. The clock is the moment of that answer, so it does not tick.
+   */
+  bgRefreshHint(): string {
+    const ms = this.listLoadedAt();
+    return ms == null
+      ? '· live refresh failing — this list is not updating'
+      : `· live refresh failing — rows as of ${format(new Date(ms), 'HH:mm:ss')}`;
+  }
+
+  /** The tooltip behind that hint. It names the cadence actually in force: the string used to
+   *  read "the 15-second live refresh", which is a wrong number rather than a stale one the
+   *  moment the page can refresh at 1 s. */
+  bgRefreshFailingTitle(): string {
+    return `The ${this.liveLabel()} live refresh keeps failing. The rows below are the last `
+      + 'complete answer; Refresh runs the query again and will show the error if it fails.';
   }
 
   // ── Formatting ────────────────────────────────────────────────────────────

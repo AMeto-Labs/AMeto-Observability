@@ -54,10 +54,92 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     // (flush/compaction/retention/self-heal). Readers grab the field once and
     // iterate without locks — a concurrent swap can never fault them, and a
     // deleted file surfaces as a per-segment skip, not a request failure.
+    //
+    // INVARIANT: sorted by MaxStartNano DESCENDING. Every writer goes through
+    // SortedByMaxStartDesc (or preserves order, as a filter does); readers take the field as it
+    // is. Two of them — the trace-list walk and the span search — need that order to name the
+    // segment they stopped BEFORE, and both used to clone the whole array and re-sort it on
+    // every call: O(n log n) over every segment on the box, per page, of every stream, where the
+    // SSE loop now runs pages back to back. The field is only ever REPLACED, never mutated, so
+    // sorting it once at the swap is the same work done once instead of once per reader.
     private volatile SpanSegmentInfo[]                         _coldSegments = [];
+
+    // The time ranges of segments that vanished from disk behind the engine's back. Removing such
+    // a segment from the snapshot is what makes the fault undiscoverable by every later request —
+    // this is where the fault goes instead, so a window overlapping one is still told. Bounded in
+    // size and pruned by retention; see VanishedRegionLog for both bounds and for the compaction
+    // race it deliberately does NOT record.
+    private readonly VanishedRegionLog                         _vanished = new();
 
     /// <summary>Test hook: cold segments currently registered.</summary>
     internal int ColdSegmentCountForTest => _coldSegments.Length;
+
+    /// <summary>Test hook: how many vanished-segment ranges the engine currently remembers.</summary>
+    /// <summary>
+    /// A cold segment that could not be loaded at startup and is therefore not in the snapshot at
+    /// all — so, unlike a vanished segment, there is no range to remember and no window this can be
+    /// narrowed to. Every read has to say so.
+    ///
+    /// <para>The alternative was measured and is the failure this endpoint exists to prevent: a
+    /// .trc held open by an antivirus or a backup agent during load left segments=0, rows=0 and
+    /// Unreadable=FALSE — a positive claim that the window was read out, for the life of the
+    /// process, over a file sitting on the disk. The same lock met on a REQUEST reports Capped, so
+    /// one fault was loud at one door and silent at the other.</para>
+    ///
+    /// <para>WHICH READS SAY SO, precisely: the trace LIST and the span SEARCH, which are the two
+    /// that have somewhere to put it. <c>GetTraceAsync</c>, <c>GetTraceVolumeAsync</c> and
+    /// <c>GetAggregateStatsAsync</c> return plain data with no channel for a fault, so a trace
+    /// detail view still renders a truncated trace as a whole one — the same gap those three have
+    /// for a vanished region, and not one this flag introduced. Naming it here because an earlier
+    /// version of this comment claimed every read reports it, which was not true.</para>
+    ///
+    /// <para>Process-wide and never cleared, because nothing rescans: LoadColdSegments runs once.
+    /// A restart is the recovery, and that is what the log line says.</para>
+    /// </summary>
+    private volatile bool _coldTierIncomplete;
+
+    internal bool ColdTierIncompleteForTest => _coldTierIncomplete;
+
+    internal int VanishedRegionCountForTest => _vanished.CountForTest;
+
+    /// <summary>Retention's own call, reachable from a test: the wall clock cannot be moved, so
+    /// proving a record is forgettable means handing Forget a cutoff past it.</summary>
+    internal int ForgetVanishedForTest(long cutoffNano) => _vanished.Forget(cutoffNano);
+
+    /// <summary>
+    /// Test hook: does what a reader does when it opens a segment its own snapshot names and finds
+    /// no file there. Compaction and retention both publish their snapshot change BEFORE unlinking
+    /// anything, so a reader holding a slightly older snapshot meets missing files as a matter of
+    /// routine — and a test that waits for that race to happen by luck is a test that usually does
+    /// not run. This reproduces it exactly, from the reader's side.
+    /// </summary>
+    /// <returns>True when the engine judged it a genuine loss rather than a handover.</returns>
+    internal bool MeetMissingSegmentFileForTest(SpanSegmentInfo seg) => RemoveColdSegment(seg);
+
+    /// <summary>The classifier's own verdict — a test needs the three-way answer, not the removal.</summary>
+    internal ColdReadFault MeetMissingSegmentFileVerdictForTest(SpanSegmentInfo seg) => MeetMissingSegmentFile(seg);
+
+    /// <summary>
+    /// Test hook: called by both cold walks once per segment, IMMEDIATELY BEFORE that segment is
+    /// opened and while the walk is already committed to its own snapshot.
+    ///
+    /// <para>That instant is the compaction handover race, and it is the only place a test can
+    /// stand in it. Both walks snapshot <c>_coldSegments</c> once and then iterate, so a segment
+    /// retired and unlinked between the snapshot and the open is met by a reader holding a list
+    /// nobody maintains any more — routine on any install that compacts, and the shape that had
+    /// 1 in 60 racing requests reporting a data loss on a healthy server. Waiting for it to happen
+    /// by luck is a test that usually does not run.</para>
+    /// </summary>
+    internal Action<SpanSegmentInfo>? _beforeColdSegmentRead;
+
+    /// <summary>
+    /// Test hook: the registered cold segments, IN SNAPSHOT ORDER — which is the invariant two
+    /// read paths depend on and neither re-establishes, so a test has to be able to see it. Also
+    /// how a test reaches a segment's file, to delete or corrupt it behind the engine's back:
+    /// not an exotic fault but the ordinary shape of compaction, whose sources are unlinked while
+    /// older snapshots still name them.
+    /// </summary>
+    internal SpanSegmentInfo[] ColdSegmentsForTest => _coldSegments;
 
     /// <summary>
     /// Test hook: called on the flush thread with the tier already detached, just before the
@@ -66,6 +148,19 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// see them.
     /// </summary>
     internal Action? _beforeSegmentWrite;
+
+    /// <summary>
+    /// Test hook: called at the top of <see cref="GetTraceListAsync"/>, BLOCKING, with the
+    /// caller's cancellation token — before any await, so it runs synchronously on whatever
+    /// thread invoked the fetch.
+    ///
+    /// <para>That is deliberately the real shape of this path: <c>SpanReader</c> contains no
+    /// await tokens at all, the <c>.tracesum</c> sidecar read is a blocking FileStream plus LZ4
+    /// plus parse, and the async iterators hand back synchronously-completed ValueTasks. A slow
+    /// page fetch therefore does not YIELD, it OCCUPIES — which is exactly what made the SSE
+    /// keepalive inert, and what a test cannot reproduce with <c>Task.Delay</c>.</para>
+    /// </summary>
+    internal Action<CancellationToken>? _beforeTraceListScan;
 
     /// <summary>Test hook: joins the in-flight background flush, if any.</summary>
     internal void WaitForFlushForTest()
@@ -123,7 +218,8 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         // accepted, or a restart would interleave recovered and live spans. Replay is a
         // sequential walk of one mmap'd file bounded by the flush thresholds, so it costs
         // milliseconds even at the 50k ceiling.
-        _wal = SpanWriteAheadLog.Open(Path.Combine(dataDir, "spans.wal"));
+        _walPath = Path.Combine(dataDir, "spans.wal");
+        _wal = SpanWriteAheadLog.Open(_walPath);
         RecoverFromWal();
     }
 
@@ -304,7 +400,6 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         // otherwise collapse every such span into one, which is data loss, not de-duplication.
         var seen = new HashSet<ulong>();
 
-        // Hot tier
         // Hot tier AND the snapshot of an in-flight flush, gathered in ONE lock hold. Read
         // separately, the pair has a hole: a flush that publishes (or fails and restores)
         // between the two reads can leave the spans in neither view, and the trace comes
@@ -329,74 +424,474 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             _lock.ExitReadLock();
         }
 
-        if (hotResults != null)
-            foreach (var r in hotResults.OrderBy(s => s.StartTimeUnixNano))
-            {
-                if (!r.SpanId.IsEmpty && !seen.Add(r.SpanId.RawValue)) continue;
-                yield return r;
-            }
-
         // Cold tier — scan the snapshot in parallel (bounded): a by-id lookup has
         // no time bounds, so every segment must be consulted, and doing that
         // sequentially took whole seconds once small segments piled up. A file
         // that compaction/retention deleted mid-flight is skipped (and healed out
         // of the snapshot) instead of failing the whole request.
         var segs = _coldSegments;
-        if (segs.Length == 0) yield break;
+        List<SpanRecord>? cold = null;
 
-        using var gate = new SemaphoreSlim(Math.Clamp(Environment.ProcessorCount / 2, 2, 8));
-        var tasks = new Task<List<SpanRecord>?>[segs.Length];
-        for (int i = 0; i < segs.Length; i++)
+        if (segs.Length > 0)
         {
-            var seg = segs[i];
-            tasks[i] = Task.Run(async () =>
+            using var gate = new SemaphoreSlim(Math.Clamp(Environment.ProcessorCount / 2, 2, 8));
+            var tasks = new Task<List<SpanRecord>?>[segs.Length];
+            for (int i = 0; i < segs.Length; i++)
             {
-                await gate.WaitAsync(ct).ConfigureAwait(false);
-                try
+                var seg = segs[i];
+                tasks[i] = Task.Run(async () =>
                 {
-                    List<SpanRecord>? found = null;
-                    await foreach (var r in SpanReader.ReadTraceAsync(seg.FilePath, traceId, ct).ConfigureAwait(false))
-                        (found ??= new List<SpanRecord>()).Add(r);
-                    return found;
-                }
-                catch (OperationCanceledException) { throw; }
-                catch (FileNotFoundException)
-                {
-                    RemoveColdSegment(seg);   // deleted behind our back — heal the snapshot
-                    return null;
-                }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "Trace lookup: skipping unreadable segment {File}", seg.FilePath);
-                    return null;
-                }
-                finally { gate.Release(); }
-            }, ct);
+                    await gate.WaitAsync(ct).ConfigureAwait(false);
+                    try
+                    {
+                        List<SpanRecord>? found = null;
+                        await foreach (var r in SpanReader.ReadTraceAsync(seg.FilePath, traceId, ct).ConfigureAwait(false))
+                            (found ??= new List<SpanRecord>()).Add(r);
+                        return found;
+                    }
+                    catch (OperationCanceledException) { throw; }
+                    catch (FileNotFoundException)
+                    {
+                        // Classified through the same door as the other two cold walks, so a
+                        // directory fault cannot heal a segment out of the snapshot here either.
+                        // This walk reports no fault bit of its own — a trace lookup either finds
+                        // the trace or does not — so the verdict is used only for its side effect.
+                        MeetMissingSegmentFile(seg);
+                        return null;
+                    }
+                    catch (DirectoryNotFoundException ex)
+                    {
+                        _logger.LogWarning(ex,
+                            "Trace lookup: could not reach segment {File} — the data directory is not " +
+                            "there; the segment stays in the snapshot", seg.FilePath);
+                        return null;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Trace lookup: skipping unreadable segment {File}", seg.FilePath);
+                        return null;
+                    }
+                    finally { gate.Release(); }
+                }, ct);
+            }
+
+            cold = new List<SpanRecord>();
+            foreach (var t in tasks)
+                if (await t.ConfigureAwait(false) is { } part)
+                    cold.AddRange(part);
         }
 
-        var cold = new List<SpanRecord>();
-        foreach (var t in tasks)
-            if (await t.ConfigureAwait(false) is { } part)
-                cold.AddRange(part);
-
-        foreach (var r in cold.OrderBy(s => s.StartTimeUnixNano))
+        // ── ONE ORDERED SEQUENCE, ACROSS BOTH TIERS ───────────────────────────────
+        //
+        // ITraceProvider.GetTraceAsync promises spans "ordered by StartTimeUnixNano", and this
+        // method used to sort each tier and then CONCATENATE them: every hot span, then every
+        // cold one. The hot tier holds the NEWEST spans by construction, so any trace straddling
+        // the two came back inverted — measured through GET /api/traces/{id} on a seven-span
+        // trace with five flushed and two still hot: hot(+20 ms), hot(+21 ms), then cold(+1),
+        // (+3), (+5), (+12), (+14). The waterfall renders what it is handed, so the root arrived
+        // last and the trace drew upside down.
+        //
+        // Sorting the union is not a new cost: the cold fan-out already buffers every matching
+        // span before the first of them is yielded, and the hot list is rooted for the whole
+        // call, so the peak was always one trace either way. What it does change is WHEN the
+        // first span is handed over — after the cold reads rather than before them. That is the
+        // price of the contract; a caller that wanted the hot spans early would have to be
+        // willing to sort, and both callers here (the detail view and the flamegraph) collect
+        // everything before drawing anything.
+        //
+        // WHICH COPY SURVIVES, decided where it can actually be decided. This comment used to say
+        // that "OrderBy is a STABLE sort and the hot spans are added first, so the HOT copy is the
+        // one that survives the dedupe below" — and the dedupe runs AFTER the sort, so what
+        // actually survived was the EARLIER-STARTING copy, whichever tier it came from. Measured
+        // through the endpoint: a cold copy of span S at +1 ms and a hot copy of the same id at
+        // +30 ms returned the COLD one. Stability orders EQUAL keys; it says nothing about two
+        // records with different start times, which is exactly the pair a re-written span is.
+        //
+        // The hot copy is the one to keep. Both duplicate sources — the flush handover and a WAL
+        // replay putting back spans a segment already holds — put the ENGINE'S MOST RECENT view of
+        // the span in the hot tier, so the cold copy is the stale one by construction.
+        //
+        // So the dedupe runs FIRST, over the concatenation in tier order, and the sort runs on the
+        // survivors. That also makes the sort cheaper by whatever the duplicates were.
+        var ordered = hotResults;
+        if (cold is { Count: > 0 })
         {
-            if (!r.SpanId.IsEmpty && !seen.Add(r.SpanId.RawValue)) continue;
-            yield return r;
+            if (ordered is null) ordered = cold;
+            else                 ordered.AddRange(cold);
         }
+        if (ordered is null) yield break;
+
+        // In place, front-to-back, which is hot-then-cold: List.RemoveAll visits in index order,
+        // so the first copy of each span id is the one `seen` admits. `ordered` is always a list
+        // this method built (hotResults or cold), never a caller's.
+        ordered.RemoveAll(r => !r.SpanId.IsEmpty && !seen.Add(r.SpanId.RawValue));
+
+        // SORTED IN PLACE, because OrderBy cannot. Enumerating an OrderedEnumerable copies the
+        // whole list into a Buffer<T>, builds a long[] of keys and an int[] index map, and hands
+        // back an iterator — three throwaway arrays per request, and past about ten thousand spans
+        // the key array alone clears the 85 KB LOH threshold. That is the exact allocation shape
+        // the rest of this branch exists to remove; leaving it on the detail-view path while
+        // rewriting the list path for it would be answering the measurement selectively.
+        //
+        // The list is a list this method built (hotResults or cold, never a caller's), so it can
+        // be reordered. Stability is not lost either: the RemoveAll above already left one record
+        // per span id, and two records with different start times were never equal keys.
+        ordered.Sort(static (a, b) => a.StartTimeUnixNano.CompareTo(b.StartTimeUnixNano));
+        foreach (var r in ordered)
+            yield return r;
     }
 
-    /// <summary>Drops a segment whose file no longer exists from the snapshot.</summary>
-    private void RemoveColdSegment(SpanSegmentInfo seg)
+    /// <summary>
+    /// The one way a new <see cref="_coldSegments"/> array is built: sorted by MaxStartNano
+    /// DESCENDING, which every reader then relies on and none of them re-establishes. Filtering
+    /// an already-sorted array preserves the order, so removals (self-heal, retention,
+    /// compaction's drop list) do not need this.
+    /// </summary>
+    private static SpanSegmentInfo[] SortedByMaxStartDesc(List<SpanSegmentInfo> segs)
     {
+        var arr = segs.ToArray();
+        Array.Sort(arr, static (a, b) => b.MaxStartNano.CompareTo(a.MaxStartNano));
+        return arr;
+    }
+
+    /// <summary>
+    /// Drops a segment whose file no longer exists from the snapshot — and remembers the range it
+    /// covered IF, and only if, the file was gone for a reason the engine did not choose.
+    ///
+    /// <para>THE REMOVAL IS WHAT COSTS THE FAULT ITS SECOND SIGHTING. Once this segment is out of
+    /// <c>_coldSegments</c>, no later read can open it, fail on it, or report the hole it leaves;
+    /// the request that got here is the only one that will ever know. That is why the range goes
+    /// into <see cref="_vanished"/>, and why the removal still happens — a segment left in the
+    /// snapshot to keep re-announcing itself would fail every page of every stream for ever.</para>
+    ///
+    /// <para>TELLING A LOSS FROM A HANDOVER, which is the whole judgement in this method and the
+    /// case that decides whether the record is useful or noise. Compaction writes its merged
+    /// output, SWAPS THE SNAPSHOT, and only then unlinks its sources; retention removes and then
+    /// deletes in the same order. So a source's absence from the CURRENT snapshot is the engine's
+    /// own signed statement that it retired the file on purpose and that the data is either in the
+    /// replacement or deliberately expired. A reader tripping over such a file has raced a healthy
+    /// server, and on an install that compacts every hour that race is the common case: recording
+    /// it would have this server reporting truncation over its own compaction window for ever —
+    /// the same false statement as the silent <c>done</c>, told the other way round.</para>
+    ///
+    /// <para>A segment that is STILL LISTED when its file turns out to be missing is the other
+    /// story entirely. Nothing in the engine retired it, so nothing wrote a replacement: the file
+    /// was removed by something outside — an operator clearing space, a half-restored backup, a
+    /// volume that dropped writes — and the spans it held are not anywhere. That is the case worth
+    /// a permanent record, and it is the case this test admits.</para>
+    ///
+    /// <para>The presence test and the removal are ONE operation under the write lock, so two
+    /// readers meeting the same dead file cannot both conclude they were first.</para>
+    ///
+    /// <para>THE VERDICT IS RETURNED, not just acted on, and that is what the callers were missing.
+    /// This method decided the question correctly for the MEMORY and then told nobody, so each
+    /// caller set its own per-request fault bit unconditionally: a request that raced a healthy
+    /// compaction recorded nothing (<c>regions=0</c>, right) and still reported a data loss
+    /// (<c>Unreadable=true</c>, wrong). Measured over 60 concurrent list/compaction races on an
+    /// undamaged server, 1 request came back that way — about 1.7% of requests overlapping a
+    /// compaction pass, each one a red "deleted or damaged" banner and a frozen list.</para>
+    /// </summary>
+    /// <returns>
+    /// TRUE when this was a genuine LOSS — the segment was still listed, so nothing in the engine
+    /// retired it and the range has been recorded. FALSE when it was a HANDOVER: compaction or
+    /// retention had already replaced or expired the file, the data is in the replacement or
+    /// deliberately gone, and the only thing the caller may conclude is that IT did not read those
+    /// rows — which is a floor, not a fault.
+    /// </returns>
+    private bool RemoveColdSegment(SpanSegmentInfo seg)
+    {
+        bool wasListed;
         _lock.EnterWriteLock();
         try
         {
-            _coldSegments = Array.FindAll(_coldSegments, s => !ReferenceEquals(s, seg));
+            var next  = Array.FindAll(_coldSegments, s => !ReferenceEquals(s, seg));
+            wasListed = next.Length != _coldSegments.Length;
+            if (wasListed) _coldSegments = next;
         }
         finally { _lock.ExitWriteLock(); }
-        _logger.LogWarning("Cold span segment {File} vanished from disk — removed from the segment list", seg.FilePath);
+
+        if (!wasListed)
+        {
+            // Already retired by compaction or retention (or by another reader that met the same
+            // fault first and recorded it). Debug, not Warning: on a compacting server this is
+            // ordinary, and a warning per race trains operators to ignore the level that carries
+            // the real one.
+            _logger.LogDebug(
+                "Cold span segment {File} was already retired before a reader met its missing file — " +
+                "compaction or retention handover, not a loss", seg.FilePath);
+            return false;
+        }
+
+        _vanished.Record(seg.MinStartNano, seg.MaxStartNano);
+        _vanished.RecordPath(seg.FilePath);
+        _logger.LogWarning(
+            "Cold span segment {File} vanished from disk — removed from the segment list; reads " +
+            "over [{MinNano}, {MaxNano}] will report truncation until retention passes that range",
+            seg.FilePath, seg.MinStartNano, seg.MaxStartNano);
+        return true;
     }
+
+    /// <summary>
+    /// WHAT A COLD WALK IS ALLOWED TO CONCLUDE ABOUT A SEGMENT IT COULD NOT READ. Three of the
+    /// engine's walks meet these faults and each used to classify them slightly differently; the
+    /// verdicts are named here so they cannot drift apart again.
+    /// </summary>
+    internal enum ColdReadFault
+    {
+        /// <summary>
+        /// Compaction or retention had already retired the file. NOTHING IS LOST — the rows are in
+        /// the replacement, or were expired on purpose — but this walk was holding the older
+        /// snapshot and did not read them, so it owes the caller a floor and nothing else.
+        /// </summary>
+        Handover,
+
+        /// <summary>
+        /// The file is gone and the engine did not retire it: an operator clearing space, a
+        /// half-restored backup, a volume that dropped writes. The spans are not anywhere, the
+        /// range is now in <see cref="_vanished"/>, and this is the one verdict that is permanent.
+        /// </summary>
+        Lost,
+
+        /// <summary>
+        /// The read could not REACH the file this time — the data directory itself was not there.
+        /// Says nothing whatever about whether the data exists, so it records no range and drops
+        /// no segment: the next request tries again and, when the mount is back, succeeds.
+        /// </summary>
+        Transient,
+
+        /// <summary>
+        /// The file is present and will not parse. It stays in the snapshot deliberately (removing
+        /// a file that still exists is compaction's and retention's decision, never a read's), so
+        /// it fails again on every page — which is what keeps the window from ever being reported
+        /// as read out.
+        /// </summary>
+        Corrupt,
+    }
+
+    /// <summary>
+    /// Classifies a cold segment whose FILE turned out to be missing, and performs the snapshot
+    /// heal when that is the right answer.
+    ///
+    /// <para>A DIRECTORY THAT IS MISSING IS NOT THE SAME EVIDENCE AS A FILE THAT IS MISSING WHILE
+    /// ITS DIRECTORY IS INTACT, and collapsing the two is what made a mount blip permanent. The
+    /// engine unlinks its own files, so a gone file inside a live directory has exactly two
+    /// stories and <see cref="RemoveColdSegment"/> tells them apart. A gone DIRECTORY has neither
+    /// story behind it: no engine path removes the data directory, so its absence is the mount, not
+    /// the data. Measured on an engine rooted at a junction — 100 rows over 2 segments healthy,
+    /// then the junction deleted for ONE request and immediately re-created with every .trc still
+    /// present: rows=0, Unreadable=true, segs=0, regions=2, and it stayed that way, because
+    /// LoadColdSegments runs once at startup and nothing rescans. A bind-mount, SMB or iSCSI blip
+    /// cost the whole cold tier for the life of the process and claimed a data loss that had not
+    /// happened.</para>
+    /// </summary>
+    internal ColdReadFault MeetMissingSegmentFile(SpanSegmentInfo seg)
+    {
+        // Probed rather than assumed, because this runs on the path that has just failed: if the
+        // directory is not there, the file's absence is not evidence about the file at all.
+        try
+        {
+            if (!Directory.Exists(_dataDir))
+            {
+                _logger.LogWarning(
+                    "Cold span segment {File} could not be reached — the data directory {Dir} is not " +
+                    "there. Treated as a transient fault: the segment stays in the snapshot and the " +
+                    "next request retries it", seg.FilePath, _dataDir);
+                return ColdReadFault.Transient;
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Could not probe the data directory {Dir} — treating {File} as transient",
+                _dataDir, seg.FilePath);
+            return ColdReadFault.Transient;
+        }
+
+        // THE DIRECTORY IS THERE, BUT IS ANYTHING? A volume that has re-attached and not populated
+        // yet answers Exists with a yes over an empty stub — a container restarted before its
+        // volume binds, an NFS or SMB mount landing on the mountpoint underneath, a fresh disk in
+        // the slot. Every listed segment is then "missing" at once, and classifying them Lost
+        // drops the whole cold tier and writes a permanent claim that survives the data coming
+        // back. Losing every segment in one instant is not how deletion behaves; it is how a mount
+        // behaves. Erring to Transient here cannot hide anything either: the segments STAY in the
+        // snapshot, so a directory that really is empty for ever keeps faulting and keeps
+        // reporting, which is "ask me again", never "it is gone".
+        // TWO SEGMENTS GONE AT ONCE AND NO SEGMENT FILE LEFT ANYWHERE — restored, after removing it
+        // proved far worse than keeping it.
+        //
+        // I took it out on the reasoning that over-reporting a loss is the recoverable direction.
+        // That reasoning does not hold HERE, and the measurement is what settles it: nothing
+        // rescans the data directory (LoadColdSegments runs once, at startup), and retention ages
+        // out the recorded REGION, not the removal from the snapshot. So a mount that flickers for
+        // a tenth of a second — long enough for one request to trip over it — costs every segment
+        // that request touched, permanently, and the only recovery is a process restart. Measured
+        // against the previous commit: with the guard, rows=20 and a whole cold tier once the files
+        // came back; without it, rows=0 Unreadable=True segs=0 across every later request and two
+        // PruneAsync passes. On a forty-segment install one blip also blows straight through the
+        // thirty-two-region cap, and coalescing then calls about four fifths of healthy time
+        // unreadable — a banner that is always on is a banner nobody reads.
+        //
+        // So this errs rarely and the alternative errs constantly. What it costs is named rather
+        // than hidden: a genuine wholesale delete is reported as truncation (Capped, "ask me
+        // again") instead of loss, until a restart finds the files really gone. That is a worse
+        // SENTENCE for a rare event; the removal was a worse OUTCOME for a common one.
+        //
+        // WHAT SEPARATES THE TWO CASES IS THE WAL, NOT A SEGMENT COUNT. The first version asked
+        // for two or more listed segments, on the reasoning that losing everything at once is not
+        // how deletion behaves — but with ONE cold segment "everything at once" and "that file was
+        // deleted" are the same observation, so the guard simply did not apply. Measured on a
+        // single-segment install, which is what a quiet stand plus the hourly CompactSmallSegments
+        // converges to: a 0.1s mount blip gave rows=0 Unreadable=True permanently, and after one
+        // retention pass rows=0 Unreadable=FALSE regions=0 over twenty rows still on the disk —
+        // the exact silent under-report this branch is named for, reachable by a flickering mount.
+        //
+        // spans.wal answers the question the count was standing in for. It is opened at
+        // construction and removed only by an explicit reset, so this process holding a handle to
+        // it means the file is in the directory; if the directory no longer has it, the directory
+        // is not the one we opened. Nothing ordinary — retention, compaction, an operator deleting
+        // a segment — can take it away. And erring here is still the recoverable direction: the
+        // segments STAY in the snapshot, so a directory that really is empty keeps faulting and
+        // keeps reporting, which is "ask me again", never "it is gone".
+        if (NoSegmentFilesLeft(_dataDir) && !WalFileStillThere())
+        {
+            _logger.LogWarning(
+                "Neither a segment file nor the engine's own spans.wal is left under {Dir} while " +
+                "{Count} cold segment(s) are still listed — treating {File} as an unpopulated " +
+                "volume rather than a deletion; the snapshot is kept and the next request retries",
+                _dataDir, _coldSegments.Length, seg.FilePath);
+            return ColdReadFault.Transient;
+        }
+
+        if (RemoveColdSegment(seg)) return ColdReadFault.Lost;
+
+        // NOT LISTED — which usually means the engine retired it itself, and a compaction handover
+        // is a healthy server's own work rather than a loss. But two readers can meet the same
+        // genuinely deleted file, and RemoveColdSegment is atomic, so exactly one of them wins the
+        // removal and the loser lands here. The memory settles which case this is.
+        //
+        // BY PATH, NOT BY TIME RANGE. The first version asked whether the segment's span OVERLAPPED
+        // a recorded loss — and cold segments overlap in time by design, as comments throughout this
+        // file say, so it could not tell the file somebody just lost from a different file in the
+        // same hour. Measured: after one real loss, the very next ordinary handover in that band
+        // came back Lost instead of Handover, and a completely healthy server showed a red
+        // deleted-or-damaged banner for the whole retention TTL.
+        if (_vanished.WasLost(seg.FilePath)) return ColdReadFault.Lost;
+
+        return ColdReadFault.Handover;
+    }
+
+    /// <summary>
+    /// The engine's own write-ahead log, inside the data directory. It is opened OpenOrCreate at
+    /// construction and removed only by an explicit reset, so while this process is alive the file
+    /// IS THERE — which makes its absence evidence about the directory rather than about any
+    /// segment. See <see cref="MeetMissingSegmentFile"/>.
+    /// </summary>
+    private readonly string _walPath;
+
+    /// <summary>
+    /// One more chance for a segment whose file was busy rather than broken. Returns null when it
+    /// is still unreadable; the caller then has to admit the cold tier is short.
+    /// </summary>
+    /// <summary>
+    /// Time the whole load may spend waiting on busy files, TOTAL. Per-file retries looked cheap
+    /// and are not: at six hundred milliseconds each, forty segments inside a backup window parks
+    /// startup for twenty-four seconds with the cold tier unavailable throughout.
+    /// </summary>
+    private static readonly TimeSpan LoadRetryBudget = TimeSpan.FromSeconds(2);
+    private long _loadRetryUsedTicks;
+
+    private SpanSegmentInfo? RetryReadSegmentInfo(string file)
+    {
+        for (int attempt = 1; attempt <= 3; attempt++)
+        {
+            if (_loadRetryUsedTicks >= LoadRetryBudget.Ticks) return null;
+            var waited = TimeSpan.FromMilliseconds(100 * attempt);
+            _loadRetryUsedTicks += waited.Ticks;
+            Thread.Sleep(waited);
+            try
+            {
+                var info = SpanReader.ReadSegmentInfo(file);
+                _logger.LogWarning(
+                    "Cold segment {File} was busy at startup and read on attempt {Attempt}", file, attempt + 1);
+                return info;
+            }
+            catch { /* still busy, or now broken — the caller decides */ }
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Whether the directory holds no segment file at all. Probe failures answer FALSE — an I/O
+    /// error is not evidence of absence, and answering TRUE would turn an unreadable mount into
+    /// "keep retrying for ever" over data that may really be gone.
+    /// </summary>
+    /// <summary>
+    /// Whether the log this engine opened is still in the data directory. A probe failure answers
+    /// TRUE — the same direction as <see cref="NoSegmentFilesLeft"/>, because an I/O error is not
+    /// evidence that the volume was swapped, and answering otherwise would turn a busy disk into a
+    /// permanent loss claim.
+    /// </summary>
+    private bool WalFileStillThere()
+    {
+        try { return File.Exists(_walPath); }
+        catch { return true; }
+    }
+
+    private static bool NoSegmentFilesLeft(string dir)
+    {
+        try
+        {
+            // Disposed: FileSystemEnumerator holds a native find handle that only the finaliser
+            // would release, on a path that runs once per faulted segment per page — exactly the
+            // sick-storage moment when handles are scarce.
+            using var it = Directory.EnumerateFiles(dir, "*.trc").GetEnumerator();
+            return !it.MoveNext();
+        }
+        catch { return false; }
+    }
+
+    /// <summary>
+    /// WHAT THE EXCEPTION ACTUALLY SAYS, rather than "anything I did not name is corruption".
+    ///
+    /// <para>Both cold walks used to end their catch chain by calling everything left
+    /// <see cref="ColdReadFault.Corrupt"/>, which <see cref="IsPermanentFault"/> treats as
+    /// permanent — so a red "deleted or damaged" claim, for the life of the record, was the answer
+    /// to: a Windows sharing violation while an antivirus or a File.Move holds the .trc open; an
+    /// <c>IOException "The specified network name is no longer available"</c> from an SMB or iSCSI
+    /// blip, which is how a mount blip presents AT THE FILE LEVEL and therefore never reaches the
+    /// directory probe; handle exhaustion under GetTraceAsync's eight-way fan-out; and an
+    /// <c>UnauthorizedAccessException</c> while a container volume remounts. Before the fault bit
+    /// existed all of these were reported as truncation, which is what they are.</para>
+    ///
+    /// <para>Corruption is a claim about CONTENT, so only the exceptions that describe content
+    /// earn it. Note the in-repo trigger for getting this wrong: SpanReader's own MaxBlockBytes
+    /// throws <see cref="InvalidDataException"/> on a segment holding a block over 64 MB — a file
+    /// this engine could have written — so that one really is about the file, and really is
+    /// permanent until someone rewrites it.</para>
+    /// </summary>
+    private ColdReadFault ClassifyReadFailure(Exception ex, string what, string filePath)
+    {
+        bool content = FileBounds.DescribesContent(ex);
+
+        if (content)
+        {
+            _logger.LogWarning(ex, "{What}: segment {File} will not parse — treated as damaged", what, filePath);
+            return ColdReadFault.Corrupt;
+        }
+
+        _logger.LogWarning(ex,
+            "{What}: segment {File} could not be read right now — treated as transient, the segment " +
+            "stays in the snapshot and the next request retries it", what, filePath);
+        return ColdReadFault.Transient;
+    }
+
+    /// <summary>
+    /// True when this verdict means rows are MISSING AND NOTHING WILL BRING THEM BACK — the only
+    /// two that may raise a page's <c>Unreadable</c> bit and the red banner behind it. A handover
+    /// is a healthy server's own compaction; a transient fault is answered by the next request.
+    /// Both of those are floors: "ask me again", not "it is gone".
+    /// </summary>
+    private static bool IsPermanentFault(ColdReadFault fault) =>
+        fault is ColdReadFault.Lost or ColdReadFault.Corrupt;
 
     public async IAsyncEnumerable<SpanRecord> SearchSpansAsync(
         DateTimeOffset?   from             = null,
@@ -409,16 +904,80 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         short?            httpStatusCode   = null,
         int               limit            = 200,
         IReadOnlyList<AttrHint>? attrHints = null,
+        SpanScanFloor?    scanFloor        = null,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
         long fromNano = from.HasValue ? from.Value.ToUnixTimeMilliseconds() * 1_000_000L : long.MinValue;
         long toNano   = to.HasValue   ? to.Value.ToUnixTimeMilliseconds()   * 1_000_000L : long.MaxValue;
 
+        // A SEGMENT THIS WINDOW LOST ON SOME EARLIER REQUEST. The catch below removes a vanished
+        // file from the snapshot, so this scan will not find it, will not fail on it, and would
+        // report a window it read out in full — for every request after the one that discovered
+        // the fault. Asserted HERE, at the top, because this method leaves through half a dozen
+        // `yield break`s and the statement is true on all of them. Bit only, no floor: see
+        // SpanScanFloor.MetUnreadableRegion.
+        // A segment this window lost on an earlier request, OR a segment startup could not load at
+        // all. The second has no range to test against — it never reached the snapshot — so it
+        // answers for every window there is, which is the honest reading of "part of the cold tier
+        // is not here".
+        if (_coldTierIncomplete || _vanished.Overlaps(fromNano, toNano)) scanFloor?.MetUnreadableRegion();
+
         int yielded = 0;
 
         // Same duplicate sources as GetTraceAsync, but results here cross traces, so the
-        // identity is the pair. Bounded by `limit`, which also bounds this set.
+        // identity is the pair. Every Add below sits on a path that yields, so this stays
+        // bounded by `limit` — recording spans that were merely READ would put the match
+        // count back into memory through this set after the segment buffer stopped doing it.
         var seen = new HashSet<(TraceId Trace, ulong Span)>();
+
+        // Offers one span to a bounded top-K heap. `present` is the identity of what is IN that
+        // heap right now.
+        //
+        // A DUPLICATE MUST NOT COST A SLOT. The dedupe check used to happen on the way in
+        // (against `seen`) while the recording happened on the way out, so two copies of one
+        // (TraceId, SpanId) arriving inside a single tier or segment both entered the heap —
+        // neither was in `seen` yet — and together evicted a distinct older span to make room.
+        // The second copy was then discarded at the drain, and the tier yielded fewer than
+        // `limit` DISTINCT spans although more existed. Both duplicate sources are ordinary:
+        // UnflushedSpansLocked concatenates the hot tier with the in-flight flush snapshot, and
+        // a segment can hold spans a WAL replay put back.
+        //
+        // `present` is bounded by the heap it mirrors (at most `limit`), never by what was read
+        // — that is the unbounded growth 3fc5472 removed and it must not come back through here.
+        //
+        // RETURNS TRUE WHEN IT DROPPED A MATCH, which is the one thing a caller paging behind
+        // this scan has to be told. A tier that evicted has decided nothing about anything below
+        // the oldest span still in its heap, and a pager that is not told treats "the newest
+        // `limit`" as "all of them".
+        bool Admit(PriorityQueue<SpanRecord, long> top, HashSet<(TraceId Trace, ulong Span)> present, SpanRecord r)
+        {
+            var  id         = (r.TraceId, r.SpanId.RawValue);
+            bool identified = !r.SpanId.IsEmpty;
+
+            if (identified)
+            {
+                // `seen` is empty for the whole of the hot-tier pass (nothing has been yielded
+                // yet) and that pass is the biggest walk in the method, so the probe is skipped
+                // rather than performed against an empty set — the same answer, one hash and one
+                // bucket lookup cheaper, inside the read lock WriteSpan contends with.
+                if (seen.Count > 0 && seen.Contains(id)) return false;   // yielded by an earlier tier or segment
+                if (!present.Add(id))  return false;   // a second copy of something already in the heap
+            }
+
+            if (top.Count < limit) { top.Enqueue(r, r.StartTimeUnixNano); return false; }
+
+            if (!top.TryPeek(out _, out long oldestKept) || r.StartTimeUnixNano <= oldestKept)
+            {
+                // Too old to make the cut — take the identity back out, or `present` would
+                // outgrow the heap and start rejecting spans that are not in it.
+                if (identified) present.Remove(id);
+                return true;
+            }
+
+            var evicted = top.EnqueueDequeue(r, r.StartTimeUnixNano);
+            if (!evicted.SpanId.IsEmpty) present.Remove((evicted.TraceId, evicted.SpanId.RawValue));
+            return true;
+        }
 
         bool Match(SpanRecord s) =>
             s.StartTimeUnixNano >= fromNano &&
@@ -432,50 +991,137 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
 
         // Hot tier plus any in-flight flush snapshot (newest first), in ONE lock hold —
         // see GetTraceAsync for why the pair must not be read separately.
+        //
+        // Bounded top-K, exactly as the cold segment scan below: a min-heap on start time that
+        // evicts its oldest once full.
+        //
+        // WHAT THIS BOUGHT IS MEMORY, AND ONLY MEMORY. An earlier version of this comment
+        // justified the rewrite by LOCK HOLD TIME, and that was wrong in the direction that
+        // matters. `Where().OrderByDescending().Take(limit)` has gone through IPartition since
+        // .NET Core 3.0: buffering is an array append per match and the finish is a partial
+        // quickselect, not an O(M log M) sort. What replaced it costs a `seen` probe plus a
+        // `present` insert per match — a HashCode.Combine over two ulongs and a bucket probe
+        // each — plus a TryPeek, and for anything admitted an O(log limit) EnqueueDequeue and a
+        // `present` removal. Over the ~100k spans UnflushedSpansLocked can walk (50k hot plus a
+        // 50k in-flight flush snapshot) that is several milliseconds of READ lock against about
+        // one before, and WriteSpan takes the WRITE side of it for every ingested span while the
+        // SSE loop runs these scans back to back. The lock hold got WORSE.
+        //
+        // It is still the right trade, for the reason the segment loop below spells out: the
+        // ordering buffer was O(M) SpanRecords — a kilobyte each once a query touches attributes
+        // — and several hundred thousand matches is what killed a 512 MB server. O(limit) is the
+        // fix; the lock hold is what it cost.
+        //
+        // Moving the heap outside the lock over a taken snapshot was considered and rejected:
+        // the snapshot is an O(M) copy of exactly the references the heap exists to stop
+        // materialising, allocated per scan, back to back, straight onto the LOH at 100k
+        // entries. The cheap part is taken instead — see `Admit`, which skips the `seen` probe
+        // while `seen` is empty, and it always is for this tier.
+        var hotTop     = new PriorityQueue<SpanRecord, long>();
+        var hotPresent = new HashSet<(TraceId Trace, ulong Span)>();
+        bool hotEvicted = false;
         _lock.EnterReadLock();
-        List<SpanRecord> candidates;
         try
         {
-            candidates = UnflushedSpansLocked()
-                .Where(Match)
-                .OrderByDescending(s => s.StartTimeUnixNano)
-                .Take(limit)
-                .ToList();
+            foreach (var s in UnflushedSpansLocked())
+            {
+                if (!Match(s)) continue;
+                hotEvicted |= Admit(hotTop, hotPresent, s);
+            }
         }
         finally
         {
             _lock.ExitReadLock();
         }
 
+        // The cold list, walked BY INDEX because the floor below has to name the segment the walk
+        // stopped BEFORE — which `OrderByDescending` in a foreach cannot say. Sorted by
+        // MaxStartNano descending, so nothing in segments [i..] starts above
+        // ordered[i].MaxStartNano: that is the whole basis of the floor.
+        //
+        // Taken AS IT IS. The order is an invariant of the field (see _coldSegments), maintained
+        // where the array is built, so this no longer clones every segment on the box and re-sorts
+        // it on every page of every stream.
+        var ordered = _coldSegments;
+
+        bool Relevant(SpanSegmentInfo s) =>
+            s.MaxStartNano >= fromNano && s.MinStartNano <= toNano &&
+            (serviceName is null || s.Services.Length == 0 ||
+             Array.Exists(s.Services, x => x.Equals(serviceName, StringComparison.OrdinalIgnoreCase)));
+
+        // The highest start time a segment the walk never opened could still hold inside the
+        // window. Segments out of range, or without the requested service, are DECIDED rather
+        // than skipped — they provably hold nothing this call would have returned.
+        long UnvisitedCeiling(int fromIndex)
+        {
+            for (int j = fromIndex; j < ordered.Length; j++)
+                if (Relevant(ordered[j])) return Math.Min(ordered[j].MaxStartNano, toNano);
+            return long.MinValue;
+        }
+
+        // The heap drains oldest-first; the caller wants newest-first.
+        var candidates = new List<SpanRecord>(hotTop.Count);
+        while (hotTop.TryDequeue(out var kept, out _)) candidates.Add(kept);
+        candidates.Reverse();
+
+        // The tier held more matches than a page can carry, so everything below the oldest one
+        // it kept is undecided — including spans the cold walk will never be reached to read.
+        if (hotEvicted && candidates.Count > 0)
+            scanFloor?.StoppedAbove(candidates[^1].StartTimeUnixNano);
+
         foreach (var r in candidates)
         {
             if (!r.SpanId.IsEmpty && !seen.Add((r.TraceId, r.SpanId.RawValue))) continue;
-            if (yielded++ >= limit) yield break;
+            if (yielded >= limit)
+            {
+                // Stopped ON this span: everything strictly above it was handed over, it was not.
+                scanFloor?.StoppedAbove(r.StartTimeUnixNano);
+                scanFloor?.StoppedAbove(UnvisitedCeiling(0));
+                yield break;
+            }
+            yielded++;
             yield return r;
         }
 
-        if (yielded >= limit) yield break;
+        if (yielded >= limit)
+        {
+            // The page filled exactly at the end of the tier — every cold segment is unread.
+            scanFloor?.StoppedAbove(UnvisitedCeiling(0));
+            yield break;
+        }
 
         // Cold tier — segment-level service pre-filter, then block-level skip inside SpanReader
-        foreach (var seg in _coldSegments.OrderByDescending(s => s.MaxStartNano))
+        for (int i = 0; i < ordered.Length; i++)
         {
-            if (seg.MaxStartNano < fromNano || seg.MinStartNano > toNano) continue;
-            // Skip entire segment if it doesn't contain the requested service
-            if (serviceName is not null && seg.Services.Length > 0 &&
-                !Array.Exists(seg.Services, s => s.Equals(serviceName, StringComparison.OrdinalIgnoreCase)))
-                continue;
+            var seg = ordered[i];
+            if (!Relevant(seg)) continue;
 
             ct.ThrowIfCancellationRequested();
 
             // Manual enumeration so a segment deleted/corrupted mid-scan skips the
             // segment (yield inside try-catch is not allowed by the language).
-            // Buffer the segment's matches and sort them newest-first BEFORE the cap bites.
             // A segment's file is written oldest-first, so streaming it under a global span
             // cap kept the OLD side of whichever segment the cap landed in and dropped its
             // new side — the caller then sorted and truncated an already old-shifted pool,
-            // and its "newest page" quietly was not. The buffer holds only this segment's
-            // MATCHES (range plus every pushed-down filter), not the segment.
-            var segMatches = new List<SpanRecord>();
+            // and its "newest page" quietly was not.
+            //
+            // Fixed by ordering, but the first version of that fix buffered EVERY match in
+            // the segment before yielding any — and a month-wide query on a busy service
+            // matches far more than a page. A SpanRecord carries two strings and, whenever
+            // the query touches an attribute (`.db.system = "mssql"`), a decoded attribute
+            // dictionary: on the order of a kilobyte each. Several hundred thousand matches
+            // is therefore several hundred megabytes, and a 512 MB server died on exactly
+            // that shape of query.
+            //
+            // Only the newest `limit` of this segment can ever be yielded, so that is all
+            // this keeps: a min-heap on start time, evicting its oldest once full. Memory
+            // is O(limit) again — the ordering the fix was for, without the buffer it cost.
+            _beforeColdSegmentRead?.Invoke(seg);
+
+            var top      = new PriorityQueue<SpanRecord, long>();
+            var present  = new HashSet<(TraceId Trace, ulong Span)>();
+            bool evicted = false;
+            ColdReadFault? segFault = null;
             await using var e = SpanReader.SearchAsync(
                 seg.FilePath, fromNano, toNano,
                 serviceName, spanName, status, httpStatusCode,
@@ -489,21 +1135,78 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                     r = e.Current;
                 }
                 catch (OperationCanceledException) { throw; }
-                catch (FileNotFoundException) { RemoveColdSegment(seg); break; }
-                catch (Exception ex)
+                catch (FileNotFoundException)
                 {
-                    _logger.LogWarning(ex, "Span search: skipping unreadable segment {File}", seg.FilePath);
+                    segFault = MeetMissingSegmentFile(seg);
                     break;
                 }
-                if (!r.SpanId.IsEmpty && !seen.Add((r.TraceId, r.SpanId.RawValue))) continue;
-                segMatches.Add(r);
+                catch (DirectoryNotFoundException)
+                {
+                    // THE ASYMMETRY, CLOSED. This walk caught only FileNotFoundException, so a
+                    // directory-level fault fell through to the generic catch below and reported
+                    // itself as an unreadable segment — the same event the trace list was calling
+                    // a permanent loss, described by the sibling walk as a corrupt file. Neither
+                    // was right, and the two streams disagreed about one blip.
+                    _logger.LogWarning(
+                        "Span search: could not reach segment {File} — the data directory is not there. " +
+                        "The segment stays in the snapshot for the next request", seg.FilePath);
+                    segFault = ColdReadFault.Transient;
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    segFault = ClassifyReadFailure(ex, "Span search", seg.FilePath);
+                    break;
+                }
+                // `seen` is still ADDED to at the yield below, never here: a span that loses its
+                // place in the heap is never returned, and recording it would grow `seen` with
+                // the match count rather than with the result — the same unbounded growth in the
+                // other structure. Duplicates within THIS segment are held off by `present`,
+                // which is bounded by the heap; see Admit.
+                evicted |= Admit(top, present, r);
             }
 
-            segMatches.Sort(static (a, b) => b.StartTimeUnixNano.CompareTo(a.StartTimeUnixNano));
+            // The heap drains oldest-first; the caller wants newest-first.
+            var segMatches = new List<SpanRecord>(top.Count);
+            while (top.TryDequeue(out var kept, out _)) segMatches.Add(kept);
+            segMatches.Reverse();
+
+            // A file that vanished or would not parse was abandoned part-read, so nothing in it
+            // was decided. Reported as truncation rather than swallowed: results missing because
+            // a segment is corrupt are still results missing — and reported as a FAULT rather
+            // than as a floor, because a vanished segment is removed from the snapshot by the
+            // catch above and no later page can rediscover it. See TraceListPage.Unreadable.
+            //
+            // The FAULT half is now conditional, for the reason spelled out on the trace list's
+            // copy of this decision: a handover and a mount blip stopped this scan without losing
+            // anything, so they name a height and nothing more. StoppedAboveUnreadable sets both
+            // at once, which is exactly why it may not be the unconditional call.
+            if (segFault is { } fault)
+            {
+                long ceiling = Math.Min(seg.MaxStartNano, toNano);
+                if (IsPermanentFault(fault)) scanFloor?.StoppedAboveUnreadable(ceiling);
+                else                         scanFloor?.StoppedAbove(ceiling);
+            }
+            else if (evicted && segMatches.Count > 0)
+                scanFloor?.StoppedAbove(segMatches[^1].StartTimeUnixNano);
+
             foreach (var r in segMatches)
             {
-                if (yielded++ >= limit) yield break;
+                if (!r.SpanId.IsEmpty && !seen.Add((r.TraceId, r.SpanId.RawValue))) continue;
+                if (yielded >= limit)
+                {
+                    scanFloor?.StoppedAbove(r.StartTimeUnixNano);
+                    scanFloor?.StoppedAbove(UnvisitedCeiling(i + 1));
+                    yield break;
+                }
+                yielded++;
                 yield return r;
+            }
+
+            if (yielded >= limit)
+            {
+                scanFloor?.StoppedAbove(UnvisitedCeiling(i + 1));
+                yield break;
             }
         }
     }
@@ -648,7 +1351,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                     // merge the file with itself.
                     if (!Array.Exists(_coldSegments,
                             s => string.Equals(s.FilePath, written.FilePath, StringComparison.Ordinal)))
-                        _coldSegments = [.. _coldSegments, written];
+                        _coldSegments = SortedByMaxStartDesc([.. _coldSegments, written]);
                 }
                 else
                 {
@@ -769,13 +1472,105 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
 
             try
             {
-                loaded.Add(SpanReader.ReadSegmentInfo(file));
+                var info = SpanReader.ReadSegmentInfo(file);
+                loaded.Add(info);
+
+                // A header time range that cannot be true. The segment is kept and queried on the
+                // range as written — correcting it here is what hid readable spans, and refusing
+                // the file would DELETE it (see the catch below) — but a volume that dropped
+                // writes is worth an operator's attention, and this is the only place that knows.
+                if (info.HeaderRangeSuspect)
+                    _logger.LogWarning(
+                        "Cold span segment {File} declares an impossible header time range "
+                      + "[{MinNano}, {MaxNano}] — it stays queryable on that range as written; "
+                      + "suspect the volume it was written to",
+                        file, info.MinStartNano, info.MaxStartNano);
+            }
+            catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
+            {
+                // GONE IS NOT BUSY. Between EnumerateFiles above and ReadSegmentInfo here, a
+                // compaction can publish its merged output and unlink the sources — the ordinary
+                // race this engine is built around, and the one RemoveColdSegment, MeetMissingSegment
+                // File and ColdReadFault.Handover exist to classify. Treating it as a busy file spent
+                // six hundred milliseconds retrying a path that does not exist and then raised the
+                // process-wide incomplete flag, so every later query answered Unreadable for the
+                // life of the process over a handover that lost nothing.
+                _logger.LogDebug("Cold segment {File} vanished while loading — retired by the engine", file);
+                continue;
+            }
+            catch (Exception ex) when (ClassifyReadFailure(ex, "Cold segment load", file) is not ColdReadFault.Corrupt)
+            {
+                // Retried first, because most of what lands here clears by itself: an antivirus
+                // scanning a freshly written file, a backup agent's handle, the compactor's own
+                // File.Move. A few hundred milliseconds is the difference between a segment that
+                // is missing for this process and one that was never really unavailable.
+                var recovered = RetryReadSegmentInfo(file);
+                if (recovered is not null) { loaded.Add(recovered); continue; }
+
+                // Still not readable. It is NOT deleted — that was the old answer and it took the
+                // sidecars with it — but it is also not in the snapshot, so no read can honestly
+                // call a window complete until a restart picks it up.
+                _coldTierIncomplete = true;
+                // NOT EVERY FAILURE TO OPEN IS A REASON TO DESTROY. This catch answered anything at
+                // all with DeleteSegmentFiles, so a segment held open by an antivirus, a backup
+                // agent or the compactor's own File.Move was deleted at startup along with its
+                // .stats, .svcgraph and .tracesum — measured, and on Linux, where File.Delete
+                // succeeds against an open handle, the .trc goes too. The query path was taught in
+                // this same change that a sharing violation is not damage; the startup path was
+                // still answering it with destruction.
+                //
+                // Skipped rather than loaded: the file is not readable NOW, and nothing rescans, so
+                // the next restart is what picks it up. That is a cold-tier gap until then, which
+                // is strictly better than a deletion that cannot be undone.
+                _logger.LogError(ex,
+                    "Cold segment {File} could not be read at startup and is left on disk, not deleted — "
+                  + "but it is missing from this run's cold tier, so every trace query will report an "
+                  + "unreadable region on the list and span-search paths until the service is restarted", file);
+                continue;
             }
             catch (Exception ex)
             {
-                // v1 files (12-byte footer) will fail with wrong footer magic — delete them.
-                _logger.LogWarning(ex, "Unreadable segment {File} — deleting (likely format v1)", file);
-                DeleteSegmentFiles(file);
+                // CONTENT-SHAPED DAMAGE — the catch above has already ruled out everything that is
+                // about the MACHINE rather than the file. v1 segments (12-byte footer) land here on
+                // the footer magic, and deleting them is the migration path they have always had.
+                //
+                // WHAT WAS MISSING IS THE RECORD. Deleting is a decision about disk; it is also, and
+                // silently, a decision about every answer this process will ever give. The window
+                // the file covered is now on no disk at all, so every later page over that band
+                // reads out every file that still exists and makes the strong positive claim that
+                // it read the window — `done {"complete":true}`. That claim is exactly what
+                // VanishedRegionLog was added in this same branch to make impossible, and the query
+                // path was taught it while the startup path went on destroying data behind its back.
+                //
+                // The range comes from the 27-byte header, which is intact in every version this
+                // engine has written and is readable even when the rest of the file is not — see
+                // SpanReader.TryReadHeaderRange. Recorded BEFORE the delete, because after it there
+                // is nothing left to ask.
+                if (SpanReader.TryReadHeaderRange(file, out long minNano, out long maxNano))
+                {
+                    _vanished.Record(minNano, maxNano);
+                    _vanished.RecordPath(file);
+                    _logger.LogWarning(ex,
+                        "Unreadable segment {File} — deleting (likely format v1). The window "
+                      + "[{MinNano}, {MaxNano}] it covered is recorded as unreadable, so queries over "
+                      + "that range will report truncation rather than claim to be complete",
+                        file, minNano, maxNano);
+                    DeleteSegmentFiles(file);
+                }
+                else
+                {
+                    // NOT BEING ABLE TO RECORD A LOSS IS NOT A LICENCE TO CAUSE ONE. Without a range
+                    // the deletion would be unreportable: no region to overlap, no path to classify,
+                    // and every later window silently whole. The file stays, and the process-wide
+                    // flag says the cold tier is short — which is loud, recoverable by a restart
+                    // once someone moves the file, and true.
+                    _coldTierIncomplete = true;
+                    _logger.LogError(ex,
+                        "Segment {File} is unreadable AND its header range cannot be read, so deleting "
+                      + "it would lose a window nothing could report. It is left on disk and excluded "
+                      + "from this run's cold tier; every trace query will report an unreadable region "
+                      + "until the file is moved aside and the service restarted", file);
+                }
             }
         }
 
@@ -788,7 +1583,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             var next  = new List<SpanSegmentInfo>(loaded.Count + _coldSegments.Length);
             next.AddRange(loaded.Where(s => !known.Contains(s.FilePath)));
             next.AddRange(_coldSegments);
-            _coldSegments = next.ToArray();
+            _coldSegments = SortedByMaxStartDesc(next);
         }
         finally { _lock.ExitWriteLock(); }
 
@@ -937,7 +1732,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                 foreach (var s in _coldSegments)
                     if (!processed.Contains(s)) next.Add(s);
                 next.Add(merged);
-                _coldSegments = next.ToArray();
+                _coldSegments = SortedByMaxStartDesc(next);
             }
             finally { _lock.ExitWriteLock(); }
 
@@ -1249,7 +2044,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// (no span deserialisation); the hot tier is grouped live. Traces are merged by id across
     /// tiers, then the cheap filters are applied and the newest <paramref name="limit"/> kept.
     /// </summary>
-    public async Task<IReadOnlyList<TraceSummary>> GetTraceListAsync(
+    public async Task<TraceListPage> GetTraceListAsync(
         DateTimeOffset   from,
         DateTimeOffset   to,
         string?          serviceName,
@@ -1260,6 +2055,8 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         int              limit,
         CancellationToken ct = default)
     {
+        _beforeTraceListScan?.Invoke(ct);
+
         long fromNano = from.ToUnixTimeMilliseconds() * 1_000_000L;
         long toNano   = to.ToUnixTimeMilliseconds()   * 1_000_000L;
         int  scanCap  = Math.Max(limit * 5, 500);
@@ -1267,11 +2064,14 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         var merged = new Dictionary<TraceId, MergedTrace>(scanCap);
 
         // Hot tier — group live spans (newest data) under read-lock. Snapshot cold too.
+        // The snapshot is taken AS IT IS: `_coldSegments` is maintained sorted by MaxStartNano
+        // DESCENDING wherever it is built, so neither this walk nor SearchSpansAsync has to
+        // clone-and-sort an array of every segment on the box on every page of every stream.
         SpanSegmentInfo[] segs;
         _lock.EnterReadLock();
         try
         {
-            segs = _coldSegments.ToArray();
+            segs = _coldSegments;
             // Includes the in-flight flush snapshot — otherwise the newest rows disappear
             // from the trace list for the duration of every segment build.
             foreach (var s in UnflushedSpansLocked())
@@ -1282,35 +2082,200 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         }
         finally { _lock.ExitReadLock(); }
 
-        // Cold — newest-first. .tracesum bodies where present, else legacy span read.
-        Array.Sort(segs, static (a, b) => b.MaxStartNano.CompareTo(a.MaxStartNano));
-        foreach (var seg in segs)
+        // THE HEIGHT ABOVE WHICH THIS PAGE SETTLED ITS WINDOW — never a minimum over what it
+        // merged, and the difference is the whole finding. Cold segments OVERLAP in time, so one
+        // WIDE segment walked first (it sorts first: the order is by MaxStartNano) can trip the
+        // cap all by itself while a NARROWER segment nested entirely inside its range is still
+        // unread. The wide segment's own oldest row says nothing whatever about that.
+        //
+        // The sound statement is the one the walk can actually make: the list is ordered by
+        // MaxStartNano DESCENDING, so nothing in an unvisited segment starts above the FIRST
+        // unvisited segment's MaxStartNano. Everything strictly above that was examined, and
+        // every match in it is in the returned rows.
+        //
+        // FLOORS COMPOSE BY MAXIMUM. Each one names a height above which some part of the work
+        // is settled, so only the highest is a claim all the others sit under — and a floor
+        // placed too LOW is a licence for the caller to page over rows nobody read. There are
+        // three sources below: the budget break, a segment that could not be read, and the
+        // `limit` cut at the end.
+        long scanFloor  = long.MinValue;
+        bool visitedAny = false;
+
+        // A FAULT, not a height, and tracked apart from the floor for the reason spelled out on
+        // TraceListPage.Unreadable: the catch blocks below HEAL the snapshot, so the floor a
+        // vanished segment records is recorded exactly once and every later page finds no
+        // segment, no fault and nothing to report.
+        bool unreadable = false;
+
+        for (int i = 0; i < segs.Length; i++)
         {
-            if (merged.Count >= scanCap) break;
+            var seg = segs[i];
+
+            // Both skips come BEFORE the cap test on purpose. A segment holding nothing in
+            // [from, to], or provably nothing for this service, is DECIDED rather than skipped
+            // — walking past it costs two comparisons and leaves nothing owed. Testing the cap
+            // first (as this loop used to) stopped on whichever segment happened to come next,
+            // so "the walk was capped" could be recorded over a segment that was irrelevant
+            // anyway, and the floor derived from it claimed less than the walk had earned.
             if (seg.MaxStartNano < fromNano || seg.MinStartNano > toNano) continue;
+            // NOTE: this treats "the segment does not list the service" as "holds nothing this
+            // query wants", which is exactly what the ROWS below already assume — a trace whose
+            // only spans in the window live in a service-skipped segment is invisible to this
+            // method with or without a floor. The floor is therefore precisely as sound as the
+            // page it describes, which is the property that matters to a pager.
             if (serviceName is not null && seg.Services.Length > 0 &&
                 !Array.Exists(seg.Services, x => x.Equals(serviceName, StringComparison.OrdinalIgnoreCase)))
                 continue;
 
+            // Out of room, with a segment in front of us that had something to contribute.
+            // Clamped to `to` because nothing above the window's own ceiling is at stake.
+            //
+            // `visitedAny` buys the caller FORWARD PROGRESS, and it is not an optimisation. The
+            // hot tier is merged before this loop and is not subject to the cap, so on a busy
+            // server it can fill the budget by itself — and then the very first cold segment
+            // trips this break untouched. Its MaxStartNano is at or above the window ceiling
+            // (it is the newest segment), the floor clamps to `to`, and a pager whose cursor is
+            // already `to` cannot move: one page of hot rows and a truthful but useless "these
+            // results are truncated" over a month of cold data nobody looked at. Reading one
+            // segment costs one segment's worth of summaries — bounded, and the same order as
+            // the budget itself — and it puts the floor below the hot tier where the cursor can
+            // get a grip.
+            if (visitedAny && merged.Count >= scanCap)
+            {
+                scanFloor = Math.Max(scanFloor, Math.Min(seg.MaxStartNano, toNano));
+                break;
+            }
+            visitedAny = true;
+
             ct.ThrowIfCancellationRequested();
 
-            if (TraceSummarySidecar.Exists(seg.FilePath))
+            // PER-SEGMENT FAILURE HANDLING, which this walk was the only cold walk in the engine
+            // to lack — GetTraceAsync and SearchSpansAsync have both had it for as long as they
+            // have existed, and the whole capped/floor contract the SSE stream is built on is
+            // derived from THIS method. Two shapes, both routine:
+            //
+            //   * a segment that VANISHED. CompactOnePass publishes its merged output and THEN
+            //     unlinks its sources, so a scan holding a slightly older snapshot meets deleted
+            //     files BY DESIGN — and SelectCompactionBatch takes everything under 10 000
+            //     spans, which on a quiet install is every freshly flushed segment, often the
+            //     newest one there is. The legacy branch below had no catch at all, so the
+            //     FileNotFoundException escaped this method, escaped the Task.Run behind it, and
+            //     reached the stream handler's outer catch as "the trace list failed while
+            //     streaming results": a banner, a frozen list, and none of the rows from the
+            //     segments that were perfectly readable;
+            //   * a .trc or .tracesum a power cut truncated. Left in the snapshot deliberately —
+            //     removing a file that still exists is a decision for compaction and retention,
+            //     not for a read — so it fails again on every page. What it must NOT do is
+            //     produce a false ending, and the floor is what stops that: with the segment's
+            //     ceiling recorded, the page is capped, and once the cursor descends past that
+            //     ceiling the stream reports the band as unexamined instead of exhausted.
+            //
+            // Either way the cost is ONE SEGMENT. A read that cannot see part of the window says
+            // so through the floor; it does not fail the request and it does not stay silent.
+            _beforeColdSegmentRead?.Invoke(seg);
+
+            ColdReadFault? segFault = null;
+            try
             {
-                foreach (var r in TraceSummarySidecar.ReadSummaries(seg.FilePath))
+                if (TraceSummarySidecar.Exists(seg.FilePath))
                 {
-                    if (r.RootStartNano < fromNano || r.RootStartNano > toNano) continue;
-                    MergeSummaryInto(merged, r);
+                    // Range-bounded: the caller used to discard the out-of-window rows one at a
+                    // time, having paid for a TraceSummary, a services array and three decoded
+                    // strings for every trace in a segment compaction may have grown to 200 000
+                    // spans — against a budget of `scanCap` rows.
+                    if (TraceSummarySidecar.TryReadSummaries(seg.FilePath, fromNano, toNano, out var summaries))
+                        foreach (var r in summaries) MergeSummaryInto(merged, r);
+                    else
+                        // THE BRANCH THE COMPACTION RACE ACTUALLY ARRIVES ON, and it used to be the
+                        // one place with no classification at all. TryReadSummaries swallows every
+                        // exception and reports false, so a sidecar that vanished between the
+                        // Exists probe above and the open — which is precisely what compaction
+                        // produces, publishing its merged output before unlinking its sources —
+                        // reached the catch blocks below never, and set the fault bit outright.
+                        // Re-probing is what tells the two apart: a sidecar that is no longer there
+                        // is the missing-file question, a sidecar that is there and will not read
+                        // is corrupt.
+                        // Reached only when the sidecar itself said "this will not parse" — every
+                        // other failure now propagates and lands in the catch chain below, where
+                        // ClassifyReadFailure can tell a damaged file from a locked one. It used to
+                        // be hardcoded here, so a lock that clears in seconds was a permanent
+                        // deleted-or-damaged claim with nothing in the log.
+                        segFault = TraceSummarySidecar.Exists(seg.FilePath)
+                                 ? ColdReadFault.Corrupt
+                                 : MeetMissingSegmentFile(seg);
+                }
+                else
+                {
+                    // Legacy segment — fall back to the span read (bounded by segment + filters).
+                    await foreach (var s in SpanReader.SearchAsync(
+                        seg.FilePath, fromNano, toNano, serviceName, spanName, status, null,
+                        minDurationNanos, maxDurationNanos, null, ct))
+                        MergeSpanInto(merged, s);
                 }
             }
-            else
+            catch (OperationCanceledException) { throw; }
+            catch (FileNotFoundException)
             {
-                // Legacy segment — fall back to the span read (bounded by segment + filters).
-                await foreach (var s in SpanReader.SearchAsync(
-                    seg.FilePath, fromNano, toNano, serviceName, spanName, status, null,
-                    minDurationNanos, maxDurationNanos, null, ct))
-                    MergeSpanInto(merged, s);
+                segFault = MeetMissingSegmentFile(seg);   // loss, handover or unreachable mount
+            }
+            catch (DirectoryNotFoundException)
+            {
+                // NOT a removal. This catch used to call RemoveColdSegment, which on a directory
+                // fault is a claim the engine has no evidence for — see MeetMissingSegmentFile.
+                _logger.LogWarning(
+                    "Trace list: could not reach segment {File} — the data directory is not there. " +
+                    "The segment stays in the snapshot for the next request", seg.FilePath);
+                segFault = ColdReadFault.Transient;
+            }
+            catch (Exception ex)
+            {
+                segFault = ClassifyReadFailure(ex, "Trace list", seg.FilePath);
+            }
+
+            // Abandoned part-read, so nothing in it was decided. Reported as truncation rather
+            // than swallowed: rows missing because a segment is unreadable are still rows
+            // missing, and the sibling SearchSpansAsync has always said so for the same two
+            // conditions — leaving this one silent made the two streams disagree about the same
+            // fault, one calling it truncation and the other calling the window exhausted.
+            //
+            // The FLOOR is what a pager needs; the BIT is what a stream needs, and the two are
+            // not the same statement. The floor says "below here I settled nothing", which the
+            // next, narrower page can and usually does make good. The bit says "a file in this
+            // window could not be read", and nothing makes that good — least of all the
+            // RemoveColdSegment above, which guarantees the next page will not even find the
+            // segment to fail on. See TraceListPage.Unreadable.
+            //
+            // EVERY FAULT OWES THE FLOOR; ONLY A PERMANENT ONE OWES THE BIT. That split is the
+            // whole of this round's fix here. A compaction handover and a mount blip both mean
+            // THIS walk did not read those rows — the floor, exactly — while the rows themselves
+            // are in the replacement or still on the disk that came back. Setting the bit for them
+            // told a user of a completely healthy server that their data was deleted or damaged,
+            // and the client answers that bit with a red banner and a frozen list.
+            if (segFault is { } fault)
+            {
+                scanFloor  = Math.Max(scanFloor, Math.Min(seg.MaxStartNano, toNano));
+                unreadable |= IsPermanentFault(fault);
             }
         }
+
+        // THE FAULT THIS WALK COULD NOT MEET. A segment that vanished was dropped from the
+        // snapshot by whichever request tripped over it, so from the next one onwards the loop
+        // above walks a clean list, finds every file it looks for, and — truthfully, as far as it
+        // can see — reports a window it read out. The engine remembers what the loop cannot; see
+        // VanishedRegionLog.
+        //
+        // THE BIT WITHOUT A FLOOR, deliberately, and it is the one asymmetry in this method. The
+        // floor is a height a LATER, NARROWER page could settle: it says "I stopped here, ask me
+        // again lower down". There is nothing to ask. This walk did not abandon a segment
+        // part-read — it opened every file that exists and finished all of them — so no height
+        // names work left undone, and raising one would send the pager down through band after
+        // empty band to arrive at "the search could not be advanced", which is both the wrong
+        // sentence and the wrong advice for a file that is simply gone. The BIT is the whole
+        // statement: part of this window is on no disk, and no width of window will help.
+        // TraceListPage.Unreadable exists precisely because those two are not the same fact.
+        // See SearchSpansAsync: a segment startup could not load has no range, so it makes every
+        // window unreadable rather than a narrower one.
+        unreadable |= _coldTierIncomplete || _vanished.Overlaps(fromNano, toNano);
 
         // Filter + sort newest-first + take limit.
         var list = new List<TraceSummary>(merged.Count);
@@ -1326,9 +2291,29 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         }
 
         list.Sort(static (a, b) => b.RootStartNano.CompareTo(a.RootStartNano));
-        if (list.Count > limit) list.RemoveRange(limit, list.Count - limit);
 
-        return list;
+        if (list.Count > limit)
+        {
+            // The `limit` cut is the THIRD place this call stopped short. Rows under it were
+            // merged and then thrown away without ever being handed to the caller, so the page
+            // does not speak for them — and the height it settled down to is therefore the
+            // OLDEST ROW IT KEPT, not the oldest it merged.
+            //
+            // This one costs the caller nothing, and the pair is worth seeing together: a pager
+            // whose cursor is its own oldest returned row lands exactly ON this floor, so the
+            // rows under the cut come back on the next page. It is the OTHER two floors — the
+            // budget break and the unreadable segment — that can sit above such a cursor, and
+            // that is precisely the gap the caller has to be told about.
+            scanFloor = Math.Max(scanFloor, list[Math.Max(0, limit - 1)].RootStartNano);
+            list.RemoveRange(limit, list.Count - limit);
+        }
+
+        // CAPPED and "there is a floor" are the same statement, so they are computed once from
+        // one another. A floor above long.MinValue is exactly a region of [from, to] this page
+        // does not speak for; no floor is exactly "the window was read out". Deriving one from
+        // the other is what stops a caller ever seeing the contradictory pair — capped, no rows,
+        // and a floor claiming nothing is left — which has no honest ending at all.
+        return new TraceListPage(list, scanFloor != long.MinValue, scanFloor, unreadable);
     }
 
     private static MergedTrace GetOrAdd(Dictionary<TraceId, MergedTrace> merged, TraceId id)
@@ -1497,9 +2482,20 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         foreach (var s in toDelete)
             DeleteSegmentFiles(s.FilePath);
 
-        if (toDelete.Count > 0)
-            _logger.LogInformation("Retention pruned {Count} trace file(s) older than {Days} days",
-                toDelete.Count, (int)ttl.TotalDays);
+        // THE OTHER BOUND ON THE FAULT RECORD, and the one that keeps it from being a leak that
+        // also never shuts up. A remembered vanished range is a statement that part of a window
+        // cannot be served; once retention has passed that range, no part of that window can be
+        // served, by design, and every query reaching there is outside the TTL anyway. Keeping the
+        // record past this point would have the server explaining a lost file to users asking
+        // about data it was told to throw away. Same cutoff as the deletion above, so the record
+        // lives exactly as long as the data it describes could have been asked for.
+        int forgotten = _vanished.Forget(cutoffNano);
+
+        if (toDelete.Count > 0 || forgotten > 0)
+            _logger.LogInformation(
+                "Retention pruned {Count} trace file(s) older than {Days} days " +
+                "(and forgot {Forgotten} vanished-segment range(s) below the cutoff)",
+                toDelete.Count, (int)ttl.TotalDays, forgotten);
 
         return Task.FromResult(toDelete.Count);
     }
@@ -1531,4 +2527,34 @@ public sealed class SpanSegmentInfo
     public string[] Services     { get; init; } = [];
     /// <summary>On-disk format version (2 = legacy string-keyed maps, 3 = current). Drives v2→v3 migration.</summary>
     public ushort   FormatVersion { get; init; } = 3;
+
+    /// <summary>
+    /// TRUE when this segment's <c>[MinStartNano, MaxStartNano]</c> is NOT what its file header
+    /// said. <c>SpanReader.SaneHeaderRange</c> replaces a range no clock could have produced —
+    /// negative, inverted, or past the file's own last-write time — because every later decision
+    /// (window skip, sort order, retention's cutoff, and the range a vanished segment hands to
+    /// <c>VanishedRegionLog</c>) is taken on these two numbers as if they were facts.
+    ///
+    /// <para>OBSERVED AND REPORTED, NEVER REPAIRED. An earlier version of this branch clamped an
+    /// implausible Max down to the file's mtime plus a day, and hid readable spans: these two
+    /// fields decide which segments a walk OPENS, so a value invented at load time can only close
+    /// a door the data is behind — silently, because the skip leaves no fault and no floor. The
+    /// range is believed as written; the hazard a torn field really creates is bounded where it
+    /// does damage, in <c>VanishedRegionLog.Record</c>.</para>
+    ///
+    /// <para>So <c>Min</c> and <c>Max</c> ARE NOT SANITISED before use, and nothing downstream may
+    /// assume they are — this flag reports, it does not repair. It is true when the range is
+    /// negative, inverted, or later than the file's own last-write time by more than a day of
+    /// clock slack; that third test is the one that catches a <c>Max</c> torn to
+    /// <c>long.MaxValue</c>, which is neither of the first two and is the tear that motivated all
+    /// of this.</para>
+    /// </summary>
+    public bool     HeaderRangeSuspect { get; init; }
+
+    /// <summary>
+    /// The segment file's last-write time in Unix nanoseconds, read when the file was opened and
+    /// carried because the moment it is needed — the segment has vanished — is the moment it can
+    /// no longer be read. The ceiling for the range handed to <c>VanishedRegionLog</c>.
+    /// </summary>
+    public long     LastWriteNano { get; init; }
 }

@@ -72,7 +72,7 @@ public sealed class TraceFlushVisibilityTests : IDisposable
 
         return new Snapshot(
             Spans:         (int)stats.Sum(s => s.SpanCount),
-            Traces:        list.Count,
+            Traces:        list.Rows.Count,
             Edges:         graph.Edges.Length,
             VolumeTraces:  volume.TotalTraces,
             OneTraceSpans: one.Count);

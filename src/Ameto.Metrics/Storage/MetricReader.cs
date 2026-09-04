@@ -1,3 +1,4 @@
+using Ameto.Core;
 using System.Buffers;
 using K4os.Compression.LZ4;
 using MessagePack;
@@ -12,6 +13,10 @@ namespace Ameto.Metrics.Storage;
 /// </summary>
 internal static class MetricReader
 {
+    /// <summary>Largest block this reader will decompress. The same ceiling SpanReader uses, and
+    /// for the same reason: nothing on disk bounds what an LZ4 payload claims to expand to.</summary>
+    private const int MaxBlockBytes = 64 * 1024 * 1024;
+
     private const uint   Magic       = 0x52_44_4D_54; // "RDMT"
     private const uint   FooterMagic = 0x52_44_4D_46; // "RDMF"
 
@@ -114,15 +119,25 @@ internal static class MetricReader
             // at a time — materialising the whole section would make the caller's peak
             // the file's series count, which is unbounded in files written before the
             // 512-series cap (exactly what a high-cardinality deployment has on disk).
+            // THE SAME RULE THE TRACE READERS FOLLOW, and this file was outside the scan that
+            // enforces it — which is exactly how it kept its unbounded rents while nine sites one
+            // project over were being fixed round after round. A compressed size taken from an
+            // untrusted .mts header is a rent of that size before anything discovers the file is
+            // shorter, and ArrayPool keeps a large bucket committed for the life of the process.
             br.ReadUInt32(); // uncompSize
             uint compSize = br.ReadUInt32();
+            FileBounds.RequireLengthFits(compSize, fs.Length - fs.Position, "Series block", filePath);
 
             byte[] comp = ArrayPool<byte>.Shared.Rent((int)compSize);
             byte[]? raw  = null;
             try
             {
                 fs.ReadExactly(comp, 0, (int)compSize);
+                // The length INSIDE the payload, which the check above never saw: LZ4 carries the
+                // decompressed size in its own header, so a short well-formed block can still ask
+                // for gigabytes.
                 int rawLen = LZ4Pickler.UnpickledSize(comp.AsSpan(0, (int)compSize));
+                FileBounds.RequireLengthFits(rawLen, MaxBlockBytes, "Series block uncompressed", filePath);
                 raw = ArrayPool<byte>.Shared.Rent(rawLen);
                 LZ4Pickler.Unpickle(comp.AsSpan(0, (int)compSize), raw.AsSpan(0, rawLen));
 
@@ -146,6 +161,7 @@ internal static class MetricReader
             {
                 br.ReadUInt32(); // uncompSize
                 uint compSize = br.ReadUInt32();
+                FileBounds.RequireLengthFits(compSize, fs.Length - fs.Position, $"Series {i} block", filePath);
 
                 byte[] comp = ArrayPool<byte>.Shared.Rent((int)compSize);
                 byte[]? raw = null;
@@ -154,6 +170,7 @@ internal static class MetricReader
                 {
                     fs.ReadExactly(comp, 0, (int)compSize);
                     int rawLen = LZ4Pickler.UnpickledSize(comp.AsSpan(0, (int)compSize));
+                    FileBounds.RequireLengthFits(rawLen, MaxBlockBytes, $"Series {i} uncompressed", filePath);
                     raw = ArrayPool<byte>.Shared.Rent(rawLen);
                     LZ4Pickler.Unpickle(comp.AsSpan(0, (int)compSize), raw.AsSpan(0, rawLen));
                     series = DeserializeNext(metricName, raw, 0, rawLen, deltaMs: false, out _);
@@ -246,15 +263,39 @@ internal static class MetricReader
     {
         int count = r.ReadArrayHeader();
         if (count == 0) return null;
-        var b = new double[count];
-        for (int i = 0; i < count; i++) b[i] = r.ReadDouble();
+        // A header is a claim, not a measurement: one byte is the least a double can occupy in
+        // MessagePack, so nothing in the block can hold more than its own remaining bytes. The
+        // reservation is capped below that and grown as the values actually arrive, because a
+        // count that survives the check can still be far larger than anything real.
+        FileBounds.RequireCountFits(count, r.Sequence.Length - r.Consumed,
+            fileBytesPerElement: 1, "Bucket bounds", "the series block");
+        var b = new double[FileBounds.PreallocFor(count, heapBytesPerElement: sizeof(double))];
+        for (int i = 0; i < count; i++)
+        {
+            if (i == b.Length) Array.Resize(ref b, Math.Min(count, Math.Max(4, b.Length * 2)));
+            b[i] = r.ReadDouble();
+        }
         return b;
     }
 
     private static LabelSet ReadLabels(ref MessagePackReader r)
     {
         int count = r.ReadMapHeader();
-        var pairs = new List<KeyValuePair<string, string>>(count);
+        // THE SAME RULE AS EVERY OTHER READER HERE, and this site went four rounds without it for a
+        // reason worth naming: the convention test that enforces the rule could not SEE this line.
+        // Its pattern read a generic argument list with `[^>]*`, which stops at the first `>`, so
+        // `List<KeyValuePair<string, string>>` matched nothing at all — the file was scanned, the
+        // shape was there, and the scanner walked past it. That blindness is fixed in
+        // FileBoundsConventionTests; this is the allocation it was hiding.
+        //
+        // Two bounds, two questions. Could the file hold this many pairs — a pair is two msgpack
+        // strings and the shortest legal one is a byte each, so two bytes on disk. And what may be
+        // reserved up front for a count that passes: a map header torn to int.MaxValue was believed
+        // whole and asked for 2.1 billion slots, 34 GB of references, before one pair was read.
+        FileBounds.RequireCountFits(count, r.Sequence.Length - r.Consumed,
+            fileBytesPerElement: 2, "Label set", "the series block");
+        int cap   = FileBounds.PreallocFor(count, heapBytesPerElement: 16);
+        var pairs = new List<KeyValuePair<string, string>>(cap);
         for (int i = 0; i < count; i++)
         {
             var k = r.ReadString() ?? string.Empty;
@@ -272,8 +313,12 @@ internal static class MetricReader
     /// </summary>
     private static List<MetricDataPoint> ReadPointsV3(ref MessagePackReader r)
     {
+        // A MessagePack array header is a number out of the file like any other: the block it
+        // lives in is bounded, but the header can still claim far more points than the block
+        // holds, and a capacity is reserved before a single one is read. Reserve modestly and
+        // let the list grow into whatever is really there.
         int count  = r.ReadArrayHeader();
-        var pts    = new List<MetricDataPoint>(count);
+        var pts    = new List<MetricDataPoint>(FileBounds.PreallocFor(count, heapBytesPerElement: 64));
         long ms    = 0;
         long    cnt = 0;
         double  sum = 0;
@@ -295,8 +340,15 @@ internal static class MetricReader
                 else
                 {
                     int bn = r.ReadArrayHeader();
-                    buckets = new long[bn];
-                    for (int j = 0; j < bn; j++) buckets[j] = r.ReadInt64();
+                    FileBounds.RequireCountFits(bn, r.Sequence.Length - r.Consumed,
+                        fileBytesPerElement: 1, "Histogram buckets", "the series block");
+                    var bk = new long[FileBounds.PreallocFor(bn, heapBytesPerElement: sizeof(long))];
+                    for (int j = 0; j < bn; j++)
+                    {
+                        if (j == bk.Length) Array.Resize(ref bk, Math.Min(bn, Math.Max(4, bk.Length * 2)));
+                        bk[j] = r.ReadInt64();
+                    }
+                    buckets = bk;
                 }
             }
             pts.Add(new MetricDataPoint
@@ -315,7 +367,7 @@ internal static class MetricReader
     private static List<MetricDataPoint> ReadPointsV2(ref MessagePackReader r)
     {
         int count = r.ReadArrayHeader();
-        var pts   = new List<MetricDataPoint>(count);
+        var pts   = new List<MetricDataPoint>(FileBounds.PreallocFor(count, heapBytesPerElement: 64));
         for (int i = 0; i < count; i++)
         {
             int n = r.ReadArrayHeader(); // 5 fields in v2
@@ -333,8 +385,15 @@ internal static class MetricReader
                 else
                 {
                     int bn = r.ReadArrayHeader();
-                    buckets = new long[bn];
-                    for (int j = 0; j < bn; j++) buckets[j] = r.ReadInt64();
+                    FileBounds.RequireCountFits(bn, r.Sequence.Length - r.Consumed,
+                        fileBytesPerElement: 1, "Histogram buckets", "the series block");
+                    var bk = new long[FileBounds.PreallocFor(bn, heapBytesPerElement: sizeof(long))];
+                    for (int j = 0; j < bn; j++)
+                    {
+                        if (j == bk.Length) Array.Resize(ref bk, Math.Min(bn, Math.Max(4, bk.Length * 2)));
+                        bk[j] = r.ReadInt64();
+                    }
+                    buckets = bk;
                 }
             }
             pts.Add(new MetricDataPoint
