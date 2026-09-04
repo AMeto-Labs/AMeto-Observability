@@ -15,6 +15,9 @@ on:
 jobs:
   backend:
     runs-on: windows-latest
+    # The suite is ~11 minutes; the default is six hours. A test that hangs should cost a coffee,
+    # not a runner-day.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
@@ -25,34 +28,56 @@ jobs:
       # Debug, so that is the configuration every contributor runs and the one their green result
       # describes. The memory probes in this suite also depend on it — an optimising JIT drops a
       # local the moment it is dead, so a forced collection inside a probe can reclaim the very
-      # allocation the probe exists to see. Those tests skip themselves under Release rather than
-      # report a healthy number over defective code; see SpanTraceReadBoundTests.
-      # All five test projects are in Ameto.slnx, so this is the whole suite, integration
-      # included. It runs once: the integration suite is run three times locally because of a
-      # known flake, and a flake that only ever shows up on a developer's third attempt is
-      # precisely what CI should be allowed to go red on.
+      # allocation the probe exists to see, and the probe then reports a healthy number over
+      # defective code.
+      #
+      # SIX test projects are in Ameto.slnx, and `dotnet test` at the root runs all of them:
+      # Core, Query, Indexing, Storage, Integration — and Ameto.Perf, which is an OutputType=Exe
+      # BenchmarkDotNet host that also carries ~53 [Fact]s and takes 2m40s-3m45s of the ~11 minute
+      # job. Its probes measure allocation and CPU on a shared two-core runner, so its timings vary
+      # by ~40% between runs of identical code; it is in the gate deliberately for now, and if it
+      # starts flaking it should be split out rather than retried.
+      #
+      # It runs once: the integration suite is run three times locally because of a known flake,
+      # and a flake that only ever shows up on a developer's third attempt is precisely what CI
+      # should be allowed to go red on.
       - name: Test (Debug)
         shell: pwsh
         run: |
           dotnet test -c Debug --nologo -v minimal 2>&1 | Tee-Object -FilePath test-output.txt
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          # A SKIPPED TEST READS AS A PASSING ONE. The memory probes skip themselves under an
-          # optimising JIT rather than report a healthy number over defective code, which is the
-          # right call and also a quiet one: nothing in a green report distinguishes "the probe
-          # ran and the peak was flat" from "the probe declined to run". This job is Debug, so
-          # the expected skip count is zero, and anything else means a test stopped running
+          # A SKIPPED TEST READS AS A PASSING ONE. Nothing in a green report distinguishes "the
+          # test ran and the assertion held" from "the test declined to run". This job is Debug,
+          # so the expected skip count is zero, and anything else means a test stopped running
           # without anyone deciding it should.
-          $skipped = (Select-String -Path test-output.txt -Pattern 'Skipped:\s+(\d+)' -AllMatches |
-                      ForEach-Object { $_.Matches } |
-                      ForEach-Object { [int]$_.Groups[1].Value } |
-                      Measure-Object -Sum).Sum
+          #
+          # WHAT THIS GUARD CANNOT SEE, stated so nobody trusts it further than it goes: it reads
+          # the runner's `Skipped:` tally, so it only catches a test that skips through the
+          # framework — Assert.Skip, [SkippableFact], a Skip= on the attribute. A test that
+          # self-skips by RETURNING EARLY is reported as Passed, is absent from this tally, and is
+          # invisible here. If you add a probe that stands down under some condition, make it skip
+          # through xUnit or this gate will not know it went quiet.
+          #
+          # The tally itself must fail closed. Summing zero matches yields $null, and $null -gt 0
+          # is false, so a change in the runner's summary format (a move to Microsoft.Testing
+          # Platform, say) would retire this check in silence — the exact failure it exists to
+          # prevent. Requiring one summary line per test project makes that a red build instead.
+          $expectedProjects = 6   # Core, Query, Indexing, Storage, Perf, Integration — see Ameto.slnx
+          $summaries = @(Select-String -Path test-output.txt -Pattern 'Skipped:\s+(\d+)' -AllMatches |
+                         ForEach-Object { $_.Matches } |
+                         ForEach-Object { [int]$_.Groups[1].Value })
+          if ($summaries.Count -lt $expectedProjects) {
+            Write-Host "::error::parsed $($summaries.Count) test summaries, expected $expectedProjects. Either a project stopped running, or the runner's output format changed and this guard can no longer read it."
+            exit 1
+          }
+          $skipped = ($summaries | Measure-Object -Sum).Sum
           if ($skipped -gt 0) {
             Write-Host "::error::$skipped test(s) skipped under Debug, where nothing should skip."
             Select-String -Path test-output.txt -Pattern 'Skipped:\s+[1-9]'
             exit 1
           }
-          Write-Host "no skipped tests"
+          Write-Host "no skipped tests across $($summaries.Count) test projects"
 
   client:
     runs-on: ubuntu-latest
