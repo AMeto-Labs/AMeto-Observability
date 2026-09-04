@@ -142,6 +142,12 @@ describe('traces list — who asked decides who owns the failure', () => {
     });
 
     const fixture = TestBed.createComponent(TracesComponent);
+
+    // These cases were written when the row ceiling was a fixed 2000, and several of them turn
+    // on row counts staying UNDER it. The ceiling is a user-chosen setting now (default 100),
+    // so it is pinned here to keep each test about its own subject rather than about the
+    // default: a hint that appears because the default moved is not this suite's finding.
+    (fixture.componentInstance as any).streamMax.set(2000);
     fixture.detectChanges();                       // ngOnInit → loadAll → the first stream
     await fixture.whenStable();
 
@@ -642,14 +648,19 @@ describe('traces list — who asked decides who owns the failure', () => {
     const c  = fixture.componentInstance as any;
     const el = fixture.nativeElement as HTMLElement;
 
+    // Restated rather than inherited from boot(): this case is the one that would silently
+    // stop meaning anything if the pinned ceiling there were ever lowered. The claim is about
+    // the bound holding AT SCALE — 2000 rows must still be ~25 rows of DOM — so the number it
+    // needs is part of the test, not part of its setup.
+    c.streamMax.set(2000);
+
     fixture.componentInstance.loadAll();
     fixture.detectChanges();
-    for (let i = 0; i < c.streamMax; i++) streams.live.next(row('t' + i));
+    for (let i = 0; i < c.streamMax(); i++) streams.live.next(row('t' + i));
     streams.live.complete();
     fixture.detectChanges();
     await fixture.whenStable();
 
-    expect(c.streamMax).toBe(2000);
     expect(c.traces().length).toBe(2000);
     const rendered = el.querySelectorAll('.trace-vrow').length;
     const elements = el.querySelectorAll('.trace-rows *').length;
@@ -660,7 +671,7 @@ describe('traces list — who asked decides who owns the failure', () => {
     // window on the array rather than a copy of it.
     expect(c.streamCapped()).toBe(true);
     expect(el.querySelector('.list-more-hint')?.textContent?.trim())
-      .toBe('· newest 2000 — narrow the range or the query for older traces');
+      .toBe(`· newest ${c.streamMax()} — narrow the range or the query for older traces`);
     // 600px of viewport at ~82px a row, plus 8 rows of overscan on each side.
     expect(rendered).toBeGreaterThan(0);
     expect(rendered).toBeLessThan(40);

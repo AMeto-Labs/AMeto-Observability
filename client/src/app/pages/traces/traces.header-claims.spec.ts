@@ -126,6 +126,12 @@ describe('the trace list header claims only what it was told', () => {
       ],
     });
     const fixture = TestBed.createComponent(TracesComponent);
+
+    // These cases were written when the row ceiling was a fixed 2000, and several of them turn
+    // on row counts staying UNDER it. The ceiling is a user-chosen setting now (default 100),
+    // so it is pinned here to keep each test about its own subject rather than about the
+    // default: a hint that appears because the default moved is not this suite's finding.
+    (fixture.componentInstance as any).streamMax.set(2000);
     fixture.detectChanges();                        // ngOnInit → loadAll → the first stream
     await fixture.whenStable();
     streams.live.complete({ complete: true, reason: 'exhausted' });
@@ -176,7 +182,7 @@ describe('the trace list header claims only what it was told', () => {
     // different row ceiling came back as a red banner.
     expect(c.listLoss()).toBe('unread-segment');
     expect(c.listEnding()).toEqual({ kind: 'capped' });      // the ceiling is its own axis
-    expect(suffix(fixture)).toBe('· newest 2000, partial list — see the message above');
+    expect(suffix(fixture)).toBe(`· newest ${c.streamMax()}, partial list — see the message above`);
     // The advice is the reason `truncatedBy` is carried this far, so it is asserted, not
     // assumed: a segment the search ran out of room to open comes back when the window is
     // narrower. It now leads with the banner and is echoed in the tooltip.
@@ -215,7 +221,7 @@ describe('the trace list header claims only what it was told', () => {
       //   max=50   : banner=false held=false hint='· newest 2000, and part of this window …'
       // A red blocking banner over a frozen list, versus a grey count suffix over a live one,
       // for one and the same missing segment — and reachable from the product, since streamMax
-      // is a fixed 2000 and which door the loss comes through is decided by how many surviving
+      // is user-chosen (default 100) and which door the loss comes through is decided by how many surviving
       // traces sit above it.
       const fixture = await boot();
       const c = fixture.componentInstance as any;
@@ -260,7 +266,7 @@ describe('the trace list header claims only what it was told', () => {
       expect(viaError.suffix).toContain('partial list — see the message above');
       // The one thing that may still differ is DETAIL only one road has: the `done` road knows
       // the ceiling ALSO bit. Extra facts are not a different screen.
-      expect(viaDone.suffix).toBe('· newest 2000, partial list — see the message above');
+      expect(viaDone.suffix).toBe(`· newest ${c.streamMax()}, partial list — see the message above`);
       expect(viaError.suffix).toBe('· partial list — see the message above');
     });
 
@@ -304,7 +310,7 @@ describe('the trace list header claims only what it was told', () => {
     // 50 rows, and the header says the ceiling stopped it — because the SERVER said so. The
     // row count cannot reach this conclusion at all, which is the point.
     expect(c.streamCapped()).toBe(true);
-    expect(suffix(fixture)).toBe('· newest 2000 — narrow the range or the query for older traces');
+    expect(suffix(fixture)).toBe(`· newest ${c.streamMax()} — narrow the range or the query for older traces`);
   });
 
   it('C3: a window read out is the only thing a bare count is allowed to mean', async () => {
@@ -327,18 +333,18 @@ describe('the trace list header claims only what it was told', () => {
 
       // The two log streams still end with a bare `data: {}`, and a future server may say
       // something new. Neither may be read as an endorsement.
-      await search(fixture, c.streamMax, {});
+      await search(fixture, c.streamMax(), {});
       expect(c.streamCapped()).toBe(true);
-      expect(suffix(fixture)).toBe('· newest 2000 — narrow the range or the query for older traces');
+      expect(suffix(fixture)).toBe(`· newest ${c.streamMax()} — narrow the range or the query for older traces`);
 
-      await search(fixture, c.streamMax, { complete: false, reason: 'some-future-ending' });
+      await search(fixture, c.streamMax(), { complete: false, reason: 'some-future-ending' });
       expect(c.streamCapped()).toBe(true);
 
       // …and an unrecognised `truncatedBy` degrades the same way: the ceiling is still
       // reported, the part this page cannot describe is not described.
       await search(fixture, 50, { complete: false, reason: 'max-rows', truncatedBy: 'moon-phase' });
       expect(c.listEnding()).toEqual({ kind: 'capped' });
-      expect(suffix(fixture)).toBe('· newest 2000 — narrow the range or the query for older traces');
+      expect(suffix(fixture)).toBe(`· newest ${c.streamMax()} — narrow the range or the query for older traces`);
     });
 
   it('C3: an ending that denies completeness is reported short even when unexplained', async () => {

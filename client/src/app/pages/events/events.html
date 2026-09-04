@@ -44,18 +44,30 @@
       <!-- List: fixed-height virtual (default) or natural-height wrapped rows -->
       <div #eventsScroll class="events-list" (scroll)="onEventsScroll($event)">
         @if (store.wrapMessages()) {
-          <!-- Wrap mode: rows grow to show the full message, so they are rendered
-               naturally — fixed-height virtualization can't hold variable heights. -->
-          @for (ev of store.displayedEvents(); track ev.id) {
-            <app-event-list-row
-              [event]="ev"
-              [selected]="ev.id === store.selectedId()"
-              [wrap]="true"
-              [isNew]="store.newEventIds().has(ev.id)"
-              (selectRequested)="store.toggleEvent(ev.id)"
-              (filterSelected)="store.applyFilter($event)"
-            />
-          }
+          <!-- Wrap mode: rows grow to show the full message, so their heights are MEASURED
+               rather than assumed. It is virtualized all the same — this is the mode that
+               produces the tallest rows, so rendering all of them was how a wrapped answer
+               of a few thousand logs stopped the page. `#evRowEl` + `data-index` are what the
+               component hands to virtualizer.measureElement. -->
+          <div [style.height.px]="virtualizer.getTotalSize()" style="position:relative">
+            @for (vRow of virtualizer.getVirtualItems(); track vRow.key) {
+              @let ev = store.displayedEvents()[vRow.index];
+              <div #evRowEl class="ev-vrow"
+                   [attr.data-index]="vRow.index"
+                   [style.transform]="'translateY(' + vRow.start + 'px)'">
+                @if (ev) {
+                  <app-event-list-row
+                    [event]="ev"
+                    [selected]="ev.id === store.selectedId()"
+                    [wrap]="true"
+                    [isNew]="store.newEventIds().has(ev.id)"
+                    (selectRequested)="store.toggleEvent(ev.id)"
+                    (filterSelected)="store.applyFilter($event)"
+                  />
+                }
+              </div>
+            }
+          </div>
         } @else {
           <div [style.height.px]="virtualizer.getTotalSize()" style="position:relative">
             @for (vRow of virtualizer.getVirtualItems(); track vRow.key) {
