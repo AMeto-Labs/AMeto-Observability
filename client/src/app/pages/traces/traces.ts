@@ -10,6 +10,7 @@ import { FormsModule } from '@angular/forms';
 import { LucideAngularModule } from 'lucide-angular';
 import { format } from 'date-fns';
 import { ApiService } from '../../core/services/api.service';
+import { UserPreferencesService } from '../../core/services/user-preferences.service';
 import { serviceColor } from '../../shared/utils/service-color';
 import { EventDto } from '../../core/models/event.model';
 import { SpanDto, TraceRowDto, TraceStatsDto } from '../../core/models/span.model';
@@ -60,6 +61,28 @@ export const LIVE_INTERVALS: readonly { ms: number; label: string }[] = [
   { ms: 10_000, label: '10s' },
   { ms: 15_000, label: '15s' },
   { ms: 30_000, label: '30s' },
+];
+
+/**
+ * The row ceilings the list control offers — what one stream may deliver before the server
+ * ends it, sent as `?max=`.
+ *
+ * <p>Same contract as {@link LIVE_INTERVALS} and for the same reason: this list fills the menu,
+ * it is what a restored URL or a stored preference is checked against, and a value that is not
+ * on it never reaches {@link TracesComponent.streamMax}. A hand-edited `?rows=1234` would stream
+ * happily and the menu could not say what it was showing.</p>
+ *
+ * <p>The ceiling stops at 5000 because that is where the server clamps ({@code max} is clamped
+ * to 1…5000 and enforced by ending the stream), so an entry above it would be a menu promising
+ * something the server refuses.</p>
+ */
+export const ROW_LIMITS: readonly { rows: number; label: string }[] = [
+  { rows: 100,  label: '100'  },
+  { rows: 250,  label: '250'  },
+  { rows: 500,  label: '500'  },
+  { rows: 1000, label: '1000' },
+  { rows: 2000, label: '2000' },
+  { rows: 5000, label: '5000' },
 ];
 
 /**
@@ -158,6 +181,8 @@ export class TracesComponent implements OnInit, OnDestroy {
   private cdr    = inject(ChangeDetectorRef);
   private router = inject(Router);
   private route  = inject(ActivatedRoute);
+  /** Public: the template reads spanDetailHeight() to size the span panel. */
+  readonly prefs = inject(UserPreferencesService);
   /** This page's slice of the shared per-user search history (scope keeps it apart
    *  from the Events/Metrics lists — see SearchHistoryService.forScope). */
   private history = inject(SearchHistoryService).forScope('traces');
@@ -452,6 +477,15 @@ export class TracesComponent implements OnInit, OnDestroy {
    *  blocking banner or a grey suffix depending on how many rows fitted above it. */
   private readonly listHeld = computed(() =>
     this.streamStopped() || this.traceqlError() !== '');
+  /** The ceiling an untouched page asks for. 100 rather than the 2000 this shipped with:
+   *  2000 was chosen when the ceiling was not choosable, so it had to be high enough for the
+   *  widest search anyone might run, and every ordinary one paid for that. It is now the menu's
+   *  first entry and the rest are one click away, so the default can be the size that answers
+   *  fastest instead of the size nothing outgrows. */
+  private static readonly DefaultStreamMax = 100;
+  /** Where the chosen ceiling outlives the URL — same split as {@link LiveKey}: the URL is the
+   *  authority, this is only what a URL that says nothing falls back to. */
+  private static readonly RowsKey = 'ameto-traces-rows';
   /** Rows one stream will deliver before the server stops — sent as `?max=` (which the server
    *  clamps to 1…5000 and enforces by ending the stream), and the number the header names.
    *
@@ -459,10 +493,11 @@ export class TracesComponent implements OnInit, OnDestroy {
    *  chip, so 2000 of them rendered flat is ~26k — a bill the old 200-row page cap never sent
    *  the browser. What bounds the DOM is the virtualizer below: at a 600px viewport and ~82px
    *  a row, a 2000-row answer stands at 16 rendered rows / 209 elements behind a spacer 2000
-   *  rows tall (measured, traces.background-intent.spec.ts). That is also what makes the 15 s
+   *  rows tall (measured, traces.background-intent.spec.ts). That is also what makes the live
    *  refresh affordable: re-streaming 2000 rows re-diffs 2000 array entries but touches ~200
-   *  elements. Raising this costs memory and wire time, not paint. */
-  readonly streamMax = 2000;
+   *  elements. Raising this costs memory and wire time, not paint — which is why it is safe to
+   *  put on a menu at all. */
+  readonly streamMax = signal(TracesComponent.DefaultStreamMax);
   /** Consecutive failures of the BACKGROUND refresh (the live poll). A user-initiated search
    *  never lands here — it gets the banner instead. Zeroed by any complete stream and by any
    *  search the user runs, so it only ever counts an unbroken run. */
@@ -802,6 +837,15 @@ export class TracesComponent implements OnInit, OnDestroy {
       }
     }
 
+    // The row ceiling, by the same rule and in the same order of authority as the cadence
+    // above. `rows`, not `max`: that key is already the duration filter's upper bound, and
+    // two meanings on one query parameter is a bug waiting for whichever reader runs second.
+    const rows = q.get('rows') ?? this.storedStreamMax();
+    if (rows !== null) {
+      const n = Number(rows);
+      if (ROW_LIMITS.some(o => o.rows === n)) this.streamMax.set(n);
+    }
+
     const trace = q.get('trace');
     if (trace) this.openTrace(trace);
   }
@@ -809,6 +853,12 @@ export class TracesComponent implements OnInit, OnDestroy {
   /** The stored cadence, or null when there is none / storage is unavailable. */
   private storedLiveMs(): string | null {
     try { return localStorage.getItem(TracesComponent.LiveKey); }
+    catch { return null; }
+  }
+
+  /** The stored row ceiling, or null when there is none / storage is unavailable. */
+  private storedStreamMax(): string | null {
+    try { return localStorage.getItem(TracesComponent.RowsKey); }
     catch { return null; }
   }
 
@@ -831,6 +881,7 @@ export class TracesComponent implements OnInit, OnDestroy {
       // Omitted at the default so the common URL stays clean, and so a shared link only
       // imposes a cadence when its sender actually chose one.
       live:   this.liveMs() === TracesComponent.DefaultLiveMs ? null : String(this.liveMs()),
+      rows:   this.streamMax() === TracesComponent.DefaultStreamMax ? null : String(this.streamMax()),
     };
     this.router.navigate([], {
       relativeTo:          this.route,
@@ -910,6 +961,33 @@ export class TracesComponent implements OnInit, OnDestroy {
   // ── Live refresh ──────────────────────────────────────────────────────────
   /** The cadence menu's contents — the module list, unfiltered. */
   readonly liveIntervals = LIVE_INTERVALS;
+
+  /** The row-ceiling menu's contents — same relationship to {@link ROW_LIMITS}. */
+  readonly rowLimits = ROW_LIMITS;
+
+  /**
+   * Change how many rows one stream may deliver, and go get them.
+   *
+   * <p>It re-runs rather than waiting for the next tick, and it re-runs as 'user'. Both halves
+   * are the point: a ceiling that only takes effect on the next poll is a control that appears
+   * to do nothing for up to 30 s (and nothing at all when Live is off), and a re-run nobody can
+   * see fail is a control that silently keeps the old rows when the new ask breaks. Going
+   * through {@link loadTraces} rather than either stream directly is what keeps TraceQL working:
+   * it is the one place that knows which of the two queries currently owns the list.</p>
+   *
+   * <p>Not on the menu is not honoured, for the reason in {@link ROW_LIMITS}. Unchanged is a
+   * no-op, so re-picking the current entry does not cancel the stream that is filling the list
+   * with it.</p>
+   */
+  setStreamMax(rows: number): void {
+    if (!ROW_LIMITS.some(o => o.rows === rows)) return;
+    if (rows === this.streamMax()) return;
+    this.streamMax.set(rows);
+    try { localStorage.setItem(TracesComponent.RowsKey, String(rows)); }
+    catch { /* quota / private mode — the URL still carries it */ }
+    this.syncUrl();
+    this.loadTraces(this.fromIso(), this.toIso(), 'user');
+  }
 
   /** The Live badge is a switch now: pause the auto-refresh, and resume it at the cadence it
    *  was paused at — never at the default (see {@link lastLiveMs}). */
@@ -1066,8 +1144,8 @@ export class TracesComponent implements OnInit, OnDestroy {
       minDurationMs:  this.filterMinDurationMs  ?? undefined,
       maxDurationMs:  this.filterMaxDurationMs  ?? undefined,
       httpStatus:     this.filterHttpStatus     || undefined,
-      max:            this.streamMax,
-    }), origin, this.streamMax);
+      max:            this.streamMax(),
+    }), origin, this.streamMax());
     return true;
   }
 
@@ -1084,8 +1162,8 @@ export class TracesComponent implements OnInit, OnDestroy {
     // why it survived — and wrong for every other custom window. The filter-bar path has
     // always sent it; TraceQL simply never did.
     this.startStream(this.api.streamTraceQuery({
-      query: q, from: this.fromIso(), to: this.toIso(), max: this.streamMax,
-    }), origin, this.streamMax);
+      query: q, from: this.fromIso(), to: this.toIso(), max: this.streamMax(),
+    }), origin, this.streamMax());
   }
 
   /**
@@ -1123,7 +1201,7 @@ export class TracesComponent implements OnInit, OnDestroy {
   private startStream(
     source: Observable<StreamFrame<TraceRowDto>>,
     origin: LoadOrigin = 'user',
-    askedMax: number = this.streamMax,
+    askedMax: number = this.streamMax(),
   ): void {
     // A background refresh NEVER supersedes a live stream. Both of its callers already decline
     // to ask for one while a stream is open — the poll checks `streaming()`, and leaving the
@@ -1728,6 +1806,46 @@ export class TracesComponent implements OnInit, OnDestroy {
   /** Closes the span detail panel. */
   closeSpan(): void {
     this.selectedSpan.set(null);
+  }
+
+  /**
+   * Drags the span panel's TOP edge to resize it. The panel is anchored to the bottom of the
+   * detail column, so that edge is the only one that moves: height = bottomEdge − mouseY.
+   *
+   * <p>Mirrors the events drawer's resizer, including the two-phase persist — the signal is
+   * written on every mousemove (zoneless: the write is what drives the repaint) and
+   * localStorage once on release, so a drag is one storage write rather than one per frame.</p>
+   *
+   * <p>The upper bound is taken against the LIVE viewport rather than the service's constant,
+   * because the constant cannot know how tall this window is: on a short screen a 900px panel
+   * would push the waterfall it exists to annotate off the top. 160px is what stays visible of
+   * it — about two rows and the header, which is the least that still shows the span the panel
+   * is describing.</p>
+   */
+  startSpanResize(e: MouseEvent): void {
+    e.preventDefault();
+    const panel = (e.currentTarget as HTMLElement).closest('.span-detail');
+    if (!panel) return;
+
+    const bottomEdge = panel.getBoundingClientRect().bottom;
+    const maxHeight  = Math.max(140, window.innerHeight - 160);
+
+    document.body.style.cursor = 'row-resize';
+    document.body.style.userSelect = 'none';
+
+    const onMove = (ev: MouseEvent) =>
+      this.prefs.setSpanDetailHeight(Math.min(bottomEdge - ev.clientY, maxHeight), false);
+
+    const onUp = () => {
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+      this.prefs.setSpanDetailHeight(this.prefs.spanDetailHeight(), true); // commit
+    };
+
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
   }
 
   /**

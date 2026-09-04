@@ -1,8 +1,11 @@
 import {
-  Component, inject, viewChild, ElementRef, OnInit, ChangeDetectionStrategy,
+  Component, inject, viewChild, viewChildren, ElementRef, OnInit,
+  ChangeDetectionStrategy, afterRenderEffect,
 } from '@angular/core';
 import { LucideAngularModule } from 'lucide-angular';
-import { injectVirtualizer } from '@tanstack/angular-virtual';
+import {
+  injectVirtualizer, measureElement as measureRenderedElement,
+} from '@tanstack/angular-virtual';
 
 import { EmptyStateComponent } from '../../shared/components/ui';
 import { EventsToolbarComponent } from './components/events-toolbar/events-toolbar';
@@ -40,14 +43,52 @@ export class EventsComponent implements OnInit {
   private eventsScroll = viewChild<ElementRef<HTMLElement>>('eventsScroll');
   private drawerEl = viewChild<ElementRef<HTMLElement>>('drawerEl');
 
-  // Fixed 29px rows — no dynamic measurement, so no overlap on selection/expand.
+  private rowEls = viewChildren<ElementRef<HTMLElement>>('evRowEl');
+
+  /**
+   * One virtualizer for BOTH list modes.
+   *
+   * <p>Wrap mode used to opt out of virtualization entirely — it rendered every row, because
+   * fixed-height virtualization cannot hold variable heights. That is true, and the conclusion
+   * was the wrong one: it made the mode that produces the TALLEST rows the only one that put
+   * all of them in the DOM at once, so a wrapped 5000-row answer was ~5000 rows of layout and
+   * the page stopped responding. Measured rows are the answer to variable heights, and the
+   * Traces list already does exactly this with the same library.</p>
+   *
+   * <p>Fixed mode keeps its 29px and measures nothing, which is what the original comment here
+   * was protecting: its rows are one line by construction, and measuring them re-introduced an
+   * overlap on selection. Only wrap mode measures — {@link measureOnlyWhenWrapping} is what
+   * makes that switch, and it is `undefined` (not a no-op function) in fixed mode so the
+   * library takes its own non-measuring path rather than one that lies about a height.</p>
+   */
   readonly virtualizer = injectVirtualizer(() => ({
     count: this.store.displayedEvents().length,
     scrollElement: this.eventsScroll(),
-    estimateSize: () => 29,
+    // Wrapped rows are one line more often than not; the estimate only has to be close enough
+    // that the scrollbar does not jump while the real heights arrive.
+    estimateSize: () => (this.store.wrapMessages() ? 48 : 29),
     overscan: 20,
     getItemKey: (i: number) => this.store.displayedEvents()[i]?.id ?? i,
+    measureElement: this.store.wrapMessages() ? measureRenderedElement : undefined,
   }));
+
+  constructor() {
+    // Releases row elements the virtualizer still holds by key but that have left the document.
+    // Keyed on event id, those entries outlive the answer that produced them, so a page left
+    // open across many searches would otherwise pin a detached node per event ever rendered.
+    // Tracks the ROW ARRAY, not the rendered elements, so scrolling pays nothing.
+    afterRenderEffect(() => {
+      this.store.displayedEvents();
+      this.virtualizer.measureElement(null);
+    });
+    // Hands each rendered wrapped row over to be measured and observed. afterRender, not
+    // effect: a height means nothing until the element exists and is laid out. Idempotent per
+    // node, and a no-op in fixed mode where nothing carries #evRowEl.
+    afterRenderEffect(() => {
+      if (!this.store.wrapMessages()) return;
+      for (const el of this.rowEls()) this.virtualizer.measureElement(el.nativeElement);
+    });
+  }
 
   ngOnInit(): void {
     this.store.initFromUrl();

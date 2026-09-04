@@ -39,6 +39,19 @@
           }
         </select>
       </div>
+      <!-- How many rows one stream may deliver. Beside the cadence because the two answer the
+           same question from opposite ends — how often the list is refetched, and how much of
+           it — and a user tuning one almost always wants the other in reach. -->
+      <div class="rows-group">
+        <span class="rows-label">Rows</span>
+        <select class="rows-select" aria-label="Maximum rows to load"
+                title="How many trace rows one search loads before the server stops sending"
+                [ngModel]="streamMax()" (ngModelChange)="setStreamMax($event)">
+          @for (o of rowLimits; track o.rows) {
+            <option [ngValue]="o.rows">{{ o.label }}</option>
+          }
+        </select>
+      </div>
       <button class="icon-btn" [class.active]="historyOpen()" (click)="toggleHistory()" title="Search history">
         <lucide-icon name="history" [size]="14" />
       </button>
@@ -482,7 +495,9 @@
 
             <!-- ── Span detail bottom panel ──────────────────────────────── -->
             @if (selectedSpan(); as span) {
-              <div class="span-detail">
+              <div class="span-detail" [style.height.px]="prefs.spanDetailHeight()">
+                <div class="span-resizer" (mousedown)="startSpanResize($event)"
+                     title="Drag to resize"></div>
 
                 <button class="span-close" (click)="closeSpan()" title="Close span details (Esc)">
                   <lucide-icon name="x" [size]="14" />
