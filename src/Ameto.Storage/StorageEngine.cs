@@ -278,6 +278,25 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// <summary>Background catalog scan started by the ctor (kept to observe faults).</summary>
     private readonly Task _catalogLoad;
 
+    /// <summary>
+    /// Completes when the constructor's catalog scan has finished publishing every segment it
+    /// found. Until it does, <see cref="ListSegments"/> reports whatever has been added SO FAR —
+    /// the scan calls TryAdd one file at a time — so a count taken before this task completes is
+    /// a snapshot of a partial catalog, not of the directory.
+    ///
+    /// <para>Exposed because the absence of it was the whole bug. Tests reached for the only
+    /// signal there was: poll until ListSegments() is non-empty, then assert on the total. On an
+    /// idle machine the enumeration of a handful of small files finishes inside the first 25 ms
+    /// tick and the two are indistinguishable; on a loaded CI runner they are not, and the
+    /// assertion sees four, six, eight of ten. Others called LoadSegmentCatalog() by hand to
+    /// "drive the scan to completion", which does not replace the background one — it runs a
+    /// second scan alongside it, over the same directory.</para>
+    ///
+    /// <para>Faults are not swallowed: awaiting a scan that threw rethrows here, which is the
+    /// right answer for a test asking whether the catalog is ready.</para>
+    /// </summary>
+    internal Task CatalogLoaded => _catalogLoad;
+
     // Hot tiers that have been frozen but whose cold-tier segment file is still
     // being written (or has just been registered but we haven't released the
     // reference yet). Queries must read from these to avoid a visibility gap
