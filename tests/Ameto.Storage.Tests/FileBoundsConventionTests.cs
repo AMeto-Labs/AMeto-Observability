@@ -112,6 +112,14 @@ public sealed class FileBoundsConventionTests
             "copies the coverage set already in memory; not a capacity",
         ["TraceManifest.cs:var drop = new HashSet<string>(removedPaths, StringComparer.Ordinal)"] =
             "copies the caller's own collection; not a capacity",
+        // The .tix WRITER, whose sizes are all this process's own. Its READER is the half that
+        // touches untrusted lengths, and every one of those goes through FileBounds — the block's
+        // compressed size against the bytes left in the file, its uncompressed size against
+        // MaxBlockBytes, the sparse-index and offset counts against what remains.
+        ["TraceIndexFile.cs:byte[] c = ArrayPool<byte>.Shared.Rent(max)"] =
+            "max is LZ4Codec.MaximumOutputSize of a buffer this process just filled",
+        ["TraceIndexFile.cs:private byte[] _buf = new byte[capacity]"] =
+            "capacity is TargetBlockBytes * 2, a constant, at the one call site",
     };
 
     /// <summary>What "a bound is in view" looks like.</summary>
