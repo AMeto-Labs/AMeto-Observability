@@ -96,6 +96,22 @@ public sealed class FileBoundsConventionTests
           + "the same `take`",
         ["MetricStorageEngine.cs:var copy = new List<MetricDataPoint>(_points)"] =
             "a copy of an in-memory list",
+        // COPY CONSTRUCTORS, NOT CAPACITIES. `new List<T>(someCollection)` and
+        // `new List<T>(someCount)` are one shape to a textual scan and opposites in fact — the
+        // first copies what is already in memory, the second reserves for a number a file may have
+        // supplied, which is the only one this rule is about. The manifest rebuilds its whole state
+        // on every mutation (immutable snapshots, swapped under a lock), so it does this a lot; the
+        // three helpers below are the ONLY places it does, deliberately, so this list stays three
+        // arguable claims instead of seven unarguable ones. Sizes that really do come out of the
+        // manifest file go through Cursor.Count → FileBounds.RequireCountFits.
+        ["TraceManifest.cs:public Dictionary<ulong, TraceSegmentEntry> CopySegments() => new(Segments)"] =
+            "copies the segment map already in memory; not a capacity",
+        ["TraceManifest.cs:public List<TraceIndexRun>                  CopyRuns()     => new(Runs)"] =
+            "copies the run list already in memory; not a capacity",
+        ["TraceManifest.cs:public HashSet<ulong>                       CopyCovered()  => new(Covered)"] =
+            "copies the coverage set already in memory; not a capacity",
+        ["TraceManifest.cs:var drop = new HashSet<string>(removedPaths, StringComparer.Ordinal)"] =
+            "copies the caller's own collection; not a capacity",
     };
 
     /// <summary>What "a bound is in view" looks like.</summary>
