@@ -10,11 +10,11 @@ namespace Ameto.Tracing.Storage;
 /// Writes a batch of <see cref="SpanRecord"/> objects to a <c>.trc</c> columnar file
 /// and a companion <c>.stats</c> sidecar with per-service duration histograms.
 ///
-/// <para>File format v3 — "RDTC":</para>
+/// <para>File format v4 — "RDTC":</para>
 /// <code>
 ///   [Header — 27 bytes]
 ///     0   Magic        : uint32  "RDTC"
-///     4   Version      : uint16  3
+///     4   Version      : uint16  4
 ///     6   SpanCount    : uint32
 ///    10   MinStartNano : int64
 ///    18   MaxStartNano : int64
@@ -29,10 +29,10 @@ namespace Ameto.Tracing.Storage;
 ///       Blocks decompress independently — the delta chain restarts per block.
 ///       attrs are written inline (typed msgpack values), not as a nested blob.
 ///
-///   [TraceId Index — one LZ4 block]
+///   [TraceId Index — one LZ4 block; EMPTY from v4, traceCount = 0]
 ///     uncompSize uint32 | compSize uint32 | LZ4 bytes of:
 ///       traceCount uint32
-///       per trace: traceId 16B | offsetCount uint32 | offsets uint32[]
+///       per trace: traceId 16B | offsetCount uint32 | offsets uint32[]   (v2/v3 only)
 ///
 ///   [Service Index]
 ///     serviceCount uint32
@@ -57,12 +57,23 @@ namespace Ameto.Tracing.Storage;
 /// skip blocks. v2 files remain readable (see <see cref="SpanReader"/>) and
 /// migrate to v3 through the background compaction in <see cref="TraceStorageEngine"/>.
 /// </para>
+/// <para>
+/// v4 versus v3: the TraceId index block is written EMPTY. It was 38% of every file and it
+/// answered one question — where in this segment is trace X — that the global trace-id index
+/// (<see cref="TraceIndexFile"/>) now answers for one 4 KB read instead of reading and
+/// inflating all of it, per segment, on every lookup. The block and its OFFSET remain because
+/// three block walks use that offset as the boundary where span blocks end; only the payload
+/// is gone. A v4 segment with no usable index run is still readable: the spans carry their
+/// trace ids, so <c>SpanReader</c> falls back to scanning, and the backfill rebuilds the run
+/// from the same scan — slow, correct, and self-healing. v3 files are never rewritten for this
+/// reason alone; they keep their index and are read exactly as before.
+/// </para>
 /// </summary>
 internal static class SpanWriter
 {
     private const uint   Magic       = 0x52_44_54_43; // "RDTC"
     private const uint   FooterMagic = 0x52_44_54_46; // "RDTF"
-    private const ushort Version     = 3;
+    private const ushort Version     = 4;
     private const int    BlockSize   = 4096;
 
     /// <param name="recoverable">
@@ -171,19 +182,41 @@ internal static class SpanWriter
                     written += batchCount;
                 }
 
-                // ── TraceId index (one LZ4 block) ──────────────────────────────
+                // ── TraceId index ──────────────────────────────────────────────
+                //
+                // EMPTY FROM v4, AND THAT IS THE POINT OF v4. This block was 38% of every .trc,
+                // and it existed to answer one question — "where in this file is trace X" — that
+                // the trace-id index now answers globally, for one 4 KB read instead of reading
+                // and inflating all of it, per segment, on every lookup.
+                //
+                // The OFFSET stays, and it is not vestigial: three block walks use it as the
+                // boundary where span blocks end (`while (fs.Position < traceIdxOffset)`). What
+                // goes is the payload. An empty block keeps the file's shape identical, so every
+                // reader that only wants that boundary is untouched.
+                //
+                // A v4 segment whose .tix is missing is therefore not indexable by any cheap
+                // route, and the reader answers that with a full span scan — expensive, correct,
+                // self-healing (the backfill rebuilds the run from the same scan). See
+                // SpanReader.ReadTraceOffsets.
                 long traceIdxOffset = fs.Position;
                 {
-                    var idxBuf = new MemoryStream(traceIndex.Count * 32);
+                    var idxBuf = new MemoryStream(Version >= 4 ? 8 : traceIndex.Count * 32);
                     var idxBw  = new BinaryWriter(idxBuf);
                     Span<byte> traceIdBuf = stackalloc byte[16];
-                    idxBw.Write((uint)traceIndex.Count);
-                    foreach (var (traceId, offsets) in traceIndex)
+                    if (Version >= 4)
                     {
-                        traceId.WriteTo(traceIdBuf);
-                        idxBw.Write(traceIdBuf);
-                        idxBw.Write((uint)offsets.Count);
-                        foreach (var o in offsets) idxBw.Write(o);
+                        idxBw.Write(0u);                       // zero traces: the block is a stub
+                    }
+                    else
+                    {
+                        idxBw.Write((uint)traceIndex.Count);
+                        foreach (var (traceId, offsets) in traceIndex)
+                        {
+                            traceId.WriteTo(traceIdBuf);
+                            idxBw.Write(traceIdBuf);
+                            idxBw.Write((uint)offsets.Count);
+                            foreach (var o in offsets) idxBw.Write(o);
+                        }
                     }
                     // Compress from the stream's own backing array — ToArray() duplicated the
                     // whole index (LOH-sized on a busy segment) for nothing.

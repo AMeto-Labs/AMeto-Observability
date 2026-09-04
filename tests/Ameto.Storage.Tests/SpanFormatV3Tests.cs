@@ -100,7 +100,7 @@ public sealed class SpanFormatV3Tests : IDisposable
     {
         var corpus = Corpus(50, 8); // 400 spans
         var info   = SpanWriter.Write(_dir, corpus);
-        Assert.Equal(3, info.FormatVersion);
+        Assert.Equal(4, info.FormatVersion);
         Assert.Equal(corpus.Count, info.SpanCount);
 
         var readBack = SpanReader.ReadAll(info.FilePath);

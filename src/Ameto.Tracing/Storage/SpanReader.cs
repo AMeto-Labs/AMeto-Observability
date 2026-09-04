@@ -98,7 +98,7 @@ internal static class SpanReader
         if (magic != Magic) throw new InvalidDataException($"Invalid .trc magic in {filePath}");
 
         ushort version = br.ReadUInt16();
-        if (version is not (2 or 3)) throw new InvalidDataException($"Unsupported .trc version {version} in {filePath}");
+        if (version is not (2 or 3 or 4)) throw new InvalidDataException($"Unsupported .trc version {version} in {filePath}");
         uint spanCount = br.ReadUInt32();
         long minNano   = br.ReadInt64();
         long maxNano   = br.ReadInt64();
@@ -512,6 +512,35 @@ internal static class SpanReader
         r.Skip();  // pid | nil
         prevTs = first ? r.ReadInt64() : prevTs + r.ReadInt64();
         for (int i = 4; i < n; i++) r.Skip();
+    }
+
+    /// <summary>
+    /// Reads ONLY the trace id out of one v3+ span and steps over everything else.
+    ///
+    /// <para>The difference between this and deserialising is the difference between a scan that
+    /// works and one that does not. A v4 segment with no index run is answered by walking its
+    /// spans, and an earlier version of that walk built a full <see cref="SpanRecord"/> per span —
+    /// strings, attribute dictionary, the lot — and kept the id. Measured by
+    /// <c>SpanTraceReadBoundTests</c>: opening a ONE-SPAN trace allocated 81.45 MB against the
+    /// 80.94 MB of reading the whole 50 000-span segment, which is to say the recovery path had
+    /// quietly reinstated the whole-file materialisation this branch removed.</para>
+    ///
+    /// <para>The delta chain still has to be run — <c>Δts</c> of one span is defined against the
+    /// previous — so the timestamp is decoded and thrown away rather than skipped.</para>
+    /// </summary>
+    private static TraceId ReadTraceIdAndSkipV3(ref MessagePackReader r, bool first, ref long prevTs)
+    {
+        int n = r.ReadArrayHeader();
+        if (n < 4) { for (int i = 0; i < n; i++) r.Skip(); return default; }
+
+        TraceId tid = default;
+        var seq = r.ReadBytes();
+        if (seq is { } tidSeq) { Span<byte> b = stackalloc byte[16]; CopyFixed(tidSeq, b); tid = TraceId.Parse(b); }
+        r.Skip();  // sid
+        r.Skip();  // pid | nil
+        prevTs = first ? r.ReadInt64() : prevTs + r.ReadInt64();
+        for (int i = 4; i < n; i++) r.Skip();
+        return tid;
     }
 
     /// <summary>Steps the reader over one v2 span. Absolute timestamps — nothing to carry.</summary>
@@ -965,6 +994,10 @@ internal static class SpanReader
     /// of that segment's life. Only v3 segments carry an index this can read; v2 returns empty and
     /// the segment simply stays uncovered until compaction migrates it.</para>
     /// </summary>
+    /// <summary>Test hook: the same map, so a test can compare v3's index with v4's scan.</summary>
+    internal static Dictionary<TraceId, List<uint>> ReadTraceIndexForTest(string filePath)
+        => ReadTraceIndex(filePath);
+
     public static Dictionary<TraceId, List<uint>> ReadTraceIndex(string filePath)
     {
         var map = new Dictionary<TraceId, List<uint>>();
@@ -974,6 +1007,12 @@ internal static class SpanReader
 
         ushort version = ReadVersion(fs, br);
         if (version < 3) return map;
+
+        // v4 carries no trace index of its own — that block is what v4 removed. The map is built
+        // by walking the spans instead: one pass over the segment, which is what the backfill is
+        // for and is why it runs one segment at a time in the background. This is also the path
+        // that heals a v4 segment whose run was lost.
+        if (version >= 4) return BuildTraceIndexByScan(filePath);
 
         var (traceIdxOffset, _, _) = ReadFooter(fs, br, version);
         fs.Seek(traceIdxOffset, SeekOrigin.Begin);
@@ -1029,8 +1068,118 @@ internal static class SpanReader
         return map;
     }
 
+    /// <summary>
+    /// Every trace in the segment and where, built by decoding every span block.
+    ///
+    /// <para>The expensive way, and the only way for a v4 segment: it has no trace index to read.
+    /// Used by the backfill, which pays it once per segment, and as the recovery path when a v4
+    /// segment's run is missing — the run gets rebuilt from exactly this, so the degraded state
+    /// heals rather than persisting.</para>
+    /// </summary>
+    private static Dictionary<TraceId, List<uint>> BuildTraceIndexByScan(string filePath)
+    {
+        var map = new Dictionary<TraceId, List<uint>>();
+        uint offset = 0;
+        foreach (var (traceId, _) in EnumerateTraceIdsInOrder(filePath))
+        {
+            if (!map.TryGetValue(traceId, out var list)) map[traceId] = list = new List<uint>(4);
+            list.Add(offset);
+            offset++;
+        }
+        return map;
+    }
+
+    /// <summary>
+    /// The trace id of every span, in file order — which is to say indexed by the same global
+    /// offsets the trace index used to record.
+    ///
+    /// <para>Decodes the blocks and reads nothing but the id out of each span, so a scan costs the
+    /// decompression and none of the string, attribute or record building a full read would.</para>
+    /// </summary>
+    private static IEnumerable<(TraceId TraceId, uint Offset)> EnumerateTraceIdsInOrder(string filePath)
+    {
+        using var fs = OpenRead(filePath);
+        using var br = new BinaryReader(fs);
+
+        br.ReadUInt32();                 // magic
+        ushort version = br.ReadUInt16();
+        br.ReadUInt32();                 // spanCount
+        br.ReadInt64();                  // minNano
+        br.ReadInt64();                  // maxNano
+        br.ReadByte();                   // flags
+
+        var (traceIdxOffset, _, _) = ReadFooter(fs, br, version);
+        fs.Seek(27, SeekOrigin.Begin);
+
+        uint offset = 0;
+        while (fs.Position < traceIdxOffset)
+        {
+            uint uncompSize = br.ReadUInt32();
+            uint compSize   = br.ReadUInt32();
+            FileBounds.RequireLengthFits(compSize, fs.Length - fs.Position, "Block", filePath);
+            FileBounds.RequireLengthFits(uncompSize, MaxBlockBytes, "Block uncompressed", filePath);
+
+            byte[]  comp   = ArrayPool<byte>.Shared.Rent((int)compSize);
+            byte[]? rawBuf = null;
+            List<TraceId> ids;
+            try
+            {
+                fs.ReadExactly(comp, 0, (int)compSize);
+                int rawLen = LZ4Pickler.UnpickledSize(comp.AsSpan(0, (int)compSize));
+                if (rawLen > MaxBlockBytes)
+                    throw new InvalidDataException($"Block decompresses to {rawLen} bytes in {filePath}");
+
+                rawBuf = ArrayPool<byte>.Shared.Rent(rawLen);
+                LZ4Pickler.Unpickle(comp.AsSpan(0, (int)compSize), rawBuf.AsSpan(0, rawLen));
+
+                var reader = new MessagePackReader(rawBuf.AsMemory(0, rawLen));
+                int cnt    = reader.ReadArrayHeader();
+                if (cnt > 50_000)
+                    throw new InvalidDataException($"Block contains too many spans: {cnt} in {filePath}");
+
+                ids = new List<TraceId>(FileBounds.PreallocFor(cnt, 16));
+                long prevTs = 0;
+                for (int i = 0; i < cnt; i++)
+                {
+                    // THE ID, AND NOTHING ELSE BUILT. Deserialising here materialised the
+                    // whole segment to answer a one-span question — measured at 81.45 MB
+                    // against the 80.94 MB of reading the entire file.
+                    ids.Add(version >= 3
+                        ? ReadTraceIdAndSkipV3(ref reader, i == 0, ref prevTs)
+                        : DeserializeSpan(ref reader, SpanFilter.MatchAll)?.TraceId ?? default);
+                }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(comp);
+                if (rawBuf is not null) ArrayPool<byte>.Shared.Return(rawBuf);
+            }
+
+            foreach (var id in ids) yield return (id, offset++);
+        }
+    }
+
     private static List<uint> ReadTraceOffsets(string filePath, TraceId traceId)
     {
+        {
+            using var probe = OpenRead(filePath);
+            using var pbr   = new BinaryReader(probe);
+            if (ReadVersion(probe, pbr) >= 4)
+            {
+                // A v4 SEGMENT REACHING HERE IS THE DEGRADED PATH, and it has to be slow rather
+                // than wrong. v4 dropped the per-segment trace index — 38% of the file — because
+                // the trace-id index answers the same question globally; a lookup only lands here
+                // when that index could not (no run, an unopenable one, coverage withdrawn). The
+                // spans themselves still carry their trace ids, so the answer is recoverable by
+                // scanning, and the backfill rebuilds the run from the same scan afterwards, so
+                // this state heals instead of persisting.
+                var found = new List<uint>(4);
+                foreach (var (id, offset) in EnumerateTraceIdsInOrder(filePath))
+                    if (id.Equals(traceId)) found.Add(offset);
+                return found;
+            }
+        }
+
         using var fs = OpenRead(filePath);
         using var br = new BinaryReader(fs);
 
@@ -1224,7 +1373,27 @@ internal static class SpanReader
         using var br = new BinaryReader(fs);
 
         ushort version = ReadVersion(fs, br);
-        var (_, svcIdxOffset, _) = ReadFooter(fs, br, version);
+        var (traceIdxOffset, svcIdxOffset, bloomIdxOffset) = ReadFooter(fs, br, version);
+
+        // WHERE IT MUST BE, NOT MERELY SOMEWHERE IN THE FILE. The footer names all three section
+        // offsets and the format lays them out in order, so the service index has to start after
+        // the trace index and end before the bloom index. "Inside the file" was the only test, and
+        // it lets a torn offset land in the span blocks — where four bytes of compressed payload
+        // read as a plausible service count and a name that matches nothing, producing an EMPTY
+        // allowed-block set. The caller reads that as "skip this segment", so a service-filtered
+        // search answers zero spans while an unfiltered one answers all of them.
+        //
+        // Found when the v4 layout shifted the file: the same bit flip that used to land in dead
+        // space started landing in a block. It was never a v3 property — only a v3 accident — and
+        // the offsets around it are what make it decidable rather than lucky.
+        // NULL, NOT A THROW: the caller reads null as "I cannot tell you which blocks" and opens
+        // all of them. Losing the index costs SPEED, never rows — the same contract the
+        // not-found case below states. A throw would retire the segment from this search and
+        // answer a service-filtered query with zero spans, which is the quiet loss this whole
+        // method is written to avoid.
+        if (svcIdxOffset <= traceIdxOffset || (bloomIdxOffset > 0 && svcIdxOffset >= bloomIdxOffset))
+            return null;
+
         // THROWN, NOT ANSWERED WITH AN EMPTY SET, and the difference is the whole finding. An empty
         // set here does NOT mean "no service index"; the caller reads it as the list of blocks worth
         // opening, so [] means SKIP THE WHOLE SEGMENT. Returning it on a torn offset turned four
@@ -1247,6 +1416,7 @@ internal static class SpanReader
         FileBounds.RequireCountFits(svcCount, fs.Length - fs.Position,
             fileBytesPerElement: 6, "Service index", filePath);
 
+        HashSet<uint>? found = null;
         for (uint i = 0; i < svcCount; i++)
         {
             ushort nameLen = br.ReadUInt16();
@@ -1259,12 +1429,27 @@ internal static class SpanReader
 
             if (name.Equals(serviceName, StringComparison.OrdinalIgnoreCase))
             {
-                var set = new HashSet<uint>(FileBounds.PreallocFor(blkCnt, heapBytesPerElement: 16));
-                for (uint b = 0; b < blkCnt; b++) set.Add(br.ReadUInt32());
-                return set;
+                found = new HashSet<uint>(FileBounds.PreallocFor(blkCnt, heapBytesPerElement: 16));
+                for (uint b = 0; b < blkCnt; b++) found.Add(br.ReadUInt32());
+                continue;   // keep parsing: the answer is only trustworthy if the WHOLE index parses
             }
             fs.Seek(blkCnt * 4L, SeekOrigin.Current);
         }
+
+        // THE SECTION HAS AN EXACT END, AND THAT IS THE CHECK THE OFFSET CANNOT FORGE. The footer
+        // says the bloom index begins at bloomIdxOffset, and the service index runs up to it with
+        // nothing in between — so a parse that starts at the right place finishes exactly there.
+        // One that starts 32 bytes early finishes 32 bytes early, however plausible every field it
+        // read looked on the way.
+        //
+        // This is what the earlier "is it inside the file" test could not do. A small flip lands
+        // back inside the section, mid-record, where a length prefix reads as a name, the real
+        // service name sits a few bytes further on and MATCHES, and its block count reads as zero —
+        // an empty allowed-block set, which the caller takes as "skip this segment". Measured with
+        // flip 32 under the v4 layout: unfiltered 100 spans, service-filtered 0, no fault raised.
+        if (bloomIdxOffset > 0 && fs.Position != bloomIdxOffset) return null;
+
+        if (found is not null) return found;
 
         // NOT FOUND IS NOT ABSENCE, and the empty set said both. A one-bit flip of the index offset
         // that lands INSIDE the file is quiet by construction: the read succeeds, a small service
