@@ -49,7 +49,7 @@ public sealed class TraceIndexFileTests : IDisposable
         const int N = 20_000;
         var w = new TraceIndexWriter();
         for (int i = 0; i < N; i++) w.Add(Id(i), segmentId: 7, Offsets(i, 3));
-        var run = w.Write(Path_("all.tix"), level: 1, coversSegment: 7);
+        var run = w.Write(Path_("all.tix"), level: 1, coveredSegments: [7]);
 
         _out.WriteLine($"{run.EntryCount} entries, {new FileInfo(run.FilePath).Length / 1024} KB "
                      + $"({new FileInfo(run.FilePath).Length / (double)N:F1} B/entry)");
@@ -74,7 +74,7 @@ public sealed class TraceIndexFileTests : IDisposable
     {
         var w = new TraceIndexWriter();
         for (int i = 0; i < 5_000; i++) w.Add(Id(i), segmentId: 3, Offsets(i, 2));
-        var run = w.Write(Path_("some.tix"), level: 1, coversSegment: 3);
+        var run = w.Write(Path_("some.tix"), level: 1, coveredSegments: [3]);
 
         using var r = TraceIndexReader.Open(run.FilePath)!;
         var hits = new List<TraceIndexHit>();
@@ -101,7 +101,7 @@ public sealed class TraceIndexFileTests : IDisposable
         var w = new TraceIndexWriter();
         for (int i = 0; i < 500; i++) w.Add(Id(i), segmentId: 1, Offsets(i, 2));
         w.Add(Id(42), segmentId: 9, [777, 778, 779]);
-        var run = w.Write(Path_("split.tix"), level: 2, coversSegment: null);
+        var run = w.Write(Path_("split.tix"), level: 2, coveredSegments: []);
 
         using var r = TraceIndexReader.Open(run.FilePath)!;
         var hits = new List<TraceIndexHit>();
@@ -123,7 +123,7 @@ public sealed class TraceIndexFileTests : IDisposable
         for (int i = 0; i < 4_000; i++) w.Add(Id(i), segmentId: 1, Offsets(i, 2));
         // 60 copies of one key is far more than fits beside its neighbours in a 4 KB block.
         for (ulong seg = 100; seg < 160; seg++) w.Add(Id(1234), seg, [(uint)seg]);
-        var run = w.Write(Path_("straddle.tix"), level: 2, coversSegment: null);
+        var run = w.Write(Path_("straddle.tix"), level: 2, coveredSegments: []);
 
         using var r = TraceIndexReader.Open(run.FilePath)!;
         var hits = new List<TraceIndexHit>();
@@ -154,7 +154,7 @@ public sealed class TraceIndexFileTests : IDisposable
             w.Add(new TraceId(0x9E3779B97F4A7C15UL, (ulong)(c + 1)), segmentId: 2, [(uint)c]);
         for (int i = 500; i < 1_000; i++) w.Add(Id(i), segmentId: 1, Offsets(i, 2));
 
-        var run = w.Write(Path_("shared.tix"), level: 2, coversSegment: null);
+        var run = w.Write(Path_("shared.tix"), level: 2, coveredSegments: []);
 
         using var r = TraceIndexReader.Open(run.FilePath)!;
         var hits = new List<TraceIndexHit>();
@@ -175,7 +175,7 @@ public sealed class TraceIndexFileTests : IDisposable
     [Fact]
     public void An_empty_run_is_a_run_that_answers_no_to_everything()
     {
-        var run = new TraceIndexWriter().Write(Path_("empty.tix"), level: 1, coversSegment: 5);
+        var run = new TraceIndexWriter().Write(Path_("empty.tix"), level: 1, coveredSegments: [5]);
         Assert.Equal(0, run.EntryCount);
 
         using var r = TraceIndexReader.Open(run.FilePath)!;
@@ -199,7 +199,7 @@ public sealed class TraceIndexFileTests : IDisposable
         Assert.Equal([0u, 1u, 4095u, 4096u, 200_000u, 199_999u, uint.MaxValue / 2], awkward);   // caller's array untouched
         w.Add(Id(2), 11, [uint.MaxValue]);
         w.Add(Id(3), 11, []);
-        var run = w.Write(Path_("offsets.tix"), level: 1, coversSegment: 11);
+        var run = w.Write(Path_("offsets.tix"), level: 1, coveredSegments: [11]);
 
         using var r = TraceIndexReader.Open(run.FilePath)!;
         var hits = new List<TraceIndexHit>();
@@ -240,7 +240,7 @@ public sealed class TraceIndexFileTests : IDisposable
     {
         var w = new TraceIndexWriter();
         for (int i = 0; i < 3_000; i++) w.Add(Id(i), 1, Offsets(i, 3));
-        var run = w.Write(Path_("dmg.tix"), level: 1, coversSegment: 1);
+        var run = w.Write(Path_("dmg.tix"), level: 1, coveredSegments: [1]);
 
         File.WriteAllBytes(run.FilePath, damage(File.ReadAllBytes(run.FilePath)));
 
@@ -260,7 +260,7 @@ public sealed class TraceIndexFileTests : IDisposable
         // return garbage offsets that would send a caller reading nonsense out of a segment.
         var w = new TraceIndexWriter();
         for (int i = 0; i < 10_000; i++) w.Add(Id(i), 1, Offsets(i, 3));
-        var run = w.Write(Path_("torn.tix"), level: 1, coversSegment: 1);
+        var run = w.Write(Path_("torn.tix"), level: 1, coveredSegments: [1]);
 
         var raw = File.ReadAllBytes(run.FilePath);
         for (int i = 40; i < 400 && i < raw.Length; i++) raw[i] ^= 0xA5;   // inside block 0

@@ -92,6 +92,12 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// <summary>Test hook: open index runs and the memory they hold.</summary>
     internal (int Runs, long RetainedBytes) IndexStatsForTest => _index.Stats;
 
+    /// <summary>Test hook: entries across every run — what a merge drops is only visible here.</summary>
+    internal int IndexEntryCountForTest
+    {
+        get { int n = 0; foreach (var r in _manifest.Runs) n += r.EntryCount; return n; }
+    }
+
     /// <summary>
     /// The rollback, exercised: withdraw every claim of coverage and close every run. Costs speed
     /// and nothing else — no span is rewritten, no <c>.trc</c> is opened, and the next lookup is
@@ -1791,6 +1797,53 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     }
 
     /// <summary>
+    /// Merges index runs into fewer, bigger ones when a level has accumulated enough. Returns
+    /// whether it did any work.
+    ///
+    /// <para>ONE MERGE PER CALL, like the backfill, and for the same reason: the caller owns the
+    /// pace. Unlike the backfill this can be skipped forever with no consequence but memory —
+    /// which is exactly the trade it manages, so it only runs when a level is genuinely full.</para>
+    ///
+    /// <para>THE MANIFEST IS TOUCHED ONCE, AFTER THE RENAME. Coverage is unchanged by construction
+    /// (the merged run carries the union of its inputs'), so there is no instant at which a segment
+    /// is vouched for by a file that does not exist, and a crash anywhere before the manifest write
+    /// leaves a temp file nobody names.</para>
+    /// </summary>
+    internal bool CompactIndexOnce(CancellationToken ct = default)
+    {
+        var batch = TraceIndexCompactor.SelectMergeBatch(_manifest.Runs);
+        if (batch.Count == 0) return false;
+
+        ct.ThrowIfCancellationRequested();
+
+        var live = new HashSet<ulong>();
+        foreach (var s in _coldSegments) if (s.SegmentId != 0) live.Add(s.SegmentId);
+
+        var merged = new TraceIndexCompactor(_dataDir, _logger).Merge(batch, live);
+        if (merged is not { } run)
+        {
+            // Nothing usable came out. Leaving the manifest alone leaves coverage exactly as it
+            // was, which is the whole safety story of this operation.
+            return false;
+        }
+
+        var oldPaths = batch.Select(static r => r.FilePath).ToList();
+        _manifest.ReplaceRuns(oldPaths, [run]);
+
+        // Open the new one BEFORE closing the old ones: a lookup racing this must never find the
+        // key in neither. Both are open for an instant, which costs a duplicate hit the read path
+        // already tolerates (a trace legitimately lives in two segments).
+        _index.Add(run);
+        _index.Remove(oldPaths);
+        foreach (var p in oldPaths)
+        {
+            try { if (File.Exists(p)) File.Delete(p); }
+            catch (Exception ex) { _logger.LogDebug(ex, "Could not delete merged-away index run {Path}", p); }
+        }
+        return true;
+    }
+
+    /// <summary>
     /// Indexes ONE segment that has no run yet, and returns whether it did any work.
     ///
     /// <para>ONE AT A TIME, ON PURPOSE. Building a run means reading a segment's whole trace index
@@ -1871,7 +1924,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             var w = new TraceIndexWriter();
             foreach (var (traceId, offsets) in traceIndex)
                 w.Add(traceId, segmentId, [.. offsets]);
-            return w.Write(IndexPathFor(segment.FilePath), level: 1, coversSegment: segmentId);
+            return w.Write(IndexPathFor(segment.FilePath), level: 1, coveredSegments: [segmentId]);
         }
         catch (Exception ex)
         {

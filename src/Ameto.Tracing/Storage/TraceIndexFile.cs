@@ -114,6 +114,26 @@ internal sealed class TraceIndexWriter
         _entries.Add((TraceIndexFile.KeyOf(traceId), segmentId, offsets));
     }
 
+    /// <summary>
+    /// Copies an entry forward from another run, key already derived.
+    ///
+    /// <para>For the index compactor, which is moving entries between files rather than recording
+    /// new ones — it has the key and must not re-derive it from a trace id it no longer holds. The
+    /// offsets come from a run this writer produced, so they are already ascending; they are
+    /// checked anyway, because "already sorted" is exactly the kind of promise that stops being
+    /// true when somebody adds a second producer.</para>
+    /// </summary>
+    public void AddRaw(ulong key, ulong segmentId, uint[] offsets)
+    {
+        if (!IsAscending(offsets))
+        {
+            var copy = (uint[])offsets.Clone();
+            Array.Sort(copy);
+            offsets = copy;
+        }
+        _entries.Add((key, segmentId, offsets));
+    }
+
     private static bool IsAscending(uint[] o)
     {
         for (int i = 1; i < o.Length; i++)
@@ -127,7 +147,7 @@ internal sealed class TraceIndexWriter
     /// what makes the contents true, so the contents must be on the platter first.
     /// </summary>
     /// <returns>The run as the manifest should record it.</returns>
-    public TraceIndexRun Write(string path, int level, ulong? coversSegment)
+    public TraceIndexRun Write(string path, int level, ulong[] coveredSegments)
     {
         // Sorted by key, then by segment so a repeated key has a stable order — the reader walks
         // duplicates forward from the first match and a stable order keeps that walk cheap.
@@ -226,7 +246,7 @@ internal sealed class TraceIndexWriter
             if (File.Exists(tmp)) { try { File.Delete(tmp); } catch { /* best effort */ } }
         }
 
-        return new TraceIndexRun(level, path, minKey, maxKey, _entries.Count, coversSegment);
+        return new TraceIndexRun(level, path, minKey, maxKey, _entries.Count, coveredSegments);
     }
 
     private static void WriteBlock(FileStream fs, ReadOnlySpan<byte> raw)
@@ -394,6 +414,78 @@ internal sealed class TraceIndexReader : IDisposable
             fs?.Dispose();
             bloom?.Dispose();
         }
+    }
+
+    /// <summary>
+    /// Every entry in the run, in key order, one block at a time.
+    ///
+    /// <para>For the index compactor. Streaming rather than materialised on purpose: a run holds
+    /// hundreds of thousands of entries and the whole point of merging is to be a background chore
+    /// that costs one block of memory per input, not one run.</para>
+    ///
+    /// <para>A block that will not decode ENDS the enumeration rather than being skipped. A caller
+    /// merging runs must not quietly produce a shorter one — see the compactor, which abandons the
+    /// merge outright rather than write a run that vouches for entries it lost.</para>
+    /// </summary>
+    public IEnumerable<(ulong Key, ulong SegmentId, uint[] Offsets)> EnumerateEntries()
+    {
+        for (int b = 0; b < _blockOffset.Length; b++)
+        {
+            var block = ReadWholeBlock(b);
+            if (block is null) yield break;
+            foreach (var e in block) yield return e;
+        }
+    }
+
+    /// <summary>One block, fully decoded, or null when it will not decode.</summary>
+    private List<(ulong Key, ulong SegmentId, uint[] Offsets)>? ReadWholeBlock(int index)
+    {
+        byte[]? raw = null;
+        try
+        {
+            using var fs = new FileStream(_path, FileMode.Open, FileAccess.Read, FileShare.Read, 8 * 1024);
+            fs.Seek(_blockOffset[index], SeekOrigin.Begin);
+
+            Span<byte> hdr = stackalloc byte[8];
+            fs.ReadExactly(hdr);
+            int uncomp = BinaryPrimitives.ReadInt32LittleEndian(hdr);
+            int comp   = BinaryPrimitives.ReadInt32LittleEndian(hdr[4..]);
+            if (!FileBounds.LengthFits(comp, fs.Length - fs.Position)) return null;
+            if (uncomp < 0 || uncomp > TraceIndexFile.MaxBlockBytes)   return null;
+
+            int rawLen;
+            byte[] c = ArrayPool<byte>.Shared.Rent(comp);
+            try
+            {
+                fs.ReadExactly(c, 0, comp);
+                raw    = ArrayPool<byte>.Shared.Rent(uncomp);
+                rawLen = LZ4Codec.Decode(c.AsSpan(0, comp), raw.AsSpan(0, uncomp));
+                if (rawLen < 0) return null;
+            }
+            finally { ArrayPool<byte>.Shared.Return(c); }
+
+            var into = new List<(ulong, ulong, uint[])>();
+            var cur  = new Cursor(raw.AsSpan(0, rawLen));
+            while (cur.Remaining > 0)
+            {
+                if (!cur.TryU64(out ulong k) || !cur.TryU64(out ulong segId)) return null;
+                if (!cur.TryUVar(out ulong n)) return null;
+                if (!FileBounds.CountFits((long)n, cur.Remaining, fileBytesPerElement: 1)) return null;
+
+                var offs = new uint[(int)n];
+                uint prev = 0;
+                for (ulong j = 0; j < n; j++)
+                {
+                    if (!cur.TryUVar(out ulong d)) return null;
+                    prev = unchecked(prev + (uint)d);
+                    offs[j] = prev;
+                }
+                into.Add((k, segId, offs));
+            }
+            return into;
+        }
+        catch { return null; }
+        finally { if (raw is not null) ArrayPool<byte>.Shared.Return(raw); }
     }
 
     /// <summary>Whether this run could hold the key. No I/O: the bloom is in memory.</summary>

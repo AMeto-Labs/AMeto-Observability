@@ -35,11 +35,11 @@ public sealed class TraceManifestTests : IDisposable
 
     /// <summary>A run written beside one segment — the kind that dies with it.</summary>
     private static TraceIndexRun Run(string path, ulong coversSegment)
-        => new(1, path, 0x1000, 0x9000, 42, coversSegment);
+        => new(1, path, 0x1000, 0x9000, 42, [coversSegment]);
 
     /// <summary>A run produced by index compaction — covers many, dies with none of them.</summary>
-    private static TraceIndexRun MergedRun(string path)
-        => new(2, path, 0x1000, 0x9000, 999, CoversSegment: null);
+    private static TraceIndexRun MergedRun(string path, params ulong[] covers)
+        => new(2, path, 0x1000, 0x9000, 999, covers);
 
     // ── Identity ───────────────────────────────────────────────────────────────
 
@@ -156,8 +156,8 @@ public sealed class TraceManifestTests : IDisposable
         var b = m.AllocateSegmentId();
         m.AddSegment(Seg(a));
         m.AddSegment(Seg(b));
-        m.ReplaceRuns([], [MergedRun("L2-0001.tix")]);
-        m.MarkCovered(a, MergedRun("L2-0001.tix"));
+        m.ReplaceRuns([], [MergedRun("L2-0001.tix", a, b)]);
+        m.MarkCovered(a, MergedRun("L2-0001.tix", a, b));
 
         m.RemoveSegments([a]);
 

@@ -72,7 +72,7 @@ internal sealed class TraceIndexStore : IDisposable
                 var opened = TraceIndexReader.Open(run.FilePath);
                 if (opened is null)
                 {
-                    if (run.CoversSegment is { } sid) unusable.Add(sid);
+                    unusable.AddRange(run.CoveredSegments);
                     _logger.LogWarning(
                         "Trace index run {Path} could not be opened — the segment(s) it covered fall "
                       + "back to the full scan", run.FilePath);

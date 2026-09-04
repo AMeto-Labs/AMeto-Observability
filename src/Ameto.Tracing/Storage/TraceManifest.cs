@@ -43,25 +43,32 @@ internal readonly record struct TraceSegmentEntry(
 /// adding the index later is not a format change — an engine that writes no runs simply writes
 /// none, and one that reads a manifest without them gets an empty list.
 /// </summary>
-/// <param name="CoversSegment">
-/// The one segment this run indexes, for a run written beside a segment — or null for a run
-/// produced by index compaction, which spans many.
+/// <param name="CoveredSegments">
+/// Every segment whose traces this run indexes — one for a run written beside a segment, many for
+/// a run produced by index compaction.
 ///
-/// <para>THIS FIELD IS WHY DELETION NEEDS NO TOMBSTONES, and it is the difference between the two
-/// kinds of run. A per-segment run dies with its segment: nothing else is in it. A merged run does
-/// NOT — it still holds live entries for every other segment it covers, so the departing segment's
-/// entries simply become garbage, filtered on read by "is this segment id still in the catalog?"
-/// and dropped physically at the next index compaction. Matching runs to segments by FILE PATH
-/// instead looked equivalent and was not: a run's path is its own <c>.tix</c>, never the
-/// <c>.trc</c> it describes, so nothing ever matched and every run outlived its segment.</para>
+/// <para>A LIST RATHER THAN A SINGLE ID, and the reason is a hole that only opens once runs merge.
+/// Coverage is the claim that lets a segment be SKIPPED, so it must be withdrawable the instant a
+/// run turns out not to open. With one id per run that works; with a merged run the engine would
+/// know a claim had failed and not know whose — and a coverage claim nobody can withdraw is
+/// exactly the silent under-report this design exists to prevent. So the run says who it speaks
+/// for, and every path that has to take a claim back has something to take back.</para>
+///
+/// <para>THIS IS ALSO WHY DELETION NEEDS NO TOMBSTONES. A run is dropped only when EVERY segment
+/// it covers is gone; a merged run outlives the loss of one of them, because it still holds live
+/// entries for the others. The departing segment's entries simply become garbage — filtered on
+/// read by "is this segment id still in the catalog?" and removed physically at the next index
+/// compaction. Matching runs to segments by FILE PATH instead looked equivalent and was not: a
+/// run's path is its own <c>.tix</c>, never the <c>.trc</c> it describes, so nothing ever matched
+/// and every run outlived its segment.</para>
 /// </param>
 internal readonly record struct TraceIndexRun(
-    int    Level,
-    string FilePath,
-    ulong  MinKey,
-    ulong  MaxKey,
-    int    EntryCount,
-    ulong? CoversSegment = null);
+    int     Level,
+    string  FilePath,
+    ulong   MinKey,
+    ulong   MaxKey,
+    int     EntryCount,
+    ulong[] CoveredSegments);
 
 /// <summary>
 /// THE CATALOG OF TRACE SEGMENTS, AND THE ONLY PLACE THAT SAYS WHAT AN INDEX MAY ANSWER FOR.
@@ -248,7 +255,7 @@ internal sealed class TraceManifest
             }
             segs[added.SegmentId] = added;
 
-            var runs = s.Runs.Where(r => r.CoversSegment is not { } sid || !gone.Contains(sid)).ToList();
+            var runs = KeepRuns(s.Runs, gone);
             if (run is { } r) { runs.Add(r); cov.Add(added.SegmentId); }
 
             Commit(s with { Segments = segs, Runs = runs, Covered = cov });
@@ -273,7 +280,7 @@ internal sealed class TraceManifest
             Commit(s with
             {
                 Segments = segs,
-                Runs     = s.Runs.Where(r => r.CoversSegment is not { } sid || !gone.Contains(sid)).ToList(),
+                Runs     = KeepRuns(s.Runs, gone),
                 Covered  = cov,
             });
         }
@@ -331,7 +338,7 @@ internal sealed class TraceManifest
             cov.Remove(segmentId);
             Commit(s with
             {
-                Runs    = s.Runs.Where(r => r.CoversSegment != segmentId).ToList(),
+                Runs    = KeepRuns(s.Runs, new HashSet<ulong> { segmentId }),
                 Covered = cov,
             });
         }
@@ -350,6 +357,29 @@ internal sealed class TraceManifest
             if (s.Covered.Count == 0 && s.Runs.Count == 0) return;
             Commit(s with { Runs = new List<TraceIndexRun>(), Covered = new HashSet<ulong>() });
         }
+    }
+
+    /// <summary>
+    /// The runs that survive the loss of <paramref name="gone"/>: everything except runs whose
+    /// EVERY covered segment has left.
+    ///
+    /// <para>All, not any, and that is the whole no-tombstone argument in one predicate. A
+    /// per-segment run has exactly one covered segment, so it dies with it — the old behaviour,
+    /// unchanged. A merged run keeps live entries for every OTHER segment in it, so dropping it
+    /// because one of them expired would silently un-index all the rest. The departing
+    /// segment's entries stay in the file as garbage, are filtered on read against the catalog,
+    /// and go away at the next index compaction.</para>
+    /// </summary>
+    private static List<TraceIndexRun> KeepRuns(List<TraceIndexRun> runs, HashSet<ulong> gone)
+    {
+        var kept = new List<TraceIndexRun>(runs.Count);
+        foreach (var r in runs)
+        {
+            bool anyAlive = false;
+            foreach (ulong sid in r.CoveredSegments) if (!gone.Contains(sid)) { anyAlive = true; break; }
+            if (anyAlive || r.CoveredSegments.Length == 0) kept.Add(r);
+        }
+        return kept;
     }
 
     /// <summary>Adds one item and hands the collection back, so a <c>with</c> can use it inline.</summary>
@@ -439,17 +469,23 @@ internal sealed class TraceManifest
             if (id > maxSeen) maxSeen = id;
         }
 
-        int runCount = r.Count(fileBytesPerElement: 33, "Manifest runs");       // 2+8+8+4+8 + at least one path byte
+        int runCount = r.Count(fileBytesPerElement: 29, "Manifest runs");       // 2+8+8+4+4 + at least one path byte
         var runs = new List<TraceIndexRun>(FileBounds.PreallocFor(runCount, 48));
         for (int i = 0; i < runCount; i++)
         {
             int    level = r.U16();
             ulong  minK  = r.U64();
             ulong  maxK  = r.U64();
-            int    n     = r.I32();
-            ulong  covers = r.U64();          // 0 = a merged run, covering many
-            string p     = r.Str();
-            runs.Add(new TraceIndexRun(level, p, minK, maxK, n, covers == 0 ? null : covers));
+            int    n      = r.I32();
+            int    covers = r.Count(fileBytesPerElement: 8, "Manifest run coverage");
+            // Grown rather than sized outright, like the two lists above it: PreallocFor caps what
+            // is reserved up front while the list still takes everything the file honestly holds,
+            // and it puts the bound on the line that allocates instead of inside Cursor.Count
+            // where nothing reviewing this can see it.
+            var    ids    = new List<ulong>(FileBounds.PreallocFor(covers, sizeof(ulong)));
+            for (int c = 0; c < covers; c++) ids.Add(r.U64());
+            string p      = r.Str();
+            runs.Add(new TraceIndexRun(level, p, minK, maxK, n, [.. ids]));
         }
 
         int covCount = r.Count(fileBytesPerElement: 8, "Manifest coverage");
@@ -497,7 +533,8 @@ internal sealed class TraceManifest
             body.U64(run.MinKey);
             body.U64(run.MaxKey);
             body.I32(run.EntryCount);
-            body.U64(run.CoversSegment ?? 0);   // ids start at 1, so 0 is free as "many"
+            body.I32(run.CoveredSegments.Length);
+            foreach (ulong sid in run.CoveredSegments) body.U64(sid);
             body.Str(run.FilePath);
         }
 

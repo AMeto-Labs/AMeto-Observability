@@ -127,7 +127,11 @@ internal sealed class TraceIndexBackfillWorker(
             bool worked;
             try
             {
-                worked = await Task.Run(() => engine.BackfillNextSegment(ct), ct).ConfigureAwait(false);
+                // Backfill first, merging second. Backfill is what makes lookups fast and merging
+                // only makes them cheap to keep fast — so an install still migrating spends its
+                // pauses on coverage, and starts consolidating once there is nothing left to cover.
+                worked = await Task.Run(() => engine.BackfillNextSegment(ct) || engine.CompactIndexOnce(ct), ct)
+                                   .ConfigureAwait(false);
             }
             catch (OperationCanceledException) { return; }
             catch (Exception ex)
