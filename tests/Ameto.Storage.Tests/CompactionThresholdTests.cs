@@ -91,11 +91,14 @@ public sealed class CompactionThresholdTests : IDisposable
     }
 
     [Fact]
-    public void A_merge_still_holds_no_more_spans_than_it_ever_did()
+    public void A_merge_holds_two_full_size_candidates_and_not_a_span_more()
     {
-        // WHY RAISING THE THRESHOLD IS SAFE RATHER THAN A TRADE. Peak memory is governed by
-        // MaxSpansPerPass, not by the threshold: at 10 000 a batch was up to twenty segments of ten
-        // thousand, and at 60 000 it is four of fifty thousand. Same two hundred thousand spans.
+        // WHAT RAISING THE THRESHOLD ACTUALLY COST, which the first version of this test missed by
+        // measuring the wrong thing. It asserted the batch never exceeded 200 000 spans — true
+        // before and after — and concluded the change was free. It was not: at 10 000 an ordinary
+        // 50 000-span flush was not a candidate AT ALL, so at volume nothing merged and the cap was
+        // never reached. Making flushes mergeable made a ~350 MB pass routine on a 512 MB box. The
+        // cap is 2 × the threshold now, which is ~210 MB and still lets every tier merge a pair.
         var many = new SpanSegmentInfo[20];
         for (int i = 0; i < 20; i++)
             many[i] = Seg(50_000, _baseNano + i * 60_000L * Ms, _baseNano + (i * 60_000L + 1_000L) * Ms, (ulong)(i + 1));
@@ -103,12 +106,30 @@ public sealed class CompactionThresholdTests : IDisposable
         var batch = TraceStorageEngine.SelectCompactionBatch(many);
         long spans = batch.Sum(s => (long)s.SpanCount);
 
-        _out.WriteLine($"twenty 50 000-span segments offered → batch of {batch.Count}, {spans:N0} spans");
+        _out.WriteLine($"twenty 50 000-span segments offered → batch of {batch.Count}, {spans:N0} spans "
+                     + $"(~{spans * 1749 / (1024 * 1024)} MB live)");
         // EXACTLY the cap, not the cap plus one segment. Enforcing it in the loader — which
-        // stopped once it had ALREADY read that many — overshot by whatever the last segment
-        // held: invisible at 10 000-span candidates, a quarter of the budget at 50 000.
-        Assert.True(spans <= 200_000,
-            $"a batch of {spans:N0} spans is past the 200 000 a pass may hold");
+        // stopped once it had ALREADY read that many — overshot by whatever the last segment held.
+        Assert.True(spans <= 120_000,
+            $"a batch of {spans:N0} spans is past the 120 000 a pass may hold — about 210 MB live");
+    }
+
+    [Fact]
+    public void The_largest_mergeable_pair_still_fits_in_one_pass()
+    {
+        // THE REASON THE CAP IS DERIVED AND NOT PICKED. A candidate is anything below the
+        // threshold, so the biggest two are just under 2 × it. A cap under that would leave the
+        // top tier permanently unmergeable — segments that are too big to merge and too small to
+        // stop being candidates, re-examined every hour forever.
+        var pair = new[]
+        {
+            Seg(59_999, _baseNano,                    _baseNano + 1_000L * Ms, 1),
+            Seg(59_999, _baseNano + 60_000L * Ms,     _baseNano + 61_000L * Ms, 2),
+        };
+
+        var batch = TraceStorageEngine.SelectCompactionBatch(pair);
+        _out.WriteLine($"two 59 999-span segments → batch of {batch.Count}");
+        Assert.Equal(2, batch.Count);
     }
 
     [Fact]

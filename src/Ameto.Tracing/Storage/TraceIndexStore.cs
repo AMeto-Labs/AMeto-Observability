@@ -61,10 +61,10 @@ internal sealed class TraceIndexStore : IDisposable
     /// segments whose runs could NOT be opened, so the caller can withdraw their coverage — a
     /// claim the index cannot back must not survive the process that discovered it.
     /// </summary>
-    public IReadOnlyList<ulong> Sync(TraceManifest manifest)
+    public IReadOnlyList<string> Sync(TraceManifest manifest)
     {
         var wanted  = manifest.Runs;
-        var unusable = new List<ulong>();
+        var unusable = new List<string>();
 
         lock (_gate)
         {
@@ -85,7 +85,10 @@ internal sealed class TraceIndexStore : IDisposable
                 if (opened is not null) opened.CoveredSegments = run.CoveredSegments;
                 if (opened is null)
                 {
-                    unusable.AddRange(run.CoveredSegments);
+                    // THE RUN, NOT ITS SEGMENTS. Reporting segment ids let the caller withdraw a
+                    // merged run's claim one segment at a time and never remove the run itself —
+                    // see TraceManifest.DropRuns.
+                    unusable.Add(run.FilePath);
                     _logger.LogWarning(
                         "Trace index run {Path} could not be opened — the segment(s) it covered fall "
                       + "back to the full scan", run.FilePath);

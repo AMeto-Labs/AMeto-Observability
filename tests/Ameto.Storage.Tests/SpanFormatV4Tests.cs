@@ -194,6 +194,7 @@ public sealed class SpanFormatV4Tests : IDisposable
 
         // And its own index is what answered — a v3 file is never scanned for this.
         var map = SpanReader.ReadTraceIndexForTest(v3Path);
+        Assert.NotNull(map);   // a healthy file accounts for every span, or it is not indexed at all
         _out.WriteLine($"v3 index read back: {map.Count} traces");
         Assert.Equal(400, map.Count);
     }
@@ -213,6 +214,8 @@ public sealed class SpanFormatV4Tests : IDisposable
 
         var fromScan  = SpanReader.ReadTraceIndexForTest(v4.FilePath);
         var fromIndex = SpanReader.ReadTraceIndexForTest(v3Path);
+        Assert.NotNull(fromScan);
+        Assert.NotNull(fromIndex);
 
         _out.WriteLine($"v4 by scan: {fromScan.Count} traces; v3 by index: {fromIndex.Count}");
         Assert.Equal(fromIndex.Count, fromScan.Count);

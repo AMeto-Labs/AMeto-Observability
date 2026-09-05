@@ -156,23 +156,31 @@ public sealed class TraceManifestTests : IDisposable
         var b = m.AllocateSegmentId();
         m.AddSegment(Seg(a));
         m.AddSegment(Seg(b));
-        m.ReplaceRuns([], [MergedRun("L2-0001.tix", a, b)]);
         m.MarkCovered(a, MergedRun("L2-0001.tix", a, b));
 
-        m.RemoveSegments([a]);
+        var dropped = m.RemoveSegments([a]);
 
         Assert.False(m.IsCovered(a));                       // the claim goes
-        Assert.NotEmpty(m.Runs);                            // the run stays
+        Assert.Empty(dropped);                              // nothing to close: b still needs it
         Assert.Contains(m.Runs, r => r.FilePath == "L2-0001.tix");
         Assert.Equal(m.Runs.Count, Open().Runs.Count);      // and through the file
 
         // The per-segment kind still behaves the other way, in the same catalog.
         m.MarkCovered(b, Run("b.tix", b));
         int before = m.Runs.Count;
-        m.RemoveSegments([b]);
-        _out.WriteLine($"runs {before} → {m.Runs.Count}; merged run kept, per-segment run dropped");
-        Assert.Equal(before - 1, m.Runs.Count);
-        Assert.DoesNotContain(m.Runs, r => r.FilePath == "b.tix");
+        var gone = m.RemoveSegments([b]);
+
+        // AND NOW THE MERGED RUN GOES TOO, which the first version of this test had backwards.
+        // It asserted the run survived b as well — but a and b were everything it covered, so what
+        // it was really recording is that a run could be kept alive by the memory of segments that
+        // had left in an EARLIER generation. Nothing could ever drop it again: at the next start
+        // its segments were no longer covered, so the withdrawal returned early, and the file was
+        // reopened, refused and re-warned at every boot for the life of the install. Liveness is
+        // the surviving catalog now, and both paths come back for the caller to close and delete.
+        _out.WriteLine($"runs {before} → {m.Runs.Count}; dropped [{string.Join(", ", gone)}]");
+        Assert.Equal(0, m.Runs.Count);
+        Assert.Equal(["b.tix", "L2-0001.tix"], gone.Order());
+        Assert.Empty(Open().Runs);
     }
 
     [Fact]

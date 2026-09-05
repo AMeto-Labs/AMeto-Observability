@@ -1040,24 +1040,48 @@ internal static class SpanReader
     /// the segment simply stays uncovered until compaction migrates it.</para>
     /// </summary>
     /// <summary>Test hook: the same map, so a test can compare v3's index with v4's scan.</summary>
-    internal static Dictionary<TraceId, List<uint>> ReadTraceIndexForTest(string filePath)
+    internal static Dictionary<TraceId, List<uint>>? ReadTraceIndexForTest(string filePath)
         => ReadTraceIndex(filePath);
 
-    public static Dictionary<TraceId, List<uint>> ReadTraceIndex(string filePath)
+    /// <summary>
+    /// NULL MEANS "I CANNOT VOUCH FOR THIS", and it is not the same answer as an empty map.
+    ///
+    /// <para>Every walk in this file ends at <c>traceIdxOffset</c>, read from the footer. A footer
+    /// torn by a crash between the block writes and the final fsync can hold an offset that is
+    /// merely SMALLER than the truth — it still lands inside the file, still points at something
+    /// that decodes, and the walk simply stops early. Nothing throws. The map that comes back looks
+    /// perfectly well-formed and is missing every span past the truncation.</para>
+    ///
+    /// <para>That is harmless for a reader — a short answer is a slow answer, and the caller falls
+    /// back to scanning — and it is NOT harmless for the backfill, which turns this map into a run
+    /// and then claims COVERAGE for the segment. A covered segment is one the lookup is allowed to
+    /// skip, so the missing spans stop being slow to find and start being absent.</para>
+    ///
+    /// <para>So the count is checked against the header's <c>spanCount</c>: exactly one index
+    /// offset exists per span, and that number is written at the FRONT of the file, so the two
+    /// agree or the file is not whole. The check lives here and not in <c>ReadFooter</c>
+    /// deliberately — throwing there would reach the cold-tier scan, which reads a throwing footer
+    /// as corruption and DELETES the segment. Losing the index costs speed; losing the segment
+    /// costs the spans.</para>
+    /// </summary>
+    public static Dictionary<TraceId, List<uint>>? ReadTraceIndex(string filePath)
     {
-        var map = new Dictionary<TraceId, List<uint>>();
+        var  map    = new Dictionary<TraceId, List<uint>>();
+        long placed = 0;
 
         using var fs = OpenRead(filePath);
         using var br = new BinaryReader(fs);
 
-        ushort version = ReadVersion(fs, br);
+        fs.Seek(6, SeekOrigin.Begin);
+        uint   headerSpanCount = br.ReadUInt32();
+        ushort version         = ReadVersion(fs, br);
         if (version < 3) return map;
 
         // v4 carries no trace index of its own — that block is what v4 removed. The map is built
         // by walking the spans instead: one pass over the segment, which is what the backfill is
         // for and is why it runs one segment at a time in the background. This is also the path
         // that heals a v4 segment whose run was lost.
-        if (version >= 4) return BuildTraceIndexByScan(filePath);
+        if (version >= 4) return BuildTraceIndexByScan(filePath, headerSpanCount);
 
         var (traceIdxOffset, _, _) = ReadFooter(fs, br, version);
         fs.Seek(traceIdxOffset, SeekOrigin.Begin);
@@ -1102,6 +1126,7 @@ internal static class SpanReader
                 // overwriting is the only version that cannot lose spans if it ever happens.
                 if (map.TryGetValue(candidate, out var already)) already.AddRange(offsets);
                 else map[candidate] = offsets;
+                placed += offsetCnt;
             }
         }
         finally
@@ -1110,7 +1135,7 @@ internal static class SpanReader
             if (rawBuf is not null) ArrayPool<byte>.Shared.Return(rawBuf);
         }
 
-        return map;
+        return placed == headerSpanCount ? map : null;
     }
 
     /// <summary>
@@ -1121,7 +1146,7 @@ internal static class SpanReader
     /// segment's run is missing — the run gets rebuilt from exactly this, so the degraded state
     /// heals rather than persisting.</para>
     /// </summary>
-    private static Dictionary<TraceId, List<uint>> BuildTraceIndexByScan(string filePath)
+    private static Dictionary<TraceId, List<uint>>? BuildTraceIndexByScan(string filePath, uint expectedSpans)
     {
         var map = new Dictionary<TraceId, List<uint>>();
         uint offset = 0;
@@ -1131,7 +1156,9 @@ internal static class SpanReader
             list.Add(offset);
             offset++;
         }
-        return map;
+        // This walk ends at traceIdxOffset like every other one, so a truncated footer offset ends
+        // it early and silently. See ReadTraceIndex for why that must not turn into coverage.
+        return offset == expectedSpans ? map : null;
     }
 
     /// <summary>

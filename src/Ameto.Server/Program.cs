@@ -194,7 +194,8 @@ if (enableTracing)
         unknownBackfillValue = configured;
 
     builder.Services.AddAmetoTracing(serverOptions.DataDirectory, backfillMode,
-                                     serverOptions.Traces.SegmentFormatV4);
+                                     serverOptions.Traces.SegmentFormatV4,
+                                     serverOptions.Traces.IndexEnabled);
 }
 
 // Metrics

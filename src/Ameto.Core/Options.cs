@@ -253,6 +253,23 @@ public sealed class TracesOptions
     /// might read this data runs this build or newer, and only when you would not roll back.</para>
     /// </summary>
     public bool SegmentFormatV4 { get; init; }
+
+    /// <summary>
+    /// The off switch for the trace-id index itself, as opposed to <see cref="IndexBackfill"/>,
+    /// which only decides whether OLD segments are migrated into it.
+    ///
+    /// <para>THE ROLLBACK HAS TO BE REACHABLE BY THE PERSON WHO NEEDS IT. The design's safety
+    /// argument is that coverage can be dropped to empty at any moment and the engine goes back to
+    /// scanning, which is how it behaved before this feature — but that was only true from a test
+    /// seam, so an operator watching a trace return too few spans at three in the morning had no
+    /// way to take it. Setting this to false and restarting withdraws every claim in one generation
+    /// and closes every run.</para>
+    ///
+    /// <para>It costs speed and nothing else. No span is rewritten, no <c>.trc</c> is touched, and
+    /// the <c>.tix</c> files are left where they are — turning it back on re-covers what the
+    /// backfill re-indexes, at whatever pace <see cref="IndexBackfill"/> allows.</para>
+    /// </summary>
+    public bool IndexEnabled { get; init; } = true;
 }
 
 /// <summary>

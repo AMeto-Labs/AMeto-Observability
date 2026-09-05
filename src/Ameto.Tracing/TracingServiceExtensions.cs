@@ -54,14 +54,16 @@ public static class TracingServiceExtensions
         this IServiceCollection services,
         string dataDirectory,
         TraceIndexBackfillMode backfill = TraceIndexBackfillMode.Idle,
-        bool writeSegmentFormatV4 = false)
+        bool writeSegmentFormatV4 = false,
+        bool indexEnabled = true)
     {
         services.AddSingleton(new TraceIndexOptions(backfill));
         services.AddSingleton(sp =>
             new TraceStorageEngine(
                 Path.Combine(dataDirectory, "traces"),
                 sp.GetRequiredService<ILogger<TraceStorageEngine>>(),
-                writeSegmentFormatV4));
+                writeSegmentFormatV4,
+                indexEnabled));
 
         services.AddSingleton<SpanRingBuffer>();
         services.AddSingleton<SpanIngestionEndpoint>();

@@ -221,6 +221,45 @@ internal sealed class TraceManifest
     }
 
     /// <summary>
+    /// Adopts many segments at once: ids allocated and entries recorded in ONE generation.
+    ///
+    /// <para>THE FIRST START AFTER AN UPGRADE IS THE WHOLE REASON THIS EXISTS. Adopting a segment
+    /// one at a time is two commits, and a commit rewrites and fsyncs the ENTIRE manifest — so
+    /// adopting N segments wrote O(N²) bytes and asked the disk to flush 2N times. At the couple
+    /// of thousand segments a week of hourly flushes leaves behind, on a spinning disk or a
+    /// throttled cloud volume, that is minutes of startup during which the catalog is the reason
+    /// the server is slow. One commit is one fsync, whatever N is.</para>
+    ///
+    /// <para>Ids still come from a monotone counter that is persisted in the same generation as
+    /// the entries using them, so a crash mid-adoption cannot hand the same id out twice: either
+    /// the whole generation landed or none of it did.</para>
+    /// </summary>
+    /// <param name="drafts">
+    /// Each segment's path, bounds and span count. The <c>SegmentId</c> field is ignored — ids are
+    /// assigned here — and the assigned ids come back in the same order.
+    /// </param>
+    public IReadOnlyList<ulong> AdoptSegments(IReadOnlyList<TraceSegmentEntry> drafts)
+    {
+        if (drafts.Count == 0) return [];
+        lock (_gate)
+        {
+            var s    = _state;
+            var segs = s.CopySegments();
+            var ids  = new List<ulong>(drafts.Count);
+
+            ulong next = s.NextSegmentId;
+            foreach (var d in drafts)
+            {
+                ulong id = next++;
+                segs[id] = d with { SegmentId = id };
+                ids.Add(id);
+            }
+            Commit(s with { Segments = segs, NextSegmentId = next });
+            return ids;
+        }
+    }
+
+    /// <summary>
     /// Registers a freshly written segment, optionally with the index run that covers it. Passing a
     /// run is what marks the segment covered, and the two are written in the same generation on
     /// purpose: a covered segment whose run is missing would be a segment the index is trusted to
@@ -249,8 +288,12 @@ internal sealed class TraceManifest
     /// A compaction, as one generation: the sources leave the catalog and the coverage set, the
     /// merged segment joins them. Their runs go with them — a run naming a segment that no longer
     /// exists is garbage the read path would have to filter forever.
+    ///
+    /// <para>Returns the paths of the runs that just stopped being named, so the caller can close
+    /// and delete them. That is not tidiness: a run dropped here is still OPEN, holding a bloom in
+    /// native memory and a handle on a file nothing will ever consult again.</para>
     /// </summary>
-    public void ReplaceSegments(
+    public IReadOnlyList<string> ReplaceSegments(
         IReadOnlyCollection<ulong> removedIds, TraceSegmentEntry added, TraceIndexRun? run = null)
     {
         lock (_gate)
@@ -258,42 +301,41 @@ internal sealed class TraceManifest
             var s     = _state;
             var segs  = s.CopySegments();
             var cov   = s.CopyCovered();
-            var gone  = new HashSet<ulong>();
             foreach (var id in removedIds)
             {
-                if (segs.Remove(id)) gone.Add(id);
+                segs.Remove(id);
                 cov.Remove(id);
             }
             segs[added.SegmentId] = added;
 
-            var runs = KeepRuns(s.Runs, gone);
+            var runs = KeepRuns(s.Runs, segs, out var dropped);
             if (run is { } r) { runs.Add(r); cov.Add(added.SegmentId); }
 
             Commit(s with { Segments = segs, Runs = runs, Covered = cov });
+            return dropped;
         }
     }
 
-    /// <summary>Retention: the segments are gone from disk, so they leave the catalog with them.</summary>
-    public void RemoveSegments(IReadOnlyCollection<ulong> removedIds)
+    /// <summary>
+    /// Retention: the segments are gone from disk, so they leave the catalog with them. Returns
+    /// the runs that stopped being named, for the caller to close and delete.
+    /// </summary>
+    public IReadOnlyList<string> RemoveSegments(IReadOnlyCollection<ulong> removedIds)
     {
-        if (removedIds.Count == 0) return;
+        if (removedIds.Count == 0) return [];
         lock (_gate)
         {
             var s    = _state;
             var segs = s.CopySegments();
             var cov  = s.CopyCovered();
-            var gone = new HashSet<ulong>();
             foreach (var id in removedIds)
             {
-                if (segs.Remove(id)) gone.Add(id);
+                segs.Remove(id);
                 cov.Remove(id);
             }
-            Commit(s with
-            {
-                Segments = segs,
-                Runs     = KeepRuns(s.Runs, gone),
-                Covered  = cov,
-            });
+            var runs = KeepRuns(s.Runs, segs, out var dropped);
+            Commit(s with { Segments = segs, Runs = runs, Covered = cov });
+            return dropped;
         }
     }
 
@@ -309,11 +351,15 @@ internal sealed class TraceManifest
         {
             var s = _state;
             if (!s.Segments.ContainsKey(segmentId)) return;   // gone while we were building it
-            Commit(s with
-            {
-                Runs    = Added(s.CopyRuns(), run),
-                Covered = Added(s.CopyCovered(), segmentId),
-            });
+
+            // ONE ENTRY PER FILE. A merged run covering several segments is marked once per
+            // segment, and a second entry for the same path is not harmless: the file would be
+            // opened and counted twice, and DropRuns would have to remove both to remove one.
+            var runs = s.CopyRuns();
+            if (!runs.Any(r => string.Equals(r.FilePath, run.FilePath, StringComparison.Ordinal)))
+                runs.Add(run);
+
+            Commit(s with { Runs = runs, Covered = Added(s.CopyCovered(), segmentId) });
         }
     }
 
@@ -335,23 +381,37 @@ internal sealed class TraceManifest
     }
 
     /// <summary>
-    /// Takes back the claim that the index answers for one segment, and drops the per-segment run
-    /// that made it. For the discovery that a run will not open: the segment is still there and
-    /// still readable, it simply goes back to being scanned.
+    /// Takes back the claim made by runs that will not open. The segments are still there and
+    /// still readable; they simply go back to being scanned.
+    ///
+    /// <para>BY PATH, NOT BY SEGMENT, and the difference is a file that could never be evicted.
+    /// Withdrawing one segment at a time kept any run that still named a second segment, so a
+    /// merged run over {A,B,C} that would not open survived all three withdrawals — and at the
+    /// next start its segments were no longer in the coverage set, so the withdrawal returned
+    /// early and the run stayed named forever: reopened, refused and re-warned at every boot,
+    /// holding nothing anyone could use. Naming the file is the only version that removes it.</para>
+    ///
+    /// <para>Coverage is then INTERSECTED with what the surviving runs still cover, so it can only
+    /// shrink. Recomputing it from the runs outright would be wrong in the other direction — it
+    /// would re-cover a segment whose claim was deliberately taken away while its run stayed.</para>
     /// </summary>
-    public void WithdrawCoverage(ulong segmentId)
+    public void DropRuns(IReadOnlyCollection<string> paths)
     {
+        if (paths.Count == 0) return;
         lock (_gate)
         {
-            var s = _state;
-            if (!s.Covered.Contains(segmentId)) return;
+            var s    = _state;
+            var drop = new HashSet<string>(paths, StringComparer.Ordinal);
+            var runs = s.CopyRuns();
+            if (runs.RemoveAll(r => drop.Contains(r.FilePath)) == 0) return;
+
+            var stillServed = new HashSet<ulong>();
+            foreach (var r in runs)
+                foreach (ulong sid in r.CoveredSegments) stillServed.Add(sid);
+
             var cov = s.CopyCovered();
-            cov.Remove(segmentId);
-            Commit(s with
-            {
-                Runs    = KeepRuns(s.Runs, new HashSet<ulong> { segmentId }),
-                Covered = cov,
-            });
+            cov.IntersectWith(stillServed);
+            Commit(s with { Runs = runs, Covered = cov });
         }
     }
 
@@ -371,25 +431,39 @@ internal sealed class TraceManifest
     }
 
     /// <summary>
-    /// The runs that survive the loss of <paramref name="gone"/>: everything except runs whose
-    /// EVERY covered segment has left.
+    /// The runs still worth naming once the catalog is <paramref name="surviving"/>: everything
+    /// except runs whose EVERY covered segment has left.
     ///
     /// <para>All, not any, and that is the whole no-tombstone argument in one predicate. A
     /// per-segment run has exactly one covered segment, so it dies with it — the old behaviour,
     /// unchanged. A merged run keeps live entries for every OTHER segment in it, so dropping it
-    /// because one of them expired would silently un-index all the rest. The departing
-    /// segment's entries stay in the file as garbage, are filtered on read against the catalog,
-    /// and go away at the next index compaction.</para>
+    /// because one of them expired would silently un-index all the rest. The departing segment's
+    /// entries stay in the file as garbage, are filtered on read against the catalog, and go away
+    /// at the next index compaction.</para>
+    ///
+    /// <para>LIVENESS IS THE SURVIVING CATALOG, NOT THE DEPARTING BATCH, and that was a leak with
+    /// no exit. Asking "is this segment absent from the ids leaving right now" said yes for every
+    /// segment that had left in some EARLIER generation, so a merged run over ten hourly segments
+    /// was kept when the tenth expired — by the memory of the nine already gone. It then held its
+    /// bloom and its handle until a restart swept it, on an install whose whole reason for merging
+    /// runs is that memory. Asking the surviving catalog instead is the same question with the
+    /// right subject.</para>
     /// </summary>
-    private static List<TraceIndexRun> KeepRuns(List<TraceIndexRun> runs, HashSet<ulong> gone)
+    private static List<TraceIndexRun> KeepRuns(
+        List<TraceIndexRun>                  runs,
+        Dictionary<ulong, TraceSegmentEntry> surviving,
+        out IReadOnlyList<string>            dropped)
     {
         var kept = new List<TraceIndexRun>(runs.Count);
+        List<string>? gone = null;
         foreach (var r in runs)
         {
             bool anyAlive = false;
-            foreach (ulong sid in r.CoveredSegments) if (!gone.Contains(sid)) { anyAlive = true; break; }
+            foreach (ulong sid in r.CoveredSegments) if (surviving.ContainsKey(sid)) { anyAlive = true; break; }
             if (anyAlive || r.CoveredSegments.Length == 0) kept.Add(r);
+            else (gone ??= new List<string>()).Add(r.FilePath);
         }
+        dropped = gone ?? (IReadOnlyList<string>)[];
         return kept;
     }
 
