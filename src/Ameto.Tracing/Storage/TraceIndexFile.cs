@@ -179,6 +179,10 @@ internal sealed class TraceIndexWriter
                 fs.Write(head);
 
                 var raw = new ByteBuffer(TraceIndexFile.TargetBlockBytes * 2);
+                // Hoisted out of the fill loop below: the bloom takes a span, so the key it is
+                // handed does not need to be a fresh array per entry. It was one, and at 200 000
+                // entries that is 1.6 MB of eight-byte arrays per flush, paid again by every merge.
+                Span<byte> keyBuf = stackalloc byte[8];
                 int  i  = 0;
                 while (i < _entries.Count)
                 {
@@ -190,7 +194,8 @@ internal sealed class TraceIndexWriter
                     while (i < _entries.Count && raw.Length < TraceIndexFile.TargetBlockBytes)
                     {
                         var (key, segId, offsets) = _entries[i++];
-                        bloom.Add(KeyBytes(key));
+                        BinaryPrimitives.WriteUInt64BigEndian(keyBuf, key);
+                        bloom.Add(keyBuf);
                         raw.U64(key);
                         raw.U64(segId);
                         raw.UVar((ulong)offsets.Length);
@@ -263,13 +268,6 @@ internal sealed class TraceIndexWriter
             fs.Write(c.AsSpan(0, n));
         }
         finally { ArrayPool<byte>.Shared.Return(c); }
-    }
-
-    private static byte[] KeyBytes(ulong key)
-    {
-        var b = new byte[8];
-        BinaryPrimitives.WriteUInt64BigEndian(b, key);
-        return b;
     }
 
     /// <summary>A growable little-endian buffer for one block. Reset per block, never reallocated.</summary>
@@ -423,16 +421,23 @@ internal sealed class TraceIndexReader : IDisposable
     /// hundreds of thousands of entries and the whole point of merging is to be a background chore
     /// that costs one block of memory per input, not one run.</para>
     ///
-    /// <para>A block that will not decode ENDS the enumeration rather than being skipped. A caller
-    /// merging runs must not quietly produce a shorter one — see the compactor, which abandons the
-    /// merge outright rather than write a run that vouches for entries it lost.</para>
+    /// <para>A block that will not decode THROWS. It used to <c>yield break</c>, and that is the
+    /// difference between a short answer and a reported one: <see cref="Open"/> validates the
+    /// header, footer, sparse index and bloom, so a run whose INTERIOR block is torn opens
+    /// perfectly and enumerates fine right up to the bad block. A merge reading that as a normal
+    /// end wrote a survivor claiming the union of its inputs' coverage while missing the tail it
+    /// never copied, deleted the sources, and left the lost traces covered-with-no-entries —
+    /// silent, and permanent, because coverage is never re-derived from a run's contents. Ending
+    /// early is indistinguishable from finishing; throwing is not.</para>
     /// </summary>
+    /// <exception cref="InvalidDataException">A block could not be decoded.</exception>
     public IEnumerable<(ulong Key, ulong SegmentId, uint[] Offsets)> EnumerateEntries()
     {
         for (int b = 0; b < _blockOffset.Length; b++)
         {
-            var block = ReadWholeBlock(b);
-            if (block is null) yield break;
+            var block = ReadWholeBlock(b)
+                ?? throw new InvalidDataException(
+                    $"Trace index run {_path} block {b} of {_blockOffset.Length} will not decode");
             foreach (var e in block) yield return e;
         }
     }

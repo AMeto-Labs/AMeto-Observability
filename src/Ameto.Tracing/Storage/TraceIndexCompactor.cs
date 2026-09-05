@@ -119,6 +119,12 @@ internal sealed class TraceIndexCompactor
             // again before it writes. Sorting twice is a real cost only when a run is enormous, and
             // buying the k-way merge machinery to avoid it would be paying complexity for a
             // background chore that already holds one block per input.
+            //
+            // A TORN INTERIOR BLOCK THROWS OUT OF EnumerateEntries and lands in the catch below,
+            // which abandons the whole batch. Open() only validates the header, footer, sparse
+            // index and bloom, so such a run opens perfectly and enumerates right up to the bad
+            // block; treating that short answer as an end wrote a survivor vouching for entries it
+            // never copied — the exact thing this class's docstring says it prevents.
             var w = new TraceIndexWriter();
             int copied = 0, dropped = 0;
             foreach (var r in readers)

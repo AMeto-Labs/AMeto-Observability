@@ -92,6 +92,29 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// <summary>Test hook: open index runs and the memory they hold.</summary>
     internal (int Runs, long RetainedBytes) IndexStatsForTest => _index.Stats;
 
+    /// <summary>
+    /// Test seam: called with the path of an index run the instant after it is written and
+    /// renamed, BEFORE anything tries to open it. That instant is the sharing violation an
+    /// antivirus produces on Windows, and it is the only way to reach the failed-open branch
+    /// without waiting for one.
+    /// </summary>
+    internal Action<string>? _afterIndexRunWrittenForTest;
+
+    /// <summary>
+    /// Test seam: called inside <c>CompleteFlush</c> at the instant the catalog knows a segment and
+    /// <c>_coldSegments</c> does not. Index compaction takes no engine lock, so it really can run
+    /// there; reaching that window any other way is a matter of luck.
+    /// </summary>
+    internal Action? _inCatalogNotYetInSnapshotForTest;
+
+    /// <summary>Test hook: every segment the manifest currently vouches for.</summary>
+    internal IReadOnlyCollection<ulong> CoveredSegmentIdsForTest =>
+        _manifest.Segments.Keys.Where(_manifest.IsCovered).ToList();
+
+    /// <summary>Test hook: every segment named by SOME open run — coverage's counterpart.</summary>
+    internal IReadOnlyCollection<ulong> IndexRunCoverageForTest =>
+        _manifest.Runs.SelectMany(r => r.CoveredSegments).Distinct().ToList();
+
     /// <summary>Test hook: entries across every run — what a merge drops is only visible here.</summary>
     internal int IndexEntryCountForTest
     {
@@ -1523,12 +1546,26 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                 // a segment the index is trusted for and has no run behind.
                 TraceIndexRun? run = WriteIndexRun(named, segId, traceIndex);
 
+                // OPENED BEFORE IT IS CLAIMED. AddSegment with a run records the coverage claim,
+                // and a claim whose run then fails to open leaves the manifest saying "covered"
+                // and the store holding nothing — a lookup racing that omits the segment's spans,
+                // and it heals only at the next restart. Open first, claim on success, and pass
+                // null otherwise: the segment is then simply uncovered, which is the scan this
+                // engine did before the index existed.
+                if (run is { } r && !_index.Add(r)) run = null;
+
                 _manifest.AddSegment(
                     new TraceSegmentEntry(segId, named.FilePath, named.MinStartNano,
                                           named.MaxStartNano, named.SpanCount),
                     run);
-                if (run is { } r) _index.Add(r);
                 info = named.WithSegmentId(segId);
+
+                // THE WINDOW. The catalog now knows this segment and vouches for it; _coldSegments
+                // does not, and will not until the swap below. Index compaction takes no engine
+                // lock, so it can run right here — and if it judged liveness by the snapshot it
+                // would call this segment dead. The seam exists because that window is otherwise
+                // only reachable by luck.
+                _inCatalogNotYetInSnapshotForTest?.Invoke();
             }
             catch (Exception ex)
             {
@@ -1876,8 +1913,22 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
 
         ct.ThrowIfCancellationRequested();
 
-        var live = new HashSet<ulong>();
-        foreach (var s in _coldSegments) if (s.SegmentId != 0) live.Add(s.SegmentId);
+        // LIVENESS COMES FROM THE CATALOG, NOT FROM THE SNAPSHOT, and the difference is a window
+        // wide enough to lose a segment in permanently.
+        //
+        // A flush publishes into Segments / Runs / Covered and only then swaps _coldSegments, and
+        // this method takes no engine lock — the backfill worker calls it straight through. Judging
+        // liveness by _coldSegments therefore lets a merge run inside that window, decide the
+        // freshly published segment is dead, drop every entry of its run as garbage, exclude it
+        // from the merged run's CoveredSegments, and then ReplaceRuns takes its run away. When the
+        // swap lands, that segment is covered with no run anywhere holding its entries, and
+        // GetTraceAsync's covered/no-hit branch skips it: every trace in it returns empty.
+        //
+        // The other coverage faults in this design heal at startup. That one does not — nothing
+        // re-derives Covered from the runs. Building the set from _manifest.Segments, which is the
+        // same structure the coverage claim lives in, is what makes this method's "coverage is
+        // unchanged by construction" true rather than nearly true.
+        var live = new HashSet<ulong>(_manifest.Segments.Keys);
 
         var merged = new TraceIndexCompactor(_dataDir, _logger).Merge(batch, live);
         if (merged is not { } run)
@@ -1887,13 +1938,25 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             return false;
         }
 
+        // OPEN THE MERGED RUN BEFORE THE MANIFEST HEARS ABOUT IT. ReplaceRuns is what transfers the
+        // coverage claim onto it; if the open then fails, every segment the batch covered is
+        // claimed with nothing serving it — and unlike the other coverage faults here, the sources
+        // are already gone from the manifest, so a restart cannot put it right. Failing before the
+        // manifest is touched leaves the old runs exactly as they were, which is the state the
+        // merge was trying to improve on and is always safe.
+        if (!_index.Add(run))
+        {
+            try { if (File.Exists(run.FilePath)) File.Delete(run.FilePath); }
+            catch (Exception ex) { _logger.LogDebug(ex, "Could not delete the unusable merged run {Path}", run.FilePath); }
+            return false;
+        }
+
         var oldPaths = batch.Select(static r => r.FilePath).ToList();
         _manifest.ReplaceRuns(oldPaths, [run]);
 
-        // Open the new one BEFORE closing the old ones: a lookup racing this must never find the
-        // key in neither. Both are open for an instant, which costs a duplicate hit the read path
-        // already tolerates (a trace legitimately lives in two segments).
-        _index.Add(run);
+        // The old ones close only now: for the instant both are open a lookup can see the key
+        // twice, which the read path already tolerates (a trace legitimately lives in two
+        // segments). Closing them first would let a lookup find it in neither.
         _index.Remove(oldPaths);
         foreach (var p in oldPaths)
         {
@@ -1948,8 +2011,14 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                 return true;
             }
 
+            // Opened before the claim: MarkCovered is what lets this segment be skipped, and a
+            // claim whose run will not open omits the segment's spans until the next restart.
+            if (!_index.Add(r))
+            {
+                lock (_backfillFailed) _backfillFailed.Add(next.SegmentId);
+                return true;
+            }
             _manifest.MarkCovered(next.SegmentId, r);
-            _index.Add(r);
             _logger.LogDebug("Trace index backfilled {File}: {Traces} traces",
                 Path.GetFileName(next.FilePath), map.Count);
             return true;
@@ -1984,7 +2053,9 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             var w = new TraceIndexWriter();
             foreach (var (traceId, offsets) in traceIndex)
                 w.Add(traceId, segmentId, [.. offsets]);
-            return w.Write(IndexPathFor(segment.FilePath), level: 1, coveredSegments: [segmentId]);
+            var written = w.Write(IndexPathFor(segment.FilePath), level: 1, coveredSegments: [segmentId]);
+            _afterIndexRunWrittenForTest?.Invoke(written.FilePath);
+            return written;
         }
         catch (Exception ex)
         {
@@ -2217,17 +2288,21 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                 ulong mergedId = _manifest.AllocateSegmentId();
                 var   run      = WriteIndexRun(merged, mergedId, mergedTraceIndex);
 
+                // Opened before it is claimed — same reason as the flush path. ReplaceSegments with
+                // a run is what makes the coverage claim, and a claim whose run will not open omits
+                // the merged segment's spans until the next restart.
+                if (run is { } fresh && !_index.Add(fresh)) run = null;
+
                 _manifest.ReplaceSegments(
                     processed.Select(static s => s.SegmentId).Where(static id => id != 0).ToList(),
                     new TraceSegmentEntry(mergedId, merged.FilePath,
                                           merged.MinStartNano, merged.MaxStartNano, merged.SpanCount),
                     run);
 
-                // The sources' runs are closed here and their files deleted below with the rest of
-                // the sidecars; the merged run opens in their place. Order matters only in that a
-                // reader must not hold a handle to a file about to be unlinked.
+                // The sources' runs close here and their files are deleted below with the rest of
+                // the sidecars. After the merged run is open, so a reader never finds the key in
+                // neither.
                 _index.Remove(processed.Select(static s => IndexPathFor(s.FilePath)));
-                if (run is { } r) _index.Add(r);
 
                 merged = merged.WithSegmentId(mergedId);
             }

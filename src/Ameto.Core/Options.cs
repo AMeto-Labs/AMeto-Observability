@@ -231,9 +231,6 @@ public sealed class LiveTailOptions
     public int PageSize { get; init; } = 500;
 }
 
-/// <summary>
-/// Top-level server configuration.
-/// </summary>
 /// <summary>Distributed-tracing settings that an operator may want to touch.</summary>
 public sealed class TracesOptions
 {
@@ -248,6 +245,9 @@ public sealed class TracesOptions
     public string IndexBackfill { get; init; } = "Idle";
 }
 
+/// <summary>
+/// Top-level server configuration.
+/// </summary>
 public sealed class ServerOptions
 {
     public NodeId           NodeId           { get; init; } = NodeId.Local;

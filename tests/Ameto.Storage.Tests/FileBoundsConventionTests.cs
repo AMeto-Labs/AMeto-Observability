@@ -122,6 +122,8 @@ public sealed class FileBoundsConventionTests
             "capacity is TargetBlockBytes * 2, a constant, at the one call site",
         ["TraceIndexStore.cs:private Dictionary<string, TraceIndexReader> CopyOpen() => new(_open, StringComparer.Ordinal)"] =
             "copies the open-run map already in memory; not a capacity",
+        ["TraceStorageEngine.cs:var live = new HashSet<ulong>(_manifest.Segments.Keys)"] =
+            "copies the catalog's key set already in memory; not a capacity",
     };
 
     /// <summary>What "a bound is in view" looks like.</summary>

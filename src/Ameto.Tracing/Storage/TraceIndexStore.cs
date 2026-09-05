@@ -91,14 +91,30 @@ internal sealed class TraceIndexStore : IDisposable
         return unusable;
     }
 
-    /// <summary>Registers a run written just now, without re-opening everything else.</summary>
-    public void Add(TraceIndexRun run)
+    /// <summary>
+    /// Registers a run written just now, without re-opening everything else.
+    ///
+    /// <para>RETURNS FALSE WHEN IT WILL NOT OPEN, and every caller has to act on that. Coverage is
+    /// the claim that lets a segment be skipped; making it and then failing to open the run behind
+    /// it leaves the manifest saying "covered" and this store holding nothing, and a lookup racing
+    /// that state finds hits, finds coverage, finds no offsets for the segment, and omits its
+    /// spans. It heals only at the next restart, when <see cref="Sync"/> reports the run unusable —
+    /// so a long-lived process under-reports until somebody bounces it.</para>
+    ///
+    /// <para>The trigger is mundane on Windows: an antivirus or backup agent holding a handle on
+    /// the just-renamed <c>.tix</c> is a sharing violation inside <c>Open</c>, which catches
+    /// everything and answers null. So the callers open FIRST and claim coverage only on success.
+    /// </para>
+    /// </summary>
+    public bool Add(TraceIndexRun run)
     {
         var opened = TraceIndexReader.Open(run.FilePath);
         if (opened is null)
         {
-            _logger.LogWarning("Trace index run {Path} was written but will not open", run.FilePath);
-            return;
+            _logger.LogWarning(
+                "Trace index run {Path} was written but will not open — the segment(s) it would "
+              + "have covered stay on the scanning path", run.FilePath);
+            return false;
         }
         lock (_gate)
         {
@@ -107,6 +123,7 @@ internal sealed class TraceIndexStore : IDisposable
             next[run.FilePath] = opened;
             _open = next;
         }
+        return true;
     }
 
     /// <summary>Closes and forgets runs by path. The files themselves are the caller's business.</summary>
