@@ -1,3 +1,4 @@
+using Ameto.Core;
 using Ameto.Indexing;
 
 namespace Ameto.Indexing.Tests;

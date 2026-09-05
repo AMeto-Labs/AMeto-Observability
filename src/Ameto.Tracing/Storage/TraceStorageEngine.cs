@@ -71,6 +71,86 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     // race it deliberately does NOT record.
     private readonly VanishedRegionLog                         _vanished = new();
 
+    /// <summary>
+    /// Segment identity, and the record of what a trace-id index may answer for. Loaded once in
+    /// the constructor and never replaced; an unreadable or absent manifest loads as an empty
+    /// catalog, which is why nothing below has to handle its failure — see
+    /// <see cref="TraceManifest.Load"/>.
+    /// </summary>
+    private readonly TraceManifest                             _manifest;
+
+    /// <summary>
+    /// The open trace-id index runs. Answers "which segment holds this trace"; whether that answer
+    /// may be believed as a NEGATIVE is decided in <see cref="GetTraceAsync"/>, against the
+    /// manifest's coverage set — see the store's docstring for why the two are kept apart.
+    /// </summary>
+    private readonly TraceIndexStore                            _index;
+
+    /// <summary>Test hook: how many segments the catalog names, and how many the index vouches for.</summary>
+    internal (int Segments, int Covered) CatalogCountsForTest => (_manifest.Segments.Count, _manifest.CoveredCount);
+
+    /// <summary>Test hook: open index runs and the memory they hold.</summary>
+    internal (int Runs, long RetainedBytes) IndexStatsForTest => _index.Stats;
+
+    /// <summary>
+    /// Test seam: called with the path of an index run the instant after it is written and
+    /// renamed, BEFORE anything tries to open it. That instant is the sharing violation an
+    /// antivirus produces on Windows, and it is the only way to reach the failed-open branch
+    /// without waiting for one.
+    /// </summary>
+    internal Action<string>? _afterIndexRunWrittenForTest;
+
+    /// <summary>
+    /// Test seam: called inside <c>CompleteFlush</c> at the instant the catalog knows a segment and
+    /// <c>_coldSegments</c> does not. Index compaction takes no engine lock, so it really can run
+    /// there; reaching that window any other way is a matter of luck.
+    /// </summary>
+    internal Action? _inCatalogNotYetInSnapshotForTest;
+
+    /// <summary>Test hook: every segment the manifest currently vouches for.</summary>
+    internal IReadOnlyCollection<ulong> CoveredSegmentIdsForTest =>
+        _manifest.Segments.Keys.Where(_manifest.IsCovered).ToList();
+
+    /// <summary>Test hook: every segment named by SOME open run — coverage's counterpart.</summary>
+    internal IReadOnlyCollection<ulong> IndexRunCoverageForTest =>
+        _manifest.Runs.SelectMany(r => r.CoveredSegments).Distinct().ToList();
+
+    /// <summary>Test hook: entries across every run — what a merge drops is only visible here.</summary>
+    internal int IndexEntryCountForTest
+    {
+        get { int n = 0; foreach (var r in _manifest.Runs) n += r.EntryCount; return n; }
+    }
+
+    /// <summary>
+    /// The rollback, exercised: withdraw every claim of coverage and close every run. Costs speed
+    /// and nothing else — no span is rewritten, no <c>.trc</c> is opened, and the next lookup is
+    /// the scan this engine did before the index existed.
+    /// </summary>
+    internal void DisableTraceIndexForTest() => DisableTraceIndex();
+
+    /// <summary>
+    /// The rollback, reachable by an operator: <c>Ameto:Traces:IndexEnabled=false</c> and a
+    /// restart. Withdraws every claim of coverage and closes every run, in one generation.
+    ///
+    /// <para>The <c>.tix</c> files stay on disk. They name nothing while the switch is off, and the
+    /// startup sweep leaves the per-segment ones alone because a segment could adopt them again —
+    /// so turning the switch back on costs a re-backfill and no data.</para>
+    /// </summary>
+    private void DisableTraceIndex()
+    {
+        var paths = _manifest.Runs.Select(r => r.FilePath).ToList();
+        _manifest.ClearCoverage();
+        _index.Remove(paths);
+    }
+
+    /// <summary>
+    /// Counts what the last trace lookup actually did, so a test can prove the index SAVED the
+    /// work rather than merely returned the right answer. A correct-but-still-scanning index is
+    /// the failure this whole branch exists to avoid, and it is invisible from the result.
+    /// </summary>
+    internal int SegmentsOpenedByLastTraceLookup;
+    internal int SegmentsSkippedByLastTraceLookup;
+
     /// <summary>Test hook: cold segments currently registered.</summary>
     internal int ColdSegmentCountForTest => _coldSegments.Length;
 
@@ -173,10 +253,67 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     }
     private readonly ILogger<TraceStorageEngine>               _logger;
 
+    /// <summary>The .trc format this engine writes — see the constructor parameter.</summary>
+    private readonly ushort                                    _segmentVersion;
+    private readonly bool                                      _indexEnabled;
+
     private const int HotFlushThreshold    = 50_000;  // spans before flush
-    private const int CompactionThreshold  = 10_000;  // merge cold segments smaller than this
+
+    /// <summary>
+    /// A cold segment smaller than this is a compaction candidate.
+    ///
+    /// <para>IT HAS TO BE ABOVE <see cref="HotFlushThreshold"/>, AND FOR MOST OF THIS ENGINE'S LIFE
+    /// IT WAS BELOW IT. At 10 000 against a flush that writes 50 000, the segment an ordinary flush
+    /// produces was never a candidate: never a seed, never in a batch, never merged with anything
+    /// until retention deleted it. Segment count therefore grew with ingest and never fell, and
+    /// since a trace lookup consults every cold segment, that count is the multiplier on the cost
+    /// of opening any trace. On a quiet install <see cref="MaxHotAge"/> alone put a floor of
+    /// twenty-four new segments a day under it.</para>
+    ///
+    /// <para>PEAK MEMORY DOES NOT MOVE WITH THIS NUMBER — but only because raising it exposed that
+    /// the cap was in the wrong place, and the cap was moved. <see cref="MaxSpansPerPass"/> was
+    /// enforced by the LOADER, which stopped once it had ALREADY read that many spans and so
+    /// overshot by whatever the last segment held: at most 10 000 before, at most 50 000 after.
+    /// <see cref="SelectCompactionBatch"/> now applies it while it plans, so a batch of four
+    /// fifty-thousand-span segments holds exactly the two hundred thousand a batch of twenty
+    /// ten-thousand-span ones did.</para>
+    ///
+    /// <para>That cap is also the real ceiling on how much this buys: four ordinary segments become
+    /// one, and the result — a hundred and fifty to two hundred thousand spans — is above this
+    /// threshold and stops merging. So it is roughly a fourfold cut in segment count, not more.
+    /// Going further means a merge that streams instead of materialising every span, which is a
+    /// change to a crash-safety-critical path and belongs in its own piece of work.</para>
+    /// </summary>
+    private const int CompactionThreshold  = 60_000;
+
     private const int MaxSegmentsPerPass   = 20;       // merge at most N oldest small segments per run
-    private const int MaxSpansPerPass      = 200_000;  // hard cap on spans loaded into memory per run
+
+    /// <summary>
+    /// Hard cap on spans loaded into memory per merge pass — the whole memory story of compaction,
+    /// since <c>CompactOnePass</c> materialises every span it merges.
+    ///
+    /// <para>EXACTLY TWO FULL-SIZE CANDIDATES, and the equality is the point rather than a round
+    /// number. Below it the largest tier cannot merge at all — two 59 999-span segments would not
+    /// fit and would sit there forever — and above it the pass just costs more for no extra
+    /// progress, because a third candidate of that size cannot be admitted either way. So the cap
+    /// is DERIVED from <see cref="CompactionThreshold"/> and moves with it.</para>
+    ///
+    /// <para>LOWERED FROM 200 000, because raising the threshold changed how often this is reached
+    /// even though it did not change the number. <c>SpanSearchBoundTests</c> measures an ordinary
+    /// eight-attribute OTel span at about 1 749 bytes live: 200 000 is roughly 350 MB, and on the
+    /// 512 MB deployment this branch exists to keep alive that is most of the process. It used to
+    /// be unreachable in practice for the worst possible reason — a 50 000-span flush was not a
+    /// candidate, so nothing an install produced at volume ever merged. Fixing that made the peak
+    /// routine. 120 000 is about 210 MB, and the price is that ordinary segments merge two at a
+    /// time instead of four: a twofold cut in segment count per pass instead of fourfold, which is
+    /// a cost the trace-id index has largely stopped charging for.</para>
+    ///
+    /// <para>A SPAN COUNT IS THE WRONG UNIT and this only makes it a smaller wrong unit — the same
+    /// 120 000 is 24 MB of bare spans or 210 MB of attribute-heavy ones. The real fix is a byte
+    /// budget, or a merge that streams instead of materialising, and both are changes to a
+    /// crash-safety-critical path that belong in their own piece of work.</para>
+    /// </summary>
+    private const int MaxSpansPerPass      = 2 * CompactionThreshold;
 
     // ── Flush policy ──────────────────────────────────────────────────────────
     // Durability belongs to the WAL, not to the segment writer, so a timed flush no
@@ -197,11 +334,51 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// </summary>
     private readonly SpanWriteAheadLog _wal;
 
-    public TraceStorageEngine(string dataDir, ILogger<TraceStorageEngine> logger)
+    /// <param name="writeSegmentFormatV4">
+    /// Whether flushes and merges write the v4 segment format, which omits the per-segment trace
+    /// index and is ~40% smaller. Reading v4 is unconditional; WRITING it is a one-way door,
+    /// because a binary older than this one deletes segments whose version it does not know.
+    /// See <c>SpanWriter.DefaultVersion</c>.
+    /// </param>
+    /// <param name="indexEnabled">
+    /// Whether the trace-id index may answer at all. False withdraws every coverage claim at
+    /// startup and stops new ones being made — the operator-reachable rollback. See
+    /// <c>TracesOptions.IndexEnabled</c>.
+    /// </param>
+    public TraceStorageEngine(string dataDir, ILogger<TraceStorageEngine> logger,
+                              bool writeSegmentFormatV4 = false, bool indexEnabled = true)
     {
+        _segmentVersion = writeSegmentFormatV4 ? SpanWriter.NewestVersion : SpanWriter.DefaultVersion;
+        _indexEnabled   = indexEnabled;
         _dataDir = dataDir;
         _logger  = logger;
         Directory.CreateDirectory(dataDir);
+
+        // Before anything else touches the directory: the catalog is what names the segments the
+        // sweep and the WAL replay are about to work over. It cannot fail — every damaged form
+        // loads as an empty catalog, and an empty catalog is exactly how this engine behaved
+        // before there was one.
+        _manifest = TraceManifest.Load(dataDir, logger);
+        _index    = new TraceIndexStore(logger);
+
+        // Open whatever runs the catalog names. A run that will not open is withdrawn from the
+        // coverage set right here rather than left standing: the claim "the index answers for this
+        // segment" must not outlive the discovery that it cannot.
+        if (_indexEnabled)
+        {
+            _manifest.DropRuns(_index.Sync(_manifest));
+        }
+        else
+        {
+            // The operator's rollback. Nothing is opened, every claim goes, and the engine reads
+            // exactly the way it did before the index existed — which is the property the whole
+            // coverage rule exists to keep true.
+            DisableTraceIndex();
+            _logger.LogWarning(
+                "The trace-id index is DISABLED by configuration: every coverage claim has been "
+              + "withdrawn and trace lookups scan the cold segments. Set Ameto:Traces:IndexEnabled "
+              + "to true and restart to bring it back");
+        }
 
         // Residue of flushes that died mid-write, plus segments whose RENAME did not
         // survive a power loss. Handled in the constructor for the same reason the metric
@@ -282,6 +459,28 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         // recoverable segment, and .trc temps the loop above could not rename.
         foreach (var tmp in Directory.EnumerateFiles(dataDir, "spans-*.tmp"))
             try { File.Delete(tmp); } catch { /* retried next start */ }
+
+        // MERGED INDEX RUNS ARE NOT NAMED "spans-…", so the sweep above never saw them. A
+        // per-segment run is spans-….tix and its temp spans-….tix.tmp, both caught by the pattern;
+        // index compaction writes tix-L{level}-{guid}.tix, which is not. A crash between that
+        // rename and the manifest write leaves a file nothing names and nothing deletes — harmless
+        // to correctness, because TraceIndexStore only ever opens runs the manifest names, and a
+        // slow disk leak all the same.
+        //
+        // Deleted against the manifest rather than by age: the catalog is loaded by now, so "is
+        // this run named?" is a question with an answer, and the alternative — a heuristic on
+        // write time — would eventually delete a live run on a machine whose clock moved.
+        var namedRuns = new HashSet<string>(
+            _manifest.Runs.Select(static r => Path.GetFullPath(r.FilePath)), StringComparer.OrdinalIgnoreCase);
+        int orphans = 0;
+        foreach (var run in Directory.EnumerateFiles(dataDir, "tix-L*.tix")
+                                     .Concat(Directory.EnumerateFiles(dataDir, "tix-L*.tix.tmp")))
+        {
+            if (namedRuns.Contains(Path.GetFullPath(run))) continue;
+            try { File.Delete(run); orphans++; } catch { /* retried next start */ }
+        }
+        if (orphans > 0)
+            _logger.LogInformation("Swept {Count} orphaned trace-index run(s) no manifest names", orphans);
     }
 
     /// <summary>
@@ -432,6 +631,32 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         var segs = _coldSegments;
         List<SpanRecord>? cold = null;
 
+        // ── THE INDEX, AND THE ONE RULE FOR BELIEVING IT ──────────────────────────
+        //
+        // A segment is skipped only when BOTH hold: the catalog says the index covers it, and no
+        // open run named this trace in it. Either half alone is not enough, and the reason is the
+        // whole design. A run that names nothing proves nothing about a segment nobody indexed —
+        // that is the silent under-report this engine has spent every review round closing — while
+        // coverage without a lookup is just a flag.
+        //
+        // Everything else is a hint. A hit hands over the span offsets, which lets the walk skip
+        // ReadTraceOffsets — the read-and-inflate of the segment's whole trace index, 38% of the
+        // file, and the entire reason this branch exists. The hint is still verified: the walk
+        // checks each span's FULL trace id, so a hit on the truncated key that turns out to be a
+        // collision yields nothing rather than another trace's spans.
+        // COVERAGE IS SAMPLED BEFORE THE LOOKUP, AND THAT ORDER IS LOAD-BEARING. Every writer
+        // publishes the other way round — the run is opened first, the coverage claim second — so a
+        // segment covered at THIS instant is guaranteed to have had an open run when the lookup ran
+        // a moment later. Asking IsCovered per segment inside the loop instead sampled it later
+        // than the lookup, which admits exactly the state the write order rules out: the backfill's
+        // MarkCovered flips a segment false→true after the lookup snapshot was taken, and its
+        // spans are then skipped on the strength of a run the lookup never saw. Coverage shrinking
+        // between the two is harmless — a segment is merely read.
+        bool useIndex = _index.HasRuns;
+        var  coveredAtLookup = useIndex ? _manifest.CoverageSnapshot() : null;
+        var  answer = useIndex ? _index.Lookup(traceId) : default;
+        int  opened = 0, skipped = 0;
+
         if (segs.Length > 0)
         {
             using var gate = new SemaphoreSlim(Math.Clamp(Environment.ProcessorCount / 2, 2, 8));
@@ -439,13 +664,36 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             for (int i = 0; i < segs.Length; i++)
             {
                 var seg = segs[i];
+
+                List<uint>? known = null;
+                if (useIndex && seg.SegmentId != 0
+                    && coveredAtLookup!.Contains(seg.SegmentId)
+                    // A run that could not be read has proved nothing about the segments it covers,
+                    // so for this request they are not covered at all.
+                    && answer.Unanswerable?.Contains(seg.SegmentId) != true)
+                {
+                    foreach (var h in answer.Hits)
+                        if (h.SegmentId == seg.SegmentId) (known ??= new List<uint>()).AddRange(h.Offsets);
+
+                    if (known is null)
+                    {
+                        skipped++;
+                        tasks[i] = Task.FromResult<List<SpanRecord>?>(null);
+                        continue;
+                    }
+                }
+                opened++;
+
                 tasks[i] = Task.Run(async () =>
                 {
                     await gate.WaitAsync(ct).ConfigureAwait(false);
                     try
                     {
                         List<SpanRecord>? found = null;
-                        await foreach (var r in SpanReader.ReadTraceAsync(seg.FilePath, traceId, ct).ConfigureAwait(false))
+                        var walk = known is null
+                            ? SpanReader.ReadTraceAsync(seg.FilePath, traceId, ct)
+                            : SpanReader.ReadTraceAtAsync(seg.FilePath, traceId, known, ct);
+                        await foreach (var r in walk.ConfigureAwait(false))
                             (found ??= new List<SpanRecord>()).Add(r);
                         return found;
                     }
@@ -480,6 +728,9 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                 if (await t.ConfigureAwait(false) is { } part)
                     cold.AddRange(part);
         }
+
+        SegmentsOpenedByLastTraceLookup  = opened;
+        SegmentsSkippedByLastTraceLookup = skipped;
 
         // ── ONE ORDERED SEQUENCE, ACROSS BOTH TIERS ───────────────────────────────
         //
@@ -1321,6 +1572,13 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     {
         SpanSegmentInfo? info    = null;
         Exception?       failure = null;
+
+        // The writer hands over the trace-to-offsets map it built anyway. Taken from there rather
+        // than read back out of the finished file, because an index derived from a second,
+        // independent pass is an index that can disagree with the segment it describes.
+        Dictionary<TraceId, List<uint>>? traceIndex = null;
+        bool registered = false;
+
         try
         {
             _beforeSegmentWrite?.Invoke();   // test seam: parks a flush mid-build
@@ -1331,11 +1589,76 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             // the cold tiers without de-duplicating. Narrow (microseconds, once per process) and
             // free to close.
             info = SpanWriter.Write(_dataDir, snapshot,
-                                    onNamed: path => _publishingSegmentPath = path);
+                                    onNamed:      path => _publishingSegmentPath = path,
+                                    onTraceIndex: map  => traceIndex = map,
+                                    version:      _segmentVersion);
         }
         catch (Exception ex) { failure = ex; }
 
         _publishingSegmentPath = info?.FilePath ?? _publishingSegmentPath;
+
+        // NAMED AFTER THE RENAME, BEFORE THE SNAPSHOT SWAP. The file is durable by this point, so
+        // an id recorded here always describes something that exists; and it is recorded before
+        // any reader can see the segment, so no reader ever meets a segment the catalog has not
+        // heard of. A crash between the two leaves a file the catalog does not name, which is the
+        // ordinary adopt-on-load case that LoadColdSegments already has to handle for any segment
+        // written before this catalog existed.
+        //
+        // Nothing here can fail the flush: the catalog is a convenience over the directory, and a
+        // segment without an id is a segment read exactly as it was read before ids existed.
+        if (info is { } named)
+        {
+            try
+            {
+                ulong segId = _manifest.AllocateSegmentId();
+
+                // The run goes to disk BEFORE the coverage claim, and the claim is what AddSegment
+                // makes when it is handed one. A crash between them leaves an orphan .tix and an
+                // uncovered segment — a wasted file and today's speed. The other order would leave
+                // a segment the index is trusted for and has no run behind.
+                TraceIndexRun? run = WriteIndexRun(named, segId, traceIndex);
+
+                // OPENED BEFORE IT IS CLAIMED. AddSegment with a run records the coverage claim,
+                // and a claim whose run then fails to open leaves the manifest saying "covered"
+                // and the store holding nothing — a lookup racing that omits the segment's spans,
+                // and it heals only at the next restart. Open first, claim on success, and pass
+                // null otherwise: the segment is then simply uncovered, which is the scan this
+                // engine did before the index existed.
+                if (run is { } r && !_index.Add(r)) run = null;
+
+                _manifest.AddSegment(
+                    new TraceSegmentEntry(segId, named.FilePath, named.MinStartNano,
+                                          named.MaxStartNano, named.SpanCount),
+                    run);
+                info = named.WithSegmentId(segId);
+                registered = true;
+
+                // THE WINDOW. The catalog now knows this segment and vouches for it; _coldSegments
+                // does not, and will not until the swap below. Index compaction takes no engine
+                // lock, so it can run right here — and if it judged liveness by the snapshot it
+                // would call this segment dead. The seam exists because that window is otherwise
+                // only reachable by luck.
+                _inCatalogNotYetInSnapshotForTest?.Invoke();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "Could not record {File} in the trace catalog — the segment is published and "
+                  + "queryable, and will be adopted on the next start", named.FilePath);
+            }
+
+            // RETRIED BY THE BACKFILL, NOT ONLY BY THE NEXT START. Any throw above — and both
+            // manifest calls end in a File.Move over the live file, which is where an antivirus
+            // gives a sharing violation on Windows — left the segment with SegmentId 0 for the
+            // life of the process: the backfill skips id 0, and nothing else re-adopts a segment
+            // already in the snapshot. The log line said "adopted on the next start" and meant it
+            // literally. Queued here instead, so the background worker picks it up in seconds.
+            if (!registered && info is { } unnamed)
+            {
+                lock (_unnamedSegments) _unnamedSegments.Add(unnamed.FilePath);
+            }
+        }
+
         try
         {
             // ── Publish (short lock hold). _flushInProgress deliberately STAYS set: it is
@@ -1546,7 +1869,27 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                 // engine has written and is readable even when the rest of the file is not — see
                 // SpanReader.TryReadHeaderRange. Recorded BEFORE the delete, because after it there
                 // is nothing left to ask.
-                if (SpanReader.TryReadHeaderRange(file, out long minNano, out long maxNano))
+                // A VERSION THIS BUILD DOES NOT KNOW IS NOT DAMAGE — IT IS THE FUTURE, AND DELETING
+                // IT IS HOW A ROLLBACK DESTROYS DATA. `Unsupported .trc version N` is an
+                // InvalidDataException like any other, so it classified as Corrupt and landed here,
+                // where TryReadHeaderRange checks only the magic and therefore SUCCEEDS on a
+                // perfectly good newer segment — and the file went, with its three sidecars, logged
+                // as "likely format v1". Roll a binary back after a day of writing a newer format
+                // and that day is gone, unrecoverably, on first start.
+                //
+                // A newer file is left alone and the cold tier says it is short: loud, reversible
+                // by rolling forward again, and true. Deletion stays for files whose header cannot
+                // be read at all, which is where the v1 migration path actually lives.
+                if (SpanReader.LooksLikeNewerFormat(file))
+                {
+                    _coldTierIncomplete = true;
+                    _logger.LogError(ex,
+                        "Segment {File} was written by a NEWER format than this build understands. "
+                      + "It is left untouched — this build cannot read it, and deleting it would "
+                      + "destroy data a newer build can. Every trace query reports an unreadable "
+                      + "region until this node runs a build that knows the format", file);
+                }
+                else if (SpanReader.TryReadHeaderRange(file, out long minNano, out long maxNano))
                 {
                     _vanished.Record(minNano, maxNano);
                     _vanished.RecordPath(file);
@@ -1574,6 +1917,8 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             }
         }
 
+        loaded = ReconcileCatalog(loaded);
+
         _lock.EnterWriteLock();
         try
         {
@@ -1589,6 +1934,435 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
 
         _logger.LogInformation("Loaded {Count} cold span segments in {Ms} ms",
             _coldSegments.Length, sw.ElapsedMilliseconds);
+    }
+
+    /// <summary>The <c>.tix</c> that sits beside a segment: same base name, different extension.</summary>
+    private static string IndexPathFor(string trcPath) => Path.ChangeExtension(trcPath, ".tix");
+
+    /// <summary>
+    /// Closes and deletes runs the catalog has just stopped naming.
+    ///
+    /// <para>A merged run outlives all of its segments eventually, and until this existed the only
+    /// thing that noticed was the startup sweep — so between two restarts an install accumulated
+    /// open readers holding a bloom in native memory and handles on files no lookup would ever
+    /// consult. Per-segment runs were always cleaned up by name because their path is derivable
+    /// from the segment's; <c>tix-L*.tix</c> has no segment to derive it from, which is exactly why
+    /// the catalog now hands the paths back.</para>
+    /// </summary>
+    private void RetireDroppedRuns(IReadOnlyList<string> paths)
+    {
+        if (paths.Count == 0) return;
+        _index.Remove(paths);
+        foreach (var p in paths)
+        {
+            try { if (File.Exists(p)) File.Delete(p); }
+            catch (Exception ex) { _logger.LogDebug(ex, "Could not delete unnamed index run {Path}", p); }
+        }
+    }
+
+    /// <summary>
+    /// Segments the backfill has tried and failed on. Without it a segment whose index cannot be
+    /// read is picked again on every pass, for ever, at whatever rate the worker runs.
+    /// </summary>
+    private readonly HashSet<ulong> _backfillFailed = new();
+
+    /// <summary>
+    /// Segments that are published and queryable but never made it into the catalog, because a
+    /// manifest write threw during their flush. Retried by the backfill rather than left until the
+    /// next restart: an unnamed segment is invisible to the index for as long as the process
+    /// lives, and being v4 it has no per-segment trace index either, so every lookup that reaches
+    /// it pays a full span scan.
+    /// </summary>
+    private readonly HashSet<string> _unnamedSegments = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// What the trace-id index is currently worth, in the numbers an operator needs to answer two
+    /// questions: is the migration finished, and what is it costing.
+    ///
+    /// <para>These were the numbers nobody had. The whole reason the fan-out went unnoticed is
+    /// that the segment count and the size of their indexes were invisible from outside — so the
+    /// first thing this feature owes anyone is a way to see them, before and after.</para>
+    /// </summary>
+    public TraceIndexReport DescribeIndex()
+    {
+        var segs = _coldSegments;
+        int covered = 0;
+        long spans = 0;
+        foreach (var s in segs)
+        {
+            spans += s.SpanCount;
+            if (s.SegmentId != 0 && _manifest.IsCovered(s.SegmentId)) covered++;
+        }
+
+        long runBytes = 0;
+        foreach (var run in _manifest.Runs)
+        {
+            try { runBytes += new FileInfo(run.FilePath).Length; }
+            catch { /* a run being replaced right now; the total is a report, not an invariant */ }
+        }
+
+        var (runs, retained) = _index.Stats;
+        return new TraceIndexReport
+        {
+            ColdSegments      = segs.Length,
+            CoveredSegments   = covered,
+            ColdSpans         = spans,
+            OpenRuns          = runs,
+            IndexBytesOnDisk  = runBytes,
+            IndexBytesInMemory= retained,
+            CatalogGeneration = _manifest.Generation,
+        };
+    }
+
+    /// <summary>How much of the cold tier the trace-id index answers for.</summary>
+    internal (int Covered, int Total) IndexCoverage
+    {
+        get
+        {
+            var segs = _coldSegments;
+            int covered = 0;
+            foreach (var s in segs)
+                if (s.SegmentId != 0 && _manifest.IsCovered(s.SegmentId)) covered++;
+            return (covered, segs.Length);
+        }
+    }
+
+    /// <summary>
+    /// Gives a catalog id to any segment whose flush-time registration threw, and puts it back in
+    /// the snapshot carrying it. Cheap and usually a no-op: the set is empty on a healthy engine.
+    /// </summary>
+    private void AdoptUnnamedSegments(SpanSegmentInfo[] segs)
+    {
+        string[] pending;
+        lock (_unnamedSegments)
+        {
+            if (_unnamedSegments.Count == 0) return;
+            pending = [.. _unnamedSegments];
+        }
+
+        foreach (string path in pending)
+        {
+            var seg = Array.Find(segs, s => string.Equals(s.FilePath, path, StringComparison.Ordinal));
+            if (seg is null || seg.SegmentId != 0 || !File.Exists(path))
+            {
+                lock (_unnamedSegments) _unnamedSegments.Remove(path);
+                continue;
+            }
+            try
+            {
+                ulong id = _manifest.AllocateSegmentId();
+                _manifest.AddSegment(new TraceSegmentEntry(
+                    id, seg.FilePath, seg.MinStartNano, seg.MaxStartNano, seg.SpanCount));
+                RenameSegmentInSnapshot(seg, seg.WithSegmentId(id));
+                lock (_unnamedSegments) _unnamedSegments.Remove(path);
+                _logger.LogInformation(
+                    "Trace catalog adopted {File}, whose flush-time registration had failed", path);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Retrying catalog registration of {File} later", path);
+            }
+        }
+    }
+
+    /// <summary>Swaps one entry of the cold snapshot for an updated copy, under the write lock.</summary>
+    private void RenameSegmentInSnapshot(SpanSegmentInfo oldSeg, SpanSegmentInfo newSeg)
+    {
+        _lock.EnterWriteLock();
+        try
+        {
+            var next = new List<SpanSegmentInfo>(_coldSegments.Length);
+            foreach (var s in _coldSegments) next.Add(ReferenceEquals(s, oldSeg) ? newSeg : s);
+            _coldSegments = SortedByMaxStartDesc(next);
+        }
+        finally { _lock.ExitWriteLock(); }
+    }
+
+    /// <summary>
+    /// Merges index runs into fewer, bigger ones when a level has accumulated enough. Returns
+    /// whether it did any work.
+    ///
+    /// <para>ONE MERGE PER CALL, like the backfill, and for the same reason: the caller owns the
+    /// pace. Unlike the backfill this can be skipped forever with no consequence but memory —
+    /// which is exactly the trade it manages, so it only runs when a level is genuinely full.</para>
+    ///
+    /// <para>THE MANIFEST IS TOUCHED ONCE, AFTER THE RENAME. Coverage is unchanged by construction
+    /// (the merged run carries the union of its inputs'), so there is no instant at which a segment
+    /// is vouched for by a file that does not exist, and a crash anywhere before the manifest write
+    /// leaves a temp file nobody names.</para>
+    /// </summary>
+    internal bool CompactIndexOnce(CancellationToken ct = default)
+    {
+        if (!_indexEnabled) return false;
+        var batch = TraceIndexCompactor.SelectMergeBatch(_manifest.Runs);
+        if (batch.Count == 0) return false;
+
+        ct.ThrowIfCancellationRequested();
+
+        // LIVENESS COMES FROM THE CATALOG, NOT FROM THE SNAPSHOT, and the difference is a window
+        // wide enough to lose a segment in permanently.
+        //
+        // A flush publishes into Segments / Runs / Covered and only then swaps _coldSegments, and
+        // this method takes no engine lock — the backfill worker calls it straight through. Judging
+        // liveness by _coldSegments therefore lets a merge run inside that window, decide the
+        // freshly published segment is dead, drop every entry of its run as garbage, exclude it
+        // from the merged run's CoveredSegments, and then ReplaceRuns takes its run away. When the
+        // swap lands, that segment is covered with no run anywhere holding its entries, and
+        // GetTraceAsync's covered/no-hit branch skips it: every trace in it returns empty.
+        //
+        // The other coverage faults in this design heal at startup. That one does not — nothing
+        // re-derives Covered from the runs. Building the set from _manifest.Segments, which is the
+        // same structure the coverage claim lives in, is what makes this method's "coverage is
+        // unchanged by construction" true rather than nearly true.
+        var live = new HashSet<ulong>(_manifest.Segments.Keys);
+
+        var merged = new TraceIndexCompactor(_dataDir, _logger).Merge(batch, live);
+        if (merged is not { } run)
+        {
+            // Nothing usable came out. Leaving the manifest alone leaves coverage exactly as it
+            // was, which is the whole safety story of this operation.
+            return false;
+        }
+
+        // OPEN THE MERGED RUN BEFORE THE MANIFEST HEARS ABOUT IT. ReplaceRuns is what transfers the
+        // coverage claim onto it; if the open then fails, every segment the batch covered is
+        // claimed with nothing serving it — and unlike the other coverage faults here, the sources
+        // are already gone from the manifest, so a restart cannot put it right. Failing before the
+        // manifest is touched leaves the old runs exactly as they were, which is the state the
+        // merge was trying to improve on and is always safe.
+        if (!_index.Add(run))
+        {
+            try { if (File.Exists(run.FilePath)) File.Delete(run.FilePath); }
+            catch (Exception ex) { _logger.LogDebug(ex, "Could not delete the unusable merged run {Path}", run.FilePath); }
+            return false;
+        }
+
+        var oldPaths = batch.Select(static r => r.FilePath).ToList();
+        try
+        {
+            _manifest.ReplaceRuns(oldPaths, [run]);
+        }
+        catch (Exception ex)
+        {
+            // THE ONE STEP THAT CAN FAIL AFTER THE READER IS OPEN. Commit saves before it
+            // publishes, so a throw here leaves memory and disk both still naming the OLD runs —
+            // correct, and complete. What is left over is this process's reader and the merged
+            // file, which no manifest names: the startup sweep would eventually take the file, but
+            // the reader would hold its bloom and its handle until the process ended, and every
+            // later merge would add another. Undoing it here costs one deleted file.
+            _logger.LogWarning(ex,
+                "Could not record the merged trace-index run — the existing runs are untouched "
+              + "and the merge will be retried");
+            _index.Remove([run.FilePath]);
+            try { if (File.Exists(run.FilePath)) File.Delete(run.FilePath); }
+            catch (Exception del) { _logger.LogDebug(del, "Could not delete the unrecorded merged run {Path}", run.FilePath); }
+            return false;
+        }
+
+        // The old ones close only now: for the instant both are open a lookup can see the key
+        // twice, which the read path already tolerates (a trace legitimately lives in two
+        // segments). Closing them first would let a lookup find it in neither.
+        _index.Remove(oldPaths);
+        foreach (var p in oldPaths)
+        {
+            try { if (File.Exists(p)) File.Delete(p); }
+            catch (Exception ex) { _logger.LogDebug(ex, "Could not delete merged-away index run {Path}", p); }
+        }
+        return true;
+    }
+
+    /// <summary>
+    /// Indexes ONE segment that has no run yet, and returns whether it did any work.
+    ///
+    /// <para>ONE AT A TIME, ON PURPOSE. Building a run means reading a segment's whole trace index
+    /// — the expensive read this feature exists to abolish — so the backfill is the one place that
+    /// still pays it. Paid once per segment in the background it buys every later lookup; paid for
+    /// forty segments in a row on a 512 MB box it competes with ingest. The caller decides the
+    /// pace; this method decides nothing but which segment is next.</para>
+    ///
+    /// <para>The order is: build the run, fsync it, rename it, and only THEN claim coverage. A
+    /// crash anywhere before the last step costs a rebuilt run. The other order would leave a
+    /// segment the index is trusted for with nothing behind the trust.</para>
+    /// </summary>
+    internal bool BackfillNextSegment(CancellationToken ct = default)
+    {
+        if (!_indexEnabled) return false;
+        var segs = _coldSegments;
+
+        // A SEGMENT WHOSE REGISTRATION FAILED IS ADOPTED HERE FIRST. Without this it keeps id 0
+        // until a restart, and id 0 is skipped by the loop below.
+        AdoptUnnamedSegments(segs);
+
+        SpanSegmentInfo? next = null;
+        foreach (var s in segs)
+        {
+            if (s.SegmentId == 0 || _manifest.IsCovered(s.SegmentId)) continue;
+            lock (_backfillFailed) { if (_backfillFailed.Contains(s.SegmentId)) continue; }
+            next = s;
+            break;
+        }
+        if (next is null) return false;
+
+        ct.ThrowIfCancellationRequested();
+        try
+        {
+            var map = SpanReader.ReadTraceIndex(next.FilePath);
+            if (map is null)
+            {
+                // THE READ COULD NOT ACCOUNT FOR EVERY SPAN. A footer whose traceIdxOffset was
+                // torn short still decodes and still ends the walk inside the file, so the map
+                // that came back is well-formed and INCOMPLETE. Indexing it would claim coverage
+                // — permission to skip the segment — over spans the scan never reached, and the
+                // failure mode of that is a trace that quietly returns fewer spans than it has.
+                // Uncovered is the safe state: the segment stays on the scanning path, whole.
+                lock (_backfillFailed) _backfillFailed.Add(next.SegmentId);
+                _logger.LogWarning(
+                    "Trace index backfill refused {File}: its span count does not match its header, "
+                  + "so an index built from it would vouch for spans that were never read. The "
+                  + "segment stays uncovered and fully queryable by scanning",
+                    Path.GetFileName(next.FilePath));
+                return true;
+            }
+            if (map.Count == 0)
+            {
+                // A v2 segment, or one with no traces. Nothing to index and nothing to retry —
+                // compaction migrates v2 to v3 in the background and it becomes eligible then.
+                lock (_backfillFailed) _backfillFailed.Add(next.SegmentId);
+                return true;
+            }
+
+            var run = WriteIndexRun(next, next.SegmentId, map);
+            if (run is not { } r)
+            {
+                lock (_backfillFailed) _backfillFailed.Add(next.SegmentId);
+                return true;
+            }
+
+            // Opened before the claim: MarkCovered is what lets this segment be skipped, and a
+            // claim whose run will not open omits the segment's spans until the next restart.
+            if (!_index.Add(r))
+            {
+                lock (_backfillFailed) _backfillFailed.Add(next.SegmentId);
+                return true;
+            }
+            _manifest.MarkCovered(next.SegmentId, r);
+            _logger.LogDebug("Trace index backfilled {File}: {Traces} traces",
+                Path.GetFileName(next.FilePath), map.Count);
+            return true;
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            // Nothing here may cost the engine anything. The segment stays readable and uncovered,
+            // and is not tried again — a file whose index will not parse will not parse next time.
+            lock (_backfillFailed) _backfillFailed.Add(next.SegmentId);
+            _logger.LogWarning(ex,
+                "Trace index backfill skipped {File} — it stays queryable by scanning", next.FilePath);
+            return true;
+        }
+    }
+
+    /// <summary>
+    /// Writes the per-segment index run, or returns null when it cannot be written.
+    ///
+    /// <para>NULL IS A COMPLETE ANSWER, and the caller must pass it on: a segment recorded without
+    /// a run is a segment outside the coverage set, which is a segment read exactly as it was read
+    /// before the index existed. Nothing here is allowed to fail a flush — the spans are already
+    /// durable by this point, and an index is an optimisation over data that is safe either
+    /// way.</para>
+    /// </summary>
+    private TraceIndexRun? WriteIndexRun(
+        SpanSegmentInfo segment, ulong segmentId, Dictionary<TraceId, List<uint>>? traceIndex)
+    {
+        if (traceIndex is null || !_indexEnabled) return null;
+        try
+        {
+            var w = new TraceIndexWriter();
+            foreach (var (traceId, offsets) in traceIndex)
+                w.Add(traceId, segmentId, [.. offsets]);
+            var written = w.Write(IndexPathFor(segment.FilePath), level: 1, coveredSegments: [segmentId]);
+            _afterIndexRunWrittenForTest?.Invoke(written.FilePath);
+            return written;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex,
+                "Could not write the trace-id index for {File} — the segment stays outside the "
+              + "index's coverage and is read by scanning, as before", segment.FilePath);
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Reconciles the catalog against what is actually on disk, and hands back the discovered
+    /// segments carrying their ids.
+    ///
+    /// <para>THE DIRECTORY WINS, ALWAYS. That is the whole shape of this method and the reason the
+    /// catalog can never become the single point of truth the scan is today. A file with no entry
+    /// is ADOPTED — it gets an id, which is how every segment written before this catalog existed
+    /// enters it, and how a segment survives a crash between its rename and its manifest write. An
+    /// entry with no file is DROPPED, and with it any claim that the index covers it, because an
+    /// index vouching for a file that is not there is the silent under-report this engine keeps
+    /// closing.</para>
+    ///
+    /// <para>"No file" means <c>File.Exists</c> said so, not merely "absent from this scan". The
+    /// scan deliberately skips the segment a flush is publishing, and a flush that lands while the
+    /// scan runs is already in the snapshot — neither is gone, and dropping either would retire an
+    /// id that something may already have recorded against.</para>
+    /// </summary>
+    private List<SpanSegmentInfo> ReconcileCatalog(List<SpanSegmentInfo> loaded)
+    {
+        try
+        {
+            var byPath = new Dictionary<string, ulong>(StringComparer.Ordinal);
+            foreach (var (id, entry) in _manifest.Segments) byPath[entry.FilePath] = id;
+
+            // ONE GENERATION FOR THE WHOLE ADOPTION. Every commit rewrites and fsyncs the entire
+            // manifest, and adopting per segment was two of them each — O(N²) bytes and 2N flushes
+            // on exactly the start that has the most to adopt, the first one after the upgrade.
+            var named    = new List<SpanSegmentInfo>(loaded.Count);
+            var unknown  = new List<SpanSegmentInfo>();
+            var drafts   = new List<TraceSegmentEntry>();
+            foreach (var seg in loaded)
+            {
+                if (byPath.TryGetValue(seg.FilePath, out ulong known))
+                {
+                    named.Add(seg.WithSegmentId(known));
+                    continue;
+                }
+                unknown.Add(seg);
+                drafts.Add(new TraceSegmentEntry(
+                    0, seg.FilePath, seg.MinStartNano, seg.MaxStartNano, seg.SpanCount));
+            }
+
+            var fresh = _manifest.AdoptSegments(drafts);
+            for (int i = 0; i < unknown.Count; i++) named.Add(unknown[i].WithSegmentId(fresh[i]));
+            int adopted = unknown.Count;
+
+            var vanished = _manifest.Segments
+                .Where(kv => !File.Exists(kv.Value.FilePath))
+                .Select(kv => kv.Key)
+                .ToList();
+            if (vanished.Count > 0) RetireDroppedRuns(_manifest.RemoveSegments(vanished));
+
+            if (adopted > 0 || vanished.Count > 0)
+                _logger.LogInformation(
+                    "Trace catalog reconciled: {Adopted} segment(s) adopted, {Dropped} entry(ies) "
+                  + "dropped for files that are gone; {Total} named, {Covered} covered by the index",
+                    adopted, vanished.Count, _manifest.Segments.Count, _manifest.CoveredCount);
+
+            return named;
+        }
+        catch (Exception ex)
+        {
+            // The catalog is a convenience. Failing to keep it is worth a log line and nothing
+            // more — every segment below simply carries id 0, which every read path already reads
+            // as "not covered", which is the scan this engine did before ids existed.
+            _logger.LogWarning(ex,
+                "Trace catalog could not be reconciled — segments are queryable and unnamed for "
+              + "this run, and the trace-id index will not be consulted");
+            return loaded;
+        }
     }
 
     /// <summary>
@@ -1645,6 +2419,14 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             long windowStart = seed.MinStartNano;
 
             var batch = new List<SpanSegmentInfo>(MaxSegmentsPerPass) { seed };
+
+            // THE PLAN CARRIES THE MEMORY BOUND, not the loader. CompactOnePass stopped adding
+            // once it had ALREADY read MaxSpansPerPass, which overshoots by whatever the last
+            // segment held — invisible while candidates were capped at 10 000 spans, and a quarter
+            // of the budget once they can be 50 000. A batch that describes more than a pass may
+            // hold is not a plan; it is a number the loader has to argue with.
+            long batchSpans = seed.SpanCount;
+
             for (int j = i + 1; j < candidates.Count && batch.Count < MaxSegmentsPerPass; j++)
             {
                 var s = candidates[j];
@@ -1660,7 +2442,9 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                 // selecting nothing at all.
                 if (s.MaxStartNano - windowStart > MaxSpanNanos) continue;
                 if (TierOf(s.SpanCount) != tier) continue;                // wrong magnitude
+                if (batchSpans + s.SpanCount > MaxSpansPerPass) break;    // past what a pass may hold
                 batch.Add(s);
+                batchSpans += s.SpanCount;
             }
 
             if (batch.Count >= 2) return batch;
@@ -1718,13 +2502,53 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             // recoverable:false — the sources are still on disk until the swap below, so a
             // merge temp resurrected after a crash would publish a SECOND copy of every
             // span it merged. Only a hot-tier flush's temp is worth recovering.
-            var merged = SpanWriter.Write(_dataDir, allSpans, recoverable: false);
+            Dictionary<TraceId, List<uint>>? mergedTraceIndex = null;
+            var merged = SpanWriter.Write(_dataDir, allSpans, recoverable: false,
+                                          onTraceIndex: map => mergedTraceIndex = map,
+                                          version: _segmentVersion);
             _logger.LogInformation("Compacted {Count} small segments → {File} ({Spans} spans)",
                 processed.Count, Path.GetFileName(merged.FilePath), allSpans.Count);
 
             // Swap the snapshot first (readers stop picking the old files up),
             // delete the merged-away files after. An in-flight reader that still
             // holds the old snapshot skips the deleted file gracefully.
+            // The catalog moves in ONE generation: the sources leave, the merged file arrives.
+            // Done before the snapshot swap for the same reason the flush does it — a reader must
+            // never see a segment the catalog has not heard of — and it takes the sources' coverage
+            // with them, because an index vouching for a file that is about to be unlinked is the
+            // silent-loss shape this whole design exists to prevent.
+            try
+            {
+                ulong mergedId = _manifest.AllocateSegmentId();
+                var   run      = WriteIndexRun(merged, mergedId, mergedTraceIndex);
+
+                // Opened before it is claimed — same reason as the flush path. ReplaceSegments with
+                // a run is what makes the coverage claim, and a claim whose run will not open omits
+                // the merged segment's spans until the next restart.
+                if (run is { } fresh && !_index.Add(fresh)) run = null;
+
+                var orphaned = _manifest.ReplaceSegments(
+                    processed.Select(static s => s.SegmentId).Where(static id => id != 0).ToList(),
+                    new TraceSegmentEntry(mergedId, merged.FilePath,
+                                          merged.MinStartNano, merged.MaxStartNano, merged.SpanCount),
+                    run);
+
+                // The sources' runs close here and their files are deleted below with the rest of
+                // the sidecars. After the merged run is open, so a reader never finds the key in
+                // neither. Any MERGED run whose last segment left with this batch goes too — it has
+                // no segment to derive its path from, so the catalog is the only thing that knows.
+                _index.Remove(processed.Select(static s => IndexPathFor(s.FilePath)));
+                RetireDroppedRuns(orphaned);
+
+                merged = merged.WithSegmentId(mergedId);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex,
+                    "Could not record the merged segment {File} in the trace catalog — it is "
+                  + "published and queryable, and will be adopted on the next start", merged.FilePath);
+            }
+
             _lock.EnterWriteLock();
             try
             {
@@ -2456,6 +3280,10 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         // on the lock — a retention pass, a compaction or a straggling query can — and that
         // throw used to take the WAL's close with it. The lock's own resources are trivial;
         // the log's durability is not.
+        // The index holds native memory (the bloom bits) behind every open run, so it is released
+        // whatever else fails below.
+        try { _index.Dispose(); } catch (Exception ex) { _logger.LogWarning(ex, "Trace index store failed to close"); }
+
         try { _lock.Dispose(); }
         catch (SynchronizationLockException ex) { _logger.LogWarning(ex, "Trace engine lock still in use at shutdown — left to the finalizer"); }
         finally { _wal.Dispose(); }
@@ -2478,6 +3306,26 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                 _coldSegments = _coldSegments.Where(s => s.MaxStartNano >= cutoffNano).ToArray();
         }
         finally { _lock.ExitWriteLock(); }
+
+        // The catalog first, then the files. A catalog entry outliving its file would have the
+        // index vouching for data that is gone; a file outliving its entry is only a file nobody
+        // has a name for yet, which the next load adopts.
+        IReadOnlyList<string> orphanedRuns = [];
+        try
+        {
+            orphanedRuns = _manifest.RemoveSegments(
+                toDelete.Select(static s => s.SegmentId).Where(static id => id != 0).ToList());
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Could not update the trace catalog while pruning — "
+                                 + "the stale entries are dropped on the next start");
+        }
+
+        // Close the runs before their files go: a reader holding an open handle to a deleted .tix
+        // is a handle to nothing, and on Windows it is a delete that fails.
+        _index.Remove(toDelete.Select(static s => IndexPathFor(s.FilePath)));
+        RetireDroppedRuns(orphanedRuns);
 
         foreach (var s in toDelete)
             DeleteSegmentFiles(s.FilePath);
@@ -2507,6 +3355,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         TryDelete(Path.ChangeExtension(trcPath, ".stats"));
         TryDelete(Path.ChangeExtension(trcPath, ".svcgraph"));
         TryDelete(Path.ChangeExtension(trcPath, ".tracesum"));
+        TryDelete(Path.ChangeExtension(trcPath, ".tix"));
 
         static void TryDelete(string path)
         {
@@ -2557,4 +3406,34 @@ public sealed class SpanSegmentInfo
     /// no longer be read. The ceiling for the range handed to <c>VanishedRegionLog</c>.
     /// </summary>
     public long     LastWriteNano { get; init; }
+
+    /// <summary>
+    /// The catalog's name for this segment, or 0 when it has none.
+    ///
+    /// <para>A FILE PATH IS NOT AN IDENTITY. Compaction writes a merged file and unlinks its
+    /// sources, so a path names something that stops existing; anything wanting to record "trace X
+    /// is in segment Y" needs a Y that survives that. Allocated once by
+    /// <see cref="TraceManifest"/> and carried here so the read paths can ask whether the trace-id
+    /// index vouches for this segment.</para>
+    ///
+    /// <para>0 IS A FIRST-CLASS ANSWER, not a missing value: it means this segment is outside the
+    /// catalog — no manifest, a manifest that would not parse, or a file adopted since the last
+    /// reconcile. Every read path treats 0 as "not covered", which is the full scan it does today.
+    /// The catalog is a convenience over the directory, never a replacement for it.</para>
+    /// </summary>
+    public ulong    SegmentId { get; init; }
+
+    /// <summary>The same segment, named. Used where the id is learned after the file was read.</summary>
+    public SpanSegmentInfo WithSegmentId(ulong id) => new()
+    {
+        FilePath           = FilePath,
+        MinStartNano       = MinStartNano,
+        MaxStartNano       = MaxStartNano,
+        SpanCount          = SpanCount,
+        Services           = Services,
+        FormatVersion      = FormatVersion,
+        HeaderRangeSuspect = HeaderRangeSuspect,
+        LastWriteNano      = LastWriteNano,
+        SegmentId          = id,
+    };
 }
