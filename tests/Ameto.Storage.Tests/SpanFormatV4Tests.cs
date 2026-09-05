@@ -85,7 +85,7 @@ public sealed class SpanFormatV4Tests : IDisposable
         string dir = Dir("size");
         var corpus = Corpus(traces: 2_000, spansPer: 3);
 
-        var v4 = SpanWriter.Write(dir, corpus);
+        var v4 = SpanWriter.Write(dir, corpus, version: SpanWriter.NewestVersion);
         Assert.Equal(4, v4.FormatVersion);
 
         string v3Path = Path.Combine(dir, "legacy-v3.trc");
@@ -110,7 +110,7 @@ public sealed class SpanFormatV4Tests : IDisposable
         // format change would silently lose every trace in every segment whose run went missing.
         string dir = Dir("noindex");
         var corpus = Corpus(traces: 300, spansPer: 3);
-        var info   = SpanWriter.Write(dir, corpus);
+        var info   = SpanWriter.Write(dir, corpus, version: SpanWriter.NewestVersion);
 
         // Written straight through SpanWriter, so no .tix exists at all — the state a crash between
         // the segment rename and the run write leaves behind.
@@ -136,7 +136,8 @@ public sealed class SpanFormatV4Tests : IDisposable
         string dir = Dir("heal");
         TraceId planted = Id(42);
 
-        using var e = new TraceStorageEngine(dir, NullLogger<TraceStorageEngine>.Instance);
+        using var e = new TraceStorageEngine(dir, NullLogger<TraceStorageEngine>.Instance,
+                                            writeSegmentFormatV4: true);
         for (int t = 0; t < 200; t++)
             for (int k = 0; k < 3; k++)
                 e.WriteSpan(new SpanIngestItem
@@ -206,7 +207,7 @@ public sealed class SpanFormatV4Tests : IDisposable
         string dir = Dir("wholeindex");
         var corpus = Corpus(traces: 500, spansPer: 3);
 
-        var v4 = SpanWriter.Write(dir, corpus);
+        var v4 = SpanWriter.Write(dir, corpus, version: SpanWriter.NewestVersion);
         string v3Path = Path.Combine(dir, "legacy-v3.trc");
         OddGeometryV3Writer.Write(v3Path, corpus, blockSpans: 4096);
 

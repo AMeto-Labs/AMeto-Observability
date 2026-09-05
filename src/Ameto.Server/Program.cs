@@ -168,17 +168,33 @@ if (enableAlerts)
     builder.Services.AddAmetoAlerts(serverOptions.DataDirectory);
 }
 
+// Set when Ameto:Traces:IndexBackfill is not one of the three names; reported once the logger
+// exists, because a setting that quietly did the opposite of what was typed is worth saying aloud.
+string? unknownBackfillValue = null;
+
 // Distributed tracing
 if (enableTracing)
 {
-    // An unparseable value falls back to the default rather than failing the start: this is a
+    // An unrecognised value falls back to the default rather than failing the start: this is a
     // performance switch, and no setting of it can make an answer wrong — an unindexed segment is
     // read the way every segment was read before the index existed.
-    if (!Enum.TryParse<TraceIndexBackfillMode>(serverOptions.Traces.IndexBackfill, ignoreCase: true,
-                                               out var backfillMode))
-        backfillMode = TraceIndexBackfillMode.Idle;
+    // MATCHED BY NAME RATHER THAN Enum.TryParse, which accepts more than the three documented
+    // values: any integer string becomes that numeric value whether or not it is defined, and a
+    // comma-separated list parses as flags even though this enum has none. And a real typo —
+    // "Offf" — silently became Idle, the mode that does the MOST work, with nothing said about it.
+    string configured = serverOptions.Traces.IndexBackfill?.Trim() ?? "";
+    var backfillMode = configured.ToLowerInvariant() switch
+    {
+        "off"   => TraceIndexBackfillMode.Off,
+        "idle"  => TraceIndexBackfillMode.Idle,
+        "eager" => TraceIndexBackfillMode.Eager,
+        _       => TraceIndexBackfillMode.Idle,
+    };
+    if (!string.Equals(configured, backfillMode.ToString(), StringComparison.OrdinalIgnoreCase))
+        unknownBackfillValue = configured;
 
-    builder.Services.AddAmetoTracing(serverOptions.DataDirectory, backfillMode);
+    builder.Services.AddAmetoTracing(serverOptions.DataDirectory, backfillMode,
+                                     serverOptions.Traces.SegmentFormatV4);
 }
 
 // Metrics
@@ -359,6 +375,10 @@ app.Lifetime.ApplicationStarted.Register(() =>
                        ?.Addresses;
     logger.LogInformation("Ameto version: {Version}", UpdateChecker.CurrentVersion);
     logger.LogInformation("Content root: {ContentRoot}", app.Environment.ContentRootPath);
+    if (unknownBackfillValue is not null)
+        logger.LogWarning(
+            "Ameto:Traces:IndexBackfill is {Value}, which is not Off, Idle or Eager — using Idle. "
+          + "Idle does MORE work than Off, so a typo here does not mean less", unknownBackfillValue);
     if (!basePath.IsRoot)
         logger.LogInformation(
             "Base path: {BasePath} — the UI and every endpoint also answer under this prefix. " +

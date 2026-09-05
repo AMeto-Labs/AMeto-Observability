@@ -100,7 +100,9 @@ public sealed class SpanFormatV3Tests : IDisposable
     {
         var corpus = Corpus(50, 8); // 400 spans
         var info   = SpanWriter.Write(_dir, corpus);
-        Assert.Equal(4, info.FormatVersion);
+        // v3 is what a flush writes by default — v4 is a one-way door behind
+        // Ameto:Traces:SegmentFormatV4. See SpanWriter.DefaultVersion.
+        Assert.Equal(3, info.FormatVersion);
         Assert.Equal(corpus.Count, info.SpanCount);
 
         var readBack = SpanReader.ReadAll(info.FilePath);

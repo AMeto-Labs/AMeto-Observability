@@ -5,8 +5,6 @@ using System.Runtime.InteropServices;
 using System.Text;
 using Ameto.Core;
 
-using Ameto.Core;
-
 namespace Ameto.Storage;
 
 /// <summary>

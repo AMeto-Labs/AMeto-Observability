@@ -142,7 +142,8 @@ public sealed class CompactionThresholdTests : IDisposable
                      + $"catalog {e.CatalogCountsForTest}");
         Assert.Equal(1, e.ColdSegmentCountForTest);
 
-        // And the merged file is v4, so the rewrite also reclaims the trace index block.
-        Assert.Equal(4, e.ColdSegmentsForTest.Single().FormatVersion);
+        // The merged file is v3 by default; with Ameto:Traces:SegmentFormatV4 on, this same
+        // rewrite is also what reclaims the trace index block from existing data.
+        Assert.Equal(3, e.ColdSegmentsForTest.Single().FormatVersion);
     }
 }

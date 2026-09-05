@@ -243,6 +243,9 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     }
     private readonly ILogger<TraceStorageEngine>               _logger;
 
+    /// <summary>The .trc format this engine writes — see the constructor parameter.</summary>
+    private readonly ushort                                    _segmentVersion;
+
     private const int HotFlushThreshold    = 50_000;  // spans before flush
 
     /// <summary>
@@ -305,8 +308,16 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// </summary>
     private readonly SpanWriteAheadLog _wal;
 
-    public TraceStorageEngine(string dataDir, ILogger<TraceStorageEngine> logger)
+    /// <param name="writeSegmentFormatV4">
+    /// Whether flushes and merges write the v4 segment format, which omits the per-segment trace
+    /// index and is ~40% smaller. Reading v4 is unconditional; WRITING it is a one-way door,
+    /// because a binary older than this one deletes segments whose version it does not know.
+    /// See <c>SpanWriter.DefaultVersion</c>.
+    /// </param>
+    public TraceStorageEngine(string dataDir, ILogger<TraceStorageEngine> logger,
+                              bool writeSegmentFormatV4 = false)
     {
+        _segmentVersion = writeSegmentFormatV4 ? SpanWriter.NewestVersion : SpanWriter.DefaultVersion;
         _dataDir = dataDir;
         _logger  = logger;
         Directory.CreateDirectory(dataDir);
@@ -588,8 +599,18 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         // file, and the entire reason this branch exists. The hint is still verified: the walk
         // checks each span's FULL trace id, so a hit on the truncated key that turns out to be a
         // collision yields nothing rather than another trace's spans.
-        var hits = _index.HasRuns ? _index.Lookup(traceId) : null;
-        int opened = 0, skipped = 0;
+        // COVERAGE IS SAMPLED BEFORE THE LOOKUP, AND THAT ORDER IS LOAD-BEARING. Every writer
+        // publishes the other way round — the run is opened first, the coverage claim second — so a
+        // segment covered at THIS instant is guaranteed to have had an open run when the lookup ran
+        // a moment later. Asking IsCovered per segment inside the loop instead sampled it later
+        // than the lookup, which admits exactly the state the write order rules out: the backfill's
+        // MarkCovered flips a segment false→true after the lookup snapshot was taken, and its
+        // spans are then skipped on the strength of a run the lookup never saw. Coverage shrinking
+        // between the two is harmless — a segment is merely read.
+        bool useIndex = _index.HasRuns;
+        var  coveredAtLookup = useIndex ? _manifest.CoverageSnapshot() : null;
+        var  answer = useIndex ? _index.Lookup(traceId) : default;
+        int  opened = 0, skipped = 0;
 
         if (segs.Length > 0)
         {
@@ -600,9 +621,13 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                 var seg = segs[i];
 
                 List<uint>? known = null;
-                if (hits is not null && seg.SegmentId != 0 && _manifest.IsCovered(seg.SegmentId))
+                if (useIndex && seg.SegmentId != 0
+                    && coveredAtLookup!.Contains(seg.SegmentId)
+                    // A run that could not be read has proved nothing about the segments it covers,
+                    // so for this request they are not covered at all.
+                    && answer.Unanswerable?.Contains(seg.SegmentId) != true)
                 {
-                    foreach (var h in hits)
+                    foreach (var h in answer.Hits)
                         if (h.SegmentId == seg.SegmentId) (known ??= new List<uint>()).AddRange(h.Offsets);
 
                     if (known is null)
@@ -1507,6 +1532,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         // than read back out of the finished file, because an index derived from a second,
         // independent pass is an index that can disagree with the segment it describes.
         Dictionary<TraceId, List<uint>>? traceIndex = null;
+        bool registered = false;
 
         try
         {
@@ -1519,7 +1545,8 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             // free to close.
             info = SpanWriter.Write(_dataDir, snapshot,
                                     onNamed:      path => _publishingSegmentPath = path,
-                                    onTraceIndex: map  => traceIndex = map);
+                                    onTraceIndex: map  => traceIndex = map,
+                                    version:      _segmentVersion);
         }
         catch (Exception ex) { failure = ex; }
 
@@ -1559,6 +1586,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                                           named.MaxStartNano, named.SpanCount),
                     run);
                 info = named.WithSegmentId(segId);
+                registered = true;
 
                 // THE WINDOW. The catalog now knows this segment and vouches for it; _coldSegments
                 // does not, and will not until the swap below. Index compaction takes no engine
@@ -1572,6 +1600,17 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                 _logger.LogWarning(ex,
                     "Could not record {File} in the trace catalog — the segment is published and "
                   + "queryable, and will be adopted on the next start", named.FilePath);
+            }
+
+            // RETRIED BY THE BACKFILL, NOT ONLY BY THE NEXT START. Any throw above — and both
+            // manifest calls end in a File.Move over the live file, which is where an antivirus
+            // gives a sharing violation on Windows — left the segment with SegmentId 0 for the
+            // life of the process: the backfill skips id 0, and nothing else re-adopts a segment
+            // already in the snapshot. The log line said "adopted on the next start" and meant it
+            // literally. Queued here instead, so the background worker picks it up in seconds.
+            if (!registered && info is { } unnamed)
+            {
+                lock (_unnamedSegments) _unnamedSegments.Add(unnamed.FilePath);
             }
         }
 
@@ -1785,7 +1824,27 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                 // engine has written and is readable even when the rest of the file is not — see
                 // SpanReader.TryReadHeaderRange. Recorded BEFORE the delete, because after it there
                 // is nothing left to ask.
-                if (SpanReader.TryReadHeaderRange(file, out long minNano, out long maxNano))
+                // A VERSION THIS BUILD DOES NOT KNOW IS NOT DAMAGE — IT IS THE FUTURE, AND DELETING
+                // IT IS HOW A ROLLBACK DESTROYS DATA. `Unsupported .trc version N` is an
+                // InvalidDataException like any other, so it classified as Corrupt and landed here,
+                // where TryReadHeaderRange checks only the magic and therefore SUCCEEDS on a
+                // perfectly good newer segment — and the file went, with its three sidecars, logged
+                // as "likely format v1". Roll a binary back after a day of writing a newer format
+                // and that day is gone, unrecoverably, on first start.
+                //
+                // A newer file is left alone and the cold tier says it is short: loud, reversible
+                // by rolling forward again, and true. Deletion stays for files whose header cannot
+                // be read at all, which is where the v1 migration path actually lives.
+                if (SpanReader.LooksLikeNewerFormat(file))
+                {
+                    _coldTierIncomplete = true;
+                    _logger.LogError(ex,
+                        "Segment {File} was written by a NEWER format than this build understands. "
+                      + "It is left untouched — this build cannot read it, and deleting it would "
+                      + "destroy data a newer build can. Every trace query reports an unreadable "
+                      + "region until this node runs a build that knows the format", file);
+                }
+                else if (SpanReader.TryReadHeaderRange(file, out long minNano, out long maxNano))
                 {
                     _vanished.Record(minNano, maxNano);
                     _vanished.RecordPath(file);
@@ -1842,6 +1901,15 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     private readonly HashSet<ulong> _backfillFailed = new();
 
     /// <summary>
+    /// Segments that are published and queryable but never made it into the catalog, because a
+    /// manifest write threw during their flush. Retried by the backfill rather than left until the
+    /// next restart: an unnamed segment is invisible to the index for as long as the process
+    /// lives, and being v4 it has no per-segment trace index either, so every lookup that reaches
+    /// it pays a full span scan.
+    /// </summary>
+    private readonly HashSet<string> _unnamedSegments = new(StringComparer.Ordinal);
+
+    /// <summary>
     /// What the trace-id index is currently worth, in the numbers an operator needs to answer two
     /// questions: is the migration finished, and what is it costing.
     ///
@@ -1891,6 +1959,57 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                 if (s.SegmentId != 0 && _manifest.IsCovered(s.SegmentId)) covered++;
             return (covered, segs.Length);
         }
+    }
+
+    /// <summary>
+    /// Gives a catalog id to any segment whose flush-time registration threw, and puts it back in
+    /// the snapshot carrying it. Cheap and usually a no-op: the set is empty on a healthy engine.
+    /// </summary>
+    private void AdoptUnnamedSegments(SpanSegmentInfo[] segs)
+    {
+        string[] pending;
+        lock (_unnamedSegments)
+        {
+            if (_unnamedSegments.Count == 0) return;
+            pending = [.. _unnamedSegments];
+        }
+
+        foreach (string path in pending)
+        {
+            var seg = Array.Find(segs, s => string.Equals(s.FilePath, path, StringComparison.Ordinal));
+            if (seg is null || seg.SegmentId != 0 || !File.Exists(path))
+            {
+                lock (_unnamedSegments) _unnamedSegments.Remove(path);
+                continue;
+            }
+            try
+            {
+                ulong id = _manifest.AllocateSegmentId();
+                _manifest.AddSegment(new TraceSegmentEntry(
+                    id, seg.FilePath, seg.MinStartNano, seg.MaxStartNano, seg.SpanCount));
+                RenameSegmentInSnapshot(seg, seg.WithSegmentId(id));
+                lock (_unnamedSegments) _unnamedSegments.Remove(path);
+                _logger.LogInformation(
+                    "Trace catalog adopted {File}, whose flush-time registration had failed", path);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Retrying catalog registration of {File} later", path);
+            }
+        }
+    }
+
+    /// <summary>Swaps one entry of the cold snapshot for an updated copy, under the write lock.</summary>
+    private void RenameSegmentInSnapshot(SpanSegmentInfo oldSeg, SpanSegmentInfo newSeg)
+    {
+        _lock.EnterWriteLock();
+        try
+        {
+            var next = new List<SpanSegmentInfo>(_coldSegments.Length);
+            foreach (var s in _coldSegments) next.Add(ReferenceEquals(s, oldSeg) ? newSeg : s);
+            _coldSegments = SortedByMaxStartDesc(next);
+        }
+        finally { _lock.ExitWriteLock(); }
     }
 
     /// <summary>
@@ -1982,6 +2101,11 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     internal bool BackfillNextSegment(CancellationToken ct = default)
     {
         var segs = _coldSegments;
+
+        // A SEGMENT WHOSE REGISTRATION FAILED IS ADOPTED HERE FIRST. Without this it keeps id 0
+        // until a restart, and id 0 is skipped by the loop below.
+        AdoptUnnamedSegments(segs);
+
         SpanSegmentInfo? next = null;
         foreach (var s in segs)
         {
@@ -2271,7 +2395,8 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             // span it merged. Only a hot-tier flush's temp is worth recovering.
             Dictionary<TraceId, List<uint>>? mergedTraceIndex = null;
             var merged = SpanWriter.Write(_dataDir, allSpans, recoverable: false,
-                                          onTraceIndex: map => mergedTraceIndex = map);
+                                          onTraceIndex: map => mergedTraceIndex = map,
+                                          version: _segmentVersion);
             _logger.LogInformation("Compacted {Count} small segments → {File} ({Spans} spans)",
                 processed.Count, Path.GetFileName(merged.FilePath), allSpans.Count);
 

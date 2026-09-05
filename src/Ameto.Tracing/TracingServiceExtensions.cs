@@ -53,13 +53,15 @@ public static class TracingServiceExtensions
     public static IServiceCollection AddAmetoTracing(
         this IServiceCollection services,
         string dataDirectory,
-        TraceIndexBackfillMode backfill = TraceIndexBackfillMode.Idle)
+        TraceIndexBackfillMode backfill = TraceIndexBackfillMode.Idle,
+        bool writeSegmentFormatV4 = false)
     {
         services.AddSingleton(new TraceIndexOptions(backfill));
         services.AddSingleton(sp =>
             new TraceStorageEngine(
                 Path.Combine(dataDirectory, "traces"),
-                sp.GetRequiredService<ILogger<TraceStorageEngine>>()));
+                sp.GetRequiredService<ILogger<TraceStorageEngine>>(),
+                writeSegmentFormatV4));
 
         services.AddSingleton<SpanRingBuffer>();
         services.AddSingleton<SpanIngestionEndpoint>();
@@ -109,13 +111,17 @@ internal sealed class TraceIndexBackfillWorker(
 
     protected override async Task ExecuteAsync(CancellationToken ct)
     {
+        // OFF STOPS THE BACKFILL, NOT THE MERGING, and returning here stopped both. Every flush
+        // opens a per-segment run whatever the mode — the engine has never heard of this setting —
+        // so with the worker gone nothing ever consolidated them and the run count grew until
+        // retention, holding a bloom and a sparse map each. That is exactly the memory the
+        // compactor exists to bound, left unbounded by a setting whose documentation says it only
+        // affects existing segments.
         if (mode == TraceIndexBackfillMode.Off)
-        {
             logger.LogInformation(
                 "Trace-id index backfill is off — segments written before the index stay on the "
-              + "scanning path. New segments are indexed as they are flushed either way");
-            return;
-        }
+              + "scanning path. New segments are still indexed as they are flushed, and their runs "
+              + "are still merged");
 
         var pause = mode == TraceIndexBackfillMode.Eager ? EagerPause : IdlePause;
         try { await Task.Delay(StartDelay, ct).ConfigureAwait(false); }
@@ -130,8 +136,18 @@ internal sealed class TraceIndexBackfillWorker(
                 // Backfill first, merging second. Backfill is what makes lookups fast and merging
                 // only makes them cheap to keep fast — so an install still migrating spends its
                 // pauses on coverage, and starts consolidating once there is nothing left to cover.
-                worked = await Task.Run(() => engine.BackfillNextSegment(ct) || engine.CompactIndexOnce(ct), ct)
-                                   .ConfigureAwait(false);
+                // BOTH, NOT EITHER. The `||` short-circuited, so while a single uncovered segment
+                // remained — and BackfillNextSegment returns true even for a segment it FAILED
+                // on — the merge never ran at all. On an install with two thousand segments to
+                // migrate that is hours with every per-segment run open and none consolidated,
+                // which is the 10x memory the compactor is there to prevent, at its worst exactly
+                // when the backfill is adding to it.
+                worked = await Task.Run(() =>
+                {
+                    bool backfilled = mode != TraceIndexBackfillMode.Off && engine.BackfillNextSegment(ct);
+                    bool merged     = engine.CompactIndexOnce(ct);
+                    return backfilled || merged;
+                }, ct).ConfigureAwait(false);
             }
             catch (OperationCanceledException) { return; }
             catch (Exception ex)

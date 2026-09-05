@@ -73,7 +73,27 @@ internal static class SpanWriter
 {
     private const uint   Magic       = 0x52_44_54_43; // "RDTC"
     private const uint   FooterMagic = 0x52_44_54_46; // "RDTF"
-    private const ushort Version     = 4;
+    /// <summary>
+    /// The format a flush writes. THREE, NOT FOUR, AND THAT IS A ROLLOUT DECISION RATHER THAN A
+    /// TECHNICAL ONE.
+    ///
+    /// <para>v4 is finished and read everywhere in this build. What is not finished is the fleet: a
+    /// binary that predates it answers an unknown version with a content-shaped exception, its
+    /// startup classifies that as corruption, and it DELETES the segment together with its three
+    /// sidecars. So the day after an upgrade, rolling the binary back — one container command on
+    /// this deployment — costs every trace written since, unrecoverably, and the log calls it
+    /// "likely format v1". This build no longer does that (see
+    /// <c>SpanReader.LooksLikeNewerFormat</c>), but the builds already out there do, and a format
+    /// bump is only safe once every binary that might read the files tolerates it.</para>
+    ///
+    /// <para>Hence two phases. This release READS v4 and refuses to destroy it; a later one, once
+    /// this build is everywhere, flips the default. An operator who knows their fleet can flip it
+    /// today with <c>Ameto:Traces:SegmentFormatV4</c> — a one-way door, and labelled as one.</para>
+    /// </summary>
+    internal const ushort DefaultVersion = 3;
+
+    /// <summary>The newest format this writer can produce — see <see cref="DefaultVersion"/>.</summary>
+    internal const ushort NewestVersion  = 4;
     private const int    BlockSize   = 4096;
 
     /// <param name="recoverable">
@@ -99,7 +119,8 @@ internal static class SpanWriter
     /// </param>
     public static SpanSegmentInfo Write(string dataDir, IList<SpanRecord> spans, bool recoverable = true,
                                         Action<string>? onNamed = null,
-                                        Action<Dictionary<TraceId, List<uint>>>? onTraceIndex = null)
+                                        Action<Dictionary<TraceId, List<uint>>>? onTraceIndex = null,
+                                        ushort version = DefaultVersion)
     {
         if (spans.Count == 0) throw new InvalidOperationException("Cannot write empty span batch.");
 
@@ -154,7 +175,7 @@ internal static class SpanWriter
             {
                 // ── Header ─────────────────────────────────────────────────────
                 bw.Write(Magic);
-                bw.Write(Version);
+                bw.Write(version);
                 bw.Write((uint)spans.Count);
                 bw.Write(minNano);
                 bw.Write(maxNano);
@@ -200,10 +221,10 @@ internal static class SpanWriter
                 // SpanReader.ReadTraceOffsets.
                 long traceIdxOffset = fs.Position;
                 {
-                    var idxBuf = new MemoryStream(Version >= 4 ? 8 : traceIndex.Count * 32);
+                    var idxBuf = new MemoryStream(version >= 4 ? 8 : traceIndex.Count * 32);
                     var idxBw  = new BinaryWriter(idxBuf);
                     Span<byte> traceIdBuf = stackalloc byte[16];
-                    if (Version >= 4)
+                    if (version >= 4)
                     {
                         idxBw.Write(0u);                       // zero traces: the block is a stub
                     }
@@ -300,7 +321,7 @@ internal static class SpanWriter
             MaxStartNano  = maxNano,
             SpanCount     = spans.Count,
             Services      = services,
-            FormatVersion = Version,
+            FormatVersion = version,
             // The file was published a moment ago, so its write time is now — and it has to be
             // carried like the reader carries it, or a segment that is flushed and then lost in
             // the same process has no ceiling for the region it hands to VanishedRegionLog and

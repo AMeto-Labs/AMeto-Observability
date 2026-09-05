@@ -10,8 +10,15 @@ namespace Ameto.Tracing.Storage;
 /// filter and sparse block map in memory: about 12 KB per ten thousand traces. One run per segment
 /// is free at a hundred segments (a megabyte or two) and is not free at ten thousand — that is over
 /// a hundred megabytes on a box with five hundred, held permanently, to answer a question the disk
-/// could answer. Merging ten runs into one replaces ten blooms with one sized for the union, which
-/// is roughly a tenth of the memory and one bloom check instead of ten.</para>
+/// could answer.</para>
+///
+/// <para>WHAT MERGING ACTUALLY BUYS, corrected. It is NOT a tenth of the memory: a bloom is sized
+/// by entry count, so one bloom over ten runs of N entries holds about the same bit capacity as
+/// ten blooms over N, and the sparse map keeps one entry per 4 KB block either way. Only the
+/// fixed per-run overhead goes — which is why the 960 → 352 B measured on a tiny fixture does not
+/// generalise, and the honest gain is FEWER BLOOM PROBES AND FEWER OPEN FILES per lookup, plus a
+/// run count that stops tracking the segment count. Real memory relief needs a higher
+/// false-positive rate on merged levels, which is a separate decision.</para>
 ///
 /// <para>IT NEVER CHANGES WHAT IS COVERED, and that single property is what makes it safe to
 /// interrupt. The merged run carries the union of its inputs' covered segments, so exactly the same
@@ -35,11 +42,20 @@ internal sealed class TraceIndexCompactor
     internal const int RunsPerLevel = 10;
 
     /// <summary>
-    /// The most runs one merge will take at once. A merge reads one block per input run at a time,
-    /// so the memory is bounded by this times the block size — not by the size of the runs. Kept
-    /// modest anyway: a merge holds the disk for its duration and this is a background chore.
+    /// The most runs one merge will take at once. NOT a memory bound on its own — the merge holds
+    /// every surviving entry until it writes, so <see cref="MaxEntriesPerMerge"/> is what bounds
+    /// the memory and this only bounds the fan-in.
     /// </summary>
     internal const int MaxRunsPerMerge = 32;
+
+    /// <summary>
+    /// Entries one merge may take, because the merge holds all of them at once. At roughly 60-88
+    /// bytes apiece — the writer's tuple in a doubling backing array plus the per-entry offset
+    /// array — two million is about 150 MB, which is as much as a background chore may ask for on
+    /// the 512 MB deployment this branch exists to keep alive. Two runs are always taken even if
+    /// they exceed it: a merge of one is not a merge, and refusing outright would wedge the level.
+    /// </summary>
+    internal const int MaxEntriesPerMerge = 2_000_000;
 
     private readonly string  _dir;
     private readonly ILogger _logger;
@@ -74,7 +90,23 @@ internal sealed class TraceIndexCompactor
             // Smallest first: merging the small ones costs least and reduces the count most per
             // byte rewritten, which is the same reason the segment compactor works in size tiers.
             list.Sort(static (a, b) => a.EntryCount.CompareTo(b.EntryCount));
-            return list.Take(MaxRunsPerMerge).ToList();
+
+            // CAPPED BY ENTRIES, NOT ONLY BY RUN COUNT. Merge holds every surviving entry in one
+            // TraceIndexWriter until it sorts and writes, so peak memory is the SIZE of the batch,
+            // not one block per input as the docstrings above once claimed. Levels grow tenfold, so
+            // ten L3 runs on a thousand-segment install is ten million entries — roughly 240 MB of
+            // backing array plus 400 MB of per-entry offset arrays, in a background chore sharing a
+            // 512 MB box with ingest. The count was already in hand and unused.
+            var batch = new List<TraceIndexRun>(Math.Min(list.Count, MaxRunsPerMerge));
+            long entries = 0;
+            foreach (var r in list)
+            {
+                if (batch.Count == MaxRunsPerMerge) break;
+                if (batch.Count >= 2 && entries + r.EntryCount > MaxEntriesPerMerge) break;
+                batch.Add(r);
+                entries += r.EntryCount;
+            }
+            return batch.Count >= 2 ? batch : [];
         }
         return [];
     }

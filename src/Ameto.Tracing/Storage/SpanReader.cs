@@ -16,6 +16,9 @@ namespace Ameto.Tracing.Storage;
 internal static class SpanReader
 {
     private const uint Magic       = 0x52_44_54_43; // "RDTC"
+
+    /// <summary>Highest .trc format this build can read. Anything above it is the future, not damage.</summary>
+    internal const ushort MaxKnownVersion = 4;
     private const uint FooterMagic = 0x52_44_54_46; // "RDTF"
 
     /// <summary>
@@ -98,7 +101,7 @@ internal static class SpanReader
         if (magic != Magic) throw new InvalidDataException($"Invalid .trc magic in {filePath}");
 
         ushort version = br.ReadUInt16();
-        if (version is not (2 or 3 or 4)) throw new InvalidDataException($"Unsupported .trc version {version} in {filePath}");
+        if (version is < 2 or > MaxKnownVersion) throw new InvalidDataException($"Unsupported .trc version {version} in {filePath}");
         uint spanCount = br.ReadUInt32();
         long minNano   = br.ReadInt64();
         long maxNano   = br.ReadInt64();
@@ -206,6 +209,28 @@ internal static class SpanReader
     }
 
     /// <summary>
+    /// Whether the file is a well-formed <c>.trc</c> whose VERSION this build does not know.
+    ///
+    /// <para>The distinction the startup path needs and did not have. An unsupported version
+    /// raises the same InvalidDataException as real damage, so it classified as corruption and
+    /// the segment was deleted — which turns rolling a binary back after a format bump into
+    /// unrecoverable data loss, since a newer file is perfectly good and only this build cannot
+    /// read it. Damage is a reason to delete; the future is not.</para>
+    /// </summary>
+    public static bool LooksLikeNewerFormat(string filePath)
+    {
+        try
+        {
+            using var fs = OpenRead(filePath);
+            Span<byte> head = stackalloc byte[6];
+            fs.ReadExactly(head);
+            if (BinaryPrimitives.ReadUInt32LittleEndian(head) != Magic) return false;
+            return BinaryPrimitives.ReadUInt16LittleEndian(head[4..]) > MaxKnownVersion;
+        }
+        catch { return false; }
+    }
+
+    /// <summary>
     /// How far past a file's own write time a header may claim before it is called suspect. A day
     /// absorbs an exporter clocked ahead and a host that drifted; it is nowhere near the 86 054
     /// days a torn field produces.
@@ -302,6 +327,22 @@ internal static class SpanReader
         // span. Sorted anyway — the walk consumes them in one pass and an index written in any
         // other order would silently lose spans rather than merely cost a seek.
         offsets.Sort();
+
+        // DEDUPLICATED, AND NOT ONLY OUT OF TIDINESS. The walk below advances its cursor only on
+        // an exact match against a position it has not passed, so a repeated offset freezes it:
+        // the duplicate never matches again, every later offset is behind the cursor, and the
+        // walk returns a PREFIX of the trace as though it were the whole thing. The geometry pass
+        // then fails its own completeness check, falls back to the exact walk, and reproduces the
+        // same short answer — decoding the segment twice to get it wrong.
+        //
+        // Duplicates are not hypothetical since the offsets started coming from outside: index
+        // compaction deliberately keeps the merged run and its inputs open at the same time, and
+        // AddRaw copies entries verbatim, so one lookup returns two hits with the SAME segment id
+        // and byte-identical offsets. The engine concatenates them.
+        int uniq = 0;
+        for (int i = 0; i < offsets.Count; i++)
+            if (i == 0 || offsets[i] != offsets[i - 1]) offsets[uniq++] = offsets[i];
+        if (uniq < offsets.Count) offsets.RemoveRange(uniq, offsets.Count - uniq);
 
         // The geometry pass first — it skips whole blocks. It returns null the moment anything
         // disagrees with SpanWriter's fixed block size (a span at the computed position carrying
@@ -476,7 +517,11 @@ internal static class SpanReader
                 }
                 else into.Add(rec);
 
-                want++;
+                // ADVANCE PAST EVERY COPY OF THIS POSITION. The caller deduplicates, but this
+                // walk must not depend on that: it is the only place that knows the cursor can
+                // only move forward, and a duplicate slipping in from a future caller would stop
+                // it dead rather than cost a wasted compare.
+                while (want < offsets.Count && offsets[want] == blockFirst + i) want++;
                 continue;
             }
 
@@ -1161,10 +1206,12 @@ internal static class SpanReader
 
     private static List<uint> ReadTraceOffsets(string filePath, TraceId traceId)
     {
+        using var fs = OpenRead(filePath);
+        using var br = new BinaryReader(fs);
+
+        ushort version = ReadVersion(fs, br);
         {
-            using var probe = OpenRead(filePath);
-            using var pbr   = new BinaryReader(probe);
-            if (ReadVersion(probe, pbr) >= 4)
+            if (version >= 4)
             {
                 // A v4 SEGMENT REACHING HERE IS THE DEGRADED PATH, and it has to be slow rather
                 // than wrong. v4 dropped the per-segment trace index — 38% of the file — because
@@ -1173,6 +1220,9 @@ internal static class SpanReader
                 // spans themselves still carry their trace ids, so the answer is recoverable by
                 // scanning, and the backfill rebuilds the run from the same scan afterwards, so
                 // this state heals instead of persisting.
+                // ONE OPEN, NOT TWO. This used to probe the version through its own FileStream and
+                // then reopen — 64 KB of buffer each, per segment, fanned out across every
+                // uncovered segment of a still-migrating install.
                 var found = new List<uint>(4);
                 foreach (var (id, offset) in EnumerateTraceIdsInOrder(filePath))
                     if (id.Equals(traceId)) found.Add(offset);
@@ -1180,10 +1230,6 @@ internal static class SpanReader
             }
         }
 
-        using var fs = OpenRead(filePath);
-        using var br = new BinaryReader(fs);
-
-        ushort version = ReadVersion(fs, br);
         var (traceIdxOffset, _, _) = ReadFooter(fs, br, version);
         fs.Seek(traceIdxOffset, SeekOrigin.Begin);
 

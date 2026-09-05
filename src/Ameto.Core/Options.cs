@@ -243,6 +243,16 @@ public sealed class TracesOptions
     /// typo in it must not stop the server from starting.</para>
     /// </summary>
     public string IndexBackfill { get; init; } = "Idle";
+
+    /// <summary>
+    /// Write the v4 segment format, which omits the per-segment trace index and is ~40% smaller.
+    ///
+    /// <para>A ONE-WAY DOOR, and off by default for that reason. Reading v4 costs nothing and is
+    /// always on. Writing it means any binary older than this one, meeting those files, deletes
+    /// them — it reads an unknown version as corruption. Turn this on only when every node that
+    /// might read this data runs this build or newer, and only when you would not roll back.</para>
+    /// </summary>
+    public bool SegmentFormatV4 { get; init; }
 }
 
 /// <summary>

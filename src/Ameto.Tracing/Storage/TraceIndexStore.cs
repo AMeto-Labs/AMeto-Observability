@@ -3,6 +3,18 @@ using Microsoft.Extensions.Logging;
 namespace Ameto.Tracing.Storage;
 
 /// <summary>
+/// What the open runs, together, could say about one trace.
+///
+/// <para><see cref="Unanswerable"/> is the half that keeps the coverage rule honest: those
+/// segments are covered on paper but no run managed to read for them just now, so for THIS request
+/// they must be treated as uncovered and read. Without it a torn block or a file locked for a
+/// moment reads as "the trace is not in that segment".</para>
+/// </summary>
+internal readonly record struct TraceIndexAnswer(
+    List<TraceIndexHit> Hits,
+    HashSet<ulong>?     Unanswerable);
+
+/// <summary>
 /// THE OPEN RUNS, AND THE ONE QUESTION THE READ PATH ASKS THEM.
 ///
 /// <para>Holds a <see cref="TraceIndexReader"/> per run named by the manifest — which is to say it
@@ -70,6 +82,7 @@ internal sealed class TraceIndexStore : IDisposable
                 }
 
                 var opened = TraceIndexReader.Open(run.FilePath);
+                if (opened is not null) opened.CoveredSegments = run.CoveredSegments;
                 if (opened is null)
                 {
                     unusable.AddRange(run.CoveredSegments);
@@ -85,7 +98,7 @@ internal sealed class TraceIndexStore : IDisposable
                 if (!next.ContainsKey(path)) stale.Add(reader);
 
             _open = next;
-            foreach (var r in stale) r.Dispose();
+            foreach (var r in stale) r.Retire();
         }
 
         return unusable;
@@ -109,6 +122,7 @@ internal sealed class TraceIndexStore : IDisposable
     public bool Add(TraceIndexRun run)
     {
         var opened = TraceIndexReader.Open(run.FilePath);
+        if (opened is not null) opened.CoveredSegments = run.CoveredSegments;
         if (opened is null)
         {
             _logger.LogWarning(
@@ -119,7 +133,7 @@ internal sealed class TraceIndexStore : IDisposable
         lock (_gate)
         {
             var next = CopyOpen();
-            if (next.Remove(run.FilePath, out var old)) old.Dispose();
+            if (next.Remove(run.FilePath, out var old)) old.Retire();
             next[run.FilePath] = opened;
             _open = next;
         }
@@ -136,7 +150,7 @@ internal sealed class TraceIndexStore : IDisposable
             foreach (var p in paths)
                 if (next.Remove(p, out var r)) drop.Add(r);
             _open = next;
-            foreach (var r in drop) r.Dispose();
+            foreach (var r in drop) r.Retire();
         }
     }
 
@@ -144,12 +158,41 @@ internal sealed class TraceIndexStore : IDisposable
     /// Every segment any open run places this trace in. An empty result means "no run named it",
     /// which is NOT the same as "it is not there" — see the class docstring.
     /// </summary>
-    public List<TraceIndexHit> Lookup(TraceId traceId)
+    public TraceIndexAnswer Lookup(TraceId traceId)
     {
+        // PINNED UNDER THE GATE, so nothing can retire and free a reader between taking the
+        // snapshot and using it. A lookup holds each reader across bloom probes and a 4 KB block
+        // read — milliseconds — and the store used to dispose dropped readers immediately, whose
+        // bloom is native memory.
+        List<TraceIndexReader> held;
+        lock (_gate)
+        {
+            var open = _open;
+            held = new List<TraceIndexReader>(open.Count);
+            foreach (var r in open.Values) if (r.TryAcquire()) held.Add(r);
+        }
+
         var hits = new List<TraceIndexHit>(2);
+        HashSet<ulong>? unanswerable = null;
         ulong key = TraceIndexFile.KeyOf(traceId);
-        foreach (var r in _open.Values) r.Lookup(key, hits);
-        return hits;
+        try
+        {
+            foreach (var r in held)
+            {
+                if (r.Lookup(key, hits) != TraceIndexOutcome.Unreadable) continue;
+
+                // A RUN THAT COULD NOT ANSWER UN-COVERS ITS SEGMENTS FOR THIS REQUEST. Silence
+                // from a covered run is what lets the engine skip a segment, and this run proved
+                // nothing — so the caller has to read those segments instead.
+                (unanswerable ??= new HashSet<ulong>()).UnionWith(r.CoveredSegments);
+                _logger.LogDebug("Trace index run {Path} could not answer a lookup; the {Count} "
+                              + "segment(s) it covers are read rather than skipped",
+                              r.Path, r.CoveredSegments.Length);
+            }
+        }
+        finally { foreach (var r in held) r.Release(); }
+
+        return new TraceIndexAnswer(hits, unanswerable);
     }
 
     /// <summary>True when any run is open at all — the read path skips its work entirely if not.</summary>
@@ -167,7 +210,7 @@ internal sealed class TraceIndexStore : IDisposable
     {
         lock (_gate)
         {
-            foreach (var r in _open.Values) r.Dispose();
+            foreach (var r in _open.Values) r.Retire();
             _open = new Dictionary<string, TraceIndexReader>(StringComparer.Ordinal);
         }
     }

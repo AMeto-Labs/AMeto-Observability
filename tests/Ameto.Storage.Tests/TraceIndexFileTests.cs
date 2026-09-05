@@ -62,7 +62,7 @@ public sealed class TraceIndexFileTests : IDisposable
         for (int i = 0; i < N; i++)
         {
             hits.Clear();
-            if (!r!.Lookup(TraceIndexFileTestsAccess.Key(Id(i)), hits)) { missing++; continue; }
+            if (r!.Lookup(TraceIndexFileTestsAccess.Key(Id(i)), hits) != TraceIndexOutcome.Found) { missing++; continue; }
             if (!hits.Any(h => h.SegmentId == 7 && h.Offsets.SequenceEqual(Offsets(i, 3)))) missing++;
         }
         _out.WriteLine($"retained in RAM: {r!.RetainedBytes / 1024} KB");
@@ -82,7 +82,7 @@ public sealed class TraceIndexFileTests : IDisposable
         for (int i = 1_000_000; i < 1_020_000; i++)
         {
             hits.Clear();
-            if (r.Lookup(TraceIndexFileTestsAccess.Key(Id(i)), hits)) falsePositives++;
+            if (r.Lookup(TraceIndexFileTestsAccess.Key(Id(i)), hits) == TraceIndexOutcome.Found) falsePositives++;
         }
 
         // A false positive is legal and cheap — the caller checks the full id against the spans.
@@ -105,7 +105,7 @@ public sealed class TraceIndexFileTests : IDisposable
 
         using var r = TraceIndexReader.Open(run.FilePath)!;
         var hits = new List<TraceIndexHit>();
-        Assert.True(r.Lookup(TraceIndexFileTestsAccess.Key(Id(42)), hits));
+        Assert.Equal(TraceIndexOutcome.Found, r.Lookup(TraceIndexFileTestsAccess.Key(Id(42)), hits));
 
         _out.WriteLine($"segments for the split trace: {string.Join(", ", hits.Select(h => h.SegmentId))}");
         Assert.Equal(2, hits.Count);
@@ -127,7 +127,7 @@ public sealed class TraceIndexFileTests : IDisposable
 
         using var r = TraceIndexReader.Open(run.FilePath)!;
         var hits = new List<TraceIndexHit>();
-        Assert.True(r.Lookup(TraceIndexFileTestsAccess.Key(Id(1234)), hits));
+        Assert.Equal(TraceIndexOutcome.Found, r.Lookup(TraceIndexFileTestsAccess.Key(Id(1234)), hits));
 
         _out.WriteLine($"copies found: {hits.Count} (1 original + 60 planted)");
         Assert.Equal(61, hits.Count);
@@ -158,7 +158,7 @@ public sealed class TraceIndexFileTests : IDisposable
 
         using var r = TraceIndexReader.Open(run.FilePath)!;
         var hits = new List<TraceIndexHit>();
-        Assert.True(r.Lookup(TraceIndexFileTestsAccess.Key(shared), hits));
+        Assert.Equal(TraceIndexOutcome.Found, r.Lookup(TraceIndexFileTestsAccess.Key(shared), hits));
 
         _out.WriteLine($"{hits.Count} of {Copies} entries recovered under one shared key");
         Assert.Equal(Copies, hits.Count);
@@ -168,7 +168,8 @@ public sealed class TraceIndexFileTests : IDisposable
         foreach (int i in new[] { 0, 499, 500, 999 })
         {
             hits.Clear();
-            Assert.True(r.Lookup(TraceIndexFileTestsAccess.Key(Id(i)), hits), $"lost ordinary key {i}");
+            Assert.True(r.Lookup(TraceIndexFileTestsAccess.Key(Id(i)), hits) == TraceIndexOutcome.Found,
+                        $"lost ordinary key {i}");
         }
     }
 
@@ -181,7 +182,7 @@ public sealed class TraceIndexFileTests : IDisposable
         using var r = TraceIndexReader.Open(run.FilePath)!;
         Assert.NotNull(r);
         var hits = new List<TraceIndexHit>();
-        Assert.False(r.Lookup(TraceIndexFileTestsAccess.Key(Id(1)), hits));
+        Assert.Equal(TraceIndexOutcome.NotPresent, r.Lookup(TraceIndexFileTestsAccess.Key(Id(1)), hits));
         Assert.Empty(hits);
     }
 
@@ -204,16 +205,16 @@ public sealed class TraceIndexFileTests : IDisposable
         using var r = TraceIndexReader.Open(run.FilePath)!;
         var hits = new List<TraceIndexHit>();
 
-        Assert.True(r.Lookup(TraceIndexFileTestsAccess.Key(Id(1)), hits));
+        Assert.Equal(TraceIndexOutcome.Found, r.Lookup(TraceIndexFileTestsAccess.Key(Id(1)), hits));
         _out.WriteLine($"awkward offsets back: {string.Join(", ", hits[0].Offsets)}");
         Assert.Equal(sorted, hits[0].Offsets);
 
         hits.Clear();
-        Assert.True(r.Lookup(TraceIndexFileTestsAccess.Key(Id(2)), hits));
+        Assert.Equal(TraceIndexOutcome.Found, r.Lookup(TraceIndexFileTestsAccess.Key(Id(2)), hits));
         Assert.Equal([uint.MaxValue], hits[0].Offsets);
 
         hits.Clear();
-        Assert.True(r.Lookup(TraceIndexFileTestsAccess.Key(Id(3)), hits));
+        Assert.Equal(TraceIndexOutcome.Found, r.Lookup(TraceIndexFileTestsAccess.Key(Id(3)), hits));
         Assert.Empty(hits[0].Offsets);
     }
 
@@ -274,7 +275,7 @@ public sealed class TraceIndexFileTests : IDisposable
         for (int i = 0; i < 10_000; i++)
         {
             hits.Clear();
-            if (r.Lookup(TraceIndexFileTestsAccess.Key(Id(i)), hits)) found++;
+            if (r.Lookup(TraceIndexFileTestsAccess.Key(Id(i)), hits) == TraceIndexOutcome.Found) found++;
         }
         _out.WriteLine($"{found} of 10000 still resolvable after one block was destroyed");
         Assert.True(found > 0, "a single torn block cost the whole run");

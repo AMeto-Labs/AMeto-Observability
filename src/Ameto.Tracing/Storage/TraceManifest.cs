@@ -176,6 +176,17 @@ internal sealed class TraceManifest
     /// </summary>
     public bool IsCovered(ulong segmentId) => _state.Covered.Contains(segmentId);
 
+    /// <summary>
+    /// The coverage set as one instant, for a caller that must compare it against something else
+    /// taken at the same moment.
+    ///
+    /// <para>Free: the set is copy-on-write, so this hands back the live reference and never
+    /// copies. The read path needs it because asking <see cref="IsCovered"/> per segment samples
+    /// coverage LATER than the index lookup it is being compared with, and a segment that became
+    /// covered in between is then skipped on the strength of a run the lookup never saw.</para>
+    /// </summary>
+    public IReadOnlySet<ulong> CoverageSnapshot() => _state.Covered;
+
     /// <summary>How many segments the index currently vouches for.</summary>
     public int CoveredCount => _state.Covered.Count;
 

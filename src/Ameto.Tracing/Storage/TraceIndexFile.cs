@@ -9,6 +9,27 @@ namespace Ameto.Tracing.Storage;
 internal readonly record struct TraceIndexHit(ulong SegmentId, uint[] Offsets);
 
 /// <summary>
+/// What a run was able to say about a key. THREE ANSWERS, NOT TWO, and the third is the whole
+/// point: a run that could not be read has not proved anything, and only a proof may be used to
+/// SKIP a segment.
+///
+/// <para>Collapsing <see cref="Unreadable"/> into <see cref="NotPresent"/> is a silent loss with
+/// no fault and no log line: the manifest still says the segment is covered, the caller finds no
+/// hit for it, and its spans are dropped from the answer. Every way a run can fail to answer —
+/// a torn block, a deleted or briefly locked file, a reader retired underneath the lookup — lands
+/// here rather than on "no".</para>
+/// </summary>
+internal enum TraceIndexOutcome
+{
+    /// <summary>The run holds the key; its hits were appended.</summary>
+    Found,
+    /// <summary>The run was read and does not hold the key. The only answer that permits a skip.</summary>
+    NotPresent,
+    /// <summary>The run could not answer. The segments it covers must be read, not skipped.</summary>
+    Unreadable,
+}
+
+/// <summary>
 /// ONE SORTED RUN OF THE TRACE-ID INDEX — a <c>.tix</c> file.
 ///
 /// <para>Answers "which segment holds this trace, and at what offsets" without opening the segment
@@ -308,7 +329,20 @@ internal sealed class TraceIndexReader : IDisposable
     private readonly SegmentBloomFilter  _bloom;
     private readonly ulong[]             _blockFirstKey;
     private readonly long[]              _blockOffset;
+    /// <summary>0 = live, 1 = freed. Volatile: written by whoever retires the run, read on every
+    /// lookup from a request thread.</summary>
     private          bool                _disposed;
+    /// <summary>Lookups currently holding this reader. Freed only at zero — see <see cref="Retire"/>.</summary>
+    private          int                 _refs;
+    /// <summary>Set when the store drops the run; the last release then does the freeing.</summary>
+    private          bool                _retired;
+    private readonly System.Threading.Lock _life = new();
+
+    /// <summary>The run's own path — for the log line when it cannot answer.</summary>
+    public string Path => _path;
+
+    /// <summary>The segments this run indexes, so a failed lookup can name whom it failed for.</summary>
+    public ulong[] CoveredSegments { get; set; } = [];
 
     public int   EntryCount { get; }
     public int   Level      { get; }
@@ -417,9 +451,10 @@ internal sealed class TraceIndexReader : IDisposable
     /// <summary>
     /// Every entry in the run, in key order, one block at a time.
     ///
-    /// <para>For the index compactor. Streaming rather than materialised on purpose: a run holds
-    /// hundreds of thousands of entries and the whole point of merging is to be a background chore
-    /// that costs one block of memory per input, not one run.</para>
+    /// <para>For the index compactor. Streaming rather than materialised, so THIS side costs one
+    /// block per input — the merge's own writer then holds what it keeps, which is why the batch is
+    /// capped by entry count in <c>TraceIndexCompactor.MaxEntriesPerMerge</c> rather than by run
+    /// count alone.</para>
     ///
     /// <para>A block that will not decode THROWS. It used to <c>yield break</c>, and that is the
     /// difference between a short answer and a reported one: <see cref="Open"/> validates the
@@ -493,10 +528,16 @@ internal sealed class TraceIndexReader : IDisposable
         finally { if (raw is not null) ArrayPool<byte>.Shared.Return(raw); }
     }
 
-    /// <summary>Whether this run could hold the key. No I/O: the bloom is in memory.</summary>
+    /// <summary>
+    /// Whether this run could hold the key. No I/O: the bloom is in memory.
+    ///
+    /// <para>A RETIRED READER ANSWERS NEITHER WAY. It used to return false here, which the caller
+    /// read as "this run does not hold the key" — and a retired run has read nothing and proved
+    /// nothing. See <see cref="TraceIndexOutcome"/>.</para>
+    /// </summary>
     public bool MightContain(ulong key)
     {
-        if (_disposed || _blockFirstKey.Length == 0) return false;
+        if (Volatile.Read(ref _disposed) || _blockFirstKey.Length == 0) return false;
         if (key < MinKey || key > MaxKey) return false;
         Span<byte> b = stackalloc byte[8];
         BinaryPrimitives.WriteUInt64BigEndian(b, key);
@@ -506,14 +547,25 @@ internal sealed class TraceIndexReader : IDisposable
     /// <summary>
     /// Every place this key is recorded, appended to <paramref name="into"/>. At most one block is
     /// read, and none at all when the bloom says no.
+    ///
+    /// <para>THE RETURN IS THREE-VALUED, and <see cref="TraceIndexOutcome.NotPresent"/> is a claim
+    /// this method has to earn. It used to be a bool, so "the block would not decode", "the file
+    /// vanished under me" and "I was retired mid-lookup" were all reported as "no" — and "no" from
+    /// a covered run is exactly what lets the engine skip a segment without opening it. Anything
+    /// short of a completed read is <see cref="TraceIndexOutcome.Unreadable"/> now.</para>
+    ///
+    /// <para>A partial read is also Unreadable rather than Found: when a key spans two blocks and
+    /// only the second fails, the hits already appended are a TRUNCATED offset list, and handing
+    /// that to the walk as if it were complete draws a waterfall missing half its spans. The
+    /// appended hits are rolled back so the caller cannot use them by accident.</para>
     /// </summary>
-    /// <returns>True when anything was appended.</returns>
-    public bool Lookup(ulong key, List<TraceIndexHit> into)
+    public TraceIndexOutcome Lookup(ulong key, List<TraceIndexHit> into)
     {
-        if (!MightContain(key)) return false;
+        if (Volatile.Read(ref _disposed)) return TraceIndexOutcome.Unreadable;
+        if (!MightContain(key)) return TraceIndexOutcome.NotPresent;
 
         int b = FirstBlockThatCouldHold(key);
-        if (b < 0) return false;
+        if (b < 0) return TraceIndexOutcome.NotPresent;
 
         // FORWARD UNTIL A KEY STRICTLY GREATER IS SEEN, not until a block happens to end on the
         // key. One key can occupy many consecutive blocks (see FirstBlockThatCouldHold), and a
@@ -522,11 +574,15 @@ internal sealed class TraceIndexReader : IDisposable
         int before = into.Count;
         while (b < _blockFirstKey.Length)
         {
-            if (!ScanBlock(b, key, into, out bool wentPast)) break;
+            if (!ScanBlock(b, key, into, out bool wentPast))
+            {
+                into.RemoveRange(before, into.Count - before);   // a truncated list is worse than none
+                return TraceIndexOutcome.Unreadable;
+            }
             if (wentPast) break;
             b++;
         }
-        return into.Count > before;
+        return into.Count > before ? TraceIndexOutcome.Found : TraceIndexOutcome.NotPresent;
     }
 
     /// <summary>
@@ -634,12 +690,54 @@ internal sealed class TraceIndexReader : IDisposable
         finally { if (raw is not null) ArrayPool<byte>.Shared.Return(raw); }
     }
 
-    public void Dispose()
+    /// <summary>
+    /// Takes a hold on this reader for the duration of one lookup, or refuses if it is already
+    /// retired.
+    ///
+    /// <para>WITHOUT THIS THE BLOOM IS FREED UNDER A RUNNING LOOKUP. The store swaps its map and
+    /// disposed the dropped readers immediately, while a lookup holds plain references to them
+    /// across bloom probes and a 4 KB block read — <c>SegmentBloomFilter.Dispose</c> is a
+    /// <c>NativeMemory.Free</c>, so the reachable outcomes were a read of freed memory or an
+    /// ObjectDisposedException surfacing as a 500. The log engine reached the same conclusion:
+    /// <c>SegmentIndexCache</c> carries RefCount/Doomed for exactly this.</para>
+    /// </summary>
+    public bool TryAcquire()
     {
-        if (_disposed) return;
-        _disposed = true;
+        lock (_life)
+        {
+            if (_retired || _disposed) return false;
+            _refs++;
+            return true;
+        }
+    }
+
+    /// <summary>Gives back a hold taken by <see cref="TryAcquire"/>, freeing if it was the last.</summary>
+    public void Release()
+    {
+        lock (_life)
+        {
+            if (--_refs > 0 || !_retired || _disposed) return;
+            _disposed = true;
+        }
         _bloom.Dispose();
     }
+
+    /// <summary>
+    /// The store is done with this run. Frees now if nothing holds it, otherwise leaves the last
+    /// <see cref="Release"/> to do it — a lookup already in flight finishes on live memory.
+    /// </summary>
+    public void Retire()
+    {
+        lock (_life)
+        {
+            _retired = true;
+            if (_refs > 0 || _disposed) return;
+            _disposed = true;
+        }
+        _bloom.Dispose();
+    }
+
+    public void Dispose() => Retire();
 
     /// <summary>A forward cursor that never reads past the block it was given.</summary>
     private ref struct Cursor(ReadOnlySpan<byte> data)
