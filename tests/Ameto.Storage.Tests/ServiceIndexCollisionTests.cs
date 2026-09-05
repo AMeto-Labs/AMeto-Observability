@@ -187,4 +187,111 @@ public sealed class ServiceIndexCollisionTests : IDisposable
         // service index, this test would pass without exercising the contract it exists for.
         Assert.True(complete > 0, "no flip reached the degrade-to-reading-everything path");
     }
+
+    /// <summary>The bloom index offset is the THIRD of the four footer fields.</summary>
+    private const int BloomIdxFromEnd = 28 - 16;
+
+    [Fact]
+    public async Task The_bloom_index_offset_gets_the_same_sweep_and_the_same_verdict()
+    {
+        // THE SAME CLASS, ONE SECTION OVER — raised in review after the service index was closed,
+        // and it is the same argument with the same consequence. The bloom index tells the search
+        // which blocks are worth opening, so a torn offset that lands back INSIDE the file reads
+        // arbitrary bytes as bitsets, blocks fail a bloom they would have passed, and an
+        // attribute-filtered query answers fewer rows than an unfiltered one. No exception, no
+        // banner. "Inside the file" was the only check standing.
+        //
+        // Closed the way the service index was: the offset must come AFTER its neighbour, and the
+        // parse must finish exactly at the footer — the bloom index is the last section, so its
+        // end is a fact of the layout rather than a guess.
+        string dir = Path.Combine(_root, "bloomsweep");
+        Directory.CreateDirectory(dir);
+
+        const int total = 100;
+        var corpus = new List<SpanRecord>(total);
+        for (int k = 0; k < total; k++)
+            corpus.Add(new SpanRecord
+            {
+                TraceId = new TraceId(0, 400_000 + (ulong)k), SpanId = new SpanId(400_000 + (ulong)k),
+                ParentSpanId = default,
+                StartTimeUnixNano = _baseNano + k * Ms, DurationNanos = 2 * Ms,
+                Name = "GET /orders", ServiceName = "billing",
+                Kind = SpanKind.Server, Status = SpanStatusCode.Ok,
+                Attributes = new Dictionary<string, object?>(1, StringComparer.Ordinal)
+                {
+                    ["db.system"] = "mssql",       // the hint every query below carries
+                },
+            });
+        string path = SpanWriter.Write(dir, corpus).FilePath;
+
+        long from = _baseNano - 1000 * Ms, to = _baseNano + 1000 * Ms;
+        var  hints = new List<AttrHint> { new("db.system", "mssql") };
+
+        // The instrument only means anything if the honest file answers in full.
+        int honestFound = 0;
+        await foreach (var _ in SpanReader.SearchAsync(
+            path, from, to, serviceName: null, spanName: null, status: null,
+            httpStatusCode: null, minDurationNanos: null, maxDurationNanos: null,
+            attrHints: hints, ct: CancellationToken.None)) honestFound++;
+        Assert.Equal(total, honestFound);
+
+        long honest;
+        using (var raw = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+        using (var br = new BinaryReader(raw))
+        {
+            raw.Seek(-BloomIdxFromEnd, SeekOrigin.End);
+            honest = (long)br.ReadUInt64();
+        }
+
+        int loud = 0, complete = 0;
+        var quiet = new List<string>();
+
+        for (int bit = 0; bit < 64; bit++)
+        {
+            long torn = honest ^ (1L << bit);
+            if (torn == honest) continue;
+
+            using (var raw = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite))
+            using (var bw = new BinaryWriter(raw))
+            {
+                raw.Seek(-BloomIdxFromEnd, SeekOrigin.End);
+                bw.Write((ulong)torn);
+            }
+
+            int  found = 0;
+            bool threw = false;
+            try
+            {
+                await foreach (var _ in SpanReader.SearchAsync(
+                    path, from, to, serviceName: null, spanName: null, status: null,
+                    httpStatusCode: null, minDurationNanos: null, maxDurationNanos: null,
+                    attrHints: hints, ct: CancellationToken.None)) found++;
+            }
+            catch (Exception ex)
+            {
+                threw = true;
+                Assert.True(FileBounds.DescribesContent(ex),
+                    $"bit {bit} reached the classifier as {ex.GetType().Name}, which reads as "
+                  + "retryable rather than as damage");
+            }
+
+            if (threw) loud++;
+            else if (found == total) complete++;
+            else quiet.Add($"bit {bit}: offset {honest} -> {torn}, {found} of {total} spans, no exception");
+        }
+
+        using (var raw = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite))
+        using (var bw = new BinaryWriter(raw))
+        {
+            raw.Seek(-BloomIdxFromEnd, SeekOrigin.End);
+            bw.Write((ulong)honest);
+        }
+
+        _out.WriteLine($"64 single-bit flips of bloomIdxOffset: {loud} loud, {complete} complete, "
+                     + $"{quiet.Count} quiet");
+        Assert.True(quiet.Count == 0,
+            "an attribute-filtered search came back short and said nothing:" + Environment.NewLine
+          + string.Join(Environment.NewLine, quiet));
+        Assert.True(complete > 0, "no flip reached the degrade-to-reading-everything path");
+    }
 }

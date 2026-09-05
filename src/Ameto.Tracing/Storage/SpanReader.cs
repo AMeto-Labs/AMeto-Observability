@@ -1393,12 +1393,23 @@ internal static class SpanReader
 
         ushort version = ReadVersion(fs, br);
         if (version < 3) return null;
-        var (_, _, bloomIdxOffset) = ReadFooter(fs, br, version);
+        var (_, svcIdxOffset, bloomIdxOffset) = ReadFooter(fs, br, version);
         // null here means "this file has no usable bloom index", which the caller treats as "skip
         // nothing" — the safe direction, and why this one may answer rather than throw. The offset
         // still has to be inside the file, because every bound below is measured from where it
         // lands: a torn offset makes "the bytes that remain" a number the file never limited.
         if (bloomIdxOffset <= 0 || bloomIdxOffset >= fs.Length) return null;
+
+        // AND AFTER ITS NEIGHBOUR, for the reason the service index already documents. "Inside the
+        // file" is not decidable enough: a small flip lands the offset back inside a section, where
+        // a length prefix reads as a plausible block count and the bitsets that follow are
+        // arbitrary bytes — so blocks fail the bloom that would have passed it, and an
+        // attribute-filtered query answers fewer rows than an unfiltered one. Same silent shape as
+        // the service index, one section over. The layout is fixed — trace index, service index,
+        // bloom index, footer — so the ordering is a fact of the format, not a heuristic.
+        if (bloomIdxOffset <= svcIdxOffset) return null;
+
+        long footerAt = fs.Length - (version >= 3 ? 28 : 20);
         fs.Seek(bloomIdxOffset, SeekOrigin.Begin);
 
         // Pre-hash the hints once.
@@ -1436,6 +1447,14 @@ internal static class SpanReader
                 pass = SpanBloom.MayContain(bitset, hashes[i]);
             if (pass) allowed.Add(b);
         }
+
+        // THE SECTION HAS AN EXACT END, and it is the check the offset cannot forge. The bloom
+        // index is the last thing before the footer, so a parse that started in the right place
+        // finishes exactly there; one that started 32 bytes early finishes 32 bytes early, however
+        // plausible every field it read looked on the way. Null, not a throw: "I cannot tell you
+        // which blocks" costs a full scan of the segment, and this method's whole contract is that
+        // losing the index costs speed, never rows.
+        if (fs.Position != footerAt) return null;
         return allowed;
     }
 
