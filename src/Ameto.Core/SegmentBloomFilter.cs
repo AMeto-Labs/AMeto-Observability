@@ -1,7 +1,7 @@
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
-namespace Ameto.Indexing;
+namespace Ameto.Core;
 
 /// <summary>
 /// Per-segment XOR/blocked Bloom filter stored on NativeMemory.
@@ -52,7 +52,7 @@ public sealed unsafe class SegmentBloomFilter : IDisposable
     }
 
     /// <summary>Native bytes the bit array occupies — for the index cache's retained-size accounting.</summary>
-    internal long RetainedBytes => (long)_blockCount * (BlockBits / 8);
+    public long RetainedBytes => (long)_blockCount * (BlockBits / 8);
 
     /// <summary>
     /// Largest item count that still sizes honestly. Above it the filter is capped rather

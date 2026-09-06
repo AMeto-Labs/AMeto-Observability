@@ -53,8 +53,21 @@ public sealed class ProcessCpuSamplerTests
     }
 
     [Fact]
-    public void Two_busy_threads_read_about_twice_one()
+    public void A_second_busy_thread_adds_about_a_core_to_the_reading()
     {
+        // WHAT THIS GUARDS: that the sampler tracks thread count at all. A sampler that divided by
+        // the wrong thing, or reported a constant, would read the same for one thread as for two.
+        //
+        // MEASURED AS A DIFFERENCE, NOT A RATIO, and that is a fix rather than a loosening. The old
+        // form asserted two > one × 1.4, which assumes `one` contains nothing but the burn — and it
+        // never does: the runner, the JIT and the GC are burning in this same process, so ambient
+        // load lands in BOTH readings and compresses the ratio without touching the signal. Seen on
+        // a 4-core CI box: one thread read 32.7 % where a lone core is 25 %, two read 45.4 %, ratio
+        // 1.39 — a failure by one hundredth, from noise the ratio had no way to cancel.
+        //
+        // The increment does cancel it: a constant offset present in both subtracts out, and what
+        // is left is what the extra thread actually bought. A sampler that ignores thread count
+        // gives an increment near zero and still fails, which is the property worth keeping.
         int cores = Environment.ProcessorCount;
         if (cores < 4) return;
 
@@ -68,8 +81,15 @@ public sealed class ProcessCpuSamplerTests
         Burn(threads: 2, ms: 800);
         double two = sampler.Sample();
 
-        _out.WriteLine($"cores={cores}  1 thread={one:F1} %  2 threads={two:F1} %  ratio={two / one:F2}");
-        Assert.True(two > one * 1.4, $"two threads read {two:F1} % against {one:F1} % for one");
+        double core  = 100.0 / cores;      // what one fully busy thread is worth
+        double gain  = two - one;
+        double floor = core * 0.4;         // a contended box will not hand over a whole second core
+
+        _out.WriteLine($"cores={cores}  1 thread={one:F1} %  2 threads={two:F1} %  "
+                     + $"gain={gain:F1} pp  (a core is {core:F1} pp, floor {floor:F1})");
+        Assert.True(gain > floor,
+            $"a second busy thread added {gain:F1} points ({one:F1} % → {two:F1} %), which is under "
+          + $"the {floor:F1} expected of a sampler that counts threads at all");
     }
 
     [Fact]

@@ -1,3 +1,4 @@
+using Ameto.Core;
 using System.Buffers.Binary;
 using System.Diagnostics;
 using Ameto.Indexing;

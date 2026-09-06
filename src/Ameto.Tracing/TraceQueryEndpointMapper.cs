@@ -260,6 +260,20 @@ public static class TraceQueryEndpointMapper
             await ctx.Response.WriteAsJsonAsync(flame);
         });
 
+        // GET /api/traces/index — what the trace-id index is doing, and whether it is finished.
+        //
+        // The numbers nobody had. A trace lookup used to consult every cold segment and inflate
+        // every segment's trace index to do it, and that went unnoticed for as long as it did
+        // because the segment count and the weight of those indexes were invisible from outside.
+        // Cheap enough to poll: it reads the snapshot and stats the run files, nothing else.
+        group.MapGet("/api/traces/index", (HttpContext ctx) =>
+        {
+            var engine = ctx.RequestServices.GetService<Storage.TraceStorageEngine>();
+            return engine is null
+                ? Results.NotFound()
+                : Results.Json(engine.DescribeIndex());
+        });
+
         // GET /api/traces/{traceId}
         group.MapGet("/api/traces/{traceId}", async (HttpContext ctx, string traceId) =>
         {

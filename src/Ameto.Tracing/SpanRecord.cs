@@ -17,6 +17,17 @@ public readonly struct TraceId : IEquatable<TraceId>
     public bool IsEmpty => _hi == 0 && _lo == 0;
 
     /// <summary>
+    /// The top 64 bits, big-endian — the first eight bytes of the id as it arrived.
+    ///
+    /// <para>Exposed for the trace-id index, which keys on exactly these bytes rather than all
+    /// sixteen: ids are uniformly random, so a 64-bit prefix collides about once in 2e-7 at this
+    /// engine's trace counts, and a collision there costs one wasted segment read rather than a
+    /// wrong answer — the full id is still checked against the spans. Half the key is half the
+    /// index. Sorting by it is also sorting by the id, since it is the most significant half.</para>
+    /// </summary>
+    public ulong High => _hi;
+
+    /// <summary>
     /// A total order over trace ids. The ordering itself means nothing — it exists so a
     /// sort that ties on timestamp has a deterministic winner, which is what keeps a
     /// paginated boundary stable from one page request to the next.

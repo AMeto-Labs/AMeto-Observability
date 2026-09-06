@@ -231,6 +231,47 @@ public sealed class LiveTailOptions
     public int PageSize { get; init; } = 500;
 }
 
+/// <summary>Distributed-tracing settings that an operator may want to touch.</summary>
+public sealed class TracesOptions
+{
+    /// <summary>
+    /// What to do about segments written before the trace-id index existed:
+    /// <c>Off</c>, <c>Idle</c> (default) or <c>Eager</c>.
+    ///
+    /// <para>A string rather than the enum itself so the YAML stays readable and an unknown value
+    /// degrades to the default instead of failing to bind — this is a performance switch, and a
+    /// typo in it must not stop the server from starting.</para>
+    /// </summary>
+    public string IndexBackfill { get; init; } = "Idle";
+
+    /// <summary>
+    /// Write the v4 segment format, which omits the per-segment trace index and is ~40% smaller.
+    ///
+    /// <para>A ONE-WAY DOOR, and off by default for that reason. Reading v4 costs nothing and is
+    /// always on. Writing it means any binary older than this one, meeting those files, deletes
+    /// them — it reads an unknown version as corruption. Turn this on only when every node that
+    /// might read this data runs this build or newer, and only when you would not roll back.</para>
+    /// </summary>
+    public bool SegmentFormatV4 { get; init; }
+
+    /// <summary>
+    /// The off switch for the trace-id index itself, as opposed to <see cref="IndexBackfill"/>,
+    /// which only decides whether OLD segments are migrated into it.
+    ///
+    /// <para>THE ROLLBACK HAS TO BE REACHABLE BY THE PERSON WHO NEEDS IT. The design's safety
+    /// argument is that coverage can be dropped to empty at any moment and the engine goes back to
+    /// scanning, which is how it behaved before this feature — but that was only true from a test
+    /// seam, so an operator watching a trace return too few spans at three in the morning had no
+    /// way to take it. Setting this to false and restarting withdraws every claim in one generation
+    /// and closes every run.</para>
+    ///
+    /// <para>It costs speed and nothing else. No span is rewritten, no <c>.trc</c> is touched, and
+    /// the <c>.tix</c> files are left where they are — turning it back on re-covers what the
+    /// backfill re-indexes, at whatever pace <see cref="IndexBackfill"/> allows.</para>
+    /// </summary>
+    public bool IndexEnabled { get; init; } = true;
+}
+
 /// <summary>
 /// Top-level server configuration.
 /// </summary>
@@ -246,6 +287,7 @@ public sealed class ServerOptions
     public RetentionConfig  Retention        { get; init; } = new();
     public UpdatesOptions   Updates          { get; init; } = new();
     public LoggingOptions   Logging          { get; init; } = new();
+    public TracesOptions    Traces           { get; init; } = new();
     public int              HttpPort         { get; init; } = 5341;
 
     /// <summary>
