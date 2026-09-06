@@ -12,20 +12,27 @@ on:
     branches: [main]
   pull_request:
 
-# ONE RUN PER REF, AND THE SUPERSEDED ONE IS CANCELLED.
+# ONE RUN PER PR REF; THE SUPERSEDED ONE IS CANCELLED.
 #
-# Not housekeeping — it cost a false red. Three pushes to one branch in quick succession started
-# three ~25-minute Windows jobs that then competed for the same runner pool: two overlapped, and a
-# CPU-scaling test sampled its own process right inside that overlap (one busy thread read 32.7 %
-# where a lone core on that 4-core box is 25 %), failing by one hundredth. A third run spent 17
-# minutes producing no output and was killed by the job timeout.
+# WHAT THIS BUYS, stated correctly on the second attempt. The first version of this comment blamed
+# a flaky CPU-scaling test on runs "competing for the same runner pool" — that is wrong, and worth
+# writing down so nobody debugs a timing test from it. Both jobs run on GitHub-hosted runners, so
+# every run gets its own ephemeral VM with its own cores; parallel runs share the QUEUE, not the
+# processor. The test read one busy thread at 32.7 % on a 4-core box where a lone core is 25 %
+# because its own process — the xUnit host, the JIT, the GC — was busy, and it asserted a RATIO,
+# which cannot subtract that. It was fixed where it broke, by measuring the increment instead.
 #
-# Nothing is lost by cancelling: only the newest commit on a branch is the one anyone is waiting
-# for a verdict on, and a superseded run's verdict is about code that has already been replaced.
-# `main` is excluded — a push there is a merge somebody may be watching, and its history of green
-# runs is what a bisect reads.
+# What the pile-up demonstrably cost is queue time: three pushes to one branch in quick succession
+# left three ~25-minute Windows jobs outstanding, one of which waited 31 minutes to start. This
+# holds one runner slot per PR ref instead of N, which is reason enough on its own.
+#
+# MAIN IS OUT OF THE GROUP ENTIRELY, not merely exempt from cancellation. `cancel-in-progress:
+# false` still serialises the group, and GitHub then cancels any PREVIOUSLY PENDING run in it — so
+# three pushes to main would have given the middle commit no verdict at all, which is precisely the
+# history a bisect needs. Keying main's group by SHA gives every commit its own group and its own
+# run, while PR refs keep sharing one and cancelling.
 concurrency:
-  group: tests-${{ github.workflow }}-${{ github.ref }}
+  group: tests-${{ github.workflow }}-${{ github.ref }}-${{ github.ref == 'refs/heads/main' && github.sha || '' }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:

@@ -106,6 +106,10 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// </summary>
     internal Action? _betweenCoverageAndLookupForTest;
 
+    /// <summary>Test seam: publish the next segment(s) with no index run, so a test can build the
+    /// mixed covered/uncovered state a still-migrating install is in.</summary>
+    internal bool SuppressIndexRunsForTest;
+
     /// <summary>
     /// Test seam: called inside <c>CompleteFlush</c> at the instant the catalog knows a segment and
     /// <c>_coldSegments</c> does not. Index compaction takes no engine lock, so it really can run
@@ -784,6 +788,20 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                     }
                     catch (Exception ex)
                     {
+                        // ANY FAILED READ COUNTS AS AN OVERTAKEN SNAPSHOT, not only a missing file.
+                        // On Windows a source that compaction has unlinked keeps its directory
+                        // entry in delete-pending while another process holds it open with
+                        // FILE_SHARE_DELETE — an antivirus or backup agent, the same class of
+                        // interference TraceIndexStore.Add and CompleteFlush already document —
+                        // and opening that name gives UnauthorizedAccessException, not
+                        // FileNotFoundException. Landing here without setting the flag left the
+                        // recovery pass switched off and the segment that now holds those spans
+                        // unread, which is the exact loss this pass exists to prevent.
+                        //
+                        // A false positive is nearly free: the pass only looks at segments that
+                        // were not in this request's snapshot, so with no replacement to find it
+                        // costs one set comparison.
+                        Interlocked.Increment(ref vanished);
                         _logger.LogWarning(ex, "Trace lookup: skipping unreadable segment {File}", seg.FilePath);
                         return null;
                     }
@@ -820,7 +838,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         // looping here would put an unbounded amount of work behind an event the caller cannot see.
         if (Volatile.Read(ref vanished) > 0)
         {
-            var scanned = new HashSet<string>(StringComparer.Ordinal);
+            var scanned = new HashSet<string>(segs.Length, StringComparer.Ordinal);
             foreach (var s in segs) scanned.Add(s.FilePath);
 
             List<SpanSegmentInfo>? appeared = null;
@@ -831,19 +849,45 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             {
                 _logger.LogDebug(
                     "Trace lookup: {Gone} segment(s) of the snapshot were replaced mid-request; "
-                  + "reading the {New} segment(s) that appeared since", vanished, appeared.Count);
+                  + "consulting the {New} segment(s) that appeared since", vanished, appeared.Count);
 
-                // Offsets where the index can supply them — the replacement is normally indexed by
-                // the same compaction that wrote it, so this stays one 4 KB read rather than a
-                // scan. Nothing is SKIPPED on this pass: skipping is what got us here.
-                var late = _index.HasRuns ? _index.Lookup(traceId) : default;
+                // THE SAME RULE AS THE MAIN PASS, ON A FRESH ANSWER. The first version of this
+                // skipped nothing, on the reasoning that "skipping is what got us here" — which
+                // conflated two different skips. What lost the trace was skipping on a STALE
+                // snapshot; skipping on an answer taken right here, from runs read right here, is
+                // exactly as sound as the decision thirty lines up and rests on the same two
+                // halves. Without it every appeared segment that does NOT hold the trace was read
+                // end to end — for v4 a walk over every block of the file — to learn what one
+                // bloom probe already knew.
+                //
+                // AND THE GUARD IS ON THE ANSWER, NOT ON THE SEGMENT ID. `default(TraceIndexAnswer)`
+                // has a null Hits, and a non-zero SegmentId says nothing about whether any run is
+                // open: ids are handed out unconditionally by the flush and the compaction, while
+                // runs are not written at all when the index is switched off. So on an engine
+                // started with Ameto:Traces:IndexEnabled=false — the documented operator rollback,
+                // whose whole promise is that it costs speed and nothing else — a compaction
+                // completing inside a request reached this loop with `late.Hits` null and threw a
+                // NullReferenceException out of GetTraceAsync, past a try that starts below it,
+                // into the pipeline as a 500. A repair written to stop a silently short answer
+                // turned it into a crash in exactly the configuration reached by someone already
+                // worried about short answers.
+                bool useLate = _index.HasRuns;
+                var  coveredLate = useLate ? _manifest.CoverageSnapshot() : null;
+                var  late = useLate ? _index.Lookup(traceId) : default;
 
                 foreach (var s in appeared)
                 {
                     List<uint>? known = null;
-                    if (s.SegmentId != 0)
+                    if (useLate && s.SegmentId != 0
+                        && coveredLate!.Contains(s.SegmentId)
+                        && late.AnsweredFor?.Contains(s.SegmentId) == true
+                        && late.Unanswerable?.Contains(s.SegmentId) != true)
+                    {
                         foreach (var h in late.Hits)
                             if (h.SegmentId == s.SegmentId) (known ??= new List<uint>()).AddRange(h.Offsets);
+
+                        if (known is null) { skipped++; continue; }
+                    }
 
                     opened++;
                     try
@@ -2416,7 +2460,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     private TraceIndexRun? WriteIndexRun(
         SpanSegmentInfo segment, ulong segmentId, Dictionary<TraceId, List<uint>>? traceIndex)
     {
-        if (traceIndex is null || !_indexEnabled) return null;
+        if (traceIndex is null || !_indexEnabled || SuppressIndexRunsForTest) return null;
         try
         {
             var w = new TraceIndexWriter();
