@@ -196,4 +196,103 @@ public sealed class CoverageSnapshotWindowTests : IDisposable
         Assert.Single(got);
         Assert.Equal(0, e.SegmentsSkippedByLastTraceLookup);
     }
+
+    [Fact]
+    public async Task A_compaction_that_completes_mid_request_does_not_cost_the_trace()
+    {
+        // THE SECOND, OLDER LOSS, and the one this file's first draft tripped over while trying to
+        // test the first. A request takes ONE snapshot of _coldSegments and keeps it for its whole
+        // life. Compaction publishes the merged segment and unlinks its sources, so a request that
+        // started first reads paths that no longer exist and never hears about the file that now
+        // holds those spans: every source contributes nothing, the replacement is not in its list,
+        // and the trace comes back short. No exception, no log line, HTTP 200.
+        //
+        // It predates the trace-id index — the same snapshot-versus-compaction shape exists with
+        // no index at all — which is why the fix is in the walk rather than in the coverage rule.
+        string dir = Dir("overtaken");
+        var    planted = Id(4_242);
+
+        using var e = new TraceStorageEngine(dir, NullLogger<TraceStorageEngine>.Instance);
+
+        // Two small segments, both compaction candidates, and one trace with a span in each.
+        for (int t = 0; t < 300; t++) Write(e, Id(t), (ulong)(t + 1), _baseNano + t * Ms);
+        Write(e, planted, 60_001, _baseNano + 400 * Ms);
+        e.FlushHotTier();
+
+        for (int t = 300; t < 600; t++) Write(e, Id(t), (ulong)(t + 1), _baseNano + t * Ms);
+        Write(e, planted, 60_002, _baseNano + 700 * Ms);
+        e.FlushHotTier();
+
+        Assert.Equal(2, e.ColdSegmentCountForTest);
+
+        var before = new List<SpanRecord>();
+        await foreach (var s in e.GetTraceAsync(planted)) before.Add(s);
+        Assert.Equal(2, before.Count);
+
+        // A WHOLE COMPACTION, at the instant the walk is committed to its snapshot. `segs` is
+        // captured before this seam fires, so everything after it reads a list nobody maintains
+        // any more: the sources are unlinked and the merged file that replaced them is not in it.
+        int fired = 0;
+        e._betweenCoverageAndLookupForTest = () =>
+        {
+            if (Interlocked.Increment(ref fired) > 1) return;
+            e.CompactSmallSegments();
+        };
+
+        var during = new List<SpanRecord>();
+        await foreach (var s in e.GetTraceAsync(planted)) during.Add(s);
+
+        _out.WriteLine($"compaction completed mid-request: {during.Count} span(s), "
+                     + $"{e.SegmentsOpenedByLastTraceLookup} opened; "
+                     + $"cold segments now {e.ColdSegmentCountForTest}");
+
+        Assert.Equal(1, e.ColdSegmentCountForTest);          // the merge really did happen
+        Assert.Equal(2, during.Count);                       // and the trace survived it whole
+        Assert.All(during, s => Assert.Equal(planted, s.TraceId));
+
+        // Steady state afterwards: one segment, answered through its own run.
+        e._betweenCoverageAndLookupForTest = null;
+        var after = new List<SpanRecord>();
+        await foreach (var s in e.GetTraceAsync(planted)) after.Add(s);
+        _out.WriteLine($"after: {after.Count} span(s), {e.SegmentsOpenedByLastTraceLookup} opened");
+        Assert.Equal(2, after.Count);
+        Assert.Equal(1, e.SegmentsOpenedByLastTraceLookup);
+    }
+
+    [Fact]
+    public async Task Retention_deleting_a_segment_mid_request_costs_nothing_extra()
+    {
+        // The other way a file vanishes, and the one the recovery pass must NOT turn into work: a
+        // retained segment is deleted, not replaced, so nothing new appears and the pass finds
+        // nothing to read. The trace living elsewhere still comes back whole.
+        string dir = Dir("retire");
+        var    planted = Id(999_777);
+
+        using var e = new TraceStorageEngine(dir, NullLogger<TraceStorageEngine>.Instance);
+        for (int t = 0; t < 200; t++) Write(e, Id(t), (ulong)(t + 1), _baseNano + t * Ms);
+        e.FlushHotTier();
+        var doomed = e.ColdSegmentsForTest.Single();
+
+        for (int t = 200; t < 400; t++) Write(e, Id(t), (ulong)(t + 1), _baseNano + t * Ms);
+        Write(e, planted, 50_001, _baseNano + 500 * Ms);
+        e.FlushHotTier();
+        Assert.Equal(2, e.ColdSegmentCountForTest);
+
+        // Unlink the older segment's file underneath the walk — what retention does, minus the
+        // catalog bookkeeping, so the snapshot is left holding a path that is gone.
+        int fired = 0;
+        e._betweenCoverageAndLookupForTest = () =>
+        {
+            if (Interlocked.Increment(ref fired) > 1) return;
+            File.Delete(doomed.FilePath);
+        };
+
+        var got = new List<SpanRecord>();
+        await foreach (var s in e.GetTraceAsync(planted)) got.Add(s);
+
+        _out.WriteLine($"segment deleted mid-request: {got.Count} span(s), "
+                     + $"{e.SegmentsOpenedByLastTraceLookup} opened");
+        Assert.Single(got);
+        Assert.Equal(planted, got[0].TraceId);
+    }
 }

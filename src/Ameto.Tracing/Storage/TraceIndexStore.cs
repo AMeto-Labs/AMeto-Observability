@@ -10,9 +10,24 @@ namespace Ameto.Tracing.Storage;
 /// they must be treated as uncovered and read. Without it a torn block or a file locked for a
 /// moment reads as "the trace is not in that segment".</para>
 /// </summary>
+/// <param name="AnsweredFor">
+/// Segments some run ACTUALLY ANSWERED FOR in this lookup — acquired, read, and returning either
+/// <c>Found</c> or <c>NotPresent</c>.
+///
+/// <para>THIS IS THE PROOF, AND IT COMES FROM THE SAME INSTANT AS THE HITS. Without it a skip was
+/// inferred from the mere ABSENCE of a hit, checked against a coverage set sampled at a different
+/// moment — which meant the decision rested on an argument about ordering rather than on a fact.
+/// <see cref="Unanswerable"/> only speaks for a run that was asked and failed; a run already gone
+/// from the store is not asked at all, so it cannot report that it could not answer, and its
+/// segments looked exactly like segments a healthy run had cleared.</para>
+///
+/// <para>Null means no run answered for anything, which is the same as an empty set and saves the
+/// allocation on the common path where the index is not in use.</para>
+/// </param>
 internal readonly record struct TraceIndexAnswer(
     List<TraceIndexHit> Hits,
-    HashSet<ulong>?     Unanswerable);
+    HashSet<ulong>?     Unanswerable,
+    HashSet<ulong>?     AnsweredFor);
 
 /// <summary>
 /// THE OPEN RUNS, AND THE ONE QUESTION THE READ PATH ASKS THEM.
@@ -197,12 +212,21 @@ internal sealed class TraceIndexStore : IDisposable
 
         var hits = new List<TraceIndexHit>(2);
         HashSet<ulong>? unanswerable = null;
+        HashSet<ulong>? answeredFor  = null;
         ulong key = TraceIndexFile.KeyOf(traceId);
         try
         {
             foreach (var r in held)
             {
-                if (r.Lookup(key, hits) != TraceIndexOutcome.Unreadable) continue;
+                if (r.Lookup(key, hits) != TraceIndexOutcome.Unreadable)
+                {
+                    // THE POSITIVE HALF, RECORDED WHERE IT IS TRUE. This run was acquired, read,
+                    // and gave a verdict, so for every segment it covers the caller now holds a
+                    // fact from this instant rather than an inference from a coverage set sampled
+                    // at another one. Only these segments may be skipped.
+                    (answeredFor ??= new HashSet<ulong>()).UnionWith(r.CoveredSegments);
+                    continue;
+                }
 
                 // A RUN THAT COULD NOT ANSWER UN-COVERS ITS SEGMENTS FOR THIS REQUEST. Silence
                 // from a covered run is what lets the engine skip a segment, and this run proved
@@ -215,7 +239,7 @@ internal sealed class TraceIndexStore : IDisposable
         }
         finally { foreach (var r in held) r.Release(); }
 
-        return new TraceIndexAnswer(hits, unanswerable);
+        return new TraceIndexAnswer(hits, unanswerable, answeredFor);
     }
 
     /// <summary>True when any run is open at all — the read path skips its work entirely if not.</summary>
