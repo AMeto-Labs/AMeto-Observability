@@ -144,16 +144,36 @@ internal sealed class TraceIndexStore : IDisposable
     }
 
     /// <summary>Closes and forgets runs by path. The files themselves are the caller's business.</summary>
-    public void Remove(IEnumerable<string> paths)
+    /// <param name="deleteFiles">
+    /// Unlink each <c>.tix</c> as part of retiring it, rather than leaving that to the caller.
+    ///
+    /// <para>THE CALLER CANNOT SAFELY DELETE IT ITSELF once a lookup may be holding the reader,
+    /// and the reason is not obvious: the reader keeps no handle, it REOPENS the file for every
+    /// block it reads. So an unlink right after <c>Remove</c> — which is what index compaction did
+    /// — cancels exactly the overlap the refcount exists to provide, and the resulting
+    /// FileNotFoundException is now <c>Unreadable</c> rather than a swallowed "no", which drops
+    /// every segment the run covered to a full scan. Deleting from the last release keeps both
+    /// properties: no lookup ever meets a missing file, and nothing is left on disk.</para>
+    /// </param>
+    public void Remove(IEnumerable<string> paths, bool deleteFiles = false)
     {
         lock (_gate)
         {
             var next  = CopyOpen();
             var drop  = new List<TraceIndexReader>();
+            var unopened = deleteFiles ? new List<string>() : null;
             foreach (var p in paths)
+            {
                 if (next.Remove(p, out var r)) drop.Add(r);
+                else unopened?.Add(p);          // never opened here — nothing can be holding it
+            }
             _open = next;
-            foreach (var r in drop) r.Retire();
+            foreach (var r in drop) r.Retire(deleteFiles);
+            if (unopened is null) return;
+            foreach (var p in unopened)
+            {
+                try { if (File.Exists(p)) File.Delete(p); } catch { /* the startup sweep gets it */ }
+            }
         }
     }
 
@@ -208,6 +228,14 @@ internal sealed class TraceIndexStore : IDisposable
     /// fact, and one arguable claim beats several unarguable ones.
     /// </summary>
     private Dictionary<string, TraceIndexReader> CopyOpen() => new(_open, StringComparer.Ordinal);
+
+    /// <summary>
+    /// The open reader for a path, so a test can install a seam on the instance a lookup will
+    /// actually take a hold on. Opening the file again would produce a DIFFERENT reader with its
+    /// own refcount, which is exactly the reader whose lifetime nothing here manages.
+    /// </summary>
+    internal TraceIndexReader? ReaderForTest(string path)
+        => _open.TryGetValue(path, out var r) ? r : null;
 
     public void Dispose()
     {

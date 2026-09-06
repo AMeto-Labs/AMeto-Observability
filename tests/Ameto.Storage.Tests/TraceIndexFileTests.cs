@@ -254,31 +254,121 @@ public sealed class TraceIndexFileTests : IDisposable
     }
 
     [Fact]
-    public void A_torn_block_is_refused_without_taking_the_lookup_with_it()
+    public void A_torn_block_answers_Unreadable_and_never_NotPresent()
     {
-        // The header and the sparse index survive; one block's bytes do not. The reader must
-        // answer "not found" for the keys in it rather than throw — and, crucially, must not
-        // return garbage offsets that would send a caller reading nonsense out of a segment.
+        // THE TEST THAT WAS SUPPOSED TO CATCH THE BLOCKER AND COULD NOT FAIL. It counted only
+        // `== Found`, and Found is unchanged by the fix: NotPresent and Unreadable are equally
+        // not-Found, so the assertion could not tell the tri-state protocol from the bool one it
+        // replaced. Reverting 1e48c4a left it green.
+        //
+        // What actually matters is the OTHER answer. A key that lives in the destroyed block must
+        // come back Unreadable, because only NotPresent — from a covered run — is a proof, and a
+        // proof is permission to drop that segment's spans from the result.
         var w = new TraceIndexWriter();
         for (int i = 0; i < 10_000; i++) w.Add(Id(i), 1, Offsets(i, 3));
         var run = w.Write(Path_("torn.tix"), level: 1, coveredSegments: [1]);
+
+        // Which keys block 0 holds, read from the healthy file first — so the assertion below is
+        // about a key that IS there, not one that happens to be missing.
+        var healthy = TraceIndexReader.Open(run.FilePath);
+        Assert.NotNull(healthy);
+        var inBlockZero = new List<ulong>();
+        var probe = new List<TraceIndexHit>();
+        for (int i = 0; i < 10_000 && inBlockZero.Count < 200; i++)
+        {
+            probe.Clear();
+            ulong key = TraceIndexFileTestsAccess.Key(Id(i));
+            if (healthy.Lookup(key, probe) == TraceIndexOutcome.Found && probe[0].Offsets.Length > 0)
+                inBlockZero.Add(key);
+        }
+        healthy.Dispose();
+        Assert.NotEmpty(inBlockZero);
 
         var raw = File.ReadAllBytes(run.FilePath);
         for (int i = 40; i < 400 && i < raw.Length; i++) raw[i] ^= 0xA5;   // inside block 0
         File.WriteAllBytes(run.FilePath, raw);
 
         using var r = TraceIndexReader.Open(run.FilePath);
-        if (r is null) { _out.WriteLine("the whole run was refused — also acceptable"); return; }
+        // Open validates the header, footer, sparse index and bloom only, so damage confined to a
+        // block's payload cannot be caught there. If this ever starts refusing, the test has
+        // stopped exercising what it is named for.
+        Assert.NotNull(r);
 
         var hits = new List<TraceIndexHit>();
-        int found = 0;
+        int found = 0, unreadable = 0, notPresent = 0;
+        var outcomes = new Dictionary<ulong, TraceIndexOutcome>();
         for (int i = 0; i < 10_000; i++)
         {
             hits.Clear();
-            if (r.Lookup(TraceIndexFileTestsAccess.Key(Id(i)), hits) == TraceIndexOutcome.Found) found++;
+            ulong key = TraceIndexFileTestsAccess.Key(Id(i));
+            var o = r.Lookup(key, hits);
+            outcomes[key] = o;
+            if (o == TraceIndexOutcome.Found) found++;
+            else if (o == TraceIndexOutcome.Unreadable) unreadable++;
+            else notPresent++;
         }
-        _out.WriteLine($"{found} of 10000 still resolvable after one block was destroyed");
+
+        _out.WriteLine($"after one destroyed block: {found} Found, {unreadable} Unreadable, "
+                     + $"{notPresent} NotPresent");
+
+        // The run is not lost — the other blocks still answer.
         Assert.True(found > 0, "a single torn block cost the whole run");
+
+        // AND THE ASSERTION THAT CAN FAIL. Under the bool protocol every one of these came back
+        // as "no"; under the tri-state one, a key whose block will not decode says so.
+        Assert.Contains(inBlockZero, k => outcomes[k] == TraceIndexOutcome.Unreadable);
+        Assert.DoesNotContain(inBlockZero, k => outcomes[k] == TraceIndexOutcome.NotPresent);
+    }
+
+    [Fact]
+    public void A_run_whose_block_count_was_zeroed_will_not_open()
+    {
+        // MANUFACTURED PROOF WITHOUT TOUCHING THE DISK, which the tri-state protocol did not
+        // close because there is nothing here to fail at. MightContain answers false when the
+        // block list is empty, Lookup turns that into NotPresent, and NotPresent from a covered
+        // run means "skip the segment". So bit rot on the four-byte block count of a merged run
+        // over four hundred segments makes every trace in all four hundred vanish — silently, and
+        // across restarts, because the file opens perfectly every time.
+        //
+        // The writer sets entryCount and blockCount together, so disagreement is damage, and a
+        // damaged run must be UNREADABLE rather than empty.
+        var w = new TraceIndexWriter();
+        for (int i = 0; i < 3_000; i++) w.Add(Id(i), 1, Offsets(i, 3));
+        var run = w.Write(Path_("zeroblocks.tix"), level: 1, coveredSegments: [1]);
+
+        var raw = File.ReadAllBytes(run.FilePath);
+        long sparseAt = BitConverter.ToInt64(raw, raw.Length - 20);
+        Assert.True(sparseAt > 0 && sparseAt < raw.Length);
+        BitConverter.GetBytes(0).CopyTo(raw, (int)sparseAt);      // blockCount := 0
+        File.WriteAllBytes(run.FilePath, raw);
+
+        var r = TraceIndexReader.Open(run.FilePath);
+        _out.WriteLine($"entryCount 3000 with blockCount 0 → {(r is null ? "refused" : "OPENED")}");
+        Assert.Null(r);
+        r?.Dispose();
+    }
+
+    [Fact]
+    public void A_run_whose_header_key_range_contradicts_its_blocks_will_not_open()
+    {
+        // The same class through the other door. MightContain also answers false for any key
+        // outside [minKey, maxKey], and both are read raw from the header — so a torn minKey
+        // narrows the run's advertised range and every key below it becomes "not present" without
+        // a byte being read. The writer derives both from the block keys, so a header that
+        // disagrees with firstKeys[0] is damage.
+        var w = new TraceIndexWriter();
+        for (int i = 0; i < 3_000; i++) w.Add(Id(i), 1, Offsets(i, 3));
+        var run = w.Write(Path_("badrange.tix"), level: 1, coveredSegments: [1]);
+
+        var raw = File.ReadAllBytes(run.FilePath);
+        ulong minKey = BitConverter.ToUInt64(raw, 12);
+        BitConverter.GetBytes(minKey + 1).CopyTo(raw, 12);        // one bit of drift is enough
+        File.WriteAllBytes(run.FilePath, raw);
+
+        var r = TraceIndexReader.Open(run.FilePath);
+        _out.WriteLine($"header minKey shifted off firstKeys[0] → {(r is null ? "refused" : "OPENED")}");
+        Assert.Null(r);
+        r?.Dispose();
     }
 }
 

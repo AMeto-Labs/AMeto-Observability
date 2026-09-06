@@ -146,6 +146,14 @@ internal sealed class TraceIndexBackfillWorker(
                 // when the backfill is adding to it.
                 worked = await Task.Run(() =>
                 {
+                    // ADOPTION IS NOT AN INDEX OPERATION, and it lived inside BackfillNextSegment,
+                    // which is behind the mode gate. So `Off` — an option documented as changing
+                    // nothing but speed — silently switched off the repair for a segment stuck at
+                    // SegmentId 0, which is the whole reason _unnamedSegments exists. Outside the
+                    // gate, and first, so a segment adopted this tick can be indexed in the same
+                    // one.
+                    engine.AdoptUnnamedSegments();
+
                     bool backfilled = mode != TraceIndexBackfillMode.Off && engine.BackfillNextSegment(ct);
                     bool merged     = engine.CompactIndexOnce(ct);
                     return backfilled || merged;

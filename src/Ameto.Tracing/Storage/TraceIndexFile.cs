@@ -336,6 +336,10 @@ internal sealed class TraceIndexReader : IDisposable
     private          int                 _refs;
     /// <summary>Set when the store drops the run; the last release then does the freeing.</summary>
     private          bool                _retired;
+    private          bool                _deleteOnFree;
+    /// <summary>Test seam: runs just before a block is read, so a test can retire this reader
+    /// from another thread at the one instant that matters. Null in production.</summary>
+    internal Action<int>? _beforeBlockReadForTest;
     private readonly System.Threading.Lock _life = new();
 
     /// <summary>The run's own path — for the log line when it cannot answer.</summary>
@@ -421,6 +425,24 @@ internal sealed class TraceIndexReader : IDisposable
                 if (offsets[i] < TraceIndexFile.HeaderBytes || offsets[i] >= sparseAt) return null;
                 if (i > 0 && (firstKeys[i] < firstKeys[i - 1] || offsets[i] <= offsets[i - 1])) return null;
             }
+
+            // THE HEADER AND THE SPARSE INDEX MUST AGREE, and until this they were never compared.
+            //
+            // Both facts below are established unconditionally by TraceIndexWriter.Write, so a run
+            // that breaks one is DAMAGED — and the distinction matters because Lookup answers
+            // "not present" from these two numbers WITHOUT TOUCHING THE DISK. An empty block list
+            // makes MightContain false; a key outside [minKey, maxKey] makes it false. Both then
+            // become NotPresent, which from a covered run is a PROOF, which is permission to skip
+            // the segment. Every other manufactured proof in this file was closed by the tri-state
+            // protocol; these two were left because they never read anything to fail at.
+            //
+            // The cost of the gap is not a lost query, it is a lost fleet: bit rot zeroing the
+            // four-byte block count of a merged L3 run over four hundred segments leaves a file
+            // that opens perfectly and answers "no such trace" for every trace in all four
+            // hundred, silently, until somebody restarts — and the restart reopens it just as
+            // happily. Refusing to open it costs a scan and heals at the next backfill.
+            if (count > 0 && blocks == 0) return null;
+            if (blocks > 0 && (firstKeys[0] != minKey || firstKeys[blocks - 1] > maxKey)) return null;
 
             // ── bloom ──
             fs.Seek(bloomAt, SeekOrigin.Begin);
@@ -626,6 +648,11 @@ internal sealed class TraceIndexReader : IDisposable
     private bool ScanBlock(int index, ulong key, List<TraceIndexHit> into, out bool wentPast)
     {
         wentPast = false;
+        // The seam the refcount test needs. Lifetime safety is a property about what happens WHILE
+        // a lookup is inside the reader, and a single-threaded test cannot express it; this lets a
+        // test retire and drop the run mid-lookup, deterministically, at the point where the next
+        // thing the reader does is read the bloom's memory and reopen the file.
+        _beforeBlockReadForTest?.Invoke(index);
         byte[]? raw = null;
         int rawLen  = 0;
         try
@@ -719,22 +746,45 @@ internal sealed class TraceIndexReader : IDisposable
             if (--_refs > 0 || !_retired || _disposed) return;
             _disposed = true;
         }
-        _bloom.Dispose();
+        Free();
     }
 
     /// <summary>
     /// The store is done with this run. Frees now if nothing holds it, otherwise leaves the last
     /// <see cref="Release"/> to do it — a lookup already in flight finishes on live memory.
     /// </summary>
-    public void Retire()
+    /// <param name="deleteFile">
+    /// Unlink the <c>.tix</c> as part of the free, rather than immediately.
+    ///
+    /// <para>THE HOLD IS ON THE PATH, NOT ON A HANDLE, which is what makes this necessary and is
+    /// easy to miss: <see cref="ScanBlock"/> REOPENS the file for every block it reads, so a
+    /// retired reader that a lookup is still holding is a reader whose next read goes to the file
+    /// system. Deleting the file the instant it was unnamed therefore cancelled exactly the
+    /// overlap the refcount was added to buy.</para>
+    ///
+    /// <para>Under the old bool protocol the resulting FileNotFoundException was swallowed as
+    /// "not present" — wrong, but cheap. Under the tri-state protocol it is <c>Unreadable</c>, and
+    /// the store unions the whole run's CoveredSegments into the unanswerable set: one merged L3
+    /// run is a thousand segments dropping to a full scan, for a file that was deleted on purpose
+    /// microseconds earlier. Two correct fixes combining into a cliff.</para>
+    /// </param>
+    public void Retire(bool deleteFile = false)
     {
         lock (_life)
         {
             _retired = true;
+            if (deleteFile) _deleteOnFree = true;
             if (_refs > 0 || _disposed) return;
             _disposed = true;
         }
+        Free();
+    }
+
+    private void Free()
+    {
         _bloom.Dispose();
+        if (!_deleteOnFree) return;
+        try { if (File.Exists(Path)) File.Delete(Path); } catch { /* the startup sweep gets it */ }
     }
 
     public void Dispose() => Retire();

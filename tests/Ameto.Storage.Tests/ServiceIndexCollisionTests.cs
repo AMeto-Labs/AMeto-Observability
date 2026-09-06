@@ -243,13 +243,22 @@ public sealed class ServiceIndexCollisionTests : IDisposable
             honest = (long)br.ReadUInt64();
         }
 
-        int loud = 0, complete = 0;
+        int loud = 0, complete = 0, reachedTheNewChecks = 0;
         var quiet = new List<string>();
+        long fileLen = new FileInfo(path).Length;
 
         for (int bit = 0; bit < 64; bit++)
         {
             long torn = honest ^ (1L << bit);
             if (torn == honest) continue;
+
+            // WHICH FLIPS THIS TEST IS ACTUALLY ABOUT. A flip that pushes the offset out of the
+            // file — bit 63 makes it negative — is caught by the "inside the file" test that was
+            // here BEFORE, degrades to reading every block, and counts as complete. Counting those
+            // as proof that the instrument works is how the first version of this assertion ended
+            // up unable to fail: it was satisfied entirely by the old code. Only a flip that lands
+            // back inside the file reaches the two checks this test exists for.
+            if (torn > 0 && torn < fileLen) reachedTheNewChecks++;
 
             using (var raw = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite))
             using (var bw = new BinaryWriter(raw))
@@ -288,10 +297,17 @@ public sealed class ServiceIndexCollisionTests : IDisposable
         }
 
         _out.WriteLine($"64 single-bit flips of bloomIdxOffset: {loud} loud, {complete} complete, "
-                     + $"{quiet.Count} quiet");
+                     + $"{quiet.Count} quiet; {reachedTheNewChecks} landed inside the file");
         Assert.True(quiet.Count == 0,
             "an attribute-filtered search came back short and said nothing:" + Environment.NewLine
           + string.Join(Environment.NewLine, quiet));
-        Assert.True(complete > 0, "no flip reached the degrade-to-reading-everything path");
+
+        // THE INSTRUMENT, ASSERTED ON THE FLIPS THAT MATTER. `complete > 0` was satisfied by bit
+        // 63 alone — it makes the offset negative, which the pre-existing "inside the file" test
+        // has always caught — so the assertion passed with the new checks reverted and said
+        // nothing about them. Measured with them removed: 3 of these land quiet.
+        Assert.True(reachedTheNewChecks > 0,
+            "no flip landed inside the file, so nothing exercised the neighbour and exact-end "
+          + "checks this test exists for");
     }
 }
