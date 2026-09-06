@@ -101,6 +101,12 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     internal Action<string>? _afterIndexRunWrittenForTest;
 
     /// <summary>
+    /// Test seam: runs between the coverage snapshot and the index lookup, which is the window a
+    /// writer has to move through to make a stale snapshot dangerous. Null in production.
+    /// </summary>
+    internal Action? _betweenCoverageAndLookupForTest;
+
+    /// <summary>
     /// Test seam: called inside <c>CompleteFlush</c> at the instant the catalog knows a segment and
     /// <c>_coldSegments</c> does not. Index compaction takes no engine lock, so it really can run
     /// there; reaching that window any other way is a matter of luck.
@@ -668,16 +674,38 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         // file, and the entire reason this branch exists. The hint is still verified: the walk
         // checks each span's FULL trace id, so a hit on the truncated key that turns out to be a
         // collision yields nothing rather than another trace's spans.
-        // COVERAGE IS SAMPLED BEFORE THE LOOKUP, AND THAT ORDER IS LOAD-BEARING. Every writer
-        // publishes the other way round — the run is opened first, the coverage claim second — so a
-        // segment covered at THIS instant is guaranteed to have had an open run when the lookup ran
-        // a moment later. Asking IsCovered per segment inside the loop instead sampled it later
-        // than the lookup, which admits exactly the state the write order rules out: the backfill's
-        // MarkCovered flips a segment false→true after the lookup snapshot was taken, and its
-        // spans are then skipped on the strength of a run the lookup never saw. Coverage shrinking
-        // between the two is harmless — a segment is merely read.
+        // COVERAGE IS SAMPLED ON BOTH SIDES OF THE LOOKUP, AND IT TAKES BOTH.
+        //
+        // BEFORE, because every writer publishes run-then-claim: a segment covered at that instant
+        // is guaranteed to have had an open run a moment later. Sampling only afterwards admits the
+        // state the write order rules out — the backfill's MarkCovered flips a segment false→true
+        // after the lookup, and its spans are skipped on the strength of a run the lookup never
+        // saw.
+        //
+        // AFTER, because the previous version of this comment claimed "coverage shrinking between
+        // the two is harmless — a segment is merely read", and that is false for both writers that
+        // shrink it. PruneAsync and CompactOnePass both withdraw coverage FIRST and close the
+        // readers second, so the safe state is "uncovered, run still open" — and a stale snapshot
+        // lands in the opposite one. Take a trace living in segments 5 and 6, each with its own
+        // run: the request samples coverage, is preempted, and compaction runs to completion —
+        // merged run opened, 5 and 6 out of the catalog with their runs, old readers closed. The
+        // lookup then sees only the merged run, whose entries carry the MERGED segment id, so
+        // there are no hits for 5 or 6 and nothing lands in Unanswerable either. The stale snapshot
+        // still says "covered", both segments are skipped, and the merged segment is not in this
+        // request's snapshot. HTTP 200, no spans, no exception, no log line.
+        //
+        // The deeper shape is that a skip is inferred from the mere ABSENCE of a hit, and
+        // Unanswerable only covers a run that was asked and failed — a run already gone from the
+        // store is not asked at all, so it cannot report that it could not answer. Requiring
+        // coverage at both ends closes it without a new concept: a segment covered before AND after
+        // had an open run across the whole window, and one covered at only one end is simply read.
+        // Carrying the proof out of the lookup itself (the set of segments some acquired run
+        // actually answered for) would remove the timing argument rather than satisfy it, and is
+        // the better shape — but it is a new field on TraceIndexAnswer and belongs in its own
+        // change, not in the one that stops the loss.
         bool useIndex = _index.HasRuns;
         var  coveredAtLookup = useIndex ? _manifest.CoverageSnapshot() : null;
+        _betweenCoverageAndLookupForTest?.Invoke();
         var  answer = useIndex ? _index.Lookup(traceId) : default;
         int  opened = 0, skipped = 0;
 
@@ -692,6 +720,10 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                 List<uint>? known = null;
                 if (useIndex && seg.SegmentId != 0
                     && coveredAtLookup!.Contains(seg.SegmentId)
+                    // AND STILL COVERED NOW. Covered before the lookup and covered after it means
+                    // an open run stood behind the claim for the whole window; covered at only one
+                    // end means a writer moved underneath this request, and the segment is read.
+                    && _manifest.IsCovered(seg.SegmentId)
                     // A run that could not be read has proved nothing about the segments it covers,
                     // so for this request they are not covered at all.
                     && answer.Unanswerable?.Contains(seg.SegmentId) != true)
