@@ -106,6 +106,10 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// </summary>
     internal Action? _betweenCoverageAndLookupForTest;
 
+    /// <summary>Test seam: publish the next segment(s) with no index run, so a test can build the
+    /// mixed covered/uncovered state a still-migrating install is in.</summary>
+    internal bool SuppressIndexRunsForTest;
+
     /// <summary>
     /// Test seam: called inside <c>CompleteFlush</c> at the instant the catalog knows a segment and
     /// <c>_coldSegments</c> does not. Index compaction takes no engine lock, so it really can run
@@ -694,20 +698,31 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         // still says "covered", both segments are skipped, and the merged segment is not in this
         // request's snapshot. HTTP 200, no spans, no exception, no log line.
         //
-        // The deeper shape is that a skip is inferred from the mere ABSENCE of a hit, and
-        // Unanswerable only covers a run that was asked and failed — a run already gone from the
-        // store is not asked at all, so it cannot report that it could not answer. Requiring
-        // coverage at both ends closes it without a new concept: a segment covered before AND after
-        // had an open run across the whole window, and one covered at only one end is simply read.
-        // Carrying the proof out of the lookup itself (the set of segments some acquired run
-        // actually answered for) would remove the timing argument rather than satisfy it, and is
-        // the better shape — but it is a new field on TraceIndexAnswer and belongs in its own
-        // change, not in the one that stops the loss.
+        // AND NOW THE PROOF COMES OUT OF THE LOOKUP ITSELF, WHICH RETIRES THE ARGUMENT ABOVE.
+        //
+        // Requiring coverage at both ends stopped the loss, and it stopped it with a timing
+        // argument: a segment covered before AND after must have had an open run in between. True,
+        // but it is reasoning about what could have happened between two samples, and the thing it
+        // was reasoning around is that a skip was inferred from the mere ABSENCE of a hit —
+        // Unanswerable speaks only for a run that was ASKED and failed, so a run already gone from
+        // the store looked exactly like a healthy one that had cleared the segment.
+        //
+        // TraceIndexAnswer.AnsweredFor is the fact that replaces the argument: the segments some
+        // run was acquired for, read, and gave a verdict on, collected in the same instant as the
+        // hits. A run that vanished before the lookup is not in it, so its segments cannot be
+        // skipped, whatever any coverage sample says. The second manifest sample is gone with the
+        // argument it supported; coveredAtLookup stays as the MANIFEST half of the rule, because
+        // the store's word alone was never the whole rule — see the two-part statement above.
         bool useIndex = _index.HasRuns;
         var  coveredAtLookup = useIndex ? _manifest.CoverageSnapshot() : null;
         _betweenCoverageAndLookupForTest?.Invoke();
         var  answer = useIndex ? _index.Lookup(traceId) : default;
         int  opened = 0, skipped = 0;
+
+        // Segments of THIS request's snapshot whose file was already gone when it went to read.
+        // Compaction unlinks its sources, so this is the signal that the snapshot has been
+        // overtaken — see the recovery pass after the scan.
+        int vanished = 0;
 
         if (segs.Length > 0)
         {
@@ -720,10 +735,10 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                 List<uint>? known = null;
                 if (useIndex && seg.SegmentId != 0
                     && coveredAtLookup!.Contains(seg.SegmentId)
-                    // AND STILL COVERED NOW. Covered before the lookup and covered after it means
-                    // an open run stood behind the claim for the whole window; covered at only one
-                    // end means a writer moved underneath this request, and the segment is read.
-                    && _manifest.IsCovered(seg.SegmentId)
+                    // AND A RUN ACTUALLY ANSWERED FOR IT, in this lookup, not according to any
+                    // sample taken beside it. A run that had already left the store is absent from
+                    // this set, so its segments are read.
+                    && answer.AnsweredFor?.Contains(seg.SegmentId) == true
                     // A run that could not be read has proved nothing about the segments it covers,
                     // so for this request they are not covered at all.
                     && answer.Unanswerable?.Contains(seg.SegmentId) != true)
@@ -761,6 +776,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                         // This walk reports no fault bit of its own — a trace lookup either finds
                         // the trace or does not — so the verdict is used only for its side effect.
                         MeetMissingSegmentFile(seg);
+                        Interlocked.Increment(ref vanished);
                         return null;
                     }
                     catch (DirectoryNotFoundException ex)
@@ -772,6 +788,20 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                     }
                     catch (Exception ex)
                     {
+                        // ANY FAILED READ COUNTS AS AN OVERTAKEN SNAPSHOT, not only a missing file.
+                        // On Windows a source that compaction has unlinked keeps its directory
+                        // entry in delete-pending while another process holds it open with
+                        // FILE_SHARE_DELETE — an antivirus or backup agent, the same class of
+                        // interference TraceIndexStore.Add and CompleteFlush already document —
+                        // and opening that name gives UnauthorizedAccessException, not
+                        // FileNotFoundException. Landing here without setting the flag left the
+                        // recovery pass switched off and the segment that now holds those spans
+                        // unread, which is the exact loss this pass exists to prevent.
+                        //
+                        // A false positive is nearly free: the pass only looks at segments that
+                        // were not in this request's snapshot, so with no replacement to find it
+                        // costs one set comparison.
+                        Interlocked.Increment(ref vanished);
                         _logger.LogWarning(ex, "Trace lookup: skipping unreadable segment {File}", seg.FilePath);
                         return null;
                     }
@@ -783,6 +813,100 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             foreach (var t in tasks)
                 if (await t.ConfigureAwait(false) is { } part)
                     cold.AddRange(part);
+        }
+
+        // ── THE SNAPSHOT THAT WAS OVERTAKEN ──────────────────────────────────────
+        //
+        // A VANISHED SEGMENT MAY HAVE BEEN REPLACED RATHER THAN DELETED, and until this the
+        // difference was invisible. This walk takes one snapshot of _coldSegments and keeps it for
+        // the whole request; compaction publishes the merged segment and unlinks its sources, so a
+        // request that started first reads paths that no longer exist and never hears about the
+        // file that now holds those spans. Every source contributes nothing, the replacement is not
+        // in the list, and the trace comes back short — HTTP 200, no exception, no log line. Older
+        // than the trace-id index and reproducible without it; the note above the scan called it
+        // "skipped (and healed out of the snapshot)", which described the bookkeeping and not the
+        // answer.
+        //
+        // Retention looks identical from here and needs no repair: its segments are deleted, not
+        // replaced, so nothing new appears and this pass finds nothing to do.
+        //
+        // BOUNDED BY CONSTRUCTION rather than by a retry count. It runs only when a file actually
+        // vanished, and it reads only segments that were NOT in the original snapshot — which can
+        // only be what flushes and compactions published during this one request, a handful at
+        // worst. A second overtaking during the recovery pass is left alone deliberately: the loss
+        // it could cause is one more compaction deep and the next request answers in full, whereas
+        // looping here would put an unbounded amount of work behind an event the caller cannot see.
+        if (Volatile.Read(ref vanished) > 0)
+        {
+            var scanned = new HashSet<string>(segs.Length, StringComparer.Ordinal);
+            foreach (var s in segs) scanned.Add(s.FilePath);
+
+            List<SpanSegmentInfo>? appeared = null;
+            foreach (var s in _coldSegments)
+                if (!scanned.Contains(s.FilePath)) (appeared ??= new List<SpanSegmentInfo>()).Add(s);
+
+            if (appeared is not null)
+            {
+                _logger.LogDebug(
+                    "Trace lookup: {Gone} segment(s) of the snapshot were replaced mid-request; "
+                  + "consulting the {New} segment(s) that appeared since", vanished, appeared.Count);
+
+                // THE SAME RULE AS THE MAIN PASS, ON A FRESH ANSWER. The first version of this
+                // skipped nothing, on the reasoning that "skipping is what got us here" — which
+                // conflated two different skips. What lost the trace was skipping on a STALE
+                // snapshot; skipping on an answer taken right here, from runs read right here, is
+                // exactly as sound as the decision thirty lines up and rests on the same two
+                // halves. Without it every appeared segment that does NOT hold the trace was read
+                // end to end — for v4 a walk over every block of the file — to learn what one
+                // bloom probe already knew.
+                //
+                // AND THE GUARD IS ON THE ANSWER, NOT ON THE SEGMENT ID. `default(TraceIndexAnswer)`
+                // has a null Hits, and a non-zero SegmentId says nothing about whether any run is
+                // open: ids are handed out unconditionally by the flush and the compaction, while
+                // runs are not written at all when the index is switched off. So on an engine
+                // started with Ameto:Traces:IndexEnabled=false — the documented operator rollback,
+                // whose whole promise is that it costs speed and nothing else — a compaction
+                // completing inside a request reached this loop with `late.Hits` null and threw a
+                // NullReferenceException out of GetTraceAsync, past a try that starts below it,
+                // into the pipeline as a 500. A repair written to stop a silently short answer
+                // turned it into a crash in exactly the configuration reached by someone already
+                // worried about short answers.
+                bool useLate = _index.HasRuns;
+                var  coveredLate = useLate ? _manifest.CoverageSnapshot() : null;
+                var  late = useLate ? _index.Lookup(traceId) : default;
+
+                foreach (var s in appeared)
+                {
+                    List<uint>? known = null;
+                    if (useLate && s.SegmentId != 0
+                        && coveredLate!.Contains(s.SegmentId)
+                        && late.AnsweredFor?.Contains(s.SegmentId) == true
+                        && late.Unanswerable?.Contains(s.SegmentId) != true)
+                    {
+                        foreach (var h in late.Hits)
+                            if (h.SegmentId == s.SegmentId) (known ??= new List<uint>()).AddRange(h.Offsets);
+
+                        if (known is null) { skipped++; continue; }
+                    }
+
+                    opened++;
+                    try
+                    {
+                        var walk = known is null
+                            ? SpanReader.ReadTraceAsync(s.FilePath, traceId, ct)
+                            : SpanReader.ReadTraceAtAsync(s.FilePath, traceId, known, ct);
+                        await foreach (var r in walk.ConfigureAwait(false))
+                            (cold ??= new List<SpanRecord>()).Add(r);
+                    }
+                    catch (OperationCanceledException) { throw; }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex,
+                            "Trace lookup: could not read {File}, which replaced a segment that went "
+                          + "away mid-request", s.FilePath);
+                    }
+                }
+            }
         }
 
         SegmentsOpenedByLastTraceLookup  = opened;
@@ -2336,7 +2460,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     private TraceIndexRun? WriteIndexRun(
         SpanSegmentInfo segment, ulong segmentId, Dictionary<TraceId, List<uint>>? traceIndex)
     {
-        if (traceIndex is null || !_indexEnabled) return null;
+        if (traceIndex is null || !_indexEnabled || SuppressIndexRunsForTest) return null;
         try
         {
             var w = new TraceIndexWriter();

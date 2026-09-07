@@ -10,9 +10,24 @@ namespace Ameto.Tracing.Storage;
 /// they must be treated as uncovered and read. Without it a torn block or a file locked for a
 /// moment reads as "the trace is not in that segment".</para>
 /// </summary>
+/// <param name="AnsweredFor">
+/// Segments some run ACTUALLY ANSWERED FOR in this lookup — acquired, read, and returning either
+/// <c>Found</c> or <c>NotPresent</c>.
+///
+/// <para>THIS IS THE PROOF, AND IT COMES FROM THE SAME INSTANT AS THE HITS. Without it a skip was
+/// inferred from the mere ABSENCE of a hit, checked against a coverage set sampled at a different
+/// moment — which meant the decision rested on an argument about ordering rather than on a fact.
+/// <see cref="Unanswerable"/> only speaks for a run that was asked and failed; a run already gone
+/// from the store is not asked at all, so it cannot report that it could not answer, and its
+/// segments looked exactly like segments a healthy run had cleared.</para>
+///
+/// <para>Null means no run answered for anything, which is the same as an empty set and saves the
+/// allocation on the common path where the index is not in use.</para>
+/// </param>
 internal readonly record struct TraceIndexAnswer(
     List<TraceIndexHit> Hits,
-    HashSet<ulong>?     Unanswerable);
+    HashSet<ulong>?     Unanswerable,
+    HashSet<ulong>?     AnsweredFor);
 
 /// <summary>
 /// THE OPEN RUNS, AND THE ONE QUESTION THE READ PATH ASKS THEM.
@@ -41,6 +56,24 @@ internal sealed class TraceIndexStore : IDisposable
 
     /// <summary>Open runs by their file path. Replaced wholesale, never mutated in place.</summary>
     private volatile Dictionary<string, TraceIndexReader> _open = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Every segment the currently open runs cover — rebuilt whenever <see cref="_open"/> is
+    /// replaced, and handed out by reference to each lookup.
+    ///
+    /// <para>ON THE MUTATION, NOT ON THE LOOKUP, and that is the whole reason it is a field. A
+    /// lookup needs this set to say which segments it actually answered for, and building it there
+    /// put a fresh <c>HashSet&lt;ulong&gt;</c> sized by the number of covered cold segments on the
+    /// SUCCESS path of every trace lookup — a bloom miss is <c>NotPresent</c>, not
+    /// <c>Unreadable</c>, so unlike the unanswerable set it was allocated whether or not anything
+    /// went wrong. Runs change on a flush, a merge or a retention pass; lookups happen per request.
+    /// Building it on the rare side costs nothing and the replaced check it stands in for was one
+    /// hash probe with no allocation at all.</para>
+    ///
+    /// <para>Published under the same lock and in the same statement as <see cref="_open"/>, so a
+    /// lookup that pinned a set of readers is holding the set that describes exactly those.</para>
+    /// </summary>
+    private volatile HashSet<ulong> _coveredByOpen = new();
 
     public TraceIndexStore(ILogger logger) => _logger = logger;
 
@@ -100,7 +133,7 @@ internal sealed class TraceIndexStore : IDisposable
             foreach (var (path, reader) in _open)
                 if (!next.ContainsKey(path)) stale.Add(reader);
 
-            _open = next;
+            Publish(next);
             foreach (var r in stale) r.Retire();
         }
 
@@ -138,7 +171,7 @@ internal sealed class TraceIndexStore : IDisposable
             var next = CopyOpen();
             if (next.Remove(run.FilePath, out var old)) old.Retire();
             next[run.FilePath] = opened;
-            _open = next;
+            Publish(next);
         }
         return true;
     }
@@ -167,7 +200,7 @@ internal sealed class TraceIndexStore : IDisposable
                 if (next.Remove(p, out var r)) drop.Add(r);
                 else unopened?.Add(p);          // never opened here — nothing can be holding it
             }
-            _open = next;
+            Publish(next);
             foreach (var r in drop) r.Retire(deleteFiles);
             if (unopened is null) return;
             foreach (var p in unopened)
@@ -188,11 +221,20 @@ internal sealed class TraceIndexStore : IDisposable
         // read — milliseconds — and the store used to dispose dropped readers immediately, whose
         // bloom is native memory.
         List<TraceIndexReader> held;
+        HashSet<ulong>         answeredFor;
         lock (_gate)
         {
             var open = _open;
             held = new List<TraceIndexReader>(open.Count);
             foreach (var r in open.Values) if (r.TryAcquire()) held.Add(r);
+
+            // TAKEN HERE, WITH THE READERS, AND NOT BUILT PER LOOKUP. This is the set the caller
+            // uses as its proof, and it describes exactly the runs pinned on the line above,
+            // because Publish assigns both in one statement under this lock. Unioning the runs'
+            // CoveredSegments here instead allocated a HashSet on the SUCCESS path of every
+            // lookup — a bloom miss is NotPresent, not Unreadable, so it happened whether or not
+            // anything went wrong — where the check it replaced was one hash probe.
+            answeredFor = _coveredByOpen;
         }
 
         var hits = new List<TraceIndexHit>(2);
@@ -206,7 +248,10 @@ internal sealed class TraceIndexStore : IDisposable
 
                 // A RUN THAT COULD NOT ANSWER UN-COVERS ITS SEGMENTS FOR THIS REQUEST. Silence
                 // from a covered run is what lets the engine skip a segment, and this run proved
-                // nothing — so the caller has to read those segments instead.
+                // nothing — so the caller has to read those segments instead. Subtracting these
+                // from AnsweredFor is the caller's job and it already does it: the skip requires
+                // AnsweredFor AND not Unanswerable, so a run that failed takes its segments back
+                // out of the proof.
                 (unanswerable ??= new HashSet<ulong>()).UnionWith(r.CoveredSegments);
                 _logger.LogDebug("Trace index run {Path} could not answer a lookup; the {Count} "
                               + "segment(s) it covers are read rather than skipped",
@@ -215,7 +260,7 @@ internal sealed class TraceIndexStore : IDisposable
         }
         finally { foreach (var r in held) r.Release(); }
 
-        return new TraceIndexAnswer(hits, unanswerable);
+        return new TraceIndexAnswer(hits, unanswerable, answeredFor);
     }
 
     /// <summary>True when any run is open at all — the read path skips its work entirely if not.</summary>
@@ -230,6 +275,22 @@ internal sealed class TraceIndexStore : IDisposable
     private Dictionary<string, TraceIndexReader> CopyOpen() => new(_open, StringComparer.Ordinal);
 
     /// <summary>
+    /// Publishes a new set of open runs together with the segment set derived from it. The only
+    /// place <see cref="_open"/> is assigned, so the two can never disagree — the derived set is
+    /// what a lookup calls its proof, and a stale one would be a proof about runs that are gone.
+    /// Callers hold <see cref="_gate"/>.
+    /// </summary>
+    private void Publish(Dictionary<string, TraceIndexReader> next)
+    {
+        var covered = new HashSet<ulong>();
+        foreach (var r in next.Values)
+            foreach (ulong sid in r.CoveredSegments) covered.Add(sid);
+
+        _open          = next;
+        _coveredByOpen = covered;
+    }
+
+    /// <summary>
     /// The open reader for a path, so a test can install a seam on the instance a lookup will
     /// actually take a hold on. Opening the file again would produce a DIFFERENT reader with its
     /// own refcount, which is exactly the reader whose lifetime nothing here manages.
@@ -242,7 +303,7 @@ internal sealed class TraceIndexStore : IDisposable
         lock (_gate)
         {
             foreach (var r in _open.Values) r.Retire();
-            _open = new Dictionary<string, TraceIndexReader>(StringComparer.Ordinal);
+            Publish(new Dictionary<string, TraceIndexReader>(StringComparer.Ordinal));
         }
     }
 }
