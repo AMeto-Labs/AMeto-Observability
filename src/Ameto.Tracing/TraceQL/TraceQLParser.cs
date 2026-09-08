@@ -225,6 +225,8 @@ public static class TraceQLParser
 
         private static SpanPredicate BuildAttrPredicate(string key, TraceQLOp op, TraceQLValue val)
         {
+            if (TryBuildPresence(key, op, val) is { } presence) return presence;
+
             // Optimise: if key is a promoted field, use the fast predicate
             if (key is "http.status_code" or "http.response.status_code" && val.IsNumber)
                 return new HttpStatusCodePredicate(op, (short)val.Number);
@@ -232,9 +234,56 @@ public static class TraceQLParser
             return new AttributePredicate(key, op, val);
         }
 
+        /// <summary>
+        /// Builds the presence test for <c>= nil</c> / <c>!= nil</c>, or null when the value is not
+        /// the bare word <c>nil</c>.
+        ///
+        /// <para>THE ONLY WAY LEFT TO ASK ABOUT ABSENCE, and that is a consequence of three-valued
+        /// logic rather than a convenience. Once an absent attribute answers "unknown" to every
+        /// comparison, no comparison can find one — so without this spelling "which spans are
+        /// missing a tenant id" has no answer at all.</para>
+        ///
+        /// <para>Ordering operators are refused rather than quietly accepted: <c>&lt; nil</c> has no
+        /// meaning, and letting it through as a string comparison against the text "nil" is the
+        /// kind of silent wrong answer this whole area has been paying for.</para>
+        /// </summary>
+        private static SpanPredicate? TryBuildPresence(string key, TraceQLOp op, TraceQLValue val)
+        {
+            if (!val.IsIdent || !string.Equals(val.StringVal, "nil", StringComparison.OrdinalIgnoreCase))
+                return null;
+
+            if (op is not (TraceQLOp.Eq or TraceQLOp.Neq))
+                throw new TraceQLException(
+                    $"nil supports only = and != (got {op}); ask '{key} = nil' for absent or "
+                  + $"'{key} != nil' for present");
+
+            bool present = op == TraceQLOp.Neq;
+
+            // The promoted field is its own storage, so presence has to be read from the same place
+            // HttpStatusCodePredicate reads absence — see HttpStatusPresencePredicate.
+            return key is "http.status_code" or "http.response.status_code"
+                ? new HttpStatusPresencePredicate(present)
+                : new AttributePresencePredicate(key, present);
+        }
+
         private static SpanPredicate BuildIntrinsicPredicate(string name, TraceQLOp op, TraceQLValue val)
         {
-            switch (name.ToLowerInvariant())
+            string lower = name.ToLowerInvariant();
+
+            // NIL AGAINST AN INTRINSIC IS REFUSED, because every intrinsic is on every span and so
+            // the question has no content. Refused rather than ignored: falling through would build
+            // a ServicePredicate comparing the service name to the TEXT "nil", which matches almost
+            // nothing and says so to nobody — the same silent-wrong-answer shape this whole area
+            // has been paying for.
+            if (val.IsIdent
+                && string.Equals(val.StringVal, "nil", StringComparison.OrdinalIgnoreCase)
+                && lower is "duration" or "status" or "service" or "service.name"
+                         or "name" or "span.name" or "kind" or "span.kind")
+                throw new TraceQLException(
+                    $"'{lower}' is present on every span, so comparing it to nil asks nothing; "
+                  + "nil tests the presence of an attribute, as in '.tenant = nil'");
+
+            switch (lower)
             {
                 case "duration":
                     if (!val.IsNumber)
@@ -256,8 +305,9 @@ public static class TraceQLParser
                     return new KindPredicate(op, kind);
 
                 default:
-                    // Treat unknown intrinsic as attribute lookup
-                    return new AttributePredicate(name, op, val);
+                    // Treat unknown intrinsic as attribute lookup — including `foo = nil`, which
+                    // has to mean the same thing here as `.foo = nil` does above.
+                    return TryBuildPresence(name, op, val) ?? new AttributePredicate(name, op, val);
             }
         }
 

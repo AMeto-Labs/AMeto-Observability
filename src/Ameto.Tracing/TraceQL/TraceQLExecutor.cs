@@ -131,6 +131,21 @@ public static class TraceQLExecutor
             case AttributePredicate anyAttr:
                 AddAttrHint(h, anyAttr);
                 break;
+
+            // THE TWO HALVES OF `nil` ARE NOT EQUALLY SAFE, and only one of them is a hint.
+            //
+            // `{ .foo != nil }` requires the key to EXIST, which is exactly what a value-less
+            // AttrHint means and the same probe AddAttrHint already emits for <, >, >= and numeric
+            // equality. Without this case the new syntax arrived without the block skip its
+            // neighbours get, so `{ .foo != nil && duration > 1s }` read every block.
+            //
+            // `{ .foo = nil }` requires the key to be ABSENT and must therefore emit NOTHING: the
+            // hint would tell the cold reader to keep only blocks whose bloom has the key, which is
+            // precisely the set that cannot contain the answer. It falls through to no case at all,
+            // deliberately — see A_presence_test_contributes_no_attribute_hint.
+            case AttributePresencePredicate presence when presence.Present:
+                (h.AttrHints ??= new List<AttrHint>(2)).Add(new AttrHint(presence.Key, null));
+                break;
         }
     }
 
@@ -219,7 +234,11 @@ public static class TraceQLExecutor
         var traces = new Dictionary<TraceId, List<SpanRecord>>(capacity: spans.Count / 4);
         foreach (var s in spans)
         {
-            if (!predicate.Evaluate(s)) continue;
+            // ONLY TRUE SELECTS. Evaluate is three-valued (issue #74): null means the span could
+            // not answer — the field the query asks about is not on it — and an unanswered question
+            // is not a match. Writing this as `!Evaluate(s)` would not compile against bool? and
+            // writing it as `Evaluate(s) == false` would silently admit every unknown.
+            if (predicate.Evaluate(s) != true) continue;
             if (!traces.TryGetValue(s.TraceId, out var list))
             {
                 list = new List<SpanRecord>(4);

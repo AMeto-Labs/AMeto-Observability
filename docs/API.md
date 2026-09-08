@@ -432,7 +432,7 @@ Distributed-tracing query surface (spans ingested via OTLP). All require JWT Bea
 | Endpoint | Purpose |
 |----------|---------|
 | `GET /api/traces` | List/search traces (root spans) by service, name, tag filter, duration, time range. |
-| `GET /api/traces/query` | Same, richer query params (tag expressions like `{ db.system = 'mssql' && duration > 200ms }`). |
+| `GET /api/traces/query` | Same, richer query params (tag expressions like `{ db.system = 'mssql' && duration > 200ms }`). A field a span does not carry matches **no** comparison, including a negated one — `{ .attr != nil }` / `{ .attr = nil }` test presence. |
 | `GET /api/traces/stats` | Aggregate trace stats (counts, error rate, latency) over a window. |
 | `GET /api/traces/latency` | Latency distribution / percentiles by service or operation. |
 | `GET /api/traces/service-graph` | Service dependency graph (edges + call counts) inferred from spans. |
