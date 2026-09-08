@@ -219,7 +219,11 @@ public static class TraceQLExecutor
         var traces = new Dictionary<TraceId, List<SpanRecord>>(capacity: spans.Count / 4);
         foreach (var s in spans)
         {
-            if (!predicate.Evaluate(s)) continue;
+            // ONLY TRUE SELECTS. Evaluate is three-valued (issue #74): null means the span could
+            // not answer — the field the query asks about is not on it — and an unanswered question
+            // is not a match. Writing this as `!Evaluate(s)` would not compile against bool? and
+            // writing it as `Evaluate(s) == false` would silently admit every unknown.
+            if (predicate.Evaluate(s) != true) continue;
             if (!traces.TryGetValue(s.TraceId, out var list))
             {
                 list = new List<SpanRecord>(4);

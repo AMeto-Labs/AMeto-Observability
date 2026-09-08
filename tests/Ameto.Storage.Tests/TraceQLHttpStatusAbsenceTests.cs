@@ -55,8 +55,12 @@ public sealed class TraceQLHttpStatusAbsenceTests
         HttpStatusCode = status,
     };
 
+    /// <summary>
+    /// What the executor does with the three-valued answer: only <c>true</c> selects, so an
+    /// unknown reads as "not a match" here exactly as it does in <c>TraceQLExecutor</c>.
+    /// </summary>
     private static bool Matches(string query, SpanRecord span) =>
-        TraceQLParser.Parse(query).Evaluate(span);
+        TraceQLParser.Parse(query).Evaluate(span) == true;
 
     // ── The regression: three operators, one span with no HTTP ─────────────────
 
@@ -112,47 +116,44 @@ public sealed class TraceQLHttpStatusAbsenceTests
         Assert.False(Matches("{ .http.status_code >= 400 }", HttpCall(399)));
     }
 
-    // ── The half of the door this change does not close ───────────────────────
+    // ── The other half of the door, closed by #74 ─────────────────────────────
 
     /// <summary>
-    /// PINNED, NOT ENDORSED — issue #74. Reading 0 as absent gives this predicate three outcomes
-    /// while <c>NotPredicate</c> is a plain <c>!</c> over two, so the two spellings of one question
-    /// part company: <c>{ .http.status_code != 200 }</c> excludes a span with no HTTP and
-    /// <c>{ !(.http.status_code = 200) }</c> includes it — which is the #66 symptom, reached the
-    /// other way round.
+    /// The negated spellings, which used to be the #66 symptom reached the other way round.
     ///
-    /// <para>Both forms included it BEFORE this change too, so nothing regressed; what is new is
-    /// that only one of them is fixed, and an asymmetry nobody wrote down is how the original
-    /// defect lasted as long as it did. So it is written down here, as the answer the engine gives
-    /// today rather than the answer it should give.</para>
-    ///
-    /// <para>THIS TEST IS MEANT TO FAIL EVENTUALLY. Making the AST three-valued — <c>Evaluate</c>
-    /// returning <c>bool?</c>, three-valued tables on And/Or/Not — turns every expectation below
-    /// into <c>False</c>. That failure is the point: it makes the fix announce itself here instead
-    /// of passing silently, and whoever does it should delete this test rather than adjust it.</para>
+    /// <para>This replaces <c>Negation_over_an_absent_field_is_still_two_valued</c>, which pinned
+    /// the opposite expectation and was written to fail the moment the AST became three-valued.
+    /// It did, and per its own instruction it was deleted rather than adjusted — this test is the
+    /// same three queries with the answers the engine now gives.</para>
     /// </summary>
     [Theory]
     [InlineData("{ !(.http.status_code = 200) }")]
     [InlineData("{ !(.http.status_code >= 400) }")]
     [InlineData("{ !(.http.status_code < 500) }")]
-    public void Negation_over_an_absent_field_is_still_two_valued(string query)
+    public void Negation_over_an_absent_field_matches_nothing(string query)
     {
         var span = DatabaseCall();
         bool hit = Matches(query, span);
 
-        _out.WriteLine($"{query} against a span with no HTTP → {hit} (today's answer, not the right one)");
-        Assert.True(hit, "if this now returns false the AST became three-valued — delete this test");
+        _out.WriteLine($"{query} against a span with no HTTP → {hit}");
+        Assert.False(hit);
     }
 
     [Fact]
-    public void The_two_spellings_of_not_two_hundred_disagree_with_each_other()
+    public void The_two_spellings_of_not_two_hundred_agree_with_each_other()
     {
-        // The finding stated as one line, so the gap is visible without reading either docstring:
-        // one span, two queries a user reads as identical, opposite answers.
+        // The finding stated as one line, now as its fix: one span, two queries a user reads as
+        // identical, the same answer. Flipping either assertion reproduces #74.
         var span = DatabaseCall();
 
         Assert.False(Matches("{ .http.status_code != 200 }",    span));
-        Assert.True (Matches("{ !(.http.status_code = 200) }",  span));
+        Assert.False(Matches("{ !(.http.status_code = 200) }",  span));
+
+        // And they still agree where the field IS there, which is what says the fix did not buy
+        // consistency by making both answers wrong.
+        var http = HttpCall(503);
+        Assert.True(Matches("{ .http.status_code != 200 }",   http));
+        Assert.True(Matches("{ !(.http.status_code = 200) }", http));
     }
 
     [Fact]
@@ -164,7 +165,8 @@ public sealed class TraceQLHttpStatusAbsenceTests
         var p     = TraceQLParser.Parse("{ .http.status_code >= 400 || .http.status_code < 200 }");
 
         var hits = new List<string>();
-        foreach (var s in spans) if (p.Evaluate(s)) hits.Add($"{s.Name}/{s.HttpStatusCode}");
+        // `== true` is the executor's own rule: an unknown is not a match. See TraceQLExecutor.
+        foreach (var s in spans) if (p.Evaluate(s) == true) hits.Add($"{s.Name}/{s.HttpStatusCode}");
 
         _out.WriteLine($"matched: {string.Join(", ", hits)}");
         Assert.Equal(new[] { "GET /orders/503" }, hits);
