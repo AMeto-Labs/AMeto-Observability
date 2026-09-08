@@ -160,7 +160,25 @@ public sealed class SpanTraceReadBoundTests : IClassFixture<TraceLookupSegmentFi
         return attrs.Length > 0
             && ((System.Diagnostics.DebuggableAttribute)attrs[0]).IsJITOptimizerDisabled;
     }
+
+    // SKIPPED BY THE FRAMEWORK, NOT BY RETURNING — issue #67. This stood down under Release with a
+    // bare `return`, which xUnit reports as PASSED: the probe claimed a healthy number without
+    // taking a single measurement, and it was absent from the runner's `Skipped:` tally, which is
+    // the one thing the skip-guard in .github/workflows/tests.yml reads. That guard was written
+    // for this very test and its own comment says a self-skip by early return "is invisible here".
+    //
+    // A `Skip=` on the attribute is the form the guard can see. Dynamic skip is not available: this
+    // project is on xunit 2.9.3, and xUnit's own documentation on SkipException.ForSkip says it
+    // "only works in v3 and later of xUnit.net, as it requires runtime infrastructure changes".
+    // The condition is a build configuration, known at compile time, so it does not need to be.
+    //
+    // CI builds Debug and so RUNS this — the guard's "zero skips under Debug" expectation is
+    // unaffected, which is the point of keying on the compilation rather than on a runtime probe.
+#if DEBUG
     [Fact]
+#else
+    [Fact(Skip = "A live-bytes probe is only sound in an unoptimised build — see IsDebugBuild.")]
+#endif
     public async Task The_peak_of_a_trace_read_is_one_block_not_the_segment()
     {
         // THIS PROBE ONLY WORKS UNOPTIMISED, so it says so rather than reporting a healthy number
@@ -172,13 +190,17 @@ public sealed class SpanTraceReadBoundTests : IClassFixture<TraceLookupSegmentFi
         // the whole frame; the bimodality within Release is tiering, since the walk decodes thirteen
         // blocks per read and sits on the promotion boundary.
         //
-        // dotnet test builds Debug, so this runs by default and in CI. Under Release it skips,
-        // because a green result there would mean nothing at all.
-        if (!IsDebugBuild())
-        {
-            _out.WriteLine("skipped: this measurement is only sound in an unoptimised build");
-            return;
-        }
+        // dotnet test builds Debug, so this runs by default and in CI. Under Release the attribute
+        // above skips it through the framework, because a green result there would mean nothing.
+        //
+        // ASSERTED RATHER THAN RETURNED FROM. The attribute keys on the DEBUG symbol while the
+        // probe's soundness depends on <Optimize>; they agree in every configuration this repo
+        // ships, and if they ever stop agreeing this must be a loud failure and not a quiet pass —
+        // the whole defect this test was carrying was a green report from a measurement that never
+        // ran.
+        Assert.True(IsDebugBuild(),
+            "DEBUG is defined but the JIT optimiser is enabled — the live-bytes probe below cannot "
+          + "measure what it claims to in this configuration, so a green result would be false");
         // Warm-up: JIT, and the ArrayPool block buffers, which are rented on the first decode and
         // stay in the pool afterwards — an unwarmed first pass reports the pool's growth as the
         // reader's live set.

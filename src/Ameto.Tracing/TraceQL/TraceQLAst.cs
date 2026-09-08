@@ -203,20 +203,62 @@ public sealed class KindPredicate(TraceQLOp op, SpanKind kind) : SpanPredicate
     };
 }
 
-/// <summary>Matches promoted <see cref="SpanRecord.HttpStatusCode"/>.</summary>
+/// <summary>
+/// Matches promoted <see cref="SpanRecord.HttpStatusCode"/>.
+///
+/// <para>NO STATUS IS NOT STATUS ZERO. The field is a plain <c>short</c>, so it is 0 on every span
+/// that carries no HTTP at all — a database call, a queue consumer, an internal operation — and
+/// comparing it straight made <c>&lt; 500</c>, <c>&lt;= 404</c> and <c>!= 200</c> true for all of
+/// them. A user asking for "everything that is not a 200" was handed the whole application's
+/// traffic, with no error and nothing in the log to say so.</para>
+///
+/// <para>THE ABSENT FIELD SATISFIES NO COMPARISON, which is the same answer a presence flag would
+/// give without one: 0 is not a valid HTTP status — the range is 100-599, and the hint path in
+/// <c>TraceQLExecutor</c> already bounds it to 100-999 — so on this field 0 can only mean absent.
+/// Deciding it here rather than in <see cref="SpanRecord"/> is also what makes the fix reach data
+/// already on disk: the segment format persists this field, so every <c>.trc</c> ever written
+/// records "no HTTP" and "status 0" as the same byte, and no new flag can tell them apart
+/// afterwards.</para>
+///
+/// <para>THE NEGATION IS STILL TWO-VALUED, AND THAT ASYMMETRY IS DELIBERATE HERE RATHER THAN
+/// OVERLOOKED. This predicate now has three outcomes — true, false, and "the field is not on this
+/// span" collapsed into false — while <see cref="NotPredicate"/> is a plain <c>!</c> over two. So
+/// <c>{ .http.status_code != 200 }</c> excludes a span with no HTTP and
+/// <c>{ !(.http.status_code = 200) }</c> includes it, though a reader takes the two for the same
+/// question. SQL has no such gap because <c>NOT</c> there is defined over three values, and
+/// <c>NOT (x = 200)</c> with <c>x IS NULL</c> does not match either.</para>
+///
+/// <para>Both forms answered "include it" before this change, so the <c>!</c> form is not a
+/// regression — but closing one door and not the other is what makes the second one easy to miss,
+/// which is how the original defect survived as long as it did. Making the whole AST three-valued
+/// (<c>Evaluate</c> returning <c>bool?</c>, with three-valued tables on And/Or/Not) is the real
+/// answer and is its own change — issue #74; until then the gap is pinned by
+/// <c>TraceQLHttpStatusAbsenceTests.Negation_over_an_absent_field_is_still_two_valued</c>, which
+/// fails the moment somebody fixes it and forces the decision to be a deliberate one.</para>
+///
+/// <para>One consequence worth knowing: with 0 read as absent there is no longer any way to ask
+/// the language for "spans that carry no HTTP status". <c>{ .http.status_code = 0 }</c> used to
+/// answer it, by accident and as a side effect of the defect. An explicit presence test belongs
+/// with the three-valued work — issue #74.</para>
+/// </summary>
 public sealed class HttpStatusCodePredicate(TraceQLOp op, short code) : SpanPredicate
 {
     public readonly TraceQLOp Op   = op;
     public readonly short     Code = code;
 
-    public override bool Evaluate(SpanRecord s) => Op switch
+    public override bool Evaluate(SpanRecord s)
     {
-        TraceQLOp.Eq  => s.HttpStatusCode == Code,
-        TraceQLOp.Neq => s.HttpStatusCode != Code,
-        TraceQLOp.Lt  => s.HttpStatusCode <  Code,
-        TraceQLOp.Lte => s.HttpStatusCode <= Code,
-        TraceQLOp.Gt  => s.HttpStatusCode >  Code,
-        TraceQLOp.Gte => s.HttpStatusCode >= Code,
-        _             => false,
-    };
+        if (s.HttpStatusCode == 0) return false;
+
+        return Op switch
+        {
+            TraceQLOp.Eq  => s.HttpStatusCode == Code,
+            TraceQLOp.Neq => s.HttpStatusCode != Code,
+            TraceQLOp.Lt  => s.HttpStatusCode <  Code,
+            TraceQLOp.Lte => s.HttpStatusCode <= Code,
+            TraceQLOp.Gt  => s.HttpStatusCode >  Code,
+            TraceQLOp.Gte => s.HttpStatusCode >= Code,
+            _             => false,
+        };
+    }
 }
