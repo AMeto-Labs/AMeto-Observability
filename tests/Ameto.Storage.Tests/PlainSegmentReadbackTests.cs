@@ -1,3 +1,4 @@
+using MessagePack;
 using Microsoft.Extensions.Logging.Abstractions;
 using Ameto.Tracing;
 using Ameto.Tracing.Storage;
@@ -100,11 +101,93 @@ public sealed class PlainSegmentReadbackTests : IDisposable
             attrHints: [new AttrHint("db.system", "mssql")], limit: 20_000))
             found++;
 
-        // Nothing matches — these spans carry no attributes at all — but the READ must succeed, and
-        // the segment must not be marked damaged for having a small index.
+        // ASSERTED, NOT PRINTED — issue #67. The count was written to the output and compared with
+        // nothing, so any regression in this path left the test green; the only assertion was that
+        // the segment was not flagged as damaged.
+        //
+        // AND THE EXPECTED NUMBER IS EVERY SPAN, NOT ZERO, which is the part worth reading twice.
+        // An AttrHint is a block-SKIPPING hint — "a necessary attribute condition ... used to skip
+        // storage blocks via their attribute blooms" — and not a per-span filter; a bloom is
+        // one-sided and can only ever rule a block out. These spans carry no attributes, so the
+        // attribute bloom is absent, and an absent index section means NO INFORMATION and must
+        // answer "might match" (Ameto.Indexing.Tests.EmptyIndexSemanticsTests, whose whole subject
+        // is that a match-nothing answer would make the segment permanently invisible to filtered
+        // queries). So nothing is skipped and all 20 000 come back.
+        //
+        // Asserting 0 here would encode exactly the behaviour that convention forbids, and would
+        // turn this test into a guard for the bug rather than against it.
         _out.WriteLine($"bloom-filtered matches: {found}");
+        Assert.Equal(20_000, found);
+
         var page = await e.GetTraceListAsync(
             Base.AddMinutes(-5), Base.AddDays(7), null, null, null, null, null, 100);
         Assert.False(page.Unreadable);
+    }
+
+    /// <summary>A span carrying exactly one attribute, in the wire form the engine reads back.</summary>
+    private static void WriteWithAttr(TraceStorageEngine e, ulong id, long startNano, string dbSystem) =>
+        e.WriteSpan(new SpanIngestItem
+        {
+            TraceId = new TraceId(0, id), SpanId = new SpanId(id), ParentSpanId = default,
+            StartTimeUnixNano = startNano, DurationNanos = 2 * Ms,
+            Name = "SELECT orders", ServiceName = "billing",
+            Kind = SpanKind.Client, Status = SpanStatusCode.Ok,
+            AttributesBytes = MessagePackSerializer.Serialize(
+                new Dictionary<string, object?> { ["db.system"] = dbSystem }),
+        });
+
+    [Fact]
+    public async Task A_bloom_hint_never_loses_a_span_that_carries_the_attribute()
+    {
+        // THE PROPERTY A SKIPPING HINT ACTUALLY HAS, and the one worth defending: it may return
+        // spans that do not match, never fewer than the ones that do. A bloom is one-sided, so the
+        // only way this path can be wrong is a FALSE NEGATIVE — a block ruled out that held a
+        // matching span — and that failure is silent, which is what makes it worth a test.
+        //
+        // Counting is not enough to see it: today nothing is skipped, so a count assertion passes
+        // whatever the bloom decides. So the tagged spans are identified and every one of them has
+        // to come back. A regression that starts rejecting blocks fails here by name.
+        string dir = Path.Combine(_root, "mixedbloom");
+        Directory.CreateDirectory(dir);
+
+        const int total = 20_000;
+        const int withAttr = 137;      // not a round number, and not a fraction of the block size
+
+        using var e = new TraceStorageEngine(dir, NullLogger<TraceStorageEngine>.Instance);
+        var expected = new HashSet<ulong>(withAttr);
+        for (int k = 0; k < total; k++)
+        {
+            ulong id = 200_000 + (ulong)k;
+
+            // Spread across the file rather than bunched at the front, so surviving depends on
+            // every block being consulted and not just the first one.
+            if (expected.Count < withAttr && k % 140 == 0)
+            {
+                WriteWithAttr(e, id, _baseNano + k * Ms, "mssql");
+                expected.Add(id);
+            }
+            else Write(e, id, _baseNano + k * Ms);
+        }
+        Assert.Equal(withAttr, expected.Count);   // the fixture built what it says it built
+        e.FlushHotTier();
+
+        var missing = new HashSet<ulong>(expected);
+        int found = 0;
+        await foreach (var s in e.SearchSpansAsync(
+            from: Base.AddMinutes(-5), to: Base.AddDays(7),
+            attrHints: [new AttrHint("db.system", "mssql")], limit: total))
+        {
+            found++;
+            missing.Remove(s.SpanId.RawValue);
+        }
+
+        _out.WriteLine($"{withAttr} of {total:N0} spans carry db.system=mssql; the hinted search "
+                     + $"returned {found} span(s) and lost {missing.Count} of the {withAttr}");
+        Assert.Empty(missing);
+
+        // The other direction, stated so the test cannot be "fixed" by making the hint match
+        // everything unconditionally: it is allowed to over-return, but it is answering about THIS
+        // segment, so it can never hand back more than the segment holds.
+        Assert.InRange(found, withAttr, total);
     }
 }

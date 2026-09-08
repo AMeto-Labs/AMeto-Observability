@@ -203,20 +203,41 @@ public sealed class KindPredicate(TraceQLOp op, SpanKind kind) : SpanPredicate
     };
 }
 
-/// <summary>Matches promoted <see cref="SpanRecord.HttpStatusCode"/>.</summary>
+/// <summary>
+/// Matches promoted <see cref="SpanRecord.HttpStatusCode"/>.
+///
+/// <para>NO STATUS IS NOT STATUS ZERO. The field is a plain <c>short</c>, so it is 0 on every span
+/// that carries no HTTP at all — a database call, a queue consumer, an internal operation — and
+/// comparing it straight made <c>&lt; 500</c>, <c>&lt;= 404</c> and <c>!= 200</c> true for all of
+/// them. A user asking for "everything that is not a 200" was handed the whole application's
+/// traffic, with no error and nothing in the log to say so.</para>
+///
+/// <para>THE ABSENT FIELD SATISFIES NO COMPARISON, which is the same answer a presence flag would
+/// give without one: 0 is not a valid HTTP status — the range is 100-599, and the hint path in
+/// <c>TraceQLExecutor</c> already bounds it to 100-999 — so on this field 0 can only mean absent.
+/// Deciding it here rather than in <see cref="SpanRecord"/> is also what makes the fix reach data
+/// already on disk: the segment format persists this field, so every <c>.trc</c> ever written
+/// records "no HTTP" and "status 0" as the same byte, and no new flag can tell them apart
+/// afterwards.</para>
+/// </summary>
 public sealed class HttpStatusCodePredicate(TraceQLOp op, short code) : SpanPredicate
 {
     public readonly TraceQLOp Op   = op;
     public readonly short     Code = code;
 
-    public override bool Evaluate(SpanRecord s) => Op switch
+    public override bool Evaluate(SpanRecord s)
     {
-        TraceQLOp.Eq  => s.HttpStatusCode == Code,
-        TraceQLOp.Neq => s.HttpStatusCode != Code,
-        TraceQLOp.Lt  => s.HttpStatusCode <  Code,
-        TraceQLOp.Lte => s.HttpStatusCode <= Code,
-        TraceQLOp.Gt  => s.HttpStatusCode >  Code,
-        TraceQLOp.Gte => s.HttpStatusCode >= Code,
-        _             => false,
-    };
+        if (s.HttpStatusCode == 0) return false;
+
+        return Op switch
+        {
+            TraceQLOp.Eq  => s.HttpStatusCode == Code,
+            TraceQLOp.Neq => s.HttpStatusCode != Code,
+            TraceQLOp.Lt  => s.HttpStatusCode <  Code,
+            TraceQLOp.Lte => s.HttpStatusCode <= Code,
+            TraceQLOp.Gt  => s.HttpStatusCode >  Code,
+            TraceQLOp.Gte => s.HttpStatusCode >= Code,
+            _             => false,
+        };
+    }
 }
