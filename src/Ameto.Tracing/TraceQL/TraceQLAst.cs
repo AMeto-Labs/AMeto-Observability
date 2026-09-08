@@ -219,6 +219,27 @@ public sealed class KindPredicate(TraceQLOp op, SpanKind kind) : SpanPredicate
 /// already on disk: the segment format persists this field, so every <c>.trc</c> ever written
 /// records "no HTTP" and "status 0" as the same byte, and no new flag can tell them apart
 /// afterwards.</para>
+///
+/// <para>THE NEGATION IS STILL TWO-VALUED, AND THAT ASYMMETRY IS DELIBERATE HERE RATHER THAN
+/// OVERLOOKED. This predicate now has three outcomes — true, false, and "the field is not on this
+/// span" collapsed into false — while <see cref="NotPredicate"/> is a plain <c>!</c> over two. So
+/// <c>{ .http.status_code != 200 }</c> excludes a span with no HTTP and
+/// <c>{ !(.http.status_code = 200) }</c> includes it, though a reader takes the two for the same
+/// question. SQL has no such gap because <c>NOT</c> there is defined over three values, and
+/// <c>NOT (x = 200)</c> with <c>x IS NULL</c> does not match either.</para>
+///
+/// <para>Both forms answered "include it" before this change, so the <c>!</c> form is not a
+/// regression — but closing one door and not the other is what makes the second one easy to miss,
+/// which is how the original defect survived as long as it did. Making the whole AST three-valued
+/// (<c>Evaluate</c> returning <c>bool?</c>, with three-valued tables on And/Or/Not) is the real
+/// answer and is its own change — issue #74; until then the gap is pinned by
+/// <c>TraceQLHttpStatusAbsenceTests.Negation_over_an_absent_field_is_still_two_valued</c>, which
+/// fails the moment somebody fixes it and forces the decision to be a deliberate one.</para>
+///
+/// <para>One consequence worth knowing: with 0 read as absent there is no longer any way to ask
+/// the language for "spans that carry no HTTP status". <c>{ .http.status_code = 0 }</c> used to
+/// answer it, by accident and as a side effect of the defect. An explicit presence test belongs
+/// with the three-valued work — issue #74.</para>
 /// </summary>
 public sealed class HttpStatusCodePredicate(TraceQLOp op, short code) : SpanPredicate
 {
