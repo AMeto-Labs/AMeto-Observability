@@ -158,7 +158,19 @@
         <li>Operators: <code>= != &lt; &lt;= &gt; &gt;=</code> · logic <code>&amp;&amp;</code> <code>||</code> <code>!</code> and <code>( )</code></li>
         <li>Durations: <code>200ms</code> <code>1.5s</code> <code>500us</code> <code>2m</code> <code>1h</code> <code>ns</code></li>
         <li>Strings: <code>'…'</code> <code>"…"</code> or backticks · <code>=~</code> is treated as <code>=</code> (regex not evaluated)</li>
+        <li>Presence: <code>.attr != nil</code> has the attribute · <code>.attr = nil</code> does not.
+        The only way to ask about a missing one — comparisons never match it. Intrinsics are on
+        every span, so <code>nil</code> does not apply to them.</li>
       </ul>
+      <div class="callout">
+        <lucide-icon name="circle-alert" [size]="15" />
+        <span>A span that <b>lacks</b> the field answers <b>no</b> comparison — not the operator and
+        not its negation. <code>&#123; .http.status_code != 200 &#125;</code> and
+        <code>&#123; !(.http.status_code = 200) &#125;</code> both leave out a span that made no HTTP
+        call, so "everything that is not a 200" no longer returns your database and queue spans.
+        One consequence to know: <code>&#123; .x = 1 || .x != 1 &#125;</code> is <b>not</b> "everything" —
+        it selects nothing for spans without <code>.x</code>. Use <code>.x = nil</code> to reach those.</span>
+      </div>
       <h3>Examples</h3>
       <div class="examples">
         @for (ex of traceExamples; track ex) { <code class="ex block">{{ ex }}</code> }

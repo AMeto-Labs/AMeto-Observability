@@ -131,6 +131,21 @@ public static class TraceQLExecutor
             case AttributePredicate anyAttr:
                 AddAttrHint(h, anyAttr);
                 break;
+
+            // THE TWO HALVES OF `nil` ARE NOT EQUALLY SAFE, and only one of them is a hint.
+            //
+            // `{ .foo != nil }` requires the key to EXIST, which is exactly what a value-less
+            // AttrHint means and the same probe AddAttrHint already emits for <, >, >= and numeric
+            // equality. Without this case the new syntax arrived without the block skip its
+            // neighbours get, so `{ .foo != nil && duration > 1s }` read every block.
+            //
+            // `{ .foo = nil }` requires the key to be ABSENT and must therefore emit NOTHING: the
+            // hint would tell the cold reader to keep only blocks whose bloom has the key, which is
+            // precisely the set that cannot contain the answer. It falls through to no case at all,
+            // deliberately — see A_presence_test_contributes_no_attribute_hint.
+            case AttributePresencePredicate presence when presence.Present:
+                (h.AttrHints ??= new List<AttrHint>(2)).Add(new AttrHint(presence.Key, null));
+                break;
         }
     }
 

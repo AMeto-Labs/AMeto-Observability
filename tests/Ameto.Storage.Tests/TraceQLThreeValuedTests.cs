@@ -213,7 +213,7 @@ public sealed class TraceQLThreeValuedTests
     /// switch fall through to no hint at all.</para>
     /// </summary>
     [Fact]
-    public void A_presence_test_contributes_no_attribute_hint()
+    public void An_absence_test_contributes_no_attribute_hint()
     {
         var hints = TraceQLExecutor.ExtractHints(TraceQLParser.Parse("{ .region = nil }"));
         Assert.Null(hints.AttrHints);
@@ -222,11 +222,33 @@ public sealed class TraceQLThreeValuedTests
         var cmp = TraceQLExecutor.ExtractHints(TraceQLParser.Parse("{ .region = \"eu\" }"));
         Assert.NotNull(cmp.AttrHints);
 
-        // And in an AND-chain the presence half contributes nothing while the other half still does.
+        // And in an AND-chain the absence half contributes nothing while the other half still does.
         var mixed = TraceQLExecutor.ExtractHints(
             TraceQLParser.Parse("{ .region = nil && .tenant = \"acme\" }"));
         _out.WriteLine($"hints for the mixed chain: {mixed.AttrHints?.Count ?? 0}");
         Assert.Single(mixed.AttrHints!);
+    }
+
+    /// <summary>
+    /// The other half of <c>nil</c>, which IS a hint. <c>!= nil</c> requires the key to exist —
+    /// the same demand <c>&lt;</c>, <c>&gt;</c> and numeric <c>=</c> make, and the same value-less
+    /// probe they emit — so leaving it out cost the new syntax a block skip its neighbours get.
+    ///
+    /// <para>This is the assertion the first version of these tests was missing: checking only
+    /// <c>= nil</c> passed whatever <c>!= nil</c> did.</para>
+    /// </summary>
+    [Fact]
+    public void A_presence_test_contributes_a_key_only_attribute_hint()
+    {
+        var hints = TraceQLExecutor.ExtractHints(TraceQLParser.Parse("{ .region != nil }"));
+
+        var hint = Assert.Single(hints.AttrHints!);
+        Assert.Equal("region", hint.Key);
+        Assert.Null(hint.LowerValue);   // key-presence only: nil pins no value
+
+        // Same shape the comparison operators already emit, which is what makes it safe.
+        var cmp = TraceQLExecutor.ExtractHints(TraceQLParser.Parse("{ .region > \"eu\" }"));
+        Assert.Equal(hint, Assert.Single(cmp.AttrHints!));
     }
 
     // ── The promoted field reads presence from the same place it reads absence ─

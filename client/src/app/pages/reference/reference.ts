@@ -163,6 +163,8 @@ export class ReferenceComponent {
     `{ service = 'checkout' && status = error }`,
     `{ .http.request.method = 'POST' && http.status_code >= 500 }`,
     `{ name = 'GET /orders' || duration > 1s }`,
+    `{ .tenant = nil && duration > 1s }`,
+    `{ .http.status_code != nil && .http.status_code >= 500 }`,
   ];
 
   // ── Metrics (mirror of Ameto.Metrics) ──────────────────────────────────────

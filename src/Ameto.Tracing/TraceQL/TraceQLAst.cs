@@ -139,9 +139,10 @@ public sealed class AttributePredicate(string key, TraceQLOp op, TraceQLValue va
     /// met by a numeric comparison (<c>{ .foo &gt; 5 }</c> where <c>.foo</c> is "bananas") is a
     /// span that HAS the field, so "unknown" would be the wrong word for it, and changing that
     /// answer is a separate semantic decision from the one this class was fixed for. It leaves a
-    /// smaller version of the same asymmetry standing on type mismatch alone, which is written
-    /// down here rather than left to be rediscovered, and pinned by
-    /// <c>TraceQLThreeValuedTests.A_type_mismatch_is_still_two_valued</c>.</para>
+    /// smaller version of the same asymmetry standing on type mismatch alone, pinned by
+    /// <c>TraceQLThreeValuedTests.A_type_mismatch_is_still_two_valued</c> and carried as issue #76
+    /// — a docstring is read only by somebody already in this file, which is how the original
+    /// defect lasted as long as it did.</para>
     /// </summary>
     public override bool? Evaluate(SpanRecord s)
     {
