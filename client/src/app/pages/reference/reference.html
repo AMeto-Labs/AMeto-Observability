@@ -164,8 +164,10 @@
       </ul>
       <div class="callout">
         <lucide-icon name="circle-alert" [size]="15" />
-        <span>A span that <b>lacks</b> the field answers <b>no</b> comparison — not the operator and
-        not its negation. <code>&#123; .http.status_code != 200 &#125;</code> and
+        <span>A span that <b>cannot answer</b> a comparison answers <b>none</b> of it — not the
+        operator and not its negation. That covers a field the span does not carry, and a value the
+        comparison does not fit (<code>.tenant &gt; 5</code> where the tenant is a name).
+        <code>&#123; .http.status_code != 200 &#125;</code> and
         <code>&#123; !(.http.status_code = 200) &#125;</code> both leave out a span that made no HTTP
         call, so "everything that is not a 200" no longer returns your database and queue spans.
         One consequence to know: <code>&#123; .x = 1 || .x != 1 &#125;</code> is <b>not</b> "everything" —
