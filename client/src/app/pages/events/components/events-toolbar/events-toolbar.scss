@@ -196,6 +196,11 @@
   0%, 100% { opacity: 1; }
   50% { opacity: .5; }
 }
+/* The dot is the only thing on this page that animates indefinitely; the lit colour and the
+   glow still say "live" without it. */
+@media (prefers-reduced-motion: reduce) {
+  .live-dot.on { animation: none; }
+}
 
 .tb-icon-btn {
   display: flex;

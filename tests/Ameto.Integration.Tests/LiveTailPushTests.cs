@@ -151,6 +151,16 @@ public sealed class LiveTailPushTests : IClassFixture<AmetoWebAppFactory>
         clock.Stop();
 
         Assert.Equal(Total, events.Count);
+
+        // The wire is ASCENDING, across poll boundaries as well as within one poll. The client
+        // buffers these frames and prepends them as one reversed block, which is correct only
+        // because the tail is a forward query — and nothing pinned that. Newest-on-top in the
+        // browser used to be an accident of prepending one event at a time, so a change to the
+        // server's ordering would have surfaced as a list that runs backwards inside every
+        // 100 ms chunk and forwards between them: a rendering glitch, not an obvious bug.
+        for (int i = 0; i < events.Count; i++)
+            Assert.Equal(i, events[i].GetProperty("props").GetProperty("n").GetInt64());
+
         // Timed, or the assertion above would also pass on a tail that parked and was
         // rescued by the 5 s safety poll — which is the bug this test exists to catch.
         Assert.True(clock.Elapsed < PushBudget,

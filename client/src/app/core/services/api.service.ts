@@ -402,12 +402,18 @@ export class ApiService {
    * Opens the live tail. `levels` is the same comma-separated list the search sends — the
    * level selector used to apply to the history and be dropped as soon as the tail started,
    * so switching to live quietly widened the view back to every level.
+   *
+   * <p>`from` is the instant the tail picks up at — ISO-8601, inclusive. Omitted, the server
+   * tails from its own `UtcNow` and the page starts on a blank list; passing the newest row
+   * already on screen is what lets a tail CONTINUE a list instead of replacing it. Inclusive
+   * means the boundary event arrives again, so a caller that seeds must dedupe.</p>
    */
-  streamLive(params: { filter?: string; levels?: string } = {}): Observable<EventDto> {
-    const { filter, levels } = params;
+  streamLive(params: { filter?: string; levels?: string; from?: string } = {}): Observable<EventDto> {
+    const { filter, levels, from } = params;
     const p = new URLSearchParams();
     if (filter) p.set('filter', filter);
     if (levels) p.set('levels', levels);
+    if (from) p.set('from', from);
     return this.rowsOnly(this.streamJson<EventDto>('/api/events/live', p, {
       // The tail has no end: it never sends `done`, and must never complete on its own.
       completeOnDone:     false,
