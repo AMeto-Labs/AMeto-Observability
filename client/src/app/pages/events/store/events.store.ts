@@ -20,6 +20,51 @@ import {
 /** Page sizes offered next to the event counter — also the whitelist for the `size` URL param. */
 const PAGE_SIZE_OPTIONS = [50, 100, 150, 300, 500];
 
+/**
+ * Shared empty highlight set. Reused BY IDENTITY so a flush that flashes nothing writes the
+ * same reference back and the row bindings that read it are not invalidated. Never mutated.
+ */
+const EMPTY_IDS: ReadonlySet<string> = new Set<string>();
+
+/**
+ * Floor under the live buffer. The server hands over LiveTail.PageSize (500) events per poll,
+ * and up to eight times that while a tail is catching up. `pageSize * 4` is 200 at the default
+ * page size — smaller than a single poll — so the whole buffer turned over between two paints
+ * and every row a reader could have started was gone before the next frame. That is why the
+ * tail read as illegible rather than merely fast: no amount of smoothing rescues content that
+ * is replaced faster than it can be looked at.
+ */
+const LIVE_BUFFER_MIN = 600;
+
+/**
+ * Rows in one flush above which the arrival flash is skipped. A highlight that fires on every
+ * visible row marks nothing — past a dozen rows in a frame the stream's own motion IS the
+ * signal, and the flash degenerates into a full-list strobe.
+ */
+const FLASH_MAX_BATCH = 12;
+
+/**
+ * How long a just-arrived row stays marked. Must match the wash animation in
+ * event-list-row.scss: the class is what starts it, so a shorter window truncates the fade and
+ * a longer one only leaves an already-finished animation sitting at its end state.
+ */
+const FLASH_MS = 900;
+
+/**
+ * How far back a tail may be asked to pick up. Bounded on purpose: seeding from the newest row
+ * of a day-old page would make the server's first poll come back full, latch its catch-up mode,
+ * and deliver history at full rate until it drained — the flood this whole path exists to avoid.
+ */
+const SEED_WINDOW_MS = 30_000;
+
+/**
+ * Hard flush trigger, independent of the frame clock. requestAnimationFrame does not fire in a
+ * hidden tab while the tail keeps arriving, so this bounds `pending` without depending on the
+ * visibility handler being correct. It is one server page, so a catch-up poll lands as whole
+ * pages rather than as one unbounded write.
+ */
+const LIVE_FLUSH_MAX = 500;
+
 /** A single cell of the 42-cell calendar month grid. */
 interface CalendarDay {
   day: number;
@@ -47,6 +92,22 @@ interface EventsState {
   hasMore: boolean;
   error: string | null;
   live: boolean;
+  /**
+   * Whether the list follows the head of the tail. False while the reader has scrolled away,
+   * and then arrivals are held rather than published — see the flush path. Strictly stronger
+   * than scroll anchoring: nothing is written, so the measurement rebuild, the level rescan and
+   * the per-row transform rewrite cost nothing rather than less, and unlike an anchor it cannot
+   * expire when the row it was anchored to falls out of the buffer.
+   */
+  liveFollow: boolean;
+  /** How many events are waiting in the held buffer — the number on the "new events" pill. */
+  livePending: number;
+  /** Arrivals per second over the last whole second, or 0 on a quiet tail. */
+  liveRate: number;
+  /** Everything this tail has delivered since it opened, including what the cap has dropped. */
+  liveReceived: number;
+  /** Rows the buffer cap has discarded on this tail. A tail that drops must say so. */
+  liveDropped: number;
   pageSize: number;
   wrapMessages: boolean;
   quickSearch: string;
@@ -56,8 +117,20 @@ interface EventsState {
   calPickingEnd: boolean;
   /** Single selected event backing the detail drawer (replaces the old expanded-ids set). */
   selectedId: string | null;
-  /** Ids of events that just arrived on the live tail — highlighted for ~1s, then dropped. */
-  newEventIds: Set<string>;
+  /**
+   * The selected event held BY VALUE, so the drawer survives its row being evicted from the
+   * live buffer. Deliberately a second place the selection lives, against this store's usual
+   * single-source-of-truth doctrine: {@link selectedEvent} reconciles them by id, so the two
+   * cannot disagree, and every path that clears `selectedId` clears this in the same patch.
+   */
+  selectedEventPinned: EventDto | null;
+  /**
+   * Ids of the events published by the LAST live flush — highlighted briefly, then dropped.
+   * Readonly because the set is swapped wholesale rather than mutated: every flush either
+   * hands over a fresh set or the shared {@link EMPTY_IDS}, and reusing that identity is what
+   * lets a flush that flashes nothing avoid invalidating the row bindings that read it.
+   */
+  newEventIds: ReadonlySet<string>;
   /** The table a `select … group by …` query answered with; null whenever the page lists events. */
   aggregation: AggregationDto | null;
 }
@@ -85,6 +158,11 @@ export const EventsStore = signalStore(
     hasMore: true,
     error: null,
     live: false,
+    liveFollow: true,
+    livePending: 0,
+    liveRate: 0,
+    liveReceived: 0,
+    liveDropped: 0,
     pageSize: 50,
     wrapMessages: false,
     quickSearch: '',
@@ -93,7 +171,8 @@ export const EventsStore = signalStore(
     calendarNav: { year: new Date().getFullYear(), month: new Date().getMonth() },
     calPickingEnd: false,
     selectedId: null,
-    newEventIds: new Set<string>(),
+    selectedEventPinned: null,
+    newEventIds: EMPTY_IDS,
     aggregation: null,
   })),
 
@@ -152,6 +231,14 @@ export const EventsStore = signalStore(
     });
 
     const totalCount = computed(() => store.events().length);
+
+    /**
+     * How many rows the live tail retains. Floored at {@link LIVE_BUFFER_MIN} so the buffer is
+     * never smaller than one server page — the page-size control is labelled "events per
+     * request" and quietly resized this too, which at the default of 50 left the tail holding
+     * less than half of what a single poll delivers.
+     */
+    const liveBufferSize = computed(() => Math.max(store.pageSize() * 4, LIVE_BUFFER_MIN));
     const allLevelsActive = computed(() => activeLevels().size === LEVELS.length);
 
     const levelsLabel = computed(() => {
@@ -219,16 +306,29 @@ export const EventsStore = signalStore(
       return [...set].sort();
     });
 
-    /** The event backing the detail drawer, or null when nothing is selected. */
+    /**
+     * The event backing the detail drawer, or null when nothing is selected.
+     *
+     * <p>The pin is checked FIRST and by id, so the two sources can never disagree — and while a
+     * tail runs it also spares this computed a linear scan of the buffer on every pass. Holding
+     * the DTO by value is what stops the drawer deleting itself mid-read: the selection used to
+     * be resolved by scanning the live ring buffer, which the tail is constantly evicting, so on
+     * a busy stand the selected row fell out within a second, this flipped to null, and the
+     * @if in the template unmounted the panel the user was reading — then the list widened into
+     * the freed space and re-laid-out every rendered row. A jolt caused entirely by traffic the
+     * user did not create.</p>
+     */
     const selectedEvent = computed<EventDto | null>(() => {
       const id = store.selectedId();
       if (!id) return null;
+      const pinned = store.selectedEventPinned();
+      if (pinned?.id === id) return pinned;
       return store.events().find(e => e.id === id) ?? null;
     });
 
     return {
       activeLevels, selectedServices, displayedEvents, availableServices,
-      levelCounts, serviceCounts, totalCount, allLevelsActive,
+      levelCounts, serviceCounts, totalCount, allLevelsActive, liveBufferSize,
       levelsLabel, serviceLabel, dateRangeLabel, calendarMonthLabel, calendarDays,
       customFromValid, customToValid, canSearch, knownPropPaths, selectedEvent,
       isAggregation,
@@ -250,25 +350,198 @@ export const EventsStore = signalStore(
     // that leaves both unchanged needs no reconnect (see loadEvents).
     let liveFilter = '';
     let liveLevels: string | undefined;
-    // Per-event timers that drop an id out of `newEventIds` ~1s after it arrived.
-    let newTimers: ReturnType<typeof setTimeout>[] = [];
+    // ── Live buffer ──────────────────────────────────────────────────────
+    // The tail publishes ONCE PER FRAME, not once per event. The server coalesces writes on a
+    // 100 ms floor and answers a poll with up to a full page, so "one event" is not the unit
+    // anything arrives in: a poll lands as a burst of hundreds of SSE frames inside a couple of
+    // milliseconds. Publishing each one separately made the page's update rate the arrival rate
+    // — a state write, a fresh `events` identity (which busts the virtualizer's measurement
+    // memo and rewrites the transform on every rendered row), and a change-detection pass, all
+    // several hundred times between two paints the user could actually see. The historical
+    // search in this same file has flushed in blocks since it was written (see loadEvents), and
+    // Traces buffers its stream for the same reason; the live path was the one that did not.
+    //
+    // `pending` is OLDEST FIRST — the order the tail streams in — and is reversed at flush.
+    let pending: EventDto[] = [];
+    // Rows that arrived while the reader was scrolled away from the head, NEWEST FIRST (the
+    // shape flushLive already produced). They are merged in by resumeFollow and by nothing
+    // else: this is the buffer behind the "N new events" pill.
+    let held: EventDto[] = [];
+    let flushHandle: number | undefined;
+    // Whether `flushHandle` came from requestAnimationFrame or from setTimeout; the two need
+    // different cancellers and a host without a frame clock must still be able to stop one.
+    let flushIsFrame = false;
+    /** ONE expiry timer for the whole highlight window, never one per event. */
+    let flashTimer: ReturnType<typeof setTimeout> | undefined;
+    /** The recent flushes still inside the highlight window — see {@link flashIdsFor}. */
+    let flashRuns: { ids: string[]; at: number }[] = [];
+    /** Publishes {@link liveRate} once a second. A third live handle: it must be cancelled
+     *  everywhere the flush handle is, or a dead tail goes on reporting a rate. */
+    let rateTimer: ReturnType<typeof setInterval> | undefined;
+    let rateWindow = 0;
+    /** Everything this tail has delivered, counted where it arrives and published on a tick —
+     *  it has to keep counting what the cap is about to throw away, but it must not cost a
+     *  state write to do it. */
+    let received = 0;
+    /**
+     * Whether the thing that failed was the TAIL. The live error handler sets `live: false`
+     * before the banner can be shown, so the Retry button had no way to tell a dead tail from a
+     * failed search and answered both with a search — which threw away every live row the user
+     * was watching, under a message the server had written as "Reconnect in a moment."
+     */
+    let liveWasRunning = false;
 
-    /** Flags a just-arrived live event as "new" for 1s, driving the row highlight. */
-    function markNew(id: string): void {
-      patchState(store, { newEventIds: new Set(store.newEventIds()).add(id) });
-      const t = setTimeout(() => {
-        newTimers = newTimers.filter(x => x !== t);
-        const next = new Set(store.newEventIds());
-        if (next.delete(id)) patchState(store, { newEventIds: next });
-      }, 1000);
-      newTimers.push(t);
+    function cancelFlushHandle(): void {
+      if (flushHandle === undefined) return;
+      if (flushIsFrame) cancelAnimationFrame(flushHandle);
+      else clearTimeout(flushHandle);
+      flushHandle = undefined;
     }
 
-    /** Cancels all pending highlight timers and clears the set. */
+    /** Books the next frame to publish on, unless one is already booked. */
+    function scheduleFlush(): void {
+      if (flushHandle !== undefined) return;
+      if (typeof requestAnimationFrame === 'function') {
+        flushIsFrame = true;
+        flushHandle = requestAnimationFrame(() => flushLive());
+      } else {
+        // No frame clock (a non-browser host): a 16 ms timer is the same cadence.
+        flushIsFrame = false;
+        flushHandle = setTimeout(() => flushLive(), 16) as unknown as number;
+      }
+    }
+
+    /**
+     * Publishes everything that arrived since the last frame in ONE state write.
+     *
+     * <p>Order is the easy thing to get backwards here. The tail is a FORWARD query
+     * (EndpointMapper: `Direction = QueryDirection.Forward`), so it streams OLDEST first, and
+     * the old code landed newest-on-top only as a side effect of prepending one event at a
+     * time. A batch has to reverse explicitly — without it timestamps run the wrong way inside
+     * each ~100 ms chunk and are correct only between chunks, which is the kind of wrongness
+     * that looks like a rendering glitch rather than a bug.</p>
+     */
+    function flushLive(): void {
+      cancelFlushHandle();
+      if (pending.length === 0) return;
+      const batch = pending;
+      pending = [];
+      batch.reverse();
+
+      // Read per flush, not captured at connect: changing the page size then only resizes the
+      // buffer, instead of needing the connection torn down and rebuilt.
+      const cap = store.liveBufferSize();
+      const kept = store.events();
+      const holding = !store.liveFollow();
+      // A seeded tail is asked to resume from a row it has already sent, and `from` is
+      // inclusive, so the boundary event arrives twice. Dedupe against whichever side the join
+      // is actually being made on: while the reader is parked, the newest rows are in the hold
+      // buffer and `events` is frozen well behind them, so checking `events` would catch
+      // nothing. Same shape loadMore uses.
+      const against = holding ? held : kept;
+      const fresh = against.length === 0
+        ? batch
+        : (() => { const seen = new Set(against.map(e => e.id)); return batch.filter(e => !seen.has(e.id)); })();
+      if (fresh.length === 0) return;
+
+      // While the reader is parked away from the head the list does not move AT ALL — see
+      // liveFollow. Held rows are kept newest-first, the shape flushLive already produced.
+      if (holding) {
+        const overflow = Math.max(0, held.length + fresh.length - cap);
+        held = fresh.concat(held).slice(0, cap);
+        patchState(store, {
+          livePending: Math.min(store.livePending() + fresh.length, cap),
+          liveDropped: store.liveDropped() + overflow,
+        });
+        return;
+      }
+
+      const events = fresh.length >= cap
+        ? fresh.slice(0, cap)                                   // already newest-first
+        : fresh.concat(kept.slice(0, cap - fresh.length));
+      const dropped = Math.max(0, kept.length + fresh.length - cap);
+      // ONE patchState for rows AND highlight. @ngrx/signals rebuilds the whole state object
+      // per CALL, so the cost is the number of calls rather than the size of the patch: three
+      // calls per event became one per frame.
+      patchState(store, {
+        events,
+        newEventIds: flashIdsFor(fresh),
+        ...(dropped ? { liveDropped: store.liveDropped() + dropped } : {}),
+      });
+    }
+
+    /**
+     * Ids to flash, as a SLIDING WINDOW over the recent flushes rather than the newest one.
+     *
+     * <p>Replaces the per-event bookkeeping, which copied the whole id set and armed a timer per
+     * arriving event: at rate R that is R²/2 set insertions and R timers a second, each expiry
+     * rebuilding an R-element array — the reason the page degraded suddenly rather than
+     * gradually, and the reason it went on janking for a second after arrivals stopped. It also
+     * fixes what the highlight MEANT: with a one-second window over a buffer this size, above a
+     * couple of hundred events a second every rendered row was "new", so the flash marked
+     * nothing and the list simply strobed.</p>
+     *
+     * <p>The window is why this keeps a list of runs instead of one set. Publishing only the
+     * newest flush's ids meant a row carried `.is-new` for exactly one flush interval — about
+     * 100 ms, the server's coalescing floor — so a 900 ms wash was cut off after a tenth of it
+     * and the arrival read as a blink rather than a fade. That is the opposite of the thing
+     * this whole path exists to fix. The window costs nothing to hold: a run is only recorded
+     * when it is small enough to flash at all, so it is bounded by FLASH_MAX_BATCH per flush
+     * over {@link FLASH_MS}.</p>
+     */
+    function flashIdsFor(batch: EventDto[]): ReadonlySet<string> {
+      const now = Date.now();
+      flashRuns = flashRuns.filter(r => now - r.at < FLASH_MS);
+      if (batch.length <= FLASH_MAX_BATCH) flashRuns.push({ ids: batch.map(e => e.id), at: now });
+      if (flashRuns.length === 0) return EMPTY_IDS;
+
+      // Re-armed on every flush so the set is emptied FLASH_MS after arrivals stop, which is
+      // the only moment nothing else will come along to expire the tail of the window.
+      if (flashTimer !== undefined) clearTimeout(flashTimer);
+      flashTimer = setTimeout(() => {
+        flashTimer = undefined;
+        flashRuns = [];
+        patchState(store, { newEventIds: EMPTY_IDS });
+      }, FLASH_MS);
+
+      const ids = new Set<string>();
+      for (const run of flashRuns) for (const id of run.ids) ids.add(id);
+      return ids;
+    }
+
+    /**
+     * Puts everything the tail delivered onto the list, wherever it currently is.
+     *
+     * <p>The pair, not just the flush: a flush made while the reader is parked routes into the
+     * hold buffer rather than onto the list, so anything that follows with {@link clearNew}
+     * would throw those rows away. Both callers — a stop and a stream that died — are ending the
+     * tail, and neither may delete rows the user was one click away from reading.</p>
+     */
+    function landEverything(): void {
+      flushLive();
+      resumeFollow();
+    }
+
+    /**
+     * Cancels the pending flush and the highlight, and drops everything the tail was holding.
+     *
+     * <p>Cancellation lives HERE rather than at each call site because every reset path in this
+     * file already goes through it — the aggregation branch, the reload branch, stopLive and the
+     * live error handler. A frame that survived one of them would drop rows captured under the
+     * OLD query on top of a list that was just emptied for a new one, which is precisely what
+     * loadAggregation's "nothing on screen may belong to a query other than the one in the box"
+     * forbids.</p>
+     */
     function clearNew(): void {
-      newTimers.forEach(clearTimeout);
-      newTimers = [];
-      if (store.newEventIds().size) patchState(store, { newEventIds: new Set() });
+      cancelFlushHandle();
+      pending = [];
+      held = [];
+      if (flashTimer !== undefined) { clearTimeout(flashTimer); flashTimer = undefined; }
+      flashRuns = [];
+      if (rateTimer !== undefined) { clearInterval(rateTimer); rateTimer = undefined; }
+      rateWindow = 0;
+      if (store.newEventIds().size || store.livePending() || store.liveRate())
+        patchState(store, { newEventIds: EMPTY_IDS, livePending: 0, liveRate: 0 });
     }
 
     // ── Private helpers ─────────────────────────────────────────────────────
@@ -349,9 +622,11 @@ export const EventsStore = signalStore(
       }
       querySub?.unsubscribe();
       clearNew();
+      liveWasRunning = false;
 
       patchState(store, {
-        loading: true, error: null, events: [], aggregation: null, hasMore: true, selectedId: null,
+        loading: true, error: null, events: [], aggregation: null, hasMore: true,
+        selectedId: null, selectedEventPinned: null,
       });
 
       const acc: EventDto[] = [];
@@ -404,8 +679,17 @@ export const EventsStore = signalStore(
      * on screen may belong to a query other than the one in the box.
      */
     function loadAggregation(query: string): void {
+      // An aggregation ENDS a tail — loadEvents tears the stream down before routing here, and
+      // the search error handler redirects here too when the server recognises a query this
+      // client's regex declined. Either way what is on screen from now on came from a table, so
+      // Retry must run the table again. Clearing this in loadEvents' non-live branch alone was
+      // not enough: the aggregation branch returns before ever reaching it, so a failed
+      // aggregation offered a Retry that reopened a live tail carrying `select … group by …`,
+      // which the tail endpoint refuses by design.
+      liveWasRunning = false;
       patchState(store, {
-        loading: true, error: null, events: [], aggregation: null, hasMore: false, selectedId: null,
+        loading: true, error: null, events: [], aggregation: null, hasMore: false,
+        selectedId: null, selectedEventPinned: null,
       });
 
       querySub = api.aggregate({
@@ -637,40 +921,223 @@ export const EventsStore = signalStore(
       // of history on top of the live rows, or sets an error banner while the live dot is on.
       querySub?.unsubscribe();
       querySub = undefined;
+      // This is also the RESTART path — loadEvents reconnects when the filter or the level set
+      // changes mid-tail — and it was the only reset in this file that emptied `newEventIds`
+      // without cancelling what feeds it. Rows captured under the old query would then land on
+      // the new list a frame later, and a second's worth of expiry timers went on firing
+      // against state they no longer described.
+      clearNew();
 
-      liveFilter = store.filter();
-      liveLevels = levelsParam(parseLevelsFromFilter(liveFilter));
+      const nextFilter = store.filter();
+      const nextLevels = levelsParam(parseLevelsFromFilter(nextFilter));
+      // Restarting on the SAME question is a continuation, not a new answer. This is a
+      // deliberate softening of "nothing on screen may belong to a query other than the one in
+      // the box": the guard is that the query is byte-identical, and when it is not, the list is
+      // still emptied exactly as before.
+      const sameQuery = liveFilter === nextFilter && liveLevels === nextLevels;
+      liveFilter = nextFilter;
+      liveLevels = nextLevels;
+      received = 0;
+
+      // Where the tail picks up. Seeding is what lets it CONTINUE the list instead of replacing
+      // it with a blank panel, which is the roughest single moment on this page: press Live,
+      // lose the search you just ran, read a false "no events match", then take an avalanche out
+      // of nowhere. See SEED_WINDOW_MS for why it is bounded.
+      const floor = new Date(Date.now() - SEED_WINDOW_MS).toISOString();
+      const newest = sameQuery ? store.events()[0]?.['@t'] : undefined;
+      // Keep the list only when the tail can actually CONTINUE it — same question, and a newest
+      // row inside the seed window. Keeping it otherwise would prepend the last thirty seconds
+      // onto a page from yesterday and leave a silent day-wide hole in the middle of a list
+      // that reads as one continuous run of time. That is a different lie from the blank panel,
+      // not a smaller one, so the old clearing behaviour is kept for exactly that case.
+      const continues = !!newest && newest > floor;
+      const from = continues ? newest : floor;
+
       patchState(store, {
-        live: true, error: null, events: [], newEventIds: new Set(), selectedId: null,
+        live: true, error: null, newEventIds: EMPTY_IDS,
+        livePending: 0, liveRate: 0, liveReceived: 0, liveDropped: 0,
         // The table belongs to the query it came from. Leaving it up while a tail runs put a
         // snapshot of totals on screen with the live dot lit beside it.
         aggregation: null,
+        // Follow is reset only where the LIST is: this function is also the restart path, and a
+        // tab coming back from the background travels it with the reader still parked halfway
+        // down. Forcing follow there would answer "I was reading this" by writing over it.
+        // Where the list IS cleared there is nothing to be parked in front of, so the head is
+        // the only sensible place to be.
+        ...(continues ? {} : {
+          events: [], selectedId: null, selectedEventPinned: null, liveFollow: true,
+        }),
       });
-      liveSub = api.streamLive({ filter: liveFilter || undefined, levels: liveLevels }).subscribe({
+
+      liveWasRunning = true;
+      openTail(from);
+    }
+
+    /**
+     * Opens the stream itself and nothing else — no state is reset here.
+     *
+     * <p>Split out of {@link startLive} because {@link resumeLive} must NOT travel the rest of
+     * it. A tab coming back from the background is not a new question: routing it through the
+     * full start discarded the hold buffer the reader had parked in front of, and — once the
+     * pause outlasted the seed window, which ten seconds on another tab is enough to do — took
+     * the `continues` branch and wiped the list, the selection and the pinned drawer with it.</p>
+     */
+    function openTail(from: string): void {
+      liveSub?.unsubscribe();
+      rateWindow = 0;
+      if (rateTimer !== undefined) clearInterval(rateTimer);
+      // Arrivals per second, counted in the tail and published once a second. One interval for
+      // the whole stream — the counter resets each tick, so a tail that goes quiet decays to 0
+      // instead of freezing on its last busy reading.
+      rateTimer = setInterval(() => {
+        patchState(store, { liveRate: rateWindow, liveReceived: received });
+        rateWindow = 0;
+      }, 1000);
+
+      liveSub = api.streamLive({ filter: liveFilter || undefined, levels: liveLevels, from }).subscribe({
         next: ev => {
-          // Read per event, not captured: changing the page size then only resizes the
-          // buffer, instead of needing the connection torn down and rebuilt.
-          const cap = store.pageSize() * 4;
-          patchState(store, { events: [ev, ...store.events().slice(0, cap - 1)] });
-          markNew(ev.id);
+          // Everything here is O(1) and touches NO state. The whole point of the buffer is that
+          // an arriving event costs a push; the counters are closure variables for the same
+          // reason — a patchState per event is exactly what this path used to do.
+          pending.push(ev);
+          rateWindow++;
+          received++;
+          if (pending.length >= LIVE_FLUSH_MAX) flushLive();
+          else scheduleFlush();
         },
         error: (err: Error) => {
           // Say WHY it stopped. The tail reports a blown poll budget or a server too busy
           // to keep it fed through a query-error frame carrying a real sentence, and
           // discarding it left the toggle flipping itself off for no visible reason.
           liveSub = undefined;
+          // Everything buffered belongs to the stream that just died, but it is also the last
+          // thing the user will get — land it before tearing the buffer down, so the list ends
+          // where the tail ended rather than a frame short of it. Publishing alone is not
+          // enough: with the reader parked, a flush routes into the hold buffer, which clearNew
+          // then drops — a stream that failed would silently delete every row behind the pill.
+          landEverything();
           clearNew();
           patchState(store, { live: false, error: err?.message || 'Live tail stopped' });
         },
       });
     }
 
+    /**
+     * Stops the tail and FREEZES what is on screen.
+     *
+     * <p>It used to re-run a backward search over the toolbar's window. That answered a
+     * different question from the one being asked: the universal reason to stop a tail is
+     * "something went past, hold it so I can read it", and for the default 1d preset the reload
+     * returned a page from a completely different part of the timeline, with the selection
+     * dropped and the scroll position gone — a second full-screen flicker immediately after the
+     * one starting Live had caused. Reloading is still one click away (Apply), but it is now
+     * something the user asks for rather than something stop implies.</p>
+     */
     function stopLive(): void {
       patchState(store, { live: false });
       liveSub?.unsubscribe();
       liveSub = undefined;
+      liveWasRunning = false;
+      // Freeze everything the tail actually delivered, not everything it managed to publish:
+      // the buffer and the held rows are both part of what the user pressed stop to look at,
+      // and clearNew below drops whatever is still in them.
+      landEverything();
       clearNew();
-      loadEvents();
+    }
+
+    /**
+     * Suspends the tail without ending it — the tab went to the background.
+     *
+     * <p>`live` stays true so the toggle does not flicker, and `events` is untouched. Both other
+     * live surfaces on this client already gate on document.hidden; this tail was the one that
+     * kept taking a server search slot every hundred milliseconds for a page nobody was looking
+     * at, and then dumped the backlog the moment it came back. The frame clock it now publishes
+     * on does not run in a hidden tab either, so stopping is the honest behaviour rather than
+     * buffering indefinitely.</p>
+     */
+    function pauseLive(): void {
+      if (!store.live() || !liveSub) return;
+      liveSub.unsubscribe();
+      liveSub = undefined;
+      if (rateTimer !== undefined) { clearInterval(rateTimer); rateTimer = undefined; }
+      // Publish what already arrived rather than stranding it in the buffer.
+      flushLive();
+      cancelFlushHandle();
+      patchState(store, { liveRate: 0 });
+    }
+
+    /**
+     * Re-opens a tail suspended by {@link pauseLive}, keeping everything the reader had.
+     *
+     * <p>Picks up from the newest row actually held — which is the HOLD buffer's head, not the
+     * list's, whenever the reader is parked, since those rows are newer than anything on screen.
+     * Clamped to the same seed floor as a fresh start, for the same reason: an unbounded seed
+     * makes the server's first poll come back full and latch its catch-up mode.</p>
+     *
+     * <p>A pause longer than that floor therefore leaves a gap. That is a real cost and it is
+     * the lesser one: the alternative on the table was to treat the return as a new question and
+     * throw away the reader's list, their place in it and the row they had open, which is a
+     * larger loss and one they did not ask for by switching tabs.</p>
+     */
+    function resumeLive(): void {
+      if (!store.live() || liveSub) return;
+      const floor = new Date(Date.now() - SEED_WINDOW_MS).toISOString();
+      const newest = held[0]?.['@t'] ?? store.events()[0]?.['@t'];
+      openTail(newest && newest > floor ? newest : floor);
+    }
+
+    /**
+     * Whether the list follows the head. Driven by the scroll position: the moment the reader
+     * moves off the top the tail stops writing, and arrivals pile up behind the pill instead.
+     */
+    function setFollow(on: boolean): void {
+      if (on === store.liveFollow()) return;
+      if (on) resumeFollow();
+      else patchState(store, { liveFollow: false });
+    }
+
+    /**
+     * Merges everything held while the reader was away and follows the head again.
+     *
+     * <p>`held` is ALREADY newest-first — flushLive reversed each batch before holding it — so
+     * this must not reverse again. That is the second of the two places in this file where wire
+     * order can go silently wrong, and the symptom is identical to the first: timestamps that
+     * run the wrong way inside a block and correctly between blocks.</p>
+     */
+    function resumeFollow(): void {
+      const batch = held;
+      held = [];
+      if (batch.length === 0) {
+        if (!store.liveFollow() || store.livePending())
+          patchState(store, { liveFollow: true, livePending: 0 });
+        return;
+      }
+      const cap = store.liveBufferSize();
+      const kept = store.events();
+      const seen = new Set(kept.map(e => e.id));
+      const fresh = batch.filter(e => !seen.has(e.id));
+      const events = fresh.length >= cap
+        ? fresh.slice(0, cap)
+        : fresh.concat(kept.slice(0, cap - fresh.length));
+      const dropped = Math.max(0, kept.length + fresh.length - cap);
+      patchState(store, {
+        events, liveFollow: true, livePending: 0,
+        // The merge evicts too, and a tail that drops must say so wherever it drops.
+        ...(dropped ? { liveDropped: store.liveDropped() + dropped } : {}),
+        // Deliberately no flash: everything here is new, so flashing it would mark the whole
+        // list — the same thing FLASH_MAX_BATCH exists to prevent on a fast tail.
+        newEventIds: EMPTY_IDS,
+      });
+    }
+
+    /**
+     * Recovers from whatever actually failed — the tail, or a search.
+     *
+     * <p>Both used to answer with a search, which for a dead tail deleted every live row the
+     * user still had on screen.</p>
+     */
+    function retry(): void {
+      if (liveWasRunning) startLive(); else loadEvents();
     }
 
     function toggleLive(): void {
@@ -724,14 +1191,21 @@ export const EventsStore = signalStore(
       loadEvents();
     }
 
-    /** Selects the event for the detail drawer; pass null to close it. */
+    /**
+     * Selects the event for the detail drawer; pass null to close it. The DTO is pinned
+     * alongside the id — see {@link EventsState.selectedEventPinned} — so a live tail evicting
+     * the row does not close the panel under the reader.
+     */
     function selectEvent(id: string | null): void {
-      patchState(store, { selectedId: id });
+      patchState(store, {
+        selectedId: id,
+        selectedEventPinned: id ? store.events().find(e => e.id === id) ?? null : null,
+      });
     }
 
     /** Row click: open the drawer for this event, or close it when it is already open. */
     function toggleEvent(id: string): void {
-      patchState(store, { selectedId: store.selectedId() === id ? null : id });
+      selectEvent(store.selectedId() === id ? null : id);
     }
 
     function toggleWrap(): void {
@@ -846,12 +1320,20 @@ export const EventsStore = signalStore(
       loadEvents();
     }
 
-    /** @internal Disposes active SSE streams + highlight timers; invoked from the onDestroy hook. */
+    /**
+     * @internal Disposes active SSE streams and every live handle; invoked from the onDestroy
+     * hook. Cancels directly rather than through {@link clearNew}, so nothing patches state on
+     * a store that is being torn down.
+     */
     function _disposeStreams(): void {
       querySub?.unsubscribe();
       liveSub?.unsubscribe();
-      newTimers.forEach(clearTimeout);
-      newTimers = [];
+      cancelFlushHandle();
+      pending = [];
+      held = [];
+      if (flashTimer !== undefined) { clearTimeout(flashTimer); flashTimer = undefined; }
+      flashRuns = [];
+      if (rateTimer !== undefined) { clearInterval(rateTimer); rateTimer = undefined; }
     }
 
     return {
@@ -878,6 +1360,12 @@ export const EventsStore = signalStore(
       setQuickSearch,
       setPageSize,
       toggleLive,
+      startLive,
+      pauseLive,
+      resumeLive,
+      setFollow,
+      resumeFollow,
+      retry,
       seek,
       setTimeRange,
       onTimeRangeBound,

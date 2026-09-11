@@ -16,6 +16,9 @@
   font-variant-ligatures: none;
   font-feature-settings: normal;
   text-rendering: optimizeLegibility;
+  /* Not dead, despite no rule in THIS file giving :host a background: the Traces log list uses
+     this component with `class="tl-log-row"` and tints the host itself when a log belongs to the
+     selected span (traces.scss `.tl-log-row--match`). This is what makes that tint fade in. */
   transition: background 120ms ease;
 }
 
@@ -44,15 +47,39 @@
   box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent);
 }
 
-/* Live tail — a just-arrived event flashes accent for ~1s, then fades out.
-   The `.is-new` class is dropped by the store after 1s, matching the animation. */
-:host.is-new .ev-main {
-  animation: ev-row-flash 1s ease-out;
+/* Live tail — a just-arrived row WASHES OVER its own background rather than replacing it.
+   Two reasons this is a pseudo-element animating opacity and not the row's `background`:
+   a background keyframe is paint-only, so every row runs a main-thread repaint for the whole
+   second; and a keyframe lives in the animation origin of the cascade, which outranks the
+   severity tints above and the selected frame below — for a full second the list lost the
+   colour-coding it is scanned by, which is the one thing a log list cannot afford to lose
+   exactly while it is moving.
+
+   `z-index: -1` under `isolation: isolate` paints the wash after the element's own background
+   and before its children, so the severity tint survives underneath and the text stays on top. */
+.ev-main { position: relative; isolation: isolate; }
+.ev-main::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background-color: var(--ev-new-flash);
+  opacity: 0;
+  pointer-events: none;
 }
+:host.is-new .ev-main::after { animation: ev-row-flash 900ms ease-out; }
+/* Selection wins. A negative-z pseudo-element paints after the element's own background AND its
+   inset box-shadow but before the text, so the wash sits directly on top of the frame at :44 —
+   verified in a browser, not reasoned about. The combination is rare and brief (a row cannot be
+   selected in the frame it arrives in), and of the two signals the one the user chose is the one
+   that has to survive. */
+:host.selected .ev-main::after { animation: none; }
 @keyframes ev-row-flash {
-  0%   { background: color-mix(in srgb, var(--accent) 45%, transparent); }
-  55%  { background: color-mix(in srgb, var(--accent) 25%, transparent); }
-  100% { background: transparent; }
+  from { opacity: .22; }
+  to   { opacity: 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  :host.is-new .ev-main::after { animation: none; }
 }
 :host.selected:hover .ev-main {
   background: color-mix(in srgb, var(--accent) 26%, transparent);

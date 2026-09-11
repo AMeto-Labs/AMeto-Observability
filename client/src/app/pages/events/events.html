@@ -30,7 +30,10 @@
         <div class="error-banner">
           <lucide-icon name="circle-alert" [size]="14" />
           {{ store.error() }}
-          <button class="err-retry" (click)="store.loadEvents()">Retry</button>
+          <!-- Retry, not "run a search". A tail failure sets live:false before this banner can
+               appear, so a plain loadEvents() answered "the live tail stopped" by throwing away
+               every live row still on screen. -->
+          <button class="err-retry" (click)="store.retry()">Retry</button>
         </div>
       }
 
@@ -40,6 +43,16 @@
              detail drawer — an aggregate row is not an event to open. -->
         <app-aggregation-table [result]="agg" />
       } @else {
+
+      <!-- Held arrivals. While the reader is scrolled away the tail stops writing entirely, so
+           without this counter a held list is indistinguishable from a dead stream — a worse
+           failure to perceive than the churn it replaces. -->
+      @if (store.live() && !store.liveFollow() && store.livePending() > 0) {
+        <button class="ev-new-pill" (click)="jumpToLive()">
+          <lucide-icon name="arrow-up" [size]="12" />
+          {{ fmtCount(store.livePending()) }} new events
+        </button>
+      }
 
       <!-- List: fixed-height virtual (default) or natural-height wrapped rows -->
       <div #eventsScroll class="events-list" (scroll)="onEventsScroll($event)">
@@ -91,13 +104,38 @@
           <div class="load-more"><span class="load-more-spin"></span></div>
         }
         @if (!store.loading() && !store.error() && store.displayedEvents().length === 0) {
-          <app-empty-state icon="inbox" text="No events match the current filter"></app-empty-state>
+          <!-- Three different nothings. `displayedEvents` is `events` narrowed client-side by
+               the service picker and the quick search, so an empty list can mean the tail has
+               delivered nothing yet OR that it is delivering steadily and the narrowing is
+               hiding all of it — saying "waiting for events" over a stream that is plainly
+               arriving is its own kind of wrong. And the plain "nothing matched" used to appear
+               the instant Live was pressed, which on a quiet service was its permanent
+               condition. Deliberately not solved by setting `loading`: the tail never completes,
+               so nothing would ever clear it and the page would spin for ever. -->
+          @if (store.events().length > 0) {
+            <app-empty-state icon="list-filter" text="Events are arriving, but none match the current service or search"></app-empty-state>
+          } @else if (store.live()) {
+            <app-empty-state icon="activity" text="Live — waiting for events"></app-empty-state>
+          } @else {
+            <app-empty-state icon="inbox" text="No events match the current filter"></app-empty-state>
+          }
         }
       </div>
 
       <!-- Footer -->
       <div class="events-footer">
-        <span class="ev-footer-count">Showing {{ store.displayedEvents().length }} of {{ fmtCount(store.totalCount()) }} events</span>
+        <!-- During a tail the old line read "Showing 200 of 200 events" for ever — both halves
+             are the same capped array — so the one number on screen was a constant, and a user
+             on a busy stand had no way to know they were seeing a fraction of the stream. -->
+        @if (store.live()) {
+          <span class="ev-footer-count"
+            >Live · {{ store.liveRate() }}/s · {{ fmtCount(store.liveReceived()) }} received ·
+            buffer {{ store.displayedEvents().length }}/{{ store.liveBufferSize() }}@if (store.liveDropped() > 0) {<span
+              class="ev-footer-dropped"> · {{ fmtCount(store.liveDropped()) }} dropped</span>}</span
+          >
+        } @else {
+          <span class="ev-footer-count">Showing {{ store.displayedEvents().length }} of {{ fmtCount(store.totalCount()) }} events</span>
+        }
         <div class="ev-footer-nav">
           <button class="ev-footer-btn" (click)="scrollToOlderLogs()">
             <lucide-icon name="arrow-down" [size]="12" /> Older logs
@@ -106,8 +144,9 @@
             <lucide-icon name="arrow-up" [size]="12" /> Newer logs
           </button>
         </div>
-        <button class="ev-footer-live" (click)="store.toggleLive()">
-          Jump to live <lucide-icon name="arrow-right" [size]="12" />
+        <button class="ev-footer-live" [class.live-on]="store.live()"
+                [disabled]="store.isAggregation()" (click)="jumpToLive()">
+          {{ store.live() ? 'Jump to live' : 'Go live' }} <lucide-icon name="arrow-right" [size]="12" />
         </button>
       </div>
       }

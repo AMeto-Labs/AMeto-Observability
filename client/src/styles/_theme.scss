@@ -38,6 +38,12 @@
      dimmed tone (the design's "dim key") — quiet landmarks, values stay bright. */
   --json-key:  #7A8496;
 
+  /* Live-tail arrival wash. Teal, from the free zone named above and deliberately NOT a level
+     hue: the flash used to paint in --accent, which is byte-identical to --lvl-w, so a burst of
+     arrivals read as a wall of warnings. Blue was the obvious replacement and is also taken —
+     --lvl-d is #3982F6 — which leaves teal as the nearest genuinely free band. */
+  --ev-new-flash: #2DD4BF;
+
   --row-ts-date: #5C6879;  /* date recedes …                       */
   --row-ts-time: #AEB8C5;  /* … time carries the row               */
   --row-svc:     #AEB8C5;  /* service name — same tone as the time */

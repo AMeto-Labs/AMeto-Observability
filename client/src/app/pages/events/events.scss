@@ -153,6 +153,41 @@
   background: var(--accent-subtle, rgba(99,102,241,.08));
   border-color: var(--accent);
 }
+/* Lit while a tail is running — the button reads "Jump to live" then and "Go live" otherwise,
+   so the state it acts on has to be visible before it is pressed. */
+.ev-footer-live.live-on { border-color: var(--accent); background: var(--accent-dim); }
+.ev-footer-live:disabled {
+  color: var(--txt-dim);
+  border-color: var(--border);
+  background: none;
+  cursor: default;
+}
+
+/* ── Held-arrivals pill ──────────────────────────────────────────────
+   Floats over the head of the list while the reader is scrolled away and the tail is holding.
+   Positioned against `.events-list-wrap`, which is already `position: relative`. */
+.ev-new-pill {
+  position: absolute;
+  top: 34px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px;
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  background: var(--surface-up);
+  color: var(--accent);
+  font-family: var(--ui);
+  font-size: 11px;
+  cursor: pointer;
+  box-shadow: 0 2px 10px rgb(0 0 0 / .35);
+}
+.ev-new-pill:hover { background: var(--accent-dim); }
+
+.ev-footer-dropped { color: var(--lvl-w); }
 
 /* ── Error + empty + loading states ──────────────────────────────── */
 .error-banner {
