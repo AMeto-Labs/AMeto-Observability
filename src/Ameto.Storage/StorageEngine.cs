@@ -771,6 +771,14 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             IReadOnlySet<Ameto.Core.LogLevel>? levels)
             => HotTierScan.ReadSorted(current, frozen, pool, fromTicks, toTicks, afterTsTicks, afterIdRaw, forward, levels);
 
+        /// <summary>Same scan, with the filter's header-level part applied before materialisation.</summary>
+        public IEnumerable<LogEvent> ReadSorted(
+            long fromTicks, long toTicks,
+            long? afterTsTicks, ulong? afterIdRaw, bool forward,
+            IReadOnlySet<Ameto.Core.LogLevel>? levels,
+            IHotHeaderPredicate? headerPredicate)
+            => HotTierScan.ReadSorted(current, frozen, pool, fromTicks, toTicks, afterTsTicks, afterIdRaw, forward, levels, headerPredicate);
+
         public IReadOnlySet<SegmentKey> CoveredSegmentKeys => covered;
 
         public void Dispose()

@@ -94,6 +94,14 @@ public sealed class QueryExecutor : IQueryExecutor
             && (to is null || to.Value.UtcTicks > boundMax))
             to = new DateTimeOffset(boundMax, TimeSpan.Zero);
 
+        // The level set the filter's AND-chain admits is a `levels` parameter the caller
+        // did not spell out — the same exactness (it is computed with the evaluator's own
+        // comparison), the same pruning: level-split cold segments drop through their
+        // posting lists, hot headers through the mask. The evaluator still re-checks every
+        // event, so like the bounds above this can only skip work. A caller's explicit set
+        // is kept as given.
+        levels ??= filter.DerivedLevels;
+
         // ── Hot tier ──────────────────────────────────────────────────────────
         // Window/cursor/level filtering and the (@t, id) sort happen at HEADER level
         // inside the reader (HotTierScan) — events are materialised lazily in result
@@ -136,9 +144,10 @@ public sealed class QueryExecutor : IQueryExecutor
 
     /// <summary>
     /// The hot tier as a (ts, id)-sorted async source for the merge. ReadSorted already
-    /// applies window, cursor and level filtering at header level; only the compiled
-    /// filter runs here, per materialised event — the same division of labour the cold
-    /// scan uses.
+    /// applies window, cursor and level filtering at header level, plus whatever of the
+    /// filter the header can answer (<see cref="CompiledFilter.HeaderPredicate"/>: level,
+    /// trace / span id, service); the compiled filter then runs here, per materialised
+    /// event, as the correctness gate — the same division of labour the cold scan uses.
     /// </summary>
     private static async IAsyncEnumerable<LogEvent> HotEventsAsync(
         IHotTierReader                hotReader,
@@ -153,7 +162,7 @@ public sealed class QueryExecutor : IQueryExecutor
     {
         foreach (var ev in hotReader.ReadSorted(
                      from?.UtcTicks ?? long.MinValue, to?.UtcTicks ?? long.MaxValue,
-                     afterTs, afterId?.RawValue, forward, levels))
+                     afterTs, afterId?.RawValue, forward, levels, filter.HeaderPredicate))
         {
             if (ct.IsCancellationRequested) yield break;
             if (!filter.Matches(ev)) continue;

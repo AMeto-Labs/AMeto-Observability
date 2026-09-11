@@ -30,6 +30,7 @@ public static class FilterEvaluator
             IsDefinedNode def             => HasProperty(ev, def.Property),
             CompareNode cmp               => EvalCompare(cmp, ev),
             TimeCompareNode tc            => EvalTimeCompare(tc, ev),
+            TraceIdCompareNode tid        => EvalTraceIdCompare(tid, ev),
             LikeNode like                 => EvalLike(like, ev),
             StartsWithNode sw             => EvalStartsWith(sw, ev),
             ContainsNode ct               => EvalContains(ct, ev),
@@ -332,6 +333,33 @@ public static class FilterEvaluator
             _            => false,
         };
     }
+
+    /// <summary>
+    /// Integer <c>@tr</c> / <c>@sp</c> equality against the literal parsed once at compile time
+    /// (see <see cref="TraceIdCompareNode"/>). An absent id (all zero) renders as null, which the
+    /// string path answered as "not equal" — so <c>=</c> needs presence and <c>!=</c> is its
+    /// exact negation.
+    /// </summary>
+    private static bool EvalTraceIdCompare(TraceIdCompareNode node, LogEvent ev)
+    {
+        bool eq = node.IsSpan
+            ? ev.SpanId != 0 && ev.SpanId == node.Lo
+            : (ev.TraceIdHi | ev.TraceIdLo) != 0 && ev.TraceIdHi == node.Hi && ev.TraceIdLo == node.Lo;
+        return node.Op == CompareOp.Eq ? eq : !eq;
+    }
+
+    /// <summary>
+    /// The scalar comparison exactly as a <see cref="CompareNode"/> applies it to a non-list
+    /// value — exposed so the header predicate can pre-compute a level's or a service name's
+    /// verdict with the SAME semantics the per-event evaluation has (a verdict computed any
+    /// other way would be a second definition of <c>=</c>).
+    /// </summary>
+    internal static bool CompareValues(object? actual, object? expected, CompareOp op)
+        => Compare(actual, expected, op);
+
+    /// <summary>Same for a non-list, non-null value against an <c>in (...)</c> list.</summary>
+    internal static bool InValues(object? actual, object?[] values)
+        => actual is not null && MatchesInValues(actual, values);
 
     private static bool EvalCompare(CompareNode node, LogEvent ev)
     {
