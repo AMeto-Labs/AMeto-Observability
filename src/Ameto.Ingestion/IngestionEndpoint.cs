@@ -22,6 +22,28 @@ public interface IOtlpLogSink
         ulong traceHi, ulong traceLo, ulong spanId,
         ReadOnlySpan<byte> serviceUtf8);
 
+    /// <summary>
+    /// Interns a <c>service.name</c> ONCE for a whole resourceLogs block and returns its
+    /// pool index, so the parser does not re-hash the same name for every record under it
+    /// (the name is a property of the resource, and a block carries hundreds of records).
+    /// Returns -1 when there is nothing to intern or the sink has no pool.
+    /// </summary>
+    int InternService(ReadOnlySpan<byte> serviceUtf8) => -1;
+
+    /// <summary>
+    /// As <see cref="TryIngestRaw(long, byte, ReadOnlySpan{byte}, ReadOnlySpan{byte}, ulong, ulong, ulong, ReadOnlySpan{byte})"/>,
+    /// with the service already interned by <see cref="InternService"/>. A negative
+    /// <paramref name="serviceIdx"/> means "not interned yet — do it from the span".
+    /// </summary>
+    bool TryIngestRaw(
+        long tsTicks, byte level,
+        ReadOnlySpan<byte> templateUtf8,
+        ReadOnlySpan<byte> msgpackProps,
+        ulong traceHi, ulong traceLo, ulong spanId,
+        ReadOnlySpan<byte> serviceUtf8,
+        int serviceIdx)
+        => TryIngestRaw(tsTicks, level, templateUtf8, msgpackProps, traceHi, traceLo, spanId, serviceUtf8);
+
     void NotifyBatchEnqueued();
 }
 
@@ -192,7 +214,25 @@ public sealed class IngestionEndpoint : IOtlpLogSink, LogEventSerializer.IClefBa
         ReadOnlySpan<byte> msgpackProps,
         ulong traceHi, ulong traceLo, ulong spanId,
         ReadOnlySpan<byte> serviceUtf8)
+        => TryIngestRaw(tsTicks, level, templateUtf8, msgpackProps, traceHi, traceLo, spanId, serviceUtf8, serviceIdx: -1);
+
+    /// <inheritdoc/>
+    public int InternService(ReadOnlySpan<byte> serviceUtf8) => _pool.Intern(serviceUtf8);
+
+    /// <inheritdoc/>
+    public bool TryIngestRaw(
+        long tsTicks, byte level,
+        ReadOnlySpan<byte> templateUtf8,
+        ReadOnlySpan<byte> msgpackProps,
+        ulong traceHi, ulong traceLo, ulong spanId,
+        ReadOnlySpan<byte> serviceUtf8,
+        int serviceIdx)
     {
+        // The service name belongs to the resourceLogs block, not the record: when the
+        // parser has already interned it, every record under that block skips the
+        // UTF-8 decode + hash that used to run once per record.
+        if (serviceIdx < 0) serviceIdx = _pool.Intern(serviceUtf8);   // -1 when empty
+
         if (msgpackProps.Length > _maxEventPayloadBytes)
         {
             // Drop the oversized original, but leave a compact Error breadcrumb in
@@ -200,7 +240,7 @@ public sealed class IngestionEndpoint : IOtlpLogSink, LogEventSerializer.IClefBa
             // the server's own log. Marked DroppedBy=server to distinguish it from
             // the client sink's own oversized marker.
             string origTmpl = templateUtf8.IsEmpty ? string.Empty : System.Text.Encoding.UTF8.GetString(templateUtf8);
-            EnqueueServerDropMarker(tsTicks, level, origTmpl, msgpackProps.Length, traceHi, traceLo, spanId, _pool.Intern(serviceUtf8));
+            EnqueueServerDropMarker(tsTicks, level, origTmpl, msgpackProps.Length, traceHi, traceLo, spanId, serviceIdx);
             _ring.CountOversizedDrop();   // the drop happens HERE, before the ring sees it
             return false; // original counted as dropped by the caller
         }
@@ -209,11 +249,10 @@ public sealed class IngestionEndpoint : IOtlpLogSink, LogEventSerializer.IClefBa
         // rather than a per-event duplicate — and one dictionary probe does the work of two.
         int    tmplIdx = _pool.Intern(templateUtf8, out string canonicalTmpl); // -1 when empty
         string tmpl    = tmplIdx >= 0 ? canonicalTmpl : string.Empty;
-        int    svcIdx  = _pool.Intern(serviceUtf8);            // -1 when empty
 
         return _ring.TryEnqueue(
             tsTicks, level, tmplIdx, tmpl, exception: null,
-            msgpackProps, traceHi, traceLo, spanId, svcIdx);
+            msgpackProps, traceHi, traceLo, spanId, serviceIdx);
     }
 
     /// <summary>Wakes the drainer once after a streaming batch (see <see cref="TryIngestRaw"/>).</summary>
