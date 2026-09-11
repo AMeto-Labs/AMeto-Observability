@@ -12,6 +12,13 @@ namespace Ameto.Replication;
 /// expects the remote node's own <see cref="PeerPayload"/> in response.
 /// Both sides update their <see cref="NodeRegistry"/> on every successful exchange,
 /// keeping <see cref="ReplicationNode.LastSeen"/> fresh for liveness detection.
+///
+/// <para>Replication is enabled by default with an empty seed list, which is the shipped
+/// single-node configuration, so this loop used to wake every 10 seconds forever to build a
+/// payload and a LINQ chain over one entry — itself — and await <c>Task.WhenAll</c> of nothing.
+/// It now parks on <see cref="NodeRegistry.PeerAdded"/> when there is nothing to probe: with no
+/// seeds, an inbound ping is the only way a peer can appear, so nothing is missed and the timer
+/// does not exist while this node is alone.</para>
 /// </summary>
 public sealed class PeerProber : IHostedService, IDisposable
 {
@@ -23,6 +30,13 @@ public sealed class PeerProber : IHostedService, IDisposable
 
     private CancellationTokenSource? _cts;
     private Task?                    _loop;
+
+    /// <summary>Pulsed when a peer is discovered, so a parked loop can resume immediately.</summary>
+    private readonly SemaphoreSlim _wake = new(0, 1);
+
+    /// <summary>Probe cycles run. Zero after start on a node with no seeds and no peers.</summary>
+    public int ProbeCycles => Volatile.Read(ref _cycles);
+    private int _cycles;
 
     public PeerProber(
         IOptions<ReplicationOptions> opts,
@@ -42,13 +56,27 @@ public sealed class PeerProber : IHostedService, IDisposable
     {
         if (!_opts.Enabled) return Task.CompletedTask;
 
+        _registry.PeerAdded += OnPeerAdded;
         _cts  = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         _loop = RunAsync(_cts.Token);
         return Task.CompletedTask;
     }
 
+    /// <summary>
+    /// A peer appeared while we were parked. One pending pulse is enough — the loop re-reads
+    /// the registry when it wakes, so a burst of discoveries is one wake-up, not N.
+    /// </summary>
+    private void OnPeerAdded()
+    {
+        if (_wake.CurrentCount == 0)
+        {
+            try { _wake.Release(); } catch (SemaphoreFullException) { /* raced; already pulsed */ }
+        }
+    }
+
     public async Task StopAsync(CancellationToken cancellationToken)
     {
+        _registry.PeerAdded -= OnPeerAdded;
         if (_cts is null) return;
         await _cts.CancelAsync();
         if (_loop is not null)
@@ -57,17 +85,31 @@ public sealed class PeerProber : IHostedService, IDisposable
 
     private async Task RunAsync(CancellationToken ct)
     {
-        // Probe seeds immediately on startup so the registry is populated before
-        // the first SegmentReplicator flush.
-        await ProbeAllAsync(ct);
-
-        using var timer = new PeriodicTimer(_opts.ProbeInterval);
+        // Created only while there is something to probe, and disposed again when there is
+        // not: a PeriodicTimer that exists is a wake-up every ProbeInterval whether or not
+        // the loop does anything with it.
+        PeriodicTimer? timer = null;
         try
         {
-            while (await timer.WaitForNextTickAsync(ct))
+            while (!ct.IsCancellationRequested)
             {
-                // Re-probe seeds + any peers discovered via previous probes.
+                if (!HasSomethingToProbe)
+                {
+                    timer?.Dispose();
+                    timer = null;
+                    // No seeds and no peers: an inbound ping (NodeRegistry.Upsert) is the only
+                    // event that can change that, and it pulses us. Until then, no wakes.
+                    await _wake.WaitAsync(ct);
+                    continue;
+                }
+
+                // Seeds are probed on the first pass so the registry is populated before the
+                // first SegmentReplicator flush, then re-probed on the interval.
                 await ProbeAllAsync(ct);
+                Interlocked.Increment(ref _cycles);
+
+                timer ??= new PeriodicTimer(_opts.ProbeInterval);
+                if (!await timer.WaitForNextTickAsync(ct)) break;
             }
         }
         catch (OperationCanceledException) { }
@@ -75,10 +117,25 @@ public sealed class PeerProber : IHostedService, IDisposable
         {
             _logger.LogError(ex, "PeerProber loop failed");
         }
+        finally
+        {
+            timer?.Dispose();
+        }
     }
+
+    /// <summary>
+    /// Static seeds, or any peer besides ourselves. Checked before anything is built, because
+    /// the answer on a single node is "no" for the life of the process.
+    /// </summary>
+    private bool HasSomethingToProbe =>
+        _opts.SeedNodes.Length > 0 || _registry.HasPeerOtherThan(_localId);
 
     private Task ProbeAllAsync(CancellationToken ct)
     {
+        // Second guard: a peer may have been removed between the check and here, and an empty
+        // cycle must not cost a payload, four LINQ operators and a Task.WhenAll over nothing.
+        if (!HasSomethingToProbe) return Task.CompletedTask;
+
         var payload = BuildPayload();
 
         // Probe static seeds + all dynamically discovered peers.
@@ -125,5 +182,10 @@ public sealed class PeerProber : IHostedService, IDisposable
         Timestamp = DateTimeOffset.UtcNow,
     };
 
-    public void Dispose() => _http.Dispose();
+    public void Dispose()
+    {
+        _registry.PeerAdded -= OnPeerAdded;
+        _wake.Dispose();
+        _http.Dispose();
+    }
 }
