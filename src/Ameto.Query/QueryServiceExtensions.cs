@@ -12,8 +12,11 @@ public static class QueryServiceExtensions
     /// </summary>
     public static IServiceCollection AddAmetoQuery(this IServiceCollection services)
     {
-        services.AddSingleton(static sp => new SegmentIndexCache(
-            sp.GetRequiredService<IOptions<ServerOptions>>().Value.Query.IndexCacheBytes));
+        services.AddSingleton(static sp =>
+        {
+            var q = sp.GetRequiredService<IOptions<ServerOptions>>().Value.Query;
+            return new SegmentIndexCache(q.IndexCacheBytes, q.IndexCacheIdleEvict);
+        });
         services.AddSingleton<IQueryExecutor, QueryExecutor>();
         return services;
     }

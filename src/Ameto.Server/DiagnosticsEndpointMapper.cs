@@ -29,7 +29,8 @@ public static class DiagnosticsEndpointMapper
     {
         app.MapGet("/api/diagnostics", (
             StorageEngine storage, ServerOptions options, ProcessCpuSampler cpu,
-            Ameto.Ingestion.IngestionRingBuffer ring, Ameto.Ingestion.IngestionDrainer drainer) =>
+            Ameto.Ingestion.IngestionRingBuffer ring, Ameto.Ingestion.IngestionDrainer drainer,
+            Ameto.Indexing.SegmentIndexCache indexCache) =>
         {
             // Disk space for the data directory drive
             long diskFreeBytes  = 0;
@@ -121,6 +122,17 @@ public static class DiagnosticsEndpointMapper
                 gen1Collections        = GC.CollectionCount(1),
                 gen2Collections        = GC.CollectionCount(2),
                 hotTierNativeBytes     = hotTierBytes,
+
+                // Decoded segment indexes held across queries: managed postings plus native
+                // bloom bits, and the part of RSS that used to ratchet up after the first wide
+                // query and never come back down. Retained bytes are what the cache charges
+                // against its budget, not what the .seg sections weigh on disk.
+                indexCacheEntries      = indexCache.EntryCount,
+                indexCacheBytes        = indexCache.TotalBytes,
+                indexCacheBudgetBytes  = options.Query.IndexCacheBytes,
+                indexCacheHits         = indexCache.HitCount,
+                indexCacheMisses       = indexCache.MissCount,
+                indexCacheIdleEvicted  = indexCache.IdleEvictedCount,
 
                 // Storage
                 segmentCount         = segs.Count,

@@ -185,6 +185,15 @@ public sealed class QueryOptions
     public long IndexCacheBytes { get; init; } = 256 * 1024 * 1024;
 
     /// <summary>
+    /// Drop cached segment indexes that no query has read for this long. Without it the only
+    /// thing that ever removes an entry is budget pressure, so a server that answers one wide
+    /// query and then goes quiet keeps those postings and native bloom bits resident for the
+    /// rest of its life — the single biggest avoidable chunk of steady-state RSS on a small
+    /// host. Zero or negative turns it off (budget pressure only). Default: 10 minutes.
+    /// </summary>
+    public TimeSpan IndexCacheIdleEvict { get; init; } = TimeSpan.FromMinutes(10);
+
+    /// <summary>
     /// Wall-clock budget for one search. A query that exceeds it is stopped and the client
     /// is told so — rather than the request occupying a core until the browser tab is
     /// closed, which is what an unbounded scan over an unbounded window did. Zero or
