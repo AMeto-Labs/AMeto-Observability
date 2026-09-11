@@ -90,7 +90,51 @@ public sealed class LogEvent
     public required DateTimeOffset Timestamp             { get; init; }
     public required LogLevel Level                       { get; init; }
     public required string MessageTemplate               { get; init; }
-    public ExceptionInfo? Exception                      { get; init; }
+
+    private ExceptionInfo? _exception;
+
+    /// <summary>
+    /// The structured exception, or <c>null</c>. Materialised on first access from
+    /// <see cref="RawException"/> when the decoder supplied only the msgpack bytes.
+    ///
+    /// <para>Lazy for the same reason <see cref="Properties"/> is, and the saving is larger:
+    /// a level-split Error segment is ~100 % exception-bearing and a stack trace is 1-5 KB,
+    /// so <c>ExceptionInfo.FromBytes</c> per candidate row built a small object tree plus a
+    /// UTF-16 copy of every frame — for rows the filter was about to reject. A filter only
+    /// touches this for an <c>@x…</c> predicate; delivery only touches it for the rows it
+    /// returns. Everything else now pays the byte slice the decoder already had to keep.</para>
+    ///
+    /// <para>Not synchronised, exactly like <see cref="Properties"/>: a race decodes twice
+    /// and one equal result wins, and an event is consumed by one reader.</para>
+    /// </summary>
+    public ExceptionInfo? Exception
+    {
+        get => _exception ??= RawException.IsEmpty
+                   ? null
+                   : ExceptionInfo.FromBytes(RawException.Span);
+        init => _exception = value;
+    }
+
+    /// <summary>
+    /// Raw msgpack bytes of the exception map, when the event was decoded from a segment.
+    /// Empty when the event carries no exception, or when <see cref="Exception"/> was set
+    /// directly (ingestion, tests).
+    /// </summary>
+    public ReadOnlyMemory<byte> RawException             { get; init; }
+
+    /// <summary>
+    /// True when <see cref="Exception"/> is already decoded, so reading it costs nothing —
+    /// the counterpart of <see cref="PropertiesMaterialised"/>, for callers that want to ask
+    /// without forcing the decode they are asking about.
+    /// </summary>
+    public bool ExceptionMaterialised => _exception is not null;
+
+    /// <summary>
+    /// Whether the event carries an exception at all, WITHOUT decoding it. This is what an
+    /// <c>@x is not null</c> / exists predicate needs, and it is the whole point of the
+    /// laziness above: the answer is a length, not a tree.
+    /// </summary>
+    public bool HasException => _exception is not null || !RawException.IsEmpty;
 
     private Dictionary<string, object?>? _properties;
 

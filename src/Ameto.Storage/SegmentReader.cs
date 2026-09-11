@@ -288,6 +288,11 @@ public sealed class SegmentReader : ISegmentReader
             Array.Sort(cands);
         }
 
+        // One vocabulary table for the whole read — blocks of one segment share their
+        // templates and service names, so the table is what makes string allocation
+        // proportional to DISTINCT values instead of to rows. See BlockStringDedup.
+        var dedup = new BlockStringDedup();
+
         int blockCount = _blocks.Length;
         for (int bi = 0; bi < blockCount; bi++)
         {
@@ -307,8 +312,8 @@ public sealed class SegmentReader : ISegmentReader
             }
 
             var events = cands is null
-                ? ReadBlock(_blocks[idx].FileOffset, reversed)
-                : ReadBlock(_blocks[idx].FileOffset, reversed, cands, candStart, candEnd, _blockOrdinals![idx]);
+                ? ReadBlock(_blocks[idx].FileOffset, reversed, dedup)
+                : ReadBlock(_blocks[idx].FileOffset, reversed, dedup, cands, candStart, candEnd, _blockOrdinals![idx]);
             foreach (var evt in events)
             {
                 long ts = evt.Timestamp.UtcTicks;
@@ -464,8 +469,49 @@ public sealed class SegmentReader : ISegmentReader
 
     // ── Block reading ─────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Collapses repeated template / service strings inside ONE read. A block holds a couple
+    /// of thousand rows drawn from a vocabulary of a few dozen templates, and the decoder used
+    /// to run <c>Encoding.UTF8.GetString</c> per row per column — two strings per candidate,
+    /// nearly all of them equal to one already on the heap and most of them belonging to rows
+    /// the filter then rejected.
+    ///
+    /// <para>Probed BY UTF-8 through <see cref="Utf8StringComparer"/>, straight off the block
+    /// buffer, so a repeat costs a hash of bytes that are already there and builds nothing;
+    /// see <c>SegmentEventCursor.Dedup</c>, whose measurement this mirrors (including why the
+    /// insert goes through the string key rather than the alternate lookup).</para>
+    ///
+    /// <para>Scoped to one <see cref="ReadEventsAsync"/> enumeration, not to the reader: a
+    /// reader is now shared between a query's prefilter and its scan, and a table shared by
+    /// two concurrent enumerations would need a lock on the hottest loop in the decoder to buy
+    /// a dedup window nothing uses — segments are scanned by one iterator each.</para>
+    /// </summary>
+    private sealed class BlockStringDedup
+    {
+        /// <summary>Matches <c>SegmentEventCursor.MaxDedupEntries</c>: past this the values
+        /// are not a vocabulary any more (interpolated templates are distinct per event), and
+        /// dedup is a pure allocation optimisation, so the table simply empties and refills.</summary>
+        private const int MaxEntries = 65_536;
+
+        private readonly Dictionary<string, string> _byString = new(Utf8StringComparer.Instance);
+        private readonly Dictionary<string, string>.AlternateLookup<ReadOnlySpan<byte>> _byUtf8;
+
+        public BlockStringDedup() => _byUtf8 = _byString.GetAlternateLookup<ReadOnlySpan<byte>>();
+
+        public string? Get(ReadOnlySpan<byte> utf8)
+        {
+            if (utf8.IsEmpty) return null;
+            if (_byUtf8.TryGetValue(utf8, out var pooled)) return pooled;
+            if (_byString.Count >= MaxEntries) _byString.Clear();
+
+            string created = Encoding.UTF8.GetString(utf8);
+            _byString[created] = created;
+            return created;
+        }
+    }
+
     private IEnumerable<LogEvent> ReadBlock(
-        long blockOffset, bool reversed,
+        long blockOffset, bool reversed, BlockStringDedup? dedup,
         uint[]? cands = null, int candStart = 0, int candEnd = 0, uint firstOrdinal = 0)
     {
         int uncompressedSize = ReadInt32At(blockOffset);
@@ -486,7 +532,7 @@ public sealed class SegmentReader : ISegmentReader
             if (decoded != uncompressedSize)
                 yield break;
 
-            events = DecodeColumnarBlock(rentedUncomp.AsSpan(0, decoded), cands, candStart, candEnd, firstOrdinal);
+            events = DecodeColumnarBlock(rentedUncomp.AsSpan(0, decoded), dedup, cands, candStart, candEnd, firstOrdinal);
         }
         finally
         {
@@ -505,7 +551,7 @@ public sealed class SegmentReader : ISegmentReader
     /// comparisons, no Dictionary / string / ExceptionInfo allocation.
     /// </summary>
     private static List<LogEvent> DecodeColumnarBlock(
-        ReadOnlySpan<byte> span,
+        ReadOnlySpan<byte> span, BlockStringDedup? dedup = null,
         uint[]? cands = null, int candStart = 0, int candEnd = 0, uint firstOrdinal = 0)
     {
         int    pos        = 0;
@@ -581,18 +627,33 @@ public sealed class SegmentReader : ISegmentReader
                 uint sStart = BinaryPrimitives.ReadUInt32LittleEndian(svcOffsets.Slice(i * 4, 4));
                 uint sEnd   = BinaryPrimitives.ReadUInt32LittleEndian(svcOffsets.Slice((i + 1) * 4, 4));
                 if (sEnd > sStart)
-                    svcName = Encoding.UTF8.GetString(svcPayload.Slice((int)sStart, (int)(sEnd - sStart)));
+                {
+                    var svcUtf8 = svcPayload.Slice((int)sStart, (int)(sEnd - sStart));
+                    svcName = dedup is null ? Encoding.UTF8.GetString(svcUtf8) : dedup.Get(svcUtf8);
+                }
             }
 
             uint mtStart = BinaryPrimitives.ReadUInt32LittleEndian(mtOffsets.Slice(i * 4, 4));
             uint mtEnd   = BinaryPrimitives.ReadUInt32LittleEndian(mtOffsets.Slice((i + 1) * 4, 4));
-            string mt    = mtEnd > mtStart ? Encoding.UTF8.GetString(mtPayload.Slice((int)mtStart, (int)(mtEnd - mtStart))) : string.Empty;
+            string mt    = string.Empty;
+            if (mtEnd > mtStart)
+            {
+                var mtUtf8 = mtPayload.Slice((int)mtStart, (int)(mtEnd - mtStart));
+                mt = (dedup is null ? Encoding.UTF8.GetString(mtUtf8) : dedup.Get(mtUtf8)) ?? string.Empty;
+            }
 
             uint exStart = BinaryPrimitives.ReadUInt32LittleEndian(exOffsets.Slice(i * 4, 4));
             uint exEnd   = BinaryPrimitives.ReadUInt32LittleEndian(exOffsets.Slice((i + 1) * 4, 4));
-            ExceptionInfo? exc = exEnd > exStart
-                ? ExceptionInfo.FromBytes(exPayload.Slice((int)exStart, (int)(exEnd - exStart)))
-                : null;
+            // Carried as BYTES, like properties, and for the same reason one level up: an
+            // Error segment is ~100 % exception-bearing, a stack trace is 1-5 KB, and the
+            // candidate set a trigram hint produces is a SUPERSET of the matches — so
+            // decoding here built an object tree and a UTF-16 copy of every frame for rows
+            // the evaluator was about to reject. LogEvent.Exception decodes on first touch.
+            // The copy is required: exPayload points into the pooled block buffer, which is
+            // returned as soon as this block is decoded.
+            ReadOnlyMemory<byte> rawExc = exEnd > exStart
+                ? exPayload.Slice((int)exStart, (int)(exEnd - exStart)).ToArray()
+                : default;
 
             uint prStart = BinaryPrimitives.ReadUInt32LittleEndian(prOffsets.Slice(i * 4, 4));
             uint prEnd   = BinaryPrimitives.ReadUInt32LittleEndian(prOffsets.Slice((i + 1) * 4, 4));
@@ -611,7 +672,7 @@ public sealed class SegmentReader : ISegmentReader
                 Timestamp       = new DateTimeOffset(blockMinTs + tDelta, TimeSpan.Zero),
                 Level           = (LogLevel)lvl,
                 MessageTemplate = mt,
-                Exception       = exc,
+                RawException    = rawExc,
                 RawProperties   = rawProps,
                 TraceIdHi       = trHi,
                 TraceIdLo       = trLo,

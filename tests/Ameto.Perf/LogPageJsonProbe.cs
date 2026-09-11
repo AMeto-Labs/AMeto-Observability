@@ -132,6 +132,55 @@ public sealed class LogPageJsonProbe
         }
     }
 
+    /// <summary>
+    /// The other half of what a scroll step costs: DECODING the page out of the segment,
+    /// before a byte of JSON is written. Reported per event, because that is the number every
+    /// change to <c>DecodeColumnarBlock</c> moves — string transcodes, the properties copy and
+    /// (until it went lazy) a whole <c>ExceptionInfo</c> tree, per candidate row.
+    /// </summary>
+    [Fact]
+    public async Task PageDecodeCostsAreReportedPerEvent()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "ameto-pagedecode-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            string path = BuildSegment(dir);
+
+            async Task<int> PageAsync(int take)
+            {
+                using var reader = SegmentReader.Open(path);
+                int n = 0;
+                await foreach (var ev in reader.ReadEventsAsync(null, null, null))
+                {
+                    _ = ev.MessageTemplate; _ = ev.ServiceName; _ = ev.RawProperties.Length;
+                    if (++n >= take) break;
+                }
+                return n;
+            }
+
+            await PageAsync(Page);   // warm
+
+            long b0 = GC.GetAllocatedBytesForCurrentThread();
+            int got = await PageAsync(Page);
+            long pageBytes = GC.GetAllocatedBytesForCurrentThread() - b0;
+            Assert.Equal(Page, got);
+
+            long b1 = GC.GetAllocatedBytesForCurrentThread();
+            await PageAsync(Events);
+            long allBytes = GC.GetAllocatedBytesForCurrentThread() - b1;
+
+            _out.WriteLine($"decode page of {Page} : {pageBytes / 1024.0:F0} KB ({pageBytes / (double)Page:F0} B/event)");
+            _out.WriteLine($"decode all {Events}   : {allBytes / 1024.0:F0} KB ({allBytes / (double)Events:F0} B/event)");
+
+            // A page must not cost the segment — the report above is the number that moves,
+            // this is only the floor under it.
+            Assert.True(pageBytes * 4 < allBytes,
+                $"a {Page}-event page costs like the whole segment: {pageBytes} B vs {allBytes} B");
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
     private static (double MsPerIter, long Bytes) Measure(int iters, Action body)
     {
         GC.Collect();
