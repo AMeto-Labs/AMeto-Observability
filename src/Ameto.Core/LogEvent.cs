@@ -111,7 +111,7 @@ public sealed class LogEvent
     {
         get => _exception ??= RawException.IsEmpty
                    ? null
-                   : ExceptionInfo.FromBytes(RawException.Span);
+                   : ExceptionInfo.FromBytes(RawException);   // ReadOnlyMemory overload — no copy
         init => _exception = value;
     }
 

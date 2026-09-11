@@ -55,6 +55,26 @@ public sealed class ExceptionInfo
     public static ExceptionInfo? Read(ref MessagePackReader reader)
         => ReadAtDepth(ref reader, depth: 1);
 
+    /// <summary>The four keys of the wire map — matched as bytes, never built as strings.</summary>
+    private enum ExcField : byte { Unknown = 0, Type, Message, Stack, Inner }
+
+    private static ExcField ClassifyKey(ReadOnlySpan<byte> key) =>
+        key.SequenceEqual("type"u8)  ? ExcField.Type    :
+        key.SequenceEqual("msg"u8)   ? ExcField.Message :
+        key.SequenceEqual("stk"u8)   ? ExcField.Stack   :
+        key.SequenceEqual("inner"u8) ? ExcField.Inner   :
+        ExcField.Unknown;
+
+    /// <summary>Fallback for the rare non-contiguous key.</summary>
+    private static ExcField ClassifyKey(string? key) => key switch
+    {
+        Fields.Type    => ExcField.Type,
+        Fields.Message => ExcField.Message,
+        Fields.Stack   => ExcField.Stack,
+        Fields.Inner   => ExcField.Inner,
+        _              => ExcField.Unknown,
+    };
+
     private static ExceptionInfo? ReadAtDepth(ref MessagePackReader reader, int depth)
     {
         if (reader.TryReadNil()) return null;
@@ -82,19 +102,27 @@ public sealed class ExceptionInfo
 
         for (int i = 0; i < fields; i++)
         {
-            string key = reader.ReadString() ?? string.Empty;
-            switch (key)
+            // The key is CLASSIFIED from its bytes, not read as a string. There are four of
+            // them, they are three or five bytes long, and the map is read once per
+            // exception per depth — so the old `ReadString()` per key built four throwaway
+            // UTF-16 strings, transcoded, only to switch on them and drop them. Same
+            // technique and same reason as LogEventSerializer.ClassifyKey.
+            ExcField field = reader.TryReadStringSpan(out ReadOnlySpan<byte> keySpan)
+                ? ClassifyKey(keySpan)
+                : ClassifyKey(reader.ReadString());   // rare: the key spans buffer segments
+
+            switch (field)
             {
-                case Fields.Type:    type  = reader.ReadString() ?? "Exception"; break;
-                case Fields.Message: msg   = reader.ReadString();                break;
-                case Fields.Stack:   stack = reader.ReadString();                break;
-                case Fields.Inner:
+                case ExcField.Type:    type  = reader.ReadString() ?? "Exception"; break;
+                case ExcField.Message: msg   = reader.ReadString();                break;
+                case ExcField.Stack:   stack = reader.ReadString();                break;
+                case ExcField.Inner:
                     if (depth < MaxDepth)
                         inner = ReadAtDepth(ref reader, depth + 1);
                     else
-                        reader.Skip();                                            // truncate deeper levels
+                        reader.Skip();                                             // truncate deeper levels
                     break;
-                default:             reader.Skip();                              break;
+                default:               reader.Skip();                              break;
             }
         }
 
@@ -153,7 +181,26 @@ public sealed class ExceptionInfo
         return buf.WrittenSpan.ToArray();
     }
 
-    /// <summary>Reads an <see cref="ExceptionInfo"/> from a previously-written msgpack byte buffer.</summary>
+    /// <summary>
+    /// Reads an <see cref="ExceptionInfo"/> from a previously-written msgpack buffer, WITHOUT
+    /// copying it. Prefer this overload wherever the bytes are already on the managed heap —
+    /// a segment's decoded exception slice, a WAL record — because the copy the span overload
+    /// has to make is the payload itself: 1-5 KB of stack trace, per exception-bearing row.
+    /// </summary>
+    public static ExceptionInfo? FromBytes(ReadOnlyMemory<byte> bytes)
+    {
+        if (bytes.IsEmpty) return null;
+        var reader = new MessagePackReader(new ReadOnlySequence<byte>(bytes));
+        return Read(ref reader);
+    }
+
+    /// <summary>
+    /// Reads an <see cref="ExceptionInfo"/> from a previously-written msgpack byte buffer.
+    ///
+    /// <para>A <see cref="MessagePackReader"/> needs a <see cref="ReadOnlySequence{T}"/>, which
+    /// cannot be built over a span that may live on the stack — so this overload COPIES.
+    /// Callers holding heap memory should use the <see cref="ReadOnlyMemory{T}"/> overload.</para>
+    /// </summary>
     public static ExceptionInfo? FromBytes(ReadOnlySpan<byte> bytes)
     {
         if (bytes.IsEmpty) return null;
