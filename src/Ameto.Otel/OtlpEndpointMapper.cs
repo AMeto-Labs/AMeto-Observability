@@ -144,20 +144,14 @@ public static class OtlpEndpointMapper
             try
             {
                 bool isProto = ctx.Request.ContentType?.StartsWith(ProtobufContentType, StringComparison.OrdinalIgnoreCase) ?? false;
-                if (isProto)
-                {
-                    // Protobuf still decodes into the object model, then maps to events.
-                    var request = OtlpProtoDecoder.DecodeLogs(body, bodyLen);
-                    if (request is null) { ctx.Response.StatusCode = 400; return; }
-                    var events = OtlpLogMapper.Map(request, Ameto.Core.NodeId.Local.Value);
-                    (ingested, dropped) = endpoint.IngestEvents(events);
-                }
-                else
-                {
-                    // JSON: zero-alloc streaming parse straight into the ring — no object
-                    // graph, no per-record LogEvent, no per-attribute strings.
-                    (ingested, dropped) = OtlpLogStreamParser.Parse(body.AsSpan(0, bodyLen), endpoint);
-                }
+
+                // Both encodings stream straight into the ring — no OTLP object graph, no
+                // per-record LogEvent, no per-attribute strings. Protobuf is what SDK
+                // exporters and the collector send, so it is the one that had to stop
+                // decoding to a DOM first (see OtlpLogProtoParser).
+                (ingested, dropped) = isProto
+                    ? OtlpLogProtoParser.Parse(body.AsSpan(0, bodyLen), endpoint)
+                    : OtlpLogStreamParser.Parse(body.AsSpan(0, bodyLen), endpoint);
             }
             catch { ctx.Response.StatusCode = 400; return; }
             finally { ArrayPool<byte>.Shared.Return(body); }

@@ -43,10 +43,8 @@ public static class OtlpGrpcEndpointMapper
         app.MapPost("/opentelemetry.proto.collector.logs.v1.LogsService/Export",
             (HttpContext ctx) => HandleAsync(ctx, ApiKeyPermissions.Logs, static (c, msg) =>
             {
-                var request = OtlpProtoDecoder.DecodeLogs(msg.Array!, msg.Offset + msg.Count);
-                if (request is null) return (false, 0, null);
-                var events = OtlpLogMapper.Map(request, Ameto.Core.NodeId.Local.Value);
-                var (_, dropped) = c.RequestServices.GetRequiredService<IngestionEndpoint>().IngestEvents(events);
+                var (_, dropped) = OtlpLogProtoParser.Parse(
+                    msg.AsSpan(), c.RequestServices.GetRequiredService<IngestionEndpoint>());
                 return (true, dropped, BufferFullReason);
             }));
 
@@ -61,7 +59,7 @@ public static class OtlpGrpcEndpointMapper
                     c.RequestServices.GetRequiredService<ISpanIngester>()
                      .TryIngest(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(spans), out int accepted);
                     return (true, spans.Count - accepted, BufferFullReason);
-                }));
+                }, decodeReadsFromZero: true));
 
         if (enableMetrics)
             app.MapPost("/opentelemetry.proto.collector.metrics.v1.MetricsService/Export",
@@ -78,10 +76,17 @@ public static class OtlpGrpcEndpointMapper
     /// The shape every Export call shares: check the content type, check the key, unframe, hand
     /// the protobuf to that signal's own decoder, and answer in trailers.
     /// </summary>
+    /// <param name="decodeReadsFromZero">
+    /// True only for the one decoder left that takes (buffer, length) and reads from index 0 —
+    /// the trace DOM decoder. An uncompressed message sits five bytes into the request buffer,
+    /// so for that one the message is memmoved down to the start first. The span parsers take
+    /// the segment where it lies and pay nothing, which on a megabyte batch is the copy itself.
+    /// </param>
     private static async Task HandleAsync(
         HttpContext ctx,
         ApiKeyPermissions required,
-        Func<HttpContext, ArraySegment<byte>, (bool Ok, int Rejected, string? Why)> decode)
+        Func<HttpContext, ArraySegment<byte>, (bool Ok, int Rejected, string? Why)> decode,
+        bool decodeReadsFromZero = false)
     {
         // Committed up front: gRPC needs the headers out before trailers can be written, and a
         // client that never sees 200 + application/grpc treats the call as a transport failure
@@ -156,18 +161,19 @@ public static class OtlpGrpcEndpointMapper
                 return;
             }
 
-            // The decoders take (buffer, length) and read from index 0, so an uncompressed
-            // message — which sits five bytes into the request buffer — is copied down rather
-            // than handed over at an offset they would misread.
             ArraySegment<byte> segment;
             if (inflated is not null)
             {
                 segment = new ArraySegment<byte>(inflated, 0, inflatedLen);
             }
-            else
+            else if (decodeReadsFromZero)
             {
                 body.AsSpan(OtlpGrpcFraming.HeaderBytes, message.Length).CopyTo(body);
                 segment = new ArraySegment<byte>(body, 0, message.Length);
+            }
+            else
+            {
+                segment = new ArraySegment<byte>(body, OtlpGrpcFraming.HeaderBytes, message.Length);
             }
 
             bool ok;
