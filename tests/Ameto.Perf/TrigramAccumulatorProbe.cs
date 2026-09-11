@@ -1,4 +1,5 @@
 using Ameto.Core;
+using Ameto.Indexing;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -32,28 +33,46 @@ public sealed class TrigramAccumulatorProbe
 
         _out.WriteLine($"{Events:N0} events, {pairs:N0} (trigram, offset) pairs after dedup\n");
 
-        long baseline = Measure(texts, static () => new HashSetAccumulator());
-        long lists    = Measure(texts, static () => new SortedListAccumulator());
-        long varint   = Measure(texts, static () => new DeltaVarintAccumulator());
+        // Warm the JIT on the production class so its CPU column is steady-state.
+        Measure(texts, static () => new ArenaAccumulator(), warm: true);
 
-        Report("A. HashSet<int>            (current)", baseline, pairs, baseline);
-        Report("B. List<int> + last-check  ", lists,  pairs, baseline);
-        Report("C. delta-varint bytes      ", varint, pairs, baseline);
+        var baseline = Measure(texts, static () => new HashSetAccumulator());
+        var lists    = Measure(texts, static () => new SortedListAccumulator());
+        var varint   = Measure(texts, static () => new DeltaVarintAccumulator());
+        var arena    = Measure(texts, static () => new ArenaAccumulator());
+
+        _out.WriteLine("                                          retained      B/pair   vs A       CPU     ns/pair");
+        Report("A. HashSet<int>            (old)    ", baseline, pairs, baseline.Bytes);
+        Report("B. List<int> + last-check  (prev)   ", lists,    pairs, baseline.Bytes);
+        Report("C. delta-varint bytes      (sketch) ", varint,   pairs, baseline.Bytes);
+        Report("D. SegmentTrigramIndex     (current)", arena,    pairs, baseline.Bytes);
     }
 
-    private void Report(string label, long bytes, long pairs, long baseline)
-        => _out.WriteLine($"  {label}  {bytes / MB,7:F1} MB   {(double)bytes / pairs,5:F1} B/pair   {(double)baseline / bytes,5:F1}x smaller");
+    private void Report(string label, (long Bytes, double CpuMs) m, long pairs, long baseline)
+        => _out.WriteLine($"  {label}  {m.Bytes / MB,7:F1} MB   {(double)m.Bytes / pairs,5:F1} B/pair   {(double)baseline / m.Bytes,5:F1}x   {m.CpuMs,7:F0} ms   {m.CpuMs * 1e6 / pairs,5:F0}");
 
-    private static long Measure(string[][] texts, Func<IAccumulator> factory)
+    private static (long Bytes, double CpuMs) Measure(string[][] texts, Func<IAccumulator> factory, bool warm = false)
     {
         long before = GC.GetTotalMemory(true);
         var acc = factory();
-        for (int i = 0; i < texts.Length; i++)
+        var cpu0 = System.Diagnostics.Process.GetCurrentProcess().TotalProcessorTime;
+        int n = warm ? Math.Min(texts.Length, 5_000) : texts.Length;
+        for (int i = 0; i < n; i++)
             foreach (var t in texts[i])
                 acc.AddText((uint)i, t);
+        double cpuMs = (System.Diagnostics.Process.GetCurrentProcess().TotalProcessorTime - cpu0).TotalMilliseconds;
         long after = GC.GetTotalMemory(true);
         GC.KeepAlive(acc);
-        return after - before;
+        acc.Release();
+        return (after - before, cpuMs);
+    }
+
+    /// <summary>The production accumulator, measured through its public surface.</summary>
+    private sealed class ArenaAccumulator : IAccumulator
+    {
+        private readonly SegmentTrigramIndex _idx = new();
+        public int AddText(uint offset, string text) { _idx.Add(offset, text); return 0; }
+        public void Release() => _idx.ReleaseBuildBuffers();
     }
 
     private static long CountPairs(string[][] texts)
@@ -68,7 +87,7 @@ public sealed class TrigramAccumulatorProbe
 
     // ── candidate accumulators ────────────────────────────────────────────────
 
-    private interface IAccumulator { int AddText(uint offset, string text); }
+    private interface IAccumulator { int AddText(uint offset, string text); void Release() { } }
 
     /// <summary>What SegmentTrigramIndex does today.</summary>
     private sealed class HashSetAccumulator : IAccumulator

@@ -444,11 +444,22 @@ public sealed class SegmentIndexBuilder : ISegmentIndexSink
         => (_inverted.Serialise(), _trigram.Serialise(), _bloom.Serialise());
 
     /// <summary>
-    /// Frees the bloom filter's bits. They live in <c>NativeMemory</c> and
-    /// <see cref="SegmentBloomFilter"/> has no finaliser, so before the sink contract made the
-    /// builder's lifetime explicit every sealed group leaked its filter off-heap — ~10 MB per
-    /// group at the documented ~10 bits/term sizing, invisible to every managed-heap probe.
-    /// <see cref="Serialise"/> copies the bits out, so disposing right after it is safe.
+    /// Frees the bloom filter's bits and hands the accumulators' pooled buffers back.
+    ///
+    /// <para>The bits live in <c>NativeMemory</c> and <see cref="SegmentBloomFilter"/> has no
+    /// finaliser, so before the sink contract made the builder's lifetime explicit every sealed
+    /// group leaked its filter off-heap — ~10 MB per group at the documented ~10 bits/term
+    /// sizing, invisible to every managed-heap probe. The trigram accumulator's slot table,
+    /// buckets and posting slabs are <c>ArrayPool</c> rentals for the same reason in reverse:
+    /// tens of MB per group that would otherwise be fresh LOH allocations every flush. Both are
+    /// released here, so <see cref="Serialise"/> and the per-section accessors throw
+    /// <see cref="ObjectDisposedException"/> afterwards — a returned pooled array is somebody
+    /// else's the moment they rent it, which is exactly the freed-memory read the bloom guard
+    /// exists for.</para>
     /// </summary>
-    public void Dispose() => _bloom.Dispose();
+    public void Dispose()
+    {
+        _bloom.Dispose();
+        _trigram.ReleaseBuildBuffers();
+    }
 }

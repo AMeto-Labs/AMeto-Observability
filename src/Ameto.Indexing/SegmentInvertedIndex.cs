@@ -11,14 +11,16 @@ namespace Ameto.Indexing;
 /// Serialisation: converts each list to a <see cref="RoaringBitmap"/> for compact storage.
 /// Deserialisation: iterates bitmap values back into sorted arrays for fast lookup.
 ///
-/// Thread safety: live index uses a lock for writes; cold index is read-only after load.
+/// Thread safety: the build side has NO lock — one index belongs to one index group's builder
+/// and <c>SegmentWriter.WriteEvents</c> drives that from a single thread (the build-mode
+/// <see cref="Lookup"/> is test-only). The lock that used to guard every add was ~3-5 M
+/// uncontended acquisitions per flush for nothing. The cold index is read-only after load.
 /// </summary>
 public sealed class SegmentInvertedIndex : ISegmentIndex
 {
     // Build-phase: propertyName → (serialisedValue → sorted offsets)
     private readonly Dictionary<string, Dictionary<string, List<int>>> _index
         = new(StringComparer.Ordinal);
-    private readonly object _writeLock = new();
 
     // Query-phase (populated after Deserialise): ascending offset arrays per (name,value).
     // Decoded from the segment's posting lists — SegmentBitmapCodec for current segments,
@@ -35,7 +37,7 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
         string serialised = SerialiseValue(value);
         int offset        = (int)localOffset;
 
-        lock (_writeLock)
+        // No lock: one builder per index group, driven from one thread (see class remarks).
         {
             if (!_index.TryGetValue(propertyName, out var values))
             {
@@ -64,7 +66,7 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
     public void AddSpan(uint localOffset, ReadOnlySpan<char> propertyName, ReadOnlySpan<char> serialisedValueUtf8)
     {
         int offset = (int)localOffset;
-        lock (_writeLock)
+        // No lock: one builder per index group, driven from one thread (see class remarks).
         {
             var outer = _index.GetAlternateLookup<ReadOnlySpan<char>>();
             if (!outer.TryGetValue(propertyName, out var values))
@@ -332,7 +334,7 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
     /// </summary>
     public byte[] Serialise()
     {
-        lock (_writeLock)
+        // No lock: one builder per index group, driven from one thread (see class remarks).
         {
             // Written through an ArrayBufferWriter sized up front rather than
             // BinaryWriter-over-MemoryStream: the stream doubles its backing array as it
@@ -413,7 +415,7 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
     /// backward-compatibility read test (current writers emit the codec format above).</summary>
     internal byte[] SerialiseRoaringV1()
     {
-        lock (_writeLock)
+        // No lock: one builder per index group, driven from one thread (see class remarks).
         {
             using var ms = new MemoryStream();
             using var bw = new BinaryWriter(ms);
