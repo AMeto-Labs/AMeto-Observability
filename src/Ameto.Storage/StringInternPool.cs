@@ -61,9 +61,25 @@ public sealed class StringInternPool
     /// string is materialised only the first time a value is seen. Powers the zero-alloc
     /// OTLP streaming ingest path. Returns -1 for empty input or when the pool is full.
     /// </summary>
-    public int Intern(ReadOnlySpan<byte> utf8)
+    public int Intern(ReadOnlySpan<byte> utf8) => Intern(utf8, out _);
+
+    /// <summary>
+    /// As <see cref="Intern(ReadOnlySpan{byte})"/>, but also hands back the pool's OWN
+    /// instance of the string (<paramref name="canonical"/>) — the same object
+    /// <see cref="Get"/> would return for the returned index.
+    ///
+    /// <para>Folding the <c>Get</c> into the lookup pays twice: it saves the second
+    /// dictionary probe per event, and it lets a caller store the shared instance instead
+    /// of a fresh per-event duplicate. A tier that keeps one duplicate template string per
+    /// event retains ~100 B/event for the life of the tier, all of it gen2 garbage at
+    /// flush.</para>
+    ///
+    /// <para>When the pool is full (index -1) the value is still materialised once and
+    /// returned, since there is no pooled instance to share.</para>
+    /// </summary>
+    public int Intern(ReadOnlySpan<byte> utf8, out string canonical)
     {
-        if (utf8.IsEmpty) return -1;
+        if (utf8.IsEmpty) { canonical = string.Empty; return -1; }
 
         // Decode UTF-8 → chars for the ordinal lookup. Short by nature ⇒ stack; pool the rare long one.
         int charCount = System.Text.Encoding.UTF8.GetCharCount(utf8);
@@ -73,17 +89,45 @@ public sealed class StringInternPool
         var key = chars[..charCount];
         try
         {
-            // Alternate lookup matches an existing key by span — no string allocation on hit.
+            // Alternate lookup matches an existing key by span — no string allocation on hit,
+            // and the STORED key is the canonical instance, so no follow-up Get is needed.
             var lookup = _stringToIndex.GetAlternateLookup<ReadOnlySpan<char>>();
-            if (lookup.TryGetValue(key, out int idx))
+            if (lookup.TryGetValue(key, out string? existing, out int idx))
+            {
+                canonical = existing;
                 return idx;
+            }
 
-            return Intern(new string(key)); // miss: materialise once, intern via the string path
+            string materialised = new string(key); // miss: materialise once, intern via the string path
+            int    newIdx       = Intern(materialised);
+            canonical = newIdx >= 0 ? Get(newIdx) : materialised;
+            return newIdx;
         }
         finally
         {
             if (rented is not null) System.Buffers.ArrayPool<char>.Shared.Return(rented);
         }
+    }
+
+    /// <summary>
+    /// String overload of <see cref="Intern(ReadOnlySpan{byte}, out string)"/>: interns
+    /// <paramref name="template"/> and hands back the pool's own instance, so a caller that
+    /// keeps the string alive (the hot tier does, for the life of the tier) keeps the shared
+    /// one rather than a per-event duplicate. Falls back to the argument itself when the
+    /// pool is full.
+    /// </summary>
+    public int Intern(string template, out string canonical)
+    {
+        var lookup = _stringToIndex.GetAlternateLookup<ReadOnlySpan<char>>();
+        if (lookup.TryGetValue(template.AsSpan(), out string? existing, out int idx))
+        {
+            canonical = existing;
+            return idx;
+        }
+
+        int newIdx = Intern(template);
+        canonical  = newIdx >= 0 ? Get(newIdx) : template;
+        return newIdx;
     }
 
     public string Get(int index)

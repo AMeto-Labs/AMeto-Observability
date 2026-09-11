@@ -211,8 +211,10 @@ public sealed class IngestionEndpoint : IOtlpLogSink
             return false; // original counted as dropped by the caller
         }
 
-        int    tmplIdx = _pool.Intern(templateUtf8);           // -1 when empty
-        string tmpl    = tmplIdx >= 0 ? _pool.Get(tmplIdx) : string.Empty;
+        // Intern hands back the pool's OWN instance, so the tier stores the shared string
+        // rather than a per-event duplicate — and one dictionary probe does the work of two.
+        int    tmplIdx = _pool.Intern(templateUtf8, out string canonicalTmpl); // -1 when empty
+        string tmpl    = tmplIdx >= 0 ? canonicalTmpl : string.Empty;
         int    svcIdx  = _pool.Intern(serviceUtf8);            // -1 when empty
 
         return _ring.TryEnqueue(
@@ -249,14 +251,21 @@ public sealed class IngestionEndpoint : IOtlpLogSink
             return;
         }
 
-        int tmplIdx = string.IsNullOrEmpty(ev.MessageTemplate) ? -1 : _pool.Intern(ev.MessageTemplate);
+        // The template that reaches the ring must be the POOL's instance, not this event's
+        // fresh one: the hot tier keeps it alive for the whole life of the tier, so a
+        // per-event duplicate is ~100 B/event of gen2-bound garbage (~60 MB on a 500k-event
+        // tier). Intern returns the canonical string, so the tier shares one per template.
+        int     tmplIdx = -1;
+        string? tmpl    = ev.MessageTemplate;
+        if (!string.IsNullOrEmpty(ev.MessageTemplate))
+            tmplIdx = _pool.Intern(ev.MessageTemplate, out tmpl);
         int svcIdx  = ev.ServiceName is not null ? _pool.Intern(ev.ServiceName) : -1;
 
         bool ok = _ring.TryEnqueue(
             ev.Timestamp.UtcTicks,
             (byte)ev.Level,
             tmplIdx,
-            ev.MessageTemplate,
+            tmpl,
             ev.Exception,
             ev.RawProperties.Span,
             ev.TraceIdHi, ev.TraceIdLo, ev.SpanId, svcIdx);

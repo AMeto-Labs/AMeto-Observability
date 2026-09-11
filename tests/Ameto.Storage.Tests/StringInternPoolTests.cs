@@ -56,6 +56,48 @@ public sealed class StringInternPoolTests
     }
 
     [Fact]
+    public void Intern_OutCanonical_ReturnsThePoolsOwnInstance()
+    {
+        var pool  = new StringInternPool();
+        string first = "Order {OrderId} shipped";
+        int idx = pool.Intern(first);
+
+        // A distinct-but-equal instance, exactly as a wire decode produces per event.
+        string fresh = new string(first.AsSpan());
+        Assert.False(ReferenceEquals(first, fresh));
+
+        int idx2 = pool.Intern(fresh, out string canonical);
+        Assert.Equal(idx, idx2);
+        Assert.Same(pool.Get(idx), canonical);
+        Assert.False(ReferenceEquals(fresh, canonical));
+    }
+
+    [Fact]
+    public void Intern_Utf8OutCanonical_ReturnsThePoolsOwnInstance()
+    {
+        var pool = new StringInternPool();
+        int idx  = pool.Intern("Hello {Name}");
+
+        int idx2 = pool.Intern("Hello {Name}"u8, out string canonical);
+        Assert.Equal(idx, idx2);
+        Assert.Same(pool.Get(idx), canonical);
+
+        // First sighting via the UTF-8 overload must also come back as the pooled instance.
+        int idx3 = pool.Intern("Fresh {Value}"u8, out string canonical3);
+        Assert.Same(pool.Get(idx3), canonical3);
+        Assert.Equal("Fresh {Value}", canonical3);
+    }
+
+    [Fact]
+    public void Intern_OutCanonical_EmptyUtf8_IsEmptyStringAndMinusOne()
+    {
+        var pool = new StringInternPool();
+        int idx  = pool.Intern(ReadOnlySpan<byte>.Empty, out string canonical);
+        Assert.Equal(-1, idx);
+        Assert.Equal(string.Empty, canonical);
+    }
+
+    [Fact]
     public void Intern_IndicesAreSequential()
     {
         var pool = new StringInternPool();
