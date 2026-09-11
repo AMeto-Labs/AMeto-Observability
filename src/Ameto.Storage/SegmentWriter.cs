@@ -232,19 +232,92 @@ public sealed class SegmentWriter : IDisposable
     /// where a mistake silently drops rows. File-global keeps the block index (which already
     /// maps file ordinal → block) as the single translation table for candidates.</para>
     /// </summary>
+    /// <remarks>
+    /// ONE SEQUENTIAL PASS over the headers, then a sort against the extracted keys — not a
+    /// delegate introsort over the tier. <c>Array.Sort(int[], Comparison&lt;int&gt;)</c> called
+    /// back into a closure ~n·log n times and every call did TWO random <c>GetHeader</c> reads
+    /// (div/mod, chunk-arena load, a 64 B header out of a ~12.5 MB header set): ~3.5M
+    /// comparisons and ~7M cache-missing reads for a 200 k tier. Here each header is read once,
+    /// in address order, into a flat 16-byte key; the sort then compares inside that array with
+    /// a STRUCT comparer, which the JIT devirtualises — no delegate, no arena indirection.
+    ///
+    /// <para>It is the INDICES that are sorted, not the keys, which is not an implementation
+    /// detail: the indices are what the caller wants and they are 4 bytes, so the ~1.7 M element
+    /// moves an introsort makes move 4 bytes each instead of a 16-byte key. Sorting the keys
+    /// themselves and reading the order out afterwards MEASURED SLOWER than the delegate version
+    /// it replaced (50 ms against 33 on a jittered 200 k tier) for exactly that reason.</para>
+    ///
+    /// <para>IDENTITY FAST PATH: the same pass notices that the tier is already ascending, which
+    /// it very nearly always is (a tier is filled in arrival order and timestamps are stamped on
+    /// arrival), and returns the identity permutation without sorting at all.</para>
+    ///
+    /// <para>The tie-break on the tier index makes the result STABLE. The old introsort was not,
+    /// so two events sharing a (timestamp, id) could come out in either order; ordering them by
+    /// tier index is both deterministic and what the fast path above produces, so the sorted and
+    /// the unsorted route can no longer disagree about the same input.</para>
+    /// </remarks>
     public static int[] ComputeSortOrder(HotTierSegment hot)
     {
         int count = hot.Count;
         var order = new int[count];
-        for (int i = 0; i < count; i++) order[i] = i;
-        Array.Sort(order, (a, b) =>
+        if (count <= 1)
         {
-            ref var ha = ref hot.GetHeader(a);
-            ref var hb = ref hot.GetHeader(b);
-            int c = ha.TimestampUtcTicks.CompareTo(hb.TimestampUtcTicks);
-            return c != 0 ? c : ha.Id.CompareTo(hb.Id);
-        });
-        return order;
+            if (count == 1) order[0] = 0;
+            return order;
+        }
+
+        SortKey[] keys = ArrayPool<SortKey>.Shared.Rent(count);
+        try
+        {
+            bool  sorted = true;
+            long  prevTs = long.MinValue;
+            ulong prevId = 0;
+            for (int i = 0; i < count; i++)
+            {
+                ref readonly LogEventHeader h = ref hot.GetHeader(i);
+                long  ts = h.TimestampUtcTicks;
+                ulong id = h.Id;
+                keys[i] = new SortKey(ts, id);
+                if (sorted && (ts < prevTs || (ts == prevTs && id < prevId))) sorted = false;
+                prevTs = ts;
+                prevId = id;
+            }
+
+            for (int i = 0; i < count; i++) order[i] = i;
+            if (sorted) return order;
+
+            order.AsSpan().Sort(new SortKeyComparer(keys));
+            return order;
+        }
+        finally
+        {
+            ArrayPool<SortKey>.Shared.Return(keys);
+        }
+    }
+
+    /// <summary>The sort key of one tier event: what the order is decided on, and nothing else.</summary>
+    private readonly struct SortKey(long ticks, ulong id)
+    {
+        public readonly long  Ticks = ticks;
+        public readonly ulong Id    = id;
+    }
+
+    /// <summary>
+    /// Orders tier indices by their extracted key. A STRUCT, so the sort specialises on it and
+    /// inlines the comparison rather than calling through a <c>Comparison&lt;int&gt;</c>.
+    /// </summary>
+    private readonly struct SortKeyComparer(SortKey[] keys) : IComparer<int>
+    {
+        private readonly SortKey[] _keys = keys;
+
+        public int Compare(int a, int b)
+        {
+            ref SortKey ka = ref _keys[a];
+            ref SortKey kb = ref _keys[b];
+            if (ka.Ticks != kb.Ticks) return ka.Ticks < kb.Ticks ? -1 : 1;
+            if (ka.Id    != kb.Id)    return ka.Id    < kb.Id    ? -1 : 1;
+            return a.CompareTo(b);          // stable: equal keys keep tier order
+        }
     }
 
     public void WriteEvents(HotTierSegment hot, StringInternPool templatePool)
