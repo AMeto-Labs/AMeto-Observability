@@ -32,10 +32,18 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
 
     // ── Build (hot path) ──────────────────────────────────────────────────────
 
-    public void Add(uint localOffset, string propertyName, object? value)
+    /// <summary>
+    /// Files one posting and says whether the bucket it went into is new. The builder feeds the
+    /// bloom filter — a SET — only on <see cref="IndexAddOutcome.NewValue"/> /
+    /// <see cref="IndexAddOutcome.NewProperty"/>: re-adding a term the filter already holds sets
+    /// bits that are already set, at the price of a fold, a UTF-8 encode and three hash passes.
+    /// About half of a prop-dense event's ~21 bloom adds were such repeats.
+    /// </summary>
+    public IndexAddOutcome Add(uint localOffset, string propertyName, object? value)
     {
         string serialised = SerialiseValue(value);
         int offset        = (int)localOffset;
+        var outcome       = IndexAddOutcome.Existing;
 
         // No lock: one builder per index group, driven from one thread (see class remarks).
         {
@@ -43,18 +51,21 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
             {
                 values = new Dictionary<string, List<int>>(StringComparer.Ordinal);
                 _index[propertyName] = values;
+                outcome = IndexAddOutcome.NewProperty;
             }
 
             if (!values.TryGetValue(serialised, out var list))
             {
                 list = new List<int>();
                 values[serialised] = list;
+                if (outcome == IndexAddOutcome.Existing) outcome = IndexAddOutcome.NewValue;
             }
 
             // Offsets arrive in monotonically increasing order during a single flush — no sort needed.
             if (list.Count == 0 || list[^1] != offset)
                 list.Add(offset);
         }
+        return outcome;
     }
 
     /// <summary>
@@ -63,9 +74,10 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
     /// Interns the property name and value key by span, so a string is allocated only the first
     /// time each distinct (name, value) is seen — not per event (both are low-cardinality).
     /// </summary>
-    public void AddSpan(uint localOffset, ReadOnlySpan<char> propertyName, ReadOnlySpan<char> serialisedValueUtf8)
+    public IndexAddOutcome AddSpan(uint localOffset, ReadOnlySpan<char> propertyName, ReadOnlySpan<char> serialisedValueUtf8)
     {
-        int offset = (int)localOffset;
+        int offset  = (int)localOffset;
+        var outcome = IndexAddOutcome.Existing;
         // No lock: one builder per index group, driven from one thread (see class remarks).
         {
             var outer = _index.GetAlternateLookup<ReadOnlySpan<char>>();
@@ -73,6 +85,7 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
             {
                 values = new Dictionary<string, List<int>>(StringComparer.Ordinal);
                 _index[new string(propertyName)] = values;
+                outcome = IndexAddOutcome.NewProperty;
             }
 
             var inner = values.GetAlternateLookup<ReadOnlySpan<char>>();
@@ -80,11 +93,13 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
             {
                 list = new List<int>();
                 values[new string(serialisedValueUtf8)] = list;
+                if (outcome == IndexAddOutcome.Existing) outcome = IndexAddOutcome.NewValue;
             }
 
             if (list.Count == 0 || list[^1] != offset)
                 list.Add(offset);
         }
+        return outcome;
     }
 
     public void AddEvent(uint localOffset, LogLevel level, Dictionary<string, object?>? properties)

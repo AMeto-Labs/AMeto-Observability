@@ -145,19 +145,32 @@ public sealed class SegmentIndexBuilder : ISegmentIndexSink
     }
 
     // ── Per-event header fields (shared by both paths) ─────────────────────────
+    //
+    // BLOOM ADDS HAPPEN ON FIRST SIGHT ONLY. The filter is a set: adding a term it already
+    // holds sets bits that are already set, and costs a case fold, a UTF-8 encode, three
+    // Murmur passes and two random writes into a multi-MB array. The inverted index already
+    // knows whether a (property, value) is new — IndexAddOutcome — so the level, the service,
+    // the exception fields and every property key and value go to the bloom exactly once per
+    // distinct term. The template is not in the inverted index and is memoised by reference
+    // (a 256-slot direct-mapped cache: templates are interned, and a miss only costs the add
+    // the old code made every time). The bits are identical to adding on every event —
+    // IndexBuildParityTests pins that against the reference build, which still adds every
+    // time on purpose. What the writer sizes the next group's filter from is the number of
+    // terms PRESENTED (_bloomPresented), repeats included, exactly the count it saw before.
+
     private void IndexHeaderFields(in SegmentEventRef ev, uint offset)
     {
         // Level — inverted + bloom
         string levelStr = ev.Level.ToSeqString();
-        _inverted.Add(offset, "@l", levelStr);
-        _bloom.Add(levelStr);
+        if (_inverted.Add(offset, "@l", levelStr) != IndexAddOutcome.Existing) _bloom.Add(levelStr);
+        _bloomPresented++;
 
         // Message template — trigram only.
         string template = ev.MessageTemplate;
         if (!string.IsNullOrEmpty(template))
         {
             _trigram.Add(offset, template);
-            _bloom.Add(template);
+            BloomAddTemplate(template);
         }
 
         // Exception (structured). The index is the ONLY consumer that needs the object graph —
@@ -166,21 +179,24 @@ public sealed class SegmentIndexBuilder : ISegmentIndexSink
         var exception = ev.DecodeException();
         if (exception is not null)
         {
-            _inverted.Add(offset, ClefFields.ExceptionExists, "true");
-            _bloom.Add(ClefFields.ExceptionExists);
+            if (_inverted.Add(offset, ClefFields.ExceptionExists, "true") != IndexAddOutcome.Existing)
+                _bloom.Add(ClefFields.ExceptionExists);
+            _bloomPresented++;
 
             if (!string.IsNullOrEmpty(exception.Type))
             {
-                _inverted.Add(offset, ClefFields.ExceptionType, exception.Type);
-                _bloom.Add(exception.Type);
+                if (_inverted.Add(offset, ClefFields.ExceptionType, exception.Type) != IndexAddOutcome.Existing)
+                    _bloom.Add(exception.Type);
+                _bloomPresented++;
                 if (exception.Type.Length >= 3) _trigram.Add(offset, exception.Type);
             }
             if (!string.IsNullOrEmpty(exception.Message) && exception.Message.Length >= 3)
                 _trigram.Add(offset, exception.Message);
             if (exception.Inner is { Type.Length: > 0 } inner)
             {
-                _inverted.Add(offset, ClefFields.ExceptionInnerType, inner.Type);
-                _bloom.Add(inner.Type);
+                if (_inverted.Add(offset, ClefFields.ExceptionInnerType, inner.Type) != IndexAddOutcome.Existing)
+                    _bloom.Add(inner.Type);
+                _bloomPresented++;
             }
         }
 
@@ -188,23 +204,39 @@ public sealed class SegmentIndexBuilder : ISegmentIndexSink
         if (ev.HasTraceId)
         {
             string traceHex = TraceIdHelper.FormatTraceId(ev.TraceIdHi, ev.TraceIdLo)!;
-            _inverted.Add(offset, ClefFields.TraceId, traceHex);
-            _bloom.Add(traceHex);
+            if (_inverted.Add(offset, ClefFields.TraceId, traceHex) != IndexAddOutcome.Existing) _bloom.Add(traceHex);
+            _bloomPresented++;
         }
         if (ev.HasSpanId)
         {
             string spanHex = TraceIdHelper.FormatSpanId(ev.SpanId)!;
-            _inverted.Add(offset, ClefFields.SpanId, spanHex);
-            _bloom.Add(spanHex);
+            if (_inverted.Add(offset, ClefFields.SpanId, spanHex) != IndexAddOutcome.Existing) _bloom.Add(spanHex);
+            _bloomPresented++;
         }
 
         // ServiceName
         if (!string.IsNullOrEmpty(ev.ServiceName))
         {
-            _inverted.Add(offset, ClefFields.ServiceName, ev.ServiceName);
-            _bloom.Add(ev.ServiceName);
+            if (_inverted.Add(offset, ClefFields.ServiceName, ev.ServiceName) != IndexAddOutcome.Existing)
+                _bloom.Add(ev.ServiceName);
+            _bloomPresented++;
         }
     }
+
+    private void BloomAddTemplate(string template)
+    {
+        _bloomPresented++;
+        int slot = System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(template) & (TemplateMemoSlots - 1);
+        if (ReferenceEquals(_templateMemo[slot], template)) return;
+        _templateMemo[slot] = template;
+        _bloom.Add(template);
+    }
+
+    private const int TemplateMemoSlots = 256;
+    private readonly string?[] _templateMemo = new string?[TemplateMemoSlots];
+
+    /// <summary>Terms handed to the bloom, repeats included — see <see cref="BloomTermsAdded"/>.</summary>
+    private long _bloomPresented;
 
     // ── Streaming property walk (msgpack → indexes, no Dictionary/boxing) ───────
     private void IndexPropertiesStreaming(ReadOnlySpan<byte> payload, uint offset)
@@ -265,9 +297,10 @@ public sealed class SegmentIndexBuilder : ISegmentIndexSink
                 EnsureVal(vc);
                 System.Text.Encoding.UTF8.GetChars(vUtf8, _val);
                 var v = _val.AsSpan(0, vc);
-                _inverted.AddSpan(offset, flatKey, v);   // serialised == plain for strings
-                _bloom.Add(flatKey);
-                _bloom.Add(v);
+                var r = _inverted.AddSpan(offset, flatKey, v);   // serialised == plain for strings
+                _bloomPresented += 2;
+                if (r == IndexAddOutcome.NewProperty) _bloom.Add(flatKey);
+                if (r != IndexAddOutcome.Existing)    _bloom.Add(v);
                 if (vc >= 3) _trigram.Add(offset, v);
                 break;
             }
@@ -295,17 +328,20 @@ public sealed class SegmentIndexBuilder : ISegmentIndexSink
             case MessagePackType.Boolean:
             {
                 bool b = reader.ReadBoolean();
-                if (b) { _bloom.Add(flatKey); _bloom.Add("True");  _inverted.AddSpan(offset, flatKey, "\0true");  }
-                else   { _bloom.Add(flatKey); _bloom.Add("False"); _inverted.AddSpan(offset, flatKey, "\0false"); }
+                var r  = _inverted.AddSpan(offset, flatKey, b ? "\0true" : "\0false");
+                _bloomPresented += 2;
+                if (r == IndexAddOutcome.NewProperty) _bloom.Add(flatKey);
+                if (r != IndexAddOutcome.Existing)    _bloom.Add(b ? "True" : "False");
                 _trigram.Add(offset, b ? "True" : "False");
                 break;
             }
             case MessagePackType.Nil:
             {
                 reader.ReadNil();
-                _bloom.Add(flatKey);
-                _bloom.Add(ReadOnlySpan<char>.Empty);          // v?.ToString() ?? "" → ""
-                _inverted.AddSpan(offset, flatKey, "\0null");
+                var r = _inverted.AddSpan(offset, flatKey, "\0null");
+                _bloomPresented += 2;
+                if (r == IndexAddOutcome.NewProperty) _bloom.Add(flatKey);
+                if (r != IndexAddOutcome.Existing)    _bloom.Add(ReadOnlySpan<char>.Empty);   // v?.ToString() ?? "" → ""
                 break;
             }
             default:
@@ -350,9 +386,10 @@ public sealed class SegmentIndexBuilder : ISegmentIndexSink
     /// </summary>
     private void AddNumeric(uint offset, ReadOnlySpan<char> flatKey, ReadOnlySpan<char> plain, ReadOnlySpan<char> serialised)
     {
-        _inverted.AddSpan(offset, flatKey, serialised);
-        _bloom.Add(flatKey);
-        _bloom.Add(plain);
+        var r = _inverted.AddSpan(offset, flatKey, serialised);
+        _bloomPresented += 2;
+        if (r == IndexAddOutcome.NewProperty) _bloom.Add(flatKey);
+        if (r != IndexAddOutcome.Existing)    _bloom.Add(plain);
         _trigram.Add(offset, plain);
     }
 
@@ -394,7 +431,11 @@ public sealed class SegmentIndexBuilder : ISegmentIndexSink
                 break;
             default:
                 _inverted.Add(offset, flatKey, v);
+                // Added on EVERY event here, deliberately: the streaming path adds on first
+                // sight only, and the byte-for-byte parity of the two bloom sections is what
+                // proves that a set does not care.
                 _bloom.Add(flatKey);
+                _bloomPresented += 2;
                 // Invariant, exactly like the streaming path's `plain` — the parity test
                 // compares the two builds byte for byte, and a ru-KZ host formats 2.5 as "2,5".
                 string valStr = IndexValueForms.PlainText(v);
@@ -409,11 +450,17 @@ public sealed class SegmentIndexBuilder : ISegmentIndexSink
     // ── Serialise ─────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Bloom terms added so far — see <see cref="ISegmentIndexSink.BloomTermsAdded"/>. Counted
-    /// by the filter itself, so it costs one increment on a path that was already hashing
-    /// three times, and it stays readable after <see cref="Dispose"/>.
+    /// Bloom terms PRESENTED so far, repeats included — see
+    /// <see cref="ISegmentIndexSink.BloomTermsAdded"/>. Counted by the builder rather than the
+    /// filter since the builder started skipping repeats (see <see cref="IndexHeaderFields"/>):
+    /// the writer's next-group forecast and its group-full check were calibrated on the
+    /// presented count, and this keeps both exactly where they were. The filter's own
+    /// <see cref="SegmentBloomFilter.AddedTermCount"/> is the de-duplicated number — sizing
+    /// by THAT (10 bits per distinct term is the design point) would shrink every bloom
+    /// section after the first and is a deliberate follow-up, not a side effect of this.
+    /// Managed state, readable after <see cref="Dispose"/>.
     /// </summary>
-    public long BloomTermsAdded => _bloom.AddedTermCount;
+    public long BloomTermsAdded => _bloomPresented;
 
     /// <summary>
     /// Terms the filter was actually able to buy — see
