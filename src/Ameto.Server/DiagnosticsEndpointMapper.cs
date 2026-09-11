@@ -11,14 +11,26 @@ namespace Ameto.Server;
 /// </summary>
 public static class DiagnosticsEndpointMapper
 {
+    /// <summary>
+    /// How long one data-directory walk is reused. The dashboard polls every 10 s; on-disk
+    /// sizes move on the flush cadence (minutes), so four or five polls per walk costs nothing
+    /// an operator can see and takes the walk off the per-request path.
+    /// </summary>
+    private static readonly DataDirectoryStatsCache DirCache = new(TimeSpan.FromSeconds(45));
+
+    /// <summary>
+    /// Process start time never changes, and reading it through a <see cref="Process"/>
+    /// instance does not come free on Windows. Formatted once.
+    /// </summary>
+    private static readonly string StartedAtIso =
+        Process.GetCurrentProcess().StartTime.ToUniversalTime().ToString("O");
+
     public static void MapDiagnosticsEndpoints(this WebApplication app)
     {
         app.MapGet("/api/diagnostics", (
             StorageEngine storage, ServerOptions options, ProcessCpuSampler cpu,
             Ameto.Ingestion.IngestionRingBuffer ring, Ameto.Ingestion.IngestionDrainer drainer) =>
         {
-            var proc = Process.GetCurrentProcess();
-
             // Disk space for the data directory drive
             long diskFreeBytes  = 0;
             long diskTotalBytes = 0;
@@ -32,18 +44,28 @@ public static class DiagnosticsEndpointMapper
 
             var segs = storage.GetSegments(null, null);
 
-            // ── Storage: on-disk size of the whole data directory, broken down by
-            // signal. Cheap directory walks (metadata only, no file reads).
-            var dataRoot     = Path.GetFullPath(options.DataDirectory);
-            var logsDir       = DirStats(Path.Combine(dataRoot, "segments"), ".seg");
-            var metricsDir    = DirStats(Path.Combine(dataRoot, "metrics"),  ".mts");
-            var tracesDir     = DirStats(Path.Combine(dataRoot, "traces"),   ".trc");
-            long logsBytes    = logsDir.Bytes + DirStats(Path.Combine(dataRoot, "wal"), null).Bytes;
-            long metricsBytes = metricsDir.Bytes;
-            long tracesBytes  = tracesDir.Bytes;
-            long dbBytes      = FilesSize(dataRoot, "Ameto.db*");
-            long dataTotal    = DirStats(dataRoot, null).Bytes;
-            long otherBytes   = Math.Max(0, dataTotal - logsBytes - metricsBytes - tracesBytes - dbBytes);
+            // Catalog totals in one pass. LINQ's Sum would walk the list twice and allocate an
+            // iterator plus a delegate per call on an endpoint polled every 10 s.
+            long totalEvents     = 0;
+            long logsSegmentBytes = 0;
+            for (int i = 0; i < segs.Count; i++)
+            {
+                var s = segs[i];
+                totalEvents      += s.EventCount;
+                logsSegmentBytes += s.CompressedBytes;
+            }
+
+            // ── Storage: on-disk size of the whole data directory, broken down by signal.
+            // One cached walk (see DataDirectoryStatsCache); the segments directory is not
+            // walked at all because CompressedBytes IS the .seg file length.
+            var  dataRoot     = Path.GetFullPath(options.DataDirectory);
+            var  dir          = DirCache.Get(dataRoot);
+            long logsBytes    = logsSegmentBytes + dir.WalBytes;
+            long metricsBytes = dir.MetricsBytes;
+            long tracesBytes  = dir.TracesBytes;
+            long dbBytes      = dir.DatabaseBytes;
+            long otherBytes   = dir.OtherBytes;
+            long dataTotal    = logsBytes + metricsBytes + tracesBytes + dbBytes + otherBytes;
 
             // Memory attribution: split process RSS into its real consumers so
             // we can stop guessing what holds the working set.
@@ -66,11 +88,17 @@ public static class DiagnosticsEndpointMapper
                 systemRamPercent  = RamPressureService.GetSystemRamPercent(),
                 ramTargetPercent  = options.RamTargetPercent,
 
-                // Process
-                processWorkingSetBytes = proc.WorkingSet64,
-                processPrivateBytes    = proc.PrivateMemorySize64,
-                processThreads         = proc.Threads.Count,
-                processStartedAt       = proc.StartTime.ToUniversalTime().ToString("O"),
+                // Process. Deliberately not via a Process instance: on Windows each of those
+                // reads snapshots EVERY process on the machine (NtQuerySystemInformation), and
+                // proc.Threads.Count did so to build a ProcessThread object per thread — the
+                // single largest allocation in this endpoint. processThreads now reports the
+                // thread-pool thread count, which is the number that actually moves with
+                // contention and slow I/O; dedicated threads (drainer, flushers, GC) are not
+                // in it, so the figure is smaller than it used to be for the same load.
+                processWorkingSetBytes = ProcessMemoryInfo.WorkingSetBytes,
+                processPrivateBytes    = ProcessMemoryInfo.PrivateBytes,
+                processThreads         = ThreadPool.ThreadCount,
+                processStartedAt       = StartedAtIso,
 
                 // CPU. The percentage is the last closed 30-second interval, sampled by
                 // RamPressureService — this endpoint deliberately does not sample, because a
@@ -96,8 +124,8 @@ public static class DiagnosticsEndpointMapper
 
                 // Storage
                 segmentCount         = segs.Count,
-                totalEventCount      = segs.Sum(s => (long)s.EventCount),
-                totalCompressedBytes = segs.Sum(s => s.CompressedBytes),
+                totalEventCount      = totalEvents,
+                totalCompressedBytes = logsSegmentBytes,
 
                 // On-disk data directory (whole folder, per-signal breakdown)
                 dataDirectory        = dataRoot,
@@ -113,8 +141,8 @@ public static class DiagnosticsEndpointMapper
                 // disagree; metrics/traces are counted by extension in the same walk
                 // that already measured their size.
                 logsSegmentCount     = segs.Count,
-                metricsSegmentCount  = metricsDir.Segments,
-                tracesSegmentCount   = tracesDir.Segments,
+                metricsSegmentCount  = dir.MetricsSegments,
+                tracesSegmentCount   = dir.TracesSegments,
 
                 // ── Ingest ─────────────────────────────────────────────────────
                 // Overload used to be invisible: a client that got a 200 with a "dropped"
@@ -143,55 +171,5 @@ public static class DiagnosticsEndpointMapper
                 ingestWriteErrorDrops    = drainer.ErrorDrops,
             });
         }).RequireAuthorization();
-    }
-
-    /// <summary>
-    /// Recursive on-disk size of a directory (0 if it doesn't exist), plus how many of its
-    /// files carry <paramref name="segmentExt"/> — pass <c>null</c> to skip counting.
-    /// Metadata-only, and one walk for both figures.
-    /// </summary>
-    /// <remarks>
-    /// <see cref="DirectoryInfo.EnumerateFiles(string, SearchOption)"/> yields
-    /// <see cref="FileInfo"/> instances whose length is already populated from the OS
-    /// enumeration record. The <c>Directory.EnumerateFiles</c> + <c>new FileInfo(path)</c>
-    /// shape this replaces paid a fresh stat syscall per file — on a data directory with
-    /// thousands of segments that dominated the endpoint's cost.
-    /// </remarks>
-    private static (long Bytes, int Segments) DirStats(string path, string? segmentExt)
-    {
-        try
-        {
-            if (!Directory.Exists(path)) return (0, 0);
-            long total    = 0;
-            int  segments = 0;
-            foreach (var f in new DirectoryInfo(path).EnumerateFiles("*", SearchOption.AllDirectories))
-            {
-                try
-                {
-                    total += f.Length;
-                    if (segmentExt is not null &&
-                        f.Extension.Equals(segmentExt, StringComparison.OrdinalIgnoreCase)) segments++;
-                }
-                catch { /* transient/locked — skip */ }
-            }
-            return (total, segments);
-        }
-        catch { return (0, 0); }
-    }
-
-    /// <summary>Sum of files matching a pattern in the top level of a directory.</summary>
-    private static long FilesSize(string dir, string pattern)
-    {
-        try
-        {
-            if (!Directory.Exists(dir)) return 0;
-            long total = 0;
-            foreach (var f in Directory.EnumerateFiles(dir, pattern, SearchOption.TopDirectoryOnly))
-            {
-                try { total += new FileInfo(f).Length; } catch { /* skip */ }
-            }
-            return total;
-        }
-        catch { return 0; }
     }
 }

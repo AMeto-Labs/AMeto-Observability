@@ -9,6 +9,7 @@ export interface DiagnosticsDto {
 
   // Process
   processWorkingSetBytes: number;
+  /** Thread-pool threads (not every OS thread — see /api/diagnostics). */
   processThreads:         number;
   processStartedAt:       string; // ISO-8601
 
