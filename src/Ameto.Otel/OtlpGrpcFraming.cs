@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Buffers.Binary;
 using System.IO.Compression;
+using System.Runtime.InteropServices;
 using Ameto.Core;
 
 namespace Ameto.Otel;
@@ -50,28 +51,34 @@ internal static class OtlpGrpcFraming
     /// <paramref name="message"/> points into the caller's own buffer and nothing extra was
     /// allocated.
     /// </param>
+    /// <remarks>
+    /// Takes the body as <see cref="ReadOnlyMemory{T}"/>, not a span, for one reason:
+    /// <c>GZipStream</c> needs a <c>Stream</c>, and a memory can be handed to a
+    /// <c>MemoryStream</c> over the caller's own array. From a span the only route was
+    /// <c>ToArray()</c> — a copy of the whole compressed payload, per request.
+    /// </remarks>
     public static UnframeResult TryUnframe(
-        ReadOnlySpan<byte> body, string? encoding, int maxInflatedBytes,
+        ReadOnlyMemory<byte> body, string? encoding, int maxInflatedBytes,
         out ReadOnlySpan<byte> message, out byte[]? rented, out int rentedLength)
     {
         message      = default;
         rented       = null;
         rentedLength = 0;
 
-        if (body.Length < HeaderBytes) return UnframeResult.Malformed;
+        var span = body.Span;
+        if (span.Length < HeaderBytes) return UnframeResult.Malformed;
 
-        bool compressed = body[0] != 0;
-        uint declared   = BinaryPrimitives.ReadUInt32BigEndian(body[1..]);
+        bool compressed = span[0] != 0;
+        uint declared   = BinaryPrimitives.ReadUInt32BigEndian(span[1..]);
         // A length that overruns the body is a truncated or hostile frame, and unsigned overflow
         // would turn it into a slice of someone else's memory.
-        if (declared > (uint)(body.Length - HeaderBytes)) return UnframeResult.Malformed;
+        if (declared > (uint)(span.Length - HeaderBytes)) return UnframeResult.Malformed;
 
-        var payload = body.Slice(HeaderBytes, (int)declared);
         if (!compressed)
         {
             // The flag decides, not the header: `grpc-encoding` only names HOW a compressed
             // message was compressed, so an identity frame is fine whatever it says.
-            message = payload;
+            message = span.Slice(HeaderBytes, (int)declared);
             return UnframeResult.Ok;
         }
 
@@ -81,7 +88,8 @@ internal static class OtlpGrpcFraming
         if (!string.Equals(encoding, "gzip", StringComparison.OrdinalIgnoreCase))
             return UnframeResult.UnsupportedEncoding;
 
-        return Inflate(payload, maxInflatedBytes, out message, out rented, out rentedLength);
+        return Inflate(body.Slice(HeaderBytes, (int)declared), maxInflatedBytes,
+                       out message, out rented, out rentedLength);
     }
 
     /// <summary>
@@ -90,18 +98,28 @@ internal static class OtlpGrpcFraming
     /// after one buffer's worth rather than after it has been materialised and measured.
     /// </summary>
     private static UnframeResult Inflate(
-        ReadOnlySpan<byte> payload, int maxInflatedBytes,
+        ReadOnlyMemory<byte> payload, int maxInflatedBytes,
         out ReadOnlySpan<byte> message, out byte[]? rented, out int rentedLength)
     {
         message      = default;
         rentedLength = 0;
-        rented       = IngestBufferPool.Rent(maxInflatedBytes);
+
+        // Sized from the message, not from the ceiling. Renting maxInflatedBytes meant every
+        // compressed request — which for a collector's gRPC exporter is every request — took an
+        // 8 MiB array to hold what is usually a few hundred KB, and made the pool keep 8 MiB
+        // arrays around for it. The gzip trailer says how big the output will be; failing that,
+        // 4:1 is the guess. Either way it grows by doubling if the guess was low, and the limit
+        // check below is unchanged.
+        int hint     = InflatedSizeHint(payload.Span);
+        long want    = Math.Max(hint > 0 ? hint : (long)payload.Length * 4, MinInflateBuffer);
+        int capacity = (int)Math.Min(want, Math.Max(maxInflatedBytes, 1));
+        rented       = IngestBufferPool.Rent(capacity);
 
         try
         {
-            // One copy of the compressed bytes, because GZipStream needs a Stream. It is bounded
-            // by the wire limit the caller already enforced.
-            using var input = new MemoryStream(payload.ToArray(), writable: false);
+            // No copy of the compressed bytes: the payload is a window onto the caller's request
+            // buffer, and MemoryStream can wrap that array where it lies.
+            using var input = AsStream(payload);
             using var gzip  = new GZipStream(input, CompressionMode.Decompress);
 
             int total = 0;
@@ -124,7 +142,21 @@ internal static class OtlpGrpcFraming
                     break;
                 }
 
-                int read = gzip.Read(rented, total, maxInflatedBytes - total);
+                // Room left in THIS buffer, which is what runs out first now. Doubling, never
+                // past the limit, so the "one more byte" test above remains the only thing that
+                // decides whether a message is too large.
+                int room = Math.Min(rented.Length, maxInflatedBytes) - total;
+                if (room == 0)
+                {
+                    int target   = (int)Math.Min((long)rented.Length * 2, maxInflatedBytes);
+                    byte[] grown = IngestBufferPool.Rent(target);
+                    rented.AsSpan(0, total).CopyTo(grown);
+                    IngestBufferPool.Return(rented);
+                    rented = grown;
+                    room   = Math.Min(rented.Length, maxInflatedBytes) - total;
+                }
+
+                int read = gzip.Read(rented, total, room);
                 if (read == 0) break;
                 total += read;
             }
@@ -139,6 +171,36 @@ internal static class OtlpGrpcFraming
             return UnframeResult.Malformed;
         }
     }
+
+    /// <summary>Smallest inflate buffer worth renting — below this the growth loop costs more than the slack.</summary>
+    private const int MinInflateBuffer = 64 * 1024;
+
+    /// <summary>
+    /// The uncompressed length a gzip member declares in its last four bytes (ISIZE, little
+    /// endian, modulo 2^32). Exporters send exactly one member, so this is normally the exact
+    /// answer and the buffer is rented once at the right size instead of doubling into it —
+    /// which on a 20:1 batch is three rents and three copies of everything written so far.
+    ///
+    /// <para>A hint and nothing more: a truncated frame, a multi-member stream or an outright
+    /// lie costs one resize, never correctness, because the loop below measures what it
+    /// actually wrote against the limit and never trusts this number for anything else.</para>
+    /// </summary>
+    private static int InflatedSizeHint(ReadOnlySpan<byte> payload)
+    {
+        if (payload.Length < 4) return 0;
+        uint isize = BinaryPrimitives.ReadUInt32LittleEndian(payload[^4..]);
+        return isize <= int.MaxValue ? (int)isize : 0;
+    }
+
+    /// <summary>
+    /// A stream over the payload without copying it, when the memory is array-backed — which it
+    /// always is here, since it is a slice of a pooled request buffer. The fallback exists so a
+    /// caller passing some other memory still works rather than throwing.
+    /// </summary>
+    private static Stream AsStream(ReadOnlyMemory<byte> payload)
+        => MemoryMarshal.TryGetArray(payload, out ArraySegment<byte> seg) && seg.Array is not null
+               ? new MemoryStream(seg.Array, seg.Offset, seg.Count, writable: false)
+               : new MemoryStream(payload.ToArray(), writable: false);
 
     /// <summary>Wraps a response message in an uncompressed frame.</summary>
     public static byte[] Frame(ReadOnlySpan<byte> message)

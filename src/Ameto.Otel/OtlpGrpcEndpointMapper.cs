@@ -134,7 +134,7 @@ public static class OtlpGrpcEndpointMapper
         {
             int maxBytes = ctx.RequestServices.GetRequiredService<Ameto.Core.ServerOptions>().Ingestion.MaxOtlpBatchBytes;
             string? encoding = ctx.Request.Headers["grpc-encoding"];
-            var unframed = OtlpGrpcFraming.TryUnframe(body.AsSpan(0, bodyLen), encoding, maxBytes,
+            var unframed = OtlpGrpcFraming.TryUnframe(body.AsMemory(0, bodyLen), encoding, maxBytes,
                                                       out var message, out inflated, out int inflatedLen);
             if (unframed != UnframeResult.Ok)
             {
