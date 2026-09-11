@@ -7,6 +7,7 @@ using System.Buffers;
 using Ameto.Ingestion;
 using Ameto.Metrics;
 using Ameto.Tracing;
+using Ameto.Core;
 
 namespace Ameto.Otel;
 
@@ -208,8 +209,8 @@ public static class OtlpGrpcEndpointMapper
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(body);
-            if (inflated is not null) ArrayPool<byte>.Shared.Return(inflated);
+            IngestBufferPool.Return(body);
+            if (inflated is not null) IngestBufferPool.Return(inflated);
         }
     }
 
@@ -264,7 +265,7 @@ public static class OtlpGrpcEndpointMapper
         // HTTP/2 rarely declares a length, so the usual path here is grow-by-doubling from
         // 64 KiB rather than the exact-size rent the HTTP receivers normally get.
         int initial = declared.HasValue ? (int)declared.Value : 65_536;
-        byte[] buf = ArrayPool<byte>.Shared.Rent(Math.Max(initial, 256));
+        byte[] buf = IngestBufferPool.Rent(Math.Max(initial, 256));
         int total = 0;
         try
         {
@@ -272,15 +273,15 @@ public static class OtlpGrpcEndpointMapper
             {
                 if (total == buf.Length)
                 {
-                    var bigger = ArrayPool<byte>.Shared.Rent(buf.Length * 2);
+                    var bigger = IngestBufferPool.Rent(buf.Length * 2);
                     buf.AsSpan(0, total).CopyTo(bigger);
-                    ArrayPool<byte>.Shared.Return(buf);
+                    IngestBufferPool.Return(buf);
                     buf = bigger;
                 }
                 int read = await ctx.Request.Body.ReadAsync(buf.AsMemory(total), ctx.RequestAborted);
                 if (read == 0) break;
                 total += read;
-                if (total > maxBytes) { ArrayPool<byte>.Shared.Return(buf); return (null, 0); }
+                if (total > maxBytes) { IngestBufferPool.Return(buf); return (null, 0); }
             }
         }
         catch
@@ -289,7 +290,7 @@ public static class OtlpGrpcEndpointMapper
             // array is simply dropped: not a leak, but a permanent withdrawal from the pool the
             // CLEF path, the HTTP OTLP path and storage all share — and a collector timing out
             // mid-upload is an everyday event, not an exceptional one.
-            ArrayPool<byte>.Shared.Return(buf);
+            IngestBufferPool.Return(buf);
             throw;
         }
         return (buf, total);

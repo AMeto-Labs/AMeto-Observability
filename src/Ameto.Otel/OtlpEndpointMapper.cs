@@ -81,7 +81,7 @@ public static class OtlpEndpointMapper
                 ctx.Response.StatusCode = 400;
                 return;
             }
-            finally { ArrayPool<byte>.Shared.Return(body); }
+            finally { IngestBufferPool.Return(body); }
 
             logger.LogDebug("OTLP /v1/traces: decoded {SpanCount} spans", spans.Count);
 
@@ -125,7 +125,7 @@ public static class OtlpEndpointMapper
                 }
             }
             catch { ctx.Response.StatusCode = 400; return; }
-            finally { ArrayPool<byte>.Shared.Return(body); }
+            finally { IngestBufferPool.Return(body); }
 
             int refused = ingester.Ingest(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(points));
             await WriteJsonOk(ctx, points.Count - refused, refused);
@@ -154,7 +154,7 @@ public static class OtlpEndpointMapper
                     : OtlpLogStreamParser.Parse(body.AsSpan(0, bodyLen), endpoint);
             }
             catch { ctx.Response.StatusCode = 400; return; }
-            finally { ArrayPool<byte>.Shared.Return(body); }
+            finally { IngestBufferPool.Return(body); }
 
             await WriteJsonOk(ctx, ingested, dropped);
         };
@@ -218,9 +218,9 @@ public static class OtlpEndpointMapper
     // ── Body reading ──────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Rents a buffer from <see cref="ArrayPool{T}.Shared"/> and reads the full request body.
+    /// Rents a buffer from <see cref="IngestBufferPool"/> and reads the full request body.
     /// Returns (null, 0) on error (status code already set). The caller MUST return the buffer
-    /// to the pool via <c>ArrayPool&lt;byte&gt;.Shared.Return(buffer)</c> — use a finally block.
+    /// via <see cref="IngestBufferPool.Return"/> — use a finally block.
     /// </summary>
     private static async ValueTask<(byte[]? Buffer, int Length)> ReadBodyAsync(HttpContext ctx)
     {
@@ -235,7 +235,7 @@ public static class OtlpEndpointMapper
 
         // Rent instead of allocating MemoryStream — Content-Length known → exact size
         int initialCapacity = declared.HasValue ? (int)declared.Value : 65_536;
-        byte[] buf = ArrayPool<byte>.Shared.Rent(Math.Max(initialCapacity, 256));
+        byte[] buf = IngestBufferPool.Rent(Math.Max(initialCapacity, 256));
         int totalRead = 0;
         try
         {
@@ -244,9 +244,9 @@ public static class OtlpEndpointMapper
                 if (totalRead == buf.Length)
                 {
                     // Grow: double the rented buffer
-                    byte[] larger = ArrayPool<byte>.Shared.Rent(buf.Length * 2);
+                    byte[] larger = IngestBufferPool.Rent(buf.Length * 2);
                     buf.AsSpan(0, totalRead).CopyTo(larger);
-                    ArrayPool<byte>.Shared.Return(buf);
+                    IngestBufferPool.Return(buf);
                     buf = larger;
                 }
 
@@ -257,7 +257,7 @@ public static class OtlpEndpointMapper
                 if (totalRead > maxBytes)
                 {
                     ctx.Response.StatusCode = StatusCodes.Status413PayloadTooLarge;
-                    ArrayPool<byte>.Shared.Return(buf);
+                    IngestBufferPool.Return(buf);
                     return (null, 0);
                 }
             }
@@ -266,7 +266,7 @@ public static class OtlpEndpointMapper
         }
         catch
         {
-            ArrayPool<byte>.Shared.Return(buf);
+            IngestBufferPool.Return(buf);
             throw;
         }
     }

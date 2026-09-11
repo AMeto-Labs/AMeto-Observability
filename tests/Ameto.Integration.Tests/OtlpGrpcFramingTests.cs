@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Buffers.Binary;
 using System.IO.Compression;
+using Ameto.Core;
 using Ameto.Otel;
 
 namespace Ameto.Integration.Tests;
@@ -42,7 +43,7 @@ public sealed class OtlpGrpcFramingTests
     {
         var result = OtlpGrpcFraming.TryUnframe(framed, encoding, limit, out var span, out var rented, out _);
         message = span.ToArray();
-        if (rented is not null) ArrayPool<byte>.Shared.Return(rented);
+        if (rented is not null) IngestBufferPool.Return(rented);
         return result;
     }
 

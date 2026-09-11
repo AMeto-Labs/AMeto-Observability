@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Buffers.Binary;
 using System.IO.Compression;
+using Ameto.Core;
 
 namespace Ameto.Otel;
 
@@ -45,8 +46,9 @@ internal static class OtlpGrpcFraming
     /// </param>
     /// <param name="rented">
     /// Non-null only when the message had to be decompressed into a pooled buffer, which the
-    /// caller then returns. When null, <paramref name="message"/> points into the caller's own
-    /// buffer and nothing extra was allocated.
+    /// caller then returns to <see cref="IngestBufferPool"/>. When null,
+    /// <paramref name="message"/> points into the caller's own buffer and nothing extra was
+    /// allocated.
     /// </param>
     public static UnframeResult TryUnframe(
         ReadOnlySpan<byte> body, string? encoding, int maxInflatedBytes,
@@ -93,7 +95,7 @@ internal static class OtlpGrpcFraming
     {
         message      = default;
         rentedLength = 0;
-        rented       = ArrayPool<byte>.Shared.Rent(maxInflatedBytes);
+        rented       = IngestBufferPool.Rent(maxInflatedBytes);
 
         try
         {
@@ -115,7 +117,7 @@ internal static class OtlpGrpcFraming
                     // than growing, so nothing past the cap is ever committed.
                     if (gzip.ReadByte() >= 0)
                     {
-                        ArrayPool<byte>.Shared.Return(rented);
+                        IngestBufferPool.Return(rented);
                         rented = null;
                         return UnframeResult.TooLarge;
                     }
@@ -133,7 +135,7 @@ internal static class OtlpGrpcFraming
         }
         catch
         {
-            if (rented is not null) { ArrayPool<byte>.Shared.Return(rented); rented = null; }
+            if (rented is not null) { IngestBufferPool.Return(rented); rented = null; }
             return UnframeResult.Malformed;
         }
     }
