@@ -43,7 +43,7 @@ public interface IOtlpLogSink
 ///   413 Payload Too Large if body exceeds the configured batch limit
 ///          (<see cref="IngestionOptions.MaxBatchBytes"/>)
 /// </summary>
-public sealed class IngestionEndpoint : IOtlpLogSink
+public sealed class IngestionEndpoint : IOtlpLogSink, LogEventSerializer.IClefBatchSink
 {
     private readonly IngestionRingBuffer     _ring;
     private readonly StringInternPool        _pool;
@@ -128,13 +128,16 @@ public sealed class IngestionEndpoint : IOtlpLogSink
 
         try
         {
-            // ── 2. Parse MessagePack array ────────────────────────────────────
-            var events = new List<LogEvent>(64);
+            // ── 2+3. Stream the MessagePack array straight into the ring ──────
+            // No LogEvent per event: the batch reader hands each event over as spans
+            // into bodyBuf, and TryIngestClef copies the property bytes into the ring
+            // slot. Malformed bodies are rejected as a whole before any event is
+            // enqueued (StreamBatch validates the structure first).
+            int ingested = 0, dropped = 0;
             try
             {
-                var seq      = new ReadOnlySequence<byte>(bodyBuf, 0, bodyLen);
-                uint nextSeq = 0;
-                LogEventSerializer.DeserializeBatch(seq, NodeId.Local.Value, ref nextSeq, events);
+                ingested = LogEventSerializer.StreamBatch(
+                    bodyBuf.AsMemory(0, bodyLen), this, out dropped);
             }
             catch (Exception ex)
             {
@@ -142,15 +145,6 @@ public sealed class IngestionEndpoint : IOtlpLogSink
                 ctx.Response.StatusCode = StatusCodes.Status400BadRequest;
                 return;
             }
-
-            // ── 3. Push to ring buffer ────────────────────────────────────────
-            // Events arrive only via this HTTP API, so RawProperties is the
-            // single source of truth — the msgpack slice points back into
-            // bodyBuf and is copied into the ring slot by TryEnqueue.
-            int ingested = 0, dropped = 0;
-
-            foreach (var ev in events)
-                TryIngest(ev, ref ingested, ref dropped);
 
             if (ingested > 0)
                 _drainer.NotifyEnqueued();
@@ -224,6 +218,48 @@ public sealed class IngestionEndpoint : IOtlpLogSink
 
     /// <summary>Wakes the drainer once after a streaming batch (see <see cref="TryIngestRaw"/>).</summary>
     public void NotifyBatchEnqueued() => _drainer.NotifyEnqueued();
+
+    /// <summary>
+    /// Streaming CLEF ingest — one event straight from the request body into the ring, with
+    /// no <see cref="LogEvent"/> in between. Same duties as <see cref="TryIngest"/>
+    /// (oversized warning + server drop marker, template/service interning, ring enqueue),
+    /// but everything arrives as spans over the pooled body buffer.
+    /// </summary>
+    public bool TryIngestClef(
+        long tsTicks,
+        byte level,
+        ReadOnlySpan<byte> templateUtf8,
+        ExceptionInfo? exception,
+        ReadOnlySpan<byte> msgpackProps,
+        ulong traceHi, ulong traceLo, ulong spanId,
+        ReadOnlySpan<byte> serviceUtf8)
+    {
+        if (msgpackProps.Length > _maxEventPayloadBytes)
+        {
+            // Cold path: the strings here are worth their cost — this is one log line and
+            // one marker event per dropped event, not per event.
+            string  tmplStr = templateUtf8.IsEmpty ? string.Empty : System.Text.Encoding.UTF8.GetString(templateUtf8);
+            string? svcStr  = serviceUtf8.IsEmpty  ? null         : System.Text.Encoding.UTF8.GetString(serviceUtf8);
+
+            _ring.CountOversizedDrop();   // the drop happens HERE, before the ring sees it
+            _logger.LogWarning(
+                "Dropped oversized log event: properties {PayloadBytes} B exceed limit {LimitBytes} B (service={Service}, template=\"{Template}\")",
+                msgpackProps.Length, _maxEventPayloadBytes, svcStr ?? "(none)", Truncate(tmplStr, 120));
+            EnqueueServerDropMarker(
+                tsTicks, level, tmplStr, msgpackProps.Length, traceHi, traceLo, spanId,
+                svcStr is not null ? _pool.Intern(svcStr) : -1);
+            return false;
+        }
+
+        // Intern returns the pool's own instance, so the hot tier shares one string per
+        // template instead of retaining this event's copy (see TryIngest).
+        int tmplIdx = _pool.Intern(templateUtf8, out string tmpl);   // -1 when empty
+        int svcIdx  = _pool.Intern(serviceUtf8);                     // -1 when empty
+
+        return _ring.TryEnqueue(
+            tsTicks, level, tmplIdx, tmpl, exception,
+            msgpackProps, traceHi, traceLo, spanId, svcIdx);
+    }
 
     /// <summary>
     /// Interns strings and pushes one event onto the ring, tallying ingested/dropped.
