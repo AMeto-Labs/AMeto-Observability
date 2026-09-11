@@ -3,6 +3,7 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using System.Buffers;
+using System.Buffers.Text;
 using System.Text.Json;
 using Ameto.Core;
 using Ameto.Ingestion;
@@ -272,20 +273,35 @@ public static class OtlpEndpointMapper
     }
 
     /// <summary>
-    /// Writes the JSON response directly to the response <see cref="System.IO.Pipelines.PipeWriter"/>.
-    /// Uses <see cref="Utf8JsonWriter"/> with UTF-8 string literals to avoid string interpolation allocs.
+    /// Writes <c>{"ingested":N,"dropped":M}</c> straight into the response pipe's own buffer.
+    ///
+    /// <para>It used to go through a <see cref="Utf8JsonWriter"/> constructed per request — an
+    /// object, its rented state and its bookkeeping, for two integers in a fixed shape, on the
+    /// reply to every ingest call the server answers. Two literals and
+    /// <see cref="Utf8Formatter"/> produce the same bytes with nothing allocated at all.</para>
     /// </summary>
     private static async ValueTask WriteJsonOk(HttpContext ctx, int ingested, int dropped)
     {
         ctx.Response.StatusCode  = 200;
         ctx.Response.ContentType = JsonContentType;
-        // Write directly to the response pipe — zero intermediate string allocation
-        var jw = new Utf8JsonWriter(ctx.Response.BodyWriter);
-        jw.WriteStartObject();
-        jw.WriteNumber("ingested"u8, ingested);
-        jw.WriteNumber("dropped"u8,  dropped);
-        jw.WriteEndObject();
-        jw.Flush(); // advance PipeWriter cursor
-        await ctx.Response.BodyWriter.FlushAsync(ctx.RequestAborted);
+
+        var writer = ctx.Response.BodyWriter;
+        writer.Advance(FormatJsonOk(writer.GetSpan(JsonOkMaxBytes), ingested, dropped));
+        await writer.FlushAsync(ctx.RequestAborted);
+    }
+
+    /// <summary>Longest the reply can be: both literals, two int32s and the closing brace.</summary>
+    internal const int JsonOkMaxBytes = 12 + 11 + 1 + (11 * 2);
+
+    /// <summary>Formats the reply into <paramref name="dest"/>; returns the byte count written.</summary>
+    internal static int FormatJsonOk(Span<byte> dest, int ingested, int dropped)
+    {
+        int n = 0;
+        "{\"ingested\":"u8.CopyTo(dest);                                    n += 12;
+        Utf8Formatter.TryFormat(ingested, dest[n..], out int written);      n += written;
+        ",\"dropped\":"u8.CopyTo(dest[n..]);                               n += 11;
+        Utf8Formatter.TryFormat(dropped, dest[n..], out written);           n += written;
+        dest[n++] = (byte)'}';
+        return n;
     }
 }
