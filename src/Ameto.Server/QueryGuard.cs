@@ -63,15 +63,25 @@ internal sealed class QueryGuard
     }
 }
 
-/// <summary>Links the request's cancellation with the query budget; see <see cref="TimedOut"/>.</summary>
+/// <summary>
+/// Links the request's cancellation with the query budget; see <see cref="TimedOut"/>.
+///
+/// <para>One instance serves ONE query, or — for a caller that runs many bounded queries
+/// on one request, the live tail — many in turn: <see cref="TryRearm"/> re-arms the same
+/// linked source and timer for the next poll instead of building a new linked source, a
+/// registration on the request token and a timer per poll, and <see cref="Disarm"/>
+/// stops the clock between polls so the budget is per poll, not per connection.</para>
+/// </summary>
 internal sealed class QueryDeadline : IDisposable
 {
     private readonly CancellationTokenSource _cts;
     private readonly CancellationToken       _requestAborted;
+    private readonly TimeSpan                _budget;
 
     public QueryDeadline(CancellationToken requestAborted, TimeSpan budget)
     {
         _requestAborted = requestAborted;
+        _budget         = budget;
         _cts            = CancellationTokenSource.CreateLinkedTokenSource(requestAborted);
         if (budget > TimeSpan.Zero) _cts.CancelAfter(budget);
     }
@@ -80,6 +90,31 @@ internal sealed class QueryDeadline : IDisposable
 
     /// <summary>True when the budget expired rather than the client disconnecting.</summary>
     public bool TimedOut => _cts.IsCancellationRequested && !_requestAborted.IsCancellationRequested;
+
+    /// <summary>
+    /// Stops the budget clock once a query has finished. Without it the timer started for
+    /// one poll would keep running while the tail is parked waiting for a write, and fire
+    /// into the next poll — or into nothing, cancelling a source the next
+    /// <see cref="TryRearm"/> then finds unusable.
+    /// </summary>
+    public void Disarm()
+    {
+        if (_budget > TimeSpan.Zero) _cts.CancelAfter(Timeout.InfiniteTimeSpan);
+    }
+
+    /// <summary>
+    /// Readies the same source for the next query: drops the previous query's
+    /// registrations and starts a fresh budget. False when the source was already
+    /// cancelled — the request went away, or the previous budget expired before
+    /// <see cref="Disarm"/> ran — in which case the caller must stop, as it would have on
+    /// a fresh deadline that was cancelled at birth.
+    /// </summary>
+    public bool TryRearm()
+    {
+        if (!_cts.TryReset()) return false;
+        if (_budget > TimeSpan.Zero) _cts.CancelAfter(_budget);
+        return true;
+    }
 
     public void Dispose() => _cts.Dispose();
 }

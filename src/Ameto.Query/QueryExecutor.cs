@@ -50,7 +50,14 @@ public sealed class QueryExecutor : IQueryExecutor
         QueryRequest request,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
-        var filter = CompiledFilter.Compile(request.Filter);
+        // A caller that runs the same request shape over and over (the live tail, once per
+        // poll) compiles the filter once and carries it on the request; it is trusted only
+        // when it was compiled from this request's own text, so a mismatched pair costs a
+        // compile, never a wrong filter.
+        var filter = request.Prepared is CompiledFilter prepared
+                     && string.Equals(prepared.Expression, request.Filter, StringComparison.Ordinal)
+            ? prepared
+            : CompiledFilter.Compile(request.Filter);
         int limit  = request.Count;
         int count  = 0;
 
@@ -213,11 +220,17 @@ public sealed class QueryExecutor : IQueryExecutor
         // Priming order: the merge front moves one way through time, so segments are
         // consumed in that order too — newest MaxTs first going backward, oldest MinTs
         // first going forward.
-        var ordered = forward
-            ? prefiltered.OrderBy(p => p.Info.MinTimestampTicks).ToList()
-            : prefiltered.OrderByDescending(p => p.Info.MaxTimestampTicks).ToList();
+        // Stable like the OrderBy it replaces (ties keep prefilter order = catalog order):
+        // the key carries the input index, so an unstable Array.Sort cannot reorder ties.
+        var ordered = new PrimeEntry[prefiltered.Count];
+        for (int i = 0; i < ordered.Length; i++)
+        {
+            var p = prefiltered[i];
+            ordered[i] = new PrimeEntry(forward ? p.Info.MinTimestampTicks : p.Info.MaxTimestampTicks, i, p);
+        }
+        ordered.AsSpan().Sort(new PrimeOrder(descending: !forward));
 
-        var iterators = new List<IAsyncEnumerator<LogEvent>>(ordered.Count + 1);
+        var iterators = new List<IAsyncEnumerator<LogEvent>>(ordered.Length + 1);
         try
         {
             // PriorityQueue ordered by (ts, id). For backward (newest-first) we invert
@@ -252,18 +265,18 @@ public sealed class QueryExecutor : IQueryExecutor
             // ordered) can contribute. Ties prime, so equal timestamps are never dropped.
             async ValueTask PrimeAsync()
             {
-                while (next < ordered.Count)
+                while (next < ordered.Length)
                 {
                     if (heap.Count > 0 && heap.TryPeek(out _, out var best))
                     {
-                        var info = ordered[next].Info;
+                        var info = ordered[next].Entry.Info;
                         bool couldBeat = forward
                             ? info.MinTimestampTicks <= best.ts
                             : info.MaxTimestampTicks >= best.ts;
                         if (!couldBeat) return;
                     }
 
-                    var (segInfo, candidateOffsets) = ordered[next++];
+                    var (segInfo, candidateOffsets) = ordered[next++].Entry;
                     var stream = ScanSegmentAsync(segInfo, filter, levels, candidateOffsets,
                                                   from, to, afterTs, afterId, !forward, ct);
                     var newIt = stream.GetAsyncEnumerator(ct);
@@ -316,6 +329,23 @@ public sealed class QueryExecutor : IQueryExecutor
     /// candidate block offsets from the trigram index (null = scan all blocks).
     /// </summary>
     private readonly record struct PrefilterResult(SegmentInfo Info, uint[]? CandidateOffsets);
+
+    /// <summary>A prefilter survivor keyed for the priming order (see <see cref="PrimeOrder"/>).</summary>
+    private readonly record struct PrimeEntry(long Key, int Index, PrefilterResult Entry);
+
+    /// <summary>
+    /// The priming order — MinTs ascending going forward, MaxTs descending going backward
+    /// — with the input index as the tiebreak, so the sort is stable like the LINQ OrderBy
+    /// it replaced without the keyed comparer, the iterator chain and the list per query.
+    /// </summary>
+    private readonly struct PrimeOrder(bool descending) : IComparer<PrimeEntry>
+    {
+        public int Compare(PrimeEntry a, PrimeEntry b)
+        {
+            int c = descending ? b.Key.CompareTo(a.Key) : a.Key.CompareTo(b.Key);
+            return c != 0 ? c : a.Index.CompareTo(b.Index);
+        }
+    }
 
     /// <summary>
     /// Runs bloom/inverted fast-skip and trigram offset lookup for every cold
