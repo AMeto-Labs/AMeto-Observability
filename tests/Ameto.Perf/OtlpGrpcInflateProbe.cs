@@ -46,8 +46,37 @@ public sealed class OtlpGrpcInflateProbe
 
         // The inflate output and the compressed input are both borrowed, so what is left per
         // call is the GZipStream and its own internal buffer — nothing that scales with the
-        // message. 64 KB is far above that and far below one full-ceiling rent.
-        Assert.True(bytes < 64 * 1024, $"expected < 64 KB/call, got {bytes} B");
+        // message. The old shape allocated 14 761 B a call copying the compressed payload out
+        // with ToArray(), so this has to sit well under that to mean anything: 1 KB does.
+        Assert.True(bytes < 1024, $"expected < 1 KB/call, got {bytes} B");
+    }
+
+    [Fact]
+    public void TheInflateBufferIsSizedFromTheMessageNotTheCeiling()
+    {
+        byte[] framed = GzipFrame(OtlpProtoPayloads.Logs_Realistic());
+
+        var result = OtlpGrpcFraming.TryUnframe(framed, "gzip", MaxInflated,
+                                                out var message, out byte[]? rented, out int rentedLength);
+        try
+        {
+            Assert.Equal(UnframeResult.Ok, result);
+            Assert.NotNull(rented);
+            Assert.Equal(message.Length, rentedLength);
+
+            // It used to be Rent(maxInflatedBytes) whatever the message weighed — an 8 MiB
+            // array for 287 KB of logs, on every compressed request a collector sends, and an
+            // 8 MiB array the pool then kept. Under 2x the message is the claim that fails the
+            // moment anyone sizes it from the ceiling again.
+            _out.WriteLine($"message {message.Length / 1024.0:F1} KB → buffer {rented!.Length / 1024.0:F1} KB "
+                         + $"(ceiling would be {MaxInflated / 1024.0:F1} KB)");
+            Assert.True(rented.Length < 2 * message.Length,
+                $"expected a buffer under 2x the {message.Length} B message, got {rented.Length} B");
+        }
+        finally
+        {
+            if (rented is not null) IngestBufferPool.Return(rented);
+        }
     }
 
     private static void Once(byte[] framed)
