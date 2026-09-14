@@ -210,12 +210,15 @@ public sealed class HotTierEventSource : ISegmentEventSource
 
     public long RemainingEventHint => Math.Max(0, _end - _pos);
 
+    /// <summary>Carried across events so the pool is asked only when the answer changes.</summary>
+    private InternMemo _memo;
+
     public bool TryReadNext(out SegmentEventRef ev)
     {
         if (_pos >= _end) { ev = default; return false; }
         int i = _order is null ? _pos : _order[_pos];
         _pos++;
-        ev = EventAt(_hot, _pool, i);
+        ev = EventAt(_hot, _pool, i, ref _memo);
         return true;
     }
 
@@ -226,15 +229,69 @@ public sealed class HotTierEventSource : ISegmentEventSource
     /// </summary>
     public static SegmentEventRef EventAt(HotTierSegment hot, StringInternPool pool, int i)
     {
+        InternMemo none = default;
+        return EventAt(hot, pool, i, ref none);
+    }
+
+    // `scoped`: the memo is read and updated here and nothing about it reaches the returned ref
+    // struct, so it must not be treated as a reference the result could capture.
+    private static SegmentEventRef EventAt(HotTierSegment hot, StringInternPool pool, int i, scoped ref InternMemo memo)
+    {
         ref readonly LogEventHeader h = ref hot.GetHeader(i);
         // The tier-local template wins over the pool: it survives a pool miss (WAL recovery
         // restores the pool separately), which is why the tier stores it at all.
-        string template = hot.GetTemplate(i) ?? pool.Get(h.MessageTemplatePoolIndex) ?? string.Empty;
-        string? service = h.ServiceNamePoolIndex >= 0 ? pool.Get(h.ServiceNamePoolIndex) : null;
+        string template = hot.GetTemplate(i)
+                       ?? memo.Template.Resolve(pool, h.MessageTemplatePoolIndex)
+                       ?? string.Empty;
+        string? service = h.ServiceNamePoolIndex >= 0
+            ? memo.Service.Resolve(pool, h.ServiceNamePoolIndex)
+            : null;
         return new SegmentEventRef(
             h.Id, h.TimestampUtcTicks, h.Level,
             h.TraceIdHi, h.TraceIdLo, h.SpanId,
             template, service, hot.GetException(i),
             hot.GetPropertiesPayload(i));
+    }
+
+    /// <summary>
+    /// The last (pool index → string) answer for each interned column.
+    ///
+    /// <para><see cref="StringInternPool.Get"/> is a <c>ConcurrentDictionary</c> probe — a hash,
+    /// a bucket walk and a volatile read — and a tier's templates and service names are a handful
+    /// of values repeated across every one of its events, so it was asked the same question a
+    /// quarter of a million times per flush. A pool index is assigned once and never reassigned,
+    /// so a remembered answer cannot go stale.</para>
+    ///
+    /// <para>The index is held PLUS ONE so that <c>default</c> — every field zero — is an EMPTY
+    /// memo rather than one claiming to know some real index. Only non-negative indices are ever
+    /// memoised, which is what makes that encoding unambiguous: were a negative index allowed in,
+    /// -1 would store a plus-one of 0 and a fresh memo would then "match" it and answer null,
+    /// while a memo warmed on anything else would ask the pool and be told <see cref="string.Empty"/>.
+    /// Both answers reach the same place today — the only caller that can pass a negative index is
+    /// the template, whose result goes through <c>?? string.Empty</c> — but the two routes
+    /// disagreeing about the same input is exactly the kind of thing that stops being harmless
+    /// when someone adds a third caller.</para>
+    /// </summary>
+    private struct InternMemo
+    {
+        public Slot Template;
+        public Slot Service;
+
+        public struct Slot
+        {
+            private int     _indexPlusOne;
+            private string? _value;
+
+            public string? Resolve(StringInternPool pool, int index)
+            {
+                // "No index" (-1: the event carries no template / no service) is not worth a memo
+                // slot and must not occupy one — the pool answers it from a branch, not a probe.
+                if (index < 0) return pool.Get(index);
+                if (_indexPlusOne == index + 1) return _value;
+                _value        = pool.Get(index);
+                _indexPlusOne = index + 1;
+                return _value;
+            }
+        }
     }
 }
