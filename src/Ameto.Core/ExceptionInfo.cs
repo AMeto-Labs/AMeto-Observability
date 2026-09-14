@@ -1,4 +1,6 @@
 using System.Buffers;
+using System.Buffers.Binary;
+using System.Text;
 using MessagePack;
 
 namespace Ameto.Core;
@@ -179,6 +181,141 @@ public sealed class ExceptionInfo
         Write(ref w);
         w.Flush();
         return buf.WrittenSpan.ToArray();
+    }
+
+    // ── Decode-free questions about a stored payload ─────────────────────────
+    //
+    // Both of these answer, from the bytes alone, a question a filter asks per SCANNED row —
+    // where building the object graph to answer it is the whole cost the lazy Exception was
+    // added to avoid. Each one mirrors a specific branch of ReadAtDepth above; if that method
+    // changes shape, these change with it, and ExceptionInfoReadTests pins them together.
+
+    /// <summary>
+    /// Whether these bytes decode to a NON-NULL <see cref="ExceptionInfo"/> — decided from the
+    /// msgpack type header alone, in constant time and with no allocation.
+    ///
+    /// <para>Exactly <c>FromBytes(bytes) is not null</c>, and it has to be exact because
+    /// <c>LogEvent.HasException</c> is what answers <c>has @x</c> / <c>@x is not null</c>.
+    /// <see cref="ReadAtDepth"/> returns null for three shapes, and all three are visible in
+    /// the first bytes: nil, an EMPTY legacy string, and anything that is neither a string nor
+    /// a map. Everything else — any map, any non-empty string — produces an object.</para>
+    /// </summary>
+    public static bool IsPresent(ReadOnlySpan<byte> bytes)
+    {
+        if (bytes.IsEmpty) return false;
+        byte b = bytes[0];
+
+        // A map is always an exception: fixmap 0x80-0x8F, map16 0xDE, map32 0xDF.
+        if ((b & 0xF0) == 0x80 || b == 0xDE || b == 0xDF) return true;
+
+        // Legacy @x as a plain string — present unless it is empty.
+        if ((b & 0xE0) == 0xA0) return (b & 0x1F) != 0;                       // fixstr
+        if (b == 0xD9) return bytes.Length >= 2 && bytes[1] != 0;             // str8
+        if (b == 0xDA) return bytes.Length >= 3 && BinaryPrimitives.ReadUInt16BigEndian(bytes[1..]) != 0;
+        if (b == 0xDB) return bytes.Length >= 5 && BinaryPrimitives.ReadUInt32BigEndian(bytes[1..]) != 0;
+
+        // nil, or a shape ReadAtDepth skips and reports as null.
+        return false;
+    }
+
+    /// <summary>
+    /// Whether the ROOT exception's <see cref="Type"/> or <see cref="Message"/> contains
+    /// <paramref name="term"/>, case-insensitively — without building the object.
+    ///
+    /// <para>This is the free-text search path. A term is tested against EVERY row a scan
+    /// touches, and on a level-split Error segment every row carries an exception whose stack
+    /// trace is 1-5 KB — so decoding the tree to read two of its strings put the whole payload,
+    /// the inner chain and the stack trace on the heap per row, per term.</para>
+    ///
+    /// <para>Root only, and Type defaulting to <c>"Exception"</c> when the key is absent or
+    /// nil, because that is what the evaluator matched off the object and the two must not
+    /// disagree. The value is transcoded into stack or pooled scratch, so the comparison is the
+    /// same <c>OrdinalIgnoreCase</c> substring test over the same chars a full decode would
+    /// have produced.</para>
+    /// </summary>
+    public static bool RootTextContains(ReadOnlyMemory<byte> bytes, string term)
+    {
+        if (bytes.IsEmpty) return false;
+        var reader = new MessagePackReader(new ReadOnlySequence<byte>(bytes));
+
+        if (reader.TryReadNil()) return false;
+
+        // Legacy plain string: Type is the literal "Exception", Message is the string. An
+        // empty one decodes to null and matches nothing at all.
+        if (reader.NextMessagePackType == MessagePackType.String)
+        {
+            if (reader.TryReadStringSpan(out var raw))
+                return !raw.IsEmpty && (Utf8Contains(raw, term) || Contains(DefaultType, term));
+
+            string? str = reader.ReadString();
+            return !string.IsNullOrEmpty(str) && (Contains(str, term) || Contains(DefaultType, term));
+        }
+
+        if (reader.NextMessagePackType != MessagePackType.Map) return false;
+
+        int  fields      = reader.ReadMapHeader();
+        bool typeIsDefault = true;
+
+        for (int i = 0; i < fields; i++)
+        {
+            ExcField field = reader.TryReadStringSpan(out ReadOnlySpan<byte> keySpan)
+                ? ClassifyKey(keySpan)
+                : ClassifyKey(reader.ReadString());
+
+            switch (field)
+            {
+                case ExcField.Type:
+                    if (reader.TryReadNil()) break;                 // nil ⇒ Type stays "Exception"
+                    typeIsDefault = false;
+                    if (ReadStringContains(ref reader, term)) return true;
+                    break;
+
+                case ExcField.Message:
+                    if (reader.TryReadNil()) break;
+                    if (ReadStringContains(ref reader, term)) return true;
+                    break;
+
+                // Stack and Inner are NOT searched, exactly as the object-side check did not
+                // search them. Skipping is also the point: the stack trace is the payload.
+                default:
+                    reader.Skip();
+                    break;
+            }
+        }
+
+        return typeIsDefault && Contains(DefaultType, term);
+    }
+
+    /// <summary>The Type a payload takes when it does not carry one — see <see cref="ReadAtDepth"/>.</summary>
+    private const string DefaultType = "Exception";
+
+    private static bool Contains(string? haystack, string term) =>
+        haystack is not null && haystack.Contains(term, StringComparison.OrdinalIgnoreCase);
+
+    private static bool ReadStringContains(ref MessagePackReader reader, string term)
+    {
+        if (reader.TryReadStringSpan(out var utf8)) return Utf8Contains(utf8, term);
+        return Contains(reader.ReadString(), term);    // rare: the value spans buffer segments
+    }
+
+    /// <summary>Scratch that a type name or an exception message sits inside; longer values
+    /// borrow from the pool. Either way nothing reaches the heap.</summary>
+    private const int TermScratch = 512;
+
+    private static bool Utf8Contains(ReadOnlySpan<byte> utf8, string term)
+    {
+        if (utf8.IsEmpty) return term.Length == 0;
+
+        int needed = Encoding.UTF8.GetMaxCharCount(utf8.Length);
+        char[]? rented = null;
+        Span<char> scratch = stackalloc char[TermScratch];
+        if (needed > TermScratch) scratch = rented = ArrayPool<char>.Shared.Rent(needed);
+        try
+        {
+            int written = Encoding.UTF8.GetChars(utf8, scratch);
+            return scratch[..written].Contains(term, StringComparison.OrdinalIgnoreCase);
+        }
+        finally { if (rented is not null) ArrayPool<char>.Shared.Return(rented); }
     }
 
     /// <summary>

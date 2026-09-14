@@ -106,6 +106,14 @@ public sealed class LogEvent
     ///
     /// <para>Not synchronised, exactly like <see cref="Properties"/>: a race decodes twice
     /// and one equal result wins, and an event is consumed by one reader.</para>
+    ///
+    /// <para>WHERE A TORN PAYLOAD SURFACES moved with the laziness, exactly as it did for
+    /// <see cref="RawProperties"/>: a malformed <c>@x</c> blob used to throw inside
+    /// <c>SegmentReader.ReadEventsAsync</c>, where the scan turned it into "this segment
+    /// stops here"; it now throws at FIRST TOUCH — in the evaluator for an <c>@x</c>
+    /// predicate, or in delivery for a returned row. The bytes are still bounded and
+    /// length-checked by the block frame before they get here, so this is about which caller
+    /// sees a corrupt segment, not about whether one is detected.</para>
     /// </summary>
     public ExceptionInfo? Exception
     {
@@ -130,11 +138,18 @@ public sealed class LogEvent
     public bool ExceptionMaterialised => _exception is not null;
 
     /// <summary>
-    /// Whether the event carries an exception at all, WITHOUT decoding it. This is what an
-    /// <c>@x is not null</c> / exists predicate needs, and it is the whole point of the
-    /// laziness above: the answer is a length, not a tree.
+    /// Whether the event carries an exception at all, WITHOUT decoding it — what <c>has @x</c>
+    /// and <c>@x is not null</c> need, and the reason the laziness above is worth anything to
+    /// them: the answer is a type byte, not a tree.
+    ///
+    /// <para>EXACTLY <c><see cref="Exception"/> is not null</c>, which is the only way a
+    /// predicate may use it. A non-empty payload is not the same thing as a non-null
+    /// exception — nil, an empty legacy string and any non-map non-string shape all decode to
+    /// null — so the decision is delegated to <see cref="ExceptionInfo.IsPresent"/>, which
+    /// mirrors those three cases off the msgpack header rather than assuming a length.</para>
     /// </summary>
-    public bool HasException => _exception is not null || !RawException.IsEmpty;
+    public bool HasException => _exception is not null
+                             || (!RawException.IsEmpty && ExceptionInfo.IsPresent(RawException.Span));
 
     private Dictionary<string, object?>? _properties;
 

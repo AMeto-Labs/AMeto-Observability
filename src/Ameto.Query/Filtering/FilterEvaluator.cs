@@ -108,7 +108,21 @@ public static class FilterEvaluator
     {
         if (Ci(ev.MessageTemplate, term)) return true;
 
-        if (ev.Exception is { } ex)
+        // The exception is searched WITHOUT decoding it whenever the decoder carried the raw
+        // bytes. This runs per row per term over everything a scan touches, and on a
+        // level-split Error segment every row has an exception whose stack trace is 1-5 KB —
+        // so reading ev.Exception here built the tree, the inner chain and a UTF-16 copy of
+        // every frame for each of them, to look at two strings. RootTextContains reads those
+        // same two (Type, Message, root only, Type defaulting to "Exception") straight out of
+        // the msgpack, with the same OrdinalIgnoreCase substring test over the same chars.
+        //
+        // Hot-tier events carry the object and no bytes, so they take the second branch —
+        // which is also the one a row takes once something else has already decoded it.
+        if (!ev.ExceptionMaterialised && !ev.RawException.IsEmpty)
+        {
+            if (ExceptionInfo.RootTextContains(ev.RawException, term)) return true;
+        }
+        else if (ev.Exception is { } ex)
         {
             if (Ci(ex.Type, term))    return true;
             if (Ci(ex.Message, term)) return true;
@@ -159,8 +173,19 @@ public static class FilterEvaluator
 
     // ── Property access ───────────────────────────────────────────────────────
 
-    private static bool HasProperty(LogEvent ev, string prop) =>
-        GetValue(ev, prop) is not null;
+    private static bool HasProperty(LogEvent ev, string prop)
+    {
+        // `has @x` / `@x is not null` is a question about PRESENCE, and LogEvent answers it
+        // from the payload's type byte. Going through GetValue reads ev.Exception?.Type, which
+        // builds the whole tree — stack trace included — to decide a boolean, for every row
+        // the scan touches. LogEvent.HasException is documented as exactly
+        // `Exception is not null`, and ExceptionType is the field @x resolves to, so the two
+        // readings cannot disagree.
+        if (BuiltinFields.TryResolve(prop, out var builtin) && builtin == BuiltinField.ExceptionType)
+            return ev.HasException;
+
+        return GetValue(ev, prop) is not null;
+    }
 
     /// <summary>
     /// Reads one property the way a predicate reads it — built-in aliases, dotted paths, the

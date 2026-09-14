@@ -102,6 +102,122 @@ public sealed class ExceptionInfoReadTests
     }
 
     /// <summary>
+    /// <see cref="ExceptionInfo.IsPresent"/> must agree with <see cref="ExceptionInfo.FromBytes"/>
+    /// on EVERY payload, because <c>LogEvent.HasException</c> is built on it and that is what
+    /// answers <c>has @x</c>. "Non-empty payload" is not the same question: nil, an empty
+    /// legacy string and any other shape all carry bytes and all decode to null.
+    /// </summary>
+    [Fact]
+    public void IsPresent_agrees_with_FromBytes_on_every_shape()
+    {
+        var payloads = new List<byte[]>
+        {
+            new ExceptionInfo { Type = "System.Exception" }.ToBytes(),
+            new ExceptionInfo { Type = "T", Message = "m", StackTrace = "s" }.ToBytes(),
+            Pack((ref MessagePackWriter w) => w.WriteMapHeader(0)),          // empty map ⇒ present
+            Pack((ref MessagePackWriter w) => w.Write("legacy")),            // non-empty string
+            Pack((ref MessagePackWriter w) => w.Write("")),                  // EMPTY string ⇒ null
+            Pack((ref MessagePackWriter w) => w.WriteNil()),                 // nil ⇒ null
+            Pack((ref MessagePackWriter w) => w.Write(42)),                  // wrong shape ⇒ null
+            Pack((ref MessagePackWriter w) => w.Write(true)),                // wrong shape ⇒ null
+            Pack((ref MessagePackWriter w) => w.WriteArrayHeader(0)),        // wrong shape ⇒ null
+            Pack((ref MessagePackWriter w) => w.Write(new string('x', 40))), // str8
+            Pack((ref MessagePackWriter w) => w.Write(new string('x', 400))),// str16
+            Pack((ref MessagePackWriter w) => w.Write(new string('x', 70_000))), // str32
+        };
+
+        // A map big enough to need a map16 header.
+        payloads.Add(Pack((ref MessagePackWriter w) =>
+        {
+            w.WriteMapHeader(20);
+            for (int i = 0; i < 20; i++) { w.Write("k" + i); w.Write(i); }
+        }));
+
+        foreach (var bytes in payloads)
+        {
+            bool decoded = ExceptionInfo.FromBytes(bytes.AsMemory()) is not null;
+            Assert.True(decoded == ExceptionInfo.IsPresent(bytes),
+                $"IsPresent disagreed with FromBytes on a {bytes.Length} B payload starting 0x{bytes[0]:X2}");
+        }
+
+        Assert.False(ExceptionInfo.IsPresent(ReadOnlySpan<byte>.Empty));
+    }
+
+    /// <summary>
+    /// THE STRING FALLBACK IS REACHABLE. <c>TryReadStringSpan</c> fails when a key straddles
+    /// two segments of the sequence, and the classifier then falls back to reading it as a
+    /// string — a branch <c>FromBytes</c> can never take, because it hands the reader ONE
+    /// contiguous buffer. <see cref="ExceptionInfo.Read"/> is public and takes whatever reader
+    /// the caller has, so the branch is not dead: this splits every key down the middle and
+    /// asserts the same answer as the contiguous read.
+    /// </summary>
+    [Fact]
+    public void A_key_split_across_buffer_segments_still_classifies()
+    {
+        var bytes = new ExceptionInfo
+        {
+            Type       = "System.InvalidOperationException",
+            Message    = "split me",
+            StackTrace = "   at A()",
+            Inner      = new ExceptionInfo { Type = "System.FormatException" },
+        }.ToBytes();
+
+        var contiguous = ExceptionInfo.FromBytes(bytes.AsMemory());
+
+        // One byte per segment: every multi-byte token, keys included, straddles a boundary.
+        var reader = new MessagePackReader(ByteAtATime(bytes));
+        var split  = ExceptionInfo.Read(ref reader);
+
+        AssertSame(contiguous, split);
+        Assert.Equal("System.InvalidOperationException", split!.Type);
+        Assert.Equal("split me", split.Message);
+        Assert.Equal("   at A()", split.StackTrace);
+        Assert.Equal("System.FormatException", split.Inner?.Type);
+    }
+
+    private sealed class Seg : ReadOnlySequenceSegment<byte>
+    {
+        public Seg(ReadOnlyMemory<byte> memory, long runningIndex)
+        {
+            Memory = memory;
+            RunningIndex = runningIndex;
+        }
+        public Seg Append(ReadOnlyMemory<byte> next)
+        {
+            var seg = new Seg(next, RunningIndex + Memory.Length);
+            Next = seg;
+            return seg;
+        }
+    }
+
+    private static ReadOnlySequence<byte> ByteAtATime(byte[] bytes)
+    {
+        var first = new Seg(bytes.AsMemory(0, 1), 0);
+        var last  = first;
+        for (int i = 1; i < bytes.Length; i++) last = last.Append(bytes.AsMemory(i, 1));
+        return new ReadOnlySequence<byte>(first, 0, last, last.Memory.Length);
+    }
+
+    /// <summary>
+    /// A key that is not a string at all is not something the fallback rescues — both
+    /// overloads refuse the payload the same way, which is what the segment and WAL readers
+    /// already treat as corruption.
+    /// </summary>
+    [Fact]
+    public void A_non_string_key_is_refused_by_both_overloads()
+    {
+        var bytes = Pack((ref MessagePackWriter w) =>
+        {
+            w.WriteMapHeader(1);
+            w.Write(7);                 // integer key — not a shape the format ever writes
+            w.Write("whatever");
+        });
+
+        Assert.ThrowsAny<Exception>(() => ExceptionInfo.FromBytes(bytes.AsMemory()));
+        Assert.ThrowsAny<Exception>(() => ExceptionInfo.FromBytes(bytes.AsSpan()));
+    }
+
+    /// <summary>
     /// The payload is NOT copied. Measured on a map whose bulk is a field the reader skips, so
     /// the copy is the only thing that could account for the bytes: the span overload must pay
     /// for the whole payload, the memory overload for essentially nothing.
