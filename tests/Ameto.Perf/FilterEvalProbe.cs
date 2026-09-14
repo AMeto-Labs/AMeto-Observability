@@ -34,6 +34,18 @@ public sealed class FilterEvalProbe
         var ascii    = BuildEvents(unicode: false);
         var unicode  = BuildEvents(unicode: true);
 
+        // EVERY expression is walked before ANY of them is timed. Tier-1 promotion is
+        // asynchronous, and the evaluator is one shared set of methods, so whichever
+        // expression was reported first used to be measured while the JIT was still catching
+        // up with it — its line came out several times worse than the same code measured
+        // later, which reads exactly like a regression and is not one.
+        foreach (var (expr, events) in Expressions(ascii, unicode))
+        {
+            var warm = CompiledFilter.Compile(expr);
+            for (int i = 0; i < 5; i++)
+                foreach (var ev in events) if (warm.Matches(ev)) { }
+        }
+
         Report("(a) @l = 'Error' and @mt like '%timeout%'", "@l = 'Error' and @mt like '%timeout%'", ascii);
         Report("    @mt like '%timeout%'",                 "@mt like '%timeout%'",                 ascii);
         Report("    @mt like 'Handled%'",                  "@mt like 'Handled%'",                  ascii);
@@ -42,6 +54,19 @@ public sealed class FilterEvalProbe
         Report("    RequestPath like '%users%'",           "RequestPath like '%users%'",           ascii);
         Report("    @mt like '%timeout%'  (non-ASCII)",    "@mt like '%timeout%'",                 unicode);
     }
+
+    /// <summary>The measured set, in one place, so the warm-up cannot fall out of step with it.</summary>
+    private static (string Expression, List<LogEvent> Events)[] Expressions(
+        List<LogEvent> ascii, List<LogEvent> unicode) =>
+    [
+        ("@l = 'Error' and @mt like '%timeout%'", ascii),
+        ("@mt like '%timeout%'",                  ascii),
+        ("@mt like 'Handled%'",                   ascii),
+        ("@mt like '%request'",                   ascii),
+        ("@l = 'Error'",                          ascii),
+        ("RequestPath like '%users%'",            ascii),
+        ("@mt like '%timeout%'",                  unicode),
+    ];
 
     /// <summary>
     /// The BEST of several passes, not the average.
