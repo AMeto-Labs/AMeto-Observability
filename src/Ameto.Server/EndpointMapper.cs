@@ -12,7 +12,11 @@ namespace Ameto.Server;
 /// <summary>Wire all Ameto HTTP endpoints onto the application.</summary>
 public static class EndpointMapper
 {
-    private static readonly JsonSerializerOptions _json = new()
+    // internal, not private: LogEventJsonParityTests serialises the same events through this
+    // and through LogEventJsonWriter and compares the bytes. Rebuilding an "equivalent" set of
+    // options in the test would let the two drift apart silently, which is the one thing the
+    // parity test exists to prevent.
+    internal static readonly JsonSerializerOptions _json = new()
     {
         PropertyNamingPolicy        = JsonNamingPolicy.CamelCase,
         DefaultIgnoreCondition      = JsonIgnoreCondition.WhenWritingNull,
@@ -124,8 +128,14 @@ public static class EndpointMapper
                 using var sse      = new SseJsonWriter(ctx.Response.Body);
                 try
                 {
+                    // Straight from the event: no DTO, no reflection resolver, no
+                    // Timestamp/Id/trace/span ToString per row, and the frames coalesce in
+                    // the writer's buffer instead of taking a socket send each. The terminal
+                    // frame below puts whatever is still buffered on the wire with it, which
+                    // is why there is no explicit flush here — every exit from this block
+                    // except a client disconnect writes one.
                     await foreach (var ev in executor.ExecuteAsync(request, deadline.Token))
-                        await sse.WriteEventAsync(LogEventDto.From(ev), _json, deadline.Token);
+                        await sse.WriteLogEventAsync(ev, deadline.Token);
 
                     // CHECKED AFTER THE LOOP, not only in a catch filter: the executor turns
                     // cancellation into a normal end-of-stream on its hot paths (a
@@ -742,11 +752,11 @@ public static class EndpointMapper
         using (lease)
         {
             using var deadline = guard.StartDeadline(ctx.RequestAborted);
-            var results = new List<LogEventDto>();
+            var results = new List<LogEvent>();
             try
             {
                 await foreach (var ev in executor.ExecuteAsync(request, deadline.Token))
-                    results.Add(LogEventDto.From(ev));
+                    results.Add(ev);
             }
             catch (OperationCanceledException) when (deadline.TimedOut) { }
             catch (OperationCanceledException) { return; }   // client disconnected
@@ -760,7 +770,19 @@ public static class EndpointMapper
                 return;
             }
 
-            await ctx.Response.WriteAsJsonAsync(results, _json, ctx.RequestAborted);
+            // Same array, same element bytes, written straight from the events — the DTO
+            // list this used to build existed only to be walked back out by the reflection
+            // serialiser. Content type spelled out because WriteAsJsonAsync set it.
+            ctx.Response.ContentType = "application/json; charset=utf-8";
+            var writer = new Utf8JsonWriter(ctx.Response.BodyWriter);
+            await using (writer.ConfigureAwait(false))
+            {
+                writer.WriteStartArray();
+                foreach (var ev in results) LogEventJsonWriter.Write(writer, ev);
+                writer.WriteEndArray();
+                await writer.FlushAsync(ctx.RequestAborted);
+            }
+            await ctx.Response.BodyWriter.FlushAsync(ctx.RequestAborted);
         }
     }
 

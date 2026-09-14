@@ -33,6 +33,21 @@ public sealed class SseJsonWriter : IDisposable
     private static readonly byte[] ErrorPrefix    = "event: query-error\ndata: "u8.ToArray();
     private static readonly byte[] KeepaliveFrame = ": keepalive\n\n"u8.ToArray();
 
+    /// <summary>
+    /// How much framed output may sit in the buffer before <see cref="WriteLogEventAsync"/>
+    /// puts it on the wire. Only the BUFFERED overload consults it; every other frame on this
+    /// writer is still sent the moment it is composed.
+    ///
+    /// <para>Roughly a TCP window's worth. A 500-row page used to cost 500 writes and 500
+    /// flushes — a socket send per row — for a payload that coalesces into some tens of
+    /// segments; the buffer turns that into one send per ~16 KB while leaving the frame bytes
+    /// themselves untouched. Anything that must not wait (the end of a page, a keepalive, a
+    /// terminal frame) goes out through a method that sends unconditionally, which is what
+    /// keeps the live tail's silence bound a property of the loop rather than of the
+    /// buffer.</para>
+    /// </summary>
+    private const int FlushThresholdBytes = 16 * 1024;
+
     private readonly ArrayBufferWriter<byte> _buffer = new(4096);
     private readonly Utf8JsonWriter          _json;
     private readonly Stream                  _body;
@@ -45,19 +60,57 @@ public sealed class SseJsonWriter : IDisposable
     }
 
     /// <summary>
+    /// Writes whatever frames are still buffered and flushes the body. A no-op when nothing
+    /// is pending, so it is safe to call at the end of every page, poll and error path —
+    /// and it MUST be called there: a frame left in this buffer is a row the client never
+    /// sees.
+    /// </summary>
+    public ValueTask FlushFramesAsync(CancellationToken ct) => SendAsync(ct);
+
+    /// <summary>
+    /// One <c>data:</c> frame carrying a log event, written straight from the event with no
+    /// DTO and no reflection (see <see cref="LogEventJsonWriter"/>), and held in the buffer
+    /// with its neighbours until <see cref="FlushThresholdBytes"/> is reached.
+    ///
+    /// <para>Callers own the end of the run: finish with <see cref="FlushFramesAsync"/> (or
+    /// any terminal frame, which sends the backlog with it) or the tail of the page stays
+    /// here.</para>
+    /// </summary>
+    public async ValueTask WriteLogEventAsync(LogEvent ev, CancellationToken ct)
+    {
+        _buffer.Write(DataPrefix);
+        _json.Reset(_buffer);
+        LogEventJsonWriter.Write(_json, ev);
+        _json.Flush();
+        _buffer.Write(FrameSuffix);
+        if (_buffer.WrittenCount >= FlushThresholdBytes)
+            await SendAsync(ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Puts the buffered bytes on the wire and empties the buffer, keeping its capacity —
+    /// one buffer per connection, for the life of the connection.
+    /// </summary>
+    private async ValueTask SendAsync(CancellationToken ct)
+    {
+        if (_buffer.WrittenCount == 0) return;
+        await _body.WriteAsync(_buffer.WrittenMemory, ct).ConfigureAwait(false);
+        await _body.FlushAsync(ct).ConfigureAwait(false);
+        _buffer.ResetWrittenCount();
+    }
+
+    /// <summary>
     /// Writes one <c>data:</c> frame with the DTO serialised through a SOURCE-GENERATED contract,
     /// then flushes. Prefer this overload: it is the one that keeps the reflection-based metadata
     /// resolver out of the per-row path, and out of the trimmed output.
     /// </summary>
     public async Task WriteEventAsync<T>(T dto, JsonTypeInfo<T> typeInfo, CancellationToken ct)
     {
-        _buffer.ResetWrittenCount();          // keep capacity — one buffer per connection
         _buffer.Write(DataPrefix);
         _json.Reset(_buffer);
         JsonSerializer.Serialize(_json, dto, typeInfo);
         _buffer.Write(FrameSuffix);
-        await _body.WriteAsync(_buffer.WrittenMemory, ct).ConfigureAwait(false);
-        await _body.FlushAsync(ct).ConfigureAwait(false);
+        await SendAsync(ct).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -72,20 +125,18 @@ public sealed class SseJsonWriter : IDisposable
     /// </summary>
     public async Task WriteEventAsync<T>(T dto, JsonSerializerOptions options, CancellationToken ct)
     {
-        _buffer.ResetWrittenCount();          // keep capacity — one buffer per connection
         _buffer.Write(DataPrefix);
         _json.Reset(_buffer);
         JsonSerializer.Serialize(_json, dto, options);
         _buffer.Write(FrameSuffix);
-        await _body.WriteAsync(_buffer.WrittenMemory, ct).ConfigureAwait(false);
-        await _body.FlushAsync(ct).ConfigureAwait(false);
+        await SendAsync(ct).ConfigureAwait(false);
     }
 
     /// <summary>Terminal <c>event: done</c> frame with an empty payload.</summary>
     public async Task WriteDoneAsync(CancellationToken ct)
     {
-        await _body.WriteAsync(DoneFrame, ct).ConfigureAwait(false);
-        await _body.FlushAsync(ct).ConfigureAwait(false);
+        _buffer.Write(DoneFrame);
+        await SendAsync(ct).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -116,7 +167,6 @@ public sealed class SseJsonWriter : IDisposable
     /// </param>
     public async Task WriteDoneAsync(bool complete, string reason, string? truncatedBy, CancellationToken ct)
     {
-        _buffer.ResetWrittenCount();
         _buffer.Write(DonePrefix);
         _json.Reset(_buffer);
         _json.WriteStartObject();
@@ -126,8 +176,7 @@ public sealed class SseJsonWriter : IDisposable
         _json.WriteEndObject();
         _json.Flush();
         _buffer.Write(FrameSuffix);
-        await _body.WriteAsync(_buffer.WrittenMemory, ct).ConfigureAwait(false);
-        await _body.FlushAsync(ct).ConfigureAwait(false);
+        await SendAsync(ct).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -145,7 +194,6 @@ public sealed class SseJsonWriter : IDisposable
     /// </param>
     public async Task WriteErrorAsync(string message, CancellationToken ct, string? truncatedBy = null)
     {
-        _buffer.ResetWrittenCount();
         _buffer.Write(ErrorPrefix);
         _json.Reset(_buffer);
         _json.WriteStartObject();
@@ -154,15 +202,14 @@ public sealed class SseJsonWriter : IDisposable
         _json.WriteEndObject();
         _json.Flush();
         _buffer.Write(FrameSuffix);
-        await _body.WriteAsync(_buffer.WrittenMemory, ct).ConfigureAwait(false);
-        await _body.FlushAsync(ct).ConfigureAwait(false);
+        await SendAsync(ct).ConfigureAwait(false);
     }
 
     /// <summary>Comment-only keepalive frame (ignored by EventSource clients).</summary>
     public async Task WriteKeepaliveAsync(CancellationToken ct)
     {
-        await _body.WriteAsync(KeepaliveFrame, ct).ConfigureAwait(false);
-        await _body.FlushAsync(ct).ConfigureAwait(false);
+        _buffer.Write(KeepaliveFrame);
+        await SendAsync(ct).ConfigureAwait(false);
     }
 
     public void Dispose() => _json.Dispose();
