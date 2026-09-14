@@ -7,7 +7,13 @@
 
   <ItemGroup>
     <PackageReference Include="MessagePack" Version="3.1.7" />
-    <PackageReference Include="Microsoft.AspNetCore.Http.Abstractions" Version="2.3.0" />
+    <!-- The shared framework, not the 2.3.0 NuGet package this used to compile against. The
+         package's HttpResponse predates PipeWriter, so the ingest reply could only be written
+         through a string; the project already RAN on the 10.0 assembly (same simple name, so
+         the runtime unified them) — it just could not see its surface. Safe to make transitive
+         here: the only consumers are Ameto.Otel, Ameto.Server and Ameto.Perf, and the first
+         two already carry this reference. -->
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
     <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="10.0.8" />
   </ItemGroup>
 

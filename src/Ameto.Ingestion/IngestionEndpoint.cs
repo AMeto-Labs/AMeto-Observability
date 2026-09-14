@@ -153,8 +153,9 @@ public sealed class IngestionEndpoint : IOtlpLogSink, LogEventSerializer.IClefBa
             // ── 2+3. Stream the MessagePack array straight into the ring ──────
             // No LogEvent per event: the batch reader hands each event over as spans
             // into bodyBuf, and TryIngestClef copies the property bytes into the ring
-            // slot. Malformed bodies are rejected as a whole before any event is
-            // enqueued (StreamBatch validates the structure first).
+            // slot. A body that is not a CLEF array is rejected before any event is
+            // seen; one that turns malformed part way through answers 400 with the
+            // intact prefix already ingested (see StreamBatch).
             int ingested = 0, dropped = 0;
             try
             {
@@ -174,14 +175,40 @@ public sealed class IngestionEndpoint : IOtlpLogSink, LogEventSerializer.IClefBa
             // ── 4. Response ───────────────────────────────────────────────────
             ctx.Response.StatusCode  = StatusCodes.Status200OK;
             ctx.Response.ContentType = "application/json";
-            await ctx.Response.WriteAsync(
-                $"{{\"ingested\":{ingested},\"dropped\":{dropped}}}",
-                ctx.RequestAborted);
+            WriteCountsJson(ctx.Response.BodyWriter, ingested, dropped);
+            await ctx.Response.BodyWriter.FlushAsync(ctx.RequestAborted);
         }
         finally
         {
             ArrayPool<byte>.Shared.Return(bodyBuf);
         }
+    }
+
+    /// <summary>
+    /// Writes <c>{"ingested":N,"dropped":M}</c> into the response buffer with no string in
+    /// between. The interpolated form allocated the formatted string, a char[] from the
+    /// handler, and then a UTF-8 transcode of it — ~300 B per request, for 30-odd bytes of
+    /// constant-shaped JSON. Both counts are non-negative ints, so the longest possible body
+    /// is well under the requested span.
+    /// </summary>
+    private static void WriteCountsJson(System.IO.Pipelines.PipeWriter writer, int ingested, int dropped)
+    {
+        const int MaxLen = 24 + 11 + 11; // 24 bytes of literals + two int32s at their widest
+        Span<byte> span = writer.GetSpan(MaxLen);
+        int pos = 0;
+
+        "{\"ingested\":"u8.CopyTo(span);
+        pos += 12;
+        System.Buffers.Text.Utf8Formatter.TryFormat(ingested, span[pos..], out int written);
+        pos += written;
+
+        ",\"dropped\":"u8.CopyTo(span[pos..]);
+        pos += 11;
+        System.Buffers.Text.Utf8Formatter.TryFormat(dropped, span[pos..], out written);
+        pos += written;
+
+        span[pos++] = (byte)'}';
+        writer.Advance(pos);
     }
 
     /// <summary>

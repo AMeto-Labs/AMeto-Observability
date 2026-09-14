@@ -130,6 +130,76 @@ public sealed class IngestPipelineOverheadProbe : IClassFixture<AmetoWebAppFacto
             $"  handler cost: {best - ctxNs,8:F0} ns   {bytes - ctxBytes,6:N0} B per request");
     }
 
+    /// <summary>
+    /// The two ways of producing the <c>{"ingested":N,"dropped":M}</c> reply, per request: the
+    /// interpolated string the endpoint used to hand to WriteAsync(string), and the
+    /// Utf8Formatter writes it now makes straight into the response buffer. The production
+    /// writer is private, so the shapes are reproduced here — the point is the technique, and
+    /// IngestResponseBodyTests pins that the real endpoint emits the same bytes.
+    /// </summary>
+    [Fact]
+    public void IngestReplyFormatting_CostPerRequest()
+    {
+        Span<byte> dest = stackalloc byte[64];
+
+        for (int i = 0; i < 1000; i++) { ViaString(dest, i, 0); ViaFormatter(dest, i, 0); }
+
+        const int iters  = 200_000;
+        const int rounds = 3;
+
+        long b0 = GC.GetAllocatedBytesForCurrentThread();
+        for (int i = 0; i < iters; i++) ViaString(dest, i, 0);
+        double strBytes = (GC.GetAllocatedBytesForCurrentThread() - b0) / (double)iters;
+
+        long b1 = GC.GetAllocatedBytesForCurrentThread();
+        for (int i = 0; i < iters; i++) ViaFormatter(dest, i, 0);
+        double fmtBytes = (GC.GetAllocatedBytesForCurrentThread() - b1) / (double)iters;
+
+        double strNs = double.MaxValue, fmtNs = double.MaxValue;
+        var sw = new Stopwatch();
+        for (int r = 0; r < rounds; r++)
+        {
+            sw.Restart();
+            for (int i = 0; i < iters; i++) ViaString(dest, i, 0);
+            sw.Stop();
+            strNs = Math.Min(strNs, sw.Elapsed.TotalNanoseconds / iters);
+
+            sw.Restart();
+            for (int i = 0; i < iters; i++) ViaFormatter(dest, i, 0);
+            sw.Stop();
+            fmtNs = Math.Min(fmtNs, sw.Elapsed.TotalNanoseconds / iters);
+        }
+
+        _out.WriteLine(
+            $"/api/events reply, one per request:\n" +
+            $"  interpolated string + transcode (before): {strBytes,5:F1} B  {strNs,5:F0} ns\n" +
+            $"  Utf8Formatter into the buffer   (after) : {fmtBytes,5:F1} B  {fmtNs,5:F0} ns");
+
+        Assert.Equal(0, fmtBytes);
+        Assert.True(strBytes > 0);
+    }
+
+    private static int ViaString(Span<byte> dest, int ingested, int dropped)
+    {
+        string s = $"{{\"ingested\":{ingested},\"dropped\":{dropped}}}";
+        return System.Text.Encoding.UTF8.GetBytes(s, dest);
+    }
+
+    private static int ViaFormatter(Span<byte> dest, int ingested, int dropped)
+    {
+        int pos = 0;
+        "{\"ingested\":"u8.CopyTo(dest);
+        pos += 12;
+        System.Buffers.Text.Utf8Formatter.TryFormat(ingested, dest[pos..], out int written);
+        pos += written;
+        ",\"dropped\":"u8.CopyTo(dest[pos..]);
+        pos += 11;
+        System.Buffers.Text.Utf8Formatter.TryFormat(dropped, dest[pos..], out written);
+        pos += written;
+        dest[pos++] = (byte)'}';
+        return pos;
+    }
+
     private static ByteArrayContent Batch()
     {
         var content = new ByteArrayContent([0x90]); // msgpack: empty array
