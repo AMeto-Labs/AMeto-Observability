@@ -1,4 +1,5 @@
 using System.Globalization;
+using Ameto.Storage;
 using Ameto.Core;
 using Ameto.Query.Filtering;
 
@@ -51,7 +52,10 @@ public sealed class AggregationResult
 /// million events — the branch that reports a truncated answer is the one that must not be
 /// taken on trust.
 /// </param>
-public sealed class AggregationExecutor(IQueryExecutor executor, int scanBudget = AggregationExecutor.MaxScanned)
+public sealed class AggregationExecutor(
+    IQueryExecutor executor,
+    int scanBudget = AggregationExecutor.MaxScanned,
+    Ameto.Storage.StorageEngine? headerScan = null)
 {
     /// <summary>
     /// Events one aggregation may read. A group-by has no natural stopping point — it is the
@@ -67,9 +71,15 @@ public sealed class AggregationExecutor(IQueryExecutor executor, int scanBudget 
         DateTimeOffset?    toUtc,
         CancellationToken  ct = default)
     {
+        // A shape the header scan can answer never reaches the event scan at all.
+        if (await TryHeaderCountAsync(query, fromUtc, toUtc, ct).ConfigureAwait(false) is { } headerAnswer)
+            return headerAnswer;
+
         var keys  = query.Keys;
         var aggs  = query.Aggregates;
         var groups = new Dictionary<string, Accumulator>(StringComparer.Ordinal);
+        var byComposite = groups.GetAlternateLookup<ReadOnlySpan<char>>();
+        var keyBuilder  = new GroupKeyBuilder(keys);
 
         long scanned      = 0;
         bool hitScanCap   = false;
@@ -113,15 +123,16 @@ public sealed class AggregationExecutor(IQueryExecutor executor, int scanBudget 
             if (scanned == scanBudget) { hitScanCap = true; break; }
             scanned++;
 
-            // The key is built before the lookup so a group that already exists costs one
-            // dictionary probe and no allocation beyond the joined string itself.
-            var (composite, parts) = BuildKey(ev, keys);
+            // The key is built before the lookup, and probed as a SPAN, so a group that already
+            // exists — which is the overwhelmingly common case — costs one dictionary probe and
+            // no allocation at all.
+            keyBuilder.Build(ev);
 
-            if (!groups.TryGetValue(composite, out var acc))
+            if (!byComposite.TryGetValue(keyBuilder.Composite, out var acc))
             {
                 if (groups.Count >= AggregationParser.MaxGroups) { hitGroupCap = true; continue; }
-                acc = new Accumulator(parts, aggs.Count);
-                groups.Add(composite, acc);
+                acc = new Accumulator(keyBuilder.TakeParts(), aggs.Count);
+                groups.Add(new string(keyBuilder.Composite), acc);
             }
             acc.Add(ev, aggs);
         }
@@ -130,12 +141,9 @@ public sealed class AggregationExecutor(IQueryExecutor executor, int scanBudget 
 
         bool timedOut = ct.IsCancellationRequested;
 
-        var rows = groups.Values
-            .Select(a => new AggregationRow { Key = a.Key, Values = a.Snapshot(aggs) })
-            .OrderByDescending(r => r.Values.Length > 0 ? r.Values[0] ?? double.MinValue : 0d)
-            .ThenBy(r => string.Concat(r.Key), StringComparer.Ordinal)
-            .Take(query.Limit)
-            .ToArray();
+        var rows = OrderAndLimit(
+            groups.Values.Select(a => new AggregationRow { Key = a.Key, Values = a.Snapshot(aggs) }),
+            query.Limit);
 
         string? reason =
             timedOut    ? "the query ran out of time — narrow the window or the filter" :
@@ -156,25 +164,232 @@ public sealed class AggregationExecutor(IQueryExecutor executor, int scanBudget 
     }
 
     /// <summary>
-    /// The group's identity, as one string for the dictionary and as its parts for the row.
-    /// A scalar aggregation has a single empty key, so it takes the same path as everything
-    /// else rather than a branch of its own.
+    /// Biggest first, ties broken by the key so the answer is stable, then the caller's limit.
+    /// ONE spelling of the row order, shared by the scan and the header scan — two orderings
+    /// that were meant to agree would eventually stop agreeing.
     /// </summary>
-    private static (string Composite, string?[] Parts) BuildKey(LogEvent ev, IReadOnlyList<GroupKeySpec> keys)
+    private static AggregationRow[] OrderAndLimit(IEnumerable<AggregationRow> rows, int limit) =>
+        rows.OrderByDescending(r => r.Values.Length > 0 ? r.Values[0] ?? double.MinValue : 0d)
+            .ThenBy(r => string.Concat(r.Key), StringComparer.Ordinal)
+            .Take(limit)
+            .ToArray();
+
+    // ── The header-only shortcut ──────────────────────────────────────────────
+
+    /// <summary>What the header scan can be asked to group by.</summary>
+    private enum HeaderGrouping { None, Service, Level }
+
+    /// <summary>
+    /// Answers a <c>count(*)</c> whose grouping and where-clause live entirely in the event
+    /// HEADER, without materialising a single <see cref="LogEvent"/>.
+    ///
+    /// <para><c>select count(*) group by ['service.name']</c> over a wide window used to run the
+    /// full ordered k-way merge — every event decoded, its properties copied, its exception
+    /// rebuilt — to look at three columns. The header aggregator behind
+    /// <c>/api/events/counts</c> already reads exactly those three columns, in parallel across
+    /// segments, and the alert evaluator already trusts <c>TryGetHeaderOnlyShape</c> to say when
+    /// a filter is expressible that way. This routes the aggregation down the same road.</para>
+    ///
+    /// <para>DELIBERATELY NARROW; anything unrecognised returns null and the ordinary scan runs.
+    /// Every aggregate must be <c>count(*)</c>, there must be at most one group key and it must
+    /// be <c>service.name</c> or <c>@l</c>, and the filter must reduce to a header-only shape
+    /// (which excludes any <c>@t</c> bound — those compile to a TimeCompareNode, which that
+    /// shape rejects). A level constraint combined with grouping BY SERVICE is also declined:
+    /// the aggregator keeps per-service totals and per-level totals, never the cross product,
+    /// so there is no honest way to narrow one by the other.</para>
+    ///
+    /// <para>TWO DIFFERENCES FROM THE SCAN PATH, both deliberate and both in the direction of a
+    /// better answer. First, this path reads the WHOLE window rather than the newest
+    /// <see cref="MaxScanned"/> events, so a window that the scan would have reported as
+    /// partial comes back complete — and it genuinely is. Second, the aggregator cannot tell an
+    /// event with no <c>service.name</c> from one whose service is literally named
+    /// <c>(unknown)</c>; both are reported as ABSENT, which is what <c>/api/events/counts</c>
+    /// has always done with them. A service actually called "(unknown)" is the one input on
+    /// which the two roads disagree.</para>
+    /// </summary>
+    private async Task<AggregationResult?> TryHeaderCountAsync(
+        AggregationQuery query, DateTimeOffset? fromUtc, DateTimeOffset? toUtc, CancellationToken ct)
     {
-        if (keys.Count == 0) return ("", []);
+        if (headerScan is null) return null;
 
-        var parts = new string?[keys.Count];
-        for (int i = 0; i < keys.Count; i++)
-            parts[i] = Stringify(FilterEvaluator.ReadProperty(ev, keys[i].Property));
+        var aggs = query.Aggregates;
+        if (aggs.Count == 0) return null;
+        for (int i = 0; i < aggs.Count; i++)
+            if (aggs[i].Kind != AggregateKind.Count || aggs[i].Property is not null) return null;
 
-        // Joined with the control characters the path encoding already relies on being absent
-        // from msgpack keys and values: U+0001 between parts, so two keys ['a','b'] and
-        // ['ab'] stay different groups, and U+0002 for a value the event did not carry, so
-        // "absent" does not merge with the group whose value is genuinely the empty string.
-        return (string.Join(PropertyPath.Separator,
-                            parts.Select(static p => p ?? PropertyPath.IndexMarker.ToString())),
-                parts);
+        var keys = query.Keys;
+        if (keys.Count > 1) return null;
+
+        var grouping = HeaderGrouping.None;
+        if (keys.Count == 1)
+        {
+            if (!BuiltinFields.TryResolve(keys[0].Property, out var field)) return null;
+            grouping = field switch
+            {
+                BuiltinField.ServiceName => HeaderGrouping.Service,
+                BuiltinField.Level       => HeaderGrouping.Level,
+                _                        => HeaderGrouping.None,
+            };
+            if (grouping == HeaderGrouping.None) return null;   // some other key: not a header question
+        }
+
+        HashSet<LogLevel>? levels;
+        string?            service;
+        try
+        {
+            if (!CompiledFilter.Compile(query.FilterText).TryGetHeaderOnlyShape(out levels, out service))
+                return null;
+        }
+        catch { return null; }     // a filter that will not compile is the scan path's error to report
+
+        if (levels is not null && grouping == HeaderGrouping.Service) return null;
+
+        LogVolumeCounts counts;
+        try
+        {
+            // nBuckets = 1 with a one-second axis: every in-window event lands OUTSIDE the
+            // single column, which is exactly right here — the aggregator counts totals before
+            // it considers the axis, so the totals are exact and the per-bucket arrays (which
+            // this path never reads) stay one long each.
+            counts = await headerScan.AggregateLogVolumeAsync(
+                fromUtc ?? DateTimeOffset.MinValue,
+                toUtc   ?? DateTimeOffset.MaxValue,
+                minBucket: 0, bucketSeconds: 1, nBuckets: 1,
+                serviceFilter: service, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) { return null; }   // the scan path reports the timeout
+
+        var rows = new List<AggregationRow>();
+        switch (grouping)
+        {
+            case HeaderGrouping.Service:
+                foreach (var s in counts.Services)
+                {
+                    if (s.Count == 0) continue;
+                    rows.Add(Row([s.Name == UnknownServiceName ? null : s.Name], s.Count, aggs.Count));
+                }
+                break;
+
+            case HeaderGrouping.Level:
+                foreach (var l in counts.Levels)
+                {
+                    if (levels is not null &&
+                        (!LogLevelExtensions.TryParse(l.Name, out var parsed) || !levels.Contains(parsed)))
+                        continue;
+                    rows.Add(Row([l.Name], l.Count, aggs.Count));
+                }
+                break;
+
+            default:
+            {
+                // One row, even when the answer is zero — the same guarantee the scan path
+                // makes by seeding its single group up front.
+                long total = counts.Total;
+                if (levels is not null)
+                {
+                    total = 0;
+                    foreach (var l in counts.Levels)
+                        if (LogLevelExtensions.TryParse(l.Name, out var parsed) && levels.Contains(parsed))
+                            total += l.Count;
+                }
+                rows.Add(Row([], total, aggs.Count));
+                break;
+            }
+        }
+
+        bool hitGroupCap = rows.Count > AggregationParser.MaxGroups;
+        if (hitGroupCap) rows.RemoveRange(AggregationParser.MaxGroups, rows.Count - AggregationParser.MaxGroups);
+
+        return new AggregationResult
+        {
+            KeyColumns    = keys.Select(k => k.Alias).ToArray(),
+            ValueColumns  = aggs.Select(a => a.Alias).ToArray(),
+            Rows          = OrderAndLimit(rows, query.Limit),
+            Scanned       = counts.Scanned,
+            GroupsFound   = rows.Count,
+            Partial       = hitGroupCap,
+            PartialReason = hitGroupCap
+                ? $"more than {AggregationParser.MaxGroups:N0} distinct groups — group by something coarser"
+                : null,
+        };
+
+        static AggregationRow Row(string?[] key, long count, int columns)
+        {
+            var values = new double?[columns];
+            for (int i = 0; i < columns; i++) values[i] = count;   // every column is count(*)
+            return new AggregationRow { Key = key, Values = values };
+        }
+    }
+
+    /// <summary>
+    /// What <c>LogVolumeAggregator</c> calls an event with no service name. Spelled here rather
+    /// than referenced because it is a presentation choice of the counts endpoint, and this
+    /// path has to translate it back into the absence the aggregation reports.
+    /// </summary>
+    private const string UnknownServiceName = "(unknown)";
+
+    /// <summary>
+    /// The group's identity, built ONCE per event into reusable storage.
+    ///
+    /// <para>The composite used to be a <c>string.Join</c> over a LINQ <c>Select</c> over a
+    /// fresh <c>string?[]</c>, with a <c>char.ToString()</c> for every absent part — three to
+    /// four heap objects per event, for a lookup that almost always finds a group that already
+    /// exists. Here the parts land in a buffer owned by the aggregation, the composite is
+    /// written into a second one, and the dictionary is probed through its span alternate
+    /// lookup; nothing is allocated until a group is genuinely NEW, and then exactly once.</para>
+    ///
+    /// <para>The encoding is unchanged and load-bearing: the control characters the path
+    /// encoding already relies on being absent from msgpack keys and values — U+0001 between
+    /// parts, so <c>['a','b']</c> and <c>['ab']</c> stay different groups, and U+0002 for a
+    /// value the event did not carry, so "absent" does not merge with the group whose value is
+    /// genuinely the empty string.</para>
+    /// </summary>
+    private sealed class GroupKeyBuilder
+    {
+        private readonly IReadOnlyList<GroupKeySpec> _keys;
+        private readonly string?[] _parts;
+        private char[] _buffer = new char[256];
+        private int    _length;
+
+        public GroupKeyBuilder(IReadOnlyList<GroupKeySpec> keys)
+        {
+            _keys  = keys;
+            _parts = keys.Count == 0 ? [] : new string?[keys.Count];
+        }
+
+        /// <summary>The composite key of the event last passed to <see cref="Build"/>.</summary>
+        public ReadOnlySpan<char> Composite => _buffer.AsSpan(0, _length);
+
+        public void Build(LogEvent ev)
+        {
+            _length = 0;
+            if (_keys.Count == 0) return;
+
+            for (int i = 0; i < _keys.Count; i++)
+                _parts[i] = Stringify(FilterEvaluator.ReadProperty(ev, _keys[i].Property));
+
+            int needed = _keys.Count - 1;                       // the separators
+            for (int i = 0; i < _parts.Length; i++)
+                needed += _parts[i]?.Length ?? 1;                // absent renders as one marker char
+            if (needed > _buffer.Length)
+                _buffer = new char[Math.Max(needed, _buffer.Length * 2)];
+
+            var dest = _buffer.AsSpan();
+            int at = 0;
+            for (int i = 0; i < _parts.Length; i++)
+            {
+                if (i > 0) dest[at++] = PropertyPath.Separator;
+                if (_parts[i] is { } p) { p.CopyTo(dest[at..]); at += p.Length; }
+                else                      dest[at++] = PropertyPath.IndexMarker;
+            }
+            _length = at;
+        }
+
+        /// <summary>
+        /// The parts of the current key, copied out for a group that is being created. The
+        /// working array is reused for the next event, so the accumulator cannot hold it.
+        /// </summary>
+        public string?[] TakeParts() => _keys.Count == 0 ? [] : (string?[])_parts.Clone();
     }
 
     /// <summary>

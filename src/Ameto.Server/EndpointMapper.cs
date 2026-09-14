@@ -173,6 +173,7 @@ public static class EndpointMapper
         app.MapGet("/api/events/aggregate", async (
             HttpContext    ctx,
             IQueryExecutor executor,
+            StorageEngine  storage,
             QueryGuard     guard,
             ILoggerFactory loggerFactory,
             string?        filter = null,
@@ -210,7 +211,7 @@ public static class EndpointMapper
                 using var deadline = guard.StartDeadline(ctx.RequestAborted);
                 try
                 {
-                    var result = await new Ameto.Query.AggregationExecutor(executor)
+                    var result = await new Ameto.Query.AggregationExecutor(executor, headerScan: storage)
                         .ExecuteAsync(query, fromBnd, toBound, deadline.Token);
 
                     var rows = new AggregationRowDto[result.Rows.Count];
