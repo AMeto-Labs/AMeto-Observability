@@ -310,9 +310,27 @@ if (serverOptions.TrustForwardedHeaders)
 if (!basePath.IsRoot) app.UsePathBase(basePath.PathBase);
 app.UseRouting();
 
-app.UseRateLimiter();
-app.UseAuthentication();
-app.UseAuthorization();
+// Auth runs for the whole application EXCEPT the telemetry receivers. On an ingest POST the
+// JwtBearer handler had nothing to do and still did it: an ActivatorUtilities-built handler
+// instance, InitializeAsync, a logger from the factory (which takes a lock), the
+// OnMessageReceived event, and finally NoResult — a couple of KB and a few microseconds per
+// request, ahead of the endpoint's own ApiKeyCache check, which is the check that actually
+// decides. At 100k events/s in 1000-event batches that is the whole auth stack running 100
+// times a second for no result.
+//
+// The endpoint's API-key check is untouched and still rejects: the bypass skips the JWT
+// middleware, not authorisation. The predicate is deliberately exact — a path that is NOT an
+// ingest route but slipped through would reach an endpoint carrying authorization metadata,
+// and ASP.NET Core throws rather than serving it.
+//
+// GET /api/events is the SSE search and shares its path with the CLEF ingest POST, so the
+// method is part of the match.
+app.UseWhen(static ctx => !IngestRoutes.IsIngestRequest(ctx), static branch =>
+{
+    branch.UseRateLimiter();
+    branch.UseAuthentication();
+    branch.UseAuthorization();
+});
 // The SPA entry document is the one file whose bytes depend on configuration, so it does not
 // come from the static-file middleware — see SpaIndex. This also replaces UseDefaultFiles,
 // whose only job here was mapping "/" to it.
@@ -407,3 +425,46 @@ app.Run();
 
 // Make the implicit Program class accessible to integration tests
 public partial class Program { }
+
+/// <summary>
+/// The telemetry receiver paths, and nothing else. Used to keep the authentication /
+/// authorization / rate-limiter stack off the ingest hot path, where it produces no result the
+/// endpoint then uses — each receiver validates its own API key through
+/// <c>ApiKeyCache</c>.
+///
+/// <para>Matching is by WHOLE path plus method. Substring or prefix matching here would hand a
+/// customer's own route the same bypass; an exact list cannot. The deployment prefix
+/// (<c>Ameto:BasePath</c>) is already stripped by <c>UsePathBase</c>, which runs above this.</para>
+/// </summary>
+internal static class IngestRoutes
+{
+    private static readonly string[] Paths =
+    [
+        "/api/events",
+        "/otlp/v1/logs", "/otlp/v1/traces", "/otlp/v1/metrics",
+        "/v1/logs",      "/v1/traces",      "/v1/metrics",
+    ];
+
+    /// <summary>The single segment every OTLP/gRPC Export method path begins with.</summary>
+    private const string GrpcPrefix = "/opentelemetry.proto.collector";
+
+    public static bool IsIngestRequest(HttpContext ctx)
+    {
+        // Every receiver is a POST. GET /api/events is the SSE search and must keep its user
+        // authentication; so must every other read route that happens to share a path.
+        if (!HttpMethods.IsPost(ctx.Request.Method)) return false;
+
+        string? path = ctx.Request.Path.Value;
+        if (string.IsNullOrEmpty(path)) return false;
+
+        // A gRPC method path is one long segment ("/opentelemetry.proto.collector.logs.v1.
+        // LogsService/Export"), so this prefix cannot overlap a segment-shaped route.
+        if (path.StartsWith(GrpcPrefix, StringComparison.OrdinalIgnoreCase)) return true;
+
+        foreach (string candidate in Paths)
+            if (path.Equals(candidate, StringComparison.OrdinalIgnoreCase))
+                return true;
+
+        return false;
+    }
+}
