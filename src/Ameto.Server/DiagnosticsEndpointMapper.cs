@@ -129,7 +129,7 @@ public static class DiagnosticsEndpointMapper
                 // against its budget, not what the .seg sections weigh on disk.
                 indexCacheEntries      = indexCache.EntryCount,
                 indexCacheBytes        = indexCache.TotalBytes,
-                indexCacheBudgetBytes  = options.Query.IndexCacheBytes,
+                indexCacheBudgetBytes  = options.Query.EffectiveIndexCacheBytes,
                 indexCacheHits         = indexCache.HitCount,
                 indexCacheMisses       = indexCache.MissCount,
                 indexCacheIdleEvicted  = indexCache.IdleEvictedCount,

@@ -194,17 +194,18 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     private const long IndexBuildBytesPerEvent = 1_400;
 
     /// <summary>
-    /// Ceiling on managed index-build state across all concurrent flushes. At the default
-    /// 64 MB tier (131,072 events ⇒ ~184 MB per build) this yields a width of 3 — enough to
-    /// stay ahead of ingest (a tier fills in ~0.9 s at 150k events/s, a build takes ~1.3 s,
-    /// so 3 in flight clears one every ~0.44 s) while capping the burst near 550 MB instead
-    /// of the 8 × 300 MB the old core-count heuristic allowed. Override with
-    /// <c>HotTier.FlushConcurrency</c> when trading RAM for throughput deliberately.
+    /// Ceilings on managed index-build state and on native frozen-tier memory, derived once at
+    /// construction from what this process may actually use — see <see cref="MemoryBudgets"/>.
+    ///
+    /// <para>On a host with room they are the constants they always were: 640 MB of concurrent
+    /// builds, which at the default 64 MB tier (131,072 events ⇒ ~184 MB per build) yields a
+    /// width of 3 — enough to stay ahead of ingest (a tier fills in ~0.9 s at 150k events/s, a
+    /// build takes ~1.3 s, so 3 in flight clears one every ~0.44 s) — and 512 MB of frozen
+    /// tiers. On a 512 MB host they become 153 MB and 128 MB, which is the difference between
+    /// back-pressure and an OOM kill. Override the width with <c>HotTier.FlushConcurrency</c>
+    /// when trading RAM for throughput deliberately.</para>
     /// </summary>
-    private const long FlushManagedBudgetBytes = 640L * 1024 * 1024;
-
-    /// <summary>Ceiling on native memory held by frozen-but-not-yet-persisted tiers.</summary>
-    private const long FlushNativeBudgetBytes = 512L * 1024 * 1024;
+    private readonly MemoryBudgets _budgets = MemoryBudgets.Current();
     /// <summary>
     /// Window anchors that produced no usable merge batch — excluded so the sweep advances
     /// (reset on restart). Keyed by <see cref="SegmentKey"/> for the same reason the catalog is:
@@ -397,7 +398,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         int  eventCapacity  = HotTierSegment.EventCapacityFor(Math.Max(1, _options.HotTier.MaxSizeBytes));
         long perFlushManaged = Math.Max(1L, (long)eventCapacity * IndexBuildBytesPerEvent);
 
-        int widthByMemory = (int)Math.Clamp(FlushManagedBudgetBytes / perFlushManaged, 1, 64);
+        int widthByMemory = (int)Math.Clamp(_budgets.ManagedBuildBytes / perFlushManaged, 1, 64);
         int flushWidth = _options.HotTier.FlushConcurrency > 0
             ? Math.Min(_options.HotTier.FlushConcurrency, 64)
             : Math.Clamp(Math.Min(Environment.ProcessorCount / 2, widthByMemory), 1, 8);
@@ -407,7 +408,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         // The previous 1.4 × MaxSizeBytes estimate under-counted by up to 17x on small
         // events, so the "1 GB" budget it computed could hold multiple GB in practice.
         // Floored at the flush width so every concurrent flush can still hold a slot.
-        int flushSlots = Math.Clamp((int)(FlushNativeBudgetBytes / tierFootprint), flushWidth, 64);
+        int flushSlots = Math.Clamp((int)(_budgets.NativeTierBytes / tierFootprint), flushWidth, 64);
         _flushSlots = new SemaphoreSlim(flushSlots, flushSlots);
 
         // Report the ceilings these settings actually produce, not just the inputs — an
@@ -418,24 +419,31 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
         _logger.LogInformation(
             "Flush budgets: width={Width} (×{PerFlush} MB managed = {ManagedCeiling} MB), " +
-            "slots={Slots} (×{Tier} MB native = {NativeCeiling} MB), tier={Events} events / {Payload} MB payload",
+            "slots={Slots} (×{Tier} MB native = {NativeCeiling} MB), tier={Events} events / {Payload} MB payload; " +
+            "derived from {Available} MB available: managed≤{ManagedBudget} MB, native≤{NativeBudget} MB, " +
+            "index cache≤{CacheBudget} MB ({Source})",
             flushWidth, perFlushManaged / 1048576, managedCeiling / 1048576,
             flushSlots, tierFootprint / 1048576, nativeCeiling / 1048576,
-            eventCapacity, _options.HotTier.MaxSizeBytes / 1048576);
+            eventCapacity, _options.HotTier.MaxSizeBytes / 1048576,
+            _budgets.AvailableBytes / 1048576,
+            _budgets.ManagedBuildBytes / 1048576,
+            _budgets.NativeTierBytes / 1048576,
+            _budgets.IndexCacheBytes / 1048576,
+            _budgets.IsConstrained ? "host-constrained" : "fixed ceilings");
 
         // Both clamps are floored so at least one flush can always proceed. That floor
         // WINS over the budget: at a large MaxSizeBytes a single tier no longer fits, and
         // the engine quietly runs above the ceiling rather than refusing to start. The
         // budget is a target, not a guarantee — say so instead of letting the line above
         // read like one.
-        if (perFlushManaged > FlushManagedBudgetBytes || tierFootprint > FlushNativeBudgetBytes)
+        if (perFlushManaged > _budgets.ManagedBuildBytes || tierFootprint > _budgets.NativeTierBytes)
             _logger.LogWarning(
                 "A single flush of a {Payload} MB tier ({PerFlush} MB managed + {Tier} MB native) does not fit " +
                 "the flush budget ({ManagedBudget} MB managed / {NativeBudget} MB native). One flush must always " +
                 "be allowed to run, so these budgets cannot be honoured at this tier size — peak RAM will exceed " +
                 "them. Lower HotTier.MaxSizeBytes to bring the peak down.",
                 _options.HotTier.MaxSizeBytes / 1048576, perFlushManaged / 1048576, tierFootprint / 1048576,
-                FlushManagedBudgetBytes / 1048576, FlushNativeBudgetBytes / 1048576);
+                _budgets.ManagedBuildBytes / 1048576, _budgets.NativeTierBytes / 1048576);
         _idGen    = new EventIdGenerator(_options.NodeId);
         _dataDir  = _options.DataDirectory;
         _walDir   = Path.Combine(_dataDir, "wal");

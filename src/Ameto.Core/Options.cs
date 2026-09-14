@@ -180,9 +180,18 @@ public sealed class QueryOptions
     /// entry's RETAINED size (expanded postings + dictionaries + bloom bits — several
     /// times the packed sections they decode from). Zero or negative disables it —
     /// every query then re-reads and re-decodes the sections it consults, the
-    /// pre-cache behaviour. Default: 256 MB.
+    /// pre-cache behaviour.
+    ///
+    /// <para>Unset (the default) derives it from memory this process may use:
+    /// <c>min(256 MB, 15 % of available)</c> — see <see cref="MemoryBudgets"/>. The flat
+    /// 256 MB this replaces was half of a 512 MB host on its own, before the engine's own
+    /// tiers and index builds asked for anything. An explicit value always wins, including
+    /// a value larger than the derived one.</para>
     /// </summary>
-    public long IndexCacheBytes { get; init; } = 256 * 1024 * 1024;
+    public long? IndexCacheBytes { get; init; }
+
+    /// <summary>The configured budget, or the one derived from available memory when unset.</summary>
+    public long EffectiveIndexCacheBytes => IndexCacheBytes ?? MemoryBudgets.Current().IndexCacheBytes;
 
     /// <summary>
     /// Drop cached segment indexes that no query has read for this long. Without it the only

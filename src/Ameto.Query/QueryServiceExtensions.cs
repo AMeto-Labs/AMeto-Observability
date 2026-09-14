@@ -15,7 +15,7 @@ public static class QueryServiceExtensions
         services.AddSingleton(static sp =>
         {
             var q = sp.GetRequiredService<IOptions<ServerOptions>>().Value.Query;
-            return new SegmentIndexCache(q.IndexCacheBytes, q.IndexCacheIdleEvict);
+            return new SegmentIndexCache(q.EffectiveIndexCacheBytes, q.IndexCacheIdleEvict);
         });
         services.AddSingleton<IQueryExecutor, QueryExecutor>();
         return services;
