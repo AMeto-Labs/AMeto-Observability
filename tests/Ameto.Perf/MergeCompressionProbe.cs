@@ -188,6 +188,90 @@ public sealed class MergeCompressionProbe : IDisposable
     }
 
     /// <summary>
+    /// What <see cref="LZ4Codec.Encode"/> costs a block BEFORE it looks at the block — i.e. the
+    /// compression context it builds and throws away on every call.
+    ///
+    /// <para>READ OUT OF K4os.Compression.LZ4 1.3.8's IL, not guessed. <c>LZ4Codec.Encode</c>
+    /// dispatches to <c>LLxx.LZ4_compress_fast</c> or <c>LLxx.LZ4_compress_HC</c>:</para>
+    /// <list type="bullet">
+    /// <item>FAST — <c>LL64.LZ4_compress_fast</c> is 15 bytes of IL and allocates NOTHING. Its
+    /// <c>LZ4_stream_t</c> (16 424 B: a 4096-entry hash table) is a LOCAL, so it is the method's
+    /// own stack frame, zeroed by <c>.locals init</c> and again by <c>LZ4_initStream</c>.</item>
+    /// <item>HC — <c>LL64.LZ4_compress_HC</c> calls <c>PinnedMemory.Alloc</c> /
+    /// <c>PinnedMemory.Free</c> around <c>LZ4_compress_HC_extStateHC</c> for an
+    /// <c>LZ4_streamHC_t</c> of 262 192 B (a 32 k hash table plus a 64 k chain table). That is
+    /// NOT a fresh allocation per call: 262 192 &lt; <c>PinnedMemory.MaxPooledSize</c>
+    /// (1 048 576), so it is rented from an <c>ArrayPool</c>-backed pinned buffer pool and
+    /// returned — measured at 0 managed bytes per call. What is paid every call is the ZEROING:
+    /// <c>LZ4_initStreamHC</c> memsets all 262 KB.</item>
+    /// </list>
+    ///
+    /// <para>NOT FIXABLE FROM OUTSIDE THE PACKAGE, and not worth fixing anyway. The reusable
+    /// entry point (<c>LZ4_compress_HC_extStateHC</c>, which takes the caller's state) is on the
+    /// internal <c>Engine.LL64</c>. The public encoders do not help: <c>LZ4BlockEncoder</c>, the
+    /// block-INDEPENDENT one, is 17 bytes of IL that call straight back into
+    /// <c>LZ4Codec.Encode</c>; the ones that do hold a context across blocks
+    /// (<c>LZ4FastChainEncoder</c>, <c>LZ4HighChainEncoder</c>, <c>Pubternal.CompressFast</c>)
+    /// use the <c>_continue</c> family, whose output references the PREVIOUS block. A segment's
+    /// blocks are decoded individually and out of order — the block index seeks straight to one
+    /// — so chained output would not be the same format, and the whole point of the block frame
+    /// is that it is self-contained.</para>
+    ///
+    /// <para>MEASURED here, per call and against a real block of this probe's own payload:
+    /// ~2 µs at L00 (4.5 % of a 62 KB block) and ~16 µs at L06_HC (1.3 % of the same block,
+    /// because HC spends 1.2 ms on it). Both allocate 0 managed bytes. In the quantities that
+    /// matter: the FLUSH path is L00 over ~1000 blocks a 64 MB tier ⇒ ~2 ms per flush, against
+    /// a flush whose index build alone is ~1.3 s; the MERGE path is L06 over 288 blocks in
+    /// <see cref="HcCostsAMinorityOfAMergeAndTheFileKeepsIt"/> ⇒ ~5 ms of a 1452 ms merge, 0.3 %.
+    /// The recon that raised this estimated ~10 % of HC time; measured, it is a fraction of
+    /// that, and there is no supported way to remove it in any case.</para>
+    /// </summary>
+    [Fact]
+    public void TheCodecRebuildsItsContextPerBlock_AndThatIsAffordable()
+    {
+        var outBuf = new byte[LZ4Codec.MaximumOutputSize(256 * 1024)];
+
+        // A 64-byte input, so the compression itself is nothing and what remains is the call's
+        // fixed cost: obtaining the context and zeroing it.
+        var tiny = new byte[64];
+        new Random(1).NextBytes(tiny);
+
+        _out.WriteLine("  fixed per-call cost (64-byte input) and its share of one of the writer's blocks");
+        var blocks = BlockPayloads(eventsPerSource: 2_000, Shape.IdDense);
+        byte[] block = blocks[blocks.Count / 2];
+
+        foreach (var (name, level) in new[] { ("L00_FAST", LZ4Level.L00_FAST), ("L06_HC", LZ4Level.L06_HC) })
+        {
+            for (int i = 0; i < 2_000; i++) LZ4Codec.Encode(tiny, 0, tiny.Length, outBuf, 0, outBuf.Length, level);
+
+            const int N = 20_000;
+            long allocBefore = GC.GetAllocatedBytesForCurrentThread();
+            var sw = Stopwatch.StartNew();
+            for (int i = 0; i < N; i++) LZ4Codec.Encode(tiny, 0, tiny.Length, outBuf, 0, outBuf.Length, level);
+            sw.Stop();
+            double fixedNs = sw.Elapsed.TotalMilliseconds * 1e6 / N;
+            double allocPerCall = (GC.GetAllocatedBytesForCurrentThread() - allocBefore) / (double)N;
+
+            int reps = level == LZ4Level.L00_FAST ? 2_000 : 300;
+            for (int i = 0; i < 20; i++) LZ4Codec.Encode(block, 0, block.Length, outBuf, 0, outBuf.Length, level);
+            sw.Restart();
+            for (int i = 0; i < reps; i++) LZ4Codec.Encode(block, 0, block.Length, outBuf, 0, outBuf.Length, level);
+            sw.Stop();
+            double blockNs = sw.Elapsed.TotalMilliseconds * 1e6 / reps;
+
+            _out.WriteLine($"    {name,-8} fixed {fixedNs / 1000.0,7:F1} µs   block ({block.Length / 1024} KB) "
+                         + $"{blockNs / 1000.0,8:F1} µs   ⇒ {100 * fixedNs / blockNs,5:F1} % of a block   "
+                         + $"managed {allocPerCall:F0} B/call");
+
+            // The context is pooled, not allocated. A regression here (a K4os upgrade that stops
+            // pooling, or a level whose context outgrows MaxPooledSize) turns every block into a
+            // quarter-megabyte of native allocation, which is the thing worth noticing.
+            Assert.True(allocPerCall < 1.0,
+                $"{name} allocates {allocPerCall:F0} managed B per Encode call — the codec context is no longer pooled");
+        }
+    }
+
+    /// <summary>
     /// Where a merged file's bytes actually are — and therefore why a 13-27 % smaller payload is
     /// a 2.5-2.8 % smaller file. HC compresses BLOCKS; the inverted, trigram and bloom sections
     /// go to disk exactly as the index builder serialised them, and they are the majority of a
