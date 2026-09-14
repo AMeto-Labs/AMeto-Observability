@@ -224,10 +224,14 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
 
     private int NewTerm(int prop, ReadOnlySpan<byte> value, uint hash)
     {
+        // Append first: nothing about the entry is published until every part of it exists, so
+        // a throw here (out of memory is the only one left) leaves no half-initialised entry
+        // for a rehash to read.
+        int off = Append(value);
         if (_termCount == _terms.Length) Grow(ref _terms, _termCount);
         int id = _termCount++;
         ref var e = ref _terms[id];
-        e.Off  = Append(value);
+        e.Off  = off;
         e.Len  = value.Length;
         e.Prop = prop;
         e.Next = -1;
@@ -307,7 +311,10 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
     /// <summary>Copies <paramref name="bytes"/> into the slabs and returns its offset.</summary>
     private int Append(ReadOnlySpan<byte> bytes)
     {
-        if (_slabUsed + bytes.Length > SlabBytes)
+        // The second test is for an EMPTY term against a full slab: the sum test alone lets it
+        // through and names offset SlabBytes of the current slab, i.e. position 0 of a slab that
+        // may not exist. An empty key or value is a legal term (the old build filed "").
+        if (_slabUsed + bytes.Length > SlabBytes || _slabUsed == SlabBytes)
         {
             // A term longer than a slab (only reachable if the ingest payload cap is raised past
             // 1 MB) gets a slab of its own at position 0, which the offset scheme still names.

@@ -128,6 +128,56 @@ public sealed class SegmentInvertedBuildParityTests
         Assert.Equal(small.TermCount, big.TermCount);
     }
 
+    // ── Empty terms: a legal value and a legal key, at every slab position ──────
+
+    [Fact]
+    public void EmptyValue_AsTheVeryFirstTerm_IsFiled()
+    {
+        var adds = new List<(uint, string, object?)> { (0u, "k", ""), (1u, "k", "v"), (1u, "k", "") };
+        Assert.Equal(Reference(adds), Arena(adds));
+        var idx = new SegmentInvertedIndex();
+        foreach (var (o, p, v) in adds) idx.Add(o, p, v);
+        Assert.Equal([0u, 1u], idx.Lookup("k", "")!);
+    }
+
+    [Fact]
+    public void EmptyKey_AsTheVeryFirstProperty_IsFiled()
+    {
+        var idx = new SegmentInvertedIndex();
+        idx.AddUtf8(0, ""u8, "v"u8);          // the property NAME is the first thing appended
+        idx.AddUtf8(1, ""u8, ""u8);
+        var adds = new List<(uint, string, object?)> { (0u, "", "v"), (1u, "", "") };
+        Assert.Equal(Reference(adds), idx.Serialise());
+    }
+
+    [Fact]
+    public void EmptyTerm_ExactlyAtASlabBoundary_DoesNotNameTheNextSlab()
+    {
+        // Fill the first 1 MB slab to the byte: the name "k" (1 B) then 1023 values of 1024 B
+        // and one of 1023 B. The next append is "", with the slab full — the case that used
+        // to compute offset (slab+1)<<20 and read a slab that did not exist.
+        var idx = new SegmentInvertedIndex();
+        var adds = new List<(uint, string, object?)>();
+        var value = new byte[1024];
+        for (int i = 0; i < 1023; i++)
+        {
+            System.Text.Encoding.ASCII.GetBytes(i.ToString("D4")).CopyTo(value, 0);
+            for (int j = 4; j < value.Length; j++) value[j] = (byte)'a';
+            string s = System.Text.Encoding.ASCII.GetString(value);
+            idx.Add((uint)i, "k", s); adds.Add(((uint)i, "k", s));
+        }
+        string last = new string('z', 1023);
+        idx.Add(1023, "k", last); adds.Add((1023u, "k", last));
+        Assert.Equal(1 + 1023 * 1024 + 1023, 1 << 20);   // the slab is exactly full
+
+        idx.Add(1024, "k", ""); adds.Add((1024u, "k", ""));
+        idx.Add(1025, "k", "after"); adds.Add((1025u, "k", "after"));
+        idx.Add(1026, "k", ""); adds.Add((1026u, "k", ""));    // the probe path: an equality hit on ""
+
+        Assert.Equal([1024u, 1026u], idx.Lookup("k", "")!);
+        Assert.Equal(Reference(adds), idx.Serialise());
+    }
+
     [Fact]
     public void BuildModeLookup_AndMightContain_StillAnswer()
     {
