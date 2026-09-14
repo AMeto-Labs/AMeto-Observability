@@ -395,9 +395,16 @@ public sealed class SegmentTrigramIndex
         }
     }
 
-    /// <summary>Bytes <see cref="WriteTo"/> will produce — exact, from the bucket bookkeeping.</summary>
+    /// <summary>
+    /// Bytes <see cref="WriteTo"/> will produce — exact, from the bucket bookkeeping. Normalises
+    /// first, like <see cref="WriteTo"/> does: an out-of-order build's postings shrink when they
+    /// are sorted and de-duplicated, and a length written ahead of a section that then comes
+    /// out shorter is a corrupt file, not a wrong estimate.
+    /// </summary>
     public long ExactSerialisedSize()
     {
+        ObjectDisposedException.ThrowIf(_released, this);
+        NormaliseIfUnsorted();
         long size = 8;
         for (int id = 0; id < _bucketCount; id++)
             size += 10 + PostingArena.SerialisedSize(in _buckets[id].Postings);
