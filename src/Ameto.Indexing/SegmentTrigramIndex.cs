@@ -105,6 +105,41 @@ public sealed class SegmentTrigramIndex
         return bytes;
     }
 
+    /// <summary>
+    /// One trigram's posting list, whichever side of the index it came from. Both are ASCENDING
+    /// and DISTINCT — <see cref="_loaded"/> by construction (delta+varint cannot decode
+    /// backwards) and <see cref="_sets"/> by the ordering contract at the top of this file — and
+    /// that is what lets the intersection be a merge instead of a hash set.
+    /// </summary>
+    private readonly struct Postings(int[]? array, List<int>? list)
+    {
+        private readonly int[]?     _array = array;
+        private readonly List<int>? _list  = list;
+
+        public int Count => _array?.Length ?? _list!.Count;
+
+        public ReadOnlySpan<int> Span =>
+            _array ?? System.Runtime.InteropServices.CollectionsMarshal.AsSpan(_list!);
+    }
+
+    /// <summary>
+    /// Local offsets that might contain <paramref name="text"/> — the intersection of its
+    /// trigrams' posting lists, ascending and distinct. Null when the index holds no
+    /// information (never built, or the term is shorter than a trigram); empty when the term is
+    /// provably absent.
+    ///
+    /// <para>Posting lists are sorted, so this is a two-pointer MERGE, run rarest list first —
+    /// the same shape as <c>SegmentInvertedIndex.IntersectSorted</c>. It used to be a
+    /// <c>HashSet&lt;int&gt;</c> seeded from the first trigram and <c>IntersectWith</c> per
+    /// further one, then <c>ToArray</c> + <c>Array.Sort</c> + <c>Array.ConvertAll</c>: four
+    /// passes and three arrays to hash data that arrived sorted, per group, per query, in
+    /// parallel across eight workers. Starting from the rarest list also bounds the work by the
+    /// SMALLEST posting list rather than the first one the term happens to spell.</para>
+    ///
+    /// <para>The search text is folded into stack scratch, not through
+    /// <c>ToString().ToLowerInvariant()</c> — two strings per call, one of them a copy of a
+    /// filter literal that never changes.</para>
+    /// </summary>
     public uint[]? Lookup(ReadOnlySpan<char> text)
     {
         // An index with no trigrams at all was never built (e.g. a WAL-recovery
@@ -112,38 +147,126 @@ public sealed class SegmentTrigramIndex
         // "no matches". Only a POPULATED index may treat a missing trigram as
         // proof of absence.
         if (_loaded.Count == 0 && _sets.Count == 0) return null;
+        if (text.Length < 3) return null;
 
-        string lower = text.ToString().ToLowerInvariant();
-        if (lower.Length < 3) return null;
+        char[]? rentedChars = text.Length > 1024 ? System.Buffers.ArrayPool<char>.Shared.Rent(text.Length) : null;
+        Span<char> lower = rentedChars ?? stackalloc char[text.Length];
+        try
+        {
+            int n = text.ToLowerInvariant(lower);
+            if (n < 0) { text.CopyTo(lower); n = text.Length; }   // never (dest sized to source)
+            if (n < 3) return null;
 
+            int k = n - 2;                                        // trigram count
+            var posts = System.Buffers.ArrayPool<Postings>.Shared.Rent(k);
+            var order = System.Buffers.ArrayPool<int>.Shared.Rent(k);
+            try
+            {
+                for (int i = 0; i < k; i++)
+                {
+                    var key = (lower[i], lower[i + 1], lower[i + 2]);
+                    if (_loaded.TryGetValue(key, out var arr))
+                        posts[i] = new Postings(arr, null);
+                    else if (_sets.TryGetValue(key, out var list))
+                    {
+                        // A build-phase bucket is only ascending while the contract holds. When
+                        // it does not, the flag says so and the set-based path answers instead —
+                        // a merge over unordered input would silently drop rows.
+                        if (_unsorted) return LookupUnsorted(lower[..n]);
+                        posts[i] = new Postings(null, list);
+                    }
+                    else
+                        return [];                                // missing trigram → no candidates
+                }
+
+                // Rarest first. Insertion sort over k indices — k is the term's length, and a
+                // Comparison<T> delegate on this path is exactly what is being removed.
+                for (int i = 0; i < k; i++) order[i] = i;
+                for (int i = 1; i < k; i++)
+                {
+                    int cur = order[i], len = posts[cur].Count, j = i - 1;
+                    while (j >= 0 && posts[order[j]].Count > len) { order[j + 1] = order[j]; j--; }
+                    order[j + 1] = cur;
+                }
+
+                var first = posts[order[0]].Span;
+                if (first.Length == 0) return [];
+
+                var acc = System.Buffers.ArrayPool<uint>.Shared.Rent(first.Length);
+                try
+                {
+                    int count = first.Length;
+                    for (int i = 0; i < count; i++) acc[i] = (uint)first[i];
+
+                    for (int t = 1; t < k && count > 0; t++)
+                        count = IntersectInto(acc, count, posts[order[t]].Span);
+
+                    if (count == 0) return [];
+                    var result = new uint[count];
+                    acc.AsSpan(0, count).CopyTo(result);
+                    return result;
+                }
+                finally { System.Buffers.ArrayPool<uint>.Shared.Return(acc); }
+            }
+            finally
+            {
+                // Cleared: the rented Postings array holds references into the index, and a
+                // pooled array outlives the call.
+                System.Buffers.ArrayPool<Postings>.Shared.Return(posts, clearArray: true);
+                System.Buffers.ArrayPool<int>.Shared.Return(order);
+            }
+        }
+        finally { if (rentedChars is not null) System.Buffers.ArrayPool<char>.Shared.Return(rentedChars); }
+    }
+
+    /// <summary>
+    /// Intersects <paramref name="acc"/>[0..<paramref name="count"/>) with an ascending posting
+    /// list, IN PLACE — the write cursor never passes the read cursor — and returns the new
+    /// length. Both sides ascending and distinct, so one pass suffices.
+    /// </summary>
+    private static int IntersectInto(uint[] acc, int count, ReadOnlySpan<int> other)
+    {
+        int i = 0, j = 0, w = 0;
+        while (i < count && j < other.Length)
+        {
+            uint x = acc[i], y = (uint)other[j];
+            if      (x < y) i++;
+            else if (x > y) j++;
+            else { acc[w++] = x; i++; j++; }
+        }
+        return w;
+    }
+
+    /// <summary>
+    /// The build-phase fallback for a bucket whose offsets arrived out of order (see
+    /// <see cref="_unsorted"/>). Correct, not fast: an unsorted build is a contract violation
+    /// that serialisation repairs, so no query path reaches this against a real segment.
+    /// </summary>
+    private uint[]? LookupUnsorted(ReadOnlySpan<char> lower)
+    {
         HashSet<int>? result = null;
-
         for (int i = 0; i <= lower.Length - 3; i++)
         {
             var key = (lower[i], lower[i + 1], lower[i + 2]);
 
             IEnumerable<int>? candidates = null;
-            if (_loaded.TryGetValue(key, out var arr))
-                candidates = arr;
-            else if (_sets.TryGetValue(key, out var set))
-                candidates = set;
+            if (_loaded.TryGetValue(key, out var arr))      candidates = arr;
+            else if (_sets.TryGetValue(key, out var set))   candidates = set;
 
-            if (candidates is null)
-                return Array.Empty<uint>(); // missing trigram → no candidates
+            if (candidates is null) return [];
 
-            if (result is null)
-                result = new HashSet<int>(candidates);
+            if (result is null) result = new HashSet<int>(candidates);
             else
             {
                 result.IntersectWith(candidates);
-                if (result.Count == 0) return Array.Empty<uint>();
+                if (result.Count == 0) return [];
             }
         }
 
         if (result is null) return null;
         var sorted = result.ToArray();
         Array.Sort(sorted);
-        return Array.ConvertAll(sorted, x => (uint)x);
+        return Array.ConvertAll(sorted, static x => (uint)x);
     }
 
     // ── Serialisation ─────────────────────────────────────────────────────────

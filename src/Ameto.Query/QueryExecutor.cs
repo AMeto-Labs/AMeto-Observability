@@ -387,22 +387,20 @@ public sealed class QueryExecutor : IQueryExecutor
                     // firstOrdinal + pos), so the groups' candidate arrays simply
                     // concatenate — no rebasing.
                     //
-                    // The ORDER of what comes out is not guaranteed and must not be relied
-                    // on. TryNarrowWithIndex builds its trigram result in a HashSet<uint>
-                    // and hands back acc.ToArray(); HashSet enumeration order is unspecified
-                    // by contract. It happens to come out ascending today — measured over
-                    // 2000 random inputs, single-hint and intersected alike, because the set
-                    // is filled from an already-sorted array and thereafter only ever has
-                    // entries removed, and removal neither reorders survivors nor frees a
-                    // slot that a later Add could reuse — but that is a property of one
-                    // implementation of HashSet, not of this code.
+                    // The ORDER of what comes out is STILL not a promise this method makes.
+                    // Each group's array is ascending — TryNarrowWithIndex merges sorted
+                    // posting lists now, where it used to drain a HashSet whose enumeration
+                    // order is unspecified by contract — but groups are appended in file
+                    // order and a later group's ordinals are all above an earlier one's only
+                    // because SegmentIndexBuilder.Build writes firstOrdinal + pos. Nothing
+                    // downstream may assume more than "the reader will handle it".
                     //
-                    // SegmentReader.ReadEventsAsync clones and Array.Sorts before its
-                    // two-pointer walk, and that sort is the contract, not a belt-and-braces
-                    // extra: the walk advances a single cursor through the candidates
-                    // alongside ascending row ordinals, so one descending pair makes it step
-                    // past a candidate it will never come back to and the query silently
-                    // loses rows the index proved it should return. Do not delete that sort
+                    // SegmentReader.ReadEventsAsync verifies the order before its two-pointer
+                    // walk and sorts a copy when it has to, and that check is the contract,
+                    // not a belt-and-braces extra: the walk advances a single cursor through
+                    // the candidates alongside ascending row ordinals, so one descending pair
+                    // makes it step past a candidate it will never come back to and the query
+                    // silently loses rows the index proved it should return. Do not delete it
                     // on the strength of a comment here.
                     List<uint>? candidates = null;
                     bool anyGroupSurvived  = false;
@@ -436,7 +434,7 @@ public sealed class QueryExecutor : IQueryExecutor
                                     continue;
                                 if (levelHints is not null && !AnyLevelMaybePresent(levelHints, cached.Bloom))
                                     continue;
-                                if (!TryNarrowWithIndex(filter, cached, levelHints, out var cachedCandidates))
+                                if (!TryNarrowWithIndex(filter, cached, levelHints, grp.EventCount, out var cachedCandidates))
                                     continue;
 
                                 anyGroupSurvived = true;
@@ -527,14 +525,14 @@ public sealed class QueryExecutor : IQueryExecutor
                                 // Insert may hand back a concurrently inserted winner for this
                                 // group and dispose `built` — use it only through the lease.
                                 using var lease = cache.Insert(info.FilePath, g, needTrigram, built, built.ApproxRetainedBytes);
-                                if (!TryNarrowWithIndex(filter, lease.Index, levelHints, out groupCandidates))
+                                if (!TryNarrowWithIndex(filter, lease.Index, levelHints, grp.EventCount, out groupCandidates))
                                     continue;
                             }
                             else
                             {
                                 using (built)
                                 {
-                                    if (!TryNarrowWithIndex(filter, built, levelHints, out groupCandidates))
+                                    if (!TryNarrowWithIndex(filter, built, levelHints, grp.EventCount, out groupCandidates))
                                         continue;
                                 }
                             }
@@ -609,6 +607,16 @@ public sealed class QueryExecutor : IQueryExecutor
 
     internal static bool TryNarrowWithIndex(
         CompiledFilter filter, ISegmentIndex idx, (string, object?)[][]? levelHints, out uint[]? candidates)
+        => TryNarrowWithIndex(filter, idx, levelHints, groupEventCount: 0, out candidates);
+
+    /// <param name="groupEventCount">
+    /// Events in the group being narrowed, or 0 for "unknown". Used for ONE decision: a level
+    /// union whose posting lists already account for every event in the group is the identity,
+    /// and intersecting with the identity is work with no result. See below.
+    /// </param>
+    internal static bool TryNarrowWithIndex(
+        CompiledFilter filter, ISegmentIndex idx, (string, object?)[][]? levelHints,
+        uint groupEventCount, out uint[]? candidates)
     {
         candidates = null;
 
@@ -622,18 +630,25 @@ public sealed class QueryExecutor : IQueryExecutor
             && !idx.MightContain(prop, val))
             return false;
 
+        // EVERY posting list below arrives ASCENDING and DISTINCT — SegmentBitmapCodec's
+        // delta encoding cannot decode backwards, and both LookupTrigram and LookupIntersect
+        // now hand back merged sorted arrays. So every combination here is a two-pointer merge.
+        // It used to be a HashSet per step: `new HashSet<uint>(offsets)` for the trigram seed,
+        // one for the inverted result and one for the level union — and for a level-split Error
+        // segment that last one is the WHOLE group, ~2 MB of buckets per group per query,
+        // built to hash data that was already in order. The sorted-array result is also what
+        // lets SegmentReader.ReadEventsAsync replace its clone-and-sort with one scan.
         if (trigramHints.Count > 0)
         {
-            HashSet<uint>? acc = null;
+            uint[]? acc = null;
             foreach (var (_, text) in trigramHints)
             {
                 var offsets = idx.LookupTrigram(text);
-                if (offsets is null) continue;
-                if (acc is null) acc = new HashSet<uint>(offsets);
-                else             acc.IntersectWith(offsets);
-                if (acc.Count == 0) return false;
+                if (offsets is null) continue;              // no information from this hint
+                acc = acc is null ? offsets : IntersectSorted(acc, offsets);
+                if (acc.Length == 0) return false;
             }
-            candidates = acc?.ToArray();
+            candidates = acc;
         }
 
         // Inverted-index event-level narrowing: AND posting lists for all equality
@@ -646,19 +661,8 @@ public sealed class QueryExecutor : IQueryExecutor
             {
                 if (invOffsets.Length == 0) return false;
 
-                if (candidates is null)
-                {
-                    candidates = invOffsets;
-                }
-                else
-                {
-                    var invSet = new HashSet<uint>(invOffsets);
-                    var merged = new List<uint>(Math.Min(candidates.Length, invOffsets.Length));
-                    foreach (var o in candidates)
-                        if (invSet.Contains(o)) merged.Add(o);
-                    if (merged.Count == 0) return false;
-                    candidates = [.. merged];
-                }
+                candidates = candidates is null ? invOffsets : IntersectSorted(candidates, invOffsets);
+                if (candidates.Length == 0) return false;
             }
         }
 
@@ -670,35 +674,75 @@ public sealed class QueryExecutor : IQueryExecutor
         // stays the correctness gate, as with every other narrowing here.
         if (levelHints is not null)
         {
-            List<uint>? union    = null;
-            bool       definitive = true;
+            uint[]? union     = null;
+            long    totalOffs = 0;
+            bool    definitive = true;
             foreach (var hint in levelHints)
             {
                 var offs = idx.LookupIntersect(hint);
                 if (offs is null) { definitive = false; break; }
-                if (offs.Length > 0) (union ??= new List<uint>(offs.Length)).AddRange(offs);
+                totalOffs += offs.Length;
+                if (offs.Length > 0) union = union is null ? offs : UnionSorted(union, offs);
             }
             if (definitive)
             {
                 if (union is null) return false;
 
+                // LEVEL-PURE GROUP: an event has exactly one level, so a group's level posting
+                // lists are disjoint and their lengths sum to at most its event count. Equality
+                // therefore proves the union IS the group — the normal case for a level-split
+                // Error segment, where `@l = Error` names all ~100k of its rows. Intersecting
+                // an existing candidate set with the identity cannot remove anything, so the
+                // merge over the whole group is skipped and the candidates stand.
+                //
+                // Only when something else already narrowed. With no other hint the union is
+                // still the answer this group contributes, and it must be returned: handing
+                // back null would mark the group UNNARROWED, and one unnarrowed group sends
+                // the whole segment — its narrowed groups included — to a full scan.
+                bool identity = groupEventCount != 0 && totalOffs == groupEventCount;
                 if (candidates is null)
+                    candidates = union;
+                else if (!identity)
                 {
-                    candidates = [.. union];
-                }
-                else
-                {
-                    var lvlSet = new HashSet<uint>(union);
-                    var merged = new List<uint>(Math.Min(candidates.Length, union.Count));
-                    foreach (var o in candidates)
-                        if (lvlSet.Contains(o)) merged.Add(o);
-                    if (merged.Count == 0) return false;
-                    candidates = [.. merged];
+                    candidates = IntersectSorted(candidates, union);
+                    if (candidates.Length == 0) return false;
                 }
             }
         }
 
         return true;
+    }
+
+    /// <summary>Intersects two ascending, distinct arrays into a new ascending array.</summary>
+    private static uint[] IntersectSorted(uint[] a, uint[] b)
+    {
+        var outp = new uint[Math.Min(a.Length, b.Length)];
+        int i = 0, j = 0, k = 0;
+        while (i < a.Length && j < b.Length)
+        {
+            uint x = a[i], y = b[j];
+            if      (x < y) i++;
+            else if (x > y) j++;
+            else { outp[k++] = x; i++; j++; }
+        }
+        return k == outp.Length ? outp : outp[..k];
+    }
+
+    /// <summary>Unions two ascending, distinct arrays into a new ascending array.</summary>
+    private static uint[] UnionSorted(uint[] a, uint[] b)
+    {
+        var outp = new uint[a.Length + b.Length];
+        int i = 0, j = 0, k = 0;
+        while (i < a.Length && j < b.Length)
+        {
+            uint x = a[i], y = b[j];
+            if      (x < y) outp[k++] = a[i++];
+            else if (x > y) outp[k++] = b[j++];
+            else { outp[k++] = x; i++; j++; }
+        }
+        while (i < a.Length) outp[k++] = a[i++];
+        while (j < b.Length) outp[k++] = b[j++];
+        return k == outp.Length ? outp : outp[..k];
     }
 
     // ── Segment scan ──────────────────────────────────────────────────────────

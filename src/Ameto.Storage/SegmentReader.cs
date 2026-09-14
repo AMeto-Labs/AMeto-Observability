@@ -274,18 +274,24 @@ public sealed class SegmentReader : ISegmentReader
         // candidate rows — the dominant query-path saving (no Dictionary/string per
         // rejected event). Candidates may arrive unsorted (trigram set → array).
         //
-        // The sort below is REQUIRED, not defensive. Everything downstream — the
+        // ASCENDING CANDIDATES ARE REQUIRED, not merely tidy. Everything downstream — the
         // LowerBound block window and the single-cursor walk in DecodeColumnarBlock —
-        // assumes ascending candidates, so one out-of-order pair makes the cursor step
-        // past a candidate and drop a row the caller's index proved matches. The caller
-        // makes no ordering promise: QueryExecutor's trigram narrowing returns a
-        // HashSet's enumeration order. The clone is what lets that stay true without
-        // mutating an array the caller still owns.
+        // assumes them, so one out-of-order pair makes the cursor step past a candidate and
+        // drop a row the caller's index proved matches. The caller still makes no ordering
+        // promise, so the check stays; what is gone is paying a clone and an O(n log n) sort
+        // to learn what a single pass can prove. QueryExecutor's narrowing now merges sorted
+        // posting lists rather than draining a HashSet, so the ordered case is the norm and
+        // costs one scan; anything else is copied and sorted exactly as before, because the
+        // array belongs to the caller and must not be mutated.
         uint[]? cands = null;
         if (candidateOffsets is { Length: > 0 } && _blockOrdinals is not null)
         {
-            cands = (uint[])candidateOffsets.Clone();
-            Array.Sort(cands);
+            cands = candidateOffsets;
+            if (!IsNonDescending(cands))
+            {
+                cands = (uint[])candidateOffsets.Clone();
+                Array.Sort(cands);
+            }
         }
 
         // One vocabulary table for the whole read — blocks of one segment share their
@@ -352,6 +358,19 @@ public sealed class SegmentReader : ISegmentReader
             if (nextMinTs != UnknownBlockMinTs && nextMinTs < fromTicks) return true;
         }
         return false;
+    }
+
+    /// <summary>
+    /// True when <paramref name="a"/> is already in the order the candidate walk needs.
+    /// Non-DESCENDING, not strictly ascending: a repeated ordinal is harmless — the walk's
+    /// cursor steps past both copies on the next row — and rejecting it would cost a sort for
+    /// nothing.
+    /// </summary>
+    private static bool IsNonDescending(uint[] a)
+    {
+        for (int i = 1; i < a.Length; i++)
+            if (a[i] < a[i - 1]) return false;
+        return true;
     }
 
     /// <summary>First index in ascending <paramref name="a"/> whose value is ≥ <paramref name="key"/>.</summary>
