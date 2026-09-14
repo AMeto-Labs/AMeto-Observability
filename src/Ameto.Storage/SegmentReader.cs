@@ -90,7 +90,9 @@ public sealed class SegmentReader : ISegmentReader
         try
         {
             view = mmf.CreateViewAccessor(0, fileSize, MemoryMappedFileAccess.Read);
-            return new SegmentReader(filePath, mmf, view, fileSize, computeUncompressedBytes);
+            var reader = new SegmentReader(filePath, mmf, view, fileSize, computeUncompressedBytes);
+            Interlocked.Increment(ref Opens);
+            return reader;
         }
         catch
         {
@@ -533,34 +535,58 @@ public sealed class SegmentReader : ISegmentReader
         long blockOffset, bool reversed, BlockStringDedup? dedup,
         uint[]? cands = null, int candStart = 0, int candEnd = 0, uint firstOrdinal = 0)
     {
+        // The decode lives in its own method because it reads the compressed bytes straight
+        // out of the mapping, and C# forbids unsafe code inside an iterator (CS1629).
+        var events = DecodeBlockAt(blockOffset, dedup, cands, candStart, candEnd, firstOrdinal);
+        if (events is null) yield break;
+
+        if (reversed) events.Reverse();
+        foreach (var ev in events) yield return ev;
+    }
+
+    /// <summary>
+    /// Decompresses one block and decodes it. Null when the block does not decompress to its
+    /// declared size — the caller's "stop reading this block" answer, unchanged.
+    ///
+    /// <para>LZ4 reads the compressed bytes WHERE THEY LIE, through the mapped pointer. They
+    /// used to be copied into a second pooled buffer by
+    /// <c>MemoryMappedViewAccessor.ReadArray</c> first, which is a memcpy of the whole
+    /// compressed block — per block, per segment, per query — to hand the decoder bytes it
+    /// could already see. The rent for that buffer goes with it.</para>
+    ///
+    /// <para>The pointer is held only across the decode. That is a smaller window than the
+    /// enclosing iterator would have given it: an iterator's consumer decides when the next
+    /// block is read, so acquiring there would keep the view pinned across the caller's
+    /// filtering and delivery.</para>
+    /// </summary>
+    private unsafe List<LogEvent>? DecodeBlockAt(
+        long blockOffset, BlockStringDedup? dedup,
+        uint[]? cands, int candStart, int candEnd, uint firstOrdinal)
+    {
         int uncompressedSize = ReadInt32At(blockOffset);
         int compressedSize   = ReadInt32At(blockOffset + 4);
         ValidateBlockFrame(Info.FilePath, blockOffset, uncompressedSize, compressedSize);
 
-        byte[]? rentedComp   = null;
-        byte[]? rentedUncomp = null;
-        List<LogEvent> events;
+        byte[] rentedUncomp = ArrayPool<byte>.Shared.Rent(uncompressedSize);
         try
         {
-            rentedComp   = ArrayPool<byte>.Shared.Rent(compressedSize);
-            rentedUncomp = ArrayPool<byte>.Shared.Rent(uncompressedSize);
+            byte* basePtr = null;
+            var handle = _view.SafeMemoryMappedViewHandle;
+            handle.AcquirePointer(ref basePtr);
+            try
+            {
+                var src = new ReadOnlySpan<byte>(
+                    basePtr + _view.PointerOffset + blockOffset + 8, compressedSize);
 
-            _view.ReadArray(blockOffset + 8, rentedComp, 0, compressedSize);
+                int decoded = LZ4Codec.Decode(src, rentedUncomp.AsSpan(0, uncompressedSize));
+                if (decoded != uncompressedSize) return null;
 
-            int decoded = LZ4Codec.Decode(rentedComp, 0, compressedSize, rentedUncomp, 0, uncompressedSize);
-            if (decoded != uncompressedSize)
-                yield break;
-
-            events = DecodeColumnarBlock(rentedUncomp.AsSpan(0, decoded), dedup, cands, candStart, candEnd, firstOrdinal);
+                return DecodeColumnarBlock(
+                    rentedUncomp.AsSpan(0, decoded), dedup, cands, candStart, candEnd, firstOrdinal);
+            }
+            finally { if (basePtr is not null) handle.ReleasePointer(); }
         }
-        finally
-        {
-            if (rentedComp   is not null) ArrayPool<byte>.Shared.Return(rentedComp);
-            if (rentedUncomp is not null) ArrayPool<byte>.Shared.Return(rentedUncomp);
-        }
-
-        if (reversed) events.Reverse();
-        foreach (var ev in events) yield return ev;
+        finally { ArrayPool<byte>.Shared.Return(rentedUncomp); }
     }
 
     /// <summary>
@@ -975,6 +1001,20 @@ public sealed class SegmentReader : ISegmentReader
     /// mapped view.</para>
     /// </summary>
     internal static long PooledSectionRents;
+
+    /// <summary>
+    /// Process-wide count of successful <see cref="Open"/> calls, in the same spirit and with
+    /// the same caveats as <see cref="PooledSectionRents"/> — a test that reads it needs the
+    /// assembly's parallelisation switched off.
+    ///
+    /// <para>Opening a segment is a <c>FileInfo</c> stat, a <c>CreateFromFile</c>, a
+    /// <c>CreateViewAccessor</c> over the whole file and a block-index read and parse. A query
+    /// used to do all of it TWICE per surviving segment — once to prefilter, once to scan —
+    /// which is invisible in a wall clock next to the decode but is 40 mappings for a
+    /// 20-segment query, and every one of them a handle that blocks deletion on Windows. This
+    /// counter is how a test states "once per segment" as a number instead of a hope.</para>
+    /// </summary>
+    internal static long Opens;
 
     private PooledSection RentSection(long offset)
     {

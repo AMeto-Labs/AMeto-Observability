@@ -60,6 +60,46 @@ public sealed class LazySegmentPrimingProbe : IAsyncLifetime
             $"a 5-event page still costs like a full read: {small} B vs {full} B — lazy priming is not working");
     }
 
+    /// <summary>
+    /// OPENS PER QUERY, over the same 40 segments. A filter that survives every segment's
+    /// prefilter used to map each survivor TWICE — once to read its index sections, once to
+    /// read its blocks — and the second mapping is the one lazy priming was supposed to have
+    /// avoided. The prefilter's reader is handed to the scan now.
+    ///
+    /// <para>Reported per query and per SURVIVING segment; the count is what the assertion is
+    /// about, so unlike the allocation ratio above it is exact.</para>
+    /// </summary>
+    [Fact]
+    public async Task AFilteredPageMapsEachSurvivingSegmentOnce()
+    {
+        const string Filter = "@mt like '%evt%'";   // every segment holds it: all 40 survive
+
+        await FilteredPageAsync(5);                 // warm
+
+        long b0 = SegmentReader.Opens;
+        var page = await FilteredPageAsync(5);
+        long pageOpens = SegmentReader.Opens - b0;
+
+        long b1 = SegmentReader.Opens;
+        var all = await FilteredPageAsync(Segments * EventsPerSeg);
+        long fullOpens = SegmentReader.Opens - b1;
+
+        Assert.Equal(5, page.Count);
+        Assert.Equal(Segments * EventsPerSeg, all.Count);
+
+        _out.WriteLine($"{Segments} segments, filter {Filter}");
+        _out.WriteLine($"page of 5 : {pageOpens} opens");
+        _out.WriteLine($"full read : {fullOpens} opens");
+
+        // The prefilter maps every segment once; the scan borrows. Nothing is mapped twice,
+        // however much of the catalog the query ends up draining.
+        Assert.Equal(Segments, fullOpens);
+        Assert.Equal(Segments, pageOpens);
+
+        Task<List<LogEvent>> FilteredPageAsync(int count) =>
+            QuerySegmentFixtures.RunAsync(_query, Filter, count);
+    }
+
     private Task<List<LogEvent>> PageAsync(int count) =>
         QuerySegmentFixtures.RunAsync(_query, null, count);
 }
