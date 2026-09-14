@@ -391,6 +391,13 @@ public sealed class SegmentWriter : IDisposable
             // memo turns the transcode into a reference check and a memcpy for every event after
             // the first of its kind. What it replaced ran Encoding.UTF8.GetByteCount over the
             // template HERE and Encoding.UTF8.GetBytes over the same string again in StageEvent.
+            //
+            // A MISS IS ALWAYS POSSIBLE and costs only what the old code paid unconditionally
+            // (one transcode), which is why the memo needs no fallback. Two sources of misses
+            // are expected rather than pathological: a template built by interpolation is a
+            // distinct string per event, and MergingSegmentEventSource's dedup table EMPTIES
+            // itself at 65 536 entries (see MaxDedupEntries), so a merge whose vocabulary
+            // exceeds that hands out fresh instances for values it had already collapsed.
             ReadOnlySpan<byte> tmplUtf8 = _tmplUtf8.Encode(ev.MessageTemplate);
             ReadOnlySpan<byte> svcUtf8  = _svcUtf8.Encode(ev.ServiceName);
             // Approximate: the exception blob is only serialised once, at staging time (and on
@@ -968,9 +975,14 @@ public sealed class SegmentWriter : IDisposable
         WriteUInt32(dst, (uint)totalLen);
 
         // The offset array is ALREADY little-endian uint32 in memory on a little-endian
-        // machine, which every platform this runs on is — so the column is one memcpy. The
-        // loop is kept for the format's sake: these bytes are read back by offset on any
-        // machine, so a big-endian host must still lay them out little-endian.
+        // machine, which every platform this runs on is — so the column is one memcpy.
+        //
+        // The else branch is therefore DEAD on every platform .NET currently supports, and it
+        // stays anyway: the format is little-endian by specification, not by accident of the
+        // host, and the reader (SegmentReader, BinaryPrimitives.ReadUInt32LittleEndian) already
+        // reads it that way on any machine. Deleting the branch would leave the writer silently
+        // emitting a file its own reader cannot read, on the day that machine exists. Asserting
+        // instead of branching would turn the same day into a crash rather than a slow path.
         if (BitConverter.IsLittleEndian)
         {
             dst.Append(MemoryMarshal.AsBytes(offsets.AsSpan(0, offsetCount)));
@@ -1032,6 +1044,14 @@ public sealed class SegmentWriter : IDisposable
 
         public void Commit(int count) => Length += count;
 
+        /// <remarks>
+        /// NOT SELF-APPEND SAFE: <paramref name="src"/> must not point into <see cref="Buffer"/>.
+        /// <see cref="Reserve"/> can resize, which leaves the caller's span over the OLD array —
+        /// it would copy the right bytes from a buffer nothing reads again — and even without a
+        /// resize the destination may overlap the source. No caller does this (every source is
+        /// another buffer, a memo, or the producer's own payload) and none should; a buffer that
+        /// needs to repeat itself should <see cref="Reserve"/> and copy under its own eye.
+        /// </remarks>
         public void Append(ReadOnlySpan<byte> src)
         {
             if (src.IsEmpty) return;

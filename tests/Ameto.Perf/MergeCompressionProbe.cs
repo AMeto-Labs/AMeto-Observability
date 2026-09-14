@@ -188,8 +188,14 @@ public sealed class MergeCompressionProbe : IDisposable
     }
 
     /// <summary>
-    /// What <see cref="LZ4Codec.Encode"/> costs a block BEFORE it looks at the block — i.e. the
-    /// compression context it builds and throws away on every call.
+    /// PACKAGE-UPGRADE CANARY. What <see cref="LZ4Codec.Encode"/> costs a block BEFORE it looks
+    /// at the block — i.e. the compression context it builds and throws away on every call.
+    ///
+    /// <para>Everything below describes the INTERNALS OF A DEPENDENCY, so it is true of
+    /// K4os.Compression.LZ4 1.3.8 and of nothing else by right. That is the point of keeping it
+    /// as a test: the assertion is on the behaviour that would hurt if a version bump changed it
+    /// — that the codec allocates no managed memory per call — and it fails on the upgrade that
+    /// breaks it rather than on the next time someone profiles a merge.</para>
     ///
     /// <para>READ OUT OF K4os.Compression.LZ4 1.3.8's IL, not guessed. <c>LZ4Codec.Encode</c>
     /// dispatches to <c>LLxx.LZ4_compress_fast</c> or <c>LLxx.LZ4_compress_HC</c>:</para>

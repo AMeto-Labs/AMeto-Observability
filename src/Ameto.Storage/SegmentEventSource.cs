@@ -262,8 +262,15 @@ public sealed class HotTierEventSource : ISegmentEventSource
     /// quarter of a million times per flush. A pool index is assigned once and never reassigned,
     /// so a remembered answer cannot go stale.</para>
     ///
-    /// <para>The index is held PLUS ONE so that <c>default</c> is an empty memo rather than one
-    /// claiming to know index 0.</para>
+    /// <para>The index is held PLUS ONE so that <c>default</c> — every field zero — is an EMPTY
+    /// memo rather than one claiming to know some real index. Only non-negative indices are ever
+    /// memoised, which is what makes that encoding unambiguous: were a negative index allowed in,
+    /// -1 would store a plus-one of 0 and a fresh memo would then "match" it and answer null,
+    /// while a memo warmed on anything else would ask the pool and be told <see cref="string.Empty"/>.
+    /// Both answers reach the same place today — the only caller that can pass a negative index is
+    /// the template, whose result goes through <c>?? string.Empty</c> — but the two routes
+    /// disagreeing about the same input is exactly the kind of thing that stops being harmless
+    /// when someone adds a third caller.</para>
     /// </summary>
     private struct InternMemo
     {
@@ -277,6 +284,9 @@ public sealed class HotTierEventSource : ISegmentEventSource
 
             public string? Resolve(StringInternPool pool, int index)
             {
+                // "No index" (-1: the event carries no template / no service) is not worth a memo
+                // slot and must not occupy one — the pool answers it from a branch, not a probe.
+                if (index < 0) return pool.Get(index);
                 if (_indexPlusOne == index + 1) return _value;
                 _value        = pool.Get(index);
                 _indexPlusOne = index + 1;
