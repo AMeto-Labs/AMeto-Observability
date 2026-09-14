@@ -164,6 +164,38 @@ public interface ISegmentIndexSink : IDisposable
 
     /// <summary>Serialises the group's sections. Called once, after the last <see cref="Add"/>.</summary>
     (byte[] Inverted, byte[] Trigram, byte[] Bloom) Serialise();
+
+    /// <summary>
+    /// Writes the group's three sections to <paramref name="destination"/> at its current
+    /// position — each as <c>uint32 length</c> + bytes, exactly what the writer's
+    /// <c>WriteInvertedIndex</c> / <c>WriteTrigramIndex</c> / <c>WriteBloomFilter</c> put on
+    /// disk — and reports where each one starts. Called once, after the last <see cref="Add"/>,
+    /// INSTEAD of <see cref="Serialise"/>.
+    ///
+    /// <para>This is the production path: a sink that can stream writes its accumulators
+    /// straight into the file, where <see cref="Serialise"/> costs three managed blobs per
+    /// group (two of them multi-MB, all on the LOH, all dead as soon as they are written). The
+    /// default goes through <see cref="Serialise"/> so a sink that only has blobs — the test
+    /// stubs — needs nothing more. <paramref name="destination"/> must be seekable: a streaming
+    /// sink writes a length placeholder and patches it once the section's size is known.</para>
+    /// </summary>
+    void WriteSections(Stream destination, out long invertedOffset, out long trigramOffset, out long bloomOffset)
+    {
+        var (inverted, trigram, bloom) = Serialise();
+        invertedOffset = WriteBlob(destination, inverted);
+        trigramOffset  = WriteBlob(destination, trigram);
+        bloomOffset    = WriteBlob(destination, bloom);
+
+        static long WriteBlob(Stream s, byte[] blob)
+        {
+            long at = s.Position;
+            Span<byte> len = stackalloc byte[4];
+            System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(len, (uint)blob.Length);
+            s.Write(len);
+            s.Write(blob);
+            return at;
+        }
+    }
 }
 
 /// <summary>

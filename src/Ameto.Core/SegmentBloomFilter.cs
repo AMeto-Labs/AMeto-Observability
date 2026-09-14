@@ -295,13 +295,37 @@ public sealed unsafe class SegmentBloomFilter : IDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
         uint byteCount = _blockCount * BlockBytes;
         var buf = new byte[4 + 4 + byteCount]; // bitCount + capacity | foldedMarker + bits
-        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(0), _blockCount * BlockBits);
+        WriteHeader(buf);
+        new Span<byte>(_bits, (int)byteCount).CopyTo(buf.AsSpan(8));
+        return buf;
+    }
+
+    /// <summary>Bytes <see cref="Serialise"/> / <see cref="WriteTo"/> produce.</summary>
+    public long SerialisedLength => 8L + (long)_blockCount * BlockBytes;
+
+    /// <summary>
+    /// Writes the section — the same bytes <see cref="Serialise"/> returns — straight from the
+    /// native bits to <paramref name="destination"/>, with no managed copy in between. The
+    /// blob path costs a ~5 MB LOH array per group that dies the moment the writer has
+    /// written it; this is the production path. Guarded like <see cref="Serialise"/>, for
+    /// the same reason.
+    /// </summary>
+    public void WriteTo(Stream destination)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        Span<byte> header = stackalloc byte[8];
+        WriteHeader(header);
+        destination.Write(header);
+        destination.Write(new ReadOnlySpan<byte>(_bits, (int)(_blockCount * BlockBytes)));
+    }
+
+    private void WriteHeader(Span<byte> dest)
+    {
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(dest, _blockCount * BlockBits);
         // Only claim folded when this instance's contents really were folded — a filter that
         // was read back from a pre-folding blob and re-serialised must keep saying so.
         uint capacityWord = _folded ? (_capacity & ~FoldedMarker) | FoldedMarker : _capacity & ~FoldedMarker;
-        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(4), capacityWord);
-        new Span<byte>(_bits, (int)byteCount).CopyTo(buf.AsSpan(8));
-        return buf;
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(dest.Slice(4), capacityWord);
     }
 
     public static SegmentBloomFilter Deserialise(ReadOnlySpan<byte> data)

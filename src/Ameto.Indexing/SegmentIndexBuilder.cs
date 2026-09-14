@@ -491,6 +491,62 @@ public sealed class SegmentIndexBuilder : ISegmentIndexSink
         => (_inverted.Serialise(), _trigram.Serialise(), _bloom.Serialise());
 
     /// <summary>
+    /// The production path — see <see cref="ISegmentIndexSink.WriteSections"/>. The inverted
+    /// and trigram sections stream through one pooled 1 MB buffer straight into the file; the
+    /// bloom goes from its native bits to the stream with no managed copy at all. Where a
+    /// section's length is known up front it is written first; otherwise a placeholder is
+    /// patched once the section is out (the file is seekable, and the seek is per group).
+    /// Same bytes as <see cref="Serialise"/> framed by the writer — pinned by
+    /// <c>SectionStreamingTests</c>.
+    /// </summary>
+    public void WriteSections(Stream destination, out long invertedOffset, out long trigramOffset, out long bloomOffset)
+    {
+        using var w = new StreamSectionWriter(destination);
+
+        invertedOffset = destination.Position;
+        WritePlaceholder(destination);
+        w.ResetCount();
+        _inverted.WriteTo(w);
+        w.Flush();
+        PatchLength(destination, invertedOffset, w.Total);
+
+        trigramOffset = destination.Position;
+        long trigramLen = _trigram.ExactSerialisedSize();
+        WriteLength(destination, trigramLen);
+        w.ResetCount();
+        _trigram.WriteTo(w);
+        w.Flush();
+        if (w.Total != trigramLen)
+            throw new InvalidOperationException($"trigram section wrote {w.Total} bytes against a computed {trigramLen}");
+
+        bloomOffset = destination.Position;
+        WriteLength(destination, _bloom.SerialisedLength);
+        _bloom.WriteTo(destination);
+    }
+
+    private static void WritePlaceholder(Stream s)
+    {
+        Span<byte> z = stackalloc byte[4];
+        z.Clear();
+        s.Write(z);
+    }
+
+    private static void WriteLength(Stream s, long len)
+    {
+        Span<byte> b = stackalloc byte[4];
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(b, checked((uint)len));
+        s.Write(b);
+    }
+
+    private static void PatchLength(Stream s, long at, long len)
+    {
+        long end = s.Position;
+        s.Position = at;
+        WriteLength(s, len);
+        s.Position = end;
+    }
+
+    /// <summary>
     /// Frees the bloom filter's bits and hands the accumulators' pooled buffers back.
     ///
     /// <para>The bits live in <c>NativeMemory</c> and <see cref="SegmentBloomFilter"/> has no

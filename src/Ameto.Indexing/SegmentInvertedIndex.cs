@@ -349,6 +349,17 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
     /// </summary>
     public byte[] Serialise()
     {
+        var w = new System.Buffers.ArrayBufferWriter<byte>(EstimateSerialisedSize());
+        WriteTo(w);
+        return w.WrittenSpan.ToArray();
+    }
+
+    /// <summary>
+    /// Streams the section into <paramref name="w"/> — the production path, where the writer
+    /// hands in a buffer that drains straight to the segment file instead of a managed blob.
+    /// </summary>
+    public void WriteTo(System.Buffers.IBufferWriter<byte> w)
+    {
         // No lock: one builder per index group, driven from one thread (see class remarks).
         {
             // Written through an ArrayBufferWriter sized up front rather than
@@ -357,7 +368,6 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
             // multi-MB index cost two Large Object Heap allocations plus every intermediate
             // doubling — and the Workstation GC this server runs never compacts the LOH,
             // so that garbage ratchets the resident set up flush after flush.
-            var w = new System.Buffers.ArrayBufferWriter<byte>(EstimateSerialisedSize());
             WriteUInt32(w, CodecMagic);        // distinguishes the codec format from a legacy propertyCount
             WriteUInt32(w, (uint)_index.Count);
 
@@ -383,7 +393,6 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
                 }
             }
 
-            return w.WrittenSpan.ToArray();
         }
     }
 
@@ -401,14 +410,14 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
         return (int)Math.Min(int.MaxValue - 64, size + 64);
     }
 
-    private static void WriteUInt32(System.Buffers.ArrayBufferWriter<byte> w, uint v)
+    private static void WriteUInt32(System.Buffers.IBufferWriter<byte> w, uint v)
     {
         BinaryPrimitives.WriteUInt32LittleEndian(w.GetSpan(4), v);
         w.Advance(4);
     }
 
     /// <summary>Length-prefixed UTF-8, encoded straight into the writer's buffer.</summary>
-    private static void WriteUtf8(System.Buffers.ArrayBufferWriter<byte> w, string s)
+    private static void WriteUtf8(System.Buffers.IBufferWriter<byte> w, string s)
     {
         var dest = w.GetSpan(2 + System.Text.Encoding.UTF8.GetMaxByteCount(s.Length));
         int n    = System.Text.Encoding.UTF8.GetBytes(s, dest[2..]);

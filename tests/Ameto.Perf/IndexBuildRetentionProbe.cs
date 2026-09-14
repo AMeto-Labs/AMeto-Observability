@@ -100,6 +100,14 @@ public sealed class IndexBuildRetentionProbe
         // flush pins in the GC heap.
         long afterBuild = GC.GetTotalMemory(forceFullCollection: true);
 
+        // Production path first: sections streamed to the file, nothing retained but the
+        // writer's pooled 1 MB buffer.
+        var counting = new CountingNullStream();
+        builder.WriteSections(counting, out long invOff, out long triOff, out long bloomOff);
+        long afterStreamed = GC.GetTotalMemory(forceFullCollection: true);
+        long invLen = triOff - invOff - 4, triLen = bloomOff - triOff - 4, bloomLen = counting.Length - bloomOff - 4;
+
+        // Then the blob path the probes and tests still use, for the LOH figure it costs.
         var inverted = builder.SerialisedInvertedIndex;
         var trigram  = builder.SerialisedTrigramIndex;
         var bloom    = builder.SerialisedBloomFilter;
@@ -113,10 +121,28 @@ public sealed class IndexBuildRetentionProbe
         _out.WriteLine($"   events                       {events:N0}");
         _out.WriteLine($"   hot tier native (off-heap)   {tierNative / MB,8:F1} MB   ({hot.AllocatedBytes / 9437184} chunks x 9 MB)");
         _out.WriteLine($"   RETAINED by index build      {(afterBuild - before) / MB,8:F1} MB   <-- x FlushConcurrency concurrent flushes");
-        _out.WriteLine($"   + serialised index blobs     {(afterSerialise - afterBuild) / MB,8:F1} MB   (LOH: {inverted.Length / MB:F1} inv / {trigram.Length / MB:F1} tri / {bloom.Length / MB:F1} bloom)");
-        _out.WriteLine($"   PEAK per in-flight flush     {(afterSerialise - before) / MB,8:F1} MB");
+        _out.WriteLine($"   + streamed sections (prod)   {(afterStreamed - afterBuild) / MB,8:F1} MB   (written: {invLen / MB:F1} inv / {triLen / MB:F1} tri / {bloomLen / MB:F1} bloom)");
+        _out.WriteLine($"   + serialised index blobs     {(afterSerialise - afterStreamed) / MB,8:F1} MB   (LOH: {inverted.Length / MB:F1} inv / {trigram.Length / MB:F1} tri / {bloom.Length / MB:F1} bloom)");
+        _out.WriteLine($"   PEAK per in-flight flush     {(afterStreamed - before) / MB,8:F1} MB   (streamed; {(afterSerialise - before) / MB:F1} MB via blobs)");
 
         Assert.True(hot.Count > 0);
+    }
+
+    /// <summary>A seekable sink that keeps only the position — what the file would receive.</summary>
+    private sealed class CountingNullStream : Stream
+    {
+        private long _pos, _len;
+        public override bool CanRead => false;
+        public override bool CanSeek => true;
+        public override bool CanWrite => true;
+        public override long Length => _len;
+        public override long Position { get => _pos; set => _pos = value; }
+        public override void Flush() { }
+        public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => _len = value;
+        public override void Write(byte[] buffer, int offset, int count) { _pos += count; if (_pos > _len) _len = _pos; }
+        public override void Write(ReadOnlySpan<byte> buffer) { _pos += buffer.Length; if (_pos > _len) _len = _pos; }
     }
 
     private static HotTierSegment BuildSegment(int events, StringInternPool pool, int svcIdx, bool withTraceIds)
