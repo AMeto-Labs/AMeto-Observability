@@ -106,6 +106,17 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
     // Per-event structured exceptions (managed, parallel to _chunkTemplates).
     // Lazily allocated per chunk on first event that carries an exception.
     private readonly ExceptionInfo?[]?[] _chunkExceptions;
+    // Zone map: the smallest and largest TimestampUtcTicks written into each chunk. Updated
+    // by the writer for every event BEFORE the count increment publishes it, so a reader
+    // that snapshotted Count sees bounds covering every event below its snapshot — and
+    // possibly events above it, which only widens the range. Each bound is a single
+    // aligned 64-bit store, monotone in one direction, so there is no torn state to read:
+    // any (min, max) pair a reader observes is a superset of the events it may touch.
+    // Exact under out-of-order arrival — it is maintained with min/max, never assumed
+    // monotone — so a query window that misses a chunk's [min, max] can skip all 16 384
+    // headers of it without looking.
+    private readonly long[]     _chunkMinTicks;
+    private readonly long[]     _chunkMaxTicks;
     private          int        _chunksAllocated;
     /// <summary>Running sum of <see cref="_chunkPayloadTails"/> — total payload bytes
     /// actually written across all chunks. Kept incrementally so the hot-path
@@ -168,6 +179,8 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
         _chunkPayloadTails = new long[_maxChunks];
         _chunkTemplates    = new string?[]?[_maxChunks];
         _chunkExceptions   = new ExceptionInfo?[]?[_maxChunks];
+        _chunkMinTicks     = new long[_maxChunks];
+        _chunkMaxTicks     = new long[_maxChunks];
 
         // Eagerly allocate first chunk only (~10 MB instead of 256 MB).
         AllocChunk(0);
@@ -269,11 +282,42 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
         _chunkPayloadTails[ci] += payloadLen;
         _payloadBytes          += payloadLen;
 
+        // Zone map, before the publish below — see the field comment for why that order
+        // is the whole guarantee.
+        long ts = h.TimestampUtcTicks;
+        if (ts < _chunkMinTicks[ci]) _chunkMinTicks[ci] = ts;
+        if (ts > _chunkMaxTicks[ci]) _chunkMaxTicks[ci] = ts;
+
         // Publish: Interlocked.Increment acts as full memory barrier —
         // header + payload writes are visible to readers before _count increases.
         Interlocked.Increment(ref _count);
         return true;
     }
+
+    // ── Chunk-wise read access (query scan) ───────────────────────────────────
+
+    /// <summary>
+    /// False when no event of chunk <paramref name="ci"/> can lie in
+    /// [<paramref name="fromTicks"/>, <paramref name="toTicks"/>] — the scan then skips the
+    /// chunk's headers entirely. Only meaningful for a chunk that holds at least one
+    /// published event (<c>ci * ChunkEventCapacity &lt; Count</c> as snapshotted by the caller).
+    /// True is "maybe": the bounds may also reflect events published after the snapshot.
+    /// </summary>
+    public bool ChunkMayOverlap(int ci, long fromTicks, long toTicks)
+    {
+        long min = Volatile.Read(ref _chunkMinTicks[ci]);
+        long max = Volatile.Read(ref _chunkMaxTicks[ci]);
+        return max >= fromTicks && min <= toTicks;
+    }
+
+    /// <summary>
+    /// The first <paramref name="count"/> header slots of chunk <paramref name="ci"/> as a
+    /// span over the native array. The caller derives <paramref name="count"/> from its
+    /// own <see cref="Count"/> snapshot, which is what makes every slot in the span a
+    /// published one.
+    /// </summary>
+    public ReadOnlySpan<LogEventHeader> ChunkHeaders(int ci, int count)
+        => new(ChunkHeadersPtr(ci), count);
 
     /// <summary>
     /// Returns the message-template string stored for <paramref name="eventIndex"/>,
@@ -402,6 +446,10 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
         // actually write become resident.
         _chunkArenas[ci]       = (nuint)NativeMemory.Alloc((nuint)ChunkTotalBytes);
         _chunkPayloadTails[ci] = 0;
+        // Empty zone: the first write narrows both bounds to its timestamp. Set here, before
+        // the chunk's first event is published, so a reader never sees a chunk without them.
+        _chunkMinTicks[ci]     = long.MaxValue;
+        _chunkMaxTicks[ci]     = long.MinValue;
         _chunksAllocated++;
     }
 

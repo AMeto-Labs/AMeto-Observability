@@ -81,18 +81,92 @@ public sealed class HotTierScanTests : IDisposable
             forward,
             new HashSet<Ameto.Core.LogLevel> { Ameto.Core.LogLevel.Information, Ameto.Core.LogLevel.Debug });
 
+    /// <summary>
+    /// Timestamps that do not follow slot order across CHUNK boundaries: each chunk holds
+    /// mostly its own band of time, but a few events of every chunk carry timestamps that
+    /// belong to another chunk's band (late arrivals, clock skew). The zone map must keep
+    /// those chunks in play for the bands they leak into, and the lazy heap must still
+    /// yield the oracle order — for a narrow window, a cursor deep into the tier (the
+    /// tail's shape), and a full read that crosses into the sort fallback.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void MatchesOracle_OutOfOrderArrivalsAcrossChunks(bool forward)
+    {
+        const int cap     = HotTierSegment.ChunkEventCapacity;
+        const int perTier = cap * 2 + 2_000;                 // three chunks, the last partial
+        var       rng     = new Random(23);
+        long      band    = TimeSpan.TicksPerSecond * 1000;  // one band of time per chunk
+
+        HotTierSegment Build(int tierNo)
+        {
+            var tier = new HotTierSegment(perTier + 1, 48L * 1024 * 1024);
+            var buf  = new ArrayBufferWriter<byte>(16);
+            var w    = new MessagePackWriter(buf); w.WriteMapHeader(0); w.Flush();
+            for (int i = 0; i < perTier; i++)
+            {
+                int  chunk  = i / cap;
+                // 2 % of every chunk's events fall into some OTHER chunk's band.
+                int  inBand = rng.Next(0, 50) == 0 ? rng.Next(0, 3) : chunk;
+                long ts     = _baseTicks + inBand * band + rng.Next(0, 1000) * TimeSpan.TicksPerMillisecond;
+                var h = new LogEventHeader
+                {
+                    Id                       = new EventId(0u, (uint)(tierNo * perTier + i)).RawValue,
+                    TimestampUtcTicks        = ts,
+                    Level                    = (Ameto.Core.LogLevel)rng.Next(0, 6),
+                    MessageTemplatePoolIndex = -1,
+                    ServiceNamePoolIndex     = -1,
+                };
+                Assert.True(tier.TryWrite(h, buf.WrittenSpan));
+            }
+            tier.Freeze();
+            return tier;
+        }
+
+        using var frozen  = Build(0);
+        using var current = Build(1);
+        var tiers = new[] { frozen };
+
+        // A window inside the middle band: chunk 1 plus the leaks from chunks 0 and 2.
+        AssertMatchesOracle(current, tiers, _pool,
+            _baseTicks + band + 200 * TimeSpan.TicksPerMillisecond,
+            _baseTicks + band + 400 * TimeSpan.TicksPerMillisecond,
+            null, null, forward, null);
+
+        // A tail-shaped read: cursor deep into the last band, open-ended.
+        AssertMatchesOracle(current, tiers, _pool,
+            long.MinValue, long.MaxValue,
+            _baseTicks + 2 * band + 900 * TimeSpan.TicksPerMillisecond, new EventId(0u, 100u).RawValue,
+            forward, null);
+
+        // A window ending inside the FIRST band, which only the late leaks of later
+        // chunks can extend into.
+        AssertMatchesOracle(current, tiers, _pool,
+            long.MinValue, _baseTicks + 100 * TimeSpan.TicksPerMillisecond,
+            null, null, forward, null);
+
+        // Everything, both tiers: exercises the sort fallback after the first pops.
+        AssertMatchesOracle(current, tiers, _pool, long.MinValue, long.MaxValue, null, null, forward, null);
+    }
+
     private void AssertMatchesOracle(
         long fromTicks, long toTicks, long? afterTs, ulong? afterId, bool forward,
         IReadOnlySet<Ameto.Core.LogLevel>? levels)
-    {
-        var frozen = new[] { _frozenA, _frozenB };
+        => AssertMatchesOracle(_current, new[] { _frozenA, _frozenB }, _pool,
+                               fromTicks, toTicks, afterTs, afterId, forward, levels);
 
+    private static void AssertMatchesOracle(
+        HotTierSegment current, HotTierSegment[] frozen, StringInternPool pool,
+        long fromTicks, long toTicks, long? afterTs, ulong? afterId, bool forward,
+        IReadOnlySet<Ameto.Core.LogLevel>? levels)
+    {
         var got = HotTierScan
-            .ReadSorted(_current, frozen, _pool, fromTicks, toTicks, afterTs, afterId, forward, levels)
+            .ReadSorted(current, frozen, pool, fromTicks, toTicks, afterTs, afterId, forward, levels)
             .Select(e => e.Id.RawValue)
             .ToList();
 
-        var all = frozen.SelectMany(t => t.ReadAll(_pool)).Concat(_current.ReadAll(_pool));
+        var all = frozen.SelectMany(t => t.ReadAll(pool)).Concat(current.ReadAll(pool));
         var filtered = all.Where(e =>
         {
             long ts = e.Timestamp.UtcTicks;

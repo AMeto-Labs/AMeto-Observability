@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Runtime.CompilerServices;
 using Ameto.Core;
 
@@ -5,29 +6,23 @@ namespace Ameto.Storage;
 
 /// <summary>
 /// Header-level sorted scan over hot tiers: filters (@t window, level, pagination cursor,
-/// and whatever of the filter the header can answer) and sorts on the fixed-size
+/// and whatever of the filter the header can answer) and orders on the fixed-size
 /// <see cref="LogEventHeader"/>s in native memory, then materialises <see cref="LogEvent"/>s
 /// lazily in result order.
 ///
-/// The previous query path materialised EVERY hot event (Dictionary + strings + payload
-/// copy) on every query/live-poll and LINQ-sorted the objects; a typical page query now
-/// allocates one candidate array plus only the events actually yielded.
+/// <para>Cost model, per call: the headers of every CHUNK whose zone map
+/// (<see cref="HotTierSegment.ChunkMayOverlap"/>) intersects the window are walked once —
+/// a live-tail poll with its cursor in the newest chunk reads that chunk, not the tier;
+/// candidates go into a pooled buffer; ordering is a heap built in O(n) and popped
+/// lazily, so a page of k costs O(n + k log n), not a full sort of every candidate. Only
+/// the events actually yielded are materialised.</para>
 /// </summary>
 public static class HotTierScan
 {
-    private readonly record struct Candidate(HotTierSegment Tier, int Index, long Ts, ulong Id);
+    /// <summary>24 bytes, no references: the tier is an ordinal (frozen first, current last).</summary>
+    private readonly record struct Candidate(int Tier, int Index, long Ts, ulong Id);
 
-    private static readonly Comparison<Candidate> Asc = static (a, b) =>
-    {
-        int c = a.Ts.CompareTo(b.Ts);
-        return c != 0 ? c : a.Id.CompareTo(b.Id);
-    };
-
-    private static readonly Comparison<Candidate> Desc = static (a, b) =>
-    {
-        int c = b.Ts.CompareTo(a.Ts);
-        return c != 0 ? c : b.Id.CompareTo(a.Id);
-    };
+    private const int ChunkCap = HotTierSegment.ChunkEventCapacity;
 
     /// <summary>
     /// Sorted, filtered scan across <paramref name="frozen"/> tiers plus
@@ -43,24 +38,62 @@ public static class HotTierScan
         IReadOnlySet<Ameto.Core.LogLevel>? levels,
         IHotHeaderPredicate? headerPredicate = null)
     {
-        var candidates = CollectAll(current, frozen, pool, fromTicks, toTicks, afterTsTicks, afterIdRaw, forward, levels, headerPredicate);
-        candidates.Sort(forward ? Asc : Desc);
+        var (buf, n) = Collect(current, frozen, pool, fromTicks, toTicks, afterTsTicks, afterIdRaw, forward, levels, headerPredicate);
+        try
+        {
+            if (n == 0) yield break;
 
-        foreach (var c in candidates)
-            yield return c.Tier.Materialise(c.Index, pool);
+            // Min-heap in the requested order: the next event to yield is always at the
+            // root. Building it is O(n); each pop O(log n).
+            Heapify(buf, n, forward);
+
+            int remaining = n, popped = 0;
+            while (remaining > 0)
+            {
+                // Once a sizeable share has been popped the consumer is evidently reading
+                // deep (a wide page, an aggregation), and one sort of what is left beats
+                // paying a cache-missing pop per remaining element. Same order either way.
+                if (remaining > 64 && popped * 8 > remaining)
+                {
+                    var rest = buf.AsSpan(0, remaining);
+                    if (forward) rest.Sort(default(AscComparer)); else rest.Sort(default(DescComparer));
+                    for (int i = 0; i < remaining; i++)
+                        yield return Materialise(current, frozen, pool, in buf[i]);
+                    yield break;
+                }
+
+                var top = buf[0];
+                remaining--;
+                if (remaining > 0)
+                {
+                    buf[0] = buf[remaining];
+                    SiftDown(buf, 0, remaining, forward);
+                }
+                popped++;
+                yield return Materialise(current, frozen, pool, in top);
+            }
+        }
+        finally
+        {
+            ArrayPool<Candidate>.Shared.Return(buf);
+        }
     }
 
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static LogEvent Materialise(HotTierSegment current, IReadOnlyList<HotTierSegment> frozen, StringInternPool? pool, in Candidate c)
+        => (c.Tier < frozen.Count ? frozen[c.Tier] : current).Materialise(c.Index, pool);
+
+    // ── Collection ────────────────────────────────────────────────────────────
+
     /// <summary>
-    /// Two passes over the fixed-size headers: count the matches, then fill an
-    /// exactly-sized list. Pre-sizing to the WHOLE tier was one multi-MB LOH allocation
-    /// per query and per 250 ms live-tail tick regardless of selectivity; the extra
-    /// header walk is cheap (sequential native reads, nothing materialised) next to the
-    /// growth churn the exact sizing was introduced against. Counts are snapshotted per
-    /// tier once, so a publish landing between the passes cannot desynchronise them —
-    /// writers publish an event by incrementing Count after the slot is fully written,
-    /// so every index below the snapshot is safe to read.
+    /// One pass over the headers of every chunk the zone map cannot rule out. Counts are
+    /// snapshotted per tier once; writers publish an event by incrementing Count after
+    /// the slot is fully written, so every index below the snapshot is safe to read. The
+    /// buffer comes from the shared pool and grows by doubling — a selective predicate
+    /// over a large window ends with a small array, a wide unfiltered one with at most
+    /// 2n slots, and neither leaves a multi-MB list for the GC on every poll.
     /// </summary>
-    private static List<Candidate> CollectAll(
+    private static (Candidate[] Buffer, int Count) Collect(
         HotTierSegment current,
         IReadOnlyList<HotTierSegment> frozen,
         StringInternPool? pool,
@@ -69,24 +102,111 @@ public static class HotTierScan
         IReadOnlySet<Ameto.Core.LogLevel>? levels,
         IHotHeaderPredicate? pred)
     {
-        int nTiers = frozen.Count + 1;
-        var caps   = new int[nTiers];
-        for (int t = 0; t < frozen.Count; t++) caps[t] = frozen[t].Count;
-        caps[nTiers - 1] = current.Count;
-
         var scan = new ScanState(pool, fromTicks, toTicks, afterTs, afterId, forward, levels, pred);
 
-        int matched = 0;
-        for (int t = 0; t < frozen.Count; t++)
-            matched += CountMatches(frozen[t], caps[t], ref scan);
-        matched += CountMatches(current, caps[nTiers - 1], ref scan);
+        // The cursor is a bound too: forward, nothing before its tick can pass the cursor
+        // check (ties go through the id, which is why the header check keeps the exact
+        // test); so a chunk entirely before it is skipped like one outside the window.
+        // Mirror image backward.
+        long zoneFrom = fromTicks, zoneTo = toTicks;
+        if (afterTs is long cursor)
+        {
+            if (forward) { if (cursor > zoneFrom) zoneFrom = cursor; }
+            else         { if (cursor < zoneTo)   zoneTo   = cursor; }
+        }
 
-        var candidates = new List<Candidate>(matched);
-        for (int t = 0; t < frozen.Count; t++)
-            Collect(frozen[t], caps[t], candidates, ref scan);
-        Collect(current, caps[nTiers - 1], candidates, ref scan);
-        return candidates;
+        var buf = ArrayPool<Candidate>.Shared.Rent(256);
+        int n   = 0;
+
+        int nFrozen = frozen.Count;
+        for (int t = 0; t < nFrozen; t++)
+            CollectTier(frozen[t], t, ref scan, zoneFrom, zoneTo, ref buf, ref n);
+        CollectTier(current, nFrozen, ref scan, zoneFrom, zoneTo, ref buf, ref n);
+
+        return (buf, n);
     }
+
+    private static void CollectTier(
+        HotTierSegment tier, int tierOrdinal, ref ScanState scan,
+        long zoneFrom, long zoneTo,
+        ref Candidate[] buf, ref int n)
+    {
+        int count = tier.Count;                       // volatile: publishes prior writes
+        for (int ci = 0; ci * ChunkCap < count; ci++)
+        {
+            if (!tier.ChunkMayOverlap(ci, zoneFrom, zoneTo)) continue;
+
+            int first   = ci * ChunkCap;
+            var headers = tier.ChunkHeaders(ci, Math.Min(ChunkCap, count - first));
+            for (int si = 0; si < headers.Length; si++)
+            {
+                ref readonly var h = ref headers[si];
+                if (!scan.Matches(in h)) continue;
+
+                if (n == buf.Length) Grow(ref buf);
+                buf[n++] = new Candidate(tierOrdinal, first + si, h.TimestampUtcTicks, h.Id);
+            }
+        }
+    }
+
+    private static void Grow(ref Candidate[] buf)
+    {
+        var bigger = ArrayPool<Candidate>.Shared.Rent(buf.Length * 2);
+        buf.AsSpan().CopyTo(bigger);
+        ArrayPool<Candidate>.Shared.Return(buf);
+        buf = bigger;
+    }
+
+    // ── Ordering ──────────────────────────────────────────────────────────────
+
+    /// <summary>True when <paramref name="a"/> is yielded before <paramref name="b"/>.</summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool Before(in Candidate a, in Candidate b, bool forward)
+    {
+        if (a.Ts != b.Ts) return forward ? a.Ts < b.Ts : a.Ts > b.Ts;
+        return forward ? a.Id < b.Id : a.Id > b.Id;
+    }
+
+    private static void Heapify(Candidate[] a, int n, bool forward)
+    {
+        for (int i = (n >> 1) - 1; i >= 0; i--)
+            SiftDown(a, i, n, forward);
+    }
+
+    private static void SiftDown(Candidate[] a, int i, int n, bool forward)
+    {
+        var item = a[i];
+        while (true)
+        {
+            int child = 2 * i + 1;
+            if (child >= n) break;
+            if (child + 1 < n && Before(in a[child + 1], in a[child], forward)) child++;
+            if (!Before(in a[child], in item, forward)) break;
+            a[i] = a[child];
+            i    = child;
+        }
+        a[i] = item;
+    }
+
+    private struct AscComparer : IComparer<Candidate>
+    {
+        public int Compare(Candidate a, Candidate b)
+        {
+            int c = a.Ts.CompareTo(b.Ts);
+            return c != 0 ? c : a.Id.CompareTo(b.Id);
+        }
+    }
+
+    private struct DescComparer : IComparer<Candidate>
+    {
+        public int Compare(Candidate a, Candidate b)
+        {
+            int c = b.Ts.CompareTo(a.Ts);
+            return c != 0 ? c : b.Id.CompareTo(a.Id);
+        }
+    }
+
+    // ── Per-header test ───────────────────────────────────────────────────────
 
     /// <summary>
     /// Everything a header is tested against, plus the per-scan memo of service verdicts.
@@ -195,24 +315,5 @@ public static class HotTierScan
 
         [InlineArray(Slots)] public struct Keys16     { private int  _e0; }
         [InlineArray(Slots)] public struct Verdicts16 { private byte _e0; }
-    }
-
-    private static int CountMatches(HotTierSegment tier, int n, ref ScanState scan)
-    {
-        int matched = 0;
-        for (int i = 0; i < n; i++)
-            if (scan.Matches(in tier.GetHeader(i)))
-                matched++;
-        return matched;
-    }
-
-    private static void Collect(HotTierSegment tier, int n, List<Candidate> into, ref ScanState scan)
-    {
-        for (int i = 0; i < n; i++)
-        {
-            ref readonly var h = ref tier.GetHeader(i);
-            if (scan.Matches(in h))
-                into.Add(new Candidate(tier, i, h.TimestampUtcTicks, h.Id));
-        }
     }
 }

@@ -152,6 +152,47 @@ public sealed class HotTierSegmentTests : IDisposable
         Assert.True(read.SequenceEqual(payload));
     }
 
+    // ── Zone map ─────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// The per-chunk [min, max] must follow the events actually written, not the order
+    /// they arrived in: a late event with an OLD timestamp lands in the newest chunk and
+    /// must widen that chunk's zone, or a query for its window would skip the chunk and
+    /// lose it.
+    /// </summary>
+    [Fact]
+    public void ChunkMayOverlap_TracksOutOfOrderArrivalsExactly()
+    {
+        const int perChunk = HotTierSegment.ChunkEventCapacity;
+        long      b        = new DateTimeOffset(2026, 9, 1, 0, 0, 0, TimeSpan.Zero).UtcTicks;
+        var       tick     = TimeSpan.TicksPerSecond;
+
+        using var seg = new HotTierSegment(perChunk * 2 + 16, 32L * 1024 * 1024);
+
+        // Chunk 0: monotone [b, b + perChunk).
+        for (int i = 0; i < perChunk; i++)
+            Assert.True(seg.TryWrite(MakeHeader(LogLevel.Information, i, new DateTimeOffset(b + i * tick, TimeSpan.Zero)), ReadOnlySpan<byte>.Empty));
+        // Chunk 1: starts far in the future…
+        for (int i = 0; i < 8; i++)
+            Assert.True(seg.TryWrite(MakeHeader(LogLevel.Information, perChunk + i, new DateTimeOffset(b + (perChunk + 1000 + i) * tick, TimeSpan.Zero)), ReadOnlySpan<byte>.Empty));
+
+        long late = b - 500 * tick;   // …then one late arrival older than anything in chunk 0
+        Assert.False(seg.ChunkMayOverlap(1, late, late));
+        Assert.False(seg.ChunkMayOverlap(1, b + 10 * tick, b + 20 * tick));           // chunk 0's band: not chunk 1's, yet
+        Assert.True(seg.TryWrite(MakeHeader(LogLevel.Information, perChunk + 8, new DateTimeOffset(late, TimeSpan.Zero)), ReadOnlySpan<byte>.Empty));
+
+        Assert.True (seg.ChunkMayOverlap(1, late, late));                             // widened downward
+        Assert.False(seg.ChunkMayOverlap(0, late, late));                             // chunk 0 untouched
+        Assert.True (seg.ChunkMayOverlap(0, b + 10 * tick, b + 20 * tick));
+        Assert.True (seg.ChunkMayOverlap(1, b + 10 * tick, b + 20 * tick));           // a zone is a range: the late arrival pulled it over chunk 0's band
+        Assert.True (seg.ChunkMayOverlap(1, b + (perChunk + 1003) * tick, long.MaxValue));
+        Assert.False(seg.ChunkMayOverlap(0, b + (perChunk + 1003) * tick, long.MaxValue));
+
+        // The span handed to the scan covers exactly the published slots of the chunk.
+        Assert.Equal(9, seg.ChunkHeaders(1, seg.Count - perChunk).Length);
+        Assert.Equal(late, seg.ChunkHeaders(1, 9)[8].TimestampUtcTicks);
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     private static LogEventHeader MakeHeader(
