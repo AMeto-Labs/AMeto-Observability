@@ -249,3 +249,55 @@ public sealed class HotTierScanAllocProbe
         return hot;
     }
 }
+
+public sealed class HotTierMaterialiseProbe
+{
+    private readonly ITestOutputHelper _out;
+    public HotTierMaterialiseProbe(ITestOutputHelper o) => _out = o;
+
+    /// <summary>Materialise every event of a 200k tier: the per-event cost of MaterialiseEvent (pool resolution included).</summary>
+    [Fact]
+    public void MaterialiseAll_PerEventCost()
+    {
+        var pool = new StringInternPool();
+        for (int i = 0; i < 2000; i++) pool.Intern("filler-" + i);   // a realistic pool, not a 3-entry one
+        using var hot = BuildTier(pool, 200_000);
+
+        double Run()
+        {
+            var sw = Stopwatch.StartNew();
+            int n = 0;
+            foreach (var ev in hot.ReadAll(pool)) if (ev.ServiceName is not null) n++;
+            sw.Stop();
+            Assert.Equal(200_000, n);
+            return sw.Elapsed.TotalMilliseconds;
+        }
+        Run(); Run();
+        double best = double.MaxValue;
+        for (int i = 0; i < 5; i++) best = Math.Min(best, Run());
+        _out.WriteLine($"materialise 200k: best {best:F1} ms = {best * 1e6 / 200_000:F0} ns/event");
+    }
+
+    private static HotTierSegment BuildTier(StringInternPool pool, int events)
+    {
+        var hot = new HotTierSegment(events + 1, (long)events * 64 + 1024 * 1024);
+        int[] tmpl = [pool.Intern("HTTP request handled"), pool.Intern("Order {OrderId} placed"), pool.Intern("Cache miss {Key}")];
+        int[] svc  = [pool.Intern("Svc.A"), pool.Intern("Svc.B"), pool.Intern("Svc.C")];
+        long  baseTicks = DateTimeOffset.UtcNow.UtcTicks;
+        var buf = new ArrayBufferWriter<byte>(64);
+        var w = new MessagePackWriter(buf); w.WriteMapHeader(1); w.Write("n"); w.Write(1L); w.Flush();
+        for (int i = 0; i < events; i++)
+        {
+            var h = new LogEventHeader
+            {
+                Id = new EventId(0u, (uint)i).RawValue, TimestampUtcTicks = baseTicks + i,
+                Level = Ameto.Core.LogLevel.Information,
+                MessageTemplatePoolIndex = tmpl[i % 3], ServiceNamePoolIndex = svc[i % 3],
+            };
+            // No template string attached: the pool is the source, as after WAL recovery / OTLP ingest.
+            Assert.True(hot.TryWrite(h, buf.WrittenSpan));
+        }
+        hot.Freeze();
+        return hot;
+    }
+}
