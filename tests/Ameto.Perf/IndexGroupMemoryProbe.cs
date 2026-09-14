@@ -76,9 +76,13 @@ public sealed class IndexGroupMemoryProbe : IDisposable
         Assert.True(g4.PeakBytes < g2.PeakBytes * 1.6);
 
         // Same events, one group: this is what the peak looked like before v7 and what a
-        // day-scale segment would have cost.
-        Assert.True(g4.PeakBytes * 2 < un.PeakBytes,
-            $"grouping saved nothing: {g4.PeakBytes / MB:F1} MB grouped vs {un.PeakBytes / MB:F1} MB ungrouped");
+        // day-scale segment would have cost. Compared ABOVE THE FLOOR: the pooled tables have
+        // a fixed cost any group pays (the trigram's 8 MB slot table alone), which grouping
+        // cannot touch and which dwarfs these deliberately small builds; what grouping bounds
+        // is the part that scales with events.
+        long floor = Measure(4_000, GroupBudget, "floor").PeakBytes;
+        Assert.True((g4.PeakBytes - floor) * 2 < un.PeakBytes - floor,
+            $"grouping saved nothing: {g4.PeakBytes / MB:F1} MB grouped vs {un.PeakBytes / MB:F1} MB ungrouped (floor {floor / MB:F1} MB)");
     }
 
     private readonly record struct Result(int Events, int Groups, long PeakBytes);
@@ -95,18 +99,15 @@ public sealed class IndexGroupMemoryProbe : IDisposable
 
         using (var writer = new SegmentWriter(path, groupBudget))
         {
-            // Baseline with the tier, the order array and the writer already alive, so what
-            // we attribute to the build is only what the BUILDER retains.
-            long baseline = GC.GetTotalMemory(forceFullCollection: true);
-
             // A FRESH builder per group — the mechanism under test. The previous group's
-            // accumulators are unreachable by the time the next one seals, so the forced
-            // collection inside the probe leaves only the current group's state live.
+            // accumulators have been handed back to the pool by the time the next one seals,
+            // so what the sealing builder HOLDS is the group's state and nothing else's. That
+            // is read off the builder, not off the heap: a GC.GetTotalMemory delta would count
+            // every buffer an earlier group parked in the ArrayPool as still live.
             writer.WriteEvents(hot, pool, order, (count, termsPerEvent) => new PeakProbeSink(
                 new SegmentIndexBuilder(count, 5, termsPerEvent),
-                () =>
+                live =>
                 {
-                    long live = GC.GetTotalMemory(forceFullCollection: true) - baseline;
                     if (live > peak) peak = live;
                     groups++;
                 }));
@@ -120,7 +121,7 @@ public sealed class IndexGroupMemoryProbe : IDisposable
     /// Wraps the real builder and samples the live heap at the instant a group seals — the
     /// group's accumulators at their fullest, everything from earlier groups already garbage.
     /// </summary>
-    private sealed class PeakProbeSink(SegmentIndexBuilder inner, Action onSeal) : ISegmentIndexSink
+    private sealed class PeakProbeSink(SegmentIndexBuilder inner, Action<long> onSeal) : ISegmentIndexSink
     {
         public void Add(uint fileOrdinal, in SegmentEventRef ev) => inner.Add(fileOrdinal, in ev);
 
@@ -133,7 +134,7 @@ public sealed class IndexGroupMemoryProbe : IDisposable
 
         public (byte[] Inverted, byte[] Trigram, byte[] Bloom) Serialise()
         {
-            onSeal();
+            onSeal(inner.BuildRetainedBytes);
             return inner.Serialise();
         }
 

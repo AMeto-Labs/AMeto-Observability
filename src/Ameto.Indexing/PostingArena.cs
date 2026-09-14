@@ -176,7 +176,7 @@ internal sealed class PostingArena
     {
         for (int i = 0; i < _slabCount; i++)
         {
-            ArrayPool<byte>.Shared.Return(_slabs[i]);
+            IndexBuildPool.Slabs.Return(_slabs[i]);
             _slabs[i] = null!;
         }
         _slabCount  = 0;
@@ -224,7 +224,7 @@ internal sealed class PostingArena
     private void AddSlab()
     {
         if (_slabCount == _slabs.Length) Array.Resize(ref _slabs, _slabs.Length * 2);
-        _slabs[_slabCount++] = ArrayPool<byte>.Shared.Rent(SlabBytes);
+        _slabs[_slabCount++] = IndexBuildPool.Slabs.Rent(SlabBytes);
     }
 
     private static int VarintLen(uint v)

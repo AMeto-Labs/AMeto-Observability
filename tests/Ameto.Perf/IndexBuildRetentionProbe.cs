@@ -120,7 +120,8 @@ public sealed class IndexBuildRetentionProbe
         _out.WriteLine($"── {label}");
         _out.WriteLine($"   events                       {events:N0}");
         _out.WriteLine($"   hot tier native (off-heap)   {tierNative / MB,8:F1} MB   ({hot.AllocatedBytes / 9437184} chunks x 9 MB)");
-        _out.WriteLine($"   RETAINED by index build      {(afterBuild - before) / MB,8:F1} MB   <-- x FlushConcurrency concurrent flushes");
+        _out.WriteLine($"   HELD by index build (pooled) {builder.BuildRetainedBytes / MB,8:F1} MB   <-- x FlushConcurrency concurrent flushes");
+        _out.WriteLine($"   heap growth over the build   {(afterBuild - before) / MB,8:F1} MB   (includes pool doublings; the line above is what the group holds)");
         _out.WriteLine($"   + streamed sections (prod)   {(afterStreamed - afterBuild) / MB,8:F1} MB   (written: {invLen / MB:F1} inv / {triLen / MB:F1} tri / {bloomLen / MB:F1} bloom)");
         _out.WriteLine($"   + serialised index blobs     {(afterSerialise - afterStreamed) / MB,8:F1} MB   (LOH: {inverted.Length / MB:F1} inv / {trigram.Length / MB:F1} tri / {bloom.Length / MB:F1} bloom)");
         _out.WriteLine($"   PEAK per in-flight flush     {(afterStreamed - before) / MB,8:F1} MB   (streamed; {(afterSerialise - before) / MB:F1} MB via blobs)");

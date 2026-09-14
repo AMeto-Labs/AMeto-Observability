@@ -1,4 +1,6 @@
+using System.Buffers;
 using System.Buffers.Binary;
+using System.Runtime.CompilerServices;
 using Collections.Special;
 using Ameto.Core;
 
@@ -7,9 +9,20 @@ namespace Ameto.Indexing;
 /// <summary>
 /// Inverted index for a single segment: maps (propertyName, value) → sorted int list of local event offsets.
 ///
-/// Building phase (hot-tier): accumulates offsets in <see cref="List{T}"/> per value bucket.
-/// Serialisation: converts each list to a <see cref="RoaringBitmap"/> for compact storage.
-/// Deserialisation: iterates bitmap values back into sorted arrays for fast lookup.
+/// Building phase: terms live as UTF-8 in pooled slabs; an open-addressing table keyed by
+/// (property, hash, bytes) finds the entry; postings sit in a <see cref="PostingArena"/> already
+/// in wire form, singletons inline. Nothing per distinct value is a heap object: the old build
+/// kept a <c>string</c>, a <c>List&lt;int&gt;</c>, its <c>int[]</c> and a dictionary entry per
+/// value — ~150 B and four objects for a 32-byte trace id, ×4 high-cardinality properties ×
+/// 200 k events per group, with the dictionaries doubling their way onto the LOH — and
+/// transcoded every key and value from UTF-8 to UTF-16 to look it up and back again to write it.
+/// Serialisation: delta+varint via <see cref="SegmentBitmapCodec"/>, terms copied from the slabs.
+/// Deserialisation: iterates postings back into sorted arrays for fast lookup.
+///
+/// <para>SECTION BYTES ARE PINNED: properties are written in first-seen order and each
+/// property's values in first-seen order (a per-property chain through the entry array), which
+/// is the dictionary insertion order the previous build wrote. <c>IndexBuildParityTests</c> and
+/// <c>SegmentInvertedBuildParityTests</c> compare against an independent reference.</para>
 ///
 /// Thread safety: the build side has NO lock — one index belongs to one index group's builder
 /// and <c>SegmentWriter.WriteEvents</c> drives that from a single thread (the build-mode
@@ -18,9 +31,45 @@ namespace Ameto.Indexing;
 /// </summary>
 public sealed class SegmentInvertedIndex : ISegmentIndex
 {
-    // Build-phase: propertyName → (serialisedValue → sorted offsets)
-    private readonly Dictionary<string, Dictionary<string, List<int>>> _index
-        = new(StringComparer.Ordinal);
+    // ── Build phase ───────────────────────────────────────────────────────────
+
+    private struct PropEntry
+    {
+        public int  NameOff, NameLen;     // into the term slabs
+        public uint Hash;
+        public int  First, Last, Count;   // chain of TermEntry ids in first-seen order (-1 = none)
+    }
+
+    private struct TermEntry
+    {
+        public int  Off, Len;             // into the term slabs
+        public int  Prop;
+        public int  Next;                 // next value of the same property, -1 = last
+        public uint Hash;
+        public PostingArena.Bucket Postings;
+    }
+
+    private const int SlabShift = 20;
+    private const int SlabBytes = 1 << SlabShift;
+    private const int SlabMask  = SlabBytes - 1;
+
+    // Term slabs: rented 1 MB arrays, terms appended, an offset is slab << 20 | position.
+    private byte[][] _slabs = Array.Empty<byte[]>();
+    private int      _slabCount;
+    private int      _slabUsed = SlabBytes;   // forces a first slab on the first append
+
+    private PropEntry[] _props     = Array.Empty<PropEntry>();
+    private int         _propCount;
+    private int[]       _propTable = Array.Empty<int>();   // entry id + 1, 0 = empty
+
+    private TermEntry[] _terms     = Array.Empty<TermEntry>();
+    private int         _termCount;
+    private int[]       _termTable = Array.Empty<int>();   // entry id + 1, 0 = empty
+
+    private readonly int _expectedTerms;
+    private PostingArena _arena = new();
+    private bool         _unsorted;
+    private bool         _released;
 
     // Query-phase (populated after Deserialise): ascending offset arrays per (name,value).
     // Decoded from the segment's posting lists — SegmentBitmapCodec for current segments,
@@ -29,6 +78,28 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
 
     /// <summary>Marks the codec posting-list format; a legacy blob starts with propertyCount (never this).</summary>
     private const uint CodecMagic = 0xFFFFFFFFu;
+
+    public SegmentInvertedIndex() { }
+
+    /// <param name="expectedTerms">Distinct (property, value) pairs the build is expected to
+    /// hold — the previous group's count, from <see cref="IndexBuildHints"/>. Sizes the term table
+    /// and entry array once instead of doubling them up to that size; a wrong hint costs one
+    /// rehash per doubling, never correctness. Nothing is rented until the first add, so a
+    /// deserialised (query-side) instance pays for none of this.</param>
+    public SegmentInvertedIndex(int expectedTerms) => _expectedTerms = expectedTerms;
+
+    /// <summary>Distinct properties seen by this build.</summary>
+    public int PropertyCount => _propCount;
+
+    /// <summary>Distinct (property, value) pairs seen by this build.</summary>
+    public int TermCount => _termCount;
+
+    /// <summary>Managed bytes the pooled build state holds — what <see cref="ReleaseBuildBuffers"/> gives back.</summary>
+    public long BuildRetainedBytes
+        => (long)_slabCount * SlabBytes
+         + (long)_props.Length * Unsafe.SizeOf<PropEntry>() + (long)_propTable.Length * sizeof(int)
+         + (long)_terms.Length * Unsafe.SizeOf<TermEntry>() + (long)_termTable.Length * sizeof(int)
+         + _arena.RetainedBytes;
 
     // ── Build (hot path) ──────────────────────────────────────────────────────
 
@@ -40,66 +111,106 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
     /// About half of a prop-dense event's ~21 bloom adds were such repeats.
     /// </summary>
     public IndexAddOutcome Add(uint localOffset, string propertyName, object? value)
+        => AddSpan(localOffset, propertyName, SerialiseValue(value));
+
+    /// <summary>
+    /// UTF-16 overload, transcoding to the UTF-8 path. For tests, probes and the reference
+    /// build; the streaming builder hands in raw UTF-8 and never comes through here.
+    /// </summary>
+    public IndexAddOutcome AddSpan(uint localOffset, ReadOnlySpan<char> propertyName, ReadOnlySpan<char> serialisedValue)
     {
-        string serialised = SerialiseValue(value);
-        int offset        = (int)localOffset;
-        var outcome       = IndexAddOutcome.Existing;
-
-        // No lock: one builder per index group, driven from one thread (see class remarks).
+        int maxName = System.Text.Encoding.UTF8.GetMaxByteCount(propertyName.Length);
+        int maxVal  = System.Text.Encoding.UTF8.GetMaxByteCount(serialisedValue.Length);
+        byte[]? rented = maxName + maxVal > 1024 ? ArrayPool<byte>.Shared.Rent(maxName + maxVal) : null;
+        Span<byte> buf = rented ?? stackalloc byte[maxName + maxVal];
+        try
         {
-            if (!_index.TryGetValue(propertyName, out var values))
-            {
-                values = new Dictionary<string, List<int>>(StringComparer.Ordinal);
-                _index[propertyName] = values;
-                outcome = IndexAddOutcome.NewProperty;
-            }
-
-            if (!values.TryGetValue(serialised, out var list))
-            {
-                list = new List<int>();
-                values[serialised] = list;
-                if (outcome == IndexAddOutcome.Existing) outcome = IndexAddOutcome.NewValue;
-            }
-
-            // Offsets arrive in monotonically increasing order during a single flush — no sort needed.
-            if (list.Count == 0 || list[^1] != offset)
-                list.Add(offset);
+            int n = System.Text.Encoding.UTF8.GetBytes(propertyName, buf);
+            int v = System.Text.Encoding.UTF8.GetBytes(serialisedValue, buf[n..]);
+            return AddUtf8(localOffset, buf[..n], buf.Slice(n, v));
         }
-        return outcome;
+        finally
+        {
+            if (rented is not null) ArrayPool<byte>.Shared.Return(rented);
+        }
+    }
+
+    /// <summary>The production entry point: property name and already-serialised value as raw UTF-8.</summary>
+    public IndexAddOutcome AddUtf8(uint localOffset, ReadOnlySpan<byte> propertyName, ReadOnlySpan<byte> serialisedValue)
+    {
+        int prop = PropertyId(propertyName, out bool created);
+        var r    = AddValue(localOffset, prop, serialisedValue);
+        return created ? IndexAddOutcome.NewProperty : r;
     }
 
     /// <summary>
-    /// Span overload for the zero-alloc flush walk: <paramref name="serialisedValueUtf8"/> is the
-    /// already-serialised value form (matching <see cref="SerialiseValue"/>, e.g. <c>\0l123</c>).
-    /// Interns the property name and value key by span, so a string is allocated only the first
-    /// time each distinct (name, value) is seen — not per event (both are low-cardinality).
+    /// Resolves (creating on first sight) the id of a property, for a caller that files several
+    /// values under one flattened key or wants to cache the id.
     /// </summary>
-    public IndexAddOutcome AddSpan(uint localOffset, ReadOnlySpan<char> propertyName, ReadOnlySpan<char> serialisedValueUtf8)
+    public int PropertyId(ReadOnlySpan<byte> nameUtf8, out bool created)
     {
-        int offset  = (int)localOffset;
-        var outcome = IndexAddOutcome.Existing;
-        // No lock: one builder per index group, driven from one thread (see class remarks).
+        ObjectDisposedException.ThrowIf(_released, this);
+        if (_propTable.Length == 0) InitTables();
+
+        uint h    = Utf8Hash.Compute(nameUtf8);
+        int  mask = _propTable.Length - 1;
+        int  i    = (int)h & mask;
+        while (true)
         {
-            var outer = _index.GetAlternateLookup<ReadOnlySpan<char>>();
-            if (!outer.TryGetValue(propertyName, out var values))
+            int slot = _propTable[i];
+            if (slot == 0) break;
+            ref var p = ref _props[slot - 1];
+            if (p.Hash == h && p.NameLen == nameUtf8.Length && Term(p.NameOff, p.NameLen).SequenceEqual(nameUtf8))
             {
-                values = new Dictionary<string, List<int>>(StringComparer.Ordinal);
-                _index[new string(propertyName)] = values;
-                outcome = IndexAddOutcome.NewProperty;
+                created = false;
+                return slot - 1;
             }
-
-            var inner = values.GetAlternateLookup<ReadOnlySpan<char>>();
-            if (!inner.TryGetValue(serialisedValueUtf8, out var list))
-            {
-                list = new List<int>();
-                values[new string(serialisedValueUtf8)] = list;
-                if (outcome == IndexAddOutcome.Existing) outcome = IndexAddOutcome.NewValue;
-            }
-
-            if (list.Count == 0 || list[^1] != offset)
-                list.Add(offset);
+            i = (i + 1) & mask;
         }
-        return outcome;
+
+        if (_propCount == _props.Length) Grow(ref _props, _propCount);
+        int id = _propCount++;
+        ref var np = ref _props[id];
+        np.NameOff = Append(nameUtf8);
+        np.NameLen = nameUtf8.Length;
+        np.Hash    = h;
+        np.First   = -1; np.Last = -1; np.Count = 0;
+        _propTable[i] = id + 1;
+        if (_propCount * 2 > _propTable.Length) RehashProps();
+        created = true;
+        return id;
+    }
+
+    /// <summary>Files <paramref name="localOffset"/> under (<paramref name="prop"/>, value).
+    /// Returns <see cref="IndexAddOutcome.NewValue"/> on the value's first sighting.</summary>
+    public IndexAddOutcome AddValue(uint localOffset, int prop, ReadOnlySpan<byte> serialisedValue)
+    {
+        uint h    = Utf8Hash.Compute(serialisedValue) ^ ((uint)prop * 0x9E3779B1u);
+        int  mask = _termTable.Length - 1;
+        int  i    = (int)h & mask;
+        int  id;
+        while (true)
+        {
+            int slot = _termTable[i];
+            if (slot == 0)
+            {
+                id = NewTerm(prop, serialisedValue, h);
+                _termTable[i] = id + 1;
+                if (_termCount * 2 > _termTable.Length) RehashTerms();
+                _arena.Append(ref _terms[id].Postings, (int)localOffset, ref _unsorted);
+                return IndexAddOutcome.NewValue;
+            }
+            ref var e = ref _terms[slot - 1];
+            if (e.Hash == h && e.Prop == prop && e.Len == serialisedValue.Length
+                && Term(e.Off, e.Len).SequenceEqual(serialisedValue))
+            {
+                // Offsets arrive in monotonically increasing order during a single flush; the
+                // arena drops a repeat of the current offset and flags anything out of order.
+                _arena.Append(ref e.Postings, (int)localOffset, ref _unsorted);
+                return IndexAddOutcome.Existing;
+            }
+            i = (i + 1) & mask;
+        }
     }
 
     public void AddEvent(uint localOffset, LogLevel level, Dictionary<string, object?>? properties)
@@ -109,6 +220,172 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
         if (properties is null) return;
         foreach (var (k, v) in properties)
             Add(localOffset, k, v);
+    }
+
+    private int NewTerm(int prop, ReadOnlySpan<byte> value, uint hash)
+    {
+        if (_termCount == _terms.Length) Grow(ref _terms, _termCount);
+        int id = _termCount++;
+        ref var e = ref _terms[id];
+        e.Off  = Append(value);
+        e.Len  = value.Length;
+        e.Prop = prop;
+        e.Next = -1;
+        e.Hash = hash;
+        e.Postings = default;
+
+        ref var p = ref _props[prop];
+        if (p.Last < 0) p.First = id; else _terms[p.Last].Next = id;
+        p.Last = id;
+        p.Count++;
+        return id;
+    }
+
+    private void InitTables()
+    {
+        int terms = Math.Max(_expectedTerms, 1024);
+        int cap   = (int)Math.Min(1 << 30, (uint)System.Numerics.BitOperations.RoundUpToPowerOf2((uint)terms * 2));
+        _termTable = RentCleared(cap);
+        _terms     = IndexBuildPool.Entries<TermEntry>().Rent(terms);
+        _propTable = RentCleared(256);
+        _props     = IndexBuildPool.Entries<PropEntry>().Rent(64);
+    }
+
+    private static int[] RentCleared(int n)
+    {
+        var t = IndexBuildPool.Ints.Rent(n);
+        // A rented array can be longer than asked; the table uses its FULL length as capacity
+        // (mask = Length - 1), so it must be a power of two — trim by re-renting exact when not.
+        if (!System.Numerics.BitOperations.IsPow2(t.Length))
+        {
+            IndexBuildPool.Ints.Return(t);
+            t = new int[n];
+            return t;
+        }
+        Array.Clear(t);
+        return t;
+    }
+
+    private static void Grow<T>(ref T[] arr, int used) where T : struct
+    {
+        var next = IndexBuildPool.Entries<T>().Rent(Math.Max(1024, arr.Length * 2));
+        arr.AsSpan(0, used).CopyTo(next);
+        if (arr.Length > 0) IndexBuildPool.Entries<T>().Return(arr);
+        arr = next;
+    }
+
+    private void RehashTerms()
+    {
+        var old = _termTable;
+        var t   = RentCleared(old.Length * 2);
+        int mask = t.Length - 1;
+        for (int id = 0; id < _termCount; id++)
+        {
+            int i = (int)_terms[id].Hash & mask;
+            while (t[i] != 0) i = (i + 1) & mask;
+            t[i] = id + 1;
+        }
+        IndexBuildPool.Ints.Return(old);
+        _termTable = t;
+    }
+
+    private void RehashProps()
+    {
+        var old = _propTable;
+        var t   = RentCleared(old.Length * 2);
+        int mask = t.Length - 1;
+        for (int id = 0; id < _propCount; id++)
+        {
+            int i = (int)_props[id].Hash & mask;
+            while (t[i] != 0) i = (i + 1) & mask;
+            t[i] = id + 1;
+        }
+        IndexBuildPool.Ints.Return(old);
+        _propTable = t;
+    }
+
+    /// <summary>Copies <paramref name="bytes"/> into the slabs and returns its offset.</summary>
+    private int Append(ReadOnlySpan<byte> bytes)
+    {
+        if (_slabUsed + bytes.Length > SlabBytes)
+        {
+            // A term longer than a slab (only reachable if the ingest payload cap is raised past
+            // 1 MB) gets a slab of its own at position 0, which the offset scheme still names.
+            if (_slabCount == _slabs.Length) Array.Resize(ref _slabs, Math.Max(4, _slabs.Length * 2));
+            _slabs[_slabCount++] = IndexBuildPool.Slabs.Rent(Math.Max(SlabBytes, bytes.Length));
+            _slabUsed = 0;
+        }
+        int slab = _slabCount - 1;
+        bytes.CopyTo(_slabs[slab].AsSpan(_slabUsed));
+        int off = (slab << SlabShift) | _slabUsed;
+        _slabUsed += bytes.Length;
+        return off;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private ReadOnlySpan<byte> Term(int off, int len) => _slabs[off >> SlabShift].AsSpan(off & SlabMask, len);
+
+    /// <summary>
+    /// Hands the slabs, tables, entries and posting arena back to their pools. The index is
+    /// unusable afterwards — adds and <see cref="Serialise"/> throw — because a returned pooled
+    /// array is somebody else's the moment they rent it (the freed-memory read
+    /// <c>SegmentBloomFilter.Serialise</c> guards against, on the managed side).
+    /// </summary>
+    public void ReleaseBuildBuffers()
+    {
+        if (_released) return;
+        _released = true;
+        for (int i = 0; i < _slabCount; i++) { IndexBuildPool.Slabs.Return(_slabs[i]); _slabs[i] = null!; }
+        _slabCount = 0; _slabUsed = SlabBytes;
+        if (_props.Length > 0)     { IndexBuildPool.Entries<PropEntry>().Return(_props);  _props = Array.Empty<PropEntry>(); }
+        if (_terms.Length > 0)     { IndexBuildPool.Entries<TermEntry>().Return(_terms);  _terms = Array.Empty<TermEntry>(); }
+        if (_propTable.Length > 0) { IndexBuildPool.Ints.Return(_propTable);    _propTable = Array.Empty<int>(); }
+        if (_termTable.Length > 0) { IndexBuildPool.Ints.Return(_termTable);    _termTable = Array.Empty<int>(); }
+        _propCount = 0; _termCount = 0;
+        _arena.Release();
+    }
+
+    // ── Build-mode reads (test-only) ──────────────────────────────────────────
+
+    private int FindPropertyBuild(string name)
+    {
+        if (_propTable.Length == 0) return -1;
+        ReadOnlySpan<byte> key = System.Text.Encoding.UTF8.GetBytes(name);
+        uint h = Utf8Hash.Compute(key);
+        int mask = _propTable.Length - 1;
+        for (int i = (int)h & mask; _propTable[i] != 0; i = (i + 1) & mask)
+        {
+            ref var p = ref _props[_propTable[i] - 1];
+            if (p.Hash == h && p.NameLen == key.Length && Term(p.NameOff, p.NameLen).SequenceEqual(key))
+                return _propTable[i] - 1;
+        }
+        return -1;
+    }
+
+    private int FindTermBuild(int prop, string serialised)
+    {
+        var bytes = System.Text.Encoding.UTF8.GetBytes(serialised);
+        uint h = Utf8Hash.Compute(bytes) ^ ((uint)prop * 0x9E3779B1u);
+        int mask = _termTable.Length - 1;
+        for (int i = (int)h & mask; _termTable[i] != 0; i = (i + 1) & mask)
+        {
+            ref var e = ref _terms[_termTable[i] - 1];
+            if (e.Hash == h && e.Prop == prop && e.Len == bytes.Length && Term(e.Off, e.Len).SequenceEqual(bytes))
+                return _termTable[i] - 1;
+        }
+        return -1;
+    }
+
+    private int[]? BuildPostings(string name, string serialised)
+    {
+        int prop = FindPropertyBuild(name);
+        if (prop < 0) return null;
+        int id = FindTermBuild(prop, serialised);
+        if (id < 0) return null;
+        ref readonly var b = ref _terms[id].Postings;
+        var arr = new int[b.Count];
+        _arena.Decode(in b, arr);
+        return arr;
     }
 
     // ── ISegmentIndex ─────────────────────────────────────────────────────────
@@ -123,9 +400,8 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
         }
 
         // Build mode (test-only: production queries always read a deserialised index).
-        if (_index.TryGetValue(propertyName, out var buildValues) &&
-            buildValues.TryGetValue(SerialiseValue(value), out var list))
-            return list.Select(x => (uint)x).ToArray();
+        int[]? build = BuildPostings(propertyName, SerialiseValue(value));
+        if (build is not null) return ToUInt(build);
 
         return null;
     }
@@ -205,9 +481,10 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
             return !known || offsets is not null;    // property not indexed → no information
         }
 
-        if (!_index.TryGetValue(propertyName, out var buildValues))
+        int prop = FindPropertyBuild(propertyName);
+        if (prop < 0)
             return true;
-        return buildValues.ContainsKey(SerialiseValue(value));
+        return FindTermBuild(prop, SerialiseValue(value)) >= 0;
     }
 
     // ── Key identity: one filter path, two possible bucket names ───────────────
@@ -349,89 +626,122 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
     /// </summary>
     public byte[] Serialise()
     {
-        var w = new System.Buffers.ArrayBufferWriter<byte>(EstimateSerialisedSize());
+        ObjectDisposedException.ThrowIf(_released, this);
+        NormaliseIfUnsorted();
+        // One allocation of the final size — the tables know every length — and no ToArray copy.
+        var blob = new byte[ExactSerialisedSize()];
+        var w    = new FixedBufferWriter(blob);
         WriteTo(w);
-        return w.WrittenSpan.ToArray();
+        return blob;
     }
 
     /// <summary>
     /// Streams the section into <paramref name="w"/> — the production path, where the writer
     /// hands in a buffer that drains straight to the segment file instead of a managed blob.
     /// </summary>
-    public void WriteTo(System.Buffers.IBufferWriter<byte> w)
+    public void WriteTo(IBufferWriter<byte> w)
     {
-        // No lock: one builder per index group, driven from one thread (see class remarks).
+        ObjectDisposedException.ThrowIf(_released, this);
+        NormaliseIfUnsorted();
+
+        WriteUInt32(w, CodecMagic);        // distinguishes the codec format from a legacy propertyCount
+        WriteUInt32(w, (uint)_propCount);
+
+        for (int p = 0; p < _propCount; p++)
         {
-            // Written through an ArrayBufferWriter sized up front rather than
-            // BinaryWriter-over-MemoryStream: the stream doubles its backing array as it
-            // grows and ms.ToArray() then copies the finished blob a second time, so a
-            // multi-MB index cost two Large Object Heap allocations plus every intermediate
-            // doubling — and the Workstation GC this server runs never compacts the LOH,
-            // so that garbage ratchets the resident set up flush after flush.
-            WriteUInt32(w, CodecMagic);        // distinguishes the codec format from a legacy propertyCount
-            WriteUInt32(w, (uint)_index.Count);
+            ref readonly var prop = ref _props[p];
+            WriteUtf8(w, Term(prop.NameOff, prop.NameLen));
+            WriteUInt32(w, (uint)prop.Count);
 
-            foreach (var (propName, values) in _index)
+            for (int id = prop.First; id >= 0; id = _terms[id].Next)
             {
-                WriteUtf8(w, propName);
-                WriteUInt32(w, (uint)values.Count);
+                ref readonly var e = ref _terms[id];
+                WriteUtf8(w, Term(e.Off, e.Len));
 
-                foreach (var (valStr, list) in values)
-                {
-                    WriteUtf8(w, valStr);
-
-                    // Encode the ascending offset list with the zero-alloc codec instead of
-                    // RoaringBitmap.Create+Serialize — the flush allocation hot spot.
-                    var offsets = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(list);
-                    // checked: a bucket dense enough to need >2 GB of varints cannot be
-                    // encoded at all, and truncating the request would hand Encode a short
-                    // buffer whose -1 result is written as the section's length prefix.
-                    var dest    = w.GetSpan(checked((int)(4 + SegmentBitmapCodec.MaxEncodedSize(offsets.Length))));
-                    int n       = SegmentBitmapCodec.Encode(offsets, dest[4..]);
-                    BinaryPrimitives.WriteUInt32LittleEndian(dest, (uint)n);
-                    w.Advance(4 + n);
-                }
+                // The posting list is already in codec form in the arena: copy it out behind
+                // its length prefix.
+                int n    = PostingArena.SerialisedSize(in e.Postings);
+                var dest = w.GetSpan(4 + n);
+                BinaryPrimitives.WriteUInt32LittleEndian(dest, (uint)n);
+                _arena.Write(in e.Postings, dest.Slice(4, n));
+                w.Advance(4 + n);
             }
-
         }
     }
 
-    /// <summary>Upper-bound estimate so the writer allocates its buffer once: header, then
-    /// per bucket a length-prefixed key and one varint byte per posting (the dense case).</summary>
-    private int EstimateSerialisedSize()
+    /// <summary>Bytes <see cref="WriteTo"/> will produce — exact, from the entry bookkeeping.</summary>
+    public long ExactSerialisedSize()
     {
         long size = 8;
-        foreach (var (propName, values) in _index)
+        for (int p = 0; p < _propCount; p++)
         {
-            size += 2 + propName.Length * 3 + 4;
-            foreach (var (valStr, list) in values)
-                size += 2 + valStr.Length * 3 + 4 + list.Count + 8;
+            ref readonly var prop = ref _props[p];
+            size += 2 + Utf8Prefixed(Term(prop.NameOff, prop.NameLen)) + 4;
+            for (int id = prop.First; id >= 0; id = _terms[id].Next)
+            {
+                ref readonly var e = ref _terms[id];
+                size += 2 + Utf8Prefixed(Term(e.Off, e.Len)) + 4 + PostingArena.SerialisedSize(in e.Postings);
+            }
         }
-        return (int)Math.Min(int.MaxValue - 64, size + 64);
+        return size;
     }
 
-    private static void WriteUInt32(System.Buffers.IBufferWriter<byte> w, uint v)
+    /// <summary>
+    /// Restores the ascending+distinct invariant the codec requires — only an out-of-order
+    /// caller (never the writer, whose ordinals are monotonic) pays for it, once, here.
+    /// </summary>
+    private void NormaliseIfUnsorted()
+    {
+        if (!_unsorted) return;
+        var fresh   = new PostingArena();
+        int[] tmp   = Array.Empty<int>();
+        bool ignore = false;
+        for (int id = 0; id < _termCount; id++)
+        {
+            ref var b = ref _terms[id].Postings;
+            if (b.Count < 2) continue;
+            if (tmp.Length < b.Count) tmp = new int[Math.Max(b.Count, tmp.Length * 2)];
+            int n = _arena.Decode(in b, tmp);
+            var span = tmp.AsSpan(0, n);
+            span.Sort();
+            PostingArena.Bucket nb = default;
+            for (int i = 0; i < span.Length; i++)
+                if (i == 0 || span[i] != span[i - 1]) fresh.Append(ref nb, span[i], ref ignore);
+            b = nb;
+        }
+        _arena.Release();
+        _arena    = fresh;
+        _unsorted = false;
+    }
+
+    private static void WriteUInt32(IBufferWriter<byte> w, uint v)
     {
         BinaryPrimitives.WriteUInt32LittleEndian(w.GetSpan(4), v);
         w.Advance(4);
     }
 
-    /// <summary>Length-prefixed UTF-8, encoded straight into the writer's buffer.</summary>
-    private static void WriteUtf8(System.Buffers.IBufferWriter<byte> w, string s)
+    /// <summary>
+    /// Length the 16-bit prefix can carry. Writing a truncated COUNT would desynchronise every
+    /// subsequent read and corrupt the whole blob; trimming the VALUE on a UTF-8 boundary only
+    /// costs one over-long index term. Reachable only if the ingest payload cap
+    /// (Ingestion.MaxEventPayloadBytes) is raised above 64 KB.
+    /// </summary>
+    private static int Utf8Prefixed(ReadOnlySpan<byte> s)
     {
-        var dest = w.GetSpan(2 + System.Text.Encoding.UTF8.GetMaxByteCount(s.Length));
-        int n    = System.Text.Encoding.UTF8.GetBytes(s, dest[2..]);
-        if (n > ushort.MaxValue)
-        {
-            // The prefix is 16-bit. Writing a truncated COUNT would desynchronise every
-            // subsequent read and corrupt the whole blob; trimming the VALUE on a UTF-8
-            // boundary only costs one over-long index term. Reachable only if the ingest
-            // payload cap (Ingestion.MaxEventPayloadBytes) is raised above 64 KB.
-            n = ushort.MaxValue;
-            var body = dest[2..];
-            while (n > 0 && (body[n] & 0xC0) == 0x80) n--;   // back off continuation bytes
-        }
+        int n = s.Length;
+        if (n <= ushort.MaxValue) return n;
+        n = ushort.MaxValue;
+        while (n > 0 && (s[n] & 0xC0) == 0x80) n--;   // back off continuation bytes
+        return n;
+    }
+
+    /// <summary>Length-prefixed UTF-8, copied straight from the slab.</summary>
+    private static void WriteUtf8(IBufferWriter<byte> w, ReadOnlySpan<byte> s)
+    {
+        int n    = Utf8Prefixed(s);
+        var dest = w.GetSpan(2 + n);
         BinaryPrimitives.WriteUInt16LittleEndian(dest, (ushort)n);
+        s[..n].CopyTo(dest[2..]);
         w.Advance(2 + n);
     }
 
@@ -439,32 +749,35 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
     /// backward-compatibility read test (current writers emit the codec format above).</summary>
     internal byte[] SerialiseRoaringV1()
     {
-        // No lock: one builder per index group, driven from one thread (see class remarks).
+        ObjectDisposedException.ThrowIf(_released, this);
+        NormaliseIfUnsorted();
+        using var ms = new MemoryStream();
+        using var bw = new BinaryWriter(ms);
+        bw.Write((uint)_propCount);
+        for (int p = 0; p < _propCount; p++)
         {
-            using var ms = new MemoryStream();
-            using var bw = new BinaryWriter(ms);
-            bw.Write((uint)_index.Count);
-            foreach (var (propName, values) in _index)
+            ref readonly var prop = ref _props[p];
+            var nameBytes = Term(prop.NameOff, prop.NameLen);
+            bw.Write((ushort)nameBytes.Length);
+            bw.Write(nameBytes);
+            bw.Write((uint)prop.Count);
+            for (int id = prop.First; id >= 0; id = _terms[id].Next)
             {
-                var nameBytes = System.Text.Encoding.UTF8.GetBytes(propName);
-                bw.Write((ushort)nameBytes.Length);
-                bw.Write(nameBytes);
-                bw.Write((uint)values.Count);
-                foreach (var (valStr, list) in values)
-                {
-                    var valBytes = System.Text.Encoding.UTF8.GetBytes(valStr);
-                    bw.Write((ushort)valBytes.Length);
-                    bw.Write(valBytes);
-                    var bm = RoaringBitmap.Create(list.ToArray());
-                    using var bitmapMs = new MemoryStream();
-                    RoaringBitmap.Serialize(bm, bitmapMs);
-                    var bitmapBytes = bitmapMs.ToArray();
-                    bw.Write((uint)bitmapBytes.Length);
-                    bw.Write(bitmapBytes);
-                }
+                ref readonly var e = ref _terms[id];
+                var valBytes = Term(e.Off, e.Len);
+                bw.Write((ushort)valBytes.Length);
+                bw.Write(valBytes);
+                var offsets = new int[e.Postings.Count];
+                _arena.Decode(in e.Postings, offsets);
+                var bm = RoaringBitmap.Create(offsets);
+                using var bitmapMs = new MemoryStream();
+                RoaringBitmap.Serialize(bm, bitmapMs);
+                var bitmapBytes = bitmapMs.ToArray();
+                bw.Write((uint)bitmapBytes.Length);
+                bw.Write(bitmapBytes);
             }
-            return ms.ToArray();
         }
+        return ms.ToArray();
     }
 
     public static SegmentInvertedIndex Deserialise(ReadOnlySpan<byte> data)

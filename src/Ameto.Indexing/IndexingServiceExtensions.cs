@@ -41,6 +41,9 @@ public sealed class IndexingWiring : Microsoft.Extensions.Hosting.IHostedService
     public Task StartAsync(CancellationToken cancellationToken)
     {
         int maxDepth = _opts.MaxPropertyFlattenDepth;
+        // One hints object for every group this process builds: each builder pre-sizes its
+        // term and trigram tables from what the last sealed group measured (see IndexBuildHints).
+        var hints = new IndexBuildHints();
         // A FRESH builder per index group — that is the mechanism, not an accident. The
         // accumulators (trigram especially, ~7.6 B/posting scaling with indexed text bytes)
         // die with the builder as soon as its sections are serialised, so peak index-build
@@ -51,7 +54,7 @@ public sealed class IndexingWiring : Microsoft.Extensions.Hosting.IHostedService
         // are the writer's forecast for the group — events from the payload budget, terms per
         // event from what the file's already-sealed groups measured. See SegmentWriter.EnsureSink.
         _storage.IndexSinkFactory = (estimatedEventCount, estimatedTermsPerEvent) =>
-            new SegmentIndexBuilder(estimatedEventCount, maxDepth, estimatedTermsPerEvent);
+            new SegmentIndexBuilder(estimatedEventCount, maxDepth, estimatedTermsPerEvent, hints);
         return Task.CompletedTask;
     }
 

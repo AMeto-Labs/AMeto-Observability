@@ -28,7 +28,7 @@ internal sealed class StreamSectionWriter : IBufferWriter<byte>, IDisposable
     public StreamSectionWriter(Stream stream, int bufferSize = DefaultBuffer)
     {
         _stream = stream;
-        _buffer = ArrayPool<byte>.Shared.Rent(bufferSize);
+        _buffer = IndexBuildPool.Slabs.Rent(bufferSize);
     }
 
     /// <summary>Bytes written since the last <see cref="ResetCount"/> (flushed or not).</summary>
@@ -69,14 +69,14 @@ internal sealed class StreamSectionWriter : IBufferWriter<byte>, IDisposable
         if (_used + sizeHint <= _buffer.Length) return;
         Flush();
         if (sizeHint <= _buffer.Length) return;
-        ArrayPool<byte>.Shared.Return(_buffer);
-        _buffer = ArrayPool<byte>.Shared.Rent(sizeHint);
+        IndexBuildPool.Slabs.Return(_buffer);
+        _buffer = IndexBuildPool.Slabs.Rent(sizeHint);
     }
 
     public void Dispose()
     {
         Flush();
-        ArrayPool<byte>.Shared.Return(_buffer);
+        IndexBuildPool.Slabs.Return(_buffer);
         _buffer = Array.Empty<byte>();
     }
 }

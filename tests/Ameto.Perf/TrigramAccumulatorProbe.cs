@@ -63,8 +63,11 @@ public sealed class TrigramAccumulatorProbe
         double cpuMs = (System.Diagnostics.Process.GetCurrentProcess().TotalProcessorTime - cpu0).TotalMilliseconds;
         long after = GC.GetTotalMemory(true);
         GC.KeepAlive(acc);
+        // Pooled accumulators report what they hold: a heap delta would count the arrays the
+        // warm-up run parked in the pool as zero growth.
+        long retained = acc.Retained >= 0 ? acc.Retained : after - before;
         acc.Release();
-        return (after - before, cpuMs);
+        return (retained, cpuMs);
     }
 
     /// <summary>The production accumulator, measured through its public surface.</summary>
@@ -73,6 +76,7 @@ public sealed class TrigramAccumulatorProbe
         private readonly SegmentTrigramIndex _idx = new();
         public int AddText(uint offset, string text) { _idx.Add(offset, text); return 0; }
         public void Release() => _idx.ReleaseBuildBuffers();
+        public long Retained => _idx.BuildRetainedBytes;
     }
 
     private static long CountPairs(string[][] texts)
@@ -87,7 +91,7 @@ public sealed class TrigramAccumulatorProbe
 
     // ── candidate accumulators ────────────────────────────────────────────────
 
-    private interface IAccumulator { int AddText(uint offset, string text); void Release() { } }
+    private interface IAccumulator { int AddText(uint offset, string text); void Release() { } long Retained => -1; }
 
     /// <summary>What SegmentTrigramIndex does today.</summary>
     private sealed class HashSetAccumulator : IAccumulator

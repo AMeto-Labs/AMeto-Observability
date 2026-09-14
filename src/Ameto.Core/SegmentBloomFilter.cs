@@ -192,6 +192,47 @@ public sealed unsafe class SegmentBloomFilter : IDisposable
         if (foldRented is not null) System.Buffers.ArrayPool<char>.Shared.Return(foldRented);
     }
 
+    /// <summary>
+    /// Adds the case-folded form of a UTF-8 value — what <see cref="Add(ReadOnlySpan{char})"/>
+    /// stores, reached without a UTF-16 round trip when the value is ASCII. Byte-wise A-Z
+    /// lowering is exactly what <c>ToLowerInvariant</c> does to an ASCII string, and the
+    /// re-encoding of the folded chars is the identity, so the hashed bytes — and therefore the
+    /// bits — are the same. Anything with a non-ASCII byte takes the UTF-16 path unchanged.
+    /// </summary>
+    public void AddUtf8(ReadOnlySpan<byte> value)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        byte[]? rented = value.Length > 512 ? System.Buffers.ArrayPool<byte>.Shared.Rent(value.Length) : null;
+        Span<byte> fold = rented ?? stackalloc byte[512];
+        try
+        {
+            if (System.Text.Ascii.ToLower(value, fold, out int n) == System.Buffers.OperationStatus.Done)
+            {
+                Add(fold[..n]);
+                return;
+            }
+        }
+        finally
+        {
+            if (rented is not null) System.Buffers.ArrayPool<byte>.Shared.Return(rented);
+        }
+
+        // Non-ASCII: decode and fold as UTF-16, exactly as the char overload does.
+        int chars = System.Text.Encoding.UTF8.GetCharCount(value);
+        char[]? rentedChars = chars > 256 ? System.Buffers.ArrayPool<char>.Shared.Rent(chars) : null;
+        Span<char> buf = rentedChars ?? stackalloc char[256];
+        try
+        {
+            int written = System.Text.Encoding.UTF8.GetChars(value, buf);
+            Add((ReadOnlySpan<char>)buf[..written]);
+        }
+        finally
+        {
+            if (rentedChars is not null) System.Buffers.ArrayPool<char>.Shared.Return(rentedChars);
+        }
+    }
+
     private void AddRaw(ReadOnlySpan<char> value)
     {
         int max = System.Text.Encoding.UTF8.GetMaxByteCount(value.Length);

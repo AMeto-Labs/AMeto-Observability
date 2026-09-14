@@ -137,12 +137,11 @@ public sealed class SegmentBloomFilterLifetimeTests
         Assert.Throws<ObjectDisposedException>(() => { _ = builder.SerialisedBloomFilter; });
         Assert.Throws<ObjectDisposedException>(() => { _ = builder.Serialise(); });
 
-        // The trigram accumulator is pooled state now (slot table, buckets, posting slabs are
-        // ArrayPool rentals returned by Dispose), so reading it after disposal is the same
-        // freed-memory hazard as the bloom's and is guarded the same way. The inverted index
-        // is still plain managed state and stays readable.
+        // The two accumulators are pooled state now (slot tables, entries, term slabs and
+        // posting slabs are ArrayPool rentals returned by Dispose), so reading either after
+        // disposal is the same freed-memory hazard as the bloom's and is guarded the same way.
         Assert.Throws<ObjectDisposedException>(() => { _ = builder.SerialisedTrigramIndex; });
-        _ = builder.SerialisedInvertedIndex;
+        Assert.Throws<ObjectDisposedException>(() => { _ = builder.SerialisedInvertedIndex; });
         Assert.Equal(0, builder.BloomTermsAdded);
     }
 }

@@ -76,7 +76,20 @@ public sealed class SegmentTrigramIndex
     /// Serialisation then sorts before encoding, which requires ascending input.</summary>
     private bool _unsorted;
 
-    public SegmentTrigramIndex() => _sets = new BuildView(this);
+    public SegmentTrigramIndex() : this(0) { }
+
+    /// <param name="expectedBuckets">Distinct trigrams the build is expected to hold — the
+    /// previous group's count, from <see cref="IndexBuildHints"/>. Sizes the bucket array once
+    /// instead of doubling up to it; nothing is rented before the first add.</param>
+    public SegmentTrigramIndex(int expectedBuckets)
+    {
+        _sets = new BuildView(this);
+        _initialBuckets = expectedBuckets <= InitialBuckets
+            ? InitialBuckets
+            : (int)Math.Min(1 << 28, System.Numerics.BitOperations.RoundUpToPowerOf2((uint)expectedBuckets));
+    }
+
+    private readonly int _initialBuckets;
 
     /// <summary>Distinct trigrams seen by this build.</summary>
     public int BucketCount => _bucketCount;
@@ -151,6 +164,30 @@ public sealed class SegmentTrigramIndex
         }
     }
 
+    /// <summary>
+    /// Indexes ASCII text that is ALREADY case-folded, as bytes — the builder's fast path, which
+    /// folds a raw UTF-8 value once (byte-wise, <c>Ascii.ToLower</c>) for the bloom and the
+    /// trigram together. A byte below 0x80 IS its UTF-16 code unit, so the slot-table key is the
+    /// same one <see cref="AddFolded"/> computes from chars, and the section is identical.
+    /// The caller guarantees every byte is ASCII.
+    /// </summary>
+    internal void AddFoldedAscii(uint localOffset, ReadOnlySpan<byte> lower)
+    {
+        int n = lower.Length;
+        if (n < 3) return;
+        ObjectDisposedException.ThrowIf(_released, this);
+        int[] ascii = _ascii ?? RentAsciiTable();
+        int offset  = (int)localOffset;
+
+        for (int i = 0; i <= n - 3; i++)
+        {
+            int k  = (lower[i] << 14) | (lower[i + 1] << 7) | lower[i + 2];
+            int id = ascii[k] - 1;
+            if (id < 0) { id = NewBucket((char)lower[i], (char)lower[i + 1], (char)lower[i + 2]); ascii[k] = id + 1; }
+            _arena.Append(ref _buckets[id].Postings, offset, ref _unsorted);
+        }
+    }
+
     private int WideBucket(char c0, char c1, char c2)
     {
         long key = ((long)c0 << 32) | ((long)c1 << 16) | c2;
@@ -175,19 +212,19 @@ public sealed class SegmentTrigramIndex
 
     private void GrowBuckets()
     {
-        int size = _buckets.Length == 0 ? InitialBuckets : _buckets.Length * 2;
-        var next = ArrayPool<TriBucket>.Shared.Rent(size);
+        int size = _buckets.Length == 0 ? _initialBuckets : _buckets.Length * 2;
+        var next = IndexBuildPool.Entries<TriBucket>().Rent(size);
         if (_buckets.Length > 0)
         {
             _buckets.AsSpan(0, _bucketCount).CopyTo(next);
-            ArrayPool<TriBucket>.Shared.Return(_buckets);
+            IndexBuildPool.Entries<TriBucket>().Return(_buckets);
         }
         _buckets = next;
     }
 
     private int[] RentAsciiTable()
     {
-        var t = ArrayPool<int>.Shared.Rent(AsciiTableSize);
+        var t = IndexBuildPool.Ints.Rent(AsciiTableSize);
         Array.Clear(t, 0, AsciiTableSize);
         return _ascii = t;
     }
@@ -203,8 +240,8 @@ public sealed class SegmentTrigramIndex
     {
         if (_released) return;
         _released = true;
-        if (_ascii is not null) { ArrayPool<int>.Shared.Return(_ascii); _ascii = null; }
-        if (_buckets.Length > 0) { ArrayPool<TriBucket>.Shared.Return(_buckets); _buckets = Array.Empty<TriBucket>(); }
+        if (_ascii is not null) { IndexBuildPool.Ints.Return(_ascii); _ascii = null; }
+        if (_buckets.Length > 0) { IndexBuildPool.Entries<TriBucket>().Return(_buckets); _buckets = Array.Empty<TriBucket>(); }
         _bucketCount = 0;
         _wide = null;
         _arena.Release();
