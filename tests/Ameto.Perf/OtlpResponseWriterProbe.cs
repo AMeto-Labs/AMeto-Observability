@@ -45,6 +45,9 @@ public sealed class OtlpResponseWriterProbe
     [Fact]
     public void FormattedReplyIsByteIdenticalToTheJsonWriter()
     {
+        // Outside the loop: a stackalloc inside one grows the frame per iteration (CA2014).
+        Span<byte> actual = stackalloc byte[OtlpEndpointMapper.JsonOkMaxBytes];
+
         foreach ((int ingested, int dropped) in
                  new[] { (0, 0), (1, 0), (0, 1), (1000, 17), (int.MaxValue, int.MaxValue) })
         {
@@ -56,7 +59,6 @@ public sealed class OtlpResponseWriterProbe
             jw.WriteEndObject();
             jw.Flush();
 
-            Span<byte> actual = stackalloc byte[OtlpEndpointMapper.JsonOkMaxBytes];
             int n = OtlpEndpointMapper.FormatJsonOk(actual, ingested, dropped);
 
             Assert.Equal(Encoding.UTF8.GetString(expected.WrittenSpan), Encoding.UTF8.GetString(actual[..n]));
