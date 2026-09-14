@@ -301,3 +301,28 @@ public sealed class HotTierMaterialiseProbe
         return hot;
     }
 }
+
+public sealed class HotTierChunkArrayProbe
+{
+    private readonly ITestOutputHelper _out;
+    public HotTierChunkArrayProbe(ITestOutputHelper o) => _out = o;
+
+    /// <summary>Managed bytes a tier allocates per 3-chunk fill with templates and exceptions attached (the per-chunk slot arrays).</summary>
+    [Fact]
+    public void ChunkSlotArrays_PerTierFill()
+    {
+        const int events = HotTierSegment.ChunkEventCapacity * 2 + 1;
+        var ex = new ExceptionInfo { Type = "T" };
+        long Round()
+        {
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            using var tier = new HotTierSegment(events + 1, 32L * 1024 * 1024);
+            for (int i = 0; i < events; i++)
+                Assert.True(tier.TryWrite(new LogEventHeader { TimestampUtcTicks = i, MessageTemplatePoolIndex = -1 }, ReadOnlySpan<byte>.Empty, "t", ex));
+            return GC.GetAllocatedBytesForCurrentThread() - before;
+        }
+        Round();
+        long bytes = Round();
+        _out.WriteLine($"3-chunk tier fill with templates+exceptions: {bytes / 1024.0:F1} KB managed allocated (steady state)");
+    }
+}

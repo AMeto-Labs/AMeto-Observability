@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Runtime.InteropServices;
 using System.Runtime.CompilerServices;
 using Ameto.Core;
@@ -270,12 +271,12 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
         // ── Store template (managed, parallel to header) ────────────────────
         if (template is not null)
         {
-            var arr = _chunkTemplates[ci] ??= new string?[ChunkEventCapacity];
+            var arr = _chunkTemplates[ci] ??= RentSlots<string?>();
             arr[si] = template;
         }
         if (exception is not null)
         {
-            var arr = _chunkExceptions[ci] ??= new ExceptionInfo?[ChunkEventCapacity];
+            var arr = _chunkExceptions[ci] ??= RentSlots<ExceptionInfo?>();
             arr[si] = exception;
         }
 
@@ -521,6 +522,35 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
                 NativeMemory.Free((void*)_chunkArenas[i]);
                 _chunkArenas[i] = 0;
             }
+            // Hand the managed slot arrays back. Nobody can still be reading them: the
+            // engine disposes a tier only once every reader snapshot that captured it is
+            // gone (_activeReaders == 0) and the flush that read it has published.
+            if (_chunkTemplates[i] is { } t)
+            {
+                _chunkTemplates[i] = null;
+                ArrayPool<string?>.Shared.Return(t, clearArray: true);
+            }
+            if (_chunkExceptions[i] is { } x)
+            {
+                _chunkExceptions[i] = null;
+                ArrayPool<ExceptionInfo?>.Shared.Return(x, clearArray: true);
+            }
         }
+    }
+
+    /// <summary>
+    /// A chunk's per-slot managed array (templates or exceptions) from the shared pool.
+    /// These are 128 KB each — LOH allocations, eight or more per tier, garbage the moment
+    /// the tier flushed — so they are recycled through <see cref="ArrayPool{T}.Shared"/>
+    /// instead. Cleared on rent as well as on return: a slot the writer never fills is
+    /// read as "no template / no exception" by <see cref="GetTemplate"/> and
+    /// <see cref="GetException"/>, and that must not depend on every past returner having
+    /// cleared. One memset per 16 384 events.
+    /// </summary>
+    private static T[] RentSlots<T>()
+    {
+        var arr = ArrayPool<T>.Shared.Rent(ChunkEventCapacity);
+        Array.Clear(arr);
+        return arr;
     }
 }

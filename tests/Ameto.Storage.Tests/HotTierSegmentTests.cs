@@ -208,3 +208,46 @@ public sealed class HotTierSegmentTests : IDisposable
         Flags                   = 0,
     };
 }
+
+/// <summary>
+/// The per-chunk template / exception arrays are pooled. A recycled array must come back
+/// clean: a slot the new tier's writer never fills reads as "no template / no exception",
+/// never as whatever the previous tier left there.
+/// </summary>
+public sealed class HotTierSlotArrayRecyclingTests
+{
+    [Fact]
+    public void A_recycled_chunk_array_never_leaks_the_previous_tiers_templates()
+    {
+        var ex = new ExceptionInfo { Type = "T", Message = "m" };
+        for (int round = 0; round < 8; round++)
+        {
+            using var tier = new HotTierSegment(64, 64 * 1024);
+            // Fill slots 0..15 with a template + exception, then dispose (returns the arrays).
+            for (int i = 0; i < 16; i++)
+                Assert.True(tier.TryWrite(Header(i), ReadOnlySpan<byte>.Empty, "tmpl-" + i, ex));
+        }
+
+        using var fresh = new HotTierSegment(64, 64 * 1024);
+        // Write slots 0..15 WITHOUT a template or exception; slot 3 with both.
+        for (int i = 0; i < 16; i++)
+            Assert.True(fresh.TryWrite(Header(i), ReadOnlySpan<byte>.Empty, i == 3 ? "only-three" : null, i == 3 ? ex : null));
+
+        for (int i = 0; i < 16; i++)
+        {
+            Assert.Equal(i == 3 ? "only-three" : null, fresh.GetTemplate(i));
+            Assert.Same(i == 3 ? ex : null, fresh.GetException(i));
+        }
+        var events = fresh.ReadAll().ToList();
+        Assert.Equal(16, events.Count);
+        Assert.All(events.Where(e => e.Id.RawValue != new EventId(0u, 3u).RawValue), e => Assert.Null(e.Exception));
+    }
+
+    private static LogEventHeader Header(int seq) => new()
+    {
+        Id                = new EventId(0u, (uint)seq).RawValue,
+        TimestampUtcTicks = DateTimeOffset.UtcNow.UtcTicks,
+        Level             = LogLevel.Information,
+        MessageTemplatePoolIndex = -1,
+    };
+}
