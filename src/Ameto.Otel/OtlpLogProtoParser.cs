@@ -42,9 +42,11 @@ namespace Ameto.Otel;
 ///   <item>A trace or span id longer than <see cref="MaxIdBytes"/> is dropped from
 ///   <c>@tr</c>/<c>@sp</c> rather than hex-encoded at any length. Conformant ids are 16 and
 ///   8 bytes; the correlation columns already refused anything but those.</item>
-///   <item>A literal <c>0x00</c> where a tag is expected ends the message silently instead of
-///   being an error — field 0 is not a legal field number, and both this reader and
-///   <c>CodedInputStream</c> read it as end-of-input.</item>
+///   <item>A literal <c>0x00</c> where a tag is expected ends the message silently, where
+///   <c>CodedInputStream</c> threw "invalid tag (zero)" and refused the whole request. Field 0
+///   is not a legal field number either way; this reader treats it as end-of-input, which is
+///   the more forgiving of the two readings and the one <see cref="ProtoReader"/> already gave
+///   the metric and trace paths.</item>
 ///   <item>A malformed tail aborts the batch mid-way, so records before the bad byte are
 ///   already in the ring when the caller answers 400. The DOM path decoded the whole request
 ///   before ingesting any of it. This matches the JSON path, which has always behaved this

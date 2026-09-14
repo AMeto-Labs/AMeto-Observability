@@ -162,20 +162,7 @@ public static class OtlpGrpcEndpointMapper
                 return;
             }
 
-            ArraySegment<byte> segment;
-            if (inflated is not null)
-            {
-                segment = new ArraySegment<byte>(inflated, 0, inflatedLen);
-            }
-            else if (decodeReadsFromZero)
-            {
-                body.AsSpan(OtlpGrpcFraming.HeaderBytes, message.Length).CopyTo(body);
-                segment = new ArraySegment<byte>(body, 0, message.Length);
-            }
-            else
-            {
-                segment = new ArraySegment<byte>(body, OtlpGrpcFraming.HeaderBytes, message.Length);
-            }
+            var segment = MessageSegment(body, message.Length, inflated, inflatedLen, decodeReadsFromZero);
 
             bool ok;
             int rejected;
@@ -212,6 +199,33 @@ public static class OtlpGrpcEndpointMapper
             IngestBufferPool.Return(body);
             if (inflated is not null) IngestBufferPool.Return(inflated);
         }
+    }
+
+    /// <summary>
+    /// Where the decoder should read the request message from.
+    ///
+    /// <para>An inflated message is already alone in its own buffer. An uncompressed one sits
+    /// five bytes into the request buffer, behind the frame header — which is fine for the span
+    /// parsers, and wrong for the one decoder left that takes (buffer, length) and reads from
+    /// index 0, so for that one the message is memmoved down first. Getting this backwards
+    /// feeds a decoder five bytes of frame header and then truncates the tail, which on
+    /// protobuf is not a parse error: it is a silently short batch.</para>
+    ///
+    /// <para>Internal so it can be tested without a host; <c>OtlpGrpcMessageSegmentTests</c>
+    /// runs each signal's real decoder over what this returns.</para>
+    /// </summary>
+    internal static ArraySegment<byte> MessageSegment(
+        byte[] body, int messageLength, byte[]? inflated, int inflatedLength, bool decodeReadsFromZero)
+    {
+        if (inflated is not null) return new ArraySegment<byte>(inflated, 0, inflatedLength);
+
+        if (decodeReadsFromZero)
+        {
+            body.AsSpan(OtlpGrpcFraming.HeaderBytes, messageLength).CopyTo(body);
+            return new ArraySegment<byte>(body, 0, messageLength);
+        }
+
+        return new ArraySegment<byte>(body, OtlpGrpcFraming.HeaderBytes, messageLength);
     }
 
     private static async Task WriteMessageAsync(HttpContext ctx, byte[] message)
