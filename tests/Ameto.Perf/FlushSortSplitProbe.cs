@@ -38,6 +38,23 @@ public sealed class FlushSortSplitProbe
         using var arrived = BuildTier(pool, shuffleTimestamps: false);
         using var jittered = BuildTier(pool, shuffleTimestamps: true);
 
+        // FIRST, on a cold array pool — which is what a server's first flush after start meets,
+        // and the only place the sort's own buffers are visible at all. The steady-state figures
+        // below cannot see them: a rented buffer is allocated once and then reused for the life
+        // of the process, so it stops being counted while still being RETAINED, per core, for as
+        // long as the pool holds it. An arrival-ordered tier takes the identity path and must
+        // therefore rent nothing: its cost is the caller's int[] order and not a byte more.
+        long coldBefore = GC.GetAllocatedBytesForCurrentThread();
+        int[] coldOrder = SegmentWriter.ComputeSortOrder(arrived);
+        long coldAlloc  = GC.GetAllocatedBytesForCurrentThread() - coldBefore;
+        _out.WriteLine($"cold pool, arrival-ordered tier: first ComputeSortOrder allocates "
+                     + $"{coldAlloc / KB:N0} KB for {Events:N0} events "
+                     + $"({coldAlloc / (double)Events:F1} B/event; the int[] order alone is "
+                     + $"{coldOrder.Length * 4 / KB:N0} KB)\n");
+        Assert.True(coldAlloc < coldOrder.Length * 4 + 4096,
+            $"the identity path allocated {coldAlloc} B for a {coldOrder.Length}-entry order — "
+            + "it is renting sort keys before it knows whether it needs them");
+
         // Warm the JIT and the array pool so the first measured run is steady state.
         Measure(arrived, baseline: true);
         Measure(arrived, baseline: false);
@@ -46,12 +63,13 @@ public sealed class FlushSortSplitProbe
 
         foreach (var (name, hot) in new[] { ("arrival-ordered tier", arrived), ("jittered tier", jittered) })
         {
-            // One discarded run per (tier, variant): the FIRST rent of an array-pool bucket
-            // allocates it, and that one-off would otherwise be read as this route's cost.
+            // Each variant is warmed IMMEDIATELY before it is measured, not both up front. The
+            // first rent of an array-pool bucket allocates it, and a gen2 collection — which the
+            // other variant's megabytes of list garbage can trigger — trims those buckets again.
+            // Interleaving the two would charge whichever ran second for the other's collection.
             Measure(hot, baseline: true);
-            Measure(hot, baseline: false);
-
             var a = Measure(hot, baseline: true);
+            Measure(hot, baseline: false);
             var b = Measure(hot, baseline: false);
 
             Assert.Equal(a.Order, b.Order);

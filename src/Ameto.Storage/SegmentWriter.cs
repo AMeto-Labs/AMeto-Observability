@@ -249,9 +249,15 @@ public sealed class SegmentWriter : IDisposable
     /// themselves and reading the order out afterwards MEASURED SLOWER than the delegate version
     /// it replaced (50 ms against 33 on a jittered 200 k tier) for exactly that reason.</para>
     ///
-    /// <para>IDENTITY FAST PATH: the same pass notices that the tier is already ascending, which
-    /// it very nearly always is (a tier is filled in arrival order and timestamps are stamped on
-    /// arrival), and returns the identity permutation without sorting at all.</para>
+    /// <para>IDENTITY FAST PATH, AND IT ALLOCATES NOTHING. The first pass only ASKS whether the
+    /// tier is already ascending — which it very nearly always is, since a tier is filled in
+    /// arrival order and timestamps are stamped on arrival — and on the way out it has touched
+    /// no buffer but the caller's result array. The keys are extracted in a second pass, on the
+    /// unsorted path only. Extracting them during the first pass looked cheaper (one pass over
+    /// the headers rather than two) and was the wrong trade: it rents 16 bytes an event whatever
+    /// the answer turns out to be, so a 1 M-event tier parks a 16 MB array in the shared pool —
+    /// per concurrent flush — to answer a question that did not need it. The second header pass
+    /// costs the rare unsorted tier one more sequential read of memory it has just walked.</para>
     ///
     /// <para>The tie-break on the tier index makes the result STABLE. The old introsort was not,
     /// so two events sharing a (timestamp, id) could come out in either order; ordering them by
@@ -268,25 +274,17 @@ public sealed class SegmentWriter : IDisposable
             return order;
         }
 
+        for (int i = 0; i < count; i++) order[i] = i;
+        if (IsAscending(hot, count)) return order;
+
         SortKey[] keys = ArrayPool<SortKey>.Shared.Rent(count);
         try
         {
-            bool  sorted = true;
-            long  prevTs = long.MinValue;
-            ulong prevId = 0;
             for (int i = 0; i < count; i++)
             {
                 ref readonly LogEventHeader h = ref hot.GetHeader(i);
-                long  ts = h.TimestampUtcTicks;
-                ulong id = h.Id;
-                keys[i] = new SortKey(ts, id);
-                if (sorted && (ts < prevTs || (ts == prevTs && id < prevId))) sorted = false;
-                prevTs = ts;
-                prevId = id;
+                keys[i] = new SortKey(h.TimestampUtcTicks, h.Id);
             }
-
-            for (int i = 0; i < count; i++) order[i] = i;
-            if (sorted) return order;
 
             order.AsSpan().Sort(new SortKeyComparer(keys));
             return order;
@@ -295,6 +293,25 @@ public sealed class SegmentWriter : IDisposable
         {
             ArrayPool<SortKey>.Shared.Return(keys);
         }
+    }
+
+    /// <summary>Is the tier already in (timestamp, id) order — i.e. is the identity permutation
+    /// the answer? One sequential pass, no buffer of any kind.</summary>
+    private static bool IsAscending(HotTierSegment hot, int count)
+    {
+        ref readonly LogEventHeader first = ref hot.GetHeader(0);
+        long  prevTs = first.TimestampUtcTicks;
+        ulong prevId = first.Id;
+        for (int i = 1; i < count; i++)
+        {
+            ref readonly LogEventHeader h = ref hot.GetHeader(i);
+            long  ts = h.TimestampUtcTicks;
+            ulong id = h.Id;
+            if (ts < prevTs || (ts == prevTs && id < prevId)) return false;
+            prevTs = ts;
+            prevId = id;
+        }
+        return true;
     }
 
     /// <summary>The sort key of one tier event: what the order is decided on, and nothing else.</summary>
