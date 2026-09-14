@@ -551,12 +551,27 @@ public static class FilterEvaluator
         // String comparison
         if (left is string ls)
         {
-            string rs = right?.ToString() ?? string.Empty;
-            int cmp   = string.Compare(ls, rs, StringComparison.OrdinalIgnoreCase);
+            // No ToString() when the right side is already a string — which it is for every
+            // literal a filter carries, and this runs per candidate event.
+            string rs = right as string ?? right?.ToString() ?? string.Empty;
+
+            // EQUALITY IS NOT AN ORDERING QUESTION. `@l = 'Error'` — the commonest predicate
+            // in the product — went through string.Compare, which walks both strings to work
+            // out WHICH is greater; Equals checks the lengths first and gives up on the
+            // overwhelming majority of non-matches without reading a character, and compares
+            // the rest vectorised. The answer is the same by construction: over the SAME
+            // comparison type, string.Compare(a, b, cmp) == 0 is the definition of
+            // string.Equals(a, b, cmp). That comparison type is OrdinalIgnoreCase here, not a
+            // culture-aware one, so there is no linguistic collation being dropped either.
+            if (op is CompareOp.Eq or CompareOp.Ne)
+            {
+                bool eq = string.Equals(ls, rs, StringComparison.OrdinalIgnoreCase);
+                return op is CompareOp.Eq ? eq : !eq;
+            }
+
+            int cmp = string.Compare(ls, rs, StringComparison.OrdinalIgnoreCase);
             return op switch
             {
-                CompareOp.Eq => cmp == 0,
-                CompareOp.Ne => cmp != 0,
                 CompareOp.Lt => cmp <  0,
                 CompareOp.Le => cmp <= 0,
                 CompareOp.Gt => cmp >  0,
