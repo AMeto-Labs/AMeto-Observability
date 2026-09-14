@@ -3,7 +3,18 @@ namespace Ameto.Query.Filtering;
 // ── Abstract base ─────────────────────────────────────────────────────────────
 
 /// <summary>Base class for all filter expression AST nodes.</summary>
-public abstract class FilterNode { }
+public abstract class FilterNode
+{
+    /// <summary>
+    /// Dispatch tag for <see cref="FilterEvaluator.Matches"/>, resolved from the concrete type
+    /// once per node — that is, once per filter compile. See <see cref="NodeKind"/> for why the
+    /// evaluator reads a tag instead of running a chain of type tests per event, and why a node
+    /// type absent from the map still evaluates correctly.
+    /// </summary>
+    internal readonly NodeKind Kind;
+
+    protected FilterNode() => Kind = NodeKinds.Of(GetType());
+}
 
 // ── Logical ───────────────────────────────────────────────────────────────────
 
@@ -92,6 +103,26 @@ public sealed class LikeNode : FilterNode
     internal readonly bool   IsMatchAll;   // pattern == "%"
     internal readonly bool   IsLiteral;    // no % or _ wildcards — plain equality
 
+    /// <summary>Which vectorisable shape the pattern reduced to, or <c>None</c>.</summary>
+    internal readonly LikeShape Shape;
+
+    /// <summary>The literal between the leading/trailing <c>%</c>, already lowercased.</summary>
+    internal readonly string Affix;
+
+    /// <summary>
+    /// Whether <see cref="Affix"/> is pure ASCII. Only then may the evaluator answer with
+    /// <c>Contains/StartsWith/EndsWith(OrdinalIgnoreCase)</c>: over ASCII the two foldings
+    /// agree exactly (A–Z ↔ a–z and nothing else), so the fast answer is the same answer.
+    /// Outside ASCII they do NOT agree — <c>OrdinalIgnoreCase</c> leaves the Kelvin sign
+    /// unequal to <c>k</c> while <c>ToLowerInvariant</c>, which lowered this pattern, folds
+    /// them together — so anything non-ASCII on either side keeps the folding matcher.
+    ///
+    /// <para>Note this is computed from the LOWERED pattern, not the one the user typed: a
+    /// non-ASCII character can lower to an ASCII one (U+0130 → <c>i</c>), and it is the
+    /// lowered form the comparison actually uses.</para>
+    /// </summary>
+    internal readonly bool AffixAscii;
+
     public LikeNode(string property, string pattern)
     {
         Property     = property;
@@ -99,7 +130,53 @@ public sealed class LikeNode : FilterNode
         PatternLower = pattern.ToLowerInvariant();
         IsMatchAll   = PatternLower == "%";
         IsLiteral    = !IsMatchAll && !PatternLower.Contains('%') && !PatternLower.Contains('_');
+
+        (Shape, Affix) = Classify(PatternLower, IsMatchAll);
+        AffixAscii     = System.Text.Ascii.IsValid(Affix);
     }
+
+    /// <summary>
+    /// Reduces <c>%lit%</c> / <c>lit%</c> / <c>%lit</c> / <c>lit</c> to a shape plus its
+    /// literal. Anything with a wildcard left INSIDE the literal — <c>%a%b%</c>, <c>%a_b%</c> —
+    /// is <see cref="LikeShape.None"/> and keeps the general matcher; there is no escape
+    /// character in this dialect, so a <c>_</c> in the middle is always a wildcard.
+    /// </summary>
+    private static (LikeShape Shape, string Affix) Classify(string patternLower, bool isMatchAll)
+    {
+        if (isMatchAll) return (LikeShape.None, string.Empty);
+
+        bool lead  = patternLower.Length > 0 && patternLower[0]  == '%';
+        bool trail = patternLower.Length > 1 && patternLower[^1] == '%';
+
+        int start = lead  ? 1 : 0;
+        int end   = trail ? patternLower.Length - 1 : patternLower.Length;
+        if (end < start) return (LikeShape.None, string.Empty);
+
+        var core = patternLower.AsSpan(start, end - start);
+        if (core.IndexOfAny('%', '_') >= 0) return (LikeShape.None, string.Empty);
+
+        string affix = core.ToString();
+        return (lead, trail) switch
+        {
+            (true,  true)  => (LikeShape.Contains,   affix),
+            (false, true)  => (LikeShape.StartsWith, affix),
+            (true,  false) => (LikeShape.EndsWith,   affix),
+            _              => (LikeShape.Equals,     affix),
+        };
+    }
+}
+
+/// <summary>
+/// The shape a LIKE pattern reduced to at compile time. <c>None</c> means "it has wildcards
+/// the span operations cannot express" and sends the value to the general matcher.
+/// </summary>
+internal enum LikeShape : byte
+{
+    None = 0,
+    Equals,
+    StartsWith,
+    EndsWith,
+    Contains,
 }
 
 /// <summary>@mt ci_startsWith 'Hello'  (case-insensitive prefix)</summary>

@@ -17,7 +17,47 @@ namespace Ameto.Query.Filtering;
 public static class FilterEvaluator
 {
     /// <summary>Returns true if <paramref name="ev"/> matches the filter.</summary>
+    ///
+    /// <remarks>
+    /// Dispatch is a jump table on <see cref="FilterNode.Kind"/>, not a chain of type tests.
+    /// The switch below covers the shapes a log query produces in bulk; everything else falls
+    /// through to <see cref="MatchesRare"/>, which is the fifty-arm type switch and stays the
+    /// single place that knows how to evaluate the function predicates. A node type that is not
+    /// tagged is therefore evaluated correctly, just without the shortcut — see
+    /// <see cref="NodeKind"/>.
+    /// </remarks>
     public static bool Matches(FilterNode filter, LogEvent ev)
+    {
+        switch (filter.Kind)
+        {
+            case NodeKind.MatchAll:    return true;
+            case NodeKind.And:         var and = (AndNode)filter;
+                                       return Matches(and.Left, ev) && Matches(and.Right, ev);
+            case NodeKind.Or:          var or  = (OrNode)filter;
+                                       return Matches(or.Left, ev)  || Matches(or.Right, ev);
+            case NodeKind.Not:         return !Matches(((NotNode)filter).Operand, ev);
+            case NodeKind.Level:       return ev.Level == ((LevelNode)filter).Level;
+            case NodeKind.Has:         return HasProperty(ev, ((HasNode)filter).Property);
+            case NodeKind.IsDefined:   return HasProperty(ev, ((IsDefinedNode)filter).Property);
+            case NodeKind.Compare:     return EvalCompare((CompareNode)filter, ev);
+            case NodeKind.TimeCompare: return EvalTimeCompare((TimeCompareNode)filter, ev);
+            case NodeKind.Like:        return EvalLike((LikeNode)filter, ev);
+            case NodeKind.StartsWith:  return EvalStartsWith((StartsWithNode)filter, ev);
+            case NodeKind.Contains:    return EvalContains((ContainsNode)filter, ev);
+            case NodeKind.EndsWith:    return EvalEndsWith((EndsWithNode)filter, ev);
+            case NodeKind.In:          return EvalIn((InNode)filter, ev);
+            case NodeKind.FreeText:    return EvalFreeText((FreeTextNode)filter, ev);
+            default:                   return MatchesRare(filter, ev);
+        }
+    }
+
+    /// <summary>
+    /// The function predicates — everything the tagged switch above does not shortcut. Kept as
+    /// a type switch on purpose: these are dozens of one-off shapes, each already an order of
+    /// magnitude more expensive than the dispatch that finds it, and one list of them is easier
+    /// to keep true than two.
+    /// </summary>
+    private static bool MatchesRare(FilterNode filter, LogEvent ev)
     {
         return filter switch
         {
@@ -1098,6 +1138,56 @@ public static class FilterEvaluator
     private static bool LikeMatchFast(string text, LikeNode node)
     {
         if (node.IsMatchAll) return true;
+
+        // THE ASCII SHORTCUT. `%timeout%` against a 130-character message template cost ~800 ns
+        // in the folding matcher — a scalar loop with a char.ToLowerInvariant and a backtrack
+        // point per position — which is per CANDIDATE event, not per returned row. When the
+        // pattern reduced to one literal (see LikeNode.Classify) and the text is ASCII where it
+        // is actually compared, the same question is answered by a vectorised span search.
+        //
+        // It is the SAME question: over ASCII, OrdinalIgnoreCase and ToLowerInvariant fold
+        // identically (A–Z ↔ a–z and nothing else), so the two roads cannot disagree.
+        // Ascii.IsValid is itself vectorised and is the guard that keeps the Kelvin-sign and
+        // supplementary-plane cases — where the two foldings genuinely differ — on the matcher.
+        //
+        // THE GUARD IS SCOPED TO WHAT IS READ, which matters as much as the search itself: an
+        // anchored pattern only ever looks at its own end of the value, so validating the whole
+        // string would make `Handled%` — which the old matcher rejected at the first character —
+        // pay a full scan of every value it rejects. A surrogate pair cannot straddle the edge
+        // of an all-ASCII window, so an ASCII window is compared one char for one char and the
+        // two roads line up exactly there.
+        if (node.AffixAscii)
+        {
+            var value = text.AsSpan();
+            var affix = node.Affix.AsSpan();
+            switch (node.Shape)
+            {
+                case LikeShape.Contains:
+                    // The literal may sit anywhere, so the whole value has to be ASCII.
+                    if (Ascii.IsValid(value))
+                        return value.Contains(affix, StringComparison.OrdinalIgnoreCase);
+                    break;
+
+                case LikeShape.StartsWith:
+                    if (value.Length >= affix.Length && Ascii.IsValid(value[..affix.Length]))
+                        return value.StartsWith(affix, StringComparison.OrdinalIgnoreCase);
+                    break;
+
+                case LikeShape.EndsWith:
+                    if (value.Length >= affix.Length && Ascii.IsValid(value[^affix.Length..]))
+                        return value.EndsWith(affix, StringComparison.OrdinalIgnoreCase);
+                    break;
+
+                case LikeShape.Equals:
+                    if (value.Length == affix.Length && Ascii.IsValid(value))
+                        return value.Equals(affix, StringComparison.OrdinalIgnoreCase);
+                    break;
+            }
+            // Falling out means the window was not ASCII, or the value was too short to hold
+            // the literal. Both go to the matcher below rather than answering here: it is the
+            // one that knows the folding, and for a short value it is the cheap answer anyway.
+        }
+
         // No ToLowerInvariant() copy of the value: the pattern is already lowercased, so
         // the walk lowercases one character at a time. That copy was an allocation per
         // scanned value, which is per event of every LIKE query.
