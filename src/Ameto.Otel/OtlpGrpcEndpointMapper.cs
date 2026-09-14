@@ -288,7 +288,7 @@ public static class OtlpGrpcEndpointMapper
         {
             // A reset stream, a client deadline, a dropped connection. Without this the rented
             // array is simply dropped: not a leak, but a permanent withdrawal from the pool the
-            // CLEF path, the HTTP OTLP path and storage all share — and a collector timing out
+            // HTTP OTLP receiver and the gzip inflate target share — and a collector timing out
             // mid-upload is an everyday event, not an exceptional one.
             IngestBufferPool.Return(buf);
             throw;

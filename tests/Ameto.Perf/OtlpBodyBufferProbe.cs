@@ -59,6 +59,56 @@ public sealed class OtlpBodyBufferProbe
             $"expected the deeper pool to allocate less, got own={ownFlat} shared={sharedFlat}");
     }
 
+    // ── What the pool is allowed to keep ──────────────────────────────────────
+
+    [Fact]
+    public void DepthIsBoundedByCores()
+    {
+        // A pool that is never trimmed is a memory leak with good manners. The gRPC reader gets
+        // no Content-Length, so it doubles 64 KB → 2 MB and leaves an array in every bucket on
+        // the way; at a flat 32 deep that is ~126 MB pinned for ever on a stand whose whole
+        // budget is 512 MB. Depth follows the core count, which is what actually bounds how
+        // many requests can be in flight.
+        Assert.Equal(Math.Clamp(2 * Environment.ProcessorCount,
+                                IngestBufferPool.MinArraysPerBucket,
+                                IngestBufferPool.MaxArraysPerBucket),
+                     IngestBufferPool.ArraysPerBucket);
+        Assert.InRange(IngestBufferPool.ArraysPerBucket,
+                       IngestBufferPool.MinArraysPerBucket, IngestBufferPool.MaxArraysPerBucket);
+
+        _out.WriteLine($"{Environment.ProcessorCount} cores ⇒ {IngestBufferPool.ArraysPerBucket} arrays/bucket "
+                     + $"⇒ at most ~{IngestBufferPool.ArraysPerBucket * 2L * IngestBufferPool.MaxPooledBytes / 1024 / 1024} MB "
+                     + "held between trims");
+    }
+
+    [Fact]
+    public void TrimActuallyReleasesWhatThePoolHeld()
+    {
+        // Rent, return, trim: the array must NOT come back, or "trim" is a comment rather than
+        // a release and the 512 MB stand goes on OOMing.
+        byte[] before = IngestBufferPool.Rent(BodyBytes);
+        IngestBufferPool.Return(before);
+
+        byte[] again = IngestBufferPool.Rent(BodyBytes);
+        IngestBufferPool.Return(again);
+        Assert.Same(before, again);                       // sanity: the pool does reuse
+
+        IngestBufferPool.Trim();
+
+        byte[] after = IngestBufferPool.Rent(BodyBytes);
+        try { Assert.NotSame(before, after); }
+        finally { IngestBufferPool.Return(after); }
+    }
+
+    [Theory]
+    [InlineData(100, 200, false)]   // comfortable
+    [InlineData(199, 200, false)]   // close, but under
+    [InlineData(200, 200, true)]    // at the GC's own high-load threshold
+    [InlineData(400, 200, true)]    // past it
+    [InlineData(400,   0, false)]   // threshold unknown — never trim on a guess
+    public void TrimTriggersOnTheGcsOwnHighLoadThreshold(long load, long threshold, bool expected)
+        => Assert.Equal(expected, IngestBufferPool.ShouldTrim(load, threshold));
+
     private static async Task<long> Measure(bool dedicated, bool gen2)
     {
         GC.Collect(2, GCCollectionMode.Forced, blocking: true);
