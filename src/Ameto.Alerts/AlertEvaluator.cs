@@ -386,8 +386,13 @@ public sealed class AlertEvaluator : IAsyncDisposable
         // nothing to narrow with: when the rule constrains no level at all ("volume over the
         // last five minutes", optionally for one service), where the scan would otherwise
         // materialise every event it counts.
+        //
+        // That case is now much cheaper still: with no service filter a cold segment lying
+        // entirely inside the window is counted from its catalog entry alone, so a 24-hour
+        // rule over 500 segments opens the two boundary segments instead of all 500, every
+        // 15 seconds. See the totalsOnly parameter on AggregateLogVolumeAsync.
         if (TryHeaderShape(rule.Filter, out var levels, out var service) && levels is null)
-            return await HeaderCountAsync(from, to, service, ct);
+            return await HeaderCountAsync(rule, from, to, service, ct);
 
         var req = new QueryRequest
         {
@@ -448,20 +453,46 @@ public sealed class AlertEvaluator : IAsyncDisposable
 
     /// <summary>
     /// Counts straight from event headers over the whole window. <paramref name="service"/>
-    /// null means every service.
+    /// null means every service; no level is constrained on this path (see the caller).
     /// </summary>
     private async Task<double> HeaderCountAsync(
-        DateTimeOffset from, DateTimeOffset to, string? service, CancellationToken ct)
+        AlertRule rule, DateTimeOffset from, DateTimeOffset to, string? service, CancellationToken ct)
     {
         // The aggregator's axis is (bucket, service, level) and the alert wants one number,
-        // so the axis collapses to a single column spanning the window. Total already has
-        // the service filter applied, and no level is constrained on this path (see the
-        // caller), so it is the answer.
+        // so the axis collapses to a single column spanning the window. Total already has the
+        // service filter applied, and no level is constrained here, so it is the answer.
         int bucketSeconds = (int)Math.Max(1, Math.Ceiling((to - from).TotalSeconds));
         long minBucket    = from.ToUnixTimeSeconds() / bucketSeconds;
 
-        var counts = await _storage.AggregateLogVolumeAsync(
-            from, to, minBucket, bucketSeconds, nBuckets: 1, serviceFilter: service, ct);
+        // The catalog shortcut answers Total and nothing else, and cannot attribute a segment's
+        // events to one service — so it is available exactly when no service is filtered.
+        bool totalsOnly = service is null;
+
+        // The same per-rule budget the scan path has, for the same reason: rules are evaluated
+        // one after another, and one rule with a huge window must not delay every rule behind
+        // it. Expiry cancels the aggregation; EvaluateAllAsync logs it and leaves the rule's
+        // state untouched for this cycle, which is better than transitioning on a partial count.
+        using var budget = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        budget.CancelAfter(RuleEvaluationBudget);
+
+        LogVolumeCounts counts;
+        try
+        {
+            counts = await _storage.AggregateLogVolumeAsync(
+                from, to, minBucket, bucketSeconds, nBuckets: 1,
+                serviceFilter: service, budget.Token, totalsOnly);
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            // Deliberately NOT reported as a floor: there is no partial count to report. The
+            // rule is simply not evaluated this cycle.
+            _logger.LogWarning(
+                "Alert rule {Rule} did not finish counting within its {Budget}s budget; " +
+                "its state is unchanged this cycle. Narrow the rule's window.",
+                rule.Id, RuleEvaluationBudget.TotalSeconds);
+            throw;
+        }
+
         return counts.Total;
     }
 

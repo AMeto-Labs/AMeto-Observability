@@ -670,10 +670,21 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// <c>GET /api/events/counts</c>. Bucketing parameters are supplied by the caller so the axis
     /// matches the endpoint's column-cap logic.
     /// </summary>
+    /// <param name="totalsOnly">
+    /// Opt-in shortcut for a caller that wants ONE number (the alert evaluator, which runs this
+    /// every 15 s per rule over a window that can span hundreds of segments). A cold segment is
+    /// immutable and its catalog <c>EventCount</c> is exact, so a segment lying entirely inside
+    /// the window contributes that count with no mmap and no LZ4 decode at all — for a 24 h
+    /// window only the two boundary segments and the hot tier are still read. In exchange
+    /// <see cref="LogVolumeCounts.Services"/> and <see cref="LogVolumeCounts.Levels"/> stop
+    /// summing to <see cref="LogVolumeCounts.Total"/>, which is why it is off by default and
+    /// ignored whenever a <paramref name="serviceFilter"/> is set — the catalog cannot say how
+    /// many of a segment's events belong to one service, so the shortcut would over-count.
+    /// </param>
     public async ValueTask<LogVolumeCounts> AggregateLogVolumeAsync(
         DateTimeOffset fromUtc, DateTimeOffset toUtc,
         long minBucket, int bucketSeconds, int nBuckets,
-        string? serviceFilter, CancellationToken ct = default)
+        string? serviceFilter, CancellationToken ct = default, bool totalsOnly = false)
     {
         long fromTicks = fromUtc.UtcTicks;
         long toTicks   = toUtc.UtcTicks;
@@ -701,6 +712,10 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             if (segInfos.Count > 0)
             {
                 string? svcFilter = serviceFilter;
+                // Whole-segment counting is only sound when nothing per-service or per-level is
+                // read back out — see the totalsOnly parameter. With a service filter the
+                // catalog cannot answer at all, so the shortcut turns itself off.
+                bool wholeSegments = totalsOnly && svcFilter is null;
                 await Task.Run(() =>
                 {
                     int degree = Math.Clamp(Environment.ProcessorCount / 2, 2, 8);
@@ -713,6 +728,19 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                         {
                             if (covered.Contains(SegmentKey.Of(info))) return local;
                             if (info.MaxTimestampTicks < fromTicks || info.MinTimestampTicks > toTicks) return local;
+
+                            // Entirely inside the window: every event in it is in the answer, and
+                            // the catalog already knows how many there are. No mmap, no block
+                            // index read, no LZ4 decode — the whole cost of this segment is one
+                            // comparison. Boundary segments still have to be decoded, because
+                            // only the headers say which of their events fall in the window.
+                            if (wholeSegments &&
+                                info.MinTimestampTicks >= fromTicks && info.MaxTimestampTicks <= toTicks)
+                            {
+                                local.AddWholeSegment(info.EventCount);
+                                return local;
+                            }
+
                             try
                             {
                                 using var reader = SegmentReader.Open(info.FilePath);
