@@ -407,6 +407,140 @@ internal static class OtlpProtoPayloads
             }))));
         })));
 
+    /// <summary>
+    /// One record whose single attribute value is <paramref name="depth"/> nested
+    /// <c>array_value</c> levels with a string at the bottom — the shape that recurses through
+    /// the parser's value writer, and a stack overflow if nothing bounds it.
+    /// </summary>
+    public static byte[] Logs_NestedToDepth(int depth) => Msg(c =>
+        Nested(c, 1, Msg(rl =>
+        {
+            Nested(rl, 1, Msg(res => Nested(res, 1, StringAttr("service.name", "Etisalat.API"))));
+            Nested(rl, 2, Msg(sl => Nested(sl, 2, Msg(lr =>
+            {
+                lr.WriteTag(1, WireFormat.WireType.Fixed64); lr.WriteFixed64(1_785_300_060_000_000_000UL);
+                lr.WriteTag(2, WireFormat.WireType.Varint);  lr.WriteEnum(9);
+                Nested(lr, 5, Msg(b => { b.WriteTag(1, WireFormat.WireType.LengthDelimited); b.WriteString("deep"); }));
+                Nested(lr, 6, Msg(kv =>
+                {
+                    kv.WriteTag(1, WireFormat.WireType.LengthDelimited); kv.WriteString("nest");
+                    Nested(kv, 2, NestedArrayValue(depth));
+                }));
+            }))));
+        })));
+
+    /// <summary>An AnyValue wrapping itself in <paramref name="depth"/> array_value levels.</summary>
+    private static byte[] NestedArrayValue(int depth)
+    {
+        byte[] value = Msg(v => { v.WriteTag(1, WireFormat.WireType.LengthDelimited); v.WriteString("leaf"); });
+        for (int i = 0; i < depth; i++)
+        {
+            byte[] inner = value;
+            value = Msg(v => Nested(v, 5, Msg(arr => Nested(arr, 1, inner))));
+        }
+        return value;
+    }
+
+    /// <summary>
+    /// A scope_logs that appears BEFORE its resource, and a second resource_logs whose own
+    /// resource must not inherit the first's service name or attributes.
+    /// </summary>
+    public static byte[] Logs_ScopeBeforeResource() => Msg(c =>
+    {
+        Nested(c, 1, Msg(rl =>
+        {
+            // scope_logs (field 2) written first — legal protobuf, and the reason the parser
+            // reads the resource in a pass of its own.
+            Nested(rl, 2, Msg(sl => Nested(sl, 2, Msg(lr =>
+            {
+                lr.WriteTag(1, WireFormat.WireType.Fixed64); lr.WriteFixed64(1_785_300_060_000_000_000UL);
+                lr.WriteTag(2, WireFormat.WireType.Varint);  lr.WriteEnum(9);
+                Nested(lr, 5, Msg(b => { b.WriteTag(1, WireFormat.WireType.LengthDelimited); b.WriteString("first"); }));
+            }))));
+            Nested(rl, 1, Msg(res =>
+            {
+                Nested(res, 1, StringAttr("service.name", "First.Service"));
+                Nested(res, 1, StringAttr("host.name", "host-a"));
+            }));
+        }));
+        // Second resource: fewer attributes and a different service, so a leaked ResBuf or
+        // ServiceSeen from the first shows up as extra keys or the wrong service name.
+        Nested(c, 1, Msg(rl =>
+        {
+            Nested(rl, 1, Msg(res => Nested(res, 1, StringAttr("service.name", "Second.Service"))));
+            Nested(rl, 2, Msg(sl => Nested(sl, 2, Msg(lr =>
+            {
+                lr.WriteTag(1, WireFormat.WireType.Fixed64); lr.WriteFixed64(1_785_300_061_000_000_000UL);
+                lr.WriteTag(2, WireFormat.WireType.Varint);  lr.WriteEnum(9);
+                Nested(lr, 5, Msg(b => { b.WriteTag(1, WireFormat.WireType.LengthDelimited); b.WriteString("second"); }));
+            }))));
+        }));
+        // Third resource: none at all, so the previous one's attributes must not carry over.
+        Nested(c, 1, Msg(rl =>
+            Nested(rl, 2, Msg(sl => Nested(sl, 2, Msg(lr =>
+            {
+                lr.WriteTag(1, WireFormat.WireType.Fixed64); lr.WriteFixed64(1_785_300_062_000_000_000UL);
+                lr.WriteTag(2, WireFormat.WireType.Varint);  lr.WriteEnum(9);
+                Nested(lr, 5, Msg(b => { b.WriteTag(1, WireFormat.WireType.LengthDelimited); b.WriteString("third"); }));
+            }))))));
+    });
+
+    /// <summary>
+    /// The wire shapes that arrive in an order the msgpack encoding cannot: a KeyValue whose
+    /// value precedes its key, an AnyValue with several oneof cases set, a timestamp past
+    /// long.MaxValue, a resource whose first service.name is not a string followed by one that
+    /// is, and a repeated key where the last occurrence wins.
+    /// </summary>
+    public static byte[] Logs_OutOfOrderAndAmbiguous() => Msg(c =>
+        Nested(c, 1, Msg(rl =>
+        {
+            Nested(rl, 1, Msg(res =>
+            {
+                Nested(res, 1, IntAttr("service.name", 7));                 // first, and not a string
+                Nested(res, 1, StringAttr("service.name", "Too.Late"));     // second — must NOT win
+            }));
+            Nested(rl, 2, Msg(sl => Nested(sl, 2, Msg(lr =>
+            {
+                lr.WriteTag(1, WireFormat.WireType.Fixed64);
+                lr.WriteFixed64(0xFFFF_FFFF_FFFF_FFFFUL);                    // past long.MaxValue
+                lr.WriteTag(2, WireFormat.WireType.Varint); lr.WriteEnum(9);
+                Nested(lr, 5, Msg(b => { b.WriteTag(1, WireFormat.WireType.LengthDelimited); b.WriteString("ambiguous"); }));
+
+                Nested(lr, 6, Msg(kv =>                                      // value BEFORE key
+                {
+                    Nested(kv, 2, Msg(v => { v.WriteTag(1, WireFormat.WireType.LengthDelimited); v.WriteString("backwards"); }));
+                    kv.WriteTag(1, WireFormat.WireType.LengthDelimited); kv.WriteString("reversed");
+                }));
+                Nested(lr, 6, Msg(kv =>                                      // oneof with four cases set
+                {
+                    kv.WriteTag(1, WireFormat.WireType.LengthDelimited); kv.WriteString("oneof");
+                    Nested(kv, 2, Msg(v =>
+                    {
+                        v.WriteTag(3, WireFormat.WireType.Varint);  v.WriteInt64(11);
+                        v.WriteTag(4, WireFormat.WireType.Fixed64); v.WriteDouble(2.5);
+                        v.WriteTag(2, WireFormat.WireType.Varint);  v.WriteBool(true);
+                        v.WriteTag(1, WireFormat.WireType.LengthDelimited); v.WriteString("string wins");
+                    }));
+                }));
+                Nested(lr, 6, Msg(kv =>                                      // key stated twice
+                {
+                    kv.WriteTag(1, WireFormat.WireType.LengthDelimited); kv.WriteString("ignored");
+                    kv.WriteTag(1, WireFormat.WireType.LengthDelimited); kv.WriteString("repeated");
+                    Nested(kv, 2, Msg(v => { v.WriteTag(1, WireFormat.WireType.LengthDelimited); v.WriteString("last key wins"); }));
+                }));
+            }))));
+        })));
+
+    /// <summary>
+    /// A resource_logs whose length prefix claims more bytes than the payload holds — a
+    /// truncated upload, or a hostile one.
+    /// </summary>
+    public static byte[] Logs_TruncatedLengthPrefix()
+    {
+        byte[] whole = Logs_Realistic(records: 2);
+        return whole[..(whole.Length - 32)];       // the outer length now overruns the buffer
+    }
+
     // ── Data points ───────────────────────────────────────────────────────────
 
     private static void PointAttributes(CodedOutputStream c, int field, int p)

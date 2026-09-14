@@ -35,6 +35,21 @@ namespace Ameto.Otel;
 /// and array / kvlist attribute values are encoded instead of being written as nil — the
 /// DOM decoder never modelled those two AnyValue cases, so protobuf clients silently lost
 /// them while JSON clients did not.</para>
+///
+/// <para>Three further differences from the DOM oracle, none of which a conformant exporter
+/// can reach, all pinned by <c>OtlpLogProtoLimitsTests</c>:</para>
+/// <list type="bullet">
+///   <item>A trace or span id longer than <see cref="MaxIdBytes"/> is dropped from
+///   <c>@tr</c>/<c>@sp</c> rather than hex-encoded at any length. Conformant ids are 16 and
+///   8 bytes; the correlation columns already refused anything but those.</item>
+///   <item>A literal <c>0x00</c> where a tag is expected ends the message silently instead of
+///   being an error — field 0 is not a legal field number, and both this reader and
+///   <c>CodedInputStream</c> read it as end-of-input.</item>
+///   <item>A malformed tail aborts the batch mid-way, so records before the bad byte are
+///   already in the ring when the caller answers 400. The DOM path decoded the whole request
+///   before ingesting any of it. This matches the JSON path, which has always behaved this
+///   way, and a client that gets a 400 is expected to resend the batch.</item>
+/// </list>
 /// </summary>
 public static class OtlpLogProtoParser
 {
@@ -59,9 +74,25 @@ public static class OtlpLogProtoParser
         public int ResKeyCount;
         public ReadOnlySpan<byte> Service;       // service.name UTF-8, sliced from the payload
         public bool ServiceSeen;                 // first service.name wins, as the mapper does
+        public int Depth;                        // nested array_value / kvlist_value levels open
         public int Ingested;
         public int Dropped;
     }
+
+    /// <summary>
+    /// How deep an attribute value may nest before the payload is refused.
+    ///
+    /// <para>A value nests through <c>array_value</c> and <c>kvlist_value</c>, and the writers
+    /// for those recurse into <see cref="WriteAnyValue"/> — so without a bound, 150 KB of
+    /// <c>array_value{values{array_value{…}}}</c> is a stack overflow, which is process death
+    /// with no exception to catch and no request to answer. It cost one small POST.</para>
+    ///
+    /// <para>64 is <c>Utf8JsonReader</c>'s default <c>MaxDepth</c>, so the two encodings refuse
+    /// at the same shape. The JSON reader spends some of its 64 on the document structure above
+    /// the value, and this counts only the value's own nesting, so protobuf is marginally the
+    /// more permissive of the two — both are far past anything an exporter emits.</para>
+    /// </summary>
+    private const int MaxValueDepth = 64;
 
     public static (int Ingested, int Dropped) Parse(ReadOnlySpan<byte> payload, IOtlpLogSink sink)
     {
@@ -269,7 +300,9 @@ public static class OtlpLogProtoParser
         if (!haveKey) return false;
 
         // service.name: the FIRST one decides, string values only, and it is NOT removed from
-        // the property map — all three are the mapper's behaviour, and the JSON path's.
+        // the property map. All three are the MAPPER's behaviour, which is what this path is
+        // pinned to. The JSON parser differs on the first of them — it overwrites, so the last
+        // service.name wins there — and that difference is not introduced here to fix it.
         if (captureService && !st.ServiceSeen && key.SequenceEqual("service.name"u8))
         {
             st.ServiceSeen = true;
@@ -343,6 +376,8 @@ public static class OtlpLogProtoParser
     /// </summary>
     private static void WriteArrayValue(ReadOnlySpan<byte> bytes, ref MessagePackWriter w, ref ParseState st)
     {
+        EnterValue(ref st);
+
         int n = 0;
         var count = new ProtoReader(bytes);
         uint tag;
@@ -359,11 +394,15 @@ public static class OtlpLogProtoParser
             if (tag == 10) WriteAnyValue(r.ReadLengthDelimited(), ref w, ref st);
             else r.SkipField(tag);
         }
+
+        st.Depth--;
     }
 
     /// <summary>KvlistValue → msgpack map, counting only the entries that carry a key.</summary>
     private static void WriteKvlistValue(ReadOnlySpan<byte> bytes, ref MessagePackWriter w, ref ParseState st)
     {
+        EnterValue(ref st);
+
         int n = 0;
         var count = new ProtoReader(bytes);
         uint tag;
@@ -380,6 +419,23 @@ public static class OtlpLogProtoParser
             if (tag == 10) TryWriteKeyValue(r.ReadLengthDelimited(), ref w, ref st, captureService: false);
             else r.SkipField(tag);
         }
+
+        st.Depth--;
+    }
+
+    /// <summary>
+    /// Opens one nesting level, refusing the payload past <see cref="MaxValueDepth"/>.
+    ///
+    /// <para>Throwing is the point: the callers catch <see cref="InvalidDataException"/> from
+    /// the wire reader already and answer 400 / INVALID_ARGUMENT, so a hostile value is refused
+    /// through the same door as a truncated one. The alternative — returning quietly — would
+    /// write a truncated property map and call it success.</para>
+    /// </summary>
+    private static void EnterValue(ref ParseState st)
+    {
+        if (++st.Depth > MaxValueDepth)
+            throw new InvalidDataException(
+                $"OTLP attribute value nests deeper than {MaxValueDepth} levels");
     }
 
     private static bool HasKey(ReadOnlySpan<byte> keyValue)
