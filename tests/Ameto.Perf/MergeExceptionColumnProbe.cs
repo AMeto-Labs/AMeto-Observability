@@ -37,9 +37,15 @@ public sealed class MergeExceptionColumnProbe : IAsyncLifetime
 
     public MergeExceptionColumnProbe(ITestOutputHelper output) => _out = output;
 
-    public Task InitializeAsync() { NewEngine(); return Task.CompletedTask; }
+    public Task InitializeAsync() { NewEngine(withSink: false); return Task.CompletedTask; }
 
-    private void NewEngine()
+    /// <param name="withSink">
+    /// With the production index sink wired, so the merge builds the three index sections
+    /// per group — which is where the exception column's bytes are actually READ (type,
+    /// message, inner type). Without it the merge only copies the column through, so the
+    /// index-less number says nothing about what an Error-level compaction costs.
+    /// </param>
+    private void NewEngine(bool withSink)
     {
         string dir = Path.Combine(Path.GetTempPath(), "ameto-excmerge-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dir);
@@ -49,8 +55,13 @@ public sealed class MergeExceptionColumnProbe : IAsyncLifetime
             new RetentionStore(new ServerOptions { DataDirectory = dir }, NullLogger<RetentionStore>.Instance),
             NullLogger<StorageEngine>.Instance)
         {
-            _allowIndexlessMerge = true,
+            _allowIndexlessMerge = !withSink,
         };
+        if (withSink)
+        {
+            var hints = new Ameto.Indexing.IndexBuildHints();
+            _engine.IndexSinkFactory = (events, terms) => new Ameto.Indexing.SegmentIndexBuilder(events, 5, terms, hints);
+        }
     }
 
     public async Task DisposeAsync()
@@ -122,7 +133,7 @@ public sealed class MergeExceptionColumnProbe : IAsyncLifetime
 
         // Fresh engine, same shape without the exception column.
         await _engine.DisposeAsync();
-        NewEngine();
+        NewEngine(withSink: false);
         long noExc = await MergeAllocationPerEventAsync(withExceptions: false, events: 8000);
         _out.WriteLine($"merge without exceptions: {noExc,6} B/event  ({withExc / (double)Math.Max(1, noExc):F1}x)");
 
@@ -131,5 +142,35 @@ public sealed class MergeExceptionColumnProbe : IAsyncLifetime
         // measured 1.3× and far below the 53× a decode-and-re-encode reads.
         Assert.True(withExc < noExc * 6,
             $"exceptions cost {withExc} B/event against {noExc} B/event without — the column is not being copied through");
+    }
+
+    /// <summary>
+    /// The same merge WITH the index sink — the production shape. The index reads the
+    /// exception's type, message and inner type per row; it used to get them by decoding the
+    /// whole object graph, stack trace included (<c>ExceptionInfo.FromBytes</c>: a payload
+    /// copy, four key strings and 1-5 KB of UTF-16 stack per row), which the index-less
+    /// number above never saw. MEASURED before the span read: 5 036 B/event with exceptions
+    /// against 157 B/event without — 4 879 B per exception-carrying row for three short
+    /// strings; after: 417 against 174 B/event, the remainder being what the message's
+    /// trigrams and the two extra properties cost the (pooled, cold here) accumulators.
+    /// </summary>
+    [Fact]
+    public async Task ExceptionsDoNotDominateMergeAllocation_WithIndexSink()
+    {
+        await _engine.DisposeAsync();
+        NewEngine(withSink: true);
+        long withExc = await MergeAllocationPerEventAsync(withExceptions: true, events: 8000);
+        _out.WriteLine($"indexed merge with exceptions:    {withExc,6} B/event");
+
+        await _engine.DisposeAsync();
+        NewEngine(withSink: true);
+        long noExc = await MergeAllocationPerEventAsync(withExceptions: false, events: 8000);
+        _out.WriteLine($"indexed merge without exceptions: {noExc,6} B/event  ({withExc / (double)Math.Max(1, noExc):F1}x, +{withExc - noExc} B per exception row)");
+
+        // The index reads three short strings out of each exception; it must not pay for the
+        // stack trace it never indexes. 600 B per row is a ceiling on the terms it files
+        // (measured 243), an order of magnitude under the 4 879 the full decode cost.
+        Assert.True(withExc - noExc < 600,
+            $"indexing an exception costs {withExc - noExc} B/event — the index is decoding more of it than it reads");
     }
 }

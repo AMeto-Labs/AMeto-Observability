@@ -263,21 +263,41 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
 
         if (ev.ExceptionPayload.IsEmpty) return;
 
-        // Merge path: the raw msgpack, decoded whole (stack trace included) — replaced by a
-        // span read of the three indexed fields in the next change.
-        var decoded = ev.DecodeException();
-        if (decoded is null) return;
-        AddExists(offset);
-        if (!string.IsNullOrEmpty(decoded.Type))
+        // Merge path: the raw msgpack. Read only the three fields the index wants, in place —
+        // the stack trace, 1-5 KB of UTF-16 nobody here reads, is skipped, not decoded. That
+        // decode cost an Error-level merge 4 879 B per row for three short strings.
+        fixed (byte* p = ev.ExceptionPayload)
         {
-            AddString(offset, "@x.type"u8, decoded.Type);
-            if (decoded.Type.Length >= 3) _trigram.Add(offset, decoded.Type);
+            _exception.Set(p, ev.ExceptionPayload.Length);
+            try
+            {
+                if (!ExceptionInfo.TryReadIndexFields(_exception.Memory, out var type, out var message, out var innerType))
+                    return;
+                AddExists(offset);
+                if (!type.IsEmpty)
+                {
+                    if (_inverted.AddUtf8(offset, "@x.type"u8, type) != IndexAddOutcome.Existing) _bloom.AddUtf8(type);
+                    _bloomPresented++;
+                    TrigramUtf8(offset, type);
+                }
+                // ExceptionInfo.Read keeps an empty message as "" and the object path indexes
+                // only a message of 3+ chars; a UTF-8 length of 3+ can be a 1-char non-ASCII
+                // message, which the trigram then ignores itself — same outcome.
+                if (!message.IsEmpty) TrigramUtf8(offset, message);
+                if (!innerType.IsEmpty)
+                {
+                    if (_inverted.AddUtf8(offset, "@x.inner.type"u8, innerType) != IndexAddOutcome.Existing) _bloom.AddUtf8(innerType);
+                    _bloomPresented++;
+                }
+            }
+            finally
+            {
+                _exception.Set(null, 0);
+            }
         }
-        if (!string.IsNullOrEmpty(decoded.Message) && decoded.Message.Length >= 3)
-            _trigram.Add(offset, decoded.Message);
-        if (decoded.Inner is { Type.Length: > 0 } decodedInner)
-            AddString(offset, "@x.inner.type"u8, decodedInner.Type);
     }
+
+    private readonly PinnedSpanMemoryManager _exception = new();
 
     private void AddExists(uint offset)
     {

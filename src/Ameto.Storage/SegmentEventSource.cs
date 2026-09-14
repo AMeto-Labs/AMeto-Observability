@@ -74,10 +74,13 @@ public readonly ref struct SegmentEventRef
     /// <summary>
     /// The exception as an object graph, decoding the raw payload if that is all we have.
     ///
-    /// <para>Only the INDEX BUILD needs this — it indexes the type, the message and the inner
-    /// type as strings. The writer does not, and asking for it there is what put a decode plus a
+    /// <para>Only the INDEX BUILD needs anything of it — the type, the message and the inner
+    /// type. The writer does not, and asking for it there is what put a decode plus a
     /// re-encode on every exception-carrying row of every merge. A merge that runs without an
-    /// index sink now never decodes at all.</para>
+    /// index sink never decodes at all, and the streaming builder no longer decodes on a merge
+    /// either: it reads the three fields as spans out of <see cref="ExceptionPayload"/>
+    /// (<see cref="ExceptionInfo.TryReadIndexFields"/>), skipping the stack trace. This full
+    /// decode remains for the builder's reference oracle and any caller that wants the graph.</para>
     /// </summary>
     public ExceptionInfo? DecodeException() =>
         Exception ?? (ExceptionPayload.IsEmpty ? null : ExceptionInfo.FromBytes(ExceptionPayload));
