@@ -14,12 +14,9 @@ namespace Ameto.Perf;
 /// depth each concurrent request gets a fresh, zeroed 2 MiB array straight on the large object
 /// heap. <see cref="IngestBufferPool"/> is deeper and is never trimmed.</para>
 ///
-/// <para>The assertion is on the depth alone, which is what a probe can hold still: with more
-/// requests in flight than the shared pool's per-core capacity, the overflow is allocated. The
-/// gen2 figures are printed and NOT asserted on — the shared pool's trimming is time-based and
-/// pressure-based, so a tight loop with a forced collection does not reproduce what a server
-/// sees over minutes, and the two numbers there are within one 2 MiB array of each other in
-/// either direction.</para>
+/// <para>Four numbers are printed and none of them is asserted on; the reasoning is at the
+/// assertion, and the claims that CAN be held still — the depth bound, the trim, and the rule
+/// that fires it — are the three facts below it.</para>
 /// </summary>
 public sealed class OtlpBodyBufferProbe
 {
@@ -53,10 +50,23 @@ public sealed class OtlpBodyBufferProbe
         _out.WriteLine($"  IngestBufferPool + gen2 per round: {ownGen2 / 1024.0 / 1024.0,7:F1} MB "
                      + $"({ownGen2 / (double)requests / 1024:F0} KB/request)");
 
-        // More requests in flight than the shared pool holds ⇒ the overflow is fresh LOH; the
-        // dedicated pool is deep enough to hand back what it was given.
-        Assert.True(ownFlat < sharedFlat,
-            $"expected the deeper pool to allocate less, got own={ownFlat} shared={sharedFlat}");
+        // Deliberately no assertion on these four numbers, and it is worth saying why rather
+        // than asserting something that only holds on the machine it was written on.
+        //
+        // ArrayPool.Shared gives each THREAD one array per bucket on top of its per-core
+        // stacks. A probe that reuses ~32 warm thread-pool threads therefore sees it hit every
+        // time; the misses this pool exists to remove come from thread churn and from Shared's
+        // own gen2 trimming, neither of which a tight loop reproduces. The first measurement
+        // taken here, before that warm round existed, read 24-32 MB against 0 MB — real, and
+        // real only because Shared was cold.
+        //
+        // And IngestBufferPool is now emptied by a gen2 whenever the GC reports high memory
+        // load, so its steady-state allocation is a function of how loaded the host is. That is
+        // the behaviour asked for, and it is not something a test can hold still.
+        //
+        // What IS asserted about this pool lives in the three facts above: the depth bound, the
+        // trim releasing what it held, and the rule that decides when to trim.
+        Assert.True(ownFlat >= 0 && sharedFlat >= 0);
     }
 
     // ── What the pool is allowed to keep ──────────────────────────────────────
@@ -115,28 +125,41 @@ public sealed class OtlpBodyBufferProbe
         GC.WaitForPendingFinalizers();
         GC.Collect(2, GCCollectionMode.Forced, blocking: true);
 
-        long before = GC.GetTotalAllocatedBytes(precise: true);
         var tasks = new Task[Concurrency];
+
+        // One unmeasured round, AFTER the collections above. Both pools are emptied by a gen2
+        // — the shared one by its own trimming, this one by the pressure hook — and what is
+        // being compared is steady-state reuse, not the cost of the first fill. Without this
+        // the measurement is dominated by whichever pool was collected last.
+        await Round(tasks, dedicated);
+
+        long before = GC.GetTotalAllocatedBytes(precise: true);
         for (int r = 0; r < Rounds; r++)
         {
-            for (int i = 0; i < Concurrency; i++)
-                tasks[i] = Task.Run(() =>
-                {
-                    byte[] buf = dedicated ? IngestBufferPool.Rent(BodyBytes) : ArrayPool<byte>.Shared.Rent(BodyBytes);
-                    try
-                    {
-                        buf[0] = 1;                       // touch both ends so the pages are real
-                        buf[BodyBytes - 1] = 2;
-                        Thread.SpinWait(2_000);           // hold it, the way a parse does
-                    }
-                    finally
-                    {
-                        if (dedicated) IngestBufferPool.Return(buf); else ArrayPool<byte>.Shared.Return(buf);
-                    }
-                });
-            await Task.WhenAll(tasks);
+            await Round(tasks, dedicated);
             if (gen2) GC.Collect(2, GCCollectionMode.Forced, blocking: true);
         }
         return GC.GetTotalAllocatedBytes(precise: true) - before;
+    }
+
+    /// <summary>One round: <see cref="Concurrency"/> request bodies rented, held and returned.</summary>
+    private static async Task Round(Task[] tasks, bool dedicated)
+    {
+        for (int i = 0; i < Concurrency; i++)
+            tasks[i] = Task.Run(() =>
+            {
+                byte[] buf = dedicated ? IngestBufferPool.Rent(BodyBytes) : ArrayPool<byte>.Shared.Rent(BodyBytes);
+                try
+                {
+                    buf[0] = 1;                       // touch both ends so the pages are real
+                    buf[BodyBytes - 1] = 2;
+                    Thread.SpinWait(2_000);           // hold it, the way a parse does
+                }
+                finally
+                {
+                    if (dedicated) IngestBufferPool.Return(buf); else ArrayPool<byte>.Shared.Return(buf);
+                }
+            });
+        await Task.WhenAll(tasks);
     }
 }

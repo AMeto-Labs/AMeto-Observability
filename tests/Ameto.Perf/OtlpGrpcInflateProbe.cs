@@ -29,11 +29,15 @@ public sealed class OtlpGrpcInflateProbe
         byte[] logs   = OtlpProtoPayloads.Logs_Realistic();
         byte[] framed = GzipFrame(logs);
 
-        for (int i = 0; i < 20; i++) Once(framed);              // warm JIT + pool
+        for (int i = 0; i < 20; i++) Once(framed);              // warm JIT
 
         const int iters = 200;
         GC.Collect();
         GC.WaitForPendingFinalizers();
+        // After the collection, not before: a gen2 under memory pressure empties
+        // IngestBufferPool, and one cold 512 KB inflate buffer spread over 200 iterations is
+        // 2.6 KB a call of pure warm-up. What is being measured is the steady state.
+        for (int i = 0; i < 5; i++) Once(framed);
         long b0 = GC.GetAllocatedBytesForCurrentThread();
         var sw = Stopwatch.StartNew();
         for (int i = 0; i < iters; i++) Once(framed);
