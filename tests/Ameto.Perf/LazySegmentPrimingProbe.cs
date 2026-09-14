@@ -96,6 +96,27 @@ public sealed class LazySegmentPrimingProbe : IAsyncLifetime
         Assert.Equal(Segments, fullOpens);
         Assert.Equal(Segments, pageOpens);
 
+        // …AND EVERY ONE OF THEM IS CLOSED. This is the half a single-segment test cannot
+        // reach: a page of 5 primes one or two of the 40, so ~38 readers were opened by the
+        // prefilter, handed to a scan that never ran, and have no iterator to close them —
+        // only the merge's finally does. On Windows a mapping keeps the file undeletable, and
+        // retention and the merge delete segments while queries run, so an escaped reader here
+        // is not a leak that shows up as memory, it is a file that never goes away.
+        //
+        // Renaming is the assertion: it is exactly what Windows refuses while a mapping is
+        // open, and it is the operation the merge's source cleanup needs.
+        await FilteredPageAsync(5);
+
+        var files = _engine.ListSegments().Select(s => s.FilePath).ToArray();
+        Assert.Equal(Segments, files.Length);
+        foreach (var path in files)
+        {
+            string moved = path + ".moved";
+            File.Move(path, moved);      // throws IOException if anything still holds it
+            File.Move(moved, path);
+        }
+        _out.WriteLine($"all {files.Length} segment files renameable after a page of 5 — no reader outlived the query");
+
         Task<List<LogEvent>> FilteredPageAsync(int count) =>
             QuerySegmentFixtures.RunAsync(_query, Filter, count);
     }

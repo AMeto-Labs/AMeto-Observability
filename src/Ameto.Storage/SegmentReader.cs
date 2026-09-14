@@ -498,9 +498,10 @@ public sealed class SegmentReader : ISegmentReader
     /// the filter then rejected.
     ///
     /// <para>Probed BY UTF-8 through <see cref="Utf8StringComparer"/>, straight off the block
-    /// buffer, so a repeat costs a hash of bytes that are already there and builds nothing;
-    /// see <c>SegmentEventCursor.Dedup</c>, whose measurement this mirrors (including why the
-    /// insert goes through the string key rather than the alternate lookup).</para>
+    /// buffer, so a repeat costs a hash of bytes that are already there and builds nothing.
+    /// The merge's <c>SegmentEventCursor._stringDedup</c> is the same table for the same
+    /// reason and carries the measurement, including why the insert goes through the string
+    /// key rather than the alternate lookup.</para>
     ///
     /// <para>Scoped to one <see cref="ReadEventsAsync"/> enumeration, not to the reader: a
     /// reader is now shared between a query's prefilter and its scan, and a table shared by
@@ -509,9 +510,11 @@ public sealed class SegmentReader : ISegmentReader
     /// </summary>
     private sealed class BlockStringDedup
     {
-        /// <summary>Matches <c>SegmentEventCursor.MaxDedupEntries</c>: past this the values
-        /// are not a vocabulary any more (interpolated templates are distinct per event), and
-        /// dedup is a pure allocation optimisation, so the table simply empties and refills.</summary>
+        /// <summary>The same ceiling as the merge's <c>SegmentEventCursor.MaxDedupEntries</c>,
+        /// for the same reason: past it the values are not a vocabulary any more (a template
+        /// built by interpolation is distinct per event), and dedup is a pure allocation
+        /// optimisation, so the table simply empties and refills with what it is seeing
+        /// now.</summary>
         private const int MaxEntries = 65_536;
 
         private readonly Dictionary<string, string> _byString = new(Utf8StringComparer.Instance);

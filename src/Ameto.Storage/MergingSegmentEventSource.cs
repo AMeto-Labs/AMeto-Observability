@@ -228,8 +228,9 @@ internal sealed class SegmentEventCursor : IDisposable
 /// <para>Insertion goes through the string key even though the alternate would skip that
 /// transcode, because <see cref="Create"/> is how the alternate obtains a key to store and it
 /// transcodes as well — into a second heap string the entry then retains. A stack scratch buffer
-/// once per distinct value is the cheaper half of that trade; see <see cref="SegmentEventCursor.Dedup"/>
-/// for the measurement.</para>
+/// once per distinct value is the cheaper half of that trade; the measurement is on
+/// <c>SegmentEventCursor</c>'s <c>_stringDedup</c> insert (18.49 MB retained the other way
+/// against 10.50 MB this way), which is a private member and so is named rather than linked.</para>
 /// </summary>
 internal sealed class Utf8StringComparer : IEqualityComparer<string>,
                                            IAlternateEqualityComparer<ReadOnlySpan<byte>, string>

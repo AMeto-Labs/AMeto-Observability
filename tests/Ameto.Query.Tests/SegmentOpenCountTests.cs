@@ -111,9 +111,15 @@ public sealed class SegmentOpenCountTests : IAsyncLifetime
     /// <summary>
     /// The lifetime claim, and the one that matters beyond speed: when the query is finished,
     /// nothing is holding the file. On Windows a mapped file cannot be deleted, and retention
-    /// and the merge delete segments while queries run — so a reader carried from the prefilter
-    /// to the scan must be closed by the end of the query even for a page that stopped early
-    /// and for a segment that never primed.
+    /// and the merge delete segments while queries run, so a reader carried from the prefilter
+    /// to the scan must be closed by the end of the query.
+    ///
+    /// <para>SCOPE, because the fixture is one segment and one segment always primes: what
+    /// this covers is the reader a DRAINED iterator borrowed, and the early-stop page. The
+    /// other half — a survivor the prefilter opened whose scan never ran, which only the
+    /// merge's own finally can close — needs a catalog the page cannot exhaust, and is
+    /// asserted over 40 segments by
+    /// <c>Ameto.Perf.LazySegmentPrimingProbe.AFilteredPageMapsEachSurvivingSegmentOnce</c>.</para>
     /// </summary>
     [Theory]
     [InlineData(null)]

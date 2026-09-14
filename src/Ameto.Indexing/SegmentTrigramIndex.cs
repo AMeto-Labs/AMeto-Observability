@@ -139,6 +139,16 @@ public sealed class SegmentTrigramIndex
     /// <para>The search text is folded into stack scratch, not through
     /// <c>ToString().ToLowerInvariant()</c> — two strings per call, one of them a copy of a
     /// filter literal that never changes.</para>
+    ///
+    /// <para>NOT SYNCHRONISED against a concurrent build, and it was not before either: the
+    /// <see cref="_sets"/> branch reads a <c>List&lt;int&gt;</c> through
+    /// <c>CollectionsMarshal.AsSpan</c> without <see cref="_lock"/>, so an <see cref="Add"/>
+    /// racing a lookup could resize the list under the span. No production caller can do that
+    /// — a query only ever holds an index that came out of <see cref="Deserialise"/>, whose
+    /// buckets are frozen <c>int[]</c> and never mutated, and a building index is private to
+    /// the flush that is filling it until it is serialised. The branch exists for tests and
+    /// for the parity oracle, which query a build-phase index single-threaded. Do not hand a
+    /// still-building index to a reader without taking the lock.</para>
     /// </summary>
     public uint[]? Lookup(ReadOnlySpan<char> text)
     {
