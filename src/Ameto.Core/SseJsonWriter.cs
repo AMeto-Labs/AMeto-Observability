@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Diagnostics;
 using System.Text.Json;
 using System.Text.Json.Serialization.Metadata;
 
@@ -48,9 +49,29 @@ public sealed class SseJsonWriter : IDisposable
     /// </summary>
     private const int FlushThresholdBytes = 16 * 1024;
 
+    /// <summary>
+    /// How long buffered frames may WAIT, whatever they weigh.
+    ///
+    /// <para>The byte threshold alone has no time bound, and the events endpoint writes nothing
+    /// else between the first row and the terminal frame. A sparse cold search — forty matches
+    /// found over thirty seconds of scanning — would therefore show the client nothing at all
+    /// until <c>done</c>, while the Angular store is built to paint progressively as rows
+    /// arrive. Coalescing rows that arrive together is the win; holding a row because the next
+    /// one has not been found yet is not.</para>
+    ///
+    /// <para>It bounds the hold to roughly one inter-row gap, which is why it is checked when a
+    /// row is written rather than on a timer: a producer that has gone quiet still leaves
+    /// under 16 KB sitting here until its next row or its terminal frame — and the terminal
+    /// frame is guaranteed, so nothing is ever stranded.</para>
+    /// </summary>
+    private static readonly TimeSpan MaxFrameHold = TimeSpan.FromMilliseconds(100);
+
     private readonly ArrayBufferWriter<byte> _buffer = new(4096);
     private readonly Utf8JsonWriter          _json;
     private readonly Stream                  _body;
+
+    /// <summary>When the buffer last went out, for <see cref="MaxFrameHold"/>.</summary>
+    private long _lastSendStamp = Stopwatch.GetTimestamp();
 
     /// <param name="body">The response body to frame into — <c>ctx.Response.Body</c>.</param>
     public SseJsonWriter(Stream body)
@@ -78,12 +99,27 @@ public sealed class SseJsonWriter : IDisposable
     /// </summary>
     public async ValueTask WriteLogEventAsync(LogEvent ev, CancellationToken ct)
     {
-        _buffer.Write(DataPrefix);
-        _json.Reset(_buffer);
-        LogEventJsonWriter.Write(_json, ev);
-        _json.Flush();
-        _buffer.Write(FrameSuffix);
-        if (_buffer.WrittenCount >= FlushThresholdBytes)
+        // Where the frame STARTS, so a writer that throws part-way through composing it does
+        // not leave half a `data:` line in front of the terminal query-error frame. A client
+        // parsing SSE by blank line would read the fragment and the error frame as one.
+        int frameStart = _buffer.WrittenCount;
+        try
+        {
+            _buffer.Write(DataPrefix);
+            _json.Reset(_buffer);
+            LogEventJsonWriter.Write(_json, ev);
+            _json.Flush();
+            _buffer.Write(FrameSuffix);
+        }
+        catch
+        {
+            _buffer.ResetWrittenCount();
+            _buffer.Advance(frameStart);      // keep the whole frames, drop the partial one
+            throw;
+        }
+
+        if (_buffer.WrittenCount >= FlushThresholdBytes ||
+            Stopwatch.GetElapsedTime(_lastSendStamp) >= MaxFrameHold)
             await SendAsync(ct).ConfigureAwait(false);
     }
 
@@ -97,6 +133,7 @@ public sealed class SseJsonWriter : IDisposable
         await _body.WriteAsync(_buffer.WrittenMemory, ct).ConfigureAwait(false);
         await _body.FlushAsync(ct).ConfigureAwait(false);
         _buffer.ResetWrittenCount();
+        _lastSendStamp = Stopwatch.GetTimestamp();
     }
 
     /// <summary>
