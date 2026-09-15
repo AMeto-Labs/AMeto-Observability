@@ -586,9 +586,12 @@ public static class EndpointMapper
                         // Bounded like any other search: an unfiltered forward poll over
                         // a wide window is a full-catalog scan, and without a budget it
                         // would hold the slot it took for as long as that takes. A source
-                        // that cannot be re-armed is one already cancelled: the client is
-                        // gone, or the last budget fired in the instant between its poll
-                        // completing and Disarm — that one is still owed the timeout frame.
+                        // that cannot be re-armed is one the client's leaving cancelled, or
+                        // one the last budget cancelled — or has only queued the timer that
+                        // will: a budget that ran out in the instant between the poll
+                        // completing and Disarm, which neither the catch nor the post-poll
+                        // check below saw. TimedOut counts that refusal as the timeout it is,
+                        // so it is still owed the frame.
                         if (!deadline.TryRearm())
                         {
                             if (deadline.TimedOut)

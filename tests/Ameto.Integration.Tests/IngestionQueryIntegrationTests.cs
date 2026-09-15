@@ -132,6 +132,12 @@ public class AmetoWebAppFactory : WebApplicationFactory<Program>
     /// </summary>
     protected virtual bool SeedSpaStub => true;
 
+    /// <summary>
+    /// The search bounds this host runs under. Defaults for every suite but the one that needs
+    /// a budget small enough to run out on purpose; see LiveTailTimeoutTests.
+    /// </summary>
+    protected virtual QueryOptions ConfiguredQuery => new();
+
     /// <summary>The per-run wwwroot, so a test can populate it after the host has started.</summary>
     public string WebRootPath { get; private set; } = "";
 
@@ -185,6 +191,7 @@ public class AmetoWebAppFactory : WebApplicationFactory<Program>
                     MaxAge       = TimeSpan.FromMinutes(60),
                 },
                 Retention = new RetentionConfig(),
+                Query     = ConfiguredQuery,
             };
 
             services.AddSingleton(opts);

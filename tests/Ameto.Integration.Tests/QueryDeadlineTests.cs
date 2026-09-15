@@ -1,3 +1,4 @@
+using System.Reflection;
 using Ameto.Server;
 
 namespace Ameto.Integration.Tests;
@@ -65,5 +66,48 @@ public sealed class QueryDeadlineTests
         await Task.Delay(300);                    // the second poll's budget expires
         Assert.True(deadline.TimedOut);
         Assert.Equal(0, firedFromFirstPoll);      // the first poll's callback was dropped by the re-arm
+    }
+
+    /// <summary>
+    /// The window a refused re-arm has to cover on its own: the previous poll's budget timer
+    /// has been QUEUED to fire (the poll ended right at its budget, the callback waits behind a
+    /// starved pool) but has not run. <c>CancellationTokenSource.TryReset</c> refuses such a
+    /// source, yet its token is not cancelled at that instant — so a TimedOut that read the
+    /// token alone answered "not a timeout", and the tail broke off with no terminal frame.
+    /// Reflection because the only production route in is a timer-versus-pool race a test can
+    /// provoke but not force: this sets exactly the state that race leaves
+    /// (<c>TimerQueueTimer._everQueued</c>, which <c>TryReset</c> reads) on a timer that is
+    /// not really going to fire.
+    /// </summary>
+    [Fact]
+    public void A_rearm_refused_by_a_queued_budget_timer_is_a_timeout_before_the_token_says_so()
+    {
+        using var request  = new CancellationTokenSource();
+        using var deadline = new QueryDeadline(request.Token, TimeSpan.FromMinutes(5));
+        Assert.True(deadline.TryRearm());
+
+        MarkBudgetTimerQueued(deadline);
+
+        Assert.False(deadline.TryRearm());
+        Assert.False(deadline.Token.IsCancellationRequested);   // the callback has not run
+        Assert.True(deadline.TimedOut);                         // but the budget is what ended it
+
+        // A client that leaves meanwhile is a disconnect, not a timeout.
+        request.Cancel();
+        Assert.False(deadline.TimedOut);
+    }
+
+    private static void MarkBudgetTimerQueued(QueryDeadline deadline)
+    {
+        const BindingFlags Instance = BindingFlags.NonPublic | BindingFlags.Instance;
+
+        var cts = typeof(QueryDeadline).GetField("_cts", Instance)?.GetValue(deadline) as CancellationTokenSource;
+        Assert.NotNull(cts);
+        object? timer = typeof(CancellationTokenSource).GetField("_timer", Instance)?.GetValue(cts);
+        Assert.NotNull(timer);
+        var everQueued = timer.GetType().GetField("_everQueued", Instance);
+        Assert.True(everQueued is not null,
+            $"{timer.GetType()} has no _everQueued field: the runtime's TryReset contract changed — re-check QueryDeadline.TryRearm");
+        everQueued!.SetValue(timer, true);
     }
 }
