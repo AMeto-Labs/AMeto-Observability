@@ -59,11 +59,18 @@ public interface IOtlpLogSink
 ///   3. Intern the message template via <see cref="StringInternPool"/>.
 ///   4. Re-serialise the properties-only map and push to <see cref="IngestionRingBuffer"/>.
 ///
-/// Returns:
-///   200 OK + JSON { "ingested": N, "dropped": M }
-///   400 Bad Request if body is not a valid MessagePack array
-///   413 Payload Too Large if body exceeds the configured batch limit
-///          (<see cref="IngestionOptions.MaxBatchBytes"/>)
+/// Returns (every 200 and 400 is application/json with the counts):
+///   200 OK          { "ingested": N, "dropped": M }
+///   400 Bad Request { "ingested": N, "dropped": M, "failedAtElement": K }
+///          The body stopped being a CLEF array at element K. The N events before it are
+///          ALREADY INGESTED and stay so. failedAtElement is omitted when the body failed
+///          before any element, at the array header (not an array, or empty).
+///   400 Bad Request { "ingested": 0, "dropped": 0 }
+///          The body ended short of its Content-Length on a stream that ends rather than
+///          throws (see HandleAsync 1b). Kestrel fails that read itself.
+///   413 Payload Too Large, no body, above <see cref="IngestionOptions.MaxBatchBytes"/>
+///   500 A fault in the server underneath (ring, intern pool, logger, shutdown
+///          mid-batch). It leaves the handler and hosting answers it; see IsMalformedPayload.
 /// </summary>
 public sealed class IngestionEndpoint : IOtlpLogSink, LogEventSerializer.IClefBatchSink
 {
@@ -103,67 +110,73 @@ public sealed class IngestionEndpoint : IOtlpLogSink, LogEventSerializer.IClefBa
             return;
         }
 
-        byte[] bodyBuf;
-        int    bodyLen;
-
-        if (contentLength.HasValue)
-        {
-            int expected = (int)contentLength.Value;
-            bodyBuf = ArrayPool<byte>.Shared.Rent(Math.Max(expected, 1));
-            int total = 0;
-            while (total < expected)
-            {
-                int n = await ctx.Request.Body.ReadAsync(
-                    bodyBuf.AsMemory(total, expected - total), ctx.RequestAborted);
-                if (n == 0) break;
-                total += n;
-            }
-            bodyLen = total;
-        }
-        else
-        {
-            bodyBuf = ArrayPool<byte>.Shared.Rent(64 * 1024);
-            bodyLen = 0;
-            while (true)
-            {
-                int n = await ctx.Request.Body.ReadAsync(
-                    bodyBuf.AsMemory(bodyLen), ctx.RequestAborted);
-                if (n == 0) break;
-                bodyLen += n;
-
-                if (bodyLen > _maxBatchBytes)
-                {
-                    ArrayPool<byte>.Shared.Return(bodyBuf);
-                    ctx.Response.StatusCode = StatusCodes.Status413PayloadTooLarge;
-                    return;
-                }
-
-                if (bodyLen == bodyBuf.Length)
-                {
-                    var bigger = ArrayPool<byte>.Shared.Rent(bodyBuf.Length * 2);
-                    Buffer.BlockCopy(bodyBuf, 0, bigger, 0, bodyLen);
-                    ArrayPool<byte>.Shared.Return(bodyBuf);
-                    bodyBuf = bigger;
-                }
-            }
-        }
-
+        // Rented, and straight into the try: a read that THROWS must still give the buffer back.
+        // Kestrel raises BadHttpRequestException for a body that ends short of its
+        // Content-Length, and RequestAborted cancels a read. Both used to fire before the try
+        // opened, so the rented array was never returned. Every exit below, the 413 included,
+        // returns it exactly once: in the finally.
+        byte[] bodyBuf = ArrayPool<byte>.Shared.Rent(
+            contentLength.HasValue ? Math.Max((int)contentLength.Value, 1) : 64 * 1024);
+        int    bodyLen = 0;
         try
         {
+            if (contentLength.HasValue)
+            {
+                int expected = (int)contentLength.Value;
+                while (bodyLen < expected)
+                {
+                    int n = await ctx.Request.Body.ReadAsync(
+                        bodyBuf.AsMemory(bodyLen, expected - bodyLen), ctx.RequestAborted);
+                    if (n == 0) break;
+                    bodyLen += n;
+                }
+            }
+            else
+            {
+                while (true)
+                {
+                    int n = await ctx.Request.Body.ReadAsync(
+                        bodyBuf.AsMemory(bodyLen), ctx.RequestAborted);
+                    if (n == 0) break;
+                    bodyLen += n;
+
+                    if (bodyLen > _maxBatchBytes)
+                    {
+                        ctx.Response.StatusCode = StatusCodes.Status413PayloadTooLarge;
+                        return;   // the finally returns the buffer
+                    }
+
+                    if (bodyLen == bodyBuf.Length)
+                    {
+                        var bigger = ArrayPool<byte>.Shared.Rent(bodyBuf.Length * 2);
+                        Buffer.BlockCopy(bodyBuf, 0, bigger, 0, bodyLen);
+                        ArrayPool<byte>.Shared.Return(bodyBuf);
+                        bodyBuf = bigger;   // nothing between the Return and here can throw
+                    }
+                }
+            }
+
             // ── 1b. A body that never arrived in full is refused whole ────────
-            // A client that aborts mid-send leaves a prefix that parses perfectly up to the
-            // cut, so streaming it would ingest that prefix and then answer 400. Seq clients
-            // treat a non-2xx as a failed batch and retry it — Serilog.Sinks.Seq throws and
-            // its batching sink retries ~8 times — so the prefix would land up to eight
-            // times over. Content-Length says how much was promised; short of it, nothing
-            // is ingested. (A body that arrives IN FULL and is malformed in the middle is
-            // the residual case: it still ingests the prefix, see StreamBatch.)
+            // Defense in depth, NOT the Kestrel path. On Kestrel a body short of its
+            // Content-Length never gets here: ReadAsync throws BadHttpRequestException
+            // ("Unexpected end of request content") above, whether the client sends FIN or
+            // RST, and hosting answers it. This guard is for a body stream that just ends
+            // early instead of throwing — TestServer, or another server. On such a stream the
+            // prefix parses perfectly up to the cut, so streaming it would ingest the prefix
+            // and then answer 400. Seq clients retry a non-2xx (Serilog.Sinks.Seq throws, and
+            // its batching sink retries), and the prefix would land again on every retry.
+            // A body that arrives IN FULL and is malformed in the middle is the residual case:
+            // it still ingests the prefix, see StreamBatch.
             if (contentLength.HasValue && bodyLen != (int)contentLength.Value)
             {
                 _logger.LogDebug(
                     "Truncated ingestion body: {Received} of {Expected} bytes — batch refused whole",
                     bodyLen, contentLength.Value);
-                ctx.Response.StatusCode = StatusCodes.Status400BadRequest;
+                // The same counts shape every other /api/events reply has: nothing landed.
+                ctx.Response.StatusCode  = StatusCodes.Status400BadRequest;
+                ctx.Response.ContentType = "application/json";
+                WriteCountsJson(ctx.Response.BodyWriter, ingested: 0, dropped: 0);
+                await ctx.Response.BodyWriter.FlushAsync(ctx.RequestAborted);
                 return;
             }
 
@@ -193,9 +206,10 @@ public sealed class IngestionEndpoint : IOtlpLogSink, LogEventSerializer.IClefBa
 
                 // Warning, not Debug, and with the counts: "some of that batch landed and
                 // some of it did not" is an operator's problem, and the element index is
-                // what makes it findable in the sender.
+                // what makes it findable in the sender. ElementIndex -1 is the array header itself
+                // (the reply then omits failedAtElement).
                 _logger.LogWarning(ex,
-                    "Malformed ingestion payload at element {ElementIndex} of {ElementCount}: "
+                    "Malformed ingestion payload at element {ElementIndex} (-1 = the array header) of {ElementCount}: "
                   + "{Ingested} event(s) already ingested, {Dropped} dropped — batch refused",
                     progress.ElementIndex, progress.ElementCount, progress.Ingested, progress.Dropped);
 

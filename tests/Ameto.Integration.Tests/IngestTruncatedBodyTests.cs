@@ -43,7 +43,8 @@ public sealed class IngestTruncatedBodyTests : IClassFixture<AmetoWebAppFactory>
     /// way to promise more bytes in Content-Length than the body actually carries — an
     /// HttpClient refuses to send that.
     /// </summary>
-    private async Task<(int Status, long Accepted)> PostAsync(byte[] body, long declaredLength)
+    private async Task<(int Status, long Accepted, string? ContentType, string Body)> PostAsync(
+        byte[] body, long declaredLength)
     {
         _factory.CreateClient().Dispose();   // makes the factory seed its API key
         var ring     = _factory.Services.GetRequiredService<IngestionRingBuffer>();
@@ -59,7 +60,22 @@ public sealed class IngestTruncatedBodyTests : IClassFixture<AmetoWebAppFactory>
             ctx.Request.Body          = new MemoryStream(body);
         });
 
-        return (response.Response.StatusCode, ring.AcceptedTotal - before);
+        using var reader = new StreamReader(response.Response.Body);
+        return (response.Response.StatusCode, ring.AcceptedTotal - before,
+                response.Response.ContentType, await reader.ReadToEndAsync());
+    }
+
+    /// <summary>
+    /// A refused truncated body answers in the same shape as every other /api/events reply —
+    /// counts, as JSON — so a sender parsing the 400 is not handed an empty body on this one path.
+    /// </summary>
+    private static void AssertNothingLandedBody(string? contentType, string body)
+    {
+        Assert.Equal("application/json", contentType);
+        using var doc = System.Text.Json.JsonDocument.Parse(body);
+        Assert.Equal(0, doc.RootElement.GetProperty("ingested").GetInt32());
+        Assert.Equal(0, doc.RootElement.GetProperty("dropped").GetInt32());
+        Assert.False(doc.RootElement.TryGetProperty("failedAtElement", out _));
     }
 
     [Fact]
@@ -68,10 +84,11 @@ public sealed class IngestTruncatedBodyTests : IClassFixture<AmetoWebAppFactory>
         byte[] full = Batch(20);
 
         // Half the promised bytes arrive — the array header and the first events are intact.
-        var (status, accepted) = await PostAsync(full[..(full.Length / 2)], full.Length);
+        var (status, accepted, contentType, body) = await PostAsync(full[..(full.Length / 2)], full.Length);
 
         Assert.Equal(StatusCodes.Status400BadRequest, status);
         Assert.Equal(0, accepted);
+        AssertNothingLandedBody(contentType, body);
     }
 
     [Fact]
@@ -79,10 +96,11 @@ public sealed class IngestTruncatedBodyTests : IClassFixture<AmetoWebAppFactory>
     {
         byte[] full = Batch(20);
 
-        var (status, accepted) = await PostAsync(full[..^1], full.Length);
+        var (status, accepted, contentType, body) = await PostAsync(full[..^1], full.Length);
 
         Assert.Equal(StatusCodes.Status400BadRequest, status);
         Assert.Equal(0, accepted);
+        AssertNothingLandedBody(contentType, body);
     }
 
     [Fact]
@@ -90,7 +108,7 @@ public sealed class IngestTruncatedBodyTests : IClassFixture<AmetoWebAppFactory>
     {
         byte[] full = Batch(20);
 
-        var (status, accepted) = await PostAsync(full, full.Length);
+        var (status, accepted, _, _) = await PostAsync(full, full.Length);
 
         Assert.Equal(StatusCodes.Status200OK, status);
         Assert.Equal(20, accepted);

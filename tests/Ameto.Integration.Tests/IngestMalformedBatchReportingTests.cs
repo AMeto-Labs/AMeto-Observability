@@ -85,8 +85,9 @@ public sealed class IngestMalformedBatchReportingTests : IClassFixture<AmetoWebA
     }
 
     /// <summary>
-    /// A body that fails before any element is read still reports nothing ingested — and no
-    /// failedAtElement beyond element zero.
+    /// A body that fails before any element is read reports nothing ingested — and NO
+    /// failedAtElement. It used to say failedAtElement 0, the very body a failure inside
+    /// element 0 produces, so a sender could not tell "not an array" from "first event bad".
     /// </summary>
     [Fact]
     public async Task NotAnArray_Answers400_WithNothingIngested()
@@ -99,6 +100,21 @@ public sealed class IngestMalformedBatchReportingTests : IClassFixture<AmetoWebA
         using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
         Assert.Equal(0, doc.RootElement.GetProperty("ingested").GetInt32());
         Assert.Equal(0, doc.RootElement.GetProperty("dropped").GetInt32());
+        Assert.False(doc.RootElement.TryGetProperty("failedAtElement", out _),
+            "the array header itself failed; no element was reached");
+    }
+
+    /// <summary>A failure INSIDE element 0 still names it — the case the header failure must not look like.</summary>
+    [Fact]
+    public async Task FirstElementBad_Answers400_WithFailedAtElementZero()
+    {
+        var resp = await _factory.CreateClient().PostAsync("/api/events", Content(BatchWithBadTail(0)));
+
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+
+        using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+        Assert.Equal(0, doc.RootElement.GetProperty("ingested").GetInt32());
+        Assert.Equal(0, doc.RootElement.GetProperty("failedAtElement").GetInt32());
     }
 
     // ── Client-built bodies the reader rejects with an unlisted type ──────────

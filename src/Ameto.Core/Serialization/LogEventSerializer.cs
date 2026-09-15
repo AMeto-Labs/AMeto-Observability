@@ -145,7 +145,11 @@ public static class LogEventSerializer
         public int Ingested;
         /// <summary>Events the sink refused (oversized, or back-pressure).</summary>
         public int Dropped;
-        /// <summary>Index of the element being read — where a throw happened, if one did.</summary>
+        /// <summary>
+        /// Index of the element being read — where a throw happened, if one did. -1 while the
+        /// array header itself is being read, so a body that is not a CLEF array at all is not
+        /// reported the same as one that failed inside element 0.
+        /// </summary>
         public int ElementIndex;
         /// <summary>Elements the array header declared. Zero until the header is read.</summary>
         public int ElementCount;
@@ -167,6 +171,7 @@ public static class LogEventSerializer
     public static void StreamBatch(ReadOnlyMemory<byte> body, IClefBatchSink sink, ref ClefBatchProgress progress)
     {
         var reader = new MessagePackReader(body);
+        progress.ElementIndex = -1;   // the header read below is not "element 0"
         progress.ElementCount = reader.ReadArrayHeader();
 
         for (int i = 0; i < progress.ElementCount; i++)

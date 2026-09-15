@@ -305,8 +305,10 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
                 {
                     // Correct, just slower — and silent, which is the trap: a platform where
                     // the range call always fails would msync the whole mapping every tick
-                    // for ever and look exactly like a working one. The counter is what tells
-                    // the difference.
+                    // for ever and look exactly like a working one. The counter records it,
+                    // but only tests read it today. The WAL has no logger and no diagnostics
+                    // surface exposes the counter, so on a live host this is still invisible.
+                    // Surfacing it (a log once, or a StorageEngine diagnostic) is follow-up work.
                     Interlocked.Increment(ref _rangeFlushFailures);
                     _accessor.Flush();     // fallback: whole view, as before
                 }
