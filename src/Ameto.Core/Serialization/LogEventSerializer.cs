@@ -149,13 +149,20 @@ public static class LogEventSerializer
         public int ElementIndex;
         /// <summary>Elements the array header declared. Zero until the header is read.</summary>
         public int ElementCount;
+        /// <summary>
+        /// True for exactly the duration of the sink call, and left true when the sink throws.
+        /// That is how a caller tells whose fault a throw was WITHOUT listing exception types:
+        /// set, it came from the sink (the server's side — ring, pool, logger, shutdown); clear,
+        /// it came from reading the body, whatever MessagePackReader chose to throw for it.
+        /// </summary>
+        public bool InSink;
     }
 
     /// <inheritdoc cref="StreamBatch(ReadOnlyMemory{byte}, IClefBatchSink, out int)"/>
     /// <summary>
     /// As <see cref="StreamBatch(ReadOnlyMemory{byte}, IClefBatchSink, out int)"/>, but
-    /// reporting progress through <paramref name="progress"/> so the counts are readable
-    /// after a throw.
+    /// reporting progress through <paramref name="progress"/> so the counts — and
+    /// <see cref="ClefBatchProgress.InSink"/> — are readable after a throw.
     /// </summary>
     public static void StreamBatch(ReadOnlyMemory<byte> body, IClefBatchSink sink, ref ClefBatchProgress progress)
     {
@@ -165,12 +172,12 @@ public static class LogEventSerializer
         for (int i = 0; i < progress.ElementCount; i++)
         {
             progress.ElementIndex = i;
-            if (StreamEvent(ref reader, sink)) progress.Ingested++;
-            else                               progress.Dropped++;
+            if (StreamEvent(ref reader, sink, ref progress)) progress.Ingested++;
+            else                                             progress.Dropped++;
         }
     }
 
-    private static bool StreamEvent(ref MessagePackReader reader, IClefBatchSink sink)
+    private static bool StreamEvent(ref MessagePackReader reader, IClefBatchSink sink, ref ClefBatchProgress progress)
     {
         var sourceSequence = reader.Sequence;
         int mapCount       = reader.ReadMapHeader();
@@ -251,9 +258,15 @@ public static class LogEventSerializer
         // CLEF @m fallback: a client that sent only a rendered message gets it as template.
         ReadOnlySpan<byte> template = tmplUtf8.IsEmpty ? msgUtf8 : tmplUtf8;
 
-        return sink.TryIngestClef(
+        // Every read of the body is behind us: from here to the end of the call, a throw is the
+        // sink's. Deliberately not cleared in a finally — the caller reads the flag AFTER the
+        // exception, and a sink fault must still say so there.
+        progress.InSink = true;
+        bool accepted = sink.TryIngestClef(
             tsTicks, (byte)level, template, exception, props,
             traceIdHi, traceIdLo, spanId, svcUtf8);
+        progress.InSink = false;
+        return accepted;
     }
 
     /// <summary>

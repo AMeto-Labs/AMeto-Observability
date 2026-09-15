@@ -101,35 +101,38 @@ public sealed class IngestMalformedBatchReportingTests : IClassFixture<AmetoWebA
         Assert.Equal(0, doc.RootElement.GetProperty("dropped").GetInt32());
     }
 
-    // ── The narrowed catch ───────────────────────────────────────────────────
+    // ── Client-built bodies the reader rejects with an unlisted type ──────────
 
     /// <summary>
-    /// The catch around StreamBatch used to be catch(Exception), so a fault in the SINK — the
-    /// ring, the intern pool, the logger, or the ObjectDisposedException a shutdown raises
-    /// mid-batch — was reported to the client as a malformed payload and hidden behind a 400.
-    /// The predicate is the narrowing; these pin it.
+    /// A 32-bit length prefix of 2^31 or more makes MessagePackReader throw OverflowException —
+    /// a checked uint-to-int conversion in TryReadStringSpan and TrySkip — not the
+    /// MessagePackSerializationException / EndOfStreamException pair the catch used to list. The
+    /// body is entirely the client's, so it answers 400 with the counts, not a 500 with a stack
+    /// trace in the server log and the prefix's drainer left unwoken.
+    ///
+    /// <para>Both bodies are a good event (<c>{"@mt":"ok"}</c>) followed by one carrying the
+    /// overflowing prefix, so the reply also has to say that element 0 landed.</para>
+    ///
+    /// <para>Only rows that answered 500 under the old type list are kept. A str32/ext32 VALUE
+    /// under an unknown key (Skip) and a str32 <c>@x</c> (ExceptionInfo.Read) were probed too:
+    /// on a body this short they end as EndOfStreamException, which the old list already
+    /// covered, so they would pass either way and prove nothing.</para>
     /// </summary>
     [Theory]
-    [InlineData(typeof(MessagePackSerializationException))]
-    [InlineData(typeof(EndOfStreamException))]
-    public void BadBodyShapes_AreTreatedAsMalformed(Type exceptionType)
+    // [{"@mt":"ok"}, {"@t": str32 len 0xffffffff, "@mt":"x"}] — a value, read by TryReadStringSpan
+    [InlineData("92" + "81a3406d74a26f6b" + "82a24074dbffffffffa3406d74a178")]
+    // [{"@mt":"ok"}, {<str32 key, len 0xffffffff>: …}] — a key, read by TryReadStringSpan
+    [InlineData("92" + "81a3406d74a26f6b" + "81dbffffffff")]
+    public async Task LengthPrefixPastInt32_Answers400_WithWhatLanded(string hex)
     {
-        var ex = (Exception)Activator.CreateInstance(exceptionType)!;
-        Assert.True(IngestionEndpoint.IsMalformedPayload(ex));
-    }
+        var resp = await _factory.CreateClient().PostAsync("/api/events", Content(Convert.FromHexString(hex)));
 
-    [Theory]
-    [InlineData(typeof(ObjectDisposedException))]
-    [InlineData(typeof(InvalidOperationException))]
-    [InlineData(typeof(NullReferenceException))]
-    [InlineData(typeof(OutOfMemoryException))]
-    [InlineData(typeof(IOException))]
-    public void ServerSideFailures_AreNotTreatedAsMalformed(Type exceptionType)
-    {
-        var ex = exceptionType == typeof(ObjectDisposedException)
-            ? new ObjectDisposedException("ring")
-            : (Exception)Activator.CreateInstance(exceptionType)!;
-        Assert.False(IngestionEndpoint.IsMalformedPayload(ex),
-            $"{exceptionType.Name} is the server's problem and must surface as 500, not 400");
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+        Assert.Equal("application/json", resp.Content.Headers.ContentType?.MediaType);
+
+        using var doc = JsonDocument.Parse(await resp.Content.ReadAsStringAsync());
+        Assert.Equal(1, doc.RootElement.GetProperty("ingested").GetInt32());
+        Assert.Equal(0, doc.RootElement.GetProperty("dropped").GetInt32());
+        Assert.Equal(1, doc.RootElement.GetProperty("failedAtElement").GetInt32());
     }
 }

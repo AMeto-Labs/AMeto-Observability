@@ -178,12 +178,13 @@ public sealed class IngestionEndpoint : IOtlpLogSink, LogEventSerializer.IClefBa
             {
                 LogEventSerializer.StreamBatch(bodyBuf.AsMemory(0, bodyLen), this, ref progress);
             }
-            // ONLY the shapes a bad body produces. This used to be catch(Exception), which
-            // also swallowed failures of the sink underneath — a ring or intern-pool fault,
-            // or the ObjectDisposedException a shutdown mid-batch raises — and reported them
-            // to the client as "malformed payload". Those are the server's problem and must
-            // surface as 500.
-            catch (Exception ex) when (IsMalformedPayload(ex))
+            // Classified by WHERE it was thrown, not by its type. This used to be
+            // catch(Exception), which also swallowed failures of the sink underneath — a ring or
+            // intern-pool fault, or the ObjectDisposedException a shutdown mid-batch raises —
+            // and reported them to the client as "malformed payload"; those surface as 500. A
+            // list of reader exception types was tried and was short on day one: a str32/bin32/
+            // ext32 length prefix of 2^31 or more throws OverflowException, and went out as 500.
+            catch (Exception ex) when (IsMalformedPayload(ex, progress.InSink))
             {
                 // The prefix is already in the ring. Wake the drainer for it, or it sits
                 // there until the drain loop's 1 s missed-signal timeout.
@@ -222,15 +223,22 @@ public sealed class IngestionEndpoint : IOtlpLogSink, LogEventSerializer.IClefBa
     }
 
     /// <summary>
-    /// The exception shapes a BAD BODY produces, and nothing else. MessagePackReader raises
-    /// <see cref="MessagePack.MessagePackSerializationException"/> for a code it cannot read
-    /// and <see cref="EndOfStreamException"/> when the body ends inside an element; those are
-    /// the client's problem and answer 400. Anything else came from the sink — the ring, the
-    /// intern pool, the logger, or a shutdown mid-batch — and is the server's, so it surfaces
-    /// as 500 rather than being reported as a malformed payload.
+    /// Whether a throw out of StreamBatch is the client's (400) or the server's (500), decided
+    /// by where it happened. <paramref name="inSink"/> is
+    /// <see cref="LogEventSerializer.ClefBatchProgress.InSink"/> as the throw left it.
+    ///
+    /// <para>Set: the fault came out of <see cref="TryIngestClef"/> — the ring, the intern
+    /// pool, the logger, a shutdown mid-batch — and is the server's, whatever its type.</para>
+    ///
+    /// <para>Clear: the reader threw while walking the body, and the body is at fault whatever
+    /// the TYPE. MessagePackReader throws MessagePackSerializationException for a code it cannot
+    /// read, EndOfStreamException for a body that ends inside an element, and OverflowException
+    /// for a str32/bin32/ext32 length prefix of 2^31 or more. A list of those types is one
+    /// reader upgrade away from being short again. The one exception is
+    /// <see cref="OutOfMemoryException"/>, which says nothing about the body.</para>
     /// </summary>
-    internal static bool IsMalformedPayload(Exception ex)
-        => ex is MessagePack.MessagePackSerializationException or EndOfStreamException;
+    internal static bool IsMalformedPayload(Exception ex, bool inSink)
+        => !inSink && ex is not OutOfMemoryException;
 
     /// <summary>
     /// Writes <c>{"ingested":N,"dropped":M}</c> into the response buffer with no string in
