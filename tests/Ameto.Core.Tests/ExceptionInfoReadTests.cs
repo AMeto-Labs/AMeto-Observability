@@ -213,8 +213,8 @@ public sealed class ExceptionInfoReadTests
             w.Write("whatever");
         });
 
-        Assert.ThrowsAny<Exception>(() => ExceptionInfo.FromBytes(bytes.AsMemory()));
-        Assert.ThrowsAny<Exception>(() => ExceptionInfo.FromBytes(bytes.AsSpan()));
+        Assert.Throws<MessagePackSerializationException>(() => ExceptionInfo.FromBytes(bytes.AsMemory()));
+        Assert.Throws<MessagePackSerializationException>(() => ExceptionInfo.FromBytes(bytes.AsSpan()));
     }
 
     /// <summary>

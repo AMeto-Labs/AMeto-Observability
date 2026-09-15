@@ -103,10 +103,20 @@ public sealed class LazySegmentPrimingProbe : IAsyncLifetime
         // retention and the merge delete segments while queries run, so an escaped reader here
         // is not a leak that shows up as memory, it is a file that never goes away.
         //
-        // Renaming is the assertion: it is exactly what Windows refuses while a mapping is
-        // open, and it is the operation the merge's source cleanup needs.
+        // COUNTED, not renamed. A rename is the honest end-to-end question ("can retention
+        // delete this?") but it answers it for the wrong reason as soon as a collection runs:
+        // a leaked reader is unreachable, so the finaliser behind MemoryMappedFile releases
+        // the handle and the rename succeeds over a bug that is really there. Closes against
+        // Opens is the same claim without the GC in it.
+        long o0 = SegmentReader.Opens, c0 = SegmentReader.Closes;
         await FilteredPageAsync(5);
+        long opened = SegmentReader.Opens - o0, closed = SegmentReader.Closes - c0;
 
+        _out.WriteLine($"page of 5 : {opened} opened, {closed} closed");
+        Assert.Equal(Segments, opened);
+        Assert.Equal(opened, closed);
+
+        // Belt and braces, and the operation the merge's source cleanup actually needs.
         var files = _engine.ListSegments().Select(s => s.FilePath).ToArray();
         Assert.Equal(Segments, files.Length);
         foreach (var path in files)
@@ -115,7 +125,7 @@ public sealed class LazySegmentPrimingProbe : IAsyncLifetime
             File.Move(path, moved);      // throws IOException if anything still holds it
             File.Move(moved, path);
         }
-        _out.WriteLine($"all {files.Length} segment files renameable after a page of 5 — no reader outlived the query");
+        _out.WriteLine($"all {files.Length} segment files renameable — no reader outlived the query");
 
         Task<List<LogEvent>> FilteredPageAsync(int count) =>
             QuerySegmentFixtures.RunAsync(_query, Filter, count);

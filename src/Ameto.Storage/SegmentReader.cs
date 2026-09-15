@@ -1019,6 +1019,19 @@ public sealed class SegmentReader : ISegmentReader
     /// </summary>
     internal static long Opens;
 
+    /// <summary>
+    /// The other half of <see cref="Opens"/>: successful <see cref="Dispose"/> calls, counted
+    /// once per reader.
+    ///
+    /// <para>It exists because "the mapping was released" is otherwise only observable by
+    /// trying to delete or rename the file, and that test passes for the WRONG reason as soon
+    /// as a collection runs — an unreachable reader gets finalised and the handle goes with
+    /// it, so a genuine leak of an un-primed survivor's reader can look fixed. Comparing
+    /// Closes against Opens over a query is deterministic and does not care what the GC
+    /// did.</para>
+    /// </summary>
+    internal static long Closes;
+
     private PooledSection RentSection(long offset)
     {
         if (offset <= 0) return default;
@@ -1041,6 +1054,7 @@ public sealed class SegmentReader : ISegmentReader
         _disposed = true;
         _view.Dispose();
         _mmf.Dispose();
+        Interlocked.Increment(ref Closes);
     }
 }
 

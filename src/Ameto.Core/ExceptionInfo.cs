@@ -194,11 +194,19 @@ public sealed class ExceptionInfo
     /// Whether these bytes decode to a NON-NULL <see cref="ExceptionInfo"/> — decided from the
     /// msgpack type header alone, in constant time and with no allocation.
     ///
-    /// <para>Exactly <c>FromBytes(bytes) is not null</c>, and it has to be exact because
-    /// <c>LogEvent.HasException</c> is what answers <c>has @x</c> / <c>@x is not null</c>.
-    /// <see cref="ReadAtDepth"/> returns null for three shapes, and all three are visible in
-    /// the first bytes: nil, an EMPTY legacy string, and anything that is neither a string nor
-    /// a map. Everything else — any map, any non-empty string — produces an object.</para>
+    /// <para>Exactly <c>FromBytes(bytes) is not null</c> FOR ANY PAYLOAD FROMBYTES ACCEPTS,
+    /// and it has to be exact because <c>LogEvent.HasException</c> is what answers
+    /// <c>has(@x)</c>. <see cref="ReadAtDepth"/> returns null for three shapes, and all three
+    /// are visible in the first bytes: nil, an EMPTY legacy string, and anything that is
+    /// neither a string nor a map. Everything else — any map, any non-empty string — produces
+    /// an object.</para>
+    ///
+    /// <para>The qualifier is the truncated case. A payload whose string header is cut short —
+    /// a str32 in four bytes — has no length to read, so this answers false where
+    /// <see cref="FromBytes"/> would throw. That is deliberate: this is asked per scanned row
+    /// of a segment whose block frame has already been length-checked, and a presence probe is
+    /// not the right place to raise corruption. Anything that then READS the payload still
+    /// throws, and the caller that hits it sees the same exception it always did.</para>
     /// </summary>
     public static bool IsPresent(ReadOnlySpan<byte> bytes)
     {

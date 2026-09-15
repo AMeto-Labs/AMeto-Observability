@@ -129,7 +129,13 @@ public sealed class LazyExceptionEvaluationTests
 
         foreach (var filter in new[]
                  {
-                     "has @x", "@x is not null", "@x is null",
+                     // PRESENCE — spelled as the grammar actually takes it. `has @x` without
+                     // parentheses is not a function call, it is two bare words, and `is` is
+                     // not a keyword at all: all three spellings parse as a FreeTextNode and
+                     // test the wrong code path entirely. ParsesAsPresenceCheck below is the
+                     // guard that keeps that from happening again quietly.
+                     "has(@x)", "isDefined(@x)", "not has(@x)",
+                     "has(@x.type)", "has(@x.message)", "has(@x.inner.type)",
                      "timeout", "gateway", "settle", "exception", "EXCEPTION",
                      "invalidoperation", "System.TimeoutException", "formatexception",
                      "nosuchterm", "order",                       // the last one hits the template
@@ -154,9 +160,10 @@ public sealed class LazyExceptionEvaluationTests
     /// the answers above are identical either way, the cost is not.
     /// </summary>
     [Theory]
-    [InlineData("has @x")]
-    [InlineData("@x is not null")]
-    [InlineData("@x is null")]
+    [InlineData("has(@x)")]                 // HasNode      → HasProperty
+    [InlineData("isDefined(@x)")]           // IsDefinedNode → HasProperty
+    [InlineData("not has(@x)")]             // negated, same reader
+    [InlineData("has(@x.type)")]            // the alias @x resolves to
     [InlineData("timeout")]                 // free text, matches the exception message
     [InlineData("gateway settle")]          // two terms, both in the message
     [InlineData("nosuchterm")]              // free text, matches nothing
@@ -171,6 +178,47 @@ public sealed class LazyExceptionEvaluationTests
         Assert.True(ev.HasException);
         Assert.False(ev.ExceptionMaterialised,
             $"`{filter}` built the ExceptionInfo tree — the stack trace with it");
+    }
+
+    /// <summary>
+    /// THE GUARD ON THE GUARD. The presence cases above are only worth anything if they
+    /// actually parse as presence checks: `has @x` without parentheses is two bare words and
+    /// `@x is not null` is four, so both become a <see cref="FreeTextNode"/> and quietly test
+    /// the free-text path twice instead of <c>HasProperty</c> once. That is exactly what this
+    /// file did until a review caught it.
+    /// </summary>
+    [Theory]
+    [InlineData("has(@x)")]
+    [InlineData("isDefined(@x)")]
+    [InlineData("has(@x.type)")]
+    [InlineData("has(@x.message)")]
+    public void PresenceFiltersParseAsPresenceChecks(string filter)
+    {
+        var node = FilterParser.Parse(filter);
+        Assert.True(node is HasNode or IsDefinedNode,
+            $"`{filter}` parsed as {node?.GetType().Name} — not a presence check, so it tests the wrong path");
+    }
+
+    /// <summary>
+    /// <c>has(@x.message)</c> asks about a FIELD, not about the exception, so it must stay
+    /// false when the message is absent — and it is not one of the no-decode cases: reading a
+    /// field is what decoding is for. The presence shortcut covers the <c>@x</c> / <c>@x.type</c>
+    /// spellings only, and this is the boundary.
+    /// </summary>
+    [Fact]
+    public void PresenceOfAFieldIsNotPresenceOfTheException()
+    {
+        var noMsg = WithBytes(PayloadBytes("map-no-msg"));     // type only, no `msg` key
+        Assert.True(noMsg.HasException);
+        Assert.True(Eval("has(@x)", noMsg));
+        Assert.False(Eval("has(@x.message)", noMsg));
+
+        var withMsg = WithBytes(PayloadBytes("map-full"));
+        Assert.True(Eval("has(@x.message)", withMsg));
+
+        // …and the object reading agrees, which is the only thing that makes it correct.
+        Assert.Equal(Eval("has(@x.message)", WithObject(ExceptionInfo.FromBytes(PayloadBytes("map-no-msg").AsSpan()))),
+                     Eval("has(@x.message)", WithBytes(PayloadBytes("map-no-msg"))));
     }
 
     /// <summary>A predicate that genuinely needs a FIELD still decodes, once.</summary>
