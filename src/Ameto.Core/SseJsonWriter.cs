@@ -224,18 +224,26 @@ public sealed class SseJsonWriter : IDisposable
     /// Puts the buffered bytes on the wire and empties the buffer, keeping its capacity —
     /// one buffer per connection, for the life of the connection.
     ///
-    /// <para>The buffer is emptied WHETHER OR NOT the send succeeds. Once the bytes have been
-    /// offered to the body they belong to it: Kestrel copies them into its pipe inside
+    /// <para>Once the bytes have been OFFERED to the body they belong to it, and the buffer is
+    /// emptied whether or not the send then succeeds: Kestrel copies them into its pipe inside
     /// <c>WriteAsync</c>, so a cancellation that lands in the flush, or in the flush that
     /// <c>WriteAsync</c> itself performs, fails a send whose rows are already on their way to
     /// the client. Keeping them here would hand them over a second time with the terminal
-    /// <c>query-error</c> frame, and the client would list up to 16 KB of rows twice. Losing a
-    /// row the body did NOT take is the lesser fault and an honest one: every road that reaches
-    /// here after a failed send ends in a frame that already says the results are partial.</para>
+    /// <c>query-error</c> frame, and the client would list up to 16 KB of rows twice.</para>
+    ///
+    /// <para>Bytes NEVER OFFERED stay. A token that is already cancelled when the send starts
+    /// fails it here, before the body sees anything — which is exactly what Kestrel's
+    /// <c>ValidateState</c> would do one call later, except that there the <c>finally</c> below
+    /// would already have thrown the rows away. That start is not rare: a scan step that goes
+    /// asynchronous after the search budget ran out makes <see cref="WriteLogEventsAsync"/> send
+    /// under the spent token. The rows found within budget then go out with the handler's
+    /// query-error, which is sent under a token of its own, instead of vanishing in front of
+    /// it.</para>
     /// </summary>
     private async ValueTask SendAsync(CancellationToken ct)
     {
         if (_buffer.WrittenCount == 0) return;
+        ct.ThrowIfCancellationRequested();       // not offered, so still ours to deliver
         try
         {
             await _body.WriteAsync(_buffer.WrittenMemory, ct).ConfigureAwait(false);

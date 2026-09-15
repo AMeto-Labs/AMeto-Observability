@@ -130,6 +130,53 @@ public sealed class SseJsonWriterSourceTests
     }
 
     /// <summary>
+    /// ROWS A SEND NEVER OFFERED TO THE BODY GO OUT WITH THE TERMINAL FRAME. The search budget
+    /// runs out while the scan is mid-step, and the step then goes asynchronous, so the writer
+    /// starts a send under a token that is already cancelled. Kestrel refuses such a token
+    /// before it copies a byte, which leaves the rows found within budget still the writer's to
+    /// deliver: the handler's query-error, sent under its own short token, must carry them out,
+    /// not go out alone in front of rows the client never gets.
+    /// </summary>
+    [Fact]
+    public async Task Rows_a_send_under_a_spent_budget_never_offered_go_out_with_the_terminal_frame()
+    {
+        var body = new RecordingStream();
+        using var sse = new SseJsonWriter(body);
+
+        // Warm the row road and send, so the source's row is held by the buffer alone.
+        await sse.WriteLogEventAsync(Event(99), default);
+        await sse.FlushFramesAsync(default);
+        body.Clear();
+
+        using var budget = new CancellationTokenSource();
+        int sendsWhileRowBuffered = -1;
+        async IAsyncEnumerable<LogEvent> Scan()
+        {
+            yield return Event(0);
+            sendsWhileRowBuffered = body.SendCount;
+            budget.Cancel();                       // the budget runs out while the scan works…
+            // …and the step goes asynchronous after it. A delay, not a bare yield: a yield's
+            // continuation can finish this step on another thread before the writer even looks,
+            // and then there is no wait to send in.
+            await Task.Delay(50);
+        }
+
+        Exception? thrown = await Record.ExceptionAsync(async () => await sse.WriteLogEventsAsync(Scan(), budget.Token));
+
+        Assert.IsAssignableFrom<OperationCanceledException>(thrown);
+        Assert.Equal(0, sendsWhileRowBuffered);
+
+        const string message = "Search exceeded its budget. Results shown are partial.";
+        using (var own = new CancellationTokenSource(TimeSpan.FromSeconds(5)))
+            await sse.WriteErrorAsync(message, own.Token);
+
+        string all = body.All();
+        Assert.Equal(1, Count(all, Row(0)));
+        Assert.StartsWith("data: {\"@t\"", all);
+        Assert.EndsWith($"}}\n\nevent: query-error\ndata: {{\"error\":\"{message}\"}}\n\n", all);
+    }
+
+    /// <summary>
     /// THE SCAN ROAD HAS ONE WRITER TOO. A send made while the source works runs beside the
     /// source's step — never beside another send, and never beside a row being composed into the
     /// buffer it is sending. Against a body that completes every call asynchronously, no body

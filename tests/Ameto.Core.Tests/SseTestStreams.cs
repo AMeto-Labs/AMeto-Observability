@@ -34,13 +34,18 @@ internal sealed class RecordingStream : Stream
         string s = Encoding.UTF8.GetString(buffer);
         lock (_sends) _sends.Add(s);
     }
+    // Both refuse a token that is ALREADY cancelled before they take anything, as Kestrel's
+    // response pipe does (HttpResponsePipeWriter.ValidateState). A body that took the bytes
+    // anyway would hide a writer that throws away rows it never offered.
     public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct = default)
     {
+        if (ct.IsCancellationRequested) return ValueTask.FromCanceled(ct);
         Write(buffer.Span);
         return ValueTask.CompletedTask;
     }
     public override Task FlushAsync(CancellationToken ct)
     {
+        if (ct.IsCancellationRequested) return Task.FromCanceled(ct);
         lock (_sends)
         {
             if (FlushFailuresLeft <= 0) return Task.CompletedTask;
