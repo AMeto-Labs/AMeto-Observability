@@ -7,7 +7,8 @@ namespace Ameto.Query.Filtering;
 /// <see cref="LogEventHeader"/> alone — see <see cref="IHotHeaderPredicate"/> for the contract.
 ///
 /// <para>Built from the filter's AND-chain only. Every leaf verdict here is EXACT (the level
-/// mask is computed by running the evaluator's own comparison over each level; trace and
+/// mask is computed by running the evaluator's own comparison over each level, and once more
+/// for all the bytes past the enum; trace and
 /// span ids compare as integers under the same presence rule the string path has; a service
 /// leaf is evaluated by the evaluator on the resolved name), which is what lets <c>not</c>
 /// be pushed down as a plain complement. What makes the whole thing three-valued is only
@@ -22,9 +23,19 @@ namespace Ameto.Query.Filtering;
 /// </summary>
 internal sealed class HeaderPredicate : IHotHeaderPredicate
 {
-    /// <summary>One bit per <see cref="LogLevel"/> value, Verbose..Fatal.</summary>
-    private const int  LevelCount = 6;
-    private const byte AllLevels  = (1 << LevelCount) - 1;
+    /// <summary>
+    /// One bit per <see cref="LogLevel"/> value, Verbose..Fatal, plus <see cref="OutOfEnumBit"/>
+    /// for every byte past the enum. One bit is exact for all of those bytes because both level
+    /// leaves answer each of them alike: a bare keyword (<see cref="LevelNode"/>) compares enum
+    /// values and no member equals any of them; an <c>@l</c> leaf compares the rendering, and
+    /// <c>ToSeqString</c> renders every one as "Information". So the bit is computed like the
+    /// others, from byte 6, rather than folded into the Information bit — which is right for
+    /// <c>@l</c> but wrong for <c>not Information</c>, a filter the evaluator matches on such a
+    /// byte.
+    /// </summary>
+    private const int  LevelCount   = 6;
+    private const int  OutOfEnumBit = LevelCount;
+    private const byte AllLevels    = (1 << (OutOfEnumBit + 1)) - 1;
 
     private readonly byte         _levelMask;
     private readonly IdTest[]     _idTests;
@@ -55,9 +66,12 @@ internal sealed class HeaderPredicate : IHotHeaderPredicate
 
     /// <summary>
     /// Levels the AND-chain admits, or null when it constrains none. Exact for the six
-    /// level bytes ingest can produce (0..5); as a <c>levels</c> allow-list it would reject
-    /// a byte outside the enum that the evaluator renders as "Information" — such a byte
-    /// cannot arrive from the wire (levels are parsed by name), only from a corrupt file.
+    /// level bytes ingest can produce (0..5). A set of enum members cannot name the bytes
+    /// past the enum, so as a <c>levels</c> allow-list this rejects every one of them
+    /// whatever the filter says — including where the evaluator matches it
+    /// (<c>@l = 'Information'</c>, <c>not Information</c>). Such a byte cannot arrive from
+    /// the wire (levels are parsed by name), only from a pre-v4 WAL or a corrupt file;
+    /// <see cref="MayMatch"/>, which is not an allow-list, answers it exactly.
     /// </summary>
     public HashSet<LogLevel>? DerivedLevels
     {
@@ -75,10 +89,9 @@ internal sealed class HeaderPredicate : IHotHeaderPredicate
 
     public bool MayMatch(in LogEventHeader header)
     {
-        // A level byte outside the enum renders as "Information" (LogLevelExtensions
-        // .ToSeqString's default), so that is the bit the evaluator's answer lives in.
+        // Every byte past the enum shares one bit; OutOfEnumBit says why that is exact.
         int lvl = (byte)header.Level;
-        if (lvl >= LevelCount) lvl = (int)LogLevel.Information;
+        if (lvl > OutOfEnumBit) lvl = OutOfEnumBit;
         if (((_levelMask >> lvl) & 1) == 0) return false;
 
         var tests = _idTests;
@@ -197,12 +210,13 @@ internal sealed class HeaderPredicate : IHotHeaderPredicate
         /// <summary>
         /// The set of levels a level-only subtree admits, computed by evaluating it for each
         /// level through the evaluator's own comparison — so an alias the evaluator never
-        /// matches (<c>'Info'</c>) yields an empty mask here too, not a guess.
+        /// matches (<c>'Info'</c>) yields an empty mask here too, not a guess. Byte 6 is
+        /// evaluated as the stand-in for every byte past the enum (<see cref="OutOfEnumBit"/>).
         /// </summary>
         private static bool TryLevelMask(FilterNode node, out byte mask)
         {
             mask = 0;
-            for (int l = 0; l < LevelCount; l++)
+            for (int l = 0; l <= OutOfEnumBit; l++)
             {
                 bool? v = LevelVerdict(node, (LogLevel)l);
                 if (v is null) { mask = 0; return false; }

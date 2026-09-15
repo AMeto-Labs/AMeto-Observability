@@ -152,17 +152,94 @@ public sealed class HotHeaderPushdownTests : IDisposable
         Assert.Equal(canonical, bloom);
     }
 
+    /// <summary>
+    /// A level byte past the enum (a pre-v4 WAL, a corrupt file — ingest parses levels by name
+    /// and cannot produce one) is answered DIFFERENTLY by the two spellings of a level leaf: a
+    /// bare keyword compares enum values and never matches it, while <c>@l</c> compares its
+    /// rendering, "Information". The header predicate used to fold such a byte into the
+    /// Information bit, which is the <c>@l</c> answer only — so under <c>not</c> it rejected an
+    /// event the evaluator matches (<c>not Information</c>). No level allow-list here: this is
+    /// the predicate alone against the evaluator alone.
+    /// </summary>
+    [Theory]
+    [InlineData("not Information",                    true )]
+    [InlineData("not Info",                           true )]
+    [InlineData("not (Information or Error)",         true )]
+    [InlineData("Information",                        false)]
+    [InlineData("Information or Error",               false)]
+    [InlineData("@l = 'Information'",                 true )]
+    [InlineData("not @l = 'Information'",             false)]
+    [InlineData("@l in ['Information', 'Error']",     true )]
+    [InlineData("not @l in ['Information', 'Error']", false)]
+    public void A_level_byte_past_the_enum_gets_the_evaluators_answer_in_either_spelling(
+        string expression, bool pastEnumMatches)
+    {
+        using var tier = BuildLevelTier(out ulong[] pastEnumIds);
+        var filter = CompiledFilter.Compile(expression);
+        Assert.NotNull(filter.HeaderPredicate);
+
+        foreach (bool forward in new[] { true, false })
+        {
+            var without = RunOver(tier, [], filter, pushdown: false, forward);
+            var with    = RunOver(tier, [], filter, pushdown: true,  forward);
+
+            // Not vacuous: the evaluator's own answer for those bytes is the one named above.
+            foreach (ulong id in pastEnumIds)
+                Assert.Equal(pastEnumMatches, without.Contains(id));
+            Assert.Equal(without, with);
+        }
+    }
+
     private List<ulong> Run(CompiledFilter filter, bool pushdown, bool forward)
+        => RunOver(_current, [_frozen], filter, pushdown, forward);
+
+    private List<ulong> RunOver(
+        HotTierSegment current, HotTierSegment[] frozen, CompiledFilter filter, bool pushdown, bool forward)
     {
         var ids = new List<ulong>();
         foreach (var ev in HotTierScan.ReadSorted(
-                     _current, [_frozen], _pool,
+                     current, frozen, _pool,
                      long.MinValue, long.MaxValue, null, null, forward, levels: null,
                      headerPredicate: pushdown ? filter.HeaderPredicate : null))
         {
             if (filter.Matches(ev)) ids.Add(ev.Id.RawValue);
         }
         return ids;
+    }
+
+    /// <summary>One event per level byte: the six enum members, then three bytes past the enum.</summary>
+    private HotTierSegment BuildLevelTier(out ulong[] pastEnumIds)
+    {
+        byte[] levelBytes = [0, 1, 2, 3, 4, 5, 6, 7, 255];
+        var tier = new HotTierSegment(levelBytes.Length + 1, 1024 * 1024);
+
+        int    tmplIdx = _pool.Intern("evt {n}");
+        string tmpl    = _pool.Get(tmplIdx);
+        var    buf     = new ArrayBufferWriter<byte>(64);
+        var    past    = new List<ulong>();
+
+        for (int i = 0; i < levelBytes.Length; i++)
+        {
+            buf.Clear();
+            var w = new MessagePackWriter(buf);
+            w.WriteMapHeader(1);
+            w.Write("n"); w.Write((long)i);
+            w.Flush();
+
+            ulong id = new EventId(0u, (uint)(10_000 + i)).RawValue;
+            Assert.True(tier.TryWrite(new LogEventHeader
+            {
+                Id                       = id,
+                TimestampUtcTicks        = _base + i * TimeSpan.TicksPerMillisecond,
+                Level                    = (LogLevel)levelBytes[i],
+                MessageTemplatePoolIndex = tmplIdx,
+                ServiceNamePoolIndex     = -1,
+            }, buf.WrittenSpan, tmpl));
+            if (levelBytes[i] > (byte)LogLevel.Fatal) past.Add(id);
+        }
+        tier.Freeze();
+        pastEnumIds = [.. past];
+        return tier;
     }
 
     private HotTierSegment BuildTier(Random rng, int tierNo)
