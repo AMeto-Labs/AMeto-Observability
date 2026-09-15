@@ -163,4 +163,29 @@ public sealed class SegmentOpenCountTests : IAsyncLifetime
         File.Move(_segPath, moved);
         File.Move(moved, _segPath);
     }
+
+    /// <summary>
+    /// A CLOSE IS COUNTED ONCE PER READER, however many times it is disposed. Every assertion
+    /// above compares Closes with Opens, so a reader that counts a second Dispose would push
+    /// Closes past Opens and fail them for a reason that has nothing to do with a leak.
+    /// <c>DisposeReaders</c> is documented as idempotent per slot and every release path in the
+    /// executor is best-effort, so a second dispose is a thing the code allows.
+    ///
+    /// <para>SCOPE: this pins the sequential case. The guard is also atomic
+    /// (<c>Interlocked.Exchange</c>) so that two threads disposing at once count once, but that
+    /// race is a two-instruction window no test here can hit on demand; it is argued in the
+    /// field's doc, not measured.</para>
+    /// </summary>
+    [Fact]
+    public void AReaderDisposedTwiceIsCountedClosedOnce()
+    {
+        long opens = SegmentReader.Opens, closes = SegmentReader.Closes;
+
+        var reader = SegmentReader.Open(_segPath);
+        reader.Dispose();
+        reader.Dispose();
+
+        Assert.Equal(1, SegmentReader.Opens - opens);
+        Assert.Equal(1, SegmentReader.Closes - closes);
+    }
 }

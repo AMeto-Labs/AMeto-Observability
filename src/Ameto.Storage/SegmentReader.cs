@@ -1021,7 +1021,9 @@ public sealed class SegmentReader : ISegmentReader
 
     /// <summary>
     /// The other half of <see cref="Opens"/>: successful <see cref="Dispose"/> calls, counted
-    /// once per reader.
+    /// exactly once per reader however many times it is disposed and from however many threads
+    /// — the claim is an atomic exchange, so a second owner disposing concurrently cannot push
+    /// Closes past Opens.
     ///
     /// <para>It exists because "the mapping was released" is otherwise only observable by
     /// trying to delete or rename the file, and that test passes for the WRONG reason as soon
@@ -1047,11 +1049,13 @@ public sealed class SegmentReader : ISegmentReader
     private short ReadInt16At(long offset)  { short v = 0; _view.Read(offset, out v); return v; }
     private byte  ReadByteAt(long offset)   { byte  v = 0; _view.Read(offset, out v); return v; }
 
-    private bool _disposed;
+    /// <summary>0 while the mapping is held, 1 once a <see cref="Dispose"/> has claimed it. An
+    /// int so the claim is one atomic exchange: a bool check-then-set lets two concurrent
+    /// Dispose calls both pass the check and count the close twice.</summary>
+    private int _disposed;
     public void Dispose()
     {
-        if (_disposed) return;
-        _disposed = true;
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
         _view.Dispose();
         _mmf.Dispose();
         Interlocked.Increment(ref Closes);
