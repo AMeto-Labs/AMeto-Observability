@@ -17,6 +17,13 @@ namespace Ameto.Otel;
 /// - <c>resource.attributes</c>  → added as properties (service.name, etc.)
 /// - <c>traceId</c> / <c>spanId</c> → properties <c>TraceId</c> / <c>SpanId</c>
 ///   (enables log↔trace correlation in the query UI)
+///
+/// <para>No longer on the request path: JSON streams through <see cref="OtlpLogStreamParser"/>
+/// and protobuf through <see cref="OtlpLogProtoParser"/>, neither of which builds this object
+/// model. It stays as the reference BOTH of those are pinned to — <c>OtlpStreamingParityTests</c>
+/// and <c>OtlpLogProtoParityTests</c> map every payload through here and compare the result byte
+/// for byte. The mapping rules above are therefore still the specification; this is just no
+/// longer the code that runs.</para>
 /// </summary>
 public static class OtlpLogMapper
 {

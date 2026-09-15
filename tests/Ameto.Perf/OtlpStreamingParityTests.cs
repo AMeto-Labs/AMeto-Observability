@@ -73,6 +73,48 @@ public sealed class OtlpStreamingParityTests
         }
     }
 
+    /// <summary>
+    /// Escaped attribute values on both sides of the per-thread unescape scratch.
+    ///
+    /// <para>Short escaped values are unescaped into a 1 KB thread buffer; longer ones fall
+    /// back to the shared pool. That boundary is a branch the parser did not have before, and
+    /// getting it wrong — off by one, or the wrong length compared — truncates a property
+    /// silently. Both sides of it are checked against the DOM path, which has no such buffer
+    /// and therefore cannot agree by accident.</para>
+    /// </summary>
+    [Theory]
+    [InlineData(16)]      // comfortably inside the scratch
+    [InlineData(1023)]    // one under
+    [InlineData(1024)]    // exactly the scratch size
+    [InlineData(1025)]    // one over — the pool fallback
+    [InlineData(40_000)]  // far past it
+    public void Streaming_MatchesDom_ForEscapedValuesEitherSideOfTheScratch(int repeats)
+    {
+        // Each repeat is 4 UTF-8 bytes escaped as 8 JSON bytes, so `repeats` straddles the
+        // boundary whichever length the parser happens to measure.
+        string escaped = string.Concat(Enumerable.Repeat("a\\\"b\\\\", repeats));
+        string json =
+            "{\"resourceLogs\":[{\"resource\":{\"attributes\":[" +
+            "{\"key\":\"service.name\",\"value\":{\"stringValue\":\"Etisalat.API\"}}]}," +
+            "\"scopeLogs\":[{\"logRecords\":[{\"timeUnixNano\":\"1783953780000000000\"," +
+            "\"severityNumber\":9,\"body\":{\"stringValue\":\"escaped\"}," +
+            "\"attributes\":[{\"key\":\"payload\",\"value\":{\"stringValue\":\"" +
+            escaped +
+            "\"}}]}]}]}]}";
+        byte[] utf8 = Encoding.UTF8.GetBytes(json);
+
+        var sink = new CapturingSink();
+        OtlpLogStreamParser.Parse(utf8, sink);
+
+        var req = JsonSerializer.Deserialize<ExportLogsServiceRequest>(utf8, new JsonSerializerOptions())!;
+        var dom = OtlpLogMapper.Map(req, NodeId.Local.Value);
+
+        var record = Assert.Single(sink.Records);
+        Assert.True(dom[0].RawProperties.Span.SequenceEqual(record.Props),
+            $"escaped value of {repeats} repeats did not round-trip identically");
+        Assert.Equal(repeats * 4, ((string)Decode(record.Props)["payload"]!).Length);
+    }
+
     private static Dictionary<string, object?> Decode(ReadOnlySpan<byte> msgpack)
         => msgpack.IsEmpty ? new() : (LogEventSerializer.DeserializePropertiesMap(msgpack) ?? new());
 

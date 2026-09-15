@@ -72,6 +72,13 @@ internal static class OtlpProtoDecoder
         return req;
     }
 
+    /// <summary>
+    /// No longer on the request path — <see cref="OtlpLogProtoParser"/> is. It stays because it
+    /// is the reference the span parser is pinned to: <c>OtlpLogProtoParityTests</c> decodes
+    /// every payload both ways and compares the ring entries byte for byte, which is the only
+    /// thing standing between a mis-read wire field and wrong bytes in storage. Deleting it
+    /// would delete the gate, not dead code.
+    /// </summary>
     public static ExportLogsServiceRequest DecodeLogs(byte[] buffer, int length)
     {
         var req = new ExportLogsServiceRequest { ResourceLogs = [] };
