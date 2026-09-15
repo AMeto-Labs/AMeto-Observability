@@ -10,10 +10,16 @@ public abstract class FilterNode
     /// once per node — that is, once per filter compile. See <see cref="NodeKind"/> for why the
     /// evaluator reads a tag instead of running a chain of type tests per event, and why a node
     /// type absent from the map still evaluates correctly.
+    ///
+    /// <para>Named <c>DispatchKind</c> rather than <c>Kind</c> because a node already has one:
+    /// <see cref="FromJsonPathStringPredicateNode.Kind"/> says WHICH string predicate it is.
+    /// A base member called <c>Kind</c> was hidden by it (CS0108), which is not only a warning
+    /// — it is a trap, because <c>switch (node.Kind)</c> written against a derived-typed
+    /// variable would silently compile against the wrong member.</para>
     /// </summary>
-    internal readonly NodeKind Kind;
+    internal readonly NodeKind DispatchKind;
 
-    protected FilterNode() => Kind = NodeKinds.Of(GetType());
+    protected FilterNode() => DispatchKind = NodeKinds.Of(GetType());
 }
 
 // ── Logical ───────────────────────────────────────────────────────────────────

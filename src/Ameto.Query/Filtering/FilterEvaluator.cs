@@ -28,7 +28,7 @@ public static class FilterEvaluator
     /// </remarks>
     public static bool Matches(FilterNode filter, LogEvent ev)
     {
-        switch (filter.Kind)
+        switch (filter.DispatchKind)
         {
             case NodeKind.MatchAll:    return true;
             case NodeKind.And:         var and = (AndNode)filter;
@@ -114,8 +114,19 @@ public static class FilterEvaluator
             RegexExtractCompareNode rxe   => EvalRegexExtract(rxe, ev),
             InNode inNode                 => EvalIn(inNode, ev),
             FreeTextNode ft               => EvalFreeText(ft, ev),
-            _                             => false,
+            // A node type NEITHER tagged nor listed above. In release it answers false, which is
+            // what it has always done; in debug it is loud, because "matches nothing, ever" is
+            // the most expensive silence in a filter — the query simply returns less than it
+            // should and nothing anywhere says why.
+            _                             => UnhandledNode(filter),
         };
+    }
+
+    private static bool UnhandledNode(FilterNode node)
+    {
+        System.Diagnostics.Debug.Fail(
+            $"FilterEvaluator has no arm for {node.GetType().Name}; it will match nothing.");
+        return false;
     }
 
     // ── Free-text search ────────────────────────────────────────────────────────
