@@ -201,12 +201,22 @@ public sealed class ExceptionInfo
     /// neither a string nor a map. Everything else — any map, any non-empty string — produces
     /// an object.</para>
     ///
-    /// <para>The qualifier is the truncated case. A payload whose string header is cut short —
-    /// a str32 in four bytes — has no length to read, so this answers false where
-    /// <see cref="FromBytes"/> would throw. That is deliberate: this is asked per scanned row
-    /// of a segment whose block frame has already been length-checked, and a presence probe is
-    /// not the right place to raise corruption. Anything that then READS the payload still
-    /// throws, and the caller that hits it sees the same exception it always did.</para>
+    /// <para>The qualifier is the TRUNCATED payload, which <see cref="FromBytes"/> never
+    /// accepts, and this answers it from the header alone — so it can land on either side:</para>
+    /// <list type="bullet">
+    ///   <item>a map header, or a string header announcing a non-zero length, answers TRUE even
+    ///         when the body it announces is cut short: <c>D9 05 61</c> (a str8 of five bytes
+    ///         carrying one) and <c>81</c> (a one-entry fixmap carrying nothing) are present;</item>
+    ///   <item>a string header too short to hold its own length answers FALSE: <c>DB 00 00 00</c>
+    ///         (a str32 in four bytes) is absent.</item>
+    /// </list>
+    /// <para><see cref="FromBytes"/> throws <see cref="System.IO.EndOfStreamException"/> for all
+    /// three. A corrupt row therefore falls OUT of <c>has(@x)</c> when its header is cut and IN
+    /// when only its body is. That is deliberate: this is asked per scanned row of a segment
+    /// whose block frame has already been length-checked, and a presence probe is neither the
+    /// place to raise corruption nor worth a body walk to detect it. Anything that then READS
+    /// the payload still throws, and the caller that hits it sees the same exception it always
+    /// did. <c>ExceptionInfoReadTests</c> pins all three.</para>
     /// </summary>
     public static bool IsPresent(ReadOnlySpan<byte> bytes)
     {

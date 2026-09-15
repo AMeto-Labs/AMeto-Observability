@@ -103,9 +103,13 @@ public sealed class ExceptionInfoReadTests
 
     /// <summary>
     /// <see cref="ExceptionInfo.IsPresent"/> must agree with <see cref="ExceptionInfo.FromBytes"/>
-    /// on EVERY payload, because <c>LogEvent.HasException</c> is built on it and that is what
-    /// answers <c>has @x</c>. "Non-empty payload" is not the same question: nil, an empty
-    /// legacy string and any other shape all carry bytes and all decode to null.
+    /// on every payload FromBytes ACCEPTS, because <c>LogEvent.HasException</c> is built on it
+    /// and that is what answers <c>has(@x)</c>. "Non-empty payload" is not the same question:
+    /// nil, an empty legacy string and any other shape all carry bytes and all decode to null.
+    ///
+    /// <para>A truncated payload, which FromBytes throws on, is NOT covered by that agreement —
+    /// IsPresent reads the header only and answers it either way. See
+    /// <see cref="IsPresent_answers_a_truncated_payload_from_its_header_alone"/>.</para>
     /// </summary>
     [Fact]
     public void IsPresent_agrees_with_FromBytes_on_every_shape()
@@ -141,6 +145,37 @@ public sealed class ExceptionInfoReadTests
         }
 
         Assert.False(ExceptionInfo.IsPresent(ReadOnlySpan<byte>.Empty));
+    }
+
+    /// <summary>
+    /// THE TRUNCATED PAYLOAD, in both directions. IsPresent answers from the msgpack header and
+    /// never walks the body, so a payload cut short answers by where it was cut: a header that
+    /// is whole says present however little body follows it, a string header too short to hold
+    /// its own length says absent. FromBytes throws on all of them.
+    ///
+    /// <para>So a corrupt row falls IN to <c>has(@x)</c> when only its body is cut. That is a
+    /// decision the doc on <see cref="ExceptionInfo.IsPresent"/> states, and this is what fails
+    /// if IsPresent is ever made strict (walking the body) or made to throw — either of which
+    /// would change which corrupt rows a presence filter returns.</para>
+    /// </summary>
+    [Fact]
+    public void IsPresent_answers_a_truncated_payload_from_its_header_alone()
+    {
+        (byte[] Bytes, bool Present, string Shape)[] cases =
+        [
+            ([0xD9, 0x05, 0x61],       true,  "str8 announcing 5 bytes, carrying 1"),
+            ([0x81],                   true,  "fixmap announcing 1 entry, carrying none"),
+            ([0xDB, 0x00, 0x00, 0x00], false, "str32 header cut short of its length"),
+        ];
+
+        foreach (var (bytes, present, shape) in cases)
+        {
+            Assert.True(present == ExceptionInfo.IsPresent(bytes),
+                $"{shape}: IsPresent said {!present}, the header says {present}");
+
+            Assert.Throws<EndOfStreamException>(() => ExceptionInfo.FromBytes(bytes.AsMemory()));
+            Assert.Throws<EndOfStreamException>(() => ExceptionInfo.FromBytes(bytes.AsSpan()));
+        }
     }
 
     /// <summary>
