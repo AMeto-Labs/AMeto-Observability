@@ -520,8 +520,16 @@ public static class LogEventSerializer
                             // fallback rather than growing a second decode path for it.
                             return false;
                         }
-                        if (Encoding.UTF8.GetCharCount(utf8) > destination.Length) return false;
-                        charsWritten = Encoding.UTF8.GetChars(utf8, destination);
+                        // ONE pass, not two: GetCharCount followed by GetChars walks the bytes
+                        // twice to answer a question the transcode answers on its own. Utf8
+                        // .ToUtf16 reports DestinationTooSmall instead, which is the "it does
+                        // not fit, use the general road" answer this method already owes its
+                        // caller. Nothing is written into `destination` that the caller can
+                        // see, because a false return means charsWritten stays 0.
+                        var status = System.Text.Unicode.Utf8.ToUtf16(
+                            utf8, destination, out _, out int chars, replaceInvalidSequences: true);
+                        if (status != System.Buffers.OperationStatus.Done) return false;
+                        charsWritten = chars;
                         return true;
 
                     case ProbeWant.Number:

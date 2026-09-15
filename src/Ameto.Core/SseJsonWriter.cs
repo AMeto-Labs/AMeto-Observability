@@ -6,11 +6,17 @@ using System.Text.Json.Serialization.Metadata;
 namespace Ameto.Core;
 
 /// <summary>
-/// Per-connection SSE frame writer. Serialises each DTO as UTF-8 directly into a
-/// reusable buffer framed as <c>data: {json}\n\n</c> and writes it to the response
-/// body. The previous path copied every event three times — a UTF-16 JSON string,
-/// an interpolated <c>$"data: {json}\n\n"</c> string, and the UTF-16→UTF-8 transcode
-/// inside <c>WriteAsync(string)</c>; all three are gone.
+/// Per-connection SSE frame writer. Composes each frame as UTF-8 directly into a reusable
+/// buffer — <c>data: {json}\n\n</c> — and puts it on the response body. The path this replaced
+/// copied every event three times: a UTF-16 JSON string, an interpolated
+/// <c>$"data: {json}\n\n"</c> string, and the UTF-16→UTF-8 transcode inside
+/// <c>WriteAsync(string)</c>.
+///
+/// <para>Log-event frames go through <see cref="WriteLogEventAsync"/>, which writes straight
+/// from the event (no DTO, no reflection) and COALESCES: frames accumulate until 16 KB or
+/// <see cref="MaxFrameHold"/>, whichever comes first. Every other frame here — the typed and
+/// reflected DTO overloads, keepalives, and the terminal done/query-error frames — is sent the
+/// moment it is composed, and carries any coalesced backlog out with it.</para>
 ///
 /// <para>Lives in Core rather than beside its first caller because the trace and metric
 /// endpoint mappers ship in their own assemblies and do not reference Ameto.Server — the
@@ -137,9 +143,10 @@ public sealed class SseJsonWriter : IDisposable
     }
 
     /// <summary>
-    /// Writes one <c>data:</c> frame with the DTO serialised through a SOURCE-GENERATED contract,
-    /// then flushes. Prefer this overload: it is the one that keeps the reflection-based metadata
-    /// resolver out of the per-row path, and out of the trimmed output.
+    /// Writes one <c>data:</c> frame with the DTO serialised through a SOURCE-GENERATED contract
+    /// and sends it, backlog and all. Prefer this overload for any stream that still goes out as
+    /// a DTO: it is the one that keeps the reflection-based metadata resolver out of the per-row
+    /// path, and out of the trimmed output.
     /// </summary>
     public async Task WriteEventAsync<T>(T dto, JsonTypeInfo<T> typeInfo, CancellationToken ct)
     {

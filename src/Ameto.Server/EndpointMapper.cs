@@ -1011,7 +1011,18 @@ internal sealed class DynamicObjectConverter : JsonConverter<object>
 
 // ── DTO ───────────────────────────────────────────────────────────────────────
 
-/// <summary>JSON-serialisable view of a <see cref="LogEvent"/>.</summary>
+/// <summary>
+/// JSON-serialisable view of a <see cref="LogEvent"/>.
+///
+/// <para>NOT the road the search takes any more — <c>/api/events</c> and the span/trace log
+/// lists write their rows straight from the event through <c>LogEventJsonWriter</c>. Two
+/// callers keep this alive, and they are the whole of it: the LIVE TAIL, whose loop belongs to
+/// another change and still serialises a DTO per row, and <c>LogEventJsonParityTests</c>, which
+/// compares the direct writer's bytes against this one's. The same goes for
+/// <see cref="EventProps"/>, <see cref="EventPropsConverter"/>, <see cref="ExceptionInfoDto"/>
+/// and <see cref="DynamicObjectConverter"/>: when the tail moves over, all of it goes, and the
+/// parity test goes with it.</para>
+/// </summary>
 internal sealed class LogEventDto
 {
     [JsonPropertyName("@t")]            public string Timestamp       { get; init; } = "";

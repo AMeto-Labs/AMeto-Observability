@@ -11,8 +11,13 @@ namespace Ameto.Query.Filtering;
 /// <summary>
 /// Evaluates a compiled <see cref="FilterNode"/> AST against a single <see cref="LogEvent"/>.
 ///
-/// All evaluation is zero-allocation where possible — comparisons operate on boxed
-/// values from the event's Properties dictionary (already heap-allocated).
+/// <para>This runs once per CANDIDATE event, not once per returned row, so the per-event
+/// allocation is the number that matters. The common shapes — a text or numeric predicate on a
+/// plain top-level property — are read straight out of the event's msgpack into stack scratch
+/// and allocate nothing at all (see <c>CanProbeUserValue</c>). Everything the probe declines
+/// falls back to <c>GetValue</c>, which decodes the value to <c>object?</c> and therefore boxes
+/// numbers and builds a string per string; a property already materialised into the event's
+/// dictionary takes that road too, since the dictionary is then the cheaper answer.</para>
 /// </summary>
 public static class FilterEvaluator
 {
@@ -322,7 +327,7 @@ public static class FilterEvaluator
     /// top-level key rather than a dotted path — exactly the case where <see cref="GetValue"/>
     /// would have done nothing but <c>ev.TryGetProperty(prop, …)</c>.</para>
     /// </summary>
-    private static bool CanProbeUserText(LogEvent ev, string prop)
+    private static bool CanProbeUserValue(LogEvent ev, string prop)
         => !ev.PropertiesMaterialised
         && !ev.RawProperties.IsEmpty
         && prop.IndexOf(PropertyPath.Separator) < 0;
@@ -445,6 +450,28 @@ public static class FilterEvaluator
 
     private static bool EvalCompare(CompareNode node, LogEvent ev)
     {
+        // THE UNBOXED NUMERIC ROAD, and it is narrow on purpose. It engages only when the
+        // right operand is a numeric LITERAL — not another property, not a string, not a bool —
+        // and the left is a plain top-level key whose msgpack value is genuinely a number.
+        // Under exactly those conditions Compare() is provably the numeric tail and nothing
+        // else: neither side is null, a container or a bool, and the left is not a string, so
+        // the string road (which would compare `Elapsed > 100` textually for a string-valued
+        // Elapsed, and still must) is unreachable. Everything outside that falls through with
+        // its semantics untouched, at the cost of one extra frozen-dictionary probe.
+        if (node.RightProperty is null
+            && node.Value is { } literal && IsNumeric(literal)
+            && !BuiltinFields.TryResolve(node.Property, out _)
+            && CanProbeUserValue(ev, node.Property))
+        {
+            if (Ameto.Core.Serialization.LogEventSerializer.TryReadPropertyNumber(
+                    ev.RawProperties, node.Property, out double number, out bool present))
+                return CompareNumbers(number, ToDouble(literal), node.Op);
+
+            // Absent is not "false": Compare(null, <a literal>, op) answers true for Ne and
+            // false for everything else, and that is the answer the scan has always given.
+            if (!present) return node.Op is CompareOp.Ne;
+        }
+
         // Inline MatchAny: avoids closure/delegate allocation on every event
         object? actual = GetValue(ev, node.Property);
 
@@ -592,19 +619,24 @@ public static class FilterEvaluator
         }
 
         // Numeric comparison — coerce both sides to double
-        double lNum = ToDouble(left);
-        double rNum = ToDouble(right);
-        return op switch
-        {
-            CompareOp.Eq => Math.Abs(lNum - rNum) < 1e-15,
-            CompareOp.Ne => Math.Abs(lNum - rNum) >= 1e-15,
-            CompareOp.Lt => lNum <  rNum,
-            CompareOp.Le => lNum <= rNum,
-            CompareOp.Gt => lNum >  rNum,
-            CompareOp.Ge => lNum >= rNum,
-            _            => false,
-        };
+        return CompareNumbers(ToDouble(left), ToDouble(right), op);
     }
+
+    /// <summary>
+    /// The numeric tail of <see cref="Compare(object?, object?, CompareOp)"/>, factored out so
+    /// the unboxed road in <see cref="EvalCompare"/> answers with the SAME arithmetic — epsilon
+    /// and all — rather than with a second spelling of it that could drift.
+    /// </summary>
+    private static bool CompareNumbers(double left, double right, CompareOp op) => op switch
+    {
+        CompareOp.Eq => Math.Abs(left - right) < 1e-15,
+        CompareOp.Ne => Math.Abs(left - right) >= 1e-15,
+        CompareOp.Lt => left <  right,
+        CompareOp.Le => left <= right,
+        CompareOp.Gt => left >  right,
+        CompareOp.Ge => left >= right,
+        _            => false,
+    };
 
     // ── String predicates ─────────────────────────────────────────────────────
 
@@ -619,7 +651,7 @@ public static class FilterEvaluator
         // The unboxed road: a plain top-level string property is compared straight out of the
         // event's msgpack, so the string the old road allocated for every candidate event is
         // never built. Anything the probe cannot answer falls through untouched.
-        if (CanProbeUserText(ev, node.Property))
+        if (CanProbeUserValue(ev, node.Property))
         {
             Span<char> scratch = stackalloc char[MaxProbeTextChars];
             switch (ProbeUserText(ev, node.Property, scratch, out int len))
@@ -654,7 +686,7 @@ public static class FilterEvaluator
         if (BuiltinFields.TryResolve(node.Property, out var field))
             return StartsWithAgainst(ReadBuiltin(ev, field), node, cmp);
 
-        if (CanProbeUserText(ev, node.Property))
+        if (CanProbeUserValue(ev, node.Property))
         {
             Span<char> scratch = stackalloc char[MaxProbeTextChars];
             switch (ProbeUserText(ev, node.Property, scratch, out int len))
@@ -686,7 +718,7 @@ public static class FilterEvaluator
         if (BuiltinFields.TryResolve(node.Property, out var field))
             return ContainsAgainst(ReadBuiltin(ev, field), node, cmp);
 
-        if (CanProbeUserText(ev, node.Property))
+        if (CanProbeUserValue(ev, node.Property))
         {
             Span<char> scratch = stackalloc char[MaxProbeTextChars];
             switch (ProbeUserText(ev, node.Property, scratch, out int len))
@@ -718,7 +750,7 @@ public static class FilterEvaluator
         if (BuiltinFields.TryResolve(node.Property, out var field))
             return EndsWithAgainst(ReadBuiltin(ev, field), node, cmp);
 
-        if (CanProbeUserText(ev, node.Property))
+        if (CanProbeUserValue(ev, node.Property))
         {
             Span<char> scratch = stackalloc char[MaxProbeTextChars];
             switch (ProbeUserText(ev, node.Property, scratch, out int len))

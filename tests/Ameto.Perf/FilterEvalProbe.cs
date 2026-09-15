@@ -52,6 +52,7 @@ public sealed class FilterEvalProbe
         Report("    @mt like '%request'",                  "@mt like '%request'",                  ascii);
         Report("    @l = 'Error'",                         "@l = 'Error'",                         ascii);
         Report("    RequestPath like '%users%'",           "RequestPath like '%users%'",           ascii);
+        Report("    Elapsed > 20000",                      "Elapsed > 20000",                      ascii);
         Report("    @mt like '%timeout%'  (non-ASCII)",    "@mt like '%timeout%'",                 unicode);
     }
 
@@ -65,6 +66,7 @@ public sealed class FilterEvalProbe
         ("@mt like '%request'",                   ascii),
         ("@l = 'Error'",                          ascii),
         ("RequestPath like '%users%'",            ascii),
+        ("Elapsed > 20000",                       ascii),
         ("@mt like '%timeout%'",                  unicode),
     ];
 

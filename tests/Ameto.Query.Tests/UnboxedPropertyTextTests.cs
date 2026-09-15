@@ -205,6 +205,106 @@ public sealed class UnboxedPropertyTextTests
         Assert.False(Matches(ev, "dup like '%a-string%'"));
     }
 
+    // ── the numeric road ──────────────────────────────────────────────────────
+
+    private static LogEvent Numbers() => Event(static (ref MessagePackWriter w) =>
+    {
+        w.WriteMapHeader(10);
+        w.Write("i32");     w.Write(125);
+        w.Write("i64");     w.Write(9_000_000_000L);
+        w.Write("u64");     w.Write(ulong.MaxValue);
+        w.Write("dbl");     w.Write(1.5d);
+        w.Write("flt");     w.Write(2.5f);
+        w.Write("neg");     w.Write(-17);
+        w.Write("zero");    w.Write(0);
+        w.Write("notNum");  w.Write("NaN");           // a STRING that looks numeric
+        w.Write("textNum"); w.Write("125");           // a STRING that IS numeric
+        w.Write("arr");     w.WriteArrayHeader(2); w.Write(1); w.Write(2);
+    });
+
+    /// <summary>
+    /// A numeric comparison against a plain top-level key reads the number straight out of the
+    /// msgpack instead of boxing it. The road is narrow — numeric literal, numeric value — and
+    /// everything outside it must keep the semantics it had, including the ones that look
+    /// surprising: a STRING-valued property compared with a number goes down the string road
+    /// and compares textually, and it still must.
+    /// </summary>
+    [Theory]
+    [InlineData("i32 = 125",        true)]
+    [InlineData("i32 <> 125",       false)]
+    [InlineData("i32 > 100",        true)]
+    [InlineData("i32 >= 125",       true)]
+    [InlineData("i32 < 100",        false)]
+    [InlineData("i64 = 9000000000", true)]
+    [InlineData("i64 > 8999999999", true)]
+    [InlineData("u64 > 0",          true)]
+    [InlineData("dbl = 1.5",        true)]
+    [InlineData("dbl > 1.4",        true)]
+    [InlineData("flt = 2.5",        true)]
+    [InlineData("neg = -17",        true)]
+    [InlineData("neg < 0",          true)]
+    [InlineData("zero = 0",         true)]
+    [InlineData("zero <> 0",        false)]
+    [InlineData("missing = 1",      false)]   // absent: false for everything…
+    [InlineData("missing > 1",      false)]
+    [InlineData("missing < 1",      false)]
+    [InlineData("missing <> 1",     true)]    // …except Ne, which is what Compare(null, …) says
+    [InlineData("notNum = 0",       false)]   // string value vs number: the string road
+    [InlineData("notNum <> 0",      true)]
+    [InlineData("textNum = 125",    true)]    // "125" coerces on the string road's numeric tail
+    [InlineData("i32 = '125'",      true)]    // number value vs STRING literal: not the fast road
+    [InlineData("i32 = 'x'",        false)]
+    [InlineData("arr = 1",          true)]    // array value: match-any, not the fast road
+    [InlineData("arr = 3",          false)]
+    public void The_numeric_road_and_the_dictionary_road_agree(string filter, bool expected)
+    {
+        var raw = Numbers();
+        Assert.Equal(expected, Matches(raw, filter));
+
+        var materialised = Numbers();
+        _ = materialised.Properties;
+        Assert.True(materialised.PropertiesMaterialised);
+        Assert.Equal(expected, Matches(materialised, filter));
+    }
+
+    /// <summary>
+    /// A duplicate key whose LAST value is not a number must decline, not answer with the
+    /// earlier number — the two roads would disagree about the same event otherwise.
+    /// </summary>
+    [Fact]
+    public void A_duplicate_whose_last_value_is_not_a_number_declines()
+    {
+        var ev = Event(static (ref MessagePackWriter w) =>
+        {
+            w.WriteMapHeader(2);
+            w.Write("dup"); w.Write(125);
+            w.Write("dup"); w.Write("not a number");
+        });
+
+        Assert.False(LogEventSerializer.TryReadPropertyNumber(ev.RawProperties, "dup", out _, out bool present));
+        Assert.True(present);
+
+        // …and the predicate agrees with the dictionary that would be built.
+        Assert.False(Matches(ev, "dup = 125"));
+        Assert.True(Matches(ev, "dup <> 125"));
+    }
+
+    [Fact]
+    public void A_numeric_predicate_never_materialises_the_map_and_allocates_nothing()
+    {
+        var ev     = Numbers();
+        var filter = CompiledFilter.Compile("i32 > 100");
+
+        for (int i = 0; i < 100; i++) filter.Matches(ev);
+
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        for (int i = 0; i < 1_000; i++) filter.Matches(ev);
+        long bytes = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        Assert.False(ev.PropertiesMaterialised);
+        Assert.True(bytes == 0, $"expected zero allocation over 1000 evaluations, saw {bytes} B");
+    }
+
     [Fact]
     public void Numbers_are_read_without_a_box()
     {

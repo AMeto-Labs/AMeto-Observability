@@ -22,7 +22,17 @@ public sealed class AggregationResult
     public required IReadOnlyList<string>         ValueColumns { get; init; }
     public required IReadOnlyList<AggregationRow> Rows         { get; init; }
 
-    /// <summary>Events read. Not the number matched — the scan counts what it looked at.</summary>
+    /// <summary>
+    /// Events read. NOT the number matched — this counts what the query looked at, which is why
+    /// it can exceed the row counts below and why the UI prints it as "events read".
+    ///
+    /// <para>What "looked at" means differs by road, and the difference is visible. The event
+    /// scan counts events the filter YIELDED, because that is all it ever sees. The header scan
+    /// counts every in-window HEADER it walked, before its service filter and before any level
+    /// narrowing — so the same question answered the fast way reports a larger number. Both are
+    /// honest answers to "how much did this cost"; neither is a count of matches, and no client
+    /// should read it as one.</para>
+    /// </summary>
     public required long Scanned { get; init; }
 
     /// <summary>Distinct groups seen, which can exceed <see cref="Rows"/> when a limit applied.</summary>
