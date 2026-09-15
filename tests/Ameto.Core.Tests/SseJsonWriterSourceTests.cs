@@ -129,6 +129,57 @@ public sealed class SseJsonWriterSourceTests
         Assert.EndsWith("\n\n", all);
     }
 
+    /// <summary>
+    /// THE SCAN ROAD HAS ONE WRITER TOO. A send made while the source works runs beside the
+    /// source's step — never beside another send, and never beside a row being composed into the
+    /// buffer it is sending. Against a body that completes every call asynchronously, no body
+    /// operation starts outside the call, none overlaps another, none is still in flight when the
+    /// call returns, and every row arrives exactly once.
+    ///
+    /// <para>The recording stream cannot show this: a send that completes inline is over before
+    /// the loop can move on, so a send the loop did not wait for would look exactly like one it
+    /// did. Here each step is a bare yield, short enough that a send left running would still be
+    /// on the body when the next rows are composed and the next send starts.</para>
+    /// </summary>
+    [Fact]
+    public async Task Sends_made_while_the_scan_works_stay_inside_the_call_and_never_overlap()
+    {
+        var body = new ProbeStream();
+        using var sse = new SseJsonWriter(body);
+
+        static async IAsyncEnumerable<LogEvent> Scan()
+        {
+            for (uint burst = 0; burst < 20; burst++)
+            {
+                yield return Event(burst * 10);
+                yield return Event(burst * 10 + 1);
+                await Task.Yield();                // the writer sends the burst now
+            }
+        }
+
+        body.CallerInside = true;
+        await sse.WriteLogEventsAsync(Scan(), default);
+        await sse.WriteDoneAsync(default);
+        body.CallerInside = false;
+        Assert.Equal(0, body.InFlight);
+
+        int operations = body.Operations;
+        await Task.Delay(200);
+
+        Assert.Equal(operations, body.Operations);
+        Assert.Equal(0, body.OutsideCalls);
+        Assert.Equal(1, body.MaxConcurrent);
+
+        string all = body.All();
+        Assert.Equal(40, Count(all, "data: {\"@t\""));
+        for (uint burst = 0; burst < 20; burst++)
+        {
+            Assert.Equal(1, Count(all, Row(burst * 10)));
+            Assert.Equal(1, Count(all, Row(burst * 10 + 1)));
+        }
+        Assert.EndsWith("event: done\ndata: {}\n\n", all);
+    }
+
     private static async Task<bool> WaitForAsync(Func<bool> condition, TimeSpan limit)
     {
         var clock = Stopwatch.StartNew();
