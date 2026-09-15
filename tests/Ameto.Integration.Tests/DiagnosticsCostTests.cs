@@ -105,14 +105,16 @@ public sealed class DiagnosticsCostTests : IDisposable
     }
 
     /// <summary>
-    /// Concurrent expiry must not start N walks: the losers are served the previous snapshot.
+    /// Concurrent expiry must not start N walks: the losers are served the previous snapshot. The
+    /// TTL is far longer than one walk of this fixture, so once the refresh lands its snapshot is
+    /// fresh for every caller in the burst and exactly one walk is the only right answer.
     /// </summary>
     [Fact]
     public void Concurrent_callers_do_not_walk_twice()
     {
-        var cache = new DataDirectoryStatsCache(TimeSpan.FromMilliseconds(1));
+        var cache = new DataDirectoryStatsCache(TimeSpan.FromMilliseconds(250));
         cache.Get(_root);                           // prime, so nobody takes the first-fill lock
-        Thread.Sleep(20);
+        Thread.Sleep(300);
 
         int before = cache.WalkCount;
         var threads = new Thread[8];
@@ -124,8 +126,61 @@ public sealed class DiagnosticsCostTests : IDisposable
         }
         foreach (var t in threads) t.Join();
 
-        Assert.True(cache.WalkCount - before <= 2,
-            $"expected at most one extra walk for a burst of 8 callers, saw {cache.WalkCount - before}");
+        Assert.Equal(1, cache.WalkCount - before);
+    }
+
+    /// <summary>
+    /// The race the flag alone did not close, made deterministic: a caller reads the expired
+    /// snapshot, another caller refreshes and releases the flag, and only then does the first one
+    /// win the flag. It must find the fresh snapshot and serve it, not walk the directory again
+    /// microseconds after the last walk.
+    /// </summary>
+    [Fact]
+    public void A_caller_that_read_the_expired_snapshot_does_not_repeat_a_refresh_that_just_finished()
+    {
+        var cache = new DataDirectoryStatsCache(TimeSpan.FromMilliseconds(200));
+        cache.Get(_root);
+        Thread.Sleep(300);                          // the snapshot is now expired
+        int before = cache.WalkCount;
+
+        using var lateSawExpired = new ManualResetEventSlim();
+        using var refreshDone    = new ManualResetEventSlim();
+        var late = new Thread(() => cache.Get(_root));
+        cache.OnExpiredRead = () =>
+        {
+            if (Thread.CurrentThread != late) return;
+            lateSawExpired.Set();                   // it has read the expired snapshot...
+            refreshDone.Wait(TimeSpan.FromSeconds(10));   // ...and is held before the flag
+        };
+
+        late.Start();
+        Assert.True(lateSawExpired.Wait(TimeSpan.FromSeconds(10)));
+        cache.Get(_root);                           // this thread refreshes and releases the flag
+        refreshDone.Set();
+        late.Join();
+
+        Assert.Equal(1, cache.WalkCount - before);
+    }
+
+    /// <summary>
+    /// The endpoint's cache is process-wide, and a test process hosts several servers with
+    /// different data directories. A snapshot of one root must not be served for another.
+    /// </summary>
+    [Fact]
+    public void A_second_data_root_is_walked_not_served_the_first_roots_sizes()
+    {
+        string other = Path.Combine(Path.GetTempPath(), "Ameto-diagcost-other-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(Path.Combine(other, "metrics"));
+        Write(Path.Combine(other, "metrics", "m-0.mts"), 7);
+        try
+        {
+            var cache = new DataDirectoryStatsCache(TimeSpan.FromMinutes(5));
+
+            Assert.Equal(300, cache.Get(_root).MetricsBytes);
+            Assert.Equal(7,   cache.Get(other).MetricsBytes);
+            Assert.Equal(300, cache.Get(_root).MetricsBytes);
+        }
+        finally { try { Directory.Delete(other, true); } catch { } }
     }
 
     /// <summary>

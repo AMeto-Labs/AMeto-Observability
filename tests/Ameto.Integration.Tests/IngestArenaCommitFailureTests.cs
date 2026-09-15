@@ -79,4 +79,20 @@ public sealed class IngestArenaCommitFailureTests
             Assert.All(buf.AsSpan(0, len).ToArray(), b => Assert.Equal((byte)i, b));
         }
     }
+
+    /// <summary>
+    /// A plain allocation (the arena everywhere but Windows) commits nothing on demand and counts
+    /// nothing, so it reports -1 — not its whole size as if it were memory in use, which would show
+    /// every idle Linux container holding 512 MB of arena.
+    /// </summary>
+    [Fact]
+    public void A_plain_arena_reports_no_commit_figure_rather_than_its_size()
+    {
+        using var plain = SlabArena.Create((nuint)(Slabs * SlabBytes), 1 << 20, reserve: false);
+        Assert.False(plain.IsCommitOnDemand);
+        Assert.Equal(-1, plain.CommittedBytes);
+
+        using var ring = new IngestionRingBuffer(1 << 10, SlabBytes, (long)Slabs * SlabBytes);
+        Assert.Equal(ring.ArenaCommitsOnDemand ? 0 : -1, ring.ArenaCommittedBytes);
+    }
 }

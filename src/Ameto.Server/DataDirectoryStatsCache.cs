@@ -31,6 +31,12 @@ namespace Ameto.Server;
 /// storage the operator can act on. And the live-segment figure comes from the catalog, which
 /// loads in the background after start, so for the first moments after a restart it under-reports
 /// until the scan has published every segment.</para>
+///
+/// <para>One cache, one root at a time. The endpoint's instance is process-wide, and several
+/// servers with different data directories can share a process (the integration tests do), so a
+/// snapshot records the root it describes and a request for another root walks rather than being
+/// handed a different directory's sizes. Alternating roots therefore defeats the cache; a server
+/// has one root, so that costs nothing outside a test process.</para>
 /// </summary>
 public sealed class DataDirectoryStatsCache
 {
@@ -50,6 +56,8 @@ public sealed class DataDirectoryStatsCache
         public long QuarantinedSegmentBytes;
         public int  MetricsSegments;
         public int  TracesSegments;
+        /// <summary>The data root this snapshot describes.</summary>
+        public string Root = "";
         /// <summary>Stopwatch timestamp the walk finished at.</summary>
         public long TakenAt;
     }
@@ -74,39 +82,59 @@ public sealed class DataDirectoryStatsCache
     private int _walks;
 
     /// <summary>
+    /// Test hook: runs on a caller that has just read an EXPIRED snapshot of its root, before it
+    /// competes to refresh it — the window in which another caller's refresh can finish.
+    /// </summary>
+    internal Action? OnExpiredRead;
+
+    /// <summary>
     /// The current breakdown, refreshing it first if it has aged past the TTL. The refresh
     /// runs on the calling thread but only ever on ONE thread: a second caller that arrives
     /// mid-walk is served the previous snapshot rather than starting a duplicate walk.
     /// </summary>
     public Snapshot Get(string dataRoot)
     {
-        long now = Stopwatch.GetTimestamp();
-        var  cur = Volatile.Read(ref _current);
+        var cur = Volatile.Read(ref _current);
 
-        if (cur is not null && now - cur.TakenAt < _ttlTicks) return cur;
-
-        // First call after start: block, because serving zeroes would be a wrong answer
-        // rather than a stale one. Only one thread walks; the rest wait and take its result.
-        if (cur is null)
+        if (cur is not null && IsOf(cur, dataRoot))
         {
-            lock (_firstFill)
+            if (IsFresh(cur)) return cur;
+
+            // Expired: one thread refreshes, everyone else keeps reading the stale snapshot
+            // instead of queueing behind a directory walk on a request thread.
+            OnExpiredRead?.Invoke();
+            if (Interlocked.CompareExchange(ref _refreshing, 1, 0) != 0) return cur;
+            try
             {
-                cur = Volatile.Read(ref _current);
-                if (cur is not null) return cur;
+                // Winning the flag does not mean the snapshot is still expired: a refresh can
+                // have finished, and released the flag, between our read above and the exchange.
+                // Walking again would repeat it microseconds later.
+                var latest = Volatile.Read(ref _current);
+                if (latest is not null && IsOf(latest, dataRoot) && IsFresh(latest)) return latest;
                 return Refresh(dataRoot);
             }
+            finally { Volatile.Write(ref _refreshing, 0); }
         }
 
-        // Expired: one thread refreshes, everyone else keeps reading the stale snapshot
-        // instead of queueing behind a directory walk on a request thread.
-        if (Interlocked.CompareExchange(ref _refreshing, 1, 0) != 0) return cur;
-        try     { return Refresh(dataRoot); }
-        finally { Volatile.Write(ref _refreshing, 0); }
+        // Nothing yet, or a snapshot of a different root: serving it would be a wrong answer
+        // rather than a stale one, so block. Only one thread walks; the rest wait and take its
+        // result.
+        lock (_firstFill)
+        {
+            cur = Volatile.Read(ref _current);
+            if (cur is not null && IsOf(cur, dataRoot) && IsFresh(cur)) return cur;
+            return Refresh(dataRoot);
+        }
     }
+
+    private bool IsFresh(Snapshot s) => Stopwatch.GetTimestamp() - s.TakenAt < _ttlTicks;
+
+    private static bool IsOf(Snapshot s, string dataRoot) => string.Equals(s.Root, dataRoot, StringComparison.Ordinal);
 
     private Snapshot Refresh(string dataRoot)
     {
         var fresh = Walk(dataRoot);
+        fresh.Root    = dataRoot;
         fresh.TakenAt = Stopwatch.GetTimestamp();
         Volatile.Write(ref _current, fresh);
         Interlocked.Increment(ref _walks);

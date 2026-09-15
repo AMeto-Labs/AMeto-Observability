@@ -74,6 +74,37 @@ public sealed class PeerProberIdleTests
         Assert.True(registry.HasPeerOtherThan(local));
     }
 
+    /// <summary>
+    /// OnPeerAdded runs inside NodeRegistry.Upsert, on the thread serving an inbound ping. At
+    /// shutdown an Upsert can still hold the old delegate while Dispose runs, and Release on the
+    /// disposed semaphore escaped Upsert: the peer was registered, and the ping returned 500.
+    /// Reproduced deterministically: a handler subscribed ahead of the prober's disposes it
+    /// inside the same invocation, which runs over a snapshot of the list.
+    /// </summary>
+    [Fact]
+    public async Task A_peer_announced_while_the_prober_is_disposed_does_not_fail_the_ping()
+    {
+        var registry = new NodeRegistry();
+        registry.EnsureKnown(new NodeId(1), "http://localhost:5341");
+
+        // A seed keeps the loop on its timer rather than parked on the semaphore being disposed,
+        // so StopAsync can still end it.
+        var prober = NewProber(
+            new ReplicationOptions { Enabled = true, SeedNodes = ["http://seed:5341"], ProbeInterval = TimeSpan.FromMilliseconds(20) },
+            registry, new CountingHandler());
+        prober.SetLocalNodeId(new NodeId(1));
+
+        registry.PeerAdded += prober.Dispose;                   // first in the invocation list
+        await prober.StartAsync(CancellationToken.None);        // OnPeerAdded second
+
+        var thrown = Record.Exception(() => registry.Upsert(
+            new PeerPayload { NodeId = 2, Address = "http://peer:5341", Timestamp = DateTimeOffset.UtcNow }));
+
+        Assert.Null(thrown);
+        Assert.NotNull(registry.Get(new NodeId(2)));
+        await prober.StopAsync(CancellationToken.None);
+    }
+
     /// <summary>An inbound ping is the only way a peer can appear here, and it must wake us.</summary>
     [Fact]
     public async Task A_discovered_peer_wakes_the_parked_loop()

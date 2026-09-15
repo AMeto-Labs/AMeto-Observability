@@ -131,7 +131,9 @@ public static class DiagnosticsEndpointMapper
                 // against its budget, not what the .seg sections weigh on disk.
                 indexCacheEntries      = indexCache.EntryCount,
                 indexCacheBytes        = indexCache.TotalBytes,
-                indexCacheBudgetBytes  = options.Query.EffectiveIndexCacheBytes,
+                // What the cache enforces, not a fresh derivation: recomputing it per poll cost a
+                // GC.GetGCMemoryInfo and could disagree with the cache after GC.RefreshMemoryLimit.
+                indexCacheBudgetBytes  = indexCache.BudgetBytes,
                 indexCacheHits         = indexCache.HitCount,
                 indexCacheMisses       = indexCache.MissCount,
                 indexCacheIdleEvicted  = indexCache.IdleEvictedCount,

@@ -49,7 +49,9 @@ public sealed class NodeRegistry
     /// <summary>
     /// Whether any node other than <paramref name="local"/> is known. The local node is
     /// always registered, so "is there anything to probe" is not the same as "is this empty".
-    /// Allocation-free on the common answer.
+    /// Not allocation-free: enumerating a ConcurrentDictionary allocates an enumerator. It runs
+    /// once per probe-loop pass (and on a single node, once per wake), not per event, so that is
+    /// one small object where the loop used to build a payload and a LINQ chain.
     /// </summary>
     public bool HasPeerOtherThan(NodeId local)
     {

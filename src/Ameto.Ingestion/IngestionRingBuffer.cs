@@ -180,9 +180,9 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
     public int SlabCapacity => _slabCount;
 
     /// <summary>
-    /// Bytes of the payload arena actually backed by memory — the ingest high-water mark, not
-    /// the ceiling. Equals the whole arena where the platform already faulted pages in lazily
-    /// (everything but Windows).
+    /// Bytes of the payload arena committed on demand — the ingest high-water mark, not the
+    /// ceiling — or -1 where the platform already faults pages in lazily (everything but
+    /// Windows) and nothing is counted.
     /// </summary>
     public long ArenaCommittedBytes => _arena.CommittedBytes;
 

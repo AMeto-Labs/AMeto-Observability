@@ -66,12 +66,21 @@ public sealed class PeerProber : IHostedService, IDisposable
     /// A peer appeared while we were parked. One pending pulse is enough — the loop re-reads
     /// the registry when it wakes, so a burst of discoveries is one wake-up, not N.
     /// </summary>
+    /// <remarks>
+    /// Runs synchronously inside <see cref="NodeRegistry.Upsert"/>, on the thread serving an
+    /// inbound ping, so nothing may escape it: an exception here fails that request. During
+    /// shutdown an Upsert that already read the delegate can call this after
+    /// <see cref="Dispose"/> has disposed the semaphore — there is no loop left to wake then,
+    /// so that is swallowed too.
+    /// </remarks>
     private void OnPeerAdded()
     {
-        if (_wake.CurrentCount == 0)
+        try
         {
-            try { _wake.Release(); } catch (SemaphoreFullException) { /* raced; already pulsed */ }
+            if (_wake.CurrentCount == 0) _wake.Release();
         }
+        catch (SemaphoreFullException)  { /* raced; already pulsed */ }
+        catch (ObjectDisposedException) { /* host stopping; nothing left to wake */ }
     }
 
     public async Task StopAsync(CancellationToken cancellationToken)

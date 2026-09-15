@@ -50,8 +50,20 @@ internal sealed unsafe class SlabArena : IDisposable
 
     public byte* Base => _base;
 
-    /// <summary>Bytes actually backed by memory. Equals the whole arena when not reserved.</summary>
-    public long CommittedBytes { get { lock (_growGate) return (long)_committed; } }
+    /// <summary>
+    /// Bytes committed on demand so far — the ingest high-water mark — or -1 when the arena is a
+    /// plain allocation (everything but Windows). There the pages are lazy and nothing is
+    /// counted, so the arena size would be an upper bound reported as memory in use: every Linux
+    /// container would show 512 MB of arena at idle.
+    /// </summary>
+    public long CommittedBytes
+    {
+        get
+        {
+            if (!_reserved) return -1;
+            lock (_growGate) return (long)_committed;
+        }
+    }
 
     /// <summary>True when pages are committed on demand rather than up front.</summary>
     public bool IsCommitOnDemand => _reserved;
@@ -60,9 +72,15 @@ internal sealed unsafe class SlabArena : IDisposable
     /// Reserves <paramref name="bytes"/>. Falls back to a plain allocation if the reservation
     /// fails for any reason — a working server matters more than a tidy commit charge.
     /// </summary>
-    public static SlabArena Create(nuint bytes, nuint commitChunk)
+    public static SlabArena Create(nuint bytes, nuint commitChunk) => Create(bytes, commitChunk, reserve: true);
+
+    /// <summary>
+    /// <paramref name="reserve"/> false takes the plain-allocation path on every platform — the
+    /// one Linux always takes — so a test on Windows can reach it.
+    /// </summary>
+    internal static SlabArena Create(nuint bytes, nuint commitChunk, bool reserve)
     {
-        if (OperatingSystem.IsWindows())
+        if (reserve && OperatingSystem.IsWindows())
         {
             nint p = VirtualAlloc(0, bytes, MEM_RESERVE, PAGE_READWRITE);
             if (p != 0)

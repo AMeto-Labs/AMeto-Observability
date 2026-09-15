@@ -93,6 +93,12 @@ public sealed class SegmentIndexCache : IDisposable
     /// <summary>False when the budget is zero or negative — every acquire misses and inserts are not retained.</summary>
     public bool Enabled => _budgetBytes > 0;
 
+    /// <summary>
+    /// The budget this cache enforces — the one it was built with, not what configuration would
+    /// derive now (a <c>GC.RefreshMemoryLimit</c> after a container resize changes the latter only).
+    /// </summary>
+    public long BudgetBytes => _budgetBytes;
+
     public long HitCount   => Interlocked.Read(ref _hits);
     public long MissCount  => Interlocked.Read(ref _misses);
     public long TotalBytes { get { lock (_lock) return _totalBytes; } }
