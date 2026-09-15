@@ -27,7 +27,7 @@ namespace Ameto.Storage;
 /// CRC32C means a crash mid-write-back — pages reaching disk in any order — truncates
 /// replay at the first torn entry instead of manufacturing garbage events.
 /// </summary>
-public sealed unsafe class WriteAheadLog : IDisposable
+public sealed unsafe partial class WriteAheadLog : IDisposable
 {
     // ── WAL file header ──────────────────────────────────────────────────────
     private const uint   MagicNumber    = 0x52_44_57_41; // "RDWA"
@@ -89,6 +89,9 @@ public sealed unsafe class WriteAheadLog : IDisposable
     private          byte*               _ptr;
     private          long                _capacity;
     private          long                _writeOffset; // logical, excludes file header
+    // Absolute file offset (header included) up to which the mapping has been msynced.
+    // Everything past it is dirty; when it equals the write offset the tick has nothing to do.
+    private          long                _lastFlushedOffset = FileHeaderSize;
     private readonly object              _writeLock = new();
     private          FileStream?          _poolStream;
     private          bool                 _poolDirty;
@@ -166,6 +169,10 @@ public sealed unsafe class WriteAheadLog : IDisposable
                 }
             }
         }
+
+        // Whatever came back from the file is already on disk, so the first tick has nothing
+        // to msync up to here. A fresh file starts at the header, which Flush always covers.
+        _lastFlushedOffset = FileHeaderSize + _writeOffset;
 
         // Open companion pool file (template index → string) for crash recovery
         _poolStream = new FileStream(_filePath + ".pool",
@@ -267,23 +274,62 @@ public sealed unsafe class WriteAheadLog : IDisposable
     // ── Durability ───────────────────────────────────────────────────────────
 
     /// <summary>
-    /// msyncs the mapped view and fsyncs the template pool if it grew. Called on a timer
-    /// by the storage engine: acknowledged events are durable within one interval of
-    /// power loss instead of "whenever the OS writes back" (up to the tier's whole life).
-    /// Runs under the write lock — bounded stall for the single writer; the ingest ring
-    /// absorbs it.
+    /// msyncs the bytes appended since the previous tick and fsyncs the template pool if it
+    /// grew. Called on a timer by the storage engine: acknowledged events are durable within
+    /// one interval of power loss instead of "whenever the OS writes back" (up to the tier's
+    /// whole life).
+    ///
+    /// <para>Three things this does NOT do any more. It does not msync the WHOLE mapping —
+    /// <c>MemoryMappedViewAccessor.Flush</c> hands FlushViewOfFile/msync the entire 64 MB+
+    /// view, and that cost scales with the mapping, not with what was written, so a tick that
+    /// appended 40 KB walked 64 MB of page tables. It does not hold <see cref="_writeLock"/>
+    /// across the file-handle flush, which is the part that waits out the drive cache and the
+    /// part the single appender was stalled behind. And it does no I/O at all on a tick where
+    /// nothing was appended — the idle case, which used to msync and fsync regardless.</para>
+    ///
+    /// <para>The first page is always in the range: <see cref="Append"/> updates the file
+    /// header's WriteOffset in place, and recovery replays only up to that value, so a durable
+    /// tail under a stale header is a tail that is never read back.</para>
     /// </summary>
     public void Flush()
     {
+        FileStream? handle = null;
         lock (_writeLock)
         {
             if (_disposed || _accessor is null) return;
-            _accessor.Flush();
-            // FlushViewOfFile (which the accessor flush is on Windows) queues the pages to
-            // the filesystem but does not wait for the drive — FlushFileBuffers does. On
-            // Linux the accessor flush is already msync(MS_SYNC); the extra fsync is cheap.
-            _fileStream?.Flush(flushToDisk: true);
+
+            long writeEnd = FileHeaderSize + _writeOffset;
+            if (writeEnd > _lastFlushedOffset)
+            {
+                if (!TryFlushRange(_lastFlushedOffset, writeEnd))
+                {
+                    // Correct, just slower — and silent, which is the trap: a platform where
+                    // the range call always fails would msync the whole mapping every tick
+                    // for ever and look exactly like a working one. The counter records it,
+                    // but only tests read it today. The WAL has no logger and no diagnostics
+                    // surface exposes the counter, so on a live host this is still invisible.
+                    // Surfacing it (a log once, or a StorageEngine diagnostic) is follow-up work.
+                    Interlocked.Increment(ref _rangeFlushFailures);
+                    _accessor.Flush();     // fallback: whole view, as before
+                }
+
+                _lastFlushedOffset = writeEnd;
+                handle             = _fileStream;
+            }
         }
+
+        // Outside the lock on purpose: FlushViewOfFile only queues the pages to the
+        // filesystem, FlushFileBuffers is what waits for the drive — milliseconds on a
+        // spinning disk, and the appender has no reason to wait with it. On Linux the
+        // msync above is already MS_SYNC and this fsync is cheap.
+        if (handle is not null)
+        {
+            // Dispose may have closed the handle between the lock and here (rotation runs
+            // on this same thread today, but the flag is the contract, not the thread).
+            try { handle.Flush(flushToDisk: true); }
+            catch (ObjectDisposedException) { /* Dispose fsyncs it on its way out */ }
+        }
+
         lock (_poolLock)
         {
             if (!_poolDirty || _poolStream is null) return;
@@ -292,6 +338,89 @@ public sealed unsafe class WriteAheadLog : IDisposable
             catch (IOException) { _poolDirty = true; } // retried next interval
         }
     }
+
+    /// <summary>
+    /// msyncs <c>[from, to)</c> of the mapping, page-aligned outwards, plus the first page
+    /// (the file header). Returns false if the platform call fails or the platform is one we
+    /// have no range call for — the caller then flushes the whole view, which is always
+    /// correct, just slower.
+    /// </summary>
+    private bool TryFlushRange(long from, long to)
+    {
+        if (_ptr is null) return false;
+
+        long pageSize  = Environment.SystemPageSize;
+        long fileSize  = FileHeaderSize + _capacity;
+        long alignedTo = Math.Min(fileSize, (to + pageSize - 1) / pageSize * pageSize);
+
+        // The header page, unless the tail range already starts inside it.
+        long tailStart = from / pageSize * pageSize;
+        if (tailStart >= pageSize && !FlushRegion(0, Math.Min(pageSize, fileSize)))
+            return false;
+
+        return FlushRegion(tailStart, alignedTo - tailStart);
+    }
+
+    private bool FlushRegion(long offset, long length)
+    {
+        if (length <= 0) return true;
+
+        nint addr = (nint)(_ptr + offset);
+        bool ok;
+        if (OperatingSystem.IsWindows())
+            ok = Native.FlushViewOfFile(addr, (nuint)length);
+        else if (OperatingSystem.IsLinux() || OperatingSystem.IsMacOS())
+            ok = Native.Msync(addr, (nuint)length, OperatingSystem.IsMacOS() ? MsyncSyncMacOS : MsyncSyncLinux) == 0;
+        else
+            return false;   // unknown platform: let the caller flush the whole view
+
+        if (ok)
+        {
+            Interlocked.Increment(ref _rangeFlushCount);
+            Interlocked.Exchange(ref _lastRangeFlushBytes, length);
+        }
+        return ok;
+    }
+
+    // MS_SYNC. Different numbers on the two Unixes, and passing the wrong one makes msync
+    // fail with EINVAL rather than do the wrong thing — which the fallback would then cover,
+    // silently, with a whole-view flush every tick.
+    private const int MsyncSyncLinux = 4;
+    private const int MsyncSyncMacOS = 0x0010;
+
+    private static partial class Native
+    {
+        [System.Runtime.InteropServices.LibraryImport("kernel32.dll", SetLastError = true)]
+        [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+        internal static partial bool FlushViewOfFile(nint lpBaseAddress, nuint dwNumberOfBytesToFlush);
+
+        [System.Runtime.InteropServices.LibraryImport("libc", EntryPoint = "msync", SetLastError = true)]
+        internal static partial int Msync(nint addr, nuint len, int flags);
+    }
+
+    // ── Flush diagnostics (tests) ────────────────────────────────────────────
+
+    private long _rangeFlushCount;
+    private long _lastRangeFlushBytes;
+    private long _rangeFlushFailures;
+
+    /// <summary>Number of successful range msyncs issued. A clean tick must not raise it.</summary>
+    internal long RangeFlushCount => Interlocked.Read(ref _rangeFlushCount);
+
+    /// <summary>
+    /// Ticks that fell back to flushing the whole view because the range call failed.
+    /// Expected to stay at zero; anything else means every tick is paying the old cost.
+    /// </summary>
+    internal long RangeFlushFailures => Interlocked.Read(ref _rangeFlushFailures);
+
+    /// <summary>Bytes covered by the most recent range msync.</summary>
+    internal long LastRangeFlushBytes => Interlocked.Read(ref _lastRangeFlushBytes);
+
+    /// <summary>Absolute file offset up to which this WAL has been msynced.</summary>
+    internal long LastFlushedOffset { get { lock (_writeLock) return _lastFlushedOffset; } }
+
+    /// <summary>Bytes appended so far, excluding the file header.</summary>
+    internal long WrittenBytes { get { lock (_writeLock) return _writeOffset; } }
 
     // ── Recovery ─────────────────────────────────────────────────────────────
 

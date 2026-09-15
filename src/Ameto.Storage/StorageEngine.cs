@@ -825,12 +825,20 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         // ── The event is COMMITTED from here on. Nothing below may throw out of TryWrite:
         //    the drainer treats a thrown TryWrite as "not written" and retries the same
         //    event — which would insert another copy (fresh id) into the tier per attempt.
-        ushort tmplIdx = h.MessageTemplatePoolIndex >= 0 ? (ushort)h.MessageTemplatePoolIndex : (ushort)0;
+        // The WAL entry's index is 16 bits with no "not pooled" value, so an event outside the
+        // pool (-1 once it is full, or a claim at/past 65 536 whose cast is 0) is logged as 0.
+        // Such an event must then write NO pool row: Append saves the text it is handed as row
+        // 0, recovery force-interns that row, and every genuine index-0 event of the WAL came
+        // back with the unpooled event's template. The receivers attach the materialised text
+        // to exactly those events, so this was the first unpooled event into every fresh WAL.
+        // The hook still gets the attached text; only the WAL is handed "" (Append skips it).
+        bool   pooled  = (uint)h.MessageTemplatePoolIndex <= ushort.MaxValue;
+        ushort tmplIdx = pooled ? (ushort)h.MessageTemplatePoolIndex : (ushort)0;
         string tmplStr = template
                          ?? (h.MessageTemplatePoolIndex >= 0 ? TemplatePool.Get(h.MessageTemplatePoolIndex) : string.Empty);
         try
         {
-            w.Wal?.Append(h.TimestampUtcTicks, h.Level, tmplIdx, tmplStr, propertiesPayload, exception);
+            w.Wal?.Append(h.TimestampUtcTicks, h.Level, tmplIdx, pooled ? tmplStr : string.Empty, propertiesPayload, exception);
             _walFaulted = false;
         }
         catch (ObjectDisposedException)

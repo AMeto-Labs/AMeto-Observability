@@ -98,6 +98,9 @@ public static class OtlpLogStreamParser
         resBuf.ResetWrittenCount();
         int resKeyCount = 0;
         int svcLen      = 0; // >0 ⇒ service.name captured in svcBuf
+        // The service name is a property of THIS resource, shared by every record under it:
+        // intern it once here instead of re-hashing the same bytes per record.
+        int svcIdx      = -1;
 
         while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
         {
@@ -106,7 +109,10 @@ public static class OtlpLogStreamParser
             if (reader.ValueTextEquals("resource"u8))
             {
                 if (reader.Read() && reader.TokenType == JsonTokenType.StartObject)
+                {
                     ParseResourceAttributes(ref reader, resBuf, ref resKeyCount, svcBuf, ref svcLen);
+                    svcIdx = svcLen > 0 ? sink.InternService(svcBuf.AsSpan(0, svcLen)) : -1;
+                }
                 else
                     reader.Skip();
             }
@@ -115,7 +121,7 @@ public static class OtlpLogStreamParser
                 if (reader.Read() && reader.TokenType == JsonTokenType.StartArray)
                 {
                     while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
-                        ParseScopeLogs(ref reader, sink, resBuf, resKeyCount, svcBuf, svcLen,
+                        ParseScopeLogs(ref reader, sink, resBuf, resKeyCount, svcBuf, svcLen, svcIdx,
                             recBuf, outBuf, ref tmplBuf, trBuf, spBuf, ref ingested, ref dropped);
                 }
                 else reader.Skip();
@@ -148,7 +154,7 @@ public static class OtlpLogStreamParser
     // ── scopeLogs[] element ────────────────────────────────────────────────────
     private static void ParseScopeLogs(
         ref Utf8JsonReader reader, IOtlpLogSink sink,
-        ArrayBufferWriter<byte> resBuf, int resKeyCount, byte[] svcBuf, int svcLen,
+        ArrayBufferWriter<byte> resBuf, int resKeyCount, byte[] svcBuf, int svcLen, int svcIdx,
         ArrayBufferWriter<byte> recBuf, ArrayBufferWriter<byte> outBuf,
         ref byte[] tmplBuf, byte[] trBuf, byte[] spBuf,
         ref int ingested, ref int dropped)
@@ -162,7 +168,7 @@ public static class OtlpLogStreamParser
             {
                 while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
                 {
-                    bool ok = ParseLogRecord(ref reader, sink, resBuf, resKeyCount, svcBuf, svcLen,
+                    bool ok = ParseLogRecord(ref reader, sink, resBuf, resKeyCount, svcBuf, svcLen, svcIdx,
                         recBuf, outBuf, ref tmplBuf, trBuf, spBuf);
                     if (ok) ingested++; else dropped++;
                 }
@@ -174,7 +180,7 @@ public static class OtlpLogStreamParser
     // ── one logRecord → one ring entry ─────────────────────────────────────────
     private static bool ParseLogRecord(
         ref Utf8JsonReader reader, IOtlpLogSink sink,
-        ArrayBufferWriter<byte> resBuf, int resKeyCount, byte[] svcBuf, int svcLen,
+        ArrayBufferWriter<byte> resBuf, int resKeyCount, byte[] svcBuf, int svcLen, int svcIdx,
         ArrayBufferWriter<byte> recBuf, ArrayBufferWriter<byte> outBuf,
         ref byte[] tmplBuf, byte[] trBuf, byte[] spBuf)
     {
@@ -269,7 +275,8 @@ public static class OtlpLogStreamParser
             tmplLen > 0 ? tmplBuf.AsSpan(0, tmplLen) : default,
             outBuf.WrittenSpan,
             trHi, trLo, spanId,
-            svcLen > 0 ? svcBuf.AsSpan(0, svcLen) : default);
+            svcLen > 0 ? svcBuf.AsSpan(0, svcLen) : default,
+            svcIdx);
     }
 
     // ── KeyValue { "key": "...", "value": { AnyValue } } → msgpack key + value ──
