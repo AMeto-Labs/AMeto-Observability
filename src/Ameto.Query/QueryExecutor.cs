@@ -50,7 +50,14 @@ public sealed class QueryExecutor : IQueryExecutor
         QueryRequest request,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
-        var filter = CompiledFilter.Compile(request.Filter);
+        // A caller that runs the same request shape over and over (the live tail, once per
+        // poll) compiles the filter once and carries it on the request; it is trusted only
+        // when it was compiled from this request's own text, so a mismatched pair costs a
+        // compile, never a wrong filter.
+        var filter = request.Prepared is CompiledFilter prepared
+                     && string.Equals(prepared.Expression, request.Filter, StringComparison.Ordinal)
+            ? prepared
+            : CompiledFilter.Compile(request.Filter);
         int limit  = request.Count;
         int count  = 0;
 
@@ -94,6 +101,14 @@ public sealed class QueryExecutor : IQueryExecutor
             && (to is null || to.Value.UtcTicks > boundMax))
             to = new DateTimeOffset(boundMax, TimeSpan.Zero);
 
+        // The level set the filter's AND-chain admits is a `levels` parameter the caller
+        // did not spell out — the same exactness (it is computed with the evaluator's own
+        // comparison), the same pruning: level-split cold segments drop through their
+        // posting lists, hot headers through the mask. The evaluator still re-checks every
+        // event, so like the bounds above this can only skip work. A caller's explicit set
+        // is kept as given.
+        levels ??= filter.DerivedLevels;
+
         // ── Hot tier ──────────────────────────────────────────────────────────
         // Window/cursor/level filtering and the (@t, id) sort happen at HEADER level
         // inside the reader (HotTierScan) — events are materialised lazily in result
@@ -136,9 +151,10 @@ public sealed class QueryExecutor : IQueryExecutor
 
     /// <summary>
     /// The hot tier as a (ts, id)-sorted async source for the merge. ReadSorted already
-    /// applies window, cursor and level filtering at header level; only the compiled
-    /// filter runs here, per materialised event — the same division of labour the cold
-    /// scan uses.
+    /// applies window, cursor and level filtering at header level, plus whatever of the
+    /// filter the header can answer (<see cref="CompiledFilter.HeaderPredicate"/>: level,
+    /// trace / span id, service); the compiled filter then runs here, per materialised
+    /// event, as the correctness gate — the same division of labour the cold scan uses.
     /// </summary>
     private static async IAsyncEnumerable<LogEvent> HotEventsAsync(
         IHotTierReader                hotReader,
@@ -153,7 +169,7 @@ public sealed class QueryExecutor : IQueryExecutor
     {
         foreach (var ev in hotReader.ReadSorted(
                      from?.UtcTicks ?? long.MinValue, to?.UtcTicks ?? long.MaxValue,
-                     afterTs, afterId?.RawValue, forward, levels))
+                     afterTs, afterId?.RawValue, forward, levels, filter.HeaderPredicate))
         {
             if (ct.IsCancellationRequested) yield break;
             if (!filter.Matches(ev)) continue;
@@ -202,17 +218,24 @@ public sealed class QueryExecutor : IQueryExecutor
                   from?.UtcTicks ?? long.MinValue, to?.UtcTicks ?? long.MaxValue, ct);
 
         // From here on the prefilter's readers are owned by this method's finally, so
-        // everything that could throw has to be inside the try — the re-sort included.
-        List<PrefilterResult> ordered = prefiltered;
+        // everything that could throw has to be inside the try — building the priming
+        // order included. The finally releases them through `prefiltered`, so they are
+        // released even when the ordered array below was never built.
         var iterators = new List<IAsyncEnumerator<LogEvent>>(prefiltered.Count + 1);
         try
         {
             // Priming order: the merge front moves one way through time, so segments are
             // consumed in that order too — newest MaxTs first going backward, oldest MinTs
             // first going forward.
-            ordered = forward
-                ? prefiltered.OrderBy(p => p.Info.MinTimestampTicks).ToList()
-                : prefiltered.OrderByDescending(p => p.Info.MaxTimestampTicks).ToList();
+            // Stable like the OrderBy it replaces (ties keep prefilter order = catalog order):
+            // the key carries the input index, so an unstable Array.Sort cannot reorder ties.
+            var ordered = new PrimeEntry[prefiltered.Count];
+            for (int i = 0; i < ordered.Length; i++)
+            {
+                var p = prefiltered[i];
+                ordered[i] = new PrimeEntry(forward ? p.Info.MinTimestampTicks : p.Info.MaxTimestampTicks, i, p);
+            }
+            ordered.AsSpan().Sort(new PrimeOrder(descending: !forward));
 
             // PriorityQueue ordered by (ts, id). For backward (newest-first) we invert
             // the comparer; .NET's PriorityQueue is a min-heap.
@@ -246,18 +269,18 @@ public sealed class QueryExecutor : IQueryExecutor
             // ordered) can contribute. Ties prime, so equal timestamps are never dropped.
             async ValueTask PrimeAsync()
             {
-                while (next < ordered.Count)
+                while (next < ordered.Length)
                 {
                     if (heap.Count > 0 && heap.TryPeek(out _, out var best))
                     {
-                        var info = ordered[next].Info;
+                        var info = ordered[next].Entry.Info;
                         bool couldBeat = forward
                             ? info.MinTimestampTicks <= best.ts
                             : info.MaxTimestampTicks >= best.ts;
                         if (!couldBeat) return;
                     }
 
-                    var (segInfo, candidateOffsets, segReader) = ordered[next++];
+                    var (segInfo, candidateOffsets, segReader) = ordered[next++].Entry;
                     // The reader is BORROWED — the finally below owns every one of them,
                     // primed or not, so the scan must not dispose what it did not open.
                     var stream = ScanSegmentAsync(segInfo, filter, levels, candidateOffsets, segReader,
@@ -309,7 +332,7 @@ public sealed class QueryExecutor : IQueryExecutor
             // runs, those files cannot be deleted on Windows; the merge already handles a
             // source held open by an in-flight query (manifest kept, recovery sweep
             // finishes), and the hold is bounded by this query either way.
-            foreach (var p in ordered)
+            foreach (var p in prefiltered)
             {
                 if (p.Reader is { } r)
                 {
@@ -341,6 +364,23 @@ public sealed class QueryExecutor : IQueryExecutor
     /// need refcounting against the catalog, which is deliberately not attempted here.</para>
     /// </summary>
     private readonly record struct PrefilterResult(SegmentInfo Info, uint[]? CandidateOffsets, SegmentReader? Reader);
+
+    /// <summary>A prefilter survivor keyed for the priming order (see <see cref="PrimeOrder"/>).</summary>
+    private readonly record struct PrimeEntry(long Key, int Index, PrefilterResult Entry);
+
+    /// <summary>
+    /// The priming order — MinTs ascending going forward, MaxTs descending going backward
+    /// — with the input index as the tiebreak, so the sort is stable like the LINQ OrderBy
+    /// it replaced without the keyed comparer, the iterator chain and the list per query.
+    /// </summary>
+    private readonly struct PrimeOrder(bool descending) : IComparer<PrimeEntry>
+    {
+        public int Compare(PrimeEntry a, PrimeEntry b)
+        {
+            int c = descending ? b.Key.CompareTo(a.Key) : a.Key.CompareTo(b.Key);
+            return c != 0 ? c : a.Index.CompareTo(b.Index);
+        }
+    }
 
     /// <summary>
     /// Runs bloom/inverted fast-skip and trigram offset lookup for every cold

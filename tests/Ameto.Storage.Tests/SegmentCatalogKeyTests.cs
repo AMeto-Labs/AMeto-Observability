@@ -136,6 +136,25 @@ public sealed class SegmentCatalogKeyTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// The unbounded window is the catalog's own sorted snapshot, shared by every reader of that
+    /// catalog version, so it must be handed out as a view nothing can write through. Handed out
+    /// as the raw array, <c>((SegmentInfo[])GetSegments(null, null))[0] = x</c> rewrote what every
+    /// concurrent and later query of that version reads.
+    /// </summary>
+    [Fact]
+    public async Task The_unbounded_window_is_a_view_no_caller_can_write_through()
+    {
+        long now = DateTime.UtcNow.Ticks;
+        Write(20, now);
+        await _engine.FlushHotTierAsync();
+
+        var segs = _engine.GetSegments(null, null);
+        Assert.NotEmpty(segs);
+        Assert.IsNotType<SegmentInfo[]>(segs);
+        Assert.Throws<NotSupportedException>(() => ((IList<SegmentInfo>)segs)[0] = segs[0]);
+    }
+
+    /// <summary>
     /// What the eviction actually cost, measured rather than argued: retention enumerates the
     /// catalog, so a segment missing from it is never expired. Its bytes then sit in the segments
     /// directory for the life of the install, past every TTL, with nothing logged anywhere.

@@ -275,7 +275,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     // served, never expired and never compacted — disk held for the life of the install, with
     // nothing logged. LoadSegmentCatalog re-ran the same collision on every restart in
     // directory-enumeration order, so which of the two survived could change from boot to boot.
-    private readonly ConcurrentDictionary<SegmentKey, SegmentInfo> _segments = new();
+    private readonly SegmentCatalog _segments = new();
     /// <summary>Background catalog scan started by the ctor (kept to observe faults).</summary>
     private readonly Task _catalogLoad;
 
@@ -580,16 +580,14 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
     // ── ISegmentProvider ──────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Newest MaxTs first. Off the catalog's cached sorted snapshot (see
+    /// <see cref="SegmentCatalog"/>): the walk + LINQ sort + list per call used to be
+    /// paid by every query and every live-tail poll for an answer that changes only
+    /// when a segment is added or removed.
+    /// </summary>
     public IReadOnlyList<SegmentInfo> GetSegments(DateTimeOffset? from, DateTimeOffset? to)
-    {
-        long fromTicks = from?.UtcTicks ?? long.MinValue;
-        long toTicks   = to?.UtcTicks   ?? long.MaxValue;
-
-        return _segments.Values
-            .Where(s => s.MaxTimestampTicks >= fromTicks && s.MinTimestampTicks <= toTicks)
-            .OrderByDescending(s => s.MaxTimestampTicks)
-            .ToList();
-    }
+        => _segments.GetOverlapping(from?.UtcTicks ?? long.MinValue, to?.UtcTicks ?? long.MaxValue);
 
     /// <summary>
     /// Total native bytes held by the hot tier right now: the live segment plus
@@ -623,23 +621,26 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// captured tier's native memory while it is being scanned — callers <b>must</b> pair this
     /// with exactly one <see cref="OnReaderDisposed"/> when finished.
     /// </summary>
-    private (HotTierSegment Current, HotTierSegment[] Frozen, HashSet<SegmentKey> Covered) SnapshotTiers()
+    private (HotTierSegment Current, HotTierSegment[] Frozen, IReadOnlySet<SegmentKey> Covered) SnapshotTiers()
     {
         HotTierSegment    current;
         HotTierSegment[]  frozen;
-        HashSet<SegmentKey> covered;
+        IReadOnlySet<SegmentKey> covered;
         lock (_frozenLock)
         {
             current = _write.Hot;
             if (_frozenHot.Count == 0)
             {
+                // The common case — no flush in progress — covers nothing, and every poll
+                // took this branch and allocated an empty set to say so.
                 frozen  = Array.Empty<HotTierSegment>();
-                covered = new HashSet<SegmentKey>();
+                covered = EmptyCoveredSet.Instance;
             }
             else
             {
                 frozen  = new HotTierSegment[_frozenHot.Count];
-                covered = new HashSet<SegmentKey>(_frozenHot.Count * LevelSegmentSlots);
+                var set = new HashSet<SegmentKey>(_frozenHot.Count * LevelSegmentSlots);
+                covered = set;
                 for (int i = 0; i < _frozenHot.Count; i++)
                 {
                     frozen[i] = _frozenHot[i].Tier;
@@ -648,7 +649,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                     // already-registered per-level segments AND the still-frozen tier.
                     ulong first = _frozenHot[i].SegId;
                     for (int s = 0; s < LevelSegmentSlots; s++)
-                        covered.Add(new SegmentKey(_options.NodeId, new SegmentId(first + (ulong)s)));
+                        set.Add(new SegmentKey(_options.NodeId, new SegmentId(first + (ulong)s)));
                 }
             }
             Interlocked.Increment(ref _activeReaders);
@@ -746,7 +747,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     private sealed class HotTierReaderSnapshot(
         HotTierSegment   current,
         HotTierSegment[] frozen,
-        HashSet<SegmentKey> covered,
+        IReadOnlySet<SegmentKey> covered,
         StringInternPool pool,
         StorageEngine    owner) : IHotTierReader
     {
@@ -771,6 +772,14 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             long? afterTsTicks, ulong? afterIdRaw, bool forward,
             IReadOnlySet<Ameto.Core.LogLevel>? levels)
             => HotTierScan.ReadSorted(current, frozen, pool, fromTicks, toTicks, afterTsTicks, afterIdRaw, forward, levels);
+
+        /// <summary>Same scan, with the filter's header-level part applied before materialisation.</summary>
+        public IEnumerable<LogEvent> ReadSorted(
+            long fromTicks, long toTicks,
+            long? afterTsTicks, ulong? afterIdRaw, bool forward,
+            IReadOnlySet<Ameto.Core.LogLevel>? levels,
+            IHotHeaderPredicate? headerPredicate)
+            => HotTierScan.ReadSorted(current, frozen, pool, fromTicks, toTicks, afterTsTicks, afterIdRaw, forward, levels, headerPredicate);
 
         public IReadOnlySet<SegmentKey> CoveredSegmentKeys => covered;
 

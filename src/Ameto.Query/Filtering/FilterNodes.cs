@@ -79,6 +79,48 @@ public sealed class TimeCompareNode : FilterNode
     public TimeCompareNode(CompareOp op, long ticks) { Op = op; Ticks = ticks; }
 }
 
+/// <summary>
+/// <c>@tr = 'hex32'</c> / <c>@sp = 'hex16'</c> (and <c>!=</c>) whose literal is exactly the
+/// hex spelling the event would render — rewritten from <see cref="CompareNode"/> at compile
+/// time (see <c>CompiledFilter</c>) so the literal is parsed ONCE and the evaluator compares
+/// the stored integers, instead of formatting every scanned event's id to a 32-character
+/// string for an ordinal-ignore-case compare. Same answer: the rendering is lowercase hex of
+/// fixed width and null when the id is absent, so equality holds exactly when the ids are
+/// equal and the event has one; <c>!=</c> is that negated (an absent id is "not equal").
+/// A literal of any other shape keeps its CompareNode and the string semantics.
+/// </summary>
+public sealed class TraceIdCompareNode : FilterNode
+{
+    /// <summary>Only <see cref="CompareOp.Eq"/> and <see cref="CompareOp.Ne"/> are rewritten.</summary>
+    public CompareOp Op     { get; }
+    /// <summary>True for <c>@sp</c> (64-bit, held in <see cref="Lo"/>); false for <c>@tr</c>.</summary>
+    public bool      IsSpan { get; }
+    public ulong     Hi     { get; }
+    public ulong     Lo     { get; }
+
+    /// <summary>
+    /// The property spelling of the <see cref="CompareNode"/> this replaced and the
+    /// CANONICAL rendering of its literal (lowercase hex, the spelling
+    /// <c>SegmentIndexBuilder</c> files under), so the index-hint builders emit the value
+    /// the posting list and bloom actually hold — the cold prefilter still prunes
+    /// segments by the <c>@tr</c> posting list, whatever case the user typed.
+    /// </summary>
+    public string    Property  { get; }
+    public string    Canonical { get; }
+
+    public TraceIdCompareNode(CompareOp op, bool isSpan, ulong hi, ulong lo, string property)
+    {
+        Op        = op;
+        IsSpan    = isSpan;
+        Hi        = hi;
+        Lo        = lo;
+        Property  = property;
+        Canonical = isSpan
+            ? Ameto.Core.TraceIdHelper.FormatSpanId(lo) ?? new string('0', 16)
+            : Ameto.Core.TraceIdHelper.FormatTraceId(hi, lo) ?? new string('0', 32);
+    }
+}
+
 // ── String predicates ─────────────────────────────────────────────────────────
 
 /// <summary>@mt like '%hello%'  or  Prop like 'prefix%'</summary>

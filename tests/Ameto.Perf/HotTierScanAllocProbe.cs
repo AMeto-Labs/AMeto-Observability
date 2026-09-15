@@ -1,6 +1,8 @@
 using System.Buffers;
+using System.Diagnostics;
 using MessagePack;
 using Ameto.Core;
+using Ameto.Query.Filtering;
 using Ameto.Storage;
 using Xunit;
 using Xunit.Abstractions;
@@ -74,6 +76,145 @@ public sealed class HotTierScanAllocProbe
             $"expected ≥4x reduction, got old={oldBytes} new={newBytes}");
     }
 
+    // ── Filtered page: header pushdown vs. materialise-then-filter ─────────────
+
+    private const int FilteredEvents = 200_000;
+
+    /// <summary>
+    /// A filtered page over a large tier. Without header pushdown every in-window hot
+    /// event is materialised (LogEvent + payload copy + pool lookups) only for the
+    /// evaluator to reject 99 % of them; with it, a filter the header can answer costs
+    /// one header read per rejected event and a materialisation per MATCH.
+    /// </summary>
+    [Theory]
+    [InlineData("@l = 'Error'")]
+    [InlineData("@tr = '0123456789abcdef0123456789abcdef'")]
+    [InlineData("service.name = 'Svc.B' and @l = 'Error'")]
+    [InlineData("@l = 'Error' and Route = '/api/pay'")]
+    public void FilteredPage_HeaderPushdown(string expression)
+    {
+        var pool = new StringInternPool();
+        using var hot = BuildFilteredTier(pool, FilteredEvents);
+        var frozen = Array.Empty<HotTierSegment>();
+        var filter = CompiledFilter.Compile(expression);
+
+        // The hot source exactly as QueryExecutor.HotEventsAsync consumes it: header
+        // scan, then the compiled filter per materialised event, first page only.
+        (long bytes, double ms, int matched) Run(bool pushdown)
+        {
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            var  sw     = Stopwatch.StartNew();
+            int  n      = 0;
+            foreach (var ev in HotTierScan.ReadSorted(
+                         hot, frozen, pool,
+                         long.MinValue, long.MaxValue, null, null, forward: false, levels: null,
+                         headerPredicate: pushdown ? filter.HeaderPredicate : null))
+            {
+                if (!filter.Matches(ev)) continue;
+                if (++n >= Page) break;
+            }
+            sw.Stop();
+            return (GC.GetAllocatedBytesForCurrentThread() - before, sw.Elapsed.TotalMilliseconds, n);
+        }
+
+        Run(false); Run(true);   // warm-up
+
+        var old = Run(false);
+        var neu = Run(true);
+        Assert.Equal(old.matched, neu.matched);
+
+        _out.WriteLine($"filter=\"{expression}\" events={FilteredEvents} page={Page} matched={neu.matched}");
+        _out.WriteLine($"no pushdown : {old.bytes / 1024.0:F1} KB, {old.ms:F2} ms");
+        _out.WriteLine($"pushdown    : {neu.bytes / 1024.0:F1} KB, {neu.ms:F2} ms  " +
+                       $"({(double)old.bytes / Math.Max(1, neu.bytes):F1}x less memory, {old.ms / Math.Max(0.001, neu.ms):F1}x faster)");
+
+        // Allocation must be proportional to the page, not to the rejected candidates.
+        Assert.True(neu.bytes * 4 < old.bytes,
+            $"expected ≥4x fewer bytes with pushdown, got old={old.bytes} new={neu.bytes}");
+    }
+
+    // ── Tail poll: zone map + lazy ordering ────────────────────────────────────
+
+    private const int TailEvents = 300_000;
+
+    /// <summary>
+    /// A live-tail poll: forward, cursor at the last ~1 % of the tier, one page. The old
+    /// scan walked every header twice and full-sorted the candidates; the zone map lets
+    /// it touch the chunks that can hold the window, and the page comes off a heap.
+    /// </summary>
+    [Fact]
+    public void TailPoll_TouchesOnlyChunksInWindow()
+    {
+        var pool = new StringInternPool();
+        using var hot = BuildFilteredTier(pool, TailEvents);
+        var frozen = Array.Empty<HotTierSegment>();
+
+        long baseTicks = hot.GetHeader(0).TimestampUtcTicks;
+        long cursorTs  = baseTicks + (long)(TailEvents * 0.99);
+        ulong cursorId = hot.GetHeader((int)(TailEvents * 0.99)).Id;
+
+        (long bytes, double ms, int n) Poll()
+        {
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            var  sw     = Stopwatch.StartNew();
+            int  n      = 0;
+            foreach (var ev in HotTierScan.ReadSorted(
+                         hot, frozen, pool,
+                         cursorTs, long.MaxValue, cursorTs, cursorId, forward: true, levels: null))
+            {
+                if (++n >= Page) break;
+            }
+            sw.Stop();
+            return (GC.GetAllocatedBytesForCurrentThread() - before, sw.Elapsed.TotalMilliseconds, n);
+        }
+
+        Poll(); Poll();   // warm-up
+        double bestMs = double.MaxValue; long bytes = 0; int n = 0;
+        for (int i = 0; i < 5; i++)
+        {
+            var r = Poll();
+            bestMs = Math.Min(bestMs, r.ms); bytes = r.bytes; n = r.n;
+        }
+        Assert.Equal(Page, n);
+        _out.WriteLine($"tail poll: events={TailEvents} page={Page} -> {bytes / 1024.0:F1} KB, best {bestMs:F3} ms");
+    }
+
+    /// <summary>1 % Error, three services round-robin, one event with a known trace id.</summary>
+    private static HotTierSegment BuildFilteredTier(StringInternPool pool, int events)
+    {
+        var hot = new HotTierSegment(events + 1, (long)events * 128 + 1024 * 1024);
+
+        int    tmplIdx = pool.Intern("HTTP request handled");
+        string tmpl    = pool.Get(tmplIdx);
+        int[]  svc     = [pool.Intern("Svc.A"), pool.Intern("Svc.B"), pool.Intern("Svc.C")];
+        long   baseTicks = DateTimeOffset.UtcNow.UtcTicks;
+
+        var buf = new ArrayBufferWriter<byte>(128);
+        for (int i = 0; i < events; i++)
+        {
+            buf.Clear();
+            var w = new MessagePackWriter(buf);
+            w.WriteMapHeader(2);
+            w.Write("OrderId"); w.Write((long)i);
+            w.Write("Route");   w.Write("/api/pay");
+            w.Flush();
+
+            var h = new LogEventHeader
+            {
+                Id                       = new EventId(0u, (uint)i).RawValue,
+                TimestampUtcTicks        = baseTicks + i,
+                Level                    = i % 100 == 7 ? Ameto.Core.LogLevel.Error : Ameto.Core.LogLevel.Information,
+                MessageTemplatePoolIndex = tmplIdx,
+                ServiceNamePoolIndex     = svc[i % 3],
+                TraceIdHi                = i == events / 2 ? 0x0123456789abcdefUL : 0,
+                TraceIdLo                = i == events / 2 ? 0x0123456789abcdefUL : 0,
+            };
+            Assert.True(hot.TryWrite(h, buf.WrittenSpan, tmpl));
+        }
+        hot.Freeze();
+        return hot;
+    }
+
     private static HotTierSegment BuildTier(StringInternPool pool)
     {
         var hot = new HotTierSegment(Events + 1, (long)Events * 512 + 1024 * 1024);
@@ -106,5 +247,82 @@ public sealed class HotTierScanAllocProbe
         }
         hot.Freeze();
         return hot;
+    }
+}
+
+public sealed class HotTierMaterialiseProbe
+{
+    private readonly ITestOutputHelper _out;
+    public HotTierMaterialiseProbe(ITestOutputHelper o) => _out = o;
+
+    /// <summary>Materialise every event of a 200k tier: the per-event cost of MaterialiseEvent (pool resolution included).</summary>
+    [Fact]
+    public void MaterialiseAll_PerEventCost()
+    {
+        var pool = new StringInternPool();
+        for (int i = 0; i < 2000; i++) pool.Intern("filler-" + i);   // a realistic pool, not a 3-entry one
+        using var hot = BuildTier(pool, 200_000);
+
+        double Run()
+        {
+            var sw = Stopwatch.StartNew();
+            int n = 0;
+            foreach (var ev in hot.ReadAll(pool)) if (ev.ServiceName is not null) n++;
+            sw.Stop();
+            Assert.Equal(200_000, n);
+            return sw.Elapsed.TotalMilliseconds;
+        }
+        Run(); Run();
+        double best = double.MaxValue;
+        for (int i = 0; i < 5; i++) best = Math.Min(best, Run());
+        _out.WriteLine($"materialise 200k: best {best:F1} ms = {best * 1e6 / 200_000:F0} ns/event");
+    }
+
+    private static HotTierSegment BuildTier(StringInternPool pool, int events)
+    {
+        var hot = new HotTierSegment(events + 1, (long)events * 64 + 1024 * 1024);
+        int[] tmpl = [pool.Intern("HTTP request handled"), pool.Intern("Order {OrderId} placed"), pool.Intern("Cache miss {Key}")];
+        int[] svc  = [pool.Intern("Svc.A"), pool.Intern("Svc.B"), pool.Intern("Svc.C")];
+        long  baseTicks = DateTimeOffset.UtcNow.UtcTicks;
+        var buf = new ArrayBufferWriter<byte>(64);
+        var w = new MessagePackWriter(buf); w.WriteMapHeader(1); w.Write("n"); w.Write(1L); w.Flush();
+        for (int i = 0; i < events; i++)
+        {
+            var h = new LogEventHeader
+            {
+                Id = new EventId(0u, (uint)i).RawValue, TimestampUtcTicks = baseTicks + i,
+                Level = Ameto.Core.LogLevel.Information,
+                MessageTemplatePoolIndex = tmpl[i % 3], ServiceNamePoolIndex = svc[i % 3],
+            };
+            // No template string attached: the pool is the source, as after WAL recovery / OTLP ingest.
+            Assert.True(hot.TryWrite(h, buf.WrittenSpan));
+        }
+        hot.Freeze();
+        return hot;
+    }
+}
+
+public sealed class HotTierChunkArrayProbe
+{
+    private readonly ITestOutputHelper _out;
+    public HotTierChunkArrayProbe(ITestOutputHelper o) => _out = o;
+
+    /// <summary>Managed bytes a tier allocates per 3-chunk fill with templates and exceptions attached (the per-chunk slot arrays).</summary>
+    [Fact]
+    public void ChunkSlotArrays_PerTierFill()
+    {
+        const int events = HotTierSegment.ChunkEventCapacity * 2 + 1;
+        var ex = new ExceptionInfo { Type = "T" };
+        long Round()
+        {
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            using var tier = new HotTierSegment(events + 1, 32L * 1024 * 1024);
+            for (int i = 0; i < events; i++)
+                Assert.True(tier.TryWrite(new LogEventHeader { TimestampUtcTicks = i, MessageTemplatePoolIndex = -1 }, ReadOnlySpan<byte>.Empty, "t", ex));
+            return GC.GetAllocatedBytesForCurrentThread() - before;
+        }
+        Round();
+        long bytes = Round();
+        _out.WriteLine($"3-chunk tier fill with templates+exceptions: {bytes / 1024.0:F1} KB managed allocated (steady state)");
     }
 }

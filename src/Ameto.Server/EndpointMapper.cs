@@ -494,6 +494,14 @@ public static class EndpointMapper
             long lastPollStamp = System.Diagnostics.Stopwatch.GetTimestamp() - System.Diagnostics.Stopwatch.Frequency;
             long lastFrameStamp = System.Diagnostics.Stopwatch.GetTimestamp();
 
+            // Per-CONNECTION, not per poll: the filter is the same text every time round,
+            // so it is compiled once and carried on each request (the executor checks the
+            // text matches before trusting it); the deadline's linked source and timer are
+            // re-armed per poll instead of rebuilt — a tail polls up to ten times a second.
+            var prepared = Ameto.Query.Filtering.CompiledFilter.Compile(filter);
+            using var deadline = guard.StartDeadline(ctx.RequestAborted);
+            deadline.Disarm();
+
             using var sse = new SseJsonWriter(ctx.Response.Body);
             try
             {
@@ -550,6 +558,7 @@ public static class EndpointMapper
                         AfterEventId        = cursor,
                         AfterTimestampTicks = cursorTs,
                         Levels              = levelSet,
+                        Prepared            = prepared,
                     };
 
                     int newCount = 0;
@@ -576,8 +585,20 @@ public static class EndpointMapper
                     {
                         // Bounded like any other search: an unfiltered forward poll over
                         // a wide window is a full-catalog scan, and without a budget it
-                        // would hold the slot it took for as long as that takes.
-                        using var deadline = guard.StartDeadline(ctx.RequestAborted);
+                        // would hold the slot it took for as long as that takes. A source
+                        // that cannot be re-armed is one the client's leaving cancelled, or
+                        // one the last budget cancelled — or has only queued the timer that
+                        // will: a budget that ran out in the instant between the poll
+                        // completing and Disarm, which neither the catch nor the post-poll
+                        // check below saw. TimedOut counts that refusal as the timeout it is,
+                        // so it is still owed the frame.
+                        if (!deadline.TryRearm())
+                        {
+                            if (deadline.TimedOut)
+                                await SafeErrorAsync(sse,
+                                    $"The live tail's poll exceeded its {guard.Timeout.TotalSeconds:0}s budget — narrow the filter.", ctx);
+                            break;
+                        }
                         try
                         {
                             await foreach (var ev in executor.ExecuteAsync(request, deadline.Token))
@@ -597,6 +618,7 @@ public static class EndpointMapper
                         // without this the throw would carry on out to the outer catch written
                         // for a plain disconnect, and the stream would simply stop instead.
                         catch (OperationCanceledException) when (deadline.TimedOut) { }
+                        deadline.Disarm();   // the budget is per poll: stop the clock while parked
                         if (deadline.TimedOut)
                         {
                             await SafeErrorAsync(sse,
