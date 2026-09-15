@@ -21,8 +21,9 @@ namespace Ameto.Core;
 /// under <c>DefaultIgnoreCondition.WhenWritingNull</c>. Field names carry explicit
 /// <c>JsonPropertyName</c>s over there, so the camelCase naming policy never applied to
 /// them and does not apply here either. The equality is pinned by
-/// <c>LogEventJsonParityTests</c>, which serialises the same events both ways and compares
-/// the bytes.</para>
+/// <c>LogEventJsonParityTests</c>, which serialises the same events both ways — through a
+/// frozen copy of the DTO road, which no stream in the server takes any more — compares the
+/// bytes, compares a live tail's whole stream frame for frame, and checks golden frames.</para>
 /// </summary>
 public static class LogEventJsonWriter
 {
@@ -131,9 +132,10 @@ public static class LogEventJsonWriter
     }
 
     /// <summary>
-    /// The already-materialised property map. Mirrors the server's DynamicObjectConverter
-    /// case for case — the concrete types <c>LogEventSerializer</c> produces — because both
-    /// shapes have to leave the same bytes on the wire.
+    /// The already-materialised property map. Mirrors the DynamicObjectConverter the DTO road
+    /// serialised through (gone from the server; its copy is kept beside the parity tests) case
+    /// for case — the concrete types <c>LogEventSerializer</c> produces — because both shapes
+    /// have to leave the same bytes on the wire.
     /// </summary>
     public static void WriteDynamicMap(Utf8JsonWriter writer, Dictionary<string, object?> map)
     {

@@ -16,9 +16,16 @@ namespace Ameto.Core;
 /// <see cref="WriteLogEventsAsync"/> for a whole query's worth. Both write straight from the
 /// event (no DTO, no reflection) and COALESCE: frames accumulate until 16 KB, until a row finds
 /// the oldest of them <see cref="MaxFrameHold"/> old, or until the source of the rows makes the
-/// caller wait. Every other frame here — the typed and reflected DTO overloads, keepalives, and
-/// the terminal done/query-error frames — is sent the moment it is composed, and carries any
-/// coalesced backlog out with it.</para>
+/// caller wait. Every other frame here — the DTO overload, keepalives, and the terminal
+/// done/query-error frames — is sent the moment it is composed, and carries any coalesced
+/// backlog out with it.</para>
+///
+/// <para>A ROW IS WRITTEN WHEN ITS FRAME IS IN THE BUFFER, not when it reaches the socket: from
+/// then on delivering it is this writer's job, and <see cref="RowsWritten"/>,
+/// <see cref="LastRowId"/> and <see cref="LastRowTimestampTicks"/> say how far that has got. A
+/// caller that pages by keyset (the live tail) continues from there, so a row whose send was
+/// refused — still buffered, and on its way out with the next frame — is never asked for, and
+/// written, a second time.</para>
 ///
 /// <para>NOTHING TOUCHES THE BODY BUT THE CALLER'S OWN CALL. Every send starts inside a public
 /// method and has ended, one way or the other, by the time that method's task completes. There
@@ -28,7 +35,7 @@ namespace Ameto.Core;
 /// call at a time — and that is the whole of the concurrency contract.</para>
 ///
 /// <para>THE BUFFER HOLDS WHOLE FRAMES ONLY, between any two calls. Every method that composes
-/// into it — the row frames, both DTO overloads, and the done and query-error frames — cuts a
+/// into it — the row frames, the DTO overload, and the done and query-error frames — cuts a
 /// frame that throws part-way back out (<see cref="DiscardFrameFrom"/>), so the frames buffered
 /// before it survive and the next frame never lands behind half a line. That is what lets every
 /// frame APPEND to the backlog, where each one used to reset the buffer before rows
@@ -113,6 +120,24 @@ public sealed class SseJsonWriter : IDisposable
     /// to non-empty. Meaningful only while the buffer holds something.
     /// </summary>
     private long _oldestFrameStamp;
+
+    /// <summary>
+    /// Log-event rows this writer has ACCEPTED — composed whole into its buffer — since it was
+    /// created. A row counts from that moment, whether or not a send has carried it out yet, and
+    /// a row that failed to compose (and was cut back out) never counts. The difference across a
+    /// query is how many rows that query wrote.
+    /// </summary>
+    public long RowsWritten { get; private set; }
+
+    /// <summary>
+    /// The id of the last row accepted; with <see cref="LastRowTimestampTicks"/>, the
+    /// (timestamp, id) keyset position a caller paging forward continues from. Meaningful once
+    /// <see cref="RowsWritten"/> is non-zero.
+    /// </summary>
+    public EventId LastRowId { get; private set; }
+
+    /// <summary>UTC ticks of the last row accepted; see <see cref="LastRowId"/>.</summary>
+    public long LastRowTimestampTicks { get; private set; }
 
     /// <param name="body">The response body to frame into — <c>ctx.Response.Body</c>.</param>
     public SseJsonWriter(Stream body)
@@ -212,6 +237,11 @@ public sealed class SseJsonWriter : IDisposable
     /// terminal frame, which sends the backlog with it). A caller that has a source rather than
     /// a row should hand the source to <see cref="WriteLogEventsAsync"/>, which also sends
     /// whenever the source makes it wait.</para>
+    ///
+    /// <para>A send refused before the body took anything leaves this frame buffered; it goes out
+    /// with the next frame, so a caller must not write it again after an
+    /// <see cref="OperationCanceledException"/>. The row counts in <see cref="RowsWritten"/>
+    /// either way.</para>
     /// </summary>
     public async ValueTask WriteLogEventAsync(LogEvent ev, CancellationToken ct)
     {
@@ -232,6 +262,13 @@ public sealed class SseJsonWriter : IDisposable
             DiscardFrameFrom(frameStart);
             throw;
         }
+
+        // Accepted: counted BEFORE the send below, which may be refused and leave the frame
+        // buffered. Counting after it would put a keyset caller's position in front of a row
+        // that is still going out, and its next page would write that row again.
+        RowsWritten++;
+        LastRowId             = ev.Id;
+        LastRowTimestampTicks = ev.Timestamp.UtcTicks;
 
         bool first = frameStart == 0;
         long now   = Stopwatch.GetTimestamp();
@@ -296,9 +333,18 @@ public sealed class SseJsonWriter : IDisposable
 
     /// <summary>
     /// Writes one <c>data:</c> frame with the DTO serialised through a SOURCE-GENERATED contract
-    /// and sends it, backlog and all. Prefer this overload for any stream that still goes out as
-    /// a DTO: it is the one that keeps the reflection-based metadata resolver out of the per-row
-    /// path, and out of the trimmed output.
+    /// and sends it, backlog and all — the door for any stream that still goes out as a DTO (the
+    /// trace streams), and the only one: it keeps the reflection-based metadata resolver out of
+    /// the per-row path, and out of the trimmed output.
+    ///
+    /// <para>A reflection overload used to sit beside this one for the log streams, whose DTO
+    /// carried <c>object</c>-typed property values a generated contract does not describe. Every
+    /// log stream now writes its rows through <see cref="WriteLogEventAsync"/>, and it went with
+    /// the last of them, the live tail.</para>
+    ///
+    /// <para>A send refused before the body took anything leaves this frame buffered; it goes out
+    /// with the next frame, so a caller must not write it again after an
+    /// <see cref="OperationCanceledException"/>.</para>
     /// </summary>
     public async Task WriteEventAsync<T>(T dto, JsonTypeInfo<T> typeInfo, CancellationToken ct)
     {
@@ -308,34 +354,6 @@ public sealed class SseJsonWriter : IDisposable
             _buffer.Write(DataPrefix);
             _json.Reset(_buffer);
             JsonSerializer.Serialize(_json, dto, typeInfo);
-            _buffer.Write(FrameSuffix);
-        }
-        catch
-        {
-            DiscardFrameFrom(frameStart);
-            throw;
-        }
-        await SendAsync(ct).ConfigureAwait(false);
-    }
-
-    /// <summary>
-    /// The reflection door, kept for callers that genuinely have no contract to hand over.
-    ///
-    /// <para>One does: the log streams serialise a DTO whose attribute values are <c>object</c>,
-    /// through a DynamicObjectConverter — a shape a generated contract does not describe, and
-    /// converting it is a change to the log path rather than to this one. Everything else should
-    /// take the <see cref="JsonTypeInfo{T}"/> overload above, which is why that one exists: when
-    /// this writer moved into Core it became the repo-wide SSE contract, and it offered no door
-    /// but this one, so every stream was structurally on the reflection resolver.</para>
-    /// </summary>
-    public async Task WriteEventAsync<T>(T dto, JsonSerializerOptions options, CancellationToken ct)
-    {
-        int frameStart = _buffer.WrittenCount;
-        try
-        {
-            _buffer.Write(DataPrefix);
-            _json.Reset(_buffer);
-            JsonSerializer.Serialize(_json, dto, options);
             _buffer.Write(FrameSuffix);
         }
         catch

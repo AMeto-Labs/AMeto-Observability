@@ -1,6 +1,5 @@
 using System.Globalization;
 using System.Text.Json;
-using System.Text.Json.Serialization;
 using Ameto.Core;
 using Ameto.Ingestion;
 using Ameto.Query;
@@ -12,18 +11,6 @@ namespace Ameto.Server;
 /// <summary>Wire all Ameto HTTP endpoints onto the application.</summary>
 public static class EndpointMapper
 {
-    // internal, not private: LogEventJsonParityTests serialises the same events through this
-    // and through LogEventJsonWriter and compares the bytes. Rebuilding an "equivalent" set of
-    // options in the test would let the two drift apart silently, which is the one thing the
-    // parity test exists to prevent.
-    internal static readonly JsonSerializerOptions _json = new()
-    {
-        PropertyNamingPolicy        = JsonNamingPolicy.CamelCase,
-        DefaultIgnoreCondition      = JsonIgnoreCondition.WhenWritingNull,
-        WriteIndented               = false,
-        Converters                  = { new DynamicObjectConverter() },
-    };
-
     public static void MapAmetoEndpoints(this WebApplication app)
     {        // ── Health ────────────────────────────────────────────────────────────
         app.MapGet("/health", () => Results.Ok(new { status = "ok", utc = DateTimeOffset.UtcNow }));
@@ -615,26 +602,50 @@ public static class EndpointMapper
                                     $"The live tail's poll exceeded its {guard.Timeout.TotalSeconds:0}s budget — narrow the filter.", ctx);
                             break;
                         }
+                        long rowsBefore = sse.RowsWritten;
                         try
                         {
-                            await foreach (var ev in executor.ExecuteAsync(request, deadline.Token))
-                            {
-                                await sse.WriteEventAsync(LogEventDto.From(ev), _json, deadline.Token);
-                                cursor   = (Ameto.Core.EventId?)ev.Id;
-                                cursorTs = ev.Timestamp.UtcTicks;
-                                newCount++;
-                            }
+                            // Straight from the event, as /api/events writes them: no DTO, no
+                            // reflection resolver, no Timestamp/Id/trace/span ToString per row,
+                            // and the rows of one poll share socket sends instead of taking one
+                            // each. The writer drives the enumerator, so the rows found so far go
+                            // out whenever the scan makes it wait (ScanPace), and a slow poll
+                            // shows each row about as soon as the per-row sends did.
+                            await sse.WriteLogEventsAsync(executor.ExecuteAsync(request, deadline.Token), deadline.Token);
+
+                            // THE POLL'S LAST ROWS GO OUT NOW. Coalesced rows left in the buffer
+                            // would otherwise wait for whatever the loop writes next — and the
+                            // next thing it does is park on the signal, so they would arrive with
+                            // the keepalive up to MaxWait later. Every wait in this loop (the
+                            // floor, the slot queue, the park) comes after this line, and every
+                            // road that skips it leaves the loop: through a query-error frame,
+                            // which carries the backlog out with it, or with no client left.
+                            await sse.FlushFramesAsync(deadline.Token);
                         }
                         // The executor ends its own scan by yielding when the budget expires,
                         // so the check below is normally reached with no exception at all. The
-                        // write does not end that way: the same token is handed to
-                        // Body.WriteAsync, and a client too slow to drain one frame turns the
-                        // expiry into a throw from the middle of the loop. Both endings are the
-                        // same timeout and both owe the client the terminal query-error below —
-                        // without this the throw would carry on out to the outer catch written
-                        // for a plain disconnect, and the stream would simply stop instead.
+                        // sends do not end that way: the same token is handed to Body.WriteAsync,
+                        // and a client too slow to drain a batch, or a scan step that goes
+                        // asynchronous after the budget ran out, turns the expiry into a throw.
+                        // Both endings are the same timeout and both owe the client the terminal
+                        // query-error below — without this the throw would carry on out to the
+                        // outer catch written for a plain disconnect, and the stream would simply
+                        // stop instead. A send the spent token refused before the body took
+                        // anything leaves its rows buffered, and that query-error carries them
+                        // out: nothing here writes them again.
                         catch (OperationCanceledException) when (deadline.TimedOut) { }
                         deadline.Disarm();   // the budget is per poll: stop the clock while parked
+
+                        // The cursor follows the WRITER, not the enumerator: it moves past every
+                        // row whose frame was accepted — a refused send's rows included, since
+                        // they are still on their way out — and past no row whose frame was not.
+                        newCount = (int)(sse.RowsWritten - rowsBefore);
+                        if (newCount > 0)
+                        {
+                            cursor   = sse.LastRowId;
+                            cursorTs = sse.LastRowTimestampTicks;
+                        }
+
                         if (deadline.TimedOut)
                         {
                             await SafeErrorAsync(sse,
@@ -987,159 +998,4 @@ public static class EndpointMapper
         Results.Json(
             new { error = $"The query exceeded its {guard.Timeout.TotalSeconds:0}s budget. Narrow the time range." },
             statusCode: StatusCodes.Status504GatewayTimeout);
-}
-
-// ── Dynamic object converter ──────────────────────────────────────────────────
-
-/// <summary>
-/// Serialises <c>object?</c> values stored in property dictionaries.
-/// Handles the concrete types produced by <see cref="LogEventSerializer"/>:
-/// nested dicts, arrays, primitives. Avoids the default ToString() fallback.
-/// </summary>
-internal sealed class DynamicObjectConverter : JsonConverter<object>
-{
-    public override object? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
-        => throw new NotSupportedException();
-
-    public override void Write(Utf8JsonWriter writer, object value, JsonSerializerOptions options)
-    {
-        switch (value)
-        {
-            case Dictionary<string, object?> d:
-                writer.WriteStartObject();
-                foreach (var (k, v) in d)
-                {
-                    writer.WritePropertyName(k);
-                    if (v is null) writer.WriteNullValue();
-                    else Write(writer, v, options);
-                }
-                writer.WriteEndObject();
-                break;
-            case object[] arr:
-                writer.WriteStartArray();
-                foreach (var item in arr)
-                {
-                    if (item is null) writer.WriteNullValue();
-                    else Write(writer, item, options);
-                }
-                writer.WriteEndArray();
-                break;
-            case string s:  writer.WriteStringValue(s);     break;
-            case bool b:    writer.WriteBooleanValue(b);    break;
-            case long l:    writer.WriteNumberValue(l);     break;
-            case int i:     writer.WriteNumberValue(i);     break;
-            case double d:  writer.WriteNumberValue(d);     break;
-            case float f:   writer.WriteNumberValue(f);     break;
-            case ulong u:   writer.WriteNumberValue(u);     break;
-            default:        writer.WriteStringValue(value.ToString()); break;
-        }
-    }
-}
-
-// ── DTO ───────────────────────────────────────────────────────────────────────
-
-/// <summary>
-/// JSON-serialisable view of a <see cref="LogEvent"/>.
-///
-/// <para>NOT the road the search takes any more — <c>/api/events</c> and the span/trace log
-/// lists write their rows straight from the event through <c>LogEventJsonWriter</c>. Two
-/// callers keep this alive, and they are the whole of it: the LIVE TAIL, whose loop belongs to
-/// another change and still serialises a DTO per row, and <c>LogEventJsonParityTests</c>, which
-/// compares the direct writer's bytes against this one's. The same goes for
-/// <see cref="EventProps"/>, <see cref="EventPropsConverter"/>, <see cref="ExceptionInfoDto"/>
-/// and <see cref="DynamicObjectConverter"/>: when the tail moves over, all of it goes, and the
-/// parity test goes with it.</para>
-/// </summary>
-internal sealed class LogEventDto
-{
-    [JsonPropertyName("@t")]            public string Timestamp       { get; init; } = "";
-    [JsonPropertyName("@mt")]           public string MessageTemplate { get; init; } = "";
-    [JsonPropertyName("@l")]            public string Level           { get; init; } = "";
-    [JsonPropertyName("@x")]            public ExceptionInfoDto? Exception { get; init; }
-    [JsonPropertyName("id")]            public string Id              { get; init; } = "";
-    [JsonPropertyName("@tr")]           public string? TraceId        { get; init; }
-    [JsonPropertyName("@sp")]           public string? SpanId         { get; init; }
-    [JsonPropertyName("service.name")]  public string? ServiceName    { get; init; }
-    [JsonPropertyName("props")]         public EventProps? Properties { get; init; }
-
-    public static LogEventDto From(LogEvent ev) => new()
-    {
-        Timestamp       = ev.Timestamp.ToString("O"),
-        MessageTemplate = ev.MessageTemplate,
-        Level           = ev.Level.ToSeqString(),
-        Exception       = ExceptionInfoDto.From(ev.Exception),
-        Id              = ev.Id.RawValue.ToString(),
-        TraceId         = TraceIdHelper.FormatTraceId(ev.TraceIdHi, ev.TraceIdLo),
-        SpanId          = TraceIdHelper.FormatSpanId(ev.SpanId),
-        ServiceName     = ev.ServiceName,
-        // Raw first: touching ev.Properties would materialise the dictionary this
-        // exists to avoid. Decoders that produce one directly still work.
-        Properties      = !ev.RawProperties.IsEmpty ? new EventProps(ev.RawProperties)
-                        : ev.Properties is { } map  ? new EventProps(map)
-                        : null,
-    };
-}
-
-/// <summary>
-/// The <c>props</c> payload as it reaches the serialiser: either the msgpack bytes the
-/// decoder carried through (written straight to JSON by <see cref="EventPropsConverter"/>)
-/// or an already-materialised dictionary.
-/// </summary>
-[JsonConverter(typeof(EventPropsConverter))]
-internal readonly struct EventProps
-{
-    public readonly ReadOnlyMemory<byte>         Raw;
-    public readonly Dictionary<string, object?>? Map;
-
-    public EventProps(ReadOnlyMemory<byte> raw)         { Raw = raw;     Map = null; }
-    public EventProps(Dictionary<string, object?> map)  { Raw = default; Map = map;  }
-}
-
-/// <summary>
-/// Writes <see cref="EventProps"/>. The msgpack branch skips the
-/// dictionary-then-reserialise round trip that dominated the log-scrolling profile;
-/// the dictionary branch delegates to <see cref="DynamicObjectConverter"/> so both
-/// produce identical JSON.
-/// </summary>
-internal sealed class EventPropsConverter : JsonConverter<EventProps>
-{
-    public override EventProps Read(ref Utf8JsonReader reader, Type t, JsonSerializerOptions o)
-        => throw new NotSupportedException();
-
-    public override void Write(Utf8JsonWriter writer, EventProps value, JsonSerializerOptions options)
-    {
-        if (!value.Raw.IsEmpty)
-        {
-            Ameto.Core.Serialization.MsgPackJsonTranscoder.WriteMap(writer, value.Raw);
-            return;
-        }
-        if (value.Map is { } map)
-        {
-            JsonSerializer.Serialize(writer, (object)map, options);
-            return;
-        }
-        writer.WriteStartObject();
-        writer.WriteEndObject();
-    }
-}
-
-/// <summary>JSON-serialisable view of an <see cref="ExceptionInfo"/> tree.</summary>
-internal sealed class ExceptionInfoDto
-{
-    [JsonPropertyName("type")]    public string  Type       { get; init; } = "";
-    [JsonPropertyName("message")] public string? Message    { get; init; }
-    [JsonPropertyName("stack")]   public string? StackTrace { get; init; }
-    [JsonPropertyName("inner")]   public ExceptionInfoDto? Inner { get; init; }
-
-    public static ExceptionInfoDto? From(ExceptionInfo? src)
-    {
-        if (src is null) return null;
-        return new ExceptionInfoDto
-        {
-            Type       = src.Type,
-            Message    = src.Message,
-            StackTrace = src.StackTrace,
-            Inner      = From(src.Inner),
-        };
-    }
 }

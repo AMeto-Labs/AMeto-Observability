@@ -200,10 +200,11 @@ public sealed class LogPageJsonProbe
     /// that exist only to be copied into the output and dropped;<br/>
     /// new — <c>LogEventJsonWriter</c> formatting straight into the output writer's buffer.</para>
     ///
-    /// <para>The DTO below is a LOCAL MIRROR of the server's, because Ameto.Perf does not
-    /// reference Ameto.Server. That the two roads emit the same bytes is not asserted here —
-    /// it is pinned against the real DTO by
-    /// <c>Ameto.Integration.Tests.LogEventJsonParityTests</c>; this probe only weighs them.</para>
+    /// <para>The DTO below is a LOCAL MIRROR of the one the server used to send, because Ameto.Perf
+    /// does not reference the integration tests, where the frozen copy of it lives. That the two
+    /// roads emit the same bytes is not asserted here — it is pinned against that copy, and golden
+    /// frames, by <c>Ameto.Integration.Tests.LogEventJsonParityTests</c>; this probe only weighs
+    /// them.</para>
     /// </summary>
     [Fact]
     public void DirectEventWriterBeatsDtoReflection()
@@ -314,8 +315,11 @@ public sealed class LogPageJsonProbe
                 (GC.GetAllocatedBytesForCurrentThread() - b0) / iters);
     }
 
-    /// <summary>A segment of fat events — the Office.API shape that hurts on this stand.</summary>
-    private static string BuildSegment(string dir)
+    /// <summary>
+    /// A segment of fat events — the Office.API shape that hurts on this stand. Internal so the
+    /// live-tail frame probe weighs the same rows.
+    /// </summary>
+    internal static string BuildSegment(string dir)
     {
         var pool = new StringInternPool();
         using var hot = new HotTierSegment(Events + 1, (long)Events * 4096 + (16L << 20));
@@ -373,10 +377,11 @@ public sealed class LogPageJsonProbe
 
 // ── local mirror of the server's SSE DTO ──────────────────────────────────────
 //
-// Ameto.Perf does not reference Ameto.Server, so the road being weighed is rebuilt here,
-// field for field and attribute for attribute. It is a MEASUREMENT fixture only: whether
-// the real DTO and LogEventJsonWriter agree on the bytes is settled in
-// Ameto.Integration.Tests.LogEventJsonParityTests, against the real one.
+// Ameto.Perf does not reference the integration tests, so the road being weighed is rebuilt
+// here, field for field and attribute for attribute. It is a MEASUREMENT fixture only (this
+// probe and LiveTailFrameProbe): whether the server's old DTO and LogEventJsonWriter agree on
+// the bytes is settled in Ameto.Integration.Tests.LogEventJsonParityTests, against the frozen
+// copy of it (LegacyDtoRoad) and golden frames.
 
 internal sealed class ProbeLogEventDto
 {

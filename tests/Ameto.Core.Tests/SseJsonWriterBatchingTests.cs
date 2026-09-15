@@ -1,4 +1,3 @@
-using System.Text.Json;
 using Ameto.Core;
 using static Ameto.Core.Tests.SseRows;
 
@@ -130,7 +129,7 @@ public sealed class SseJsonWriterBatchingTests
 
     public static TheoryData<string> FramesThatSend => new()
     {
-        "done", "done-with-ending", "query-error", "keepalive", "event-contract", "event-reflection",
+        "done", "done-with-ending", "query-error", "keepalive", "event-contract",
     };
 
     /// <summary>
@@ -175,10 +174,6 @@ public sealed class SseJsonWriterBatchingTests
                 break;
             case "event-contract":
                 await sse.WriteEventAsync(new ProbeDto { X = 1 }, ProbeContract, default);
-                marker = "data: {\"X\":1}\n\n";
-                break;
-            case "event-reflection":
-                await sse.WriteEventAsync(new ProbeDto { X = 1 }, new JsonSerializerOptions(), default);
                 marker = "data: {\"X\":1}\n\n";
                 break;
             default:
@@ -288,29 +283,26 @@ public sealed class SseJsonWriterBatchingTests
         Assert.EndsWith("\n\n", all);
     }
 
-    public static TheoryData<string> DtoRoads => new() { "contract", "reflection" };
-
     /// <summary>
-    /// A DTO FRAME THAT THROWS PART-WAY LEAVES NO FRAGMENT in front of the error frame. The live
-    /// tail still writes a DTO per row, and an OTLP double attribute of NaN — the mapper stores it
+    /// A DTO FRAME THAT THROWS PART-WAY LEAVES NO FRAGMENT in front of the error frame. The trace
+    /// streams still write a DTO per row, and a double of NaN — an OTLP attribute is stored
     /// unfiltered — makes the serialiser throw with <c>data: </c> already buffered. The handler's
     /// catch then writes query-error through this same writer. Without a rollback the client
     /// receives <c>data: event: query-error</c>: one <c>message</c> event of invalid JSON, a
-    /// query-error listener that never fires, and a tail that stops without a word. Before rows
+    /// query-error listener that never fires, and a stream that stops without a word. Before rows
     /// coalesced, every frame reset the buffer first and the error frame went out clean; that
     /// must still be what the client gets.
     /// </summary>
-    [Theory]
-    [MemberData(nameof(DtoRoads))]
-    public async Task A_dto_frame_that_throws_leaves_no_fragment_in_front_of_the_error_frame(string road)
+    [Fact]
+    public async Task A_dto_frame_that_throws_leaves_no_fragment_in_front_of_the_error_frame()
     {
         var body = new RecordingStream();
         using var sse = new SseJsonWriter(body);
 
-        await Assert.ThrowsAnyAsync<ArgumentException>(async () => await WriteProbeAsync(sse, road, double.NaN));
+        await Assert.ThrowsAnyAsync<ArgumentException>(async () => await WriteProbeAsync(sse, double.NaN));
         Assert.Equal(0, body.SendCount);
 
-        await sse.WriteErrorAsync("The live tail failed. See the server log for details.", default);
+        await sse.WriteErrorAsync("The trace search failed. See the server log for details.", default);
 
         string all = body.All();
         Assert.StartsWith("event: query-error\ndata: {\"error\":", all);
@@ -324,9 +316,8 @@ public sealed class SseJsonWriterBatchingTests
     /// frames and go out with the next one, and the DTO frame after the failure is framed as
     /// cleanly as if nothing had happened.
     /// </summary>
-    [Theory]
-    [MemberData(nameof(DtoRoads))]
-    public async Task A_dto_frame_that_throws_keeps_the_rows_before_it_and_the_frame_after_it_clean(string road)
+    [Fact]
+    public async Task A_dto_frame_that_throws_keeps_the_rows_before_it_and_the_frame_after_it_clean()
     {
         var body = new RecordingStream();
         using var sse = new SseJsonWriter(body);
@@ -336,8 +327,8 @@ public sealed class SseJsonWriterBatchingTests
         body.Clear();
         await sse.WriteLogEventAsync(Event(1), default);          // buffered
 
-        await Assert.ThrowsAnyAsync<ArgumentException>(async () => await WriteProbeAsync(sse, road, double.NaN));
-        await WriteProbeAsync(sse, road, 2);
+        await Assert.ThrowsAnyAsync<ArgumentException>(async () => await WriteProbeAsync(sse, double.NaN));
+        await WriteProbeAsync(sse, 2);
 
         Assert.Equal(1, body.SendCount);
         string sent = body.SendAt(0);
@@ -347,12 +338,8 @@ public sealed class SseJsonWriterBatchingTests
         Assert.EndsWith("}\n\ndata: {\"X\":2}\n\n", sent);
     }
 
-    private static async Task WriteProbeAsync(SseJsonWriter sse, string road, double x)
-    {
-        var dto = new ProbeDto { X = x };
-        if (road == "contract") await sse.WriteEventAsync(dto, ProbeContract, default);
-        else                    await sse.WriteEventAsync(dto, new JsonSerializerOptions(), default);
-    }
+    private static Task WriteProbeAsync(SseJsonWriter sse, double x)
+        => sse.WriteEventAsync(new ProbeDto { X = x }, ProbeContract, default);
 
     /// <summary>A row whose property bytes promise a two-pair msgpack map and carry one pair.</summary>
     private static LogEvent Broken() => new()
