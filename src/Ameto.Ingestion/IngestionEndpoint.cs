@@ -334,10 +334,12 @@ public sealed class IngestionEndpoint : IOtlpLogSink, LogEventSerializer.IClefBa
         // Intern hands back the pool's OWN instance, so the tier stores the shared string
         // rather than a per-event duplicate — and one dictionary probe does the work of two.
         int     tmplIdx = _pool.Intern(templateUtf8, out string canonicalTmpl); // -1 when empty
-        // null, not "", when there is no pooled template: the tier prefers the attached
-        // string over the pool and its ?? does not catch an empty one, so an empty string
-        // here would serve the event with no template at all.
-        string? tmpl    = tmplIdx >= 0 ? canonicalTmpl : null;
+        // Attach on CONTENT, not on the index. A full pool answers -1 with the template
+        // materialised in canonicalTmpl, and past that point the attached string is the only
+        // copy of it anywhere: the header says -1 and pool.Get(-1) is "". Keying this on
+        // tmplIdx >= 0 dropped @mt from every event ingested after saturation. Only an empty
+        // template attaches null — never "", which the tier would prefer over the pool.
+        string? tmpl    = canonicalTmpl.Length != 0 ? canonicalTmpl : null;
 
         return _ring.TryEnqueue(
             tsTicks, level, tmplIdx, tmpl, exception: null,
@@ -382,7 +384,7 @@ public sealed class IngestionEndpoint : IOtlpLogSink, LogEventSerializer.IClefBa
         // Intern returns the pool's own instance, so the hot tier shares one string per
         // template instead of retaining this event's copy (see TryIngest).
         int     tmplIdx  = _pool.Intern(templateUtf8, out string canonical); // -1 when empty
-        string? tmpl     = tmplIdx >= 0 ? canonical : null;   // see TryIngestRaw: never ""
+        string? tmpl     = canonical.Length != 0 ? canonical : null;   // see TryIngestRaw: kept past saturation, never ""
         int svcIdx  = _pool.Intern(serviceUtf8);                     // -1 when empty
 
         return _ring.TryEnqueue(
