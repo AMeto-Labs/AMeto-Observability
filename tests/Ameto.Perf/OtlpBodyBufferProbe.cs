@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Diagnostics;
 using Ameto.Core;
 using Xunit;
 using Xunit.Abstractions;
@@ -8,15 +9,19 @@ namespace Ameto.Perf;
 /// <summary>
 /// What the ingest receivers pay to get a buffer for one request body.
 ///
-/// <para>A batch of 1.4 MB rounds up to the 2 MiB bucket, and every OTLP/CLEF receiver rents
-/// one per request. <see cref="ArrayPool{T}.Shared"/> keeps one array per thread plus at most
-/// eight per core in each bucket and drops all of it on every gen2 collection, so past that
-/// depth each concurrent request gets a fresh, zeroed 2 MiB array straight on the large object
-/// heap. <see cref="IngestBufferPool"/> is deeper and is never trimmed.</para>
+/// <para>A batch of 1.4 MB rounds up to the 2 MiB bucket, and each OTLP receiver rents one per
+/// request. (The CLEF receiver still rents from <see cref="ArrayPool{T}.Shared"/>; moving it
+/// needs its rents and its returns changed together.) <see cref="ArrayPool{T}.Shared"/> keeps
+/// one array per thread plus at most eight per core in each bucket and drops all of it on
+/// every gen2 collection, so past that depth each concurrent request gets a fresh, zeroed
+/// 2 MiB array straight on the large object heap. <see cref="IngestBufferPool"/> is deeper,
+/// and is emptied only when the GC reports high memory load and at most once every
+/// <see cref="IngestBufferPool.MinTrimInterval"/>.</para>
 ///
 /// <para>Four numbers are printed and none of them is asserted on; the reasoning is at the
-/// assertion, and the claims that CAN be held still — the depth bound, the trim, and the rule
-/// that fires it — are the three facts below it.</para>
+/// place the assertion would have gone, and the claims that CAN be held still — the depth
+/// bound, the trim releasing what it held, the threshold rule and the interval between trims
+/// — are the facts below it.</para>
 /// </summary>
 public sealed class OtlpBodyBufferProbe
 {
@@ -60,13 +65,13 @@ public sealed class OtlpBodyBufferProbe
         // taken here, before that warm round existed, read 24-32 MB against 0 MB — real, and
         // real only because Shared was cold.
         //
-        // And IngestBufferPool is now emptied by a gen2 whenever the GC reports high memory
-        // load, so its steady-state allocation is a function of how loaded the host is. That is
-        // the behaviour asked for, and it is not something a test can hold still.
+        // And IngestBufferPool is now emptied by a gen2 when the GC reports high memory load
+        // (at most once every MinTrimInterval), so its steady-state allocation is a function of
+        // how loaded the host is and of where in that window the measurement lands. That is the
+        // behaviour asked for, and it is not something a test can hold still.
         //
-        // What IS asserted about this pool lives in the three facts above: the depth bound, the
-        // trim releasing what it held, and the rule that decides when to trim.
-        Assert.True(ownFlat >= 0 && sharedFlat >= 0);
+        // What IS asserted about this pool lives in the facts above: the depth bound, the trim
+        // releasing what it held, the threshold rule, and the interval between trims.
     }
 
     // ── What the pool is allowed to keep ──────────────────────────────────────
@@ -117,7 +122,31 @@ public sealed class OtlpBodyBufferProbe
     [InlineData(400, 200, true)]    // past it
     [InlineData(400,   0, false)]   // threshold unknown — never trim on a guess
     public void TrimTriggersOnTheGcsOwnHighLoadThreshold(long load, long threshold, bool expected)
-        => Assert.Equal(expected, IngestBufferPool.ShouldTrim(load, threshold));
+        => Assert.Equal(expected,
+            IngestBufferPool.ShouldTrim(load, threshold, Stopwatch.GetTimestamp(), lastTrimTimestamp: 0));
+
+    [Fact]
+    public void TrimWillNotFireAgainWithinItsInterval()
+    {
+        // Two gen2s a second apart under sustained load must trim ONCE. Without the gap the
+        // trim feeds itself: every gen2 empties the pool, the next gRPC request doubles
+        // 64 KB → 2 MB refilling it with ~4 MB of fresh large-object garbage, and that brings
+        // the following gen2 forward. The pool never gets past one refill, and the allocation
+        // it causes makes the pressure it is reacting to worse.
+        long first = Stopwatch.GetTimestamp();
+        Assert.True(IngestBufferPool.ShouldTrim(400, 200, first, lastTrimTimestamp: 0));
+
+        long oneSecondLater = first + Stopwatch.Frequency;
+        Assert.False(IngestBufferPool.ShouldTrim(400, 200, oneSecondLater, first));
+
+        // Still high load, but the window has passed: trim again.
+        long afterTheWindow = first + (long)((IngestBufferPool.MinTrimInterval.TotalSeconds + 1) * Stopwatch.Frequency);
+        Assert.True(IngestBufferPool.ShouldTrim(400, 200, afterTheWindow, first));
+
+        // The gap never turns a trim ON: below the threshold it stays false however long ago
+        // the last one was.
+        Assert.False(IngestBufferPool.ShouldTrim(100, 200, afterTheWindow, first));
+    }
 
     private static async Task<long> Measure(bool dedicated, bool gen2)
     {

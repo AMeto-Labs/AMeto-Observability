@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Diagnostics;
 
 namespace Ameto.Core;
 
@@ -26,10 +27,12 @@ namespace Ameto.Core;
 ///   [<see cref="MinArraysPerBucket"/>, <see cref="MaxArraysPerBucket"/>] — request
 ///   concurrency is bounded by cores far more tightly than by that ceiling, and the small
 ///   containers that cannot afford the memory are exactly the ones with few cores.</item>
-///   <item><see cref="Trim"/> runs at the end of a gen2 collection and empties the pool
-///   outright whenever the GC says memory load has passed its high threshold. Dropping the
-///   whole pool is the trim: the arrays become garbage in the collection that follows, and a
-///   pool that has to refill under pressure is the outcome worth having.</item>
+///   <item><see cref="Trim"/> runs after a gen2 collection and empties the pool outright when
+///   the GC says memory load has passed its high threshold — but at most once every
+///   <see cref="MinTrimInterval"/>, or the refill it causes drives the next collection and the
+///   pool never gets past one. Dropping the whole pool is the trim: the arrays become garbage
+///   in the collection that follows, and a pool that has to refill under pressure is the
+///   outcome worth having.</item>
 /// </list>
 /// <para>The arithmetic, stated plainly rather than flatteringly: a full set of buckets up
 /// to <see cref="MaxPooledBytes"/> is about <c>2 x MaxPooledBytes</c> = 16 MB, so the
@@ -93,17 +96,55 @@ public static class IngestBufferPool
     public static void Trim() => Volatile.Write(ref _pool, Create());
 
     /// <summary>
-    /// Whether the pool should be emptied: the GC's own high-memory-load threshold, which on a
-    /// container is a fraction of the cgroup limit rather than of the host's RAM. Public so the
-    /// rule can be tested against numbers instead of against a real memory shortage.
+    /// Shortest gap between two pressure trims.
+    ///
+    /// <para>Without a gap the trim feeds itself. Every gen2 under sustained load empties the
+    /// pool; the next gRPC request, which has no Content-Length and so doubles 64 KB → 2 MB,
+    /// then leaves about 4 MB of fresh large-object garbage refilling it; that brings the next
+    /// gen2 forward, which empties it again. The pool never gets past one refill and the whole
+    /// point of it is gone — while the allocation it causes makes the pressure worse. And the
+    /// signal is not always ours to believe: on a bare Windows host <c>MemoryLoadBytes</c> is
+    /// machine-wide, so one greedy neighbour would switch the pool off permanently.</para>
+    ///
+    /// <para>Thirty seconds is far longer than the interval between gen2 collections under
+    /// load and far shorter than an operator would wait to see memory come back.</para>
     /// </summary>
-    public static bool ShouldTrim(long memoryLoadBytes, long highLoadThresholdBytes)
-        => highLoadThresholdBytes > 0 && memoryLoadBytes >= highLoadThresholdBytes;
+    public static readonly TimeSpan MinTrimInterval = TimeSpan.FromSeconds(30);
 
+    /// <summary><see cref="Stopwatch"/> timestamp of the last pressure trim; 0 = never.</summary>
+    private static long _lastPressureTrim;
+
+    /// <summary>
+    /// Whether the pool should be emptied: the GC's own high-memory-load threshold — which on a
+    /// container is a fraction of the cgroup limit rather than of the host's RAM — and not
+    /// again for <see cref="MinTrimInterval"/> after the last time it was.
+    ///
+    /// <para>Public, and taking the clock rather than reading it, so the rule can be tested
+    /// against numbers instead of against a real memory shortage and a real wait.</para>
+    /// </summary>
+    /// <param name="nowTimestamp">A <see cref="Stopwatch.GetTimestamp"/> reading.</param>
+    /// <param name="lastTrimTimestamp">The reading taken at the last trim, or 0 for never.</param>
+    public static bool ShouldTrim(
+        long memoryLoadBytes, long highLoadThresholdBytes, long nowTimestamp, long lastTrimTimestamp)
+    {
+        if (highLoadThresholdBytes <= 0 || memoryLoadBytes < highLoadThresholdBytes) return false;
+        if (lastTrimTimestamp == 0) return true;
+        return nowTimestamp - lastTrimTimestamp >= (long)(MinTrimInterval.TotalSeconds * Stopwatch.Frequency);
+    }
+
+    /// <summary>
+    /// The gen2 hook. A manual <see cref="Trim"/> deliberately does NOT move the window — this
+    /// records only the trims the hysteresis is there to space out.
+    /// </summary>
     private static void TrimIfUnderPressure()
     {
         var info = GC.GetGCMemoryInfo();
-        if (ShouldTrim(info.MemoryLoadBytes, info.HighMemoryLoadThresholdBytes)) Trim();
+        long now = Stopwatch.GetTimestamp();
+        if (!ShouldTrim(info.MemoryLoadBytes, info.HighMemoryLoadThresholdBytes,
+                        now, Volatile.Read(ref _lastPressureTrim))) return;
+
+        Volatile.Write(ref _lastPressureTrim, now);
+        Trim();
     }
 
     /// <summary>
@@ -125,7 +166,9 @@ public static class IngestBufferPool
         ~Gen2GcCallback()
         {
             bool again;
-            // A throwing finaliser tears the process down, and this one runs inside a GC.
+            // An unhandled exception in a finaliser tears the process down, and nothing here is
+            // worth that. (This runs on the finaliser thread after the collection, not inside
+            // it, which is also why GC.GetGCMemoryInfo below reports the one that just ended.)
             try { again = _callback(); } catch { again = false; }
             if (again && !Environment.HasShutdownStarted) GC.ReRegisterForFinalize(this);
         }
