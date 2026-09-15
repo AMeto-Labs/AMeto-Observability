@@ -28,11 +28,17 @@ internal sealed class SegmentCatalog
     private readonly Lock                                          _buildLock = new();
     private volatile Snapshot?                                     _snapshot;
 
-    /// <summary>Segments sorted by MaxTimestampTicks descending, tagged with the version they reflect.</summary>
+    /// <summary>
+    /// Segments sorted by MaxTimestampTicks descending, tagged with the version they reflect.
+    /// <see cref="ReadOnly"/> is the view handed out for the unbounded window: the array is
+    /// shared by every reader of this version, so no caller may be able to cast its way to
+    /// a write into it.
+    /// </summary>
     private sealed class Snapshot(int version, SegmentInfo[] byMaxTsDesc)
     {
-        public readonly int           Version     = version;
-        public readonly SegmentInfo[] ByMaxTsDesc = byMaxTsDesc;
+        public readonly int                          Version     = version;
+        public readonly SegmentInfo[]                ByMaxTsDesc = byMaxTsDesc;
+        public readonly IReadOnlyList<SegmentInfo>   ReadOnly    = Array.AsReadOnly(byMaxTsDesc);
     }
 
     // ── Map surface (unchanged signatures) ────────────────────────────────────
@@ -79,8 +85,9 @@ internal sealed class SegmentCatalog
     /// </summary>
     public IReadOnlyList<SegmentInfo> GetOverlapping(long fromTicks, long toTicks)
     {
-        var sorted = Sorted();
-        if (fromTicks == long.MinValue && toTicks == long.MaxValue) return sorted;
+        var snap   = Sorted();
+        if (fromTicks == long.MinValue && toTicks == long.MaxValue) return snap.ReadOnly;
+        var sorted = snap.ByMaxTsDesc;
 
         int n = 0;
         for (int i = 0; i < sorted.Length; i++)
@@ -100,17 +107,17 @@ internal sealed class SegmentCatalog
         return result;
     }
 
-    private SegmentInfo[] Sorted()
+    private Snapshot Sorted()
     {
         var snap = _snapshot;
         int v    = Volatile.Read(ref _version);
-        if (snap is not null && snap.Version == v) return snap.ByMaxTsDesc;
+        if (snap is not null && snap.Version == v) return snap;
 
         lock (_buildLock)
         {
             snap = _snapshot;
             v    = Volatile.Read(ref _version);      // re-read UNDER the lock, before the walk
-            if (snap is not null && snap.Version == v) return snap.ByMaxTsDesc;
+            if (snap is not null && snap.Version == v) return snap;
 
             var arr = new SegmentInfo[_map.Count];
             int n   = 0;
@@ -121,8 +128,9 @@ internal sealed class SegmentCatalog
             }
             if (n != arr.Length) Array.Resize(ref arr, n);
             arr.AsSpan().Sort(default(ByMaxTsDescStable));
-            _snapshot = new Snapshot(v, arr);
-            return arr;
+            var built = new Snapshot(v, arr);
+            _snapshot = built;
+            return built;
         }
     }
 

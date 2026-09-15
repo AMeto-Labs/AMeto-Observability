@@ -525,6 +525,10 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
             // Hand the managed slot arrays back. Nobody can still be reading them: the
             // engine disposes a tier only once every reader snapshot that captured it is
             // gone (_activeReaders == 0) and the flush that read it has published.
+            // Cleared on return as well as on rent — deliberately, not redundantly: a
+            // returned array sits in the pool for an unbounded time, and uncleared it would
+            // keep up to 16 384 exception objects (stack traces, KB each) of a tier that
+            // has already flushed reachable for exactly that long.
             if (_chunkTemplates[i] is { } t)
             {
                 _chunkTemplates[i] = null;

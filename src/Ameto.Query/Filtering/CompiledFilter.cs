@@ -108,7 +108,7 @@ public sealed class CompiledFilter : IPreparedFilter
                   && BuiltinFields.TryResolve(idCmp.Property, out var idField)
                   && (idField is BuiltinField.TraceId or BuiltinField.SpanId)
                   && TryParseIdLiteral(idText, idField == BuiltinField.SpanId, out ulong hi, out ulong lo):
-                return new TraceIdCompareNode(idCmp.Op, idField == BuiltinField.SpanId, hi, lo, idCmp.Property, idText);
+                return new TraceIdCompareNode(idCmp.Op, idField == BuiltinField.SpanId, hi, lo, idCmp.Property);
 
             case AndNode and:
             {
@@ -225,10 +225,10 @@ public sealed class CompiledFilter : IPreparedFilter
                 val = cmp.Value;
                 return true;
 
-            // The same hint the CompareNode it replaced would have given.
+            // The hint the CompareNode it replaced would have given, in the index's spelling.
             case TraceIdCompareNode { Op: CompareOp.Eq } tid:
                 if (!TryBloomHintKey(tid.Property, out prop)) { prop = string.Empty; return false; }
-                val = tid.Literal;
+                val = tid.Canonical;
                 return true;
 
             case LevelNode lvl:
@@ -477,7 +477,7 @@ public sealed class CompiledFilter : IPreparedFilter
                 if (TryIndexKey(cmp.Property, out string cmpKey)) out_.Add((cmpKey, cmp.Value));
                 break;
             case TraceIdCompareNode { Op: CompareOp.Eq } tid:
-                if (TryIndexKey(tid.Property, out string tidKey)) out_.Add((tidKey, tid.Literal));
+                if (TryIndexKey(tid.Property, out string tidKey)) out_.Add((tidKey, tid.Canonical));
                 break;
             case LevelNode lvl:
                 out_.Add((ClefFields.Level, lvl.Level.ToSeqString()));

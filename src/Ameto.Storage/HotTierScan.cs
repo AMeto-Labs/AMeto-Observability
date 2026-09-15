@@ -38,9 +38,12 @@ public static class HotTierScan
         IReadOnlySet<Ameto.Core.LogLevel>? levels,
         IHotHeaderPredicate? headerPredicate = null)
     {
-        var (buf, n) = Collect(current, frozen, pool, fromTicks, toTicks, afterTsTicks, afterIdRaw, forward, levels, headerPredicate);
+        // Rented here, inside the frame the finally below protects, so a throw anywhere in
+        // the collection (the predicate, a growth) still returns it.
+        var buf = ArrayPool<Candidate>.Shared.Rent(256);
         try
         {
+            int n = Collect(current, frozen, pool, fromTicks, toTicks, afterTsTicks, afterIdRaw, forward, levels, headerPredicate, ref buf);
             if (n == 0) yield break;
 
             // Min-heap in the requested order: the next event to yield is always at the
@@ -93,14 +96,15 @@ public static class HotTierScan
     /// over a large window ends with a small array, a wide unfiltered one with at most
     /// 2n slots, and neither leaves a multi-MB list for the GC on every poll.
     /// </summary>
-    private static (Candidate[] Buffer, int Count) Collect(
+    private static int Collect(
         HotTierSegment current,
         IReadOnlyList<HotTierSegment> frozen,
         StringInternPool? pool,
         long fromTicks, long toTicks,
         long? afterTs, ulong? afterId, bool forward,
         IReadOnlySet<Ameto.Core.LogLevel>? levels,
-        IHotHeaderPredicate? pred)
+        IHotHeaderPredicate? pred,
+        ref Candidate[] buf)
     {
         var scan = new ScanState(pool, fromTicks, toTicks, afterTs, afterId, forward, levels, pred);
 
@@ -115,15 +119,12 @@ public static class HotTierScan
             else         { if (cursor < zoneTo)   zoneTo   = cursor; }
         }
 
-        var buf = ArrayPool<Candidate>.Shared.Rent(256);
-        int n   = 0;
-
+        int n = 0;
         int nFrozen = frozen.Count;
         for (int t = 0; t < nFrozen; t++)
             CollectTier(frozen[t], t, ref scan, zoneFrom, zoneTo, ref buf, ref n);
         CollectTier(current, nFrozen, ref scan, zoneFrom, zoneTo, ref buf, ref n);
-
-        return (buf, n);
+        return n;
     }
 
     private static void CollectTier(

@@ -135,6 +135,23 @@ public sealed class HotHeaderPushdownTests : IDisposable
         Assert.Equal(TraceA, v);
     }
 
+    [Theory]
+    [InlineData("@tr", "0123456789ABCDEF0123456789ABCDEF", "0123456789abcdef0123456789abcdef")]
+    [InlineData("@tr", "0123456789AbCdEf0123456789aBcDeF", "0123456789abcdef0123456789abcdef")]
+    [InlineData("@sp", "00000000000000AA",                 "00000000000000aa")]
+    public void Trace_id_hints_are_emitted_in_the_index_spelling_whatever_case_the_user_typed(
+        string field, string typed, string canonical)
+    {
+        // The index files ids as lowercase hex; the hint must be that spelling, not the
+        // user's, so the posting-list lookup and the bloom probe see the value stored.
+        var f = CompiledFilter.Compile($"{field} = '{typed}'");
+        var hints = f.GetInvertedHints();
+        Assert.Single(hints);
+        Assert.Equal(canonical, hints[0].value);
+        Assert.True(f.TryGetIndexHint(out _, out var bloom));
+        Assert.Equal(canonical, bloom);
+    }
+
     private List<ulong> Run(CompiledFilter filter, bool pushdown, bool forward)
     {
         var ids = new List<ulong>();

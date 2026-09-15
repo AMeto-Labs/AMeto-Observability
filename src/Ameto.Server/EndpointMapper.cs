@@ -586,12 +586,15 @@ public static class EndpointMapper
                         // Bounded like any other search: an unfiltered forward poll over
                         // a wide window is a full-catalog scan, and without a budget it
                         // would hold the slot it took for as long as that takes. A source
-                        // that cannot be re-armed is one already cancelled — the client is
-                        // gone (the loop condition ends it) or the last budget expired
-                        // after its poll (reported below, as a timeout).
+                        // that cannot be re-armed is one already cancelled: the client is
+                        // gone, or the last budget fired in the instant between its poll
+                        // completing and Disarm — that one is still owed the timeout frame.
                         if (!deadline.TryRearm())
                         {
-                            if (!deadline.TimedOut) break;
+                            if (deadline.TimedOut)
+                                await SafeErrorAsync(sse,
+                                    $"The live tail's poll exceeded its {guard.Timeout.TotalSeconds:0}s budget — narrow the filter.", ctx);
+                            break;
                         }
                         try
                         {

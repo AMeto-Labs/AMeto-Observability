@@ -99,21 +99,25 @@ public sealed class TraceIdCompareNode : FilterNode
     public ulong     Lo     { get; }
 
     /// <summary>
-    /// The property spelling and literal of the <see cref="CompareNode"/> this replaced, so
-    /// the index-hint builders emit exactly the hint the original would have — the cold
-    /// prefilter still prunes segments by the <c>@tr</c> posting list.
+    /// The property spelling of the <see cref="CompareNode"/> this replaced and the
+    /// CANONICAL rendering of its literal (lowercase hex, the spelling
+    /// <c>SegmentIndexBuilder</c> files under), so the index-hint builders emit the value
+    /// the posting list and bloom actually hold — the cold prefilter still prunes
+    /// segments by the <c>@tr</c> posting list, whatever case the user typed.
     /// </summary>
-    public string    Property { get; }
-    public string    Literal  { get; }
+    public string    Property  { get; }
+    public string    Canonical { get; }
 
-    public TraceIdCompareNode(CompareOp op, bool isSpan, ulong hi, ulong lo, string property, string literal)
+    public TraceIdCompareNode(CompareOp op, bool isSpan, ulong hi, ulong lo, string property)
     {
-        Op       = op;
-        IsSpan   = isSpan;
-        Hi       = hi;
-        Lo       = lo;
-        Property = property;
-        Literal  = literal;
+        Op        = op;
+        IsSpan    = isSpan;
+        Hi        = hi;
+        Lo        = lo;
+        Property  = property;
+        Canonical = isSpan
+            ? Ameto.Core.TraceIdHelper.FormatSpanId(lo) ?? new string('0', 16)
+            : Ameto.Core.TraceIdHelper.FormatTraceId(hi, lo) ?? new string('0', 32);
     }
 }
 

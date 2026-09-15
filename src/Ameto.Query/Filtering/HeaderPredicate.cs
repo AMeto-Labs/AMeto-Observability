@@ -53,7 +53,12 @@ internal sealed class HeaderPredicate : IHotHeaderPredicate
         _serviceLeaves = serviceLeaves;
     }
 
-    /// <summary>Levels the AND-chain admits, or null when it constrains none.</summary>
+    /// <summary>
+    /// Levels the AND-chain admits, or null when it constrains none. Exact for the six
+    /// level bytes ingest can produce (0..5); as a <c>levels</c> allow-list it would reject
+    /// a byte outside the enum that the evaluator renders as "Information" — such a byte
+    /// cannot arrive from the wire (levels are parsed by name), only from a corrupt file.
+    /// </summary>
     public HashSet<LogLevel>? DerivedLevels
     {
         get
@@ -70,10 +75,11 @@ internal sealed class HeaderPredicate : IHotHeaderPredicate
 
     public bool MayMatch(in LogEventHeader header)
     {
-        // A level byte outside the enum is not one the mask speaks for: leave it to the
-        // evaluator rather than guess.
+        // A level byte outside the enum renders as "Information" (LogLevelExtensions
+        // .ToSeqString's default), so that is the bit the evaluator's answer lives in.
         int lvl = (byte)header.Level;
-        if (lvl < LevelCount && ((_levelMask >> lvl) & 1) == 0) return false;
+        if (lvl >= LevelCount) lvl = (int)LogLevel.Information;
+        if (((_levelMask >> lvl) & 1) == 0) return false;
 
         var tests = _idTests;
         for (int i = 0; i < tests.Length; i++)
