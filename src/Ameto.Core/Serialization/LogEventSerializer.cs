@@ -633,20 +633,77 @@ public static class LogEventSerializer
     /// </summary>
     /// <returns>True when the key was present; <paramref name="value"/> is then its decoded value.</returns>
     public static bool TryReadProperty(ReadOnlyMemory<byte> map, ReadOnlySpan<char> key, out object? value)
-        => Probe(map, key, decode: true, out value, out _);
+        => Probe(map, key, ProbeWant.Decode, out value, out _, default, out _, out _, out _);
 
     /// <summary>
     /// Presence of a key WITHOUT decoding its value — used where only "is there anything
     /// under this name" matters, so a nested subtree is never built just to be discarded.
     /// </summary>
     public static bool HasProperty(ReadOnlyMemory<byte> map, ReadOnlySpan<char> key, out bool isNil)
-        => Probe(map, key, decode: false, out _, out isNil);
+        => Probe(map, key, ProbeWant.Presence, out _, out isNil, default, out _, out _, out _);
+
+    /// <summary>
+    /// A string-valued property decoded straight into the CALLER'S buffer — no string, no box,
+    /// nothing on the heap at all.
+    ///
+    /// <para>This is what a text predicate wants per scanned event. <see cref="TryReadProperty"/>
+    /// already avoided building the whole map, but it still handed back <c>object?</c>, so every
+    /// candidate event a <c>like '%…%'</c> touched allocated one string for the value and threw
+    /// it away — ~62 B per event, per predicate, on a scan that evaluates hundreds of thousands
+    /// of them to return a few hundred rows.</para>
+    ///
+    /// <para>Deliberately narrow. It answers only for a top-level key whose value is a msgpack
+    /// STRING that fits <paramref name="destination"/>; an array, a nested map, a number and an
+    /// over-long value all return false with <paramref name="keyPresent"/> telling the caller
+    /// which it was, so the caller can fall back to the general road for the first three and
+    /// stop immediately for a key the event does not carry. The last-wins duplicate-key rule is
+    /// the one walk below, shared with every other probe, so the two can never disagree.</para>
+    /// </summary>
+    /// <param name="destination">Buffer the value's UTF-16 characters are written into.</param>
+    /// <param name="charsWritten">Length of the value in <paramref name="destination"/>.</param>
+    /// <param name="keyPresent">
+    /// True when the key WAS on the event, whatever its value turned out to be. False is a
+    /// positive statement — this event does not carry the key — so a caller that has already
+    /// established the key is a plain top-level name needs no second lookup to answer null.
+    /// </param>
+    public static bool TryReadPropertyText(
+        ReadOnlyMemory<byte> map, ReadOnlySpan<char> key,
+        Span<char> destination, out int charsWritten, out bool keyPresent)
+        => Probe(map, key, ProbeWant.Text, out _, out _, destination, out charsWritten, out _, out keyPresent);
+
+    /// <summary>
+    /// A numeric property as a <see cref="double"/> without the box <see cref="TryReadProperty"/>
+    /// would hand back. Integers, unsigned integers and floats all answer; anything else returns
+    /// false and leaves the caller on the general road.
+    /// </summary>
+    /// <param name="keyPresent">As for <see cref="TryReadPropertyText"/>.</param>
+    public static bool TryReadPropertyNumber(
+        ReadOnlyMemory<byte> map, ReadOnlySpan<char> key, out double number, out bool keyPresent)
+        => Probe(map, key, ProbeWant.Number, out _, out _, default, out _, out number, out keyPresent);
+
+    /// <summary>What the caller wants out of the one walk below.</summary>
+    private enum ProbeWant : byte
+    {
+        /// <summary>Is the key there at all (and is its value nil)?</summary>
+        Presence,
+        /// <summary>Decode the value to <c>object?</c>, boxing as the dictionary would.</summary>
+        Decode,
+        /// <summary>Write a string value into the caller's char buffer.</summary>
+        Text,
+        /// <summary>Read a numeric value as a double.</summary>
+        Number,
+    }
 
     private static bool Probe(
-        ReadOnlyMemory<byte> map, ReadOnlySpan<char> key, bool decode, out object? value, out bool isNil)
+        ReadOnlyMemory<byte> map, ReadOnlySpan<char> key, ProbeWant want,
+        out object? value, out bool isNil,
+        Span<char> destination, out int charsWritten, out double number, out bool keyPresent)
     {
-        value = null;
-        isNil = false;
+        value        = null;
+        isNil        = false;
+        charsWritten = 0;
+        number       = 0;
+        keyPresent   = false;
         if (map.IsEmpty) return false;
 
         int byteCount = Encoding.UTF8.GetByteCount(key);
@@ -694,8 +751,64 @@ public static class LogEventSerializer
 
             if (found)
             {
-                if (decode) value = ReadDynamic(ref hit);
-                return true;
+                keyPresent = true;
+                switch (want)
+                {
+                    case ProbeWant.Decode:
+                        value = ReadDynamic(ref hit);
+                        return true;
+
+                    case ProbeWant.Text:
+                        // Only a msgpack string answers here, and only when it fits. Anything
+                        // else leaves keyPresent true and the result false, which is the
+                        // caller's signal to take the general road rather than to conclude the
+                        // event has no such property.
+                        if (hit.NextMessagePackType != MessagePackType.String) return false;
+                        if (!hit.TryReadStringSpan(out ReadOnlySpan<byte> utf8))
+                        {
+                            // Defensive: properties arrive as one contiguous buffer, so a value
+                            // that spans segments does not occur here. Hand it to the caller's
+                            // fallback rather than growing a second decode path for it.
+                            return false;
+                        }
+                        // ONE pass, not two: GetCharCount followed by GetChars walks the bytes
+                        // twice to answer a question the transcode answers on its own. Utf8
+                        // .ToUtf16 reports DestinationTooSmall instead, which is the "it does
+                        // not fit, use the general road" answer this method already owes its
+                        // caller. Nothing is written into `destination` that the caller can
+                        // see, because a false return means charsWritten stays 0.
+                        var status = System.Text.Unicode.Utf8.ToUtf16(
+                            utf8, destination, out _, out int chars, replaceInvalidSequences: true);
+                        if (status != System.Buffers.OperationStatus.Done) return false;
+                        charsWritten = chars;
+                        return true;
+
+                    case ProbeWant.Number:
+                        switch (hit.NextMessagePackType)
+                        {
+                            case MessagePackType.Integer:
+                                // Mirrors ReadInteger: only a true uint64 above long.MaxValue
+                                // is read unsigned, so the value is the one the boxing road
+                                // would have produced, converted the same way.
+                                if (hit.NextCode == MessagePackCode.UInt64)
+                                {
+                                    ulong u = hit.ReadUInt64();
+                                    number = u <= (ulong)long.MaxValue ? (long)u : u;
+                                }
+                                else number = hit.ReadInt64();
+                                return true;
+
+                            case MessagePackType.Float:
+                                number = hit.ReadDouble();
+                                return true;
+
+                            default:
+                                return false;
+                        }
+
+                    default:                       // ProbeWant.Presence
+                        return true;
+                }
             }
         }
         catch { /* malformed map — same answer as the full deserialiser: nothing */ }

@@ -11,13 +11,60 @@ namespace Ameto.Query.Filtering;
 /// <summary>
 /// Evaluates a compiled <see cref="FilterNode"/> AST against a single <see cref="LogEvent"/>.
 ///
-/// All evaluation is zero-allocation where possible — comparisons operate on boxed
-/// values from the event's Properties dictionary (already heap-allocated).
+/// <para>This runs once per CANDIDATE event, not once per returned row, so the per-event
+/// allocation is the number that matters. The common shapes — a text or numeric predicate on a
+/// plain top-level property — are read straight out of the event's msgpack into stack scratch
+/// and allocate nothing at all (see <c>CanProbeUserValue</c>). Everything the probe declines
+/// falls back to <c>GetValue</c>, which decodes the value to <c>object?</c> and therefore boxes
+/// numbers and builds a string per string; a property already materialised into the event's
+/// dictionary takes that road too, since the dictionary is then the cheaper answer.</para>
 /// </summary>
 public static class FilterEvaluator
 {
     /// <summary>Returns true if <paramref name="ev"/> matches the filter.</summary>
+    ///
+    /// <remarks>
+    /// Dispatch is a jump table on <see cref="FilterNode.DispatchKind"/>, not a chain of type tests.
+    /// The switch below covers the shapes a log query produces in bulk; everything else falls
+    /// through to <see cref="MatchesRare"/>, which is the fifty-arm type switch and stays the
+    /// single place that knows how to evaluate the function predicates. A node type that is not
+    /// tagged is therefore evaluated correctly, just without the shortcut — see
+    /// <see cref="NodeKind"/>.
+    /// </remarks>
     public static bool Matches(FilterNode filter, LogEvent ev)
+    {
+        switch (filter.DispatchKind)
+        {
+            case NodeKind.MatchAll:    return true;
+            case NodeKind.And:         var and = (AndNode)filter;
+                                       return Matches(and.Left, ev) && Matches(and.Right, ev);
+            case NodeKind.Or:          var or  = (OrNode)filter;
+                                       return Matches(or.Left, ev)  || Matches(or.Right, ev);
+            case NodeKind.Not:         return !Matches(((NotNode)filter).Operand, ev);
+            case NodeKind.Level:       return ev.Level == ((LevelNode)filter).Level;
+            case NodeKind.Has:         return HasProperty(ev, ((HasNode)filter).Property);
+            case NodeKind.IsDefined:   return HasProperty(ev, ((IsDefinedNode)filter).Property);
+            case NodeKind.Compare:     return EvalCompare((CompareNode)filter, ev);
+            case NodeKind.TimeCompare: return EvalTimeCompare((TimeCompareNode)filter, ev);
+            case NodeKind.TraceIdCompare:
+                                       return EvalTraceIdCompare((TraceIdCompareNode)filter, ev);
+            case NodeKind.Like:        return EvalLike((LikeNode)filter, ev);
+            case NodeKind.StartsWith:  return EvalStartsWith((StartsWithNode)filter, ev);
+            case NodeKind.Contains:    return EvalContains((ContainsNode)filter, ev);
+            case NodeKind.EndsWith:    return EvalEndsWith((EndsWithNode)filter, ev);
+            case NodeKind.In:          return EvalIn((InNode)filter, ev);
+            case NodeKind.FreeText:    return EvalFreeText((FreeTextNode)filter, ev);
+            default:                   return MatchesRare(filter, ev);
+        }
+    }
+
+    /// <summary>
+    /// The function predicates — everything the tagged switch above does not shortcut. Kept as
+    /// a type switch on purpose: these are dozens of one-off shapes, each already an order of
+    /// magnitude more expensive than the dispatch that finds it, and one list of them is easier
+    /// to keep true than two.
+    /// </summary>
+    private static bool MatchesRare(FilterNode filter, LogEvent ev)
     {
         return filter switch
         {
@@ -75,9 +122,39 @@ public static class FilterEvaluator
             RegexExtractCompareNode rxe   => EvalRegexExtract(rxe, ev),
             InNode inNode                 => EvalIn(inNode, ev),
             FreeTextNode ft               => EvalFreeText(ft, ev),
-            _                             => false,
+            // A node type NEITHER tagged nor listed above.
+            _                             => UnhandledNode(filter),
         };
     }
+
+    /// <summary>
+    /// A node the evaluator cannot answer for THROWS, in every build configuration.
+    ///
+    /// <para>"Matches nothing, ever" is the most expensive silence a filter has: the query
+    /// returns less than it should and nothing anywhere says why. This used to be a
+    /// <c>Debug.Fail</c> followed by <c>return false</c>, which was the wrong shape in both
+    /// configurations. Release — where CI and every deployment run — compiled the assertion
+    /// out and kept the silence. A Debug server (<c>dotnet run</c>) turned it into a FailFast
+    /// that killed the process. A throw is what every caller already knows how to report: the
+    /// search stream ends in a <c>query-error</c> frame and the server log names the type.</para>
+    ///
+    /// <para><c>FilterEvaluatorCompletenessTests</c> walks every concrete
+    /// <see cref="FilterNode"/> through here, so a node that loses its arm fails the build's
+    /// tests rather than a user's query.</para>
+    /// </summary>
+    [System.Diagnostics.CodeAnalysis.DoesNotReturn]
+    private static bool UnhandledNode(FilterNode node) =>
+        throw new UnhandledFilterNodeException(node.GetType());
+
+    /// <summary>
+    /// Thrown by <see cref="UnhandledNode"/>, and by nothing else. A type of its own, rather
+    /// than a message to match, so the completeness test can tell "this node has no arm" from
+    /// whatever an arm throws when it meets a node built without its constructor. Rewording the
+    /// message cannot make that test quietly stop finding anything.
+    /// </summary>
+    internal sealed class UnhandledFilterNodeException(Type nodeType)
+        : NotSupportedException(
+            $"FilterEvaluator has no arm for {nodeType.Name}, so it cannot say whether an event matches it.");
 
     // ── Free-text search ────────────────────────────────────────────────────────
 
@@ -243,6 +320,65 @@ public static class FilterEvaluator
         return ReadFlatKeyOrNull(ev, prop);
     }
 
+    // ── The unboxed road for a plain top-level property ───────────────────────
+
+    /// <summary>
+    /// Longest property value answered out of stack scratch. Past this the general road takes
+    /// over, which allocates the string it always did — a value this long is a payload, not
+    /// something a text predicate is typed against, and the ceiling is what keeps the scratch
+    /// buffer a fixed, small cost on every evaluator frame.
+    /// </summary>
+    private const int MaxProbeTextChars = 512;
+
+    /// <summary>What the unboxed probe was able to say about a property.</summary>
+    private enum ScalarProbe : byte
+    {
+        /// <summary>Not answerable here — use <see cref="GetValue"/>, as before.</summary>
+        Unavailable,
+        /// <summary>Answered: the value is in the caller's scratch buffer.</summary>
+        Value,
+        /// <summary>Answered: the event does not carry this property at all.</summary>
+        Absent,
+    }
+
+    /// <summary>
+    /// Reads a plain top-level string property into <paramref name="scratch"/> without
+    /// allocating, or says it cannot.
+    ///
+    /// <para><see cref="ScalarProbe.Absent"/> means exactly what a null from
+    /// <see cref="GetValue"/> would have meant for such a name, so the caller may stop on it.
+    /// Anything the probe declines — an array, a nested map, a number, a value past the
+    /// scratch ceiling — falls through to the general road unchanged. When the map has already
+    /// been materialised the dictionary is the cheaper answer and is left alone; that is also
+    /// what keeps last-wins duplicate-key semantics identical, since both roads are the same
+    /// walk over the same bytes.</para>
+    /// </summary>
+    private static ScalarProbe ProbeUserText(LogEvent ev, string prop, Span<char> scratch, out int length)
+    {
+        if (Ameto.Core.Serialization.LogEventSerializer.TryReadPropertyText(
+                ev.RawProperties, prop, scratch, out length, out bool present))
+            return ScalarProbe.Value;
+
+        return present ? ScalarProbe.Unavailable : ScalarProbe.Absent;
+    }
+
+    /// <summary>
+    /// Whether the unboxed probe can speak for this property at all — asked BEFORE the scratch
+    /// buffer exists, because <c>stackalloc</c> zeroes what it reserves and a kilobyte of that
+    /// on a road the probe cannot serve is pure loss. It doubled the cost of
+    /// <c>@mt like 'Handled%'</c>, which the matcher already rejects at the first character.
+    ///
+    /// <para>Built-in fields are resolved by the CALLER and never reach here, so this is one
+    /// lookup per event rather than two. What is left to establish is that the event carries
+    /// raw msgpack, that its dictionary has not been built, and that the name is a plain
+    /// top-level key rather than a dotted path — exactly the case where <see cref="GetValue"/>
+    /// would have done nothing but <c>ev.TryGetProperty(prop, …)</c>.</para>
+    /// </summary>
+    private static bool CanProbeUserValue(LogEvent ev, string prop)
+        => !ev.PropertiesMaterialised
+        && !ev.RawProperties.IsEmpty
+        && prop.IndexOf(PropertyPath.Separator) < 0;
+
     /// <summary>The dotted name read as ONE key, when the grammar allows that reading.</summary>
     private static object? ReadFlatKeyOrNull(LogEvent ev, string prop) =>
         PropertyPath.MayBeFlatKey(prop) ? ReadFlatKey(ev, prop) : null;
@@ -388,6 +524,28 @@ public static class FilterEvaluator
 
     private static bool EvalCompare(CompareNode node, LogEvent ev)
     {
+        // THE UNBOXED NUMERIC ROAD, and it is narrow on purpose. It engages only when the
+        // right operand is a numeric LITERAL — not another property, not a string, not a bool —
+        // and the left is a plain top-level key whose msgpack value is genuinely a number.
+        // Under exactly those conditions Compare() is provably the numeric tail and nothing
+        // else: neither side is null, a container or a bool, and the left is not a string, so
+        // the string road (which would compare `Elapsed > 100` textually for a string-valued
+        // Elapsed, and still must) is unreachable. Everything outside that falls through with
+        // its semantics untouched, at the cost of one extra frozen-dictionary probe.
+        if (node.RightProperty is null
+            && node.Value is { } literal && IsNumeric(literal)
+            && !BuiltinFields.TryResolve(node.Property, out _)
+            && CanProbeUserValue(ev, node.Property))
+        {
+            if (Ameto.Core.Serialization.LogEventSerializer.TryReadPropertyNumber(
+                    ev.RawProperties, node.Property, out double number, out bool present))
+                return CompareNumbers(number, ToDouble(literal), node.Op);
+
+            // Absent is not "false": Compare(null, <a literal>, op) answers true for Ne and
+            // false for everything else, and that is the answer the scan has always given.
+            if (!present) return node.Op is CompareOp.Ne;
+        }
+
         // Inline MatchAny: avoids closure/delegate allocation on every event
         object? actual = GetValue(ev, node.Property);
 
@@ -505,12 +663,27 @@ public static class FilterEvaluator
         // String comparison
         if (left is string ls)
         {
-            string rs = right?.ToString() ?? string.Empty;
-            int cmp   = string.Compare(ls, rs, StringComparison.OrdinalIgnoreCase);
+            // No ToString() when the right side is already a string — which it is for every
+            // literal a filter carries, and this runs per candidate event.
+            string rs = right as string ?? right?.ToString() ?? string.Empty;
+
+            // EQUALITY IS NOT AN ORDERING QUESTION. `@l = 'Error'` — the commonest predicate
+            // in the product — went through string.Compare, which walks both strings to work
+            // out WHICH is greater; Equals checks the lengths first and gives up on the
+            // overwhelming majority of non-matches without reading a character, and compares
+            // the rest vectorised. The answer is the same by construction: over the SAME
+            // comparison type, string.Compare(a, b, cmp) == 0 is the definition of
+            // string.Equals(a, b, cmp). That comparison type is OrdinalIgnoreCase here, not a
+            // culture-aware one, so there is no linguistic collation being dropped either.
+            if (op is CompareOp.Eq or CompareOp.Ne)
+            {
+                bool eq = string.Equals(ls, rs, StringComparison.OrdinalIgnoreCase);
+                return op is CompareOp.Eq ? eq : !eq;
+            }
+
+            int cmp = string.Compare(ls, rs, StringComparison.OrdinalIgnoreCase);
             return op switch
             {
-                CompareOp.Eq => cmp == 0,
-                CompareOp.Ne => cmp != 0,
                 CompareOp.Lt => cmp <  0,
                 CompareOp.Le => cmp <= 0,
                 CompareOp.Gt => cmp >  0,
@@ -520,40 +693,89 @@ public static class FilterEvaluator
         }
 
         // Numeric comparison — coerce both sides to double
-        double lNum = ToDouble(left);
-        double rNum = ToDouble(right);
-        return op switch
-        {
-            CompareOp.Eq => Math.Abs(lNum - rNum) < 1e-15,
-            CompareOp.Ne => Math.Abs(lNum - rNum) >= 1e-15,
-            CompareOp.Lt => lNum <  rNum,
-            CompareOp.Le => lNum <= rNum,
-            CompareOp.Gt => lNum >  rNum,
-            CompareOp.Ge => lNum >= rNum,
-            _            => false,
-        };
+        return CompareNumbers(ToDouble(left), ToDouble(right), op);
     }
+
+    /// <summary>
+    /// The numeric tail of <see cref="Compare(object?, object?, CompareOp)"/>, factored out so
+    /// the unboxed road in <see cref="EvalCompare"/> answers with the SAME arithmetic — epsilon
+    /// and all — rather than with a second spelling of it that could drift.
+    /// </summary>
+    private static bool CompareNumbers(double left, double right, CompareOp op) => op switch
+    {
+        CompareOp.Eq => Math.Abs(left - right) < 1e-15,
+        CompareOp.Ne => Math.Abs(left - right) >= 1e-15,
+        CompareOp.Lt => left <  right,
+        CompareOp.Le => left <= right,
+        CompareOp.Gt => left >  right,
+        CompareOp.Ge => left >= right,
+        _            => false,
+    };
 
     // ── String predicates ─────────────────────────────────────────────────────
 
     private static bool EvalLike(LikeNode node, LogEvent ev)
     {
-        // Inline MatchAny + use pre-lowercased pattern: no closure, no per-event ToLowerInvariant on pattern
-        object? val = GetValue(ev, node.Property);
+        // Built-ins are resolved here rather than inside GetValue so the name is looked up ONCE
+        // per event however the value is eventually read — the probe below needs to know it is
+        // not a built-in, and asking twice cost more than the probe saves.
+        if (BuiltinFields.TryResolve(node.Property, out var field))
+            return LikeAgainst(ReadBuiltin(ev, field), node);
+
+        // The unboxed road: a plain top-level string property is compared straight out of the
+        // event's msgpack, so the string the old road allocated for every candidate event is
+        // never built. Anything the probe cannot answer falls through untouched.
+        if (CanProbeUserValue(ev, node.Property))
+        {
+            Span<char> scratch = stackalloc char[MaxProbeTextChars];
+            switch (ProbeUserText(ev, node.Property, scratch, out int len))
+            {
+                case ScalarProbe.Value:  return LikeMatchFast(scratch[..len], node);
+                case ScalarProbe.Absent: return false;
+            }
+        }
+
+        return LikeAgainst(GetValue(ev, node.Property), node);
+    }
+
+    /// <summary>
+    /// LIKE against an already-read value: match-any over a list, inlined so there is no
+    /// closure per event, and the pre-lowercased pattern so there is no ToLowerInvariant either.
+    /// </summary>
+    private static bool LikeAgainst(object? val, LikeNode node)
+    {
         if (val is IList list && val is not byte[] && val is not string)
         {
             for (int i = 0; i < list.Count; i++)
-                if (list[i]?.ToString() is { } s && LikeMatchFast(s, node)) return true;
+                if (list[i]?.ToString() is { } s && LikeMatchFast(s.AsSpan(), node)) return true;
             return false;
         }
-        return val?.ToString() is { } sv && LikeMatchFast(sv, node);
+        return val?.ToString() is { } sv && LikeMatchFast(sv.AsSpan(), node);
     }
 
     private static bool EvalStartsWith(StartsWithNode node, LogEvent ev)
     {
-        // Inline MatchAny: no closure allocation per event
-        object? val = GetValue(ev, node.Property);
         var cmp = node.CaseInsensitive ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+
+        if (BuiltinFields.TryResolve(node.Property, out var field))
+            return StartsWithAgainst(ReadBuiltin(ev, field), node, cmp);
+
+        if (CanProbeUserValue(ev, node.Property))
+        {
+            Span<char> scratch = stackalloc char[MaxProbeTextChars];
+            switch (ProbeUserText(ev, node.Property, scratch, out int len))
+            {
+                case ScalarProbe.Value:  return scratch[..len].StartsWith(node.Prefix, cmp);
+                case ScalarProbe.Absent: return false;
+            }
+        }
+
+        return StartsWithAgainst(GetValue(ev, node.Property), node, cmp);
+    }
+
+    /// <summary>Inline match-any: no closure allocation per event.</summary>
+    private static bool StartsWithAgainst(object? val, StartsWithNode node, StringComparison cmp)
+    {
         if (val is IList list && val is not byte[] && val is not string)
         {
             for (int i = 0; i < list.Count; i++)
@@ -565,9 +787,27 @@ public static class FilterEvaluator
 
     private static bool EvalContains(ContainsNode node, LogEvent ev)
     {
-        // Inline MatchAny: no closure allocation per event
-        object? val = GetValue(ev, node.Property);
         var cmp = node.CaseInsensitive ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+
+        if (BuiltinFields.TryResolve(node.Property, out var field))
+            return ContainsAgainst(ReadBuiltin(ev, field), node, cmp);
+
+        if (CanProbeUserValue(ev, node.Property))
+        {
+            Span<char> scratch = stackalloc char[MaxProbeTextChars];
+            switch (ProbeUserText(ev, node.Property, scratch, out int len))
+            {
+                case ScalarProbe.Value:  return scratch[..len].Contains(node.Text, cmp);
+                case ScalarProbe.Absent: return false;
+            }
+        }
+
+        return ContainsAgainst(GetValue(ev, node.Property), node, cmp);
+    }
+
+    /// <summary>Inline match-any: no closure allocation per event.</summary>
+    private static bool ContainsAgainst(object? val, ContainsNode node, StringComparison cmp)
+    {
         if (val is IList list && val is not byte[] && val is not string)
         {
             for (int i = 0; i < list.Count; i++)
@@ -579,9 +819,27 @@ public static class FilterEvaluator
 
     private static bool EvalEndsWith(EndsWithNode node, LogEvent ev)
     {
-        // Inline MatchAny: no closure allocation per event
-        object? val = GetValue(ev, node.Property);
         var cmp = node.CaseInsensitive ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+
+        if (BuiltinFields.TryResolve(node.Property, out var field))
+            return EndsWithAgainst(ReadBuiltin(ev, field), node, cmp);
+
+        if (CanProbeUserValue(ev, node.Property))
+        {
+            Span<char> scratch = stackalloc char[MaxProbeTextChars];
+            switch (ProbeUserText(ev, node.Property, scratch, out int len))
+            {
+                case ScalarProbe.Value:  return scratch[..len].EndsWith(node.Suffix, cmp);
+                case ScalarProbe.Absent: return false;
+            }
+        }
+
+        return EndsWithAgainst(GetValue(ev, node.Property), node, cmp);
+    }
+
+    /// <summary>Inline match-any: no closure allocation per event.</summary>
+    private static bool EndsWithAgainst(object? val, EndsWithNode node, StringComparison cmp)
+    {
         if (val is IList list && val is not byte[] && val is not string)
         {
             for (int i = 0; i < list.Count; i++)
@@ -1148,14 +1406,64 @@ public static class FilterEvaluator
 
     // Fast path: pattern already lowercased + flags pre-computed in LikeNode constructor.
     // Avoids two ToLowerInvariant() + two Contains() calls per event.
-    private static bool LikeMatchFast(string text, LikeNode node)
+    private static bool LikeMatchFast(ReadOnlySpan<char> text, LikeNode node)
     {
         if (node.IsMatchAll) return true;
+
+        // THE ASCII SHORTCUT. `%timeout%` against a 130-character message template cost ~800 ns
+        // in the folding matcher — a scalar loop with a char.ToLowerInvariant and a backtrack
+        // point per position — which is per CANDIDATE event, not per returned row. When the
+        // pattern reduced to one literal (see LikeNode.Classify) and the text is ASCII where it
+        // is actually compared, the same question is answered by a vectorised span search.
+        //
+        // It is the SAME question: over ASCII, OrdinalIgnoreCase and ToLowerInvariant fold
+        // identically (A–Z ↔ a–z and nothing else), so the two roads cannot disagree.
+        // Ascii.IsValid is itself vectorised and is the guard that keeps the Kelvin-sign and
+        // supplementary-plane cases — where the two foldings genuinely differ — on the matcher.
+        //
+        // THE GUARD IS SCOPED TO WHAT IS READ, which matters as much as the search itself: an
+        // anchored pattern only ever looks at its own end of the value, so validating the whole
+        // string would make `Handled%` — which the old matcher rejected at the first character —
+        // pay a full scan of every value it rejects. A surrogate pair cannot straddle the edge
+        // of an all-ASCII window, so an ASCII window is compared one char for one char and the
+        // two roads line up exactly there.
+        if (node.AffixAscii)
+        {
+            var value = text;
+            var affix = node.Affix.AsSpan();
+            switch (node.Shape)
+            {
+                case LikeShape.Contains:
+                    // The literal may sit anywhere, so the whole value has to be ASCII.
+                    if (Ascii.IsValid(value))
+                        return value.Contains(affix, StringComparison.OrdinalIgnoreCase);
+                    break;
+
+                case LikeShape.StartsWith:
+                    if (value.Length >= affix.Length && Ascii.IsValid(value[..affix.Length]))
+                        return value.StartsWith(affix, StringComparison.OrdinalIgnoreCase);
+                    break;
+
+                case LikeShape.EndsWith:
+                    if (value.Length >= affix.Length && Ascii.IsValid(value[^affix.Length..]))
+                        return value.EndsWith(affix, StringComparison.OrdinalIgnoreCase);
+                    break;
+
+                case LikeShape.Equals:
+                    if (value.Length == affix.Length && Ascii.IsValid(value))
+                        return value.Equals(affix, StringComparison.OrdinalIgnoreCase);
+                    break;
+            }
+            // Falling out means the window was not ASCII, or the value was too short to hold
+            // the literal. Both go to the matcher below rather than answering here: it is the
+            // one that knows the folding, and for a short value it is the cheap answer anyway.
+        }
+
         // No ToLowerInvariant() copy of the value: the pattern is already lowercased, so
         // the walk lowercases one character at a time. That copy was an allocation per
         // scanned value, which is per event of every LIKE query.
-        if (node.IsLiteral) return EqualsFolded(text.AsSpan(), node.PatternLower.AsSpan());
-        return LikeMatchLower(text.AsSpan(), node.PatternLower.AsSpan());
+        if (node.IsLiteral) return EqualsFolded(text, node.PatternLower.AsSpan());
+        return LikeMatchLower(text, node.PatternLower.AsSpan());
     }
 
     // Kept for callers outside of LikeNode context (e.g. fromJson path LIKE).

@@ -12,7 +12,11 @@ namespace Ameto.Server;
 /// <summary>Wire all Ameto HTTP endpoints onto the application.</summary>
 public static class EndpointMapper
 {
-    private static readonly JsonSerializerOptions _json = new()
+    // internal, not private: LogEventJsonParityTests serialises the same events through this
+    // and through LogEventJsonWriter and compares the bytes. Rebuilding an "equivalent" set of
+    // options in the test would let the two drift apart silently, which is the one thing the
+    // parity test exists to prevent.
+    internal static readonly JsonSerializerOptions _json = new()
     {
         PropertyNamingPolicy        = JsonNamingPolicy.CamelCase,
         DefaultIgnoreCondition      = JsonIgnoreCondition.WhenWritingNull,
@@ -124,8 +128,19 @@ public static class EndpointMapper
                 using var sse      = new SseJsonWriter(ctx.Response.Body);
                 try
                 {
-                    await foreach (var ev in executor.ExecuteAsync(request, deadline.Token))
-                        await sse.WriteEventAsync(LogEventDto.From(ev), _json, deadline.Token);
+                    // Straight from the event: no DTO, no reflection resolver, no
+                    // Timestamp/Id/trace/span ToString per row, and the frames coalesce in
+                    // the writer's buffer instead of taking a socket send each. The writer
+                    // drives the enumerator itself so it can send the rows found so far
+                    // whenever the scan makes it wait. Nothing under the executor waits on its
+                    // own — the reader decodes inline, the hot tier is RAM, the merge never
+                    // blocks — so the executor makes the scan wait on purpose, at least every
+                    // 50 ms of synchronous work (ScanPace). Rows found together still share a
+                    // send, and a sparse search shows each row within about that much scanning
+                    // of finding it rather than at `done`. The terminal frame below puts whatever
+                    // is still buffered on the wire with it, which is why there is no explicit
+                    // flush here — every exit from this block except a client disconnect writes one.
+                    await sse.WriteLogEventsAsync(executor.ExecuteAsync(request, deadline.Token), deadline.Token);
 
                     // CHECKED AFTER THE LOOP, not only in a catch filter: the executor turns
                     // cancellation into a normal end-of-stream on its hot paths (a
@@ -163,6 +178,7 @@ public static class EndpointMapper
         app.MapGet("/api/events/aggregate", async (
             HttpContext    ctx,
             IQueryExecutor executor,
+            StorageEngine  storage,
             QueryGuard     guard,
             ILoggerFactory loggerFactory,
             string?        filter = null,
@@ -200,7 +216,7 @@ public static class EndpointMapper
                 using var deadline = guard.StartDeadline(ctx.RequestAborted);
                 try
                 {
-                    var result = await new Ameto.Query.AggregationExecutor(executor)
+                    var result = await new Ameto.Query.AggregationExecutor(executor, headerScan: storage)
                         .ExecuteAsync(query, fromBnd, toBound, deadline.Token);
 
                     var rows = new AggregationRowDto[result.Rows.Count];
@@ -764,11 +780,11 @@ public static class EndpointMapper
         using (lease)
         {
             using var deadline = guard.StartDeadline(ctx.RequestAborted);
-            var results = new List<LogEventDto>();
+            var results = new List<LogEvent>();
             try
             {
                 await foreach (var ev in executor.ExecuteAsync(request, deadline.Token))
-                    results.Add(LogEventDto.From(ev));
+                    results.Add(ev);
             }
             catch (OperationCanceledException) when (deadline.TimedOut) { }
             catch (OperationCanceledException) { return; }   // client disconnected
@@ -782,7 +798,19 @@ public static class EndpointMapper
                 return;
             }
 
-            await ctx.Response.WriteAsJsonAsync(results, _json, ctx.RequestAborted);
+            // Same array, same element bytes, written straight from the events — the DTO
+            // list this used to build existed only to be walked back out by the reflection
+            // serialiser. Content type spelled out because WriteAsJsonAsync set it.
+            ctx.Response.ContentType = "application/json; charset=utf-8";
+            var writer = new Utf8JsonWriter(ctx.Response.BodyWriter);
+            await using (writer.ConfigureAwait(false))
+            {
+                writer.WriteStartArray();
+                foreach (var ev in results) LogEventJsonWriter.Write(writer, ev);
+                writer.WriteEndArray();
+                await writer.FlushAsync(ctx.RequestAborted);
+            }
+            await ctx.Response.BodyWriter.FlushAsync(ctx.RequestAborted);
         }
     }
 
@@ -1010,7 +1038,18 @@ internal sealed class DynamicObjectConverter : JsonConverter<object>
 
 // ── DTO ───────────────────────────────────────────────────────────────────────
 
-/// <summary>JSON-serialisable view of a <see cref="LogEvent"/>.</summary>
+/// <summary>
+/// JSON-serialisable view of a <see cref="LogEvent"/>.
+///
+/// <para>NOT the road the search takes any more — <c>/api/events</c> and the span/trace log
+/// lists write their rows straight from the event through <c>LogEventJsonWriter</c>. Two
+/// callers keep this alive, and they are the whole of it: the LIVE TAIL, whose loop belongs to
+/// another change and still serialises a DTO per row, and <c>LogEventJsonParityTests</c>, which
+/// compares the direct writer's bytes against this one's. The same goes for
+/// <see cref="EventProps"/>, <see cref="EventPropsConverter"/>, <see cref="ExceptionInfoDto"/>
+/// and <see cref="DynamicObjectConverter"/>: when the tail moves over, all of it goes, and the
+/// parity test goes with it.</para>
+/// </summary>
 internal sealed class LogEventDto
 {
     [JsonPropertyName("@t")]            public string Timestamp       { get; init; } = "";
