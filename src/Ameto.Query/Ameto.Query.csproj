@@ -8,6 +8,10 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="Ameto.Query.Tests" />
+    <!-- The allocation probes live in Ameto.Perf, not in the functional suite: they compare
+         two readings of a GC counter against a ratio. IndexGroupNarrowAllocProbe measures
+         QueryExecutor.TryNarrowWithIndex directly. -->
+    <InternalsVisibleTo Include="Ameto.Perf" />
   </ItemGroup>
 
   <ItemGroup>

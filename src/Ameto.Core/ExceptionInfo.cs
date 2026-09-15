@@ -1,4 +1,6 @@
 using System.Buffers;
+using System.Buffers.Binary;
+using System.Text;
 using MessagePack;
 
 namespace Ameto.Core;
@@ -55,6 +57,26 @@ public sealed class ExceptionInfo
     public static ExceptionInfo? Read(ref MessagePackReader reader)
         => ReadAtDepth(ref reader, depth: 1);
 
+    /// <summary>The four keys of the wire map — matched as bytes, never built as strings.</summary>
+    private enum ExcField : byte { Unknown = 0, Type, Message, Stack, Inner }
+
+    private static ExcField ClassifyKey(ReadOnlySpan<byte> key) =>
+        key.SequenceEqual("type"u8)  ? ExcField.Type    :
+        key.SequenceEqual("msg"u8)   ? ExcField.Message :
+        key.SequenceEqual("stk"u8)   ? ExcField.Stack   :
+        key.SequenceEqual("inner"u8) ? ExcField.Inner   :
+        ExcField.Unknown;
+
+    /// <summary>Fallback for the rare non-contiguous key.</summary>
+    private static ExcField ClassifyKey(string? key) => key switch
+    {
+        Fields.Type    => ExcField.Type,
+        Fields.Message => ExcField.Message,
+        Fields.Stack   => ExcField.Stack,
+        Fields.Inner   => ExcField.Inner,
+        _              => ExcField.Unknown,
+    };
+
     private static ExceptionInfo? ReadAtDepth(ref MessagePackReader reader, int depth)
     {
         if (reader.TryReadNil()) return null;
@@ -82,19 +104,27 @@ public sealed class ExceptionInfo
 
         for (int i = 0; i < fields; i++)
         {
-            string key = reader.ReadString() ?? string.Empty;
-            switch (key)
+            // The key is CLASSIFIED from its bytes, not read as a string. There are four of
+            // them, they are three or five bytes long, and the map is read once per
+            // exception per depth — so the old `ReadString()` per key built four throwaway
+            // UTF-16 strings, transcoded, only to switch on them and drop them. Same
+            // technique and same reason as LogEventSerializer.ClassifyKey.
+            ExcField field = reader.TryReadStringSpan(out ReadOnlySpan<byte> keySpan)
+                ? ClassifyKey(keySpan)
+                : ClassifyKey(reader.ReadString());   // rare: the key spans buffer segments
+
+            switch (field)
             {
-                case Fields.Type:    type  = reader.ReadString() ?? "Exception"; break;
-                case Fields.Message: msg   = reader.ReadString();                break;
-                case Fields.Stack:   stack = reader.ReadString();                break;
-                case Fields.Inner:
+                case ExcField.Type:    type  = reader.ReadString() ?? "Exception"; break;
+                case ExcField.Message: msg   = reader.ReadString();                break;
+                case ExcField.Stack:   stack = reader.ReadString();                break;
+                case ExcField.Inner:
                     if (depth < MaxDepth)
                         inner = ReadAtDepth(ref reader, depth + 1);
                     else
-                        reader.Skip();                                            // truncate deeper levels
+                        reader.Skip();                                             // truncate deeper levels
                     break;
-                default:             reader.Skip();                              break;
+                default:               reader.Skip();                              break;
             }
         }
 
@@ -246,7 +276,179 @@ public sealed class ExceptionInfo
         }
     }
 
-    /// <summary>Reads an <see cref="ExceptionInfo"/> from a previously-written msgpack byte buffer.</summary>
+    // ── Decode-free questions about a stored payload ─────────────────────────
+    //
+    // Both of these answer, from the bytes alone, a question a filter asks per SCANNED row —
+    // where building the object graph to answer it is the whole cost the lazy Exception was
+    // added to avoid. Each one mirrors a specific branch of ReadAtDepth above; if that method
+    // changes shape, these change with it, and ExceptionInfoReadTests pins them together.
+
+    /// <summary>
+    /// Whether these bytes decode to a NON-NULL <see cref="ExceptionInfo"/> — decided from the
+    /// msgpack type header alone, in constant time and with no allocation.
+    ///
+    /// <para>Exactly <c>FromBytes(bytes) is not null</c> FOR ANY PAYLOAD FROMBYTES ACCEPTS,
+    /// and it has to be exact because <c>LogEvent.HasException</c> is what answers
+    /// <c>has(@x)</c>. <see cref="ReadAtDepth"/> returns null for three shapes, and all three
+    /// are visible in the first bytes: nil, an EMPTY legacy string, and anything that is
+    /// neither a string nor a map. Everything else — any map, any non-empty string — produces
+    /// an object.</para>
+    ///
+    /// <para>The qualifier is the TRUNCATED payload, which <see cref="FromBytes"/> never
+    /// accepts, and this answers it from the header alone — so it can land on either side:</para>
+    /// <list type="bullet">
+    ///   <item>a map header, or a string header announcing a non-zero length, answers TRUE even
+    ///         when the body it announces is cut short: <c>D9 05 61</c> (a str8 of five bytes
+    ///         carrying one) and <c>81</c> (a one-entry fixmap carrying nothing) are present;</item>
+    ///   <item>a string header too short to hold its own length answers FALSE: <c>DB 00 00 00</c>
+    ///         (a str32 in four bytes) is absent.</item>
+    /// </list>
+    /// <para><see cref="FromBytes"/> throws <see cref="System.IO.EndOfStreamException"/> for all
+    /// three. A corrupt row therefore falls OUT of <c>has(@x)</c> when its header is cut and IN
+    /// when only its body is. That is deliberate: this is asked per scanned row of a segment
+    /// whose block frame has already been length-checked, and a presence probe is neither the
+    /// place to raise corruption nor worth a body walk to detect it. Anything that then READS
+    /// the payload still throws, and the caller that hits it sees the same exception it always
+    /// did. <c>ExceptionInfoReadTests</c> pins all three.</para>
+    /// </summary>
+    public static bool IsPresent(ReadOnlySpan<byte> bytes)
+    {
+        if (bytes.IsEmpty) return false;
+        byte b = bytes[0];
+
+        // A map is always an exception: fixmap 0x80-0x8F, map16 0xDE, map32 0xDF.
+        if ((b & 0xF0) == 0x80 || b == 0xDE || b == 0xDF) return true;
+
+        // Legacy @x as a plain string — present unless it is empty.
+        if ((b & 0xE0) == 0xA0) return (b & 0x1F) != 0;                       // fixstr
+        if (b == 0xD9) return bytes.Length >= 2 && bytes[1] != 0;             // str8
+        if (b == 0xDA) return bytes.Length >= 3 && BinaryPrimitives.ReadUInt16BigEndian(bytes[1..]) != 0;
+        if (b == 0xDB) return bytes.Length >= 5 && BinaryPrimitives.ReadUInt32BigEndian(bytes[1..]) != 0;
+
+        // nil, or a shape ReadAtDepth skips and reports as null.
+        return false;
+    }
+
+    /// <summary>
+    /// Whether the ROOT exception's <see cref="Type"/> or <see cref="Message"/> contains
+    /// <paramref name="term"/>, case-insensitively — without building the object.
+    ///
+    /// <para>This is the free-text search path. A term is tested against EVERY row a scan
+    /// touches, and on a level-split Error segment every row carries an exception whose stack
+    /// trace is 1-5 KB — so decoding the tree to read two of its strings put the whole payload,
+    /// the inner chain and the stack trace on the heap per row, per term.</para>
+    ///
+    /// <para>Root only, and Type defaulting to <c>"Exception"</c> when the key is absent or
+    /// nil, because that is what the evaluator matched off the object and the two must not
+    /// disagree. The value is transcoded into stack or pooled scratch, so the comparison is the
+    /// same <c>OrdinalIgnoreCase</c> substring test over the same chars a full decode would
+    /// have produced.</para>
+    /// </summary>
+    public static bool RootTextContains(ReadOnlyMemory<byte> bytes, string term)
+    {
+        if (bytes.IsEmpty) return false;
+        var reader = new MessagePackReader(new ReadOnlySequence<byte>(bytes));
+
+        if (reader.TryReadNil()) return false;
+
+        // Legacy plain string: Type is the literal "Exception", Message is the string. An
+        // empty one decodes to null and matches nothing at all.
+        if (reader.NextMessagePackType == MessagePackType.String)
+        {
+            if (reader.TryReadStringSpan(out var raw))
+                return !raw.IsEmpty && (Utf8Contains(raw, term) || Contains(DefaultType, term));
+
+            string? str = reader.ReadString();
+            return !string.IsNullOrEmpty(str) && (Contains(str, term) || Contains(DefaultType, term));
+        }
+
+        if (reader.NextMessagePackType != MessagePackType.Map) return false;
+
+        int  fields      = reader.ReadMapHeader();
+        bool typeIsDefault = true;
+
+        for (int i = 0; i < fields; i++)
+        {
+            ExcField field = reader.TryReadStringSpan(out ReadOnlySpan<byte> keySpan)
+                ? ClassifyKey(keySpan)
+                : ClassifyKey(reader.ReadString());
+
+            switch (field)
+            {
+                case ExcField.Type:
+                    if (reader.TryReadNil()) break;                 // nil ⇒ Type stays "Exception"
+                    typeIsDefault = false;
+                    if (ReadStringContains(ref reader, term)) return true;
+                    break;
+
+                case ExcField.Message:
+                    if (reader.TryReadNil()) break;
+                    if (ReadStringContains(ref reader, term)) return true;
+                    break;
+
+                // Stack and Inner are NOT searched, exactly as the object-side check did not
+                // search them. Skipping is also the point: the stack trace is the payload.
+                default:
+                    reader.Skip();
+                    break;
+            }
+        }
+
+        return typeIsDefault && Contains(DefaultType, term);
+    }
+
+    /// <summary>The Type a payload takes when it does not carry one — see <see cref="ReadAtDepth"/>.</summary>
+    private const string DefaultType = "Exception";
+
+    private static bool Contains(string? haystack, string term) =>
+        haystack is not null && haystack.Contains(term, StringComparison.OrdinalIgnoreCase);
+
+    private static bool ReadStringContains(ref MessagePackReader reader, string term)
+    {
+        if (reader.TryReadStringSpan(out var utf8)) return Utf8Contains(utf8, term);
+        return Contains(reader.ReadString(), term);    // rare: the value spans buffer segments
+    }
+
+    /// <summary>Scratch that a type name or an exception message sits inside; longer values
+    /// borrow from the pool. Either way nothing reaches the heap.</summary>
+    private const int TermScratch = 512;
+
+    private static bool Utf8Contains(ReadOnlySpan<byte> utf8, string term)
+    {
+        if (utf8.IsEmpty) return term.Length == 0;
+
+        int needed = Encoding.UTF8.GetMaxCharCount(utf8.Length);
+        char[]? rented = null;
+        Span<char> scratch = stackalloc char[TermScratch];
+        if (needed > TermScratch) scratch = rented = ArrayPool<char>.Shared.Rent(needed);
+        try
+        {
+            int written = Encoding.UTF8.GetChars(utf8, scratch);
+            return scratch[..written].Contains(term, StringComparison.OrdinalIgnoreCase);
+        }
+        finally { if (rented is not null) ArrayPool<char>.Shared.Return(rented); }
+    }
+
+    /// <summary>
+    /// Reads an <see cref="ExceptionInfo"/> from a previously-written msgpack buffer, WITHOUT
+    /// copying it. Prefer this overload wherever the bytes are already on the managed heap —
+    /// a segment's decoded exception slice, a WAL record — because the copy the span overload
+    /// has to make is the payload itself: 1-5 KB of stack trace, per exception-bearing row.
+    /// </summary>
+    public static ExceptionInfo? FromBytes(ReadOnlyMemory<byte> bytes)
+    {
+        if (bytes.IsEmpty) return null;
+        var reader = new MessagePackReader(new ReadOnlySequence<byte>(bytes));
+        return Read(ref reader);
+    }
+
+    /// <summary>
+    /// Reads an <see cref="ExceptionInfo"/> from a previously-written msgpack byte buffer.
+    ///
+    /// <para>A <see cref="MessagePackReader"/> needs a <see cref="ReadOnlySequence{T}"/>, which
+    /// cannot be built over a span that may live on the stack — so this overload COPIES.
+    /// Callers holding heap memory should use the <see cref="ReadOnlyMemory{T}"/> overload.</para>
+    /// </summary>
     public static ExceptionInfo? FromBytes(ReadOnlySpan<byte> bytes)
     {
         if (bytes.IsEmpty) return null;
