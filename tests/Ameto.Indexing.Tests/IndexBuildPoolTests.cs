@@ -87,6 +87,41 @@ public sealed class IndexBuildPoolTests
     }
 
     [Fact]
+    public void ByteCap_BindsOnTheIntsPool_WhereTheDepthAloneWouldKeepMore()
+    {
+        // Four 16 MB tables fit the depth (4) but not the 48 MB cap, so the fourth return is
+        // dropped. The slab pool cannot show this: 64 slabs x 1 MB IS its cap, so its depth binds first.
+        IndexBuildPool.TrimAll();
+        int len = IndexBuildPool.Ints.MaxLength;                        // 1 << 22 ints = 16 MB
+        var held = new int[4][];
+        for (int i = 0; i < held.Length; i++) held[i] = IndexBuildPool.Ints.Rent(len);
+        for (int i = 0; i < held.Length; i++) IndexBuildPool.Ints.Return(held[i]);
+        Assert.Equal(48L << 20, IndexBuildPool.Ints.MaxPooledBytes);
+        Assert.Equal(3L * len * sizeof(int), IndexBuildPool.Ints.PooledBytes);
+        IndexBuildPool.TrimAll();
+    }
+
+    [Fact]
+    public void AGen2Collection_TrimsThePools_ThroughTheRegisteredCallback()
+    {
+        IndexBuildPool.TrimAll();
+        var held = new byte[4][];
+        for (int i = 0; i < held.Length; i++) held[i] = IndexBuildPool.Slabs.Rent(IndexBuildPool.SlabBytes);
+        for (int i = 0; i < held.Length; i++) IndexBuildPool.Slabs.Return(held[i]);
+        IndexBuildPool.TrimIdle();                                      // keeps the four (all were out at once), resets the high-water mark
+        Assert.Equal(4L << 20, IndexBuildPool.Slabs.PooledBytes);
+
+        // Nothing rents before the next gen2, so its high-water trim (or, under memory pressure,
+        // its full trim) drops all four. Nothing but the registered gen2 callback runs one here.
+        for (int i = 0; i < 2; i++)
+        {
+            GC.Collect(2, GCCollectionMode.Forced, blocking: true);
+            GC.WaitForPendingFinalizers();
+        }
+        Assert.Equal(0, IndexBuildPool.Slabs.PooledBytes);
+    }
+
+    [Fact]
     public void OversizedRent_IsNotPooled()
     {
         IndexBuildPool.TrimAll();
