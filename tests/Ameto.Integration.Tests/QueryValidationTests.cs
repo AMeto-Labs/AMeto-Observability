@@ -207,6 +207,7 @@ public sealed class QueryValidationTests : IClassFixture<AmetoWebAppFactory>
                      "ingestAcceptedTotal", "ingestDrainedTotal", "ingestPending", "ingestCapacity",
                      "ingestSlabCapacity",
                      "ingestDroppedOversized", "ingestDroppedNoSlab", "ingestDroppedRingFull",
+                     "ingestDroppedNoCommit",
                      "ingestWriteErrorDrops",
                      // Index build: merge rows written without their @x.* terms, and pooled build memory.
                      "indexMalformedExceptionPayloads", "indexBuildPooledBytes",

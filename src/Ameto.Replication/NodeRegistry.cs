@@ -11,25 +11,61 @@ public sealed class NodeRegistry
 {
     private readonly ConcurrentDictionary<uint, ReplicationNode> _nodes = new();
 
+    /// <summary>
+    /// Raised once for each peer id that appears here for the first time. Exists so
+    /// <see cref="PeerProber"/> can sleep instead of polling when this node is alone:
+    /// with no seeds, an inbound ping is the only way a peer can ever show up, and this
+    /// is that moment.
+    /// </summary>
+    public event Action? PeerAdded;
+
     /// <summary>Register or update a peer from an incoming probe payload.</summary>
     public ReplicationNode Upsert(PeerPayload payload)
     {
-        return _nodes.AddOrUpdate(
-            payload.NodeId,
-            _ => new ReplicationNode
+        // Not AddOrUpdate: its add-factory may run and be discarded under contention, which
+        // would announce a peer that was never added. TryAdd tells us who actually won.
+        while (true)
+        {
+            if (_nodes.TryGetValue(payload.NodeId, out var existing))
+            {
+                existing.LastSeen = payload.Timestamp;
+                return existing;
+            }
+
+            var fresh = new ReplicationNode
             {
                 Id          = new NodeId(payload.NodeId),
                 BaseAddress = payload.Address,
                 LastSeen    = payload.Timestamp,
-            },
-            (_, existing) =>
+            };
+            if (_nodes.TryAdd(payload.NodeId, fresh))
             {
-                existing.LastSeen = payload.Timestamp;
-                return existing;
-            });
+                PeerAdded?.Invoke();
+                return fresh;
+            }
+        }
     }
 
-    /// <summary>Register a peer from static config (before first probe).</summary>
+    /// <summary>
+    /// Whether any node other than <paramref name="local"/> is known. The local node is
+    /// always registered, so "is there anything to probe" is not the same as "is this empty".
+    /// Not allocation-free: enumerating a ConcurrentDictionary allocates an enumerator. It runs
+    /// once per probe-loop pass (and on a single node, once per wake), not per event, so that is
+    /// one small object where the loop used to build a payload and a LINQ chain.
+    /// </summary>
+    public bool HasPeerOtherThan(NodeId local)
+    {
+        if (_nodes.IsEmpty) return false;
+        foreach (var kv in _nodes)
+            if (kv.Key != local.Value) return true;
+        return false;
+    }
+
+    /// <summary>
+    /// Register a peer from static config (before first probe). Deliberately silent: its only
+    /// caller registers THIS node, and waking the prober for ourselves would have it probe its
+    /// own address — see <see cref="PeerAdded"/>, which announces discovered peers only.
+    /// </summary>
     public void EnsureKnown(NodeId id, string address)
     {
         _nodes.TryAdd(id.Value, new ReplicationNode

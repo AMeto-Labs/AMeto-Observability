@@ -1,3 +1,5 @@
+using System.Diagnostics;
+
 namespace Ameto.Indexing;
 
 /// <summary>
@@ -20,20 +22,82 @@ namespace Ameto.Indexing;
 /// queries never consult them, so an entry may be cached WITHOUT its trigram index. A
 /// query that needs trigrams treats such an entry as a miss and re-inserts the full
 /// reader in its place (upgrade); one that does not is happy with either.</para>
+///
+/// <para>Budget pressure is the only thing that used to remove an entry, so one wide
+/// dashboard query filled the cache and the process held those bytes — managed postings AND
+/// native bloom bits — until something else needed the room. On a server that then goes idle
+/// nothing ever does, which is the "RSS ratchets after the first big query" shape. An
+/// optional idle age (<see cref="IdleEvict"/>) drops entries nothing has read for that long;
+/// because the LRU is ordered by last touch, the sweep stops at the first entry that is still
+/// young and is therefore O(evicted), not O(entries).</para>
 /// </summary>
-public sealed class SegmentIndexCache
+public sealed class SegmentIndexCache : IDisposable
 {
     private readonly object                                   _lock = new();
     private readonly Dictionary<(string Path, int Group), Entry> _map  = new();
     private readonly LinkedList<Entry>                        _lru  = new(); // head = most recent
     private readonly long                                     _budgetBytes;
+    private readonly long                                     _idleTicks;   // 0 = no idle eviction
+    private readonly Timer?                                   _sweepTimer;
     private          long                                     _totalBytes;
     private          long                                     _hits, _misses;
+    private          long                                     _idleEvicted;
 
-    public SegmentIndexCache(long budgetBytes) => _budgetBytes = budgetBytes;
+    public SegmentIndexCache(long budgetBytes) : this(budgetBytes, default) { }
+
+    /// <param name="idleEvict">
+    /// Drop entries that nothing has acquired for this long. <see cref="TimeSpan.Zero"/> or
+    /// less turns it off, which is the pre-existing behaviour (budget pressure only).
+    /// </param>
+    public SegmentIndexCache(long budgetBytes, TimeSpan idleEvict)
+    {
+        _budgetBytes = budgetBytes;
+        // Past MaxIdleEvict the age is "never": treated as off, which is what it means, and which
+        // keeps the Stopwatch-tick conversion below inside a long on every platform.
+        IdleEvict    = idleEvict > TimeSpan.Zero && idleEvict <= MaxIdleEvict ? idleEvict : TimeSpan.Zero;
+        _idleTicks   = (long)(IdleEvict.TotalSeconds * Stopwatch.Frequency);
+
+        if (_idleTicks <= 0 || !Enabled) return;
+
+        // A sweep only ever runs if the cache is enabled AND an idle age is configured. The
+        // cadence is a quarter of the idle age so an entry is released within 1.25× of it;
+        // at the 10-minute default that is one wake every 2.5 minutes, which on an idle
+        // server reads one timestamp under the lock and returns. The callback is static and
+        // takes its state through the timer, so the timer holds no closure.
+        //
+        // Capped at MaxSweepPeriod: System.Threading.Timer rejects a period above 0xFFFFFFFE ms
+        // (~49.7 days), so a quarter of any idle age from ~199 days up used to throw out of the
+        // DI factory and take every query endpoint down with it. Past four days an entry is
+        // therefore released within a day of its idle age rather than within a quarter of it.
+        long periodTicks = Math.Clamp(IdleEvict.Ticks / 4, TimeSpan.TicksPerMillisecond, MaxSweepPeriod.Ticks);
+        var  period      = TimeSpan.FromTicks(periodTicks);
+        _sweepTimer = new Timer(static s => ((SegmentIndexCache)s!).Sweep(), this, period, period);
+    }
+
+    /// <summary>
+    /// Longest idle age taken literally. Anything longer — <see cref="TimeSpan.MaxValue"/> included —
+    /// is "never" and turns idle eviction off. A century in Stopwatch ticks still fits a long at
+    /// Linux's 1e9 ticks per second; TimeSpan.MaxValue does not.
+    /// </summary>
+    private static readonly TimeSpan MaxIdleEvict = TimeSpan.FromDays(100 * 366);
+
+    /// <summary>Longest sweep cadence: far inside Timer's ~49.7-day limit, and a day late at worst.</summary>
+    private static readonly TimeSpan MaxSweepPeriod = TimeSpan.FromDays(1);
+
+    /// <summary>Idle age after which an untouched entry is evicted; <see cref="TimeSpan.Zero"/> = off.</summary>
+    public TimeSpan IdleEvict { get; }
+
+    /// <summary>Entries dropped by idle age (not by budget pressure) since start.</summary>
+    public long IdleEvictedCount => Interlocked.Read(ref _idleEvicted);
 
     /// <summary>False when the budget is zero or negative — every acquire misses and inserts are not retained.</summary>
     public bool Enabled => _budgetBytes > 0;
+
+    /// <summary>
+    /// The budget this cache enforces — the one it was built with, not what configuration would
+    /// derive now (a <c>GC.RefreshMemoryLimit</c> after a container resize changes the latter only).
+    /// </summary>
+    public long BudgetBytes => _budgetBytes;
 
     public long HitCount   => Interlocked.Read(ref _hits);
     public long MissCount  => Interlocked.Read(ref _misses);
@@ -48,6 +112,7 @@ public sealed class SegmentIndexCache
         public required long                     Size;
         public int  RefCount;                    // guarded by the cache lock
         public bool Doomed;                      // evicted/replaced — dispose at RefCount 0
+        public long LastTouched;                 // Stopwatch timestamp of the last acquire
         public LinkedListNode<Entry>? Node;      // null once off the LRU
     }
 
@@ -76,6 +141,7 @@ public sealed class SegmentIndexCache
                 return null;
             }
             e.RefCount++;
+            e.LastTouched = Stopwatch.GetTimestamp();
             _lru.Remove(e.Node!);
             _lru.AddFirst(e.Node!);
             Interlocked.Increment(ref _hits);
@@ -113,6 +179,7 @@ public sealed class SegmentIndexCache
                 // Lost the race to an equal-or-better entry — serve that one, drop ours.
                 (toDispose ??= []).Add(reader);
                 existing.RefCount++;
+                existing.LastTouched = Stopwatch.GetTimestamp();
                 _lru.Remove(existing.Node!);
                 _lru.AddFirst(existing.Node!);
                 lease = new Lease(this, existing);
@@ -125,7 +192,7 @@ public sealed class SegmentIndexCache
                 var e = new Entry
                 {
                     Key = key, Reader = reader, HasTrigram = hasTrigram,
-                    Size = sizeBytes, RefCount = 1,
+                    Size = sizeBytes, RefCount = 1, LastTouched = Stopwatch.GetTimestamp(),
                 };
                 e.Node       = _lru.AddFirst(e);
                 _map[key]    = e;
@@ -160,6 +227,36 @@ public sealed class SegmentIndexCache
             RemoveLocked(tail.Value, toDispose);
     }
 
+    /// <summary>
+    /// Drops every entry nothing has acquired for <see cref="IdleEvict"/>, and returns how
+    /// many. Ownership is the same as budget eviction: the entry is unlisted and its bytes
+    /// stop counting immediately, but the native bloom bits are freed by the LAST lease to
+    /// be released — an idle sweep can never pull memory out from under a running query.
+    /// Public so a test can drive it without waiting for the timer.
+    /// </summary>
+    public int Sweep()
+    {
+        if (_idleTicks <= 0) return 0;
+
+        List<SegmentIndexReader>? toDispose = null;
+        int evicted = 0;
+        long cutoff = Stopwatch.GetTimestamp() - _idleTicks;
+        lock (_lock)
+        {
+            // The LRU tail is the least recently touched entry, so the first young one ends
+            // the sweep: everything ahead of it is younger still.
+            while (_lru.Last is { } tail && tail.Value.LastTouched <= cutoff)
+            {
+                RemoveLocked(tail.Value, toDispose ??= []);
+                evicted++;
+            }
+        }
+        if (toDispose is not null)
+            foreach (var r in toDispose) r.Dispose();
+        if (evicted > 0) Interlocked.Add(ref _idleEvicted, evicted);
+        return evicted;
+    }
+
     private void Release(Entry e)
     {
         SegmentIndexReader? dispose = null;
@@ -170,4 +267,11 @@ public sealed class SegmentIndexCache
         }
         dispose?.Dispose();
     }
+
+    /// <summary>
+    /// Stops the sweep timer. Cached readers are NOT disposed here: a lease may still be
+    /// open on one, and the process is going away anyway — the same reasoning that lets an
+    /// unreferenced entry sit in the LRU until something evicts it.
+    /// </summary>
+    public void Dispose() => _sweepTimer?.Dispose();
 }

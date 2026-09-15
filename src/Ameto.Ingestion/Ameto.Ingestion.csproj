@@ -4,6 +4,8 @@
     <!-- Lets the integration tests pin IngestionEndpoint.IsMalformedPayload, which decides
          whether a failure is the client's (400) or the server's (500). -->
     <InternalsVisibleTo Include="Ameto.Integration.Tests" />
+    <!-- The Perf probes drive the ring buffer's payload arena and its commit-failure hook. -->
+    <InternalsVisibleTo Include="Ameto.Perf" />
   </ItemGroup>
 
   <ItemGroup>

@@ -125,6 +125,30 @@ public sealed class LogVolumeAggregator
         if (svc >= 0) Record(timestampTicks, level, svc);
     }
 
+    // ── Whole-segment shortcut (TOTAL ONLY) ───────────────────────────────────────
+
+    /// <summary>
+    /// Counts a whole cold segment from its catalog entry, without opening the file.
+    ///
+    /// <para>A cold segment is immutable and its <c>SegmentInfo.EventCount</c> is exact, so when
+    /// the segment lies entirely inside the window every one of its events is in the answer and
+    /// there is nothing to decide per event. What the catalog does NOT record is which service
+    /// each event belongs to, and — for the legacy mixed-level files that predate level-pure
+    /// flushing — which level. So this adds to <see cref="Total"/> and <see cref="Scanned"/> and
+    /// to nothing else: after any call to it, the per-service and per-level series no longer sum
+    /// to the total.</para>
+    ///
+    /// <para>That is why it is not reachable from <c>/api/events/counts</c>: only a caller that
+    /// wants a single number may ask for it, and <see cref="StorageEngine"/> gates it behind an
+    /// explicit opt-in with no service filter.</para>
+    /// </summary>
+    public void AddWholeSegment(long eventCount)
+    {
+        if (eventCount <= 0) return;
+        _total   += eventCount;
+        _scanned += eventCount;
+    }
+
     // ── Recording ─────────────────────────────────────────────────────────────────
 
     private void Record(long timestampTicks, LogLevel level, int svcId)

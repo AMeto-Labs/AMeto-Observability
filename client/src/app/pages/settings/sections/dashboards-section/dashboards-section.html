@@ -150,12 +150,12 @@
     </div>
 
     <div class="metric">
-      <div class="metric-name">Process threads</div>
+      <div class="metric-name">Thread-pool threads</div>
       <div class="metric-right">
         <div class="metric-value">{{ d.processThreads }}</div>
         <div class="metric-desc">
-          Number of active threads in the server process.
-          A high thread count may indicate contention or slow I/O.
+          Threads currently in the server's thread pool (dedicated threads are not counted).
+          A rising count means work is queueing behind contention or slow I/O.
         </div>
       </div>
     </div>

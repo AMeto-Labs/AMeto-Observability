@@ -180,9 +180,29 @@ public sealed class QueryOptions
     /// entry's RETAINED size (expanded postings + dictionaries + bloom bits — several
     /// times the packed sections they decode from). Zero or negative disables it —
     /// every query then re-reads and re-decodes the sections it consults, the
-    /// pre-cache behaviour. Default: 256 MB.
+    /// pre-cache behaviour.
+    ///
+    /// <para>Unset (the default) derives it from memory this process may use:
+    /// <c>min(256 MB, 15 % of the managed-heap limit)</c> — the cache is mostly managed postings,
+    /// so it is a share of the GC's limit (384 MB in a 512 MB container, giving 57 MB), not of
+    /// the container — see <see cref="MemoryBudgets"/>. The flat
+    /// 256 MB this replaces was half of a 512 MB host on its own, before the engine's own
+    /// tiers and index builds asked for anything. An explicit value always wins, including
+    /// a value larger than the derived one.</para>
     /// </summary>
-    public long IndexCacheBytes { get; init; } = 256 * 1024 * 1024;
+    public long? IndexCacheBytes { get; init; }
+
+    /// <summary>The configured budget, or the one derived from available memory when unset.</summary>
+    public long EffectiveIndexCacheBytes => IndexCacheBytes ?? MemoryBudgets.Current().IndexCacheBytes;
+
+    /// <summary>
+    /// Drop cached segment indexes that no query has read for this long. Without it the only
+    /// thing that ever removes an entry is budget pressure, so a server that answers one wide
+    /// query and then goes quiet keeps those postings and native bloom bits resident for the
+    /// rest of its life — the single biggest avoidable chunk of steady-state RSS on a small
+    /// host. Zero or negative turns it off (budget pressure only). Default: 10 minutes.
+    /// </summary>
+    public TimeSpan IndexCacheIdleEvict { get; init; } = TimeSpan.FromMinutes(10);
 
     /// <summary>
     /// Wall-clock budget for one search. A query that exceeds it is stopped and the client

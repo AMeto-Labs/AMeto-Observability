@@ -216,6 +216,12 @@ public sealed class AlertEvaluator : IAsyncDisposable
         }
     }
 
+    /// <summary>
+    /// Test hook: one evaluation cycle, now, instead of after <see cref="EvalInterval"/>. It is the
+    /// method the loop calls, so what a test observes is what the loop does.
+    /// </summary>
+    internal Task EvaluateOnceAsync(CancellationToken ct = default) => EvaluateAllAsync(ct);
+
     private async Task EvaluateAllAsync(CancellationToken ct)
     {
         var now = DateTimeOffset.UtcNow;
@@ -386,6 +392,11 @@ public sealed class AlertEvaluator : IAsyncDisposable
         // nothing to narrow with: when the rule constrains no level at all ("volume over the
         // last five minutes", optionally for one service), where the scan would otherwise
         // materialise every event it counts.
+        //
+        // That case is now much cheaper still: with no service filter a cold segment lying
+        // entirely inside the window is counted from its catalog entry alone, so a 24-hour
+        // rule over 500 segments opens the two boundary segments instead of all 500, every
+        // 15 seconds. See the totalsOnly parameter on AggregateLogVolumeAsync.
         if (TryHeaderShape(rule.Filter, out var levels, out var service) && levels is null)
             return await HeaderCountAsync(from, to, service, ct);
 
@@ -402,8 +413,7 @@ public sealed class AlertEvaluator : IAsyncDisposable
         // matches nothing still walks the catalog, and the evaluation loop runs rules one
         // after another, so one slow rule delays every rule behind it — and the loop waits
         // its interval AFTER the cycle, so the delay compounds.
-        using var budget = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        budget.CancelAfter(RuleEvaluationBudget);
+        using var budget = StartRuleBudget(ct);
 
         int count = 0;
         try
@@ -441,27 +451,57 @@ public sealed class AlertEvaluator : IAsyncDisposable
     private readonly ConcurrentDictionary<string, DateTimeOffset> _partialWarned = new();
 
     /// <summary>
-    /// Wall-clock a single rule may spend scanning. Comfortably inside <see cref="EvalInterval"/>
-    /// so a cycle of several slow rules still finishes before the next one is due.
+    /// Wall-clock a single rule may spend SCANNING (the header-count path has no budget — see
+    /// <see cref="HeaderCountAsync"/>). Comfortably inside <see cref="EvalInterval"/> so a cycle
+    /// of several slow rules still finishes before the next one is due.
+    ///
+    /// <para>Internal and settable for tests only. Zero or negative means "already expired": the
+    /// budget token is cancelled before the rule starts, which is the only way to make expiry
+    /// deterministic — a timer of 1 ms races whatever it is meant to interrupt.</para>
     /// </summary>
-    private static readonly TimeSpan RuleEvaluationBudget = TimeSpan.FromSeconds(10);
+    internal TimeSpan RuleEvaluationBudget { get; set; } = TimeSpan.FromSeconds(10);
+
+    /// <summary>A token source that is cancelled when this rule's evaluation budget runs out.</summary>
+    private CancellationTokenSource StartRuleBudget(CancellationToken ct)
+    {
+        var budget = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        if (RuleEvaluationBudget <= TimeSpan.Zero) budget.Cancel();
+        else                                       budget.CancelAfter(RuleEvaluationBudget);
+        return budget;
+    }
 
     /// <summary>
     /// Counts straight from event headers over the whole window. <paramref name="service"/>
-    /// null means every service.
+    /// null means every service; no level is constrained on this path (see the caller).
     /// </summary>
     private async Task<double> HeaderCountAsync(
         DateTimeOffset from, DateTimeOffset to, string? service, CancellationToken ct)
     {
         // The aggregator's axis is (bucket, service, level) and the alert wants one number,
-        // so the axis collapses to a single column spanning the window. Total already has
-        // the service filter applied, and no level is constrained on this path (see the
-        // caller), so it is the answer.
+        // so the axis collapses to a single column spanning the window. Total already has the
+        // service filter applied, and no level is constrained here, so it is the answer.
         int bucketSeconds = (int)Math.Max(1, Math.Ceiling((to - from).TotalSeconds));
         long minBucket    = from.ToUnixTimeSeconds() / bucketSeconds;
 
+        // The catalog shortcut answers Total and nothing else, and cannot attribute a segment's
+        // events to one service — so it is available exactly when no service is filtered.
+        bool totalsOnly = service is null;
+
+        // NO per-rule budget on this path, deliberately, unlike the scan below. The scan has a
+        // floor to report when its budget expires — the events it counted so far — so a rule
+        // that is slow to count can still fire. This aggregation has nothing: cancelled, it
+        // returns no number at all, and a rule that always takes longer than the budget would
+        // never be evaluated, never change state and never fire, every cycle, for as long as
+        // its window is that expensive. A late alert is a smaller failure than a missing one.
+        //
+        // What the budget protected is the rules behind this one, and the shortcut above is
+        // what protects them now: with no service filter a 24-hour window costs the two
+        // boundary segments, not the day. A service-filtered rule still decodes the window,
+        // exactly as it did before the budget was added here.
         var counts = await _storage.AggregateLogVolumeAsync(
-            from, to, minBucket, bucketSeconds, nBuckets: 1, serviceFilter: service, ct);
+            from, to, minBucket, bucketSeconds, nBuckets: 1,
+            serviceFilter: service, ct, totalsOnly);
+
         return counts.Total;
     }
 

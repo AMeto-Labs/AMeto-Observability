@@ -195,17 +195,32 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     private const long IndexBuildBytesPerEvent = 1_400;
 
     /// <summary>
-    /// Ceiling on managed index-build state across all concurrent flushes. At the default
-    /// 64 MB tier (131,072 events ⇒ ~184 MB per build) this yields a width of 3 — enough to
-    /// stay ahead of ingest (a tier fills in ~0.9 s at 150k events/s, a build takes ~1.3 s,
-    /// so 3 in flight clears one every ~0.44 s) while capping the burst near 550 MB instead
-    /// of the 8 × 300 MB the old core-count heuristic allowed. Override with
-    /// <c>HotTier.FlushConcurrency</c> when trading RAM for throughput deliberately.
+    /// Ceilings on managed index-build state and on native frozen-tier memory, derived once at
+    /// construction from what this process may actually use — see <see cref="MemoryBudgets"/>.
+    ///
+    /// <para>On a host with room they are the constants they always were: 640 MB of concurrent
+    /// builds, which at the default 64 MB tier (131,072 events ⇒ ~184 MB per build) yields a
+    /// width of 3 — enough to stay ahead of ingest (a tier fills in ~0.9 s at 150k events/s, a
+    /// build takes ~1.3 s, so 3 in flight clears one every ~0.44 s) — and 512 MB of frozen
+    /// tiers. In a 512 MB container they become 115 MB (30 % of the GC's 384 MB heap limit —
+    /// index builds are managed) and 128 MB (25 % of the container — frozen tiers are native and
+    /// not under the heap limit), which is the difference between back-pressure and an OOM kill.
+    /// Override the width with <c>HotTier.FlushConcurrency</c>
+    /// when trading RAM for throughput deliberately.</para>
     /// </summary>
-    private const long FlushManagedBudgetBytes = 640L * 1024 * 1024;
+    private readonly MemoryBudgets _budgets;
 
-    /// <summary>Ceiling on native memory held by frozen-but-not-yet-persisted tiers.</summary>
-    private const long FlushNativeBudgetBytes = 512L * 1024 * 1024;
+    /// <summary>
+    /// Concurrent index builds the constructor settled on (the <c>_flushConcurrency</c> count).
+    /// Internal so a test can see the budgets actually reach the engine.
+    /// </summary>
+    internal int FlushWidth { get; }
+
+    /// <summary>
+    /// Frozen tiers allowed in flight at once (the <c>_flushSlots</c> count). Internal for the
+    /// same reason as <see cref="FlushWidth"/>.
+    /// </summary>
+    internal int FlushSlots { get; }
     /// <summary>
     /// Window anchors that produced no usable merge batch — excluded so the sweep advances
     /// (reset on restart). Keyed by <see cref="SegmentKey"/> for the same reason the catalog is:
@@ -373,10 +388,23 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     public StringInternPool TemplatePool { get; } = new();
 
     public StorageEngine(IOptions<ServerOptions> options, RetentionStore retentionStore, ILogger<StorageEngine> logger)
+        : this(options, retentionStore, logger, MemoryBudgets.Current())
+    {
+    }
+
+    /// <summary>
+    /// Takes the memory budgets instead of reading them from this process, so a test can build
+    /// the engine a 512 MB container would get on a machine that is not one. Not public: the DI
+    /// container only sees the constructor above.
+    /// </summary>
+    internal StorageEngine(
+        IOptions<ServerOptions> options, RetentionStore retentionStore, ILogger<StorageEngine> logger,
+        MemoryBudgets budgets)
     {
         _options        = options.Value;
         _retentionStore = retentionStore;
         _logger         = logger;
+        _budgets        = budgets;
         // ── Flush RAM budgets ────────────────────────────────────────────────────
         // A flush costs memory in two separate places, and each needs its own bound:
         //
@@ -398,7 +426,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         int  eventCapacity  = HotTierSegment.EventCapacityFor(Math.Max(1, _options.HotTier.MaxSizeBytes));
         long perFlushManaged = Math.Max(1L, (long)eventCapacity * IndexBuildBytesPerEvent);
 
-        int widthByMemory = (int)Math.Clamp(FlushManagedBudgetBytes / perFlushManaged, 1, 64);
+        int widthByMemory = (int)Math.Clamp(_budgets.ManagedBuildBytes / perFlushManaged, 1, 64);
         int flushWidth = _options.HotTier.FlushConcurrency > 0
             ? Math.Min(_options.HotTier.FlushConcurrency, 64)
             : Math.Clamp(Math.Min(Environment.ProcessorCount / 2, widthByMemory), 1, 8);
@@ -408,8 +436,10 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         // The previous 1.4 × MaxSizeBytes estimate under-counted by up to 17x on small
         // events, so the "1 GB" budget it computed could hold multiple GB in practice.
         // Floored at the flush width so every concurrent flush can still hold a slot.
-        int flushSlots = Math.Clamp((int)(FlushNativeBudgetBytes / tierFootprint), flushWidth, 64);
+        int flushSlots = Math.Clamp((int)(_budgets.NativeTierBytes / tierFootprint), flushWidth, 64);
         _flushSlots = new SemaphoreSlim(flushSlots, flushSlots);
+        FlushWidth  = flushWidth;
+        FlushSlots  = flushSlots;
 
         // Report the ceilings these settings actually produce, not just the inputs — an
         // explicit HotTier.FlushConcurrency override raises them, and that should be
@@ -419,24 +449,32 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
         _logger.LogInformation(
             "Flush budgets: width={Width} (×{PerFlush} MB managed = {ManagedCeiling} MB), " +
-            "slots={Slots} (×{Tier} MB native = {NativeCeiling} MB), tier={Events} events / {Payload} MB payload",
+            "slots={Slots} (×{Tier} MB native = {NativeCeiling} MB), tier={Events} events / {Payload} MB payload; " +
+            "derived from a {ManagedLimit} MB managed-heap limit and {PhysicalLimit} MB physical: " +
+            "managed≤{ManagedBudget} MB, native≤{NativeBudget} MB, index cache≤{CacheBudget} MB ({Source})",
             flushWidth, perFlushManaged / 1048576, managedCeiling / 1048576,
             flushSlots, tierFootprint / 1048576, nativeCeiling / 1048576,
-            eventCapacity, _options.HotTier.MaxSizeBytes / 1048576);
+            eventCapacity, _options.HotTier.MaxSizeBytes / 1048576,
+            _budgets.ManagedLimitBytes / 1048576,
+            _budgets.PhysicalLimitBytes / 1048576,
+            _budgets.ManagedBuildBytes / 1048576,
+            _budgets.NativeTierBytes / 1048576,
+            _budgets.IndexCacheBytes / 1048576,
+            _budgets.IsConstrained ? "host-constrained" : "fixed ceilings");
 
         // Both clamps are floored so at least one flush can always proceed. That floor
         // WINS over the budget: at a large MaxSizeBytes a single tier no longer fits, and
         // the engine quietly runs above the ceiling rather than refusing to start. The
         // budget is a target, not a guarantee — say so instead of letting the line above
         // read like one.
-        if (perFlushManaged > FlushManagedBudgetBytes || tierFootprint > FlushNativeBudgetBytes)
+        if (perFlushManaged > _budgets.ManagedBuildBytes || tierFootprint > _budgets.NativeTierBytes)
             _logger.LogWarning(
                 "A single flush of a {Payload} MB tier ({PerFlush} MB managed + {Tier} MB native) does not fit " +
                 "the flush budget ({ManagedBudget} MB managed / {NativeBudget} MB native). One flush must always " +
                 "be allowed to run, so these budgets cannot be honoured at this tier size — peak RAM will exceed " +
                 "them. Lower HotTier.MaxSizeBytes to bring the peak down.",
                 _options.HotTier.MaxSizeBytes / 1048576, perFlushManaged / 1048576, tierFootprint / 1048576,
-                FlushManagedBudgetBytes / 1048576, FlushNativeBudgetBytes / 1048576);
+                _budgets.ManagedBuildBytes / 1048576, _budgets.NativeTierBytes / 1048576);
         _idGen    = new EventIdGenerator(_options.NodeId);
         _dataDir  = _options.DataDirectory;
         _walDir   = Path.Combine(_dataDir, "wal");
@@ -664,10 +702,21 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// <c>GET /api/events/counts</c>. Bucketing parameters are supplied by the caller so the axis
     /// matches the endpoint's column-cap logic.
     /// </summary>
+    /// <param name="totalsOnly">
+    /// Opt-in shortcut for a caller that wants ONE number (the alert evaluator, which runs this
+    /// every 15 s per rule over a window that can span hundreds of segments). A cold segment is
+    /// immutable and its catalog <c>EventCount</c> is exact, so a segment lying entirely inside
+    /// the window contributes that count with no mmap and no LZ4 decode at all — for a 24 h
+    /// window only the two boundary segments and the hot tier are still read. In exchange
+    /// <see cref="LogVolumeCounts.Services"/> and <see cref="LogVolumeCounts.Levels"/> stop
+    /// summing to <see cref="LogVolumeCounts.Total"/>, which is why it is off by default and
+    /// ignored whenever a <paramref name="serviceFilter"/> is set — the catalog cannot say how
+    /// many of a segment's events belong to one service, so the shortcut would over-count.
+    /// </param>
     public async ValueTask<LogVolumeCounts> AggregateLogVolumeAsync(
         DateTimeOffset fromUtc, DateTimeOffset toUtc,
         long minBucket, int bucketSeconds, int nBuckets,
-        string? serviceFilter, CancellationToken ct = default)
+        string? serviceFilter, CancellationToken ct = default, bool totalsOnly = false)
     {
         long fromTicks = fromUtc.UtcTicks;
         long toTicks   = toUtc.UtcTicks;
@@ -695,6 +744,10 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             if (segInfos.Count > 0)
             {
                 string? svcFilter = serviceFilter;
+                // Whole-segment counting is only sound when nothing per-service or per-level is
+                // read back out — see the totalsOnly parameter. With a service filter the
+                // catalog cannot answer at all, so the shortcut turns itself off.
+                bool wholeSegments = totalsOnly && svcFilter is null;
                 await Task.Run(() =>
                 {
                     int degree = Math.Clamp(Environment.ProcessorCount / 2, 2, 8);
@@ -707,6 +760,19 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                         {
                             if (covered.Contains(SegmentKey.Of(info))) return local;
                             if (info.MaxTimestampTicks < fromTicks || info.MinTimestampTicks > toTicks) return local;
+
+                            // Entirely inside the window: every event in it is in the answer, and
+                            // the catalog already knows how many there are. No mmap, no block
+                            // index read, no LZ4 decode — the whole cost of this segment is one
+                            // comparison. Boundary segments still have to be decoded, because
+                            // only the headers say which of their events fall in the window.
+                            if (wholeSegments &&
+                                info.MinTimestampTicks >= fromTicks && info.MaxTimestampTicks <= toTicks)
+                            {
+                                local.AddWholeSegment(info.EventCount);
+                                return local;
+                            }
+
                             try
                             {
                                 using var reader = SegmentReader.Open(info.FilePath);
