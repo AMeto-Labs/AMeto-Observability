@@ -15,7 +15,8 @@ public static class DiagnosticsEndpointMapper
     {
         app.MapGet("/api/diagnostics", (
             StorageEngine storage, ServerOptions options, ProcessCpuSampler cpu,
-            Ameto.Ingestion.IngestionRingBuffer ring, Ameto.Ingestion.IngestionDrainer drainer) =>
+            Ameto.Ingestion.IngestionRingBuffer ring, Ameto.Ingestion.IngestionDrainer drainer,
+            Ameto.Indexing.IndexingWiring indexing) =>
         {
             var proc = Process.GetCurrentProcess();
 
@@ -141,6 +142,16 @@ public static class DiagnosticsEndpointMapper
                 // Events the storage write path refused repeatedly and the drainer gave up
                 // on — a different failure from a full buffer, and previously silent.
                 ingestWriteErrorDrops    = drainer.ErrorDrops,
+
+                // ── Index build ────────────────────────────────────────────────
+                // Merge rows whose exception column is not a readable exception map: written,
+                // but without their @x.* terms, so @x.type filters and free-text search over
+                // merged segments miss them. Non-zero means a producer writes maps the index
+                // cannot read; it was previously counted nowhere an operator could see.
+                indexMalformedExceptionPayloads = indexing.Hints.MalformedExceptionPayloads,
+                // Bytes parked in the index build pools — transient after a gen2 trim, but
+                // counted in no memory budget.
+                indexBuildPooledBytes           = indexing.IndexBuildPooledBytes,
             });
         }).RequireAuthorization();
     }

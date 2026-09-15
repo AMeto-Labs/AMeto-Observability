@@ -326,6 +326,11 @@ public sealed class SegmentWriter : IDisposable
         if (_sinkFactory is not null) SealGroup();
     }
 
+    // ── Test seam ─────────────────────────────────────────────────────────────
+    // The three section writers below are how tests and probes write sections they built by
+    // hand. Production never calls them: SealGroup has the sink stream its sections straight
+    // into the file (ISegmentIndexSink.WriteSections), with exactly this framing.
+
     public void WriteInvertedIndex(ReadOnlySpan<byte> indexBytes)
     {
         _invertedIndexOffset = _fs.Position;
@@ -496,10 +501,14 @@ public sealed class SegmentWriter : IDisposable
         {
             if (_groupEventCount > 0)
             {
-                var (inverted, trigram, bloom) = _sink.Serialise();
-                WriteInvertedIndex(inverted);
-                WriteTrigramIndex(trigram);
-                WriteBloomFilter(bloom);
+                // The sink writes its three sections straight into the file (same framing as
+                // WriteInvertedIndex / WriteTrigramIndex / WriteBloomFilter) instead of
+                // handing back three blobs to copy: those were 70-110 MB of immediately dead
+                // LOH per group. BinaryWriter holds nothing back, but flushing it first keeps
+                // the file position the sink reads honest by construction, not by knowledge
+                // of BinaryWriter's internals.
+                _bw.Flush();
+                _sink.WriteSections(_fs, out _invertedIndexOffset, out _trigramIndexOffset, out _bloomFilterOffset);
 
                 // What this group cost, banked for the next one's forecast. Here and not in
                 // CloseGroup because this is the last moment the sink is in hand and the group's

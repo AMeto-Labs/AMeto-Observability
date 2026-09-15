@@ -74,10 +74,13 @@ public readonly ref struct SegmentEventRef
     /// <summary>
     /// The exception as an object graph, decoding the raw payload if that is all we have.
     ///
-    /// <para>Only the INDEX BUILD needs this — it indexes the type, the message and the inner
-    /// type as strings. The writer does not, and asking for it there is what put a decode plus a
+    /// <para>Only the INDEX BUILD needs anything of it — the type, the message and the inner
+    /// type. The writer does not, and asking for it there is what put a decode plus a
     /// re-encode on every exception-carrying row of every merge. A merge that runs without an
-    /// index sink now never decodes at all.</para>
+    /// index sink never decodes at all, and the streaming builder no longer decodes on a merge
+    /// either: it reads the three fields as spans out of <see cref="ExceptionPayload"/>
+    /// (<see cref="ExceptionInfo.TryReadIndexFields"/>), skipping the stack trace. This full
+    /// decode remains for the builder's reference oracle and any caller that wants the graph.</para>
     /// </summary>
     public ExceptionInfo? DecodeException() =>
         Exception ?? (ExceptionPayload.IsEmpty ? null : ExceptionInfo.FromBytes(ExceptionPayload));
@@ -162,8 +165,47 @@ public interface ISegmentIndexSink : IDisposable
     /// </summary>
     long BloomTermCapacity { get; }
 
-    /// <summary>Serialises the group's sections. Called once, after the last <see cref="Add"/>.</summary>
-    (byte[] Inverted, byte[] Trigram, byte[] Bloom) Serialise();
+    /// <summary>
+    /// Writes the group's three sections to <paramref name="destination"/> at its current
+    /// position — each as <c>uint32 length</c> + bytes (<see cref="WriteFramed"/>), the framing
+    /// the segment reader expects — and reports where each one starts. Called once, after the
+    /// last <see cref="Add"/>. This is the production call: a sink that can stream writes its
+    /// accumulators straight into the file instead of handing back three multi-MB blobs that
+    /// die as soon as they are copied. <paramref name="destination"/> must be seekable: a
+    /// streaming sink writes a length placeholder and patches it once the section's size is
+    /// known.
+    /// </summary>
+    void WriteSections(Stream destination, out long invertedOffset, out long trigramOffset, out long bloomOffset);
+
+    /// <summary>
+    /// The three sections as blobs — a test and probe seam, never called by the writer. The
+    /// default runs <see cref="WriteSections"/> into memory and slices the frames back out; a
+    /// sink with its own blobs may override it to skip the round trip.
+    /// </summary>
+    (byte[] Inverted, byte[] Trigram, byte[] Bloom) Serialise()
+    {
+        var ms = new MemoryStream();
+        WriteSections(ms, out long inv, out long tri, out long bloom);
+        var all = ms.GetBuffer();
+        return (Unframe(all, inv), Unframe(all, tri), Unframe(all, bloom));
+
+        static byte[] Unframe(byte[] all, long at)
+        {
+            uint len = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(all.AsSpan((int)at));
+            return all.AsSpan((int)at + 4, (int)len).ToArray();
+        }
+    }
+
+    /// <summary>Writes one section as <c>uint32 length</c> + bytes and returns where it starts.</summary>
+    static long WriteFramed(Stream destination, ReadOnlySpan<byte> section)
+    {
+        long at = destination.Position;
+        Span<byte> len = stackalloc byte[4];
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(len, (uint)section.Length);
+        destination.Write(len);
+        destination.Write(section);
+        return at;
+    }
 }
 
 /// <summary>

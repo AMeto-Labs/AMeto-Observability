@@ -40,8 +40,14 @@ public sealed class IndexBuildAllocProbe
         _ = builder.SerialisedBloomFilter;
         long serialiseBytes = GC.GetAllocatedBytesForCurrentThread() - s0;
 
+        // The production path: sections streamed into the file through one pooled buffer.
+        long t0 = GC.GetAllocatedBytesForCurrentThread();
+        builder.WriteSections(Stream.Null, out _, out _, out _);
+        long streamedBytes = GC.GetAllocatedBytesForCurrentThread() - t0;
+
         string report = $"index — {events:N0} events:  build={buildBytes / 1048576.0:F1} MB  " +
-                        $"serialise={serialiseBytes / 1048576.0:F1} MB  total={(buildBytes + serialiseBytes) / 1048576.0:F1} MB";
+                        $"serialise={serialiseBytes / 1048576.0:F1} MB (blobs)  streamed={streamedBytes / 1024.0:F1} KB (production)  " +
+                        $"total={(buildBytes + streamedBytes) / 1048576.0:F1} MB";
         _out.WriteLine(report);
         Assert.True(hot.Count > 0);
     }

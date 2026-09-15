@@ -192,6 +192,47 @@ public sealed unsafe class SegmentBloomFilter : IDisposable
         if (foldRented is not null) System.Buffers.ArrayPool<char>.Shared.Return(foldRented);
     }
 
+    /// <summary>
+    /// Adds the case-folded form of a UTF-8 value — what <see cref="Add(ReadOnlySpan{char})"/>
+    /// stores, reached without a UTF-16 round trip when the value is ASCII. Byte-wise A-Z
+    /// lowering is exactly what <c>ToLowerInvariant</c> does to an ASCII string, and the
+    /// re-encoding of the folded chars is the identity, so the hashed bytes — and therefore the
+    /// bits — are the same. Anything with a non-ASCII byte takes the UTF-16 path unchanged.
+    /// </summary>
+    public void AddUtf8(ReadOnlySpan<byte> value)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        byte[]? rented = value.Length > 512 ? System.Buffers.ArrayPool<byte>.Shared.Rent(value.Length) : null;
+        Span<byte> fold = rented ?? stackalloc byte[512];
+        try
+        {
+            if (System.Text.Ascii.ToLower(value, fold, out int n) == System.Buffers.OperationStatus.Done)
+            {
+                Add(fold[..n]);
+                return;
+            }
+        }
+        finally
+        {
+            if (rented is not null) System.Buffers.ArrayPool<byte>.Shared.Return(rented);
+        }
+
+        // Non-ASCII: decode and fold as UTF-16, exactly as the char overload does.
+        int chars = System.Text.Encoding.UTF8.GetCharCount(value);
+        char[]? rentedChars = chars > 256 ? System.Buffers.ArrayPool<char>.Shared.Rent(chars) : null;
+        Span<char> buf = rentedChars ?? stackalloc char[256];
+        try
+        {
+            int written = System.Text.Encoding.UTF8.GetChars(value, buf);
+            Add((ReadOnlySpan<char>)buf[..written]);
+        }
+        finally
+        {
+            if (rentedChars is not null) System.Buffers.ArrayPool<char>.Shared.Return(rentedChars);
+        }
+    }
+
     private void AddRaw(ReadOnlySpan<char> value)
     {
         int max = System.Text.Encoding.UTF8.GetMaxByteCount(value.Length);
@@ -295,13 +336,37 @@ public sealed unsafe class SegmentBloomFilter : IDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
         uint byteCount = _blockCount * BlockBytes;
         var buf = new byte[4 + 4 + byteCount]; // bitCount + capacity | foldedMarker + bits
-        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(0), _blockCount * BlockBits);
+        WriteHeader(buf);
+        new Span<byte>(_bits, (int)byteCount).CopyTo(buf.AsSpan(8));
+        return buf;
+    }
+
+    /// <summary>Bytes <see cref="Serialise"/> / <see cref="WriteTo"/> produce.</summary>
+    public long SerialisedLength => 8L + (long)_blockCount * BlockBytes;
+
+    /// <summary>
+    /// Writes the section — the same bytes <see cref="Serialise"/> returns — straight from the
+    /// native bits to <paramref name="destination"/>, with no managed copy in between. The
+    /// blob path costs a ~5 MB LOH array per group that dies the moment the writer has
+    /// written it; this is the production path. Guarded like <see cref="Serialise"/>, for
+    /// the same reason.
+    /// </summary>
+    public void WriteTo(Stream destination)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        Span<byte> header = stackalloc byte[8];
+        WriteHeader(header);
+        destination.Write(header);
+        destination.Write(new ReadOnlySpan<byte>(_bits, (int)(_blockCount * BlockBytes)));
+    }
+
+    private void WriteHeader(Span<byte> dest)
+    {
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(dest, _blockCount * BlockBits);
         // Only claim folded when this instance's contents really were folded — a filter that
         // was read back from a pre-folding blob and re-serialised must keep saying so.
         uint capacityWord = _folded ? (_capacity & ~FoldedMarker) | FoldedMarker : _capacity & ~FoldedMarker;
-        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(4), capacityWord);
-        new Span<byte>(_bits, (int)byteCount).CopyTo(buf.AsSpan(8));
-        return buf;
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(dest.Slice(4), capacityWord);
     }
 
     public static SegmentBloomFilter Deserialise(ReadOnlySpan<byte> data)

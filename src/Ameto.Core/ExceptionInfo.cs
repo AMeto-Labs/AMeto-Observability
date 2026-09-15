@@ -153,6 +153,99 @@ public sealed class ExceptionInfo
         return buf.WrittenSpan.ToArray();
     }
 
+    /// <summary>
+    /// Reads just what the segment index files — <c>type</c>, <c>msg</c> and the inner
+    /// exception's <c>type</c> — as UTF-8 spans into <paramref name="payload"/>, skipping the
+    /// stack trace and everything else without decoding it.
+    ///
+    /// <para>For the merge path, where the exception travels as bytes and the index is the only
+    /// consumer. <see cref="FromBytes"/> there meant copying the payload, decoding four key
+    /// strings and the 1-5 KB stack trace to UTF-16 per row, on a path that level-split flush
+    /// makes 100 % exceptions for every Error segment — gigabytes of gen0 garbage per large
+    /// merge for three short strings. The same shapes <see cref="Read"/> accepts are accepted
+    /// here: nil (false), a legacy plain string (type <c>Exception</c>, the string as message),
+    /// or a map; a map deeper than <see cref="MaxDepth"/> is truncated the same way. Malformed
+    /// input returns false rather than throwing. The spans alias <paramref name="payload"/>, which
+    /// is a <see cref="ReadOnlyMemory{T}"/> only because <see cref="MessagePackReader"/> has no
+    /// span constructor — a caller holding a span pins it and wraps it, without a copy.</para>
+    /// </summary>
+    public static bool TryReadIndexFields(ReadOnlyMemory<byte> payload,
+        out ReadOnlySpan<byte> type, out ReadOnlySpan<byte> message, out ReadOnlySpan<byte> innerType)
+    {
+        type = "Exception"u8; message = default; innerType = default;
+        if (payload.IsEmpty) return false;
+        try
+        {
+            var reader = new MessagePackReader(payload);
+            if (reader.TryReadNil()) return false;
+
+            if (reader.NextMessagePackType == MessagePackType.String)
+            {
+                if (!reader.TryReadStringSpan(out var legacy) || legacy.IsEmpty) return false;
+                message = legacy;
+                return true;
+            }
+            if (reader.NextMessagePackType != MessagePackType.Map) return false;
+
+            int fields = reader.ReadMapHeader();
+            for (int i = 0; i < fields; i++)
+            {
+                if (!reader.TryReadStringSpan(out var key)) { reader.Skip(); reader.Skip(); continue; }
+                // A non-string, non-nil type or message is what Read throws on (ReadString);
+                // it is reported as malformed here rather than indexed under a made-up type.
+                if (key.SequenceEqual("type"u8))
+                {
+                    if (reader.TryReadNil()) type = "Exception"u8;
+                    else if (reader.NextMessagePackType == MessagePackType.String && reader.TryReadStringSpan(out var t)) type = t;
+                    else return false;
+                }
+                else if (key.SequenceEqual("msg"u8))
+                {
+                    if (reader.TryReadNil()) message = default;
+                    else if (reader.NextMessagePackType == MessagePackType.String && reader.TryReadStringSpan(out var m)) message = m;
+                    else return false;
+                }
+                else if (key.SequenceEqual("inner"u8))
+                {
+                    // Depth 2 of MaxDepth = 3: the inner's type is indexed, nothing below it is.
+                    if (reader.TryReadNil()) continue;
+                    if (reader.NextMessagePackType == MessagePackType.String)
+                    {
+                        // A legacy inner string reads as type "Exception" — unless it is empty,
+                        // which ReadAtDepth turns into no inner at all.
+                        if (reader.TryReadStringSpan(out var legacyInner)) { if (!legacyInner.IsEmpty) innerType = "Exception"u8; }
+                        else reader.Skip();
+                        continue;
+                    }
+                    if (reader.NextMessagePackType != MessagePackType.Map) { reader.Skip(); continue; }
+                    innerType = "Exception"u8;
+                    int innerFields = reader.ReadMapHeader();
+                    for (int j = 0; j < innerFields; j++)
+                    {
+                        if (!reader.TryReadStringSpan(out var ik)) { reader.Skip(); reader.Skip(); continue; }
+                        if (ik.SequenceEqual("type"u8))
+                        {
+                            if (reader.TryReadNil()) innerType = "Exception"u8;
+                            else if (reader.NextMessagePackType == MessagePackType.String && reader.TryReadStringSpan(out var it)) innerType = it;
+                            else return false;
+                        }
+                        else reader.Skip();
+                    }
+                }
+                else reader.Skip();   // stk, unknown keys
+            }
+            return true;
+        }
+        catch (MessagePackSerializationException)
+        {
+            return false;
+        }
+        catch (EndOfStreamException)
+        {
+            return false;
+        }
+    }
+
     /// <summary>Reads an <see cref="ExceptionInfo"/> from a previously-written msgpack byte buffer.</summary>
     public static ExceptionInfo? FromBytes(ReadOnlySpan<byte> bytes)
     {

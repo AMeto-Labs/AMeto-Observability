@@ -77,6 +77,94 @@ public sealed class FlushCpuProbe
         _out.WriteLine($"  ReleaseMaintenanceMemory() blocking compacting gen2: {swGc.Elapsed.TotalMilliseconds:F0} ms");
     }
 
+    /// <summary>
+    /// The PRODUCTION path — <see cref="SegmentIndexBuilder"/> over a realistic trace-carrying
+    /// hot tier, header fields plus the streaming msgpack walk into all three indexes, then the
+    /// three sections — as CPU per event. Minimum of three runs, because this box is shared
+    /// and a single sample says more about the neighbours than the code.
+    /// </summary>
+    [Fact]
+    public void IndexBuilder_CpuPerEvent()
+    {
+        const int events = 130_000;
+        var pool   = new Ameto.Storage.StringInternPool();
+        int svcIdx = pool.Intern("Etisalat.API");
+        using var hot = BuildRealisticTier(events, pool, svcIdx);
+
+        BuildOnce(hot, pool, 5_000);   // JIT
+
+        double bestCpu = double.MaxValue, bestWall = double.MaxValue;
+        long   alloc   = 0;
+        for (int run = 0; run < 3; run++)
+        {
+            long a0 = GC.GetAllocatedBytesForCurrentThread();
+            var cpu0 = Process.GetCurrentProcess().TotalProcessorTime;
+            var sw   = Stopwatch.StartNew();
+            BuildOnce(hot, pool, hot.Count);
+            sw.Stop();
+            double cpu = (Process.GetCurrentProcess().TotalProcessorTime - cpu0).TotalMilliseconds;
+            bestCpu  = Math.Min(bestCpu,  cpu);
+            bestWall = Math.Min(bestWall, sw.Elapsed.TotalMilliseconds);
+            alloc    = GC.GetAllocatedBytesForCurrentThread() - a0;
+        }
+
+        _out.WriteLine($"  SegmentIndexBuilder, {hot.Count:N0} trace-carrying events (min of 3):");
+        _out.WriteLine($"    CPU       {bestCpu,8:F0} ms   = {bestCpu * 1000 / hot.Count,5:F2} µs/event");
+        _out.WriteLine($"    wall      {bestWall,8:F0} ms");
+        _out.WriteLine($"    allocated {alloc / MB,8:F1} MB   = {(double)alloc / hot.Count,5:F0} B/event (build + three sections)");
+    }
+
+    private static void BuildOnce(Ameto.Storage.HotTierSegment hot, Ameto.Storage.StringInternPool pool, int count)
+    {
+        using var builder = new SegmentIndexBuilder(count);
+        builder.Build(hot, pool, null, 0, count);
+        var (inv, tri, bloom) = builder.Serialise();
+        GC.KeepAlive(inv); GC.KeepAlive(tri); GC.KeepAlive(bloom);
+    }
+
+    private static Ameto.Storage.HotTierSegment BuildRealisticTier(int events, Ameto.Storage.StringInternPool pool, int svcIdx)
+    {
+        var hot = new Ameto.Storage.HotTierSegment(2_000_000, 64L * 1024 * 1024);
+        long baseTicks = DateTimeOffset.UtcNow.UtcTicks;
+        var rng = new Random(5);
+        string[] methods = { "GET", "POST", "PUT", "DELETE" };
+        string[] routes  = { "/api/pay", "/api/topup", "/api/status", "/api/balance" };
+        int[]    codes   = { 200, 201, 400, 404, 500 };
+        int tmplIdx = pool.Intern("HTTP {Method} {Route} responded {Status} in {Elapsed} ms");
+        string tmpl = pool.Get(tmplIdx);
+
+        var buf = new System.Buffers.ArrayBufferWriter<byte>(512);
+        for (int i = 0; i < events; i++)
+        {
+            buf.Clear();
+            var w = new MessagePack.MessagePackWriter(buf);
+            w.WriteMapHeader(8);
+            w.Write("orderId");          w.Write(rng.Next(0, 10_000_000));
+            w.Write("customerId");       w.Write("cust-" + rng.Next(0, 100_000));
+            w.Write("http.method");      w.Write(methods[rng.Next(methods.Length)]);
+            w.Write("http.route");       w.Write(routes[rng.Next(routes.Length)]);
+            w.Write("http.status_code"); w.Write(codes[rng.Next(codes.Length)]);
+            w.Write("duration_ms");      w.Write(Math.Round(rng.NextDouble() * 500, 2));
+            w.Write("region");           w.Write("ae-dxb");
+            w.Write("RequestId");        w.Write("0HN" + rng.Next().ToString("x"));
+            w.Flush();
+
+            var h = new LogEventHeader
+            {
+                Id                       = new EventId(0u, (uint)i).RawValue,
+                TimestampUtcTicks        = baseTicks + i,
+                Level                    = LogLevel.Information,
+                MessageTemplatePoolIndex = tmplIdx,
+                ServiceNamePoolIndex     = svcIdx,
+                TraceIdHi                = (ulong)rng.NextInt64(),
+                TraceIdLo                = (ulong)rng.NextInt64(),
+                SpanId                   = (ulong)rng.NextInt64(),
+            };
+            if (!hot.TryWrite(h, buf.WrittenSpan, tmpl)) break;
+        }
+        return hot;
+    }
+
     private static void RunOne(Ev[] ev, int count)
     {
         const string template = "HTTP {Method} {Route} responded {Status} in {Elapsed} ms";

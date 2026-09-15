@@ -208,6 +208,8 @@ public sealed class QueryValidationTests : IClassFixture<AmetoWebAppFactory>
                      "ingestSlabCapacity",
                      "ingestDroppedOversized", "ingestDroppedNoSlab", "ingestDroppedRingFull",
                      "ingestWriteErrorDrops",
+                     // Index build: merge rows written without their @x.* terms, and pooled build memory.
+                     "indexMalformedExceptionPayloads", "indexBuildPooledBytes",
                  })
         {
             Assert.True(json.TryGetProperty(field, out var value), $"missing '{field}'");

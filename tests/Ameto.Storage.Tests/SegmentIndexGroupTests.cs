@@ -422,12 +422,12 @@ public sealed class SegmentIndexGroupTests : IDisposable
         public long BloomTermsAdded   => 0;
         public long BloomTermCapacity => 0;
 
-        public (byte[] Inverted, byte[] Trigram, byte[] Bloom) Serialise()
+        public void WriteSections(Stream destination, out long invertedOffset, out long trigramOffset, out long bloomOffset)
         {
             int seq = onSeal();
-            return (Encoding.UTF8.GetBytes($"inv:{_first}:{_count}"),
-                    Encoding.UTF8.GetBytes($"tri:{_first}:{_count}:{new string('t', seq)}"),
-                    Encoding.UTF8.GetBytes($"bloom:{_first}:{_count}"));
+            invertedOffset = ISegmentIndexSink.WriteFramed(destination, Encoding.UTF8.GetBytes($"inv:{_first}:{_count}"));
+            trigramOffset  = ISegmentIndexSink.WriteFramed(destination, Encoding.UTF8.GetBytes($"tri:{_first}:{_count}:{new string('t', seq)}"));
+            bloomOffset    = ISegmentIndexSink.WriteFramed(destination, Encoding.UTF8.GetBytes($"bloom:{_first}:{_count}"));
         }
 
         public void Dispose() { }
