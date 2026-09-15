@@ -17,10 +17,10 @@ namespace Ameto.Perf;
 /// the merge budgets were 32 MB / 100k events: they were a MEMORY bound wearing a policy hat.</para>
 ///
 /// <para>The writer now pulls from a k-way merged stream and holds one block plus one index
-/// group. This probe merges the same source shape at 1×, 2×, 4× and 8× the size and shows what
-/// the merge keeps reachable at its peak staying flat — stated as an absolute ceiling on that
-/// state at every size, an absolute bound on what each further merged event may add, and ratios
-/// against the smaller merges.</para>
+/// group. This probe merges the same source shape at 1×, 2×, 4×, 8× and 16× the size and shows
+/// what the merge keeps reachable at its peak staying flat — stated as an absolute ceiling on
+/// that state at every size, an absolute bound on what each further merged event may add, and
+/// ratios against the smaller merges.</para>
 ///
 /// <para>Beside it, for scale, the cost of merely MATERIALISING the same events: the first and
 /// cheapest of the three stages the old pipeline paid for. It is checked only for scaling with
@@ -108,18 +108,27 @@ public sealed class StreamingMergeMemoryProbe : IDisposable
     }
 
     /// <summary>
-    /// What one further merged event may add to the merge's peak reachable state.
+    /// What one further merged event may add to the merge's peak reachable state, over the
+    /// 168 000 events from the 2× merge to the 16× one.
     ///
     /// <para>What legitimately grows with the merged size is per BLOCK or per GROUP (the block
-    /// index, the group directory): well under a byte an event here. The measured slope is a few
-    /// bytes either way (0.2 to 3.5 B), heap and group-shape noise.</para>
+    /// index, the group directory): well under a byte an event here. The measured slope is about
+    /// 1 B. What moves it is group shape, not events: the state at the peak seal differs by up to
+    /// about 1 MB from one size to the next (21.2 MB at 24 000 events and 21.7 MB at 48 000; with a
+    /// 20 MB array held through the merge, 41.4 MB at 24 000 and 42.4 MB at 96 000), which over
+    /// this span is up to 6 B an event. Over 24 000 to 96 000 events, the span this was first
+    /// measured on, the same noise read up to 14.6 B. That is why the span is 16× and not 8×.</para>
     ///
-    /// <para>Holding something per event does not fit under it. Simulated against this probe: a
-    /// copy of every event taken before the writer sees one (the old pipeline's first stage)
-    /// reads 288 B, a <c>byte[32]</c> kept per event 73 B, an object and its reference 43 B. A
-    /// bare 8 B id appended to a list reads 13 B and gets through: that is the floor.</para>
+    /// <para>The floor, measured with throwaway retention in <c>SegmentWriter.WriteEvents</c>, one
+    /// entry per merged event held for the whole merge. An 8 B id in an array sized up front reads
+    /// 8.9 B and passes. The same id appended to a <c>List</c>, which over-allocates as it
+    /// doubles, reads 12.6 B: right at the bound, so it can go either way. A 16 B record in an
+    /// array sized up front reads 17.3 B and fails; a 24 B one reads 24.5 B. So a leak of 8 B an
+    /// event gets through, 16 B does not, and what lies between depends on how the leak
+    /// allocates. Under the previous span and bound (32 B over 24 000 to 96 000 events) a 16 B
+    /// record read 16.8 to 19.8 B and a 24 B one 24.6 to 27.6 B, and both passed.</para>
     /// </summary>
-    private const double MaxMarginalBytesPerEvent = 32;
+    private const double MaxMarginalBytesPerEvent = 12;
 
     /// <summary>
     /// Ceiling on what <see cref="IndexBuildPool"/> may hold parked at a seal of these 4 MB groups:
@@ -131,7 +140,7 @@ public sealed class StreamingMergeMemoryProbe : IDisposable
     /// <summary>
     /// Ceiling on what the merge keeps reachable at a group seal, at every size.
     ///
-    /// <para>What that is, measured from 12 000 to 96 000 events: the index build state of the
+    /// <para>What that is, measured from 12 000 to 192 000 events: the index build state of the
     /// group being sealed, as <see cref="SegmentIndexBuilder.BuildRetainedBytes"/> counts it,
     /// 19.5 to 20.5 MB (the table prints it); and 0.6 to 1.3 MB of everything else the merge holds
     /// beside it — the source cursors, the writer's buffers, the group's bloom filter. 20.1 to
@@ -142,8 +151,8 @@ public sealed class StreamingMergeMemoryProbe : IDisposable
     /// 19.7 MB once the query decoder got cheaper). The slope and the ratios compare this probe's
     /// merges with each other, so a cost that is flat in the merged size passes them however large
     /// it is. Simulated with a 20 MB array held for the whole merge (throwaway, in
-    /// <c>SegmentWriter.WriteEvents</c>): 40.7 to 42.5 MB at every size, a slope of 7.0 to 14.6
-    /// B/event, 1.03× from 1× to 8×. Only this ceiling fails it.</para>
+    /// <c>SegmentWriter.WriteEvents</c>): 40.7 to 42.5 MB at every size, a slope of 3.2 B/event,
+    /// 1.03× from 1× to 16×. Only this ceiling fails it.</para>
     /// </summary>
     private const long MaxMergeStateBytes = 32L << 20;
 
@@ -158,54 +167,55 @@ public sealed class StreamingMergeMemoryProbe : IDisposable
 
         Measure(250, "warm", hints);   // JIT + ArrayPool growth out of the way
 
-        var m1 = Measure(1_000, "merge 1x", hints);
-        var m2 = Measure(2_000, "merge 2x", hints);
-        var m4 = Measure(4_000, "merge 4x", hints);
-        var m8 = Measure(8_000, "merge 8x", hints);
+        var m1  = Measure(1_000,  "merge 1x",  hints);
+        var m2  = Measure(2_000,  "merge 2x",  hints);
+        var m4  = Measure(4_000,  "merge 4x",  hints);
+        var m8  = Measure(8_000,  "merge 8x",  hints);
+        var m16 = Measure(16_000, "merge 16x", hints);
 
-        _out.WriteLine("  events | groups | merge state at peak | of it index build | parked in pool | gross heap at peak | materialising the same");
-        _out.WriteLine("  -------+--------+---------------------+-------------------+----------------+--------------------+-----------------------");
-        foreach (var r in new[] { m1, m2, m4, m8 })
-            _out.WriteLine($"  {r.Events,6:N0} | {r.Groups,6} | {r.PeakBytes / MB,16:F1} MB | {r.BuildStateAtPeakBytes / MB,14:F1} MB | " +
+        _out.WriteLine("   events | groups | merge state at peak | of it index build | parked in pool | gross heap at peak | materialising the same");
+        _out.WriteLine("  --------+--------+---------------------+-------------------+----------------+--------------------+-----------------------");
+        foreach (var r in new[] { m1, m2, m4, m8, m16 })
+            _out.WriteLine($"  {r.Events,7:N0} | {r.Groups,6} | {r.PeakBytes / MB,16:F1} MB | {r.BuildStateAtPeakBytes / MB,14:F1} MB | " +
                            $"{r.ParkedBytes / MB,11:F1} MB | {r.GrossPeakBytes / MB,15:F1} MB | {r.MaterialisedBytes / MB,18:F1} MB");
 
-        double mergePerEvent = (m8.PeakBytes - m2.PeakBytes) / (double)(m8.Events - m2.Events);
-        double matPerEvent   = (m8.MaterialisedBytes - m2.MaterialisedBytes) / (double)(m8.Events - m2.Events);
-        _out.WriteLine($"  each merged event from {m2.Events:N0} to {m8.Events:N0}: merge state {mergePerEvent:F1} B " +
+        double mergePerEvent = (m16.PeakBytes - m2.PeakBytes) / (double)(m16.Events - m2.Events);
+        double matPerEvent   = (m16.MaterialisedBytes - m2.MaterialisedBytes) / (double)(m16.Events - m2.Events);
+        _out.WriteLine($"  each merged event from {m2.Events:N0} to {m16.Events:N0}: merge state {mergePerEvent:F1} B " +
                        $"(bound {MaxMarginalBytesPerEvent} B), materialising {matPerEvent:F1} B");
 
-        Assert.True(m8.Groups >= 6, $"budget did not cut the merged file: {m8.Groups} group(s)");
-        Assert.Equal(m1.Events * 8, m8.Events);
+        Assert.True(m16.Groups >= 12, $"budget did not cut the merged file: {m16.Groups} group(s)");
+        Assert.Equal(m1.Events * 16, m16.Events);
 
         // The sources must hold data that scales, or a flat merge proves nothing.
-        Assert.True(m8.MaterialisedBytes > m1.MaterialisedBytes * 5,
+        Assert.True(m16.MaterialisedBytes > m1.MaterialisedBytes * 10,
             "the materialised baseline is not scaling — the probe is measuring nothing");
 
         // The absolute half: however flat, the merge's working state has a size. A cost that does
         // not grow with the merged file passes the slope and the ratios below, and this catches it.
-        foreach (var r in new[] { m1, m2, m4, m8 })
+        foreach (var r in new[] { m1, m2, m4, m8, m16 })
             Assert.True(r.PeakBytes < MaxMergeStateBytes,
                 $"the {r.Events:N0}-event merge held {r.PeakBytes / MB:F1} MB at a seal (ceiling {MaxMergeStateBytes / MB:F0} MB; " +
                 $"the group's index build state was {r.BuildStateAtPeakBytes / MB:F1} MB of it)");
 
-        // The claim, as a slope: between two multi-group merges, 4× the events apart, each further
+        // The claim, as a slope: between two multi-group merges, 8× the events apart, each further
         // event adds at most a few bytes to what the merge holds at its peak. The bound is
         // absolute, so a change to another code path's cost cannot move it.
         Assert.True(mergePerEvent < MaxMarginalBytesPerEvent,
             $"each merged event adds {mergePerEvent:F1} B to the merge's peak (bound {MaxMarginalBytesPerEvent} B; " +
             $"materialising adds {matPerEvent:F1} B) — the merge is not streaming");
 
-        // And as ratios: 8× the merged data does not cost 8× the peak.
-        Assert.True(m8.PeakBytes < m1.PeakBytes * 1.6,
+        // And as ratios: 16× the merged data does not cost 16× the peak.
+        Assert.True(m16.PeakBytes < m1.PeakBytes * 1.6,
             $"peak grew with the merged file: {m1.PeakBytes / MB:F1} MB at {m1.Events:N0} events " +
-            $"vs {m8.PeakBytes / MB:F1} MB at {m8.Events:N0} — the merge is not streaming");
-        Assert.True(m8.PeakBytes < m4.PeakBytes * 1.6,
+            $"vs {m16.PeakBytes / MB:F1} MB at {m16.Events:N0} — the merge is not streaming");
+        Assert.True(m16.PeakBytes < m4.PeakBytes * 1.6,
             $"peak grew with the merged file: {m4.PeakBytes / MB:F1} MB at {m4.Events:N0} events " +
-            $"vs {m8.PeakBytes / MB:F1} MB at {m8.Events:N0} — the merge is not streaming");
+            $"vs {m16.PeakBytes / MB:F1} MB at {m16.Events:N0} — the merge is not streaming");
 
         // The pool is bounded apart: reusable, but memory the process holds all the same.
-        Assert.True(m8.ParkedBytes < MaxParkedBytes,
-            $"{m8.ParkedBytes / MB:F1} MB parked in IndexBuildPool at a seal of the {m8.Events:N0}-event merge");
+        Assert.True(m16.ParkedBytes < MaxParkedBytes,
+            $"{m16.ParkedBytes / MB:F1} MB parked in IndexBuildPool at a seal of the {m16.Events:N0}-event merge");
     }
 
     /// <param name="PeakBytes">The most the merge kept reachable at any group seal, above a settled baseline.</param>
