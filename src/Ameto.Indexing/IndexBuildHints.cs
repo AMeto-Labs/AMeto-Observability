@@ -10,10 +10,17 @@ namespace Ameto.Indexing;
 /// <para>CLAMPED, not the raw last count. A single huge merge group would otherwise make every
 /// builder created before the next small group sealed rent its 90 MB entry array and 16 MB
 /// tables, hold them for the group, and park them in the pool. The hint is the smaller of the
-/// last group's count and twice a running average (so a real step up in shape is followed in
-/// two or three groups, a one-off is not), under an absolute ceiling
+/// last group's count and twice a running average, under an absolute ceiling
 /// (<see cref="MaxTerms"/>, <see cref="MaxTrigrams"/>) that bounds the pre-size at what a 64 MB
-/// group of dense events actually reaches; a group past it grows by doubling from there.</para>
+/// group of dense events actually reaches; a group past it grows by doubling from there. So a
+/// real step up in shape is followed fully within two or three groups, and a one-off IS followed,
+/// at roughly half its size, until the next group seals: steady 10k-term groups then one 400k
+/// group give min(400k, 2 x 107.5k) = 215k for every builder created before the next seal.</para>
+///
+/// <para>One instance serves every flush level and every merge, so interleaved small and large
+/// groups pre-size each other imperfectly: a large group rehashes up from a small hint, a small
+/// one rents tables sized for a large one. That costs rehashes or oversized rentals, never
+/// correctness. Keying the hints by (flush or merge, level) is the fix if it shows in a profile.</para>
 /// </summary>
 public sealed class IndexBuildHints
 {

@@ -224,7 +224,10 @@ internal sealed class PostingArena
     private void AddSlab()
     {
         if (_slabCount == _slabs.Length) Array.Resize(ref _slabs, _slabs.Length * 2);
-        _slabs[_slabCount++] = IndexBuildPool.Slabs.Rent(SlabBytes);
+        // Rent, THEN count it: a rent that throws (out of memory) must not leave a null slot
+        // counted for Release to hand back.
+        var fresh = IndexBuildPool.Slabs.Rent(SlabBytes);
+        _slabs[_slabCount++] = fresh;
     }
 
     private static int VarintLen(uint v)

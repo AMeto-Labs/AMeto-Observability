@@ -128,11 +128,18 @@ public sealed class SegmentInvertedBuildParityTests
         Assert.Equal(small.TermCount, big.TermCount);
     }
 
-    // ── Empty terms: a legal value and a legal key, at every slab position ──────
+    // ── Empty terms: a legal value and a legal key ──────────────────────────────
+    //
+    // The one shape that ever failed is an empty name or term as the VERY FIRST append, before
+    // any slab exists: the old test (sum only) let it through with slab index -1 and threw.
+    // EmptyKey_AsTheVeryFirstProperty_IsFiled reproduces that and fails on the old Append. The
+    // other two are byte-parity checks, not regression tests: an empty value after a non-empty
+    // name, and an empty term against a full slab, both read back correctly on the old code too.
 
     [Fact]
-    public void EmptyValue_AsTheVeryFirstTerm_IsFiled()
+    public void EmptyValue_AfterItsName_MatchesTheReference()
     {
+        // The property name "k" is appended first, so a slab exists before the empty value.
         var adds = new List<(uint, string, object?)> { (0u, "k", ""), (1u, "k", "v"), (1u, "k", "") };
         Assert.Equal(Reference(adds), Arena(adds));
         var idx = new SegmentInvertedIndex();
@@ -151,11 +158,13 @@ public sealed class SegmentInvertedBuildParityTests
     }
 
     [Fact]
-    public void EmptyTerm_ExactlyAtASlabBoundary_DoesNotNameTheNextSlab()
+    public void EmptyTerm_ExactlyAtASlabBoundary_MatchesTheReference()
     {
         // Fill the first 1 MB slab to the byte: the name "k" (1 B) then 1023 values of 1024 B
-        // and one of 1023 B. The next append is "", with the slab full — the case that used
-        // to compute offset (slab+1)<<20 and read a slab that did not exist.
+        // and one of 1023 B. The next append is "", with the slab full. The old Append OR'd
+        // SlabBytes into that offset, naming slab 1: an unrented null slot, which reads back as
+        // an empty span. So this passed on the old code too. It pins byte parity at the boundary;
+        // it does not reproduce a crash.
         var idx = new SegmentInvertedIndex();
         var adds = new List<(uint, string, object?)>();
         var value = new byte[1024];

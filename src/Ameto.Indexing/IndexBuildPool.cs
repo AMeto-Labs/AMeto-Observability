@@ -44,7 +44,17 @@ internal static class IndexBuildPool
     /// <summary>Term, posting and section-writer slabs: exactly 1 MB each.</summary>
     public static readonly SlabPool<byte> Slabs = new(maxLength: SlabBytes, maxArraysPerBucket: 64, maxPooledBytes: 64L << 20);
 
-    /// <summary>Slot and hash tables; the largest is the trigram's 2^21-entry table (8 MB).</summary>
+    /// <summary>
+    /// Slot and hash tables; the largest is the trigram's 2^21-entry table (8 MB).
+    ///
+    /// <para>A TRADE-OFF, stated plainly: depth 4 and 48 MB sit below the widest flush. The
+    /// storage engine runs up to 8 builders at once, each holding an 8 MB ASCII trigram table, so
+    /// at width 8 a wave returns eight tables, this keeps four, and every wave allocates at least
+    /// 32 MB of those tables fresh on the LOH. Where the width is 4 or less (half the cores, or
+    /// fewer concurrent builds than the managed flush budget affords) depth 4 covers it, and a
+    /// deeper pool would park tables no builder there can use. <c>IndexBuildPoolProbe</c>
+    /// is sequential and cannot see this, so measure a parallel probe before raising it.</para>
+    /// </summary>
     public static readonly SlabPool<int> Ints = new(maxLength: 1 << 22, maxArraysPerBucket: 4, maxPooledBytes: 48L << 20);
 
     /// <summary>Entry arrays of one struct type — a pool per type.</summary>
@@ -195,8 +205,13 @@ internal static class IndexBuildPool
 
         public T[] Rent(int minimumLength)
         {
+            // Beyond the pool: live memory, GC-owned. Tested BEFORE rounding: past 2^30 the
+            // round-up is 2^31, which as an int is negative, slips under a post-rounding test and
+            // indexes past the buckets. Rounded to a power of two while one fits in an int (the
+            // tables use Length as their capacity), exact beyond that.
+            if (minimumLength > MaxLength)
+                return new T[minimumLength <= 1 << 30 ? (int)BitOperations.RoundUpToPowerOf2((uint)minimumLength) : minimumLength];
             int length = (int)BitOperations.RoundUpToPowerOf2((uint)Math.Max(minimumLength, MinLength));
-            if (length > MaxLength) return new T[length];   // beyond the pool: live memory, GC-owned
             int b = BucketOf(length);
             lock (_lock)
             {
@@ -212,8 +227,12 @@ internal static class IndexBuildPool
             return new T[length];
         }
 
-        public void Return(T[] array)
+        public void Return(T[]? array)
         {
+            // Null is ignored: cleanup after a failed rent must not turn into a
+            // NullReferenceException that masks the OutOfMemoryException behind it and skips
+            // the rest of the cleanup (the segment writer's file handles).
+            if (array is null) return;
             int length = array.Length;
             if (length > MaxLength || length < MinLength || !BitOperations.IsPow2(length)) return;
             long bytes = (long)length * Unsafe.SizeOf<T>();

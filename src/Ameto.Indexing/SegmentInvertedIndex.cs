@@ -311,15 +311,21 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
     /// <summary>Copies <paramref name="bytes"/> into the slabs and returns its offset.</summary>
     private int Append(ReadOnlySpan<byte> bytes)
     {
-        // The second test is for an EMPTY term against a full slab: the sum test alone lets it
-        // through and names offset SlabBytes of the current slab, i.e. position 0 of a slab that
-        // may not exist. An empty key or value is a legal term (the old build filed "").
+        // The second test is for an EMPTY term when no slab has room; the sum test alone lets it
+        // through. As the very first append (no slab yet, since _slabUsed starts at SlabBytes) it
+        // named slab -1 and threw. That is the one shape that failed. Against a full slab s it
+        // OR'd SlabBytes into the offset, naming slab s|1 (s itself, or an unrented null slot
+        // that reads back as an empty span): wrong in principle, harmless in effect. An empty
+        // key or value is a legal term (the old build filed "").
         if (_slabUsed + bytes.Length > SlabBytes || _slabUsed == SlabBytes)
         {
             // A term longer than a slab (only reachable if the ingest payload cap is raised past
             // 1 MB) gets a slab of its own at position 0, which the offset scheme still names.
             if (_slabCount == _slabs.Length) Array.Resize(ref _slabs, Math.Max(4, _slabs.Length * 2));
-            _slabs[_slabCount++] = IndexBuildPool.Slabs.Rent(Math.Max(SlabBytes, bytes.Length));
+            // Rent, THEN count it: a rent that throws (out of memory) must not leave a null slot
+            // counted for ReleaseBuildBuffers to hand back.
+            var fresh = IndexBuildPool.Slabs.Rent(Math.Max(SlabBytes, bytes.Length));
+            _slabs[_slabCount++] = fresh;
             _slabUsed = 0;
         }
         int slab = _slabCount - 1;
