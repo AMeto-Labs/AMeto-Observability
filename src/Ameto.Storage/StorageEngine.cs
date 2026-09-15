@@ -207,7 +207,19 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// Override the width with <c>HotTier.FlushConcurrency</c>
     /// when trading RAM for throughput deliberately.</para>
     /// </summary>
-    private readonly MemoryBudgets _budgets = MemoryBudgets.Current();
+    private readonly MemoryBudgets _budgets;
+
+    /// <summary>
+    /// Concurrent index builds the constructor settled on (the <c>_flushConcurrency</c> count).
+    /// Internal so a test can see the budgets actually reach the engine.
+    /// </summary>
+    internal int FlushWidth { get; }
+
+    /// <summary>
+    /// Frozen tiers allowed in flight at once (the <c>_flushSlots</c> count). Internal for the
+    /// same reason as <see cref="FlushWidth"/>.
+    /// </summary>
+    internal int FlushSlots { get; }
     /// <summary>
     /// Window anchors that produced no usable merge batch — excluded so the sweep advances
     /// (reset on restart). Keyed by <see cref="SegmentKey"/> for the same reason the catalog is:
@@ -375,10 +387,23 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     public StringInternPool TemplatePool { get; } = new();
 
     public StorageEngine(IOptions<ServerOptions> options, RetentionStore retentionStore, ILogger<StorageEngine> logger)
+        : this(options, retentionStore, logger, MemoryBudgets.Current())
+    {
+    }
+
+    /// <summary>
+    /// Takes the memory budgets instead of reading them from this process, so a test can build
+    /// the engine a 512 MB container would get on a machine that is not one. Not public: the DI
+    /// container only sees the constructor above.
+    /// </summary>
+    internal StorageEngine(
+        IOptions<ServerOptions> options, RetentionStore retentionStore, ILogger<StorageEngine> logger,
+        MemoryBudgets budgets)
     {
         _options        = options.Value;
         _retentionStore = retentionStore;
         _logger         = logger;
+        _budgets        = budgets;
         // ── Flush RAM budgets ────────────────────────────────────────────────────
         // A flush costs memory in two separate places, and each needs its own bound:
         //
@@ -412,6 +437,8 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         // Floored at the flush width so every concurrent flush can still hold a slot.
         int flushSlots = Math.Clamp((int)(_budgets.NativeTierBytes / tierFootprint), flushWidth, 64);
         _flushSlots = new SemaphoreSlim(flushSlots, flushSlots);
+        FlushWidth  = flushWidth;
+        FlushSlots  = flushSlots;
 
         // Report the ceilings these settings actually produce, not just the inputs — an
         // explicit HotTier.FlushConcurrency override raises them, and that should be
