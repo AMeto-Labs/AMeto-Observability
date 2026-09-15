@@ -123,8 +123,13 @@ public static class LogEventSerializer
     /// does not retry.</para>
     /// </summary>
     /// <returns>The number of events the sink accepted.</returns>
-    /// <exception cref="MessagePackSerializationException">The body is not a well-formed CLEF array.</exception>
-    /// <exception cref="EndOfStreamException">The body ends inside an element.</exception>
+    /// <remarks>
+    /// Any exception may escape. A malformed body throws whatever <c>MessagePackReader</c>
+    /// chooses (<c>MessagePackSerializationException</c>, <c>EndOfStreamException</c> and
+    /// <c>OverflowException</c> among them), and whatever the sink throws passes through. To
+    /// tell a bad body from a sink fault, use the <see cref="ClefBatchProgress"/> overload and
+    /// read <see cref="ClefBatchProgress.InSink"/> — never a list of exception types.
+    /// </remarks>
     public static int StreamBatch(ReadOnlyMemory<byte> body, IClefBatchSink sink, out int dropped)
     {
         var progress = default(ClefBatchProgress);
