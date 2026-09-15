@@ -10,6 +10,14 @@ namespace Ameto.Storage.Tests;
 /// boundary both pass a pre-increment check and one of them would otherwise be handed
 /// an id past the last slot — which the growth loop could never reach, spinning for ever
 /// under the lock with every later miss (ingest) queued behind it.
+///
+/// <para>The race tests are timeout-guarded, so a regression FAILS instead of hanging the run
+/// — but a hung thread cannot be stopped. A regressed pool leaves one thread spinning in the
+/// growth loop under the slot lock (a core pegged) with up to fifteen more blocked on that
+/// lock, and the SetSlot test leaves a second spinner, for the rest of the test process. They
+/// are background threads, so the process still exits; but every later test in that run loses
+/// a core to each spinner, so after such a failure trust the first failure, not the timings
+/// or timeouts of what ran after it.</para>
 /// </summary>
 public sealed class StringInternPoolSlotArrayTests
 {
