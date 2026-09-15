@@ -52,7 +52,9 @@ public sealed class SegmentIndexCache : IDisposable
     public SegmentIndexCache(long budgetBytes, TimeSpan idleEvict)
     {
         _budgetBytes = budgetBytes;
-        IdleEvict    = idleEvict > TimeSpan.Zero ? idleEvict : TimeSpan.Zero;
+        // Past MaxIdleEvict the age is "never": treated as off, which is what it means, and which
+        // keeps the Stopwatch-tick conversion below inside a long on every platform.
+        IdleEvict    = idleEvict > TimeSpan.Zero && idleEvict <= MaxIdleEvict ? idleEvict : TimeSpan.Zero;
         _idleTicks   = (long)(IdleEvict.TotalSeconds * Stopwatch.Frequency);
 
         if (_idleTicks <= 0 || !Enabled) return;
@@ -62,9 +64,25 @@ public sealed class SegmentIndexCache : IDisposable
         // at the 10-minute default that is one wake every 2.5 minutes, which on an idle
         // server reads one timestamp under the lock and returns. The callback is static and
         // takes its state through the timer, so the timer holds no closure.
-        var period = TimeSpan.FromTicks(Math.Max(TimeSpan.TicksPerMillisecond, IdleEvict.Ticks / 4));
+        //
+        // Capped at MaxSweepPeriod: System.Threading.Timer rejects a period above 0xFFFFFFFE ms
+        // (~49.7 days), so a quarter of any idle age from ~199 days up used to throw out of the
+        // DI factory and take every query endpoint down with it. Past four days an entry is
+        // therefore released within a day of its idle age rather than within a quarter of it.
+        long periodTicks = Math.Clamp(IdleEvict.Ticks / 4, TimeSpan.TicksPerMillisecond, MaxSweepPeriod.Ticks);
+        var  period      = TimeSpan.FromTicks(periodTicks);
         _sweepTimer = new Timer(static s => ((SegmentIndexCache)s!).Sweep(), this, period, period);
     }
+
+    /// <summary>
+    /// Longest idle age taken literally. Anything longer — <see cref="TimeSpan.MaxValue"/> included —
+    /// is "never" and turns idle eviction off. A century in Stopwatch ticks still fits a long at
+    /// Linux's 1e9 ticks per second; TimeSpan.MaxValue does not.
+    /// </summary>
+    private static readonly TimeSpan MaxIdleEvict = TimeSpan.FromDays(100 * 366);
+
+    /// <summary>Longest sweep cadence: far inside Timer's ~49.7-day limit, and a day late at worst.</summary>
+    private static readonly TimeSpan MaxSweepPeriod = TimeSpan.FromDays(1);
 
     /// <summary>Idle age after which an untouched entry is evicted; <see cref="TimeSpan.Zero"/> = off.</summary>
     public TimeSpan IdleEvict { get; }

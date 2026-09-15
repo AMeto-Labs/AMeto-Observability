@@ -30,6 +30,41 @@ public sealed class SegmentIndexCacheIdleEvictionTests
         catch (ObjectDisposedException) { return true; }
     }
 
+    /// <summary>
+    /// An operator who means "practically never" writes a long idle age. The sweep period was a
+    /// quarter of it, and System.Threading.Timer rejects periods above 0xFFFFFFFE ms (~49.7 days),
+    /// so anything from ~199 days up threw ArgumentOutOfRangeException out of the DI factory — and
+    /// every endpoint that resolves the cache (every query, /api/diagnostics) returned 500.
+    /// </summary>
+    [Theory]
+    [InlineData(200)]
+    [InlineData(365)]
+    [InlineData(36_500)]   // a century: still a real idle age, and still within the tick range
+    public void A_long_idle_age_constructs_and_still_keeps_young_entries(int days)
+    {
+        using var cache = new SegmentIndexCache(1 << 20, TimeSpan.FromDays(days));
+        Assert.Equal(TimeSpan.FromDays(days), cache.IdleEvict);
+
+        using (cache.Insert("a.seg", 0, true, NewNativeReader(), 100)) { }
+        Assert.Equal(0, cache.Sweep());               // a second-old entry is young for months
+        Assert.Equal(1, cache.EntryCount);
+    }
+
+    /// <summary>
+    /// TimeSpan.MaxValue is "never". Converted to Stopwatch ticks it does not fit a long on Linux
+    /// (Stopwatch.Frequency = 1e9), so it is treated as off: no timer, nothing evicted.
+    /// </summary>
+    [Fact]
+    public void An_idle_age_of_TimeSpan_MaxValue_turns_idle_eviction_off()
+    {
+        using var cache = new SegmentIndexCache(1 << 20, TimeSpan.MaxValue);
+        Assert.Equal(TimeSpan.Zero, cache.IdleEvict);
+
+        using (cache.Insert("a.seg", 0, true, NewNativeReader(), 100)) { }
+        Assert.Equal(0, cache.Sweep());
+        Assert.Equal(1, cache.EntryCount);
+    }
+
     [Fact]
     public void Untouched_entry_is_evicted_and_its_native_memory_released()
     {
