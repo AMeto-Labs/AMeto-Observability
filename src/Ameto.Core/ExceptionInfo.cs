@@ -191,17 +191,19 @@ public sealed class ExceptionInfo
             for (int i = 0; i < fields; i++)
             {
                 if (!reader.TryReadStringSpan(out var key)) { reader.Skip(); reader.Skip(); continue; }
+                // A non-string, non-nil type or message is what Read throws on (ReadString);
+                // it is reported as malformed here rather than indexed under a made-up type.
                 if (key.SequenceEqual("type"u8))
                 {
                     if (reader.TryReadNil()) type = "Exception"u8;
                     else if (reader.NextMessagePackType == MessagePackType.String && reader.TryReadStringSpan(out var t)) type = t;
-                    else reader.Skip();
+                    else return false;
                 }
                 else if (key.SequenceEqual("msg"u8))
                 {
                     if (reader.TryReadNil()) message = default;
                     else if (reader.NextMessagePackType == MessagePackType.String && reader.TryReadStringSpan(out var m)) message = m;
-                    else reader.Skip();
+                    else return false;
                 }
                 else if (key.SequenceEqual("inner"u8))
                 {
@@ -225,7 +227,7 @@ public sealed class ExceptionInfo
                         {
                             if (reader.TryReadNil()) innerType = "Exception"u8;
                             else if (reader.NextMessagePackType == MessagePackType.String && reader.TryReadStringSpan(out var it)) innerType = it;
-                            else reader.Skip();
+                            else return false;
                         }
                         else reader.Skip();
                     }

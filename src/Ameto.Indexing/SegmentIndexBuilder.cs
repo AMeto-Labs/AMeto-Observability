@@ -80,12 +80,13 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
     /// </param>
     public SegmentIndexBuilder(int expectedEventCount, int maxFlattenDepth = 5,
                                int estimatedTermsPerEvent = EstimatedBloomTermsPerEvent,
-                               IndexBuildHints? hints = null)
+                               IndexBuildHints? hints = null, Microsoft.Extensions.Logging.ILogger? log = null)
     {
         long termsPerEvent = estimatedTermsPerEvent > 0 ? estimatedTermsPerEvent : EstimatedBloomTermsPerEvent;
         _bloom            = SegmentBloomFilter.Create((long)Math.Max(1, expectedEventCount) * termsPerEvent);
         _maxFlattenDepth  = maxFlattenDepth;
         _hints            = hints;
+        _log              = log;
         _inverted         = new SegmentInvertedIndex(hints?.LastTerms ?? 0);
         _trigram          = new SegmentTrigramIndex(hints?.LastTrigrams ?? 0);
     }
@@ -272,7 +273,21 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
             try
             {
                 if (!ExceptionInfo.TryReadIndexFields(_exception.Memory, out var type, out var message, out var innerType))
+                {
+                    // The row is written whatever its exception column holds; what is lost is
+                    // the row's place in the @x.* buckets. The old full decode threw here and
+                    // failed the merge, so this is counted and logged rather than silent: a
+                    // non-zero count is a producer writing exception maps this reader cannot
+                    // read (a non-string type, a truncated map), which is worth knowing about
+                    // and not worth losing a compaction over.
+                    _malformedExceptions++;
+                    _hints?.NoteMalformedException();
+                    if (_malformedExceptions == 1 && _log is { } log && log.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Debug))
+                        Microsoft.Extensions.Logging.LoggerExtensions.LogDebug(log,
+                            "Index build: exception payload at file ordinal {Ordinal} ({Bytes} B) is not a readable exception map; the row is written, its @x.* terms are not indexed",
+                            offset, ev.ExceptionPayload.Length);
                     return;
+                }
                 AddExists(offset);
                 if (!type.IsEmpty)
                 {
@@ -681,6 +696,16 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
     /// <c>ArrayPool</c> by a builder that already sealed.
     /// </summary>
     public long BuildRetainedBytes => _inverted.BuildRetainedBytes + _trigram.BuildRetainedBytes;
+
+    /// <summary>
+    /// Exception payloads this group could not read as an exception map (merge path only; the
+    /// flush path holds decoded objects). Each is a row written without its @x.* terms. The
+    /// process-wide total is on <see cref="IndexBuildHints.MalformedExceptionPayloads"/>.
+    /// </summary>
+    public long MalformedExceptionPayloads => _malformedExceptions;
+
+    private long _malformedExceptions;
+    private readonly Microsoft.Extensions.Logging.ILogger? _log;
 
     /// <summary>
     /// The three sections one at a time, for probes and tests that want to compare or size just
