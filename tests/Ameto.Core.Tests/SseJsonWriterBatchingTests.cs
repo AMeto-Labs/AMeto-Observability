@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text;
 using Ameto.Core;
 
@@ -15,10 +16,13 @@ namespace Ameto.Core.Tests;
 /// </summary>
 public sealed class SseJsonWriterBatchingTests
 {
-    /// <summary>A body that remembers each write as the client's socket would see it.</summary>
+    /// <summary>
+    /// A body that remembers each write as the client's socket would see it. Locked, because
+    /// the writer's hold timer sends from a pool thread while the test reads.
+    /// </summary>
     private sealed class RecordingStream : Stream
     {
-        public readonly List<string> Sends = [];
+        private readonly List<string> _sends = [];
 
         /// <summary>
         /// How many of the coming flushes fail AFTER their write has taken the bytes — the shape
@@ -30,17 +34,29 @@ public sealed class SseJsonWriterBatchingTests
         /// <summary>How many flushes actually failed, so a test can prove the fault happened.</summary>
         public int FlushFailures;
 
-        public override void Write(ReadOnlySpan<byte> buffer) => Sends.Add(Encoding.UTF8.GetString(buffer));
+        public int    SendCount   { get { lock (_sends) return _sends.Count; } }
+        public string SendAt(int i) { lock (_sends) return _sends[i]; }
+        public string All()         { lock (_sends) return string.Concat(_sends); }
+        public void   Clear()       { lock (_sends) _sends.Clear(); }
+
+        public override void Write(ReadOnlySpan<byte> buffer)
+        {
+            string s = Encoding.UTF8.GetString(buffer);
+            lock (_sends) _sends.Add(s);
+        }
         public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct = default)
         {
-            Sends.Add(Encoding.UTF8.GetString(buffer.Span));
+            Write(buffer.Span);
             return ValueTask.CompletedTask;
         }
         public override Task FlushAsync(CancellationToken ct)
         {
-            if (FlushFailuresLeft <= 0) return Task.CompletedTask;
-            FlushFailuresLeft--;
-            FlushFailures++;
+            lock (_sends)
+            {
+                if (FlushFailuresLeft <= 0) return Task.CompletedTask;
+                FlushFailuresLeft--;
+                FlushFailures++;
+            }
             return Task.FromCanceled(new CancellationToken(canceled: true));
         }
 
@@ -81,13 +97,73 @@ public sealed class SseJsonWriterBatchingTests
             await sse.WriteLogEventAsync(Event(i), default);
         }
 
-        Assert.Equal(3, body.Sends.Count);
+        Assert.Equal(3, body.SendCount);
         for (int i = 0; i < 3; i++)
         {
-            Assert.StartsWith("data: {", body.Sends[i]);
-            Assert.EndsWith("\n\n", body.Sends[i]);
-            Assert.Contains($"\"@mt\":\"row {i}\"", body.Sends[i]);
+            Assert.StartsWith("data: {", body.SendAt(i));
+            Assert.EndsWith("\n\n", body.SendAt(i));
+            Assert.Contains($"\"@mt\":\"row {i}\"", body.SendAt(i));
         }
+    }
+
+    /// <summary>
+    /// …and the REST of a burst is not held hostage by the gap after it. A cold search finds two
+    /// rows a millisecond apart after a quiet spell, then scans for thirty seconds. The first
+    /// row goes out at once; the second was buffered, and a bound checked only when a row is
+    /// written kept it invisible for the whole scan.
+    ///
+    /// <para>The producer BLOCKS here rather than awaiting, because that is what the cold read
+    /// does: <c>SegmentReader.ReadEventsAsync</c> never yields, so a flush that waits for the
+    /// caller to come back — or for the enumerator to suspend — never runs. Only a deadline
+    /// enforced from outside the caller's thread delivers the row.</para>
+    /// </summary>
+    [Fact]
+    public async Task The_rest_of_a_burst_reaches_the_client_while_the_producer_is_still_reading()
+    {
+        var body = new RecordingStream();
+        using var sse = new SseJsonWriter(body);
+
+        await Task.Delay(150);                               // a quiet spell: row 0 is sent at once
+        await sse.WriteLogEventAsync(Event(0), default);
+        await sse.WriteLogEventAsync(Event(1), default);     // a millisecond later: buffered
+
+        // The scan carries on, synchronously, and writes nothing more.
+        var clock = Stopwatch.StartNew();
+        while (!body.All().Contains("\"@mt\":\"row 1\"") && clock.Elapsed < TimeSpan.FromSeconds(3))
+            Thread.Sleep(10);
+        clock.Stop();
+
+        string all = body.All();
+        Assert.Contains("\"@mt\":\"row 0\"", all);
+        Assert.True(all.Contains("\"@mt\":\"row 1\""),
+            "row 1 was still buffered after 3 s of a producer that never came back");
+        Assert.True(clock.Elapsed < TimeSpan.FromSeconds(1),
+            $"row 1 took {clock.ElapsedMilliseconds} ms to leave a writer whose hold bound is 100 ms");
+        Assert.Equal(2, all.Split("data: {\"@t\"").Length - 1);   // each row once, framing intact
+        Assert.EndsWith("\n\n", all);
+    }
+
+    /// <summary>
+    /// The hold timer must not outlive the writer. A client that disconnects leaves its backlog
+    /// buffered and the handler disposes the writer without a terminal frame; by the time the
+    /// timer would have fired, the response may be complete, and a send then is a write to a
+    /// body the request no longer owns.
+    /// </summary>
+    [Fact]
+    public async Task A_disposed_writer_leaves_the_body_alone()
+    {
+        var body = new RecordingStream();
+        var sse  = new SseJsonWriter(body);
+
+        await sse.WriteLogEventAsync(Event(0), default);
+        await sse.WriteLogEventAsync(Event(1), default);   // buffered whichever way row 0 went
+        int before = body.SendCount;
+        sse.Dispose();
+
+        await Task.Delay(300);
+
+        Assert.Equal(before, body.SendCount);
+        Assert.DoesNotContain("\"@mt\":\"row 1\"", body.All());
     }
 
     /// <summary>
@@ -104,10 +180,10 @@ public sealed class SseJsonWriterBatchingTests
             await sse.WriteLogEventAsync(Event(i), default);
         await sse.FlushFramesAsync(default);
 
-        Assert.True(body.Sends.Count <= 5, $"200 rows should coalesce, saw {body.Sends.Count} sends");
+        Assert.True(body.SendCount <= 5, $"200 rows should coalesce, saw {body.SendCount} sends");
 
         // Every row is there, in order, and the framing is intact.
-        string all = string.Concat(body.Sends);
+        string all = body.All();
         Assert.Equal(200, all.Split("data: {\"@t\"").Length - 1);
         int previous = -1;
         for (uint i = 0; i < 200; i++)
@@ -129,11 +205,11 @@ public sealed class SseJsonWriterBatchingTests
         using var sse = new SseJsonWriter(body);
 
         await sse.WriteLogEventAsync(Event(0), default);   // may or may not have gone out yet
-        body.Sends.Clear();
+        body.Clear();
         await sse.WriteLogEventAsync(Event(1), default);
         await sse.WriteDoneAsync(default);
 
-        string all = string.Concat(body.Sends);
+        string all = body.All();
         Assert.Contains("\"@mt\":\"row 1\"", all);
         Assert.Contains("event: done", all);
         Assert.EndsWith("\n\n", all);
@@ -163,7 +239,7 @@ public sealed class SseJsonWriterBatchingTests
         // can only be the fragment this test is about.
         await sse.WriteLogEventAsync(Event(0), default);
         await sse.FlushFramesAsync(default);
-        body.Sends.Clear();
+        body.Clear();
 
         // 0x82 = fixmap(2); then one key/value pair, and nothing where the second belongs.
         byte[] truncated = [0x82, 0xa1, (byte)'a', 0xa1, (byte)'b'];
@@ -179,7 +255,7 @@ public sealed class SseJsonWriterBatchingTests
 
         await sse.WriteErrorAsync("the search failed", default);
 
-        string all = string.Concat(body.Sends);
+        string all = body.All();
         Assert.StartsWith("event: query-error", all);
         Assert.DoesNotContain("data: {\"@t\"", all);   // no half-written row in front of it
         Assert.DoesNotContain("row 99", all);
@@ -210,7 +286,7 @@ public sealed class SseJsonWriterBatchingTests
 
         await sse.WriteErrorAsync("the search failed", default);
 
-        string all = string.Concat(body.Sends);
+        string all = body.All();
         Assert.Contains("\"@mt\":\"row 0\"", all);
         Assert.DoesNotContain("row 99", all);
         // Exactly one ROW frame, not one and a half. ("data: " alone would also count the
@@ -246,7 +322,7 @@ public sealed class SseJsonWriterBatchingTests
 
         await sse.WriteErrorAsync("Search exceeded its budget. Results shown are partial.", default);
 
-        string all = string.Concat(body.Sends);
+        string all = body.All();
         int copies = all.Split("\"@mt\":\"row 7\"").Length - 1;
         Assert.True(copies == 1, $"row 7 reached the socket {copies} times");
         Assert.True(all.IndexOf("row 7", StringComparison.Ordinal)
