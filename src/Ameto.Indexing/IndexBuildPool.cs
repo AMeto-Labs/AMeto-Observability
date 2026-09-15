@@ -27,7 +27,9 @@ namespace Ameto.Indexing;
 ///   twenty keeps the three the steady state of small groups actually uses. So a one-off
 ///   group's arrays outlive it by at most one collection cycle;</item>
 ///   <item>a FULL TRIM when the GC reports memory load past its high threshold (on a container,
-///   a fraction of the cgroup limit): every pool is emptied outright and refills.</item>
+///   a fraction of the cgroup limit): every pool is emptied outright and refills — at most once
+///   every <see cref="MinTrimInterval"/>; a gen2 inside that window does the high-water trim, or
+///   the refill would drive the next gen2 and the pools would never get past one group.</item>
 /// </list>
 /// <para>Arrays larger than a pool's maximum are allocated and, on return, dropped — they are
 /// live memory a group genuinely needed, accounted to it by the GC like any other.</para>
@@ -71,12 +73,51 @@ internal static class IndexBuildPool
         get { long n = 0; lock (_all) foreach (var p in _all) n += p.PooledBytes; return n; }
     }
 
-    /// <summary>The gen2 hook's action, callable directly so the policy is testable.</summary>
+    /// <summary>
+    /// Shortest gap between two pressure trims — the rule <c>IngestBufferPool</c> applies, for
+    /// the same reason.
+    ///
+    /// <para>Without it the full trim feeds itself. Under sustained load past the GC's high
+    /// threshold every gen2 empties every pool; the next 16 MB group then re-allocates ~30 MB of
+    /// LOH refilling them (1 MB slabs, the 8 MB ASCII trigram table, the term table, the entry
+    /// arrays), which spends the LOH budget and brings the next gen2 forward, which empties them
+    /// again. The hit rate goes to zero exactly when the box is short of memory — the per-group
+    /// LOH churn the pool exists to remove, caused by the pool. And the signal is not always ours
+    /// to believe: on a bare Windows host <c>MemoryLoadBytes</c> is machine-wide.</para>
+    ///
+    /// <para>Between pressure trims a gen2 does the ordinary high-water trim, so the pools still
+    /// shed what the last cycle did not use while the window is closed.</para>
+    /// </summary>
+    public static readonly TimeSpan MinTrimInterval = TimeSpan.FromSeconds(30);
+
+    /// <summary><see cref="System.Diagnostics.Stopwatch"/> timestamp of the last pressure trim; 0 = never.
+    /// Moved only by the gen2 hook — a manual <see cref="TrimAll"/> is not a trim the window spaces out.</summary>
+    private static long _lastPressureTrim;
+
+    /// <summary>The gen2 hook's action.</summary>
     public static void OnGen2()
     {
         var info = GC.GetGCMemoryInfo();
-        if (ShouldTrimAll(info.MemoryLoadBytes, info.HighMemoryLoadThresholdBytes)) TrimAll();
-        else TrimIdle();
+        OnGen2(info.MemoryLoadBytes, info.HighMemoryLoadThresholdBytes, System.Diagnostics.Stopwatch.GetTimestamp(),
+               ref _lastPressureTrim, AllPools.Instance);
+    }
+
+    /// <summary>
+    /// The gen2 policy with its inputs injected — memory info, clock, the window's state and the
+    /// pools — so the branch it takes is testable without a real memory shortage or a real wait.
+    /// Returns whether it emptied the pools.
+    /// </summary>
+    internal static bool OnGen2(long memoryLoadBytes, long highLoadThresholdBytes, long nowTimestamp,
+                                ref long lastPressureTrimTimestamp, ITrimmable pools)
+    {
+        if (ShouldTrimAll(memoryLoadBytes, highLoadThresholdBytes, nowTimestamp, lastPressureTrimTimestamp))
+        {
+            lastPressureTrimTimestamp = nowTimestamp;
+            pools.TrimAll();
+            return true;
+        }
+        pools.TrimIdle();
+        return false;
     }
 
     /// <summary>Each bucket keeps at most what was simultaneously out of it since the last call.</summary>
@@ -85,8 +126,28 @@ internal static class IndexBuildPool
     /// <summary>Empties every pool.</summary>
     public static void TrimAll() { lock (_all) foreach (var p in _all) p.TrimAll(); }
 
-    public static bool ShouldTrimAll(long memoryLoadBytes, long highLoadThresholdBytes)
-        => highLoadThresholdBytes > 0 && memoryLoadBytes >= highLoadThresholdBytes;
+    /// <summary>
+    /// Whether a gen2 should empty every pool: memory load at or past the GC's own high threshold
+    /// (on a container a fraction of the cgroup limit), and not again for
+    /// <see cref="MinTrimInterval"/> after the last time it did.
+    /// </summary>
+    /// <param name="nowTimestamp">A <see cref="System.Diagnostics.Stopwatch.GetTimestamp"/> reading.</param>
+    /// <param name="lastTrimTimestamp">The reading taken at the last pressure trim, or 0 for never.</param>
+    public static bool ShouldTrimAll(long memoryLoadBytes, long highLoadThresholdBytes, long nowTimestamp, long lastTrimTimestamp)
+    {
+        if (highLoadThresholdBytes <= 0 || memoryLoadBytes < highLoadThresholdBytes) return false;
+        if (lastTrimTimestamp == 0) return true;
+        return nowTimestamp - lastTrimTimestamp >= (long)(MinTrimInterval.TotalSeconds * System.Diagnostics.Stopwatch.Frequency);
+    }
+
+    /// <summary>Every registered pool as one <see cref="ITrimmable"/> — what the gen2 hook trims.</summary>
+    private sealed class AllPools : ITrimmable
+    {
+        public static readonly AllPools Instance = new();
+        public long PooledBytes => IndexBuildPool.PooledBytes;
+        public void TrimIdle() => IndexBuildPool.TrimIdle();
+        public void TrimAll()  => IndexBuildPool.TrimAll();
+    }
 
     internal interface ITrimmable
     {

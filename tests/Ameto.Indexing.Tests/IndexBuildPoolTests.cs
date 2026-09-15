@@ -96,11 +96,52 @@ public sealed class IndexBuildPoolTests
         Assert.Equal(0, IndexBuildPool.PooledBytes);
     }
 
+    private static readonly long Interval =
+        (long)(IndexBuildPool.MinTrimInterval.TotalSeconds * System.Diagnostics.Stopwatch.Frequency);
+
     [Fact]
-    public void HighMemoryLoad_TrimsEverything()
+    public void HighMemoryLoad_TrimsEverything_ButNotAgainWithinTheInterval()
     {
-        Assert.True(IndexBuildPool.ShouldTrimAll(memoryLoadBytes: 900, highLoadThresholdBytes: 900));
-        Assert.False(IndexBuildPool.ShouldTrimAll(memoryLoadBytes: 899, highLoadThresholdBytes: 900));
-        Assert.False(IndexBuildPool.ShouldTrimAll(memoryLoadBytes: 900, highLoadThresholdBytes: 0));
+        const long t = 1_000_000;
+        Assert.True (IndexBuildPool.ShouldTrimAll(memoryLoadBytes: 900, highLoadThresholdBytes: 900, t, lastTrimTimestamp: 0));
+        Assert.False(IndexBuildPool.ShouldTrimAll(memoryLoadBytes: 899, highLoadThresholdBytes: 900, t, lastTrimTimestamp: 0));
+        Assert.False(IndexBuildPool.ShouldTrimAll(memoryLoadBytes: 900, highLoadThresholdBytes: 0,   t, lastTrimTimestamp: 0));
+        // The refill a full trim causes drives the next gen2: still under pressure, it must not empty the pools again yet.
+        Assert.False(IndexBuildPool.ShouldTrimAll(memoryLoadBytes: 950, highLoadThresholdBytes: 900, t + Interval - 1, lastTrimTimestamp: t));
+        Assert.True (IndexBuildPool.ShouldTrimAll(memoryLoadBytes: 950, highLoadThresholdBytes: 900, t + Interval,     lastTrimTimestamp: t));
+    }
+
+    private sealed class RecordingPools : IndexBuildPool.ITrimmable
+    {
+        public int Idle, All;
+        public long PooledBytes => 0;
+        public void TrimIdle() => Idle++;
+        public void TrimAll()  => All++;
+    }
+
+    [Fact]
+    public void Gen2_UnderPressure_EmptiesThePools_ThenIdleTrimsUntilTheIntervalHasPassed()
+    {
+        var pools = new RecordingPools();
+        long last = 0;
+        long t = System.Diagnostics.Stopwatch.GetTimestamp();
+
+        Assert.False(IndexBuildPool.OnGen2(memoryLoadBytes: 100, highLoadThresholdBytes: 900, t, ref last, pools));
+        Assert.Equal((1, 0), (pools.Idle, pools.All));                  // no pressure: the high-water trim
+        Assert.Equal(0, last);
+
+        Assert.True(IndexBuildPool.OnGen2(memoryLoadBytes: 900, highLoadThresholdBytes: 900, t, ref last, pools));
+        Assert.Equal((1, 1), (pools.Idle, pools.All));                  // pressure: emptied, and the window opens
+        Assert.Equal(t, last);
+
+        // Sustained pressure, a gen2 every few seconds: inside the window each one idle-trims.
+        for (int i = 1; i <= 5; i++)
+            Assert.False(IndexBuildPool.OnGen2(memoryLoadBytes: 950, highLoadThresholdBytes: 900, t + i * (Interval / 6), ref last, pools));
+        Assert.Equal((6, 1), (pools.Idle, pools.All));
+        Assert.Equal(t, last);
+
+        Assert.True(IndexBuildPool.OnGen2(memoryLoadBytes: 950, highLoadThresholdBytes: 900, t + Interval, ref last, pools));
+        Assert.Equal((6, 2), (pools.Idle, pools.All));
+        Assert.Equal(t + Interval, last);
     }
 }
