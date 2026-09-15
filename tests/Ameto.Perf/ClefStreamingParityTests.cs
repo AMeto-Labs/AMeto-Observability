@@ -275,6 +275,64 @@ public sealed class ClefStreamingParityTests
         Assert.Equal(7, dropped);
     }
 
+    // ── Whose fault a throw was ───────────────────────────────────────────────
+
+    /// <summary>
+    /// The receiver answers 400 for a throw out of the READER and lets a throw out of the SINK
+    /// surface as 500 — told apart by <see cref="LogEventSerializer.ClefBatchProgress.InSink"/>,
+    /// not by exception type. So the flag has to be set when the sink throws, whatever it throws,
+    /// and clear when the body does.
+    /// </summary>
+    [Fact]
+    public void StreamBatch_SinkFault_EscapesWithInSinkSet()
+    {
+        var progress = default(LogEventSerializer.ClefBatchProgress);
+        Exception? thrown = null;
+        try   { LogEventSerializer.StreamBatch(BuildBatch(), new ThrowOnThird(), ref progress); }
+        catch (Exception ex) { thrown = ex; }
+
+        Assert.IsType<InvalidOperationException>(thrown);
+        Assert.True(progress.InSink, "a sink fault must leave InSink set for the caller to read");
+        Assert.Equal(2, progress.Ingested);
+        Assert.Equal(2, progress.ElementIndex);
+    }
+
+    [Fact]
+    public void StreamBatch_ReadFault_EscapesWithInSinkClear()
+    {
+        byte[] good      = BuildBatch();
+        byte[] truncated = good.AsSpan(0, good.Length - 12).ToArray();
+
+        var progress = default(LogEventSerializer.ClefBatchProgress);
+        Exception? thrown = null;
+        try   { LogEventSerializer.StreamBatch(truncated, new CaptureSink(), ref progress); }
+        catch (Exception ex) { thrown = ex; }
+
+        Assert.NotNull(thrown);
+        Assert.False(progress.InSink, "a body that ends inside an element is the reader's fault, not the sink's");
+        Assert.Equal(13, progress.Ingested);
+    }
+
+    [Fact]
+    public void StreamBatch_CompleteBatch_EndsWithInSinkClear()
+    {
+        var progress = default(LogEventSerializer.ClefBatchProgress);
+        LogEventSerializer.StreamBatch(BuildBatch(), new CaptureSink(), ref progress);
+
+        Assert.False(progress.InSink);
+        Assert.Equal(14, progress.Ingested);
+    }
+
+    private sealed class ThrowOnThird : LogEventSerializer.IClefBatchSink
+    {
+        private int _n;
+        public bool TryIngestClef(
+            long tsTicks, byte level, ReadOnlySpan<byte> templateUtf8, ExceptionInfo? exception,
+            ReadOnlySpan<byte> msgpackProps, ulong traceHi, ulong traceLo, ulong spanId,
+            ReadOnlySpan<byte> serviceUtf8)
+            => ++_n == 3 ? throw new InvalidOperationException("sink fault") : true;
+    }
+
     private sealed class RejectEverySecond : LogEventSerializer.IClefBatchSink
     {
         private int _n;
