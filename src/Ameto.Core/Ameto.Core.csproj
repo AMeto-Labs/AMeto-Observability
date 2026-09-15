@@ -16,4 +16,10 @@
     <PackageReference Include="MessagePack.Annotations" Version="3.1.7" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- IngestBufferPool.Observer: lets the integration tests prove /api/events rents every
+         body buffer from that pool and returns each one to it exactly once. -->
+    <InternalsVisibleTo Include="Ameto.Integration.Tests" />
+  </ItemGroup>
+
 </Project>

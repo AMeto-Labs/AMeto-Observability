@@ -4,10 +4,8 @@ using System.Diagnostics;
 namespace Ameto.Core;
 
 /// <summary>
-/// The buffer pool the OTLP receivers read their request bodies into — OTLP/HTTP, OTLP/gRPC,
-/// and the gRPC gzip inflate target. (The CLEF receiver still rents from
-/// <see cref="ArrayPool{T}.Shared"/>; moving it needs its rents and its returns changed
-/// together, which is a separate change.)
+/// The buffer pool the ingest receivers read their request bodies into — CLEF
+/// <c>POST /api/events</c>, OTLP/HTTP, OTLP/gRPC, and the gRPC gzip inflate target.
 ///
 /// <para>These buffers are large and they are rented one per request.
 /// <see cref="ArrayPool{T}.Shared"/> is the wrong shape for that: it keeps one array per
@@ -19,9 +17,9 @@ namespace Ameto.Core;
 ///
 /// <h3>What it can hold, and why that is bounded on purpose</h3>
 /// <para>A pool that is never trimmed is a memory leak with good manners. The gRPC reader
-/// does not get a Content-Length, so it doubles 64 KB → 2 MB and leaves an array in EVERY
-/// bucket on the way; at 32 deep that is about 126 MB pinned for ever by 32 concurrent 2 MB
-/// batches, on a stand whose whole budget is 512 MB. So:</para>
+/// does not get a Content-Length (nor does a chunked CLEF post), so it doubles 64 KB → 2 MB
+/// and leaves an array in EVERY bucket on the way; at 32 deep that is about 126 MB pinned for
+/// ever by 32 concurrent 2 MB batches, on a stand whose whole budget is 512 MB. So:</para>
 /// <list type="bullet">
 ///   <item>Depth is <c>2 x ProcessorCount</c>, clamped to
 ///   [<see cref="MinArraysPerBucket"/>, <see cref="MaxArraysPerBucket"/>] — request
@@ -54,6 +52,11 @@ public static class IngestBufferPool
     /// Largest array kept. Covers the default ceilings of both receivers —
     /// <c>Ingestion.MaxOtlpBatchBytes</c> (8 MiB) and <c>Ingestion.MaxBatchBytes</c> (4 MiB) —
     /// so a body that is accepted at all is a body this pool can serve.
+    ///
+    /// <para>An operator who raises either ceiling past this still gets correct behaviour, just
+    /// not pooled: <see cref="Rent"/> above it allocates an array of exactly the requested
+    /// length, and <see cref="Return"/> drops such an array rather than throwing, because its
+    /// length maps past the last bucket.</para>
     /// </summary>
     public const int MaxPooledBytes = 8 * 1024 * 1024;
 
@@ -74,7 +77,12 @@ public static class IngestBufferPool
     private static ArrayPool<byte> Create() => ArrayPool<byte>.Create(MaxPooledBytes, ArraysPerBucket);
 
     /// <summary>Rents an array of at least <paramref name="minimumLength"/> bytes. Contents are undefined.</summary>
-    public static byte[] Rent(int minimumLength) => Volatile.Read(ref _pool).Rent(minimumLength);
+    public static byte[] Rent(int minimumLength)
+    {
+        byte[] array = Volatile.Read(ref _pool).Rent(minimumLength);
+        Observer?.Rented(array);
+        return array;
+    }
 
     /// <summary>
     /// Returns an array rented from THIS pool. Never call it twice for one array.
@@ -84,7 +92,25 @@ public static class IngestBufferPool
     /// array is accepted, and the only consequence is that one buffer survives a trim it could
     /// have been dropped by.</para>
     /// </summary>
-    public static void Return(byte[] array) => Volatile.Read(ref _pool).Return(array);
+    public static void Return(byte[] array)
+    {
+        // Told BEFORE the pool has it back: after, another thread may already have rented it,
+        // and an observer would see that rent ahead of this return.
+        Observer?.Returning(array);
+        Volatile.Read(ref _pool).Return(array);
+    }
+
+    /// <summary>
+    /// Test hook: sees every rent and every return. Null outside tests, where it costs one static
+    /// read and a null check on calls that each move a request body of kilobytes to megabytes.
+    ///
+    /// <para>It exists because nothing else can tell whether a receiver's buffers came from this
+    /// pool and all came back to it. A buffer rented here and returned to
+    /// <see cref="ArrayPool{T}.Shared"/>, or the reverse, raises no error anywhere; the pool just
+    /// stops pooling. A field rather than a registration API so a test can install it with one
+    /// <see cref="Interlocked.CompareExchange{T}(ref T, T, T)"/>.</para>
+    /// </summary>
+    internal static IIngestBufferPoolObserver? Observer;
 
     /// <summary>
     /// Drops every pooled array. The next rents allocate and refill.
@@ -173,4 +199,14 @@ public static class IngestBufferPool
             if (again && !Environment.HasShutdownStarted) GC.ReRegisterForFinalize(this);
         }
     }
+}
+
+/// <summary>What <see cref="IngestBufferPool.Observer"/> is told. Called on the renting or returning thread.</summary>
+internal interface IIngestBufferPoolObserver
+{
+    /// <summary>After <paramref name="array"/> has been handed out.</summary>
+    void Rented(byte[] array);
+
+    /// <summary>Before <paramref name="array"/> goes back into the pool.</summary>
+    void Returning(byte[] array);
 }

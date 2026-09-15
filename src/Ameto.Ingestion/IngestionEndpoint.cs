@@ -54,7 +54,7 @@ public interface IOtlpLogSink
 ///   [ { "@t": "...", "@mt": "...", "@l": "...", "Prop": value, ... }, ... ]
 ///
 /// Processing:
-///   1. Read body into a pooled buffer.
+///   1. Read body into a buffer from <see cref="IngestBufferPool"/>.
 ///   2. Deserialise each CLEF event using <see cref="LogEventSerializer"/>.
 ///   3. Intern the message template via <see cref="StringInternPool"/>.
 ///   4. Re-serialise the properties-only map and push to <see cref="IngestionRingBuffer"/>.
@@ -110,12 +110,18 @@ public sealed class IngestionEndpoint : IOtlpLogSink, LogEventSerializer.IClefBa
             return;
         }
 
+        // From IngestBufferPool, the pool the OTLP receivers read into, not ArrayPool.Shared: a
+        // 1.4 MB batch rounds up to the 2 MB bucket, and past Shared's shallow per-core depth
+        // every concurrent request got a fresh array on the large object heap. Every buffer
+        // below goes back to IngestBufferPool and nowhere else — one handed to Shared is not a
+        // crash, it is this pool emptying one request at a time.
+        //
         // Rented, and straight into the try: a read that THROWS must still give the buffer back.
         // Kestrel raises BadHttpRequestException for a body that ends short of its
         // Content-Length, and RequestAborted cancels a read. Both used to fire before the try
         // opened, so the rented array was never returned. Every exit below, the 413 included,
         // returns it exactly once: in the finally.
-        byte[] bodyBuf = ArrayPool<byte>.Shared.Rent(
+        byte[] bodyBuf = IngestBufferPool.Rent(
             contentLength.HasValue ? Math.Max((int)contentLength.Value, 1) : 64 * 1024);
         int    bodyLen = 0;
         try
@@ -148,10 +154,13 @@ public sealed class IngestionEndpoint : IOtlpLogSink, LogEventSerializer.IClefBa
 
                     if (bodyLen == bodyBuf.Length)
                     {
-                        var bigger = ArrayPool<byte>.Shared.Rent(bodyBuf.Length * 2);
+                        byte[] bigger = IngestBufferPool.Rent(bodyBuf.Length * 2);
                         Buffer.BlockCopy(bodyBuf, 0, bigger, 0, bodyLen);
-                        ArrayPool<byte>.Shared.Return(bodyBuf);
-                        bodyBuf = bigger;   // nothing between the Return and here can throw
+                        // Swap first, return second: from the swap on, the finally owns `bigger`,
+                        // so even a Return that threw could not send `smaller` back twice.
+                        byte[] smaller = bodyBuf;
+                        bodyBuf = bigger;
+                        IngestBufferPool.Return(smaller);
                     }
                 }
             }
@@ -232,7 +241,7 @@ public sealed class IngestionEndpoint : IOtlpLogSink, LogEventSerializer.IClefBa
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(bodyBuf);
+            IngestBufferPool.Return(bodyBuf);
         }
     }
 
