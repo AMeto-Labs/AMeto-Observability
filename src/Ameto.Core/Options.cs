@@ -183,7 +183,9 @@ public sealed class QueryOptions
     /// pre-cache behaviour.
     ///
     /// <para>Unset (the default) derives it from memory this process may use:
-    /// <c>min(256 MB, 15 % of available)</c> — see <see cref="MemoryBudgets"/>. The flat
+    /// <c>min(256 MB, 15 % of the managed-heap limit)</c> — the cache is mostly managed postings,
+    /// so it is a share of the GC's limit (384 MB in a 512 MB container, giving 57 MB), not of
+    /// the container — see <see cref="MemoryBudgets"/>. The flat
     /// 256 MB this replaces was half of a 512 MB host on its own, before the engine's own
     /// tiers and index builds asked for anything. An explicit value always wins, including
     /// a value larger than the derived one.</para>

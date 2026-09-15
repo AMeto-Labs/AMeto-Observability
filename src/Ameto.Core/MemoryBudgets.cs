@@ -11,10 +11,29 @@ namespace Ameto.Core;
 /// that, and the runtime's own managed hard limit (75 % = 384 MB) sits underneath. The failure
 /// mode was an OOM kill, which looks like a crash rather than a capacity problem.</para>
 ///
-/// <para>Each ceiling is now <c>min(the old constant, a fraction of available memory)</c>, so a
-/// large host behaves exactly as before and a small one gets budgets it can honour.
-/// <see cref="GC.GetGCMemoryInfo()"/> reports the cgroup limit when there is one, so this reads
-/// the container's memory rather than the machine's.</para>
+/// <para>Each ceiling is now <c>min(the old constant, a fraction of a limit)</c>, so a large host
+/// behaves exactly as before and a small one gets budgets it can honour.</para>
+///
+/// <para><b>Two limits, chosen by where the bytes live.</b> A process has two different memory
+/// ceilings, and they are not the same number:</para>
+/// <list type="bullet">
+/// <item><b>The managed-heap limit</b> — <see cref="GCMemoryInfo.TotalAvailableMemoryBytes"/>.
+/// Under a container (cgroup on Linux, job object on Windows) the GC sets a heap hard limit of
+/// 75 % of the container limit, and this reports THAT, not the container limit: 384 MB in a
+/// 512 MB container. An explicit <c>GCHeapHardLimit</c> / <c>GCHeapHardLimitPercent</c> is
+/// reported the same way. Index builds and the segment-index cache (expanded postings and
+/// dictionaries — managed objects, with a small native bloom share) live on the GC heap, so they
+/// are shares of this.</item>
+/// <item><b>The physical limit</b> — the container limit, or host RAM without one. Frozen tiers
+/// are <c>NativeMemory</c> and are not under the GC hard limit at all, so their share is of this.
+/// The runtime does not expose it directly; it is recovered from
+/// <see cref="GCMemoryInfo.HighMemoryLoadThresholdBytes"/>, which the GC computes as
+/// <c>GCHighMemPercent</c> of exactly that figure (measured: 460 MB = 90 % of a 512 MB job
+/// limit, and 90 % of host RAM under a 512 MB <c>GCHeapHardLimit</c>).</item>
+/// </list>
+/// <para>Using one base for all three — the managed limit — under-provisioned the native budget by
+/// a quarter in every container (96 MB instead of 128 MB at 512 MB) and shrank it on a big host
+/// that merely capped its managed heap.</para>
 ///
 /// <para>The trade on a tiny host is deliberate: fewer flush slots mean the ingest ring applies
 /// back-pressure earlier under a burst, so events are dropped at the door with a counted reason
@@ -33,23 +52,34 @@ public readonly struct MemoryBudgets
     /// <summary>Cross-query cache of decoded segment indexes.</summary>
     public const long IndexCacheCapBytes = 256L * 1024 * 1024;
 
-    // ── The shares of available memory, when that is the smaller number ──
+    // ── The shares, when that is the smaller number ──
     //
-    // They sum to 70 %, which is not an accident and not a coincidence either: the remaining
-    // 30 % is the runtime itself (~60-90 MB of JIT'd code and runtime data on a self-contained
-    // build), the ingest ring, the live hot tier, the WAL mapping, and the slack the GC needs
-    // to collect at all. Native is the largest share because a frozen tier is bytes already
-    // written that cannot be given back until its cold segment is; the index cache is the
-    // smallest because losing it costs latency, not correctness.
+    // Managed builds and the index cache together take 45 % of the managed-heap limit; the rest
+    // of the heap is queries, ASP.NET, the drainer and the slack the GC needs to collect at all.
+    // Native tiers take 25 % of the physical limit; the rest of the process's native memory is
+    // the runtime itself (~60-90 MB of JIT'd code and runtime data on a self-contained build),
+    // the ingest ring, the live hot tier and the WAL mapping — and the managed heap, which sits
+    // inside the same container. In a 512 MB container that is 115 + 57 MB managed and 128 MB
+    // native: 300 MB, 59 % of the container. Native is the largest single share because a frozen
+    // tier is bytes already written that cannot be given back until its cold segment is; the
+    // index cache is the smallest because losing it costs latency, not correctness.
 
-    /// <summary>Share of available memory the frozen-tier backlog may hold.</summary>
+    /// <summary>Share of the PHYSICAL limit the frozen-tier backlog may hold.</summary>
     public const double NativeTierFraction = 0.25;
 
-    /// <summary>Share of available memory concurrent index builds may hold.</summary>
+    /// <summary>Share of the MANAGED-HEAP limit concurrent index builds may hold.</summary>
     public const double ManagedBuildFraction = 0.30;
 
-    /// <summary>Share of available memory the segment-index cache may hold.</summary>
+    /// <summary>Share of the MANAGED-HEAP limit the segment-index cache may hold.</summary>
     public const double IndexCacheFraction = 0.15;
+
+    /// <summary>
+    /// The GC's default high-memory-load percentage below 80 GB of physical memory, used when the
+    /// runtime does not report <c>GCHighMemPercent</c>. Above 80 GB the default is higher and this
+    /// over-estimates the physical limit slightly — harmless, because every ceiling is already at
+    /// its constant from 4 GB up.
+    /// </summary>
+    private const int DefaultHighMemoryLoadPercent = 90;
 
     // ── Floors, so a pathologically small limit still yields a working engine ──
 
@@ -57,16 +87,26 @@ public readonly struct MemoryBudgets
     private const long MinNativeBytes     = 16L * 1024 * 1024;
     private const long MinIndexCacheBytes =  8L * 1024 * 1024;
 
-    private MemoryBudgets(long available, long managed, long native, long indexCache)
+    private MemoryBudgets(long managedLimit, long physicalLimit, long managed, long native, long indexCache)
     {
-        AvailableBytes    = available;
-        ManagedBuildBytes = managed;
-        NativeTierBytes   = native;
-        IndexCacheBytes   = indexCache;
+        ManagedLimitBytes  = managedLimit;
+        PhysicalLimitBytes = physicalLimit;
+        ManagedBuildBytes  = managed;
+        NativeTierBytes    = native;
+        IndexCacheBytes    = indexCache;
     }
 
-    /// <summary>Memory this process may use — the cgroup limit under a container, else host RAM.</summary>
-    public long AvailableBytes { get; }
+    /// <summary>
+    /// The managed-heap limit the managed shares were taken of: the GC hard limit when there is
+    /// one (75 % of a container limit by default), else physical memory. 0 when unknown.
+    /// </summary>
+    public long ManagedLimitBytes { get; }
+
+    /// <summary>
+    /// The physical limit the native share was taken of: the container limit, else host RAM.
+    /// 0 when unknown.
+    /// </summary>
+    public long PhysicalLimitBytes { get; }
 
     /// <summary>Ceiling on managed index-build state across all concurrent flushes.</summary>
     public long ManagedBuildBytes { get; }
@@ -77,36 +117,89 @@ public readonly struct MemoryBudgets
     /// <summary>Default budget for the cross-query segment-index cache.</summary>
     public long IndexCacheBytes { get; }
 
-    /// <summary>True when a share of available memory, not the constant, set a ceiling.</summary>
+    /// <summary>True when a share of a limit, not the constant, set a ceiling.</summary>
     public bool IsConstrained =>
         ManagedBuildBytes < ManagedBuildCapBytes ||
         NativeTierBytes   < NativeTierCapBytes   ||
         IndexCacheBytes   < IndexCacheCapBytes;
 
     /// <summary>
-    /// Pure function over an available-memory figure, so the arithmetic can be tested at
-    /// 512 MB, 4 GB and 64 GB without a machine of each size. A non-positive figure means the
-    /// runtime could not tell us, and falls back to the constants — the pre-existing behaviour,
-    /// which is the right answer when the alternative is guessing low and refusing work.
+    /// One figure for both limits — what a process with no GC hard limit sees, where the heap
+    /// may grow to physical memory. Kept for callers that only have one number.
     /// </summary>
-    public static MemoryBudgets Derive(long availableBytes)
+    public static MemoryBudgets Derive(long availableBytes) => Derive(availableBytes, availableBytes);
+
+    /// <summary>
+    /// Pure function over the two limits, so the arithmetic can be tested at 512 MB, 4 GB and
+    /// 64 GB without a machine of each size. A non-positive figure means the runtime could not
+    /// tell us, and falls back to the constants for the shares taken of it — the pre-existing
+    /// behaviour, which is the right answer when the alternative is guessing low and refusing
+    /// work. An unknown physical limit borrows the managed one if that is known.
+    /// </summary>
+    public static MemoryBudgets Derive(long managedLimitBytes, long physicalLimitBytes)
     {
-        if (availableBytes <= 0)
-            return new MemoryBudgets(0, ManagedBuildCapBytes, NativeTierCapBytes, IndexCacheCapBytes);
+        long managedBase  = managedLimitBytes  > 0 ? managedLimitBytes  : 0;
+        long physicalBase = physicalLimitBytes > 0 ? physicalLimitBytes : managedBase;
 
         return new MemoryBudgets(
-            availableBytes,
-            Share(availableBytes, ManagedBuildFraction, ManagedBuildCapBytes, MinBuildBytes),
-            Share(availableBytes, NativeTierFraction,   NativeTierCapBytes,   MinNativeBytes),
-            Share(availableBytes, IndexCacheFraction,   IndexCacheCapBytes,   MinIndexCacheBytes));
+            managedBase,
+            physicalBase,
+            Share(managedBase,  ManagedBuildFraction, ManagedBuildCapBytes, MinBuildBytes),
+            Share(physicalBase, NativeTierFraction,   NativeTierCapBytes,   MinNativeBytes),
+            Share(managedBase,  IndexCacheFraction,   IndexCacheCapBytes,   MinIndexCacheBytes));
 
-        static long Share(long available, double fraction, long cap, long floor)
+        static long Share(long limit, double fraction, long cap, long floor)
         {
-            long share = (long)(available * fraction);
+            if (limit <= 0) return cap;
+            long share = (long)(limit * fraction);
             return Math.Max(floor, Math.Min(cap, share));
         }
     }
 
-    /// <summary>Budgets for the memory THIS process may use right now.</summary>
-    public static MemoryBudgets Current() => Derive(GC.GetGCMemoryInfo().TotalAvailableMemoryBytes);
+    /// <summary>
+    /// Recovers the physical limit (container limit, else host RAM) from the GC's high-memory-load
+    /// threshold, which the GC computes as <paramref name="highMemoryLoadPercent"/> of it. Rounded
+    /// to a 4 KiB page, since the GC's own multiply truncates. Falls back to
+    /// <paramref name="managedLimitBytes"/> when either input is unusable.
+    /// </summary>
+    public static long PhysicalLimitFrom(long highMemoryLoadThresholdBytes, int highMemoryLoadPercent, long managedLimitBytes)
+    {
+        if (highMemoryLoadThresholdBytes <= 0 || highMemoryLoadPercent is <= 0 or > 100)
+            return managedLimitBytes;
+
+        long raw = (long)Math.Round(highMemoryLoadThresholdBytes * 100.0 / highMemoryLoadPercent);
+        return (raw + 2048) & ~4095L;
+    }
+
+    /// <summary>
+    /// Budgets for THIS process right now. Allocates (the GC's configuration dictionary), so it is
+    /// for startup and configuration paths, not for anything polled.
+    /// </summary>
+    public static MemoryBudgets Current()
+    {
+        var  info    = GC.GetGCMemoryInfo();
+        long managed = info.TotalAvailableMemoryBytes;
+        return Derive(managed, PhysicalLimitFrom(info.HighMemoryLoadThresholdBytes, HighMemoryLoadPercent(), managed));
+    }
+
+    /// <summary>The GC's effective high-memory-load percentage (configured or default).</summary>
+    private static int HighMemoryLoadPercent()
+    {
+        try
+        {
+            if (GC.GetConfigurationVariables().TryGetValue("GCHighMemPercent", out object? v))
+            {
+                long pct = v switch
+                {
+                    long  l => l,
+                    int   i => i,
+                    ulong u => (long)Math.Min(u, 100UL),
+                    _       => 0,
+                };
+                if (pct is > 0 and <= 100) return (int)pct;
+            }
+        }
+        catch { /* a runtime that cannot say falls back to the default */ }
+        return DefaultHighMemoryLoadPercent;
+    }
 }

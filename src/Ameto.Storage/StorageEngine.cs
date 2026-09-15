@@ -201,8 +201,10 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// builds, which at the default 64 MB tier (131,072 events ⇒ ~184 MB per build) yields a
     /// width of 3 — enough to stay ahead of ingest (a tier fills in ~0.9 s at 150k events/s, a
     /// build takes ~1.3 s, so 3 in flight clears one every ~0.44 s) — and 512 MB of frozen
-    /// tiers. On a 512 MB host they become 153 MB and 128 MB, which is the difference between
-    /// back-pressure and an OOM kill. Override the width with <c>HotTier.FlushConcurrency</c>
+    /// tiers. In a 512 MB container they become 115 MB (30 % of the GC's 384 MB heap limit —
+    /// index builds are managed) and 128 MB (25 % of the container — frozen tiers are native and
+    /// not under the heap limit), which is the difference between back-pressure and an OOM kill.
+    /// Override the width with <c>HotTier.FlushConcurrency</c>
     /// when trading RAM for throughput deliberately.</para>
     /// </summary>
     private readonly MemoryBudgets _budgets = MemoryBudgets.Current();
@@ -420,12 +422,13 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         _logger.LogInformation(
             "Flush budgets: width={Width} (×{PerFlush} MB managed = {ManagedCeiling} MB), " +
             "slots={Slots} (×{Tier} MB native = {NativeCeiling} MB), tier={Events} events / {Payload} MB payload; " +
-            "derived from {Available} MB available: managed≤{ManagedBudget} MB, native≤{NativeBudget} MB, " +
-            "index cache≤{CacheBudget} MB ({Source})",
+            "derived from a {ManagedLimit} MB managed-heap limit and {PhysicalLimit} MB physical: " +
+            "managed≤{ManagedBudget} MB, native≤{NativeBudget} MB, index cache≤{CacheBudget} MB ({Source})",
             flushWidth, perFlushManaged / 1048576, managedCeiling / 1048576,
             flushSlots, tierFootprint / 1048576, nativeCeiling / 1048576,
             eventCapacity, _options.HotTier.MaxSizeBytes / 1048576,
-            _budgets.AvailableBytes / 1048576,
+            _budgets.ManagedLimitBytes / 1048576,
+            _budgets.PhysicalLimitBytes / 1048576,
             _budgets.ManagedBuildBytes / 1048576,
             _budgets.NativeTierBytes / 1048576,
             _budgets.IndexCacheBytes / 1048576,
