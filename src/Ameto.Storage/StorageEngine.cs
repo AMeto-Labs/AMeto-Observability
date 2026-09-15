@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Numerics;
 using Microsoft.Extensions.Logging;
@@ -2216,33 +2217,42 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     {
         int[] order = SegmentWriter.ComputeSortOrder(hot);
 
-        var perLevel = new List<int>[LevelSegmentSlots];
-        for (int oi = 0; oi < order.Length; oi++)
+        var perLevel = new int[LevelSegmentSlots][];
+        var counts   = new int[LevelSegmentSlots];
+        var written  = new List<SegmentInfo>(LevelSegmentSlots);
+        try
         {
-            int lvl = (int)hot.GetHeader(order[oi]).Level;
-            if ((uint)lvl >= LevelSegmentSlots) lvl = (int)Ameto.Core.LogLevel.Information;   // defensive
-            (perLevel[lvl] ??= new List<int>()).Add(order[oi]);
-        }
+            SplitOrderByLevel(hot, order, perLevel, counts);
 
-        var written = new List<SegmentInfo>(LevelSegmentSlots);
-        for (int lvl = 0; lvl < LevelSegmentSlots; lvl++)
-        {
-            var idx = perLevel[lvl];
-            if (idx is null || idx.Count == 0) continue;
-
-            var segId = new SegmentId(firstSegId + (ulong)lvl);
-            if (skipPublishedLevels && SegmentFileExists(segId.Value))
+            for (int lvl = 0; lvl < LevelSegmentSlots; lvl++)
             {
-                _logger.LogInformation(
-                    "WAL recovery: level {Level} is already published as segment {Id} — {Count} event(s) not rewritten",
-                    (Ameto.Core.LogLevel)lvl, segId.Value, idx.Count);
-                continue;
-            }
+                int n = counts[lvl];
+                if (n == 0) continue;
 
-            var subset  = idx.ToArray();
-            var segPath = BuildSegmentPath(segId, hot, subset);
-            written.Add(await FlushToColdAsync(hot, segId, segPath, ct, subset));
-            _afterLevelPublished?.Invoke(lvl);
+                var segId = new SegmentId(firstSegId + (ulong)lvl);
+                if (skipPublishedLevels && SegmentFileExists(segId.Value))
+                {
+                    _logger.LogInformation(
+                        "WAL recovery: level {Level} is already published as segment {Id} — {Count} event(s) not rewritten",
+                        (Ameto.Core.LogLevel)lvl, segId.Value, n);
+                    continue;
+                }
+
+                // A RENTED array is longer than its level's event count, so every consumer
+                // below is told how much of it is real. The writer would otherwise stage the
+                // rent's tail — stale tier indices from a previous flush — as events.
+                var subset  = perLevel[lvl];
+                var segPath = BuildSegmentPath(segId, hot, subset, n);
+                written.Add(await FlushToColdAsync(hot, segId, segPath, ct, subset, n));
+                _afterLevelPublished?.Invoke(lvl);
+            }
+        }
+        finally
+        {
+            // Returned only here: each level's array is read by the write it was handed to,
+            // and that write is awaited inside the loop, so nothing below still holds one.
+            for (int lvl = 0; lvl < LevelSegmentSlots; lvl++)
+                if (perLevel[lvl] is { } a) ArrayPool<int>.Shared.Return(a);
         }
 
         // ── MARKER LAST. Every level is on disk and fsynced (SegmentWriter.Finalise flushes to
@@ -2252,6 +2262,52 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         //    ordering only the page cache observes does not survive a power loss.
         WriteFlushCompletionMarker(firstSegId, written);
         return written;
+    }
+
+    /// <summary>
+    /// Partitions a tier's sort order by log level: <paramref name="perLevel"/>[l] comes back
+    /// holding <paramref name="counts"/>[l] tier indices, still ascending by (timestamp, id).
+    ///
+    /// <para>COUNT, THEN FILL, into POOLED arrays. The straightforward
+    /// <c>(perLevel[lvl] ??= new List&lt;int&gt;()).Add(…)</c> followed by <c>ToArray()</c> cost
+    /// the dominant level three large-object copies per flush: the list doubling its way up to
+    /// ~800 KB — every step past 85 KB an LOH allocation of immediately-dead bytes — and then
+    /// one more full-size copy to hand the writer an array. Counting first costs one extra pass
+    /// over a rented BYTE array, which is where the first pass parks each event's level, so the
+    /// expensive part (a random <c>GetHeader</c> into a ~12.5 MB header set) still happens
+    /// exactly once per event.</para>
+    ///
+    /// <para>The arrays come from <see cref="ArrayPool{T}"/> and are therefore LONGER than their
+    /// level's count — every consumer must be told how much of one is real, or it stages the
+    /// rent's tail (stale tier indices from an earlier flush) as events. The caller returns them.</para>
+    /// </summary>
+    internal static void SplitOrderByLevel(HotTierSegment hot, int[] order, int[]?[] perLevel, int[] counts)
+    {
+        var levels = ArrayPool<byte>.Shared.Rent(order.Length);
+        try
+        {
+            for (int oi = 0; oi < order.Length; oi++)
+            {
+                int lvl = (int)hot.GetHeader(order[oi]).Level;
+                if ((uint)lvl >= LevelSegmentSlots) lvl = (int)Ameto.Core.LogLevel.Information;   // defensive
+                levels[oi] = (byte)lvl;
+                counts[lvl]++;
+            }
+
+            for (int lvl = 0; lvl < LevelSegmentSlots; lvl++)
+                if (counts[lvl] > 0) perLevel[lvl] = ArrayPool<int>.Shared.Rent(counts[lvl]);
+
+            Span<int> fill = stackalloc int[LevelSegmentSlots];
+            for (int oi = 0; oi < order.Length; oi++)
+            {
+                int lvl = levels[oi];
+                perLevel[lvl]![fill[lvl]++] = order[oi];
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(levels);
+        }
     }
 
     /// <summary>True when a segment file carrying <paramref name="segId"/> is on disk.</summary>
@@ -2298,8 +2354,13 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         }
     }
 
+    /// <param name="orderCount">
+    /// How many of <paramref name="order_"/>'s entries are this segment's, or -1 for all of it.
+    /// A level-split flush hands over a POOLED array, which is longer than the level it holds.
+    /// </param>
     private Task<SegmentInfo> FlushToColdAsync(
-        HotTierSegment hot, SegmentId segId, string segPath, CancellationToken ct, int[]? order_ = null)
+        HotTierSegment hot, SegmentId segId, string segPath, CancellationToken ct,
+        int[]? order_ = null, int orderCount = -1)
     {
         // Capture delegate reference before entering Task.Run
         var sinkFactory  = IndexSinkFactory;
@@ -2310,6 +2371,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             // offsets become file ordinals, which the reader maps back to blocks/rows.
             // A caller-supplied order may be a SUBSET of the tier (level-split flush).
             int[] order = order_ ?? SegmentWriter.ComputeSortOrder(hot);
+            int   count = orderCount >= 0 ? orderCount : order.Length;
 
             // The writer drives the index build now, one INDEX GROUP at a time: it knows
             // where the group's payload budget falls, and only it can interleave a group's
@@ -2325,7 +2387,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 SegmentInfo info;
                 using (var writer = new SegmentWriter(tmpPath, groupBudget))
                 {
-                    writer.WriteEvents(new HotTierEventSource(hot, TemplatePool, order), sinkFactory);
+                    writer.WriteEvents(new HotTierEventSource(hot, TemplatePool, order, 0, count), sinkFactory);
                     info = writer.Finalise(_options.NodeId, segId);
                 } // FileStream closed here before Move
                 File.Move(tmpPath, segPath, overwrite: false);
@@ -3210,10 +3272,14 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// carries the range, and retention reads MaxTimestamp out of it, so a level-split
     /// segment must be named from ITS OWN events rather than the tier's.
     /// </param>
-    private string BuildSegmentPath(SegmentId segId, HotTierSegment hot, int[]? order = null)
+    /// <param name="orderCount">
+    /// How many of <paramref name="order"/>'s entries belong to this segment, or -1 for all of
+    /// it. A level-split flush passes a POOLED array whose tail is another flush's leftovers.
+    /// </param>
+    private string BuildSegmentPath(SegmentId segId, HotTierSegment hot, int[]? order = null, int orderCount = -1)
     {
         long minTs = long.MaxValue, maxTs = long.MinValue;
-        int n = order?.Length ?? hot.Count;
+        int n = order is null ? hot.Count : (orderCount >= 0 ? orderCount : order.Length);
         for (int k = 0; k < n; k++)
         {
             int i = order?[k] ?? k;
