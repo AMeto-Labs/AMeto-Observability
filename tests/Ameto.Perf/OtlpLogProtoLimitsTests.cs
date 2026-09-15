@@ -49,6 +49,44 @@ public sealed class OtlpLogProtoLimitsTests
             () => OtlpLogProtoParser.Parse(OtlpProtoPayloads.Logs_NestedToDepth(65), sink));
     }
 
+    /// <summary>
+    /// The bound has to hold for the OTHER recursive writer too, and for the two recursing
+    /// through each other: array_value and kvlist_value both call back into the value writer,
+    /// and counting only one of them would leave the whole hole open to a payload built from
+    /// the other.
+    /// </summary>
+    [Fact]
+    public void The_depth_bound_counts_kvlists()
+        => AssertBoundHolds(OtlpProtoPayloads.Nesting.Kvlists);
+
+    [Fact]
+    public void The_depth_bound_counts_kvlists_and_arrays_recursing_through_each_other()
+        => AssertBoundHolds(OtlpProtoPayloads.Nesting.Mixed);
+
+    // Internal, not a public [Theory] parameter: OtlpProtoPayloads is internal, and xUnit only
+    // discovers public methods.
+    private static void AssertBoundHolds(OtlpProtoPayloads.Nesting nesting)
+    {
+        var sink = Parse(OtlpProtoPayloads.Logs_NestedToDepth(64, nesting), out int ingested);
+        Assert.Equal(1, ingested);
+
+        object? value = Props(sink.Records[0].Props)["nest"];
+        for (int level = 0; level < 64; level++) value = Descend(value);
+        Assert.Equal("leaf", value);
+
+        var refused = new OtlpLogProtoParityTests.CapturingSink();
+        Assert.Throws<InvalidDataException>(
+            () => OtlpLogProtoParser.Parse(OtlpProtoPayloads.Logs_NestedToDepth(65, nesting), refused));
+    }
+
+    /// <summary>One level down, whichever of the two shapes this level happens to be.</summary>
+    private static object? Descend(object? value) => value switch
+    {
+        object[] array                      => Assert.Single(array),
+        Dictionary<string, object?> map      => map["k"],
+        _ => throw new Xunit.Sdk.XunitException($"expected an array or a map, got {value?.GetType().Name ?? "null"}"),
+    };
+
     [Fact]
     public void A_value_nested_ten_thousand_deep_is_refused_without_taking_the_process_down()
     {

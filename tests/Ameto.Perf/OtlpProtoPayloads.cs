@@ -407,12 +407,23 @@ internal static class OtlpProtoPayloads
             }))));
         })));
 
+    /// <summary>How a nested attribute value wraps itself at each level.</summary>
+    public enum Nesting
+    {
+        /// <summary>Every level an <c>array_value</c>.</summary>
+        Arrays,
+        /// <summary>Every level a <c>kvlist_value</c> — the other recursive writer.</summary>
+        Kvlists,
+        /// <summary>Alternating, so the two recurse through each other.</summary>
+        Mixed,
+    }
+
     /// <summary>
-    /// One record whose single attribute value is <paramref name="depth"/> nested
-    /// <c>array_value</c> levels with a string at the bottom — the shape that recurses through
-    /// the parser's value writer, and a stack overflow if nothing bounds it.
+    /// One record whose single attribute value is <paramref name="depth"/> nested levels with a
+    /// string at the bottom — the shape that recurses through the parser's value writer, and a
+    /// stack overflow if nothing bounds it.
     /// </summary>
-    public static byte[] Logs_NestedToDepth(int depth) => Msg(c =>
+    public static byte[] Logs_NestedToDepth(int depth, Nesting nesting = Nesting.Arrays) => Msg(c =>
         Nested(c, 1, Msg(rl =>
         {
             Nested(rl, 1, Msg(res => Nested(res, 1, StringAttr("service.name", "Etisalat.API"))));
@@ -424,19 +435,34 @@ internal static class OtlpProtoPayloads
                 Nested(lr, 6, Msg(kv =>
                 {
                     kv.WriteTag(1, WireFormat.WireType.LengthDelimited); kv.WriteString("nest");
-                    Nested(kv, 2, NestedArrayValue(depth));
+                    Nested(kv, 2, NestedValue(depth, nesting));
                 }));
             }))));
         })));
 
-    /// <summary>An AnyValue wrapping itself in <paramref name="depth"/> array_value levels.</summary>
-    private static byte[] NestedArrayValue(int depth)
+    /// <summary>An AnyValue wrapping itself in <paramref name="depth"/> recursive levels.</summary>
+    private static byte[] NestedValue(int depth, Nesting nesting)
     {
         byte[] value = Msg(v => { v.WriteTag(1, WireFormat.WireType.LengthDelimited); v.WriteString("leaf"); });
         for (int i = 0; i < depth; i++)
         {
             byte[] inner = value;
-            value = Msg(v => Nested(v, 5, Msg(arr => Nested(arr, 1, inner))));
+            bool kvlist = nesting switch
+            {
+                Nesting.Kvlists => true,
+                Nesting.Mixed   => i % 2 == 0,
+                _               => false,
+            };
+
+            value = kvlist
+                // AnyValue{ kvlist_value(6){ values(1) = KeyValue{ key(1), value(2) = inner } } }
+                ? Msg(v => Nested(v, 6, Msg(kvl => Nested(kvl, 1, Msg(e =>
+                    {
+                        e.WriteTag(1, WireFormat.WireType.LengthDelimited); e.WriteString("k");
+                        Nested(e, 2, inner);
+                    })))))
+                // AnyValue{ array_value(5){ values(1) = inner } }
+                : Msg(v => Nested(v, 5, Msg(arr => Nested(arr, 1, inner))));
         }
         return value;
     }

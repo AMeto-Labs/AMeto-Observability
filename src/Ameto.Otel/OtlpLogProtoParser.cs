@@ -46,7 +46,8 @@ namespace Ameto.Otel;
 ///   <c>CodedInputStream</c> threw "invalid tag (zero)" and refused the whole request. Field 0
 ///   is not a legal field number either way; this reader treats it as end-of-input, which is
 ///   the more forgiving of the two readings and the one <see cref="ProtoReader"/> already gave
-///   the metric and trace paths.</item>
+///   the metric path. (The trace path still decodes through <c>CodedInputStream</c> and still
+///   throws — <c>OtlpGrpcMessageSegmentTests</c> relies on exactly that.)</item>
 ///   <item>A malformed tail aborts the batch mid-way, so records before the bad byte are
 ///   already in the ring when the caller answers 400. The DOM path decoded the whole request
 ///   before ingesting any of it. This matches the JSON path, which has always behaved this
@@ -89,10 +90,13 @@ public static class OtlpLogProtoParser
     /// <c>array_value{values{array_value{…}}}</c> is a stack overflow, which is process death
     /// with no exception to catch and no request to answer. It cost one small POST.</para>
     ///
-    /// <para>64 is <c>Utf8JsonReader</c>'s default <c>MaxDepth</c>, so the two encodings refuse
-    /// at the same shape. The JSON reader spends some of its 64 on the document structure above
-    /// the value, and this counts only the value's own nesting, so protobuf is marginally the
-    /// more permissive of the two — both are far past anything an exporter emits.</para>
+    /// <para>64 is the number <c>Utf8JsonReader</c> uses for its default <c>MaxDepth</c>, but
+    /// the two are not counting the same thing and the limits are not equivalent: the JSON
+    /// reader counts every object and array from the root, which is about ten levels before the
+    /// first attribute value and three more per nested value, so JSON refuses somewhere near
+    /// eighteen nested values where this refuses at sixty-four. Protobuf is the more permissive
+    /// by roughly 3.5x. Both are far past anything an exporter emits, and the point of the
+    /// number is that it is small enough to keep the stack, not that the two agree.</para>
     /// </summary>
     private const int MaxValueDepth = 64;
 
