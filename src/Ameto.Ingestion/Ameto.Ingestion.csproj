@@ -1,6 +1,12 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <ItemGroup>
+    <!-- Lets the integration tests pin IngestionEndpoint.IsMalformedPayload, which decides
+         whether a failure is the client's (400) or the server's (500). -->
+    <InternalsVisibleTo Include="Ameto.Integration.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\Ameto.Core\Ameto.Core.csproj" />
     <ProjectReference Include="..\Ameto.Storage\Ameto.Storage.csproj" />
   </ItemGroup>

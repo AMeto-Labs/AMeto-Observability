@@ -173,26 +173,46 @@ public sealed class IngestionEndpoint : IOtlpLogSink, LogEventSerializer.IClefBa
             // slot. A body that is not a CLEF array is rejected before any event is
             // seen; one that turns malformed part way through answers 400 with the
             // intact prefix already ingested (see StreamBatch).
-            int ingested = 0, dropped = 0;
+            var progress = default(LogEventSerializer.ClefBatchProgress);
             try
             {
-                ingested = LogEventSerializer.StreamBatch(
-                    bodyBuf.AsMemory(0, bodyLen), this, out dropped);
+                LogEventSerializer.StreamBatch(bodyBuf.AsMemory(0, bodyLen), this, ref progress);
             }
-            catch (Exception ex)
+            // ONLY the shapes a bad body produces. This used to be catch(Exception), which
+            // also swallowed failures of the sink underneath — a ring or intern-pool fault,
+            // or the ObjectDisposedException a shutdown mid-batch raises — and reported them
+            // to the client as "malformed payload". Those are the server's problem and must
+            // surface as 500.
+            catch (Exception ex) when (IsMalformedPayload(ex))
             {
-                _logger.LogDebug(ex, "Malformed ingestion payload");
-                ctx.Response.StatusCode = StatusCodes.Status400BadRequest;
+                // The prefix is already in the ring. Wake the drainer for it, or it sits
+                // there until the drain loop's 1 s missed-signal timeout.
+                if (progress.Ingested > 0)
+                    _drainer.NotifyEnqueued();
+
+                // Warning, not Debug, and with the counts: "some of that batch landed and
+                // some of it did not" is an operator's problem, and the element index is
+                // what makes it findable in the sender.
+                _logger.LogWarning(ex,
+                    "Malformed ingestion payload at element {ElementIndex} of {ElementCount}: "
+                  + "{Ingested} event(s) already ingested, {Dropped} dropped — batch refused",
+                    progress.ElementIndex, progress.ElementCount, progress.Ingested, progress.Dropped);
+
+                ctx.Response.StatusCode  = StatusCodes.Status400BadRequest;
+                ctx.Response.ContentType = "application/json";
+                WriteCountsJson(ctx.Response.BodyWriter, progress.Ingested, progress.Dropped,
+                                failedAtElement: progress.ElementIndex);
+                await ctx.Response.BodyWriter.FlushAsync(ctx.RequestAborted);
                 return;
             }
 
-            if (ingested > 0)
+            if (progress.Ingested > 0)
                 _drainer.NotifyEnqueued();
 
             // ── 4. Response ───────────────────────────────────────────────────
             ctx.Response.StatusCode  = StatusCodes.Status200OK;
             ctx.Response.ContentType = "application/json";
-            WriteCountsJson(ctx.Response.BodyWriter, ingested, dropped);
+            WriteCountsJson(ctx.Response.BodyWriter, progress.Ingested, progress.Dropped);
             await ctx.Response.BodyWriter.FlushAsync(ctx.RequestAborted);
         }
         finally
@@ -202,15 +222,29 @@ public sealed class IngestionEndpoint : IOtlpLogSink, LogEventSerializer.IClefBa
     }
 
     /// <summary>
-    /// Writes <c>{"ingested":N,"dropped":M}</c> into the response buffer with no string in
-    /// between. The interpolated form allocated the formatted string, a char[] from the
-    /// handler, and then a UTF-8 transcode of it — ~300 B per request, for 30-odd bytes of
-    /// constant-shaped JSON. Both counts are non-negative ints, so the longest possible body
-    /// is well under the requested span.
+    /// The exception shapes a BAD BODY produces, and nothing else. MessagePackReader raises
+    /// <see cref="MessagePack.MessagePackSerializationException"/> for a code it cannot read
+    /// and <see cref="EndOfStreamException"/> when the body ends inside an element; those are
+    /// the client's problem and answer 400. Anything else came from the sink — the ring, the
+    /// intern pool, the logger, or a shutdown mid-batch — and is the server's, so it surfaces
+    /// as 500 rather than being reported as a malformed payload.
     /// </summary>
-    private static void WriteCountsJson(System.IO.Pipelines.PipeWriter writer, int ingested, int dropped)
+    internal static bool IsMalformedPayload(Exception ex)
+        => ex is MessagePack.MessagePackSerializationException or EndOfStreamException;
+
+    /// <summary>
+    /// Writes <c>{"ingested":N,"dropped":M}</c> into the response buffer with no string in
+    /// between — plus <c>,"failedAtElement":K</c> when the batch was refused part way, so a
+    /// sender reading the 400 can tell how much of it landed and where it stopped. The
+    /// interpolated form allocated the formatted string, a char[] from the handler, and then
+    /// a UTF-8 transcode of it — ~300 B per request, for 30-odd bytes of constant-shaped
+    /// JSON. Every count is a non-negative int, so the longest possible body is well under
+    /// the requested span.
+    /// </summary>
+    private static void WriteCountsJson(
+        System.IO.Pipelines.PipeWriter writer, int ingested, int dropped, int failedAtElement = -1)
     {
-        const int MaxLen = 24 + 11 + 11; // 24 bytes of literals + two int32s at their widest
+        const int MaxLen = 24 + 19 + 11 + 11 + 11; // literals + three int32s at their widest
         Span<byte> span = writer.GetSpan(MaxLen);
         int pos = 0;
 
@@ -223,6 +257,14 @@ public sealed class IngestionEndpoint : IOtlpLogSink, LogEventSerializer.IClefBa
         pos += 11;
         System.Buffers.Text.Utf8Formatter.TryFormat(dropped, span[pos..], out written);
         pos += written;
+
+        if (failedAtElement >= 0)
+        {
+            ",\"failedAtElement\":"u8.CopyTo(span[pos..]);
+            pos += 19;
+            System.Buffers.Text.Utf8Formatter.TryFormat(failedAtElement, span[pos..], out written);
+            pos += written;
+        }
 
         span[pos++] = (byte)'}';
         writer.Advance(pos);

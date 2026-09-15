@@ -55,12 +55,22 @@ public sealed class IngestionDrainer : IAsyncDisposable
     /// </summary>
     internal void NotifyEnqueued()
     {
+        Interlocked.Increment(ref _notifyCount);
         if (_signal.CurrentCount == 0)
         {
             try { _signal.Release(); }
             catch (SemaphoreFullException) { } // already signaled — fine
         }
     }
+
+    /// <summary>
+    /// Times a producer has asked the drainer to wake. Diagnostic: the thing worth knowing
+    /// is that it still happens on the paths that THROW part way through a batch — a prefix
+    /// left in the ring with nobody woken for it waits out the drain loop's 1 s
+    /// missed-signal timeout.
+    /// </summary>
+    public long NotifyCount => Interlocked.Read(ref _notifyCount);
+    private long _notifyCount;
 
     /// <summary>Events abandoned after exhausting per-event write retries (see DrainLoopAsync).</summary>
     public long ErrorDrops => Interlocked.Read(ref _errorDrops);

@@ -124,20 +124,50 @@ public static class LogEventSerializer
     /// </summary>
     /// <returns>The number of events the sink accepted.</returns>
     /// <exception cref="MessagePackSerializationException">The body is not a well-formed CLEF array.</exception>
+    /// <exception cref="EndOfStreamException">The body ends inside an element.</exception>
     public static int StreamBatch(ReadOnlyMemory<byte> body, IClefBatchSink sink, out int dropped)
     {
-        var reader     = new MessagePackReader(body);
-        int arrayCount = reader.ReadArrayHeader();
+        var progress = default(ClefBatchProgress);
+        StreamBatch(body, sink, ref progress);
+        dropped = progress.Dropped;
+        return progress.Ingested;
+    }
 
-        int ingested = 0;
-        dropped      = 0;
-        for (int i = 0; i < arrayCount; i++)
+    /// <summary>
+    /// How far a batch got. A struct passed by ref, so the counts SURVIVE the exception a
+    /// malformed element throws — the caller needs them: events already handed to the sink
+    /// are in the ring and their drainer still has to be woken, and an operator reading the
+    /// 400 needs to know that some of the batch landed, and where it stopped.
+    /// </summary>
+    public struct ClefBatchProgress
+    {
+        /// <summary>Events the sink accepted.</summary>
+        public int Ingested;
+        /// <summary>Events the sink refused (oversized, or back-pressure).</summary>
+        public int Dropped;
+        /// <summary>Index of the element being read — where a throw happened, if one did.</summary>
+        public int ElementIndex;
+        /// <summary>Elements the array header declared. Zero until the header is read.</summary>
+        public int ElementCount;
+    }
+
+    /// <inheritdoc cref="StreamBatch(ReadOnlyMemory{byte}, IClefBatchSink, out int)"/>
+    /// <summary>
+    /// As <see cref="StreamBatch(ReadOnlyMemory{byte}, IClefBatchSink, out int)"/>, but
+    /// reporting progress through <paramref name="progress"/> so the counts are readable
+    /// after a throw.
+    /// </summary>
+    public static void StreamBatch(ReadOnlyMemory<byte> body, IClefBatchSink sink, ref ClefBatchProgress progress)
+    {
+        var reader = new MessagePackReader(body);
+        progress.ElementCount = reader.ReadArrayHeader();
+
+        for (int i = 0; i < progress.ElementCount; i++)
         {
-            if (StreamEvent(ref reader, sink)) ingested++;
-            else                               dropped++;
+            progress.ElementIndex = i;
+            if (StreamEvent(ref reader, sink)) progress.Ingested++;
+            else                               progress.Dropped++;
         }
-
-        return ingested;
     }
 
     private static bool StreamEvent(ref MessagePackReader reader, IClefBatchSink sink)
