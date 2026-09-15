@@ -24,7 +24,7 @@ public static class FilterEvaluator
     /// <summary>Returns true if <paramref name="ev"/> matches the filter.</summary>
     ///
     /// <remarks>
-    /// Dispatch is a jump table on <see cref="FilterNode.Kind"/>, not a chain of type tests.
+    /// Dispatch is a jump table on <see cref="FilterNode.DispatchKind"/>, not a chain of type tests.
     /// The switch below covers the shapes a log query produces in bulk; everything else falls
     /// through to <see cref="MatchesRare"/>, which is the fifty-arm type switch and stays the
     /// single place that knows how to evaluate the function predicates. A node type that is not

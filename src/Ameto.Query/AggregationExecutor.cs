@@ -198,12 +198,15 @@ public sealed class AggregationExecutor(
     /// Answers a <c>count(*)</c> whose grouping and where-clause live entirely in the event
     /// HEADER, without materialising a single <see cref="LogEvent"/>.
     ///
-    /// <para><c>select count(*) group by ['service.name']</c> over a wide window used to run the
-    /// full ordered k-way merge — every event decoded, its properties copied, its exception
-    /// rebuilt — to look at three columns. The header aggregator behind
-    /// <c>/api/events/counts</c> already reads exactly those three columns, in parallel across
-    /// segments, and the alert evaluator already trusts <c>TryGetHeaderOnlyShape</c> to say when
-    /// a filter is expressible that way. This routes the aggregation down the same road.</para>
+    /// <para><c>select count(*) where @l = 'Error' group by @l</c> over a wide window used to run
+    /// the full ordered k-way merge — every event decoded, its properties copied, its exception
+    /// rebuilt — to look at three header columns: level, service and timestamp. The header
+    /// aggregator behind <c>/api/events/counts</c> already reads exactly those three columns, in
+    /// parallel across segments, and the alert evaluator already trusts
+    /// <c>TryGetHeaderOnlyShape</c> to say when a filter is expressible that way. This routes the
+    /// aggregation down the same road. The shape that motivated it, <c>group by
+    /// ['service.name']</c>, is NOT one of them: it is declined for the reasons given
+    /// below.</para>
     ///
     /// <para>DELIBERATELY NARROW; anything unrecognised returns null and the ordinary scan runs.
     /// Every aggregate must be <c>count(*)</c>, there may be at most one group key and it must
