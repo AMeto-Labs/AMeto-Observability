@@ -27,6 +27,13 @@ namespace Ameto.Core;
 /// response whose request has already completed. The caller owes the usual SSE discipline — one
 /// call at a time — and that is the whole of the concurrency contract.</para>
 ///
+/// <para>THE BUFFER HOLDS WHOLE FRAMES ONLY, between any two calls. Every method that composes
+/// into it — the row frames, both DTO overloads, and the done and query-error frames — cuts a
+/// frame that throws part-way back out (<see cref="DiscardFrameFrom"/>), so the frames buffered
+/// before it survive and the next frame never lands behind half a line. That is what lets every
+/// frame APPEND to the backlog, where each one used to reset the buffer before rows
+/// coalesced.</para>
+///
 /// <para>Lives in Core rather than beside its first caller because the trace and metric
 /// endpoint mappers ship in their own assemblies and do not reference Ameto.Server — the
 /// reference runs the other way, so a second copy over there was the only alternative.</para>
@@ -200,8 +207,7 @@ public sealed class SseJsonWriter : IDisposable
         }
         catch
         {
-            _buffer.ResetWrittenCount();
-            _buffer.Advance(frameStart);      // keep the whole frames, drop the partial one
+            DiscardFrameFrom(frameStart);
             throw;
         }
 
@@ -242,6 +248,20 @@ public sealed class SseJsonWriter : IDisposable
         }
     }
 
+    /// <summary>
+    /// Cuts a frame that failed part-way back out of the buffer — the one rollback every
+    /// composing method uses. Everything before <paramref name="frameStart"/> is whole frames and
+    /// stays. The JSON writer's unflushed tail of the failed frame is dropped as well, so a later
+    /// flush (<see cref="Dispose"/> flushes) cannot advance the buffer over bytes that are no
+    /// longer there.
+    /// </summary>
+    private void DiscardFrameFrom(int frameStart)
+    {
+        _buffer.ResetWrittenCount();
+        _buffer.Advance(frameStart);      // keep the whole frames, drop the partial one
+        _json.Reset(_buffer);
+    }
+
     // ── Frames that are sent at once ──────────────────────────────────────────
 
     /// <summary>
@@ -252,10 +272,19 @@ public sealed class SseJsonWriter : IDisposable
     /// </summary>
     public async Task WriteEventAsync<T>(T dto, JsonTypeInfo<T> typeInfo, CancellationToken ct)
     {
-        _buffer.Write(DataPrefix);
-        _json.Reset(_buffer);
-        JsonSerializer.Serialize(_json, dto, typeInfo);
-        _buffer.Write(FrameSuffix);
+        int frameStart = _buffer.WrittenCount;
+        try
+        {
+            _buffer.Write(DataPrefix);
+            _json.Reset(_buffer);
+            JsonSerializer.Serialize(_json, dto, typeInfo);
+            _buffer.Write(FrameSuffix);
+        }
+        catch
+        {
+            DiscardFrameFrom(frameStart);
+            throw;
+        }
         await SendAsync(ct).ConfigureAwait(false);
     }
 
@@ -271,10 +300,19 @@ public sealed class SseJsonWriter : IDisposable
     /// </summary>
     public async Task WriteEventAsync<T>(T dto, JsonSerializerOptions options, CancellationToken ct)
     {
-        _buffer.Write(DataPrefix);
-        _json.Reset(_buffer);
-        JsonSerializer.Serialize(_json, dto, options);
-        _buffer.Write(FrameSuffix);
+        int frameStart = _buffer.WrittenCount;
+        try
+        {
+            _buffer.Write(DataPrefix);
+            _json.Reset(_buffer);
+            JsonSerializer.Serialize(_json, dto, options);
+            _buffer.Write(FrameSuffix);
+        }
+        catch
+        {
+            DiscardFrameFrom(frameStart);
+            throw;
+        }
         await SendAsync(ct).ConfigureAwait(false);
     }
 
@@ -313,15 +351,24 @@ public sealed class SseJsonWriter : IDisposable
     /// </param>
     public async Task WriteDoneAsync(bool complete, string reason, string? truncatedBy, CancellationToken ct)
     {
-        _buffer.Write(DonePrefix);
-        _json.Reset(_buffer);
-        _json.WriteStartObject();
-        _json.WriteBoolean("complete", complete);
-        _json.WriteString("reason", reason);
-        if (truncatedBy is not null) _json.WriteString("truncatedBy", truncatedBy);
-        _json.WriteEndObject();
-        _json.Flush();
-        _buffer.Write(FrameSuffix);
+        int frameStart = _buffer.WrittenCount;
+        try
+        {
+            _buffer.Write(DonePrefix);
+            _json.Reset(_buffer);
+            _json.WriteStartObject();
+            _json.WriteBoolean("complete", complete);
+            _json.WriteString("reason", reason);
+            if (truncatedBy is not null) _json.WriteString("truncatedBy", truncatedBy);
+            _json.WriteEndObject();
+            _json.Flush();
+            _buffer.Write(FrameSuffix);
+        }
+        catch
+        {
+            DiscardFrameFrom(frameStart);
+            throw;
+        }
         await SendAsync(ct).ConfigureAwait(false);
     }
 
@@ -340,14 +387,23 @@ public sealed class SseJsonWriter : IDisposable
     /// </param>
     public async Task WriteErrorAsync(string message, CancellationToken ct, string? truncatedBy = null)
     {
-        _buffer.Write(ErrorPrefix);
-        _json.Reset(_buffer);
-        _json.WriteStartObject();
-        _json.WriteString("error", message);
-        if (truncatedBy is not null) _json.WriteString("truncatedBy", truncatedBy);
-        _json.WriteEndObject();
-        _json.Flush();
-        _buffer.Write(FrameSuffix);
+        int frameStart = _buffer.WrittenCount;
+        try
+        {
+            _buffer.Write(ErrorPrefix);
+            _json.Reset(_buffer);
+            _json.WriteStartObject();
+            _json.WriteString("error", message);
+            if (truncatedBy is not null) _json.WriteString("truncatedBy", truncatedBy);
+            _json.WriteEndObject();
+            _json.Flush();
+            _buffer.Write(FrameSuffix);
+        }
+        catch
+        {
+            DiscardFrameFrom(frameStart);
+            throw;
+        }
         await SendAsync(ct).ConfigureAwait(false);
     }
 
