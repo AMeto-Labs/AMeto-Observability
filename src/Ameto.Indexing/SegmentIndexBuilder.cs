@@ -18,7 +18,9 @@ namespace Ameto.Indexing;
 /// <see cref="MessagePackReader"/> and feeds the indexes directly — no per-event
 /// <c>Dictionary</c>, no boxing, no per-attribute strings. This is the flush-path allocation hot
 /// spot (index build was ~16 KB/event); the streaming walk is byte-parity with the old dictionary
-/// path (see <see cref="BuildReference"/>, exercised by the parity test).
+/// path (see <see cref="BuildReference"/>, exercised by the parity test) for every valid UTF-8
+/// input. A key or value that is NOT valid UTF-8 is indexed as its raw bytes, where the
+/// char-based walk indexed the U+FFFD-replaced decoding — see <see cref="SegmentInvertedIndex"/>.
 /// </summary>
 public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
 {
@@ -729,8 +731,16 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
         return (_inverted.Serialise(), _trigram.Serialise(), _bloom.Serialise());
     }
 
-    /// <summary>What this group measured, for the next one to size itself by.</summary>
-    private void RecordHints() => _hints?.Record(_inverted.TermCount, _trigram.BucketCount);
+    /// <summary>What this group measured, for the next one to size itself by — once, however
+    /// many of the section accessors are called (a probe calls both paths).</summary>
+    private void RecordHints()
+    {
+        if (_hintsRecorded) return;
+        _hintsRecorded = true;
+        _hints?.Record(_inverted.TermCount, _trigram.BucketCount);
+    }
+
+    private bool _hintsRecorded;
 
     /// <summary>
     /// The production path — see <see cref="ISegmentIndexSink.WriteSections"/>. The inverted

@@ -326,6 +326,11 @@ public sealed class SegmentWriter : IDisposable
         if (_sinkFactory is not null) SealGroup();
     }
 
+    // ── Test seam ─────────────────────────────────────────────────────────────
+    // The three section writers below are how tests and probes write sections they built by
+    // hand. Production never calls them: SealGroup has the sink stream its sections straight
+    // into the file (ISegmentIndexSink.WriteSections), with exactly this framing.
+
     public void WriteInvertedIndex(ReadOnlySpan<byte> indexBytes)
     {
         _invertedIndexOffset = _fs.Position;

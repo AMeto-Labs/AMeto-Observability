@@ -165,39 +165,46 @@ public interface ISegmentIndexSink : IDisposable
     /// </summary>
     long BloomTermCapacity { get; }
 
-    /// <summary>Serialises the group's sections. Called once, after the last <see cref="Add"/>.</summary>
-    (byte[] Inverted, byte[] Trigram, byte[] Bloom) Serialise();
-
     /// <summary>
     /// Writes the group's three sections to <paramref name="destination"/> at its current
-    /// position — each as <c>uint32 length</c> + bytes, exactly what the writer's
-    /// <c>WriteInvertedIndex</c> / <c>WriteTrigramIndex</c> / <c>WriteBloomFilter</c> put on
-    /// disk — and reports where each one starts. Called once, after the last <see cref="Add"/>,
-    /// INSTEAD of <see cref="Serialise"/>.
-    ///
-    /// <para>This is the production path: a sink that can stream writes its accumulators
-    /// straight into the file, where <see cref="Serialise"/> costs three managed blobs per
-    /// group (two of them multi-MB, all on the LOH, all dead as soon as they are written). The
-    /// default goes through <see cref="Serialise"/> so a sink that only has blobs — the test
-    /// stubs — needs nothing more. <paramref name="destination"/> must be seekable: a streaming
-    /// sink writes a length placeholder and patches it once the section's size is known.</para>
+    /// position — each as <c>uint32 length</c> + bytes (<see cref="WriteFramed"/>), the framing
+    /// the segment reader expects — and reports where each one starts. Called once, after the
+    /// last <see cref="Add"/>. This is the production call: a sink that can stream writes its
+    /// accumulators straight into the file instead of handing back three multi-MB blobs that
+    /// die as soon as they are copied. <paramref name="destination"/> must be seekable: a
+    /// streaming sink writes a length placeholder and patches it once the section's size is
+    /// known.
     /// </summary>
-    void WriteSections(Stream destination, out long invertedOffset, out long trigramOffset, out long bloomOffset)
-    {
-        var (inverted, trigram, bloom) = Serialise();
-        invertedOffset = WriteBlob(destination, inverted);
-        trigramOffset  = WriteBlob(destination, trigram);
-        bloomOffset    = WriteBlob(destination, bloom);
+    void WriteSections(Stream destination, out long invertedOffset, out long trigramOffset, out long bloomOffset);
 
-        static long WriteBlob(Stream s, byte[] blob)
+    /// <summary>
+    /// The three sections as blobs — a test and probe seam, never called by the writer. The
+    /// default runs <see cref="WriteSections"/> into memory and slices the frames back out; a
+    /// sink with its own blobs may override it to skip the round trip.
+    /// </summary>
+    (byte[] Inverted, byte[] Trigram, byte[] Bloom) Serialise()
+    {
+        var ms = new MemoryStream();
+        WriteSections(ms, out long inv, out long tri, out long bloom);
+        var all = ms.GetBuffer();
+        return (Unframe(all, inv), Unframe(all, tri), Unframe(all, bloom));
+
+        static byte[] Unframe(byte[] all, long at)
         {
-            long at = s.Position;
-            Span<byte> len = stackalloc byte[4];
-            System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(len, (uint)blob.Length);
-            s.Write(len);
-            s.Write(blob);
-            return at;
+            uint len = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(all.AsSpan((int)at));
+            return all.AsSpan((int)at + 4, (int)len).ToArray();
         }
+    }
+
+    /// <summary>Writes one section as <c>uint32 length</c> + bytes and returns where it starts.</summary>
+    static long WriteFramed(Stream destination, ReadOnlySpan<byte> section)
+    {
+        long at = destination.Position;
+        Span<byte> len = stackalloc byte[4];
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(len, (uint)section.Length);
+        destination.Write(len);
+        destination.Write(section);
+        return at;
     }
 }
 

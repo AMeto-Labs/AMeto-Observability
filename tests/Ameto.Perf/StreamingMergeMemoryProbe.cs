@@ -212,10 +212,10 @@ public sealed class StreamingMergeMemoryProbe : IDisposable
         public long BloomTermsAdded   => inner.BloomTermsAdded;
         public long BloomTermCapacity => inner.BloomTermCapacity;
 
-        public (byte[] Inverted, byte[] Trigram, byte[] Bloom) Serialise()
+        public void WriteSections(Stream destination, out long invertedOffset, out long trigramOffset, out long bloomOffset)
         {
             onSeal();
-            return inner.Serialise();
+            inner.WriteSections(destination, out invertedOffset, out trigramOffset, out bloomOffset);
         }
 
         public void Dispose() => inner.Dispose();

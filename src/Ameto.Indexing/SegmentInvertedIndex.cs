@@ -19,6 +19,12 @@ namespace Ameto.Indexing;
 /// Serialisation: delta+varint via <see cref="SegmentBitmapCodec"/>, terms copied from the slabs.
 /// Deserialisation: iterates postings back into sorted arrays for fast lookup.
 ///
+/// <para>Terms are the payload's own bytes. A key or value that is not valid UTF-8 is filed and
+/// written as it arrived; the previous build decoded it through <c>Encoding.UTF8.GetChars</c>,
+/// which replaced each bad sequence with U+FFFD and wrote THAT. The reader decodes the section
+/// with the same replacement, so a query sees the same term either way; only the bytes on disk
+/// differ for such a value, and the ingest path validates its strings before they get here.</para>
+///
 /// <para>SECTION BYTES ARE PINNED: properties are written in first-seen order and each
 /// property's values in first-seen order (a per-property chain through the entry array), which
 /// is the dictionary insertion order the previous build wrote. <c>IndexBuildParityTests</c> and
@@ -255,17 +261,11 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
         _props     = IndexBuildPool.Entries<PropEntry>().Rent(64);
     }
 
+    /// <summary>A zeroed table of exactly <paramref name="n"/> slots — the pool hands out the
+    /// power-of-two bucket size, and the table uses its full length as capacity (mask = Length - 1).</summary>
     private static int[] RentCleared(int n)
     {
         var t = IndexBuildPool.Ints.Rent(n);
-        // A rented array can be longer than asked; the table uses its FULL length as capacity
-        // (mask = Length - 1), so it must be a power of two — trim by re-renting exact when not.
-        if (!System.Numerics.BitOperations.IsPow2(t.Length))
-        {
-            IndexBuildPool.Ints.Return(t);
-            t = new int[n];
-            return t;
-        }
         Array.Clear(t);
         return t;
     }
@@ -629,7 +629,9 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
     ///     uint32 valueCount
     ///     per value:
     ///       uint16 valueLen, value utf8
-    ///       uint32 bitmapLen, RoaringBitmap bytes
+    ///       uint32 postingsLen, SegmentBitmapCodec bytes (varint count, varint gaps)
+    /// preceded by the uint32 CodecMagic marker; a legacy blob starts with propertyCount and
+    /// carries RoaringBitmap postings (read-only, see Deserialise).
     /// </summary>
     public byte[] Serialise()
     {

@@ -75,8 +75,12 @@ internal sealed class StreamSectionWriter : IBufferWriter<byte>, IDisposable
 
     public void Dispose()
     {
-        Flush();
-        IndexBuildPool.Slabs.Return(_buffer);
-        _buffer = Array.Empty<byte>();
+        // Return in a finally: a failed final write (disk full) must not also leak the slab.
+        try { Flush(); }
+        finally
+        {
+            IndexBuildPool.Slabs.Return(_buffer);
+            _buffer = Array.Empty<byte>();
+        }
     }
 }
