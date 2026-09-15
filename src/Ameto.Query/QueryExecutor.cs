@@ -44,6 +44,13 @@ public sealed class QueryExecutor : IQueryExecutor
         _indexCache   = indexCache is { Enabled: true } ? indexCache : null;
     }
 
+    /// <summary>
+    /// How much SYNCHRONOUS scanning a query may do before it hands its consumer a pending step
+    /// (<see cref="ScanPace"/>). Settable only so a test can make every clock read a yield and see
+    /// the yields on a fixture far too small to take the default's 50 ms.
+    /// </summary>
+    internal TimeSpan ScanYieldInterval { get; init; } = ScanPace.DefaultInterval;
+
     // ── IQueryExecutor ────────────────────────────────────────────────────────
 
     public async IAsyncEnumerable<LogEvent> ExecuteAsync(
@@ -108,7 +115,13 @@ public sealed class QueryExecutor : IQueryExecutor
         // failed the cursor on all subsequent pages — silently unreachable rows.
         using var hotReader = _segments.OpenHotTierReader();
         var covered   = hotReader.CoveredSegmentKeys;
-        var hotStream = HotEventsAsync(hotReader, filter, from, to, afterTs, afterId, forward, levels, ct);
+
+        // ONE pace for every source below, the hot tier and each segment scan: the scan hands its
+        // consumer a pending step at least every ScanYieldInterval of synchronous work, wherever
+        // in the merge that work is spent. Without it no step of a real scan is ever pending, and
+        // a consumer that sends while the scan works never gets the chance (see ScanPace).
+        var pace      = new ScanPace(ScanYieldInterval);
+        var hotStream = HotEventsAsync(hotReader, filter, from, to, afterTs, afterId, forward, levels, pace, ct);
 
         // ── Cold-tier segments (k-way merge) ─────────────────────────────────
         // After Variant B, every segment's blocks are individually sorted by @t,
@@ -126,7 +139,7 @@ public sealed class QueryExecutor : IQueryExecutor
             .Where(s => s.MaxTimestampTicks >= fromTicksGlobal && s.MinTimestampTicks <= toTicksGlobal)
             .ToList();
 
-        await foreach (var ev in MergeSourcesAsync(hotStream, segInfos, filter, levels, from, to, afterTs, afterId, forward, ct))
+        await foreach (var ev in MergeSourcesAsync(hotStream, segInfos, filter, levels, from, to, afterTs, afterId, forward, pace, ct))
         {
             if (ct.IsCancellationRequested || count >= limit) yield break;
             yield return ev;
@@ -149,6 +162,7 @@ public sealed class QueryExecutor : IQueryExecutor
         Ameto.Core.EventId?           afterId,
         bool                          forward,
         HashSet<Ameto.Core.LogLevel>? levels,
+        ScanPace                      pace,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
         foreach (var ev in hotReader.ReadSorted(
@@ -156,10 +170,10 @@ public sealed class QueryExecutor : IQueryExecutor
                      afterTs, afterId?.RawValue, forward, levels))
         {
             if (ct.IsCancellationRequested) yield break;
+            if (pace.Due()) await ScanPace.Yield();
             if (!filter.Matches(ev)) continue;
             yield return ev;
         }
-        await Task.CompletedTask; // the source is synchronous; async only to fit the merge
     }
 
     // ── Cold-tier k-way merge ─────────────────────────────────────────────────
@@ -188,6 +202,7 @@ public sealed class QueryExecutor : IQueryExecutor
         long?                                afterTs,
         Ameto.Core.EventId?                 afterId,
         bool                                 forward,
+        ScanPace                             pace,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct)
     {
         // Open one async iterator per segment that survives index/trigram fast-skip.
@@ -256,7 +271,7 @@ public sealed class QueryExecutor : IQueryExecutor
 
                     var (segInfo, candidateOffsets) = ordered[next++];
                     var stream = ScanSegmentAsync(segInfo, filter, levels, candidateOffsets,
-                                                  from, to, afterTs, afterId, !forward, ct);
+                                                  from, to, afterTs, afterId, !forward, pace, ct);
                     var newIt = stream.GetAsyncEnumerator(ct);
                     if (await newIt.MoveNextAsync())
                     {
@@ -713,6 +728,7 @@ public sealed class QueryExecutor : IQueryExecutor
         long? afterTs,
         Ameto.Core.EventId? afterId,
         bool reversed,
+        ScanPace pace,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct)
     {
         SegmentReader? reader = null;
@@ -731,6 +747,7 @@ public sealed class QueryExecutor : IQueryExecutor
             // blocks themselves are sorted, so we can stream lazily without buffering.
             await foreach (var ev in reader.ReadEventsAsync(candidateOffsets, from, to, reversed, ct))
             {
+                if (pace.Due()) await ScanPace.Yield();
                 if (!InWindow(ev, from, to)) continue;
                 if (!AfterCursor(ev, afterTs, afterId, !reversed)) continue;
                 if (levels != null && !levels.Contains(ev.Level)) continue;

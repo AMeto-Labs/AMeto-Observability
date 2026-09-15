@@ -91,10 +91,12 @@ public sealed class SseJsonWriter : IDisposable
     /// <para>Neither rule can send a row that nothing is written after. That is
     /// <see cref="WriteLogEventsAsync"/>'s job: it sends the backlog whenever its source makes
     /// it wait. A source that computes its next row SYNCHRONOUSLY gives the writer no moment to
-    /// send in, so the tail of a burst it produces waits for the next row, the 16 KB, or the
-    /// terminal frame (which the search budget bounds). A timer used to cover that stretch and
-    /// was taken out: its send ran on a pool thread as a second writer to the body, so it needed
-    /// a gate every row paid for, it could outlive <see cref="Dispose"/> and the request, and it
+    /// send in, and every stage of the query executor does, so the executor makes its scan wait
+    /// on purpose, at least every 50 ms of synchronous work (<c>Ameto.Query.ScanPace</c>). A
+    /// source that neither waits nor paces keeps the tail of each burst until the next row, the
+    /// 16 KB, or the terminal frame. A timer used to cover that stretch from this side and was
+    /// taken out: its send ran on a pool thread as a second writer to the body, so it needed a
+    /// gate every row paid for, it could outlive <see cref="Dispose"/> and the request, and it
     /// re-armed every 20 ms through a stalled send.</para>
     /// </summary>
     private static readonly TimeSpan MaxFrameHold = TimeSpan.FromMilliseconds(100);
@@ -134,9 +136,12 @@ public sealed class SseJsonWriter : IDisposable
     /// found so far go out while the source works.
     ///
     /// <para>Rows the source hands over synchronously — one decoded block's matches, a hot-tier
-    /// page — keep coalescing up to 16 KB; a sparse search shows each row before its next
-    /// asynchronous gap ends, not at <c>done</c>. The send runs WHILE the source works, but on
-    /// this call and against nothing the source touches, so the body still has one writer.</para>
+    /// page — keep coalescing up to 16 KB; a sparse search shows each row before the source's
+    /// next wait ends, not at <c>done</c>. That is only as good as the source's waits. The query
+    /// executor's own stages never wait, so it paces its scan to wait at least every 50 ms of
+    /// synchronous work (<c>Ameto.Query.ScanPace</c>), and that is the bound a search gets. The
+    /// send runs WHILE the source works, but on this call and against nothing the source
+    /// touches, so the body still has one writer.</para>
     ///
     /// <para>The source is never disposed in the middle of a step. A send that fails while the
     /// source is working waits for that step first, bounded by the source's own token (on the

@@ -132,11 +132,14 @@ public static class EndpointMapper
                     // Timestamp/Id/trace/span ToString per row, and the frames coalesce in
                     // the writer's buffer instead of taking a socket send each. The writer
                     // drives the enumerator itself so it can send the rows found so far
-                    // whenever the scan makes it wait — rows found together still share a
-                    // send, and a sparse search shows each row before its next wait ends
-                    // rather than at `done`. The terminal frame below puts whatever is still
-                    // buffered on the wire with it, which is why there is no explicit flush
-                    // here — every exit from this block except a client disconnect writes one.
+                    // whenever the scan makes it wait. Nothing under the executor waits on its
+                    // own — the reader decodes inline, the hot tier is RAM, the merge never
+                    // blocks — so the executor makes the scan wait on purpose, at least every
+                    // 50 ms of synchronous work (ScanPace). Rows found together still share a
+                    // send, and a sparse search shows each row within about that much scanning
+                    // of finding it rather than at `done`. The terminal frame below puts whatever
+                    // is still buffered on the wire with it, which is why there is no explicit
+                    // flush here — every exit from this block except a client disconnect writes one.
                     await sse.WriteLogEventsAsync(executor.ExecuteAsync(request, deadline.Token), deadline.Token);
 
                     // CHECKED AFTER THE LOOP, not only in a catch filter: the executor turns
