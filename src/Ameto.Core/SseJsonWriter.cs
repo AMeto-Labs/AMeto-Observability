@@ -144,6 +144,13 @@ public sealed class SseJsonWriter : IDisposable
     /// mid-step throws <see cref="NotSupportedException"/>, which would replace the send's own
     /// failure — the one the caller's catch filters are written for.</para>
     ///
+    /// <para>A REAL FAULT IN THAT STEP IS NOT SWALLOWED. If the step the failed send waited for
+    /// throws anything but a cancellation — a corrupt block, a filter node the evaluator has no
+    /// arm for — both come out together as an <see cref="AggregateException"/>, the send's failure
+    /// first. Reporting the send alone would take the handler down its timeout or disconnect
+    /// branch, which logs nothing, and the fault would never be recorded. A step that stopped
+    /// because it was cancelled adds nothing to the send's failure and is dropped.</para>
+    ///
     /// <para>Ends without a terminal frame and without sending what the last rows left
     /// buffered: the caller writes <c>done</c> or <c>query-error</c> next, and that frame
     /// carries them.</para>
@@ -162,10 +169,20 @@ public sealed class SseJsonWriter : IDisposable
                     {
                         await SendAsync(ct).ConfigureAwait(false);
                     }
-                    catch
+                    catch (Exception sendFault)
                     {
-                        try   { await next.ConfigureAwait(false); }
-                        catch { /* the send's failure is the one to report */ }
+                        try
+                        {
+                            await next.ConfigureAwait(false);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            // The scan stopped for the reason the send did: nothing to add.
+                        }
+                        catch (Exception scanFault)
+                        {
+                            throw new AggregateException(sendFault, scanFault);
+                        }
                         throw;
                     }
                 }

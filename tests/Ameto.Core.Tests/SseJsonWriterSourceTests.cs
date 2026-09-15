@@ -177,6 +177,55 @@ public sealed class SseJsonWriterSourceTests
     }
 
     /// <summary>
+    /// A SCAN FAULT IN THE STEP A FAILED SEND WAITED FOR COMES OUT WITH THE SEND'S FAILURE. The
+    /// client stops reading and the budget fires in the flush while the scan's step is decoding a
+    /// block that turns out to be corrupt. The handler picks its branch by the exception: a
+    /// cancellation alone takes the timeout or disconnect branch, which logs nothing, so the
+    /// corruption would go unrecorded. Both come out, the send's failure first.
+    ///
+    /// <para>A step that throws a CANCELLATION adds nothing — it stopped for the reason the send
+    /// failed — so the send's own failure still surfaces as itself.</para>
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task A_failed_send_reports_a_fault_in_the_step_it_waited_for_but_not_a_cancellation(bool stepFaults)
+    {
+        var body = new RecordingStream();
+        using var sse = new SseJsonWriter(body);
+
+        // Warm the row road and send, so the source's row is held by the buffer alone.
+        await sse.WriteLogEventAsync(Event(99), default);
+        await sse.FlushFramesAsync(default);
+        body.Clear();
+        body.FlushFailuresLeft = 1;
+
+        async IAsyncEnumerable<LogEvent> Scan()
+        {
+            yield return Event(0);
+            await Task.Delay(50);                  // the writer sends row 0 now, and that send fails
+            throw stepFaults
+                ? new InvalidDataException("block 7 failed its checksum")
+                : new OperationCanceledException("the scan saw the budget run out");
+        }
+
+        Exception? thrown = await Record.ExceptionAsync(async () => await sse.WriteLogEventsAsync(Scan(), default));
+
+        Assert.Equal(1, body.FlushFailures);
+        if (stepFaults)
+        {
+            var both = Assert.IsType<AggregateException>(thrown);
+            Assert.Collection(both.InnerExceptions,
+                send => Assert.IsType<TaskCanceledException>(send),
+                scan => Assert.IsType<InvalidDataException>(scan));
+        }
+        else
+        {
+            Assert.IsType<TaskCanceledException>(thrown);   // the send's, not the scan's
+        }
+    }
+
+    /// <summary>
     /// THE SCAN ROAD HAS ONE WRITER TOO. A send made while the source works runs beside the
     /// source's step — never beside another send, and never beside a row being composed into the
     /// buffer it is sending. Against a body that completes every call asynchronously, no body
