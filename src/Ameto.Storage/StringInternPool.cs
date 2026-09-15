@@ -44,14 +44,19 @@ public sealed class StringInternPool
         if (_stringToIndex.TryGetValue(template, out int idx))
             return idx;
 
+        // Fast reject once saturated, so a saturated pool's misses do not keep incrementing
+        // the counter (a stream of new templates could carry it round to negative ids).
         if (_nextIndex >= MaxPoolSize)
-        {
-            if (Interlocked.Exchange(ref _exhaustedSignalled, 1) == 0)
-                PoolExhausted?.Invoke(MaxPoolSize);
-            return -1; // pool full — caller stores -1, template resolved differently
-        }
+            return Exhausted();
 
+        // The cap is checked AGAIN on the index actually claimed: two threads missing
+        // together at 65535 both pass the check above and one of them claims 65536, an id
+        // beyond every slot the pool can hold. The counter overshoots the cap by at most
+        // the number of threads racing at the boundary; each overshooter answers -1 and
+        // never touches the map.
         int newIdx = System.Threading.Interlocked.Increment(ref _nextIndex) - 1;
+        if (newIdx >= MaxPoolSize)
+            return Exhausted();
 
         // Another thread may have beaten us; accept their index
         if (_stringToIndex.TryAdd(template, newIdx))
@@ -100,6 +105,13 @@ public sealed class StringInternPool
         return (uint)index < (uint)slots.Length ? slots[index] ?? string.Empty : string.Empty;
     }
 
+    private int Exhausted()
+    {
+        if (Interlocked.Exchange(ref _exhaustedSignalled, 1) == 0)
+            PoolExhausted?.Invoke(MaxPoolSize);
+        return -1; // pool full — caller stores -1, template resolved differently
+    }
+
     /// <summary>
     /// Stores <paramref name="template"/> at <paramref name="index"/>, growing the array as
     /// needed. Under the lock so that a growth (copy old → new, then publish new) cannot
@@ -107,6 +119,12 @@ public sealed class StringInternPool
     /// </summary>
     private void SetSlot(int index, string template)
     {
+        // The growth loop below is bounded by MaxPoolSize; an index at or past it would
+        // spin it for ever — under the lock, with ingest behind it. No such id is ever
+        // handed out (Intern re-checks the cap on the claimed index), so this is a guard,
+        // not a path.
+        if ((uint)index >= MaxPoolSize) return;
+
         lock (_slotLock)
         {
             var slots = _indexToString;
@@ -132,7 +150,7 @@ public sealed class StringInternPool
         // The array is bounded by MaxPoolSize; an id beyond it was never handed out by this
         // pool (Intern stops at the cap), so only the reverse map is kept for it.
         _stringToIndex[template] = index;
-        if ((uint)index < MaxPoolSize) SetSlot(index, template);
+        SetSlot(index, template);   // guarded inside for an id beyond the cap
         int expected = _nextIndex;
         while (index + 1 > expected)
         {
