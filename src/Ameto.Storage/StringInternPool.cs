@@ -31,10 +31,28 @@ public sealed class StringInternPool
 
     private int _exhaustedSignalled;
 
-    public int Intern(string template)
+    public int Intern(string template) => Intern(template, out _);
+
+    /// <summary>
+    /// The one place an index is claimed. Everything else routes through it, so the
+    /// index→string publication order is reasoned about once.
+    ///
+    /// <para><paramref name="canonical"/> is NEVER resolved through <see cref="Get"/>.
+    /// <c>TryAdd</c> publishes the key — and therefore the index — BEFORE the index→string
+    /// map is written, so a thread that loses the race and reads the winner's index in that
+    /// window would see <see cref="Get"/> return <see cref="string.Empty"/>. The caller
+    /// stores that empty string as the event's template, the hot tier prefers an attached
+    /// string over the pool (a <c>??</c> does not catch <c>""</c>), and the event is served
+    /// with no template at all while the WAL pool row is skipped as empty. Measured at 4 875
+    /// events out of 8 threads × 64 fresh names × 200 rounds.</para>
+    ///
+    /// <para>So: the winner returns the very instance it stored, and a loser re-probes the
+    /// dictionary, whose KEY is the winner's instance and is present by the time
+    /// <c>TryAdd</c> failed.</para>
+    /// </summary>
+    private int Claim(string template, out string canonical)
     {
-        if (_stringToIndex.TryGetValue(template, out int idx))
-            return idx;
+        canonical = template;
 
         if (_nextIndex >= MaxPoolSize)
         {
@@ -45,14 +63,25 @@ public sealed class StringInternPool
 
         int newIdx = System.Threading.Interlocked.Increment(ref _nextIndex) - 1;
 
-        // Another thread may have beaten us; accept their index
         if (_stringToIndex.TryAdd(template, newIdx))
         {
             _indexToString[newIdx] = template;
-            return newIdx;
+            return newIdx;          // canonical is `template` — the instance just stored
         }
 
-        return _stringToIndex[template];
+        // Another thread beat us: accept their index AND their instance, from the one
+        // structure that is guaranteed to hold both.
+        var lookup = _stringToIndex.GetAlternateLookup<ReadOnlySpan<char>>();
+        if (lookup.TryGetValue(template.AsSpan(), out string? winner, out int winnerIdx))
+        {
+            canonical = winner;
+            return winnerIdx;
+        }
+
+        // Only reachable if Clear() ran between the failed TryAdd and this probe. The old
+        // code indexed the dictionary here and would have thrown KeyNotFoundException;
+        // answering "not pooled" is the same outcome the caller already handles.
+        return -1;
     }
 
     /// <summary>
@@ -98,10 +127,9 @@ public sealed class StringInternPool
                 return idx;
             }
 
-            string materialised = new string(key); // miss: materialise once, intern via the string path
-            int    newIdx       = Intern(materialised);
-            canonical = newIdx >= 0 ? Get(newIdx) : materialised;
-            return newIdx;
+            // Miss: materialise once and claim. Claim answers with the pooled instance —
+            // its own on a win, the winner's on a loss — never through Get().
+            return Claim(new string(key), out canonical);
         }
         finally
         {
@@ -125,9 +153,7 @@ public sealed class StringInternPool
             return idx;
         }
 
-        int newIdx = Intern(template);
-        canonical  = newIdx >= 0 ? Get(newIdx) : template;
-        return newIdx;
+        return Claim(template, out canonical);
     }
 
     public string Get(int index)

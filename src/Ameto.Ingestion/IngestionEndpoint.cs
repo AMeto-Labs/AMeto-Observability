@@ -274,8 +274,11 @@ public sealed class IngestionEndpoint : IOtlpLogSink, LogEventSerializer.IClefBa
 
         // Intern hands back the pool's OWN instance, so the tier stores the shared string
         // rather than a per-event duplicate — and one dictionary probe does the work of two.
-        int    tmplIdx = _pool.Intern(templateUtf8, out string canonicalTmpl); // -1 when empty
-        string tmpl    = tmplIdx >= 0 ? canonicalTmpl : string.Empty;
+        int     tmplIdx = _pool.Intern(templateUtf8, out string canonicalTmpl); // -1 when empty
+        // null, not "", when there is no pooled template: the tier prefers the attached
+        // string over the pool and its ?? does not catch an empty one, so an empty string
+        // here would serve the event with no template at all.
+        string? tmpl    = tmplIdx >= 0 ? canonicalTmpl : null;
 
         return _ring.TryEnqueue(
             tsTicks, level, tmplIdx, tmpl, exception: null,
@@ -319,7 +322,8 @@ public sealed class IngestionEndpoint : IOtlpLogSink, LogEventSerializer.IClefBa
 
         // Intern returns the pool's own instance, so the hot tier shares one string per
         // template instead of retaining this event's copy (see TryIngest).
-        int tmplIdx = _pool.Intern(templateUtf8, out string tmpl);   // -1 when empty
+        int     tmplIdx  = _pool.Intern(templateUtf8, out string canonical); // -1 when empty
+        string? tmpl     = tmplIdx >= 0 ? canonical : null;   // see TryIngestRaw: never ""
         int svcIdx  = _pool.Intern(serviceUtf8);                     // -1 when empty
 
         return _ring.TryEnqueue(
@@ -358,9 +362,12 @@ public sealed class IngestionEndpoint : IOtlpLogSink, LogEventSerializer.IClefBa
         // per-event duplicate is ~100 B/event of gen2-bound garbage (~60 MB on a 500k-event
         // tier). Intern returns the canonical string, so the tier shares one per template.
         int     tmplIdx = -1;
-        string? tmpl    = ev.MessageTemplate;
+        string? tmpl    = null;
         if (!string.IsNullOrEmpty(ev.MessageTemplate))
-            tmplIdx = _pool.Intern(ev.MessageTemplate, out tmpl);
+        {
+            tmplIdx = _pool.Intern(ev.MessageTemplate, out string canonical);
+            tmpl    = tmplIdx >= 0 ? canonical : ev.MessageTemplate;   // see TryIngestRaw: never ""
+        }
         int svcIdx  = ev.ServiceName is not null ? _pool.Intern(ev.ServiceName) : -1;
 
         bool ok = _ring.TryEnqueue(
