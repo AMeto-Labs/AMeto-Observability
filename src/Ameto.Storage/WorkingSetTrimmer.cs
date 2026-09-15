@@ -18,49 +18,17 @@ namespace Ameto.Storage;
 /// jemalloc preloaded and neither exports it, so the <c>DllImport</c> this used to make threw
 /// <see cref="EntryPointNotFoundException"/> on every single call — a throw plus a stack
 /// capture every 30 seconds, forever, on the platform the product actually ships on. The
-/// export is now probed once and the address cached; when it is absent the per-cycle call
-/// compiles down to a null check. Nothing is lost by not calling it there: jemalloc's
-/// background thread purges on its own decay timer.</para>
+/// export is now probed once through <see cref="MallocTrim"/> and the address cached; when it is
+/// absent the per-cycle call compiles down to a null check. Nothing is lost by not calling it
+/// there: jemalloc's background thread purges on its own decay timer.</para>
 /// </summary>
-internal static unsafe class WorkingSetTrimmer
+internal static class WorkingSetTrimmer
 {
-    /// <summary>Resolved <c>malloc_trim</c>, or null when the loaded libc does not export it.</summary>
-    private static delegate* unmanaged<nuint, int> _mallocTrim;
-    private static bool _probed;
+    /// <summary>The process-wide <c>malloc_trim</c> binding, resolved on first use.</summary>
+    internal static readonly MallocTrimBinding MallocTrim = new(MallocTrimBinding.ResolveFromLoadedLibc);
 
     /// <summary>Whether a usable <c>malloc_trim</c> was found. Probes on first use.</summary>
-    internal static bool HasMallocTrim
-    {
-        get
-        {
-            if (!_probed) Probe();
-            return _mallocTrim is not null;
-        }
-    }
-
-    /// <summary>
-    /// One-shot lookup. Benign if two threads race: both do the same work and write the same
-    /// address, and the field is only ever read after <c>_probed</c> is set.
-    /// </summary>
-    private static void Probe()
-    {
-        delegate* unmanaged<nuint, int> fn = null;
-        if (OperatingSystem.IsLinux())
-        {
-            try
-            {
-                // The main program handle searches everything already loaded — glibc, and any
-                // LD_PRELOADed allocator — which is exactly the set a call would have bound to.
-                if (NativeLibrary.TryGetExport(NativeLibrary.GetMainProgramHandle(), "malloc_trim", out nint addr) ||
-                    (NativeLibrary.TryLoad("libc.so.6", out nint libc) &&
-                     NativeLibrary.TryGetExport(libc, "malloc_trim", out addr)))
-                    fn = (delegate* unmanaged<nuint, int>)addr;
-            }
-            catch { /* no libc, no export, no trim — the null below is the answer */ }
-        }
-        _mallocTrim = fn;
-        _probed     = true;
-    }
+    internal static bool HasMallocTrim => MallocTrim.IsAvailable;
 
     /// <summary>
     /// Full release of resident memory back to the OS — used only after a
@@ -73,7 +41,7 @@ internal static unsafe class WorkingSetTrimmer
         try
         {
             if (OperatingSystem.IsWindows())    TrimWindows();
-            else if (OperatingSystem.IsLinux()) TrimLinux();
+            else if (OperatingSystem.IsLinux()) MallocTrim.Trim();
         }
         catch
         {
@@ -94,7 +62,7 @@ internal static unsafe class WorkingSetTrimmer
     {
         try
         {
-            if (OperatingSystem.IsLinux()) TrimLinux();
+            if (OperatingSystem.IsLinux()) MallocTrim.Trim();
         }
         catch
         {
@@ -110,14 +78,6 @@ internal static unsafe class WorkingSetTrimmer
         SetProcessWorkingSetSizeEx((IntPtr)(-1), (IntPtr)(-1), (IntPtr)(-1), 0);
     }
 
-    [SupportedOSPlatform("linux")]
-    private static void TrimLinux()
-    {
-        if (!_probed) Probe();
-        var fn = _mallocTrim;
-        if (fn is not null) fn(0);
-    }
-
     [DllImport("kernel32.dll", SetLastError = true)]
     [SupportedOSPlatform("windows")]
     private static extern bool SetProcessWorkingSetSizeEx(
@@ -125,4 +85,70 @@ internal static unsafe class WorkingSetTrimmer
         IntPtr dwMinimumWorkingSetSize,
         IntPtr dwMaximumWorkingSetSize,
         uint   Flags);
+}
+
+/// <summary>
+/// <c>int malloc_trim(size_t pad)</c>, looked up once and then called through a cached function
+/// pointer — or not at all, when the lookup found nothing.
+///
+/// <para>The lookup is a constructor argument rather than a hard-wired call so the property that
+/// matters — ONE lookup, no matter how many trims, and no exception per trim when the export is
+/// absent — can be tested on every platform with a lookup that answers "absent", "present" or
+/// throws. The real lookup only finds anything on Linux, and CI runs the backend suite on Windows,
+/// where going back to a per-call <c>DllImport</c> would have stayed green.</para>
+/// </summary>
+internal sealed unsafe class MallocTrimBinding
+{
+    private readonly Func<nint> _resolve;
+    private delegate* unmanaged<nuint, int> _fn;
+    private bool _probed;
+
+    /// <param name="resolve">Returns the export's address, or 0 when it is absent. May throw; a throw counts as absent.</param>
+    internal MallocTrimBinding(Func<nint> resolve) => _resolve = resolve;
+
+    /// <summary>Whether the export was found. Probes on first use.</summary>
+    internal bool IsAvailable
+    {
+        get
+        {
+            if (!_probed) Probe();
+            return _fn is not null;
+        }
+    }
+
+    /// <summary><c>malloc_trim(0)</c> when the export exists; a null check when it does not.</summary>
+    internal void Trim()
+    {
+        if (!_probed) Probe();
+        var fn = _fn;
+        if (fn is not null) fn(0);
+    }
+
+    /// <summary>
+    /// One-shot lookup. Benign if two threads race: both do the same work and write the same
+    /// address, and the pointer is only read after <c>_probed</c> is set.
+    /// </summary>
+    private void Probe()
+    {
+        nint addr;
+        try   { addr = _resolve(); }
+        catch { addr = 0; }                 // no libc, no export, no trim — the null below is the answer
+        _fn     = (delegate* unmanaged<nuint, int>)addr;
+        _probed = true;
+    }
+
+    /// <summary>
+    /// The production lookup. The main program handle searches everything already loaded — glibc,
+    /// and any LD_PRELOADed allocator — which is exactly the set a call would have bound to. 0
+    /// anywhere but Linux, without looking.
+    /// </summary>
+    internal static nint ResolveFromLoadedLibc()
+    {
+        if (!OperatingSystem.IsLinux()) return 0;
+        if (NativeLibrary.TryGetExport(NativeLibrary.GetMainProgramHandle(), "malloc_trim", out nint addr))
+            return addr;
+        return NativeLibrary.TryLoad("libc.so.6", out nint libc) && NativeLibrary.TryGetExport(libc, "malloc_trim", out addr)
+            ? addr
+            : 0;
+    }
 }
