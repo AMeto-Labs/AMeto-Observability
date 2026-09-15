@@ -69,8 +69,13 @@ internal sealed class StreamSectionWriter : IBufferWriter<byte>, IDisposable
         if (_used + sizeHint <= _buffer.Length) return;
         Flush();
         if (sizeHint <= _buffer.Length) return;
+        // Rent BEFORE returning. If the bigger rental throws (out of memory on a hard-limited
+        // box), _buffer must still be the slab this writer owns: returned first, Dispose would
+        // hand the same array back a second time, the pool would park it twice, and two
+        // builders would write their sections into one slab.
+        var next = IndexBuildPool.Slabs.Rent(sizeHint);
         IndexBuildPool.Slabs.Return(_buffer);
-        _buffer = IndexBuildPool.Slabs.Rent(sizeHint);
+        _buffer = next;
     }
 
     public void Dispose()
