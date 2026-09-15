@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Reflection;
 using MessagePack;
 using Ameto.Core;
 using Ameto.Storage;
@@ -148,6 +149,58 @@ public sealed class HotTierScanTests : IDisposable
 
         // Everything, both tiers: exercises the sort fallback after the first pops.
         AssertMatchesOracle(current, tiers, _pool, long.MinValue, long.MaxValue, null, null, forward, null);
+    }
+
+    /// <summary>
+    /// The candidate buffer is rented in the frame whose finally returns it. Rented inside the
+    /// collection instead, a predicate (or anything else in the header walk) that throws took
+    /// the array with it — never returned, the pool re-allocating in its place. Observed through
+    /// the pool's per-thread slot: prime it with a known array, which the scan's Rent(256) then
+    /// takes; after the throw, this thread's next Rent(256) must hand that same array back. The
+    /// throw comes on the tenth header, long before the buffer would grow (a growth returns the
+    /// original array by itself and would hide the leak). Reflection because the candidate type
+    /// is private to the scan.
+    /// </summary>
+    [Fact]
+    public void A_predicate_that_throws_mid_scan_does_not_take_the_candidate_buffer_with_it()
+    {
+        var candidate = typeof(HotTierScan).GetNestedType("Candidate", BindingFlags.NonPublic);
+        Assert.NotNull(candidate);
+        var    poolType = typeof(ArrayPool<>).MakeGenericType(candidate);
+        object shared   = poolType.GetProperty(nameof(ArrayPool<byte>.Shared))!.GetValue(null)!;
+        var    rent     = poolType.GetMethod(nameof(ArrayPool<byte>.Rent))!;
+        var    ret      = poolType.GetMethod(nameof(ArrayPool<byte>.Return))!;
+
+        object primed = rent.Invoke(shared, [256])!;
+        ret.Invoke(shared, [primed, false]);
+
+        var pred = new ThrowingPredicate(throwOnCall: 10);
+        Assert.Throws<InvalidOperationException>(() =>
+        {
+            foreach (var _ in HotTierScan.ReadSorted(
+                         _current, [_frozenA, _frozenB], _pool, long.MinValue, long.MaxValue,
+                         null, null, forward: true, levels: null, headerPredicate: pred)) { }
+        });
+        Assert.Equal(10, pred.Calls);
+
+        object next = rent.Invoke(shared, [256])!;
+        try { Assert.Same(primed, next); }
+        finally { ret.Invoke(shared, [next, false]); }
+    }
+
+    private sealed class ThrowingPredicate(int throwOnCall) : IHotHeaderPredicate
+    {
+        public int Calls { get; private set; }
+
+        public bool MayMatch(in LogEventHeader header)
+        {
+            if (++Calls == throwOnCall) throw new InvalidOperationException("predicate failed mid-scan");
+            return true;
+        }
+
+        public bool HasServicePredicate => false;
+
+        public bool ServiceMayMatch(string? serviceName) => true;
     }
 
     private void AssertMatchesOracle(
