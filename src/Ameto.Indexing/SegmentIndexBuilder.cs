@@ -278,16 +278,18 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
                 {
                     // The row is written whatever its exception column holds; what is lost is
                     // the row's place in the @x.* buckets. The old full decode threw here and
-                    // failed the merge, so this is counted and logged rather than silent: a
-                    // non-zero count is a producer writing exception maps this reader cannot
-                    // read (a non-string type, a truncated map), which is worth knowing about
-                    // and not worth losing a compaction over.
-                    _malformedExceptions++;
+                    // failed the merge, so this is counted rather than silent: a non-zero count
+                    // is a producer writing exception maps this reader cannot read (a non-string
+                    // type, a truncated map), which is worth knowing about and not worth losing a
+                    // compaction over. It is reported at Warning ONCE, when the group seals (see
+                    // RecordHints), with the group's count — not per row, and not at Debug, which
+                    // the production level never prints.
+                    if (_malformedExceptions++ == 0)
+                    {
+                        _firstMalformedOrdinal = offset;
+                        _firstMalformedBytes   = ev.ExceptionPayload.Length;
+                    }
                     _hints?.NoteMalformedException();
-                    if (_malformedExceptions == 1 && _log is { } log && log.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Debug))
-                        Microsoft.Extensions.Logging.LoggerExtensions.LogDebug(log,
-                            "Index build: exception payload at file ordinal {Ordinal} ({Bytes} B) is not a readable exception map; the row is written, its @x.* terms are not indexed",
-                            offset, ev.ExceptionPayload.Length);
                     return;
                 }
                 AddExists(offset);
@@ -732,15 +734,29 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
     }
 
     /// <summary>What this group measured, for the next one to size itself by — once, however
-    /// many of the section accessors are called (a probe calls both paths).</summary>
+    /// many of the section accessors are called (a probe calls both paths). Also where a group
+    /// that met unreadable exception maps is reported: once per group, at Warning, with its
+    /// count, the first one's file ordinal and the process-wide total.</summary>
     private void RecordHints()
     {
         if (_hintsRecorded) return;
         _hintsRecorded = true;
         _hints?.Record(_inverted.TermCount, _trigram.BucketCount);
+        if (_malformedExceptions > 0 && _log is { } log && log.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Warning))
+            LogMalformedExceptions(log, _malformedExceptions, _firstMalformedOrdinal, _firstMalformedBytes,
+                                   _hints?.MalformedExceptionPayloads ?? _malformedExceptions, null);
     }
 
     private bool _hintsRecorded;
+    private uint _firstMalformedOrdinal;
+    private int  _firstMalformedBytes;
+
+    /// <summary>Pre-compiled so the report formats without boxing its arguments.</summary>
+    private static readonly Action<Microsoft.Extensions.Logging.ILogger, long, uint, int, long, Exception?> LogMalformedExceptions =
+        Microsoft.Extensions.Logging.LoggerMessage.Define<long, uint, int, long>(
+            Microsoft.Extensions.Logging.LogLevel.Warning,
+            new Microsoft.Extensions.Logging.EventId(0, "IndexMalformedExceptionPayloads"),
+            "Index build: {Count} exception payload(s) in this group are not readable exception maps (first at file ordinal {Ordinal}, {Bytes} B); the rows are written but their @x.* terms are not indexed, so @x.type filters and free-text search over the merged segment miss them. Process total: {Total}");
 
     /// <summary>
     /// The production path — see <see cref="ISegmentIndexSink.WriteSections"/>. The inverted

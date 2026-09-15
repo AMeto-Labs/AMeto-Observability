@@ -44,12 +44,26 @@ public sealed class MalformedExceptionPayloadTests
         return buf.WrittenSpan.ToArray();
     }
 
+    /// <summary>Records what reaches the log at the production level (Information and up).</summary>
+    private sealed class ListLogger : Microsoft.Extensions.Logging.ILogger
+    {
+        public readonly List<(Microsoft.Extensions.Logging.LogLevel Level, string Message)> Entries = new();
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => logLevel >= Microsoft.Extensions.Logging.LogLevel.Information;
+        public void Log<TState>(Microsoft.Extensions.Logging.LogLevel logLevel, Microsoft.Extensions.Logging.EventId eventId,
+                                TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            if (IsEnabled(logLevel)) Entries.Add((logLevel, formatter(state, exception)));
+        }
+    }
+
     [Fact]
     public void MalformedPayload_IsCounted_AndTheRowIsStillWritten()
     {
         var good      = new ExceptionInfo { Type = "System.TimeoutException", Message = "ledger" }.ToBytes();
         var truncated = good.AsSpan(0, good.Length - 4).ToArray();
         var hints     = new IndexBuildHints();
+        var log       = new ListLogger();
         SegmentIndexBuilder? builder = null;
 
         string path = Path.Combine(Path.GetTempPath(), "Ameto-malformed-" + Guid.NewGuid().ToString("N") + ".seg");
@@ -59,7 +73,7 @@ public sealed class MalformedExceptionPayloadTests
             using (var writer = new SegmentWriter(path))
             {
                 writer.WriteEvents(new BytesSource([good, truncated, NonStringType(), good]),
-                                   (events, terms) => builder = new SegmentIndexBuilder(events, 5, terms, hints));
+                                   (events, terms) => builder = new SegmentIndexBuilder(events, 5, terms, hints, log));
                 info = writer.Finalise(new NodeId(0), new SegmentId(1));
             }
         }
@@ -71,6 +85,13 @@ public sealed class MalformedExceptionPayloadTests
         Assert.Equal(4u, info.EventCount);                       // every row written
         Assert.Equal(2, builder!.MalformedExceptionPayloads);    // the truncated map and the non-string type
         Assert.Equal(2, hints.MalformedExceptionPayloads);
+
+        // An operator at the production log level sees it: one Warning for the group, with its
+        // count and where the first one is — not a Debug line nobody prints, and not one per row.
+        var entry = Assert.Single(log.Entries);
+        Assert.Equal(Microsoft.Extensions.Logging.LogLevel.Warning, entry.Level);
+        Assert.Contains("2 exception payload", entry.Message);
+        Assert.Contains("file ordinal 1", entry.Message);
     }
 
     [Fact]

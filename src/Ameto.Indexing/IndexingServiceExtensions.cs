@@ -44,6 +44,13 @@ public sealed class IndexingWiring : Microsoft.Extensions.Hosting.IHostedService
     /// <summary>The hints (and counters) every group this process builds shares — see <see cref="IndexBuildHints"/>.</summary>
     public IndexBuildHints Hints { get; } = new();
 
+    /// <summary>
+    /// Bytes parked right now in the index build pools (term and posting slabs, hash tables,
+    /// entry arrays) — for diagnostics. Transient after a gen2 trim, but counted in no memory
+    /// budget, so it is the figure to read when the build side's resting memory is in question.
+    /// </summary>
+    public long IndexBuildPooledBytes => IndexBuildPool.PooledBytes;
+
     public Task StartAsync(CancellationToken cancellationToken)
     {
         int maxDepth = _opts.MaxPropertyFlattenDepth;
