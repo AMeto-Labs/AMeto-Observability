@@ -65,6 +65,10 @@ public sealed class WalFlushTickTests : IDisposable
 
         // And the watermark advanced to exactly what has been written.
         Assert.Equal(wal.WrittenBytes + 32, wal.LastFlushedOffset);
+
+        // Nothing fell back to the whole-view flush — a platform where the range call always
+        // failed would still pass every other assertion here while paying the old cost.
+        Assert.Equal(0, wal.RangeFlushFailures);
     }
 
     [Fact]

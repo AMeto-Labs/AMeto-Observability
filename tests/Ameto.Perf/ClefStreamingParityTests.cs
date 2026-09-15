@@ -212,6 +212,10 @@ public sealed class ClefStreamingParityTests
 
             Assert.Equal((byte)ev.Level, c.Level);
             Assert.Equal(ev.MessageTemplate ?? string.Empty, c.Template);
+            // One deliberate divergence, not visible here because it is not in the bytes: a
+            // `service.name: ""` used to be interned (an empty string got a pool index); the
+            // streaming path answers -1 for it, matching the OTLP path. Absent and empty are
+            // therefore the same thing now, which is what a reader already saw.
             Assert.Equal(ev.ServiceName ?? string.Empty, c.Service);
             Assert.Equal(ev.TraceIdHi, c.TraceHi);
             Assert.Equal(ev.TraceIdLo, c.TraceLo);

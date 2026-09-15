@@ -302,7 +302,14 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
             if (writeEnd > _lastFlushedOffset)
             {
                 if (!TryFlushRange(_lastFlushedOffset, writeEnd))
+                {
+                    // Correct, just slower — and silent, which is the trap: a platform where
+                    // the range call always fails would msync the whole mapping every tick
+                    // for ever and look exactly like a working one. The counter is what tells
+                    // the difference.
+                    Interlocked.Increment(ref _rangeFlushFailures);
                     _accessor.Flush();     // fallback: whole view, as before
+                }
 
                 _lastFlushedOffset = writeEnd;
                 handle             = _fileStream;
@@ -393,9 +400,16 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
 
     private long _rangeFlushCount;
     private long _lastRangeFlushBytes;
+    private long _rangeFlushFailures;
 
     /// <summary>Number of successful range msyncs issued. A clean tick must not raise it.</summary>
     internal long RangeFlushCount => Interlocked.Read(ref _rangeFlushCount);
+
+    /// <summary>
+    /// Ticks that fell back to flushing the whole view because the range call failed.
+    /// Expected to stay at zero; anything else means every tick is paying the old cost.
+    /// </summary>
+    internal long RangeFlushFailures => Interlocked.Read(ref _rangeFlushFailures);
 
     /// <summary>Bytes covered by the most recent range msync.</summary>
     internal long LastRangeFlushBytes => Interlocked.Read(ref _lastRangeFlushBytes);

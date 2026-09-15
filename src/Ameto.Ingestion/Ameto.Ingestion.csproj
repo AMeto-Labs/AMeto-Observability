@@ -20,7 +20,6 @@
          here: the only consumers are Ameto.Otel, Ameto.Server and Ameto.Perf, and the first
          two already carry this reference. -->
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
-    <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="10.0.8" />
   </ItemGroup>
 
   <PropertyGroup>
