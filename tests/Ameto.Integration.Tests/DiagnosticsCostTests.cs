@@ -67,6 +67,25 @@ public sealed class DiagnosticsCostTests : IDisposable
         Assert.Equal(920, counted);               // 200 000 bytes of .seg excluded
     }
 
+    /// <summary>
+    /// A quarantined segment (<c>*.seg.corrupt</c>) is permanent storage the catalog no longer
+    /// lists, so skipping the segments directory dropped it from every figure and the dashboard
+    /// total fell below what <c>du</c> reports — the mismatch StorageEngine's startup warning
+    /// exists to explain. It is counted on its own; the live .seg files still are not walked.
+    /// </summary>
+    [Fact]
+    public void Quarantined_segments_are_counted_and_live_segments_still_are_not()
+    {
+        Write(Path.Combine(_root, "segments", "n-42.seg.corrupt"), 2000);
+        Write(Path.Combine(_root, "segments", "n-43.seg.corrupt"), 300);
+
+        var s = new DataDirectoryStatsCache(TimeSpan.FromMinutes(1)).Get(_root);
+
+        Assert.Equal(2300, s.QuarantinedSegmentBytes);
+        long everythingElse = s.MetricsBytes + s.TracesBytes + s.WalBytes + s.DatabaseBytes + s.OtherBytes;
+        Assert.Equal(920, everythingElse);        // not double-counted, and 200 000 B of .seg still excluded
+    }
+
     [Fact]
     public void Poll_within_the_ttl_walks_once()
     {

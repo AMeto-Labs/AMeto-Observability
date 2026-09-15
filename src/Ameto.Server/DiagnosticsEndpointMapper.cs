@@ -61,7 +61,9 @@ public static class DiagnosticsEndpointMapper
             // walked at all because CompressedBytes IS the .seg file length.
             var  dataRoot     = Path.GetFullPath(options.DataDirectory);
             var  dir          = DirCache.Get(dataRoot);
-            long logsBytes    = logsSegmentBytes + dir.WalBytes;
+            // Quarantined segments are logs storage the catalog no longer lists; they stay on disk
+            // until an operator removes them, so leaving them out would put the total under `du`.
+            long logsBytes    = logsSegmentBytes + dir.WalBytes + dir.QuarantinedSegmentBytes;
             long metricsBytes = dir.MetricsBytes;
             long tracesBytes  = dir.TracesBytes;
             long dbBytes      = dir.DatabaseBytes;
@@ -147,6 +149,9 @@ public static class DiagnosticsEndpointMapper
                 tracesStorageBytes   = tracesBytes,
                 databaseStorageBytes = dbBytes,
                 otherStorageBytes    = otherBytes,
+                // Already inside logsStorageBytes; broken out because it is the one part of it
+                // that retention will never free — an operator has to inspect or remove it.
+                logsQuarantinedBytes = dir.QuarantinedSegmentBytes,
 
                 // Segment counts per signal. Logs come from the engine rather than the
                 // directory walk so this figure and the one on the Stats page cannot

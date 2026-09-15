@@ -12,16 +12,25 @@ namespace Ameto.Server;
 /// dashboard polls this endpoint every 10 s, so on a server with thousands of segments that
 /// was thousands of <see cref="FileInfo"/> objects and syscalls per poll, forever.</para>
 ///
-/// <para>Two changes: the <c>segments</c> directory is not walked at all — its size is the sum
-/// of <c>SegmentInfo.CompressedBytes</c> over the catalog, which is the .seg file length
-/// (<c>SegmentWriter</c>/<c>SegmentReader</c> set it from the file size) and is already in
-/// memory; and what remains is walked once and cached for <see cref="Ttl"/>. Sizes on disk move
-/// slowly — a flush every few minutes — so a staleness window of under a minute is invisible on
-/// a dashboard that rounds to MB.</para>
+/// <para>Two changes: the <c>segments</c> directory is not walked — the size of its live
+/// segments is the sum of <c>SegmentInfo.CompressedBytes</c> over the catalog, which is the .seg
+/// file length (<c>SegmentWriter</c>/<c>SegmentReader</c> set it from the file size) and is
+/// already in memory; and what remains is walked once and cached for <see cref="Ttl"/>. Sizes on
+/// disk move slowly — a flush every few minutes — so a staleness window of under a minute is
+/// invisible on a dashboard that rounds to MB.</para>
 ///
-/// <para>Not walking <c>segments</c> means transient <c>*.seg.tmp</c> and
-/// <c>*.mergemanifest</c> files there are no longer counted in the total. They exist only
-/// during a flush, merge or replication transfer, and are not storage the operator can act on.</para>
+/// <para>The one thing in <c>segments</c> the catalog cannot answer for is a QUARANTINED segment,
+/// <c>*.seg.corrupt</c>: unreadable at some start, set aside, excluded from the catalog, and kept
+/// for an operator to inspect or remove. That is permanent storage an operator has to act on, and
+/// StorageEngine warns about it at every start precisely so disk usage does not silently disagree
+/// with retention — so it is counted, from a top-level, pattern-filtered enumeration of
+/// <c>segments</c> that usually matches nothing (see <see cref="Snapshot.QuarantinedSegmentBytes"/>).</para>
+///
+/// <para>What is knowingly left out: transient <c>*.seg.tmp</c> and <c>*.mergemanifest</c> files in
+/// <c>segments</c>, which exist only during a flush, merge or replication transfer and are not
+/// storage the operator can act on. And the live-segment figure comes from the catalog, which
+/// loads in the background after start, so for the first moments after a restart it under-reports
+/// until the scan has published every segment.</para>
 /// </summary>
 public sealed class DataDirectoryStatsCache
 {
@@ -34,6 +43,11 @@ public sealed class DataDirectoryStatsCache
         public long DatabaseBytes;
         /// <summary>Everything under the root that is not logs, metrics, traces, WAL or the DB.</summary>
         public long OtherBytes;
+        /// <summary>
+        /// <c>segments/*.seg.corrupt</c>: quarantined segments the catalog no longer lists. Logs
+        /// storage, and not in any other figure here.
+        /// </summary>
+        public long QuarantinedSegmentBytes;
         public int  MetricsSegments;
         public int  TracesSegments;
         /// <summary>Stopwatch timestamp the walk finished at.</summary>
@@ -100,8 +114,9 @@ public sealed class DataDirectoryStatsCache
     }
 
     /// <summary>
-    /// Visits every file under the root exactly once, except the <c>segments</c> subtree,
-    /// which the catalog already accounts for.
+    /// Visits every file under the root exactly once, except the <c>segments</c> subtree, whose
+    /// live segments the catalog already accounts for and whose quarantined ones are matched by
+    /// name at its top level only.
     /// </summary>
     private static Snapshot Walk(string dataRoot)
     {
@@ -120,7 +135,13 @@ public sealed class DataDirectoryStatsCache
 
             foreach (var d in root.EnumerateDirectories())
             {
-                if (Is(d.Name, "segments")) continue;              // logs: from the catalog
+                if (Is(d.Name, "segments"))
+                {
+                    // Live segments: from the catalog. Quarantined ones: here, because nothing
+                    // else lists them and they stay on disk until an operator acts.
+                    s.QuarantinedSegmentBytes = QuarantinedBytes(d);
+                    continue;
+                }
 
                 if (Is(d.Name, "metrics"))
                 {
@@ -145,6 +166,24 @@ public sealed class DataDirectoryStatsCache
 
         static bool Is(string name, string expected) =>
             name.Equals(expected, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Bytes of <c>*.seg.corrupt</c> directly in <paramref name="segments"/> — where StorageEngine
+    /// sets a segment aside. The name filter runs over the directory listing, so the .seg files
+    /// around them cost a name comparison each and no <see cref="FileInfo"/>; there is usually
+    /// nothing to match.
+    /// </summary>
+    private static long QuarantinedBytes(DirectoryInfo segments)
+    {
+        try
+        {
+            long total = 0;
+            foreach (var f in segments.EnumerateFiles("*.seg.corrupt", SearchOption.TopDirectoryOnly))
+                total += Length(f);
+            return total;
+        }
+        catch { return 0; }
     }
 
     /// <summary>
