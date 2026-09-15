@@ -74,10 +74,11 @@ public readonly struct MemoryBudgets
     public const double IndexCacheFraction = 0.15;
 
     /// <summary>
-    /// The GC's default high-memory-load percentage below 80 GB of physical memory, used when the
-    /// runtime does not report <c>GCHighMemPercent</c>. Above 80 GB the default is higher and this
-    /// over-estimates the physical limit slightly — harmless, because every ceiling is already at
-    /// its constant from 4 GB up.
+    /// A guard for a runtime that does not report <c>GCHighMemPercent</c>. The .NET 10 runtime
+    /// reports the EFFECTIVE percentage, whether configured or chosen by default, including the
+    /// higher default at 80 GB of physical memory or more. Measured on 10.0.11: 90 with nothing set,
+    /// 70 with <c>GCHighMemPercent=46</c> (hex), and 95 at 100 GB and at 512 GB physical. So this
+    /// value is not used today. It is the GC's default below 80 GB.
     /// </summary>
     private const int DefaultHighMemoryLoadPercent = 90;
 

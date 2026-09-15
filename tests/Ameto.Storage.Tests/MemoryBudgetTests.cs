@@ -200,7 +200,7 @@ public sealed class MemoryBudgetTests
     [Fact]
     public void Current_in_a_512_mb_container_takes_native_from_the_container_not_the_heap_limit()
     {
-        var child = RunChild("DOTNET_GCTotalPhysicalMemory", "0x20000000");   // 512 MB
+        var child = RunChild(("DOTNET_GCTotalPhysicalMemory", "0x20000000"));   // 512 MB
 
         Assert.Equal(384 * MB, child.ManagedLimit);
         Assert.Equal(512 * MB, child.PhysicalLimit);
@@ -221,7 +221,7 @@ public sealed class MemoryBudgetTests
         long hostPhysical = MemoryBudgets.Current().PhysicalLimitBytes;
         Assert.True(hostPhysical > 1 * GB, $"this test needs a host with more than 1 GB, saw {hostPhysical / MB} MB");
 
-        var child = RunChild("DOTNET_GCHeapHardLimit", "0x20000000");        // 512 MB
+        var child = RunChild(("DOTNET_GCHeapHardLimit", "0x20000000"));        // 512 MB
 
         Assert.Equal(512 * MB,     child.ManagedLimit);
         Assert.Equal(hostPhysical, child.PhysicalLimit);
@@ -233,11 +233,29 @@ public sealed class MemoryBudgetTests
             "a heap hard limit must not shrink the native budget");
     }
 
+    /// <summary>
+    /// The physical limit is the threshold divided by GCHighMemPercent, so that has to be the
+    /// percentage the GC actually used. A 512 MB container that sets GCHighMemPercent=70 has a
+    /// 358 MB threshold. Divided by the default 90 %, that reads as a 398 MB container and a 99 MB
+    /// native budget instead of 128 MB. The two tests above run at the default, so they cannot
+    /// tell the lookup from the constant.
+    /// </summary>
+    [Fact]
+    public void Current_divides_by_a_configured_high_memory_percent_not_the_default()
+    {
+        var child = RunChild(("DOTNET_GCTotalPhysicalMemory", "0x20000000"),    // 512 MB
+                             ("DOTNET_GCHighMemPercent",      "46"));           // hex: 70 %
+
+        Assert.Equal(384 * MB, child.ManagedLimit);
+        Assert.Equal(512 * MB, child.PhysicalLimit);
+        Assert.Equal(128 * MB, child.NativeTier);
+    }
+
     private readonly record struct ChildBudgets(
         long ManagedLimit, long PhysicalLimit, long ManagedBuild, long NativeTier, long IndexCache);
 
-    /// <summary>Runs this test assembly's own entry point (<see cref="ChildProcessEntry"/>) under one GC setting.</summary>
-    private static ChildBudgets RunChild(string gcVariable, string value)
+    /// <summary>Runs this test assembly's own entry point (<see cref="ChildProcessEntry"/>) under the given GC settings.</summary>
+    private static ChildBudgets RunChild(params ReadOnlySpan<(string Name, string Value)> gcSettings)
     {
         string? hostPath = Environment.GetEnvironmentVariable("DOTNET_HOST_PATH");
         var psi = new ProcessStartInfo(hostPath is { Length: > 0 } && File.Exists(hostPath) ? hostPath : "dotnet")
@@ -250,13 +268,15 @@ public sealed class MemoryBudgetTests
         psi.ArgumentList.Add(typeof(MemoryBudgetTests).Assembly.Location);
         psi.ArgumentList.Add(ChildProcessEntry.MemoryBudgetsCommand);
 
-        // Nothing inherited may pre-empt the one setting under test.
+        // Nothing inherited may pre-empt the settings under test.
         foreach (string prefix in (string[])["DOTNET_", "COMPlus_"])
             foreach (string name in (string[])["GCHeapHardLimit", "GCHeapHardLimitPercent", "GCTotalPhysicalMemory",
                                                "GCHeapHardLimitSOH", "GCHeapHardLimitLOH", "GCHeapHardLimitPOH",
-                                               "GCHeapHardLimitSOHPercent", "GCHeapHardLimitLOHPercent", "GCHeapHardLimitPOHPercent"])
+                                               "GCHeapHardLimitSOHPercent", "GCHeapHardLimitLOHPercent", "GCHeapHardLimitPOHPercent",
+                                               "GCHighMemPercent"])
                 psi.Environment.Remove(prefix + name);
-        psi.Environment[gcVariable] = value;
+        foreach (var (name, value) in gcSettings)
+            psi.Environment[name] = value;
 
         using var proc = Process.Start(psi)!;
         var stderr = proc.StandardError.ReadToEndAsync();
