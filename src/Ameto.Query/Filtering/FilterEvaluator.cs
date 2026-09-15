@@ -175,7 +175,7 @@ public static class FilterEvaluator
 
     private static bool HasProperty(LogEvent ev, string prop)
     {
-        // `has @x` / `@x is not null` is a question about PRESENCE, and LogEvent answers it
+        // `has(@x)` / `isDefined(@x)` is a question about PRESENCE, and LogEvent answers it
         // from the payload's type byte. Going through GetValue reads ev.Exception?.Type, which
         // builds the whole tree — stack trace included — to decide a boolean, for every row
         // the scan touches. LogEvent.HasException is documented as exactly

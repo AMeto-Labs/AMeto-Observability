@@ -138,8 +138,8 @@ public sealed class LogEvent
     public bool ExceptionMaterialised => _exception is not null;
 
     /// <summary>
-    /// Whether the event carries an exception at all, WITHOUT decoding it — what <c>has @x</c>
-    /// and <c>@x is not null</c> need, and the reason the laziness above is worth anything to
+    /// Whether the event carries an exception at all, WITHOUT decoding it — what <c>has(@x)</c>
+    /// and <c>isDefined(@x)</c> need, and the reason the laziness above is worth anything to
     /// them: the answer is a type byte, not a tree.
     ///
     /// <para>EXACTLY <c><see cref="Exception"/> is not null</c>, which is the only way a

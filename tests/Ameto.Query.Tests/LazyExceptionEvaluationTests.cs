@@ -14,7 +14,7 @@ namespace Ameto.Query.Tests;
 /// most and where it was not being taken:
 ///
 /// <list type="bullet">
-///   <item><c>has @x</c> / <c>@x is not null</c> resolved to <c>ev.Exception?.Type</c>, so a
+///   <item><c>has(@x)</c> / <c>isDefined(@x)</c> resolved to <c>ev.Exception?.Type</c>, so a
 ///         presence question built the whole tree, stack trace included.</item>
 ///   <item>a free-text term read <c>ev.Exception</c> per row per term, and on a level-split
 ///         Error segment that is every row.</item>
@@ -132,7 +132,7 @@ public sealed class LazyExceptionEvaluationTests
                      // PRESENCE — spelled as the grammar actually takes it. `has @x` without
                      // parentheses is not a function call, it is two bare words, and `is` is
                      // not a keyword at all: all three spellings parse as a FreeTextNode and
-                     // test the wrong code path entirely. ParsesAsPresenceCheck below is the
+                     // test the wrong code path entirely. PresenceFiltersParseAsPresenceChecks below is the
                      // guard that keeps that from happening again quietly.
                      "has(@x)", "isDefined(@x)", "not has(@x)",
                      "has(@x.type)", "has(@x.message)", "has(@x.inner.type)",
@@ -190,13 +190,18 @@ public sealed class LazyExceptionEvaluationTests
     [Theory]
     [InlineData("has(@x)")]
     [InlineData("isDefined(@x)")]
+    [InlineData("not has(@x)")]
     [InlineData("has(@x.type)")]
     [InlineData("has(@x.message)")]
+    [InlineData("has(@x.inner.type)")]
     public void PresenceFiltersParseAsPresenceChecks(string filter)
     {
         var node = FilterParser.Parse(filter);
-        Assert.True(node is HasNode or IsDefinedNode,
-            $"`{filter}` parsed as {node?.GetType().Name} — not a presence check, so it tests the wrong path");
+        Assert.True(node is HasNode or IsDefinedNode or NotNode { Operand: HasNode },
+            $"`{filter}` parsed as {Describe(node)} — not a presence check, so it tests the wrong path");
+
+        static string Describe(FilterNode? n) =>
+            n is NotNode not ? $"NotNode({not.Operand.GetType().Name})" : n?.GetType().Name ?? "null";
     }
 
     /// <summary>
@@ -216,9 +221,21 @@ public sealed class LazyExceptionEvaluationTests
         var withMsg = WithBytes(PayloadBytes("map-full"));
         Assert.True(Eval("has(@x.message)", withMsg));
 
-        // …and the object reading agrees, which is the only thing that makes it correct.
-        Assert.Equal(Eval("has(@x.message)", WithObject(ExceptionInfo.FromBytes(PayloadBytes("map-no-msg").AsSpan()))),
-                     Eval("has(@x.message)", WithBytes(PayloadBytes("map-no-msg"))));
+        // The same boundary one level down: an INNER type is a field of a field, and a flat
+        // exception has no inner. Widening the shortcut to InnerExceptionType would answer
+        // true here off HasException.
+        var flat   = PayloadBytes("map-full");
+        var nested = PayloadBytes("map-nested");
+        Assert.False(Eval("has(@x.inner.type)", WithBytes(flat)));
+        Assert.True (Eval("has(@x.inner.type)", WithBytes(nested)));
+
+        // …and on the object, which a widened shortcut would ALSO get wrong. The oracle cannot
+        // catch that: both of its sides run the same HasProperty, so a wrong shortcut answers
+        // wrongly on both and they still agree. The absolute answers are what pin the boundary.
+        Assert.False(Eval("has(@x.message)",    WithObject(ExceptionInfo.FromBytes(PayloadBytes("map-no-msg").AsSpan()))));
+        Assert.True (Eval("has(@x.message)",    WithObject(ExceptionInfo.FromBytes(PayloadBytes("map-full").AsSpan()))));
+        Assert.False(Eval("has(@x.inner.type)", WithObject(ExceptionInfo.FromBytes(flat.AsSpan()))));
+        Assert.True (Eval("has(@x.inner.type)", WithObject(ExceptionInfo.FromBytes(nested.AsSpan()))));
     }
 
     /// <summary>A predicate that genuinely needs a FIELD still decodes, once.</summary>
