@@ -132,14 +132,29 @@ public sealed class SseJsonWriter : IDisposable
     /// <summary>
     /// Puts the buffered bytes on the wire and empties the buffer, keeping its capacity —
     /// one buffer per connection, for the life of the connection.
+    ///
+    /// <para>The buffer is emptied WHETHER OR NOT the send succeeds. Once the bytes have been
+    /// offered to the body they belong to it: Kestrel copies them into its pipe inside
+    /// <c>WriteAsync</c>, so a cancellation that lands in the flush, or in the flush that
+    /// <c>WriteAsync</c> itself performs, fails a send whose rows are already on their way to
+    /// the client. Keeping them here would hand them over a second time with the terminal
+    /// <c>query-error</c> frame, and the client would list up to 16 KB of rows twice. Losing a
+    /// row the body did NOT take is the lesser fault and an honest one: every road that reaches
+    /// here after a failed send ends in a frame that already says the results are partial.</para>
     /// </summary>
     private async ValueTask SendAsync(CancellationToken ct)
     {
         if (_buffer.WrittenCount == 0) return;
-        await _body.WriteAsync(_buffer.WrittenMemory, ct).ConfigureAwait(false);
-        await _body.FlushAsync(ct).ConfigureAwait(false);
-        _buffer.ResetWrittenCount();
-        _lastSendStamp = Stopwatch.GetTimestamp();
+        try
+        {
+            await _body.WriteAsync(_buffer.WrittenMemory, ct).ConfigureAwait(false);
+            await _body.FlushAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _buffer.ResetWrittenCount();
+            _lastSendStamp = Stopwatch.GetTimestamp();
+        }
     }
 
     /// <summary>

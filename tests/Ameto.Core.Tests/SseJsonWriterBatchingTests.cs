@@ -20,13 +20,29 @@ public sealed class SseJsonWriterBatchingTests
     {
         public readonly List<string> Sends = [];
 
+        /// <summary>
+        /// How many of the coming flushes fail AFTER their write has taken the bytes — the shape
+        /// of a search deadline firing inside <c>Body.FlushAsync</c> while Kestrel's pipe already
+        /// holds the frame.
+        /// </summary>
+        public int FlushFailuresLeft;
+
+        /// <summary>How many flushes actually failed, so a test can prove the fault happened.</summary>
+        public int FlushFailures;
+
         public override void Write(ReadOnlySpan<byte> buffer) => Sends.Add(Encoding.UTF8.GetString(buffer));
         public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct = default)
         {
             Sends.Add(Encoding.UTF8.GetString(buffer.Span));
             return ValueTask.CompletedTask;
         }
-        public override Task FlushAsync(CancellationToken ct) => Task.CompletedTask;
+        public override Task FlushAsync(CancellationToken ct)
+        {
+            if (FlushFailuresLeft <= 0) return Task.CompletedTask;
+            FlushFailuresLeft--;
+            FlushFailures++;
+            return Task.FromCanceled(new CancellationToken(canceled: true));
+        }
 
         public override bool CanRead => false;
         public override bool CanSeek => false;
@@ -202,5 +218,39 @@ public sealed class SseJsonWriterBatchingTests
         Assert.Equal(1, all.Split("data: {\"@t\"").Length - 1);
         Assert.True(all.IndexOf("row 0", StringComparison.Ordinal)
                   < all.IndexOf("event: query-error", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// A send that fails AFTER the body took the bytes must not offer them again. The search
+    /// deadline firing inside the flush reaches the handler's timeout catch, whose query-error
+    /// frame goes out through this same writer — and if the failed batch were still buffered,
+    /// the client would receive every row in it twice, then the error.
+    ///
+    /// <para>The failure is allowed to surface from whichever call happened to send — the row
+    /// write if the hold bound had already passed, the explicit flush otherwise — so the test
+    /// does not depend on timing; <c>FlushFailures</c> proves it did happen.</para>
+    /// </summary>
+    [Fact]
+    public async Task A_batch_whose_flush_failed_is_not_sent_again_with_the_terminal_frame()
+    {
+        var body = new RecordingStream { FlushFailuresLeft = 1 };
+        using var sse = new SseJsonWriter(body);
+
+        try
+        {
+            await sse.WriteLogEventAsync(Event(7), default);
+            await sse.FlushFramesAsync(default);
+        }
+        catch (OperationCanceledException) { /* the deadline, as the handler would see it */ }
+        Assert.Equal(1, body.FlushFailures);
+
+        await sse.WriteErrorAsync("Search exceeded its budget. Results shown are partial.", default);
+
+        string all = string.Concat(body.Sends);
+        int copies = all.Split("\"@mt\":\"row 7\"").Length - 1;
+        Assert.True(copies == 1, $"row 7 reached the socket {copies} times");
+        Assert.True(all.IndexOf("row 7", StringComparison.Ordinal)
+                  < all.IndexOf("event: query-error", StringComparison.Ordinal));
+        Assert.EndsWith("\n\n", all);
     }
 }
