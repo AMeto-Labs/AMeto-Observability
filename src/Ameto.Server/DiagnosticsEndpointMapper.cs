@@ -178,6 +178,9 @@ public static class DiagnosticsEndpointMapper
                 ingestDroppedOversized   = ring.DroppedOversized,
                 ingestDroppedNoSlab      = ring.DroppedNoSlab,
                 ingestDroppedRingFull    = ring.DroppedRingFull,
+                // A free slab whose pages the OS would not commit: the host is out of commit
+                // charge. Not the buffer's limit, so not folded into NoSlab.
+                ingestDroppedNoCommit    = ring.DroppedNoCommit,
                 // Events the storage write path refused repeatedly and the drainer gave up
                 // on — a different failure from a full buffer, and previously silent.
                 ingestWriteErrorDrops    = drainer.ErrorDrops,

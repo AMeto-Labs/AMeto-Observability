@@ -75,24 +75,32 @@ internal sealed unsafe class SlabArena : IDisposable
     }
 
     /// <summary>
-    /// Guarantees the first <paramref name="endOffset"/> bytes are writable. On the hot path
-    /// this is one volatile read and a predicted-false branch; it only does work when the
-    /// buffer reaches deeper than it ever has.
+    /// Makes the first <paramref name="endOffset"/> bytes writable, or reports that it could
+    /// not. On the hot path this is one volatile read and a predicted-true branch; it only
+    /// does work when the buffer reaches deeper than it ever has. (A plain allocation starts
+    /// with <c>_committed</c> at the whole arena, so it never leaves the fast path.)
+    ///
+    /// <para>False means the operating system refused the commit — on Windows, the machine's
+    /// commit charge is exhausted. That is a transient, host-wide condition, and the caller is
+    /// on the ingest path: it must turn this into a counted, refused enqueue, the same
+    /// back-pressure an exhausted arena produces. It used to throw OutOfMemoryException out of
+    /// TryEnqueue into the HTTP handler, after the slab had already been taken off the free
+    /// list, so every failure both failed the request and shrank the arena for good.</para>
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void EnsureCommitted(nuint endOffset)
+    public bool TryEnsureCommitted(nuint endOffset)
     {
-        if (!_reserved) return;
-        if (endOffset <= Volatile.Read(ref _committed)) return;
-        Grow(endOffset);
+        if (endOffset <= Volatile.Read(ref _committed)) return true;
+        return TryGrow(endOffset);
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
-    private void Grow(nuint endOffset)
+    private bool TryGrow(nuint endOffset)
     {
         lock (_growGate)
         {
-            if (endOffset <= _committed) return;           // someone else grew past us
+            if (endOffset <= _committed) return true;      // someone else grew past us
+            if (_simulateCommitFailure) return false;
 
             // Round up to a commit chunk so a burst that walks the arena does not make one
             // syscall per slab, and never past the reservation.
@@ -101,17 +109,36 @@ internal sealed unsafe class SlabArena : IDisposable
             if (target > _bytes) target = _bytes;
 
             nuint len = target - _committed;
-            if (len == 0) return;
+            if (len == 0) return true;
 
-            if (VirtualAlloc((nint)(_base + _committed), len, MEM_COMMIT, PAGE_READWRITE) == 0)
-            {
-                // Out of commit charge. Leave _committed where it is: the caller's write would
-                // fault, so tell it plainly rather than corrupting memory.
-                throw new OutOfMemoryException(
-                    $"Could not commit {len} bytes of the ingest payload arena (committed {_committed} of {_bytes}).");
-            }
+            // Out of commit charge: leave _committed where it is (a write past it would fault)
+            // and let the caller refuse the event. The next slab that reaches this deep tries
+            // again, so the arena recovers on its own once the pressure is over.
+            if (!_reserved || VirtualAlloc((nint)(_base + _committed), len, MEM_COMMIT, PAGE_READWRITE) == 0)
+                return false;
 
             Volatile.Write(ref _committed, target);
+            return true;
+        }
+    }
+
+    // ── Test hook ──────────────────────────────────────────────────────────────
+
+    private bool _simulateCommitFailure;   // read and written under _growGate only
+
+    /// <summary>
+    /// Test hook: every commit past the current high-water mark fails, as
+    /// <c>VirtualAlloc(MEM_COMMIT)</c> does when the commit charge runs out. On a plain
+    /// allocation — where nothing is committed on demand — the high-water mark is lowered to
+    /// zero for the duration so the failure path is reachable on every platform; clearing the
+    /// hook puts it back.
+    /// </summary>
+    internal void SimulateCommitFailure(bool fail)
+    {
+        lock (_growGate)
+        {
+            _simulateCommitFailure = fail;
+            if (!_reserved) Volatile.Write(ref _committed, fail ? 0 : _bytes);
         }
     }
 

@@ -207,6 +207,7 @@ public sealed class QueryValidationTests : IClassFixture<AmetoWebAppFactory>
                      "ingestAcceptedTotal", "ingestDrainedTotal", "ingestPending", "ingestCapacity",
                      "ingestSlabCapacity",
                      "ingestDroppedOversized", "ingestDroppedNoSlab", "ingestDroppedRingFull",
+                     "ingestDroppedNoCommit",
                      "ingestWriteErrorDrops",
                  })
         {

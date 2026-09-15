@@ -212,13 +212,34 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
     /// <summary>Rejected because every ring slot was still unread.</summary>
     public long DroppedRingFull => Interlocked.Read(ref _droppedRingFull);
 
+    /// <summary>
+    /// Rejected because a free slab's pages could not be committed — the HOST is out of commit
+    /// charge (Windows), not this buffer out of room. Counted apart from
+    /// <see cref="DroppedNoSlab"/> because the remedy is different: memory on the machine, not
+    /// a bigger arena or a faster drainer.
+    /// </summary>
+    public long DroppedNoCommit => Interlocked.Read(ref _droppedNoCommit);
+
+    /// <summary>Test hook: makes every commit past the arena's high-water mark fail.</summary>
+    internal void SimulateArenaCommitFailure(bool fail) => _arena.SimulateCommitFailure(fail);
+
     private long _droppedOversized;
     private long _droppedNoSlab;
     private long _droppedRingFull;
+    private long _droppedNoCommit;
 
     // ── Slab pool (lock-free Treiber stack, ABA-safe via versioned head) ────────
 
-    /// <summary>Pops a free slab index, or -1 when the payload pool is exhausted.</summary>
+    /// <summary>AcquireSlab: the free list is empty.</summary>
+    private const int NoFreeSlab   = -1;
+    /// <summary>AcquireSlab: a slab was free but its pages could not be committed.</summary>
+    private const int NoCommitSlab = -2;
+
+    /// <summary>
+    /// Pops a free slab index whose pages are writable, or <see cref="NoFreeSlab"/> when the
+    /// payload pool is exhausted, or <see cref="NoCommitSlab"/> when the operating system
+    /// refused to commit the slab's pages.
+    /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private int AcquireSlab()
     {
@@ -226,17 +247,23 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
         {
             long head = Volatile.Read(ref _freeHead->Value);
             int  idx  = unchecked((int)head);          // low 32 bits; -1 ⇒ empty
-            if (idx < 0) return -1;
+            if (idx < 0) return NoFreeSlab;
             int  next = _slabNext[idx];
             long newHead = unchecked((((head >> 32) + 1) << 32) | (uint)next); // bump version, swing to next
             if (Interlocked.CompareExchange(ref _freeHead->Value, newHead, head) == head)
             {
-                // The caller is about to write this slab, so its pages must exist. On a reserved
-                // arena this is one volatile read and a branch that is taken only when the
-                // buffer reaches deeper than it ever has; on a plain allocation it compiles
-                // away to nothing.
-                _arena.EnsureCommitted((nuint)(((long)idx + 1) * _slabBytes));
-                return idx;
+                // The caller is about to write this slab, so its pages must exist. On the hot
+                // path this is one volatile read and a branch that is taken only when the
+                // buffer reaches deeper than it ever has.
+                if (_arena.TryEnsureCommitted((nuint)(((long)idx + 1) * _slabBytes)))
+                    return idx;
+
+                // Out of commit charge. The slab is ours and was never written: put it back,
+                // or every failure would shrink the arena for the life of the process. It goes
+                // back on top, so the next acquirer retries the same depth — the free list
+                // stays in index order and the arena recovers once the pressure is over.
+                ReleaseSlab(idx);
+                return NoCommitSlab;
             }
         }
     }
@@ -285,7 +312,8 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
         int slab = AcquireSlab();
         if (slab < 0)
         {
-            Interlocked.Increment(ref _droppedNoSlab);
+            if (slab == NoFreeSlab) Interlocked.Increment(ref _droppedNoSlab);
+            else                    Interlocked.Increment(ref _droppedNoCommit);
             return false;
         }
 

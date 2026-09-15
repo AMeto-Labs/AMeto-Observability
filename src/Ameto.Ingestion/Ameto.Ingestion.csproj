@@ -11,6 +11,11 @@
     <PackageReference Include="Microsoft.Extensions.Hosting.Abstractions" Version="10.0.8" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="Ameto.Integration.Tests" />
+    <InternalsVisibleTo Include="Ameto.Perf" />
+  </ItemGroup>
+
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
