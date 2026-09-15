@@ -119,20 +119,39 @@ public static class FilterEvaluator
             RegexExtractCompareNode rxe   => EvalRegexExtract(rxe, ev),
             InNode inNode                 => EvalIn(inNode, ev),
             FreeTextNode ft               => EvalFreeText(ft, ev),
-            // A node type NEITHER tagged nor listed above. In release it answers false, which is
-            // what it has always done; in debug it is loud, because "matches nothing, ever" is
-            // the most expensive silence in a filter — the query simply returns less than it
-            // should and nothing anywhere says why.
+            // A node type NEITHER tagged nor listed above.
             _                             => UnhandledNode(filter),
         };
     }
 
-    private static bool UnhandledNode(FilterNode node)
-    {
-        System.Diagnostics.Debug.Fail(
-            $"FilterEvaluator has no arm for {node.GetType().Name}; it will match nothing.");
-        return false;
-    }
+    /// <summary>
+    /// A node the evaluator cannot answer for THROWS, in every build configuration.
+    ///
+    /// <para>"Matches nothing, ever" is the most expensive silence a filter has: the query
+    /// returns less than it should and nothing anywhere says why. This used to be a
+    /// <c>Debug.Fail</c> followed by <c>return false</c>, which was the wrong shape in both
+    /// configurations. Release — where CI and every deployment run — compiled the assertion
+    /// out and kept the silence. A Debug server (<c>dotnet run</c>) turned it into a FailFast
+    /// that killed the process. A throw is what every caller already knows how to report: the
+    /// search stream ends in a <c>query-error</c> frame and the server log names the type.</para>
+    ///
+    /// <para><c>FilterEvaluatorCompletenessTests</c> walks every concrete
+    /// <see cref="FilterNode"/> through here, so a node that loses its arm fails the build's
+    /// tests rather than a user's query.</para>
+    /// </summary>
+    [System.Diagnostics.CodeAnalysis.DoesNotReturn]
+    private static bool UnhandledNode(FilterNode node) =>
+        throw new UnhandledFilterNodeException(node.GetType());
+
+    /// <summary>
+    /// Thrown by <see cref="UnhandledNode"/>, and by nothing else. A type of its own, rather
+    /// than a message to match, so the completeness test can tell "this node has no arm" from
+    /// whatever an arm throws when it meets a node built without its constructor. Rewording the
+    /// message cannot make that test quietly stop finding anything.
+    /// </summary>
+    internal sealed class UnhandledFilterNodeException(Type nodeType)
+        : NotSupportedException(
+            $"FilterEvaluator has no arm for {nodeType.Name}, so it cannot say whether an event matches it.");
 
     // ── Free-text search ────────────────────────────────────────────────────────
 
