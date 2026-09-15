@@ -81,6 +81,73 @@ public sealed class IngestArenaCommitFailureTests
     }
 
     /// <summary>
+    /// A failing commit must not bury the committed slabs the drainer frees while it fails. The
+    /// first fix popped a slab, tried to commit it, and on failure pushed it back on top, so a
+    /// committed slab freed during that window ended up UNDER the uncommitted one. The ring then
+    /// refused events although committed slabs were free. Under sustained commit exhaustion every
+    /// slab freed in such a window was buried, and a server that already had hundreds of MB
+    /// committed refused nearly everything until the host recovered.
+    ///
+    /// <para>The producer is held inside its failing commit while the test frees a slab. The ring
+    /// is then drained, and, with commits still failing, it must take one event per committed slab.
+    /// Measured before the fix: 15 of 16.</para>
+    /// </summary>
+    [Fact]
+    public void A_slab_freed_while_a_commit_is_failing_is_not_buried_under_the_uncommitted_one()
+    {
+        const int Committed = 16;                              // one 1 MB commit chunk of 64 KB slabs
+        using var ring = new IngestionRingBuffer(1 << 10, SlabBytes, (long)Slabs * SlabBytes);
+
+        for (int i = 0; i < Committed; i++) Assert.True(Enqueue(ring, (byte)i));
+        if (ring.ArenaCommitsOnDemand) Assert.Equal((long)Committed * SlabBytes, ring.ArenaCommittedBytes);
+
+        using var parked  = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        int held = 0;
+        ring.SimulateArenaCommitFailure(true, plainCommittedBytes: (long)Committed * SlabBytes, onFailure: () =>
+        {
+            if (Interlocked.Exchange(ref held, 1) != 0) return;   // hold only the first failing commit
+            parked.Set();
+            release.Wait(TimeSpan.FromSeconds(30));
+        });
+
+        // A producer reaches for slab 16, the first uncommitted one, and is held inside the commit.
+        bool producerAccepted = false;
+        var producer = new Thread(() => producerAccepted = Enqueue(ring, 0xAA)) { IsBackground = true };
+        producer.Start();
+        Assert.True(parked.Wait(TimeSpan.FromSeconds(30)), "the producer never reached the failing commit");
+
+        // Meanwhile the drainer frees committed slab 0.
+        var buf = new byte[SlabBytes];
+        Assert.True(Dequeue(ring, buf));
+        release.Set();
+        Assert.True(producer.Join(TimeSpan.FromSeconds(30)), "the producer never returned");
+
+        while (Dequeue(ring, buf)) { }
+        long refusedBeforeRefill = ring.DroppedNoCommit;
+
+        // The ring is empty and every committed slab is free. Commits still fail, so a committed
+        // slab buried under an uncommitted one shows up here as a refusal.
+        int accepted = 0;
+        for (int i = 0; i < Committed; i++)
+            if (Enqueue(ring, (byte)i)) accepted++;
+        Assert.Equal(Committed, accepted);
+
+        // The next event is the real commit boundary: refused for commit, not for want of a slab.
+        Assert.False(Enqueue(ring, 0xFF));
+        Assert.Equal(refusedBeforeRefill + 1, ring.DroppedNoCommit);
+        Assert.Equal(0, ring.DroppedNoSlab);
+
+        // Slab 0 was already free when the producer's commit failed, so the producer takes it
+        // instead of counting a commit refusal.
+        Assert.True(producerAccepted, "the producer was refused although a committed slab was free");
+        Assert.Equal(0, refusedBeforeRefill);
+    }
+
+    private static bool Dequeue(IngestionRingBuffer ring, byte[] buf) =>
+        ring.TryDequeue(out _, out _, out _, out _, out _, buf, out _, out _, out _, out _, out _);
+
+    /// <summary>
     /// A plain allocation (the arena everywhere but Windows) commits nothing on demand and counts
     /// nothing, so it reports -1 — not its whole size as if it were memory in use, which would show
     /// every idle Linux container holding 512 MB of arena.

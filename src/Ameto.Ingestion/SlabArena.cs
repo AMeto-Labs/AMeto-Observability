@@ -118,7 +118,11 @@ internal sealed unsafe class SlabArena : IDisposable
         lock (_growGate)
         {
             if (endOffset <= _committed) return true;      // someone else grew past us
-            if (_simulateCommitFailure) return false;
+            if (_simulateCommitFailure)
+            {
+                _onSimulatedFailure?.Invoke();
+                return false;
+            }
 
             // Round up to a commit chunk so a burst that walks the arena does not make one
             // syscall per slab, and never past the reservation.
@@ -142,21 +146,32 @@ internal sealed unsafe class SlabArena : IDisposable
 
     // ── Test hook ──────────────────────────────────────────────────────────────
 
-    private bool _simulateCommitFailure;   // read and written under _growGate only
+    private bool    _simulateCommitFailure;   // read and written under _growGate only
+    private Action? _onSimulatedFailure;      // likewise
 
     /// <summary>
     /// Test hook: every commit past the current high-water mark fails, as
     /// <c>VirtualAlloc(MEM_COMMIT)</c> does when the commit charge runs out. On a plain
     /// allocation — where nothing is committed on demand — the high-water mark is lowered to
-    /// zero for the duration so the failure path is reachable on every platform; clearing the
-    /// hook puts it back.
+    /// <paramref name="plainHighWaterMark"/> for the duration so the failure path is reachable on
+    /// every platform; clearing the hook puts it back.
     /// </summary>
-    internal void SimulateCommitFailure(bool fail)
+    /// <param name="plainHighWaterMark">
+    /// The bytes a plain allocation pretends are committed while the hook is set, so a test can
+    /// give it the same committed prefix a reserved arena reached. Ignored by a reserved arena,
+    /// which keeps its real mark.
+    /// </param>
+    /// <param name="onFailure">
+    /// Runs under the grow lock each time a simulated commit fails, so a test can hold a producer
+    /// inside the failing commit while another thread works the free list.
+    /// </param>
+    internal void SimulateCommitFailure(bool fail, nuint plainHighWaterMark = 0, Action? onFailure = null)
     {
         lock (_growGate)
         {
             _simulateCommitFailure = fail;
-            if (!_reserved) Volatile.Write(ref _committed, fail ? 0 : _bytes);
+            _onSimulatedFailure    = fail ? onFailure : null;
+            if (!_reserved) Volatile.Write(ref _committed, fail ? Math.Min(plainHighWaterMark, _bytes) : _bytes);
         }
     }
 

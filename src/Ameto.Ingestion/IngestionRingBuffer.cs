@@ -220,8 +220,13 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
     /// </summary>
     public long DroppedNoCommit => Interlocked.Read(ref _droppedNoCommit);
 
-    /// <summary>Test hook: makes every commit past the arena's high-water mark fail.</summary>
-    internal void SimulateArenaCommitFailure(bool fail) => _arena.SimulateCommitFailure(fail);
+    /// <summary>
+    /// Test hook: makes every commit past the arena's high-water mark fail. On a plain allocation
+    /// the mark is lowered to <paramref name="plainCommittedBytes"/> while it is set;
+    /// <paramref name="onFailure"/> runs inside each failing commit, under the arena's grow lock.
+    /// </summary>
+    internal void SimulateArenaCommitFailure(bool fail, long plainCommittedBytes = 0, Action? onFailure = null) =>
+        _arena.SimulateCommitFailure(fail, (nuint)plainCommittedBytes, onFailure);
 
     private long _droppedOversized;
     private long _droppedNoSlab;
@@ -237,8 +242,21 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
 
     /// <summary>
     /// Pops a free slab index whose pages are writable, or <see cref="NoFreeSlab"/> when the
-    /// payload pool is exhausted, or <see cref="NoCommitSlab"/> when the operating system
-    /// refused to commit the slab's pages.
+    /// payload pool is exhausted, or <see cref="NoCommitSlab"/> when the slab on top of the free
+    /// list could not have its pages committed.
+    ///
+    /// <para>The commit happens BEFORE the pop, so a slab whose pages cannot be written never
+    /// leaves the free list. The earlier version popped first and, on failure, pushed the slab
+    /// back on top; a committed slab the drainer freed in between then sat UNDER the uncommitted
+    /// one, and the ring refused events with committed slabs free. Under sustained commit
+    /// exhaustion every slab freed in such a window was buried for as long as the pressure lasted.
+    /// Now only popped, and therefore committed, slabs are ever pushed, and the untouched tail
+    /// of the list is in index order, so every committed free slab sits above every uncommitted
+    /// one. An uncommitted slab is on top only when no committed slab is free.</para>
+    ///
+    /// <para>Committing for an index another thread pops first is harmless, because commits only
+    /// grow. On the hot path the commit check is one volatile read and a branch, taken only when
+    /// the buffer reaches deeper than it ever has.</para>
     /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private int AcquireSlab()
@@ -248,23 +266,21 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
             long head = Volatile.Read(ref _freeHead->Value);
             int  idx  = unchecked((int)head);          // low 32 bits; -1 ⇒ empty
             if (idx < 0) return NoFreeSlab;
+
+            if (!_arena.TryEnsureCommitted((nuint)(((long)idx + 1) * _slabBytes)))
+            {
+                // Out of commit charge. A failed commit can take long enough for the drainer to
+                // push a committed slab on top meanwhile; if the head moved, look again rather
+                // than refuse an event a free slab could take. The head changes only when
+                // another thread made progress, so this retry cannot spin on its own.
+                if (Volatile.Read(ref _freeHead->Value) != head) continue;
+                return NoCommitSlab;
+            }
+
             int  next = _slabNext[idx];
             long newHead = unchecked((((head >> 32) + 1) << 32) | (uint)next); // bump version, swing to next
             if (Interlocked.CompareExchange(ref _freeHead->Value, newHead, head) == head)
-            {
-                // The caller is about to write this slab, so its pages must exist. On the hot
-                // path this is one volatile read and a branch that is taken only when the
-                // buffer reaches deeper than it ever has.
-                if (_arena.TryEnsureCommitted((nuint)(((long)idx + 1) * _slabBytes)))
-                    return idx;
-
-                // Out of commit charge. The slab is ours and was never written: put it back,
-                // or every failure would shrink the arena for the life of the process. It goes
-                // back on top, so the next acquirer retries the same depth — the free list
-                // stays in index order and the arena recovers once the pressure is over.
-                ReleaseSlab(idx);
-                return NoCommitSlab;
-            }
+                return idx;
         }
     }
 
