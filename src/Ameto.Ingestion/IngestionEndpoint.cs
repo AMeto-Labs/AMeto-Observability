@@ -150,6 +150,23 @@ public sealed class IngestionEndpoint : IOtlpLogSink, LogEventSerializer.IClefBa
 
         try
         {
+            // ── 1b. A body that never arrived in full is refused whole ────────
+            // A client that aborts mid-send leaves a prefix that parses perfectly up to the
+            // cut, so streaming it would ingest that prefix and then answer 400. Seq clients
+            // treat a non-2xx as a failed batch and retry it — Serilog.Sinks.Seq throws and
+            // its batching sink retries ~8 times — so the prefix would land up to eight
+            // times over. Content-Length says how much was promised; short of it, nothing
+            // is ingested. (A body that arrives IN FULL and is malformed in the middle is
+            // the residual case: it still ingests the prefix, see StreamBatch.)
+            if (contentLength.HasValue && bodyLen != (int)contentLength.Value)
+            {
+                _logger.LogDebug(
+                    "Truncated ingestion body: {Received} of {Expected} bytes — batch refused whole",
+                    bodyLen, contentLength.Value);
+                ctx.Response.StatusCode = StatusCodes.Status400BadRequest;
+                return;
+            }
+
             // ── 2+3. Stream the MessagePack array straight into the ring ──────
             // No LogEvent per event: the batch reader hands each event over as spans
             // into bodyBuf, and TryIngestClef copies the property bytes into the ring
