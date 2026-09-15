@@ -130,12 +130,14 @@ public static class EndpointMapper
                 {
                     // Straight from the event: no DTO, no reflection resolver, no
                     // Timestamp/Id/trace/span ToString per row, and the frames coalesce in
-                    // the writer's buffer instead of taking a socket send each. The terminal
-                    // frame below puts whatever is still buffered on the wire with it, which
-                    // is why there is no explicit flush here — every exit from this block
-                    // except a client disconnect writes one.
-                    await foreach (var ev in executor.ExecuteAsync(request, deadline.Token))
-                        await sse.WriteLogEventAsync(ev, deadline.Token);
+                    // the writer's buffer instead of taking a socket send each. The writer
+                    // drives the enumerator itself so it can send the rows found so far
+                    // whenever the scan makes it wait — rows found together still share a
+                    // send, and a sparse search shows each row before its next wait ends
+                    // rather than at `done`. The terminal frame below puts whatever is still
+                    // buffered on the wire with it, which is why there is no explicit flush
+                    // here — every exit from this block except a client disconnect writes one.
+                    await sse.WriteLogEventsAsync(executor.ExecuteAsync(request, deadline.Token), deadline.Token);
 
                     // CHECKED AFTER THE LOOP, not only in a catch filter: the executor turns
                     // cancellation into a normal end-of-stream on its hot paths (a

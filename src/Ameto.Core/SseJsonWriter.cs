@@ -12,18 +12,20 @@ namespace Ameto.Core;
 /// <c>$"data: {json}\n\n"</c> string, and the UTF-16→UTF-8 transcode inside
 /// <c>WriteAsync(string)</c>.
 ///
-/// <para>Log-event frames go through <see cref="WriteLogEventAsync"/>, which writes straight
-/// from the event (no DTO, no reflection) and COALESCES: frames accumulate until 16 KB, or until
-/// the oldest of them has waited <see cref="MaxFrameHold"/> — a deadline a timer enforces, so it
-/// holds while the producer is stuck in a synchronous read. Every other frame here — the typed
-/// and reflected DTO overloads, keepalives, and the terminal done/query-error frames — is sent
-/// the moment it is composed, and carries any coalesced backlog out with it.</para>
+/// <para>Log-event frames go through <see cref="WriteLogEventAsync"/>, or through
+/// <see cref="WriteLogEventsAsync"/> for a whole query's worth. Both write straight from the
+/// event (no DTO, no reflection) and COALESCE: frames accumulate until 16 KB, until a row finds
+/// the oldest of them <see cref="MaxFrameHold"/> old, or until the source of the rows makes the
+/// caller wait. Every other frame here — the typed and reflected DTO overloads, keepalives, and
+/// the terminal done/query-error frames — is sent the moment it is composed, and carries any
+/// coalesced backlog out with it.</para>
 ///
-/// <para>ONE WRITER TO THE BODY AT A TIME. The hold timer sends from a pool thread, so every
-/// method that composes into the buffer or touches the body enters <c>_gate</c> first. The
-/// caller still owes the usual SSE discipline — one call at a time from its own side — and gets
-/// nothing new to think about: the gate is uncontended except in the instant the timer
-/// fires.</para>
+/// <para>NOTHING TOUCHES THE BODY BUT THE CALLER'S OWN CALL. Every send starts inside a public
+/// method and has ended, one way or the other, by the time that method's task completes. There
+/// is no timer and no background send, so there is nothing to serialise against the caller,
+/// nothing for <see cref="Dispose"/> to cancel or wait for, and no way for a write to reach a
+/// response whose request has already completed. The caller owes the usual SSE discipline — one
+/// call at a time — and that is the whole of the concurrency contract.</para>
 ///
 /// <para>Lives in Core rather than beside its first caller because the trace and metric
 /// endpoint mappers ship in their own assemblies and do not reference Ameto.Server — the
@@ -49,7 +51,7 @@ public sealed class SseJsonWriter : IDisposable
 
     /// <summary>
     /// How much framed output may sit in the buffer before <see cref="WriteLogEventAsync"/>
-    /// puts it on the wire. Only the BUFFERED overload consults it; every other frame on this
+    /// puts it on the wire. Only the BUFFERED road consults it; every other frame on this
     /// writer is still sent the moment it is composed.
     ///
     /// <para>Roughly a TCP window's worth. A 500-row page used to cost 500 writes and 500
@@ -63,70 +65,45 @@ public sealed class SseJsonWriter : IDisposable
     private const int FlushThresholdBytes = 16 * 1024;
 
     /// <summary>
-    /// How long a buffered frame may WAIT, whatever the buffer weighs — measured from the moment
-    /// the OLDEST frame still buffered was composed.
+    /// How long a buffered frame may wait before the NEXT ROW WRITTEN sends it: measured from the
+    /// moment the oldest frame still buffered was composed, or — for the first frame of a batch —
+    /// from the last send.
     ///
     /// <para>The byte threshold alone has no time bound, and the events endpoint writes nothing
     /// else between the first row and the terminal frame. A sparse cold search — forty matches
-    /// found over thirty seconds of scanning — would therefore show the client nothing at all
-    /// until <c>done</c>, while the Angular store is built to paint progressively as rows
-    /// arrive. Coalescing rows that arrive together is the win; holding a row because the next
-    /// one has not been found yet is not.</para>
+    /// found over thirty seconds of scanning — would show the client nothing at all until
+    /// <c>done</c>, while the Angular store is built to paint progressively as rows arrive.
+    /// Coalescing rows that arrive together is the win; holding a row because the next one has
+    /// not been found yet is not.</para>
     ///
-    /// <para>ENFORCED BY A TIMER, not only when the next row is written. A check on write bounds
-    /// the hold by the gap to the NEXT row, and that gap is exactly what is unbounded: a cold
-    /// search that finds two rows a millisecond apart and then scans for thirty seconds kept the
-    /// second one here for all thirty, because <c>SegmentReader.ReadEventsAsync</c> is
-    /// synchronous and the producer never yields. Flushing when the enumerator is about to
-    /// suspend would not help for the same reason. The timer is armed when the buffer goes from
-    /// empty to non-empty and sends from a pool thread once that frame is old enough.</para>
+    /// <para>Two rules on write, and no clock of the writer's own. A row that arrives after the
+    /// stream has been quiet this long goes out at once, so a search that finds its rows one at
+    /// a time shows each as it is found. A row that finds the oldest buffered frame this old
+    /// sends the backlog, so a steady trickle is never more than one row late.</para>
     ///
-    /// <para>The on-write check stays too, for the two cases it serves without a thread hop: a
-    /// row that arrives after the stream has been quiet this long goes out at once, and a
-    /// steady trickle is sent by the row that finds the oldest frame overdue.</para>
+    /// <para>Neither rule can send a row that nothing is written after. That is
+    /// <see cref="WriteLogEventsAsync"/>'s job: it sends the backlog whenever its source makes
+    /// it wait. A source that computes its next row SYNCHRONOUSLY gives the writer no moment to
+    /// send in, so the tail of a burst it produces waits for the next row, the 16 KB, or the
+    /// terminal frame (which the search budget bounds). A timer used to cover that stretch and
+    /// was taken out: its send ran on a pool thread as a second writer to the body, so it needed
+    /// a gate every row paid for, it could outlive <see cref="Dispose"/> and the request, and it
+    /// re-armed every 20 ms through a stalled send.</para>
     /// </summary>
     private static readonly TimeSpan MaxFrameHold = TimeSpan.FromMilliseconds(100);
-
-    /// <summary>
-    /// How soon the hold timer looks again when it fires while a call is inside the writer.
-    /// Short, because that call may be composing a row and about to leave the overdue backlog
-    /// behind; the look after it is one uncontended probe.
-    /// </summary>
-    private static readonly TimeSpan HoldRetry = TimeSpan.FromMilliseconds(20);
 
     private readonly ArrayBufferWriter<byte> _buffer = new(4096);
     private readonly Utf8JsonWriter          _json;
     private readonly Stream                  _body;
-
-    /// <summary>
-    /// Admits one writer at a time — the caller's call, or the hold timer's send. A
-    /// <see cref="SemaphoreSlim"/> rather than a <c>Lock</c> because it is held across the
-    /// body's awaits; entered through <c>Wait(0)</c> first, which is a counter check that
-    /// neither allocates nor blocks, so a row pays for it only in the instant the timer fires.
-    /// </summary>
-    private readonly SemaphoreSlim _gate = new(1, 1);
 
     /// <summary>When the buffer last went out, for the quiet-stream rule on write.</summary>
     private long _lastSendStamp = Stopwatch.GetTimestamp();
 
     /// <summary>
     /// When the OLDEST frame still buffered was composed — stamped as the buffer goes from empty
-    /// to non-empty. Meaningful only while the buffer holds something; read under the gate.
+    /// to non-empty. Meaningful only while the buffer holds something.
     /// </summary>
     private long _oldestFrameStamp;
-
-    /// <summary>
-    /// The token of the call that last buffered a row, which is the token the hold timer sends
-    /// under: the timer's send is that call's send, deferred. On the events endpoint it is the
-    /// search deadline, linked to the request, so a disconnect or an expired budget stops a
-    /// timer send exactly as it would have stopped the call's own.
-    /// </summary>
-    private CancellationToken _holdToken;
-
-    /// <summary>Created on the first held frame; most writers (trace streams, the live tail) never hold one.</summary>
-    private Timer? _holdTimer;
-
-    private volatile bool _disposed;
 
     /// <param name="body">The response body to frame into — <c>ctx.Response.Body</c>.</param>
     public SseJsonWriter(Stream body)
@@ -138,71 +115,108 @@ public sealed class SseJsonWriter : IDisposable
     /// <summary>
     /// Writes whatever frames are still buffered and flushes the body. A no-op when nothing
     /// is pending, so it is safe to call at the end of every page, poll and error path —
-    /// and it MUST be called there: a frame left in this buffer is a row the client sees only
-    /// when the hold timer gets to it.
+    /// and a run of <see cref="WriteLogEventAsync"/> calls that does not end in a terminal
+    /// frame MUST end here: nothing else will send what it left buffered.
     /// </summary>
-    public async ValueTask FlushFramesAsync(CancellationToken ct)
+    public ValueTask FlushFramesAsync(CancellationToken ct) => SendAsync(ct);
+
+    /// <summary>
+    /// Writes every event <paramref name="events"/> yields as a <see cref="WriteLogEventAsync"/>
+    /// frame, and sends the backlog WHENEVER THE SOURCE MAKES IT WAIT: a <c>MoveNextAsync</c>
+    /// that does not complete at once is a stretch in which nothing will be written, so the rows
+    /// found so far go out while the source works.
+    ///
+    /// <para>Rows the source hands over synchronously — one decoded block's matches, a hot-tier
+    /// page — keep coalescing up to 16 KB; a sparse search shows each row before its next
+    /// asynchronous gap ends, not at <c>done</c>. The send runs WHILE the source works, but on
+    /// this call and against nothing the source touches, so the body still has one writer.</para>
+    ///
+    /// <para>The source is never disposed in the middle of a step. A send that fails while the
+    /// source is working waits for that step first, bounded by the source's own token (on the
+    /// events endpoint the same deadline, linked to the request): an async iterator disposed
+    /// mid-step throws <see cref="NotSupportedException"/>, which would replace the send's own
+    /// failure — the one the caller's catch filters are written for.</para>
+    ///
+    /// <para>Ends without a terminal frame and without sending what the last rows left
+    /// buffered: the caller writes <c>done</c> or <c>query-error</c> next, and that frame
+    /// carries them.</para>
+    /// </summary>
+    public async ValueTask WriteLogEventsAsync(IAsyncEnumerable<LogEvent> events, CancellationToken ct)
     {
-        await EnterAsync(ct).ConfigureAwait(false);
-        try     { await SendAsync(ct).ConfigureAwait(false); }
-        finally { _gate.Release(); }
+        IAsyncEnumerator<LogEvent> rows = events.GetAsyncEnumerator(ct);
+        try
+        {
+            while (true)
+            {
+                ValueTask<bool> next = rows.MoveNextAsync();
+                if (!next.IsCompleted)
+                {
+                    try
+                    {
+                        await SendAsync(ct).ConfigureAwait(false);
+                    }
+                    catch
+                    {
+                        try   { await next.ConfigureAwait(false); }
+                        catch { /* the send's failure is the one to report */ }
+                        throw;
+                    }
+                }
+
+                if (!await next.ConfigureAwait(false)) return;
+                await WriteLogEventAsync(rows.Current, ct).ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            await rows.DisposeAsync().ConfigureAwait(false);
+        }
     }
 
     /// <summary>
     /// One <c>data:</c> frame carrying a log event, written straight from the event with no
     /// DTO and no reflection (see <see cref="LogEventJsonWriter"/>), and held in the buffer
-    /// with its neighbours until <see cref="FlushThresholdBytes"/> is reached or the oldest of
-    /// them has waited <see cref="MaxFrameHold"/>.
+    /// with its neighbours until <see cref="FlushThresholdBytes"/> is reached or a row finds the
+    /// oldest of them <see cref="MaxFrameHold"/> old.
     ///
-    /// <para>Callers still own the end of the run: finish with <see cref="FlushFramesAsync"/>
-    /// (or any terminal frame, which sends the backlog with it). The timer bounds how long a row
-    /// waits; it is not a substitute for ending the stream.</para>
+    /// <para>Callers own the end of the run: finish with <see cref="FlushFramesAsync"/> (or any
+    /// terminal frame, which sends the backlog with it). A caller that has a source rather than
+    /// a row should hand the source to <see cref="WriteLogEventsAsync"/>, which also sends
+    /// whenever the source makes it wait.</para>
     /// </summary>
     public async ValueTask WriteLogEventAsync(LogEvent ev, CancellationToken ct)
     {
-        await EnterAsync(ct).ConfigureAwait(false);
+        // Where the frame STARTS, so a writer that throws part-way through composing it does
+        // not leave half a `data:` line in front of the terminal query-error frame. A client
+        // parsing SSE by blank line would read the fragment and the error frame as one.
+        int frameStart = _buffer.WrittenCount;
         try
         {
-            // Where the frame STARTS, so a writer that throws part-way through composing it does
-            // not leave half a `data:` line in front of the terminal query-error frame. A client
-            // parsing SSE by blank line would read the fragment and the error frame as one.
-            int frameStart = _buffer.WrittenCount;
-            try
-            {
-                _buffer.Write(DataPrefix);
-                _json.Reset(_buffer);
-                LogEventJsonWriter.Write(_json, ev);
-                _json.Flush();
-                _buffer.Write(FrameSuffix);
-            }
-            catch
-            {
-                _buffer.ResetWrittenCount();
-                _buffer.Advance(frameStart);      // keep the whole frames, drop the partial one
-                throw;
-            }
-
-            _holdToken = ct;
-            bool first = frameStart == 0;
-            long now   = Stopwatch.GetTimestamp();
-            if (first) _oldestFrameStamp = now;
-
-            if (_buffer.WrittenCount >= FlushThresholdBytes
-                || Stopwatch.GetElapsedTime(first ? _lastSendStamp : _oldestFrameStamp, now) >= MaxFrameHold)
-                await SendAsync(ct).ConfigureAwait(false);
-            else if (first)
-                ArmHoldTimer(MaxFrameHold);
+            _buffer.Write(DataPrefix);
+            _json.Reset(_buffer);
+            LogEventJsonWriter.Write(_json, ev);
+            _json.Flush();
+            _buffer.Write(FrameSuffix);
         }
-        finally { _gate.Release(); }
-    }
+        catch
+        {
+            _buffer.ResetWrittenCount();
+            _buffer.Advance(frameStart);      // keep the whole frames, drop the partial one
+            throw;
+        }
 
-    /// <summary>Takes the gate: the uncontended probe first, the awaiting road only if the timer holds it.</summary>
-    private ValueTask EnterAsync(CancellationToken ct) =>
-        _gate.Wait(0) ? ValueTask.CompletedTask : new ValueTask(_gate.WaitAsync(ct));
+        bool first = frameStart == 0;
+        long now   = Stopwatch.GetTimestamp();
+        if (first) _oldestFrameStamp = now;
+
+        if (_buffer.WrittenCount >= FlushThresholdBytes
+            || Stopwatch.GetElapsedTime(first ? _lastSendStamp : _oldestFrameStamp, now) >= MaxFrameHold)
+            await SendAsync(ct).ConfigureAwait(false);
+    }
 
     /// <summary>
     /// Puts the buffered bytes on the wire and empties the buffer, keeping its capacity —
-    /// one buffer per connection, for the life of the connection. Called with the gate held.
+    /// one buffer per connection, for the life of the connection.
     ///
     /// <para>The buffer is emptied WHETHER OR NOT the send succeeds. Once the bytes have been
     /// offered to the body they belong to it: Kestrel copies them into its pipe inside
@@ -228,93 +242,6 @@ public sealed class SseJsonWriter : IDisposable
         }
     }
 
-    // ── The hold deadline ─────────────────────────────────────────────────────
-
-    /// <summary>
-    /// Arms the one-shot hold timer <paramref name="due"/> from now. Called with the gate held
-    /// (or, for the contended retry, without it — an earlier look is always harmless).
-    /// </summary>
-    private void ArmHoldTimer(TimeSpan due)
-    {
-        if (_disposed) return;
-        if (_holdTimer is null)
-        {
-            // Without the request's ExecutionContext: the timer lives as long as the connection
-            // and has no business pinning the request's AsyncLocals (logging scopes, activity)
-            // for that long, nor flowing them into a pool thread's send.
-            bool suppress = !ExecutionContext.IsFlowSuppressed();
-            AsyncFlowControl flow = suppress ? ExecutionContext.SuppressFlow() : default;
-            try
-            {
-                _holdTimer = new Timer(static s => ((SseJsonWriter)s!).OnHoldExpired(), this,
-                                       Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
-            }
-            finally { if (suppress) flow.Undo(); }
-        }
-        _holdTimer.Change(due, Timeout.InfiniteTimeSpan);
-    }
-
-    /// <summary>
-    /// The hold timer fired: send the backlog if its oldest frame is overdue.
-    ///
-    /// <para>Every exit leaves one of three things true — the buffer is empty, the timer is
-    /// armed again, or the caller's token is already cancelled (its loop is ending, and the
-    /// terminal frame it owes carries the backlog, or the client is gone and nothing is owed).
-    /// That is what makes the deadline a guarantee rather than a hope.</para>
-    ///
-    /// <para>A failed send is swallowed here, and nothing is lost by that: the bytes were the
-    /// body's either way (see <see cref="SendAsync"/>), a cancelled send means the caller's own
-    /// token has fired and its loop will see that, and a broken connection fails the caller's
-    /// next write too.</para>
-    /// </summary>
-    private void OnHoldExpired()
-    {
-        if (!_gate.Wait(0))
-        {
-            // A call is inside the writer. It may be composing a row and about to leave the
-            // backlog behind, so look again shortly rather than queue behind it.
-            try { ArmHoldTimer(HoldRetry); } catch { /* disposed under us */ }
-            return;
-        }
-
-        bool handedOff = false;
-        try
-        {
-            if (_disposed || _buffer.WrittenCount == 0) return;
-
-            TimeSpan age = Stopwatch.GetElapsedTime(_oldestFrameStamp);
-            if (age < MaxFrameHold)
-            {
-                // Fired early (timer granularity), or for a batch that has since gone out and
-                // been replaced by a younger one: wait out the remainder of THIS one.
-                ArmHoldTimer(MaxFrameHold - age);
-                return;
-            }
-
-            CancellationToken ct = _holdToken;
-            if (ct.IsCancellationRequested) return;
-
-            ValueTask send = SendAsync(ct);
-            if (!send.IsCompleted)
-            {
-                handedOff = true;
-                _ = ReleaseAfterAsync(send);
-                return;
-            }
-            send.GetAwaiter().GetResult();          // observe a synchronous failure
-        }
-        catch { /* see the remarks: nothing to report, nothing lost */ }
-        finally { if (!handedOff) _gate.Release(); }
-    }
-
-    /// <summary>The hold timer's send, when the body made it wait: the gate is released only once it is done.</summary>
-    private async Task ReleaseAfterAsync(ValueTask send)
-    {
-        try     { await send.ConfigureAwait(false); }
-        catch   { /* see OnHoldExpired */ }
-        finally { _gate.Release(); }
-    }
-
     // ── Frames that are sent at once ──────────────────────────────────────────
 
     /// <summary>
@@ -325,16 +252,11 @@ public sealed class SseJsonWriter : IDisposable
     /// </summary>
     public async Task WriteEventAsync<T>(T dto, JsonTypeInfo<T> typeInfo, CancellationToken ct)
     {
-        await EnterAsync(ct).ConfigureAwait(false);
-        try
-        {
-            _buffer.Write(DataPrefix);
-            _json.Reset(_buffer);
-            JsonSerializer.Serialize(_json, dto, typeInfo);
-            _buffer.Write(FrameSuffix);
-            await SendAsync(ct).ConfigureAwait(false);
-        }
-        finally { _gate.Release(); }
+        _buffer.Write(DataPrefix);
+        _json.Reset(_buffer);
+        JsonSerializer.Serialize(_json, dto, typeInfo);
+        _buffer.Write(FrameSuffix);
+        await SendAsync(ct).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -349,28 +271,18 @@ public sealed class SseJsonWriter : IDisposable
     /// </summary>
     public async Task WriteEventAsync<T>(T dto, JsonSerializerOptions options, CancellationToken ct)
     {
-        await EnterAsync(ct).ConfigureAwait(false);
-        try
-        {
-            _buffer.Write(DataPrefix);
-            _json.Reset(_buffer);
-            JsonSerializer.Serialize(_json, dto, options);
-            _buffer.Write(FrameSuffix);
-            await SendAsync(ct).ConfigureAwait(false);
-        }
-        finally { _gate.Release(); }
+        _buffer.Write(DataPrefix);
+        _json.Reset(_buffer);
+        JsonSerializer.Serialize(_json, dto, options);
+        _buffer.Write(FrameSuffix);
+        await SendAsync(ct).ConfigureAwait(false);
     }
 
     /// <summary>Terminal <c>event: done</c> frame with an empty payload.</summary>
     public async Task WriteDoneAsync(CancellationToken ct)
     {
-        await EnterAsync(ct).ConfigureAwait(false);
-        try
-        {
-            _buffer.Write(DoneFrame);
-            await SendAsync(ct).ConfigureAwait(false);
-        }
-        finally { _gate.Release(); }
+        _buffer.Write(DoneFrame);
+        await SendAsync(ct).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -401,21 +313,16 @@ public sealed class SseJsonWriter : IDisposable
     /// </param>
     public async Task WriteDoneAsync(bool complete, string reason, string? truncatedBy, CancellationToken ct)
     {
-        await EnterAsync(ct).ConfigureAwait(false);
-        try
-        {
-            _buffer.Write(DonePrefix);
-            _json.Reset(_buffer);
-            _json.WriteStartObject();
-            _json.WriteBoolean("complete", complete);
-            _json.WriteString("reason", reason);
-            if (truncatedBy is not null) _json.WriteString("truncatedBy", truncatedBy);
-            _json.WriteEndObject();
-            _json.Flush();
-            _buffer.Write(FrameSuffix);
-            await SendAsync(ct).ConfigureAwait(false);
-        }
-        finally { _gate.Release(); }
+        _buffer.Write(DonePrefix);
+        _json.Reset(_buffer);
+        _json.WriteStartObject();
+        _json.WriteBoolean("complete", complete);
+        _json.WriteString("reason", reason);
+        if (truncatedBy is not null) _json.WriteString("truncatedBy", truncatedBy);
+        _json.WriteEndObject();
+        _json.Flush();
+        _buffer.Write(FrameSuffix);
+        await SendAsync(ct).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -433,44 +340,30 @@ public sealed class SseJsonWriter : IDisposable
     /// </param>
     public async Task WriteErrorAsync(string message, CancellationToken ct, string? truncatedBy = null)
     {
-        await EnterAsync(ct).ConfigureAwait(false);
-        try
-        {
-            _buffer.Write(ErrorPrefix);
-            _json.Reset(_buffer);
-            _json.WriteStartObject();
-            _json.WriteString("error", message);
-            if (truncatedBy is not null) _json.WriteString("truncatedBy", truncatedBy);
-            _json.WriteEndObject();
-            _json.Flush();
-            _buffer.Write(FrameSuffix);
-            await SendAsync(ct).ConfigureAwait(false);
-        }
-        finally { _gate.Release(); }
+        _buffer.Write(ErrorPrefix);
+        _json.Reset(_buffer);
+        _json.WriteStartObject();
+        _json.WriteString("error", message);
+        if (truncatedBy is not null) _json.WriteString("truncatedBy", truncatedBy);
+        _json.WriteEndObject();
+        _json.Flush();
+        _buffer.Write(FrameSuffix);
+        await SendAsync(ct).ConfigureAwait(false);
     }
 
     /// <summary>Comment-only keepalive frame (ignored by EventSource clients).</summary>
     public async Task WriteKeepaliveAsync(CancellationToken ct)
     {
-        await EnterAsync(ct).ConfigureAwait(false);
-        try
-        {
-            _buffer.Write(KeepaliveFrame);
-            await SendAsync(ct).ConfigureAwait(false);
-        }
-        finally { _gate.Release(); }
+        _buffer.Write(KeepaliveFrame);
+        await SendAsync(ct).ConfigureAwait(false);
     }
 
     /// <summary>
-    /// Stops the hold timer; a frame still buffered is dropped, which is only ever the case on
-    /// the client-disconnect road (every other ending writes a terminal frame first, and that
-    /// frame waits for any timer send in progress). A timer that fires after this finds the flag
-    /// and leaves the body alone — the response may already be complete by then.
+    /// Releases the JSON writer. A frame still buffered is dropped, which is only ever the case
+    /// on the client-disconnect road: every other ending writes a terminal frame first, and that
+    /// frame carries the backlog. There is nothing to stop and nothing to wait for — no send
+    /// outlives the call that started it, so once the handler's last call has returned the body
+    /// is never touched again.
     /// </summary>
-    public void Dispose()
-    {
-        _disposed = true;
-        _holdTimer?.Dispose();
-        _json.Dispose();
-    }
+    public void Dispose() => _json.Dispose();
 }
