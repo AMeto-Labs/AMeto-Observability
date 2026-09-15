@@ -15,10 +15,11 @@ namespace Ameto.Query.Tests;
 /// number is a standing invitation for them to drift, so every query below is run BOTH ways —
 /// with the header scan wired in and with it absent — and the tables must be identical.
 ///
-/// <para>The corpus spans both tiers, three named services and one that is deliberately
-/// NAMELESS, every level, and a user property the header knows nothing about, so the tests
-/// cover what the shortcut answers, what it must decline, and the one input on which the two
-/// roads genuinely disagree.</para>
+/// <para>The corpus spans both tiers, every level, a user property the header knows nothing
+/// about, and six producers chosen for the ways a header aggregator and an ordinal group-by can
+/// disagree: two differing only in CASING, one named with the EMPTY STRING, one with no service
+/// at all. So the tests cover what the shortcut answers and — just as load-bearing — what it
+/// has to refuse.</para>
 /// </summary>
 public sealed class AggregationHeaderPathTests : IDisposable
 {
@@ -26,7 +27,13 @@ public sealed class AggregationHeaderPathTests : IDisposable
     private static readonly DateTimeOffset From = Base.AddMinutes(-1);
     private static readonly DateTimeOffset To   = Base.AddHours(4);
 
-    private static readonly string?[]  Services = ["checkout", "billing", "gateway", null];
+    /// <summary>
+    /// Six producers, chosen for the disagreements they expose: two that differ only in CASING,
+    /// one whose name is the EMPTY STRING, and one with no service at all. The header
+    /// aggregator folds the last three together and the first two into one; the scan road keeps
+    /// all six apart. That is why grouping by service stays on the scan road.
+    /// </summary>
+    private static readonly string?[]  Services = ["checkout", "billing", "Billing", "", "gateway", null];
     private static readonly LogLevel[] Levels   =
         [LogLevel.Verbose, LogLevel.Debug, LogLevel.Information, LogLevel.Warning, LogLevel.Error, LogLevel.Fatal];
 
@@ -56,8 +63,8 @@ public sealed class AggregationHeaderPathTests : IDisposable
         var buf = new ArrayBufferWriter<byte>(128);
         void Write(int i)
         {
-            string? service = Services[i % 4];
-            var     level   = Levels[(i / 4) % Levels.Length];
+            string? service = Services[i % Services.Length];
+            var     level   = Levels[(i / Services.Length) % Levels.Length];
 
             buf.ResetWrittenCount();
             var w = new MessagePackWriter(buf);
@@ -90,23 +97,22 @@ public sealed class AggregationHeaderPathTests : IDisposable
     [Theory]
     // Answered by the header scan.
     [InlineData("select count(*)")]
-    [InlineData("select count(*) group by ['service.name']")]
     [InlineData("select count(*) group by @l")]
     [InlineData("select count(*) where @l = 'Error'")]
     [InlineData("select count(*) where @l = 'Error' group by @l")]
     [InlineData("select count(*) where @l in ['Error','Fatal'] group by @l")]
     [InlineData("select count(*) where ['service.name'] = 'billing'")]
-    [InlineData("select count(*) where ['service.name'] = 'billing' group by ['service.name']")]
     [InlineData("select count(*) where ['service.name'] = 'billing' group by @l")]
-    [InlineData("select count(*) group by ['service.name'] limit 2")]
-    [InlineData("select count(*) where @l = 'Fatal' and ['service.name'] = 'gateway'")]   // legitimately empty
+    [InlineData("select count(*) where @l = 'Fatal' and ['service.name'] = 'gateway'")]
     // Declined by the header scan, and therefore identical for a duller reason.
-    [InlineData("select count(*) where @l = 'Error' group by ['service.name']")]          // level x service
-    [InlineData("select count(*) where n > 100")]                                          // not a header field
-    [InlineData("select count(*) group by n")]                                             // not a header key
-    [InlineData("select count(*), count(n) group by ['service.name']")]                     // not every column is count(*)
+    [InlineData("select count(*) group by ['service.name']")]                    // casing and empty names
+    [InlineData("select count(*) group by ['service.name'] limit 2")]
+    [InlineData("select count(*) where @l = 'Error' group by ['service.name']")]
+    [InlineData("select count(*) where n > 100")]                                // not a header field
+    [InlineData("select count(*) group by n")]                                   // not a header key
+    [InlineData("select count(*), count(n) group by ['service.name']")]          // not every column is count(*)
     [InlineData("select sum(n) group by ['service.name']")]
-    [InlineData("select count(*) group by ['service.name'], @l")]                           // two keys
+    [InlineData("select count(*) group by ['service.name'], @l")]                // two keys
     public async Task Both_roads_answer_the_same_table(string text)
     {
         Assert.True(AggregationParser.TryParse(text, out var q));
@@ -128,20 +134,40 @@ public sealed class AggregationHeaderPathTests : IDisposable
     }
 
     /// <summary>
-    /// The absent service is reported as absent, not as a group named after a placeholder —
-    /// the header aggregator calls it "(unknown)" for the counts chart, and this path has to
-    /// translate that back.
+    /// GROUPING BY SERVICE IS DECLINED, and these are the reasons why — the cases the header
+    /// aggregator cannot reproduce, each asserted against the scan road's answer.
+    ///
+    /// <para>The corpus carries <c>Billing</c> and <c>billing</c> as separate producers, and an
+    /// event whose service is the EMPTY STRING. The scan road keys ordinally, so that is three
+    /// distinct groups plus the absent one. The aggregator keys case-insensitively and folds
+    /// the empty name into its "(unknown)" placeholder, so it would answer with fewer groups,
+    /// one of them labelled with whichever casing a parallel worker happened to merge first —
+    /// which its own contract admits can flap between refreshes. Counts on a volume chart do
+    /// not care; a table of counts by service does.</para>
+    ///
+    /// <para>So the assertion is the scan road's, and that the shortcut did not take the query:
+    /// if it ever does, the group count drops and this fails.</para>
     /// </summary>
     [Fact]
-    public async Task An_event_with_no_service_is_its_own_absent_group()
+    public async Task Grouping_by_service_keeps_the_scan_road_and_its_ordinal_groups()
     {
         Assert.True(AggregationParser.TryParse("select count(*) group by ['service.name']", out var q));
         var result = await _withHeader.ExecuteAsync(q!, From, To);
 
-        Assert.Equal(4, result.GroupsFound);
-        var absent = Assert.Single(result.Rows.Where(r => r.Key[0] is null));
-        Assert.Equal(100d, absent.Values[0]);                      // every fourth event of 400
-        Assert.DoesNotContain(result.Rows, r => r.Key[0] == "(unknown)");
+        // checkout, billing, Billing, "", gateway, and the absent one.
+        Assert.Equal(6, result.GroupsFound);
+
+        Assert.Equal(2, result.Rows.Count(r => string.Equals(r.Key[0], "billing", StringComparison.OrdinalIgnoreCase)));
+        Assert.Contains(result.Rows, r => r.Key[0] == "billing");
+        Assert.Contains(result.Rows, r => r.Key[0] == "Billing");
+        Assert.Contains(result.Rows, r => r.Key[0] == "");        // the empty name is its own group
+        Assert.Contains(result.Rows, r => r.Key[0] is null);      // …and is not the absent one
+
+        // The header road, had it been taken, would have merged three of those into two.
+        var viaScan = await _scanOnly.ExecuteAsync(q!, From, To);
+        Assert.Equal(viaScan.GroupsFound, result.GroupsFound);
+        for (int i = 0; i < viaScan.Rows.Count; i++)
+            Assert.Equal(viaScan.Rows[i].Key[0], result.Rows[i].Key[0]);
     }
 
     /// <summary>
@@ -152,7 +178,7 @@ public sealed class AggregationHeaderPathTests : IDisposable
     [Fact]
     public async Task The_header_road_is_complete_where_the_scan_road_would_be_partial()
     {
-        Assert.True(AggregationParser.TryParse("select count(*) group by ['service.name']", out var q));
+        Assert.True(AggregationParser.TryParse("select count(*) group by @l", out var q));
 
         var starved   = new AggregationExecutor(_query, scanBudget: 50);
         var viaScan   = await starved.ExecuteAsync(q!, From, To);

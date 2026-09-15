@@ -14,7 +14,7 @@ using Xunit.Abstractions;
 namespace Ameto.Perf;
 
 /// <summary>
-/// What <c>select count(*) group by ['service.name']</c> costs, on the two roads it can take.
+/// What a header-only <c>count(*)</c> costs, on the two roads it can take.
 ///
 /// <para>old — the ordered k-way merge: every event in the window decoded into a LogEvent, its
 /// properties copied, its exception rebuilt, then three columns read off it and thrown away;<br/>
@@ -54,7 +54,13 @@ public sealed class AggregationPathProbe
             var scanOnly = new AggregationExecutor(query);
             var withHdr  = new AggregationExecutor(query, headerScan: engine);
 
-            Assert.True(AggregationParser.TryParse("select count(*) group by ['service.name']", out var q));
+            // `group by @l` and not `group by ['service.name']`: the header aggregator keys
+            // services case-insensitively and folds empty/absent names together, so the service
+            // grouping is DECLINED for correctness and stays on the scan road (see
+            // AggregationHeaderPathTests). Levels are a closed set of canonical spellings, so
+            // that grouping is exact — and it meets the same per-event decode either way, which
+            // is what this probe weighs.
+            Assert.True(AggregationParser.TryParse("select count(*) group by @l", out var q));
             var from = Base.AddMinutes(-1);
             var to   = Base.AddDays(2);
 
@@ -72,7 +78,7 @@ public sealed class AggregationPathProbe
             var (scanMs, scanBytes) = Measure(3, () => scanOnly.ExecuteAsync(q!, from, to).GetAwaiter().GetResult());
             var (hdrMs,  hdrBytes)  = Measure(3, () => withHdr.ExecuteAsync(q!, from, to).GetAwaiter().GetResult());
 
-            _out.WriteLine($"{Events:N0} events, {a.Rows.Count} services, both tiers");
+            _out.WriteLine($"{Events:N0} events, {a.Rows.Count} levels, both tiers");
             _out.WriteLine($"ordered event scan : {scanMs,8:F1} ms | {scanBytes / (1024.0 * 1024.0),7:F1} MB allocated | {scanBytes / (double)Events,6:F0} B/event");
             _out.WriteLine($"parallel header scan: {hdrMs,8:F1} ms | {hdrBytes / (1024.0 * 1024.0),7:F1} MB allocated | {hdrBytes / (double)Events,6:F0} B/event");
             _out.WriteLine($"gain                : {scanMs / Math.Max(hdrMs, 0.001),4:F1}x faster, {scanBytes / (double)Math.Max(hdrBytes, 1),4:F0}x less allocated");

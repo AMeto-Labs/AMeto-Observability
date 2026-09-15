@@ -176,8 +176,13 @@ public sealed class AggregationExecutor(
 
     // ── The header-only shortcut ──────────────────────────────────────────────
 
-    /// <summary>What the header scan can be asked to group by.</summary>
-    private enum HeaderGrouping { None, Service, Level }
+    /// <summary>
+    /// What the header scan can be asked to group by.
+    ///
+    /// <para>There is no <c>Service</c> member, and its absence is a correctness decision, not
+    /// an omission — see <see cref="TryHeaderCountAsync"/>.</para>
+    /// </summary>
+    private enum HeaderGrouping { None, Level }
 
     /// <summary>
     /// Answers a <c>count(*)</c> whose grouping and where-clause live entirely in the event
@@ -191,21 +196,31 @@ public sealed class AggregationExecutor(
     /// a filter is expressible that way. This routes the aggregation down the same road.</para>
     ///
     /// <para>DELIBERATELY NARROW; anything unrecognised returns null and the ordinary scan runs.
-    /// Every aggregate must be <c>count(*)</c>, there must be at most one group key and it must
-    /// be <c>service.name</c> or <c>@l</c>, and the filter must reduce to a header-only shape
-    /// (which excludes any <c>@t</c> bound — those compile to a TimeCompareNode, which that
-    /// shape rejects). A level constraint combined with grouping BY SERVICE is also declined:
-    /// the aggregator keeps per-service totals and per-level totals, never the cross product,
-    /// so there is no honest way to narrow one by the other.</para>
+    /// Every aggregate must be <c>count(*)</c>, there may be at most one group key and it must
+    /// be <c>@l</c>, and the filter must reduce to a header-only shape (which excludes any
+    /// <c>@t</c> bound — those compile to a TimeCompareNode, which that shape rejects).</para>
     ///
-    /// <para>TWO DIFFERENCES FROM THE SCAN PATH, both deliberate and both in the direction of a
-    /// better answer. First, this path reads the WHOLE window rather than the newest
+    /// <para>GROUPING BY <c>service.name</c> IS DECLINED, although it is the shape that would
+    /// gain most, because the header aggregator cannot reproduce the scan's groups exactly and
+    /// an aggregation is read as a fact. It keys services case-INSENSITIVELY and a series keeps
+    /// whichever casing reached it first, which the aggregator's own contract admits can flap
+    /// between refreshes as parallel workers merge in completion order; the scan road keys
+    /// ordinally, so <c>Billing</c> and <c>billing</c> are two rows there and one
+    /// nondeterministically-labelled row here. It also cannot tell an event with no service
+    /// from one whose service is the empty string or literally <c>(unknown)</c> — all three
+    /// collapse together. None of that matters to a volume chart, which is what the aggregator
+    /// was built for; all of it matters to a table of counts by service. Grouping by
+    /// <c>@l</c> has neither problem: the levels are a closed set of canonical spellings.</para>
+    ///
+    /// <para>A service EQUALITY in the where-clause is fine and is passed through, because the
+    /// evaluator compares service names with <c>OrdinalIgnoreCase</c> too, and
+    /// <c>IsUsableServiceLiteral</c> has already refused the empty and <c>(unknown)</c>
+    /// literals before this is reached.</para>
+    ///
+    /// <para>ONE REMAINING DIFFERENCE FROM THE SCAN PATH, deliberate and in the direction of a
+    /// better answer: this path reads the WHOLE window rather than the newest
     /// <see cref="MaxScanned"/> events, so a window that the scan would have reported as
-    /// partial comes back complete — and it genuinely is. Second, the aggregator cannot tell an
-    /// event with no <c>service.name</c> from one whose service is literally named
-    /// <c>(unknown)</c>; both are reported as ABSENT, which is what <c>/api/events/counts</c>
-    /// has always done with them. A service actually called "(unknown)" is the one input on
-    /// which the two roads disagree.</para>
+    /// partial comes back complete — and it genuinely is.</para>
     /// </summary>
     private async Task<AggregationResult?> TryHeaderCountAsync(
         AggregationQuery query, DateTimeOffset? fromUtc, DateTimeOffset? toUtc, CancellationToken ct)
@@ -224,13 +239,8 @@ public sealed class AggregationExecutor(
         if (keys.Count == 1)
         {
             if (!BuiltinFields.TryResolve(keys[0].Property, out var field)) return null;
-            grouping = field switch
-            {
-                BuiltinField.ServiceName => HeaderGrouping.Service,
-                BuiltinField.Level       => HeaderGrouping.Level,
-                _                        => HeaderGrouping.None,
-            };
-            if (grouping == HeaderGrouping.None) return null;   // some other key: not a header question
+            if (field != BuiltinField.Level) return null;       // including service.name — see above
+            grouping = HeaderGrouping.Level;
         }
 
         HashSet<LogLevel>? levels;
@@ -241,8 +251,6 @@ public sealed class AggregationExecutor(
                 return null;
         }
         catch { return null; }     // a filter that will not compile is the scan path's error to report
-
-        if (levels is not null && grouping == HeaderGrouping.Service) return null;
 
         LogVolumeCounts counts;
         try
@@ -262,14 +270,6 @@ public sealed class AggregationExecutor(
         var rows = new List<AggregationRow>();
         switch (grouping)
         {
-            case HeaderGrouping.Service:
-                foreach (var s in counts.Services)
-                {
-                    if (s.Count == 0) continue;
-                    rows.Add(Row([s.Name == UnknownServiceName ? null : s.Name], s.Count, aggs.Count));
-                }
-                break;
-
             case HeaderGrouping.Level:
                 foreach (var l in counts.Levels)
                 {
@@ -320,13 +320,6 @@ public sealed class AggregationExecutor(
             return new AggregationRow { Key = key, Values = values };
         }
     }
-
-    /// <summary>
-    /// What <c>LogVolumeAggregator</c> calls an event with no service name. Spelled here rather
-    /// than referenced because it is a presentation choice of the counts endpoint, and this
-    /// path has to translate it back into the absence the aggregation reports.
-    /// </summary>
-    private const string UnknownServiceName = "(unknown)";
 
     /// <summary>
     /// The group's identity, built ONCE per event into reusable storage.
