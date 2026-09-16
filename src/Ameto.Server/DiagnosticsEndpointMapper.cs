@@ -137,6 +137,15 @@ public static class DiagnosticsEndpointMapper
                 indexCacheHits         = indexCache.HitCount,
                 indexCacheMisses       = indexCache.MissCount,
                 indexCacheIdleEvicted  = indexCache.IdleEvictedCount,
+                // The native share and its own ceiling, reported apart from the total because
+                // these bytes are NativeMemory: no collection reclaims them, they do not count
+                // against the GC's hard limit that indexCacheBudgetBytes is a share of, and on a
+                // small host they are the part of this cache that can push the process past its
+                // container limit. indexCacheShedEvicted counts entries dropped under RAM
+                // pressure — a non-zero value means the server has been giving this cache back.
+                indexCacheNativeBytes       = indexCache.NativeBytes,
+                indexCacheNativeBudgetBytes = indexCache.NativeBudgetBytes,
+                indexCacheShedEvicted       = indexCache.ShedEvictedCount,
 
                 // Storage
                 segmentCount         = segs.Count,

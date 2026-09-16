@@ -81,7 +81,8 @@ public sealed class ApiDocsTests
 
         foreach (string field in new[]
                  {
-                     "indexCacheBudgetBytes", "indexCacheIdleEvicted", "indexBuildPooledBytes",
+                     "indexCacheBudgetBytes", "indexCacheIdleEvicted", "indexCacheNativeBytes",
+                     "indexBuildPooledBytes",
                      "ingestBufferPooledBytes", "ingestArenaResidentBytes", "logsQuarantinedBytes",
                  })
             Assert.Contains(field, doc, StringComparison.Ordinal);

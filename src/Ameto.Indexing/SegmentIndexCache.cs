@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using Ameto.Core;
 
 namespace Ameto.Indexing;
 
@@ -30,28 +31,57 @@ namespace Ameto.Indexing;
 /// optional idle age (<see cref="IdleEvict"/>) drops entries nothing has read for that long;
 /// because the LRU is ordered by last touch, the sweep stops at the first entry that is still
 /// young and is therefore O(evicted), not O(entries).</para>
+///
+/// <para><b>Two budgets, because an entry lives in two places.</b> Decoded postings are managed;
+/// the bloom bits behind them are <c>NativeMemory</c>, 15.6-26.6 % of an entry by the repo's own
+/// <c>BloomSizingProbe</c>. One budget charged the whole thing against a share of the GC's hard
+/// limit, so the native part spent managed headroom on memory the GC never sees. The native share
+/// now has its own ceiling, taken of the PHYSICAL limit, and whichever is reached first evicts.
+/// Both figures are reported (<c>/api/diagnostics</c>) rather than merged into one.</para>
+///
+/// <para><b>Sheddable.</b> Neither budget helps when the pressure is elsewhere: the RAM-pressure
+/// loop flushes the hot tier, forces a collection and trims the working set, and none of that
+/// touches native bloom bits. As an <see cref="IMemoryShedder"/> the cache can be told to let go
+/// of everything — which it does on the same ownership rule as eviction, so a query holding a
+/// lease keeps its reader until it is done.</para>
 /// </summary>
-public sealed class SegmentIndexCache : IDisposable
+public sealed class SegmentIndexCache : IDisposable, IMemoryShedder
 {
     private readonly object                                   _lock = new();
     private readonly Dictionary<(string Path, int Group), Entry> _map  = new();
     private readonly LinkedList<Entry>                        _lru  = new(); // head = most recent
     private readonly long                                     _budgetBytes;
+    private readonly long                                     _nativeBudgetBytes; // 0 = no separate ceiling
     private readonly long                                     _idleTicks;   // 0 = no idle eviction
     private readonly Timer?                                   _sweepTimer;
     private          long                                     _totalBytes;
+    private          long                                     _nativeBytes;
     private          long                                     _hits, _misses;
     private          long                                     _idleEvicted;
+    private          long                                     _shedEvicted;
+    private          IDisposable?                             _shedRegistration;
 
-    public SegmentIndexCache(long budgetBytes) : this(budgetBytes, default) { }
+    public SegmentIndexCache(long budgetBytes) : this(budgetBytes, 0, default) { }
 
+    /// <inheritdoc cref="SegmentIndexCache(long, long, TimeSpan)"/>
+    public SegmentIndexCache(long budgetBytes, TimeSpan idleEvict) : this(budgetBytes, 0, idleEvict) { }
+
+    /// <param name="budgetBytes">
+    /// Total retained bytes the cache may hold — managed postings and native bloom bits together.
+    /// Zero or negative disables the cache.
+    /// </param>
+    /// <param name="nativeBudgetBytes">
+    /// Ceiling on the NATIVE part of that total (bloom bits). Zero or negative means no separate
+    /// ceiling, which is what the plain constructors give a caller that has only one number.
+    /// </param>
     /// <param name="idleEvict">
     /// Drop entries that nothing has acquired for this long. <see cref="TimeSpan.Zero"/> or
     /// less turns it off, which is the pre-existing behaviour (budget pressure only).
     /// </param>
-    public SegmentIndexCache(long budgetBytes, TimeSpan idleEvict)
+    public SegmentIndexCache(long budgetBytes, long nativeBudgetBytes, TimeSpan idleEvict)
     {
-        _budgetBytes = budgetBytes;
+        _budgetBytes       = budgetBytes;
+        _nativeBudgetBytes = nativeBudgetBytes;
         // Past MaxIdleEvict the age is "never": treated as off, which is what it means, and which
         // keeps the Stopwatch-tick conversion below inside a long on every platform.
         IdleEvict    = idleEvict > TimeSpan.Zero && idleEvict <= MaxIdleEvict ? idleEvict : TimeSpan.Zero;
@@ -104,12 +134,25 @@ public sealed class SegmentIndexCache : IDisposable
     public long TotalBytes { get { lock (_lock) return _totalBytes; } }
     public int  EntryCount { get { lock (_lock) return _map.Count; } }
 
+    /// <summary>
+    /// The part of <see cref="TotalBytes"/> held in <c>NativeMemory</c> (bloom bits) — bytes no
+    /// collection can reclaim and that do not count against the GC's hard limit.
+    /// </summary>
+    public long NativeBytes { get { lock (_lock) return _nativeBytes; } }
+
+    /// <summary>Ceiling on <see cref="NativeBytes"/>; 0 when there is no separate native ceiling.</summary>
+    public long NativeBudgetBytes => _nativeBudgetBytes;
+
+    /// <summary>Entries dropped by <see cref="Shed"/> (memory pressure) since start.</summary>
+    public long ShedEvictedCount => Interlocked.Read(ref _shedEvicted);
+
     internal sealed class Entry
     {
         public required (string Path, int Group) Key;
         public required SegmentIndexReader       Reader;
         public required bool                     HasTrigram;
         public required long                     Size;
+        public          long                     NativeSize;  // the part of Size that is NativeMemory
         public int  RefCount;                    // guarded by the cache lock
         public bool Doomed;                      // evicted/replaced — dispose at RefCount 0
         public long LastTouched;                 // Stopwatch timestamp of the last acquire
@@ -193,10 +236,14 @@ public sealed class SegmentIndexCache : IDisposable
                 {
                     Key = key, Reader = reader, HasTrigram = hasTrigram,
                     Size = sizeBytes, RefCount = 1, LastTouched = Stopwatch.GetTimestamp(),
+                    // Read off the reader rather than passed in: the caller charges one number,
+                    // and only the reader knows how much of it the GC cannot see.
+                    NativeSize = reader.ApproxNativeBytes,
                 };
-                e.Node       = _lru.AddFirst(e);
-                _map[key]    = e;
-                _totalBytes += sizeBytes;
+                e.Node        = _lru.AddFirst(e);
+                _map[key]     = e;
+                _totalBytes  += sizeBytes;
+                _nativeBytes += e.NativeSize;
                 EvictLocked(toDispose ??= []);
                 lease = new Lease(this, e);
             }
@@ -211,21 +258,31 @@ public sealed class SegmentIndexCache : IDisposable
     {
         _map.Remove(e.Key);
         if (e.Node is not null) { _lru.Remove(e.Node); e.Node = null; }
-        _totalBytes -= e.Size;
+        _totalBytes  -= e.Size;
+        _nativeBytes -= e.NativeSize;
         if (e.RefCount == 0) toDispose.Add(e.Reader);
         else e.Doomed = true;
     }
 
     /// <summary>
-    /// Evicts from the LRU tail down to budget. A leased tail entry is still unlisted —
-    /// its bytes stop counting and its last lease frees it — so one oversized group can
-    /// never wedge the budget.
+    /// Evicts from the LRU tail until BOTH budgets are met. A leased tail entry is still
+    /// unlisted — its bytes stop counting and its last lease frees it — so one oversized group
+    /// can never wedge either budget.
     /// </summary>
     private void EvictLocked(List<SegmentIndexReader> toDispose)
     {
-        while (_totalBytes > _budgetBytes && _lru.Last is { } tail)
+        while (OverBudgetLocked() && _lru.Last is { } tail)
             RemoveLocked(tail.Value, toDispose);
     }
+
+    /// <summary>
+    /// Over the total budget, or over the native one. The native ceiling can bite while the
+    /// total has room to spare: a cache of thin-event groups is a quarter bloom by weight, and
+    /// those bytes are the ones outside the GC's limit.
+    /// </summary>
+    private bool OverBudgetLocked() =>
+        _totalBytes > _budgetBytes ||
+        (_nativeBudgetBytes > 0 && _nativeBytes > _nativeBudgetBytes);
 
     /// <summary>
     /// Drops every entry nothing has acquired for <see cref="IdleEvict"/>, and returns how
@@ -257,6 +314,62 @@ public sealed class SegmentIndexCache : IDisposable
         return evicted;
     }
 
+    // ── IMemoryShedder ────────────────────────────────────────────────────────
+
+    /// <inheritdoc/>
+    public long ShedableBytes => TotalBytes;
+
+    /// <inheritdoc/>
+    public long ShedableNativeBytes => NativeBytes;
+
+    /// <summary>
+    /// Drops every entry and returns the retained bytes that releases.
+    ///
+    /// <para>Ownership is eviction's, not something stricter: an entry under lease is unlisted
+    /// and stops counting immediately, and its reader — including the native bloom bits — is
+    /// freed by the LAST lease to be released. A shed can therefore never pull memory out from
+    /// under a running query, which is what makes it safe to call from the pressure loop while
+    /// queries are in flight.</para>
+    ///
+    /// <para>The cost is latency, never correctness: the next query re-reads and re-decodes the
+    /// sections it needs. That is the right trade when the alternative is the OOM killer, and it
+    /// is why nothing sheds on a schedule — only under real pressure.</para>
+    /// </summary>
+    public long Shed()
+    {
+        List<SegmentIndexReader>? toDispose = null;
+        long released = 0;
+        int  dropped  = 0;
+        lock (_lock)
+        {
+            while (_lru.Last is { } tail)
+            {
+                released += tail.Value.Size;
+                RemoveLocked(tail.Value, toDispose ??= []);
+                dropped++;
+            }
+        }
+        if (toDispose is not null)
+            foreach (var r in toDispose) r.Dispose();
+        if (dropped > 0) Interlocked.Add(ref _shedEvicted, dropped);
+        return released;
+    }
+
+    /// <summary>
+    /// Registers this cache with <see cref="MemoryShedRegistry"/> so the RAM-pressure loop can
+    /// shed it, and returns it for chaining from a DI factory. Idempotent; undone by
+    /// <see cref="Dispose"/>.
+    ///
+    /// <para>Explicit rather than automatic in the constructor, because registration is a
+    /// process-wide effect and a cache built by a test — or by a second host inside one process
+    /// — has no business being shed when something else reports pressure.</para>
+    /// </summary>
+    public SegmentIndexCache RegisterForMemoryPressure()
+    {
+        lock (_lock) _shedRegistration ??= MemoryShedRegistry.Register(this);
+        return this;
+    }
+
     private void Release(Entry e)
     {
         SegmentIndexReader? dispose = null;
@@ -269,9 +382,19 @@ public sealed class SegmentIndexCache : IDisposable
     }
 
     /// <summary>
-    /// Stops the sweep timer. Cached readers are NOT disposed here: a lease may still be
-    /// open on one, and the process is going away anyway — the same reasoning that lets an
-    /// unreferenced entry sit in the LRU until something evicts it.
+    /// Stops the sweep timer and gives up the shed registration. Cached readers are NOT disposed
+    /// here: a lease may still be open on one, and the process is going away anyway — the same
+    /// reasoning that lets an unreferenced entry sit in the LRU until something evicts it.
+    ///
+    /// <para>The registration must go even though the registry holds it weakly: a host disposed
+    /// inside a still-running process (every integration test) would otherwise leave a cache to
+    /// be shed on behalf of a server that no longer exists.</para>
     /// </summary>
-    public void Dispose() => _sweepTimer?.Dispose();
+    public void Dispose()
+    {
+        IDisposable? registration;
+        lock (_lock) { registration = _shedRegistration; _shedRegistration = null; }
+        registration?.Dispose();
+        _sweepTimer?.Dispose();
+    }
 }

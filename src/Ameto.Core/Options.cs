@@ -210,6 +210,20 @@ public sealed class QueryOptions
     public long EffectiveIndexCacheBytes => IndexCacheBytes ?? MemoryBudgets.Current().IndexCacheBytes;
 
     /// <summary>
+    /// Ceiling on the NATIVE part of the cache — the segment bloom filters' bits, which are
+    /// <c>NativeMemory</c> and so sit outside the GC's hard limit that
+    /// <see cref="EffectiveIndexCacheBytes"/> is a share of. Whichever ceiling is reached first
+    /// evicts from the LRU tail.
+    ///
+    /// <para>Not settable, and deliberately not scaled by an explicit
+    /// <see cref="IndexCacheBytes"/>: it is a backstop on where the bytes LIVE, not a tuning
+    /// knob on how much the cache may hold. An operator who raises the total budget is asking
+    /// for more decoded postings, which are managed; nothing about that says the process may
+    /// also hold more memory the GC cannot see. See <see cref="MemoryBudgets"/>.</para>
+    /// </summary>
+    public long EffectiveIndexCacheNativeBytes => MemoryBudgets.Current().IndexCacheNativeBytes;
+
+    /// <summary>
     /// Drop cached segment indexes that no query has read for this long. Without it the only
     /// thing that ever removes an entry is budget pressure, so a server that answers one wide
     /// query and then goes quiet keeps those postings and native bloom bits resident for the

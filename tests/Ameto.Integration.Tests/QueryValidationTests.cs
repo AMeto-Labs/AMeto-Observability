@@ -220,6 +220,11 @@ public sealed class QueryValidationTests : IClassFixture<AmetoWebAppFactory>
                      // a refactor could drop any of them and leave the whole suite green.
                      "indexCacheEntries", "indexCacheBytes", "indexCacheBudgetBytes",
                      "indexCacheHits", "indexCacheMisses", "indexCacheIdleEvicted",
+                     // The native share of that cache, its own ceiling, and what pressure has
+                     // dropped: bloom bits are NativeMemory, so they are invisible to every GC
+                     // figure beside them and are the part that can push a small host past its
+                     // container limit.
+                     "indexCacheNativeBytes", "indexCacheNativeBudgetBytes", "indexCacheShedEvicted",
                      // Inside logsStorageBytes, and the one part of it retention will never free.
                      "logsQuarantinedBytes",
                  })

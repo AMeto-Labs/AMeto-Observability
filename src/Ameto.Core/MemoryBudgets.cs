@@ -53,6 +53,18 @@ public readonly struct MemoryBudgets
     public const long IndexCacheCapBytes = 256L * 1024 * 1024;
 
     /// <summary>
+    /// The NATIVE part of that cache — the segment bloom filters' bits, which are
+    /// <c>NativeMemory</c> and therefore sit outside the GC's hard limit entirely.
+    ///
+    /// <para>A backstop, not a working budget: it is sized so that nothing realistic reaches it,
+    /// and so that a pathological mix cannot push native bytes past the limit the rest of the
+    /// engine is sized against. Measured by the repo's own <c>BloomSizingProbe</c>, bloom is
+    /// 15.6 % of a prop-dense group's three index sections and 26.6 % of a thin one's; at the
+    /// worst of those, a full 256 MB cache holds ~68 MB of bloom, under this ceiling.</para>
+    /// </summary>
+    public const long IndexCacheNativeCapBytes = 96L * 1024 * 1024;
+
+    /// <summary>
     /// Request bodies parked in <c>IngestBufferPool</c> between requests.
     ///
     /// <para>This one has no "what it was before": the pool sized itself from
@@ -92,6 +104,18 @@ public readonly struct MemoryBudgets
     public const double IndexCacheFraction = 0.15;
 
     /// <summary>
+    /// Share of the PHYSICAL limit the segment-index cache's NATIVE bloom bits may hold.
+    ///
+    /// <para>Of the physical limit, like the frozen tiers and the ingest arena, because that is
+    /// where these bytes actually live: <see cref="IndexCacheFraction"/> is a share of the GC's
+    /// hard limit, and charging native allocations against it let the cache spend managed
+    /// headroom on memory the GC never sees — on a 512 MB stand, in the one component the RAM
+    /// pressure path could not reclaim. Five percent is 25.6 MB in that container, comfortably
+    /// above the ~15 MB the worst measured bloom share of a 57 MB cache would ask for there.</para>
+    /// </summary>
+    public const double IndexCacheNativeFraction = 0.05;
+
+    /// <summary>
     /// Share of the MANAGED-HEAP limit the ingest body-buffer pool may park. Request bodies are
     /// managed <c>byte[]</c> on the large object heap, so this is a share of the GC's limit like
     /// the two above. It bounds what is PARKED, never what is live: a body larger than the pool
@@ -123,23 +147,25 @@ public readonly struct MemoryBudgets
 
     // ── Floors, so a pathologically small limit still yields a working engine ──
 
-    private const long MinBuildBytes        = 16L * 1024 * 1024;
-    private const long MinNativeBytes       = 16L * 1024 * 1024;
-    private const long MinIndexCacheBytes   =  8L * 1024 * 1024;
-    private const long MinIngestBufferBytes =  8L * 1024 * 1024;
-    private const long MinIngestArenaBytes  = 16L * 1024 * 1024;   // ~256 slabs at the 64 KB default
+    private const long MinBuildBytes            = 16L * 1024 * 1024;
+    private const long MinNativeBytes           = 16L * 1024 * 1024;
+    private const long MinIndexCacheBytes       =  8L * 1024 * 1024;
+    private const long MinIndexCacheNativeBytes =  4L * 1024 * 1024;
+    private const long MinIngestBufferBytes     =  8L * 1024 * 1024;
+    private const long MinIngestArenaBytes      = 16L * 1024 * 1024;   // ~256 slabs at the 64 KB default
 
     private MemoryBudgets(
         long managedLimit, long physicalLimit, long managed, long native, long indexCache,
-        long ingestBuffers, long ingestArena)
+        long indexCacheNative, long ingestBuffers, long ingestArena)
     {
-        ManagedLimitBytes  = managedLimit;
-        PhysicalLimitBytes = physicalLimit;
-        ManagedBuildBytes  = managed;
-        NativeTierBytes    = native;
-        IndexCacheBytes    = indexCache;
-        IngestBufferBytes  = ingestBuffers;
-        IngestArenaBytes   = ingestArena;
+        ManagedLimitBytes     = managedLimit;
+        PhysicalLimitBytes    = physicalLimit;
+        ManagedBuildBytes     = managed;
+        NativeTierBytes       = native;
+        IndexCacheBytes       = indexCache;
+        IndexCacheNativeBytes = indexCacheNative;
+        IngestBufferBytes     = ingestBuffers;
+        IngestArenaBytes      = ingestArena;
     }
 
     /// <summary>
@@ -162,6 +188,12 @@ public readonly struct MemoryBudgets
 
     /// <summary>Default budget for the cross-query segment-index cache.</summary>
     public long IndexCacheBytes { get; }
+
+    /// <summary>
+    /// Ceiling on the NATIVE part of that cache (bloom bits), taken of the physical limit
+    /// because that is where those bytes live. See <see cref="IndexCacheNativeFraction"/>.
+    /// </summary>
+    public long IndexCacheNativeBytes { get; }
 
     /// <summary>Ceiling on request bodies parked in the ingest buffer pool between requests.</summary>
     public long IngestBufferBytes { get; }
@@ -199,6 +231,7 @@ public readonly struct MemoryBudgets
             Share(managedBase,  ManagedBuildFraction, ManagedBuildCapBytes, MinBuildBytes),
             Share(physicalBase, NativeTierFraction,   NativeTierCapBytes,   MinNativeBytes),
             Share(managedBase,  IndexCacheFraction,   IndexCacheCapBytes,   MinIndexCacheBytes),
+            Share(physicalBase, IndexCacheNativeFraction, IndexCacheNativeCapBytes, MinIndexCacheNativeBytes),
             Share(managedBase,  IngestBufferFraction, IngestBufferCapBytes, MinIngestBufferBytes),
             Share(physicalBase, IngestArenaFraction,  IngestArenaCapBytes,  MinIngestArenaBytes));
 
