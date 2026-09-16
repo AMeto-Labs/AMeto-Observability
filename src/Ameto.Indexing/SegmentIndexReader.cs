@@ -41,9 +41,11 @@ public sealed class SegmentIndexReader : ISegmentIndex, IDisposable
     /// <para>Reported apart from the total because the two are bounded by different limits and
     /// reclaimed by different means. No collection frees these bytes, and they do not count
     /// against the GC's hard limit — which is what made charging them silently against a
-    /// managed-heap-derived cache budget wrong. Measured by <c>BloomSizingProbe</c> at 15.6 % of
-    /// a prop-dense group's three index sections and 26.6 % of a thin one's, so this is a real
-    /// share of an entry, not a rounding error.</para>
+    /// managed-heap-derived cache budget wrong. Measured by <c>BloomSizingProbe</c> at 4.1 % of a
+    /// prop-dense group's retained entry and 8.3 % of a thin one's: a real share, not a rounding
+    /// error — and not the 15.6-26.6 % those same shapes' packed SECTIONS give, because
+    /// <see cref="ApproxRetainedBytes"/> expands the inverted and trigram halves 3-4x and leaves
+    /// these bits exactly as they were on disk.</para>
     /// </summary>
     public long ApproxNativeBytes { get; }
 

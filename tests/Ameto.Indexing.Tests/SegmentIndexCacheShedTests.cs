@@ -8,7 +8,7 @@ namespace Ameto.Indexing.Tests;
 /// The native half of a cached index, and giving it back.
 ///
 /// <para>An entry is not one kind of memory. Its postings are managed; its bloom bits are
-/// <c>NativeMemory</c> — 15.6-26.6 % of an entry by the repo's own <c>BloomSizingProbe</c>. The
+/// <c>NativeMemory</c> — 4-8 % of an entry by the repo's own <c>BloomSizingProbe</c>. The
 /// cache charged the sum against one budget derived from the GC's HARD LIMIT, so the native part
 /// spent managed headroom on bytes the GC never sees; and nothing in the RAM-pressure path could
 /// drop the cache, because it lives in an assembly <c>RamPressureService</c> cannot reference and

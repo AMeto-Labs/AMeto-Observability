@@ -58,9 +58,16 @@ public readonly struct MemoryBudgets
     ///
     /// <para>A backstop, not a working budget: it is sized so that nothing realistic reaches it,
     /// and so that a pathological mix cannot push native bytes past the limit the rest of the
-    /// engine is sized against. Measured by the repo's own <c>BloomSizingProbe</c>, bloom is
-    /// 15.6 % of a prop-dense group's three index sections and 26.6 % of a thin one's; at the
-    /// worst of those, a full 256 MB cache holds ~68 MB of bloom, under this ceiling.</para>
+    /// engine is sized against.</para>
+    ///
+    /// <para>The figure that sizes it is bloom's share of a cache ENTRY, which is not its share of
+    /// the packed sections: the cache charges <c>ApproxRetainedBytes</c>, in which the inverted and
+    /// trigram halves are decoded structures 3-4x their sections while these bits are the same
+    /// bytes decoded as on disk. Measured by the repo's own <c>BloomSizingProbe</c>, bloom is 4.1 %
+    /// of a prop-dense group's entry and 8.3 % of a thin one's — their 15.6 % and 26.6 % of
+    /// SECTIONS is the query prefilter's phase-split figure and belongs to that argument alone. At
+    /// the worst of those, a full 256 MB cache holds ~21 MB of bloom, so this ceiling first binds
+    /// at a configured cache of roughly 1.2 GB.</para>
     /// </summary>
     public const long IndexCacheNativeCapBytes = 96L * 1024 * 1024;
 
@@ -110,8 +117,9 @@ public readonly struct MemoryBudgets
     /// where these bytes actually live: <see cref="IndexCacheFraction"/> is a share of the GC's
     /// hard limit, and charging native allocations against it let the cache spend managed
     /// headroom on memory the GC never sees — on a 512 MB stand, in the one component the RAM
-    /// pressure path could not reclaim. Five percent is 25.6 MB in that container, comfortably
-    /// above the ~15 MB the worst measured bloom share of a 57 MB cache would ask for there.</para>
+    /// pressure path could not reclaim. Five percent is 25.6 MB in that container, where the worst
+    /// measured bloom share of an entry (8.3 %) puts a full 57 MB cache at ~4.7 MB of native bits:
+    /// room to spare, which is what a backstop is for.</para>
     /// </summary>
     public const double IndexCacheNativeFraction = 0.05;
 

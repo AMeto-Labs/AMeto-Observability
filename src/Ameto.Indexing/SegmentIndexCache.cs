@@ -33,8 +33,10 @@ namespace Ameto.Indexing;
 /// young and is therefore O(evicted), not O(entries).</para>
 ///
 /// <para><b>Two budgets, because an entry lives in two places.</b> Decoded postings are managed;
-/// the bloom bits behind them are <c>NativeMemory</c>, 15.6-26.6 % of an entry by the repo's own
-/// <c>BloomSizingProbe</c>. One budget charged the whole thing against a share of the GC's hard
+/// the bloom bits behind them are <c>NativeMemory</c> — 4.1 % of a prop-dense entry and 8.3 % of a
+/// thin one by the repo's own <c>BloomSizingProbe</c>. (Their share of the PACKED sections is
+/// 15.6-26.6 %, a larger and different number: decoding expands the managed half 3-4x and leaves
+/// these bits alone.) One budget charged the whole thing against a share of the GC's hard
 /// limit, so the native part spent managed headroom on memory the GC never sees. The native share
 /// now has its own ceiling, taken of the PHYSICAL limit, and whichever is reached first evicts.
 /// Both figures are reported (<c>/api/diagnostics</c>) rather than merged into one.</para>
