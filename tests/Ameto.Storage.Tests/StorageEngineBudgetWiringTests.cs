@@ -60,13 +60,44 @@ public sealed class StorageEngineBudgetWiringTests : IDisposable
         Assert.True(engine.FlushWidth <= 2, $"width {engine.FlushWidth} exceeds what 115 MB of builds affords");
     }
 
-    /// <summary>A host with room keeps the ceilings it always had: 512 MB / 18 MB = 28 slots, 640 MB / 43.75 MB = 14.</summary>
+    /// <summary>
+    /// A host with room keeps the native ceiling it always had — 512 MB / 18 MB = 28 slots — and
+    /// prices the width on the HEAVIER of the two builds the same semaphore admits. With a 16 MB
+    /// tier a flush build is 43.75 MB, but a MERGE build of a full 64 MB group is ~96 MB, so the
+    /// width that bounds concurrent builds is 640 / 96 = 6 rather than the 640 / 43.75 = 14 the
+    /// tier alone suggested. That is the correction: the old figure let eight concurrent builds
+    /// of ~96 MB be admitted against a 640 MB budget.
+    /// </summary>
     [Fact]
-    public async Task On_a_64_gb_host_the_same_tier_keeps_the_fixed_ceilings()
+    public async Task On_a_64_gb_host_the_width_is_priced_on_the_heavier_build()
     {
         await using var engine = NewEngine(MemoryBudgets.Derive(64 * GB));
 
         Assert.Equal(28, engine.FlushSlots);
-        Assert.Equal(WidthFor(widthByMemory: 14), engine.FlushWidth);
+        Assert.Equal(WidthFor(widthByMemory: 6), engine.FlushWidth);
+    }
+
+    /// <summary>
+    /// THE ASYMMETRY. Compaction takes the same _flushConcurrency slot as an ingest flush — the
+    /// comment there says so, and says it is what makes the logged ceiling the enforced one — but
+    /// a merge's index build is sized by the GROUP PAYLOAD BUDGET, not by the tier: its source
+    /// hint is every source segment's event count, so the tier-shaped forecast never clamps it.
+    /// At the 64 MB default that is four times the stand's whole 16 MB tier, and the round's own
+    /// probe measures the difference at 30 MB held for 16 MB groups against 90 MB for 64 MB ones.
+    /// So on a constrained host the group budget follows the managed build budget, and a host
+    /// with room merges in exactly the groups it always did.
+    /// </summary>
+    [Fact]
+    public async Task A_constrained_host_merges_in_smaller_groups_than_the_default()
+    {
+        var budgets = MemoryBudgets.Derive(managedLimitBytes: 384 * MB, physicalLimitBytes: 512 * MB);
+        await using var stand = NewEngine(budgets);
+
+        Assert.Equal(budgets.ManagedBuildBytes / 4, stand._groupPayloadBudgetBytes);
+        Assert.True(stand._groupPayloadBudgetBytes < SegmentWriter.DefaultGroupPayloadBudgetBytes,
+            $"a 512 MB container still merges in {stand._groupPayloadBudgetBytes / MB} MB groups");
+
+        await using var big = NewEngine(MemoryBudgets.Derive(64 * GB));
+        Assert.Equal(SegmentWriter.DefaultGroupPayloadBudgetBytes, big._groupPayloadBudgetBytes);
     }
 }

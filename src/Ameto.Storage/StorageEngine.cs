@@ -195,6 +195,29 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     private const long IndexBuildBytesPerEvent = 1_400;
 
     /// <summary>
+    /// Managed index-build state ONE MERGE holds per byte of its group payload budget.
+    ///
+    /// <para>A merge takes the same flush slot as an ingest flush (see <c>MergeToColdAsync</c>)
+    /// but is not sized by the tier: its writer forecasts a group from the GROUP PAYLOAD BUDGET,
+    /// and its source hint is every source segment's event count, so the tier-shaped figure above
+    /// does not bound it. MEASURED (<c>tests/Ameto.Perf/IndexBuildPoolProbe</c>, prop-dense
+    /// trace-carrying events): 30 MB held for 16 MB groups and 90 MB for 64 MB ones — about
+    /// 1.5 bytes of build state per byte of group payload.</para>
+    /// </summary>
+    private const double MergeBuildBytesPerGroupByte = 1.5;
+
+    /// <summary>
+    /// Share of the managed build budget one merge's GROUP may be worth — a quarter, so that at
+    /// the ratio above a merge build costs about a third of the budget and stays inside the slot
+    /// the admission arithmetic priced. The default 64 MB group is the ceiling, so a host with
+    /// room merges exactly as it always did.
+    /// </summary>
+    private const int MergeGroupBudgetDivisor = 4;
+
+    /// <summary>Floor on the group payload budget: below this a group stops being worth its index sections.</summary>
+    private const long MinGroupPayloadBudgetBytes = 8L * 1024 * 1024;
+
+    /// <summary>
     /// Ceilings on managed index-build state and on native frozen-tier memory, derived once at
     /// construction from what this process may actually use — see <see cref="MemoryBudgets"/>.
     ///
@@ -426,7 +449,21 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         int  eventCapacity  = HotTierSegment.EventCapacityFor(Math.Max(1, _options.HotTier.MaxSizeBytes));
         long perFlushManaged = Math.Max(1L, (long)eventCapacity * IndexBuildBytesPerEvent);
 
-        int widthByMemory = (int)Math.Clamp(_budgets.ManagedBuildBytes / perFlushManaged, 1, 64);
+        // The OTHER workload this semaphore admits. A merge runs the same index build through the
+        // same slot, but its size comes from the group payload budget rather than from the tier:
+        // at the 64 MB default that is a heavier build than the stand's whole 16 MB tier, so the
+        // width — which exists to bound concurrent builds — was computed for the lighter of the
+        // two, and the ceiling logged below was not the ceiling enforced. Both halves are fixed
+        // here: the group budget is scaled by what the managed budget affords, and the width is
+        // taken from the HEAVIER build.
+        _groupPayloadBudgetBytes = Math.Clamp(
+            _budgets.ManagedBuildBytes / MergeGroupBudgetDivisor,
+            MinGroupPayloadBudgetBytes,
+            SegmentWriter.DefaultGroupPayloadBudgetBytes);
+        long perMergeManaged = Math.Max(1L, (long)(_groupPayloadBudgetBytes * MergeBuildBytesPerGroupByte));
+        long perBuildManaged = Math.Max(perFlushManaged, perMergeManaged);
+
+        int widthByMemory = (int)Math.Clamp(_budgets.ManagedBuildBytes / perBuildManaged, 1, 64);
         int flushWidth = _options.HotTier.FlushConcurrency > 0
             ? Math.Min(_options.HotTier.FlushConcurrency, 64)
             : Math.Clamp(Math.Min(Environment.ProcessorCount / 2, widthByMemory), 1, 8);
@@ -444,15 +481,17 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         // Report the ceilings these settings actually produce, not just the inputs — an
         // explicit HotTier.FlushConcurrency override raises them, and that should be
         // visible in the journal rather than inferred.
-        long managedCeiling = (long)flushWidth * perFlushManaged;
+        long managedCeiling = (long)flushWidth * perBuildManaged;
         long nativeCeiling  = (long)flushSlots * tierFootprint;
 
         _logger.LogInformation(
-            "Flush budgets: width={Width} (×{PerFlush} MB managed = {ManagedCeiling} MB), " +
+            "Flush budgets: width={Width} (×{PerBuild} MB managed = {ManagedCeiling} MB; " +
+            "a flush holds {PerFlush} MB, a merge {PerMerge} MB in {GroupBudget} MB groups), " +
             "slots={Slots} (×{Tier} MB native = {NativeCeiling} MB), tier={Events} events / {Payload} MB payload; " +
             "derived from a {ManagedLimit} MB managed-heap limit and {PhysicalLimit} MB physical: " +
             "managed≤{ManagedBudget} MB, native≤{NativeBudget} MB, index cache≤{CacheBudget} MB ({Source})",
-            flushWidth, perFlushManaged / 1048576, managedCeiling / 1048576,
+            flushWidth, perBuildManaged / 1048576, managedCeiling / 1048576,
+            perFlushManaged / 1048576, perMergeManaged / 1048576, _groupPayloadBudgetBytes / 1048576,
             flushSlots, tierFootprint / 1048576, nativeCeiling / 1048576,
             eventCapacity, _options.HotTier.MaxSizeBytes / 1048576,
             _budgets.ManagedLimitBytes / 1048576,
@@ -467,13 +506,13 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         // the engine quietly runs above the ceiling rather than refusing to start. The
         // budget is a target, not a guarantee — say so instead of letting the line above
         // read like one.
-        if (perFlushManaged > _budgets.ManagedBuildBytes || tierFootprint > _budgets.NativeTierBytes)
+        if (perBuildManaged > _budgets.ManagedBuildBytes || tierFootprint > _budgets.NativeTierBytes)
             _logger.LogWarning(
-                "A single flush of a {Payload} MB tier ({PerFlush} MB managed + {Tier} MB native) does not fit " +
+                "A single build of a {Payload} MB tier ({PerFlush} MB managed + {Tier} MB native) does not fit " +
                 "the flush budget ({ManagedBudget} MB managed / {NativeBudget} MB native). One flush must always " +
                 "be allowed to run, so these budgets cannot be honoured at this tier size — peak RAM will exceed " +
                 "them. Lower HotTier.MaxSizeBytes to bring the peak down.",
-                _options.HotTier.MaxSizeBytes / 1048576, perFlushManaged / 1048576, tierFootprint / 1048576,
+                _options.HotTier.MaxSizeBytes / 1048576, perBuildManaged / 1048576, tierFootprint / 1048576,
                 _budgets.ManagedBuildBytes / 1048576, _budgets.NativeTierBytes / 1048576);
         _idGen    = new EventIdGenerator(_options.NodeId);
         _dataDir  = _options.DataDirectory;
