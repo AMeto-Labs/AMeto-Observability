@@ -149,8 +149,21 @@ Ingest a batch of log events.
 { "ingested": 42, "dropped": 0 }
 ```
 
-**Response `413 Payload Too Large`:** body > 4 MB.  
-**Response `400 Bad Request`:** invalid MessagePack.
+**Response `413 Payload Too Large`:** body > 4 MB.
+
+**Response `400 Bad Request`** — two shapes, and they must not be treated alike:
+
+```json
+{ "ingested": 742, "dropped": 0, "failedAtElement": 742 }
+```
+
+The body stopped being a CLEF array at element `failedAtElement`. **The events before it are already ingested and stay so.** The server has no de-duplication, so resending the whole batch stores that prefix a second time — and again on every retry. Retry from element `failedAtElement` onward, or drop the batch.
+
+```json
+{ "ingested": 0, "dropped": 0 }
+```
+
+Nothing landed — the body was not a MessagePack array at all, or it ended short of its `Content-Length`, which is refused whole for exactly this reason. Safe to retry entire. Note that `failedAtElement` is **absent** here: a failure at the array header is deliberately distinguishable from a failure inside element 0, which reports `"failedAtElement": 0`.
 
 ### `POST /v1/logs`, `POST /v1/traces`, `POST /v1/metrics`
 
@@ -164,6 +177,8 @@ to its configured endpoint. The older `/otlp/v1/…` spellings still work and ar
 
 **Response `200 OK`:** `{ "ingested": N, "dropped": M }`.  
 `resource.attributes["service.name"]` becomes the event's service; `traceId` / `spanId` are indexed for log↔trace correlation.
+
+**Response `400 Bad Request`:** the payload could not be decoded — malformed protobuf or JSON, or an attribute value nested deeper than 64 levels. The response body is **empty**: there are no counts on this road. As with `/api/events`, **records decoded before the bad byte may already be ingested** — both parsers write into the ring as they walk — so treat a 400 as "some prefix may have landed", not as a no-op. Logs sent as kvlist or array attribute values are encoded rather than dropped (they used to be silently lost on the protobuf road only).
 
 ### OTLP over gRPC
 
