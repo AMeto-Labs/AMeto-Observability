@@ -97,9 +97,63 @@ public sealed class IndexBuildPoolTests
         var held = new int[4][];
         for (int i = 0; i < held.Length; i++) held[i] = IndexBuildPool.Ints.Rent(len);
         for (int i = 0; i < held.Length; i++) IndexBuildPool.Ints.Return(held[i]);
-        Assert.Equal(48L << 20, IndexBuildPool.Ints.MaxPooledBytes);
+        Assert.Equal(IndexBuildPool.CapsFor(MemoryBudgets.Current().ManagedBuildBytes).Ints,
+                     IndexBuildPool.Ints.MaxPooledBytes);
         Assert.Equal(3L * len * sizeof(int), IndexBuildPool.Ints.PooledBytes);
         IndexBuildPool.TrimAll();
+    }
+
+    // ── What every pool may park, against what the heap allows ───────────────
+
+    /// <summary>
+    /// THE SUM NOBODY CHECKED. MemoryBudgetTests asserts that the managed ceilings leave the heap
+    /// room for queries, ASP.NET and the GC — and these pools sat entirely outside those very
+    /// assertions, at three flat constants totalling 400 MB against the 384 MB managed hard limit
+    /// of the 512 MB container they were shipped to. Caps above the limit can never bind: the
+    /// OutOfMemoryException arrives first, and "bounded three ways" reduces to the gen2 trim.
+    /// </summary>
+    [Fact]
+    public void AtA512MbContainersBudgets_EveryManagedCeilingFitsTheHeapLimit()
+    {
+        const long MB = 1024 * 1024;
+        var b = MemoryBudgets.Derive(managedLimitBytes: 384 * MB, physicalLimitBytes: 512 * MB);
+
+        long pools = IndexBuildPool.TotalCapBytes(b.ManagedBuildBytes);
+        long total = b.ManagedBuildBytes + b.IndexCacheBytes + b.IngestBufferBytes + pools;
+
+        Assert.True(total <= b.ManagedLimitBytes,
+            $"{total / MB} MB of managed ceilings against a {b.ManagedLimitBytes / MB} MB heap limit "
+          + $"— build {b.ManagedBuildBytes / MB}, cache {b.IndexCacheBytes / MB}, "
+          + $"ingest {b.IngestBufferBytes / MB}, pools {pools / MB}");
+    }
+
+    /// <summary>A host with room keeps exactly the constants these shares replace.</summary>
+    [Fact]
+    public void OnAHostWithRoom_ThePoolCapsAreTheConstantsTheyAlwaysWere()
+    {
+        var caps = IndexBuildPool.CapsFor(MemoryBudgets.ManagedBuildCapBytes);
+
+        Assert.Equal(64L << 20, caps.Slabs);
+        Assert.Equal(48L << 20, caps.Ints);
+        Assert.Equal(96L << 20, caps.Entries);
+        Assert.Equal(400L << 20, IndexBuildPool.TotalCapBytes(MemoryBudgets.ManagedBuildCapBytes));
+    }
+
+    /// <summary>A constrained host gets caps it can honour, and the live pools use them.</summary>
+    [Fact]
+    public void OnAConstrainedHost_TheCapsShrinkWithTheBuildBudget()
+    {
+        const long MB = 1024 * 1024;
+        var stand = IndexBuildPool.CapsFor(MemoryBudgets.Derive(384 * MB, 512 * MB).ManagedBuildBytes);
+
+        Assert.True(stand.Slabs   < 64L << 20);
+        Assert.True(stand.Ints    < 48L << 20);
+        Assert.True(stand.Entries < 96L << 20);
+
+        var live = IndexBuildPool.CapsFor(MemoryBudgets.Current().ManagedBuildBytes);
+        Assert.Equal(live.Slabs,   IndexBuildPool.Slabs.MaxPooledBytes);
+        Assert.Equal(live.Ints,    IndexBuildPool.Ints.MaxPooledBytes);
+        Assert.Equal(live.Entries, IndexBuildPool.Entries<long>().MaxPooledBytes);
     }
 
     [Fact]

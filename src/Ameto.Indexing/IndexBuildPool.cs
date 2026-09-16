@@ -19,9 +19,10 @@ namespace Ameto.Indexing;
 /// the life of the process, invisible to GC pressure, on a stand whose whole budget is 512 MB.
 /// So each pool is bounded three ways:</para>
 /// <list type="bullet">
-///   <item>a BYTE CAP per pool (<see cref="SlabPool{T}.MaxPooledBytes"/>) and a depth per size
-///   bucket: a return that would exceed either is dropped — the array becomes ordinary
-///   garbage;</item>
+///   <item>a BYTE CAP per pool (<see cref="SlabPool{T}.MaxPooledBytes"/>), derived from
+///   <see cref="MemoryBudgets.ManagedBuildBytes"/> so it is a share of what this process may
+///   actually hold rather than a constant chosen for a big host, and a depth per size bucket:
+///   a return that would exceed either is dropped — the array becomes ordinary garbage;</item>
 ///   <item>a HIGH-WATER TRIM at the end of every gen2 collection: each size bucket keeps at
 ///   most as many arrays as were simultaneously OUT of it since the previous gen2, and drops
 ///   the rest. A size nothing rented is emptied; the slab bucket a giant group filled to
@@ -40,10 +41,58 @@ namespace Ameto.Indexing;
 /// </summary>
 internal static class IndexBuildPool
 {
+    // ── What these pools may PARK, as a share of what the flushes may HOLD ────
+    //
+    // The caps were three flat constants: 64 MB of slabs, 48 MB of tables and 96 MB of entry
+    // arrays PER STRUCT TYPE, of which production builds three — 400 MB, all managed. In a
+    // 512 MB container the runtime's own managed hard limit is 384 MB, so on the deployment the
+    // caps were written for they could never bind: an OutOfMemoryException from the heap limit
+    // arrives before any of them is reached, and the only thing left bounding the pools is the
+    // gen2 high-water trim. The resting level is not hypothetical — MEASURED
+    // (IndexBuildPoolProbe, the 64 MB groups a merge builds whatever the tier size): 136 MB
+    // parked after two of them and 91 MB still parked after a trim, a quarter of that heap
+    // limit, counted in no budget.
+    //
+    // So each cap is now min(the old constant, a share of MemoryBudgets.ManagedBuildBytes). The
+    // fractions are chosen so a host with room keeps EXACTLY the constants — that budget is
+    // capped at 640 MB, and 0.10 / 0.075 / 0.15 of 640 MB is 64 / 48 / 96 MB — while a 512 MB
+    // container gets about 72 MB of pools instead of 400 MB.
+
+    private const double SlabsFraction   = 0.10;
+    private const double IntsFraction    = 0.075;
+    private const double EntriesFraction = 0.15;
+
+    /// <summary>Entry pools are per struct type, and production builds three (terms, props, trigrams).</summary>
+    public const int EntryPoolTypes = 3;
+
+    /// <summary>
+    /// The byte caps at a given managed index-build budget. Pure, so the SUM of everything this
+    /// process may hold on the managed heap can be checked at any container size without being
+    /// on such a machine — which is what nothing did.
+    /// </summary>
+    internal static (long Slabs, long Ints, long Entries) CapsFor(long managedBuildBytes) => (
+        Share(managedBuildBytes, SlabsFraction,   64L << 20, 4L << 20),
+        Share(managedBuildBytes, IntsFraction,    48L << 20, 4L << 20),
+        Share(managedBuildBytes, EntriesFraction, 96L << 20, 8L << 20));
+
+    /// <summary>What every pool together may park at that budget, the three entry pools included.</summary>
+    internal static long TotalCapBytes(long managedBuildBytes)
+    {
+        var (slabs, ints, entries) = CapsFor(managedBuildBytes);
+        return slabs + ints + EntryPoolTypes * entries;
+    }
+
+    private static long Share(long budget, double fraction, long cap, long floor)
+        => budget <= 0 ? cap : Math.Max(floor, Math.Min(cap, (long)(budget * fraction)));
+
+    /// <summary>Derived once. Declared BEFORE the pools: static initialisers run in textual order.</summary>
+    private static readonly (long Slabs, long Ints, long Entries) Caps =
+        CapsFor(MemoryBudgets.Current().ManagedBuildBytes);
+
     public const int SlabBytes = 1 << 20;
 
     /// <summary>Term, posting and section-writer slabs: exactly 1 MB each.</summary>
-    public static readonly SlabPool<byte> Slabs = new(maxLength: SlabBytes, maxArraysPerBucket: 64, maxPooledBytes: 64L << 20);
+    public static readonly SlabPool<byte> Slabs = new(maxLength: SlabBytes, maxArraysPerBucket: 64, maxPooledBytes: Caps.Slabs);
 
     /// <summary>
     /// Slot and hash tables; the largest is the trigram's 2^21-entry table (8 MB).
@@ -56,14 +105,14 @@ internal static class IndexBuildPool
     /// deeper pool would park tables no builder there can use. <c>IndexBuildPoolProbe</c>
     /// is sequential and cannot see this, so measure a parallel probe before raising it.</para>
     /// </summary>
-    public static readonly SlabPool<int> Ints = new(maxLength: 1 << 22, maxArraysPerBucket: 4, maxPooledBytes: 48L << 20);
+    public static readonly SlabPool<int> Ints = new(maxLength: 1 << 22, maxArraysPerBucket: 4, maxPooledBytes: Caps.Ints);
 
     /// <summary>Entry arrays of one struct type — a pool per type.</summary>
     public static SlabPool<T> Entries<T>() where T : struct => EntryPool<T>.Instance;
 
     private static class EntryPool<T> where T : struct
     {
-        public static readonly SlabPool<T> Instance = new(maxLength: 1 << 21, maxArraysPerBucket: 4, maxPooledBytes: 96L << 20);
+        public static readonly SlabPool<T> Instance = new(maxLength: 1 << 21, maxArraysPerBucket: 4, maxPooledBytes: Caps.Entries);
         static EntryPool() => Register(Instance);
     }
 
