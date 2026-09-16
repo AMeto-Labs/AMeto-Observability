@@ -36,9 +36,22 @@ public sealed class IndexCacheMemoryPressureWiringTests : IClassFixture<AmetoWeb
           + "which is not where they live");
         Assert.Equal(new QueryOptions().EffectiveIndexCacheNativeBytes, cache.NativeBudgetBytes);
 
-        // The native ceiling bounds where bytes LIVE, not how much the cache may hold, so it is
-        // not simply a fraction of the total budget and must not be derived from one.
-        Assert.True(cache.NativeBudgetBytes <= MemoryBudgets.IndexCacheNativeCapBytes);
+        // The native ceiling bounds where bytes LIVE, so it is anchored to the PHYSICAL limit and
+        // never to the managed budget alone: it is the derived backstop, which an explicitly
+        // configured Query.IndexCacheBytes may raise — but never past
+        // IndexCacheNativeMaxFraction of that limit, because a budget says how much this
+        // component may hold and only the host says how much may be pinned beyond the GC's reach.
+        // This fixture configures nothing, so the hosted cache must sit on the backstop itself.
+        var budgets = MemoryBudgets.Current();
+        Assert.Equal(budgets.IndexCacheNativeBytes, cache.NativeBudgetBytes);
+
+        // And the rule holds for any budget an operator could set — which is what the clamp is for.
+        long hostCeiling = Math.Max(
+            budgets.IndexCacheNativeBytes,
+            (long)(budgets.PhysicalLimitBytes * MemoryBudgets.IndexCacheNativeMaxFraction));
+        Assert.True(cache.NativeBudgetBytes <= hostCeiling);
+        Assert.True(new QueryOptions { IndexCacheBytes = 64L << 30 }.EffectiveIndexCacheNativeBytes <= hostCeiling,
+            "a configured budget may raise the native ceiling, but never past the host's share");
     }
 
     [Fact]
