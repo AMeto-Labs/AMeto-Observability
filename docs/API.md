@@ -357,13 +357,16 @@ Server health snapshot.
   "ingestBufferBudgetBytes": 134217728,
   "ingestArenaBytes": 80530636,
   "ingestArenaResidentBytes": 655360,
-  "indexBuildPooledBytes": 8388608
+  "indexBuildPooledBytes": 8388608,
+  "indexMalformedExceptionPayloads": 0
 }
 ```
 
 The response carries more fields than are shown here (disk, GC, per-signal storage, ingest counters); **new fields are added without notice**, so parse it permissively.
 
 The memory figures are the ones worth watching on a constrained host, and each is a ceiling paired with what is held against it: `indexCacheBytes` / `indexCacheBudgetBytes` is the decoded-index cache (the budget is what the cache was BUILT with, not a fresh derivation), `ingestBufferPooledBytes` / `ingestBufferBudgetBytes` is request bodies parked between requests, and `ingestArenaResidentBytes` / `ingestArenaBytes` is how far into the payload arena the ring has ever reached — those pages are never given back, so it is a resting level rather than a peak. `logsQuarantinedBytes` is inside `logsStorageBytes` and is the one part retention will never free.
+
+`indexMalformedExceptionPayloads` counts exception payloads a merge could not read as an exception map. Those rows are written but their `@x.*` terms are not indexed, so `@x.type` filters and free-text search over the merged segment miss them — a non-zero value means a producer is writing exception maps this reader cannot read. It counts **encounters, not distinct rows**: the raw payload survives into the merged segment, so the same row is counted again at every later merge level and again on a retried merge, and the counter resets on restart. Watch whether it moves, not how large it is.
 
 > **Changed in this release — `processThreads` counts thread-pool threads.** It now reports `ThreadPool.ThreadCount`; it used to report `Process.Threads.Count`, which snapshots every process on the machine on Windows and allocated a `ProcessThread` object per thread — the single largest allocation in this endpoint. Dedicated threads (the drainer, the flushers, the GC) are **not** in the new figure, so it is smaller than before for the same load. A scrape, alert threshold or runbook calibrated against the old meaning will see a step change after upgrading.
 

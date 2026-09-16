@@ -36,7 +36,10 @@ public sealed class IndexBuildHints
     public int LastTrigrams => Volatile.Read(ref _trigrams);
 
     /// <summary>Exception payloads no group could read as an exception map, process-wide — see
-    /// <c>SegmentIndexBuilder.MalformedExceptionPayloads</c>. Rows are written; their @x.* terms are not.</summary>
+    /// <c>SegmentIndexBuilder.MalformedExceptionPayloads</c>. Rows are written; their @x.* terms are not.
+    /// Encounters met during merges, not distinct rows: the raw payload survives into the merged
+    /// segment, so the same row is counted again at every later merge level and on a retried merge.
+    /// It grows with compaction depth rather than with ingest, and resets on restart.</summary>
     public long MalformedExceptionPayloads => Volatile.Read(ref _malformed);
     private long _malformed;
     internal void NoteMalformedException() => Interlocked.Increment(ref _malformed);

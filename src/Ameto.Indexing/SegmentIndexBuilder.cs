@@ -705,6 +705,13 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
     /// Exception payloads this group could not read as an exception map (merge path only; the
     /// flush path holds decoded objects). Each is a row written without its @x.* terms. The
     /// process-wide total is on <see cref="IndexBuildHints.MalformedExceptionPayloads"/>.
+    ///
+    /// <para>ENCOUNTERS, not distinct rows. The merged segment keeps the raw payload, so the same
+    /// row is met and counted again at every later merge level, and a merge that fails after this
+    /// group was added counts its rows again on the retry. The figure therefore grows with
+    /// compaction depth rather than with ingest, and a fully compacted store reports 0 after a
+    /// restart while <c>@x.type</c> queries still miss those rows. Read it as "how much unreadable
+    /// exception data the merges are meeting", never as a count of affected rows.</para>
     /// </summary>
     public long MalformedExceptionPayloads => _malformedExceptions;
 
