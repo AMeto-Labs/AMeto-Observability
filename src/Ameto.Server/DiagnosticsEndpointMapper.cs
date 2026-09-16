@@ -191,6 +191,13 @@ public static class DiagnosticsEndpointMapper
                 // Events the storage write path refused repeatedly and the drainer gave up
                 // on — a different failure from a full buffer, and previously silent.
                 ingestWriteErrorDrops    = drainer.ErrorDrops,
+                // Request bodies parked between requests by IngestBufferPool: CLEF, OTLP/HTTP,
+                // OTLP/gRPC and the gzip inflate target all read into it, so on a busy server
+                // this is the largest managed thing the ingest path holds. Bounded by
+                // MemoryBudgets.IngestBufferBytes and emptied by a pressure trim; until it was
+                // reported here, no figure attributed those megabytes to anything.
+                ingestBufferPooledBytes  = IngestBufferPool.PooledBytes,
+                ingestBufferBudgetBytes  = IngestBufferPool.MaxPooledTotalBytes,
 
                 // ── Index build ────────────────────────────────────────────────
                 // Merge rows whose exception column is not a readable exception map: written,

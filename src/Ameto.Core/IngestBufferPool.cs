@@ -21,10 +21,18 @@ namespace Ameto.Core;
 /// and leaves an array in EVERY bucket on the way; at 32 deep that is about 126 MB pinned for
 /// ever by 32 concurrent 2 MB batches, on a stand whose whole budget is 512 MB. So:</para>
 /// <list type="bullet">
-///   <item>Depth is <c>2 x ProcessorCount</c>, clamped to
-///   [<see cref="MinArraysPerBucket"/>, <see cref="MaxArraysPerBucket"/>] — request
-///   concurrency is bounded by cores far more tightly than by that ceiling, and the small
-///   containers that cannot afford the memory are exactly the ones with few cores.</item>
+///   <item>A TOTAL BYTE CAP across every bucket, <see cref="MaxPooledTotalBytes"/>, taken from
+///   the same memory model as the flush, tier and index-cache ceilings
+///   (<see cref="MemoryBudgets.IngestBufferBytes"/>): a return that would exceed it is dropped
+///   and becomes ordinary garbage. This is the bound that binds, and it is the one that was
+///   missing — see the arithmetic below for what depth alone allowed.</item>
+///   <item>Depth per bucket is still <c>2 x ProcessorCount</c>, clamped to
+///   [<see cref="MinArraysPerBucket"/>, <see cref="MaxArraysPerBucket"/>], because request
+///   concurrency really is bounded by cores. What it must not be asked to do is bound the
+///   MEMORY: that argument assumed the containers which cannot afford it are the ones with few
+///   cores, which holds only under a CPU quota — and this project's deployments set a memory
+///   limit and no CPU limit, so <c>ProcessorCount</c> reports the host's cores. With the cap
+///   above, a deep pool is free to use its depth in whichever bucket the traffic rents from.</item>
 ///   <item><see cref="Trim"/> runs after a gen2 collection and empties the pool outright when
 ///   the GC says memory load has passed its high threshold — but at most once every
 ///   <see cref="MinTrimInterval"/>, or the refill it causes drives the next collection and the
@@ -32,14 +40,14 @@ namespace Ameto.Core;
 ///   in the collection that follows, and a pool that has to refill under pressure is the
 ///   outcome worth having.</item>
 /// </list>
-/// <para>The arithmetic, stated plainly rather than flatteringly: a full set of buckets up
-/// to <see cref="MaxPooledBytes"/> is about <c>2 x MaxPooledBytes</c> = 16 MB, so the
-/// absolute ceiling between two trims is <c>depth x 16 MB</c> — 64 MB at the four-deep floor,
-/// 512 MB at the 32-deep ceiling. Reaching the top of that needs 32 concurrent EIGHT-MEGABYTE
-/// batches to have been in flight at once, which is 256 MB of live request bodies: memory the
-/// process had committed at that peak whatever pool it came from. The realistic shape — 2 MB
-/// batches through the doubling reader — is <c>depth x ~4 MB</c>, so 16 MB on the two-core
-/// stand. The trim is what makes either of those a peak rather than a resting level.</para>
+/// <para>The arithmetic this replaces, stated plainly rather than flatteringly: a full set of
+/// buckets up to <see cref="MaxPooledBytes"/> is about <c>2 x MaxPooledBytes</c> = 16 MB, so the
+/// ceiling between two trims WAS <c>depth x 16 MB</c> — 64 MB at the four-deep floor, 512 MB at
+/// the 32-deep one, which is the whole of a 512 MB container and reachable there because the
+/// core count is the host's. It is now <c>min(that, the budget)</c>: about 38 MB in a 512 MB
+/// container, 128 MB where there is room for it. The trim is what makes even that a peak rather
+/// than a resting level, and <see cref="PooledBytes"/> is what makes it visible — the figure
+/// <c>/api/diagnostics</c> reports beside the index-build pool's.</para>
 ///
 /// <para>Arrays are rented dirty and must be treated as uninitialised, and — as with any
 /// pool — an array rented here must be returned here, in a <c>finally</c>, exactly once.
@@ -70,11 +78,26 @@ public static class IngestBufferPool
     public static int ArraysPerBucket { get; } =
         Math.Clamp(2 * Environment.ProcessorCount, MinArraysPerBucket, MaxArraysPerBucket);
 
-    private static ArrayPool<byte> _pool = Create();
+    /// <summary>
+    /// Total bytes this pool may park, from <see cref="MemoryBudgets.IngestBufferBytes"/> — a
+    /// share of the managed-heap limit, because request bodies are managed arrays on the large
+    /// object heap. Read once: the budgets are a startup decision, and this is consulted on a
+    /// path that runs per request.
+    /// </summary>
+    public static long MaxPooledTotalBytes { get; } = MemoryBudgets.Current().IngestBufferBytes;
+
+    private static BoundedByteArrayPool _pool = Create();
 
     static IngestBufferPool() => Gen2GcCallback.Register(static () => { TrimIfUnderPressure(); return true; });
 
-    private static ArrayPool<byte> Create() => ArrayPool<byte>.Create(MaxPooledBytes, ArraysPerBucket);
+    private static BoundedByteArrayPool Create() => new(MaxPooledBytes, ArraysPerBucket, MaxPooledTotalBytes);
+
+    /// <summary>
+    /// Bytes parked right now — what a <see cref="Trim"/> would release. Reported by
+    /// <c>/api/diagnostics</c>: this pool holds the highest-volume ingest road's buffers, and
+    /// until it could be read there was no figure anywhere that attributed them.
+    /// </summary>
+    public static long PooledBytes => Volatile.Read(ref _pool).PooledBytes;
 
     /// <summary>Rents an array of at least <paramref name="minimumLength"/> bytes. Contents are undefined.</summary>
     public static byte[] Rent(int minimumLength)

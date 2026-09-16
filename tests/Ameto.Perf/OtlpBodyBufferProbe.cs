@@ -77,7 +77,7 @@ public sealed class OtlpBodyBufferProbe
     // ── What the pool is allowed to keep ──────────────────────────────────────
 
     [Fact]
-    public void DepthIsBoundedByCores()
+    public void DepthIsBoundedByCores_AndTheFootprintByTheMemoryBudget()
     {
         // A pool that is never trimmed is a memory leak with good manners. The gRPC reader gets
         // no Content-Length, so it doubles 64 KB → 2 MB and leaves an array in every bucket on
@@ -91,9 +91,18 @@ public sealed class OtlpBodyBufferProbe
         Assert.InRange(IngestBufferPool.ArraysPerBucket,
                        IngestBufferPool.MinArraysPerBucket, IngestBufferPool.MaxArraysPerBucket);
 
+        // But depth is NOT what bounds the memory, and it never was: the ceiling it implies is
+        // depth x a full set of buckets (~2 x the largest array), which at the 32-deep end is
+        // 512 MB — and ProcessorCount reports the HOST's cores when only memory is capped, so a
+        // 512 MB container on a big host took exactly that end. The bound is the byte cap, from
+        // the same MemoryBudgets the flush width, tier backlog and index cache come from.
+        Assert.Equal(MemoryBudgets.Current().IngestBufferBytes, IngestBufferPool.MaxPooledTotalBytes);
+        Assert.True(IngestBufferPool.PooledBytes <= IngestBufferPool.MaxPooledTotalBytes);
+
         _out.WriteLine($"{Environment.ProcessorCount} cores ⇒ {IngestBufferPool.ArraysPerBucket} arrays/bucket "
-                     + $"⇒ at most ~{IngestBufferPool.ArraysPerBucket * 2L * IngestBufferPool.MaxPooledBytes / 1024 / 1024} MB "
-                     + "held between trims");
+                     + $"(depth alone would allow ~{IngestBufferPool.ArraysPerBucket * 2L * IngestBufferPool.MaxPooledBytes / 1024 / 1024} MB), "
+                     + $"capped at {IngestBufferPool.MaxPooledTotalBytes / 1024 / 1024} MB by the memory budget; "
+                     + $"{IngestBufferPool.PooledBytes / 1024.0 / 1024.0:F1} MB parked now");
     }
 
     [Fact]

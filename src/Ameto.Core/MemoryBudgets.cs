@@ -52,6 +52,18 @@ public readonly struct MemoryBudgets
     /// <summary>Cross-query cache of decoded segment indexes.</summary>
     public const long IndexCacheCapBytes = 256L * 1024 * 1024;
 
+    /// <summary>
+    /// Request bodies parked in <c>IngestBufferPool</c> between requests.
+    ///
+    /// <para>This one has no "what it was before": the pool sized itself from
+    /// <c>2 x ProcessorCount</c> alone, on the argument that the containers which cannot afford
+    /// the memory are the ones with few cores. That holds only under a CPU quota, and this
+    /// project's own deployments set a memory limit and no CPU limit — so a 512 MB container on
+    /// a 16-core host took the 32-deep ceiling, and its arithmetic (a full set of buckets is
+    /// ~2 x the largest array, so depth x 16 MB) allowed more than the whole container.</para>
+    /// </summary>
+    public const long IngestBufferCapBytes = 128L * 1024 * 1024;
+
     // ── The shares, when that is the smaller number ──
     //
     // Managed builds and the index cache together take 45 % of the managed-heap limit; the rest
@@ -74,6 +86,14 @@ public readonly struct MemoryBudgets
     public const double IndexCacheFraction = 0.15;
 
     /// <summary>
+    /// Share of the MANAGED-HEAP limit the ingest body-buffer pool may park. Request bodies are
+    /// managed <c>byte[]</c> on the large object heap, so this is a share of the GC's limit like
+    /// the two above. It bounds what is PARKED, never what is live: a body larger than the pool
+    /// will serve is still read, just allocated and dropped rather than kept.
+    /// </summary>
+    public const double IngestBufferFraction = 0.10;
+
+    /// <summary>
     /// A guard for a runtime that does not report <c>GCHighMemPercent</c>. The .NET 10 runtime
     /// reports the EFFECTIVE percentage, whether configured or chosen by default, including the
     /// higher default at 80 GB of physical memory or more. Measured on 10.0.11: 90 with nothing set,
@@ -84,17 +104,20 @@ public readonly struct MemoryBudgets
 
     // ── Floors, so a pathologically small limit still yields a working engine ──
 
-    private const long MinBuildBytes      = 16L * 1024 * 1024;
-    private const long MinNativeBytes     = 16L * 1024 * 1024;
-    private const long MinIndexCacheBytes =  8L * 1024 * 1024;
+    private const long MinBuildBytes        = 16L * 1024 * 1024;
+    private const long MinNativeBytes       = 16L * 1024 * 1024;
+    private const long MinIndexCacheBytes   =  8L * 1024 * 1024;
+    private const long MinIngestBufferBytes =  8L * 1024 * 1024;
 
-    private MemoryBudgets(long managedLimit, long physicalLimit, long managed, long native, long indexCache)
+    private MemoryBudgets(
+        long managedLimit, long physicalLimit, long managed, long native, long indexCache, long ingestBuffers)
     {
         ManagedLimitBytes  = managedLimit;
         PhysicalLimitBytes = physicalLimit;
         ManagedBuildBytes  = managed;
         NativeTierBytes    = native;
         IndexCacheBytes    = indexCache;
+        IngestBufferBytes  = ingestBuffers;
     }
 
     /// <summary>
@@ -117,6 +140,9 @@ public readonly struct MemoryBudgets
 
     /// <summary>Default budget for the cross-query segment-index cache.</summary>
     public long IndexCacheBytes { get; }
+
+    /// <summary>Ceiling on request bodies parked in the ingest buffer pool between requests.</summary>
+    public long IngestBufferBytes { get; }
 
     /// <summary>True when a share of a limit, not the constant, set a ceiling.</summary>
     public bool IsConstrained =>
@@ -147,7 +173,8 @@ public readonly struct MemoryBudgets
             physicalBase,
             Share(managedBase,  ManagedBuildFraction, ManagedBuildCapBytes, MinBuildBytes),
             Share(physicalBase, NativeTierFraction,   NativeTierCapBytes,   MinNativeBytes),
-            Share(managedBase,  IndexCacheFraction,   IndexCacheCapBytes,   MinIndexCacheBytes));
+            Share(managedBase,  IndexCacheFraction,   IndexCacheCapBytes,   MinIndexCacheBytes),
+            Share(managedBase,  IngestBufferFraction, IngestBufferCapBytes, MinIngestBufferBytes));
 
         static long Share(long limit, double fraction, long cap, long floor)
         {

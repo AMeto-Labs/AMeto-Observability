@@ -20,6 +20,9 @@
     <!-- IngestBufferPool.Observer: lets the integration tests prove /api/events rents every
          body buffer from that pool and returns each one to it exactly once. -->
     <InternalsVisibleTo Include="Ameto.Integration.Tests" />
+    <!-- BoundedByteArrayPool: its depth and byte caps are testable with small numbers only by
+         constructing one, which the process-wide IngestBufferPool cannot be asked to do. -->
+    <InternalsVisibleTo Include="Ameto.Core.Tests" />
   </ItemGroup>
 
 </Project>

@@ -45,6 +45,32 @@ public sealed class MemoryBudgetTests
     }
 
     /// <summary>
+    /// The ingest body-buffer pool is the fourth ceiling, and the last one that sized itself from
+    /// something other than memory: its depth came from <c>2 x ProcessorCount</c>, so a 512 MB
+    /// container on a 16-core host took the 32-deep ceiling and could park more than the whole
+    /// container. It is a share of the MANAGED limit, because request bodies are byte arrays on
+    /// the large object heap.
+    /// </summary>
+    [Fact]
+    public void The_ingest_buffer_pool_is_a_share_of_the_heap_limit_like_the_other_managed_ceilings()
+    {
+        var stand = MemoryBudgets.Derive(managedLimitBytes: 384 * MB, physicalLimitBytes: 512 * MB);
+
+        Assert.Equal((long)(384 * MB * 0.10), stand.IngestBufferBytes);            // 38 MB
+        Assert.True(stand.IngestBufferBytes < MemoryBudgets.IngestBufferCapBytes);
+
+        // Every managed ceiling together still has to leave the heap room for queries, ASP.NET
+        // and the GC itself — the sum the pool used to sit outside of.
+        Assert.True(stand.ManagedBuildBytes + stand.IndexCacheBytes + stand.IngestBufferBytes < 384 * MB * 0.60);
+
+        // A host with room keeps the absolute ceiling, and an unknown limit falls back to it
+        // rather than strangling a healthy machine.
+        Assert.Equal(MemoryBudgets.IngestBufferCapBytes, MemoryBudgets.Derive(64 * GB).IngestBufferBytes);
+        Assert.Equal(MemoryBudgets.IngestBufferCapBytes, MemoryBudgets.Derive(0).IngestBufferBytes);
+        Assert.True(MemoryBudgets.Derive(32 * MB).IngestBufferBytes >= 8 * MB);    // the floor
+    }
+
+    /// <summary>
     /// A big host that caps its managed heap with GCHeapHardLimit has said nothing about native
     /// memory, so the native budget must not shrink with the heap.
     /// </summary>
