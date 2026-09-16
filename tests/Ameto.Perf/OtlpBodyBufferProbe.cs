@@ -12,11 +12,13 @@ namespace Ameto.Perf;
 /// <para>A batch of 1.4 MB rounds up to the 2 MiB bucket, and each OTLP receiver rents one per
 /// request; so does the CLEF receiver, measured through its handler in ClefBodyBufferProbe.
 /// <see cref="ArrayPool{T}.Shared"/> keeps one array per thread plus at most eight per core in
-/// each bucket and drops all of it on every gen2 collection, so past that depth each
-/// concurrent request gets a fresh, zeroed
-/// 2 MiB array straight on the large object heap. <see cref="IngestBufferPool"/> is deeper,
-/// and is emptied only when the GC reports high memory load and at most once every
-/// <see cref="IngestBufferPool.MinTrimInterval"/>.</para>
+/// each bucket, so past that depth each concurrent request gets a fresh, zeroed
+/// 2 MiB array straight on the large object heap. It also drops what it holds on a gen2
+/// collection — but only once the GC reports high memory pressure (about 0.9x its high-load
+/// threshold), or once the arrays have gone stale; on a comfortably loaded box the gen2 columns
+/// below barely move, which is why the load they were taken at is printed beside them.
+/// <see cref="IngestBufferPool"/> is deeper, and is emptied only when the GC reports high memory
+/// load and at most once every <see cref="IngestBufferPool.MinTrimInterval"/>.</para>
 ///
 /// <para>Four numbers are printed and none of them is asserted on; the reasoning is at the
 /// place the assertion would have gone, and the claims that CAN be held still — the depth
@@ -44,8 +46,12 @@ public sealed class OtlpBodyBufferProbe
         long ownGen2    = await Measure(dedicated: true,  gen2: true);
 
         int requests = Rounds * Concurrency;
+        var gc = GC.GetGCMemoryInfo();
         _out.WriteLine($"{Concurrency} concurrent {BodyBytes / 1024.0 / 1024.0:F1} MB bodies x {Rounds} rounds "
                      + $"= {requests} rents, on {Environment.ProcessorCount} cores");
+        _out.WriteLine($"  GC memory load {gc.MemoryLoadBytes / 1048576.0:N0} MB against a high-load "
+                     + $"threshold of {gc.HighMemoryLoadThresholdBytes / 1048576.0:N0} MB "
+                     + "— the gen2 rows depend on it (see the class summary)");
         _out.WriteLine($"  ArrayPool.Shared                : {sharedFlat / 1024.0 / 1024.0,8:F1} MB "
                      + $"({sharedFlat / (double)requests / 1024:F0} KB/request)");
         _out.WriteLine($"  IngestBufferPool                : {ownFlat / 1024.0 / 1024.0,8:F1} MB "

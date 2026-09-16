@@ -89,6 +89,14 @@ public sealed class ClefBodyBufferProbe : IAsyncLifetime
         _out.WriteLine($"{Concurrency} concurrent {_body.Length / 1024.0 / 1024.0:F2} MB CLEF bodies "
                      + $"({_eventsPerBody:N0} events each) x {Rounds} rounds = {Concurrency * Rounds} requests, "
                      + $"{Environment.ProcessorCount} cores; IngestBufferPool depth {IngestBufferPool.ArraysPerBucket}");
+        // The gen2 column is a property of THIS MACHINE'S load as much as of the pool, so print
+        // the load it was taken at. ArrayPool.Shared drops what it holds on a gen2 only once the
+        // GC reports high memory pressure (about 0.9x the threshold below), or once the arrays
+        // have gone stale — on a comfortably loaded box its gen2 figures barely move, and someone
+        // rerunning this elsewhere would otherwise have no way to tell why their numbers differ.
+        var gc = GC.GetGCMemoryInfo();
+        _out.WriteLine($"  GC memory load {gc.MemoryLoadBytes / 1048576.0:N0} MB against a high-load "
+                     + $"threshold of {gc.HighMemoryLoadThresholdBytes / 1048576.0:N0} MB");
         _out.WriteLine("                                   bytes/request   bytes/request, gen2 before each round");
         _out.WriteLine($"  harness alone (Task.Run)       : {harnessFlat,13:N0}   {harnessGen2,13:N0}");
         _out.WriteLine($"  Content-Length body            : {lengthFlat,13:N0}   {lengthGen2,13:N0}");

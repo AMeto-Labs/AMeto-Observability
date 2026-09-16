@@ -10,6 +10,14 @@ using Xunit.Abstractions;
 
 namespace Ameto.Perf;
 
+// xUnit1031 (blocking task operations) is off for this probe deliberately. The page is read
+// synchronously so that everything after it runs on the test's own thread: the comparison below is
+// GC.GetAllocatedBytesForCurrentThread, which is per-THREAD, and an async test method may resume
+// its continuation on another thread-pool thread and weigh whatever that one had done. The wait is
+// on a completed cold-segment read with no synchronization context, so the deadlock the rule
+// guards cannot happen here.
+#pragma warning disable xUnit1031
+
 /// <summary>
 /// What a page of the log list actually costs on the server: read 50 events out of a
 /// cold segment and write their properties as JSON — the work behind one scroll step.

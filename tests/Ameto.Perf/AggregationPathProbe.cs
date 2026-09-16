@@ -13,6 +13,14 @@ using Xunit.Abstractions;
 
 namespace Ameto.Perf;
 
+// xUnit1031 (blocking task operations) is off for this probe deliberately. Every figure below
+// comes from GC.GetAllocatedBytesForCurrentThread, which is per-THREAD: the work being weighed has
+// to run on the test's own thread, so an async test method — whose continuations may resume on
+// another thread-pool thread — would report whatever else that thread had allocated. These waits
+// are on CPU-bound work with no synchronization context, so the deadlock the rule guards does not
+// exist here; what it would cost is the measurement.
+#pragma warning disable xUnit1031
+
 /// <summary>
 /// What a header-only <c>count(*)</c> costs, on the two roads it can take.
 ///

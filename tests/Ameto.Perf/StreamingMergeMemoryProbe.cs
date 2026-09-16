@@ -144,11 +144,17 @@ public sealed class StreamingMergeMemoryProbe : IDisposable
     /// group being sealed, as <see cref="SegmentIndexBuilder.BuildRetainedBytes"/> counts it,
     /// 19.5 to 20.5 MB (the table prints it); and 0.6 to 1.3 MB of everything else the merge holds
     /// beside it — the source cursors, the writer's buffers, the group's bloom filter. 20.1 to
-    /// 21.8 MB in all. The ceiling is about 1.5× the largest, the slack the ratios below allow.</para>
+    /// 21.8 MB in all. The ceiling is 32 MB, about 1.47× the largest of those readings — a little
+    /// under the 1.6× the ratios below allow. What that slack lets through, measured rather than
+    /// asserted: a flat 10 MB held for the whole merge fails this only narrowly (32.5 MB at 48 000
+    /// events in Release, 32.8 in Debug), so roughly 9 MB of flat retention — about 45 % of the
+    /// working state — passes every assertion in this probe.</para>
     ///
     /// <para>This is the absolute half of the guard, the role the old crossover played: the peak
-    /// had to stay under two thirds of what materialising the 96 000 events cost (29.9 MB at base,
-    /// 19.7 MB once the query decoder got cheaper). The slope and the ratios compare this probe's
+    /// had to stay under two thirds of what materialising the 96 000 events cost — 29.9 MB of the
+    /// 44.9 that cost at base, and 19.7 MB of the 29.5 it costs now that the query decoder got
+    /// cheaper. (Those are the LIMITS two thirds gives; the materialising costs themselves are the
+    /// 44.9 and 29.5 MB in the class summary above.) The slope and the ratios compare this probe's
     /// merges with each other, so a cost that is flat in the merged size passes them however large
     /// it is. Simulated with a 20 MB array held for the whole merge (throwaway, in
     /// <c>SegmentWriter.WriteEvents</c>): 40.7 to 42.5 MB at every size, a slope of 3.2 B/event,
