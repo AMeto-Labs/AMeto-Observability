@@ -506,6 +506,51 @@ public sealed class QueryExecutor : IQueryExecutor
                         // information about its rows. Candidates would then silently exclude them,
                         // so the whole segment falls back to a full scan.
                         bool unnarrowedGroup   = false;
+                        // THE THIRD NARROWING STATE: groups that contribute EVERY one of their
+                        // rows (see TryNarrowWithIndex — the level union that IS the group). Their
+                        // ordinals are the contiguous range [FirstOrdinal, +EventCount), so they
+                        // are not materialised here at all; they are generated only if some OTHER
+                        // group genuinely narrows and the segment therefore has to name ordinals.
+                        List<(uint First, uint Count)>? everyRowGroups = null;
+                        // Groups this segment could contribute rows from, and groups that survived.
+                        // When they agree, every row of the segment is a candidate, and the honest
+                        // way to say so is to hand the scan no candidate list at all.
+                        int groupsConsidered = 0, groupsAccepted = 0;
+
+                        // Appends the pending whole-group ranges. Called before a narrowed group's
+                        // own ordinals go in, so the list stays ascending: groups are visited in
+                        // ordinal order and everything pending came from an earlier one.
+                        void FlushEveryRowGroups()
+                        {
+                            if (everyRowGroups is null || candidates is null) return;
+                            for (int r = 0; r < everyRowGroups.Count; r++)
+                            {
+                                var (first, count) = everyRowGroups[r];
+                                for (uint o = 0; o < count; o++) candidates.Add(first + o);
+                            }
+                            everyRowGroups.Clear();
+                        }
+
+                        void Accept(uint[]? groupCandidates, bool everyRow, uint firstOrdinal, uint eventCount)
+                        {
+                            anyGroupSurvived = true;
+                            groupsAccepted++;
+
+                            if (everyRow)
+                            {
+                                (everyRowGroups ??= new List<(uint, uint)>(4)).Add((firstOrdinal, eventCount));
+                            }
+                            else if (groupCandidates is null)
+                            {
+                                unnarrowedGroup = true;
+                            }
+                            else
+                            {
+                                candidates ??= new List<uint>(groupCandidates.Length);
+                                FlushEveryRowGroups();
+                                candidates.AddRange(groupCandidates);
+                            }
+                        }
 
                         var groups = reader.Groups;
                         for (int g = 0; g < groups.Length; g++)
@@ -514,8 +559,12 @@ public sealed class QueryExecutor : IQueryExecutor
                             if (grp.EventCount == 0) continue;
                             // Group time bounds are exact, so this drops a group's index sections
                             // without reading them. The reader's per-event window check remains
-                            // the correctness gate.
+                            // the correctness gate. NOT counted as a dropped group below: the
+                            // reader prunes by the same window itself, so leaving such a group out
+                            // of an explicit candidate list buys nothing.
                             if (grp.MaxTs < fromTicks || grp.MinTs > toTicks) continue;
+
+                            groupsConsidered++;
 
                             // A cache hit skips every section read below: the group's bloom,
                             // inverted and (when cached full) trigram indexes are already decoded.
@@ -531,16 +580,11 @@ public sealed class QueryExecutor : IQueryExecutor
                                         continue;
                                     if (levelHints is not null && !AnyLevelMaybePresent(levelHints, cached.Bloom))
                                         continue;
-                                    if (!TryNarrowWithIndex(filter, cached, levelHints, grp.EventCount, out var cachedCandidates))
+                                    if (!TryNarrowWithIndex(filter, cached, levelHints, grp.EventCount,
+                                                            out var cachedCandidates, out bool cachedEveryRow))
                                         continue;
 
-                                    anyGroupSurvived = true;
-                                    if (cachedCandidates is null) unnarrowedGroup = true;
-                                    else
-                                    {
-                                        candidates ??= new List<uint>(cachedCandidates.Length);
-                                        candidates.AddRange(cachedCandidates);
-                                    }
+                                    Accept(cachedCandidates, cachedEveryRow, grp.FirstOrdinal, grp.EventCount);
                                 }
                                 continue;
                             }
@@ -601,6 +645,7 @@ public sealed class QueryExecutor : IQueryExecutor
                             // an equality hint) load the big indexes for trigram offset
                             // lookup and the inverted-index definitive check.
                             uint[]? groupCandidates = null;
+                            bool    groupEveryRow   = false;
                             if (needTrigram || hasIndexHint || hasInvHints || levelHints is not null)
                             {
                                 // Pooled: sections are copied out inside the deserialisers, so the
@@ -626,33 +671,67 @@ public sealed class QueryExecutor : IQueryExecutor
                                     // Insert may hand back a concurrently inserted winner for this
                                     // group and dispose `built` — use it only through the lease.
                                     using var lease = cache.Insert(info.FilePath, g, needTrigram, built, built.ApproxRetainedBytes);
-                                    if (!TryNarrowWithIndex(filter, lease.Index, levelHints, grp.EventCount, out groupCandidates))
+                                    if (!TryNarrowWithIndex(filter, lease.Index, levelHints, grp.EventCount,
+                                                            out groupCandidates, out groupEveryRow))
                                         continue;
                                 }
                                 else
                                 {
                                     using (built)
                                     {
-                                        if (!TryNarrowWithIndex(filter, built, levelHints, grp.EventCount, out groupCandidates))
+                                        if (!TryNarrowWithIndex(filter, built, levelHints, grp.EventCount,
+                                                                out groupCandidates, out groupEveryRow))
                                             continue;
                                     }
                                 }
                             }
 
-                            anyGroupSurvived = true;
-                            if (groupCandidates is null) unnarrowedGroup = true;
-                            else
-                            {
-                                candidates ??= new List<uint>(groupCandidates.Length);
-                                candidates.AddRange(groupCandidates);
-                            }
+                            Accept(groupCandidates, groupEveryRow, grp.FirstOrdinal, grp.EventCount);
                         }
 
                         // Every group rejected ⇒ the segment holds nothing this query can match.
                         if (!anyGroupSurvived) return ValueTask.CompletedTask;
 
-                        results[i] = new PrefilterResult(
-                            info, unnarrowedGroup ? null : candidates?.ToArray(), reader);
+                        uint[]? candidateOffsets;
+                        if (unnarrowedGroup)
+                        {
+                            // One group with no information sends the whole segment to a full scan,
+                            // its narrowed groups included — a candidate list would exclude rows
+                            // nothing proved absent.
+                            candidateOffsets = null;
+                        }
+                        else if (candidates is not null)
+                        {
+                            // Something genuinely narrowed, so this segment has to name its rows —
+                            // and a whole-group contributor names its contiguous range, generated
+                            // directly rather than unioned out of its posting lists.
+                            FlushEveryRowGroups();
+                            candidateOffsets = candidates.ToArray();
+                        }
+                        else if (everyRowGroups is null)
+                        {
+                            candidateOffsets = null;                      // nothing narrowed at all
+                        }
+                        else if (groupsAccepted == groupsConsidered)
+                        {
+                            // EVERY group of this segment contributes EVERY one of its rows: the
+                            // candidate list would be 0,1,2,…,n-1. Saying so by handing back no
+                            // list is the same scan over the same rows, and it is the difference
+                            // between a plain block walk and a group-sized uint[] built by a
+                            // posting-list union, copied into a List, copied out again, and then
+                            // resolved by a binary search per block and a cursor step per row —
+                            // to select all of them. This is the level-only filter's normal shape
+                            // against a level-split store.
+                            candidateOffsets = null;
+                        }
+                        else
+                        {
+                            // Some group WAS rejected, so the survivors' rows still have to be
+                            // named — but as their plain ranges, with no posting lists involved.
+                            candidateOffsets = ContiguousOrdinals(everyRowGroups);
+                        }
+
+                        results[i] = new PrefilterResult(info, candidateOffsets, reader);
                         keep = true;
                     }
                     catch (Exception ex)
@@ -738,16 +817,29 @@ public sealed class QueryExecutor : IQueryExecutor
         CompiledFilter filter, ISegmentIndex idx, (string, object?)[][]? levelHints, out uint[]? candidates)
         => TryNarrowWithIndex(filter, idx, levelHints, groupEventCount: 0, out candidates);
 
+    internal static bool TryNarrowWithIndex(
+        CompiledFilter filter, ISegmentIndex idx, (string, object?)[][]? levelHints,
+        uint groupEventCount, out uint[]? candidates)
+        => TryNarrowWithIndex(filter, idx, levelHints, groupEventCount, out candidates, out _);
+
     /// <param name="groupEventCount">
     /// Events in the group being narrowed, or 0 for "unknown". Used for ONE decision: a level
     /// union whose posting lists already account for every event in the group is the identity,
     /// and intersecting with the identity is work with no result. See below.
     /// </param>
+    /// <param name="everyRow">
+    /// True when the group contributes EVERY one of its rows — the third narrowing state,
+    /// distinct from both "these ordinals" (<paramref name="candidates"/>) and "no information"
+    /// (a null <paramref name="candidates"/> with this false). <paramref name="candidates"/> is
+    /// left null, because the answer is the contiguous range the caller already knows from the
+    /// group directory; materialising it is what this state exists to avoid.
+    /// </param>
     internal static bool TryNarrowWithIndex(
         CompiledFilter filter, ISegmentIndex idx, (string, object?)[][]? levelHints,
-        uint groupEventCount, out uint[]? candidates)
+        uint groupEventCount, out uint[]? candidates, out bool everyRow)
     {
         candidates = null;
+        everyRow   = false;
 
         var trigramHints  = filter.GetTrigramHints();
         var invertedHints = filter.GetInvertedHints();
@@ -824,13 +916,23 @@ public sealed class QueryExecutor : IQueryExecutor
                 // an existing candidate set with the identity cannot remove anything, so the
                 // merge over the whole group is skipped and the candidates stand.
                 //
-                // Only when something else already narrowed. With no other hint the union is
-                // still the answer this group contributes, and it must be returned: handing
-                // back null would mark the group UNNARROWED, and one unnarrowed group sends
-                // the whole segment — its narrowed groups included — to a full scan.
+                // Only when something else already narrowed. With NO other hint the union is
+                // still the whole answer this group contributes — and the honest way to say so
+                // is `everyRow`, not the array. Returning the array made a level-only filter
+                // (`@l != 'Error'`, which the compiled filter now derives a level set from even
+                // when the request names none) pay, per group and per query, for a group-sized
+                // uint[] built by a posting-list union, copied into a List and copied out again
+                // — three copies of the group — which the reader then resolved with two binary
+                // searches per block and a cursor step per row, to select 100 % of them.
+                // Returning null instead is not available here: null means UNNARROWED, and one
+                // unnarrowed group sends the whole segment, its narrowed groups included, to a
+                // full scan. Hence the third state.
                 bool identity = groupEventCount != 0 && totalOffs == groupEventCount;
                 if (candidates is null)
-                    candidates = union;
+                {
+                    if (identity) everyRow = true;
+                    else          candidates = union;
+                }
                 else if (!identity)
                 {
                     candidates = IntersectSorted(candidates, union);
@@ -840,6 +942,26 @@ public sealed class QueryExecutor : IQueryExecutor
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// The ordinals of whole-group contributors, as plain ascending ranges. Groups are visited
+    /// in ordinal order, so concatenating their ranges is already sorted — no posting list is
+    /// read and no merge runs to produce what the group directory already states.
+    /// </summary>
+    private static uint[] ContiguousOrdinals(List<(uint First, uint Count)> ranges)
+    {
+        long total = 0;
+        for (int r = 0; r < ranges.Count; r++) total += ranges[r].Count;
+
+        var outp = new uint[total];
+        int k = 0;
+        for (int r = 0; r < ranges.Count; r++)
+        {
+            var (first, count) = ranges[r];
+            for (uint o = 0; o < count; o++) outp[k++] = first + o;
+        }
+        return outp;
     }
 
     /// <summary>Intersects two ascending, distinct arrays into a new ascending array.</summary>

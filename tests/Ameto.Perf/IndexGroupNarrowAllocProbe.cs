@@ -103,6 +103,63 @@ public sealed class IndexGroupNarrowAllocProbe : IAsyncLifetime
     }
 
     /// <summary>
+    /// THE SHAPE THAT NOW REACHES THIS CODE. Q1 made the compiled filter derive a level set from
+    /// the filter itself, so `@l != 'Error'` — with no <c>levels=</c> parameter anywhere — builds
+    /// level hints and takes the candidate road that Q2 wrote for trigram and equality
+    /// narrowing. On a level-split store the level union IS the group, so the road's answer was
+    /// a group-sized uint[] naming every row: allocated by the union, copied into a List, copied
+    /// out again, and then resolved with two binary searches per block and a cursor step per
+    /// row, to select all of them.
+    ///
+    /// <para>A group that contributes every row now says so instead (the third narrowing state),
+    /// and the prefilter hands the scan no candidate list at all when every group does. What is
+    /// left here is the one posting list the INDEX materialises for the matching level; the two
+    /// copies the prefilter made of it, and the per-row cursor walk the reader then did over it,
+    /// went with the array this no longer hands back. The earlier probe cases cannot see this
+    /// shape, because they drive a filter with a trigram hint, which narrows first and leaves
+    /// the level union with something to intersect against.</para>
+    /// </summary>
+    [Fact]
+    public void ALevelOnlyFilterOnALevelPureGroup_MaterialisesNothing()
+    {
+        using var reader = SegmentReader.Open(_segPath);
+        uint groupEvents = reader.Groups[0].EventCount;
+
+        using var invSec = reader.RentInvertedIndexBytes(0);
+        using var triSec = reader.RentTrigramIndexBytes(0);
+        using var bloSec = reader.RentBloomFilterBytes(0);
+        using var idx    = SegmentIndexReader.Load(invSec.Span, triSec.Span, bloSec.Span);
+
+        // Exactly what QueryExecutor builds for `@l != 'Error'` against this fixture, which
+        // writes Information events only: every allowed level, the union covering the group.
+        (string, object?)[][] levelHints = [[(Ameto.Core.ClefFields.Level, "Information")]];
+        var levelOnly = CompiledFilter.Compile("@l != 'Error'");
+
+        for (int i = 0; i < 20; i++)
+            QueryExecutor.TryNarrowWithIndex(levelOnly, idx, levelHints, groupEvents, out _);
+
+        const int Iterations = 200;
+        long b0 = GC.GetAllocatedBytesForCurrentThread();
+        uint[]? last = null;
+        for (int i = 0; i < Iterations; i++)
+        {
+            Assert.True(QueryExecutor.TryNarrowWithIndex(levelOnly, idx, levelHints, groupEvents, out var c));
+            last = c;
+        }
+        long perCall = (GC.GetAllocatedBytesForCurrentThread() - b0) / Iterations;
+
+        _out.WriteLine($"level-only filter over a {groupEvents}-event level-pure group: {perCall} B/call, "
+                     + (last is null ? "no candidate list" : last.Length + " candidates"));
+
+        Assert.Null(last);
+        // What is left is the ONE posting list the index materialises for the matching level.
+        // The copies the prefilter used to make OF it — a List and a ToArray, per group per
+        // query — went with the array this no longer hands back.
+        Assert.True(perCall < 8L * groupEvents,
+            $"{perCall} B to narrow a {groupEvents}-event group that contributes every row");
+    }
+
+    /// <summary>
     /// The trigram lookup on its own — the same public API before and after, so this is the one
     /// number here that can be read against the parent commit. It used to spend
     /// <c>ToString().ToLowerInvariant()</c> (two strings per call, over a filter literal that
