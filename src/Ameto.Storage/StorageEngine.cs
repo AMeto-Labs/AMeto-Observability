@@ -490,7 +490,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             "slots={Slots} (×{Tier} MB native = {NativeCeiling} MB), tier={Events} events / {Payload} MB payload; " +
             "derived from a {ManagedLimit} MB managed-heap limit and {PhysicalLimit} MB physical: " +
             "managed≤{ManagedBudget} MB, native≤{NativeBudget} MB ({Source}); " +
-            "index cache≤{CacheBudget} MB ({CacheSource}), idle evict {IdleEvict}",
+            "index cache≤{CacheBudget} MB ({CacheSource}), native≤{CacheNativeBudget} MB, idle evict {IdleEvict}",
             flushWidth, perBuildManaged / 1048576, managedCeiling / 1048576,
             perFlushManaged / 1048576, perMergeManaged / 1048576, _groupPayloadBudgetBytes / 1048576,
             flushSlots, tierFootprint / 1048576, nativeCeiling / 1048576,
@@ -510,6 +510,11 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             // registered before the query services that construct it.
             _options.Query.EffectiveIndexCacheBytes / 1048576,
             _options.Query.IndexCacheBytes.HasValue ? "configured" : "derived",
+            // The cache's OTHER ceiling, on the same line for the same reason: an operator can now
+            // move it — a configured budget raises it, clamped to the host's share — and these are
+            // the bytes the GC cannot see. Reading it off a running server's /api/diagnostics is
+            // the harder road on exactly the constrained hosts this line was added for.
+            _options.Query.EffectiveIndexCacheNativeBytes / 1048576,
             _options.Query.IndexCacheIdleEvict);
 
         // Both clamps are floored so at least one flush can always proceed. That floor

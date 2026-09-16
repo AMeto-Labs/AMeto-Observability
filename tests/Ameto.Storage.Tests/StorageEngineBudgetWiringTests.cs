@@ -91,6 +91,29 @@ public sealed class StorageEngineBudgetWiringTests : IDisposable
     }
 
     /// <summary>
+    /// The cache's NATIVE ceiling is on that line too. It became operator-influenced — a configured
+    /// IndexCacheBytes raises it, clamped to a share of the host — and it bounds the one part of the
+    /// cache the GC cannot see and RAM pressure cannot reclaim, so the line that exists to be read
+    /// off a constrained host's log must not leave it to GET /api/diagnostics on a running server.
+    /// </summary>
+    [Fact]
+    public async Task The_startup_line_reports_the_index_caches_native_ceiling_too()
+    {
+        var log   = new CapturingLogger();
+        var query = new QueryOptions { IndexCacheBytes = 48 * MB };
+        await using var engine = NewEngine(
+            MemoryBudgets.Derive(managedLimitBytes: 384 * MB, physicalLimitBytes: 512 * MB), query, log);
+
+        string line = Assert.Single(log.Lines, l => l.Contains("Flush budgets:", StringComparison.Ordinal));
+
+        // The figure AddAmetoQuery hands the cache, resolved the same way the line resolves it —
+        // both read this process's budgets, so the assertion holds on a host of any size.
+        long native = query.EffectiveIndexCacheNativeBytes / MB;
+        Assert.True(native > 0);
+        Assert.Contains($"index cache≤48 MB (configured), native≤{native} MB", line, StringComparison.Ordinal);
+    }
+
+    /// <summary>
     /// With nothing configured the same line says so, and prints the derived figure.
     ///
     /// <para>The figure is THIS PROCESS's derivation, not the budgets injected above: an unset
