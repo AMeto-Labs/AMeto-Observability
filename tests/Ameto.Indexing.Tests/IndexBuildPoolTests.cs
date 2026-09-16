@@ -192,25 +192,47 @@ public sealed class IndexBuildPoolTests
     public void AGen2Collection_TrimsThePools_ThroughTheRegisteredCallback()
     {
         // The four parked slabs below are only there to be trimmed by the collection this test
-        // forces, and the trim callback is registered process-wide: a gen2 that an earlier class's
-        // allocations set up can complete inside the setup and run the very trim the first
-        // assertion denies (seen once in a full-suite run: 2 MB parked where 4 was expected).
-        // Nothing between the returns and the read allocates, so the window is bracketed by the
-        // gen2 count and RE-ENTERED when one lands in it, rather than asserted through.
-        long pooled = 0;
-        for (int attempt = 0; attempt < 8; attempt++)
-        {
-            IndexBuildPool.TrimAll();
-            var held = new byte[4][];
-            for (int i = 0; i < held.Length; i++) held[i] = IndexBuildPool.Slabs.Rent(IndexBuildPool.SlabBytes);
+        // forces, and the trim callback is registered process-wide AND runs on the finaliser
+        // thread: any gen2 — one an earlier class's allocations set up, or one THESE RENTS
+        // provoke — can run the very trim the first assertion denies (seen in a full-suite run:
+        // 2 MB parked where 4 was expected). After a TrimAll each of the four rents takes a fresh
+        // 1 MB array off the LOH, which is exactly what charges the gen2 budget, so a bracket
+        // that starts after them leaves the likeliest cause outside it; and a collection counted
+        // BEFORE the bracket can still have its callback run inside, because that callback is a
+        // finaliser. So the measured window is made unable to cause a collection and drained of
+        // one it could inherit:
+        //   · a callback already queued is run out first (forced gen2 + WaitForPendingFinalizers);
+        //   · the bucket is WARMED outside the window, so the window's four rents come from the
+        //     pool and it allocates nothing at all — an attempt whose warm-up was itself
+        //     disturbed is started over rather than measured;
+        //   · the window is still bracketed by the gen2 count and the attempt RE-ENTERED when a
+        //     foreign collection lands in it, rather than asserted through.
+        const long Parked = 4L << 20;
+        var  held     = new byte[4][];                                  // allocated once, outside the window
+        long pooled   = -1;
+        bool measured = false;
 
-            int gen2 = GC.CollectionCount(2);
+        for (int attempt = 0; attempt < 8 && !measured; attempt++)
+        {
+            GC.Collect(2, GCCollectionMode.Forced, blocking: true);     // run out a queued callback
+            GC.WaitForPendingFinalizers();
+
+            IndexBuildPool.TrimAll();                                   // warm-up: the LOH rents live HERE
+            for (int i = 0; i < held.Length; i++) held[i] = IndexBuildPool.Slabs.Rent(IndexBuildPool.SlabBytes);
+            for (int i = 0; i < held.Length; i++) IndexBuildPool.Slabs.Return(held[i]);
+            IndexBuildPool.TrimIdle();                                  // four parked, the high-water mark back at zero
+            if (IndexBuildPool.Slabs.PooledBytes != Parked) continue;   // a trim landed in the warm-up: start over
+
+            int gen2 = GC.CollectionCount(2);                           // ─── window opens: nothing below allocates ───
+            for (int i = 0; i < held.Length; i++) held[i] = IndexBuildPool.Slabs.Rent(IndexBuildPool.SlabBytes);
             for (int i = 0; i < held.Length; i++) IndexBuildPool.Slabs.Return(held[i]);
             IndexBuildPool.TrimIdle();                                  // keeps the four (all were out at once), resets the high-water mark
-            pooled = IndexBuildPool.Slabs.PooledBytes;
-            if (GC.CollectionCount(2) == gen2) break;
+            pooled   = IndexBuildPool.Slabs.PooledBytes;
+            measured = GC.CollectionCount(2) == gen2;                   // ─── window closes ───
         }
-        Assert.Equal(4L << 20, pooled);
+
+        Assert.True(measured, $"eight attempts, and a foreign gen2 disturbed every one — last reading {pooled} bytes");
+        Assert.Equal(Parked, pooled);
 
         // Nothing rents before the next gen2, so its high-water trim (or, under memory pressure,
         // its full trim) drops all four. Nothing but the registered gen2 callback runs one here.
