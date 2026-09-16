@@ -438,7 +438,16 @@ public partial class Program { }
 /// </summary>
 internal static class IngestRoutes
 {
-    private static readonly string[] Paths =
+    /// <summary>
+    /// Internal so a test can hold this list against the routes the application actually maps.
+    /// It is hand-maintained and it has a sibling (<c>AmetoIngestEndpoints</c>) that is also
+    /// hand-maintained; adding a spelling to one and not the other is exactly what happened once
+    /// already, and drift in either direction here is silent — a receiver that stops matching
+    /// quietly puts the whole auth stack back on the ingest hot path, and a path that matches but
+    /// is NOT a receiver reaches an endpoint carrying authorization metadata, which ASP.NET Core
+    /// answers with a 500 rather than serving.
+    /// </summary>
+    internal static readonly string[] Paths =
     [
         "/api/events",
         "/otlp/v1/logs", "/otlp/v1/traces", "/otlp/v1/metrics",
@@ -446,7 +455,7 @@ internal static class IngestRoutes
     ];
 
     /// <summary>The single segment every OTLP/gRPC Export method path begins with.</summary>
-    private const string GrpcPrefix = "/opentelemetry.proto.collector";
+    internal const string GrpcPrefix = "/opentelemetry.proto.collector";
 
     public static bool IsIngestRequest(HttpContext ctx)
     {
