@@ -29,6 +29,10 @@ internal static class ChildProcessEntry
             Console.WriteLine($"managedBuild={b.ManagedBuildBytes}");
             Console.WriteLine($"nativeTier={b.NativeTierBytes}");
             Console.WriteLine($"indexCache={b.IndexCacheBytes}");
+            // The cache's native share is the one budget whose BASE is the interesting part —
+            // it is taken of the container, not of the heap limit the rest of the cache is a
+            // share of — so a child that cannot print it cannot prove which base was used.
+            Console.WriteLine($"indexCacheNative={b.IndexCacheNativeBytes}");
             return 0;
         }
 

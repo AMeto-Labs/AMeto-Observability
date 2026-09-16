@@ -38,6 +38,17 @@ public sealed class MemoryBudgetTests
         Assert.Equal((long)(384 * MB * 0.15), b.IndexCacheBytes);     //  57 MB
         Assert.True(b.IsConstrained);
 
+        // The index cache's NATIVE share (bloom bits) is the second budget taken of the
+        // CONTAINER rather than of the heap limit, and that choice is the whole point of having
+        // it: 5 % of 512 MB is 25.6 MB, where 5 % of the 384 MB heap limit would be 20.1 MB —
+        // managed headroom spent on bytes the GC cannot see. Spelled out in bytes as well as in
+        // the formula, so swapping the base under it fails here rather than moving with it.
+        Assert.Equal(26_843_545L, b.IndexCacheNativeBytes);
+        Assert.Equal((long)(512 * MB * 0.05), b.IndexCacheNativeBytes);
+        Assert.NotEqual((long)(384 * MB * 0.05), b.IndexCacheNativeBytes);
+        Assert.True(b.IndexCacheNativeBytes < b.IndexCacheBytes,
+            "the native ceiling is a backstop on part of the cache, never larger than the whole");
+
         // The managed shares must leave the heap room for queries, ASP.NET and the GC itself, and
         // all three must leave the container room for the runtime, the ring and the live tier.
         Assert.True(b.ManagedBuildBytes + b.IndexCacheBytes < 384 * MB / 2);
@@ -112,6 +123,13 @@ public sealed class MemoryBudgetTests
         Assert.Equal((long)(512 * MB * 0.30), b.ManagedBuildBytes);
         Assert.Equal(MemoryBudgets.NativeTierCapBytes, b.NativeTierBytes);
         Assert.Equal((long)(512 * MB * 0.15), b.IndexCacheBytes);
+
+        // Including the cache's own native share, which is the sharpest reading of the rule:
+        // on a 64 GB host it takes the fixed ceiling, where the managed base would have given
+        // 5 % of 512 MB = 26.8 MB — a quarter of it, on a host with 64 GB of room.
+        Assert.Equal(MemoryBudgets.IndexCacheNativeCapBytes, b.IndexCacheNativeBytes);
+        Assert.True(b.IndexCacheNativeBytes > (long)(512 * MB * 0.05),
+            "a heap hard limit says nothing about native memory and must not shrink this either");
     }
 
     [Fact]
@@ -122,6 +140,7 @@ public sealed class MemoryBudgetTests
         Assert.Equal(MemoryBudgets.ManagedBuildCapBytes, b.ManagedBuildBytes);  // 30 % = 1.2 GB > cap
         Assert.Equal(MemoryBudgets.NativeTierCapBytes,   b.NativeTierBytes);    // 25 % = 1.0 GB > cap
         Assert.Equal(MemoryBudgets.IndexCacheCapBytes,   b.IndexCacheBytes);    // 15 % = 614 MB > cap
+        Assert.Equal(MemoryBudgets.IndexCacheNativeCapBytes, b.IndexCacheNativeBytes); // 5 % = 205 MB > cap
         Assert.False(b.IsConstrained);
     }
 
@@ -133,6 +152,7 @@ public sealed class MemoryBudgetTests
         Assert.Equal(MemoryBudgets.ManagedBuildCapBytes, b.ManagedBuildBytes);
         Assert.Equal(MemoryBudgets.NativeTierCapBytes,   b.NativeTierBytes);
         Assert.Equal(MemoryBudgets.IndexCacheCapBytes,   b.IndexCacheBytes);
+        Assert.Equal(MemoryBudgets.IndexCacheNativeCapBytes, b.IndexCacheNativeBytes);
         Assert.False(b.IsConstrained);
     }
 
@@ -151,6 +171,7 @@ public sealed class MemoryBudgetTests
         Assert.Equal(MemoryBudgets.ManagedBuildCapBytes, b.ManagedBuildBytes);
         Assert.Equal(MemoryBudgets.NativeTierCapBytes,   b.NativeTierBytes);
         Assert.Equal(MemoryBudgets.IndexCacheCapBytes,   b.IndexCacheBytes);
+        Assert.Equal(MemoryBudgets.IndexCacheNativeCapBytes, b.IndexCacheNativeBytes);
         Assert.False(b.IsConstrained);
     }
 
@@ -160,6 +181,7 @@ public sealed class MemoryBudgetTests
     {
         var b = MemoryBudgets.Derive(managedLimitBytes: 384 * MB, physicalLimitBytes: 0);
         Assert.Equal((long)(384 * MB * 0.25), b.NativeTierBytes);
+        Assert.Equal((long)(384 * MB * 0.05), b.IndexCacheNativeBytes);
         Assert.Equal(384 * MB, b.PhysicalLimitBytes);
     }
 
@@ -172,19 +194,25 @@ public sealed class MemoryBudgetTests
         Assert.True(b.ManagedBuildBytes >= 16 * MB);
         Assert.True(b.NativeTierBytes   >= 16 * MB);
         Assert.True(b.IndexCacheBytes   >=  8 * MB);
+
+        // 5 % of 32 MB is 1.6 MB, which would not hold one production group's bloom section:
+        // the native ceiling has a floor of its own, and it is the floor that applies here.
+        Assert.Equal(4 * MB, b.IndexCacheNativeBytes);
     }
 
     [Fact]
     public void Budgets_rise_monotonically_with_available_memory()
     {
-        long prevManaged = 0, prevNative = 0, prevCache = 0;
+        long prevManaged = 0, prevNative = 0, prevCache = 0, prevCacheNative = 0;
         for (long available = 64 * MB; available <= 64 * GB; available *= 2)
         {
             var b = MemoryBudgets.Derive(available * 3 / 4, available);
-            Assert.True(b.ManagedBuildBytes >= prevManaged);
-            Assert.True(b.NativeTierBytes   >= prevNative);
-            Assert.True(b.IndexCacheBytes   >= prevCache);
-            (prevManaged, prevNative, prevCache) = (b.ManagedBuildBytes, b.NativeTierBytes, b.IndexCacheBytes);
+            Assert.True(b.ManagedBuildBytes     >= prevManaged);
+            Assert.True(b.NativeTierBytes       >= prevNative);
+            Assert.True(b.IndexCacheBytes       >= prevCache);
+            Assert.True(b.IndexCacheNativeBytes >= prevCacheNative);
+            (prevManaged, prevNative, prevCache, prevCacheNative) =
+                (b.ManagedBuildBytes, b.NativeTierBytes, b.IndexCacheBytes, b.IndexCacheNativeBytes);
         }
     }
 
@@ -265,6 +293,13 @@ public sealed class MemoryBudgetTests
         Assert.Equal(expected.ManagedBuildBytes, child.ManagedBuild);   // 115 MB
         Assert.Equal(expected.NativeTierBytes,   child.NativeTier);     // 128 MB
         Assert.Equal(expected.IndexCacheBytes,   child.IndexCache);     //  57 MB
+
+        // The index cache's native share is the other budget this test exists for: bloom bits are
+        // NativeMemory, so they are bounded by the CONTAINER, not by the heap limit the rest of
+        // the cache is a share of. 25.6 MB here; taken of the managed limit it would be 20.1 MB,
+        // and the difference is managed headroom spent on bytes the GC never sees.
+        Assert.Equal(expected.IndexCacheNativeBytes, child.IndexCacheNative);
+        Assert.Equal(26_843_545L, child.IndexCacheNative);
     }
 
     /// <summary>
@@ -285,8 +320,11 @@ public sealed class MemoryBudgetTests
         var expected = MemoryBudgets.Derive(512 * MB, hostPhysical);
         Assert.Equal(expected.ManagedBuildBytes, child.ManagedBuild);
         Assert.Equal(expected.NativeTierBytes,   child.NativeTier);
+        Assert.Equal(expected.IndexCacheNativeBytes, child.IndexCacheNative);
         Assert.True(child.NativeTier > MemoryBudgets.Derive(512 * MB).NativeTierBytes,
             "a heap hard limit must not shrink the native budget");
+        Assert.True(child.IndexCacheNative > MemoryBudgets.Derive(512 * MB).IndexCacheNativeBytes,
+            "nor the cache's native ceiling, which is native memory for exactly the same reason");
     }
 
     /// <summary>
@@ -308,7 +346,8 @@ public sealed class MemoryBudgetTests
     }
 
     private readonly record struct ChildBudgets(
-        long ManagedLimit, long PhysicalLimit, long ManagedBuild, long NativeTier, long IndexCache);
+        long ManagedLimit, long PhysicalLimit, long ManagedBuild, long NativeTier, long IndexCache,
+        long IndexCacheNative);
 
     /// <summary>Runs this test assembly's own entry point (<see cref="ChildProcessEntry"/>) under the given GC settings.</summary>
     private static ChildBudgets RunChild(params ReadOnlySpan<(string Name, string Value)> gcSettings)
@@ -356,6 +395,7 @@ public sealed class MemoryBudgetTests
 
         return new ChildBudgets(
             values["managedLimit"], values["physicalLimit"],
-            values["managedBuild"], values["nativeTier"], values["indexCache"]);
+            values["managedBuild"], values["nativeTier"], values["indexCache"],
+            values["indexCacheNative"]);
     }
 }
