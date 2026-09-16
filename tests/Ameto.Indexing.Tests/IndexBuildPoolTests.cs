@@ -191,12 +191,26 @@ public sealed class IndexBuildPoolTests
     [Fact]
     public void AGen2Collection_TrimsThePools_ThroughTheRegisteredCallback()
     {
-        IndexBuildPool.TrimAll();
-        var held = new byte[4][];
-        for (int i = 0; i < held.Length; i++) held[i] = IndexBuildPool.Slabs.Rent(IndexBuildPool.SlabBytes);
-        for (int i = 0; i < held.Length; i++) IndexBuildPool.Slabs.Return(held[i]);
-        IndexBuildPool.TrimIdle();                                      // keeps the four (all were out at once), resets the high-water mark
-        Assert.Equal(4L << 20, IndexBuildPool.Slabs.PooledBytes);
+        // The four parked slabs below are only there to be trimmed by the collection this test
+        // forces, and the trim callback is registered process-wide: a gen2 that an earlier class's
+        // allocations set up can complete inside the setup and run the very trim the first
+        // assertion denies (seen once in a full-suite run: 2 MB parked where 4 was expected).
+        // Nothing between the returns and the read allocates, so the window is bracketed by the
+        // gen2 count and RE-ENTERED when one lands in it, rather than asserted through.
+        long pooled = 0;
+        for (int attempt = 0; attempt < 8; attempt++)
+        {
+            IndexBuildPool.TrimAll();
+            var held = new byte[4][];
+            for (int i = 0; i < held.Length; i++) held[i] = IndexBuildPool.Slabs.Rent(IndexBuildPool.SlabBytes);
+
+            int gen2 = GC.CollectionCount(2);
+            for (int i = 0; i < held.Length; i++) IndexBuildPool.Slabs.Return(held[i]);
+            IndexBuildPool.TrimIdle();                                  // keeps the four (all were out at once), resets the high-water mark
+            pooled = IndexBuildPool.Slabs.PooledBytes;
+            if (GC.CollectionCount(2) == gen2) break;
+        }
+        Assert.Equal(4L << 20, pooled);
 
         // Nothing rents before the next gen2, so its high-water trim (or, under memory pressure,
         // its full trim) drops all four. Nothing but the registered gen2 callback runs one here.
