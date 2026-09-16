@@ -175,11 +175,19 @@ Request/size limits, in bytes. Oversized requests are rejected with `413` before
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `MaxBatchBytes` | int | `4194304` (4 MB) | Max body for a CLEF batch (`POST /api/events`). |
+| `MaxBatchBytes` | int | `4194304` (4 MB) | Max body for a CLEF batch (`POST /api/events`). Raising it past 8 MB stops the body being pooled — see below. |
 | `MaxEventPayloadBytes` | int | `65536` (64 KB) | Max serialised properties for a single event (also the ring-buffer slab size). An oversized event is dropped (and logged) while the rest of the batch ingests. |
-| `MaxOtlpBatchBytes` | int | `8388608` (8 MB) | Max body for the OTLP endpoints (`POST /otlp/v1/*`). |
+| `MaxOtlpBatchBytes` | int | `8388608` (8 MB) | Max body for the OTLP endpoints (`POST /otlp/v1/*`). Raising it past 8 MB stops the body being pooled — see below. |
 | `RingCapacity` | int | `65536` | Ring-buffer slots between the HTTP ingest endpoints and the storage drainer (rounded up to a power of two, ~64 B each). Together with `PayloadPoolBytes` this is the absorption window for flush stalls before events drop. |
 | `PayloadPoolBytes` | long | *unset* → `min(512 MB, 15 % of the physical limit)` | Payload slab arena budget: slab count = min(`RingCapacity`, this / `MaxEventPayloadBytes`). Slabs, not ring slots, are the true drop threshold under stall. Reserved virtual memory — resident pages track the payload bytes actually written — but those pages are **never given back**, so the high-water mark is a resting level. Unset derives it from the memory this process may use (~76 MB in a 512 MB container, the full 512 MB where there is room); an explicit value always wins. `GET /api/diagnostics` reports `ingestArenaBytes` and `ingestArenaResidentBytes`. |
+
+> **A body over 8 MB is not pooled.** Request bodies are rented from a dedicated pool whose
+> largest bucket is 8 MB, chosen to cover the defaults of both receivers. Raising `MaxBatchBytes`
+> or `MaxOtlpBatchBytes` past that still behaves correctly, but every request above 8 MB then
+> allocates an array of exactly its size straight on the large object heap and drops it again on
+> return — the per-request LOH churn the pool exists to remove, on hosts that are usually the
+> ones least able to afford it. Nothing reports the cliff and `ingestBufferPooledBytes` will
+> simply stop growing, so raise these ceilings only as far as the traffic actually needs.
 
 ---
 
@@ -326,7 +334,7 @@ Ameto:
   Ingestion:
     MaxBatchBytes: 4194304        # 4 MB  (CLEF /api/events)
     MaxEventPayloadBytes: 65536   # 64 KB (per-event properties)
-    MaxOtlpBatchBytes: 8388608    # 8 MB  (/otlp/v1/*)
+    MaxOtlpBatchBytes: 8388608    # 8 MB  (/otlp/v1/*); above 8 MB bodies are no longer pooled
     # RingCapacity: 65536         # ring slots between the receivers and the drainer
     # PayloadPoolBytes:           # unset = min(512 MB, 15% of the physical limit)
 
