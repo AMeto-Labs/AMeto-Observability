@@ -2754,6 +2754,25 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 // at that slot — resolving it would stamp a random template onto every
                 // recovered event. -1 = "no template", persisted as an empty @mt.
                 MessageTemplatePoolIndex = poolMissing ? -1 : entry.TemplateIndex,
+                // EXPLICITLY -1. The WAL entry format carries no service name, so "absent" is
+                // the only honest value — but the field is a plain int on a struct, and its
+                // default of 0 is a VALID pool index, not the sentinel every reader tests for
+                // (`ServiceNamePoolIndex >= 0`). The pool is shared by templates and service
+                // names and recovery force-interns this WAL's own rows into it, so slot 0 is
+                // ordinarily this WAL's first template: every recovered event was stamped with
+                // it, and the flush below wrote that string permanently into the recovery
+                // segment's @svc column, where it answers service.name queries and skews
+                // per-service counts.
+                ServiceNamePoolIndex     = -1,
+                // EXPLICITLY -1. The WAL entry format carries no service name, so "absent" is
+                // the only honest value — but the field is a plain int on a struct, and its
+                // default of 0 is a VALID pool index, not the sentinel every reader tests for
+                // (`ServiceNamePoolIndex >= 0`). The pool is shared by templates and service
+                // names and recovery force-interns this WAL's own rows into it, so slot 0 is
+                // ordinarily this WAL's first template: every recovered event was stamped with
+                // it, and the flush below wrote that string permanently into the recovery
+                // segment's @svc column, where it answers service.name queries and skews
+                // per-service counts.
             };
             // Resolve template via the freshly restored pool and attach it
             // to the hot tier so the recovery flush persists @mt correctly.
