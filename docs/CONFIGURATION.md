@@ -179,7 +179,23 @@ Request/size limits, in bytes. Oversized requests are rejected with `413` before
 | `MaxEventPayloadBytes` | int | `65536` (64 KB) | Max serialised properties for a single event (also the ring-buffer slab size). An oversized event is dropped (and logged) while the rest of the batch ingests. |
 | `MaxOtlpBatchBytes` | int | `8388608` (8 MB) | Max body for the OTLP endpoints (`POST /otlp/v1/*`). |
 | `RingCapacity` | int | `65536` | Ring-buffer slots between the HTTP ingest endpoints and the storage drainer (rounded up to a power of two, ~64 B each). Together with `PayloadPoolBytes` this is the absorption window for flush stalls before events drop. |
-| `PayloadPoolBytes` | long | `536870912` (512 MB) | Payload slab arena budget: slab count = min(`RingCapacity`, this / `MaxEventPayloadBytes`). Reserved virtual memory — resident pages track the payload bytes actually written, not the budget. Slabs, not ring slots, are the true drop threshold under stall. |
+| `PayloadPoolBytes` | long | *unset* → `min(512 MB, 15 % of the physical limit)` | Payload slab arena budget: slab count = min(`RingCapacity`, this / `MaxEventPayloadBytes`). Slabs, not ring slots, are the true drop threshold under stall. Reserved virtual memory — resident pages track the payload bytes actually written — but those pages are **never given back**, so the high-water mark is a resting level. Unset derives it from the memory this process may use (~76 MB in a 512 MB container, the full 512 MB where there is room); an explicit value always wins. `GET /api/diagnostics` reports `ingestArenaBytes` and `ingestArenaResidentBytes`. |
+
+---
+
+## Query options (`Ameto:Query`)
+
+Search budgets, and the cross-query cache of decoded segment indexes.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `IndexCacheBytes` | long | *unset* → `min(256 MB, 15 % of the managed-heap limit)` | Budget for the cache of decoded segment indexes, charged at each entry's **retained** size (expanded postings + dictionaries + bloom bits, several times the packed sections they decode from). Unset derives it from the memory this process may use: in a 512 MB container the GC's own heap limit is 384 MB, giving ~57 MB. `0` disables the cache — every query then re-reads and re-decodes the sections it consults. An explicit value always wins, including one larger than the derived figure. |
+| `IndexCacheIdleEvict` | TimeSpan | `"00:10:00"` | Drop cached segment indexes that no query has read for this long. Without it the only thing that ever removes an entry is budget pressure, so a server that answers one wide query and then goes quiet keeps those postings and bloom bits resident for the rest of its life. `0` turns it off (budget pressure only); the first wide query after an eviction pays to re-read and re-decode. |
+| `Timeout` | TimeSpan | `"00:01:00"` | Wall-clock budget for one search. A query that exceeds it is stopped and the client told so, rather than occupying a core until the browser tab is closed. Zero or negative removes the budget. |
+| `MaxConcurrent` | int | `0` | Searches allowed to run at once — each memory-maps segments and decompresses blocks in parallel. `0` = auto (processor count, clamped 2–16); negative = unlimited. Past the limit a request is refused quickly (`503` + `Retry-After`) instead of everything crawling. |
+| `QueueWait` | TimeSpan | `"00:00:05"` | How long a request waits for a search slot before it is refused. |
+
+**Upgrading — both cache settings changed behaviour.** `IndexCacheBytes` was a flat 256 MB and is now derived when unset, so an existing install that never set it gets less (~153 MB on a 1 GB VM, ~57 MB in a 512 MB container); and `IndexCacheIdleEvict` is new and **on by default**. To keep the previous behaviour exactly, set `IndexCacheBytes: 268435456` and `IndexCacheIdleEvict: "00:00:00"`. The effective figures are printed at startup on the `Flush budgets:` line and exposed by `GET /api/diagnostics` as `indexCacheBudgetBytes`, `indexCacheBytes` and `indexCacheIdleEvicted`.
 
 ---
 
@@ -311,6 +327,15 @@ Ameto:
     MaxBatchBytes: 4194304        # 4 MB  (CLEF /api/events)
     MaxEventPayloadBytes: 65536   # 64 KB (per-event properties)
     MaxOtlpBatchBytes: 8388608    # 8 MB  (/otlp/v1/*)
+    # RingCapacity: 65536         # ring slots between the receivers and the drainer
+    # PayloadPoolBytes:           # unset = min(512 MB, 15% of the physical limit)
+
+  Query:
+    # IndexCacheBytes:            # unset = min(256 MB, 15% of the managed-heap limit); 0 disables
+    # IndexCacheIdleEvict: "00:10:00"   # 0 = off (budget pressure only)
+    Timeout: "00:01:00"
+    MaxConcurrent: 0              # 0 = auto (cores, 2-16); negative = unlimited
+    QueueWait: "00:00:05"
 
   Retention:
     VerboseDays: 90

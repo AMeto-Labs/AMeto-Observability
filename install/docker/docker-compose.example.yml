@@ -82,6 +82,18 @@ services:
       # Ameto__Ingestion__MaxBatchBytes: "4194304"        # default 4 MB — max CLEF body (POST /api/events)
       # Ameto__Ingestion__MaxEventPayloadBytes: "65536"   # default 64 KB — max properties per event (ring slab)
       # Ameto__Ingestion__MaxOtlpBatchBytes: "8388608"    # default 8 MB — max OTLP body (POST /otlp/v1/*)
+      # Payload slab arena (the burst absorption window). Unset = min(512 MB, 15% of mem_limit),
+      # so ~76 MB at the 1g limit above. Its pages are never given back once touched.
+      # Ameto__Ingestion__PayloadPoolBytes: "536870912"
+
+      # ── Query (search budgets + the decoded-index cache) ──────────────────
+      # Unset = min(256 MB, 15% of the GC's heap limit, itself 75% of mem_limit) — ~115 MB at 1g.
+      # 0 disables the cache; an explicit value always wins.
+      # Ameto__Query__IndexCacheBytes: "268435456"
+      # Drop cached indexes nothing has read for this long; "00:00:00" = off (budget pressure only).
+      # Ameto__Query__IndexCacheIdleEvict: "00:10:00"
+      # Ameto__Query__Timeout: "00:01:00"                 # wall-clock budget for one search
+      # Ameto__Query__MaxConcurrent: "0"                  # 0 = auto (cores, 2-16); negative = unlimited
 
       # ── Retention (first-run defaults, days; afterwards managed in the UI / SQLite) ──
       Ameto__Retention__VerboseDays: "90"

@@ -136,6 +136,36 @@ Ameto:
     MaxEventPayloadBytes: 65536   # 64 KB — max properties per event (larger events dropped + logged)
     MaxOtlpBatchBytes: 8388608    # 8 MB  — max OTLP /otlp/v1/* body (larger → 413)
 
+    # Payload slab arena — the absorption window when the drainer stalls (slabs, not ring
+    # slots, are what a burst runs out of). Left unset it is derived from the memory this
+    # process may use: min(512 MB, 15% of the physical limit), so ~76 MB in a 512 MB
+    # container and the full 512 MB where there is room. The arena's pages are never given
+    # back once touched, which is why it is no longer a flat 512 MB on every host. Raise it
+    # to widen the window; watch ingestArenaResidentBytes in /api/diagnostics.
+    # PayloadPoolBytes: 536870912
+
+  # ── Query ────────────────────────────────────────────────────────────────────
+  # Search budgets and the cross-query cache of decoded segment indexes.
+  Query:
+    # Cache of decoded index sections, charged at each entry's RETAINED size (expanded
+    # postings + dictionaries + bloom bits). Unset = min(256 MB, 15% of the managed-heap
+    # limit) — in a 512 MB container the GC's heap limit is 384 MB, so ~57 MB. 0 disables
+    # the cache entirely (every query re-reads and re-decodes what it consults).
+    # For a 512 MB stand an explicit 48 MB is a reasonable floor to pin:
+    # IndexCacheBytes: 50331648
+    #
+    # Drop cached indexes nothing has read for this long. 0 = off, which is how servers
+    # behaved before this setting existed: then only budget pressure ever evicts, and a
+    # server that answers one wide query and goes quiet keeps those postings for ever.
+    # IndexCacheIdleEvict: "00:10:00"
+    #
+    # Wall-clock budget for one search; 0 or negative removes it.
+    Timeout: "00:01:00"
+    # Searches at once: 0 = auto (cores, clamped 2-16), negative = unlimited. Past the
+    # limit a request is refused quickly (503 + Retry-After) rather than everything crawling.
+    MaxConcurrent: 0
+    QueueWait: "00:00:05"
+
   # Per-level default retention (days).
   # These are only used the very first time — after that the values live in SQLite.
   Retention:
