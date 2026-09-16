@@ -83,7 +83,7 @@ public sealed class TimeBoundsTests : IDisposable
     public void Dispose()
     {
         try { _engine?.DisposeAsync().AsTask().GetAwaiter().GetResult(); } catch { }
-        try { Directory.Delete(_dir, true); } catch { }
+        QuerySegmentFixtures.DeleteDataDirectory(_dir);
     }
 
     private async Task BuildAsync()

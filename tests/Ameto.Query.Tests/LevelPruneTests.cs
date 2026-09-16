@@ -27,7 +27,7 @@ public sealed class LevelPruneTests : IDisposable
     {
         foreach (var e in _engines)
             try { e.DisposeAsync().AsTask().GetAwaiter().GetResult(); } catch { }
-        try { Directory.Delete(_dir, true); } catch { }
+        QuerySegmentFixtures.DeleteDataDirectory(_dir);
     }
 
     private static LogLevel LevelOf(int i) => (i % 3) switch

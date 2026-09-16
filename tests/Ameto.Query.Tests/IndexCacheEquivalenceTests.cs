@@ -69,7 +69,7 @@ public sealed class IndexCacheEquivalenceTests : IDisposable
     public void Dispose()
     {
         try { _engine.DisposeAsync().AsTask().GetAwaiter().GetResult(); } catch { }
-        try { Directory.Delete(_dir, true); } catch { }
+        QuerySegmentFixtures.DeleteDataDirectory(_dir);
     }
 
     private static async Task<List<long>> RunAsync(QueryExecutor q, string? filter, HashSet<LogLevel>? levels = null)

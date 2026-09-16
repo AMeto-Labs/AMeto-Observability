@@ -43,7 +43,7 @@ public sealed class IndexGroupPrefilterTests : IAsyncLifetime
     public async Task DisposeAsync()
     {
         await _engine.DisposeAsync();
-        try { Directory.Delete(_dir, true); } catch { }
+        QuerySegmentFixtures.DeleteDataDirectory(_dir);
     }
 
     private int GroupCount() => QuerySegmentFixtures.GroupCountOf(_segPath);

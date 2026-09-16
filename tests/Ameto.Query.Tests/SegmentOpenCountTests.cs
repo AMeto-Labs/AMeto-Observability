@@ -44,7 +44,7 @@ public sealed class SegmentOpenCountTests : IAsyncLifetime
     public async Task DisposeAsync()
     {
         await _engine.DisposeAsync();
-        try { Directory.Delete(_dir, true); } catch { }
+        QuerySegmentFixtures.DeleteDataDirectory(_dir);
     }
 
     private async Task<(long Opens, long Closes, List<LogEvent> Rows)> CountAsync(string? filter, int count = Events + 10)

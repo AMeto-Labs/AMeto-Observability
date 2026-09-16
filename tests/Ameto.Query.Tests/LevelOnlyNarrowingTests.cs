@@ -43,7 +43,7 @@ public sealed class LevelOnlyNarrowingTests : IAsyncLifetime
     {
         foreach (var e in _extra) { try { await e.DisposeAsync(); } catch { } }
         await _engine.DisposeAsync();
-        try { Directory.Delete(_dir, true); } catch { }
+        QuerySegmentFixtures.DeleteDataDirectory(_dir);
     }
 
     /// <summary>The level hints QueryExecutor builds from a derived level set.</summary>

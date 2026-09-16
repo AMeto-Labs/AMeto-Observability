@@ -111,7 +111,7 @@ public sealed class ScanPaceTests
         finally
         {
             await engine.DisposeAsync();
-            try { Directory.Delete(dir, true); } catch { /* best-effort */ }
+            QuerySegmentFixtures.DeleteDataDirectory(dir);
         }
     }
 

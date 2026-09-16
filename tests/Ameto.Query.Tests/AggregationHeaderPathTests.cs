@@ -89,7 +89,7 @@ public sealed class AggregationHeaderPathTests : IDisposable
     public void Dispose()
     {
         try { _engine.DisposeAsync().AsTask().GetAwaiter().GetResult(); } catch { }
-        try { Directory.Delete(_dir, true); } catch { }
+        QuerySegmentFixtures.DeleteDataDirectory(_dir);
     }
 
     // ── Running out of time on the header road ────────────────────────────────

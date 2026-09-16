@@ -49,7 +49,7 @@ public sealed class PreparedFilterTests : IAsyncLifetime
     public async Task DisposeAsync()
     {
         await _engine.DisposeAsync();
-        try { Directory.Delete(_dir, true); } catch { }
+        QuerySegmentFixtures.DeleteDataDirectory(_dir);
     }
 
     private async Task<List<LogLevel>> RunAsync(string? filter, IPreparedFilter? prepared)

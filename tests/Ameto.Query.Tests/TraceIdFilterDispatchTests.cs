@@ -149,10 +149,7 @@ public sealed class TraceIdFilterDispatchTests
         finally
         {
             await engine.DisposeAsync();
-            // RetentionStore's pooled SQLite connection keeps Ameto.db open; without this the
-            // delete fails on Windows and every run leaves a directory in TEMP.
-            Microsoft.Data.Sqlite.SqliteConnection.ClearAllPools();
-            try { Directory.Delete(dir, true); } catch { /* best-effort */ }
+            QuerySegmentFixtures.DeleteDataDirectory(dir);
         }
     }
 
