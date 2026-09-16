@@ -187,8 +187,16 @@ public sealed class IngestBodyBufferPoolTests : IClassFixture<AmetoWebAppFactory
         using var aborted = new CancellationTokenSource();
         ctx.RequestAborted = aborted.Token;
 
+        // The endpoint is built BEFORE the ledger opens. Endpoint() is the first touch of the
+        // factory's services in this theory, and that first touch starts the host: every hosted
+        // service and background loop it starts would capture an ExecutionContext holding this
+        // ledger, for the life of the process. Nothing in the background rents from
+        // IngestBufferPool today, so it is harmless today — and order-dependent the moment one
+        // does. (DriveAsync avoids this already, by evaluating Endpoint() as an argument.)
+        var endpoint = Endpoint();
+
         using var ledger = IngestBufferPoolLedger.Open();
-        Task handler = Endpoint().HandleAsync(ctx);
+        Task handler = endpoint.HandleAsync(ctx);
         await stalling.Stalled.Task.WaitAsync(Patience);
         await aborted.CancelAsync();
         Exception? thrown = await Record.ExceptionAsync(() => handler.WaitAsync(Patience));

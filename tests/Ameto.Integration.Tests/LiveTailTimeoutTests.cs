@@ -9,12 +9,21 @@ using LogLevel = Ameto.Core.LogLevel;
 namespace Ameto.Integration.Tests;
 
 /// <summary>
-/// A live tail whose poll outruns its budget must END, and say why exactly once. The budget
-/// can run out on any of three paths — mid-poll (the executor yields early, or the write
-/// throws), after the poll but before Disarm, or with its timer only queued when the next
-/// poll tries to re-arm — and each owes the client one terminal <c>query-error</c> frame.
-/// A tail that stopped without one looks exactly like a quiet live view; one that sent two
-/// would be reporting a single failure twice.
+/// A live tail whose poll outruns its budget must END, and say why exactly once: a tail that
+/// stopped without a terminal <c>query-error</c> frame looks exactly like a quiet live view, and
+/// one that sent two would be reporting a single failure twice.
+///
+/// <para>WHAT THIS ONE REACHES, which is less than the rule. The budget can run out on three
+/// paths — mid-poll (the executor yields early, or the write throws), after the poll but before
+/// Disarm, and with its timer only queued when the next poll tries to re-arm. This end-to-end
+/// test reaches the MID-POLL path only, and reaches it by racing a 1 ms budget against a 16 000
+/// event backlog rather than deterministically: on a fast machine a poll can finish inside the OS
+/// timer's ~15.6 ms tick, in which case the tail simply parks and rescans until one does not.
+/// Reverting QueryGuard.cs does not fail it, so read it as a smoke test over the whole wire. The
+/// other two paths and the re-arm rule itself are pinned as unit tests by
+/// <c>QueryDeadlineTests</c> — in particular
+/// <c>A_rearm_refused_by_a_queued_budget_timer_is_a_timeout_before_the_token_says_so</c>, which
+/// is what actually fails on a revert.</para>
 /// </summary>
 public sealed class LiveTailTimeoutTests : IClassFixture<LiveTailTimeoutTests.TinyBudgetFactory>
 {
