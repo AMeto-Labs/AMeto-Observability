@@ -440,6 +440,35 @@ internal static class OtlpProtoPayloads
             }))));
         })));
 
+    /// <summary>
+    /// <paramref name="good"/> complete records followed by one whose attribute value nests past
+    /// the parser's depth cap: a batch that turns hostile AFTER its prefix is already in the ring.
+    ///
+    /// <para>Truncating a buffer cannot produce this shape — the outer resource_logs length
+    /// prefix then overruns and the reader throws before it has read a single record (see
+    /// <see cref="Logs_TruncatedLengthPrefix"/>). The depth guard is what throws mid-walk.</para>
+    /// </summary>
+    public static byte[] Logs_PrefixThenOverDeepValue(int good, int depth = 65) => Msg(c =>
+        Nested(c, 1, Msg(rl =>
+        {
+            Nested(rl, 1, StandardResource());
+            Nested(rl, 2, Msg(sl =>
+            {
+                for (int i = 0; i < good; i++) Nested(sl, 2, LogRecord(i));
+                Nested(sl, 2, Msg(lr =>
+                {
+                    lr.WriteTag(1, WireFormat.WireType.Fixed64); lr.WriteFixed64(1_785_300_060_000_000_000UL);
+                    lr.WriteTag(2, WireFormat.WireType.Varint);  lr.WriteEnum(9);
+                    Nested(lr, 5, Msg(b => { b.WriteTag(1, WireFormat.WireType.LengthDelimited); b.WriteString("deep"); }));
+                    Nested(lr, 6, Msg(kv =>
+                    {
+                        kv.WriteTag(1, WireFormat.WireType.LengthDelimited); kv.WriteString("nest");
+                        Nested(kv, 2, NestedValue(depth, Nesting.Arrays));
+                    }));
+                }));
+            }));
+        })));
+
     /// <summary>An AnyValue wrapping itself in <paramref name="depth"/> recursive levels.</summary>
     private static byte[] NestedValue(int depth, Nesting nesting)
     {

@@ -123,13 +123,27 @@ public static class OtlpLogProtoParser
 
         var r = new ProtoReader(payload);
         uint tag;
-        while ((tag = r.ReadTag()) != 0)
+        try
         {
-            if (tag == 10) ReadResourceLogs(r.ReadLengthDelimited(), ref st);   // field 1
-            else r.SkipField(tag);
+            while ((tag = r.ReadTag()) != 0)
+            {
+                if (tag == 10) ReadResourceLogs(r.ReadLengthDelimited(), ref st);   // field 1
+                else r.SkipField(tag);
+            }
+        }
+        finally
+        {
+            // IN A FINALLY, because this parser ingests as it walks. A batch that turns
+            // hostile part way through — a value nested past MaxValueDepth, a malformed tail —
+            // throws with its intact prefix ALREADY in the ring, and the caller answers 400 /
+            // INVALID_ARGUMENT without coming back here. Those events would then wait out the
+            // drain loop's 1 s missed-signal timeout, invisible to queries and the live tail.
+            // The CLEF receiver wakes the drainer from inside its malformed-payload catch for
+            // exactly this reason (IngestionEndpoint); ParseState is a ref struct whose counts
+            // survive the unwind at this frame, so the same promise is kept here.
+            if (st.Ingested > 0) sink.NotifyBatchEnqueued();
         }
 
-        if (st.Ingested > 0) sink.NotifyBatchEnqueued();
         return (st.Ingested, st.Dropped);
     }
 
