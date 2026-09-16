@@ -414,8 +414,8 @@ public sealed class ExceptionInfo
         return Contains(reader.ReadString(), term);    // rare: the value spans buffer segments
     }
 
-    /// <summary>Scratch that a type name or an exception message sits inside; longer values
-    /// borrow from the pool. Either way nothing reaches the heap.</summary>
+    /// <summary>Ceiling on the scratch a type name or an exception message is decoded into;
+    /// longer values borrow from the pool instead. Either way nothing reaches the heap.</summary>
     private const int TermScratch = 512;
 
     private static bool Utf8Contains(ReadOnlySpan<byte> utf8, string term)
@@ -424,8 +424,14 @@ public sealed class ExceptionInfo
 
         int needed = Encoding.UTF8.GetMaxCharCount(utf8.Length);
         char[]? rented = null;
-        Span<char> scratch = stackalloc char[TermScratch];
-        if (needed > TermScratch) scratch = rented = ArrayPool<char>.Shared.Rent(needed);
+        // Sized from the VALUE, not from the ceiling. `stackalloc` zeroes everything it reserves
+        // (nothing in this repo sets SkipLocalsInit), and this runs per scanned row per term —
+        // twice, for the type and then the message — over values that are usually a short type
+        // name. Reserving TermScratch unconditionally also paid that kilobyte on the over-long
+        // road, which then rents from the pool anyway and never touches the reservation.
+        Span<char> scratch = needed <= TermScratch
+            ? stackalloc char[needed]
+            : (rented = ArrayPool<char>.Shared.Rent(needed));
         try
         {
             int written = Encoding.UTF8.GetChars(utf8, scratch);
