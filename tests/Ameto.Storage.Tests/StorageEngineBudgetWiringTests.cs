@@ -25,7 +25,10 @@ public sealed class StorageEngineBudgetWiringTests : IDisposable
 
     public void Dispose() { try { Directory.Delete(_root, true); } catch { } }
 
-    private StorageEngine NewEngine(MemoryBudgets budgets)
+    private StorageEngine NewEngine(
+        MemoryBudgets budgets,
+        QueryOptions? query = null,
+        Microsoft.Extensions.Logging.ILogger<StorageEngine>? logger = null)
     {
         string dir = Path.Combine(_root, Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dir);
@@ -33,12 +36,79 @@ public sealed class StorageEngineBudgetWiringTests : IDisposable
         {
             DataDirectory = dir,
             HotTier       = new HotTierOptions { MaxSizeBytes = 16 * MB },
+            Query         = query ?? new QueryOptions(),
         };
         return new StorageEngine(
             Options.Create(opts),
             new RetentionStore(opts, NullLogger<RetentionStore>.Instance),
-            NullLogger<StorageEngine>.Instance,
+            logger ?? NullLogger<StorageEngine>.Instance,
             budgets);
+    }
+
+    /// <summary>Keeps the formatted messages, so the one startup line an operator reads can be read back.</summary>
+    private sealed class CapturingLogger : Microsoft.Extensions.Logging.ILogger<StorageEngine>
+    {
+        public readonly List<string> Lines = [];
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            Microsoft.Extensions.Logging.LogLevel logLevel, Microsoft.Extensions.Logging.EventId eventId,
+            TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            lock (Lines) Lines.Add(formatter(state, exception));
+        }
+    }
+
+    /// <summary>
+    /// THE ONE LINE AN OPERATOR READS to verify the memory plan reported the DERIVED index-cache
+    /// ceiling, never the configured one — and the cache is the only one of the three that is
+    /// configurable. A 512 MB stand told to hold 48 MB was told it would hold 57; a big host told
+    /// to hold 4 GB was told 256 MB, which is the direction that ends in an OOM kill. The
+    /// diagnostics endpoint was given exactly this treatment in this same round — it reports what
+    /// the cache was BUILT with, pinned by DiagnosticsIndexCacheBudgetTests, because a fresh
+    /// derivation "could disagree with the budget the cache was actually built with". The startup
+    /// line was not.
+    /// </summary>
+    [Fact]
+    public async Task The_startup_line_reports_the_index_cache_that_will_be_enforced()
+    {
+        var log = new CapturingLogger();
+        // Derives 57 MB; configured to 48 MB. The two must not be confusable.
+        await using var engine = NewEngine(
+            MemoryBudgets.Derive(managedLimitBytes: 384 * MB, physicalLimitBytes: 512 * MB),
+            new QueryOptions { IndexCacheBytes = 48 * MB },
+            log);
+
+        string line = Assert.Single(log.Lines, l => l.Contains("Flush budgets:", StringComparison.Ordinal));
+
+        Assert.Contains("index cache≤48 MB (configured)", line, StringComparison.Ordinal);
+        Assert.DoesNotContain("index cache≤57 MB", line, StringComparison.Ordinal);
+        // The eviction that is on by default for every install appears in no document and no
+        // other log line; an operator reading this one should not have to infer it.
+        Assert.Contains("idle evict 00:10:00", line, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// With nothing configured the same line says so, and prints the derived figure.
+    ///
+    /// <para>The figure is THIS PROCESS's derivation, not the budgets injected above: an unset
+    /// Query.IndexCacheBytes resolves through MemoryBudgets.Current(), which is also what
+    /// AddAmetoQuery passes to the cache — so the line reports exactly what will be enforced,
+    /// which is the whole point. In production the two sources are the same call anyway.</para>
+    /// </summary>
+    [Fact]
+    public async Task An_unconfigured_index_cache_is_reported_as_derived()
+    {
+        var log = new CapturingLogger();
+        await using var engine = NewEngine(
+            MemoryBudgets.Derive(managedLimitBytes: 384 * MB, physicalLimitBytes: 512 * MB), query: null, log);
+
+        string line = Assert.Single(log.Lines, l => l.Contains("Flush budgets:", StringComparison.Ordinal));
+
+        long willEnforce = new QueryOptions().EffectiveIndexCacheBytes / MB;
+        Assert.Contains($"index cache≤{willEnforce} MB (derived)", line, StringComparison.Ordinal);
     }
 
     /// <summary>What the core-count half of the width formula allows, given what memory allows.</summary>

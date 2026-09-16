@@ -489,7 +489,8 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             "a flush holds {PerFlush} MB, a merge {PerMerge} MB in {GroupBudget} MB groups), " +
             "slots={Slots} (×{Tier} MB native = {NativeCeiling} MB), tier={Events} events / {Payload} MB payload; " +
             "derived from a {ManagedLimit} MB managed-heap limit and {PhysicalLimit} MB physical: " +
-            "managed≤{ManagedBudget} MB, native≤{NativeBudget} MB, index cache≤{CacheBudget} MB ({Source})",
+            "managed≤{ManagedBudget} MB, native≤{NativeBudget} MB ({Source}); " +
+            "index cache≤{CacheBudget} MB ({CacheSource}), idle evict {IdleEvict}",
             flushWidth, perBuildManaged / 1048576, managedCeiling / 1048576,
             perFlushManaged / 1048576, perMergeManaged / 1048576, _groupPayloadBudgetBytes / 1048576,
             flushSlots, tierFootprint / 1048576, nativeCeiling / 1048576,
@@ -498,8 +499,18 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             _budgets.PhysicalLimitBytes / 1048576,
             _budgets.ManagedBuildBytes / 1048576,
             _budgets.NativeTierBytes / 1048576,
-            _budgets.IndexCacheBytes / 1048576,
-            _budgets.IsConstrained ? "host-constrained" : "fixed ceilings");
+            _budgets.IsConstrained ? "host-constrained" : "fixed ceilings",
+            // The EFFECTIVE figure, not the derivation: Query.IndexCacheBytes overrides it, and
+            // this line is the only place an operator is told what the cache will hold. Reporting
+            // the derivation meant a stand configured to 48 MB was told 57, and a big host
+            // configured to 4 GB was told 256 — under-reporting, which is the direction that
+            // ends in an OOM kill. /api/diagnostics was given exactly this treatment in this same
+            // round (indexCacheBudgetBytes reports what the cache was BUILT with); the startup
+            // line was not. Resolving SegmentIndexCache itself is not available here: storage is
+            // registered before the query services that construct it.
+            _options.Query.EffectiveIndexCacheBytes / 1048576,
+            _options.Query.IndexCacheBytes.HasValue ? "configured" : "derived",
+            _options.Query.IndexCacheIdleEvict);
 
         // Both clamps are floored so at least one flush can always proceed. That floor
         // WINS over the budget: at a large MaxSizeBytes a single tier no longer fits, and
