@@ -77,6 +77,13 @@ public static class OtlpLogProtoParser
         public int ResKeyCount;
         public ReadOnlySpan<byte> Service;       // service.name UTF-8, sliced from the payload
         public bool ServiceSeen;                 // first service.name wins, as the mapper does
+        /// <summary>
+        /// The block's service.name, interned ONCE per resourceLogs (see
+        /// <see cref="IOtlpLogSink.InternService"/>), or -1 for "not interned — do it from the
+        /// span". Without it every record under the block re-ran a UTF-8 decode, a Marvin hash
+        /// and a dictionary probe over the same dozen bytes; the JSON parser has never done that.
+        /// </summary>
+        public int ServiceIdx;
         public int Depth;                        // nested array_value / kvlist_value levels open
         public int Ingested;
         public int Dropped;
@@ -136,6 +143,7 @@ public static class OtlpLogProtoParser
         st.ResKeyCount = 0;
         st.Service     = default;
         st.ServiceSeen = false;
+        st.ServiceIdx  = -1;
 
         var pass1 = new ProtoReader(bytes);
         uint tag;
@@ -144,6 +152,12 @@ public static class OtlpLogProtoParser
             if (tag == 10) ReadResource(pass1.ReadLengthDelimited(), ref st);   // field 1
             else pass1.SkipField(tag);
         }
+
+        // Pass 1 has walked the whole resource, so this block's service.name is final HERE —
+        // the same point the JSON parser interns at, and before pass 2 reads a single record.
+        // A saturated pool answers -1, which simply leaves every record on the old per-record
+        // path rather than making anything wrong.
+        if (!st.Service.IsEmpty) st.ServiceIdx = st.Sink.InternService(st.Service);
 
         var pass2 = new ProtoReader(bytes);
         while ((tag = pass2.ReadTag()) != 0)
@@ -252,7 +266,7 @@ public static class OtlpLogProtoParser
             ReadBodyString(body),
             st.OutBuf.WrittenSpan,
             trHi, trLo, sp,
-            st.Service);
+            st.Service, st.ServiceIdx);
 
         if (ok) st.Ingested++; else st.Dropped++;
     }

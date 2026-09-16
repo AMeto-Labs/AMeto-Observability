@@ -124,6 +124,32 @@ public sealed class ServiceInternProbe
             $"  saved               : {(beforeNs - afterNs) / Records:F0} ns/record");
     }
 
+    /// <summary>
+    /// The SAME guarantee on the protobuf road — which is the one production takes, since it is
+    /// what SDK exporters and the collector send. The optimisation was wired into the JSON
+    /// parser only: <c>OtlpLogProtoParser</c> called the 8-argument overload, so
+    /// <c>IngestionEndpoint</c> re-interned the resource's service.name for every record under
+    /// it. The two packages that introduced the parser and the interning share no file, so
+    /// nothing collided and nothing noticed.
+    /// </summary>
+    [Fact]
+    public void TheProtobufParserAlsoInternsOncePerResource_NotOncePerRecord()
+    {
+        byte[] payload = OtlpProtoPayloads.Logs_Realistic();
+        var    sink    = new PerResourceSink();
+
+        OtlpLogProtoParser.Parse(payload, sink);          // warm the thread-static scratch
+        sink.Interns = sink.Records = 0;
+        OtlpLogProtoParser.Parse(payload, sink);
+
+        Assert.Equal(OtlpProtoPayloads.LogRecords, sink.Records);
+        Assert.Equal(1, sink.Interns);
+
+        _out.WriteLine(
+            $"OTLP protobuf service.name interning — {OtlpProtoPayloads.LogRecords:N0} records in one "
+          + $"resourceLogs block: {sink.Interns} intern(s), {sink.Interns / (double)sink.Records:F3} per record");
+    }
+
     private static string BuildBatch(int records)
     {
         var sb = new StringBuilder(records * 400);
