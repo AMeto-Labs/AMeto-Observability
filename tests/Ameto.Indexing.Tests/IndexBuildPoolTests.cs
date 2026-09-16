@@ -75,32 +75,64 @@ public sealed class IndexBuildPoolTests
         Assert.True(h.LastTerms <= IndexBuildHints.MaxTerms && h.LastTrigrams <= IndexBuildHints.MaxTrigrams);
     }
 
+    /// <summary>
+    /// The byte cap, driven on a pool of this suite's own.
+    ///
+    /// <para>NOT on the process-wide pools: those are registered with the gen2 hook, which empties
+    /// them from the finaliser thread whenever the GC reports high memory load — and on Windows
+    /// that reading is MACHINE-wide. An exact parked-bytes assertion on them therefore reads 0
+    /// whenever a build box happens to be loaded while these very tests allocate tens of megabytes
+    /// on the large object heap, which is a failure that says nothing about the cap. A local pool
+    /// is never registered, so what it parks depends only on the rule under test. The real pools'
+    /// caps are asserted below, on numbers rather than on what they hold at an instant.</para>
+    /// </summary>
     [Fact]
     public void ByteCap_DropsReturnsBeyondIt()
     {
-        IndexBuildPool.TrimAll();
+        var slabs = new IndexBuildPool.SlabPool<byte>(
+            maxLength: IndexBuildPool.SlabBytes, maxArraysPerBucket: 64, maxPooledBytes: 48L << 20);
+
         var held = new byte[80][];
-        for (int i = 0; i < held.Length; i++) held[i] = IndexBuildPool.Slabs.Rent(IndexBuildPool.SlabBytes);
-        for (int i = 0; i < held.Length; i++) IndexBuildPool.Slabs.Return(held[i]);
-        Assert.True(IndexBuildPool.Slabs.PooledBytes <= IndexBuildPool.Slabs.MaxPooledBytes);
-        Assert.True(IndexBuildPool.Slabs.PooledBytes >= 32L << 20);   // it did keep a working set
-        IndexBuildPool.TrimAll();
+        for (int i = 0; i < held.Length; i++) held[i] = slabs.Rent(IndexBuildPool.SlabBytes);
+        for (int i = 0; i < held.Length; i++) slabs.Return(held[i]);
+
+        // 80 returns of 1 MB against a 48 MB cap: it keeps 48 and drops the rest, rather than
+        // keeping all 80 because the per-bucket depth (64) had not been reached either.
+        Assert.Equal(48L << 20, slabs.PooledBytes);
+        Assert.True(slabs.PooledBytes <= slabs.MaxPooledBytes);
     }
 
     [Fact]
     public void ByteCap_BindsOnTheIntsPool_WhereTheDepthAloneWouldKeepMore()
     {
         // Four 16 MB tables fit the depth (4) but not the 48 MB cap, so the fourth return is
-        // dropped. The slab pool cannot show this: 64 slabs x 1 MB IS its cap, so its depth binds first.
-        IndexBuildPool.TrimAll();
-        int len = IndexBuildPool.Ints.MaxLength;                        // 1 << 22 ints = 16 MB
+        // dropped. The slab pool cannot show this: 64 slabs x 1 MB IS its cap, so its depth binds
+        // first. On a local pool, for the reason given on the test above.
+        const int len = 1 << 22;                                       // 1 << 22 ints = 16 MB
+        var ints = new IndexBuildPool.SlabPool<int>(
+            maxLength: len, maxArraysPerBucket: 4, maxPooledBytes: 48L << 20);
+
         var held = new int[4][];
-        for (int i = 0; i < held.Length; i++) held[i] = IndexBuildPool.Ints.Rent(len);
-        for (int i = 0; i < held.Length; i++) IndexBuildPool.Ints.Return(held[i]);
+        for (int i = 0; i < held.Length; i++) held[i] = ints.Rent(len);
+        for (int i = 0; i < held.Length; i++) ints.Return(held[i]);
+
+        Assert.Equal(3L * len * sizeof(int), ints.PooledBytes);
+    }
+
+    /// <summary>
+    /// …and the pools the process actually builds through carry the caps the budget derives, at
+    /// the shape the tests above drive. This is the half that has to be asserted on the real
+    /// pools, and it is a wiring question: it does not depend on when a collection happened.
+    /// </summary>
+    [Fact]
+    public void TheProcessWidePools_CarryTheCapsTheBudgetDerives()
+    {
         Assert.Equal(IndexBuildPool.CapsFor(MemoryBudgets.Current().ManagedBuildBytes).Ints,
                      IndexBuildPool.Ints.MaxPooledBytes);
-        Assert.Equal(3L * len * sizeof(int), IndexBuildPool.Ints.PooledBytes);
-        IndexBuildPool.TrimAll();
+        Assert.Equal(IndexBuildPool.CapsFor(MemoryBudgets.Current().ManagedBuildBytes).Slabs,
+                     IndexBuildPool.Slabs.MaxPooledBytes);
+        Assert.Equal(1 << 22,                 IndexBuildPool.Ints.MaxLength);
+        Assert.Equal(IndexBuildPool.SlabBytes, IndexBuildPool.Slabs.MaxLength);
     }
 
     // ── What every pool may park, against what the heap allows ───────────────
