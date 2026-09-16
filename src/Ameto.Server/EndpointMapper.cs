@@ -639,6 +639,14 @@ public static class EndpointMapper
                         // The cursor follows the WRITER, not the enumerator: it moves past every
                         // row whose frame was accepted — a refused send's rows included, since
                         // they are still on their way out — and past no row whose frame was not.
+                        //
+                        // On the TAIL this ordering never decides anything, and saying so is worth
+                        // more than implying otherwise: every road that leaves rows unsent also
+                        // ends the stream. A refusal arrives as an OperationCanceledException,
+                        // TimedOut is sticky, so either the break below or the outer catch follows
+                        // it — the cursor set here is never read by another poll. It is the
+                        // WRITER's contract that this pins, for the other keyset callers of it,
+                        // which do go round again.
                         newCount = (int)(sse.RowsWritten - rowsBefore);
                         if (newCount > 0)
                         {
