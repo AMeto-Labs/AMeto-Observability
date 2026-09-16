@@ -149,14 +149,18 @@ public sealed class ExceptionInfoReadTests
 
     /// <summary>
     /// THE TRUNCATED PAYLOAD, in both directions. IsPresent answers from the msgpack header and
-    /// never walks the body, so a payload cut short answers by where it was cut: a header that
-    /// is whole says present however little body follows it, a string header too short to hold
-    /// its own length says absent. FromBytes throws on all of them.
+    /// never walks the body, so what decides is the KIND of header rather than how far the cut
+    /// went: any map header says present, a string header announcing a non-zero length says
+    /// present however little body follows it, and a string header too short to hold its own
+    /// length says absent. FromBytes throws on all of them.
     ///
-    /// <para>So a corrupt row falls IN to <c>has(@x)</c> when only its body is cut. That is a
+    /// <para>So a corrupt row falls IN to <c>has(@x)</c> when its body is cut — and also when a
+    /// map16 or map32 header is cut short of its own entry count, because that branch tests the
+    /// lead byte and no length. A cut STRING header is the one shape that falls out. That is a
     /// decision the doc on <see cref="ExceptionInfo.IsPresent"/> states, and this is what fails
-    /// if IsPresent is ever made strict (walking the body) or made to throw — either of which
-    /// would change which corrupt rows a presence filter returns.</para>
+    /// if IsPresent is ever made strict — walking the body, or length-checking the map headers
+    /// to "match the doc" — or made to throw, any of which would change which corrupt rows a
+    /// presence filter returns.</para>
     /// </summary>
     [Fact]
     public void IsPresent_answers_a_truncated_payload_from_its_header_alone()
@@ -165,6 +169,8 @@ public sealed class ExceptionInfoReadTests
         [
             ([0xD9, 0x05, 0x61],       true,  "str8 announcing 5 bytes, carrying 1"),
             ([0x81],                   true,  "fixmap announcing 1 entry, carrying none"),
+            ([0xDE, 0x00],             true,  "map16 header cut short of its count"),
+            ([0xDF, 0x00, 0x00, 0x00], true,  "map32 header cut short of its count"),
             ([0xDB, 0x00, 0x00, 0x00], false, "str32 header cut short of its length"),
         ];
 

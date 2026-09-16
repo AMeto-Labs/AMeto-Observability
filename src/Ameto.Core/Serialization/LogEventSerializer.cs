@@ -167,12 +167,19 @@ public static class LogEventSerializer
         public bool InSink;
     }
 
-    /// <inheritdoc cref="StreamBatch(ReadOnlyMemory{byte}, IClefBatchSink, out int)"/>
     /// <summary>
     /// As <see cref="StreamBatch(ReadOnlyMemory{byte}, IClefBatchSink, out int)"/>, but
     /// reporting progress through <paramref name="progress"/> so the counts — and
     /// <see cref="ClefBatchProgress.InSink"/> — are readable after a throw.
     /// </summary>
+    /// <remarks>
+    /// Any exception may escape, exactly as on the counting overload: a malformed body throws
+    /// whatever <c>MessagePackReader</c> chooses, and whatever the sink throws passes through.
+    /// This overload returns nothing — what the batch achieved is in <paramref name="progress"/>,
+    /// and <see cref="ClefBatchProgress.InSink"/> is what says whose fault a throw was.
+    /// </remarks>
+    // No whole-method <inheritdoc> here: it pulled the other overload's <returns> onto a void
+    // method, and its remark "use the ClefBatchProgress overload" onto the overload that IS one.
     public static void StreamBatch(ReadOnlyMemory<byte> body, IClefBatchSink sink, ref ClefBatchProgress progress)
     {
         var reader = new MessagePackReader(body);

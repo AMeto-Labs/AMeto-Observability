@@ -297,19 +297,24 @@ public sealed class ExceptionInfo
     /// <para>The qualifier is the TRUNCATED payload, which <see cref="FromBytes"/> never
     /// accepts, and this answers it from the header alone — so it can land on either side:</para>
     /// <list type="bullet">
-    ///   <item>a map header, or a string header announcing a non-zero length, answers TRUE even
-    ///         when the body it announces is cut short: <c>D9 05 61</c> (a str8 of five bytes
-    ///         carrying one) and <c>81</c> (a one-entry fixmap carrying nothing) are present;</item>
-    ///   <item>a string header too short to hold its own length answers FALSE: <c>DB 00 00 00</c>
-    ///         (a str32 in four bytes) is absent.</item>
+    ///   <item>ANY map header answers TRUE, whatever follows it: <c>81</c> (a one-entry fixmap
+    ///         carrying nothing), and <c>DE 00</c> or <c>DF 00 00 00</c> — map16 and map32
+    ///         headers cut short of their own entry count, which the map branch below tests by
+    ///         its lead byte alone and never length-checks;</item>
+    ///   <item>a string header announcing a non-zero length answers TRUE even when the body it
+    ///         announces is cut short: <c>D9 05 61</c> is a str8 of five bytes carrying one;</item>
+    ///   <item>a STRING header too short to hold its own length answers FALSE: <c>D9</c>,
+    ///         <c>DA 00</c> and <c>DB 00 00 00</c> (a str32 in four bytes) are absent.</item>
     /// </list>
-    /// <para><see cref="FromBytes"/> throws <see cref="System.IO.EndOfStreamException"/> for all
-    /// three. A corrupt row therefore falls OUT of <c>has(@x)</c> when its header is cut and IN
-    /// when only its body is. That is deliberate: this is asked per scanned row of a segment
+    /// <para><see cref="FromBytes"/> throws <see cref="System.IO.EndOfStreamException"/> for every
+    /// one of them. A corrupt row therefore falls OUT of <c>has(@x)</c> when a STRING header is
+    /// cut and IN otherwise: what decides is the KIND of header, not how far the cut went — so a
+    /// cut map header is present and a cut string header is not.
+    /// That is deliberate: this is asked per scanned row of a segment
     /// whose block frame has already been length-checked, and a presence probe is neither the
     /// place to raise corruption nor worth a body walk to detect it. Anything that then READS
     /// the payload still throws, and the caller that hits it sees the same exception it always
-    /// did. <c>ExceptionInfoReadTests</c> pins all three.</para>
+    /// did. <c>ExceptionInfoReadTests</c> pins each of these shapes.</para>
     /// </summary>
     public static bool IsPresent(ReadOnlySpan<byte> bytes)
     {
