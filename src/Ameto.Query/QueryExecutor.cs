@@ -667,7 +667,12 @@ public sealed class QueryExecutor : IQueryExecutor
                                     // Charged at the reader's RETAINED size, not the section
                                     // lengths it decoded from: postings expand ~3-8x out of their
                                     // varint packing, and budgeting by the packed size pinned
-                                    // several times Query.IndexCacheBytes of managed heap.
+                                    // several times the index-cache budget of managed heap. That
+                                    // budget is Query.EffectiveIndexCacheBytes, which is what the
+                                    // cache is constructed with; Query.IndexCacheBytes is the
+                                    // OPTION, nullable and null unless an operator sets it, with
+                                    // the figure otherwise derived from the memory this process
+                                    // may use.
                                     // Insert may hand back a concurrently inserted winner for this
                                     // group and dispose `built` — use it only through the lease.
                                     using var lease = cache.Insert(info.FilePath, g, needTrigram, built, built.ApproxRetainedBytes);
