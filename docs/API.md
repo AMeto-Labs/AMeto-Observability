@@ -341,9 +341,31 @@ Server health snapshot.
   "processStartedAt": "2026-05-20T09:00:00Z",
   "segmentCount": 7,
   "totalEventCount": 462345,
-  "totalCompressedBytes": 134217728
+  "totalCompressedBytes": 134217728,
+
+  "logsStorageBytes": 134217728,
+  "logsQuarantinedBytes": 0,
+
+  "indexCacheEntries": 12,
+  "indexCacheBytes": 41943040,
+  "indexCacheBudgetBytes": 60129542,
+  "indexCacheHits": 1843,
+  "indexCacheMisses": 57,
+  "indexCacheIdleEvicted": 3,
+
+  "ingestBufferPooledBytes": 4194304,
+  "ingestBufferBudgetBytes": 134217728,
+  "ingestArenaBytes": 80530636,
+  "ingestArenaResidentBytes": 655360,
+  "indexBuildPooledBytes": 8388608
 }
 ```
+
+The response carries more fields than are shown here (disk, GC, per-signal storage, ingest counters); **new fields are added without notice**, so parse it permissively.
+
+The memory figures are the ones worth watching on a constrained host, and each is a ceiling paired with what is held against it: `indexCacheBytes` / `indexCacheBudgetBytes` is the decoded-index cache (the budget is what the cache was BUILT with, not a fresh derivation), `ingestBufferPooledBytes` / `ingestBufferBudgetBytes` is request bodies parked between requests, and `ingestArenaResidentBytes` / `ingestArenaBytes` is how far into the payload arena the ring has ever reached — those pages are never given back, so it is a resting level rather than a peak. `logsQuarantinedBytes` is inside `logsStorageBytes` and is the one part retention will never free.
+
+> **Changed in this release — `processThreads` counts thread-pool threads.** It now reports `ThreadPool.ThreadCount`; it used to report `Process.Threads.Count`, which snapshots every process on the machine on Windows and allocated a `ProcessThread` object per thread — the single largest allocation in this endpoint. Dedicated threads (the drainer, the flushers, the GC) are **not** in the new figure, so it is smaller than before for the same load. A scrape, alert threshold or runbook calibrated against the old meaning will see a step change after upgrading.
 
 ---
 

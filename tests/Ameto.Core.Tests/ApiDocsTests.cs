@@ -53,4 +53,37 @@ public sealed class ApiDocsTests
         Assert.Contains("400 Bad Request", httpSection, StringComparison.Ordinal);
         Assert.Contains("may already be ingested", httpSection, StringComparison.Ordinal);
     }
+
+    /// <summary>
+    /// <c>processThreads</c> is a documented field whose MEANING changed — Process.Threads.Count
+    /// became ThreadPool.ThreadCount, which excludes the drainer, the flushers and the GC, so the
+    /// number is smaller for the same load. The Angular client was updated for it and the wire
+    /// contract was not, leaving every non-browser consumer (a scrape, an alert threshold, a
+    /// runbook) reading the field under its old meaning and seeing an unexplained step change.
+    /// </summary>
+    [Fact]
+    public void The_processThreads_meaning_change_is_called_out()
+    {
+        string doc = Api();
+
+        Assert.Contains("processThreads", doc, StringComparison.Ordinal);
+        Assert.Contains("thread-pool threads", doc, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The memory figures this round added exist to be READ by an operator on a small host; a
+    /// figure documented nowhere is one nobody will look for.
+    /// </summary>
+    [Fact]
+    public void The_memory_figures_are_in_the_diagnostics_example()
+    {
+        string doc = Api();
+
+        foreach (string field in new[]
+                 {
+                     "indexCacheBudgetBytes", "indexCacheIdleEvicted", "indexBuildPooledBytes",
+                     "ingestBufferPooledBytes", "ingestArenaResidentBytes", "logsQuarantinedBytes",
+                 })
+            Assert.Contains(field, doc, StringComparison.Ordinal);
+    }
 }

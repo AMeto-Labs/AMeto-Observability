@@ -215,6 +215,13 @@ public sealed class QueryValidationTests : IClassFixture<AmetoWebAppFactory>
                      "ingestArenaBytes", "ingestArenaResidentBytes",
                      // Index build: merge rows written without their @x.* terms, and pooled build memory.
                      "indexMalformedExceptionPayloads", "indexBuildPooledBytes",
+                     // The decoded-index cache: what it holds, what it may hold, and whether it is
+                     // earning its keep. Six fields the endpoint promises that nothing guarded —
+                     // a refactor could drop any of them and leave the whole suite green.
+                     "indexCacheEntries", "indexCacheBytes", "indexCacheBudgetBytes",
+                     "indexCacheHits", "indexCacheMisses", "indexCacheIdleEvicted",
+                     // Inside logsStorageBytes, and the one part of it retention will never free.
+                     "logsQuarantinedBytes",
                  })
         {
             Assert.True(json.TryGetProperty(field, out var value), $"missing '{field}'");
