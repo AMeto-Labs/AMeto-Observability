@@ -1,3 +1,4 @@
+using Ameto.Core;
 using Ameto.Indexing;
 
 namespace Ameto.Indexing.Tests;
@@ -134,16 +135,26 @@ public sealed class IndexBuildPoolTests
     private static readonly long Interval =
         (long)(IndexBuildPool.MinTrimInterval.TotalSeconds * System.Diagnostics.Stopwatch.Frequency);
 
+    /// <summary>
+    /// The rule these pools ask is now <see cref="PoolTrimPolicy"/>, shared with the ingest
+    /// buffer pool rather than copied into it. Asked here the way a container asks it — the
+    /// reading is this process's — with the held bytes standing in for a pool with something in
+    /// it; the host-wide half is pinned in <c>Ameto.Core.Tests.PoolTrimPolicyTests</c>.
+    /// </summary>
     [Fact]
     public void HighMemoryLoad_TrimsEverything_ButNotAgainWithinTheInterval()
     {
         const long t = 1_000_000;
-        Assert.True (IndexBuildPool.ShouldTrimAll(memoryLoadBytes: 900, highLoadThresholdBytes: 900, t, lastTrimTimestamp: 0));
-        Assert.False(IndexBuildPool.ShouldTrimAll(memoryLoadBytes: 899, highLoadThresholdBytes: 900, t, lastTrimTimestamp: 0));
-        Assert.False(IndexBuildPool.ShouldTrimAll(memoryLoadBytes: 900, highLoadThresholdBytes: 0,   t, lastTrimTimestamp: 0));
+        Assert.True (ShouldTrimAll(memoryLoadBytes: 900, highLoadThresholdBytes: 900, t, lastTrimTimestamp: 0));
+        Assert.False(ShouldTrimAll(memoryLoadBytes: 899, highLoadThresholdBytes: 900, t, lastTrimTimestamp: 0));
+        Assert.False(ShouldTrimAll(memoryLoadBytes: 900, highLoadThresholdBytes: 0,   t, lastTrimTimestamp: 0));
         // The refill a full trim causes drives the next gen2: still under pressure, it must not empty the pools again yet.
-        Assert.False(IndexBuildPool.ShouldTrimAll(memoryLoadBytes: 950, highLoadThresholdBytes: 900, t + Interval - 1, lastTrimTimestamp: t));
-        Assert.True (IndexBuildPool.ShouldTrimAll(memoryLoadBytes: 950, highLoadThresholdBytes: 900, t + Interval,     lastTrimTimestamp: t));
+        Assert.False(ShouldTrimAll(memoryLoadBytes: 950, highLoadThresholdBytes: 900, t + Interval - 1, lastTrimTimestamp: t));
+        Assert.True (ShouldTrimAll(memoryLoadBytes: 950, highLoadThresholdBytes: 900, t + Interval,     lastTrimTimestamp: t));
+
+        static bool ShouldTrimAll(long memoryLoadBytes, long highLoadThresholdBytes, long now, long lastTrimTimestamp)
+            => PoolTrimPolicy.ShouldTrim(pooledBytes: 64L << 20, memoryLoadBytes, highLoadThresholdBytes,
+                                         scaleBytes: 0, readingIsOurs: true, now, lastTrimTimestamp);
     }
 
     private sealed class RecordingPools : IndexBuildPool.ITrimmable
@@ -161,22 +172,56 @@ public sealed class IndexBuildPoolTests
         long last = 0;
         long t = System.Diagnostics.Stopwatch.GetTimestamp();
 
-        Assert.False(IndexBuildPool.OnGen2(memoryLoadBytes: 100, highLoadThresholdBytes: 900, t, ref last, pools));
+        Assert.False(OnGen2(memoryLoadBytes: 100, highLoadThresholdBytes: 900, t, ref last, pools));
         Assert.Equal((1, 0), (pools.Idle, pools.All));                  // no pressure: the high-water trim
         Assert.Equal(0, last);
 
-        Assert.True(IndexBuildPool.OnGen2(memoryLoadBytes: 900, highLoadThresholdBytes: 900, t, ref last, pools));
+        Assert.True(OnGen2(memoryLoadBytes: 900, highLoadThresholdBytes: 900, t, ref last, pools));
         Assert.Equal((1, 1), (pools.Idle, pools.All));                  // pressure: emptied, and the window opens
         Assert.Equal(t, last);
 
         // Sustained pressure, a gen2 every few seconds: inside the window each one idle-trims.
         for (int i = 1; i <= 5; i++)
-            Assert.False(IndexBuildPool.OnGen2(memoryLoadBytes: 950, highLoadThresholdBytes: 900, t + i * (Interval / 6), ref last, pools));
+            Assert.False(OnGen2(memoryLoadBytes: 950, highLoadThresholdBytes: 900, t + i * (Interval / 6), ref last, pools));
         Assert.Equal((6, 1), (pools.Idle, pools.All));
         Assert.Equal(t, last);
 
-        Assert.True(IndexBuildPool.OnGen2(memoryLoadBytes: 950, highLoadThresholdBytes: 900, t + Interval, ref last, pools));
+        Assert.True(OnGen2(memoryLoadBytes: 950, highLoadThresholdBytes: 900, t + Interval, ref last, pools));
         Assert.Equal((6, 2), (pools.Idle, pools.All));
         Assert.Equal(t + Interval, last);
+
+        static bool OnGen2(long memoryLoadBytes, long highLoadThresholdBytes, long now,
+                           ref long last, IndexBuildPool.ITrimmable pools)
+            => IndexBuildPool.OnGen2(memoryLoadBytes, highLoadThresholdBytes, scaleBytes: 0,
+                                     readingIsOurs: true, now, ref last, pools);
+    }
+
+    /// <summary>
+    /// THE NEIGHBOUR. On a host-wide reading — a bare Windows box, or a container started without
+    /// a memory limit — a process that is not this one can hold the machine past the GC's
+    /// threshold indefinitely. Emptying pools that hold nothing worth reclaiming cannot relieve
+    /// that, and doing it every thirty seconds for ever re-allocates the slabs and tables these
+    /// pools exist to stop re-allocating. The gen2 still does its ordinary high-water trim.
+    /// </summary>
+    [Fact]
+    public void Gen2_UnderSomeoneElsesPressure_DoesNotEmptyPoolsThatCannotRelieveIt()
+    {
+        var pools = new RecordingPools();          // holds nothing: PooledBytes is 0
+        long last = 0;
+        long t = System.Diagnostics.Stopwatch.GetTimestamp();
+
+        for (int i = 0; i < 4; i++)
+            Assert.False(IndexBuildPool.OnGen2(
+                memoryLoadBytes: 15L << 30, highLoadThresholdBytes: 14L << 30, scaleBytes: 16L << 30,
+                readingIsOurs: false, t + i * Interval, ref last, pools));
+
+        Assert.Equal((4, 0), (pools.Idle, pools.All));                  // high-water only, never emptied
+        Assert.Equal(0, last);
+
+        // The same pressure, in a container whose limit this reading describes: ours to relieve.
+        Assert.True(IndexBuildPool.OnGen2(
+            memoryLoadBytes: 15L << 30, highLoadThresholdBytes: 14L << 30, scaleBytes: 16L << 30,
+            readingIsOurs: true, t + 4 * Interval, ref last, pools));
+        Assert.Equal((4, 1), (pools.Idle, pools.All));   // emptied — and a full trim does not also idle-trim
     }
 }

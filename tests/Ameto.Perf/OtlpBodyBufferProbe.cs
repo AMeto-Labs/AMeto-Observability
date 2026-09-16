@@ -131,8 +131,18 @@ public sealed class OtlpBodyBufferProbe
     [InlineData(400, 200, true)]    // past it
     [InlineData(400,   0, false)]   // threshold unknown — never trim on a guess
     public void TrimTriggersOnTheGcsOwnHighLoadThreshold(long load, long threshold, bool expected)
-        => Assert.Equal(expected,
-            IngestBufferPool.ShouldTrim(load, threshold, Stopwatch.GetTimestamp(), lastTrimTimestamp: 0));
+        => Assert.Equal(expected, ShouldTrim(load, threshold, Stopwatch.GetTimestamp(), lastTrimTimestamp: 0));
+
+    /// <summary>
+    /// The rule, as this pool asks it under a container limit — where the load reading really is
+    /// about this process. The other half of it (a host-wide reading, where emptying a pool that
+    /// holds little cannot relieve anything) lives with the rule itself, in
+    /// <c>Ameto.Core.Tests.PoolTrimPolicyTests</c>.
+    /// </summary>
+    private static bool ShouldTrim(long load, long threshold, long now, long lastTrimTimestamp)
+        => PoolTrimPolicy.ShouldTrim(
+            pooledBytes: IngestBufferPool.MaxPooledTotalBytes, memoryLoadBytes: load,
+            highLoadThresholdBytes: threshold, scaleBytes: 0, readingIsOurs: true, now, lastTrimTimestamp);
 
     [Fact]
     public void TrimWillNotFireAgainWithinItsInterval()
@@ -143,18 +153,18 @@ public sealed class OtlpBodyBufferProbe
         // the following gen2 forward. The pool never gets past one refill, and the allocation
         // it causes makes the pressure it is reacting to worse.
         long first = Stopwatch.GetTimestamp();
-        Assert.True(IngestBufferPool.ShouldTrim(400, 200, first, lastTrimTimestamp: 0));
+        Assert.True(ShouldTrim(400, 200, first, lastTrimTimestamp: 0));
 
         long oneSecondLater = first + Stopwatch.Frequency;
-        Assert.False(IngestBufferPool.ShouldTrim(400, 200, oneSecondLater, first));
+        Assert.False(ShouldTrim(400, 200, oneSecondLater, first));
 
         // Still high load, but the window has passed: trim again.
         long afterTheWindow = first + (long)((IngestBufferPool.MinTrimInterval.TotalSeconds + 1) * Stopwatch.Frequency);
-        Assert.True(IngestBufferPool.ShouldTrim(400, 200, afterTheWindow, first));
+        Assert.True(ShouldTrim(400, 200, afterTheWindow, first));
 
         // The gap never turns a trim ON: below the threshold it stays false however long ago
         // the last one was.
-        Assert.False(IngestBufferPool.ShouldTrim(100, 200, afterTheWindow, first));
+        Assert.False(ShouldTrim(100, 200, afterTheWindow, first));
     }
 
     private static async Task<long> Measure(bool dedicated, bool gen2)

@@ -88,7 +88,7 @@ public static class IngestBufferPool
 
     private static BoundedByteArrayPool _pool = Create();
 
-    static IngestBufferPool() => Gen2GcCallback.Register(static () => { TrimIfUnderPressure(); return true; });
+    static IngestBufferPool() => PoolTrimPolicy.OnGen2Collection(static () => { TrimIfUnderPressure(); return true; });
 
     private static BoundedByteArrayPool Create() => new(MaxPooledBytes, ArraysPerBucket, MaxPooledTotalBytes);
 
@@ -145,82 +145,38 @@ public static class IngestBufferPool
     public static void Trim() => Volatile.Write(ref _pool, Create());
 
     /// <summary>
-    /// Shortest gap between two pressure trims.
-    ///
-    /// <para>Without a gap the trim feeds itself. Every gen2 under sustained load empties the
-    /// pool; the next gRPC request, which has no Content-Length and so doubles 64 KB → 2 MB,
-    /// then leaves about 4 MB of fresh large-object garbage refilling it; that brings the next
-    /// gen2 forward, which empties it again. The pool never gets past one refill and the whole
-    /// point of it is gone — while the allocation it causes makes the pressure worse. And the
-    /// signal is not always ours to believe: on a bare Windows host <c>MemoryLoadBytes</c> is
-    /// machine-wide, so one greedy neighbour would switch the pool off permanently.</para>
-    ///
-    /// <para>Thirty seconds is far longer than the interval between gen2 collections under
-    /// load and far shorter than an operator would wait to see memory come back.</para>
+    /// Shortest gap between two pressure trims — <see cref="PoolTrimPolicy.MinTrimInterval"/>,
+    /// where the rule and its reasoning now live for both pools. Without a gap the trim feeds
+    /// itself: every gen2 under sustained load empties the pool, the next gRPC request (which
+    /// gets no Content-Length, so it doubles 64 KB → 2 MB) leaves about 4 MB of fresh
+    /// large-object garbage refilling it, and that brings the next gen2 forward.
     /// </summary>
-    public static readonly TimeSpan MinTrimInterval = TimeSpan.FromSeconds(30);
+    public static TimeSpan MinTrimInterval => PoolTrimPolicy.MinTrimInterval;
 
     /// <summary><see cref="Stopwatch"/> timestamp of the last pressure trim; 0 = never.</summary>
     private static long _lastPressureTrim;
 
     /// <summary>
-    /// Whether the pool should be emptied: the GC's own high-memory-load threshold — which on a
-    /// container is a fraction of the cgroup limit rather than of the host's RAM — and not
-    /// again for <see cref="MinTrimInterval"/> after the last time it was.
+    /// The gen2 hook: <see cref="PoolTrimPolicy.ShouldTrim"/> decides, and a manual
+    /// <see cref="Trim"/> deliberately does NOT move the window — this records only the trims
+    /// the hysteresis is there to space out.
     ///
-    /// <para>Public, and taking the clock rather than reading it, so the rule can be tested
-    /// against numbers instead of against a real memory shortage and a real wait.</para>
-    /// </summary>
-    /// <param name="nowTimestamp">A <see cref="Stopwatch.GetTimestamp"/> reading.</param>
-    /// <param name="lastTrimTimestamp">The reading taken at the last trim, or 0 for never.</param>
-    public static bool ShouldTrim(
-        long memoryLoadBytes, long highLoadThresholdBytes, long nowTimestamp, long lastTrimTimestamp)
-    {
-        if (highLoadThresholdBytes <= 0 || memoryLoadBytes < highLoadThresholdBytes) return false;
-        if (lastTrimTimestamp == 0) return true;
-        return nowTimestamp - lastTrimTimestamp >= (long)(MinTrimInterval.TotalSeconds * Stopwatch.Frequency);
-    }
-
-    /// <summary>
-    /// The gen2 hook. A manual <see cref="Trim"/> deliberately does NOT move the window — this
-    /// records only the trims the hysteresis is there to space out.
+    /// <para>What is passed matters as much as the threshold: on a host-wide reading the policy
+    /// weighs <see cref="PooledBytes"/> against the machine, so a neighbouring process cannot
+    /// empty this pool every thirty seconds for ever while it holds a few megabytes that could
+    /// not have relieved anything.</para>
     /// </summary>
     private static void TrimIfUnderPressure()
     {
         var info = GC.GetGCMemoryInfo();
         long now = Stopwatch.GetTimestamp();
-        if (!ShouldTrim(info.MemoryLoadBytes, info.HighMemoryLoadThresholdBytes,
-                        now, Volatile.Read(ref _lastPressureTrim))) return;
+        if (!PoolTrimPolicy.ShouldTrim(
+                PooledBytes, info.MemoryLoadBytes, info.HighMemoryLoadThresholdBytes,
+                info.TotalAvailableMemoryBytes, PoolTrimPolicy.ReadingIsScopedToThisProcess,
+                now, Volatile.Read(ref _lastPressureTrim))) return;
 
         Volatile.Write(ref _lastPressureTrim, now);
         Trim();
-    }
-
-    /// <summary>
-    /// Runs an action at the end of each gen2 collection, the pattern the BCL's own pools use.
-    ///
-    /// <para>The object is unreachable from the moment it is constructed, so a collection
-    /// finalises it; the finaliser resurrects it with <see cref="GC.ReRegisterForFinalize"/>.
-    /// After the first couple of collections it lives in gen2, which is what makes the
-    /// callback a gen2 callback rather than a gen0 one.</para>
-    /// </summary>
-    private sealed class Gen2GcCallback
-    {
-        private readonly Func<bool> _callback;
-
-        private Gen2GcCallback(Func<bool> callback) => _callback = callback;
-
-        public static void Register(Func<bool> callback) => _ = new Gen2GcCallback(callback);
-
-        ~Gen2GcCallback()
-        {
-            bool again;
-            // An unhandled exception in a finaliser tears the process down, and nothing here is
-            // worth that. (This runs on the finaliser thread after the collection, not inside
-            // it, which is also why GC.GetGCMemoryInfo below reports the one that just ended.)
-            try { again = _callback(); } catch { again = false; }
-            if (again && !Environment.HasShutdownStarted) GC.ReRegisterForFinalize(this);
-        }
     }
 }
 

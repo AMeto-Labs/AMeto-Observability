@@ -1,5 +1,6 @@
 using System.Numerics;
 using System.Runtime.CompilerServices;
+using Ameto.Core;
 
 namespace Ameto.Indexing;
 
@@ -72,7 +73,7 @@ internal static class IndexBuildPool
     {
         Register(Slabs);
         Register(Ints);
-        Gen2GcCallback.Register(static () => { OnGen2(); return true; });
+        PoolTrimPolicy.OnGen2Collection(static () => { OnGen2(); return true; });
     }
 
     private static void Register(ITrimmable p) { lock (_all) _all.Add(p); }
@@ -84,21 +85,20 @@ internal static class IndexBuildPool
     }
 
     /// <summary>
-    /// Shortest gap between two pressure trims — the rule <c>IngestBufferPool</c> applies, for
-    /// the same reason.
+    /// Shortest gap between two pressure trims — <see cref="PoolTrimPolicy.MinTrimInterval"/>,
+    /// the one rule both pools now share.
     ///
     /// <para>Without it the full trim feeds itself. Under sustained load past the GC's high
     /// threshold every gen2 empties every pool; the next 16 MB group then re-allocates ~30 MB of
     /// LOH refilling them (1 MB slabs, the 8 MB ASCII trigram table, the term table, the entry
     /// arrays), which spends the LOH budget and brings the next gen2 forward, which empties them
     /// again. The hit rate goes to zero exactly when the box is short of memory — the per-group
-    /// LOH churn the pool exists to remove, caused by the pool. And the signal is not always ours
-    /// to believe: on a bare Windows host <c>MemoryLoadBytes</c> is machine-wide.</para>
+    /// LOH churn the pool exists to remove, caused by the pool.</para>
     ///
     /// <para>Between pressure trims a gen2 does the ordinary high-water trim, so the pools still
     /// shed what the last cycle did not use while the window is closed.</para>
     /// </summary>
-    public static readonly TimeSpan MinTrimInterval = TimeSpan.FromSeconds(30);
+    public static TimeSpan MinTrimInterval => PoolTrimPolicy.MinTrimInterval;
 
     /// <summary><see cref="System.Diagnostics.Stopwatch"/> timestamp of the last pressure trim; 0 = never.
     /// Moved only by the gen2 hook — a manual <see cref="TrimAll"/> is not a trim the window spaces out.</summary>
@@ -108,19 +108,25 @@ internal static class IndexBuildPool
     public static void OnGen2()
     {
         var info = GC.GetGCMemoryInfo();
-        OnGen2(info.MemoryLoadBytes, info.HighMemoryLoadThresholdBytes, System.Diagnostics.Stopwatch.GetTimestamp(),
+        OnGen2(info.MemoryLoadBytes, info.HighMemoryLoadThresholdBytes, info.TotalAvailableMemoryBytes,
+               PoolTrimPolicy.ReadingIsScopedToThisProcess, System.Diagnostics.Stopwatch.GetTimestamp(),
                ref _lastPressureTrim, AllPools.Instance);
     }
 
     /// <summary>
-    /// The gen2 policy with its inputs injected — memory info, clock, the window's state and the
-    /// pools — so the branch it takes is testable without a real memory shortage or a real wait.
-    /// Returns whether it emptied the pools.
+    /// The gen2 policy with its inputs injected — memory info, whose memory the reading describes,
+    /// the clock, the window's state and the pools — so the branch it takes is testable without a
+    /// real memory shortage, a real neighbour or a real wait. Returns whether it emptied the pools.
     /// </summary>
-    internal static bool OnGen2(long memoryLoadBytes, long highLoadThresholdBytes, long nowTimestamp,
+    internal static bool OnGen2(long memoryLoadBytes, long highLoadThresholdBytes, long scaleBytes,
+                                bool readingIsOurs, long nowTimestamp,
                                 ref long lastPressureTrimTimestamp, ITrimmable pools)
     {
-        if (ShouldTrimAll(memoryLoadBytes, highLoadThresholdBytes, nowTimestamp, lastPressureTrimTimestamp))
+        // What the pools hold is part of the decision: on a reading that describes the whole
+        // machine rather than this container, emptying them is only worth doing when it could
+        // actually relieve it — see PoolTrimPolicy.
+        if (PoolTrimPolicy.ShouldTrim(pools.PooledBytes, memoryLoadBytes, highLoadThresholdBytes,
+                                      scaleBytes, readingIsOurs, nowTimestamp, lastPressureTrimTimestamp))
         {
             lastPressureTrimTimestamp = nowTimestamp;
             pools.TrimAll();
@@ -135,20 +141,6 @@ internal static class IndexBuildPool
 
     /// <summary>Empties every pool.</summary>
     public static void TrimAll() { lock (_all) foreach (var p in _all) p.TrimAll(); }
-
-    /// <summary>
-    /// Whether a gen2 should empty every pool: memory load at or past the GC's own high threshold
-    /// (on a container a fraction of the cgroup limit), and not again for
-    /// <see cref="MinTrimInterval"/> after the last time it did.
-    /// </summary>
-    /// <param name="nowTimestamp">A <see cref="System.Diagnostics.Stopwatch.GetTimestamp"/> reading.</param>
-    /// <param name="lastTrimTimestamp">The reading taken at the last pressure trim, or 0 for never.</param>
-    public static bool ShouldTrimAll(long memoryLoadBytes, long highLoadThresholdBytes, long nowTimestamp, long lastTrimTimestamp)
-    {
-        if (highLoadThresholdBytes <= 0 || memoryLoadBytes < highLoadThresholdBytes) return false;
-        if (lastTrimTimestamp == 0) return true;
-        return nowTimestamp - lastTrimTimestamp >= (long)(MinTrimInterval.TotalSeconds * System.Diagnostics.Stopwatch.Frequency);
-    }
 
     /// <summary>Every registered pool as one <see cref="ITrimmable"/> — what the gen2 hook trims.</summary>
     private sealed class AllPools : ITrimmable
@@ -279,23 +271,4 @@ internal static class IndexBuildPool
         }
     }
 
-    /// <summary>
-    /// Runs an action at the end of each gen2 collection — the pattern the BCL's own pools use.
-    /// The object is unreachable from the moment it is constructed, so a collection finalises
-    /// it; the finaliser resurrects it with <see cref="GC.ReRegisterForFinalize"/>. After the
-    /// first couple of collections it lives in gen2, which makes the callback a gen2 callback.
-    /// </summary>
-    private sealed class Gen2GcCallback
-    {
-        private readonly Func<bool> _callback;
-        private Gen2GcCallback(Func<bool> callback) => _callback = callback;
-        public static void Register(Func<bool> callback) => _ = new Gen2GcCallback(callback);
-
-        ~Gen2GcCallback()
-        {
-            bool again;
-            try { again = _callback(); } catch { again = false; }   // a throwing finaliser tears the process down
-            if (again && !Environment.HasShutdownStarted) GC.ReRegisterForFinalize(this);
-        }
-    }
 }
