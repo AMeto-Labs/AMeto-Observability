@@ -338,7 +338,14 @@ public sealed class MemoryBudgetTests
         var stderr = proc.StandardError.ReadToEndAsync();
         string stdout = proc.StandardOutput.ReadToEnd();
         Assert.True(proc.WaitForExit(60_000), "child process did not exit");
-        Assert.True(proc.ExitCode == 0, $"child exited {proc.ExitCode}: {stderr.Result}");
+
+        // stderr is read only on the road that reports it. Interpolated into the assert message it
+        // was evaluated on EVERY call, including the ones that pass: a blocking wait on the happy
+        // path, which does not return until the handle is closed — and a grandchild that inherited
+        // it keeps it open past the child's own exit, so the bounded WaitForExit above would be
+        // followed by an unbounded wait here.
+        if (proc.ExitCode != 0)
+            Assert.Fail($"child exited {proc.ExitCode}: {stderr.GetAwaiter().GetResult()}");
 
         var values = new Dictionary<string, long>(StringComparer.Ordinal);
         foreach (string line in stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))

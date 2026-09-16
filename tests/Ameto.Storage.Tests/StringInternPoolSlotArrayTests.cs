@@ -23,6 +23,15 @@ public sealed class StringInternPoolSlotArrayTests
 {
     private const int MaxPoolSize = 65536;   // mirrors the pool's private cap
 
+    /// <summary>
+    /// Waits with a bound and REPORTS the outcome instead of throwing it, so a regression that
+    /// hangs fails with the message written for it rather than stalling the run. This is what the
+    /// blocking <c>Task.Wait(timeout)</c> calls here used to say; they tripped xUnit1031, which
+    /// cannot tell a bounded wait on CPU-bound work from a deadlock waiting to happen.
+    /// </summary>
+    private static async Task<bool> CompletesWithin(Task task, TimeSpan bound) =>
+        ReferenceEquals(task, await Task.WhenAny(task, Task.Delay(bound)));
+
     [Fact]
     public void Get_resolves_an_interned_id_and_answers_empty_for_anything_else()
     {
@@ -40,7 +49,7 @@ public sealed class StringInternPoolSlotArrayTests
     }
 
     [Fact]
-    public void Growth_does_not_lose_a_store_and_readers_see_every_id_they_are_told_about()
+    public async Task Growth_does_not_lose_a_store_and_readers_see_every_id_they_are_told_about()
     {
         var pool = new StringInternPool();
         const int n = 20_000;                                     // several doublings past the initial array
@@ -70,7 +79,7 @@ public sealed class StringInternPoolSlotArrayTests
             Volatile.Write(ref announced, i + 1);
         }
         Volatile.Write(ref stop, true);
-        Task.WaitAll(readers);
+        await Task.WhenAll(readers);
 
         Assert.Empty(failures);
         for (int i = 0; i < n; i++) Assert.Equal("t" + i, pool.Get(i));
@@ -83,7 +92,7 @@ public sealed class StringInternPoolSlotArrayTests
     /// race at the boundary, which the test below provokes but cannot force.
     /// </summary>
     [Fact]
-    public void SetSlot_at_or_past_the_cap_returns_instead_of_growing_for_ever()
+    public async Task SetSlot_at_or_past_the_cap_returns_instead_of_growing_for_ever()
     {
         var pool    = new StringInternPool();
         var setSlot = typeof(StringInternPool).GetMethod("SetSlot", BindingFlags.NonPublic | BindingFlags.Instance);
@@ -95,13 +104,17 @@ public sealed class StringInternPoolSlotArrayTests
             setSlot.Invoke(pool, [MaxPoolSize + 1, "past the cap"]);
             setSlot.Invoke(pool, [int.MaxValue,    "far past"]);
         });
-        Assert.True(done.Wait(TimeSpan.FromSeconds(20)), "SetSlot hung in the slot-array growth loop");
+        Assert.True(await CompletesWithin(done, TimeSpan.FromSeconds(20)),
+            "SetSlot hung in the slot-array growth loop");
+        await done;                                               // a fault surfaces as itself
         Assert.Equal(string.Empty, pool.Get(MaxPoolSize));
         Assert.Equal(string.Empty, pool.Get(MaxPoolSize + 1));
 
         // ForceIntern goes through the same guard (recovery of a corrupt pool file).
         var forced = Task.Run(() => pool.ForceIntern(MaxPoolSize, "beyond"));
-        Assert.True(forced.Wait(TimeSpan.FromSeconds(20)), "ForceIntern hung in the slot-array growth loop");
+        Assert.True(await CompletesWithin(forced, TimeSpan.FromSeconds(20)),
+            "ForceIntern hung in the slot-array growth loop");
+        await forced;
         Assert.Equal(-1, pool.Intern("anything new"));            // the counter is past the cap
     }
 
@@ -113,7 +126,7 @@ public sealed class StringInternPoolSlotArrayTests
     /// hung test run.
     /// </summary>
     [Fact]
-    public void Concurrent_misses_at_the_cap_never_hang_and_hand_out_exactly_one_last_id()
+    public async Task Concurrent_misses_at_the_cap_never_hang_and_hand_out_exactly_one_last_id()
     {
         const int threads = 16, rounds = 200;
         for (int round = 0; round < rounds; round++)
@@ -129,8 +142,10 @@ public sealed class StringInternPoolSlotArrayTests
                 results[t] = pool.Intern("last-" + t);
             }, TaskCreationOptions.LongRunning)).ToArray();
 
-            Assert.True(Task.WaitAll(workers, TimeSpan.FromSeconds(20)),
+            var all = Task.WhenAll(workers);
+            Assert.True(await CompletesWithin(all, TimeSpan.FromSeconds(20)),
                 $"round {round}: Intern hung — a claimant past the cap spun in the slot-array growth loop");
+            await all;
 
             Assert.Equal(1, results.Count(r => r == MaxPoolSize - 1));
             Assert.Equal(threads - 1, results.Count(r => r == -1));
