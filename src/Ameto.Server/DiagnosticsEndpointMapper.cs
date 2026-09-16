@@ -146,6 +146,10 @@ public static class DiagnosticsEndpointMapper
                 indexCacheNativeBytes       = indexCache.NativeBytes,
                 indexCacheNativeBudgetBytes = indexCache.NativeBudgetBytes,
                 indexCacheShedEvicted       = indexCache.ShedEvictedCount,
+                // Evictions the NATIVE ceiling caused while the total budget still had room. A
+                // cache capped this way looks healthy in every other figure — it simply sits
+                // below its budget and misses — so without this there is nothing to read.
+                indexCacheNativeEvicted     = indexCache.NativeEvictedCount,
 
                 // Storage
                 segmentCount         = segs.Count,

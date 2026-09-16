@@ -225,6 +225,9 @@ public sealed class QueryValidationTests : IClassFixture<AmetoWebAppFactory>
                      // figure beside them and are the part that can push a small host past its
                      // container limit.
                      "indexCacheNativeBytes", "indexCacheNativeBudgetBytes", "indexCacheShedEvicted",
+                     // And the eviction that ceiling causes while the total budget still has room,
+                     // which no other figure reveals: the cache just rests below its budget.
+                     "indexCacheNativeEvicted",
                      // Inside logsStorageBytes, and the one part of it retention will never free.
                      "logsQuarantinedBytes",
                  })

@@ -39,7 +39,9 @@ namespace Ameto.Indexing;
 /// these bits alone.) One budget charged the whole thing against a share of the GC's hard
 /// limit, so the native part spent managed headroom on memory the GC never sees. The native share
 /// now has its own ceiling, taken of the PHYSICAL limit, and whichever is reached first evicts.
-/// Both figures are reported (<c>/api/diagnostics</c>) rather than merged into one.</para>
+/// Both figures are reported (<c>/api/diagnostics</c>) rather than merged into one, and so is the
+/// eviction the native ceiling causes while the total still has room — the one an operator cannot
+/// otherwise see.</para>
 ///
 /// <para><b>Sheddable.</b> Neither budget helps when the pressure is elsewhere: the RAM-pressure
 /// loop flushes the hot tier, forces a collection and trims the working set, and none of that
@@ -61,6 +63,7 @@ public sealed class SegmentIndexCache : IDisposable, IMemoryShedder
     private          long                                     _hits, _misses;
     private          long                                     _idleEvicted;
     private          long                                     _shedEvicted;
+    private          long                                     _nativeEvicted;
     private          IDisposable?                             _shedRegistration;
 
     public SegmentIndexCache(long budgetBytes) : this(budgetBytes, 0, default) { }
@@ -147,6 +150,16 @@ public sealed class SegmentIndexCache : IDisposable, IMemoryShedder
 
     /// <summary>Entries dropped by <see cref="Shed"/> (memory pressure) since start.</summary>
     public long ShedEvictedCount => Interlocked.Read(ref _shedEvicted);
+
+    /// <summary>
+    /// Entries dropped because the NATIVE ceiling was reached while the total budget still had
+    /// room. Counted apart from every other eviction because it is the one nothing else reveals:
+    /// the cache then sits far below its total budget for ever, evicting on every insert, and the
+    /// only other clue is noticing that <see cref="NativeBytes"/> is pinned to
+    /// <see cref="NativeBudgetBytes"/>. A number that climbs means this cache is bounded by its
+    /// bloom bits rather than by the budget an operator set.
+    /// </summary>
+    public long NativeEvictedCount => Interlocked.Read(ref _nativeEvicted);
 
     internal sealed class Entry
     {
@@ -273,8 +286,18 @@ public sealed class SegmentIndexCache : IDisposable, IMemoryShedder
     /// </summary>
     private void EvictLocked(List<SegmentIndexReader> toDispose)
     {
+        int nativeDriven = 0;
         while (OverBudgetLocked() && _lru.Last is { } tail)
+        {
+            // Attribute the removal before it happens. The native ceiling is the reason exactly
+            // when the total budget still has room — the case an operator cannot otherwise see,
+            // because the symptom is a cache that stays far below its budget and never improves
+            // its hit rate. The two causes have different remedies, so one counter for both would
+            // not be a diagnosis.
+            if (_totalBytes <= _budgetBytes) nativeDriven++;
             RemoveLocked(tail.Value, toDispose);
+        }
+        if (nativeDriven > 0) Interlocked.Add(ref _nativeEvicted, nativeDriven);
     }
 
     /// <summary>

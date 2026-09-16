@@ -215,13 +215,32 @@ public sealed class QueryOptions
     /// <see cref="EffectiveIndexCacheBytes"/> is a share of. Whichever ceiling is reached first
     /// evicts from the LRU tail.
     ///
-    /// <para>Not settable, and deliberately not scaled by an explicit
-    /// <see cref="IndexCacheBytes"/>: it is a backstop on where the bytes LIVE, not a tuning
-    /// knob on how much the cache may hold. An operator who raises the total budget is asking
-    /// for more decoded postings, which are managed; nothing about that says the process may
-    /// also hold more memory the GC cannot see. See <see cref="MemoryBudgets"/>.</para>
+    /// <para>Not settable on its own, but it follows an explicit <see cref="IndexCacheBytes"/>
+    /// UPWARD: <c>max(the derived backstop, 20 % of a configured budget)</c>. Held fixed it
+    /// silently capped the cache of anyone who deliberately raised the budget — at the measured
+    /// worst-case native share of an entry (8.3 %) a 96 MB ceiling starts binding at roughly
+    /// 1.2 GB of configured cache, and past that every insert evicts the LRU tail while
+    /// <c>indexCacheBytes</c> sits far below <c>indexCacheBudgetBytes</c> and the hit rate never
+    /// improves. An operator who asks for a 2 GB cache has said how much memory this component
+    /// may hold; the native part of it remains bounded, by this share and by the total budget it
+    /// is a part of.</para>
+    ///
+    /// <para>It never follows the budget DOWN — a small configured cache keeps the derived
+    /// backstop — and the derived figure is still a share of the PHYSICAL limit, because that is
+    /// where these bytes live. An eviction this ceiling causes is counted separately
+    /// (<c>indexCacheNativeEvicted</c>), since it is otherwise invisible. See
+    /// <see cref="MemoryBudgets"/>.</para>
     /// </summary>
-    public long EffectiveIndexCacheNativeBytes => MemoryBudgets.Current().IndexCacheNativeBytes;
+    public long EffectiveIndexCacheNativeBytes
+    {
+        get
+        {
+            long derived = MemoryBudgets.Current().IndexCacheNativeBytes;
+            return IndexCacheBytes is not > 0
+                ? derived
+                : Math.Max(derived, (long)(IndexCacheBytes.Value * MemoryBudgets.IndexCacheNativeEntryShare));
+        }
+    }
 
     /// <summary>
     /// Drop cached segment indexes that no query has read for this long. Without it the only

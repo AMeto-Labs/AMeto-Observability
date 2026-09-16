@@ -133,6 +133,43 @@ public sealed class SegmentIndexCacheShedTests
     }
 
     /// <summary>
+    /// An eviction the native ceiling caused is the one an operator cannot otherwise see: the
+    /// total budget still has room, so the cache simply rests below it, evicting on every insert
+    /// with a hit rate that never improves and no counter moving. It gets its own.
+    /// </summary>
+    [Fact]
+    public void An_eviction_the_native_ceiling_caused_is_counted_as_one()
+    {
+        using var cache = new SegmentIndexCache(1 << 20, 3000, TimeSpan.Zero);
+
+        using (cache.Insert("a.seg", 0, true, NewNativeReader(), 10)) { }
+        using (cache.Insert("b.seg", 0, true, NewNativeReader(), 10)) { }
+        Assert.Equal(0L, cache.NativeEvictedCount);   // 2560 ≤ 3000: nothing has been dropped
+
+        using (cache.Insert("c.seg", 0, true, NewNativeReader(), 10)) { }   // 3840 > 3000
+
+        Assert.Equal(1L, cache.NativeEvictedCount);
+        Assert.Equal(20L, cache.TotalBytes);          // while the total budget never came close
+    }
+
+    /// <summary>
+    /// And an eviction the TOTAL budget caused is not counted as a native one. The two have
+    /// different remedies — raise the budget, or accept that bloom bits bound this cache — so a
+    /// counter that cannot tell them apart is not a diagnosis.
+    /// </summary>
+    [Fact]
+    public void An_eviction_the_total_budget_caused_is_not_counted_as_a_native_one()
+    {
+        using var cache = new SegmentIndexCache(6000, 1 << 20, TimeSpan.Zero);
+
+        using (cache.Insert("a.seg", 0, true, NewNativeReader(), 5000)) { }
+        using (cache.Insert("b.seg", 0, true, NewNativeReader(), 5000)) { }   // 10000 > 6000
+
+        Assert.Equal(1, cache.EntryCount);
+        Assert.Equal(0L, cache.NativeEvictedCount);
+    }
+
+    /// <summary>
     /// A caller with only one number gets the pre-existing behaviour: no native ceiling, so the
     /// same three entries all stay. This is what every existing construction site does.
     /// </summary>

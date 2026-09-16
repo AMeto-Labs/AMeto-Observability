@@ -124,6 +124,19 @@ public readonly struct MemoryBudgets
     public const double IndexCacheNativeFraction = 0.05;
 
     /// <summary>
+    /// The largest share of a cache ENTRY the bloom bits have been measured at, with headroom —
+    /// the factor an explicitly configured <c>Query.IndexCacheBytes</c> scales its native ceiling
+    /// by, so that raising the budget cannot silently cap the cache on its native share.
+    ///
+    /// <para><c>BloomSizingProbe</c> measures 4.1 % of a prop-dense entry and 8.3 % of a thin one.
+    /// This sits well above both on purpose: it bounds a BUDGET rather than describing a file, and
+    /// a shape nobody has measured must not be the thing that caps a cache an operator deliberately
+    /// asked for. The native part stays bounded either way — it is a part of the total budget, so
+    /// it can never exceed it.</para>
+    /// </summary>
+    public const double IndexCacheNativeEntryShare = 0.20;
+
+    /// <summary>
     /// Share of the MANAGED-HEAP limit the ingest body-buffer pool may park. Request bodies are
     /// managed <c>byte[]</c> on the large object heap, so this is a share of the GC's limit like
     /// the two above. It bounds what is PARKED, never what is live: a body larger than the pool

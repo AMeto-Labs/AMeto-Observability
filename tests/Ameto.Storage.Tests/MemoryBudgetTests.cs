@@ -273,6 +273,32 @@ public sealed class MemoryBudgetTests
         Assert.True(derived > 0 && derived <= MemoryBudgets.IndexCacheCapBytes);
     }
 
+    /// <summary>
+    /// The native ceiling is a backstop, not a cap on a cache an operator asked for. Fixed at
+    /// min(96 MB, 5 % of physical) whatever the budget said, it silently capped anyone who raised
+    /// IndexCacheBytes: at the worst measured native share of an entry it binds at roughly 1.2 GB
+    /// of configured cache, and past that every insert evicts the LRU tail while indexCacheBytes
+    /// rests far below indexCacheBudgetBytes and the hit rate never improves.
+    /// </summary>
+    [Fact]
+    public void An_explicitly_configured_cache_budget_carries_its_native_ceiling_up_with_it()
+    {
+        long derived = new QueryOptions().EffectiveIndexCacheNativeBytes;
+        Assert.Equal(MemoryBudgets.Current().IndexCacheNativeBytes, derived);
+
+        // A budget well past where the fixed ceiling used to start binding.
+        long big = new QueryOptions { IndexCacheBytes = 4 * GB }.EffectiveIndexCacheNativeBytes;
+        Assert.Equal((long)(4 * GB * MemoryBudgets.IndexCacheNativeEntryShare), big);
+        Assert.True(big > derived, "a budget an operator set must not be capped by the backstop");
+        Assert.True(big < 4 * GB, "and the native share is still a part of the total, never all of it");
+
+        // It never follows the budget DOWN: a small cache keeps the derived backstop, which is
+        // what bounds where these bytes actually live.
+        Assert.Equal(derived, new QueryOptions { IndexCacheBytes = 1 * MB }.EffectiveIndexCacheNativeBytes);
+        // A disabled cache has no native ceiling question to answer.
+        Assert.Equal(derived, new QueryOptions { IndexCacheBytes = 0 }.EffectiveIndexCacheNativeBytes);
+    }
+
     // ── Current(), end to end, in a process started under a GC memory setting ─────────────
 
     /// <summary>
