@@ -51,6 +51,18 @@ public static class PoolTrimPolicy
     /// <para>Pure, and taking every input rather than reading any of them, so the branch it takes
     /// can be tested against numbers instead of against a real memory shortage on a real
     /// neighbour's schedule.</para>
+    ///
+    /// <para>ONE CONSEQUENCE, stated because it is invisible at the call site: the worthwhile
+    /// floor below is a share of the MACHINE, while each pool's own cap is a share of the managed
+    /// heap. A pool whose cap is under one percent of host RAM can therefore never meet the floor
+    /// on a host-wide reading — not "has not met it yet", but cannot.
+    /// <see cref="IngestBufferPool"/> caps at 128 MB, so above about 12.8 GB of host RAM its
+    /// pressure trim is unreachable and it keeps what it holds. That is the right answer on the
+    /// merits (releasing 128 MB cannot move a 16 GB shortage, which is the whole argument for the
+    /// scope test) and it is what the sandbox-kz02 shape gets: shared Windows, no job object, so
+    /// the reading is never ours. The index-build pools reach 400 MB where there is room for them
+    /// and do cross one percent. <c>PoolTrimPolicyTests</c> drives the ingest pool's own ceiling so
+    /// this asymmetry is visible rather than incidental.</para>
     /// </summary>
     /// <param name="pooledBytes">What this pool would release — see <paramref name="readingIsOurs"/>.</param>
     /// <param name="scaleBytes">

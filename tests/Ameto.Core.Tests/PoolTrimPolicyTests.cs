@@ -151,6 +151,46 @@ public sealed class PoolTrimPolicyTests
     }
 
     /// <summary>
+    /// THE ASYMMETRY, driven at a real pool's own ceiling rather than at a round number.
+    ///
+    /// <para>The floor is a share of the MACHINE; each pool's cap is a share of the managed heap.
+    /// So there are pools that cannot reach the floor at all on a host-wide reading, and the ingest
+    /// body-buffer pool is one of them: it caps at 128 MB, which is under one percent of a 16 GB
+    /// box — the sandbox-kz02 shape, where no job object is detected and the reading is therefore
+    /// never "ours". The two host-wide cases above use 2 MB and 300 MB, and 300 MB is a figure that
+    /// pool can never hold, so neither of them says anything about it.</para>
+    ///
+    /// <para>The outcome is the intended one — releasing 128 MB cannot move a 16 GB shortage — but
+    /// it is a floor that is never met, not a threshold not yet met, and the difference matters to
+    /// anyone reading "trims when the pool holds at least max(8 MB, 1 % of the machine)" as
+    /// something that can happen. Change the floor to scale with what a pool could hold and this
+    /// test is what says so.</para>
+    /// </summary>
+    [Fact]
+    public void AFloorThatAPoolsOwnCapCannotReach_NeverTrimsItOnAHostWideReading()
+    {
+        long now = Stopwatch.GetTimestamp();
+
+        // Everything the ingest pool could ever park, on a 16 GB box past its threshold.
+        long full = Math.Max(IngestBufferPool.MaxPooledTotalBytes, PoolTrimPolicy.MinWorthwhileBytes);
+        Assert.True(full <= 128 * MB, $"the ingest pool's ceiling moved: {full / MB} MB");
+
+        Assert.False(PoolTrimPolicy.ShouldTrim(
+            pooledBytes: full, memoryLoadBytes: 15 * GB, highLoadThresholdBytes: 14 * GB,
+            scaleBytes: 16 * GB, readingIsOurs: false, now, lastTrimTimestamp: 0));
+
+        // The crossover: a host small enough that one percent of it is what this pool can hold.
+        Assert.True(PoolTrimPolicy.ShouldTrim(
+            pooledBytes: full, memoryLoadBytes: 15 * GB, highLoadThresholdBytes: 14 * GB,
+            scaleBytes: full * 100, readingIsOurs: false, now, lastTrimTimestamp: 0));
+
+        // And under a container limit the cap is beside the point: the pressure is ours.
+        Assert.True(PoolTrimPolicy.ShouldTrim(
+            pooledBytes: full, memoryLoadBytes: 15 * GB, highLoadThresholdBytes: 14 * GB,
+            scaleBytes: 16 * GB, readingIsOurs: true, now, lastTrimTimestamp: 0));
+    }
+
+    /// <summary>
     /// The scope is detected, not configured, and this test asserts only that it answers without
     /// throwing and agrees with itself — the value depends on the host running the suite.
     /// </summary>
