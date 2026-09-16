@@ -92,6 +92,37 @@ public sealed class AggregationHeaderPathTests : IDisposable
         try { Directory.Delete(_dir, true); } catch { }
     }
 
+    // ── Running out of time on the header road ────────────────────────────────
+
+    /// <summary>
+    /// The header road owns the whole query budget, so when it runs out of time the counts it
+    /// had already merged are gone. What must NOT happen then is the answer becoming zero.
+    ///
+    /// <para>It did. The cancelled header road returned null, which falls through to the scan
+    /// road — with the SAME token, already cancelled. That road yields nothing, and for a
+    /// `count(*)` with no `group by` it seeds one group with a count of 0 before the first
+    /// event and reports it. The client was shown 0 events, flagged partial, after the server
+    /// had spent sixty seconds counting a real number; before the header road existed, the
+    /// scan reported what it had counted when the budget expired, which is a floor but a true
+    /// one. An already-cancelled token reproduces the timeout deterministically: the cold leg
+    /// runs its segments under Parallel.ForEach with the token in ParallelOptions, which
+    /// throws, and this fixture writes a cold tier.</para>
+    /// </summary>
+    [Fact]
+    public async Task A_header_count_that_runs_out_of_time_answers_no_rows_rather_than_zero()
+    {
+        Assert.True(AggregationParser.TryParse("select count(*)", out var q));
+
+        using var spent = new CancellationTokenSource();
+        spent.Cancel();
+
+        var result = await _withHeader.ExecuteAsync(q!, From, To, spent.Token);
+
+        Assert.True(result.Partial);
+        Assert.NotNull(result.PartialReason);
+        Assert.Empty(result.Rows);
+    }
+
     // ── The two roads answer the same table ───────────────────────────────────
 
     [Theory]

@@ -278,7 +278,36 @@ public sealed class AggregationExecutor(
                 minBucket: 0, bucketSeconds: 1, nBuckets: 1,
                 serviceFilter: service, ct).ConfigureAwait(false);
         }
-        catch (OperationCanceledException) { return null; }   // the scan path reports the timeout
+        catch (OperationCanceledException)
+        {
+            // A cancelled header road must NOT fall through to the scan road. Its
+            // Parallel.ForEach throws on expiry and the counts its workers had already merged
+            // die with it — and the scan road would then run with a token that is already
+            // cancelled, yielding nothing. For a `count(*)` with no `group by` that road seeds
+            // one group with a count of 0 up front and reports it: zero, presented as the
+            // answer, after the server spent the whole budget computing a real number. It is
+            // the very thing Accumulator.Snapshot refuses to do two screens down ("reporting 0
+            // would be a number the data does not contain"), and it is a regression against the
+            // pre-header-road behaviour, where the scan reported however many events it had
+            // counted when the budget ran out — a floor, but a true one.
+            //
+            // So answer "timed out, with no rows" — the flag the client already renders as a
+            // partial result, and no fabricated row underneath it. An OperationCanceledException
+            // that is NOT this query's deadline still falls through, because then the scan road
+            // has a live token and can genuinely answer.
+            if (!ct.IsCancellationRequested) return null;
+
+            return new AggregationResult
+            {
+                KeyColumns    = keys.Select(k => k.Alias).ToArray(),
+                ValueColumns  = aggs.Select(a => a.Alias).ToArray(),
+                Rows          = [],
+                Scanned       = 0,
+                GroupsFound   = 0,
+                Partial       = true,
+                PartialReason = "the query ran out of time — narrow the window or the filter",
+            };
+        }
 
         var rows = new List<AggregationRow>();
         switch (grouping)
