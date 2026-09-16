@@ -2771,15 +2771,23 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             return;
         }
 
-        // Load template pool. An empty pool (its writes are only fsynced periodically, so
-        // power loss can zero it) used to discard the ENTIRE WAL — dropping events whose
-        // payloads DID reach disk because their template strings did not. Replay them
+        // Load template pool. An empty pool used to discard the ENTIRE WAL — dropping events
+        // whose payloads DID reach disk because their template strings did not. Replay them
         // template-less instead: timestamp, level, properties and exception all survive,
         // only @mt is lost, and the index below must not alias a live pool entry.
+        //
+        // Empty has TWO causes and the warning must name both. Pool writes are only fsynced
+        // periodically, so power loss can zero the file — that is the one this started as. But
+        // since the template pool stopped writing a row for an event it could not intern, a WAL
+        // every one of whose events arrived past a SATURATED pool writes no rows either, and its
+        // .pool file stays at 0 bytes with nothing wrong. The replay is right in both cases;
+        // only an operator reading "no template pool" as corruption would be wrong.
         var pool         = WriteAheadLog.LoadPool(poolPath);
         bool poolMissing = pool.Count == 0;
         if (poolMissing)
-            _logger.LogWarning("Orphaned WAL {File}: no template pool — replaying {Count} events without templates",
+            _logger.LogWarning(
+                "Orphaned WAL {File}: no template pool rows — either power loss before the pool was fsynced, "
+              + "or every event in it was outside a saturated template pool. Replaying {Count} events without templates",
                 walFile, entries.Count);
 
         // Restore templates into TemplatePool
@@ -2814,15 +2822,6 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 // segment's @svc column, where it answers service.name queries and skews
                 // per-service counts.
                 ServiceNamePoolIndex     = -1,
-                // EXPLICITLY -1. The WAL entry format carries no service name, so "absent" is
-                // the only honest value — but the field is a plain int on a struct, and its
-                // default of 0 is a VALID pool index, not the sentinel every reader tests for
-                // (`ServiceNamePoolIndex >= 0`). The pool is shared by templates and service
-                // names and recovery force-interns this WAL's own rows into it, so slot 0 is
-                // ordinarily this WAL's first template: every recovered event was stamped with
-                // it, and the flush below wrote that string permanently into the recovery
-                // segment's @svc column, where it answers service.name queries and skews
-                // per-service counts.
             };
             // Resolve template via the freshly restored pool and attach it
             // to the hot tier so the recovery flush persists @mt correctly.
