@@ -131,10 +131,29 @@ public readonly struct MemoryBudgets
     /// <para><c>BloomSizingProbe</c> measures 4.1 % of a prop-dense entry and 8.3 % of a thin one.
     /// This sits well above both on purpose: it bounds a BUDGET rather than describing a file, and
     /// a shape nobody has measured must not be the thing that caps a cache an operator deliberately
-    /// asked for. The native part stays bounded either way — it is a part of the total budget, so
-    /// it can never exceed it.</para>
+    /// asked for. The native part stays bounded twice over — it is a part of the total budget, so
+    /// it can never exceed it, and <see cref="IndexCacheNativeMaxFraction"/> bounds it by the host
+    /// as well.</para>
     /// </summary>
     public const double IndexCacheNativeEntryShare = 0.20;
+
+    /// <summary>
+    /// The most of the PHYSICAL limit those bloom bits may be allowed to pin, however large
+    /// <c>Query.IndexCacheBytes</c> is set: the clamp on <see cref="IndexCacheNativeEntryShare"/>.
+    ///
+    /// <para>A configured budget says how much memory this component may hold; only the host says
+    /// how much of it may sit where no collection can reach it. Scaling with no reference to the
+    /// host let the managed knob move native bytes without bound — in a 512 MB container a 1 GB
+    /// budget asked for 204 MB of bloom bits, 40 % of the box, outside the GC's hard limit and
+    /// unreclaimable by the RAM pressure path, which is the class of defect
+    /// <see cref="IndexCacheNativeCapBytes"/> exists to prevent.</para>
+    ///
+    /// <para>Twice the derived backstop and still under the ingest arena's share, it leaves the
+    /// three native shares — tiers 25 %, arena 15 %, these bits 10 % — at half the container in
+    /// the worst case. It is a clamp and never a floor: it can only lower a scaled ceiling, never
+    /// cut into the backstop a host that configured nothing gets.</para>
+    /// </summary>
+    public const double IndexCacheNativeMaxFraction = 0.10;
 
     /// <summary>
     /// Share of the MANAGED-HEAP limit the ingest body-buffer pool may park. Request bodies are

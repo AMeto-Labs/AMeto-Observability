@@ -283,20 +283,67 @@ public sealed class MemoryBudgetTests
     [Fact]
     public void An_explicitly_configured_cache_budget_carries_its_native_ceiling_up_with_it()
     {
-        long derived = new QueryOptions().EffectiveIndexCacheNativeBytes;
-        Assert.Equal(MemoryBudgets.Current().IndexCacheNativeBytes, derived);
+        // A big host: 64 GB, no container. The backstop is the 96 MB constant, and 20 % of a 4 GB
+        // budget — well past where the fixed ceiling used to start binding — is far under what the
+        // host clamp allows there (10 % of 64 GB), so the scaling is what decides.
+        var host = MemoryBudgets.Derive(64 * GB);
+        long derived = host.IndexCacheNativeBytes;
+        Assert.Equal(MemoryBudgets.IndexCacheNativeCapBytes, derived);
 
-        // A budget well past where the fixed ceiling used to start binding.
-        long big = new QueryOptions { IndexCacheBytes = 4 * GB }.EffectiveIndexCacheNativeBytes;
-        Assert.Equal((long)(4 * GB * MemoryBudgets.IndexCacheNativeEntryShare), big);
+        long big = new QueryOptions { IndexCacheBytes = 4 * GB }.IndexCacheNativeBytesFor(host);
+        Assert.Equal((long)(4 * GB * MemoryBudgets.IndexCacheNativeEntryShare), big);   // 819 MB
         Assert.True(big > derived, "a budget an operator set must not be capped by the backstop");
         Assert.True(big < 4 * GB, "and the native share is still a part of the total, never all of it");
 
         // It never follows the budget DOWN: a small cache keeps the derived backstop, which is
         // what bounds where these bytes actually live.
-        Assert.Equal(derived, new QueryOptions { IndexCacheBytes = 1 * MB }.EffectiveIndexCacheNativeBytes);
+        Assert.Equal(derived, new QueryOptions { IndexCacheBytes = 1 * MB }.IndexCacheNativeBytesFor(host));
         // A disabled cache has no native ceiling question to answer.
-        Assert.Equal(derived, new QueryOptions { IndexCacheBytes = 0 }.EffectiveIndexCacheNativeBytes);
+        Assert.Equal(derived, new QueryOptions { IndexCacheBytes = 0 }.IndexCacheNativeBytesFor(host));
+
+        // And the property the server actually reads is that same rule against THIS process.
+        var here = MemoryBudgets.Current();
+        Assert.Equal(here.IndexCacheNativeBytes, new QueryOptions().EffectiveIndexCacheNativeBytes);
+        Assert.Equal(new QueryOptions { IndexCacheBytes = 4 * GB }.IndexCacheNativeBytesFor(here),
+                     new QueryOptions { IndexCacheBytes = 4 * GB }.EffectiveIndexCacheNativeBytes);
+    }
+
+    /// <summary>
+    /// ...and the scaling stays anchored to what the HOST can afford. These bytes are the ones the
+    /// GC cannot see and RAM pressure cannot reclaim, so a knob that raises the MANAGED budget must
+    /// not raise the native pin without bound: on the 512 MB stand this whole round was sized for,
+    /// 20 % of a 1 GB budget is 204 MB of bloom bits — 40 % of the container, outside the heap
+    /// limit — which is the class of defect the backstop exists to prevent.
+    /// </summary>
+    [Fact]
+    public void A_configured_budget_cannot_raise_the_native_ceiling_past_the_hosts_share()
+    {
+        var stand = MemoryBudgets.Derive(managedLimitBytes: 384 * MB, physicalLimitBytes: 512 * MB);
+        Assert.Equal(26_843_545L, stand.IndexCacheNativeBytes);                   // 5 % of 512 MB
+
+        long hostCeiling = (long)(512 * MB * MemoryBudgets.IndexCacheNativeMaxFraction);   // 51.2 MB
+        Assert.True(hostCeiling < (long)(1 * GB * MemoryBudgets.IndexCacheNativeEntryShare),
+            "the case only means anything if the scaling would otherwise have gone higher");
+
+        Assert.Equal(hostCeiling, new QueryOptions { IndexCacheBytes = 1 * GB }.IndexCacheNativeBytesFor(stand));
+        // However large the budget gets. The managed knob cannot move this figure past the host.
+        Assert.Equal(hostCeiling, new QueryOptions { IndexCacheBytes = 64 * GB }.IndexCacheNativeBytesFor(stand));
+
+        // A clamp, never a floor: it only ever lowers a SCALED ceiling. On a host small enough
+        // that its own 10 % is under the 4 MB floor, a configured cache still keeps the backstop.
+        var tiny = MemoryBudgets.Derive(managedLimitBytes: 24 * MB, physicalLimitBytes: 32 * MB);
+        Assert.True(tiny.IndexCacheNativeBytes > (long)(32 * MB * MemoryBudgets.IndexCacheNativeMaxFraction),
+            "the case only means anything where the clamp is below the floor the backstop sits on");
+        Assert.Equal(tiny.IndexCacheNativeBytes, new QueryOptions { IndexCacheBytes = 8 * MB }.IndexCacheNativeBytesFor(tiny));
+        Assert.True(new QueryOptions { IndexCacheBytes = 4 * GB }.IndexCacheNativeBytesFor(tiny)
+                        >= tiny.IndexCacheNativeBytes,
+            "the clamp must never cut a configured host below the backstop");
+
+        // A runtime that cannot report a physical limit has nothing to clamp against, so it gets
+        // no scaling at all rather than a scaling anchored to a figure nobody can vouch for.
+        var unknown = MemoryBudgets.Derive(0, 0);
+        Assert.Equal(unknown.IndexCacheNativeBytes,
+                     new QueryOptions { IndexCacheBytes = 4 * GB }.IndexCacheNativeBytesFor(unknown));
     }
 
     // ── Current(), end to end, in a process started under a GC memory setting ─────────────

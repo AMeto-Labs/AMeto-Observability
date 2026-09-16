@@ -215,31 +215,50 @@ public sealed class QueryOptions
     /// <see cref="EffectiveIndexCacheBytes"/> is a share of. Whichever ceiling is reached first
     /// evicts from the LRU tail.
     ///
-    /// <para>Not settable on its own, but it follows an explicit <see cref="IndexCacheBytes"/>
-    /// UPWARD: <c>max(the derived backstop, 20 % of a configured budget)</c>. Held fixed it
-    /// silently capped the cache of anyone who deliberately raised the budget — at the measured
-    /// worst-case native share of an entry (8.3 %) a 96 MB ceiling starts binding at roughly
-    /// 1.2 GB of configured cache, and past that every insert evicts the LRU tail while
-    /// <c>indexCacheBytes</c> sits far below <c>indexCacheBudgetBytes</c> and the hit rate never
-    /// improves. An operator who asks for a 2 GB cache has said how much memory this component
-    /// may hold; the native part of it remains bounded, by this share and by the total budget it
-    /// is a part of.</para>
+    /// <para><b>The rule: an explicitly configured <see cref="IndexCacheBytes"/> may raise this
+    /// ceiling — to 20 % of the budget set — but never above
+    /// <see cref="MemoryBudgets.IndexCacheNativeMaxFraction"/> of the PHYSICAL limit, because a
+    /// budget says how much memory this component may hold and only the host says how much of it
+    /// may be pinned where no collection can reach it.</b></para>
+    ///
+    /// <para>Both halves are needed. Held fixed, the ceiling silently capped the cache of anyone
+    /// who deliberately raised the budget — at the measured worst-case native share of an entry
+    /// (8.3 %) a 96 MB ceiling starts binding at roughly 1.2 GB of configured cache, and past that
+    /// every insert evicts the LRU tail while <c>indexCacheBytes</c> sits far below
+    /// <c>indexCacheBudgetBytes</c> and the hit rate never improves. Scaled without a reference to
+    /// the host, it let the managed knob move NATIVE bytes without bound: in a 512 MB container a
+    /// 1 GB budget asked for 204 MB of bloom bits — 40 % of the box, outside the GC's hard limit
+    /// and unreclaimable by the RAM pressure path, which is the class of defect the backstop
+    /// exists for.</para>
     ///
     /// <para>It never follows the budget DOWN — a small configured cache keeps the derived
-    /// backstop — and the derived figure is still a share of the PHYSICAL limit, because that is
+    /// backstop — and every figure in the rule is a share of the PHYSICAL limit, because that is
     /// where these bytes live. An eviction this ceiling causes is counted separately
     /// (<c>indexCacheNativeEvicted</c>), since it is otherwise invisible. See
     /// <see cref="MemoryBudgets"/>.</para>
     /// </summary>
-    public long EffectiveIndexCacheNativeBytes
+    public long EffectiveIndexCacheNativeBytes => IndexCacheNativeBytesFor(MemoryBudgets.Current());
+
+    /// <summary>
+    /// That same rule as a pure function of the host's budgets, so it can be checked at 512 MB and
+    /// at 64 GB without a machine of each size — the shape
+    /// <see cref="MemoryBudgets.Derive(long, long)"/> already uses for the budgets themselves.
+    ///
+    /// <para>A host that could not report a physical limit gets no scaling at all: with nothing
+    /// real to clamp against, the backstop is the only figure anchored to anything.</para>
+    /// </summary>
+    public long IndexCacheNativeBytesFor(in MemoryBudgets budgets)
     {
-        get
-        {
-            long derived = MemoryBudgets.Current().IndexCacheNativeBytes;
-            return IndexCacheBytes is not > 0
-                ? derived
-                : Math.Max(derived, (long)(IndexCacheBytes.Value * MemoryBudgets.IndexCacheNativeEntryShare));
-        }
+        long derived = budgets.IndexCacheNativeBytes;
+        if (IndexCacheBytes is not > 0) return derived;
+
+        long scaled = (long)(IndexCacheBytes.Value * MemoryBudgets.IndexCacheNativeEntryShare);
+        long host   = budgets.PhysicalLimitBytes > 0
+            ? (long)(budgets.PhysicalLimitBytes * MemoryBudgets.IndexCacheNativeMaxFraction)
+            : derived;
+
+        // Max last: the clamp may only lower a SCALED ceiling, never cut into the backstop.
+        return Math.Max(derived, Math.Min(scaled, host));
     }
 
     /// <summary>
