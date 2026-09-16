@@ -219,57 +219,23 @@ public static class OtlpEndpointMapper
     // ── Body reading ──────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Rents a buffer from <see cref="IngestBufferPool"/> and reads the full request body.
-    /// Returns (null, 0) on error (status code already set). The caller MUST return the buffer
-    /// via <see cref="IngestBufferPool.Return"/> — use a finally block.
+    /// Reads the full request body into a buffer from <see cref="IngestBufferPool"/>. The read
+    /// itself is <see cref="OtlpBodyReader"/>, which the gRPC receiver shares — a body over
+    /// <c>Ingestion.MaxOtlpBatchBytes</c> is refused there without ever renting past the ceiling.
+    ///
+    /// <para>Returns (null, 0) with the 413 already written, and nothing left rented, for a body
+    /// over that limit. On success the caller MUST return the buffer via
+    /// <see cref="IngestBufferPool.Return"/> — use a finally block.</para>
     /// </summary>
     private static async ValueTask<(byte[]? Buffer, int Length)> ReadBodyAsync(HttpContext ctx)
     {
-        int maxBytes = ctx.RequestServices.GetRequiredService<Ameto.Core.ServerOptions>().Ingestion.MaxOtlpBatchBytes;
+        var body = await OtlpBodyReader.ReadAsync(
+            ctx, ctx.RequestServices.GetRequiredService<Ameto.Core.ServerOptions>().Ingestion.MaxOtlpBatchBytes);
 
-        long? declared = ctx.Request.ContentLength;
-        if (declared > maxBytes)
-        {
-            ctx.Response.StatusCode = StatusCodes.Status413PayloadTooLarge;
-            return (null, 0);
-        }
-
-        // Rent instead of allocating MemoryStream — Content-Length known → exact size
-        int initialCapacity = declared.HasValue ? (int)declared.Value : 65_536;
-        byte[] buf = IngestBufferPool.Rent(Math.Max(initialCapacity, 256));
-        int totalRead = 0;
-        try
-        {
-            while (true)
-            {
-                if (totalRead == buf.Length)
-                {
-                    // Grow: double the rented buffer
-                    byte[] larger = IngestBufferPool.Rent(buf.Length * 2);
-                    buf.AsSpan(0, totalRead).CopyTo(larger);
-                    IngestBufferPool.Return(buf);
-                    buf = larger;
-                }
-
-                int read = await ctx.Request.Body.ReadAsync(buf.AsMemory(totalRead), ctx.RequestAborted);
-                if (read == 0) break;
-                totalRead += read;
-
-                if (totalRead > maxBytes)
-                {
-                    ctx.Response.StatusCode = StatusCodes.Status413PayloadTooLarge;
-                    IngestBufferPool.Return(buf);
-                    return (null, 0);
-                }
-            }
-
-            return (buf, totalRead);
-        }
-        catch
-        {
-            IngestBufferPool.Return(buf);
-            throw;
-        }
+        // The one thing the two receivers do differently with a refusal: this one has an HTTP
+        // status to say it in. The gRPC receiver says it in trailers, as RESOURCE_EXHAUSTED.
+        if (body.Buffer is null) ctx.Response.StatusCode = StatusCodes.Status413PayloadTooLarge;
+        return body;
     }
 
     /// <summary>

@@ -269,44 +269,18 @@ public static class OtlpGrpcEndpointMapper
         return key is not null && validator.Validate(key.AsSpan(), required);
     }
 
-    private static async ValueTask<(byte[]? Buffer, int Length)> ReadBodyAsync(HttpContext ctx)
-    {
-        int maxBytes = ctx.RequestServices.GetRequiredService<Ameto.Core.ServerOptions>().Ingestion.MaxOtlpBatchBytes;
-
-        long? declared = ctx.Request.ContentLength;
-        if (declared > maxBytes) return (null, 0);
-
-        // HTTP/2 rarely declares a length, so the usual path here is grow-by-doubling from
-        // 64 KiB rather than the exact-size rent the HTTP receivers normally get.
-        int initial = declared.HasValue ? (int)declared.Value : 65_536;
-        byte[] buf = IngestBufferPool.Rent(Math.Max(initial, 256));
-        int total = 0;
-        try
-        {
-            while (true)
-            {
-                if (total == buf.Length)
-                {
-                    var bigger = IngestBufferPool.Rent(buf.Length * 2);
-                    buf.AsSpan(0, total).CopyTo(bigger);
-                    IngestBufferPool.Return(buf);
-                    buf = bigger;
-                }
-                int read = await ctx.Request.Body.ReadAsync(buf.AsMemory(total), ctx.RequestAborted);
-                if (read == 0) break;
-                total += read;
-                if (total > maxBytes) { IngestBufferPool.Return(buf); return (null, 0); }
-            }
-        }
-        catch
-        {
-            // A reset stream, a client deadline, a dropped connection. Without this the rented
-            // array is simply dropped: not a leak, but a permanent withdrawal from the pool the
-            // HTTP OTLP receiver and the gzip inflate target share — and a collector timing out
-            // mid-upload is an everyday event, not an exceptional one.
-            IngestBufferPool.Return(buf);
-            throw;
-        }
-        return (buf, total);
-    }
+    /// <summary>
+    /// Reads the full request body into a buffer from <see cref="IngestBufferPool"/> — the same
+    /// <see cref="OtlpBodyReader"/> the HTTP receivers read through, including its rule that a
+    /// body over <c>Ingestion.MaxOtlpBatchBytes</c> is never given a buffer past that ceiling.
+    /// HTTP/2 rarely declares a length, so the usual path here is grow-by-doubling from 64 KiB
+    /// rather than the exact-size rent a declared body gets.
+    ///
+    /// <para>Null means the batch is over the limit; the caller answers RESOURCE_EXHAUSTED,
+    /// because a status code would go unread on a gRPC call. On success the caller owns the
+    /// buffer and returns it in a finally.</para>
+    /// </summary>
+    private static ValueTask<(byte[]? Buffer, int Length)> ReadBodyAsync(HttpContext ctx)
+        => OtlpBodyReader.ReadAsync(
+            ctx, ctx.RequestServices.GetRequiredService<Ameto.Core.ServerOptions>().Ingestion.MaxOtlpBatchBytes);
 }
