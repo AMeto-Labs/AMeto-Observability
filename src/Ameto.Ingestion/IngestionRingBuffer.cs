@@ -68,6 +68,10 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
     private readonly int         _slabBytes;     // max payload bytes per event
     private readonly int         _slabCount;
     private readonly int*        _slabNext;      // free-list chain: _slabNext[i] = next free slab, or -1
+    // Deepest slab index ever handed out, +1. Managed, so it survives disposal and can be read
+    // without touching freed native memory — and it is the arena's RESIDENCY on every platform:
+    // pages are never given back, and the free list hands slabs out in increasing index order.
+    private          long        _slabHighWater;
     private          PaddedLong* _freeHead;      // packed (version:hi32 | index:lo32); index -1 ⇒ empty
 
     // Per-slot message-template strings + structured exceptions (managed, parallel to slots).
@@ -189,6 +193,21 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
     /// <summary>True when arena pages are committed as the buffer grows rather than at startup.</summary>
     public bool ArenaCommitsOnDemand => _arena.IsCommitOnDemand;
 
+    /// <summary>
+    /// The whole arena — what <c>Ingestion.PayloadPoolBytes</c> bought, derived from the physical
+    /// memory this process may use when it is not set.
+    /// </summary>
+    public long ArenaCapacityBytes => (long)_payloadArenaBytes;
+
+    /// <summary>
+    /// Bytes of the arena the buffer has ever reached: the deepest slab handed out, times the
+    /// slab size. THE RESIDENCY FIGURE, and the one that holds on every platform —
+    /// <see cref="ArenaCommittedBytes"/> is -1 wherever pages fault in lazily, which is
+    /// everywhere but Windows, so on the Linux containers this matters most for there was no
+    /// figure at all. Pages are never given back, so this is a resting level and not a peak.
+    /// </summary>
+    public long ArenaHighWaterBytes => Volatile.Read(ref _slabHighWater) * _slabBytes;
+
     /// <summary>Events ever accepted into the ring (monotonic). Zero once disposed.</summary>
     public long AcceptedTotal => Volatile.Read(ref _disposed) ? 0 : Volatile.Read(ref _enqueuePos->Value);
 
@@ -280,7 +299,27 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
             int  next = _slabNext[idx];
             long newHead = unchecked((((head >> 32) + 1) << 32) | (uint)next); // bump version, swing to next
             if (Interlocked.CompareExchange(ref _freeHead->Value, newHead, head) == head)
+            {
+                // One predicted-false branch on the hot path. The interlocked update below runs
+                // only on a NEW high — O(slabCount) times in the life of the process, because the
+                // free list hands slabs out in increasing index order and reuses them LIFO.
+                if (idx >= Volatile.Read(ref _slabHighWater)) RecordHighWater(idx);
                 return idx;
+            }
+        }
+    }
+
+    /// <summary>Raises the high-water mark to <paramref name="idx"/> + 1, losing no concurrent riser.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void RecordHighWater(int idx)
+    {
+        long mark = idx + 1L;
+        long seen = Volatile.Read(ref _slabHighWater);
+        while (mark > seen)
+        {
+            long prev = Interlocked.CompareExchange(ref _slabHighWater, mark, seen);
+            if (prev == seen) return;
+            seen = prev;
         }
     }
 

@@ -148,6 +148,30 @@ public sealed class IngestArenaCommitFailureTests
         ring.TryDequeue(out _, out _, out _, out _, out _, buf, out _, out _, out _, out _, out _);
 
     /// <summary>
+    /// THE RESIDENCY FIGURE, on every platform. The commit counter above is Windows-only by
+    /// design, so on a Linux container — the 512 MB stand — nothing reported how much of the
+    /// arena the buffer had actually touched, and those pages are never given back. The deepest
+    /// slab ever handed out is that number: the free list gives slabs out in increasing index
+    /// order and reuses them LIFO, so the mark is the true high-water depth rather than the
+    /// ceiling the arena is allowed to reach.
+    /// </summary>
+    [Fact]
+    public void The_arena_reports_how_far_the_buffer_has_ever_reached()
+    {
+        using var ring = new IngestionRingBuffer(1 << 10, SlabBytes, (long)Slabs * SlabBytes);
+
+        Assert.Equal((long)Slabs * SlabBytes, ring.ArenaCapacityBytes);
+        Assert.Equal(0, ring.ArenaHighWaterBytes);                 // nothing written, nothing resident
+
+        const int Held = 10;
+        for (int i = 0; i < Held; i++) Assert.True(Enqueue(ring, (byte)i));
+
+        // Ten slabs deep — not the whole arena, which is the point of measuring it.
+        Assert.Equal((long)Held * SlabBytes, ring.ArenaHighWaterBytes);
+        Assert.True(ring.ArenaHighWaterBytes < ring.ArenaCapacityBytes);
+    }
+
+    /// <summary>
     /// A plain allocation (the arena everywhere but Windows) commits nothing on demand and counts
     /// nothing, so it reports -1 — not its whole size as if it were memory in use, which would show
     /// every idle Linux container holding 512 MB of arena.

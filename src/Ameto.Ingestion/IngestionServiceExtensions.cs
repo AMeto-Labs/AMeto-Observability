@@ -25,7 +25,7 @@ public static class IngestionServiceExtensions
                 (uint)Math.Clamp(ing.RingCapacity, 1024, 1 << 24));
             return new IngestionRingBuffer(cap,
                 maxPayloadBytesPerSlot: ing.MaxEventPayloadBytes,
-                payloadPoolBytes:       ing.PayloadPoolBytes);
+                payloadPoolBytes:       ing.EffectivePayloadPoolBytes);
         });
 
         // Endpoint — singleton, mapped as a route handler in Program.cs

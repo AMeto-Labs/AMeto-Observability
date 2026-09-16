@@ -134,11 +134,25 @@ public sealed class IngestionOptions
     /// <summary>
     /// Payload slab arena budget for the ring: slabCount = min(RingCapacity, this /
     /// MaxEventPayloadBytes). Slabs — not ring slots — are the true drop threshold when
-    /// the drainer stalls. The arena is reserved virtual memory: resident pages track the
-    /// bytes actually written (typical events touch one 4 KB page per slab), not the
-    /// budget, so a generous value is cheap. Default: 512 MB (= 8192 slabs of 64 KB).
+    /// the drainer stalls.
+    ///
+    /// <para>Unset (the default) derives it from the memory this process may use:
+    /// <c>min(512 MB, 15 % of the physical limit)</c> — about 76 MB in a 512 MB container,
+    /// the full 512 MB where there is room for it. See <see cref="MemoryBudgets"/>. The flat
+    /// 512 MB this replaces was the whole of that container, reserved for one buffer, and the
+    /// arena's pages are never given back once touched: the high-water mark is a resting level,
+    /// not a peak. Lowering it on a small host means a burst applies back-pressure earlier and
+    /// drops at the door with a counted reason, which is the trade the budgets exist to make.</para>
+    ///
+    /// <para>The arena is reserved virtual memory: resident pages track the bytes actually
+    /// written (typical events touch one 4 KB page per slab), not the budget — and
+    /// <c>/api/diagnostics</c> reports the high-water mark as <c>ingestArenaResidentBytes</c>.
+    /// An explicit value always wins.</para>
     /// </summary>
-    public long PayloadPoolBytes { get; init; } = 512L * 1024 * 1024;
+    public long? PayloadPoolBytes { get; init; }
+
+    /// <summary>The configured arena budget, or the one derived from available memory when unset.</summary>
+    public long EffectivePayloadPoolBytes => PayloadPoolBytes ?? MemoryBudgets.Current().IngestArenaBytes;
 }
 
 /// <summary>

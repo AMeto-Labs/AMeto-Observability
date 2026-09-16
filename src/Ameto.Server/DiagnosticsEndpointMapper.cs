@@ -198,6 +198,13 @@ public static class DiagnosticsEndpointMapper
                 // reported here, no figure attributed those megabytes to anything.
                 ingestBufferPooledBytes  = IngestBufferPool.PooledBytes,
                 ingestBufferBudgetBytes  = IngestBufferPool.MaxPooledTotalBytes,
+                // The payload arena: what it may reserve, and how far into it the buffer has
+                // ever reached. The second figure IS its residency — the pages are never given
+                // back — and it is the largest single thing the ingest path holds. It used to be
+                // reported nowhere: the commit counter next to it is Windows-only by design, so
+                // on the Linux container this matters most for, no figure existed at all.
+                ingestArenaBytes         = ring.ArenaCapacityBytes,
+                ingestArenaResidentBytes = ring.ArenaHighWaterBytes,
 
                 // ── Index build ────────────────────────────────────────────────
                 // Merge rows whose exception column is not a readable exception map: written,

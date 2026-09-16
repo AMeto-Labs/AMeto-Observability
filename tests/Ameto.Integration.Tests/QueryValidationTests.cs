@@ -211,6 +211,8 @@ public sealed class QueryValidationTests : IClassFixture<AmetoWebAppFactory>
                      "ingestWriteErrorDrops",
                      // Request bodies parked by IngestBufferPool, and the budget that caps them.
                      "ingestBufferPooledBytes", "ingestBufferBudgetBytes",
+                     // The payload arena's size and how far into it the buffer has ever reached.
+                     "ingestArenaBytes", "ingestArenaResidentBytes",
                      // Index build: merge rows written without their @x.* terms, and pooled build memory.
                      "indexMalformedExceptionPayloads", "indexBuildPooledBytes",
                  })

@@ -64,6 +64,12 @@ public readonly struct MemoryBudgets
     /// </summary>
     public const long IngestBufferCapBytes = 128L * 1024 * 1024;
 
+    /// <summary>
+    /// The ingest payload arena — <c>Ingestion.PayloadPoolBytes</c>'s default, which was a flat
+    /// 512 MB whatever the host had.
+    /// </summary>
+    public const long IngestArenaCapBytes = 512L * 1024 * 1024;
+
     // ── The shares, when that is the smaller number ──
     //
     // Managed builds and the index cache together take 45 % of the managed-heap limit; the rest
@@ -94,6 +100,19 @@ public readonly struct MemoryBudgets
     public const double IngestBufferFraction = 0.10;
 
     /// <summary>
+    /// Share of the PHYSICAL limit the ingest payload arena may reserve — native, like the frozen
+    /// tiers, and not under the GC's hard limit.
+    ///
+    /// <para>The arena is the ring's absorption window: the pages it touches are never given
+    /// back, so its high-water mark is a resting level, not a peak. At the flat 512 MB default
+    /// that is a bound larger than the whole of a 512 MB container, which is why this is a share
+    /// — the trade being the one this class already documents, that a small host applies
+    /// back-pressure earlier and drops at the door with a counted reason instead of being killed
+    /// with everything in it.</para>
+    /// </summary>
+    public const double IngestArenaFraction = 0.15;
+
+    /// <summary>
     /// A guard for a runtime that does not report <c>GCHighMemPercent</c>. The .NET 10 runtime
     /// reports the EFFECTIVE percentage, whether configured or chosen by default, including the
     /// higher default at 80 GB of physical memory or more. Measured on 10.0.11: 90 with nothing set,
@@ -108,9 +127,11 @@ public readonly struct MemoryBudgets
     private const long MinNativeBytes       = 16L * 1024 * 1024;
     private const long MinIndexCacheBytes   =  8L * 1024 * 1024;
     private const long MinIngestBufferBytes =  8L * 1024 * 1024;
+    private const long MinIngestArenaBytes  = 16L * 1024 * 1024;   // ~256 slabs at the 64 KB default
 
     private MemoryBudgets(
-        long managedLimit, long physicalLimit, long managed, long native, long indexCache, long ingestBuffers)
+        long managedLimit, long physicalLimit, long managed, long native, long indexCache,
+        long ingestBuffers, long ingestArena)
     {
         ManagedLimitBytes  = managedLimit;
         PhysicalLimitBytes = physicalLimit;
@@ -118,6 +139,7 @@ public readonly struct MemoryBudgets
         NativeTierBytes    = native;
         IndexCacheBytes    = indexCache;
         IngestBufferBytes  = ingestBuffers;
+        IngestArenaBytes   = ingestArena;
     }
 
     /// <summary>
@@ -143,6 +165,9 @@ public readonly struct MemoryBudgets
 
     /// <summary>Ceiling on request bodies parked in the ingest buffer pool between requests.</summary>
     public long IngestBufferBytes { get; }
+
+    /// <summary>Default size of the ingest payload arena (the ring's slab budget).</summary>
+    public long IngestArenaBytes { get; }
 
     /// <summary>True when a share of a limit, not the constant, set a ceiling.</summary>
     public bool IsConstrained =>
@@ -174,7 +199,8 @@ public readonly struct MemoryBudgets
             Share(managedBase,  ManagedBuildFraction, ManagedBuildCapBytes, MinBuildBytes),
             Share(physicalBase, NativeTierFraction,   NativeTierCapBytes,   MinNativeBytes),
             Share(managedBase,  IndexCacheFraction,   IndexCacheCapBytes,   MinIndexCacheBytes),
-            Share(managedBase,  IngestBufferFraction, IngestBufferCapBytes, MinIngestBufferBytes));
+            Share(managedBase,  IngestBufferFraction, IngestBufferCapBytes, MinIngestBufferBytes),
+            Share(physicalBase, IngestArenaFraction,  IngestArenaCapBytes,  MinIngestArenaBytes));
 
         static long Share(long limit, double fraction, long cap, long floor)
         {

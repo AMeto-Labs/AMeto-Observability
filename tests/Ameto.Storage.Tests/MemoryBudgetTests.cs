@@ -71,6 +71,36 @@ public sealed class MemoryBudgetTests
     }
 
     /// <summary>
+    /// The ingest payload arena is the largest native consumer of all — 512 MB by default, the
+    /// whole of the console stand's container, reserved for one buffer. Its pages are never given
+    /// back once touched, so its high-water mark is a resting level; the reserve-and-commit
+    /// mitigation is Windows-only, which is not the 512 MB Linux stand. It is a share of the
+    /// PHYSICAL limit, like the frozen tiers and for the same reason: it is native memory, not
+    /// under the GC's hard limit.
+    /// </summary>
+    [Fact]
+    public void The_ingest_arena_is_a_share_of_the_physical_limit_and_the_ring_takes_it()
+    {
+        var stand = MemoryBudgets.Derive(managedLimitBytes: 384 * MB, physicalLimitBytes: 512 * MB);
+
+        Assert.Equal((long)(512 * MB * 0.15), stand.IngestArenaBytes);              // 76 MB
+        Assert.True(stand.IngestArenaBytes < MemoryBudgets.IngestArenaCapBytes);
+
+        // Native ceilings together have to leave the container room for the managed heap, the
+        // live tier and the runtime itself.
+        Assert.True(stand.NativeTierBytes + stand.IngestArenaBytes < 512 * MB / 2);
+
+        // A host with room keeps the 512 MB default; an unknown limit falls back to it.
+        Assert.Equal(MemoryBudgets.IngestArenaCapBytes, MemoryBudgets.Derive(64 * GB).IngestArenaBytes);
+        Assert.Equal(MemoryBudgets.IngestArenaCapBytes, MemoryBudgets.Derive(0).IngestArenaBytes);
+        Assert.True(MemoryBudgets.Derive(32 * MB).IngestArenaBytes >= 16 * MB);     // the floor
+
+        // …and the ring is what takes it, unless an operator says otherwise.
+        Assert.Equal(MemoryBudgets.Current().IngestArenaBytes, new IngestionOptions().EffectivePayloadPoolBytes);
+        Assert.Equal(96 * MB, new IngestionOptions { PayloadPoolBytes = 96 * MB }.EffectivePayloadPoolBytes);
+    }
+
+    /// <summary>
     /// A big host that caps its managed heap with GCHeapHardLimit has said nothing about native
     /// memory, so the native budget must not shrink with the heap.
     /// </summary>
