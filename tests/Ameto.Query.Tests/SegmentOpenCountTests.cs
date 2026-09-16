@@ -16,11 +16,18 @@ namespace Ameto.Query.Tests;
 /// 20-segment query, and every one of them a handle that blocks deletion on Windows. The
 /// prefilter's reader is carried to the scan now.</para>
 ///
-/// <para>Carrying it made the release path three paths: the scan's iterator, the merge's
-/// finally for survivors that never primed, and the prefilter's own finally for a segment it
-/// rejects. Every case below therefore asserts Closes against Opens as well as the open
-/// count, so a path that stops disposing fails here and not only in a Perf probe whose filter
-/// every segment survives.</para>
+/// <para>Carrying it made the release path three paths, and WHICH ONE OWNS WHAT is what these
+/// counts pin. The MERGE's finally closes every reader the prefilter carried — primed or not:
+/// it is the only owner, and the scan borrows. The SCAN's iterator closes only a reader it
+/// opened itself, which is the no-hint passthrough. The PREFILTER's own finally closes the
+/// reader of a segment it rejects. (DisposeReaders, the cancellation and fault road, is not
+/// asserted here.)</para>
+///
+/// <para>Stated that way round because the obvious misreading has a cost: believing the merge
+/// closes only the survivors that never primed invites narrowing that loop to those entries,
+/// which leaks every primed reader the prefilter carried. Every case below asserts Closes
+/// against Opens as well as the open count, so a path that stops disposing fails here and not
+/// only in a Perf probe whose filter every segment survives.</para>
 ///
 /// <para>Counted, not weighed: an exact expected number is the only way to state "once". The
 /// counters are process-wide, so this depends on the assembly's
