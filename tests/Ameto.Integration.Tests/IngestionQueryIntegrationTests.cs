@@ -138,6 +138,13 @@ public class AmetoWebAppFactory : WebApplicationFactory<Program>
     /// </summary>
     protected virtual QueryOptions ConfiguredQuery => new();
 
+    /// <summary>
+    /// The ingest limits this host runs under. Defaults for every suite but the one that needs a
+    /// body ceiling small enough to cross without posting megabytes through TestServer; see
+    /// <see cref="OtlpHttpOversizedBodyStatusTests"/>.
+    /// </summary>
+    protected virtual IngestionOptions ConfiguredIngestion => new();
+
     /// <summary>The per-run wwwroot, so a test can populate it after the host has started.</summary>
     public string WebRootPath { get; private set; } = "";
 
@@ -192,6 +199,7 @@ public class AmetoWebAppFactory : WebApplicationFactory<Program>
                 },
                 Retention = new RetentionConfig(),
                 Query     = ConfiguredQuery,
+                Ingestion = ConfiguredIngestion,
             };
 
             services.AddSingleton(opts);
