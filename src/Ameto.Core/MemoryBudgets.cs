@@ -85,7 +85,8 @@ public readonly struct MemoryBudgets
 
     /// <summary>
     /// The ingest payload arena — <c>Ingestion.PayloadPoolBytes</c>'s default, which was a flat
-    /// 512 MB whatever the host had.
+    /// 512 MB whatever the host had, and is still the ceiling on both terms of the default rule
+    /// (see <see cref="IngestArenaFraction"/>).
     /// </summary>
     public const long IngestArenaCapBytes = 512L * 1024 * 1024;
 
@@ -148,9 +149,11 @@ public readonly struct MemoryBudgets
     /// unreclaimable by the RAM pressure path, which is the class of defect
     /// <see cref="IndexCacheNativeCapBytes"/> exists to prevent.</para>
     ///
-    /// <para>Twice the derived backstop and still under the ingest arena's share, it leaves the
-    /// three native shares — tiers 25 %, arena 15 %, these bits 10 % — at half the container in
-    /// the worst case. It is a clamp and never a floor: it can only lower a scaled ceiling, never
+    /// <para>Twice the derived backstop and still under the ingest arena's byte share, it leaves
+    /// the tiers' 25 % and these bits' 10 % at a third of the container in the worst case. (The
+    /// arena's default is floored by a slab count, see <see cref="IngestArenaFraction"/>, so its
+    /// worst case is its 512 MB cap rather than a share; its typical residency is a page per
+    /// slab touched.) It is a clamp and never a floor: it can only lower a scaled ceiling, never
     /// cut into the backstop a host that configured nothing gets.</para>
     /// </summary>
     public const double IndexCacheNativeMaxFraction = 0.10;
@@ -165,14 +168,30 @@ public readonly struct MemoryBudgets
 
     /// <summary>
     /// Share of the PHYSICAL limit the ingest payload arena may reserve — native, like the frozen
-    /// tiers, and not under the GC's hard limit.
+    /// tiers, and not under the GC's hard limit. ONE of the two terms of the arena's default, not
+    /// the whole of it.
     ///
-    /// <para>The arena is the ring's absorption window: the pages it touches are never given
-    /// back, so its high-water mark is a resting level, not a peak. At the flat 512 MB default
-    /// that is a bound larger than the whole of a 512 MB container, which is why this is a share
-    /// — the trade being the one this class already documents, that a small host applies
-    /// back-pressure earlier and drops at the door with a counted reason instead of being killed
-    /// with everything in it.</para>
+    /// <para><b>The rule</b> (applied by <c>IngestionOptions.DefaultPayloadPoolBytesFor</c>, which
+    /// knows the slab size this class does not): the default arena is the larger of this share,
+    /// <c>min(512 MB, 15 %)</c>, and a floor of 8 192 slabs of <c>MaxEventPayloadBytes</c> capped
+    /// at <see cref="IngestArenaCapBytes"/>. At the 64 KB default slab the floor is 512 MB, so this
+    /// share only sets the size for a lowered slab size on a host where 15 % is more than 8 192
+    /// slabs.</para>
+    ///
+    /// <para><b>Why the floor overrides the share.</b> The share alone gave a 512 MB container
+    /// ~76 MB, about 1 200 slabs. A pending event holds a slab whatever its size, and an
+    /// OpenTelemetry collector sends 8 192 records a batch by default, so ordinary batches dropped
+    /// part way through for want of slabs. That was a real drop at normal load, traded for a
+    /// theoretical residency bound.</para>
+    ///
+    /// <para><b>The residency trade, honestly.</b> The pages the arena touches are never given
+    /// back, so its high-water mark is a resting level, not a peak. But residency is per touched
+    /// page, not per slab: a typical 0.3-2 KB event touches one 4 KB page at the start of its
+    /// 64 KB slab (lazily paged on Linux; committed in 1 MB chunks as the deepest slab advances on
+    /// Windows), so 8 192 slabs of small events rest at about 32 MB. Only events near the maximum
+    /// size fill their slabs, and that worst case — 512 MB — is the one the flat default always
+    /// had. A small host that expects large events sets <c>Ingestion.PayloadPoolBytes</c>
+    /// explicitly, which always wins.</para>
     /// </summary>
     public const double IngestArenaFraction = 0.15;
 
@@ -238,7 +257,11 @@ public readonly struct MemoryBudgets
     /// <summary>Ceiling on request bodies parked in the ingest buffer pool between requests.</summary>
     public long IngestBufferBytes { get; }
 
-    /// <summary>Default size of the ingest payload arena (the ring's slab budget).</summary>
+    /// <summary>
+    /// The byte-share term of the ingest payload arena's default. The arena's actual default also
+    /// has a slab-count floor, applied where the slab size is known:
+    /// <c>IngestionOptions.DefaultPayloadPoolBytesFor</c>. See <see cref="IngestArenaFraction"/>.
+    /// </summary>
     public long IngestArenaBytes { get; }
 
     /// <summary>True when a share of a limit, not the constant, set a ceiling.</summary>

@@ -134,25 +134,62 @@ public sealed class IngestionOptions
     /// <summary>
     /// Payload slab arena budget for the ring: slabCount = min(RingCapacity, this /
     /// MaxEventPayloadBytes). Slabs — not ring slots — are the true drop threshold when
-    /// the drainer stalls.
+    /// the drainer stalls: a pending event holds one slab whatever its size.
     ///
-    /// <para>Unset (the default) derives it from the memory this process may use:
-    /// <c>min(512 MB, 15 % of the physical limit)</c> — about 76 MB in a 512 MB container,
-    /// the full 512 MB where there is room for it. See <see cref="MemoryBudgets"/>. The flat
-    /// 512 MB this replaces was the whole of that container, reserved for one buffer, and the
-    /// arena's pages are never given back once touched: the high-water mark is a resting level,
-    /// not a peak. Lowering it on a small host means a burst applies back-pressure earlier and
-    /// drops at the door with a counted reason, which is the trade the budgets exist to make.</para>
+    /// <para><b>The default, when unset, is the larger of two terms:</b></para>
+    /// <list type="bullet">
+    /// <item>a slab floor — <see cref="DefaultArenaMinSlabs"/> (8 192) slabs of
+    /// <see cref="MaxEventPayloadBytes"/>, capped at <see cref="MemoryBudgets.IngestArenaCapBytes"/>
+    /// (512 MB) so a raised slab size cannot balloon the reservation; and</item>
+    /// <item>the byte share — <c>min(512 MB, 15 % of the physical limit)</c>, see
+    /// <see cref="MemoryBudgets.IngestArenaFraction"/>.</item>
+    /// </list>
+    /// <para>At the 64 KB default slab the floor is exactly 512 MB, so every host, the 512 MB
+    /// container included, gets 8 192 slabs. The floor is there because an OpenTelemetry collector
+    /// sends batches of 8 192 records by default and the parser fills the ring faster than the
+    /// drainer empties it: the byte share alone gave a 512 MB container ~1 200 slabs, so one
+    /// ordinary batch could run out of slabs part way through (HTTP 200 with a non-zero
+    /// <c>dropped</c>, gRPC partial success). The byte share decides the size only when the slab
+    /// is small enough that 8 192 of them come to less than it.</para>
     ///
-    /// <para>The arena is reserved virtual memory: resident pages track the bytes actually
-    /// written (typical events touch one 4 KB page per slab), not the budget — and
-    /// <c>/api/diagnostics</c> reports the high-water mark as <c>ingestArenaResidentBytes</c>.
-    /// An explicit value always wins.</para>
+    /// <para><b>What that costs.</b> The arena is reserved virtual memory, and the pages it
+    /// touches are never given back, so its high-water mark is a resting level. Residency is per
+    /// touched PAGE, not per slab: on Linux the allocation is lazily paged and a typical 0.3-2 KB
+    /// event touches one 4 KB page at the start of its slab, so a full default batch of small
+    /// events rests at about 32 MB; on Windows the arena commits in 1 MB chunks as the deepest
+    /// slab advances. Only events near the maximum size approach the full slab each, which is the
+    /// same 512 MB worst case the flat default always had. A small host that expects large events,
+    /// or needs a hard ceiling below that, sets this explicitly and accepts that a batch then
+    /// meets back-pressure earlier. <c>/api/diagnostics</c> reports the high-water mark as
+    /// <c>ingestArenaResidentBytes</c>. An explicit value always wins.</para>
     /// </summary>
     public long? PayloadPoolBytes { get; init; }
 
-    /// <summary>The configured arena budget, or the one derived from available memory when unset.</summary>
-    public long EffectivePayloadPoolBytes => PayloadPoolBytes ?? MemoryBudgets.Current().IngestArenaBytes;
+    /// <summary>
+    /// Slabs the DEFAULT arena holds at least: one OpenTelemetry collector batch at its default
+    /// size (8 192 records), so an ordinary batch does not run out of slabs before the drainer
+    /// catches up. See <see cref="PayloadPoolBytes"/>.
+    /// </summary>
+    public const int DefaultArenaMinSlabs = 8192;
+
+    /// <summary>The configured arena budget, or the default rule applied to this host when unset.</summary>
+    public long EffectivePayloadPoolBytes =>
+        PayloadPoolBytes ?? DefaultPayloadPoolBytesFor(MemoryBudgets.Current(), MaxEventPayloadBytes);
+
+    /// <summary>
+    /// The default arena rule as a pure function of the host's budgets and the slab size, so it
+    /// can be checked at 512 MB and at 64 GB without a machine of each size — the shape
+    /// <see cref="MemoryBudgets.Derive(long, long)"/> uses. It lives here, not in
+    /// <see cref="MemoryBudgets"/>, because the slab size is an ingestion setting.
+    /// </summary>
+    public static long DefaultPayloadPoolBytesFor(in MemoryBudgets budgets, int maxEventPayloadBytes)
+    {
+        long slabFloor = Math.Min(
+            MemoryBudgets.IngestArenaCapBytes,
+            (long)DefaultArenaMinSlabs * Math.Max(1, maxEventPayloadBytes));
+
+        return Math.Max(slabFloor, budgets.IngestArenaBytes);
+    }
 }
 
 /// <summary>

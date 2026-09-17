@@ -33,6 +33,9 @@ internal static class ChildProcessEntry
             // it is taken of the container, not of the heap limit the rest of the cache is a
             // share of — so a child that cannot print it cannot prove which base was used.
             Console.WriteLine($"indexCacheNative={b.IndexCacheNativeBytes}");
+            // The ring's default arena as the bound options compute it — the byte share above is
+            // only one of its two terms, so the child prints the rule's result, not the share.
+            Console.WriteLine($"ingestArenaDefault={new IngestionOptions().EffectivePayloadPoolBytes}");
             return 0;
         }
 
