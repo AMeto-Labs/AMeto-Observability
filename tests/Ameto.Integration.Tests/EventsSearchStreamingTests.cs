@@ -52,7 +52,15 @@ public sealed class EventsSearchStreamingTests : IClassFixture<EventsSearchStrea
     /// </summary>
     public sealed class SparseScan : IQueryExecutor
     {
-        public static readonly TimeSpan WaitLimit = TimeSpan.FromSeconds(3);
+        /// <summary>
+        /// A hang guard, not a timing bound. The send this waits for happens the moment the scan goes
+        /// pending, and what a slow runner adds is only the delivery: the TestServer pipe, the client's
+        /// read and parse, the signal's continuation. At 3 s that trip failed a correct handler on a
+        /// loaded two-core runner. A handler that holds the row never completes the signal at all, so
+        /// the guard only has to be long enough to be sure of that; the scan stops at the first miss,
+        /// which keeps a real failure inside the client's 30 s token.
+        /// </summary>
+        public static readonly TimeSpan WaitLimit = TimeSpan.FromSeconds(10);
 
         private readonly ConcurrentDictionary<string, TaskCompletionSource> _seen = new();
 
@@ -87,6 +95,7 @@ public sealed class EventsSearchStreamingTests : IClassFixture<EventsSearchStrea
                     seen = false;
                 }
                 SeenDuringWait.Enqueue(seen);
+                if (!seen) yield break;             // one held row is the failure; do not wait out the rest
             }
         }
 
