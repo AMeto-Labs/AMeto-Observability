@@ -88,6 +88,44 @@ public sealed class WalFlushTickTests : IDisposable
         Assert.True(wal.LastFlushedOffset > firstWatermark);
     }
 
+    /// <summary>
+    /// A failed drive flush must be retried by the next tick even when nothing new is appended.
+    /// The watermark used to advance under the lock BEFORE the handle flush ran outside it, so
+    /// when FlushFileBuffers threw, the next idle tick found writeEnd == watermark and did
+    /// nothing: the acknowledged tail stayed in the drive cache until another event arrived
+    /// or the WAL rotated.
+    /// </summary>
+    [Fact]
+    public void FailedHandleFlush_IsRetriedByTheNextIdleTick()
+    {
+        using var wal = Open();
+        wal.Append(100, Ameto.Core.LogLevel.Information, 0, "tmpl", new byte[] { 1, 2, 3 });
+
+        bool failNext = true;
+        wal.HandleFlushHookForTest = h =>
+        {
+            if (failNext) { failNext = false; throw new IOException("simulated FlushFileBuffers failure"); }
+            h.Flush(flushToDisk: true);
+        };
+
+        // Tick 1: the msync lands, the drive flush throws, and the loop would log it.
+        Assert.Throws<IOException>(wal.Flush);
+        Assert.Equal(0, wal.HandleFlushCount);
+        Assert.True(wal.LastFlushedOffset < wal.WrittenBytes + 32,
+            "the watermark claimed durability the failed drive flush never delivered");
+
+        // Tick 2: nothing appended, but the tail is still not durable, so the flush is retried.
+        wal.Flush();
+        Assert.Equal(1, wal.HandleFlushCount);
+        Assert.Equal(wal.WrittenBytes + 32, wal.LastFlushedOffset);
+
+        // Tick 3: now it really is idle.
+        long ranges = wal.RangeFlushCount;
+        wal.Flush();
+        Assert.Equal(1, wal.HandleFlushCount);
+        Assert.Equal(ranges, wal.RangeFlushCount);
+    }
+
     [Fact]
     public void FlushedEntriesSurviveAndReplay()
     {

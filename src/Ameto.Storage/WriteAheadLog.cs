@@ -89,8 +89,9 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
     private          byte*               _ptr;
     private          long                _capacity;
     private          long                _writeOffset; // logical, excludes file header
-    // Absolute file offset (header included) up to which the mapping has been msynced.
-    // Everything past it is dirty; when it equals the write offset the tick has nothing to do.
+    // Absolute file offset (header included) up to which the mapping has been msynced AND the
+    // file handle flushed. Everything past it is not yet durable; when it equals the write
+    // offset the tick has nothing to do.
     private          long                _lastFlushedOffset = FileHeaderSize;
     private readonly object              _writeLock = new();
     private          FileStream?          _poolStream;
@@ -285,7 +286,9 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
     /// appended 40 KB walked 64 MB of page tables. It does not hold <see cref="_writeLock"/>
     /// across the file-handle flush, which is the part that waits out the drive cache and the
     /// part the single appender was stalled behind. And it does no I/O at all on a tick where
-    /// nothing was appended — the idle case, which used to msync and fsync regardless.</para>
+    /// nothing was appended since the last SUCCESSFUL flush — the idle case, which used to
+    /// msync and fsync regardless. A tick whose handle flush threw is not a success: the
+    /// following tick repeats it even if nothing new arrived.</para>
     ///
     /// <para>The first page is always in the range: <see cref="Append"/> updates the file
     /// header's WriteOffset in place, and recovery replays only up to that value, so a durable
@@ -293,12 +296,13 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
     /// </summary>
     public void Flush()
     {
-        FileStream? handle = null;
+        FileStream? handle   = null;
+        long        writeEnd = 0;
         lock (_writeLock)
         {
             if (_disposed || _accessor is null) return;
 
-            long writeEnd = FileHeaderSize + _writeOffset;
+            writeEnd = FileHeaderSize + _writeOffset;
             if (writeEnd > _lastFlushedOffset)
             {
                 if (!TryFlushRange(_lastFlushedOffset, writeEnd))
@@ -313,8 +317,12 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
                     _accessor.Flush();     // fallback: whole view, as before
                 }
 
-                _lastFlushedOffset = writeEnd;
-                handle             = _fileStream;
+                // The watermark is NOT advanced here. It means "durable up to", and nothing is
+                // durable until the handle flush below returns. Advancing it first made a failed
+                // FlushFileBuffers permanent while the WAL sat idle: the next tick saw
+                // writeEnd == watermark and did nothing, so the acknowledged tail stayed in the
+                // drive cache until another event arrived or the WAL rotated.
+                handle = _fileStream;
             }
         }
 
@@ -326,8 +334,26 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
         {
             // Dispose may have closed the handle between the lock and here (rotation runs
             // on this same thread today, but the flag is the contract, not the thread).
-            try { handle.Flush(flushToDisk: true); }
+            // An IOException propagates to the flush loop, which logs it. The watermark stays
+            // where it was, so the next tick, idle or not, re-issues both flushes.
+            bool flushed = false;
+            try
+            {
+                if (HandleFlushHookForTest is { } hook) hook(handle);
+                else handle.Flush(flushToDisk: true);
+                flushed = true;
+            }
             catch (ObjectDisposedException) { /* Dispose fsyncs it on its way out */ }
+
+            if (flushed)
+            {
+                Interlocked.Increment(ref _handleFlushCount);
+                lock (_writeLock)
+                {
+                    // Never backwards: a concurrent Flush may already have advanced it further.
+                    if (writeEnd > _lastFlushedOffset) _lastFlushedOffset = writeEnd;
+                }
+            }
         }
 
         lock (_poolLock)
@@ -416,7 +442,22 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
     /// <summary>Bytes covered by the most recent range msync.</summary>
     internal long LastRangeFlushBytes => Interlocked.Read(ref _lastRangeFlushBytes);
 
-    /// <summary>Absolute file offset up to which this WAL has been msynced.</summary>
+    private long _handleFlushCount;
+
+    /// <summary>File-handle flushes (FlushFileBuffers / fsync) that returned successfully.</summary>
+    internal long HandleFlushCount => Interlocked.Read(ref _handleFlushCount);
+
+    /// <summary>
+    /// Test seam: when set, <see cref="Flush"/> calls this instead of
+    /// <c>handle.Flush(flushToDisk: true)</c>, so a test can make the drive flush fail.
+    /// Never set in production.
+    /// </summary>
+    internal Action<FileStream>? HandleFlushHookForTest;
+
+    /// <summary>
+    /// Absolute file offset up to which this WAL is durable: msynced AND its file handle
+    /// flushed. It stays behind a failed handle flush, so the next tick retries it.
+    /// </summary>
     internal long LastFlushedOffset { get { lock (_writeLock) return _lastFlushedOffset; } }
 
     /// <summary>Bytes appended so far, excluding the file header.</summary>
