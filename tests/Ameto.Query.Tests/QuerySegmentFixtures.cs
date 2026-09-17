@@ -182,17 +182,32 @@ internal static class QuerySegmentFixtures
     /// segment file a finishing background read still has mapped. Still best-effort at the end of
     /// it: a teardown is not the place to fail a green test. <c>FixtureCleanupTests</c> is where
     /// the outcome is asserted.</para>
+    ///
+    /// <para>The retries are bounded by <see cref="DeleteRetryLimit"/> in total, backing off from
+    /// 10 ms, not by a count. Four tries 50 ms apart gave a late handle about 150 ms, and on a loaded
+    /// Windows runner a background read, or an antivirus or indexer scan of the fresh .seg files in
+    /// TEMP, can hold one longer than that — which failed <c>FixtureCleanupTests</c> on a directory
+    /// that was gone a moment later. A handle nothing will release, the parked SQLite pool this exists
+    /// for, still outlasts any bound, so that failure stays deterministic. A delete that succeeds at
+    /// once, the normal case, costs nothing extra.</para>
     /// </summary>
     public static void DeleteDataDirectory(string dir)
     {
         SqliteConnection.ClearAllPools();
 
-        for (int attempt = 0; attempt < 4; attempt++)
+        long started = Environment.TickCount64;
+        for (int backoffMs = 10; ; backoffMs = Math.Min(backoffMs * 2, 500))
         {
             try { Directory.Delete(dir, recursive: true); return; }
-            catch (DirectoryNotFoundException)  { return; }
-            catch (IOException)                 { Thread.Sleep(50); }
-            catch (UnauthorizedAccessException) { Thread.Sleep(50); }
+            catch (DirectoryNotFoundException) { return; }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                if (Environment.TickCount64 - started >= (long)DeleteRetryLimit.TotalMilliseconds) return;
+                Thread.Sleep(backoffMs);
+            }
         }
     }
+
+    /// <summary>How long <see cref="DeleteDataDirectory"/> keeps retrying a delete that a handle blocks.</summary>
+    public static readonly TimeSpan DeleteRetryLimit = TimeSpan.FromSeconds(10);
 }
