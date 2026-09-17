@@ -105,6 +105,18 @@ public sealed class DiagnosticsCostTests : IDisposable
     }
 
     /// <summary>
+    /// A TTL no test outlives, for the tests that need a snapshot to STAY fresh once refreshed.
+    /// They expire the primed snapshot by hand (<see cref="Expire"/>) rather than by sleeping past a
+    /// short TTL: with a 200-250 ms TTL, a caller that waited that long for a core on the two-core
+    /// runner found the NEW snapshot expired as well and walked again.
+    /// </summary>
+    private static readonly TimeSpan LongTtl = TimeSpan.FromMinutes(5);
+
+    /// <summary>Ages a snapshot just past <paramref name="ttl"/>, as if that long had passed since its walk.</summary>
+    private static void Expire(DataDirectoryStatsCache.Snapshot snapshot, TimeSpan ttl) =>
+        snapshot.TakenAt -= (long)(ttl.TotalSeconds * Stopwatch.Frequency) + 1;
+
+    /// <summary>
     /// Concurrent expiry must not start N walks: the losers are served the previous snapshot. The
     /// TTL is far longer than one walk of this fixture, so once the refresh lands its snapshot is
     /// fresh for every caller in the burst and exactly one walk is the only right answer.
@@ -112,9 +124,8 @@ public sealed class DiagnosticsCostTests : IDisposable
     [Fact]
     public void Concurrent_callers_do_not_walk_twice()
     {
-        var cache = new DataDirectoryStatsCache(TimeSpan.FromMilliseconds(250));
-        cache.Get(_root);                           // prime, so nobody takes the first-fill lock
-        Thread.Sleep(300);
+        var cache = new DataDirectoryStatsCache(LongTtl);
+        Expire(cache.Get(_root), LongTtl);          // primed, so nobody takes the first-fill lock; and expired
 
         int before = cache.WalkCount;
         var threads = new Thread[8];
@@ -138,9 +149,8 @@ public sealed class DiagnosticsCostTests : IDisposable
     [Fact]
     public void A_caller_that_read_the_expired_snapshot_does_not_repeat_a_refresh_that_just_finished()
     {
-        var cache = new DataDirectoryStatsCache(TimeSpan.FromMilliseconds(200));
-        cache.Get(_root);
-        Thread.Sleep(300);                          // the snapshot is now expired
+        var cache = new DataDirectoryStatsCache(LongTtl);
+        Expire(cache.Get(_root), LongTtl);          // the snapshot is now expired; the refresh below will not be
         int before = cache.WalkCount;
 
         using var lateSawExpired = new ManualResetEventSlim();
