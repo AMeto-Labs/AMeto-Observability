@@ -129,13 +129,13 @@ public sealed class AggregationHeaderPathTests : IDisposable
     // Answered by the header scan.
     [InlineData("select count(*)")]
     [InlineData("select count(*) group by @l")]
-    [InlineData("select count(*) where @l = 'Error'")]
-    [InlineData("select count(*) where @l = 'Error' group by @l")]
-    [InlineData("select count(*) where @l in ['Error','Fatal'] group by @l")]
     [InlineData("select count(*) where ['service.name'] = 'billing'")]
     [InlineData("select count(*) where ['service.name'] = 'billing' group by @l")]
-    [InlineData("select count(*) where @l = 'Fatal' and ['service.name'] = 'gateway'")]
     // Declined by the header scan, and therefore identical for a duller reason.
+    [InlineData("select count(*) where @l = 'Error'")]                           // a level the scan's index narrows by
+    [InlineData("select count(*) where @l = 'Error' group by @l")]
+    [InlineData("select count(*) where @l in ['Error','Fatal'] group by @l")]
+    [InlineData("select count(*) where @l = 'Fatal' and ['service.name'] = 'gateway'")]
     [InlineData("select count(*) group by ['service.name']")]                    // casing and empty names
     [InlineData("select count(*) group by ['service.name'] limit 2")]
     [InlineData("select count(*) where @l = 'Error' group by ['service.name']")]
@@ -222,6 +222,62 @@ public sealed class AggregationHeaderPathTests : IDisposable
         Assert.False(viaHeader.Partial);
         Assert.Null(viaHeader.PartialReason);
         Assert.Equal(400d, viaHeader.Rows.Sum(r => r.Values[0] ?? 0));
+    }
+
+    // ── Which road a shape takes ──────────────────────────────────────────────
+
+    /// <summary>
+    /// A LEVEL IN THE WHERE-CLAUSE KEEPS THE SCAN ROAD. The header aggregator consults no index:
+    /// it decompresses every block of every segment in the window and would drop the other
+    /// levels only afterwards, while the scan gets an exact level hint and level-pure flushes
+    /// leave it a handful of segments. On a busy store an Error count over a day decoded the
+    /// Information and Debug volume too, ran out of time, and came back partial with no rows
+    /// where the scan returns the number.
+    ///
+    /// <para>The two roads report different <see cref="AggregationResult.Scanned"/> for the same
+    /// question, and that is the observable: the scan counts only the events its filter
+    /// yielded, the header road every in-window header it walked — all 400 of them. Equal to the
+    /// scan-only executor's figure, and below the corpus size, means the scan answered.</para>
+    /// </summary>
+    [Theory]
+    [InlineData("select count(*) where @l = 'Error'")]
+    [InlineData("select count(*) where @l = 'Error' group by @l")]
+    [InlineData("select count(*) where @l in ['Error','Fatal'] group by @l")]
+    [InlineData("select count(*) where @l = 'Fatal' and ['service.name'] = 'gateway'")]
+    public async Task A_level_in_the_filter_keeps_the_scan_road(string text)
+    {
+        Assert.True(AggregationParser.TryParse(text, out var q));
+
+        var viaHeader = await _withHeader.ExecuteAsync(q!, From, To);
+        var viaScan   = await _scanOnly.ExecuteAsync(q!, From, To);
+
+        Assert.Equal(viaScan.Scanned, viaHeader.Scanned);
+        Assert.True(viaHeader.Scanned < 400, $"read {viaHeader.Scanned} of 400 — the header road walked the whole window");
+        Assert.Equal(viaScan.Rows.Sum(r => r.Values[0] ?? 0), viaHeader.Rows.Sum(r => r.Values[0] ?? 0));
+    }
+
+    /// <summary>
+    /// …and a filter that constrains NO level still takes the header road, where the scan has
+    /// nothing to narrow with. A budget too small for the scan tells them apart: the scan road
+    /// comes back partial, the header road complete with the scan-only executor's full count.
+    /// </summary>
+    [Theory]
+    [InlineData("select count(*)")]
+    [InlineData("select count(*) group by @l")]
+    [InlineData("select count(*) where ['service.name'] = 'billing'")]
+    [InlineData("select count(*) where ['service.name'] = 'billing' group by @l")]
+    public async Task A_filter_with_no_level_keeps_the_header_road(string text)
+    {
+        Assert.True(AggregationParser.TryParse(text, out var q));
+
+        var complete = await _scanOnly.ExecuteAsync(q!, From, To);
+        var starved  = await new AggregationExecutor(_query, scanBudget: 50).ExecuteAsync(q!, From, To);
+        var viaHeader = await new AggregationExecutor(_query, scanBudget: 50, headerScan: _engine)
+                                  .ExecuteAsync(q!, From, To);
+
+        Assert.True(starved.Partial, "the corpus no longer starves the scan road — the test proves nothing");
+        Assert.False(viaHeader.Partial);
+        Assert.Equal(complete.Rows.Sum(r => r.Values[0] ?? 0), viaHeader.Rows.Sum(r => r.Values[0] ?? 0));
     }
 
     /// <summary>

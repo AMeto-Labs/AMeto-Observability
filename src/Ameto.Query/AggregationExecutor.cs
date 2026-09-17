@@ -28,8 +28,8 @@ public sealed class AggregationResult
     ///
     /// <para>What "looked at" means differs by road, and the difference is visible. The event
     /// scan counts events the filter YIELDED, because that is all it ever sees. The header scan
-    /// counts every in-window HEADER it walked, before its service filter and before any level
-    /// narrowing — so the same question answered the fast way reports a larger number. Both are
+    /// counts every in-window HEADER it walked, before its service filter — so the same question
+    /// answered the fast way can report a larger number. Both are
     /// honest answers to "how much did this cost"; neither is a count of matches, and no client
     /// should read it as one.</para>
     /// </summary>
@@ -198,20 +198,29 @@ public sealed class AggregationExecutor(
     /// Answers a <c>count(*)</c> whose grouping and where-clause live entirely in the event
     /// HEADER, without materialising a single <see cref="LogEvent"/>.
     ///
-    /// <para><c>select count(*) where @l = 'Error' group by @l</c> over a wide window used to run
-    /// the full ordered k-way merge — every event decoded, its properties copied, its exception
-    /// rebuilt — to look at three header columns: level, service and timestamp. The header
-    /// aggregator behind <c>/api/events/counts</c> already reads exactly those three columns, in
-    /// parallel across segments, and the alert evaluator already trusts
-    /// <c>TryGetHeaderOnlyShape</c> to say when a filter is expressible that way. This routes the
-    /// aggregation down the same road. The shape that motivated it, <c>group by
-    /// ['service.name']</c>, is NOT one of them: it is declined for the reasons given
-    /// below.</para>
+    /// <para><c>select count(*) group by @l</c> over a wide window used to run the full ordered
+    /// k-way merge — every event decoded, its properties copied, its exception rebuilt — to look
+    /// at three header columns: level, service and timestamp. The header aggregator behind
+    /// <c>/api/events/counts</c> already reads exactly those three columns, in parallel across
+    /// segments, and the alert evaluator already trusts <c>TryGetHeaderOnlyShape</c> to say when
+    /// a filter is expressible that way. This routes the aggregation down the same road. The
+    /// shape that motivated it, <c>group by ['service.name']</c>, is NOT one of them: it is
+    /// declined for the reasons given below.</para>
     ///
     /// <para>DELIBERATELY NARROW; anything unrecognised returns null and the ordinary scan runs.
     /// Every aggregate must be <c>count(*)</c>, there may be at most one group key and it must
     /// be <c>@l</c>, and the filter must reduce to a header-only shape (which excludes any
-    /// <c>@t</c> bound — those compile to a TimeCompareNode, which that shape rejects).</para>
+    /// <c>@t</c> bound — those compile to a TimeCompareNode, which that shape rejects) that
+    /// constrains NO level.</para>
+    ///
+    /// <para>A LEVEL IN THE WHERE-CLAUSE KEEPS THE SCAN ROAD, for the reason the alert evaluator
+    /// gives in <c>LogValueAsync</c>: the header aggregator consults no index and decompresses
+    /// every block of every segment in the window, while the scan gets an exact level hint and
+    /// level-pure flushes leave it a small segment set. <c>where @l = 'Error'</c> over a day of a
+    /// busy store would decode all the Information and Debug volume only to discard it, and on a
+    /// store large enough to run out of time that turns a count the scan could give into a
+    /// partial answer with no rows at all. The header road is taken exactly where the scan has
+    /// nothing to narrow with.</para>
     ///
     /// <para>GROUPING BY <c>service.name</c> IS DECLINED, although it is the shape that would
     /// gain most, because the header aggregator cannot reproduce the scan's groups exactly and
@@ -256,11 +265,13 @@ public sealed class AggregationExecutor(
             grouping = HeaderGrouping.Level;
         }
 
-        HashSet<LogLevel>? levels;
-        string?            service;
+        string? service;
         try
         {
-            if (!CompiledFilter.Compile(query.FilterText).TryGetHeaderOnlyShape(out levels, out service))
+            // A level constraint declines: it is exactly what the scan's index hint narrows by,
+            // and exactly what this road would have to decode the whole window to apply.
+            if (!CompiledFilter.Compile(query.FilterText).TryGetHeaderOnlyShape(out var levels, out service) ||
+                levels is not null)
                 return null;
         }
         catch { return null; }     // a filter that will not compile is the scan path's error to report
@@ -314,29 +325,14 @@ public sealed class AggregationExecutor(
         {
             case HeaderGrouping.Level:
                 foreach (var l in counts.Levels)
-                {
-                    if (levels is not null &&
-                        (!LogLevelExtensions.TryParse(l.Name, out var parsed) || !levels.Contains(parsed)))
-                        continue;
                     rows.Add(Row([l.Name], l.Count, aggs.Count));
-                }
                 break;
 
             default:
-            {
                 // One row, even when the answer is zero — the same guarantee the scan path
                 // makes by seeding its single group up front.
-                long total = counts.Total;
-                if (levels is not null)
-                {
-                    total = 0;
-                    foreach (var l in counts.Levels)
-                        if (LogLevelExtensions.TryParse(l.Name, out var parsed) && levels.Contains(parsed))
-                            total += l.Count;
-                }
-                rows.Add(Row([], total, aggs.Count));
+                rows.Add(Row([], counts.Total, aggs.Count));
                 break;
-            }
         }
 
         bool hitGroupCap = rows.Count > AggregationParser.MaxGroups;
