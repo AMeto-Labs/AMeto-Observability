@@ -1152,15 +1152,20 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         // waiting is the point.
         //
         // And under _scanDeleteGate, the one lock the boot catalog scan takes (it must never
-        // take _importLock -- see LoadSegmentCatalog). Removing the entry, unlinking the file
-        // and parking a failed unlink are then one step to the scan: it cannot register this
-        // path after the entry has gone but before the park that tells it to leave the path
-        // alone. An unlink that succeeded leaves no file, which the scan checks under the same gate.
+        // take _importLock -- see LoadSegmentCatalog). Removing the entry, recording the path for
+        // a running scan, unlinking the file and parking a failed unlink are then one step to the
+        // scan: it cannot register this path after the entry has gone but before the record or
+        // the park that tells it to leave the path alone.
         lock (_importLock)
         lock (_scanDeleteGate)
         {
             if (_segments.TryRemove(key, out var info))
             {
+                // Whatever the unlink below does -- succeeds, parks, or fails outright -- a
+                // running catalog scan must not register this path again. Null, and so free,
+                // once no scan runs (see _deletedDuringCatalogScan).
+                _deletedDuringCatalogScan?.Add(info.FilePath);
+
                 // Its place under the header aggregation's warning cap goes with it: the set
                 // bounds unreadable segments still SERVED, not every one this process has met.
                 _warnedUnreadableSegments.TryRemove(key, out _);
@@ -1240,13 +1245,40 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     }
 
     /// <summary>
-    /// Serialises the boot catalog scan's registration with <see cref="DeleteSegmentAsync"/>'s
-    /// remove, unlink and park. Its own lock and not <c>_importLock</c>, because an import holds
-    /// that one across its publish and the scan must still be able to land inside that window
-    /// (see <see cref="ImportSegment(string, string)"/>). Taken inside <c>_importLock</c> by the
-    /// delete; nothing is taken under it.
+    /// Serialises the boot catalog scan's check-and-register with <see cref="DeleteSegmentAsync"/>'s
+    /// remove, record, unlink and park, and guards <see cref="_deletedDuringCatalogScan"/> and
+    /// <see cref="_catalogScansRunning"/>. Its own lock and not <c>_importLock</c>, because an
+    /// import holds that one across its publish and the scan must still be able to land inside
+    /// that window (see <see cref="ImportSegment(string, string)"/>). Taken inside
+    /// <c>_importLock</c> by the delete; nothing is taken under it.
     /// </summary>
     private readonly System.Threading.Lock _scanDeleteGate = new();
+
+    /// <summary>
+    /// Paths whose catalog entry <see cref="DeleteSegmentAsync"/> removed while a catalog scan was
+    /// running, whatever became of the unlink; null while none runs. The scan skips a path in
+    /// here, as it skips a parked one.
+    ///
+    /// <para>A record the delete keeps, not a question put to the filesystem. The scan used to
+    /// skip a path when <c>File.Exists</c> said false, and that says false for any error too: EIO
+    /// or ESTALE on NFS, a bad network path during an SMB hiccup. A LIVE segment skipped on such an
+    /// answer stayed out of queries, retention and merges until the next restart. Only a delete
+    /// writes here, so a path in here was deleted.</para>
+    ///
+    /// <para>Created when a scan starts and dropped when the last one ends, both under
+    /// <see cref="_scanDeleteGate"/>, so it holds one boot scan's deletes and cannot grow for the
+    /// life of the process.</para>
+    /// </summary>
+    private HashSet<string>? _deletedDuringCatalogScan;
+
+    /// <summary>Catalog scans running: the boot scan, and any a test runs beside it. Under <see cref="_scanDeleteGate"/>.</summary>
+    private int _catalogScansRunning;
+
+    /// <summary>Paths recorded for running catalog scans (tests); 0 once none runs.</summary>
+    internal int DeletedDuringCatalogScanCount
+    {
+        get { lock (_scanDeleteGate) return _deletedDuringCatalogScan?.Count ?? 0; }
+    }
 
     /// <summary>
     /// Test hook: called by <see cref="DeleteSegmentAsync"/> after the entry is removed and
@@ -3087,6 +3119,30 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// </summary>
     internal void LoadSegmentCatalog()
     {
+        // From before the directory is listed until the scan ends, every delete records its path
+        // for it (see _deletedDuringCatalogScan). A delete before this line either unlinked its
+        // file before the listing or parked it, and the scan sees both.
+        lock (_scanDeleteGate)
+        {
+            _catalogScansRunning++;
+            _deletedDuringCatalogScan ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        }
+        try
+        {
+            LoadSegmentCatalogCore();
+        }
+        finally
+        {
+            // Recording stops with the last scan, and what it recorded goes with it.
+            lock (_scanDeleteGate)
+            {
+                if (--_catalogScansRunning == 0) _deletedDuringCatalogScan = null;
+            }
+        }
+    }
+
+    private void LoadSegmentCatalogCore()
+    {
         var sw = System.Diagnostics.Stopwatch.StartNew();
 
         // Finish merges interrupted between publishing the merged segment and
@@ -3137,38 +3193,46 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 //   expired segment back in service, and the parked retry then found the catalog
                 //   naming its path, took that for a re-import and dropped the delete, until the
                 //   next retention pass.
-                // - GONE: the unlink succeeded after this scan opened the file (Linux unlinks a
-                //   mapped file; everywhere, once the reader above is closed), so nothing was
-                //   parked. Registering it added an entry for a file that no longer exists: every
-                //   header count over its window was Partial and every merge that picked it
-                //   failed, until the next retention pass removed the entry.
+                // - DELETED: the delete ran while this scan was running, and recorded the path
+                //   in _deletedDuringCatalogScan whatever its unlink did. Typically the unlink
+                //   succeeded after this scan opened the file (Linux unlinks a mapped file;
+                //   everywhere, once the reader above is closed), so nothing was parked, and
+                //   registering it added an entry for a file that no longer exists: every header
+                //   count over its window was Partial and every merge that picked it failed,
+                //   until the next retention pass removed the entry. The record, not File.Exists,
+                //   is what tells: File.Exists also says false when NFS or SMB fails the probe,
+                //   and a live segment skipped on that stayed unserved until the next restart.
                 //
                 // Under _scanDeleteGate, which DeleteSegmentAsync holds across removing the entry,
-                // unlinking the file and parking a failed unlink. What that gives is atomicity
-                // against a delete, not a fresh reading: the info above was read before the gate
-                // and says nothing about a delete since. A delete of this key is instead either
-                // wholly before these checks -- and left a park, or no file, both seen here -- or
-                // wholly after the add, and removes the entry the add made. It does not cover a
-                // delete whose unlink failed and was NOT parked (past PendingSegmentDeleteCap, or
-                // an exception no retry fixes): that file is still on disk, is registered again,
-                // and the next retention pass deletes it again. Not under _importLock, which an
-                // import holds across its publish while this scan must still be able to land
-                // (see ImportSegment).
-                bool parked, gone, added;
+                // recording the path, unlinking the file and parking a failed unlink. What that
+                // gives is atomicity against a delete, not a fresh reading: the info above was
+                // read before the gate and says nothing about a delete since. A delete of this key
+                // is instead either wholly before these checks -- and left a park or a record,
+                // both seen here -- or wholly after the add, and removes the entry the add made.
+                // A delete from before the scan began recorded nothing: its unlink either
+                // succeeded before the directory was listed, or was parked. What that does not
+                // cover is such a delete whose unlink failed and was NOT parked (past
+                // PendingSegmentDeleteCap, or an exception no retry fixes): the file is still on
+                // disk, is registered again, and the next retention pass deletes it again. (The
+                // same failure during the scan is recorded, so the file stays on disk unserved
+                // until the next start, as it does when no scan runs.) Not under _importLock,
+                // which an import holds across its publish while this scan must still be able to
+                // land (see ImportSegment).
+                bool parked, deleted, added;
                 lock (_scanDeleteGate)
                 {
-                    parked = _pendingSegmentDeletes.ContainsKey(file);
-                    gone   = !parked && !File.Exists(file);
-                    added  = !parked && !gone && _segments.TryAdd(key, info);
+                    parked  = _pendingSegmentDeletes.ContainsKey(file);
+                    deleted = !parked && _deletedDuringCatalogScan?.Contains(file) == true;
+                    added   = !parked && !deleted && _segments.TryAdd(key, info);
                 }
                 if (parked)
                 {
                     _logger.LogDebug("Segment {File} is waiting for its delete to complete; the catalog scan skips it", file);
                     continue;
                 }
-                if (gone)
+                if (deleted)
                 {
-                    _logger.LogDebug("Segment {File} was deleted after the catalog scan read it; the scan skips it", file);
+                    _logger.LogDebug("Segment {File} was deleted while the catalog scan was running; the scan skips it", file);
                     continue;
                 }
                 if (added) continue;

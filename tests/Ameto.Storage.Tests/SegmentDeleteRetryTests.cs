@@ -68,6 +68,14 @@ public sealed class SegmentDeleteRetryTests : IAsyncLifetime
     /// <summary>A replicated segment, written and imported the way the replication endpoint does it.</summary>
     private (string Path, SegmentKey Key) ImportPeerSegment(ulong segId)
     {
+        var (path, key) = WritePeerSegment(segId);
+        Assert.Equal(SegmentImportOutcome.Registered, _engine.ImportSegment(path));
+        return (path, key);
+    }
+
+    /// <summary>A replicated segment's file in the segments directory, not registered: what a boot scan finds.</summary>
+    private (string Path, SegmentKey Key) WritePeerSegment(ulong segId)
+    {
         var pool = new StringInternPool();
         using var hot = new HotTierSegment(16, 1L << 20);
         long now = DateTime.UtcNow.Ticks;
@@ -88,8 +96,6 @@ public sealed class SegmentDeleteRetryTests : IAsyncLifetime
             writer.WriteEvents(hot, pool);
             writer.Finalise(Peer, new SegmentId(segId));
         }
-
-        Assert.Equal(SegmentImportOutcome.Registered, _engine.ImportSegment(path));
         return (path, new SegmentKey(Peer, new SegmentId(segId)));
     }
 
@@ -426,24 +432,111 @@ public sealed class SegmentDeleteRetryTests : IAsyncLifetime
         await _engine.CatalogLoaded;
 
         var (path, key) = ImportPeerSegment(72);
-        bool deleted = false;
+        bool deleted = false, deleteCompleted = false;
+        int  recordedInsideScan = -1;
 
         // Retention deletes the segment after the scan has read the file and before it registers
         // it. Nothing holds the file, so the unlink succeeds and nothing is parked: the scan has
-        // no park to find, only a file that is no longer there.
+        // no park to find, only the delete's record of the path.
+        //
+        // Nothing in the hook may throw: the scan's quarantine catch would swallow it and keep the
+        // key out of the catalog for the wrong reason. Outcomes are kept and asserted afterwards.
         _engine._beforeScanRegistersSegment = file =>
         {
             if (deleted || !string.Equals(file, path, StringComparison.OrdinalIgnoreCase)) return;
-            deleted = true;
-            Assert.True(_engine.DeleteSegmentAsync(key).IsCompletedSuccessfully);
+            deleted            = true;
+            deleteCompleted    = _engine.DeleteSegmentAsync(key).IsCompletedSuccessfully;
+            recordedInsideScan = _engine.DeletedDuringCatalogScanCount;
         };
 
         _engine.LoadSegmentCatalog();
 
         Assert.True(deleted, "setup: the scan never reached the file");
+        Assert.True(deleteCompleted, "setup: the delete did not complete synchronously");
+        Assert.Equal(1, recordedInsideScan);   // setup: the delete recorded its path for the scan
         Assert.False(File.Exists(path), "setup: the delete should have unlinked the file (is the scan still holding it open?)");
         Assert.Equal(0, _engine.PendingSegmentDeleteCount);
         Assert.False(InCatalog(key), "the catalog scan registered a segment whose file a delete had just removed");
+
+        // Skipped because of the delete, not quarantined: an exception inside the scan's step
+        // also keeps the key out, and says so with an Error and a .seg.corrupt file.
+        AssertSkippedAsDeleted(path);
+
+        // Recording ends with the scan, and what it recorded goes with it.
+        Assert.Equal(0, _engine.DeletedDuringCatalogScanCount);
+    }
+
+    [Fact]
+    public async Task The_catalog_scan_skips_a_deleted_segment_by_the_delete_s_record_not_by_the_file_and_registers_one_nobody_deleted()
+    {
+        await _engine.CatalogLoaded;
+
+        // Two files the scan reaches, in this order. The first is in the catalog and deleted under
+        // the scan. The second is a file nobody deleted and the catalog does not hold yet, as at boot.
+        var (deletedPath, deletedKey) = ImportPeerSegment(73);
+        var (livePath, liveKey)       = WritePeerSegment(74);
+        Assert.False(InCatalog(liveKey));   // setup
+
+        string     backup    = Path.Combine(_dir, "73.bak");
+        bool       deleted   = false, unlinked = false, restored = false;
+        Exception? hookError = null;
+
+        // The engine deletes the first segment, and its file is back on disk before the scan
+        // decides. A probe of the filesystem finds a file there, just as it does for the live
+        // second one, and on a flaky NFS or SMB mount it can find neither. Only the delete's record
+        // tells the two apart. (Nothing here may throw: see the test above.)
+        _engine._beforeScanRegistersSegment = file =>
+        {
+            if (deleted || !string.Equals(file, deletedPath, StringComparison.OrdinalIgnoreCase)) return;
+            deleted = true;
+            try
+            {
+                File.Copy(deletedPath, backup);
+                _engine.DeleteSegmentAsync(deletedKey);
+                unlinked = !File.Exists(deletedPath);
+                File.Move(backup, deletedPath);
+                restored = File.Exists(deletedPath);
+            }
+            catch (Exception ex) { hookError = ex; }
+        };
+
+        _engine.LoadSegmentCatalog();
+
+        Assert.Null(hookError);
+        Assert.True(deleted && unlinked && restored, $"setup: deleted={deleted} unlinked={unlinked} restored={restored}");
+        Assert.Equal(0, _engine.PendingSegmentDeleteCount);   // setup: skipped by the record, not by a park
+
+        Assert.True(File.Exists(deletedPath));
+        Assert.False(InCatalog(deletedKey), "the catalog scan registered a segment the engine had deleted because its file was on disk");
+        AssertSkippedAsDeleted(deletedPath);
+
+        Assert.True(InCatalog(liveKey), "the catalog scan skipped a file nobody deleted");
+        Assert.Equal(0, _engine.DeletedDuringCatalogScanCount);
+    }
+
+    [Fact]
+    public async Task A_delete_once_the_catalog_scan_has_finished_records_nothing()
+    {
+        await _engine.CatalogLoaded;
+
+        var (path, key) = ImportPeerSegment(75);
+        await _engine.DeleteSegmentAsync(key);
+
+        Assert.False(InCatalog(key));
+        Assert.False(File.Exists(path));
+        Assert.Equal(0, _engine.DeletedDuringCatalogScanCount);
+    }
+
+    /// <summary>The scan skipped <paramref name="path"/> as deleted: it said so, and did not quarantine it.</summary>
+    private void AssertSkippedAsDeleted(string path)
+    {
+        var entries = _log.Entries;
+        Assert.Contains(entries, e => e.Level == Microsoft.Extensions.Logging.LogLevel.Debug &&
+                                      e.Message.Contains("was deleted while the catalog scan was running", StringComparison.Ordinal) &&
+                                      e.Message.Contains(path, StringComparison.OrdinalIgnoreCase));
+        Assert.DoesNotContain(entries, e => e.Message.Contains("Quarantining unreadable segment", StringComparison.Ordinal) ||
+                                            e.Message.Contains("Failed to quarantine corrupt segment", StringComparison.Ordinal));
+        Assert.False(File.Exists(path + ".corrupt"), "the scan quarantined the file instead of skipping it as deleted");
     }
 
     private IEnumerable<(Microsoft.Extensions.Logging.LogLevel Level, string Message, Exception? Error)> CapWarnings() =>
