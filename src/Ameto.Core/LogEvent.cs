@@ -107,13 +107,18 @@ public sealed class LogEvent
     /// <para>Not synchronised, exactly like <see cref="Properties"/>: a race decodes twice
     /// and one equal result wins, and an event is consumed by one reader.</para>
     ///
-    /// <para>WHERE A TORN PAYLOAD SURFACES moved with the laziness, exactly as it did for
-    /// <see cref="RawProperties"/>: a malformed <c>@x</c> blob used to throw inside
-    /// <c>SegmentReader.ReadEventsAsync</c>, where the scan turned it into "this segment
-    /// stops here"; it now throws at FIRST TOUCH — in the evaluator for an <c>@x</c>
-    /// predicate, or in delivery for a returned row. The bytes are still bounded and
-    /// length-checked by the block frame before they get here, so this is about which caller
-    /// sees a corrupt segment, not about whether one is detected.</para>
+    /// <para>WHERE A TORN PAYLOAD SURFACES moved with the laziness, as it did for
+    /// <see cref="RawProperties"/>. A malformed <c>@x</c> blob used to throw inside
+    /// <c>SegmentReader.ReadEventsAsync</c> for EVERY row the reader decoded. Nothing on the way
+    /// out caught it: <c>QueryExecutor.ScanSegmentAsync</c> catches only
+    /// <c>SegmentReader.Open</c>, so the throw went through the merge to the search endpoint's
+    /// <c>catch (Exception)</c>, and the whole search failed with "Search failed after the
+    /// stream had opened". There was never a per-segment "this segment stops here", so do not add
+    /// a per-segment catch to bring one back. It now throws at FIRST TOUCH, in the evaluator for
+    /// an <c>@x</c> predicate or in delivery for a returned row, so it fails the search in fewer
+    /// cases than before: a torn blob on a row the filter rejects without reading <c>@x</c> no
+    /// longer fails anything. The bytes are still bounded and length-checked by the block frame
+    /// before they get here.</para>
     /// </summary>
     public ExceptionInfo? Exception
     {
