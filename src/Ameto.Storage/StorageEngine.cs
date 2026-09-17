@@ -2970,8 +2970,21 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// payload is torn. It was removed from this list once on the strength of a grep over src/,
     /// which does not see into dependencies; the streaming merge then retried such a file
     /// forever, warning every pass.</para>
+    ///
+    /// <para>The list is <see cref="FileBounds.DescribesContent"/>, because those two were not the
+    /// whole of it and the retry had since gone quiet. MessagePack answers a count of 2^31 or more
+    /// with <see cref="OverflowException"/> (a checked uint→int conversion), a flipped column
+    /// offset slices with <see cref="ArgumentOutOfRangeException"/>, and both come out of the
+    /// writer on a source that opened cleanly. Classified as circumstance, such a batch was
+    /// logged at Debug and picked again by the next pass — the planner is deterministic, oldest
+    /// bucket first — so compaction for that bucket and every younger one stopped without a
+    /// Warning until retention removed the source. Nothing in the shared list is a condition of
+    /// the machine: an I/O error, a full disk, a sharing violation or a missing file is none of
+    /// them, and still gets another attempt. A writer BUG throwing one of them on healthy bytes
+    /// is quarantined too, at Warning and until restart, which is the louder of the two
+    /// outcomes.</para>
     /// </summary>
-    private static bool IsSourceCorruption(Exception ex) => ex is InvalidDataException or EndOfStreamException;
+    private static bool IsSourceCorruption(Exception ex) => FileBounds.DescribesContent(ex);
 
     /// <summary>
     /// Streams the sources through a k-way merge straight into a new segment file.

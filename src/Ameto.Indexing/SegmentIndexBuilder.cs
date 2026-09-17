@@ -341,6 +341,19 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
     /// server wrote, where a row without an exception has an empty column. IsPresent and
     /// FromBytes are unchanged: a presence probe still answers from the header, and delivery
     /// still throws.</para>
+    ///
+    /// <para>What counts as "throws" is <see cref="FileBounds.DescribesContent"/>, not a list of its
+    /// own. The first version caught only MessagePackSerializationException and
+    /// EndOfStreamException, and MessagePack 3.1.7 has a third answer for a torn header: a count
+    /// of 2^31 or more (<c>DD 80 00 00 00</c>, or the same one array down) reaches a checked
+    /// uint→int conversion in <c>TrySkip</c> / <c>TryReadArrayHeader</c> /
+    /// <c>TryReadMapHeader</c> and throws <see cref="OverflowException"/>. That escaped
+    /// <c>Add</c> and failed the merge, which the engine did not classify as corruption, so the
+    /// same batch was re-selected every pass — where before this check the row was simply
+    /// written. The shared list is also the list the engine quarantines a batch by, so what this
+    /// lets escape is exactly what the engine will retry. Probed with two million byte-flipped
+    /// exception maps and two million random 1-8 byte payloads, FromBytes threw nothing outside
+    /// it (and a skip nested two million arrays deep did not recurse).</para>
     /// </summary>
     private bool ReadsAsNoException(ReadOnlySpan<byte> payload)
     {
@@ -351,7 +364,7 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
             {
                 return ExceptionInfo.FromBytes(_exception.Memory) is null;
             }
-            catch (Exception ex) when (ex is MessagePackSerializationException or EndOfStreamException)
+            catch (Exception ex) when (FileBounds.DescribesContent(ex))
             {
                 return false;
             }

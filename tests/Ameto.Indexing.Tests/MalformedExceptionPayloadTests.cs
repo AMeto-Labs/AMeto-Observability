@@ -199,4 +199,90 @@ public sealed class MalformedExceptionPayloadTests
         Assert.Contains($"{cut.Length} exception payload", entry.Message);
         Assert.Contains($"file ordinal {readable.Length}", entry.Message);   // the first cut one
     }
+
+    /// <summary>
+    /// A count too large for an <c>int</c> is the other way a header lies, and MessagePack 3.1.7
+    /// answers it with <see cref="OverflowException"/> — the checked uint→int conversion in
+    /// <c>TrySkip</c>, <c>TryReadArrayHeader</c> and <c>TryReadMapHeader</c> — which is neither of
+    /// the two exceptions the no-exception check used to catch. An array32 or map32 announcing
+    /// 2^31 entries is absent to IsPresent (it is not a map at the root) and delivery throws on
+    /// it. Let out of <c>Add</c>, that failed the merge; the engine did not call it corruption,
+    /// so the same batch was selected again on every pass and compaction stalled behind it. It
+    /// is counted like any cut header, and the group seals.
+    /// </summary>
+    [Fact]
+    public void OverflowingCounts_AbsentToIsPresent_AreCounted_NotThrown()
+    {
+        byte[][] overflowing =
+        [
+            [0xDD, 0x80, 0x00, 0x00, 0x00],        // array32 announcing 2^31 elements
+            [0x91, 0xDD, 0x80, 0x00, 0x00, 0x00],  // the same, one array down
+            [0x91, 0xDF, 0x80, 0x00, 0x00, 0x00],  // a map32 announcing 2^31 entries, one array down
+        ];
+        foreach (var b in overflowing)
+        {
+            Assert.False(ExceptionInfo.IsPresent(b));
+            Assert.Throws<OverflowException>(() => ExceptionInfo.FromBytes(b.AsMemory()));
+        }
+
+        var hints = new IndexBuildHints();
+        var log   = new ListLogger();
+        using var builder = new SegmentIndexBuilder(overflowing.Length + 1, 5, 0, hints, log);
+        var src = new BytesSource([[0xC0], .. overflowing]);
+        uint i = 0;
+        while (src.TryReadNext(out var ev)) builder.Add(i++, in ev);
+
+        Assert.Equal(overflowing.Length, builder.MalformedExceptionPayloads);
+        Assert.Equal(overflowing.Length, hints.MalformedExceptionPayloads);
+
+        _ = builder.Serialise();
+        var entry = Assert.Single(log.Entries);
+        Assert.Equal(Microsoft.Extensions.Logging.LogLevel.Warning, entry.Level);
+        Assert.Contains($"{overflowing.Length} exception payload", entry.Message);
+        Assert.Contains("file ordinal 1", entry.Message);
+    }
+
+    /// <summary>
+    /// The same overflow on the PRESENT side, where <see cref="ExceptionInfo.TryReadIndexFields"/>
+    /// reads the payload: a map32 root announcing 2^31 entries, a skipped <c>stk</c> holding an
+    /// array32 of 2^31, an <c>inner</c> map32 of 2^31, and a legacy str32 claiming 2^31 bytes.
+    /// Its contract is that malformed input returns false; these threw instead, out of the
+    /// builder and out of the merge, for the same unending retry.
+    /// </summary>
+    [Fact]
+    public void OverflowingCounts_InsideAPresentPayload_AreCounted_NotThrown()
+    {
+        byte[][] overflowing =
+        [
+            [0xDF, 0x80, 0x00, 0x00, 0x00],
+            [0x81, 0xA3, (byte)'s', (byte)'t', (byte)'k', 0xDD, 0x80, 0x00, 0x00, 0x00],
+            [0x81, 0xA5, (byte)'i', (byte)'n', (byte)'n', (byte)'e', (byte)'r', 0xDF, 0x80, 0x00, 0x00, 0x00],
+            [0xDB, 0x80, 0x00, 0x00, 0x00],
+        ];
+        var good = new ExceptionInfo { Type = "System.TimeoutException", Message = "ledger" }.ToBytes();
+        foreach (var b in overflowing)
+        {
+            Assert.True(ExceptionInfo.IsPresent(b));
+            Assert.True(FileBounds.DescribesContent(Record.Exception(() => ExceptionInfo.FromBytes(b.AsMemory()))!));
+        }
+
+        var hints = new IndexBuildHints();
+        var log   = new ListLogger();
+        using var builder = new SegmentIndexBuilder(overflowing.Length + 2, 5, 0, hints, log);
+        var src = new BytesSource([good, .. overflowing, good]);
+        uint i = 0;
+        while (src.TryReadNext(out var ev)) builder.Add(i++, in ev);
+
+        Assert.Equal(overflowing.Length, builder.MalformedExceptionPayloads);
+        Assert.Equal(overflowing.Length, hints.MalformedExceptionPayloads);
+
+        _ = builder.Serialise();
+        var entry = Assert.Single(log.Entries);
+        Assert.Contains($"{overflowing.Length} exception payload", entry.Message);
+        Assert.Contains("file ordinal 1", entry.Message);
+
+        // And at the reader itself, whose contract the builder relies on.
+        foreach (var b in overflowing)
+            Assert.False(ExceptionInfo.TryReadIndexFields(b, out _, out _, out _));
+    }
 }

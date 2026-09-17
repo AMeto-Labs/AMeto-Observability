@@ -266,11 +266,12 @@ public sealed class ExceptionInfo
             }
             return true;
         }
-        catch (MessagePackSerializationException)
-        {
-            return false;
-        }
-        catch (EndOfStreamException)
+        // Every content-shaped failure, not the two this used to name. A count or length of 2^31
+        // or more — a map32 root, an inner map32, an array32 under a skipped key, a str32 — hits
+        // MessagePack's checked uint→int conversion and throws OverflowException, which escaped
+        // the index builder and failed a merge the engine then retried every pass. The list is
+        // FileBounds's, so this and the engine's corruption verdict cannot drift apart.
+        catch (Exception ex) when (FileBounds.DescribesContent(ex))
         {
             return false;
         }
