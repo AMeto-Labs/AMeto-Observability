@@ -264,7 +264,11 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
             return;
         }
 
-        if (ev.ExceptionPayload.IsEmpty) return;
+        // nil, an empty legacy string and any non-string, non-map value are "no exception" to
+        // ExceptionInfo.FromBytes, not a malformed one. TryReadIndexFields answers false for all
+        // three as it does for a broken map, so they are told apart here, before the count below
+        // could take them for a producer writing exceptions this reader cannot read.
+        if (!ExceptionInfo.IsPresent(ev.ExceptionPayload)) return;
 
         // Merge path: the raw msgpack. Read only the three fields the index wants, in place —
         // the stack trace, 1-5 KB of UTF-16 nobody here reads, is skipped, not decoded. That

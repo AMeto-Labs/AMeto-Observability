@@ -113,4 +113,31 @@ public sealed class MalformedExceptionPayloadTests
             return buf.WrittenSpan.ToArray();
         }
     }
+
+    /// <summary>
+    /// nil, an empty legacy string and a non-string, non-map value are all "no exception" to
+    /// <see cref="ExceptionInfo.FromBytes(ReadOnlyMemory{byte})"/>, so they are not malformed and
+    /// must not reach the count or the group's Warning. A malformed MAP beside them still does.
+    /// </summary>
+    [Fact]
+    public void NoExceptionPayloads_CountNothing_WhileMalformedMapsStillCount()
+    {
+        var good      = new ExceptionInfo { Type = "System.TimeoutException", Message = "ledger" }.ToBytes();
+        var truncated = good.AsSpan(0, good.Length - 4).ToArray();
+        byte[] nil         = [0xC0];
+        byte[] emptyLegacy = [0xA0];
+        byte[] integer     = [0x2A];
+        Assert.Null(ExceptionInfo.FromBytes(nil.AsMemory()));
+        Assert.Null(ExceptionInfo.FromBytes(emptyLegacy.AsMemory()));
+        Assert.Null(ExceptionInfo.FromBytes(integer.AsMemory()));
+
+        var hints = new IndexBuildHints();
+        using var builder = new SegmentIndexBuilder(6, 5, 0, hints);
+        var src = new BytesSource([nil, emptyLegacy, integer, truncated, NonStringType(), good]);
+        uint i = 0;
+        while (src.TryReadNext(out var ev)) builder.Add(i++, in ev);
+
+        Assert.Equal(2, builder.MalformedExceptionPayloads);     // the truncated map and the non-string type only
+        Assert.Equal(2, hints.MalformedExceptionPayloads);
+    }
 }
