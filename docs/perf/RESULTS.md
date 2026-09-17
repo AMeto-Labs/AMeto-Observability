@@ -90,5 +90,4 @@ Every package was reviewed adversarially, then its fix commits were reviewed aga
 - The segment index cache is the biggest remaining query win: about 73 MB per entry against a 256 MB budget gave 37 hits against 2 072 misses in the load run, so most of a filtered query re-decodes index sections it decoded a query ago. A finer cache unit, or no cache at all on a small host, is worth more than anything else left on the query path.
 - Re-measure on the 512 MB stand, where the budget work actually applies.
 - OTLP over HTTP still refuses `Content-Encoding: gzip`, which is what a default collector sends.
-- The live tail recompiles its filter on every poll (4.6 KB per poll).
 - Traces and metrics have not been through this treatment.
