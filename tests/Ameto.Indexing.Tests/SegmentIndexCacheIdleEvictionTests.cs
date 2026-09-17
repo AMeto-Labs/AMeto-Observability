@@ -74,10 +74,23 @@ public sealed class SegmentIndexCacheIdleEvictionTests
     private static SegmentIndexCache NewCache(TimeSpan idleEvict, ManualTimeProvider clock) =>
         new(1 << 20, 0, idleEvict, clock);
 
-    [Fact]
-    public void Untouched_entry_is_evicted_and_its_native_memory_released()
+    /// <summary>
+    /// The clock tests run at both <c>Stopwatch.Frequency</c> values the cache meets: 1e7 per second
+    /// (Windows, where a timestamp is a TimeSpan tick) and 1e9 (Linux). The idle age is converted into
+    /// timestamps once, and a conversion made in ticks instead is exact at 1e7; only at 1e9 does it
+    /// age every entry out a hundred times too soon.
+    /// </summary>
+    public static TheoryData<long> Frequencies => new()
     {
-        var clock = new ManualTimeProvider();
+        ManualTimeProvider.TickFrequency,
+        ManualTimeProvider.NanosecondFrequency,
+    };
+
+    [Theory]
+    [MemberData(nameof(Frequencies))]
+    public void Untouched_entry_is_evicted_and_its_native_memory_released(long frequency)
+    {
+        var clock = new ManualTimeProvider(frequency);
         using var cache = NewCache(TimeSpan.FromMilliseconds(30), clock);
         var r = NewNativeReader();
         Assert.True(r.ApproxRetainedBytes > 0);      // there really are native bits to free
@@ -124,10 +137,11 @@ public sealed class SegmentIndexCacheIdleEvictionTests
     /// The sweep walks the LRU tail and stops at the first young entry, so a hot entry
     /// survives however long the cache has been up.
     /// </summary>
-    [Fact]
-    public void Touched_entry_survives_while_its_neighbours_age_out()
+    [Theory]
+    [MemberData(nameof(Frequencies))]
+    public void Touched_entry_survives_while_its_neighbours_age_out(long frequency)
     {
-        var clock = new ManualTimeProvider();
+        var clock = new ManualTimeProvider(frequency);
         using var cache = NewCache(TimeSpan.FromMilliseconds(50), clock);
         using (cache.Insert("cold.seg", 0, true, NewNativeReader(), 100)) { }
         using (cache.Insert("hot.seg",  0, true, NewNativeReader(), 100)) { }
@@ -167,10 +181,11 @@ public sealed class SegmentIndexCacheIdleEvictionTests
     /// one query is precisely the case this exists for, and nothing would touch the cache
     /// again to trigger a lazy sweep.
     /// </summary>
-    [Fact]
-    public void Timer_sweeps_an_idle_cache_with_no_caller()
+    [Theory]
+    [MemberData(nameof(Frequencies))]
+    public void Timer_sweeps_an_idle_cache_with_no_caller(long frequency)
     {
-        var clock = new ManualTimeProvider();
+        var clock = new ManualTimeProvider(frequency);
         using var cache = NewCache(TimeSpan.FromMilliseconds(100), clock);
         using (cache.Insert("a.seg", 0, true, NewNativeReader(), 100)) { }
         Assert.Equal(1, clock.ActiveTimers);          // the cache armed its own sweep

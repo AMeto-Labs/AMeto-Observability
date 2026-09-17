@@ -46,6 +46,46 @@ public sealed class SseJsonWriterBatchingTests
     }
 
     /// <summary>
+    /// THE HOLD IS 100 MS WHATEVER UNIT THE CLOCK COUNTS IN: a row is held one tick short of it and
+    /// sent at it, under both rules. The writer converts the hold into its clock's timestamps once,
+    /// and <c>Stopwatch.Frequency</c> is 1e7 per second on Windows but 1e9 on Linux. At 1e7 a
+    /// timestamp is a TimeSpan tick, so a conversion with its operands swapped is still exact there
+    /// and shows only at 1e9, where the hold shrinks to 10 µs and every row goes out on its own.
+    /// </summary>
+    [Theory]
+    [InlineData(ManualTimeProvider.TickFrequency)]
+    [InlineData(ManualTimeProvider.NanosecondFrequency)]
+    public async Task A_row_is_held_exactly_the_hold_at_any_timestamp_frequency(long frequency)
+    {
+        var hold    = TimeSpan.FromMilliseconds(100);
+        var oneTick = TimeSpan.FromTicks(1);
+        var body    = new RecordingStream();
+        var clock   = new ManualTimeProvider(frequency);
+        using var sse = new SseJsonWriter(body, clock);
+
+        // Quiet-stream rule: one tick short of the hold since the last send (the writer's start).
+        clock.Advance(hold - oneTick);
+        await sse.WriteLogEventAsync(Event(0), default);
+        Assert.Equal(0, body.SendCount);
+
+        // Backlog rule: the oldest frame one tick short of the hold, then exactly at it.
+        clock.Advance(hold - oneTick);
+        await sse.WriteLogEventAsync(Event(1), default);
+        Assert.Equal(0, body.SendCount);
+
+        clock.Advance(oneTick);
+        await sse.WriteLogEventAsync(Event(2), default);
+        Assert.Equal(1, body.SendCount);
+        Assert.Equal(3, Count(body.SendAt(0), "data: {\"@t\""));
+
+        // Quiet-stream rule again: exactly the hold since that send.
+        clock.Advance(hold);
+        await sse.WriteLogEventAsync(Event(3), default);
+        Assert.Equal(2, body.SendCount);
+        Assert.Contains(Row(3), body.SendAt(1));
+    }
+
+    /// <summary>
     /// THE BODY HAS ONE WRITER, AND IT IS THE CALLER. Every byte goes out inside a call the
     /// caller is awaiting and none after that call has returned: not while rows sit buffered
     /// past every hold bound, not while the client has stopped reading, and not after Dispose.

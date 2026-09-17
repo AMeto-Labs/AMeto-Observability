@@ -12,23 +12,48 @@ namespace Ameto.Testing;
 /// concurrently with the test, and an assertion made after <see cref="Advance"/> returns sees
 /// everything that advance caused.</para>
 ///
-/// <para>Timestamps are <see cref="TimeSpan"/> ticks (<see cref="TimestampFrequency"/> =
-/// <see cref="TimeSpan.TicksPerSecond"/>), starting well away from zero so a cutoff computed as
-/// "now minus an age" is never negative.</para>
+/// <para>TIMESTAMPS ARE NOT TICKS BY DEFAULT. The clock keeps time in <see cref="TimeSpan"/> ticks
+/// and converts only in <see cref="GetTimestamp"/>, at a <see cref="TimestampFrequency"/> the test
+/// chooses, <see cref="NanosecondFrequency"/> unless it says otherwise. <c>Stopwatch.Frequency</c> is
+/// 1e7 on Windows, where CI runs, and 1e9 on Linux, where the server runs. A clock counting in ticks
+/// has a frequency equal to <see cref="TimeSpan.TicksPerSecond"/>, so a production conversion with
+/// its operands swapped is exact against it, and a 100 ms hold that collapses to 10 µs on Linux
+/// passed every test. The clock starts a day in, so a cutoff computed as "now minus an age" is
+/// never negative.</para>
 /// </summary>
 internal sealed class ManualTimeProvider : TimeProvider
 {
+    /// <summary><c>Stopwatch.Frequency</c> on Windows: one timestamp per <see cref="TimeSpan"/> tick.</summary>
+    public const long TickFrequency = TimeSpan.TicksPerSecond;
+
+    /// <summary><c>Stopwatch.Frequency</c> on Linux, and this clock's default.</summary>
+    public const long NanosecondFrequency = 1_000_000_000;
+
     private static readonly DateTimeOffset Epoch = new(2026, 9, 1, 0, 0, 0, TimeSpan.Zero);
 
     private readonly Lock              _lock   = new();
     private readonly List<ManualTimer> _timers = [];
-    private long _now = TimeSpan.TicksPerDay;
+    private readonly long              _frequency;
+    private long _now = TimeSpan.TicksPerDay;   // in TimeSpan ticks, as are every timer's DueAt and period
 
-    public override long TimestampFrequency => TimeSpan.TicksPerSecond;
+    /// <param name="timestampFrequency">Timestamps per second, as <see cref="TimestampFrequency"/> reports it.</param>
+    public ManualTimeProvider(long timestampFrequency = NanosecondFrequency)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(timestampFrequency);
+        _frequency = timestampFrequency;
+    }
 
-    public override long GetTimestamp() => Volatile.Read(ref _now);
+    public override long TimestampFrequency => _frequency;
 
-    public override DateTimeOffset GetUtcNow() => Epoch.AddTicks(GetTimestamp());
+    /// <summary>
+    /// The time in timestamps: ticks × frequency ÷ ticks per second, computed from the absolute tick
+    /// count every time (so no rounding accumulates across advances) and in 128 bits (a day in ticks
+    /// times 1e9 does not fit a long).
+    /// </summary>
+    public override long GetTimestamp() =>
+        (long)((Int128)Volatile.Read(ref _now) * _frequency / TimeSpan.TicksPerSecond);
+
+    public override DateTimeOffset GetUtcNow() => Epoch.AddTicks(Volatile.Read(ref _now));
 
     /// <summary>Timers created and not yet disposed.</summary>
     public int ActiveTimers { get { lock (_lock) return _timers.Count; } }
