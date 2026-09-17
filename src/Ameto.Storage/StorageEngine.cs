@@ -218,6 +218,19 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// </summary>
     internal Action? _onWaitingForFlushLock;
 
+    /// <summary>
+    /// Test hook: called by <see cref="DisposeAsync"/> as it starts waiting for running heavy
+    /// phases — only when there is one to wait for, so a test can tell "shutdown is waiting for the
+    /// flush" from "shutdown went straight on" by which happens first, with no timer.
+    /// </summary>
+    internal Action? _onWaitingForHeavyPhases;
+
+    /// <summary>
+    /// Test hook: called by <see cref="DisposeAsync"/> as it starts waiting for open readers — only
+    /// when one is open. Reader snapshots are already closed by then, and nothing is freed.
+    /// </summary>
+    internal Action? _onWaitingForReaders;
+
     /// <summary>Test hook: the live hot tier.</summary>
     internal HotTierSegment LiveHotTier => _write.Hot;
 
@@ -4652,7 +4665,10 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         Volatile.Write(ref _heavyPhasesDrained, heavyDrained);
         Interlocked.MemoryBarrier();   // the decrement's read of the source must see it, or this read must see the zero
         if (Volatile.Read(ref _heavyPhases) != 0)
+        {
+            _onWaitingForHeavyPhases?.Invoke();
             flushesEnded = await CompletesBy(heavyDrained.Task, deadline).ConfigureAwait(false);
+        }
 
         // ── Collect what to free and close reader snapshots in the same step, under the lock
         //    snapshots are taken under. From here _activeReaders only falls.
@@ -4684,13 +4700,16 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         var readersDrained = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         Volatile.Write(ref _readersDrained, readersDrained);
         Interlocked.MemoryBarrier();
-        if (Volatile.Read(ref _activeReaders) != 0 &&
-            !await CompletesBy(readersDrained.Task, deadline).ConfigureAwait(false))
+        if (Volatile.Read(ref _activeReaders) != 0)
         {
-            _logger.LogError(
-                "Shutdown: {Readers} hot-tier reader(s) still open after {Budget}s — {Tiers} tier(s) stay " +
-                "allocated until the last of them closes",
-                Volatile.Read(ref _activeReaders), _shutdownWaitBudget.TotalSeconds, tiers.Count);
+            _onWaitingForReaders?.Invoke();
+            if (!await CompletesBy(readersDrained.Task, deadline).ConfigureAwait(false))
+            {
+                _logger.LogError(
+                    "Shutdown: {Readers} hot-tier reader(s) still open after {Budget}s — {Tiers} tier(s) stay " +
+                    "allocated until the last of them closes",
+                    Volatile.Read(ref _activeReaders), _shutdownWaitBudget.TotalSeconds, tiers.Count);
+            }
         }
 
         _beforeTiersFreed?.Invoke();

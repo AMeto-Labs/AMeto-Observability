@@ -253,9 +253,12 @@ public sealed class StorageEngineShutdownTests : IDisposable
     /// writing. Parked between its two level files, the flush must hold shutdown — the first
     /// DisposeAsync and a second, concurrent one alike.
     ///
-    /// <para>The "must not complete" side is safe by construction: on a correct engine neither
-    /// dispose can finish while this thread sits in the hook, so the bounded wait always runs
-    /// out. If one did finish, the hook throws before the flush reads its tier again.</para>
+    /// <para>The verdict is which happens first: a DisposeAsync completing, or shutdown starting its
+    /// wait for heavy phases (a seam that fires only when there is one to wait for). No timer
+    /// decides it. On a correct engine the wait always comes first, and while this thread sits in
+    /// the hook nothing can complete. An engine that did not count this flush never waits: a
+    /// dispose completes having freed the tier, and the hook then throws before the flush reads
+    /// that tier again.</para>
     /// </summary>
     [Fact]
     public async Task Shutdown_waits_for_an_inline_flush_parked_between_two_levels()
@@ -266,8 +269,11 @@ public sealed class StorageEngineShutdownTests : IDisposable
         Write(engine, 50, LogLevel.Error);
         string segDir = Path.Combine(dir, "segments");
 
+        var waitingForFlush = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        engine._onWaitingForHeavyPhases = () => waitingForFlush.TrySetResult();
+
         Task? first = null, second = null;
-        bool firstDoneInside = true, secondDoneInside = true;
+        bool waitedFirst = false, firstDoneInside = true, secondDoneInside = true;
         int  calls = 0;
         engine._afterLevelPublished = _ =>
         {
@@ -275,22 +281,24 @@ public sealed class StorageEngineShutdownTests : IDisposable
 
             first  = engine.DisposeAsync().AsTask();
             second = engine.DisposeAsync().AsTask();
-            Task.WhenAny(Task.WhenAny(first, second), Task.Delay(TimeSpan.FromMilliseconds(500))).Wait();
+            var winner = Task.WhenAny(first, second, waitingForFlush.Task, Task.Delay(HangGuard)).Result;
+            waitedFirst      = ReferenceEquals(winner, waitingForFlush.Task);
             firstDoneInside  = first.IsCompleted;
             secondDoneInside = second.IsCompleted;
 
-            if (firstDoneInside || secondDoneInside)
-                throw new InvalidOperationException("test: shutdown finished under a running flush — aborting the flush before it reads its freed tier");
+            if (!waitedFirst || firstDoneInside || secondDoneInside)
+                throw new InvalidOperationException("test: shutdown did not wait for this flush — aborting it before it reads its tier again");
         };
 
         var flush = Task.Run(() => engine.FlushHotTierAsync());
         try { await flush.WaitAsync(TimeSpan.FromSeconds(60)); }
-        catch (Exception) when (firstDoneInside || secondDoneInside) { /* reported below */ }
+        catch (Exception) when (!waitedFirst || firstDoneInside || secondDoneInside) { /* reported below */ }
 
         Assert.NotNull(first);
         Assert.NotNull(second);
         Assert.False(firstDoneInside,  "DisposeAsync completed while FlushHotTierAsync was between two levels");
         Assert.False(secondDoneInside, "a second DisposeAsync completed while the first was still waiting for the flush");
+        Assert.True(waitedFirst, "DisposeAsync neither completed nor started waiting for the flush within the hang guard");
         Assert.Equal(2, calls);
 
         await Task.WhenAll(first!, second!).WaitAsync(TimeSpan.FromSeconds(60));
@@ -303,6 +311,12 @@ public sealed class StorageEngineShutdownTests : IDisposable
     /// A tier retired while a query still reads it is freed when the last reader closes — and
     /// shutdown used to free it regardless. Held across DisposeAsync, the reader keeps its tier
     /// alive and readable; shutdown waits for it; closing it frees the tier.
+    ///
+    /// <para>No timer decides the verdict: either DisposeAsync completes first, or its reader wait
+    /// starts first (a seam that fires only while a reader is open). The reader is enumerated only
+    /// once that wait has started, with dispose still pending and the tier still allocated. At that
+    /// point only this reader's close can move shutdown on, so an engine that does not wait fails
+    /// before the test reads anything it might have freed.</para>
     /// </summary>
     [Fact]
     public async Task A_retired_tier_a_reader_holds_outlives_shutdown_until_the_reader_closes()
@@ -312,21 +326,29 @@ public sealed class StorageEngineShutdownTests : IDisposable
         var tier   = engine.LiveHotTier;
         var reader = engine.OpenHotTierReader();   // captures `tier` as its current tier
 
+        var waitingForReaders = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        engine._onWaitingForReaders = () => waitingForReaders.TrySetResult();
+
         Task? dispose = null;
-        bool freedWhileHeld = true;
-        int  readWhileHeld  = -1;
+        bool disposedFirst = false, waitedFirst = false, doneAtWait = true, freedAtWait = true;
+        int  readWhileHeld = -1;
         try
         {
             await engine.FlushHotTierAsync();
             Assert.False(tier.IsDisposed, "precondition: the flush retired the tier without freeing it under the reader");
 
             dispose = engine.DisposeAsync().AsTask();
-            await Task.WhenAny(dispose, Task.Delay(TimeSpan.FromMilliseconds(500)));
+            var winner = await Task.WhenAny(dispose, waitingForReaders.Task, Task.Delay(HangGuard));
+            disposedFirst = ReferenceEquals(winner, dispose);
+            waitedFirst   = ReferenceEquals(winner, waitingForReaders.Task);
 
-            freedWhileHeld = tier.IsDisposed;
-            if (!freedWhileHeld)
-                readWhileHeld = reader.ReadAll().Count();   // only when it is still there to read
-            Assert.False(dispose.IsCompleted, "DisposeAsync did not wait for the open reader");
+            if (waitedFirst)
+            {
+                doneAtWait  = dispose.IsCompleted;
+                freedAtWait = tier.IsDisposed;
+                if (!doneAtWait && !freedAtWait)
+                    readWhileHeld = reader.ReadAll().Count();   // only while shutdown is provably parked on this reader
+            }
         }
         finally
         {
@@ -334,7 +356,10 @@ public sealed class StorageEngineShutdownTests : IDisposable
             if (dispose is not null) await dispose.WaitAsync(TimeSpan.FromSeconds(60));
         }
 
-        Assert.False(freedWhileHeld, "shutdown freed a tier an open reader still held");
+        Assert.False(disposedFirst, "DisposeAsync did not wait for the open reader");
+        Assert.True(waitedFirst, "DisposeAsync neither completed nor started waiting for the reader within the hang guard");
+        Assert.False(doneAtWait, "DisposeAsync completed while it was waiting for the open reader");
+        Assert.False(freedAtWait, "shutdown freed a tier an open reader still held");
         Assert.Equal(50, readWhileHeld);
         Assert.True(tier.IsDisposed, "the tier was not freed once its last reader closed");
     }
