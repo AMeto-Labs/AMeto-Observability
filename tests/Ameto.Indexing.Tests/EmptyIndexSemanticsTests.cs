@@ -109,8 +109,8 @@ public sealed class EmptyIndexSemanticsTests
         var idx = SegmentInvertedIndex.Deserialise(build.Serialise());
 
         const string decoded = "a�";
-        Assert.Equal([0u, 2u], idx.LookupIntersect([(decoded, "x")]));
-        Assert.Equal([1u],     idx.LookupIntersect([(decoded, "y")]));
+        Assert.Equal([0u, 2u], idx.LookupIntersect([(decoded, "x")])!);
+        Assert.Equal([1u],     idx.LookupIntersect([(decoded, "y")])!);
         Assert.True(idx.MightContain(decoded, "x"));
         Assert.True(idx.MightContain(decoded, "y"));
     }
