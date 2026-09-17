@@ -73,19 +73,51 @@ internal sealed unsafe class SlabArena : IDisposable
     /// <summary>
     /// True when the arena is advised <c>MADV_NOHUGEPAGE</c>, so its residency stays per touched
     /// 4 KB page whatever <c>transparent_hugepage/enabled</c> says. Only ever true on Linux, and
-    /// only for the plain allocation there, after a <c>madvise</c> call that answered 0. False on
-    /// Linux means the advice failed (see
-    /// <see cref="HugePageOptOutErrno"/>) and the arena behaves as it did before: nothing breaks,
-    /// but with THP set to <c>always</c> a burst can make whole 2 MB ranges resident.
+    /// only for the plain allocation there, after a <c>madvise</c> call that answered 0.
+    ///
+    /// <para>False says only that no advice was applied; whether that leaves the arena exposed is
+    /// <see cref="IsHugePageOptOutFailure"/>. On a kernel built without transparent huge pages
+    /// <c>madvise</c> answers EINVAL: this stays false and <see cref="HugePageOptOutErrno"/> keeps
+    /// the 22, because nothing was advised and a diagnostic should show what the kernel said, but
+    /// that kernel has no huge pages to back the arena with, so it is not a failure. Anywhere
+    /// else false on Linux means the advice failed and the arena behaves as it did before:
+    /// nothing breaks, but with THP set to <c>always</c> a burst can make whole 2 MB ranges
+    /// resident.</para>
     /// </summary>
     public bool HugePagesDisabled => _hugePageOptOut == 0;
 
     /// <summary>
-    /// 0 when <c>madvise(MADV_NOHUGEPAGE)</c> succeeded; its errno when it failed;
-    /// <see cref="HugePageOptOutUnbound"/> when it could not be called; <see cref="NoHugePageOptOut"/>
-    /// when it was not attempted (not Linux, a reserved arena, or not one whole page to advise).
+    /// 0 when <c>madvise(MADV_NOHUGEPAGE)</c> succeeded; its errno when it failed, EINVAL (22)
+    /// included; <see cref="HugePageOptOutUnbound"/> when it could not be called;
+    /// <see cref="NoHugePageOptOut"/> when it was not attempted (not Linux, a reserved arena, or
+    /// not one whole page to advise). The raw answer, not a verdict: see
+    /// <see cref="IsHugePageOptOutFailure"/>.
     /// </summary>
     public int HugePageOptOutErrno => _hugePageOptOut;
+
+    /// <summary>Linux's <c>EINVAL</c>, the same number on every Linux architecture.</summary>
+    internal const int EINVAL = 22;
+
+    /// <summary>
+    /// Whether a <see cref="HugePageOptOutErrno"/> means transparent huge pages may still back the
+    /// arena — the one case worth telling an operator about. True for an errno <c>madvise</c>
+    /// refused the advice with, and for <see cref="HugePageOptOutUnbound"/>.
+    ///
+    /// <para>False for 0 (advised), for <see cref="NoHugePageOptOut"/> (not attempted: off Linux
+    /// there is no THP, and a range holding no whole page is smaller than anything a huge page
+    /// would add), and for EINVAL. <c>madvise</c> answers EINVAL for a start that is not page
+    /// aligned, for a length that wraps, and for an advice the kernel does not know.
+    /// <see cref="PageAlignInward"/> rules out the first two, so what is left is
+    /// <c>MADV_NOHUGEPAGE</c> itself being unknown: a kernel built without
+    /// <c>CONFIG_TRANSPARENT_HUGEPAGE</c>, where there is nothing to opt out of. The startup
+    /// message used to fire there too and send the operator after a setting that cannot
+    /// matter.</para>
+    ///
+    /// <para>A pure function of the number, so the decision is tested on every platform even
+    /// though only Linux can produce most of its inputs.</para>
+    /// </summary>
+    internal static bool IsHugePageOptOutFailure(int result) =>
+        result is not (0 or NoHugePageOptOut or EINVAL);
 
     /// <summary>
     /// Bytes committed on demand so far — the ingest high-water mark — or -1 when the arena is a

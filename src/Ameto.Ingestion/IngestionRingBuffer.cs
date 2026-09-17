@@ -199,7 +199,8 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
 
     /// <summary>
     /// The arena's <c>madvise(MADV_NOHUGEPAGE)</c> outcome: 0 when it succeeded, else see
-    /// <see cref="SlabArena.HugePageOptOutErrno"/>. Only Linux attempts it; the host logs a failure once.
+    /// <see cref="SlabArena.HugePageOptOutErrno"/>. Only Linux attempts it; the host logs it once, and only when
+    /// <see cref="SlabArena.IsHugePageOptOutFailure"/> calls it a failure (EINVAL, no THP in the kernel, is not).
     /// </summary>
     internal int ArenaHugePageOptOutErrno => _arena.HugePageOptOutErrno;
 

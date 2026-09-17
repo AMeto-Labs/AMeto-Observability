@@ -27,15 +27,8 @@ public static class IngestionServiceExtensions
                 maxPayloadBytesPerSlot: ing.MaxEventPayloadBytes,
                 payloadPoolBytes:       ing.EffectivePayloadPoolBytes);
 
-            // Once, since this is a singleton. The arena works either way; what is lost is the
-            // per-4 KB-page residency under transparent_hugepage=always (see SlabArena).
-            int thp = ring.ArenaHugePageOptOutErrno;
-            if (OperatingSystem.IsLinux() && thp != 0)
-                sp.GetService<ILogger<IngestionRingBuffer>>()?.LogInformation(
-                    "The ingest payload arena could not opt out of transparent huge pages (madvise result {Result}). " +
-                    "Where transparent_hugepage is 'always', a burst can make whole 2 MB ranges of it resident " +
-                    "rather than the 4 KB pages it writes; set Ingestion.PayloadPoolBytes for a hard ceiling.",
-                    thp);
+            // Once, since this is a singleton.
+            ReportHugePageOptOut(sp.GetService<ILogger<IngestionRingBuffer>>(), ring.ArenaHugePageOptOutErrno);
             return ring;
         });
 
@@ -47,6 +40,27 @@ public static class IngestionServiceExtensions
         services.AddHostedService<IngestionDrainerService>();
 
         return services;
+    }
+
+    /// <summary>
+    /// Logs the payload arena's transparent-huge-page opt-out only when it failed in a way that
+    /// leaves the arena exposed (<see cref="SlabArena.IsHugePageOptOutFailure"/>). The arena works
+    /// either way; what is lost is the per-4 KB-page residency under
+    /// <c>transparent_hugepage=always</c> (see <see cref="SlabArena"/>).
+    ///
+    /// <para>No platform check: off Linux the result is always <see cref="SlabArena.NoHugePageOptOut"/>,
+    /// which the decision already treats as nothing to report. Neither is EINVAL, a kernel built
+    /// without transparent huge pages, where "could not opt out … set PayloadPoolBytes" sent an
+    /// operator after a problem that kernel cannot have.</para>
+    /// </summary>
+    internal static void ReportHugePageOptOut(ILogger? logger, int result)
+    {
+        if (!SlabArena.IsHugePageOptOutFailure(result)) return;
+        logger?.LogInformation(
+            "The ingest payload arena could not opt out of transparent huge pages (madvise result {Result}). " +
+            "Where transparent_hugepage is 'always', a burst can make whole 2 MB ranges of it resident " +
+            "rather than the 4 KB pages it writes; set Ingestion.PayloadPoolBytes for a hard ceiling.",
+            result);
     }
 }
 
