@@ -114,11 +114,16 @@ public sealed class LogEvent
     /// <c>SegmentReader.Open</c>, so the throw went through the merge to the search endpoint's
     /// <c>catch (Exception)</c>, and the whole search failed with "Search failed after the
     /// stream had opened". There was never a per-segment "this segment stops here", so do not add
-    /// a per-segment catch to bring one back. It now throws at FIRST TOUCH, in the evaluator for
-    /// an <c>@x</c> predicate or in delivery for a returned row, so it fails the search in fewer
-    /// cases than before: a torn blob on a row the filter rejects without reading <c>@x</c> no
-    /// longer fails anything. The bytes are still bounded and length-checked by the block frame
-    /// before they get here.</para>
+    /// a per-segment catch to bring one back. It now throws where the payload is first READ: in
+    /// the evaluator for a predicate that reads a field of <c>@x</c> (<c>@x.Type</c>,
+    /// <c>@x.Message</c>, …) or for a free-text term (which reads the root type and message out
+    /// of the bytes), or in delivery for a returned row. <c>has(@x)</c> and <c>isDefined(@x)</c>
+    /// are not among them: they go through <see cref="HasException"/>, which reads only the
+    /// header, never throws, and may answer either way for a torn payload (see
+    /// <see cref="ExceptionInfo.IsPresent"/>). So it fails the search in fewer cases than before:
+    /// a torn blob on a row the filter rejects without reading <c>@x</c>'s fields no longer fails
+    /// anything. The bytes are still bounded and length-checked by the block frame before they
+    /// get here.</para>
     /// </summary>
     public ExceptionInfo? Exception
     {
