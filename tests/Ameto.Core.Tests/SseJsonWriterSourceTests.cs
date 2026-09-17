@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using Ameto.Core;
 using static Ameto.Core.Tests.SseRows;
 
@@ -13,16 +12,24 @@ namespace Ameto.Core.Tests;
 public sealed class SseJsonWriterSourceTests
 {
     /// <summary>
+    /// How long a scan step waits for a row the writer should already have sent. Not a timing
+    /// bound: the send happens on the writer's own thread the moment the step goes pending, before
+    /// the step can even resume, so this only turns a writer that never sends into a failure
+    /// instead of a hang.
+    /// </summary>
+    private static readonly TimeSpan HangGuard = TimeSpan.FromSeconds(10);
+
+    /// <summary>
     /// A SPARSE SEARCH SHOWS EACH ROW BEFORE ITS NEXT WAIT ENDS, NOT AT <c>done</c>. Each burst
     /// is two rows back to back — the second is buffered by every on-write rule — and then the
-    /// scan goes asynchronous (a segment open, a prefilter). The wait ends only once the client
-    /// has the second row, or after 3 s if it never gets it.
+    /// scan goes asynchronous (a segment open, a prefilter). The wait ends the moment the body
+    /// receives the second row; a writer that holds it instead leaves the wait to the hang guard.
     /// </summary>
     [Fact]
     public async Task A_sparse_search_shows_each_row_before_its_next_wait_ends()
     {
         var body = new RecordingStream();
-        using var sse = new SseJsonWriter(body);
+        using var sse = OnFrozenClock(body);          // nothing but the pending step can send the second row
         var seenDuringWait = new List<bool>();
 
         async IAsyncEnumerable<LogEvent> Sparse()
@@ -33,7 +40,9 @@ public sealed class SseJsonWriterSourceTests
                 yield return Event(first);
                 yield return Event(second);        // right behind it: buffered, not sent on write
 
-                seenDuringWait.Add(await WaitForAsync(() => body.All().Contains(Row(second)), TimeSpan.FromSeconds(3)));
+                bool seen = await SentBeforeHangGuard(body.WhenSent(Row(second)));
+                seenDuringWait.Add(seen);
+                if (!seen) yield break;            // one held row is the failure; do not wait out the rest
             }
         }
 
@@ -63,7 +72,7 @@ public sealed class SseJsonWriterSourceTests
     public async Task Rows_the_source_hands_over_without_waiting_still_share_sends()
     {
         var body = new RecordingStream();
-        using var sse = new SseJsonWriter(body);
+        using var sse = OnFrozenClock(body);
 
         static async IAsyncEnumerable<LogEvent> Burst()
         {
@@ -96,7 +105,7 @@ public sealed class SseJsonWriterSourceTests
     public async Task A_send_that_fails_while_the_scan_is_mid_step_surfaces_as_itself()
     {
         var body = new RecordingStream();
-        using var sse = new SseJsonWriter(body);
+        using var sse = OnFrozenClock(body);
 
         // Warm the row road and send, so the source's first row is held by the buffer alone.
         await sse.WriteLogEventAsync(Event(99), default);
@@ -141,7 +150,7 @@ public sealed class SseJsonWriterSourceTests
     public async Task Rows_a_send_under_a_spent_budget_never_offered_go_out_with_the_terminal_frame()
     {
         var body = new RecordingStream();
-        using var sse = new SseJsonWriter(body);
+        using var sse = OnFrozenClock(body);
 
         // Warm the row road and send, so the source's row is held by the buffer alone.
         await sse.WriteLogEventAsync(Event(99), default);
@@ -192,7 +201,7 @@ public sealed class SseJsonWriterSourceTests
     public async Task A_failed_send_reports_a_fault_in_the_step_it_waited_for_but_not_a_cancellation(bool stepFaults)
     {
         var body = new RecordingStream();
-        using var sse = new SseJsonWriter(body);
+        using var sse = OnFrozenClock(body);
 
         // Warm the row road and send, so the source's row is held by the buffer alone.
         await sse.WriteLogEventAsync(Event(99), default);
@@ -276,14 +285,16 @@ public sealed class SseJsonWriterSourceTests
         Assert.EndsWith("event: done\ndata: {}\n\n", all);
     }
 
-    private static async Task<bool> WaitForAsync(Func<bool> condition, TimeSpan limit)
+    private static async Task<bool> SentBeforeHangGuard(Task sent)
     {
-        var clock = Stopwatch.StartNew();
-        while (!condition())
+        try
         {
-            if (clock.Elapsed > limit) return false;
-            await Task.Delay(10);
+            await sent.WaitAsync(HangGuard);
+            return true;
         }
-        return true;
+        catch (TimeoutException)
+        {
+            return false;
+        }
     }
 }

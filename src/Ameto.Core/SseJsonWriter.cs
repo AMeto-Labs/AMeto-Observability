@@ -1,5 +1,4 @@
 using System.Buffers;
-using System.Diagnostics;
 using System.Text.Json;
 using System.Text.Json.Serialization.Metadata;
 
@@ -112,8 +111,14 @@ public sealed class SseJsonWriter : IDisposable
     private readonly Utf8JsonWriter          _json;
     private readonly Stream                  _body;
 
+    /// <summary>The clock both hold rules read. <see cref="TimeProvider.System"/> outside tests.</summary>
+    private readonly TimeProvider _time;
+
+    /// <summary><see cref="MaxFrameHold"/> in <see cref="_time"/>'s timestamp units, so a row compares two longs.</summary>
+    private readonly long _maxFrameHoldStamps;
+
     /// <summary>When the buffer last went out, for the quiet-stream rule on write.</summary>
-    private long _lastSendStamp = Stopwatch.GetTimestamp();
+    private long _lastSendStamp;
 
     /// <summary>
     /// When the OLDEST frame still buffered was composed — stamped as the buffer goes from empty
@@ -140,10 +145,21 @@ public sealed class SseJsonWriter : IDisposable
     public long LastRowTimestampTicks { get; private set; }
 
     /// <param name="body">The response body to frame into — <c>ctx.Response.Body</c>.</param>
-    public SseJsonWriter(Stream body)
+    public SseJsonWriter(Stream body) : this(body, TimeProvider.System) { }
+
+    /// <param name="body">The response body to frame into.</param>
+    /// <param name="time">
+    /// The clock the hold rules read. A test passes one that moves only when it says so: against the
+    /// wall clock, "this row is still buffered" held only as long as nothing stalled the test for
+    /// 100 ms between two calls, which a loaded two-core CI runner does not promise.
+    /// </param>
+    internal SseJsonWriter(Stream body, TimeProvider time)
     {
-        _body = body;
-        _json = new Utf8JsonWriter(_buffer);
+        _body               = body;
+        _time               = time;
+        _maxFrameHoldStamps = MaxFrameHold.Ticks * time.TimestampFrequency / TimeSpan.TicksPerSecond;
+        _lastSendStamp      = time.GetTimestamp();
+        _json               = new Utf8JsonWriter(_buffer);
     }
 
     /// <summary>
@@ -271,11 +287,11 @@ public sealed class SseJsonWriter : IDisposable
         LastRowTimestampTicks = ev.Timestamp.UtcTicks;
 
         bool first = frameStart == 0;
-        long now   = Stopwatch.GetTimestamp();
+        long now   = _time.GetTimestamp();
         if (first) _oldestFrameStamp = now;
 
         if (_buffer.WrittenCount >= FlushThresholdBytes
-            || Stopwatch.GetElapsedTime(first ? _lastSendStamp : _oldestFrameStamp, now) >= MaxFrameHold)
+            || now - (first ? _lastSendStamp : _oldestFrameStamp) >= _maxFrameHoldStamps)
             await SendAsync(ct).ConfigureAwait(false);
     }
 
@@ -311,7 +327,7 @@ public sealed class SseJsonWriter : IDisposable
         finally
         {
             _buffer.ResetWrittenCount();
-            _lastSendStamp = Stopwatch.GetTimestamp();
+            _lastSendStamp = _time.GetTimestamp();
         }
     }
 

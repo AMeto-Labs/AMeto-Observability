@@ -2,6 +2,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization.Metadata;
 using Ameto.Core;
+using Ameto.Testing;
 
 namespace Ameto.Core.Tests;
 
@@ -24,15 +25,43 @@ internal sealed class RecordingStream : Stream
     /// <summary>How many flushes actually failed, so a test can prove the fault happened.</summary>
     public int FlushFailures;
 
+    private readonly List<(string Needle, TaskCompletionSource Sent)> _waiters = [];
+
     public int    SendCount   { get { lock (_sends) return _sends.Count; } }
     public string SendAt(int i) { lock (_sends) return _sends[i]; }
     public string All()         { lock (_sends) return string.Concat(_sends); }
     public void   Clear()       { lock (_sends) _sends.Clear(); }
 
+    /// <summary>
+    /// Completes when a write carrying <paramref name="needle"/> reaches this body — at once if one
+    /// already has. Completed from inside that write, so a test waiting on it learns of the send the
+    /// moment it happens instead of polling for it against a clock.
+    /// </summary>
+    public Task WhenSent(string needle)
+    {
+        lock (_sends)
+        {
+            foreach (string s in _sends)
+                if (s.Contains(needle, StringComparison.Ordinal)) return Task.CompletedTask;
+            var sent = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            _waiters.Add((needle, sent));
+            return sent.Task;
+        }
+    }
+
     public override void Write(ReadOnlySpan<byte> buffer)
     {
         string s = Encoding.UTF8.GetString(buffer);
-        lock (_sends) _sends.Add(s);
+        lock (_sends)
+        {
+            _sends.Add(s);
+            for (int i = _waiters.Count - 1; i >= 0; i--)
+            {
+                if (!s.Contains(_waiters[i].Needle, StringComparison.Ordinal)) continue;
+                _waiters[i].Sent.TrySetResult();
+                _waiters.RemoveAt(i);
+            }
+        }
     }
     // Both refuse a token that is ALREADY cancelled before they take anything, as Kestrel's
     // response pipe does (HttpResponsePipeWriter.ValidateState). A body that took the bytes
@@ -92,6 +121,13 @@ internal sealed class ProbeStream : Stream
     /// <summary>When set, every flush waits for it, or for its own token — a client that has stopped reading.</summary>
     public volatile TaskCompletionSource? FlushStall;
 
+    /// <summary>
+    /// Completed by a flush the moment it starts waiting on <see cref="FlushStall"/>: the send's bytes
+    /// have been offered and it is now stuck, so a test can cancel it THERE rather than after a guess
+    /// at how long getting there takes.
+    /// </summary>
+    public TaskCompletionSource FlushStalled { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
     public int Operations    => Volatile.Read(ref _operations);
     public int OutsideCalls  => Volatile.Read(ref _outsideCalls);
     public int InFlight      => Volatile.Read(ref _inFlight);
@@ -129,7 +165,11 @@ internal sealed class ProbeStream : Stream
         try
         {
             await Task.Yield();
-            if (FlushStall is { } stall) await stall.Task.WaitAsync(ct);
+            if (FlushStall is { } stall)
+            {
+                FlushStalled.TrySetResult();
+                await stall.Task.WaitAsync(ct);
+            }
         }
         finally { Exit(); }
     }
@@ -154,6 +194,15 @@ internal sealed class ProbeDto
 
 internal static class SseRows
 {
+    /// <summary>
+    /// A writer whose hold rules read a clock that never moves, so a row the rules would buffer is
+    /// buffered however long the test takes between two calls. On the wall clock a 100 ms stall
+    /// anywhere between a send and the next row — a GC, a first JIT, a descheduled thread on a
+    /// loaded two-core runner — sent that row on write instead, and every assertion about what was
+    /// still buffered went with it.
+    /// </summary>
+    public static SseJsonWriter OnFrozenClock(Stream body) => new(body, new ManualTimeProvider());
+
     public static LogEvent Event(uint seq) => new()
     {
         Id              = new EventId(0u, seq),

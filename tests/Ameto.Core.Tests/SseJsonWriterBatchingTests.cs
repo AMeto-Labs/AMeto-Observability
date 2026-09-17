@@ -1,4 +1,5 @@
 using Ameto.Core;
+using Ameto.Testing;
 using static Ameto.Core.Tests.SseRows;
 
 namespace Ameto.Core.Tests;
@@ -25,12 +26,13 @@ public sealed class SseJsonWriterBatchingTests
     [Fact]
     public async Task Rows_found_far_apart_are_sent_as_they_are_found()
     {
-        var body = new RecordingStream();
-        using var sse = new SseJsonWriter(body);
+        var body  = new RecordingStream();
+        var clock = new ManualTimeProvider();
+        using var sse = new SseJsonWriter(body, clock);
 
         for (uint i = 0; i < 3; i++)
         {
-            await Task.Delay(150);
+            clock.Advance(TimeSpan.FromMilliseconds(150));
             await sse.WriteLogEventAsync(Event(i), default);
         }
 
@@ -71,13 +73,18 @@ public sealed class SseJsonWriterBatchingTests
         Assert.Equal(0, body.OutsideCalls);
 
         // A client that has stopped reading. The terminal frame's send stalls in the flush and
-        // its own short token gives up, which is the shape of SafeErrorAsync.
+        // its own token gives up, which is the shape of SafeErrorAsync. The token gives up once
+        // the flush is stuck, not after a fixed 300 ms: a runner slow enough to take that long to
+        // compose the frame cancelled it before the body had been offered a byte, and the rows
+        // then stayed buffered for Dispose to drop.
         body.FlushStall   = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         body.CallerInside = true;
-        using (var giveUp = new CancellationTokenSource(TimeSpan.FromMilliseconds(300)))
+        using (var giveUp = new CancellationTokenSource())
         {
-            await Assert.ThrowsAnyAsync<OperationCanceledException>(
-                async () => await sse.WriteErrorAsync("the search failed", giveUp.Token));
+            Task terminal = sse.WriteErrorAsync("the search failed", giveUp.Token);
+            await Task.WhenAny(body.FlushStalled.Task, terminal);   // stuck in the flush (or, wrongly, done)
+            giveUp.Cancel();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => terminal);
         }
         body.CallerInside = false;
         Assert.Equal(0, body.InFlight);                  // the send ended before the call did
@@ -107,7 +114,7 @@ public sealed class SseJsonWriterBatchingTests
     public async Task Rows_found_together_coalesce_into_few_sends()
     {
         var body = new RecordingStream();
-        using var sse = new SseJsonWriter(body);
+        using var sse = OnFrozenClock(body);          // together means together, however slow the runner
 
         for (uint i = 0; i < 200; i++)
             await sse.WriteLogEventAsync(Event(i), default);
@@ -142,10 +149,10 @@ public sealed class SseJsonWriterBatchingTests
     public async Task Every_frame_that_sends_carries_the_backlog_out_ahead_of_it(string frame)
     {
         var body = new RecordingStream();
-        using var sse = new SseJsonWriter(body);
+        using var sse = OnFrozenClock(body);
 
         // Warm the row road and send it, so the row below is held by nothing but the buffer:
-        // the last send was a moment ago and it is the only frame waiting.
+        // the last send was no time ago on this clock, and it is the only frame waiting.
         await sse.WriteLogEventAsync(Event(0), default);
         await sse.FlushFramesAsync(default);
         body.Clear();
@@ -320,7 +327,7 @@ public sealed class SseJsonWriterBatchingTests
     public async Task A_dto_frame_that_throws_keeps_the_rows_before_it_and_the_frame_after_it_clean()
     {
         var body = new RecordingStream();
-        using var sse = new SseJsonWriter(body);
+        using var sse = OnFrozenClock(body);
 
         await sse.WriteLogEventAsync(Event(0), default);
         await sse.FlushFramesAsync(default);
