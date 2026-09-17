@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Diagnostics;
 using System.Reflection;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Text.Json.Serialization.Metadata;
 using Ameto.Core;
@@ -113,20 +114,28 @@ public sealed class LiveTailFrameProbe
         dtoSink.Reset(); RunInline(dto());
         rowSink.Reset(); RunInline(row());
 
+        // COUNTED, NOT ASSUMED. One WriteLogEventAsync a row is how WriteLogEventsAsync is written
+        // today, not something the probe can take on trust: a refactor that composed the rows inline
+        // and left WriteLogEventAsync public for its other callers would leave 500 × 88 B subtracted in
+        // Debug for state machines the poll no longer builds — room for a real 88 B allocation on every
+        // row, hidden in the only build CI gates. The calls are counted on a poll of their own because
+        // counting walks the stack, which allocates; how many a poll makes does not depend on timing.
+        int rowCalls = CountCalls(row, Method(typeof(SseJsonWriter), nameof(SseJsonWriter.WriteLogEventAsync)));
+
         // Every async call on the row road, weighed as the build compiled it: the poll, the source
-        // loop, one WriteLogEventAsync a row, and one SendAsync a send the sink counted. A closing
-        // FlushFramesAsync that finds the last row already sent calls SendAsync without writing, and
-        // is the one call this misses — at most one a poll.
+        // loop, each WriteLogEventAsync the count above saw, and one SendAsync a send the sink counted.
+        // A closing FlushFramesAsync that finds the last row already sent calls SendAsync without
+        // writing, and is the one call this misses — at most one a poll.
         double asyncBoxes = AsyncBoxBytes(typeof(LiveTailFrameProbe), nameof(RowPollAsync))
                           + AsyncBoxBytes(typeof(SseJsonWriter), nameof(SseJsonWriter.WriteLogEventsAsync))
-                          + AsyncBoxBytes(typeof(SseJsonWriter), nameof(SseJsonWriter.WriteLogEventAsync)) * PollRows
+                          + AsyncBoxBytes(typeof(SseJsonWriter), nameof(SseJsonWriter.WriteLogEventAsync)) * (double)rowCalls
                           + AsyncBoxBytes(typeof(SseJsonWriter), "SendAsync") * rowSends;
         double ownPerRow  = (rowBytes - asyncBoxes) / PollRows;
 
         _out.WriteLine($"{shape}: {PollRows}-row poll, {frameBytes / 1024.0:F0} KB of frames ({frameBytes / (double)PollRows:F0} B/frame)");
         _out.WriteLine($"  DTO frame per row  : {dtoUs * 1000 / PollRows,6:F0} ns/frame | {dtoBytes / PollRows,6:F1} B/frame | {dtoUs / 1000,6:F2} ms/poll | {dtoBytes / 1024.0,7:F1} KB/poll | {dtoSink.Writes} writes + {dtoSink.Flushes} flushes");
         _out.WriteLine($"  row writer + flush : {rowUs * 1000 / PollRows,6:F0} ns/frame | {rowBytes / PollRows,6:F1} B/frame | {rowUs / 1000,6:F2} ms/poll | {rowBytes / 1024.0,7:F1} KB/poll | {rowSink.Writes} writes + {rowSink.Flushes} flushes");
-        _out.WriteLine($"    async state machines built as classes: {asyncBoxes / PollRows,6:F1} B/frame; the writer's own: {ownPerRow,6:F1} B/frame");
+        _out.WriteLine($"    async state machines built as classes: {asyncBoxes / PollRows,6:F1} B/frame ({rowCalls} WriteLogEventAsync calls a poll); the writer's own: {ownPerRow,6:F1} B/frame");
         _out.WriteLine($"  gain               : {dtoUs / rowUs:F1}x faster, {dtoBytes / Math.Max(rowBytes, 1):F0}x less allocated, {dtoSink.Writes / (double)Math.Max(rowSink.Writes, 1):F0}x fewer sends");
 
         // GC.GetAllocatedBytesForCurrentThread is deterministic, so this holds on any machine, and with
@@ -141,9 +150,45 @@ public sealed class LiveTailFrameProbe
         // 2 B a row: the smallest object on a 64-bit heap is 24 B, so one allocation on every row is
         // twelve times over it and one on every tenth row is still over, while the call the count above
         // can miss is 80 B a poll in Debug — 0.16 B a row. The timings are reported, not asserted.
+        //
+        // BOUNDED BELOW AS WELL. The poll cannot allocate less than nothing, so a figure under -2 B a
+        // row means the accounting subtracts state machines the build did not allocate — a call the
+        // list above names that the road no longer makes, or makes fewer times than counted. Left
+        // unbounded, that surplus would cancel a real allocation of the same size.
+        Assert.True(ownPerRow > -2,
+            $"the async accounting is stale: {ownPerRow:F1} B/frame of the writer's own means it subtracts " +
+            $"state machines the poll no longer builds ({rowBytes:F0} B/poll measured, {asyncBoxes:F0} B " +
+            $"subtracted); make the call list above follow the row road");
         Assert.True(ownPerRow < 2,
             $"the row writer should allocate nothing per row: {ownPerRow:F1} B/frame of its own " +
             $"({rowBytes:F0} B/poll, of which {asyncBoxes:F0} B async state machines built as classes)");
+    }
+
+    private static MethodInfo Method(Type owner, string method) =>
+        owner.GetMethod(method, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static)
+        ?? throw new InvalidOperationException($"{owner.Name}.{method} is gone; the probe's async accounting must follow it");
+
+    /// <summary>
+    /// How many rows one <paramref name="poll"/> composes inside <paramref name="method"/> — a row whose
+    /// property bytes are read while that method is on the stack (<see cref="WatchedBytes"/>), counted
+    /// once however often it is read.
+    ///
+    /// <para>A frame of the method's own async state machine counts as the method: that is where its
+    /// body runs. A row composed anywhere else is not counted, which leaves its state machine in the
+    /// writer's own bytes and fails the bound loudly rather than hiding anything.</para>
+    /// </summary>
+    private static int CountCalls(Func<ValueTask> poll, MethodInfo method)
+    {
+        WatchedBytes.Begin(method);
+        try
+        {
+            RunInline(poll());
+            return WatchedBytes.Composed;
+        }
+        finally
+        {
+            WatchedBytes.End();
+        }
     }
 
     /// <summary>
@@ -159,15 +204,13 @@ public sealed class LiveTailFrameProbe
     ///
     /// <para>Read from the method's own <see cref="AsyncStateMachineAttribute"/> and weighed by
     /// allocating one, so it follows the build it runs in and the method as it is now. A method that
-    /// stops being async weighs nothing here, which only makes the bound stricter; one that is renamed
-    /// fails loudly rather than quietly weighing nothing.</para>
+    /// stops being async weighs nothing here, which only makes the upper bound stricter; one that is
+    /// renamed fails loudly rather than quietly weighing nothing. One the road stops CALLING still
+    /// weighs what it did, which is why the row writer's calls are counted and the bound has a floor.</para>
     /// </summary>
     private static long AsyncBoxBytes(Type owner, string method)
     {
-        var m = owner.GetMethod(method, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static)
-             ?? throw new InvalidOperationException($"{owner.Name}.{method} is gone; the probe's async accounting must follow it");
-
-        Type? stateMachine = m.GetCustomAttribute<AsyncStateMachineAttribute>()?.StateMachineType;
+        Type? stateMachine = Method(owner, method).GetCustomAttribute<AsyncStateMachineAttribute>()?.StateMachineType;
         if (stateMachine is null || stateMachine.IsValueType) return 0;
 
         // The first call fills the runtime's allocator cache for the type; the second is the object alone.
@@ -233,7 +276,7 @@ public sealed class LiveTailFrameProbe
                 Level           = e.Level,
                 MessageTemplate = e.MessageTemplate,
                 ServiceName     = e.ServiceName,
-                RawProperties   = e.RawProperties.ToArray(),
+                RawProperties   = new WatchedBytes(e.RawProperties.ToArray()).Memory,
                 TraceIdHi       = 0x0123456789abcdefUL,
                 TraceIdLo       = (ulong)(i + 1),
                 SpanId          = (ulong)(i + 1),
@@ -268,10 +311,71 @@ public sealed class LiveTailFrameProbe
                 Timestamp       = new DateTimeOffset(baseTicks + i, TimeSpan.Zero),
                 Level           = Ameto.Core.LogLevel.Information,
                 MessageTemplate = "tailed {n}",
-                RawProperties   = buf.WrittenSpan.ToArray(),
+                RawProperties   = new WatchedBytes(buf.WrittenSpan.ToArray()).Memory,
             });
         }
         return rows;
+    }
+
+    /// <summary>
+    /// A row's property bytes behind a <see cref="MemoryManager{T}"/>, so the probe can see WHERE a row
+    /// is composed: every writer reads them through <see cref="GetSpan"/>, and while a count is running
+    /// (<see cref="CountCalls"/>) that read looks at the stack.
+    ///
+    /// <para>Outside a count the read is one static check and the array — nothing allocated, so the
+    /// measured polls weigh what they did over plain arrays. The frames are identical either way; the
+    /// capture comparison in <see cref="Weigh"/> is over these rows.</para>
+    /// </summary>
+    private sealed class WatchedBytes(byte[] bytes) : MemoryManager<byte>
+    {
+        private static MethodInfo? s_method;
+        private static Type?       s_stateMachine;
+        private static int         s_count;
+
+        /// <summary>The count this row was last seen in, so a row read twice counts once.</summary>
+        private int _seenIn;
+
+        public static int Composed { get; private set; }
+
+        public static void Begin(MethodInfo method)
+        {
+            s_method       = method;
+            s_stateMachine = method.GetCustomAttribute<AsyncStateMachineAttribute>()?.StateMachineType;
+            s_count++;
+            Composed = 0;
+        }
+
+        public static void End() => s_method = null;
+
+        public override Span<byte> GetSpan()
+        {
+            if (s_method is not null && _seenIn != s_count && OnStack())
+            {
+                _seenIn = s_count;
+                Composed++;
+            }
+            return bytes;
+        }
+
+        private static bool OnStack()
+        {
+            foreach (StackFrame frame in new StackTrace(1, false).GetFrames())
+            {
+                MethodBase? m = frame.GetMethod();
+                if (m is null) continue;
+                if (m.Equals(s_method) || (s_stateMachine is not null && m.DeclaringType == s_stateMachine)) return true;
+            }
+            return false;
+        }
+
+        public override unsafe MemoryHandle Pin(int elementIndex = 0)
+        {
+            GCHandle handle = GCHandle.Alloc(bytes, GCHandleType.Pinned);
+            return new MemoryHandle((byte*)handle.AddrOfPinnedObject() + elementIndex, handle, this);
+        }
+
+        public override void Unpin() { }
+        protected override void Dispose(bool disposing) { }
     }
 
     /// <summary>A poll's rows, handed over inline; re-enumerable without allocating.</summary>
