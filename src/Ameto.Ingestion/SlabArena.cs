@@ -49,7 +49,10 @@ internal sealed unsafe class SlabArena : IDisposable
     private nuint _committed;               // bytes committed from _base; only grows
     private bool  _disposed;
 
-    /// <summary><see cref="HugePageOptOutErrno"/> when the arena was never advised: not Linux, or reserved.</summary>
+    /// <summary>
+    /// <see cref="HugePageOptOutErrno"/> when the arena was never advised: not Linux, reserved, or
+    /// too small to hold one whole page.
+    /// </summary>
     internal const int NoHugePageOptOut = -1;
 
     /// <summary><see cref="HugePageOptOutErrno"/> when libc or its <c>madvise</c> export could not be bound.</summary>
@@ -70,7 +73,8 @@ internal sealed unsafe class SlabArena : IDisposable
     /// <summary>
     /// True when the arena is advised <c>MADV_NOHUGEPAGE</c>, so its residency stays per touched
     /// 4 KB page whatever <c>transparent_hugepage/enabled</c> says. Only ever true on Linux, and
-    /// only for the plain allocation there. False on Linux means the advice failed (see
+    /// only for the plain allocation there, after a <c>madvise</c> call that answered 0. False on
+    /// Linux means the advice failed (see
     /// <see cref="HugePageOptOutErrno"/>) and the arena behaves as it did before: nothing breaks,
     /// but with THP set to <c>always</c> a burst can make whole 2 MB ranges resident.
     /// </summary>
@@ -79,7 +83,7 @@ internal sealed unsafe class SlabArena : IDisposable
     /// <summary>
     /// 0 when <c>madvise(MADV_NOHUGEPAGE)</c> succeeded; its errno when it failed;
     /// <see cref="HugePageOptOutUnbound"/> when it could not be called; <see cref="NoHugePageOptOut"/>
-    /// when it was not attempted (not Linux, or a reserved arena).
+    /// when it was not attempted (not Linux, a reserved arena, or not one whole page to advise).
     /// </summary>
     public int HugePageOptOutErrno => _hugePageOptOut;
 
@@ -125,19 +129,25 @@ internal sealed unsafe class SlabArena : IDisposable
         // fault in on first touch. On Linux it is also opted out of transparent huge pages, one
         // syscall at creation, so that stays true per 4 KB page (see the class remarks).
         byte* plain = (byte*)NativeMemory.Alloc(bytes);
-        int optOut = OperatingSystem.IsLinux() ? DisableHugePages((nuint)plain, bytes) : NoHugePageOptOut;
+        int optOut = OperatingSystem.IsLinux()
+            ? DisableHugePages((nuint)plain, bytes, (nuint)Environment.SystemPageSize)
+            : NoHugePageOptOut;
         return new SlabArena(plain, bytes, bytes, reserved: false, committed: bytes, hugePageOptOut: optOut);
     }
 
     /// <summary>
     /// <c>madvise(MADV_NOHUGEPAGE)</c> over the whole pages of the allocation. Returns 0, the
-    /// errno, or <see cref="HugePageOptOutUnbound"/>; never throws, because a server that cannot
-    /// advise its arena still works.
+    /// errno, <see cref="HugePageOptOutUnbound"/>, or <see cref="NoHugePageOptOut"/> when not one
+    /// whole page fits; never throws, because a server that cannot advise its arena still works.
+    /// Internal, with the page size as a parameter, so the no-whole-page answer — which returns
+    /// before the P/Invoke — is tested on every platform.
     /// </summary>
-    private static int DisableHugePages(nuint address, nuint bytes)
+    internal static int DisableHugePages(nuint address, nuint bytes, nuint pageSize)
     {
-        var (start, length) = PageAlignInward(address, bytes, (nuint)Environment.SystemPageSize);
-        if (length == 0) return 0;   // not one whole page: nothing a huge page could back
+        var (start, length) = PageAlignInward(address, bytes, pageSize);
+        // Not one whole page: nothing a huge page could back, and nothing was advised. This
+        // answered 0, which made HugePagesDisabled claim an advice no madvise call ever gave.
+        if (length == 0) return NoHugePageOptOut;
 
         try
         {
