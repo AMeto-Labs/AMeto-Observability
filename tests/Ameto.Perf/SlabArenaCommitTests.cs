@@ -172,4 +172,76 @@ public sealed class SlabArenaCommitTests
             Assert.Equal(Payload(4096, p[0]), p);        // the seed is the first byte
         }
     }
+
+    // ── Transparent huge pages (Linux) ─────────────────────────────────────────
+
+    /// <summary>
+    /// madvise takes a page-aligned start and NativeMemory.Alloc promises none, so the Linux
+    /// arena is advised over the whole pages inside it: start rounded up, end rounded down, and
+    /// nothing at all when no whole page fits. Pure arithmetic, so it runs everywhere.
+    /// </summary>
+    [Fact]
+    public void The_huge_page_advice_covers_only_whole_pages_inside_the_allocation()
+    {
+        const ulong Page = 4096;
+
+        static (ulong Start, ulong Length) Align(ulong address, ulong bytes, ulong page)
+        {
+            var (s, l) = SlabArena.PageAlignInward((nuint)address, (nuint)bytes, (nuint)page);
+            return (s, l);
+        }
+
+        // Exact multiples: the range is its own answer.
+        Assert.Equal((2 * Page, 3 * Page), Align(2 * Page, 3 * Page, Page));
+
+        // A start 16 bytes past a boundary (glibc's mmap'd chunk): the partial first and last
+        // pages are left out.
+        Assert.Equal((4 * Page, 9 * Page), Align(3 * Page + 16, 10 * Page, Page));
+
+        // An aligned start with a ragged end: the end is rounded down.
+        Assert.Equal((8 * Page, 2 * Page), Align(8 * Page, 2 * Page + 100, Page));
+
+        // Shorter than a page, aligned or not, or straddling a boundary without a whole page.
+        Assert.Equal((0UL, 0UL), Align(2 * Page, Page - 1, Page));
+        Assert.Equal((0UL, 0UL), Align(Page + 100, 1000, Page));
+        Assert.Equal((0UL, 0UL), Align(Page + 4000, 200, Page));
+        Assert.Equal((0UL, 0UL), Align(Page + 1, Page, Page));   // a page long, but no page inside
+
+        // Nothing, and a range that would wrap the address space.
+        Assert.Equal((0UL, 0UL), Align(2 * Page, 0, Page));
+        if (IntPtr.Size == 8)
+            Assert.Equal((0UL, 0UL), Align(ulong.MaxValue - 10, 100, Page));
+
+        // A 16 KB page (some arm64 kernels).
+        Assert.Equal((3 * 16384UL, 2 * 16384UL), Align(2 * 16384 + 1, 3 * 16384, 16384));
+    }
+
+    /// <summary>
+    /// With transparent_hugepage=always the first write in a 2 MB-aligned range can take a whole
+    /// huge page, so a burst of small events touching every range could make most of the arena
+    /// resident. The Linux arena is advised MADV_NOHUGEPAGE at creation; this checks the advice
+    /// was accepted. Linux-only; returns early elsewhere, and on a kernel built without THP,
+    /// where madvise answers EINVAL and there is nothing to opt out of.
+    /// </summary>
+    [Fact]
+    public void On_Linux_the_arena_is_opted_out_of_transparent_huge_pages()
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            // Nothing is advised elsewhere, and nothing claims it was.
+            using var plain = SlabArena.Create((nuint)(8 * MB), (nuint)MB, reserve: false);
+            Assert.False(plain.HugePagesDisabled);
+            Assert.Equal(SlabArena.NoHugePageOptOut, plain.HugePageOptOutErrno);
+            return;
+        }
+        if (!Directory.Exists("/sys/kernel/mm/transparent_hugepage")) return;
+
+        using var arena = SlabArena.Create((nuint)(64 * MB), (nuint)MB);
+        _out.WriteLine($"madvise result {arena.HugePageOptOutErrno}");
+        Assert.False(arena.IsCommitOnDemand);
+        Assert.True(arena.HugePagesDisabled, $"madvise(MADV_NOHUGEPAGE) failed: {arena.HugePageOptOutErrno}");
+
+        using var ring = new IngestionRingBuffer(1 << 12, 64 * 1024, 64 * MB);
+        Assert.Equal(0, ring.ArenaHugePageOptOutErrno);
+    }
 }

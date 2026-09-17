@@ -157,9 +157,13 @@ public sealed class IngestionOptions
     /// level, not a peak.</para>
     /// <list type="bullet">
     /// <item><b>Linux</b>: the allocation is lazily paged, so residency is per touched PAGE, not
-    /// per slab. A typical 0.3-2 KB event touches one 4 KB page at the start of its slab, so a
-    /// full default batch of small events rests at about 32 MB. Only events near the maximum size
-    /// fill their slabs, which is the same 512 MB worst case the flat default always had.</item>
+    /// per slab. The arena opts out of transparent huge pages (<c>MADV_NOHUGEPAGE</c>), so that
+    /// page stays 4 KB even where <c>transparent_hugepage</c> is <c>always</c>, as on RHEL; without
+    /// it, the first write in each 2 MB range could make the whole 2 MB resident. A typical
+    /// 0.3-2 KB event touches one 4 KB page at the start of its slab, so a full default batch of
+    /// small events rests at about 32 MB. Only events near the maximum size fill their slabs, which
+    /// is the same 512 MB worst case the flat default always had. (If the opt-out fails, the server
+    /// logs it once at startup.)</item>
     /// <item><b>Windows</b>: the range is reserved and COMMITTED, in 1 MB chunks, up to the
     /// deepest slab ever handed out, whatever the events in it weigh, and never decommitted. One
     /// batch that outruns the drainer by ~8 192 events therefore commits ~512 MB even at 300 B an
@@ -168,8 +172,10 @@ public sealed class IngestionOptions
     /// Windows job or container memory limit, set this explicitly</b> to what that limit can
     /// carry.</item>
     /// </list>
-    /// <para>A host that expects large events, or needs a hard ceiling below 512 MB, likewise sets
-    /// this explicitly and accepts that a burst then meets back-pressure earlier (counted as
+    /// <para>Under a container memory limit, on EITHER platform, set this explicitly for a hard
+    /// ceiling: the ~32 MB on Linux is what small events cost, not a bound, and large events still
+    /// fill their slabs. A host that expects large events, or needs a ceiling below 512 MB, likewise
+    /// sets it, and accepts that a burst then meets back-pressure earlier (counted as
     /// <c>ingestDroppedNoSlab</c>). <c>/api/diagnostics</c> reports
     /// <c>ingestArenaResidentBytes</c>: the deepest slab ever handed out times the slab size. On
     /// Windows that is the commit charge (to within 1 MB); on Linux it is an upper bound on the

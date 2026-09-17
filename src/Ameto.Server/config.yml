@@ -142,16 +142,19 @@ Ameto:
     # collector batch) and 15% of the physical limit, both capped at 512 MB. At the 64 KB
     # default slab that is 512 MB on every host, a 512 MB container included.
     # The arena is reserved, and what it takes is never given back. On Linux that is per
-    # touched page, not per slab: a typical small event touches one 4 KB page of its slab,
-    # so a full batch of them rests at ~32 MB, and only events near the maximum size approach
-    # 512 MB. On Windows it is committed (1 MB chunks) up to the deepest slab ever used,
-    # whatever the events weigh: one batch that outruns the drainer by ~8192 events commits
-    # ~512 MB even for 300-byte events, and a job object's memory limit counts commit, so
-    # under a Windows job or container memory limit set it explicitly. Likewise on a small host
-    # that expects large events, or needs a hard ceiling (an explicit value always wins), and
-    # accept earlier, counted drops under a burst. Watch ingestArenaResidentBytes (deepest slab
-    # x slab size: the commit charge on Windows, an upper bound on resident memory on Linux)
-    # and ingestDroppedNoSlab in /api/diagnostics.
+    # touched page, not per slab, and the arena opts out of transparent huge pages
+    # (MADV_NOHUGEPAGE) so the page stays 4 KB even with transparent_hugepage=always (the RHEL
+    # default): a typical small event touches one 4 KB page of its slab, so a full batch of
+    # them rests at ~32 MB, and only events near the maximum size approach 512 MB. On Windows
+    # it is committed (1 MB chunks) up to the deepest slab ever used, whatever the events
+    # weigh: one batch that outruns the drainer by ~8192 events commits ~512 MB even for
+    # 300-byte events, and a job object's memory limit counts commit. Under a container or job
+    # memory limit, on either platform, set it explicitly for a hard ceiling (~32 MB is what
+    # small events cost on Linux, not a bound). Likewise on a small host that expects large
+    # events (an explicit value always wins), and accept earlier, counted drops under a
+    # burst. Watch ingestArenaResidentBytes (deepest slab x slab size: the commit charge on
+    # Windows, an upper bound on resident memory on Linux) and ingestDroppedNoSlab in
+    # /api/diagnostics.
     # PayloadPoolBytes: 536870912
 
   # ── Query ────────────────────────────────────────────────────────────────────

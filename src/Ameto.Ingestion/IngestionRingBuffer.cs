@@ -101,7 +101,8 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
     /// capacity, is the true absorption window when the drainer stalls: once slabs run out,
     /// events with payloads are dropped even with free ring slots. The arena is reserved
     /// virtual memory. On Linux only pages actually written become resident (~real payload
-    /// bytes, not slabCount × slabSize), so a generous budget costs little RSS. On Windows
+    /// bytes, not slabCount × slabSize; the arena opts out of transparent huge pages so a written
+    /// page stays 4 KB), so a generous budget costs little RSS. On Windows
     /// (see <see cref="SlabArena"/>) it is committed up to the deepest slab ever handed out,
     /// whatever the payloads weigh, and never decommitted — commit charge a job object's memory
     /// limit counts.
@@ -195,6 +196,12 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
 
     /// <summary>True when arena pages are committed as the buffer grows rather than at startup.</summary>
     public bool ArenaCommitsOnDemand => _arena.IsCommitOnDemand;
+
+    /// <summary>
+    /// The arena's <c>madvise(MADV_NOHUGEPAGE)</c> outcome: 0 when it succeeded, else see
+    /// <see cref="SlabArena.HugePageOptOutErrno"/>. Only Linux attempts it; the host logs a failure once.
+    /// </summary>
+    internal int ArenaHugePageOptOutErrno => _arena.HugePageOptOutErrno;
 
     /// <summary>
     /// The whole arena — what <c>Ingestion.PayloadPoolBytes</c> bought, derived from the physical

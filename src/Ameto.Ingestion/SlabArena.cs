@@ -22,6 +22,14 @@ namespace Ameto.Ingestion;
 /// has ever been — a server whose drainer keeps up commits a few slabs and no more. Everywhere
 /// else this is a plain allocation, because there the pages were already lazy.</para>
 ///
+/// <para>Lazy per 4 KB page on Linux only while transparent huge pages leave the range alone.
+/// With <c>transparent_hugepage/enabled=always</c> (the RHEL default) the first write in a
+/// 2 MB-aligned range can fault in a whole 2 MB page, and khugepaged collapses sparsely touched
+/// ranges too. A 64 KB slab puts 32 slabs in each 2 MB, so one burst of ~8 192 small events,
+/// touching every range, could make most of a 512 MB arena resident instead of ~32 MB. So on
+/// Linux the arena is advised <c>MADV_NOHUGEPAGE</c> once, at creation (see
+/// <see cref="HugePagesDisabled"/>).</para>
+///
 /// <para>What is deliberately NOT done: committed slabs are never given back. Decommitting
 /// above the high-water mark would need a background sweep — a timer wake on an idle server,
 /// which is the thing this work package is removing — to reclaim memory that a LIFO free list
@@ -36,19 +44,44 @@ internal sealed unsafe class SlabArena : IDisposable
     private readonly bool  _reserved;       // true => committed on demand, false => already committed
     private readonly Lock  _growGate = new();
 
+    private readonly int   _hugePageOptOut; // NoHugePageOptOut, 0 when madvise succeeded, else its errno
+
     private nuint _committed;               // bytes committed from _base; only grows
     private bool  _disposed;
 
-    private SlabArena(byte* @base, nuint bytes, nuint commitChunk, bool reserved, nuint committed)
+    /// <summary><see cref="HugePageOptOutErrno"/> when the arena was never advised: not Linux, or reserved.</summary>
+    internal const int NoHugePageOptOut = -1;
+
+    /// <summary><see cref="HugePageOptOutErrno"/> when libc or its <c>madvise</c> export could not be bound.</summary>
+    internal const int HugePageOptOutUnbound = -2;
+
+    private SlabArena(byte* @base, nuint bytes, nuint commitChunk, bool reserved, nuint committed, int hugePageOptOut)
     {
-        _base        = @base;
-        _bytes       = bytes;
-        _commitChunk = commitChunk;
-        _reserved    = reserved;
-        _committed   = committed;
+        _base           = @base;
+        _bytes          = bytes;
+        _commitChunk    = commitChunk;
+        _reserved       = reserved;
+        _committed      = committed;
+        _hugePageOptOut = hugePageOptOut;
     }
 
     public byte* Base => _base;
+
+    /// <summary>
+    /// True when the arena is advised <c>MADV_NOHUGEPAGE</c>, so its residency stays per touched
+    /// 4 KB page whatever <c>transparent_hugepage/enabled</c> says. Only ever true on Linux, and
+    /// only for the plain allocation there. False on Linux means the advice failed (see
+    /// <see cref="HugePageOptOutErrno"/>) and the arena behaves as it did before: nothing breaks,
+    /// but with THP set to <c>always</c> a burst can make whole 2 MB ranges resident.
+    /// </summary>
+    public bool HugePagesDisabled => _hugePageOptOut == 0;
+
+    /// <summary>
+    /// 0 when <c>madvise(MADV_NOHUGEPAGE)</c> succeeded; its errno when it failed;
+    /// <see cref="HugePageOptOutUnbound"/> when it could not be called; <see cref="NoHugePageOptOut"/>
+    /// when it was not attempted (not Linux, or a reserved arena).
+    /// </summary>
+    public int HugePageOptOutErrno => _hugePageOptOut;
 
     /// <summary>
     /// Bytes committed on demand so far — the ingest high-water mark — or -1 when the arena is a
@@ -84,12 +117,58 @@ internal sealed unsafe class SlabArena : IDisposable
         {
             nint p = VirtualAlloc(0, bytes, MEM_RESERVE, PAGE_READWRITE);
             if (p != 0)
-                return new SlabArena((byte*)p, bytes, Math.Max(commitChunk, (nuint)4096), reserved: true, committed: 0);
+                return new SlabArena((byte*)p, bytes, Math.Max(commitChunk, (nuint)4096), reserved: true, committed: 0,
+                                     hugePageOptOut: NoHugePageOptOut);
         }
 
         // Linux/macOS: a large NativeMemory.Alloc is already an anonymous mapping whose pages
-        // fault in on first touch, so there is nothing to improve and no syscalls to add.
-        return new SlabArena((byte*)NativeMemory.Alloc(bytes), bytes, bytes, reserved: false, committed: bytes);
+        // fault in on first touch. On Linux it is also opted out of transparent huge pages, one
+        // syscall at creation, so that stays true per 4 KB page (see the class remarks).
+        byte* plain = (byte*)NativeMemory.Alloc(bytes);
+        int optOut = OperatingSystem.IsLinux() ? DisableHugePages((nuint)plain, bytes) : NoHugePageOptOut;
+        return new SlabArena(plain, bytes, bytes, reserved: false, committed: bytes, hugePageOptOut: optOut);
+    }
+
+    /// <summary>
+    /// <c>madvise(MADV_NOHUGEPAGE)</c> over the whole pages of the allocation. Returns 0, the
+    /// errno, or <see cref="HugePageOptOutUnbound"/>; never throws, because a server that cannot
+    /// advise its arena still works.
+    /// </summary>
+    private static int DisableHugePages(nuint address, nuint bytes)
+    {
+        var (start, length) = PageAlignInward(address, bytes, (nuint)Environment.SystemPageSize);
+        if (length == 0) return 0;   // not one whole page: nothing a huge page could back
+
+        try
+        {
+            return madvise((nint)start, length, MADV_NOHUGEPAGE) == 0 ? 0 : Marshal.GetLastPInvokeError();
+        }
+        catch (Exception ex) when (ex is DllNotFoundException or EntryPointNotFoundException)
+        {
+            return HugePageOptOutUnbound;
+        }
+    }
+
+    /// <summary>
+    /// The whole pages inside [<paramref name="address"/>, <paramref name="address"/> +
+    /// <paramref name="bytes"/>): the start rounded UP and the end rounded DOWN to
+    /// <paramref name="pageSize"/>, or length 0 when no whole page fits. <c>madvise</c> takes only
+    /// a page-aligned start, and <c>NativeMemory.Alloc</c> promises none (glibc returns an mmap'd
+    /// chunk 16 bytes past its page boundary). Rounding inward never advises memory outside the
+    /// allocation, and what it leaves out is under one page at either end.
+    /// </summary>
+    internal static (nuint Start, nuint Length) PageAlignInward(nuint address, nuint bytes, nuint pageSize)
+    {
+        if (pageSize == 0) return (0, 0);
+        nuint end = address + bytes;
+        if (end < address) return (0, 0);   // the range wraps the address space: not an allocation
+
+        nuint headGap = (pageSize - address % pageSize) % pageSize;
+        if (headGap >= bytes) return (0, 0);
+
+        nuint start      = address + headGap;   // <= end, so it cannot wrap
+        nuint alignedEnd = end - end % pageSize;
+        return alignedEnd > start ? (start, alignedEnd - start) : (0, 0);
     }
 
     /// <summary>
@@ -196,4 +275,11 @@ internal sealed unsafe class SlabArena : IDisposable
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool VirtualFree(nint address, nuint size, uint freeType);
+
+    // ── Linux ──────────────────────────────────────────────────────────────────
+
+    private const int MADV_NOHUGEPAGE = 15;
+
+    [DllImport("libc", SetLastError = true)]
+    private static extern int madvise(nint address, nuint length, int advice);
 }

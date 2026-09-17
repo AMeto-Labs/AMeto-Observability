@@ -23,9 +23,20 @@ public static class IngestionServiceExtensions
             // The ring requires a power-of-two capacity — round the configured value up.
             int cap = (int)System.Numerics.BitOperations.RoundUpToPowerOf2(
                 (uint)Math.Clamp(ing.RingCapacity, 1024, 1 << 24));
-            return new IngestionRingBuffer(cap,
+            var ring = new IngestionRingBuffer(cap,
                 maxPayloadBytesPerSlot: ing.MaxEventPayloadBytes,
                 payloadPoolBytes:       ing.EffectivePayloadPoolBytes);
+
+            // Once, since this is a singleton. The arena works either way; what is lost is the
+            // per-4 KB-page residency under transparent_hugepage=always (see SlabArena).
+            int thp = ring.ArenaHugePageOptOutErrno;
+            if (OperatingSystem.IsLinux() && thp != 0)
+                sp.GetService<ILogger<IngestionRingBuffer>>()?.LogInformation(
+                    "The ingest payload arena could not opt out of transparent huge pages (madvise result {Result}). " +
+                    "Where transparent_hugepage is 'always', a burst can make whole 2 MB ranges of it resident " +
+                    "rather than the 4 KB pages it writes; set Ingestion.PayloadPoolBytes for a hard ceiling.",
+                    thp);
+            return ring;
         });
 
         // Endpoint — singleton, mapped as a route handler in Program.cs

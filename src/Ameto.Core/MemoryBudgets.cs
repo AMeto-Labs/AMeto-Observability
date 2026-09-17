@@ -193,15 +193,19 @@ public readonly struct MemoryBudgets
     /// <list type="bullet">
     /// <item><b>Linux</b> pages it lazily, so the cost is per touched page, not per slab: a
     /// typical 0.3-2 KB event touches one 4 KB page at the start of its 64 KB slab, and 8 192
-    /// slabs of small events rest at about 32 MB. Only events near the maximum size fill their
-    /// slabs, and that worst case, 512 MB, is the one the flat default always had.</item>
+    /// slabs of small events rest at about 32 MB. The page stays 4 KB because the arena opts out
+    /// of transparent huge pages (<c>MADV_NOHUGEPAGE</c>); under <c>transparent_hugepage=always</c>
+    /// without that, each 2 MB range the burst touched could be resident whole, most of 512 MB.
+    /// Only events near the maximum size fill their slabs, and that worst case, 512 MB, is the one
+    /// the flat default always had.</item>
     /// <item><b>Windows</b> commits it in 1 MB chunks up to the deepest slab ever handed out and
     /// never decommits, whatever the events weigh: one batch that outruns the drainer by ~8 192
     /// events commits ~512 MB even at 300 B an event. The ~32 MB figure is working set there, not
     /// commit, and a job object's memory limit counts commit.</item>
     /// </list>
-    /// <para>A host that expects large events, or runs on Windows under a job or container memory
-    /// limit, sets <c>Ingestion.PayloadPoolBytes</c> explicitly, which always wins.</para>
+    /// <para>A host under a container or job memory limit, on either platform, or one that expects
+    /// large events, sets <c>Ingestion.PayloadPoolBytes</c> explicitly for a hard ceiling, which
+    /// always wins: the Linux ~32 MB is what small events cost, not a bound.</para>
     /// </summary>
     public const double IngestArenaFraction = 0.15;
 
