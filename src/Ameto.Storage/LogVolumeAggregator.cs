@@ -23,9 +23,12 @@ public sealed class LogVolumeCounts
     public required IReadOnlyList<LogSeries> Levels   { get; init; }
 
     /// <summary>
-    /// Cold segments in the window that could not be read and were left out (a torn block, a
-    /// file gone mid-scan). Zero means every count above is exact; anything else means each is a
-    /// floor. Not required, so a caller that only draws a chart can ignore it.
+    /// Cold segments in the window that the catalog still serves but that could not be read, and
+    /// so were left out (a torn block, a file missing under a live entry). A segment that a merge
+    /// or retention removed while the scan ran is not one of them: nothing is damaged, and a
+    /// merge's events are in its output (which a snapshot taken just before the merge published
+    /// does not list, the same race every snapshot-based read has). Non-zero means each count
+    /// above is a floor. Not required, so a caller that only draws a chart can ignore it.
     /// </summary>
     public int SkippedSegments { get; init; }
 }

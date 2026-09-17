@@ -104,6 +104,157 @@ public sealed class LogVolumeUnreadableSegmentTests : IDisposable
                                            e.Error is InvalidDataException);
     }
 
+    private IEnumerable<(Microsoft.Extensions.Logging.LogLevel Level, string Message, Exception? Error)> HeaderWarnings() =>
+        _log.Entries.Where(e => e.Level == Microsoft.Extensions.Logging.LogLevel.Warning &&
+                                e.Message.Contains("Header aggregation", StringComparison.Ordinal));
+
+    /// <summary>Tears the first block frame, as the test above does.</summary>
+    private static void Tear(SegmentInfo seg)
+    {
+        using var f = File.Open(seg.FilePath, FileMode.Open, FileAccess.Write);
+        f.Position = 46;
+        f.Write([0xF9, 0xFF, 0xFF, 0xFF]);
+    }
+
+    /// <summary>The ten hot events become a second Error segment, so there are two to tear.</summary>
+    private async Task<(SegmentInfo First, SegmentInfo Second)> TwoSegmentsAsync()
+    {
+        var first = Assert.Single(_engine.ListSegments());
+        await _engine.FlushHotTierAsync();
+        var second = Assert.Single(_engine.ListSegments(), s => SegmentKey.Of(s) != SegmentKey.Of(first));
+        return (first, second);
+    }
+
+    [Fact]
+    public async Task A_segment_removed_from_the_catalog_while_the_scan_runs_is_neither_partial_nor_warned()
+    {
+        var seg = Assert.Single(_engine.ListSegments());
+
+        // A merge publishing its output and deleting its sources while a histogram poll still
+        // walks a snapshot that lists them: the entry goes, the file goes, the scan opens it.
+        int removed = 0;
+        _engine._beforeHeaderSegmentOpen = info =>
+        {
+            if (Interlocked.Exchange(ref removed, 1) == 0)
+                _engine.DeleteSegmentAsync(SegmentKey.Of(info)).GetAwaiter().GetResult();
+        };
+
+        var counts = await CountAsync();
+
+        Assert.Equal(1, removed);
+        Assert.False(File.Exists(seg.FilePath), "setup: the delete should have removed the file");
+        Assert.Equal(0, counts.SkippedSegments);
+        Assert.Equal(10, counts.Total);   // the hot tier; the removed segment is simply not in the window any more
+        Assert.Empty(HeaderWarnings());
+        Assert.Contains(_log.Entries, e => e.Level == Microsoft.Extensions.Logging.LogLevel.Debug &&
+                                           e.Message.Contains("left the catalog", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task A_segment_whose_import_has_published_but_not_moved_is_counted_once_the_move_lands()
+    {
+        // A replicated segment staged outside the segments directory, moved in by the import.
+        var peer    = new NodeId(7);
+        var pool    = new StringInternPool();
+        string staged = Path.Combine(_dir, "staged-7-40.seg");
+        string final  = Path.Combine(_dir, "segments", "7-40.seg");
+        using (var hot = new HotTierSegment(16, 1L << 20))
+        {
+            var buf = new ArrayBufferWriter<byte>(32);
+            for (int i = 0; i < 5; i++)
+            {
+                buf.ResetWrittenCount();
+                var w = new MessagePackWriter(buf);
+                w.WriteMapHeader(1);
+                w.Write("n"); w.Write((long)i);
+                w.Flush();
+                Assert.True(hot.TryWrite(new LogEventHeader
+                {
+                    Id                       = new EventId(peer.Value, (uint)i).RawValue,
+                    TimestampUtcTicks        = Base.AddMinutes(30).UtcTicks + i * TimeSpan.TicksPerSecond,
+                    Level                    = LogLevel.Information,
+                    MessageTemplatePoolIndex = pool.Intern("peer {n}"),
+                }, buf.WrittenSpan.ToArray(), "peer {n}"));
+            }
+            hot.Freeze();
+            using var writer = new SegmentWriter(staged);
+            writer.WriteEvents(hot, pool);
+            writer.Finalise(peer, new SegmentId(40));
+        }
+
+        using var published = new ManualResetEventSlim();
+        using var release   = new ManualResetEventSlim();
+        using var opening   = new ManualResetEventSlim();
+        _engine._afterImportPublish = () =>
+        {
+            published.Set();
+            Assert.True(release.Wait(TimeSpan.FromSeconds(30)), "the test never released the import");
+        };
+
+        var import = Task.Run(() => _engine.ImportSegment(staged, final));
+        Assert.True(published.Wait(TimeSpan.FromSeconds(30)), "the import never published its entry");
+        Assert.False(File.Exists(final), "setup: the file must not have landed yet");
+
+        _engine._beforeHeaderSegmentOpen = info =>
+        {
+            if (info.NodeId.Value == peer.Value) opening.Set();
+        };
+        var count = CountAsync().AsTask();
+
+        try
+        {
+            Assert.True(opening.Wait(TimeSpan.FromSeconds(30)), "the scan never reached the imported segment");
+            // The open has found no file. It must wait for the import rather than call the count
+            // partial over a file that is only in flight.
+            await Task.Delay(300);
+            Assert.False(count.IsCompleted, "the scan finished while the import was still moving the file in");
+        }
+        finally { release.Set(); }
+
+        Assert.Equal(SegmentImportOutcome.Registered, await import);
+        var counts = await count;
+
+        Assert.Equal(0, counts.SkippedSegments);
+        Assert.Equal(75, counts.Total);   // 60 cold + 10 hot + the 5 imported
+        Assert.Empty(HeaderWarnings());
+    }
+
+    [Fact]
+    public async Task Past_the_warning_cap_an_unreadable_segment_is_not_warned_about_on_every_poll()
+    {
+        var (first, second) = await TwoSegmentsAsync();
+        Tear(first);
+        Tear(second);
+        _engine.WarnedUnreadableSegmentCap = 1;
+
+        for (int poll = 0; poll < 3; poll++)
+            Assert.Equal(2, (await CountAsync()).SkippedSegments);   // still a floor, cap or no cap
+
+        // One segment is named; the other is past the cap and stays at Debug, poll after poll.
+        // Clearing the set when it filled up named both again on every poll.
+        Assert.Single(HeaderWarnings());
+    }
+
+    [Fact]
+    public async Task A_deleted_segment_gives_back_its_place_under_the_warning_cap()
+    {
+        var (first, second) = await TwoSegmentsAsync();
+        _engine.WarnedUnreadableSegmentCap = 1;
+
+        Tear(first);
+        Assert.Equal(1, (await CountAsync()).SkippedSegments);
+        Assert.Contains(first.FilePath, Assert.Single(HeaderWarnings()).Message);
+
+        // Retention (or an operator) removes the torn segment; a different one is torn later.
+        await _engine.DeleteSegmentAsync(SegmentKey.Of(first));
+        Tear(second);
+        Assert.Equal(1, (await CountAsync()).SkippedSegments);
+
+        var warnings = HeaderWarnings().ToList();
+        Assert.Equal(2, warnings.Count);
+        Assert.Contains(second.FilePath, warnings[1].Message);
+    }
+
     private sealed class CapturingLogger : Microsoft.Extensions.Logging.ILogger<StorageEngine>
     {
         private readonly List<(Microsoft.Extensions.Logging.LogLevel Level, string Message, Exception? Error)> _entries = [];

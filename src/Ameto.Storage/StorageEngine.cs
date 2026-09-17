@@ -140,11 +140,18 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// <summary>
     /// Segments the header aggregation has already warned it could not read, so a torn file is
     /// named at Warning ONCE rather than on every histogram poll and alert tick that meets it.
-    /// Cleared wholesale at <see cref="MaxWarnedUnreadableSegments"/>: the population that
-    /// matters is the handful of damaged files, and forgetting one only repeats its warning.
+    ///
+    /// <para>Bounded by <see cref="WarnedUnreadableSegmentCap"/>, and never cleared to make room:
+    /// clearing it once full made every unreadable segment past the cap warn again on every poll.
+    /// Once full, a segment not already in it is logged at Debug only (the count still reports
+    /// it). A key leaves when <see cref="DeleteSegmentAsync"/> removes its segment, so the set
+    /// holds segments the catalog still serves, not every torn file this process ever met.</para>
     /// </summary>
     private readonly ConcurrentDictionary<SegmentKey, byte> _warnedUnreadableSegments = new();
-    private const int MaxWarnedUnreadableSegments = 1024;
+    /// <summary>Makes the cap check and the add in <see cref="LogUnreadableSegment"/> one step.</summary>
+    private readonly System.Threading.Lock _warnedUnreadableGate = new();
+    /// <summary>How many unreadable segments are named at Warning; internal so a test can lower it.</summary>
+    internal int WarnedUnreadableSegmentCap = 1024;
     /// <summary>Pause between attempts to persist a frozen tier whose flush failed.</summary>
     private static readonly TimeSpan FlushRetryDelay = TimeSpan.FromSeconds(15);
     /// <summary>True while the live WAL is refusing appends — gates the once-per-episode error log (writer thread only).</summary>
@@ -183,6 +190,17 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// sequence passes either way.
     /// </summary>
     internal Action? _beforeImportPublish;
+    /// <summary>
+    /// Test hook: called inside <see cref="ImportSegment(string, string)"/> after the entry is
+    /// published and before <c>File.Move</c> lands the file, under <c>_importLock</c> — the window
+    /// in which the catalog names a path that does not exist yet.
+    /// </summary>
+    internal Action? _afterImportPublish;
+    /// <summary>
+    /// Test hook: called by the header aggregation's cold scan just before it opens a segment
+    /// from its catalog snapshot, so a test can remove the segment in between, as a merge does.
+    /// </summary>
+    internal Action<SegmentInfo>? _beforeHeaderSegmentOpen;
     /// <summary>Test hook: first id of the block reserved for the live WAL (see <see cref="WriteState.WalSegId"/>).</summary>
     internal ulong LiveWalSegmentId => _write.WalSegId;
     /// <summary>
@@ -770,9 +788,11 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// matches the endpoint's column-cap logic.
     ///
     /// <para>A cold segment that throws while being read is skipped rather than failing the
-    /// whole aggregate, and counted in <see cref="LogVolumeCounts.SkippedSegments"/>: when that
-    /// is non-zero every total is a floor, and a caller that reports a count as a fact must say
-    /// so.</para>
+    /// whole aggregate, and counted in <see cref="LogVolumeCounts.SkippedSegments"/> when the
+    /// catalog still serves it: when that is non-zero every total is a floor, and a caller that
+    /// reports a count as a fact must say so. A segment that left the catalog while the scan ran
+    /// (a merge's sources, a retention delete) is a race, not damage, and is not counted; see
+    /// <see cref="OnHeaderSegmentUnreadable"/>.</para>
     /// </summary>
     /// <param name="totalsOnly">
     /// Opt-in shortcut for a caller that wants ONE number (the alert evaluator, which runs this
@@ -847,17 +867,16 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
                             try
                             {
-                                using var reader = SegmentReader.Open(info.FilePath);
+                                _beforeHeaderSegmentOpen?.Invoke(info);
+                                using var reader = OpenForHeaderScan(info);
                                 reader.AggregateHeaders(local, fromTicks, toTicks);
                             }
                             catch (Exception ex)
                             {
                                 // Never lose the whole aggregate over one bad/racing segment file —
-                                // but never HIDE it either: the skip is counted, so a caller that
-                                // presents the total as a fact can say it is a floor. Whatever the
-                                // segment yielded before the throw stays in; it is real data.
-                                local.AddSkippedSegment();
-                                LogUnreadableSegment(ex, info);
+                                // but never HIDE a bad one either. Whatever the segment yielded
+                                // before the throw stays in; it is real data.
+                                OnHeaderSegmentUnreadable(ex, info, local);
                             }
                             return local;
                         },
@@ -874,18 +893,81 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     }
 
     /// <summary>
+    /// Opens a cold segment for the header scan, waiting out an import that has published the
+    /// entry but not yet landed its file.
+    ///
+    /// <para><see cref="ImportSegment(string, string)"/> publishes the catalog entry BEFORE its
+    /// <c>File.Move</c> (see the comment there for why that order), and holds <c>_importLock</c>
+    /// across both. A scan whose snapshot caught the entry in that window finds no file. Waiting
+    /// for the lock waits the rename out, and one more open then reads the segment that was
+    /// always going to be there. If that open fails too, the caller decides what it means: the
+    /// import may have withdrawn its entry, or a delete (which takes the same lock) may have
+    /// removed it in the meantime.</para>
+    ///
+    /// <para>Only a missing file waits. A torn file is not something an import can be in the
+    /// middle of fixing, and every other caller that removes a file removes its entry first.</para>
+    /// </summary>
+    private SegmentReader OpenForHeaderScan(SegmentInfo info)
+    {
+        try { return SegmentReader.Open(info.FilePath); }
+        catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
+        {
+            lock (_importLock) { }   // wait out an import between its publish and its move
+            return SegmentReader.Open(info.FilePath);
+        }
+    }
+
+    /// <summary>
+    /// Sorts a failed header read into a race or a real unreadable segment.
+    ///
+    /// <para><b>A race</b>: the catalog no longer holds this segment under its key and path. The
+    /// scan works from a snapshot, and a merge publishes its output and then deletes its sources,
+    /// and retention deletes expired ones, while a poll is still walking that snapshot. The file
+    /// is gone because the segment was meant to go; nothing is damaged, so it is not counted and
+    /// logged at Debug only. Counting it made every merge that overlapped a histogram poll turn
+    /// the query language's count partial and warn about a corruption that did not exist, and
+    /// the once-per-key warning could not help, since each merge removes new keys.</para>
+    ///
+    /// <para><b>Unreadable</b>: the catalog still serves it. The skip is counted, so a caller that
+    /// presents the total as a fact can say it is a floor, and named once at Warning.</para>
+    /// </summary>
+    private void OnHeaderSegmentUnreadable(Exception ex, SegmentInfo info, LogVolumeAggregator local)
+    {
+        if (!_segments.TryGetValue(SegmentKey.Of(info), out var current)
+            || !string.Equals(current.FilePath, info.FilePath, StringComparison.OrdinalIgnoreCase))
+        {
+            _logger.LogDebug(ex,
+                "Header aggregation skipped segment {NodeId}-{Id}: it left the catalog while the scan ran (merge or retention)",
+                info.NodeId, info.Id);
+            return;
+        }
+
+        local.AddSkippedSegment();
+        LogUnreadableSegment(ex, info);
+    }
+
+    /// <summary>
     /// A segment the header aggregation could not read is now visible to users — the query
     /// language reports the count as partial because of it — so its cause has to be findable in
     /// the server log at a level that is kept: Warning, with the segment id and the exception.
     /// Once per segment, because the histogram polls every few seconds and every alert rule ticks
     /// every 15 s, and a torn file stays in the catalog until the next start quarantines it; a
-    /// warning per poll would bury everything else. Repeats go to Debug, as before.
+    /// warning per poll would bury everything else. Repeats go to Debug, as before, and so does
+    /// every segment past <see cref="WarnedUnreadableSegmentCap"/>.
     /// </summary>
     private void LogUnreadableSegment(Exception ex, SegmentInfo info)
     {
-        if (_warnedUnreadableSegments.Count >= MaxWarnedUnreadableSegments) _warnedUnreadableSegments.Clear();
+        // Count first: a full set never grows and is never cleared, so past the cap each poll
+        // costs a Debug line rather than a Warning per segment. The check and the add are one
+        // step under a gate, or parallel workers would all see room and all add: this runs only
+        // for a segment that failed to read, so the gate costs the scan nothing. A delete
+        // removing a key outside it can only make room.
+        bool warn;
+        lock (_warnedUnreadableGate)
+            warn = _warnedUnreadableSegments.Count < WarnedUnreadableSegmentCap
+                && _warnedUnreadableSegments.TryAdd(SegmentKey.Of(info), 0);
 
-        if (_warnedUnreadableSegments.TryAdd(SegmentKey.Of(info), 0))
+        if (warn)
             _logger.LogWarning(ex,
                 "Header aggregation could not read segment {NodeId}-{Id} ({File}); counts over its window are partial",
                 info.NodeId, info.Id, info.FilePath);
@@ -1072,6 +1154,10 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         {
             if (_segments.TryRemove(key, out var info))
             {
+                // Its place under the header aggregation's warning cap goes with it: the set
+                // bounds unreadable segments still SERVED, not every one this process has met.
+                _warnedUnreadableSegments.TryRemove(key, out _);
+
                 // The merge bookkeeping (_mergeDeferStrikes, _mergeSkip) is deliberately NOT
                 // touched here. Both are plain collections owned lock-free by the maintenance
                 // thread, and this method also runs on retention's threads — a background
@@ -3277,8 +3363,10 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         // deciding it on the stale probe is what let a refusal arrive with the other peer's bytes
         // already destroyed. Registering first opens a window in the other direction, where the
         // entry names a path the file has not reached. For the two QUERY consumers that is
-        // harmless -- QueryExecutor yields nothing for an unreadable path, the aggregator logs
-        // and moves on -- but retention and the merge planner act on the ENTRY, not the file:
+        // harmless -- QueryExecutor yields nothing for an unreadable path, and the header
+        // aggregation waits for this lock on a missing file and opens it again (see
+        // OpenForHeaderScan), so it neither drops the segment nor calls its count partial --
+        // but retention and the merge planner act on the ENTRY, not the file:
         // retention could remove it and orphan the file the move then lands, and the planner
         // could quarantine the not-yet-arrived path until restart. Both are held off explicitly
         // instead of argued away: DeleteSegmentAsync takes this same lock, and the planner
@@ -3360,6 +3448,8 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
                 break;
             }
+
+            _afterImportPublish?.Invoke();
 
             if (!inPlace)
             {
