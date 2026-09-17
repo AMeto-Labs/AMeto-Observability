@@ -1,3 +1,4 @@
+using System.Globalization;
 using Ameto.Core;
 using Ameto.Ingestion;
 using Xunit;
@@ -220,11 +221,12 @@ public sealed class SlabArenaCommitTests
     /// With transparent_hugepage=always the first write in a 2 MB-aligned range can take a whole
     /// huge page, so a burst of small events touching every range could make most of the arena
     /// resident. The Linux arena is advised MADV_NOHUGEPAGE at creation; this checks the advice
-    /// was accepted. Linux-only; returns early elsewhere, and on a kernel built without THP,
-    /// where madvise answers EINVAL and there is nothing to opt out of.
+    /// was accepted, and that it was THAT advice: the kernel marks the arena's mapping <c>nh</c>
+    /// in /proc/self/smaps. Linux-only; returns early elsewhere, and on a kernel built without
+    /// THP, where madvise answers EINVAL and there is nothing to opt out of.
     /// </summary>
     [Fact]
-    public void On_Linux_the_arena_is_opted_out_of_transparent_huge_pages()
+    public unsafe void On_Linux_the_arena_is_opted_out_of_transparent_huge_pages()
     {
         if (!OperatingSystem.IsLinux())
         {
@@ -241,7 +243,119 @@ public sealed class SlabArenaCommitTests
         Assert.False(arena.IsCommitOnDemand);
         Assert.True(arena.HugePagesDisabled, $"madvise(MADV_NOHUGEPAGE) failed: {arena.HugePageOptOutErrno}");
 
+        // madvise answering 0 says only that SOME advice was taken: MADV_HUGEPAGE (14) answers 0
+        // as well, and would make the arena huge-page-eager instead. The kernel's record of which
+        // advice is the mapping's VmFlags: nh for MADV_NOHUGEPAGE, hg for MADV_HUGEPAGE. Looked up
+        // at the first and last whole pages of the arena, the range the advice covers, not at
+        // Base: NativeMemory.Alloc starts a few bytes into a page, and madvise splits that partial
+        // page off into a mapping of its own that is not advised.
+        string? smaps = ReadSmaps();
+        if (smaps is null)
+        {
+            _out.WriteLine("/proc/self/smaps unavailable: which advice took effect is not checked");
+        }
+        else
+        {
+            nuint @base = (nuint)arena.Base;
+            var (start, length) = SlabArena.PageAlignInward(@base, (nuint)(64 * MB), (nuint)Environment.SystemPageSize);
+            Assert.True(length > 0, "setup: a 64 MB arena holds whole pages");
+            _out.WriteLine($"VmFlags at Base 0x{(ulong)@base:x} (not asserted): {VmFlagsAt(smaps, @base)}");
+
+            foreach (ulong address in new[] { (ulong)start, (ulong)(start + length - 1) })
+            {
+                string? flags = VmFlagsAt(smaps, address);
+                _out.WriteLine($"VmFlags at 0x{address:x}: {flags}");
+                Assert.NotNull(flags);
+                Assert.Contains("nh", flags.Split(' ', StringSplitOptions.RemoveEmptyEntries));
+            }
+        }
+
         using var ring = new IngestionRingBuffer(1 << 12, 64 * 1024, 64 * MB);
         Assert.Equal(0, ring.ArenaHugePageOptOutErrno);
+    }
+
+    /// <summary>
+    /// Finding a mapping's flags by address in smaps text is plain parsing, so it is checked on
+    /// every platform against a canned snippet: inside a range, outside every range, and on a
+    /// boundary between two adjacent mappings (a range's end is exclusive).
+    /// </summary>
+    [Fact]
+    public void The_smaps_lookup_finds_the_flags_of_the_mapping_that_contains_an_address()
+    {
+        const string smaps = """
+            00400000-00452000 r-xp 00000000 08:02 173521                     /usr/bin/dbus-daemon
+            Size:                328 kB
+            KernelPageSize:        4 kB
+            VmFlags: rd ex mr mw me dw
+            7f0000000000-7f0000001000 rw-p 00000000 00:00 0
+            Size:                  4 kB
+            VmFlags: rd wr mr mw me ac
+            7f0000001000-7f0004000000 rw-p 00000000 00:00 0
+            Size:              65532 kB
+            AnonHugePages:         0 kB
+            THPeligible:    0
+            VmFlags: rd wr mr mw me ac nh
+            7f0004000000-7f0004001000 rw-p 00000000 00:00 0
+            Size:                  4 kB
+            VmFlags: rd wr mr mw me ac
+            7ffc1a2b3000-7ffc1a2d4000 rw-p 00000000 00:00 0                  [stack]
+            Size:                132 kB
+            VmFlags: rd wr mr mw me gd ac
+            """;
+
+        // Inside a range.
+        Assert.Equal("rd ex mr mw me dw",       VmFlagsAt(smaps, 0x00400010));
+        Assert.Equal("rd wr mr mw me ac nh",    VmFlagsAt(smaps, 0x7f0002345678));
+        Assert.Equal("rd wr mr mw me gd ac",    VmFlagsAt(smaps, 0x7ffc1a2d3fff));
+
+        // Outside every range: below the first, in a gap, past the last.
+        Assert.Null(VmFlagsAt(smaps, 0x1000));
+        Assert.Null(VmFlagsAt(smaps, 0x00452000));   // the first range's end
+        Assert.Null(VmFlagsAt(smaps, 0x7f0005000000));
+        Assert.Null(VmFlagsAt(smaps, ulong.MaxValue));
+
+        // On boundaries between adjacent mappings: the start belongs to the range, the end does not.
+        Assert.Equal("rd wr mr mw me ac",       VmFlagsAt(smaps, 0x7f0000000fff));
+        Assert.Equal("rd wr mr mw me ac nh",    VmFlagsAt(smaps, 0x7f0000001000));
+        Assert.Equal("rd wr mr mw me ac nh",    VmFlagsAt(smaps, 0x7f0003ffffff));
+        Assert.Equal("rd wr mr mw me ac",       VmFlagsAt(smaps, 0x7f0004000000));
+        Assert.Null(VmFlagsAt(smaps, 0x7ffc1a2d4000));   // the last range's end
+    }
+
+    private static string? ReadSmaps()
+    {
+        try { return File.ReadAllText("/proc/self/smaps"); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return null; }
+    }
+
+    /// <summary>
+    /// The VmFlags of the mapping in <paramref name="smaps"/> (/proc/[pid]/smaps text) whose range
+    /// contains <paramref name="address"/>, or null when no mapping does. Each mapping opens with a
+    /// header line <c>start-end perms offset dev inode [path]</c>, start and end in hex and end
+    /// exclusive, followed by its <c>Name: value</c> fields, VmFlags among them.
+    /// </summary>
+    internal static string? VmFlagsAt(string smaps, ulong address)
+    {
+        bool inside = false;
+        foreach (ReadOnlySpan<char> line in smaps.AsSpan().EnumerateLines())
+        {
+            if (TryParseMappingHeader(line, out ulong start, out ulong end))
+                inside = address >= start && address < end;
+            else if (inside && line.StartsWith("VmFlags:", StringComparison.Ordinal))
+                return line["VmFlags:".Length..].Trim().ToString();
+        }
+        return null;
+    }
+
+    /// <summary>A header's first token is <c>start-end</c> in hex; a field line's is <c>Name:</c>.</summary>
+    private static bool TryParseMappingHeader(ReadOnlySpan<char> line, out ulong start, out ulong end)
+    {
+        start = end = 0;
+        int space = line.IndexOf(' ');
+        ReadOnlySpan<char> range = space < 0 ? line : line[..space];
+        int dash = range.IndexOf('-');
+        return dash > 0
+            && ulong.TryParse(range[..dash], NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out start)
+            && ulong.TryParse(range[(dash + 1)..], NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out end);
     }
 }
