@@ -840,7 +840,23 @@ public sealed class SegmentInvertedIndex : ISegmentIndex
                     : decoded;
             }
 
-            idx._postings[propName] = values;
+            // Names merge too. The builder keys properties by their raw UTF-8 bytes, so two
+            // names that are different invalid UTF-8 (`a\xFF`, `a\xFE`) are two entries on disk
+            // and decode to the SAME string here (`a�`). Assigning would replace the first
+            // property's values with the second's, and a lookup of a value only the first held
+            // would find the property but not the value: "proven empty", and the segment dropped
+            // where the scan would have returned the row.
+            if (idx._postings.TryGetValue(propName, out var existing))
+            {
+                foreach (var (valStr, offsets) in values)
+                    existing[valStr] = existing.TryGetValue(valStr, out var prior)
+                        ? UnionAscending(prior, offsets)
+                        : offsets;
+            }
+            else
+            {
+                idx._postings[propName] = values;
+            }
         }
 
         return idx;
