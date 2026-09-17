@@ -136,7 +136,76 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     private readonly SemaphoreSlim                        _flushSlots;
     // In-flight parallel cold-flush tasks, so DisposeAsync can await them before the
     // tiers they read are freed. Self-pruning via ContinueWith on completion.
+    //
+    // NOT what makes freeing a tier safe: a task is registered only after Task.Run has
+    // already handed it to the pool, so its body can swap and start reading a tier before any
+    // snapshot of this dictionary can see it, and FlushHotTierAsync's inline flush is never
+    // registered at all. _heavyPhases is the count that shutdown waits on.
     private readonly ConcurrentDictionary<Task, byte>    _inFlightFlushes = new();
+
+    // ── Shutdown fences ─────────────────────────────────────────────────────────
+    //
+    // THE INVARIANT: a hot tier's native memory is freed only once every flush that swapped it
+    // has ended and no reader snapshot holds it. DisposeAsync used to ASSUME the first half ("no
+    // writes remain") and ignore the second. When a late write filled the tier after
+    // DisposeAsync's in-flight snapshot, the flush it scheduled read the tier while DisposeAsync
+    // freed it: AccessViolation in HotTierEventSource.EventAt. And since freed chunk arenas and
+    // pooled slot arrays can be handed straight to a successor tier, the losing flush could
+    // also write another tier's rows into a segment without crashing.
+
+    /// <summary>
+    /// 1 once <see cref="DisposeAsync"/> has shut the write path. <see cref="TryWrite"/> refuses
+    /// from then on (a volatile read, the only cost on the ingest path), and no flush but
+    /// DisposeAsync's own may swap a tier. Set with a full fence; see <see cref="DisposeCoreAsync"/>.
+    /// </summary>
+    private int _writesClosed;
+
+    /// <summary>
+    /// Frozen tiers whose HEAVY PHASE has not ended — the cold write in
+    /// <see cref="TryFlushAsync"/>, or the background retry that took it over. Incremented under
+    /// <see cref="_flushLock"/> in the same step that publishes the tier to
+    /// <see cref="_frozenHot"/>, and decremented when that phase ends, whoever started it: the
+    /// flush loop, a write that found the tier full, <see cref="FlushHotTierAsync"/>, or a retry.
+    /// Since only the swap increments it, a shutdown holding <see cref="_flushLock"/> after
+    /// <see cref="_writesClosed"/> sees it only fall.
+    /// </summary>
+    private int _heavyPhases;
+
+    /// <summary>Installed by DisposeAsync; completed by the decrement that takes <see cref="_heavyPhases"/> to zero.</summary>
+    private TaskCompletionSource? _heavyPhasesDrained;
+
+    /// <summary>Installed by DisposeAsync; completed by the reader release that takes <see cref="_activeReaders"/> to zero.</summary>
+    private TaskCompletionSource? _readersDrained;
+
+    /// <summary>
+    /// Set under <see cref="_frozenLock"/> once DisposeAsync has collected the tiers it will free.
+    /// A reader snapshot is taken under the same lock, so after it no reader can capture a tier
+    /// and <see cref="_activeReaders"/> only falls.
+    /// </summary>
+    private bool _snapshotsClosed;
+
+    /// <summary>
+    /// How long shutdown waits, in total, for its turn at the flush lock and a flush slot, for
+    /// running flushes and for open readers. Past it a tier that may still be in use is LEFT
+    /// ALLOCATED and an Error says so — never freed under its user. Internal so a test can
+    /// shorten it.
+    /// </summary>
+    internal TimeSpan _shutdownWaitBudget = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// Test hook: called by <see cref="DisposeAsync"/> after the write path is closed, the writer
+    /// fenced, flushes drained and readers drained — immediately before tiers are freed.
+    /// </summary>
+    internal Action? _beforeTiersFreed;
+
+    /// <summary>Test hook: the live hot tier.</summary>
+    internal HotTierSegment LiveHotTier => _write.Hot;
+
+    /// <summary>Test hook: heavy phases in flight (see <see cref="_heavyPhases"/>).</summary>
+    internal int HeavyPhasesInFlight => Volatile.Read(ref _heavyPhases);
+
+    /// <summary>Test hook: the scheduled flush tasks registered right now.</summary>
+    internal Task[] InFlightFlushTasks() => _inFlightFlushes.Keys.ToArray();
     /// <summary>
     /// Segments the header aggregation has already warned it could not read, so a torn file is
     /// named at Warning ONCE rather than on every histogram poll and alert tick that meets it.
@@ -820,6 +889,10 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         IReadOnlySet<SegmentKey> covered;
         lock (_frozenLock)
         {
+            // After shutdown collected the tiers it frees, a snapshot would capture memory that
+            // is about to go — and its reader count would arrive after the wait that honours it.
+            ObjectDisposedException.ThrowIf(_snapshotsClosed, this);
+
             current = _write.Hot;
             if (_frozenHot.Count == 0)
             {
@@ -1224,7 +1297,10 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     private void OnReaderDisposed()
     {
         if (Interlocked.Decrement(ref _activeReaders) == 0)
+        {
             DrainRetired();
+            Volatile.Read(ref _readersDrained)?.TrySetResult();
+        }
     }
 
     /// <summary>
@@ -1292,6 +1368,12 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// </summary>
     public bool TryWrite(in LogEventHeader header, ReadOnlySpan<byte> propertiesPayload, string? template = null, ExceptionInfo? exception = null)
     {
+        // Shut by DisposeAsync. Refused like back-pressure — the caller keeps the event — and
+        // before anything else, so a refused write neither takes an id nor schedules a flush.
+        // A write already past this line when the path closes is fenced by the tier's Freeze.
+        if (Volatile.Read(ref _writesClosed) != 0)
+            return false;
+
         // Assign time-sortable, monotonic event id.
         // Time component is derived from the event's own @t (TimestampUtcTicks), not
         // server ingest time, so sorting by Id matches the timestamp shown in the UI.
@@ -1374,6 +1456,11 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
     // ── ISegmentManager ───────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Flushes the live hot tier inline. Not registered in <see cref="_inFlightFlushes"/>, and
+    /// does not need to be: its heavy phase is counted in <see cref="_heavyPhases"/> like every
+    /// other, so shutdown waits for it. After shutdown has begun it does nothing.
+    /// </summary>
     public async Task FlushHotTierAsync(CancellationToken ct = default) =>
         await TryFlushAsync(ct);
 
@@ -1864,6 +1951,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// <summary>Fire-and-forget a parallel flush, tracked so shutdown can await it.</summary>
     private void ScheduleFlush()
     {
+        // After shutdown shut the write path there is nothing a new flush may swap.
+        if (Volatile.Read(ref _writesClosed) != 0) return;
+
         var t = Task.Run(() => TryFlushAsync());
         _inFlightFlushes[t] = 0;
         _ = t.ContinueWith(
@@ -1872,7 +1962,13 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
     }
 
-    private async Task TryFlushAsync(CancellationToken ct = default)
+    /// <param name="waitDeadline">
+    /// 0 for every caller but shutdown's final flush: a busy swap lock or an exhausted slot budget
+    /// means someone else is flushing, so the call drops out. The final flush instead WAITS for
+    /// both until this <see cref="Environment.TickCount64"/> deadline — dropping out there left
+    /// the live tier unflushed whenever a racing flush held the lock.
+    /// </param>
+    private async Task TryFlushAsync(CancellationToken ct = default, long waitDeadline = 0)
     {
         // ── SWAP PHASE — serialised (via _flushLock) and fast. Freezes the current
         //    hot tier, publishes it to the frozen list, installs a fresh hot tier and
@@ -1883,16 +1979,34 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         string?         oldWalPath = null;
         ulong           reservedSegId = 0;
 
-        if (!await _flushLock.WaitAsync(0, ct)) return; // a swap is already in progress
+        bool finalFlush = waitDeadline != 0;
+        if (!finalFlush && Volatile.Read(ref _writesClosed) != 0) return; // shutdown owns the tiers now
+
+        if (!await _flushLock.WaitAsync(finalFlush ? Until(waitDeadline) : TimeSpan.Zero, ct))
+            return; // a swap is already in progress
         try
         {
+            // Again under the lock: shutdown takes this lock after closing, so a flush that got
+            // here first either sees the close or swaps before shutdown counts what is running.
+            if (!finalFlush && Volatile.Read(ref _writesClosed) != 0) return;
+
             var oldState = _write;
             if (oldState.Hot.Count == 0) return;
 
             // Back-pressure gate: if the in-flight tier budget is exhausted, skip the swap.
             // The hot tier stays full → TryWrite returns false → the drainer parks (ring
             // back-pressure) rather than letting frozen tiers pile up unbounded in RAM.
-            if (!_flushSlots.Wait(0)) return;
+            // The final flush waits for a slot instead: every holder is a heavy phase or a retry
+            // that shutdown's cancellation has already ended, and none of them takes this lock.
+            if (!_flushSlots.Wait(0) &&
+                (!finalFlush || !await _flushSlots.WaitAsync(Until(waitDeadline), ct).ConfigureAwait(false)))
+            {
+                if (finalFlush)
+                    _logger.LogWarning(
+                        "Final hot-tier flush skipped: no flush slot came free within the shutdown budget — " +
+                        "the WAL replays the tier on the next start");
+                return;
+            }
             try
             {
                 // Open the SUCCESSOR first, so the swap installs a complete (tier, WAL)
@@ -1911,6 +2025,12 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
                 reservedSegId = oldState.WalSegId;
                 oldState.Hot.Freeze();
+
+                // Counted in the step that publishes the tier to the frozen list, and under
+                // _flushLock: from here on the heavy phase below owns reading this tier, and the
+                // decrement at its end is what lets shutdown free it. Nothing between this line
+                // and the try that decrements can throw.
+                Interlocked.Increment(ref _heavyPhases);
 
                 // Publish oldHot AND install the successor under the lock queries snapshot
                 // from, so a concurrent query sees oldHot exactly once — as current before
@@ -1942,17 +2062,19 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
         if (oldHot is null) return; // hot tier was empty — nothing swapped (no slot taken)
 
-        // Nobody writes to the old WAL any more (writers see the new _wal) — close its
-        // handles before the flush so File.Delete below succeeds afterwards.
-        oldWal?.Dispose();
-
         // ── HEAVY PHASE — parallel, bounded by _flushConcurrency. Builds the inverted/
         //    trigram/bloom indexes, compresses and writes the cold segment. Runs off the
         //    swap lock so several segments persist at once on otherwise idle cores. The
-        //    back-pressure slot (taken at swap) is held until the tier is fully persisted.
+        //    back-pressure slot (taken at swap) is held until the tier is fully persisted,
+        //    and so is the heavy-phase count; a retry that takes the slot over takes both.
         bool slotTransferred = false;
         try
         {
+            // Nobody writes to the old WAL any more (writers see the new _wal) — close its
+            // handles before the flush so File.Delete below succeeds afterwards. Inside the
+            // try, so a WAL that throws on close still hands back the slot and the count.
+            oldWal?.Dispose();
+
             await _flushConcurrency.WaitAsync(ct).ConfigureAwait(false);
             List<SegmentInfo> written;
             try
@@ -1980,8 +2102,26 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
             PublishFlushedTier(written, oldHot, oldWalPath, reservedSegId);
         }
-        finally { if (!slotTransferred) _flushSlots.Release(); }
+        finally
+        {
+            if (!slotTransferred)
+            {
+                _flushSlots.Release();
+                EndHeavyPhase();
+            }
+        }
     }
+
+    /// <summary>Ends one counted heavy phase and wakes shutdown if it was the last.</summary>
+    private void EndHeavyPhase()
+    {
+        if (Interlocked.Decrement(ref _heavyPhases) == 0)
+            Volatile.Read(ref _heavyPhasesDrained)?.TrySetResult();
+    }
+
+    /// <summary>Time left until a <see cref="Environment.TickCount64"/> deadline, never negative.</summary>
+    private static TimeSpan Until(long deadline) =>
+        TimeSpan.FromMilliseconds(Math.Max(0, deadline - Environment.TickCount64));
 
     /// <summary>
     /// Registers a persisted tier's cold segments, unlists the frozen tier, deletes its WAL
@@ -2018,9 +2158,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
     /// <summary>
     /// Background retry for a frozen tier whose flush failed. Owns the tier's back-pressure
-    /// slot until the tier is persisted or the engine shuts down (then the slot is released
-    /// and the tier's WAL replays it on the next start). Tracked in
-    /// <see cref="_inFlightFlushes"/> so DisposeAsync awaits it after cancelling.
+    /// slot AND its heavy-phase count until the tier is persisted or the engine shuts down
+    /// (then both are released and the tier's WAL replays it on the next start). Tracked in
+    /// <see cref="_inFlightFlushes"/> as well, so DisposeAsync awaits it after cancelling.
     /// </summary>
     private void ScheduleFlushRetry(HotTierSegment oldHot, string? oldWalPath, ulong reservedSegId)
     {
@@ -2065,9 +2205,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             catch (ObjectDisposedException)    { /* raced DisposeAsync's CTS teardown — same outcome */ }
             finally
             {
-                // The slot semaphore can already be disposed when this task was spawned by a
-                // late ScheduleFlush during shutdown; the release is then moot, not an error.
+                // DisposeAsync no longer disposes the slot semaphore; the catch stays as defence.
                 try { _flushSlots.Release(); } catch (ObjectDisposedException) { }
+                EndHeavyPhase();
             }
         });
         _inFlightFlushes[t] = 0;
@@ -4392,10 +4532,37 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
     private int _disposed;
 
+    /// <summary>
+    /// Completed once the teardown has finished. A later <see cref="DisposeAsync"/> caller awaits
+    /// it: host shutdown can dispose this engine from two chains at once, and the one that
+    /// returned on the exchange used to let the process — or a test fixture deleting the data
+    /// directory — run on top of a flush still writing.
+    /// </summary>
+    private readonly TaskCompletionSource _disposeCompleted =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            await _disposeCompleted.Task.ConfigureAwait(false);
             return;
+        }
+
+        try { await DisposeCoreAsync().ConfigureAwait(false); }
+        finally { _disposeCompleted.TrySetResult(); }
+    }
+
+    /// <summary>
+    /// The teardown, in the order the tier-lifetime invariant needs (see <see cref="_writesClosed"/>):
+    /// stop the background loops → final flush, waiting its turn → close the write path → take the
+    /// swap lock for good → fence the writer → wait for every heavy phase → close reader snapshots
+    /// → wait for readers → free. Each wait shares one budget, and running out of it leaves the
+    /// tier that might still be in use allocated, with an Error, rather than freeing it.
+    /// </summary>
+    private async Task DisposeCoreAsync()
+    {
+        long deadline = Environment.TickCount64 + (long)_shutdownWaitBudget.TotalMilliseconds;
 
         await _cts.CancelAsync();
         try { await _flushLoop; }
@@ -4413,34 +4580,123 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         try { await Volatile.Read(ref _segmentDeleteRetryLoop); } catch { /* best-effort */ }
         try { RetryPendingSegmentDeletes(); } catch { /* best-effort */ }
 
-        // Await all in-flight parallel flushes before freeing the frozen tiers they
-        // read — disposing their native memory mid-flush faults (AccessViolation).
-        // No new flush can start: the age loop is stopped and no writes remain.
+        // Flushes scheduled before shutdown. Not the guarantee (see _inFlightFlushes) — only a
+        // way to let them finish before the final flush competes with them for the lock.
         try { await Task.WhenAll(_inFlightFlushes.Keys.ToArray()); } catch { /* best-effort */ }
 
+        // ── Final flush. Waits for its turn at the lock and for a slot rather than dropping out
+        //    when a racing flush holds either: dropping out left the live tier to the WAL replay.
         if (_write.Hot.Count > 0)
         {
-            try { await TryFlushAsync(); } catch { /* best-effort final flush */ }
-            // TryFlushAsync's heavy phase runs to completion inline here (we awaited it),
-            // but a concurrent trigger may have scheduled another — drain those too.
-            try { await Task.WhenAll(_inFlightFlushes.Keys.ToArray()); } catch { }
+            try { await TryFlushAsync(waitDeadline: deadline); }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Final hot-tier flush failed — the WAL replays the tier on the next start");
+            }
         }
 
-        _write.Hot.Dispose();
-        lock (_retireLock)
+        // ── Close the write path. A full fence, because the other half of this handshake is a
+        //    lock-free read: TryWrite and ScheduleFlush load the flag, and a store that sank below
+        //    those loads could let a flush swap a tier after shutdown stopped counting.
+        Interlocked.Exchange(ref _writesClosed, 1);
+        Interlocked.MemoryBarrier();
+
+        // ── Take the swap lock and KEEP it. A flush that holds it now finishes its swap (and is
+        //    counted) first; every later one finds the close, or the lock taken, and swaps nothing.
+        if (!await _flushLock.WaitAsync(Until(deadline)).ConfigureAwait(false))
         {
-            foreach (var t in _retired) t.Dispose();
-            _retired.Clear();
+            _logger.LogError(
+                "Shutdown could not take the hot-tier swap lock within {Budget}s — every hot tier is left " +
+                "allocated rather than freed under a flush that may still be swapping it",
+                _shutdownWaitBudget.TotalSeconds);
+            return;
         }
+
+        // ── Fence the writer. A TryWrite that passed the close check before it was set is either
+        //    finished with the tier when Freeze returns, or finds it frozen and refuses.
+        var live = _write;
+        live.Hot.Freeze();
+
+        // ── Wait for every heavy phase: the ones scheduled after the snapshot above, the inline
+        //    FlushHotTierAsync one, the retries shutdown's cancellation is ending. Only the swap
+        //    increments the count, under the lock now held, so it can only fall.
+        bool flushesEnded = true;
+        var heavyDrained = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Volatile.Write(ref _heavyPhasesDrained, heavyDrained);
+        Interlocked.MemoryBarrier();   // the decrement's read of the source must see it, or this read must see the zero
+        if (Volatile.Read(ref _heavyPhases) != 0)
+            flushesEnded = await CompletesBy(heavyDrained.Task, deadline).ConfigureAwait(false);
+
+        // ── Collect what to free and close reader snapshots in the same step, under the lock
+        //    snapshots are taken under. From here _activeReaders only falls.
+        List<HotTierSegment> tiers;
+        int leftFrozen = 0;
         lock (_frozenLock)
         {
-            foreach (var (tier, _) in _frozenHot) tier.Dispose();
-            _frozenHot.Clear();
+            _snapshotsClosed = true;
+            tiers = new List<HotTierSegment>(1 + _frozenHot.Count) { live.Hot };
+            if (flushesEnded)
+            {
+                foreach (var (tier, _) in _frozenHot) tiers.Add(tier);
+                _frozenHot.Clear();
+            }
+            else
+            {
+                // Which of them a still-running flush reads cannot be told apart, so none is
+                // freed here. A flush that finishes later retires its own tier the usual way.
+                leftFrozen = _frozenHot.Count;
+            }
         }
-        _write.Wal?.Dispose();
-        _flushConcurrency.Dispose();
-        _flushSlots.Dispose();
-        _flushLock.Dispose();
+        if (!flushesEnded)
+            _logger.LogError(
+                "Shutdown: {Running} hot-tier flush(es) still running after {Budget}s — {Frozen} frozen tier(s) " +
+                "are left allocated rather than freed under them",
+                Volatile.Read(ref _heavyPhases), _shutdownWaitBudget.TotalSeconds, leftFrozen);
+
+        // ── Wait for open readers (queries still scanning a snapshot).
+        var readersDrained = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Volatile.Write(ref _readersDrained, readersDrained);
+        Interlocked.MemoryBarrier();
+        if (Volatile.Read(ref _activeReaders) != 0 &&
+            !await CompletesBy(readersDrained.Task, deadline).ConfigureAwait(false))
+        {
+            _logger.LogError(
+                "Shutdown: {Readers} hot-tier reader(s) still open after {Budget}s — {Tiers} tier(s) stay " +
+                "allocated until the last of them closes",
+                Volatile.Read(ref _activeReaders), _shutdownWaitBudget.TotalSeconds, tiers.Count);
+        }
+
+        _beforeTiersFreed?.Invoke();
+
+        // ── Free, by the retire list's rule: now if no reader is open, otherwise when the last
+        //    one closes (OnReaderDisposed → DrainRetired). Tiers retired before shutdown too.
+        lock (_retireLock)
+        {
+            _retired.AddRange(tiers);
+            if (Volatile.Read(ref _activeReaders) == 0)
+            {
+                foreach (var t in _retired) t.Dispose();
+                _retired.Clear();
+            }
+        }
+
+        live.Wal?.Dispose();
+
+        // The three semaphores are deliberately NOT disposed. A SemaphoreSlim holds nothing to
+        // release unless its wait handle was asked for, and disposing one turns a late
+        // Release — a flush left running past the budget, a WaitAsync that read the close flag
+        // just before it was set — into an ObjectDisposedException on a pool thread.
         _cts.Dispose();
+    }
+
+    /// <summary>True if <paramref name="task"/> completes by the <see cref="Environment.TickCount64"/> deadline.</summary>
+    private static async Task<bool> CompletesBy(Task task, long deadline)
+    {
+        try
+        {
+            await task.WaitAsync(Until(deadline)).ConfigureAwait(false);
+            return true;
+        }
+        catch (TimeoutException) { return false; }
     }
 }

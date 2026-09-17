@@ -510,6 +510,9 @@ public sealed unsafe class HotTierSegment : IDisposable, IHotTierReader
 
     private bool _disposed;
 
+    /// <summary>Test hook: true once the native chunks have been freed.</summary>
+    internal bool IsDisposed => _disposed;
+
     public void Dispose()
     {
         if (_disposed) return;
