@@ -75,10 +75,20 @@ if (serverOptions.Logging.FileEnabled)
         ? lvl
         : Microsoft.Extensions.Logging.LogLevel.Information;
 
-    builder.Logging.AddProvider(new FileLoggerProvider(
-        Path.Combine(serverOptions.DataDirectory, "logs"),
-        fileLevel,
-        serverOptions.Logging.FileRetainDays));
+    // Registered as a factory, NOT handed over as an instance (AddProvider(new …)): the container
+    // disposes the singletons it creates and never the instances it is given, and LoggerFactory
+    // disposes only providers added to it directly. The instance was therefore never disposed,
+    // and every host left its drain parked in GetConsumingEnumerable on a pool thread — thirty of
+    // them in one integration-test dump, starving the pool the shutdown path runs on — with the
+    // log file still open under a data directory the test fixture then failed to delete.
+    //
+    // Late shutdown lines are kept: the provider is created with the logger factory, before
+    // anything that logs, and the container disposes in reverse creation order, so everything
+    // that logs while being disposed is gone before this is — and Dispose drains the queue.
+    string fileLogDir    = Path.Combine(serverOptions.DataDirectory, "logs");
+    int    fileRetainDays = serverOptions.Logging.FileRetainDays;
+    builder.Services.AddSingleton<Microsoft.Extensions.Logging.ILoggerProvider>(
+        _ => new FileLoggerProvider(fileLogDir, fileLevel, fileRetainDays));
 }
 
 
