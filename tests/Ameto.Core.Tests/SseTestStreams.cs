@@ -27,6 +27,9 @@ internal sealed class RecordingStream : Stream
 
     private readonly List<(string Needle, TaskCompletionSource Sent)> _waiters = [];
 
+    /// <summary>Armed by <see cref="NextCallEntered"/>; guarded by <c>_sends</c>.</summary>
+    private TaskCompletionSource? _nextCall;
+
     public int    SendCount   { get { lock (_sends) return _sends.Count; } }
     public string SendAt(int i) { lock (_sends) return _sends[i]; }
     public string All()         { lock (_sends) return string.Concat(_sends); }
@@ -49,6 +52,31 @@ internal sealed class RecordingStream : Stream
         }
     }
 
+    /// <summary>
+    /// Completes when the NEXT <c>WriteAsync</c> or <c>FlushAsync</c> is entered, a refused or failing
+    /// call included: entering is what shows a send has started. Armed when asked, so calls made
+    /// before do not count. A scan step that awaits it stays pending until the writer's send reaches
+    /// the body, however long the writer takes to look at the step, where a fixed delay ended the
+    /// step without a send whenever the writer stalled longer. Its continuation runs asynchronously,
+    /// never inside the writer's call.
+    /// </summary>
+    public Task NextCallEntered()
+    {
+        lock (_sends)
+            return (_nextCall ??= new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously)).Task;
+    }
+
+    private void Entered()
+    {
+        TaskCompletionSource? entered;
+        lock (_sends)
+        {
+            entered   = _nextCall;
+            _nextCall = null;
+        }
+        entered?.TrySetResult();
+    }
+
     public override void Write(ReadOnlySpan<byte> buffer)
     {
         string s = Encoding.UTF8.GetString(buffer);
@@ -68,12 +96,14 @@ internal sealed class RecordingStream : Stream
     // anyway would hide a writer that throws away rows it never offered.
     public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken ct = default)
     {
+        Entered();
         if (ct.IsCancellationRequested) return ValueTask.FromCanceled(ct);
         Write(buffer.Span);
         return ValueTask.CompletedTask;
     }
     public override Task FlushAsync(CancellationToken ct)
     {
+        Entered();
         if (ct.IsCancellationRequested) return Task.FromCanceled(ct);
         lock (_sends)
         {

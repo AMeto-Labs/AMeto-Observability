@@ -12,10 +12,15 @@ namespace Ameto.Core.Tests;
 public sealed class SseJsonWriterSourceTests
 {
     /// <summary>
-    /// How long a scan step waits for a row the writer should already have sent. Not a timing
+    /// How long a scan step waits for a send the writer should already have made. Not a timing
     /// bound: the send happens on the writer's own thread the moment the step goes pending, before
     /// the step can even resume, so this only turns a writer that never sends into a failure
     /// instead of a hang.
+    ///
+    /// <para>No step here goes pending on a fixed delay. A step that waited 50 ms was already
+    /// finished when a writer stalled that long before looking at it, so no send happened and a
+    /// correct writer failed. Each step waits instead for the event that shows the writer acted on
+    /// it: the send reaching the body, or the writer's call coming back waiting on the step.</para>
     /// </summary>
     private static readonly TimeSpan HangGuard = TimeSpan.FromSeconds(10);
 
@@ -113,19 +118,27 @@ public sealed class SseJsonWriterSourceTests
         body.Clear();
         body.FlushFailuresLeft = 1;
 
-        bool scanClosed = false;
+        bool scanClosed  = false;
+        var  writerWaits = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         async IAsyncEnumerable<LogEvent> Scan()
         {
             try
             {
                 yield return Event(0);
-                await Task.Delay(50);              // the writer sends row 0 now, and that send fails
+                // Pending until the writer's send of row 0 reaches the body (where its flush fails),
+                // AND the writer's call has come back to the test waiting on this step. The second
+                // gate keeps the step unfinished at the moment a writer that does not wait for it
+                // would dispose it, so that break always shows as its NotSupportedException instead
+                // of losing a race to this step's own continuation.
+                await Task.WhenAll(body.NextCallEntered(), writerWaits.Task).WaitAsync(HangGuard);
                 yield return Event(1);
             }
             finally { scanClosed = true; }
         }
 
-        Exception? thrown = await Record.ExceptionAsync(async () => await sse.WriteLogEventsAsync(Scan(), default));
+        ValueTask call = sse.WriteLogEventsAsync(Scan(), default);   // back at the writer's first real wait
+        writerWaits.SetResult();
+        Exception? thrown = await Record.ExceptionAsync(async () => await call);
 
         Assert.IsAssignableFrom<OperationCanceledException>(thrown);
         Assert.Equal(1, body.FlushFailures);
@@ -158,19 +171,23 @@ public sealed class SseJsonWriterSourceTests
         body.Clear();
 
         using var budget = new CancellationTokenSource();
+        var writerWaits = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         int sendsWhileRowBuffered = -1;
         async IAsyncEnumerable<LogEvent> Scan()
         {
             yield return Event(0);
             sendsWhileRowBuffered = body.SendCount;
             budget.Cancel();                       // the budget runs out while the scan works…
-            // …and the step goes asynchronous after it. A delay, not a bare yield: a yield's
-            // continuation can finish this step on another thread before the writer even looks,
-            // and then there is no wait to send in.
-            await Task.Delay(50);
+            // …and the step goes asynchronous after it, until the writer's call has come back to the
+            // test waiting on it. Not a bare yield or a delay: either can finish this step before the
+            // writer looks, and then there is no wait to send in. Not the body's NextCallEntered: the
+            // writer refuses a send under a spent token itself, before the body sees any call.
+            await writerWaits.Task;
         }
 
-        Exception? thrown = await Record.ExceptionAsync(async () => await sse.WriteLogEventsAsync(Scan(), budget.Token));
+        ValueTask call = sse.WriteLogEventsAsync(Scan(), budget.Token);   // back at the writer's first real wait
+        writerWaits.SetResult();
+        Exception? thrown = await Record.ExceptionAsync(async () => await call);
 
         Assert.IsAssignableFrom<OperationCanceledException>(thrown);
         Assert.Equal(0, sendsWhileRowBuffered);
@@ -212,7 +229,8 @@ public sealed class SseJsonWriterSourceTests
         async IAsyncEnumerable<LogEvent> Scan()
         {
             yield return Event(0);
-            await Task.Delay(50);                  // the writer sends row 0 now, and that send fails
+            // Pending until the writer's send of row 0 reaches the body; its flush then fails.
+            await body.NextCallEntered().WaitAsync(HangGuard);
             throw stepFaults
                 ? new InvalidDataException("block 7 failed its checksum")
                 : new OperationCanceledException("the scan saw the budget run out");
