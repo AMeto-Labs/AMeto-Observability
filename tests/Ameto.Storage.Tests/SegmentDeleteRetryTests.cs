@@ -428,33 +428,86 @@ public sealed class SegmentDeleteRetryTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task The_catalog_scan_cannot_register_a_path_between_its_entry_going_and_its_park()
+    public async Task The_catalog_scan_cannot_act_on_a_path_between_its_entry_going_and_its_park()
     {
         if (!OperatingSystem.IsWindows()) return;
         await _engine.CatalogLoaded;
 
         var (path, key) = ImportPeerSegment(71);
-        using var scanned = new ManualResetEventSlim();
-        Task? scan = null;
-        bool  scanFinishedInside = false;
+        using var atFile   = new ManualResetEventSlim();
+        using var released = new ManualResetEventSlim();
+        using var scanned  = new ManualResetEventSlim();
+        bool held = false, releasedInside = false;
+        bool finishedInside = false, registeredInside = false, loggedInside = false;
 
-        // Inside the delete, after the entry went and before the unlink fails and parks: the
-        // scan reaching the file right now must wait for the park, not register the path.
+        // The delete's step, under _importLock and _scanDeleteGate: remove the entry, record the
+        // path for a running scan, unlink the file, park the failed unlink. The scan's check and
+        // register take the same gate, so they land wholly before that step or wholly after it,
+        // and here, with a reader holding the file, after it the path is parked.
+        //
+        // The scan starts BEFORE the delete and is held where it has read and closed the file:
+        // past its entry lock, before the gate, holding neither. Started from inside the delete,
+        // as this test once did, it blocks at that entry lock, which takes the gate too, and runs
+        // only once the step is over: the test then passed with the scan's per-file gate removed.
+        //
+        // Nothing in this hook may throw: the scan's quarantine catch would swallow it.
+        _engine._beforeScanRegistersSegment = file =>
+        {
+            if (held || !string.Equals(file, path, StringComparison.OrdinalIgnoreCase)) return;
+            held = true;
+            atFile.Set();
+            released.Wait(TimeSpan.FromSeconds(20));
+        };
+
+        // Inside the delete, after the entry went and was recorded and before the unlink fails and
+        // parks, the scan is released and given half a second. Whatever it does about the path in
+        // that time, it did inside the step:
+        // - finishing (its exit takes the gate): the delete does not hold the gate;
+        // - registering: the scan's check did not wait for the gate, and nothing recorded the path;
+        // - logging why it skips the path: the scan's check did not wait for the gate, and only
+        //   the record kept the path out. Harmless here, where the hook runs after the record. The
+        //   scan's gate is what keeps it out of the two places this test cannot land in: the
+        //   delete's few instructions between TryRemove and the record, and a read of the record's
+        //   HashSet while a delete adds to it.
         _engine._afterSegmentEntryRemoved = () =>
         {
-            if (scan is not null) return;
-            scan = Task.Run(() => { try { _engine.LoadSegmentCatalog(); } finally { scanned.Set(); } });
-            scanFinishedInside = scanned.Wait(TimeSpan.FromMilliseconds(500));
+            if (!atFile.IsSet || released.IsSet) return;
+            int logged = _log.Entries.Count;
+            released.Set();
+            releasedInside   = true;
+            finishedInside   = scanned.Wait(TimeSpan.FromMilliseconds(500));
+            registeredInside = InCatalog(key);
+            loggedInside     = _log.Entries.Skip(logged).Any(e => e.Message.Contains(path, StringComparison.OrdinalIgnoreCase));
         };
 
         using (SegmentReader.Open(path))
         {
-            await _engine.DeleteSegmentAsync(key);
-            await scan!.WaitAsync(TimeSpan.FromSeconds(20));
+            var scan = Task.Run(() => { try { _engine.LoadSegmentCatalog(); } finally { scanned.Set(); } });
+            try
+            {
+                Assert.True(atFile.Wait(TimeSpan.FromSeconds(20)), "setup: the scan never reached the file");
+                await _engine.DeleteSegmentAsync(key);
+            }
+            finally
+            {
+                released.Set();
+                await scan.WaitAsync(TimeSpan.FromSeconds(20));
+            }
 
-            Assert.False(scanFinishedInside, "the scan ran to completion inside the delete's remove-to-park step");
+            Assert.True(releasedInside, "setup: the delete did not release the scan from inside its step");
+            Assert.False(finishedInside, "the scan ran to completion inside the delete's remove-to-park step");
+            Assert.False(registeredInside, "the catalog scan registered the path inside the delete's remove-to-park step");
+            Assert.False(loggedInside, "the catalog scan decided about the path inside the delete's remove-to-park step");
+
             Assert.Equal(1, _engine.PendingSegmentDeleteCount);
             Assert.False(InCatalog(key), "the catalog scan registered the path the delete was about to park");
+
+            // It did decide, once the delete was over: skipped the path, and did not quarantine it.
+            var entries = _log.Entries;
+            Assert.Contains(entries, e => e.Level == Microsoft.Extensions.Logging.LogLevel.Debug &&
+                                          e.Message.Contains("skips it", StringComparison.Ordinal) &&
+                                          e.Message.Contains(path, StringComparison.OrdinalIgnoreCase));
+            Assert.DoesNotContain(entries, e => e.Message.Contains("Quarantining unreadable segment", StringComparison.Ordinal));
         }
 
         Assert.Equal(0, _engine.RetryPendingSegmentDeletes());
