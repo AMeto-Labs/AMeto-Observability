@@ -224,19 +224,32 @@ public sealed class SlabArenaCommitTests
     /// was accepted, and that it was THAT advice: the kernel marks the arena's mapping <c>nh</c>
     /// in /proc/self/smaps. Linux-only; returns early elsewhere, and on a kernel built without
     /// THP, where madvise answers EINVAL and there is nothing to opt out of.
+    ///
+    /// <para>AN EARLY RETURN IS REPORTED AS PASSED, so on its own this test cannot say whether it
+    /// checked anything — and the backend CI job is Windows, where it never does. The Linux job in
+    /// .github/workflows/tests.yml exists to run it for real and sets <see cref="RequireHugePageCheck"/>:
+    /// there, every road that stands down without checking the advice (not Linux, a kernel without
+    /// THP, no smaps to confirm which advice) fails instead, so a runner image that changes under
+    /// the job turns it red rather than quietly green.</para>
     /// </summary>
     [Fact]
     public unsafe void On_Linux_the_arena_is_opted_out_of_transparent_huge_pages()
     {
         if (!OperatingSystem.IsLinux())
         {
+            NotChecked("not Linux");
+
             // Nothing is advised elsewhere, and nothing claims it was.
             using var plain = SlabArena.Create((nuint)(8 * MB), (nuint)MB, reserve: false);
             Assert.False(plain.HugePagesDisabled);
             Assert.Equal(SlabArena.NoHugePageOptOut, plain.HugePageOptOutErrno);
             return;
         }
-        if (!Directory.Exists("/sys/kernel/mm/transparent_hugepage")) return;
+        if (!Directory.Exists("/sys/kernel/mm/transparent_hugepage"))
+        {
+            NotChecked("this kernel has no transparent huge pages (/sys/kernel/mm/transparent_hugepage is absent)");
+            return;
+        }
 
         using var arena = SlabArena.Create((nuint)(64 * MB), (nuint)MB);
         _out.WriteLine($"madvise result {arena.HugePageOptOutErrno}");
@@ -252,7 +265,7 @@ public sealed class SlabArenaCommitTests
         string? smaps = ReadSmaps();
         if (smaps is null)
         {
-            _out.WriteLine("/proc/self/smaps unavailable: which advice took effect is not checked");
+            NotChecked("/proc/self/smaps unavailable: which advice took effect is not checked");
         }
         else
         {
@@ -272,6 +285,21 @@ public sealed class SlabArenaCommitTests
 
         using var ring = new IngestionRingBuffer(1 << 12, 64 * 1024, 64 * MB);
         Assert.Equal(0, ring.ArenaHugePageOptOutErrno);
+    }
+
+    /// <summary>
+    /// <c>AMETO_REQUIRE_THP=1</c>: this run exists to check the Linux huge-page opt-out, so a road
+    /// that does not check it is a failure, not a pass. Set by the Linux CI job only; unset, the test
+    /// stands down where there is nothing to check, as it always has.
+    /// </summary>
+    private static bool RequireHugePageCheck => Environment.GetEnvironmentVariable("AMETO_REQUIRE_THP") == "1";
+
+    /// <summary>Says why the huge-page check was not made, and fails when <see cref="RequireHugePageCheck"/> is set.</summary>
+    private void NotChecked(string why)
+    {
+        _out.WriteLine($"huge-page opt-out not checked: {why}");
+        if (RequireHugePageCheck)
+            Assert.Fail($"AMETO_REQUIRE_THP=1 but the huge-page opt-out was not checked: {why}");
     }
 
     /// <summary>
