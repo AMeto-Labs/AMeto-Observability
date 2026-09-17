@@ -321,8 +321,34 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
     /// <para>The first page is always in the range: <see cref="Append"/> updates the file
     /// header's WriteOffset in place, and recovery replays only up to that value, so a durable
     /// tail under a stale header is a tail that is never read back.</para>
+    ///
+    /// <para>The pool fsync runs even when the WAL half throws. If both fail, the WAL's
+    /// exception is the one that propagates (see <see cref="FlushPool"/>).</para>
     /// </summary>
     public void Flush()
+    {
+        // The pool is fsynced in a finally because the WAL half can throw on EVERY tick: a drive
+        // whose FlushFileBuffers keeps failing leaves the watermark where it was, so each tick,
+        // idle or not, retries the handle flush and throws again. With the pool after it in
+        // straight-line code, a dirty pool on an idle WAL was then never fsynced, and after power
+        // loss replay brought the WAL's events back with no template or another event's. (Before
+        // the watermark waited for the handle flush, the idle tick after a failure skipped the
+        // handle and reached the pool by accident.) The finally runs after FlushTail has released
+        // _writeLock, so the pool fsync still never holds up the appender.
+        bool walFlushed = false;
+        try
+        {
+            FlushTail();
+            walFlushed = true;
+        }
+        finally
+        {
+            FlushPool(walFailed: !walFlushed);
+        }
+    }
+
+    /// <summary>The WAL half of <see cref="Flush"/>: msync the un-synced tail, then flush the file handle.</summary>
+    private void FlushTail()
     {
         FileStream? handle   = null;
         long        writeEnd = 0;
@@ -363,7 +389,8 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
             // Dispose may have closed the handle between the lock and here (rotation runs
             // on this same thread today, but the flag is the contract, not the thread).
             // An IOException propagates to the flush loop, which logs it. The watermark stays
-            // where it was, so the next tick, idle or not, re-issues both flushes.
+            // where it was, so the next tick, idle or not, re-issues both flushes; the pool
+            // fsync in Flush's finally still runs on every one of those ticks.
             bool flushed = false;
             try
             {
@@ -383,13 +410,36 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
                 }
             }
         }
+    }
 
+    /// <summary>
+    /// fsyncs the template pool if a row was written since its last successful fsync. A failed
+    /// fsync leaves it dirty, whatever it threw, so the next tick retries it.
+    /// </summary>
+    /// <param name="walFailed">
+    /// The WAL half's exception is already on its way out of <see cref="Flush"/>. That is the
+    /// one the flush loop logs: a pool failure thrown from the finally would replace it, and
+    /// the log would name the pool while the WAL tail went on failing unreported. So a pool
+    /// failure is swallowed here and the pool stays dirty for the next tick. (An IOException
+    /// from the pool was already swallowed and retried; this extends the retry to whatever else
+    /// it throws, which reaches the loop only on a tick where the WAL half succeeded.)
+    /// </param>
+    private void FlushPool(bool walFailed)
+    {
         lock (_poolLock)
         {
             if (!_poolDirty || _poolStream is null) return;
-            _poolDirty = false;
-            try { _poolStream.Flush(flushToDisk: true); }
-            catch (IOException) { _poolDirty = true; } // retried next interval
+            try
+            {
+                if (PoolFlushHookForTest is { } hook) hook(_poolStream);
+                else _poolStream.Flush(flushToDisk: true);
+                // Cleared only on success. Rows are written under this same lock, so nothing
+                // can dirty the pool between the fsync returning and this line.
+                _poolDirty = false;
+                Interlocked.Increment(ref _poolFlushCount);
+            }
+            catch (IOException) { /* retried next interval */ }
+            catch when (walFailed) { /* retried next interval; the WAL's exception is the one reported */ }
         }
     }
 
@@ -481,6 +531,18 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
     /// Never set in production.
     /// </summary>
     internal Action<FileStream>? HandleFlushHookForTest;
+
+    private long _poolFlushCount;
+
+    /// <summary>Template-pool fsyncs that returned successfully.</summary>
+    internal long PoolFlushCount => Interlocked.Read(ref _poolFlushCount);
+
+    /// <summary>
+    /// Test seam: when set, <see cref="Flush"/> calls this instead of the pool's
+    /// <c>Flush(flushToDisk: true)</c>, so a test can watch or fail the pool fsync.
+    /// Never set in production.
+    /// </summary>
+    internal Action<FileStream>? PoolFlushHookForTest;
 
     /// <summary>
     /// Absolute file offset up to which this WAL is durable: msynced AND its file handle

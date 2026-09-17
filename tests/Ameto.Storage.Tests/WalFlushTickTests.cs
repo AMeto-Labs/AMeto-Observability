@@ -126,6 +126,120 @@ public sealed class WalFlushTickTests : IDisposable
         Assert.Equal(ranges, wal.RangeFlushCount);
     }
 
+    /// <summary>
+    /// A drive flush that fails on every tick must not starve the template pool's fsync. Because
+    /// the watermark waits for the handle flush, every tick of such a WAL, idle or not, retries
+    /// the handle flush and throws. The pool fsync came after it in straight-line code and was
+    /// never reached, so after power loss replay brought the events back with no template or
+    /// with another event's.
+    /// </summary>
+    [Fact]
+    public void HandleFlushFailingOnEveryTick_StillFsyncsThePool()
+    {
+        using var wal = Open();
+        wal.HandleFlushHookForTest = static _ => throw new IOException("simulated FlushFileBuffers failure");
+
+        int poolAttempts = 0;
+        wal.PoolFlushHookForTest = h =>
+        {
+            // The pool's own first fsync fails as well (an IOException, which the pool retries
+            // quietly), so the idle second tick has to reach the pool again past a handle flush
+            // that throws again.
+            if (++poolAttempts == 1) throw new IOException("simulated pool fsync failure");
+            h.Flush(flushToDisk: true);
+        };
+
+        wal.Append(100, Ameto.Core.LogLevel.Information, 0, "tmpl-a", new byte[] { 1, 2, 3 });
+
+        // Tick 1: the handle flush throws, and the pool fsync is still attempted.
+        var ex = Assert.Throws<IOException>(wal.Flush);
+        Assert.Equal("simulated FlushFileBuffers failure", ex.Message);
+        Assert.Equal(1, poolAttempts);
+        Assert.Equal(0, wal.PoolFlushCount);
+
+        // Tick 2: idle, the handle throws again, and the still-dirty pool is fsynced.
+        Assert.Throws<IOException>(wal.Flush);
+        Assert.Equal(2, poolAttempts);
+        Assert.Equal(1, wal.PoolFlushCount);
+
+        // Tick 3: idle and the pool is clean, so there is no pool I/O.
+        Assert.Throws<IOException>(wal.Flush);
+        Assert.Equal(2, poolAttempts);
+
+        // A new template while the drive is still failing gets its row fsynced on the next tick.
+        wal.Append(101, Ameto.Core.LogLevel.Information, 1, "tmpl-b", new byte[] { 4 });
+        Assert.Throws<IOException>(wal.Flush);
+        Assert.Equal(2, wal.PoolFlushCount);
+
+        // None of that moved the WAL's watermark: its tail is still not durable.
+        Assert.Equal(0, wal.HandleFlushCount);
+        Assert.True(wal.LastFlushedOffset < wal.WrittenBytes + 32);
+    }
+
+    /// <summary>
+    /// When the drive flush and the pool fsync fail on the same tick, the drive's exception is
+    /// the one that reaches the flush loop's log. A pool exception thrown from the finally would
+    /// replace it, and the log would name the pool while the WAL tail went on failing. The pool
+    /// must also stay dirty so the next tick fsyncs it. The pool throws a non-IO exception on
+    /// purpose, because the pool always swallowed its own IOException.
+    /// </summary>
+    [Fact]
+    public void HandleAndPoolFailingOnTheSameTick_ReportTheHandleFailure_AndBothAreRetried()
+    {
+        using var wal = Open();
+        bool failing = true;
+        wal.HandleFlushHookForTest = h =>
+        {
+            if (failing) throw new IOException("simulated FlushFileBuffers failure");
+            h.Flush(flushToDisk: true);
+        };
+        wal.PoolFlushHookForTest = h =>
+        {
+            if (failing) throw new UnauthorizedAccessException("simulated pool fsync failure");
+            h.Flush(flushToDisk: true);
+        };
+
+        wal.Append(100, Ameto.Core.LogLevel.Information, 0, "tmpl", new byte[] { 1, 2, 3 });
+
+        var ex = Assert.Throws<IOException>(wal.Flush);
+        Assert.Equal("simulated FlushFileBuffers failure", ex.Message);
+        Assert.Equal(0, wal.PoolFlushCount);
+
+        // The device recovers. The next tick is idle but has both flushes left to do.
+        failing = false;
+        wal.Flush();
+        Assert.Equal(1, wal.HandleFlushCount);
+        Assert.Equal(1, wal.PoolFlushCount);
+        Assert.Equal(wal.WrittenBytes + 32, wal.LastFlushedOffset);
+    }
+
+    /// <summary>
+    /// A pool fsync that fails with something other than an IOException, on a tick where the
+    /// WAL half succeeded, still reaches the loop's log. It also leaves the pool dirty: the flag
+    /// used to be cleared before the fsync and restored only for IOException, so any other
+    /// failure meant the row was never fsynced again.
+    /// </summary>
+    [Fact]
+    public void PoolFsyncFailingAlone_Propagates_AndIsRetriedByTheNextTick()
+    {
+        using var wal = Open();
+        bool failPool = true;
+        wal.PoolFlushHookForTest = h =>
+        {
+            if (failPool) { failPool = false; throw new UnauthorizedAccessException("simulated pool fsync failure"); }
+            h.Flush(flushToDisk: true);
+        };
+
+        wal.Append(100, Ameto.Core.LogLevel.Information, 0, "tmpl", new byte[] { 1, 2, 3 });
+
+        Assert.Throws<UnauthorizedAccessException>(wal.Flush);
+        Assert.Equal(1, wal.HandleFlushCount);
+        Assert.Equal(0, wal.PoolFlushCount);
+
+        wal.Flush();
+        Assert.Equal(1, wal.PoolFlushCount);
+    }
+
     [Fact]
     public void FlushedEntriesSurviveAndReplay()
     {
