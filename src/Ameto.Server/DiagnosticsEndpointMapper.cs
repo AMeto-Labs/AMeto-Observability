@@ -212,9 +212,11 @@ public static class DiagnosticsEndpointMapper
                 ingestBufferPooledBytes  = IngestBufferPool.PooledBytes,
                 ingestBufferBudgetBytes  = IngestBufferPool.MaxPooledTotalBytes,
                 // The payload arena: what it may reserve, and how far into it the buffer has
-                // ever reached. The second figure IS its residency — the pages are never given
-                // back — and it is the largest single thing the ingest path holds. It used to be
-                // reported nowhere: the commit counter next to it is Windows-only by design, so
+                // ever reached (deepest slab x slab size) -- never given back, and the largest
+                // single thing the ingest path holds. On Windows the second figure is the
+                // arena's commit charge; on Linux it is an upper bound on its resident pages,
+                // since a small event touches only the first page of its slab. It used to be
+                // reported nowhere: the ring's commit counter is Windows-only by design, so
                 // on the Linux container this matters most for, no figure existed at all.
                 ingestArenaBytes         = ring.ArenaCapacityBytes,
                 ingestArenaResidentBytes = ring.ArenaHighWaterBytes,

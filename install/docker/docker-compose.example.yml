@@ -85,9 +85,11 @@ services:
       # Payload slab arena (the burst absorption window). Unset = the larger of 8192 slabs of
       # MaxEventPayloadBytes (one OTel collector batch) and 15% of mem_limit, capped at 512 MB:
       # at the 1g limit above the share is ~153 MB and the floor 512 MB, so 512 MB / 8192 slabs.
-      # Touched pages are never given back, but that is per page, not per slab: a small event
-      # touches one 4 KB page of its slab (~32 MB for a full batch); only max-size events approach
-      # 512 MB. Set it explicitly to cap that worst case lower, at the cost of earlier counted drops.
+      # Touched pages are never given back, but on Linux (this image) that is per page, not per
+      # slab: a small event touches one 4 KB page of its slab (~32 MB for a full batch); only
+      # max-size events approach 512 MB. (A Windows host commits up to the deepest slab used
+      # whatever the event size; see docs/CONFIGURATION.md.) Set it explicitly to cap that worst
+      # case lower, at the cost of earlier counted drops.
       # Ameto__Ingestion__PayloadPoolBytes: "536870912"
 
       # ── Query (search budgets + the decoded-index cache) ──────────────────

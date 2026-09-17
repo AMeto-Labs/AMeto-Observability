@@ -98,9 +98,11 @@ public readonly struct MemoryBudgets
     // the runtime itself (~60-90 MB of JIT'd code and runtime data on a self-contained build),
     // the ingest ring, the live hot tier and the WAL mapping — and the managed heap, which sits
     // inside the same container. In a 512 MB container that is 115 + 57 MB managed and 128 MB
-    // native: 300 MB, 59 % of the container. Native is the largest single share because a frozen
-    // tier is bytes already written that cannot be given back until its cold segment is; the
-    // index cache is the smallest because losing it costs latency, not correctness.
+    // native: 300 MB, 59 % of the container -- not counting the ingest arena, whose default is
+    // floored at 8 192 slabs rather than taken as a share and can reach 512 MB by itself (see
+    // IngestArenaFraction). Native is the largest single share because a frozen tier is bytes
+    // already written that cannot be given back until its cold segment is; the index cache is the
+    // smallest because losing it costs latency, not correctness.
 
     /// <summary>Share of the PHYSICAL limit the frozen-tier backlog may hold.</summary>
     public const double NativeTierFraction = 0.25;
@@ -149,12 +151,14 @@ public readonly struct MemoryBudgets
     /// unreclaimable by the RAM pressure path, which is the class of defect
     /// <see cref="IndexCacheNativeCapBytes"/> exists to prevent.</para>
     ///
-    /// <para>Twice the derived backstop and still under the ingest arena's byte share, it leaves
-    /// the tiers' 25 % and these bits' 10 % at a third of the container in the worst case. (The
-    /// arena's default is floored by a slab count, see <see cref="IngestArenaFraction"/>, so its
-    /// worst case is its 512 MB cap rather than a share; its typical residency is a page per
-    /// slab touched.) It is a clamp and never a floor: it can only lower a scaled ceiling, never
-    /// cut into the backstop a host that configured nothing gets.</para>
+    /// <para>Twice the derived backstop, it holds the tiers' 25 % and these bits' 10 % to 35 % of
+    /// the physical limit in the worst case. That bounds these two, not the process's native
+    /// memory: the ingest arena is no longer a share beside them. Its default is floored at 8 192
+    /// slabs (see <see cref="IngestArenaFraction"/>), so at the 64 KB default slab its worst case
+    /// is 512 MB, the whole of a 512 MB container on its own: committed on Windows as soon as the
+    /// ring has been that deep, resident on Linux only if those events were near the maximum
+    /// size. It is a clamp and never a floor: it can only lower a scaled ceiling, never cut into
+    /// the backstop a host that configured nothing gets.</para>
     /// </summary>
     public const double IndexCacheNativeMaxFraction = 0.10;
 
@@ -184,14 +188,20 @@ public readonly struct MemoryBudgets
     /// part way through for want of slabs. That was a real drop at normal load, traded for a
     /// theoretical residency bound.</para>
     ///
-    /// <para><b>The residency trade, honestly.</b> The pages the arena touches are never given
-    /// back, so its high-water mark is a resting level, not a peak. But residency is per touched
-    /// page, not per slab: a typical 0.3-2 KB event touches one 4 KB page at the start of its
-    /// 64 KB slab (lazily paged on Linux; committed in 1 MB chunks as the deepest slab advances on
-    /// Windows), so 8 192 slabs of small events rest at about 32 MB. Only events near the maximum
-    /// size fill their slabs, and that worst case — 512 MB — is the one the flat default always
-    /// had. A small host that expects large events sets <c>Ingestion.PayloadPoolBytes</c>
-    /// explicitly, which always wins.</para>
+    /// <para><b>The residency trade, honestly, and it differs by platform.</b> What the arena
+    /// takes is never given back, so its high-water mark is a resting level, not a peak.</para>
+    /// <list type="bullet">
+    /// <item><b>Linux</b> pages it lazily, so the cost is per touched page, not per slab: a
+    /// typical 0.3-2 KB event touches one 4 KB page at the start of its 64 KB slab, and 8 192
+    /// slabs of small events rest at about 32 MB. Only events near the maximum size fill their
+    /// slabs, and that worst case, 512 MB, is the one the flat default always had.</item>
+    /// <item><b>Windows</b> commits it in 1 MB chunks up to the deepest slab ever handed out and
+    /// never decommits, whatever the events weigh: one batch that outruns the drainer by ~8 192
+    /// events commits ~512 MB even at 300 B an event. The ~32 MB figure is working set there, not
+    /// commit, and a job object's memory limit counts commit.</item>
+    /// </list>
+    /// <para>A host that expects large events, or runs on Windows under a job or container memory
+    /// limit, sets <c>Ingestion.PayloadPoolBytes</c> explicitly, which always wins.</para>
     /// </summary>
     public const double IngestArenaFraction = 0.15;
 
@@ -261,6 +271,12 @@ public readonly struct MemoryBudgets
     /// The byte-share term of the ingest payload arena's default. The arena's actual default also
     /// has a slab-count floor, applied where the slab size is known:
     /// <c>IngestionOptions.DefaultPayloadPoolBytesFor</c>. See <see cref="IngestArenaFraction"/>.
+    ///
+    /// <para>This term decides the default only when the slab is smaller than 64 KB. It is at
+    /// most 512 MB, and the floor is 8 192 slabs capped at 512 MB, which is exactly 512 MB from a
+    /// 64 KB slab up; so at the default slab size, or above it, the floor wins on every host and
+    /// this figure is not the arena's size. Below 64 KB it wins only where 15 % of the physical
+    /// limit exceeds 8 192 slabs.</para>
     /// </summary>
     public long IngestArenaBytes { get; }
 

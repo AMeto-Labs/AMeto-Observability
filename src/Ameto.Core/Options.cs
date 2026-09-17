@@ -152,16 +152,28 @@ public sealed class IngestionOptions
     /// <c>dropped</c>, gRPC partial success). The byte share decides the size only when the slab
     /// is small enough that 8 192 of them come to less than it.</para>
     ///
-    /// <para><b>What that costs.</b> The arena is reserved virtual memory, and the pages it
-    /// touches are never given back, so its high-water mark is a resting level. Residency is per
-    /// touched PAGE, not per slab: on Linux the allocation is lazily paged and a typical 0.3-2 KB
-    /// event touches one 4 KB page at the start of its slab, so a full default batch of small
-    /// events rests at about 32 MB; on Windows the arena commits in 1 MB chunks as the deepest
-    /// slab advances. Only events near the maximum size approach the full slab each, which is the
-    /// same 512 MB worst case the flat default always had. A small host that expects large events,
-    /// or needs a hard ceiling below that, sets this explicitly and accepts that a batch then
-    /// meets back-pressure earlier. <c>/api/diagnostics</c> reports the high-water mark as
-    /// <c>ingestArenaResidentBytes</c>. An explicit value always wins.</para>
+    /// <para><b>What that costs, which depends on the operating system.</b> The arena is reserved
+    /// virtual memory, and what it takes is never given back, so its high-water mark is a resting
+    /// level, not a peak.</para>
+    /// <list type="bullet">
+    /// <item><b>Linux</b>: the allocation is lazily paged, so residency is per touched PAGE, not
+    /// per slab. A typical 0.3-2 KB event touches one 4 KB page at the start of its slab, so a
+    /// full default batch of small events rests at about 32 MB. Only events near the maximum size
+    /// fill their slabs, which is the same 512 MB worst case the flat default always had.</item>
+    /// <item><b>Windows</b>: the range is reserved and COMMITTED, in 1 MB chunks, up to the
+    /// deepest slab ever handed out, whatever the events in it weigh, and never decommitted. One
+    /// batch that outruns the drainer by ~8 192 events therefore commits ~512 MB even at 300 B an
+    /// event. The working set still grows only by the pages written, but commit charge is what a
+    /// job object's memory limit counts, and what counts against the system commit limit. <b>Under a
+    /// Windows job or container memory limit, set this explicitly</b> to what that limit can
+    /// carry.</item>
+    /// </list>
+    /// <para>A host that expects large events, or needs a hard ceiling below 512 MB, likewise sets
+    /// this explicitly and accepts that a burst then meets back-pressure earlier (counted as
+    /// <c>ingestDroppedNoSlab</c>). <c>/api/diagnostics</c> reports
+    /// <c>ingestArenaResidentBytes</c>: the deepest slab ever handed out times the slab size. On
+    /// Windows that is the commit charge (to within 1 MB); on Linux it is an upper bound on the
+    /// arena's resident memory, not a measurement of it. An explicit value always wins.</para>
     /// </summary>
     public long? PayloadPoolBytes { get; init; }
 

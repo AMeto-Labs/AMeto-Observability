@@ -100,8 +100,11 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
     /// Slab arena budget. slabCount = min(capacity, budget / slabSize) — this, not the ring
     /// capacity, is the true absorption window when the drainer stalls: once slabs run out,
     /// events with payloads are dropped even with free ring slots. The arena is reserved
-    /// virtual memory; only pages actually written become resident (~real payload bytes,
-    /// not slabCount × slabSize), so a generous budget costs little RSS.
+    /// virtual memory. On Linux only pages actually written become resident (~real payload
+    /// bytes, not slabCount × slabSize), so a generous budget costs little RSS. On Windows
+    /// (see <see cref="SlabArena"/>) it is committed up to the deepest slab ever handed out,
+    /// whatever the payloads weigh, and never decommitted — commit charge a job object's memory
+    /// limit counts.
     /// </param>
     public IngestionRingBuffer(int capacity = 1 << 16, int maxPayloadBytesPerSlot = 64 * 1024, long payloadPoolBytes = DefaultPayloadPoolBytes)
     {
@@ -201,10 +204,14 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
 
     /// <summary>
     /// Bytes of the arena the buffer has ever reached: the deepest slab handed out, times the
-    /// slab size. THE RESIDENCY FIGURE, and the one that holds on every platform —
+    /// slab size. The one arena figure that exists on every platform —
     /// <see cref="ArenaCommittedBytes"/> is -1 wherever pages fault in lazily, which is
     /// everywhere but Windows, so on the Linux containers this matters most for there was no
-    /// figure at all. Pages are never given back, so this is a resting level and not a peak.
+    /// figure at all. What it means differs: on Windows it is the commit charge (which
+    /// <see cref="ArenaCommittedBytes"/> rounds up to the next commit chunk); on Linux it is an
+    /// UPPER BOUND on the arena's resident memory, not a measurement of it, because a page
+    /// becomes resident only when written and a small event writes only the first page of its
+    /// slab. Nothing below it is ever given back, so this is a resting level and not a peak.
     /// </summary>
     public long ArenaHighWaterBytes => Volatile.Read(ref _slabHighWater) * _slabBytes;
 
