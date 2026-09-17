@@ -1,5 +1,6 @@
 using Ameto.Core;
 using Ameto.Indexing;
+using Ameto.Testing;
 using Xunit;
 
 namespace Ameto.Indexing.Tests;
@@ -65,19 +66,30 @@ public sealed class SegmentIndexCacheIdleEvictionTests
         Assert.Equal(1, cache.EntryCount);
     }
 
+    /// <summary>
+    /// A cache on a clock that moves only when the test advances it. Its sweep timer fires inside
+    /// <see cref="ManualTimeProvider.Advance"/>, on the test's thread, so no sweep ever runs beside
+    /// an assertion, and a stamp cannot age because the runner descheduled the test for a while.
+    /// </summary>
+    private static SegmentIndexCache NewCache(TimeSpan idleEvict, ManualTimeProvider clock) =>
+        new(1 << 20, 0, idleEvict, clock);
+
     [Fact]
     public void Untouched_entry_is_evicted_and_its_native_memory_released()
     {
-        var cache = new SegmentIndexCache(1 << 20, TimeSpan.FromMilliseconds(30));
+        var clock = new ManualTimeProvider();
+        using var cache = NewCache(TimeSpan.FromMilliseconds(30), clock);
         var r = NewNativeReader();
         Assert.True(r.ApproxRetainedBytes > 0);      // there really are native bits to free
         using (cache.Insert("a.seg", 0, true, r, 100)) { }
 
+        clock.Advance(TimeSpan.FromMilliseconds(29));
         Assert.Equal(0, cache.Sweep());               // still young: nothing goes
         Assert.Equal(1, cache.EntryCount);
 
-        // The background timer may get there first — assert the outcome, not who did it.
-        Thread.Sleep(80);
+        // The sweep timer fires inside the advance and may get there first — assert the outcome,
+        // not who did it. Everything it does has finished by the time Advance returns.
+        clock.Advance(TimeSpan.FromMilliseconds(51));
         cache.Sweep();
         Assert.Equal(0, cache.EntryCount);
         Assert.Equal(0, cache.TotalBytes);
@@ -115,13 +127,16 @@ public sealed class SegmentIndexCacheIdleEvictionTests
     [Fact]
     public void Touched_entry_survives_while_its_neighbours_age_out()
     {
-        var cache = new SegmentIndexCache(1 << 20, TimeSpan.FromMilliseconds(50));
+        var clock = new ManualTimeProvider();
+        using var cache = NewCache(TimeSpan.FromMilliseconds(50), clock);
         using (cache.Insert("cold.seg", 0, true, NewNativeReader(), 100)) { }
         using (cache.Insert("hot.seg",  0, true, NewNativeReader(), 100)) { }
 
+        // 120 ms in all, well past cold's idle age; hot is never more than 20 ms old, and the
+        // sweep timer runs at every 12.5 ms crossed on the way.
         for (int i = 0; i < 6; i++)
         {
-            Thread.Sleep(20);
+            clock.Advance(TimeSpan.FromMilliseconds(20));
             cache.TryAcquire("hot.seg", 0, false)?.Dispose();   // keeps refreshing its stamp
         }
 
@@ -155,14 +170,17 @@ public sealed class SegmentIndexCacheIdleEvictionTests
     [Fact]
     public void Timer_sweeps_an_idle_cache_with_no_caller()
     {
-        using var cache = new SegmentIndexCache(1 << 20, TimeSpan.FromMilliseconds(100));
+        var clock = new ManualTimeProvider();
+        using var cache = NewCache(TimeSpan.FromMilliseconds(100), clock);
         using (cache.Insert("a.seg", 0, true, NewNativeReader(), 100)) { }
+        Assert.Equal(1, clock.ActiveTimers);          // the cache armed its own sweep
 
-        var deadline = DateTime.UtcNow.AddSeconds(5);
-        while (cache.EntryCount > 0 && DateTime.UtcNow < deadline) Thread.Sleep(25);
+        // The idle age plus one sweep period (a quarter of it). Nothing here calls Sweep: only the
+        // cache's timer, which fires inside the advance, can have removed the entry.
+        clock.Advance(TimeSpan.FromMilliseconds(100 + 25));
 
         Assert.Equal(0, cache.EntryCount);
-        Assert.True(cache.IdleEvictedCount >= 1);
+        Assert.Equal(1, cache.IdleEvictedCount);
     }
 
     /// <summary>A disabled cache retains nothing, so it must not start a timer either.</summary>

@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using Ameto.Core;
 
 namespace Ameto.Indexing;
@@ -56,8 +55,9 @@ public sealed class SegmentIndexCache : IDisposable, IMemoryShedder
     private readonly LinkedList<Entry>                        _lru  = new(); // head = most recent
     private readonly long                                     _budgetBytes;
     private readonly long                                     _nativeBudgetBytes; // 0 = no separate ceiling
-    private readonly long                                     _idleTicks;   // 0 = no idle eviction
-    private readonly Timer?                                   _sweepTimer;
+    private readonly long                                     _idleTicks;   // 0 = no idle eviction; in _time's units
+    private readonly TimeProvider                             _time;
+    private readonly ITimer?                                  _sweepTimer;
     private          long                                     _totalBytes;
     private          long                                     _nativeBytes;
     private          long                                     _hits, _misses;
@@ -84,13 +84,24 @@ public sealed class SegmentIndexCache : IDisposable, IMemoryShedder
     /// less turns it off, which is the pre-existing behaviour (budget pressure only).
     /// </param>
     public SegmentIndexCache(long budgetBytes, long nativeBudgetBytes, TimeSpan idleEvict)
+        : this(budgetBytes, nativeBudgetBytes, idleEvict, TimeProvider.System) { }
+
+    /// <summary>The public constructor with its clock made explicit.</summary>
+    /// <param name="time">
+    /// The clock behind idle eviction: each entry's last-touch stamp, the sweep's cutoff and the
+    /// sweep timer. <see cref="TimeProvider.System"/> outside tests. A test passes a clock it moves by
+    /// hand, because against the wall clock a sweep timer ticking every few milliseconds raced every
+    /// assertion, on a CI runner that can deschedule a thread for longer than the whole idle age.
+    /// </param>
+    internal SegmentIndexCache(long budgetBytes, long nativeBudgetBytes, TimeSpan idleEvict, TimeProvider time)
     {
         _budgetBytes       = budgetBytes;
         _nativeBudgetBytes = nativeBudgetBytes;
+        _time              = time;
         // Past MaxIdleEvict the age is "never": treated as off, which is what it means, and which
-        // keeps the Stopwatch-tick conversion below inside a long on every platform.
+        // keeps the timestamp conversion below inside a long on every platform.
         IdleEvict    = idleEvict > TimeSpan.Zero && idleEvict <= MaxIdleEvict ? idleEvict : TimeSpan.Zero;
-        _idleTicks   = (long)(IdleEvict.TotalSeconds * Stopwatch.Frequency);
+        _idleTicks   = (long)(IdleEvict.TotalSeconds * time.TimestampFrequency);
 
         if (_idleTicks <= 0 || !Enabled) return;
 
@@ -106,7 +117,7 @@ public sealed class SegmentIndexCache : IDisposable, IMemoryShedder
         // therefore released within a day of its idle age rather than within a quarter of it.
         long periodTicks = Math.Clamp(IdleEvict.Ticks / 4, TimeSpan.TicksPerMillisecond, MaxSweepPeriod.Ticks);
         var  period      = TimeSpan.FromTicks(periodTicks);
-        _sweepTimer = new Timer(static s => ((SegmentIndexCache)s!).Sweep(), this, period, period);
+        _sweepTimer = time.CreateTimer(static s => ((SegmentIndexCache)s!).Sweep(), this, period, period);
     }
 
     /// <summary>
@@ -170,7 +181,7 @@ public sealed class SegmentIndexCache : IDisposable, IMemoryShedder
         public          long                     NativeSize;  // the part of Size that is NativeMemory
         public int  RefCount;                    // guarded by the cache lock
         public bool Doomed;                      // evicted/replaced — dispose at RefCount 0
-        public long LastTouched;                 // Stopwatch timestamp of the last acquire
+        public long LastTouched;                 // the cache clock's timestamp of the last acquire
         public LinkedListNode<Entry>? Node;      // null once off the LRU
     }
 
@@ -199,7 +210,7 @@ public sealed class SegmentIndexCache : IDisposable, IMemoryShedder
                 return null;
             }
             e.RefCount++;
-            e.LastTouched = Stopwatch.GetTimestamp();
+            e.LastTouched = _time.GetTimestamp();
             _lru.Remove(e.Node!);
             _lru.AddFirst(e.Node!);
             Interlocked.Increment(ref _hits);
@@ -237,7 +248,7 @@ public sealed class SegmentIndexCache : IDisposable, IMemoryShedder
                 // Lost the race to an equal-or-better entry — serve that one, drop ours.
                 (toDispose ??= []).Add(reader);
                 existing.RefCount++;
-                existing.LastTouched = Stopwatch.GetTimestamp();
+                existing.LastTouched = _time.GetTimestamp();
                 _lru.Remove(existing.Node!);
                 _lru.AddFirst(existing.Node!);
                 lease = new Lease(this, existing);
@@ -250,7 +261,7 @@ public sealed class SegmentIndexCache : IDisposable, IMemoryShedder
                 var e = new Entry
                 {
                     Key = key, Reader = reader, HasTrigram = hasTrigram,
-                    Size = sizeBytes, RefCount = 1, LastTouched = Stopwatch.GetTimestamp(),
+                    Size = sizeBytes, RefCount = 1, LastTouched = _time.GetTimestamp(),
                     // Read off the reader rather than passed in: the caller charges one number,
                     // and only the reader knows how much of it the GC cannot see.
                     NativeSize = reader.ApproxNativeBytes,
@@ -322,7 +333,7 @@ public sealed class SegmentIndexCache : IDisposable, IMemoryShedder
 
         List<SegmentIndexReader>? toDispose = null;
         int evicted = 0;
-        long cutoff = Stopwatch.GetTimestamp() - _idleTicks;
+        long cutoff = _time.GetTimestamp() - _idleTicks;
         lock (_lock)
         {
             // The LRU tail is the least recently touched entry, so the first young one ends
