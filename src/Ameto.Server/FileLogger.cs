@@ -33,6 +33,14 @@ public sealed class FileLoggerProvider : ILoggerProvider
     private StreamWriter? _writer;
     private DateOnly      _openFor;
 
+    /// <summary>
+    /// Set first thing in <see cref="Dispose"/>, so <see cref="Enqueue"/> drops a late line without
+    /// touching <see cref="_queue"/>, which Dispose may already have disposed: every member of a
+    /// disposed <see cref="BlockingCollection{T}"/> throws, and MEL hands that throw back to the
+    /// caller that logged.
+    /// </summary>
+    private volatile bool _disposed;
+
     public FileLoggerProvider(string directory, LogLevel minimumLevel, int retainDays = 7)
     {
         _dir        = directory;
@@ -50,12 +58,20 @@ public sealed class FileLoggerProvider : ILoggerProvider
     internal bool IsEnabled(LogLevel level) => level >= _min && level != LogLevel.None;
 
     /// <summary>Hands a formatted line to the drain. Drops rather than blocks when the
-    /// queue is saturated — losing a log line must never stall ingest.</summary>
+    /// queue is saturated — losing a log line must never stall ingest — and drops, never throws,
+    /// once the provider is disposed.</summary>
     internal void Enqueue(string line)
     {
-        if (_queue.IsAddingCompleted) return;
+        // Not _queue.IsAddingCompleted: that is a member of the queue too, and throws
+        // ObjectDisposedException once Dispose has disposed it. A late line — a flush left running
+        // past the host's shutdown budget logging "Flushed segment" — then threw out of the
+        // caller's LogInformation, skipping whatever the caller did next (the WAL delete and the
+        // tier retire, in that case).
+        if (_disposed) return;
         try { _queue.TryAdd(line); }
-        catch (InvalidOperationException) { /* completed concurrently */ }
+        // Read _disposed as false, then lost the race to Dispose: InvalidOperationException once
+        // adding is completed, ObjectDisposedException (which derives from it) once disposed.
+        catch (InvalidOperationException) { }
     }
 
     private async Task DrainAsync()
@@ -125,6 +141,10 @@ public sealed class FileLoggerProvider : ILoggerProvider
 
     public void Dispose()
     {
+        // Before anything below can dispose the queue. A line logged from here on is dropped, as it
+        // would be once CompleteAdding runs anyway.
+        _disposed = true;
+
         // CompleteAdding is what ends the drain's GetConsumingEnumerable, so on a healthy
         // shutdown the wait below returns once the backlog is on disk and the drain's
         // finally has flushed the writer.

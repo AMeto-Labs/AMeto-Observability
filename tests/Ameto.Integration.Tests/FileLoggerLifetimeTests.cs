@@ -43,4 +43,40 @@ public sealed class FileLoggerLifetimeTests
         Assert.True(ReferenceEquals(exited, provider.Drain),
             "the host was disposed but its file logger's drain is still waiting on the queue");
     }
+
+    /// <summary>
+    /// A line logged after the provider is disposed is dropped, never thrown. Loggers outlive their
+    /// provider: a flush left running past the host's shutdown budget still logs "Flushed segment"
+    /// through the <see cref="ILogger"/> it was handed at startup. Enqueue used to ask the disposed
+    /// queue whether adding was completed, which throws ObjectDisposedException, and MEL rethrows a
+    /// provider's throw to the caller as an AggregateException — so that flush skipped its WAL
+    /// delete and leaked its tier.
+    /// </summary>
+    [Fact]
+    public void A_line_logged_through_an_existing_logger_after_the_provider_is_disposed_is_dropped_not_thrown()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "ameto-filelog-" + Guid.NewGuid().ToString("N"));
+        var provider = new FileLoggerProvider(dir, LogLevel.Information);
+        try
+        {
+            // A provider handed to the factory's constructor stays the caller's to dispose.
+            using var factory = new LoggerFactory([provider]);
+            var logger = factory.CreateLogger("Ameto.Storage.StorageEngine");
+            logger.LogInformation("before dispose");
+
+            provider.Dispose();
+            Assert.True(provider.Drain.IsCompleted, "precondition: the drain finished, so Dispose went on to dispose the queue");
+
+            var thrown = Record.Exception(() => logger.LogInformation("after dispose"));
+
+            Assert.Null(thrown);
+            string written = string.Concat(Directory.GetFiles(dir, "ameto-*.log").Select(File.ReadAllText));
+            Assert.Contains("before dispose", written);
+            Assert.DoesNotContain("after dispose", written);
+        }
+        finally
+        {
+            try { Directory.Delete(dir, recursive: true); } catch { /* best-effort */ }
+        }
+    }
 }
