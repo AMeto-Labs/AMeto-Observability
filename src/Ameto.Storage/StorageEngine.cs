@@ -983,20 +983,18 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         // ── The event is COMMITTED from here on. Nothing below may throw out of TryWrite:
         //    the drainer treats a thrown TryWrite as "not written" and retries the same
         //    event — which would insert another copy (fresh id) into the tier per attempt.
-        // The WAL entry's index is 16 bits with no "not pooled" value, so an event outside the
-        // pool (-1 once it is full, or a claim at/past 65 536 whose cast is 0) is logged as 0.
-        // Such an event must then write NO pool row: Append saves the text it is handed as row
-        // 0, recovery force-interns that row, and every genuine index-0 event of the WAL came
-        // back with the unpooled event's template. The receivers attach the materialised text
-        // to exactly those events, so this was the first unpooled event into every fresh WAL.
-        // The hook still gets the attached text; only the WAL is handed "" (Append skips it).
-        bool   pooled  = (uint)h.MessageTemplatePoolIndex <= ushort.MaxValue;
-        ushort tmplIdx = pooled ? (ushort)h.MessageTemplatePoolIndex : (ushort)0;
+        // The WAL entry's index is 16 bits and all 65 536 values are real pool ids, so an event
+        // outside the pool (-1 once it is full, or a claim at/past 65 536) is passed through
+        // as-is and Append logs it with the Unpooled flag instead of an index. It writes NO
+        // pool row for it: a row 0 carrying the unpooled text would be force-interned by
+        // recovery and become every genuine index-0 event's template. And without the flag,
+        // recovery gave the unpooled event itself index 0's template whenever the pool file
+        // held any row. The hook still gets the attached text; the WAL never stores it.
         string tmplStr = template
                          ?? (h.MessageTemplatePoolIndex >= 0 ? TemplatePool.Get(h.MessageTemplatePoolIndex) : string.Empty);
         try
         {
-            w.Wal?.Append(h.TimestampUtcTicks, h.Level, tmplIdx, pooled ? tmplStr : string.Empty, propertiesPayload, exception);
+            w.Wal?.Append(h.TimestampUtcTicks, h.Level, h.MessageTemplatePoolIndex, tmplStr, propertiesPayload, exception);
             _walFaulted = false;
         }
         catch (ObjectDisposedException)
@@ -2845,6 +2843,10 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         int replayed = 0;
         foreach (var entry in entries)
         {
+            // Unpooled: the event was outside a saturated pool when it was logged. Its index
+            // field is 0 and names nothing, and its template text was never stored, so it
+            // replays with no template. Resolving the 0 attached index 0's template to it.
+            bool noTemplate = poolMissing || entry.Unpooled;
             var header = new LogEventHeader
             {
                 Id                       = _idGen.Next(entry.TimestampTicks),
@@ -2853,7 +2855,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 // With no pool the stored index points at whatever the LIVE pool holds
                 // at that slot — resolving it would stamp a random template onto every
                 // recovered event. -1 = "no template", persisted as an empty @mt.
-                MessageTemplatePoolIndex = poolMissing ? -1 : entry.TemplateIndex,
+                MessageTemplatePoolIndex = noTemplate ? -1 : entry.TemplateIndex,
                 // EXPLICITLY -1. The WAL entry format carries no service name, so "absent" is
                 // the only honest value — but the field is a plain int on a struct, and its
                 // default of 0 is a VALID pool index, not the sentinel every reader tests for
@@ -2867,7 +2869,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             };
             // Resolve template via the freshly restored pool and attach it
             // to the hot tier so the recovery flush persists @mt correctly.
-            string tmpl = poolMissing ? string.Empty : TemplatePool.Get(entry.TemplateIndex);
+            string tmpl = noTemplate ? string.Empty : TemplatePool.Get(entry.TemplateIndex);
             if (recoveredHot.TryWrite(header, entry.Payload, tmpl, entry.Exception))
                 replayed++;
         }

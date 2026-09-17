@@ -13,11 +13,25 @@ namespace Ameto.Storage;
 /// Format:
 ///   [WAL Header   — 32 bytes]
 ///   [Entry 0 …]
-///     [Entry Header — 24 bytes: payloadLen uint32, timestamp int64, level byte, pad byte,
+///     [Entry Header — 24 bytes: payloadLen uint32, timestamp int64, level byte, flags byte,
 ///      templateIndex uint16, exceptionLen uint32, crc32c uint32]
 ///     [Entry Payload — raw msgpack bytes][Exception — msgpack ExceptionInfo]
 ///   [Entry 1 …]
 ///   ...
+///
+/// Flags (byte 13 of the entry header, inside the checksummed range):
+///   bit 0 — Unpooled: the event's template was outside the template pool (the pool was full,
+///           or the index was past its 65 536 ids). templateIndex is then 0 and meaningless,
+///           no pool row was written, and the template TEXT is not in the WAL at all, so
+///           recovery yields the event with no template. Without the bit, a replay whose pool
+///           file held any row resolved index 0 and gave the event index 0's template.
+///   Other bits are reserved and written as zero.
+/// The byte was unwritten padding before this flag existed, and the format is still v4: the
+/// previous build never set it, and the engine opens every WAL as a fresh file named after a
+/// newly reserved segment block and extends it with SetLength, which zero-fills. Entries that
+/// build wrote therefore read back with no flag and replay exactly as they did. (Only a
+/// same-name reopen that reset the write offset over older entries could leave a stale byte
+/// there, and the engine never reuses a WAL name.) Append now writes the byte explicitly.
 ///
 /// The WAL is append-only. On crash recovery, the storage layer replays complete entries
 /// and rebuilds the hot-tier up to the last entry whose checksum verifies.
@@ -48,6 +62,8 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
     private const int    EntryHeaderSizeV3 = 20;
     // Bytes of the entry header covered by the checksum (everything except the crc itself).
     private const int    ChecksummedHeaderBytes = EntryHeaderSize - 4;
+    // WalEntryHeader.Flags: the event's template is outside the pool (see the class doc).
+    private const byte   EntryFlagUnpooled = 0x01;
 
     [StructLayout(LayoutKind.Sequential, Size = FileHeaderSize)]
     private struct WalFileHeader
@@ -70,8 +86,8 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
         public uint   PayloadLength;
         public long   TimestampTicks;
         public byte   Level;
-        private byte  _pad;
-        public ushort TemplateIndex;   // index into companion .pool file
+        public byte   Flags;           // EntryFlag* bits; was never-written padding (see the class doc)
+        public ushort TemplateIndex;   // index into companion .pool file; 0 and meaningless when Unpooled
         public uint   ExceptionLength; // bytes of msgpack ExceptionInfo appended after payload
         public uint   Checksum;        // CRC32C over header[0..20) + payload + exception (v4+)
     }
@@ -183,17 +199,26 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
 
     // ── Append ───────────────────────────────────────────────────────────────
 
-    /// <summary>
-    /// Appends a single event payload to the WAL. Thread-safe via lock.
-    /// Fast path: a single Span copy into the mmap region.
-    /// </summary>
     // Reused per thread: exception msgpack scratch — the bytes are copied into the mmap
     // below, so nothing outlives the call. Avoids a byte[] per exception-carrying event.
     [ThreadStatic] private static System.Buffers.ArrayBufferWriter<byte>? _tExc;
 
-    public unsafe void Append(long timestampTicks, LogLevel level, ushort templateIndex, string template, ReadOnlySpan<byte> payload, ExceptionInfo? exception = null)
+    /// <summary>
+    /// Appends a single event payload to the WAL. Thread-safe via lock.
+    /// Fast path: a single Span copy into the mmap region.
+    /// </summary>
+    /// <param name="templateIndex">
+    /// The event's template-pool index. Anything outside <c>[0, 65 535]</c> (-1 once the pool
+    /// is full, or a claim past its cap) is logged as UNPOOLED: the entry carries the Unpooled
+    /// flag with index 0, and <paramref name="template"/> is ignored, so no pool row is written
+    /// for it. Recovery then yields that event with no template.
+    /// </param>
+    public unsafe void Append(long timestampTicks, LogLevel level, int templateIndex, string template, ReadOnlySpan<byte> payload, ExceptionInfo? exception = null)
     {
-        EnsureTemplateInPool(templateIndex, template);
+        // One unsigned compare covers both -1 and anything past the pool's 65 536 ids.
+        bool   pooled = (uint)templateIndex <= ushort.MaxValue;
+        ushort index  = pooled ? (ushort)templateIndex : (ushort)0;
+        if (pooled) EnsureTemplateInPool(index, template);
 
         ReadOnlySpan<byte> excBytes = default;
         if (exception is not null)
@@ -228,7 +253,10 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
             eh.PayloadLength   = (uint)payload.Length;
             eh.TimestampTicks  = timestampTicks;
             eh.Level           = (byte)level;
-            eh.TemplateIndex   = templateIndex;
+            // Written explicitly, set or not: the bytes under a reset write offset are not
+            // guaranteed zero, and the checksum below covers whatever is here.
+            eh.Flags           = pooled ? (byte)0 : EntryFlagUnpooled;
+            eh.TemplateIndex   = index;
             eh.ExceptionLength = (uint)excBytes.Length;
 
             // Checksum the header bytes (crc field excluded — it is the last 4 bytes)
@@ -549,6 +577,8 @@ public sealed unsafe partial class WriteAheadLog : IDisposable
             TimestampTicks = eh.TimestampTicks,
             Level          = (LogLevel)eh.Level,
             TemplateIndex  = eh.TemplateIndex,
+            // v3 entries predate the flag and their byte 13 was never written: never unpooled.
+            Unpooled       = !v3Layout && (eh.Flags & EntryFlagUnpooled) != 0,
             Payload        = payload,
             Exception      = exception,
         };
@@ -726,6 +756,14 @@ public sealed class WalEntry
     public long           TimestampTicks { get; init; }
     public LogLevel       Level          { get; init; }
     public ushort         TemplateIndex  { get; init; }
+
+    /// <summary>
+    /// The event's template was outside the template pool when it was logged.
+    /// <see cref="TemplateIndex"/> is then 0 and names nothing, and the WAL never stored the
+    /// template text, so the event is recovered with no template.
+    /// </summary>
+    public bool           Unpooled       { get; init; }
+
     public byte[]         Payload        { get; init; } = [];
     public ExceptionInfo? Exception      { get; init; }
 }
