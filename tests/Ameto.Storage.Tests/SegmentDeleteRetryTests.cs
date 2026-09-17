@@ -152,6 +152,75 @@ public sealed class SegmentDeleteRetryTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task A_re_import_landing_between_a_retry_s_catalog_check_and_its_unlink_keeps_its_file()
+    {
+        await _engine.CatalogLoaded;
+
+        var (path, key) = ImportPeerSegment(15);
+
+        // Parked by a failure the unlink seam stages, so this runs on every platform; on Windows a
+        // query's open reader parks it the same way.
+        _engine._deleteSegmentFile = static p => throw new IOException($"The process cannot access the file '{p}'.");
+        await _engine.DeleteSegmentAsync(key);
+        Assert.Equal(1, _engine.PendingSegmentDeleteCount);   // setup
+
+        // The peer pushes the same segment again, staged beside the final path as the replication
+        // endpoint stages it. The old file is still at the final path, so the import's move fails
+        // and its incumbent branch registers that file: the entry then names the parked path.
+        string staged = Path.Combine(SegDir, $"{Peer.Value}-15.0badf00d.seg.tmp");
+        File.Copy(path, staged);
+
+        using var go        = new ManualResetEventSlim();
+        using var published = new ManualResetEventSlim();
+        SegmentImportOutcome? outcome     = null;
+        Exception?            importError = null;
+        _engine._afterImportPublish = published.Set;
+
+        // A thread already running and parked on the signal, not a pool task: when the retry's
+        // lock is missing, the import must get through inside the half second below, and a pool
+        // under a parallel test run can take longer than that just to start a task.
+        var import = new Thread(() =>
+        {
+            go.Wait();
+            try { outcome = _engine.ImportSegment(staged, path); }
+            catch (Exception ex) { importError = ex; }
+        }) { IsBackground = true };
+        import.Start();
+
+        // The reader has closed, and the retry has found no entry naming the path. Between that
+        // check and the unlink, the import is let go and given half a second. With the retry
+        // holding _importLock across both, the import cannot publish in that time: it runs once
+        // the unlink is done, and its move then lands the file on a free path. Without the lock it
+        // registers the old file here, and the unlink below removes the file its entry names.
+        // (Nothing in this hook may throw: the retry's catch would take it for a failed unlink.)
+        bool attempted = false, publishedInside = false;
+        _engine._deleteSegmentFile = p =>
+        {
+            if (!attempted)
+            {
+                attempted = true;
+                go.Set();
+                publishedInside = published.Wait(TimeSpan.FromMilliseconds(500));
+                if (publishedInside) import.Join(TimeSpan.FromSeconds(20));
+            }
+            File.Delete(p);
+        };
+
+        int left = _engine.RetryPendingSegmentDeletes();
+        go.Set();
+        Assert.True(import.Join(TimeSpan.FromSeconds(20)), "setup: the import never finished");
+
+        Assert.Null(importError);
+        Assert.True(attempted, "setup: the retry never reached its unlink");
+        Assert.False(publishedInside, "the re-import published its entry between the retry's catalog check and its unlink");
+        Assert.Equal(SegmentImportOutcome.Registered, outcome);
+        Assert.Equal(0, left);
+        Assert.True(InCatalog(key));
+        Assert.True(File.Exists(path), "the retry unlinked the file of the entry a re-import had just registered");
+        Assert.False(File.Exists(staged));
+    }
+
+    [Fact]
     public async Task The_background_retry_deletes_the_file_after_the_reader_closes()
     {
         if (!OperatingSystem.IsWindows()) return;
