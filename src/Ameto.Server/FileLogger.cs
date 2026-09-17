@@ -44,8 +44,8 @@ public sealed class FileLoggerProvider : ILoggerProvider
 
     public ILogger CreateLogger(string categoryName) => new FileLogger(this, categoryName);
 
-    /// <summary>Test-facing: true once the drain has left the queue — which only <see cref="Dispose"/> makes it do.</summary>
-    internal bool DrainExited => _drain.IsCompleted;
+    /// <summary>Test-facing: the drain, which leaves the queue only once <see cref="Dispose"/> completes adding.</summary>
+    internal Task Drain => _drain;
 
     internal bool IsEnabled(LogLevel level) => level >= _min && level != LogLevel.None;
 
