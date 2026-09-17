@@ -341,8 +341,10 @@ public sealed class AggregationExecutor(
 
         // A segment the header scan could not read is left out of every count, and the scan
         // carries on — right for a volume chart, wrong for an answer read as a fact. The event
-        // scan would have failed the query outright over the same file; a total that is quietly
-        // low is worse than that, so it is reported as the floor it is.
+        // scan is no model to copy here: a torn BLOCK fails its query outright, but a file whose
+        // header or footer SegmentReader.Open rejects is skipped by ScanSegmentAsync without a
+        // word, and its count comes back quietly low. That is the worst of the three outcomes,
+        // so this road reports the total as the floor it is, whichever part of the file is torn.
         //
         // A segment a merge rewrote under the scan is left out too, for a different reason and
         // with its own words: nothing is damaged and nothing is logged above Debug, so pointing
