@@ -25,12 +25,21 @@ public sealed class LogVolumeCounts
     /// <summary>
     /// Cold segments in the window that the catalog still serves but that could not be read, and
     /// so were left out (a torn block, a file missing under a live entry). A segment that a merge
-    /// or retention removed while the scan ran is not one of them: nothing is damaged, and a
-    /// merge's events are in its output (which a snapshot taken just before the merge published
-    /// does not list, the same race every snapshot-based read has). Non-zero means each count
-    /// above is a floor. Not required, so a caller that only draws a chart can ignore it.
+    /// or retention removed while the scan ran is not one of them: nothing is damaged (a merge's
+    /// removals are in <see cref="MergedAwaySegments"/>). Non-zero means each count above is a
+    /// floor. Not required, so a caller that only draws a chart can ignore it.
     /// </summary>
     public int SkippedSegments { get; init; }
+
+    /// <summary>
+    /// Cold segments in the window that a merge rewrote after the scan took its snapshot and
+    /// before it read them, and so were left out. Nothing is damaged — their events are in the
+    /// merged output — but that output is not in the snapshot, so non-zero means each count
+    /// above is a floor, and running the same scan again reads the output instead. A segment
+    /// retention removed is not counted here or anywhere: its events are gone, so the count
+    /// without them is exact. Not required, like <see cref="SkippedSegments"/>.
+    /// </summary>
+    public int MergedAwaySegments { get; init; }
 }
 
 /// <summary>
@@ -83,10 +92,12 @@ public sealed class LogVolumeAggregator
     private long _total;
     private long _scanned;
     private int  _skippedSegments;
+    private int  _mergedAwaySegments;
 
-    public long Total           => _total;
-    public long Scanned         => _scanned;
-    public int  SkippedSegments => _skippedSegments;
+    public long Total              => _total;
+    public long Scanned            => _scanned;
+    public int  SkippedSegments    => _skippedSegments;
+    public int  MergedAwaySegments => _mergedAwaySegments;
 
     /// <param name="fromTicks">Inclusive lower bound (UTC ticks); events outside are ignored.</param>
     /// <param name="toTicks">Inclusive upper bound (UTC ticks).</param>
@@ -167,6 +178,13 @@ public sealed class LogVolumeAggregator
     /// <see cref="MergeFrom"/> folds them under the caller's lock.
     /// </summary>
     public void AddSkippedSegment() => _skippedSegments++;
+
+    /// <summary>
+    /// Records a segment a merge rewrote before this scan could read it. Kept apart from
+    /// <see cref="AddSkippedSegment"/> because it is not damage — a caller may report it
+    /// differently — and unsynchronised for the same reason.
+    /// </summary>
+    public void AddMergedAwaySegment() => _mergedAwaySegments++;
 
     // ── Recording ─────────────────────────────────────────────────────────────────
 
@@ -270,9 +288,10 @@ public sealed class LogVolumeAggregator
     /// </summary>
     public void MergeFrom(LogVolumeAggregator other)
     {
-        _total           += other._total;
-        _scanned         += other._scanned;
-        _skippedSegments += other._skippedSegments;
+        _total              += other._total;
+        _scanned            += other._scanned;
+        _skippedSegments    += other._skippedSegments;
+        _mergedAwaySegments += other._mergedAwaySegments;
 
         for (int l = 0; l < LevelCount; l++)
         {
@@ -312,14 +331,15 @@ public sealed class LogVolumeAggregator
 
         return new LogVolumeCounts
         {
-            Total           = _total,
-            Scanned         = _scanned,
-            MinBucket       = _minBucket,
-            BucketSeconds   = _bucketSeconds,
-            NBuckets        = _nBuckets,
-            Services        = services,
-            Levels          = levels,
-            SkippedSegments = _skippedSegments,
+            Total              = _total,
+            Scanned            = _scanned,
+            MinBucket          = _minBucket,
+            BucketSeconds      = _bucketSeconds,
+            NBuckets           = _nBuckets,
+            Services           = services,
+            Levels             = levels,
+            SkippedSegments    = _skippedSegments,
+            MergedAwaySegments = _mergedAwaySegments,
         };
     }
 }

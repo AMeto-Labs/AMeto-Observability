@@ -270,6 +270,59 @@ public sealed class AggregationHeaderPathTests : IDisposable
     }
 
     /// <summary>
+    /// A MERGE UNDER THE HEADER ROAD MAKES THE COUNT PARTIAL, IN ITS OWN WORDS. A merge that lands
+    /// while the header scan walks its snapshot deletes sources the snapshot lists, and moves
+    /// their events into an output it does not — so the total comes back low, and it used to come
+    /// back low with <c>Partial = false</c>. Nothing is damaged, so the reason must not send the
+    /// user to the server log for a fault: it says the storage changed and that a rerun helps.
+    ///
+    /// <para>The merge runs inside the scan, before its first segment open, and every other
+    /// worker waits for it, so neither source is read. The fixture's hot tier is flushed first,
+    /// which gives every level a second segment the planner can pair with its first.</para>
+    /// </summary>
+    [Fact]
+    public async Task A_merge_under_the_header_road_makes_the_count_partial_with_its_own_reason()
+    {
+        Assert.True(AggregationParser.TryParse("select count(*)", out var total));
+        await _engine.FlushHotTierAsync();
+        var before = _engine.ListSegments();
+
+        using var done = new ManualResetEventSlim();
+        int  first  = 0;
+        bool merged = false;
+        _engine._beforeHeaderSegmentOpen = _ =>
+        {
+            if (Interlocked.Exchange(ref first, 1) == 0)
+            {
+                try   { merged = _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None).GetAwaiter().GetResult(); }
+                finally { done.Set(); }
+            }
+            else done.Wait(TimeSpan.FromSeconds(30));
+        };
+
+        AggregationResult raced;
+        try { raced = await _withHeader.ExecuteAsync(total!, From, To); }
+        finally { _engine._beforeHeaderSegmentOpen = null; }
+
+        Assert.True(merged, "setup: the merge pass merged nothing — the test proves nothing");
+        var after   = _engine.ListSegments().Select(SegmentKey.Of).ToHashSet();
+        var sources = before.Where(s => !after.Contains(SegmentKey.Of(s))).ToList();
+        Assert.Equal(2, sources.Count);
+
+        Assert.True(raced.Partial, "a count missing a merge's sources was reported as complete");
+        Assert.NotNull(raced.PartialReason);
+        Assert.StartsWith("storage changed during the scan", raced.PartialReason);
+        Assert.Contains("2 segment(s)", raced.PartialReason);
+        Assert.DoesNotContain("server log", raced.PartialReason);
+        Assert.Equal(400d - sources.Sum(s => (double)s.EventCount), Assert.Single(raced.Rows).Values[0]);
+
+        // Run again: the snapshot now lists the merged output, and the count is whole.
+        var rerun = await _withHeader.ExecuteAsync(total!, From, To);
+        Assert.False(rerun.Partial);
+        Assert.Equal(400d, Assert.Single(rerun.Rows).Values[0]);
+    }
+
+    /// <summary>
     /// The first block's <c>uncompressedSize</c> sits right after the 46-byte segment header;
     /// torn to a negative it fails <c>ValidateBlockFrame</c> with InvalidDataException before a
     /// single header of the segment is counted (the same tear SegmentCatalogKeyTests uses).

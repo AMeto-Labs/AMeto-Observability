@@ -37,25 +37,29 @@ public sealed class LogVolumeUnreadableSegmentTests : IDisposable
 
         // One level, so the flush writes exactly one cold segment; then a hot tier on top that
         // the tear cannot touch.
-        var buf = new ArrayBufferWriter<byte>(64);
         for (int i = 0; i < 70; i++)
         {
             if (i == 60) _engine.FlushHotTierAsync().GetAwaiter().GetResult();
-
-            buf.ResetWrittenCount();
-            var w = new MessagePackWriter(buf);
-            w.WriteMapHeader(1);
-            w.Write("n"); w.Write((long)i);
-            w.Flush();
-
-            Assert.True(_engine.TryWrite(new LogEventHeader
-            {
-                TimestampUtcTicks        = Base.UtcTicks + i * TimeSpan.TicksPerSecond,
-                Level                    = LogLevel.Error,
-                MessageTemplatePoolIndex = _engine.TemplatePool.Intern("evt {n}"),
-                ServiceNamePoolIndex     = _engine.TemplatePool.Intern("billing"),
-            }, buf.WrittenSpan.ToArray()));
+            WriteError(i);
         }
+    }
+
+    /// <summary>The <paramref name="i"/>-th Error event, <paramref name="i"/> seconds after <see cref="Base"/>.</summary>
+    private void WriteError(int i)
+    {
+        var buf = new ArrayBufferWriter<byte>(64);
+        var w   = new MessagePackWriter(buf);
+        w.WriteMapHeader(1);
+        w.Write("n"); w.Write((long)i);
+        w.Flush();
+
+        Assert.True(_engine.TryWrite(new LogEventHeader
+        {
+            TimestampUtcTicks        = Base.UtcTicks + i * TimeSpan.TicksPerSecond,
+            Level                    = LogLevel.Error,
+            MessageTemplatePoolIndex = _engine.TemplatePool.Intern("evt {n}"),
+            ServiceNamePoolIndex     = _engine.TemplatePool.Intern("billing"),
+        }, buf.WrittenSpan.ToArray()));
     }
 
     public void Dispose()
@@ -130,8 +134,8 @@ public sealed class LogVolumeUnreadableSegmentTests : IDisposable
     {
         var seg = Assert.Single(_engine.ListSegments());
 
-        // A merge publishing its output and deleting its sources while a histogram poll still
-        // walks a snapshot that lists them: the entry goes, the file goes, the scan opens it.
+        // Retention deleting an expired segment while a histogram poll still walks a snapshot
+        // that lists it: the entry goes, the file goes, the scan opens it.
         int removed = 0;
         _engine._beforeHeaderSegmentOpen = info =>
         {
@@ -144,10 +148,129 @@ public sealed class LogVolumeUnreadableSegmentTests : IDisposable
         Assert.Equal(1, removed);
         Assert.False(File.Exists(seg.FilePath), "setup: the delete should have removed the file");
         Assert.Equal(0, counts.SkippedSegments);
+        Assert.Equal(0, counts.MergedAwaySegments);   // its events are gone, not moved: the count is exact
         Assert.Equal(10, counts.Total);   // the hot tier; the removed segment is simply not in the window any more
         Assert.Empty(HeaderWarnings());
         Assert.Contains(_log.Entries, e => e.Level == Microsoft.Extensions.Logging.LogLevel.Debug &&
                                            e.Message.Contains("left the catalog", StringComparison.Ordinal));
+    }
+
+    /// <summary>
+    /// A second 60-event Error segment beside the first, and no hot tier left. The planner merges
+    /// a pair only in a sealed bucket and only when the smaller half adds at least half the
+    /// larger; <see cref="Base"/> is weeks in the past, so its bucket is sealed.
+    /// </summary>
+    private async Task<IReadOnlyList<SegmentInfo>> MergeablePairAsync()
+    {
+        for (int i = 70; i < 120; i++) WriteError(i);
+        await _engine.FlushHotTierAsync();
+        var pair = _engine.ListSegments();
+        Assert.Equal(2, pair.Count);
+        return pair;
+    }
+
+    /// <summary>
+    /// Runs one merge pass from inside the scan, before its first open: the merge publishes its
+    /// output and deletes both sources while the scan walks a snapshot that lists the sources and
+    /// not the output. Every other worker waits for the merge, so neither source is read.
+    /// Returns whether the pass merged.
+    /// </summary>
+    private async Task<(LogVolumeCounts Counts, bool Merged)> CountWithMergeUnderneathAsync()
+    {
+        using var done = new ManualResetEventSlim();
+        int  first  = 0;
+        bool merged = false;
+        _engine._beforeHeaderSegmentOpen = _ =>
+        {
+            if (Interlocked.Exchange(ref first, 1) == 0)
+            {
+                try   { merged = _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None).GetAwaiter().GetResult(); }
+                finally { done.Set(); }
+            }
+            else done.Wait(TimeSpan.FromSeconds(30));
+        };
+
+        try { return (await CountAsync(), merged); }
+        finally { _engine._beforeHeaderSegmentOpen = null; }
+    }
+
+    /// <summary>
+    /// A MERGE UNDER THE SCAN MAKES THE COUNT A FLOOR. Its sources' events are in the merged
+    /// output, which the scan's snapshot does not list, so leaving them out gives a LOW number —
+    /// and at 7693f2a that low number came back with nothing to say so, the race silenced along
+    /// with retention's. It is still not damage: no skip, no Warning.
+    /// </summary>
+    [Fact]
+    public async Task A_segment_a_merge_rewrote_while_the_scan_ran_is_counted_as_merged_away_without_a_warning()
+    {
+        var sources = await MergeablePairAsync();
+
+        var (counts, merged) = await CountWithMergeUnderneathAsync();
+
+        Assert.True(merged, "setup: the merge pass did not merge the pair");
+        Assert.Equal(120u, Assert.Single(_engine.ListSegments()).EventCount);
+        foreach (var s in sources) Assert.False(File.Exists(s.FilePath), "setup: a source survived the merge");
+
+        Assert.Equal(0, counts.Total);                 // neither source was read, and the output was never in the snapshot
+        Assert.Equal(2, counts.MergedAwaySegments);    // …which is what makes that 0 a floor
+        Assert.Equal(0, counts.SkippedSegments);       // nothing is damaged
+        Assert.Empty(HeaderWarnings());
+
+        // The next scan lists the output and is whole.
+        var again = await CountAsync();
+        Assert.Equal(120, again.Total);
+        Assert.Equal(0, again.MergedAwaySegments);
+    }
+
+    /// <summary>
+    /// The record of merged-away keys is bounded, and a scan that may have lost a record to the
+    /// bound calls the removal a merge rather than guess retention. With room for ONE key, the
+    /// merge's second source evicts the first while the scan runs; the first is still a floor.
+    /// </summary>
+    [Fact]
+    public async Task A_merged_away_segment_whose_record_was_evicted_during_the_scan_is_still_a_floor()
+    {
+        _engine.MergedAwaySegmentCap = 1;
+        await MergeablePairAsync();
+
+        var (counts, merged) = await CountWithMergeUnderneathAsync();
+
+        Assert.True(merged, "setup: the merge pass did not merge the pair");
+        Assert.Equal(0, counts.Total);
+        Assert.Equal(2, counts.MergedAwaySegments);
+        Assert.Empty(HeaderWarnings());
+    }
+
+    /// <summary>
+    /// The fallback is decided by how far eviction has reached, not by whether it ever happened:
+    /// on a server that has merged more sources than the record holds, something always has
+    /// been evicted, and a rule that looked only at that would call every retention delete racing
+    /// a scan a merge. Here the record is full and has evicted — before this scan started — and
+    /// retention removes the merged output under the scan: its events are gone, so the count
+    /// stays exact.
+    /// </summary>
+    [Fact]
+    public async Task A_retention_delete_is_not_called_a_merge_because_older_merge_records_were_evicted()
+    {
+        _engine.MergedAwaySegmentCap = 1;
+        await MergeablePairAsync();
+        Assert.True(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None), "setup: the pair did not merge");
+        var output = Assert.Single(_engine.ListSegments());
+
+        int removed = 0;
+        _engine._beforeHeaderSegmentOpen = info =>
+        {
+            if (Interlocked.Exchange(ref removed, 1) == 0)
+                _engine.DeleteSegmentAsync(SegmentKey.Of(info)).GetAwaiter().GetResult();
+        };
+
+        var counts = await CountAsync();
+
+        Assert.Equal(1, removed);
+        Assert.False(File.Exists(output.FilePath), "setup: the delete should have removed the merged file");
+        Assert.Equal(0, counts.Total);
+        Assert.Equal(0, counts.MergedAwaySegments);
+        Assert.Equal(0, counts.SkippedSegments);
     }
 
     [Fact]

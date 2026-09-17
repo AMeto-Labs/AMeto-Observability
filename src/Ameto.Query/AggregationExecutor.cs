@@ -343,12 +343,20 @@ public sealed class AggregationExecutor(
         // carries on — right for a volume chart, wrong for an answer read as a fact. The event
         // scan would have failed the query outright over the same file; a total that is quietly
         // low is worse than that, so it is reported as the floor it is.
+        //
+        // A segment a merge rewrote under the scan is left out too, for a different reason and
+        // with its own words: nothing is damaged and nothing is logged above Debug, so pointing
+        // the user at the server log would send them hunting for a fault that does not exist.
+        // The merged output holds those events, and a rerun reads it. The unreadable reason wins
+        // when both apply, since a rerun does not clear that one.
         string? reason =
             counts.SkippedSegments > 0
                 ? $"{counts.SkippedSegments:N0} storage segment(s) in the window could not be read — the counts are a floor; the server log names the segments"
-                : hitGroupCap
-                    ? $"more than {AggregationParser.MaxGroups:N0} distinct groups — group by something coarser"
-                    : null;
+                : counts.MergedAwaySegments > 0
+                    ? $"storage changed during the scan — a merge rewrote {counts.MergedAwaySegments:N0} segment(s) in the window before they were read, so the counts are a floor; run the query again"
+                    : hitGroupCap
+                        ? $"more than {AggregationParser.MaxGroups:N0} distinct groups — group by something coarser"
+                        : null;
 
         return new AggregationResult
         {

@@ -152,6 +152,42 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     private readonly System.Threading.Lock _warnedUnreadableGate = new();
     /// <summary>How many unreadable segments are named at Warning; internal so a test can lower it.</summary>
     internal int WarnedUnreadableSegmentCap = 1024;
+    /// <summary>
+    /// Segments a merge has taken out of the catalog, by key, with the number of the record that
+    /// named each. The header aggregation consults it when a segment in its snapshot is gone by
+    /// the time a worker opens it, because the two ways a segment leaves mid-scan mean opposite
+    /// things for the count. Retention's removal took the events out of the store, so leaving
+    /// them out IS the answer. A merge's removal moved them into its output, which a snapshot
+    /// taken before the merge published does not list, so leaving them out gives a low total —
+    /// and presented as complete, a wrong one.
+    ///
+    /// <para>Written by the merge (<see cref="RecordMergedAwaySegment"/>), not by
+    /// <see cref="DeleteSegmentAsync"/>: every caller of the delete — retention, the merge's source
+    /// cleanup, anything calling the public method — arrives with nothing but a key. And written
+    /// BEFORE the delete, so a scan that finds the entry gone always finds the record too.</para>
+    ///
+    /// <para>Bounded by <see cref="MergedAwaySegmentCap"/>, oldest record out first. Eviction is
+    /// not allowed to turn a merge back into a silent low count: <see cref="_mergedAwayEvictedThrough"/>
+    /// says how far it has reached, and a scan that may have lost a record to it reports the
+    /// removal as a merge (see <see cref="MayHaveBeenMergedAway"/>). Everything here is under
+    /// <see cref="_mergedAwayGate"/>, a leaf, taken only by the merge's cleanup and by a scan
+    /// that has already failed to read a segment.</para>
+    /// </summary>
+    private readonly Dictionary<SegmentKey, long> _mergedAwaySegments = new();
+    /// <summary>Record <c>n</c>'s key at <c>[(n - 1) % Length]</c>; allocated by the first merge.</summary>
+    private SegmentKey[]? _mergedAwayRing;
+    /// <summary>Records ever made. Written under the gate; a scan reads it without, as its mark.</summary>
+    private long _mergedAwayRecorded;
+    /// <summary>Number of the newest record evicted from <see cref="_mergedAwaySegments"/>; 0 while none has been.</summary>
+    private long _mergedAwayEvictedThrough;
+    private readonly System.Threading.Lock _mergedAwayGate = new();
+    /// <summary>
+    /// How many merged-away keys are kept: eight full merge batches, a few hundred KB once full. A
+    /// record only has to outlive the scans already running when it was made, and a scan that
+    /// outlives this many records calls any removal it meets a merge rather than guess. Internal
+    /// so a test can lower it before the first merge.
+    /// </summary>
+    internal int MergedAwaySegmentCap = 8 * MergeMaxSources;
     /// <summary>Pause between attempts to persist a frozen tier whose flush failed.</summary>
     private static readonly TimeSpan FlushRetryDelay = TimeSpan.FromSeconds(15);
     /// <summary>True while the live WAL is refusing appends — gates the once-per-episode error log (writer thread only).</summary>
@@ -791,8 +827,10 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// whole aggregate, and counted in <see cref="LogVolumeCounts.SkippedSegments"/> when the
     /// catalog still serves it: when that is non-zero every total is a floor, and a caller that
     /// reports a count as a fact must say so. A segment that left the catalog while the scan ran
-    /// (a merge's sources, a retention delete) is a race, not damage, and is not counted; see
-    /// <see cref="OnHeaderSegmentUnreadable"/>.</para>
+    /// is a race, not damage, and is never counted there. A retention delete is not counted at
+    /// all, because its events are gone; a merge's source is counted in
+    /// <see cref="LogVolumeCounts.MergedAwaySegments"/>, because its events are in an output this
+    /// scan's snapshot does not list. See <see cref="OnHeaderSegmentUnreadable"/>.</para>
     /// </summary>
     /// <param name="totalsOnly">
     /// Opt-in shortcut for a caller that wants ONE number (the alert evaluator, which runs this
@@ -812,6 +850,11 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     {
         long fromTicks = fromUtc.UtcTicks;
         long toTicks   = toUtc.UtcTicks;
+
+        // Taken BEFORE the segment snapshot below, so a merge that removes a segment the snapshot
+        // lists has recorded it at or after this mark; MayHaveBeenMergedAway relies on that when
+        // the record has had to evict.
+        long mergedAwayMark = Interlocked.Read(ref _mergedAwayRecorded);
 
         var agg = new LogVolumeAggregator(
             fromTicks, toTicks, minBucket, bucketSeconds, nBuckets, serviceFilter, TemplatePool);
@@ -876,7 +919,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                                 // Never lose the whole aggregate over one bad/racing segment file —
                                 // but never HIDE a bad one either. Whatever the segment yielded
                                 // before the throw stays in; it is real data.
-                                OnHeaderSegmentUnreadable(ex, info, local);
+                                OnHeaderSegmentUnreadable(ex, info, local, mergedAwayMark);
                             }
                             return local;
                         },
@@ -918,32 +961,117 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     }
 
     /// <summary>
-    /// Sorts a failed header read into a race or a real unreadable segment.
+    /// Sorts a failed header read into a race or a real unreadable segment, and the race into
+    /// the two kinds that mean opposite things for the count.
     ///
     /// <para><b>A race</b>: the catalog no longer holds this segment under its key and path. The
     /// scan works from a snapshot, and a merge publishes its output and then deletes its sources,
-    /// and retention deletes expired ones, while a poll is still walking that snapshot. The file
-    /// is gone because the segment was meant to go; nothing is damaged, so it is not counted and
-    /// logged at Debug only. Counting it made every merge that overlapped a histogram poll turn
-    /// the query language's count partial and warn about a corruption that did not exist, and
-    /// the once-per-key warning could not help, since each merge removes new keys.</para>
+    /// and retention deletes expired ones, while a poll is still walking that snapshot. Nothing
+    /// is damaged, so neither kind is a skip and neither warns: counting every race as a skip made
+    /// every merge that overlapped a histogram poll warn about a corruption that did not exist,
+    /// and the once-per-key warning could not help, since each merge removes new keys.</para>
+    ///
+    /// <para>But the kinds differ in where the events went. <b>Retention</b> removed them from the
+    /// store: leaving them out is the right answer, so the race is only logged at Debug.
+    /// <b>A merge</b> moved them into its output, which this snapshot does not list, so the total
+    /// is low; it is counted in <see cref="LogVolumeCounts.MergedAwaySegments"/> for a caller that
+    /// presents the total as a fact to call it a floor. Silencing that case too made
+    /// <c>select count(*)</c> over a wide window report a low number as complete whenever a merge
+    /// landed under it.</para>
+    ///
+    /// <para>Told apart, rather than answered by scanning the window again with a fresh snapshot.
+    /// A rescan doubles the decode cost of exactly the wide windows a merge is most likely to land
+    /// under. It can race too — while a backlog lasts the maintenance loop merges again every
+    /// 15 s — so it would still need this verdict. And the next poll, or a rerun, reads the merged
+    /// output anyway.</para>
     ///
     /// <para><b>Unreadable</b>: the catalog still serves it. The skip is counted, so a caller that
     /// presents the total as a fact can say it is a floor, and named once at Warning.</para>
     /// </summary>
-    private void OnHeaderSegmentUnreadable(Exception ex, SegmentInfo info, LogVolumeAggregator local)
+    private void OnHeaderSegmentUnreadable(Exception ex, SegmentInfo info, LogVolumeAggregator local, long mergedAwayMark)
     {
-        if (!_segments.TryGetValue(SegmentKey.Of(info), out var current)
+        var key = SegmentKey.Of(info);
+        if (!_segments.TryGetValue(key, out var current)
             || !string.Equals(current.FilePath, info.FilePath, StringComparison.OrdinalIgnoreCase))
         {
-            _logger.LogDebug(ex,
-                "Header aggregation skipped segment {NodeId}-{Id}: it left the catalog while the scan ran (merge or retention)",
-                info.NodeId, info.Id);
+            // The catalog first and the record second, never the other way round: the merge
+            // records a key before it deletes the segment, so an entry seen gone by a merge is
+            // always already recorded. Read in the opposite order, a merge landing between the
+            // two reads would be found in neither and pass for retention.
+            if (MayHaveBeenMergedAway(key, mergedAwayMark))
+            {
+                local.AddMergedAwaySegment();
+                _logger.LogDebug(ex,
+                    "Header aggregation skipped segment {NodeId}-{Id}: a merge rewrote it while the scan ran, so counts over its window are a floor",
+                    info.NodeId, info.Id);
+            }
+            else
+                _logger.LogDebug(ex,
+                    "Header aggregation skipped segment {NodeId}-{Id}: it left the catalog while the scan ran (retention or delete)",
+                    info.NodeId, info.Id);
             return;
         }
 
         local.AddSkippedSegment();
         LogUnreadableSegment(ex, info);
+    }
+
+    /// <summary>
+    /// Records that a merge is about to delete <paramref name="key"/>, whose events its published
+    /// output now holds. Called for each source immediately before its delete, so the record is
+    /// in place before the catalog entry goes (see <see cref="_mergedAwaySegments"/>).
+    /// </summary>
+    private void RecordMergedAwaySegment(SegmentKey key)
+    {
+        lock (_mergedAwayGate)
+        {
+            var  ring = _mergedAwayRing ??= new SegmentKey[Math.Max(1, MergedAwaySegmentCap)];
+            long n    = _mergedAwayRecorded + 1;
+            int  slot = (int)((n - 1) % ring.Length);
+
+            if (n > ring.Length)
+            {
+                // The slot holds the oldest record kept. Its key leaves the lookup only if no
+                // later record names it again, and the eviction point moves either way: what a
+                // scan needs to know is how far eviction has reached, not whether this key
+                // survived it.
+                long evicted = n - ring.Length;
+                var  old     = ring[slot];
+                if (_mergedAwaySegments.TryGetValue(old, out long at) && at == evicted)
+                    _mergedAwaySegments.Remove(old);
+                _mergedAwayEvictedThrough = evicted;
+            }
+
+            ring[slot] = key;
+            _mergedAwaySegments[key] = n;
+            Interlocked.Exchange(ref _mergedAwayRecorded, n);   // the scan's mark reads it without the gate
+        }
+    }
+
+    /// <summary>
+    /// Whether a segment that left the catalog during the scan whose mark is
+    /// <paramref name="mark"/> may have been a merge's source rather than a retention delete.
+    ///
+    /// <para>True when the record names it. Also true when eviction may have dropped its record,
+    /// which is the conservative direction: a retention delete called a merge makes one count a
+    /// floor that was exact, where a merge called retention makes a low count look exact.</para>
+    ///
+    /// <para>"May have" is decided by the mark, not by whether anything was ever evicted — on a
+    /// server that has merged more than <see cref="MergedAwaySegmentCap"/> sources in its life
+    /// something always has been, and every retention delete racing a scan would then be called
+    /// a merge. Merges run one at a time on the maintenance loop, and each records a source
+    /// immediately before deleting it, with nothing between the two (the delete completes
+    /// synchronously), so no other record is made between a key's record and its entry leaving
+    /// the catalog. The scan read its mark before its snapshot listed the key, so before the
+    /// entry left. If the key's record came before the mark, the mark was read in that gap and
+    /// equals the record's number; otherwise the number is above the mark. Either way it is at
+    /// least the mark, and eviction that has not reached the mark cannot have dropped it.</para>
+    /// </summary>
+    private bool MayHaveBeenMergedAway(SegmentKey key, long mark)
+    {
+        lock (_mergedAwayGate)
+            return _mergedAwaySegments.ContainsKey(key)
+                || (_mergedAwayEvictedThrough > 0 && _mergedAwayEvictedThrough >= mark);
     }
 
     /// <summary>
@@ -2645,6 +2773,11 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         foreach (var seg in consumed)
         {
             _mergeDeferStrikes.Remove(SegmentKey.Of(seg));
+            // Before the delete, so a header scan that finds the entry gone finds the record
+            // too, and calls the count it gives a floor rather than presenting it as complete:
+            // this source's events are in the output just published, which a scan already
+            // running does not list. Retention deletes are not recorded; their events are gone.
+            RecordMergedAwaySegment(SegmentKey.Of(seg));
             await DeleteSegmentAsync(SegmentKey.Of(seg), ct);
         }
 
