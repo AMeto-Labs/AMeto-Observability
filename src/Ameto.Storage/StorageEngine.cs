@@ -198,6 +198,26 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// </summary>
     internal Action? _beforeTiersFreed;
 
+    /// <summary>
+    /// Test hook: called by <see cref="TryWrite"/> right after the shutdown gate let it through,
+    /// before it captures the write state — the window in which the tier's Freeze, not the gate,
+    /// is what fences the write. Costs the ingest path one field read while unset.
+    /// </summary>
+    internal Action? _afterWriteGate;
+
+    /// <summary>
+    /// Test hook: called by <see cref="TryFlushAsync"/> holding <see cref="_flushLock"/>, after the
+    /// in-lock close re-check and before the swap reads the live tier — the window in which a flush
+    /// has committed to swapping but has not yet counted a heavy phase.
+    /// </summary>
+    internal Action? _beforeSwap;
+
+    /// <summary>
+    /// Test hook: called by <see cref="DisposeAsync"/>, after closing the write path, when its take
+    /// of <see cref="_flushLock"/> has to wait for a flush that holds it.
+    /// </summary>
+    internal Action? _onWaitingForFlushLock;
+
     /// <summary>Test hook: the live hot tier.</summary>
     internal HotTierSegment LiveHotTier => _write.Hot;
 
@@ -1374,6 +1394,8 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         if (Volatile.Read(ref _writesClosed) != 0)
             return false;
 
+        _afterWriteGate?.Invoke();
+
         // Assign time-sortable, monotonic event id.
         // Time component is derived from the event's own @t (TimestampUtcTicks), not
         // server ingest time, so sorting by Id matches the timestamp shown in the UI.
@@ -1989,6 +2011,8 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             // Again under the lock: shutdown takes this lock after closing, so a flush that got
             // here first either sees the close or swaps before shutdown counts what is running.
             if (!finalFlush && Volatile.Read(ref _writesClosed) != 0) return;
+
+            _beforeSwap?.Invoke();
 
             var oldState = _write;
             if (oldState.Hot.Count == 0) return;
@@ -4603,7 +4627,10 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
         // ── Take the swap lock and KEEP it. A flush that holds it now finishes its swap (and is
         //    counted) first; every later one finds the close, or the lock taken, and swaps nothing.
-        if (!await _flushLock.WaitAsync(Until(deadline)).ConfigureAwait(false))
+        var swapLockTaken = _flushLock.WaitAsync(Until(deadline));
+        if (!swapLockTaken.IsCompleted)
+            _onWaitingForFlushLock?.Invoke();
+        if (!await swapLockTaken.ConfigureAwait(false))
         {
             _logger.LogError(
                 "Shutdown could not take the hot-tier swap lock within {Budget}s — every hot tier is left " +

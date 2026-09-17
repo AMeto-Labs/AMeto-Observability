@@ -28,6 +28,12 @@ public sealed class StorageEngineShutdownTests : IDisposable
 {
     private readonly string _root = Path.Combine(Path.GetTempPath(), "ameto-shutdown-" + Guid.NewGuid().ToString("N"));
 
+    /// <summary>
+    /// Bound on a step that, on a correct engine, a signal ends at once. Only a hang reaches it, so
+    /// it decides nothing but how long a hung test takes to report.
+    /// </summary>
+    private static readonly TimeSpan HangGuard = TimeSpan.FromSeconds(30);
+
     public void Dispose()
     {
         try { Directory.Delete(_root, recursive: true); } catch { /* best-effort */ }
@@ -80,6 +86,10 @@ public sealed class StorageEngineShutdownTests : IDisposable
     /// the time tiers are freed no flush is running. Checked from inside the teardown, at the
     /// seam just before the free, by writing until the engine says no — enough writes to fill
     /// the tier, so an engine that still accepts them also reaches "tier full → schedule a flush".
+    ///
+    /// <para>Only writes that ARRIVE after the close are covered here: by this seam shutdown already
+    /// holds the swap lock and has frozen the live tier, so a flush or a write that got in before
+    /// the close cannot race it any more. Those two are the next tests.</para>
     /// </summary>
     [Fact]
     public async Task After_the_write_path_closes_no_write_lands_and_no_flush_is_running_when_tiers_are_freed()
@@ -110,6 +120,131 @@ public sealed class StorageEngineShutdownTests : IDisposable
         Assert.Equal(0, accepted);
         Assert.Equal(0, runningAtFree);
         Assert.Equal(0, heavyAtFree);
+    }
+
+    /// <summary>
+    /// A flush that took the swap lock and passed its close re-check just before shutdown closed the
+    /// write path is committed to swapping the live tier, but has not counted a heavy phase yet.
+    /// Shutdown must not read that count until the flush lets go of the lock. If it reads it
+    /// sooner, it sees zero, frees the live tier, and the flush then swaps it and writes freed
+    /// memory out.
+    ///
+    /// <para>The flush F starts inside the final flush's heavy phase (swap lock free, writes still
+    /// open) and parks at the swap seam, holding the lock. It is released only when shutdown's take
+    /// of that lock has to wait for it. An engine that does not take the lock never waits, so it
+    /// reaches the free with F still parked. That is recorded there, and then F runs to the end
+    /// BEFORE the free, so such an engine fails the assertion instead of faulting the test host.</para>
+    /// </summary>
+    [Fact]
+    public async Task A_flush_holding_the_swap_lock_when_the_write_path_closes_ends_before_its_tier_is_freed()
+    {
+        var log    = new CapturingLogger();
+        var engine = NewEngine(out string dir, log);
+        Write(engine, 100, LogLevel.Information);   // tier X, for the final flush
+        string segDir = Path.Combine(dir, "segments");
+
+        var fParked  = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseF = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        HotTierSegment? y = null;
+        Task? f = null;
+        int  armF = 0, levels = 0, writtenToY = -1;
+        bool fWroteYBeforeFree = false, yFreedDuringItsFlush = true, releasedByLockWait = false;
+
+        engine._afterLevelPublished = _ =>
+        {
+            if (Interlocked.Increment(ref levels) == 1)
+            {
+                // The final flush's heavy phase: X is swapped out, the lock is free, writes are open.
+                y = engine.LiveHotTier;
+                writtenToY = 0;
+                for (int i = 0; i < 50 && TryWrite(engine, i, LogLevel.Information); i++)
+                    writtenToY++;
+
+                Volatile.Write(ref armF, 1);
+                f = Task.Run(() => engine.FlushHotTierAsync());
+                if (!fParked.Task.Wait(HangGuard))
+                    throw new InvalidOperationException("test: the second flush never reached the swap seam");
+            }
+            else
+            {
+                // F's heavy phase, just after it wrote Y's level out of Y's memory.
+                yFreedDuringItsFlush = y!.IsDisposed;
+            }
+        };
+        engine._beforeSwap = () =>
+        {
+            if (Interlocked.Exchange(ref armF, 0) == 0) return;   // the final flush's own swap
+            fParked.TrySetResult();
+            releaseF.Task.Wait(HangGuard);
+        };
+        engine._onWaitingForFlushLock = () =>
+        {
+            releasedByLockWait = true;
+            releaseF.TrySetResult();
+        };
+        engine._beforeTiersFreed = () =>
+        {
+            fWroteYBeforeFree = Volatile.Read(ref levels) >= 2;
+
+            // Only an engine that never waited for F's lock gets here with F still parked. Let F
+            // finish before the free, so it never reads the memory this is about to release.
+            if (releaseF.TrySetResult())
+                try { f?.Wait(HangGuard); } catch { /* the assertions below report it */ }
+        };
+
+        await engine.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(60));
+        Assert.NotNull(f);
+        await f!.WaitAsync(TimeSpan.FromSeconds(60));
+
+        Assert.Equal(50, writtenToY);
+        Assert.True(fWroteYBeforeFree,
+            "shutdown reached the free while a flush that took the swap lock before the close had not swapped yet — " +
+            "it counted nothing, so the tier that flush then swaps and reads would be freed under it");
+        Assert.True(releasedByLockWait, "shutdown's take of the swap lock never waited for the flush holding it");
+        Assert.False(yFreedDuringItsFlush, "the tier the flush swapped was freed during its heavy phase");
+        Assert.DoesNotContain(log.Snapshot(), static l => l.Contains("Segment flush failed", StringComparison.Ordinal));
+        Assert.Equal(2, Directory.GetFiles(segDir, "*.seg").Length);   // X's level, then Y's
+        Assert.True(y!.IsDisposed, "the tier was not freed once its flush published it");
+    }
+
+    /// <summary>
+    /// A write that passed the shutdown gate just before the write path closed has not captured its
+    /// tier yet. Only the tier's Freeze can stop it landing in memory that shutdown is about to free.
+    /// The write parks right after the gate and is released at the last seam before the free, and it
+    /// must be refused there. An engine that does not freeze accepts it into the live tier it then
+    /// frees. The write finishes before that free, so the failure shows as "accepted", not a crash.
+    /// </summary>
+    [Fact]
+    public async Task A_write_past_the_gate_when_the_write_path_closes_is_refused_by_the_frozen_tier()
+    {
+        var engine = NewEngine();
+        Write(engine, 100, LogLevel.Information);   // the final flush has something to do
+
+        var parked  = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int arm = 1;
+        engine._afterWriteGate = () =>
+        {
+            if (Interlocked.Exchange(ref arm, 0) == 0) return;
+            parked.TrySetResult();
+            release.Task.Wait(HangGuard);
+        };
+        var write = Task.Run(() => TryWrite(engine, 100, LogLevel.Information));
+        await parked.Task.WaitAsync(HangGuard);   // past the gate before shutdown starts
+
+        bool finishedBeforeFree = false, acceptedIntoFreedTier = true;
+        engine._beforeTiersFreed = () =>
+        {
+            release.TrySetResult();
+            finishedBeforeFree = write.Wait(HangGuard);
+            if (finishedBeforeFree) acceptedIntoFreedTier = write.Result;
+        };
+
+        await engine.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(60));
+
+        Assert.True(finishedBeforeFree, "the write parked past the gate did not finish once released");
+        Assert.False(acceptedIntoFreedTier,
+            "a write that passed the gate before the write path closed was accepted into the live tier shutdown then freed");
     }
 
     /// <summary>
