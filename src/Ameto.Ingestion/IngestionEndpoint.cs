@@ -526,6 +526,21 @@ public sealed class IngestionEndpoint : IOtlpLogSink, LogEventSerializer.IClefBa
         if (ok) _drainer.NotifyEnqueued();
     }
 
-    private static string Truncate(string? s, int max) =>
-        string.IsNullOrEmpty(s) ? "(none)" : s.Length <= max ? s : string.Concat(s.AsSpan(0, max), "…");
+    /// <summary>
+    /// The template as the drop Warning names it: at most <paramref name="max"/> UTF-16 units and
+    /// an ellipsis, or "(none)".
+    ///
+    /// <para>Never cut between the halves of a surrogate pair. A cut after a high surrogate left
+    /// half an emoji or CJK extension character at the end of the logged template: an unpaired
+    /// surrogate, which turns into U+FFFD (or an encoder error) once a sink writes the line as
+    /// UTF-8. Backing off one unit leaves the pair out whole; it is the same one concat, over a
+    /// span one shorter, so nothing more is allocated.</para>
+    /// </summary>
+    internal static string Truncate(string? s, int max)
+    {
+        if (string.IsNullOrEmpty(s)) return "(none)";
+        if (s.Length <= max) return s;
+        int cut = max > 0 && char.IsHighSurrogate(s[max - 1]) ? max - 1 : max;
+        return string.Concat(s.AsSpan(0, cut), "…");
+    }
 }
