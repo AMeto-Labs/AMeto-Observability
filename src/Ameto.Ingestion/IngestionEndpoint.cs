@@ -356,9 +356,20 @@ public sealed class IngestionEndpoint : IOtlpLogSink, LogEventSerializer.IClefBa
             // the stream so the loss is visible on the Events page — not only in
             // the server's own log. Marked DroppedBy=server to distinguish it from
             // the client sink's own oversized marker.
+            //
+            // Cold path, one per dropped event: the strings are worth their cost. The log line
+            // is the one that names the producer, as TryIngest and TryIngestClef do. The service
+            // comes from the span when the caller passed one, else from the pool: a parser that
+            // interned the block's service.name once may hand over only the index.
             string origTmpl = templateUtf8.IsEmpty ? string.Empty : System.Text.Encoding.UTF8.GetString(templateUtf8);
-            EnqueueServerDropMarker(tsTicks, level, origTmpl, msgpackProps.Length, traceHi, traceLo, spanId, serviceIdx);
+            string svcStr   = !serviceUtf8.IsEmpty ? System.Text.Encoding.UTF8.GetString(serviceUtf8)
+                            : serviceIdx >= 0      ? _pool.Get(serviceIdx)
+                            : string.Empty;
             _ring.CountOversizedDrop();   // the drop happens HERE, before the ring sees it
+            _logger.LogWarning(
+                "Dropped oversized log event: properties {PayloadBytes} B exceed limit {LimitBytes} B (service={Service}, template=\"{Template}\")",
+                msgpackProps.Length, _maxEventPayloadBytes, svcStr.Length != 0 ? svcStr : "(none)", Truncate(origTmpl, 120));
+            EnqueueServerDropMarker(tsTicks, level, origTmpl, msgpackProps.Length, traceHi, traceLo, spanId, serviceIdx);
             return false; // original counted as dropped by the caller
         }
 
