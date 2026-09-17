@@ -343,7 +343,7 @@ public static class OtlpLogProtoParser
             st.Service     = StringValueOf(value);
         }
 
-        w.WriteString(key);
+        WriteUtf8(ref w, key);
         if (haveValue) WriteAnyValue(value, ref w, ref st);
         else w.WriteNil();
         return true;
@@ -393,7 +393,7 @@ public static class OtlpLogProtoParser
             }
         }
 
-        if (haveStr)       w.WriteString(str);
+        if (haveStr)       WriteUtf8(ref w, str);
         else if (haveBool) w.Write(boolVal);
         else if (haveDbl)  w.Write(dblVal);
         else if (haveInt)  w.Write(intVal);
@@ -485,6 +485,44 @@ public static class OtlpLogProtoParser
     }
 
     // ── Small helpers ──────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Writes a protobuf <c>string</c> field as a msgpack str holding the text the DOM path stored.
+    ///
+    /// <para>Protobuf does not guarantee valid UTF-8 on the wire, and an exporter sending Latin-1
+    /// or cp1251 text sends invalid sequences. <c>CodedInputStream.ReadString()</c> decoded
+    /// through <see cref="Encoding.UTF8"/>, which replaces each invalid sequence with U+FFFD, and
+    /// that is what reached storage. Copied verbatim, the bytes would be stored as invalid UTF-8,
+    /// and the filters and the trigram index compare raw bytes, so those rows would match
+    /// differently from main (and two property names that decode alike would become two index
+    /// entries).</para>
+    ///
+    /// <para>Valid input, which is every conformant exporter, costs one vectorised check and the
+    /// same raw copy as before. Only invalid input is decoded and re-encoded, through a pooled
+    /// char buffer.</para>
+    /// </summary>
+    private static void WriteUtf8(ref MessagePackWriter w, ReadOnlySpan<byte> utf8)
+    {
+        if (System.Text.Unicode.Utf8.IsValid(utf8)) w.WriteString(utf8);
+        else WriteReplacingInvalid(ref w, utf8);
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static void WriteReplacingInvalid(ref MessagePackWriter w, ReadOnlySpan<byte> utf8)
+    {
+        // Decoding never yields more chars than there are bytes: an invalid sequence becomes one
+        // U+FFFD per maximal invalid subsequence, and a valid sequence is never longer in UTF-16.
+        char[] chars = ArrayPool<char>.Shared.Rent(utf8.Length);
+        try
+        {
+            int n = Encoding.UTF8.GetChars(utf8, chars);
+            w.Write(chars.AsSpan(0, n));
+        }
+        finally
+        {
+            ArrayPool<char>.Shared.Return(chars);
+        }
+    }
 
     /// <summary>Longest id the stack hex buffer below covers; conformant ones are 16 and 8.</summary>
     private const int MaxIdBytes = 32;
