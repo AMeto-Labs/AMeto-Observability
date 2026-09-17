@@ -139,6 +139,12 @@ public class AmetoWebAppFactory : WebApplicationFactory<Program>
     protected virtual QueryOptions ConfiguredQuery => new();
 
     /// <summary>
+    /// The live-tail pacing this host runs under. Defaults for every suite but the one that needs a
+    /// parked tail to stay parked for longer than the test runs; see LiveTailRowWriterTests.
+    /// </summary>
+    protected virtual LiveTailOptions ConfiguredLiveTail => new();
+
+    /// <summary>
     /// The ingest limits this host runs under. Defaults for every suite but the one that needs a
     /// body ceiling small enough to cross without posting megabytes through TestServer; see
     /// <see cref="OtlpHttpOversizedBodyStatusTests"/>.
@@ -199,6 +205,7 @@ public class AmetoWebAppFactory : WebApplicationFactory<Program>
                 },
                 Retention = new RetentionConfig(),
                 Query     = ConfiguredQuery,
+                LiveTail  = ConfiguredLiveTail,
                 Ingestion = ConfiguredIngestion,
             };
 

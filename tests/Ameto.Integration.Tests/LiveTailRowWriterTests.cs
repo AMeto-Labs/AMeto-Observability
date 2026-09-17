@@ -1,5 +1,4 @@
 using System.Buffers;
-using System.Diagnostics;
 using System.Net;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
@@ -29,25 +28,47 @@ namespace Ameto.Integration.Tests;
 /// </summary>
 public sealed class LiveTailRowWriterTests : IClassFixture<LiveTailRowWriterTests.ScriptedTailFactory>
 {
-    /// <summary>Per-poll budget. Only the spent-budget script runs into it; it waits it out.</summary>
-    private static readonly TimeSpan Budget = TimeSpan.FromSeconds(1);
+    /// <summary>
+    /// Per-poll budget. Only the spent-budget script runs into it; it waits it out. Two seconds, not
+    /// one: the tail arms it at connect and disarms it on the next statement, and a runner that
+    /// descheduled the handler between those two for the whole budget would end the tail before its
+    /// first poll.
+    /// </summary>
+    private static readonly TimeSpan Budget = TimeSpan.FromSeconds(2);
 
     /// <summary>
-    /// Well under LiveTail.MaxWait (5 s) — how long a row left in the buffer would sit until the
-    /// keepalive that ends the park carried it out. A row inside this bound was sent by its own poll.
+    /// How long a parked tail waits before its keepalive — longer than any test here runs. A row left
+    /// in the buffer at the end of a poll would go out with that keepalive, so here it never reaches
+    /// the client before the test's own 30 s token gives up: the bug fails by cancellation, and a slow
+    /// runner never does. (A Stopwatch bound of 2 s under the default 5 s used to stand in for this, and
+    /// a Debug first poll on a loaded runner could take longer than that on its own.)
     /// </summary>
-    private static readonly TimeSpan PushBudget = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan ParkedLongerThanAnyTest = TimeSpan.FromMinutes(10);
+
+    /// <summary>
+    /// How long the slow scan waits for the client to have its second row. Not the poll's budget:
+    /// the round trip it waits for — the server's send, the TestServer pipe, the client's read and
+    /// parse — ran against that one second, and a starved pool could spend it. The send it needs is
+    /// made the moment the scan goes pending, so this only turns a tail that never sends into a
+    /// failure instead of a hang.
+    /// </summary>
+    private static readonly TimeSpan SlowScanWaitLimit = TimeSpan.FromSeconds(10);
 
     private readonly ScriptedTailFactory _factory;
 
     public LiveTailRowWriterTests(ScriptedTailFactory factory) => _factory = factory;
 
-    /// <summary>The ordinary test host, a one-second search budget, and the executor swapped for <see cref="ScriptedTail"/>.</summary>
+    /// <summary>
+    /// The ordinary test host, a one-second search budget, a park longer than any test, and the
+    /// executor swapped for <see cref="ScriptedTail"/>.
+    /// </summary>
     public sealed class ScriptedTailFactory : AmetoWebAppFactory
     {
         public ScriptedTail Tail { get; } = new();
 
         protected override QueryOptions ConfiguredQuery => new() { Timeout = Budget };
+
+        protected override LiveTailOptions ConfiguredLiveTail => new() { MaxWait = ParkedLongerThanAnyTest };
 
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
@@ -67,9 +88,13 @@ public sealed class LiveTailRowWriterTests : IClassFixture<LiveTailRowWriterTest
         public const string SpentBudget = "@mt = 'scripted spent budget'";
 
         private int _spentBudgetPolls;
+        private int _spentBudgetRowsProduced;
 
         /// <summary>How many polls the spent-budget tail made. One: it ends after the first.</summary>
         public int SpentBudgetPolls => Volatile.Read(ref _spentBudgetPolls);
+
+        /// <summary>How many rows the spent-budget script handed to the writer (see <see cref="SpentBudgetAsync"/>).</summary>
+        public int SpentBudgetRowsProduced => Volatile.Read(ref _spentBudgetRowsProduced);
 
         /// <summary>The burst tail's second poll, which carries the cursor the first one left.</summary>
         public TaskCompletionSource<QueryRequest> BurstFollowUp { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -98,10 +123,10 @@ public sealed class LiveTailRowWriterTests : IClassFixture<LiveTailRowWriterTest
                     BurstFollowUp.TrySetResult(request);
                     return new Inline([]);
                 case SlowScan when request.AfterEventId is null:
-                    return SlowScanAsync(ct);
+                    return SlowScanAsync();
                 case SpentBudget:
                     Interlocked.Increment(ref _spentBudgetPolls);
-                    return SpentBudgetAsync(ct);
+                    return SpentBudgetAsync(this, ct);
                 default:
                     return new Inline([]);
             }
@@ -110,9 +135,10 @@ public sealed class LiveTailRowWriterTests : IClassFixture<LiveTailRowWriterTest
         /// <summary>
         /// Two rows back to back — the second is held by every on-write rule — and then the scan goes on
         /// working asynchronously, as ScanPace makes a real one wait, until the client has the second row
-        /// or the budget runs out.
+        /// (or <see cref="SlowScanWaitLimit"/> passes). The budget does not end the wait: whether the
+        /// client got the row in time must not depend on how fast a loaded runner delivers it.
         /// </summary>
-        private async IAsyncEnumerable<LogEvent> SlowScanAsync([EnumeratorCancellation] CancellationToken ct)
+        private async IAsyncEnumerable<LogEvent> SlowScanAsync()
         {
             yield return Row(0);
             yield return Row(1);
@@ -120,10 +146,10 @@ public sealed class LiveTailRowWriterTests : IClassFixture<LiveTailRowWriterTest
             bool seen;
             try
             {
-                await SlowScanRowSeen.Task.WaitAsync(ct);
+                await SlowScanRowSeen.Task.WaitAsync(SlowScanWaitLimit);
                 seen = true;
             }
-            catch (OperationCanceledException)
+            catch (TimeoutException)
             {
                 seen = false;
             }
@@ -135,10 +161,19 @@ public sealed class LiveTailRowWriterTests : IClassFixture<LiveTailRowWriterTest
         /// evaluating — so nothing gives the writer a moment to send before it does. Only then does the
         /// step go asynchronous: the writer's send starts under the spent token, is refused before the
         /// body takes a byte, and both rows stay buffered for the handler's query-error to carry out.
+        ///
+        /// <para>The rows it PRODUCED are counted before each is handed over. A runner that stalls the
+        /// poll for the whole budget before the first row reaches the writer makes that row's own write
+        /// the refused send (the stream has been quiet past the hold), which ends the scan there: one row,
+        /// not two, carried out by the same query-error. That is the same contract, reached one row
+        /// earlier, so the test asserts it against what was produced rather than failing on it.</para>
         /// </summary>
-        private static async IAsyncEnumerable<LogEvent> SpentBudgetAsync([EnumeratorCancellation] CancellationToken ct)
+        private static async IAsyncEnumerable<LogEvent> SpentBudgetAsync(
+            ScriptedTail script, [EnumeratorCancellation] CancellationToken ct)
         {
+            Volatile.Write(ref script._spentBudgetRowsProduced, 1);
             yield return Row(0);
+            Volatile.Write(ref script._spentBudgetRowsProduced, 2);
             yield return Row(1);
             ct.WaitHandle.WaitOne(Budget * 10);
             await Task.Delay(50, CancellationToken.None);
@@ -273,14 +308,21 @@ public sealed class LiveTailRowWriterTests : IClassFixture<LiveTailRowWriterTest
     {
         using var tail = await OpenTailAsync(ScriptedTail.Burst);
 
-        var clock = Stopwatch.StartNew();
-        var rows  = await ReadRowsAsync(tail, 3);
-        clock.Stop();
+        // The tail parks for longer than this test's token lives (ParkedLongerThanAnyTest), so rows
+        // that waited in the buffer for the keepalive after the park never arrive in time.
+        List<string> rows;
+        try
+        {
+            rows = await ReadRowsAsync(tail, 3);
+        }
+        catch (OperationCanceledException)
+        {
+            Assert.Fail("the poll's rows never reached the client — they waited in the buffer for the keepalive " +
+                        "after the park instead of going out with their poll");
+            throw;
+        }
 
         Assert.Equal(new[] { "row 0", "row 1", "row 2" }, rows);
-        Assert.True(clock.Elapsed < PushBudget,
-            $"the poll's rows took {clock.ElapsedMilliseconds} ms to reach the client — they waited in the " +
-            "buffer for the keepalive after the park instead of going out with their poll");
 
         WakeTheTail();
         var next = await _factory.Tail.BurstFollowUp.Task.WaitAsync(TimeSpan.FromSeconds(10), tail.Token);
@@ -305,7 +347,7 @@ public sealed class LiveTailRowWriterTests : IClassFixture<LiveTailRowWriterTest
         });
 
         Assert.Equal(new[] { "row 0", "row 1" }, rows);
-        Assert.True(await _factory.Tail.SlowScanWaitEnded.Task.WaitAsync(TimeSpan.FromSeconds(10), tail.Token),
+        Assert.True(await _factory.Tail.SlowScanWaitEnded.Task.WaitAsync(SlowScanWaitLimit * 2, tail.Token),
             "the client got row 1 only after the scan stopped waiting for it — the poll held its rows to the end");
     }
 
@@ -322,7 +364,13 @@ public sealed class LiveTailRowWriterTests : IClassFixture<LiveTailRowWriterTest
 
         var (frames, error) = await ReadToEndAsync(tail);
 
-        Assert.Equal(new[] { "row 0", "row 1", "query-error" }, frames);
+        // Two rows, unless the runner stalled the poll for its whole budget before the first row was
+        // written; then that row's own send is the refused one and the scan ends after it. Either
+        // way: every row produced, once, in order, ahead of exactly one query-error.
+        int produced = _factory.Tail.SpentBudgetRowsProduced;
+        Assert.InRange(produced, 1, 2);
+        string[] expected = [.. new[] { "row 0", "row 1" }.Take(produced), "query-error"];
+        Assert.Equal(expected, frames);
         Assert.NotNull(error);
         Assert.Contains("budget", error);
         Assert.Equal(1, _factory.Tail.SpentBudgetPolls);
