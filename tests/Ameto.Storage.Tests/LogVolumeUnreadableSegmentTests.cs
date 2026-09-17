@@ -223,6 +223,68 @@ public sealed class LogVolumeUnreadableSegmentTests : IDisposable
     }
 
     /// <summary>
+    /// A MERGE WHOSE OUTPUT THE SNAPSHOT ALREADY LISTS IS NOT A FLOOR. The merge publishes its
+    /// output and then deletes its sources one by one, so a scan whose snapshot is taken in
+    /// between lists the output AND a source still to be deleted. The output holds that source's
+    /// events and the scan reads them there; the source it then fails to open lost nothing, and
+    /// calling the count a floor made an exact total look partial.
+    ///
+    /// <para>The scan starts right after the merge removed its first source's entry, so its
+    /// snapshot lists the output and the second source; every worker waits for the merge to
+    /// finish, so the second source's file is gone when it is opened.</para>
+    /// </summary>
+    [Fact]
+    public async Task A_merge_source_deleted_after_a_snapshot_that_lists_its_output_is_not_a_floor()
+    {
+        var sources = await MergeablePairAsync();
+
+        using var firstRemoved = new ManualResetEventSlim();
+        using var scanning     = new ManualResetEventSlim();
+        using var mergeDone    = new ManualResetEventSlim();
+        int removals = 0;
+        _engine._afterSegmentEntryRemoved = () =>
+        {
+            if (Interlocked.Increment(ref removals) != 1) return;
+            firstRemoved.Set();
+            Assert.True(scanning.Wait(TimeSpan.FromSeconds(30)), "the scan never took its snapshot");
+        };
+        var merge = Task.Run(async () =>
+        {
+            try     { return await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None); }
+            finally { mergeDone.Set(); }
+        });
+        Assert.True(firstRemoved.Wait(TimeSpan.FromSeconds(30)), "the merge never removed a source");
+
+        IReadOnlyList<SegmentInfo>? listed = null;
+        _engine._beforeHeaderSegmentOpen = _ =>
+        {
+            // Read before the merge is released, and kept only from the worker that got here
+            // first: a later worker's read may already see the second source gone.
+            Interlocked.CompareExchange(ref listed, _engine.ListSegments(), null);
+            scanning.Set();
+            mergeDone.Wait(TimeSpan.FromSeconds(30));
+        };
+        LogVolumeCounts counts;
+        try     { counts = await CountAsync(); }
+        finally { _engine._beforeHeaderSegmentOpen = null; _engine._afterSegmentEntryRemoved = null; }
+
+        Assert.True(await merge, "setup: the merge pass did not merge the pair");
+        var output = Assert.Single(_engine.ListSegments());
+        Assert.Equal(120u, output.EventCount);
+        Assert.Equal(2, removals);
+        Assert.NotNull(listed);
+        // The catalog the scan's workers saw: the output and one source, never both sources.
+        Assert.Contains(listed!, s => SegmentKey.Of(s) == SegmentKey.Of(output));
+        Assert.Single(listed!, s => sources.Any(src => SegmentKey.Of(src) == SegmentKey.Of(s)));
+        foreach (var s in sources) Assert.False(File.Exists(s.FilePath), "setup: a source survived the merge");
+
+        Assert.Equal(120, counts.Total);               // every event, read in the output
+        Assert.Equal(0,   counts.MergedAwaySegments);  // …so the missed source is no floor
+        Assert.Equal(0,   counts.SkippedSegments);
+        Assert.Empty(HeaderWarnings());
+    }
+
+    /// <summary>
     /// The record of merged-away keys is bounded, and a scan that may have lost a record to the
     /// bound calls the removal a merge rather than guess retention. With room for ONE key, the
     /// merge's second source evicts the first while the scan runs; the first is still a floor.

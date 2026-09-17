@@ -156,12 +156,19 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     internal int WarnedUnreadableSegmentCap = 1024;
     /// <summary>
     /// Segments a merge has taken out of the catalog, by key, with the number of the record that
-    /// named each. The header aggregation consults it when a segment in its snapshot is gone by
-    /// the time a worker opens it, because the two ways a segment leaves mid-scan mean opposite
-    /// things for the count. Retention's removal took the events out of the store, so leaving
-    /// them out IS the answer. A merge's removal moved them into its output, which a snapshot
-    /// taken before the merge published does not list, so leaving them out gives a low total —
-    /// and presented as complete, a wrong one.
+    /// named each and the key of the output that now holds its events. The header aggregation
+    /// consults it when a segment in its snapshot is gone by the time a worker opens it, because
+    /// the two ways a segment leaves mid-scan mean opposite things for the count. Retention's
+    /// removal took the events out of the store, so leaving them out IS the answer. A merge's
+    /// removal moved them into its output, which a snapshot taken before the merge published
+    /// does not list, so leaving them out gives a low total — and presented as complete, a wrong
+    /// one.
+    ///
+    /// <para>The output is kept because "before the merge published" is not every snapshot that
+    /// lists a source. The merge publishes its output first and deletes its sources after, so a
+    /// snapshot taken in between lists both — and a scan over it reads the source's events in
+    /// the output. Missing the source there loses nothing, and calling the total a floor would
+    /// make an exact count look partial.</para>
     ///
     /// <para>Written by the merge (<see cref="RecordMergedAwaySegment"/>), not by
     /// <see cref="DeleteSegmentAsync"/>: every caller of the delete — retention, the merge's source
@@ -175,7 +182,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// <see cref="_mergedAwayGate"/>, a leaf, taken only by the merge's cleanup and by a scan
     /// that has already failed to read a segment.</para>
     /// </summary>
-    private readonly Dictionary<SegmentKey, long> _mergedAwaySegments = new();
+    private readonly Dictionary<SegmentKey, MergedAwayRecord> _mergedAwaySegments = new();
+    /// <summary>One entry of <see cref="_mergedAwaySegments"/>: which record named the source, and where its events went.</summary>
+    private readonly record struct MergedAwayRecord(long Number, SegmentKey Output);
     /// <summary>Record <c>n</c>'s key at <c>[(n - 1) % Length]</c>; allocated by the first merge.</summary>
     private SegmentKey[]? _mergedAwayRing;
     /// <summary>Records ever made. Written under the gate; a scan reads it without, as its mark.</summary>
@@ -891,6 +900,10 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 // read back out — see the totalsOnly parameter. With a service filter the
                 // catalog cannot answer at all, so the shortcut turns itself off.
                 bool wholeSegments = totalsOnly && svcFilter is null;
+                // The snapshot's keys as a set, built only if a worker meets a merged-away source
+                // (see SnapshotLists). Declared beside the other captured locals so it shares
+                // their closure rather than adding one.
+                HashSet<SegmentKey>? snapshotKeys = null;
                 await Task.Run(() =>
                 {
                     int degree = Math.Clamp(Environment.ProcessorCount / 2, 2, 8);
@@ -927,7 +940,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                                 // Never lose the whole aggregate over one bad/racing segment file —
                                 // but never HIDE a bad one either. Whatever the segment yielded
                                 // before the throw stays in; it is real data.
-                                OnHeaderSegmentUnreadable(ex, info, local, mergedAwayMark);
+                                OnHeaderSegmentUnreadable(ex, info, local, mergedAwayMark, segInfos, ref snapshotKeys);
                             }
                             return local;
                         },
@@ -981,11 +994,13 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     ///
     /// <para>But the kinds differ in where the events went. <b>Retention</b> removed them from the
     /// store: leaving them out is the right answer, so the race is only logged at Debug.
-    /// <b>A merge</b> moved them into its output, which this snapshot does not list, so the total
-    /// is low; it is counted in <see cref="LogVolumeCounts.MergedAwaySegments"/> for a caller that
-    /// presents the total as a fact to call it a floor. Silencing that case too made
+    /// <b>A merge</b> moved them into its output. When this snapshot does not list that output
+    /// the total is low; it is counted in <see cref="LogVolumeCounts.MergedAwaySegments"/> for a
+    /// caller that presents the total as a fact to call it a floor. Silencing that case too made
     /// <c>select count(*)</c> over a wide window report a low number as complete whenever a merge
-    /// landed under it.</para>
+    /// landed under it. When the snapshot DOES list the output — taken after the merge published
+    /// and before it deleted this source — the scan reads the events there, so the race is as
+    /// silent as retention's: counted, it turned an exact total into a floor.</para>
     ///
     /// <para>Told apart, rather than answered by scanning the window again with a fresh snapshot.
     /// A rescan doubles the decode cost of exactly the wide windows a merge is most likely to land
@@ -996,7 +1011,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// <para><b>Unreadable</b>: the catalog still serves it. The skip is counted, so a caller that
     /// presents the total as a fact can say it is a floor, and named once at Warning.</para>
     /// </summary>
-    private void OnHeaderSegmentUnreadable(Exception ex, SegmentInfo info, LogVolumeAggregator local, long mergedAwayMark)
+    private void OnHeaderSegmentUnreadable(
+        Exception ex, SegmentInfo info, LogVolumeAggregator local,
+        long mergedAwayMark, IReadOnlyList<SegmentInfo> snapshot, ref HashSet<SegmentKey>? snapshotKeys)
     {
         var key = SegmentKey.Of(info);
         if (!CatalogServes(key, info))
@@ -1005,7 +1022,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             // records a key before it deletes the segment, so an entry seen gone by a merge is
             // always already recorded. Read in the opposite order, a merge landing between the
             // two reads would be found in neither and pass for retention.
-            if (MayHaveBeenMergedAway(key, mergedAwayMark))
+            if (MayHaveBeenMergedAway(key, mergedAwayMark, snapshot, ref snapshotKeys))
             {
                 local.AddMergedAwaySegment();
                 _logger.LogDebug(ex,
@@ -1014,7 +1031,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             }
             else
                 _logger.LogDebug(ex,
-                    "Header aggregation skipped segment {NodeId}-{Id}: it left the catalog while the scan ran (retention or delete)",
+                    "Header aggregation skipped segment {NodeId}-{Id}: it left the catalog while the scan ran (retention, delete, or a merge whose output the scan reads)",
                     info.NodeId, info.Id);
             return;
         }
@@ -1030,10 +1047,11 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
     /// <summary>
     /// Records that a merge is about to delete <paramref name="key"/>, whose events its published
-    /// output now holds. Called for each source immediately before its delete, so the record is
-    /// in place before the catalog entry goes (see <see cref="_mergedAwaySegments"/>).
+    /// output <paramref name="output"/> now holds. Called for each source immediately before its
+    /// delete, so the record is in place before the catalog entry goes (see
+    /// <see cref="_mergedAwaySegments"/>).
     /// </summary>
-    private void RecordMergedAwaySegment(SegmentKey key)
+    private void RecordMergedAwaySegment(SegmentKey key, SegmentKey output)
     {
         lock (_mergedAwayGate)
         {
@@ -1049,22 +1067,30 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 // survived it.
                 long evicted = n - ring.Length;
                 var  old     = ring[slot];
-                if (_mergedAwaySegments.TryGetValue(old, out long at) && at == evicted)
+                if (_mergedAwaySegments.TryGetValue(old, out var at) && at.Number == evicted)
                     _mergedAwaySegments.Remove(old);
                 _mergedAwayEvictedThrough = evicted;
             }
 
             ring[slot] = key;
-            _mergedAwaySegments[key] = n;
+            _mergedAwaySegments[key] = new MergedAwayRecord(n, output);
             Interlocked.Exchange(ref _mergedAwayRecorded, n);   // the scan's mark reads it without the gate
         }
     }
 
     /// <summary>
     /// Whether a segment that left the catalog during the scan whose mark is
-    /// <paramref name="mark"/> may have been a merge's source rather than a retention delete.
+    /// <paramref name="mark"/> and whose snapshot is <paramref name="snapshot"/> may have been a
+    /// merge's source whose events that scan does not read — rather than a retention delete, or
+    /// a merge whose output the snapshot lists.
     ///
-    /// <para>True when the record names it. Also true when eviction may have dropped its record,
+    /// <para>True when the record names it and the snapshot does not list the output it names.
+    /// A listed output was published before the snapshot was taken, so the scan reads the
+    /// source's events there (or, if the output cannot be read either, sorts THAT failure on its
+    /// own). The snapshot's keys are looked up only here, after the record has named an output,
+    /// so a scan that meets no merged-away source builds nothing.</para>
+    ///
+    /// <para>Also true when eviction may have dropped its record,
     /// which is the conservative direction: a retention delete called a merge makes one count a
     /// floor that was exact, where a merge called retention makes a low count look exact.</para>
     ///
@@ -1079,11 +1105,41 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// equals the record's number; otherwise the number is above the mark. Either way it is at
     /// least the mark, and eviction that has not reached the mark cannot have dropped it.</para>
     /// </summary>
-    private bool MayHaveBeenMergedAway(SegmentKey key, long mark)
+    private bool MayHaveBeenMergedAway(
+        SegmentKey key, long mark, IReadOnlyList<SegmentInfo> snapshot, ref HashSet<SegmentKey>? snapshotKeys)
     {
+        SegmentKey output;
         lock (_mergedAwayGate)
-            return _mergedAwaySegments.ContainsKey(key)
-                || (_mergedAwayEvictedThrough > 0 && _mergedAwayEvictedThrough >= mark);
+        {
+            // An evicted record took its output with it: no telling whether the snapshot lists
+            // it, so the cautious answer stands.
+            if (!_mergedAwaySegments.TryGetValue(key, out var record))
+                return _mergedAwayEvictedThrough > 0 && _mergedAwayEvictedThrough >= mark;
+            output = record.Output;
+        }
+
+        // Outside the gate: the first lookup a scan makes builds a set of its snapshot, and the
+        // merge's cleanup must not wait on that.
+        return !SnapshotLists(snapshot, output, ref snapshotKeys);
+    }
+
+    /// <summary>
+    /// Whether <paramref name="snapshot"/> lists <paramref name="key"/>. The key set is built by
+    /// the first call a scan makes and shared by its parallel workers: published whole by a
+    /// compare-exchange and never written after, so concurrent lookups are safe. Two workers
+    /// racing to build it each build one and one wins, and both answer from a complete set.
+    /// A merge output's key is freshly allocated, so the key alone names it.
+    /// </summary>
+    private static bool SnapshotLists(IReadOnlyList<SegmentInfo> snapshot, SegmentKey key, ref HashSet<SegmentKey>? keys)
+    {
+        var set = Volatile.Read(ref keys);
+        if (set is null)
+        {
+            var built = new HashSet<SegmentKey>(snapshot.Count);
+            for (int i = 0; i < snapshot.Count; i++) built.Add(SegmentKey.Of(snapshot[i]));
+            set = Interlocked.CompareExchange(ref keys, built, null) ?? built;
+        }
+        return set.Contains(key);
     }
 
     /// <summary>
@@ -2807,8 +2863,10 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             // Before the delete, so a header scan that finds the entry gone finds the record
             // too, and calls the count it gives a floor rather than presenting it as complete:
             // this source's events are in the output just published, which a scan already
-            // running does not list. Retention deletes are not recorded; their events are gone.
-            RecordMergedAwaySegment(SegmentKey.Of(seg));
+            // running does not list. The output is named with it, because a scan that started
+            // after the publish above DOES list it and reads the events there. Retention deletes
+            // are not recorded; their events are gone.
+            RecordMergedAwaySegment(SegmentKey.Of(seg), SegmentKey.Of(info));
             await DeleteSegmentAsync(SegmentKey.Of(seg), ct);
         }
 

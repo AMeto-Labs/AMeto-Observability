@@ -323,6 +323,54 @@ public sealed class AggregationHeaderPathTests : IDisposable
     }
 
     /// <summary>
+    /// …BUT NOT WHEN THE SNAPSHOT ALREADY LISTS THE MERGE'S OUTPUT. The merge publishes its output
+    /// and then deletes its sources, so a scan whose snapshot falls between the two lists the
+    /// output and a source not yet deleted. It reads that source's events in the output; the
+    /// source's own failed open lost nothing, so the count is exact and must say so.
+    ///
+    /// <para>The scan starts once the merge has removed its first source's entry, and every
+    /// worker waits for the merge to finish before it opens anything.</para>
+    /// </summary>
+    [Fact]
+    public async Task A_merge_whose_output_the_header_snapshot_lists_leaves_the_count_complete()
+    {
+        Assert.True(AggregationParser.TryParse("select count(*)", out var total));
+        await _engine.FlushHotTierAsync();
+
+        using var firstRemoved = new ManualResetEventSlim();
+        using var scanning     = new ManualResetEventSlim();
+        using var mergeDone    = new ManualResetEventSlim();
+        int removals = 0;
+        _engine._afterSegmentEntryRemoved = () =>
+        {
+            if (Interlocked.Increment(ref removals) != 1) return;
+            firstRemoved.Set();
+            Assert.True(scanning.Wait(TimeSpan.FromSeconds(30)), "the scan never reached a segment");
+        };
+        var merge = Task.Run(async () =>
+        {
+            try     { return await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None); }
+            finally { mergeDone.Set(); }
+        });
+        Assert.True(firstRemoved.Wait(TimeSpan.FromSeconds(30)), "the merge never removed a source");
+
+        _engine._beforeHeaderSegmentOpen = _ =>
+        {
+            scanning.Set();
+            mergeDone.Wait(TimeSpan.FromSeconds(30));
+        };
+        AggregationResult raced;
+        try     { raced = await _withHeader.ExecuteAsync(total!, From, To); }
+        finally { _engine._beforeHeaderSegmentOpen = null; _engine._afterSegmentEntryRemoved = null; }
+
+        Assert.True(await merge, "setup: the merge pass merged nothing — the test proves nothing");
+        Assert.Equal(2, removals);   // one pair: the second source was deleted under the scan
+
+        Assert.False(raced.Partial, $"an exact count was reported as partial: {raced.PartialReason}");
+        Assert.Equal(400d, Assert.Single(raced.Rows).Values[0]);
+    }
+
+    /// <summary>
     /// The first block's <c>uncompressedSize</c> sits right after the 46-byte segment header;
     /// torn to a negative it fails <c>ValidateBlockFrame</c> with InvalidDataException before a
     /// single header of the segment is counted (the same tear SegmentCatalogKeyTests uses).
