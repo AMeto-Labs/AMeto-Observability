@@ -1008,36 +1008,44 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// 15 s — so it would still need this verdict. And the next poll, or a rerun, reads the merged
     /// output anyway.</para>
     ///
-    /// <para><b>Unreadable</b>: the catalog still serves it. The skip is counted, so a caller that
-    /// presents the total as a fact can say it is a floor, and named once at Warning.</para>
+    /// <para><b>Unreadable</b>: the catalog still serves it — checked again once its place under
+    /// the warning cap is taken, since a delete can land in between. The skip is counted, so a
+    /// caller that presents the total as a fact can say it is a floor, and named once at
+    /// Warning.</para>
     /// </summary>
     private void OnHeaderSegmentUnreadable(
         Exception ex, SegmentInfo info, LogVolumeAggregator local,
         long mergedAwayMark, IReadOnlyList<SegmentInfo> snapshot, ref HashSet<SegmentKey>? snapshotKeys)
     {
         var key = SegmentKey.Of(info);
-        if (!CatalogServes(key, info))
+
+        // Counted as a skip only AFTER LogUnreadableSegment has taken the segment's place under
+        // the warning cap and found it still served. A delete can land between this catalog
+        // check and that place; counted up front, a segment retention removed in that window was
+        // a skip, and the partial reason pointed at a Warning the take-back never let be written,
+        // for a count that was exact. It is the same race the check here catches, one step
+        // later, so it is sorted the same way.
+        if (CatalogServes(key, info) && LogUnreadableSegment(ex, info, key))
         {
-            // The catalog first and the record second, never the other way round: the merge
-            // records a key before it deletes the segment, so an entry seen gone by a merge is
-            // always already recorded. Read in the opposite order, a merge landing between the
-            // two reads would be found in neither and pass for retention.
-            if (MayHaveBeenMergedAway(key, mergedAwayMark, snapshot, ref snapshotKeys))
-            {
-                local.AddMergedAwaySegment();
-                _logger.LogDebug(ex,
-                    "Header aggregation skipped segment {NodeId}-{Id}: a merge rewrote it while the scan ran, so counts over its window are a floor",
-                    info.NodeId, info.Id);
-            }
-            else
-                _logger.LogDebug(ex,
-                    "Header aggregation skipped segment {NodeId}-{Id}: it left the catalog while the scan ran (retention, delete, or a merge whose output the scan reads)",
-                    info.NodeId, info.Id);
+            local.AddSkippedSegment();
             return;
         }
 
-        local.AddSkippedSegment();
-        LogUnreadableSegment(ex, info);
+        // The catalog first and the record second, never the other way round: the merge
+        // records a key before it deletes the segment, so an entry seen gone by a merge is
+        // always already recorded. Read in the opposite order, a merge landing between the
+        // two reads would be found in neither and pass for retention.
+        if (MayHaveBeenMergedAway(key, mergedAwayMark, snapshot, ref snapshotKeys))
+        {
+            local.AddMergedAwaySegment();
+            _logger.LogDebug(ex,
+                "Header aggregation skipped segment {NodeId}-{Id}: a merge rewrote it while the scan ran, so counts over its window are a floor",
+                info.NodeId, info.Id);
+        }
+        else
+            _logger.LogDebug(ex,
+                "Header aggregation skipped segment {NodeId}-{Id}: it left the catalog while the scan ran (retention, delete, or a merge whose output the scan reads)",
+                info.NodeId, info.Id);
     }
 
     /// <summary>Whether the catalog still holds this segment under its key AND at its path.</summary>
@@ -1150,10 +1158,13 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// every 15 s, and a torn file stays in the catalog until the next start quarantines it; a
     /// warning per poll would bury everything else. Repeats go to Debug, as before, and so does
     /// every segment past <see cref="WarnedUnreadableSegmentCap"/>.
+    ///
+    /// <para>Returns whether the catalog still served the segment once its place was taken: true
+    /// means a real skip, logged here; false means it left the catalog after the caller's check,
+    /// nothing is logged, and the caller sorts the race as it sorts one its own check caught.</para>
     /// </summary>
-    private void LogUnreadableSegment(Exception ex, SegmentInfo info)
+    private bool LogUnreadableSegment(Exception ex, SegmentInfo info, SegmentKey key)
     {
-        var key = SegmentKey.Of(info);
         _beforeUnreadableSegmentWarned?.Invoke(info);
 
         // Count first: a full set never grows and is never cleared, so past the cap each poll
@@ -1176,10 +1187,13 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         // Rather than the delete evicting under the gate and the check moving inside it: that
         // closes the same window, but only by adding a lock to DeleteSegmentAsync's nest for a
         // log line, and the ordering here needs no lock at all. The gate stays a leaf.
-        if (warn && !CatalogServes(key, info))
+        //
+        // Checked whether or not a place was taken: a segment gone by now is gone for the count
+        // too, cap or no cap, and giving the place back is only the half of it that needs one.
+        if (!CatalogServes(key, info))
         {
-            _warnedUnreadableSegments.TryRemove(key, out _);
-            warn = false;
+            if (warn) _warnedUnreadableSegments.TryRemove(key, out _);
+            return false;
         }
 
         if (warn)
@@ -1188,6 +1202,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 info.NodeId, info.Id, info.FilePath);
         else
             _logger.LogDebug(ex, "Header aggregation skipped segment {Id}", info.Id);
+        return true;
     }
 
     private void OnReaderDisposed()

@@ -446,6 +446,12 @@ public sealed class LogVolumeUnreadableSegmentTests : IDisposable
     /// and the add then kept a key for a segment nothing would ever delete again — one capped
     /// place gone for the life of the process, and a Warning about a segment already removed.
     /// The hook deletes the torn segment exactly there.
+    ///
+    /// <para>And the segment is not a skip either. It was counted as one before its place was
+    /// taken, so the count came back a floor whose reason pointed at a Warning the take-back never
+    /// let be written — for a segment retention removed, whose events are gone, so the count
+    /// without it was exact. Found gone at that point it is the same race as one found gone a
+    /// step earlier, and sorted the same way.</para>
     /// </summary>
     [Fact]
     public async Task A_segment_deleted_between_the_catalog_check_and_the_warning_gives_its_place_back()
@@ -468,13 +474,47 @@ public sealed class LogVolumeUnreadableSegmentTests : IDisposable
         var later = await CountAsync();
 
         Assert.Equal(1, deleted);
-        Assert.Equal(1, raced.SkippedSegments);   // it was still served when its read failed
+        // Retention removed it before its place under the cap was settled: its events are gone,
+        // so the count without them is exact — no skip, no merge, nothing to call a floor.
+        Assert.Equal(0,  raced.SkippedSegments);
+        Assert.Equal(0,  raced.MergedAwaySegments);
+        Assert.Equal(10, raced.Total);             // the second segment, whole
+        Assert.Contains(_log.Entries, e => e.Level == Microsoft.Extensions.Logging.LogLevel.Debug &&
+                                           e.Message.Contains("left the catalog", StringComparison.Ordinal));
         Assert.Equal(1, later.SkippedSegments);
 
         // The one place under the cap is free for the next torn segment…
         Assert.Contains(second.FilePath, Assert.Single(HeaderWarnings()).Message);
         // …and nothing was said at Warning about the segment already gone.
         Assert.False(warnedAboutTheDeleted, "the deleted segment was named at Warning");
+    }
+
+    /// <summary>
+    /// The same window with no place to take — the cap already full — is the same race: the
+    /// segment is gone for the count whether or not a place under the cap was involved, so the
+    /// check after the gate runs either way.
+    /// </summary>
+    [Fact]
+    public async Task A_segment_deleted_in_that_window_past_the_warning_cap_is_not_a_skip_either()
+    {
+        var (first, _) = await TwoSegmentsAsync();
+        _engine.WarnedUnreadableSegmentCap = 0;
+        Tear(first);
+
+        int deleted = 0;
+        _engine._beforeUnreadableSegmentWarned = info =>
+        {
+            if (Interlocked.Exchange(ref deleted, 1) == 0)
+                _engine.DeleteSegmentAsync(SegmentKey.Of(info)).GetAwaiter().GetResult();
+        };
+        var raced = await CountAsync();
+        _engine._beforeUnreadableSegmentWarned = null;
+
+        Assert.Equal(1, deleted);
+        Assert.Equal(0,  raced.SkippedSegments);
+        Assert.Equal(0,  raced.MergedAwaySegments);
+        Assert.Equal(10, raced.Total);
+        Assert.Empty(HeaderWarnings());
     }
 
     private sealed class CapturingLogger : Microsoft.Extensions.Logging.ILogger<StorageEngine>
