@@ -196,11 +196,9 @@ public sealed class SegmentDeleteRetryTests : IAsyncLifetime
     {
         var (path, key) = ImportPeerSegment(21);
 
-        // The file and its directory are gone before the delete (an operator, a lost mount).
-        // File.Delete is silent about a missing file but throws DirectoryNotFoundException for a
-        // missing directory, which is an IOException and was parked as "still open".
+        // The file is gone before the delete (an operator), and its directory is still there.
         File.Delete(path);
-        Directory.Delete(SegDir);
+        Assert.True(Directory.Exists(SegDir));
 
         await _engine.DeleteSegmentAsync(key);
 
@@ -221,9 +219,43 @@ public sealed class SegmentDeleteRetryTests : IAsyncLifetime
         }
 
         File.Delete(path);
-        Directory.Delete(SegDir);
+        Assert.True(Directory.Exists(SegDir));
 
         Assert.Equal(0, _engine.RetryPendingSegmentDeletes());
+    }
+
+    [Fact]
+    public async Task A_delete_whose_segments_directory_is_unreachable_is_parked_and_completed_once_it_is_back()
+    {
+        // The outage below is the Windows one: File.Delete under a missing directory throws
+        // DirectoryNotFoundException (ERROR_PATH_NOT_FOUND).
+        if (!OperatingSystem.IsWindows()) return;
+        await _engine.CatalogLoaded;
+
+        var (path, key) = ImportPeerSegment(23);
+
+        // A volume outage, as a missing drive letter or a broken junction presents it: the
+        // segments directory cannot be reached, and the file behind it still exists. Renaming
+        // the directory away makes File.Delete throw exactly that.
+        string away = SegDir + "-away";
+        Directory.Move(SegDir, away);
+        try
+        {
+            Assert.Throws<DirectoryNotFoundException>(() => File.Delete(path));   // setup
+
+            await _engine.DeleteSegmentAsync(key);
+            Assert.False(InCatalog(key), "the entry must go at once");
+            Assert.Equal(1, _engine.PendingSegmentDeleteCount);   // parked, not taken for gone
+
+            // Still unreachable: the retry keeps the path too.
+            Assert.Equal(1, _engine.RetryPendingSegmentDeletes());
+        }
+        finally { Directory.Move(away, SegDir); }
+
+        // The volume is back, and so is the file; the next pass deletes it.
+        Assert.True(File.Exists(path), "setup: the file must have survived the outage");
+        Assert.Equal(0, _engine.RetryPendingSegmentDeletes());
+        Assert.False(File.Exists(path), "the expired segment's file outlived the outage");
     }
 
     // ── One loop, and a cap ───────────────────────────────────────────────────
