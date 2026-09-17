@@ -1495,20 +1495,21 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// <see cref="_catalogScansRunning"/>. Its own lock and not <c>_importLock</c>, because an
     /// import holds that one across its publish and the scan must still be able to land inside
     /// that window (see <see cref="ImportSegment(string, string)"/>). Taken inside
-    /// <c>_importLock</c> by the delete; nothing is taken under it.
+    /// <c>_importLock</c> by the delete and by the parked retry's record; nothing is taken under it.
     /// </summary>
     private readonly System.Threading.Lock _scanDeleteGate = new();
 
     /// <summary>
     /// Paths whose catalog entry <see cref="DeleteSegmentAsync"/> removed while a catalog scan was
-    /// running, whatever became of the unlink; null while none runs. The scan skips a path in
-    /// here, as it skips a parked one.
+    /// running, whatever became of the unlink, and parked paths a retry settled while one was
+    /// running (see <see cref="TryCompletePendingSegmentDelete"/>); null while none runs. The scan
+    /// skips a path in here, as it skips a parked one, whether it read the file or failed to.
     ///
     /// <para>A record the delete keeps, not a question put to the filesystem. The scan used to
     /// skip a path when <c>File.Exists</c> said false, and that says false for any error too: EIO
     /// or ESTALE on NFS, a bad network path during an SMB hiccup. A LIVE segment skipped on such an
     /// answer stayed out of queries, retention and merges until the next restart. Only a delete
-    /// writes here, so a path in here was deleted.</para>
+    /// and its retry write here, so a path in here was deleted.</para>
     ///
     /// <para>Created when a scan starts and dropped when the last one ends, both under
     /// <see cref="_scanDeleteGate"/>, so it holds one boot scan's deletes and cannot grow for the
@@ -1794,6 +1795,16 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             {
                 _logger.LogWarning(ex, "Failed to delete segment file {File} — not retried", path);
             }
+
+            // Settled, and no entry names the path. A catalog scan running now may have listed it,
+            // and the park is what has kept the scan off it; the record takes over BEFORE the park
+            // goes, both under the gate the scan reads them under, so the scan never sees neither.
+            // A path parked before the scan began has no record of the delete's, and without this
+            // one the scan registered a file it had read just before this unlink (an entry for a
+            // missing file), or quarantined it at Error when its open came after the unlink.
+            // Recorded for an exception no retry fixes too, as the delete records it: that file
+            // stays on disk unserved until the next start.
+            lock (_scanDeleteGate) _deletedDuringCatalogScan?.Add(path);
             Unpark(path);
             return true;
         }
@@ -3488,7 +3499,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 // is instead either wholly before these checks -- and left a park or a record,
                 // both seen here -- or wholly after the add, and removes the entry the add made.
                 // A delete from before the scan began recorded nothing: its unlink either
-                // succeeded before the directory was listed, or was parked. What that does not
+                // succeeded before the directory was listed, or was parked, and a retry that
+                // settles the parked path during the scan records it before unparking it (see
+                // TryCompletePendingSegmentDelete). What that does not
                 // cover is such a delete whose unlink failed and was NOT parked (past
                 // PendingSegmentDeleteCap, or an exception no retry fixes): the file is still on
                 // disk, is registered again, and the next retention pass deletes it again. (The

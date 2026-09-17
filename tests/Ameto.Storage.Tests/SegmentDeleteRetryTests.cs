@@ -709,6 +709,64 @@ public sealed class SegmentDeleteRetryTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task The_catalog_scan_does_not_register_a_parked_file_its_retry_deleted_after_the_scan_read_it()
+    {
+        await _engine.CatalogLoaded;
+
+        // Parked before the scan began, so the delete recorded nothing for it: the park alone keeps
+        // it out, until a retry settles the path and takes the park away.
+        var (path, key) = ParkThroughTheSeam(78);
+        bool retried = false;
+        int  left    = -1;
+
+        // The retry lands after the scan has read and closed the file and before it registers it.
+        // Nothing holds the file any more, so the unlink succeeds on every platform and the path is
+        // unparked. (Nothing in the hook may throw: see the tests above.)
+        _engine._beforeScanRegistersSegment = file =>
+        {
+            if (retried || !string.Equals(file, path, StringComparison.OrdinalIgnoreCase)) return;
+            retried = true;
+            left    = _engine.RetryPendingSegmentDeletes();
+        };
+
+        _engine.LoadSegmentCatalog();
+
+        Assert.True(retried, "setup: the scan never reached the file");
+        Assert.Equal(0, left);   // setup: the retry settled the path
+        Assert.False(File.Exists(path), "setup: the retry should have unlinked the file");
+        Assert.False(InCatalog(key), "the catalog scan registered a segment whose parked delete a retry had just completed");
+        AssertSkippedAsDeleted(path);
+        Assert.Equal(0, _engine.DeletedDuringCatalogScanCount);
+    }
+
+    [Fact]
+    public async Task The_catalog_scan_does_not_quarantine_a_parked_file_its_retry_deleted_before_the_scan_opened_it()
+    {
+        await _engine.CatalogLoaded;
+
+        var (path, key) = ParkThroughTheSeam(79);
+        bool retried = false;
+        int  left    = -1;
+
+        // The same retry, landing between the listing and the open, and running to its end: the
+        // path is unparked by the time the scan's open fails on the missing file.
+        _engine._beforeScanOpensSegment = file =>
+        {
+            if (retried || !string.Equals(file, path, StringComparison.OrdinalIgnoreCase)) return;
+            retried = true;
+            left    = _engine.RetryPendingSegmentDeletes();
+        };
+
+        _engine.LoadSegmentCatalog();
+
+        Assert.True(retried, "setup: the scan never reached the file");
+        Assert.Equal(0, left);   // setup: the retry settled the path
+        Assert.False(File.Exists(path), "setup: the retry should have unlinked the file");
+        Assert.False(InCatalog(key));
+        AssertSkippedAsDeleted(path);
+    }
+
+    [Fact]
     public async Task The_catalog_scan_does_not_quarantine_a_parked_file_its_retry_unlinked_before_the_scan_opened_it()
     {
         await _engine.CatalogLoaded;
