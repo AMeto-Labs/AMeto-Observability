@@ -16,17 +16,20 @@ namespace Ameto.Storage.Tests;
 /// it until the next retention pass.
 ///
 /// <para>The entry is still removed at once, so no new query picks the segment. The unlink is
-/// now retried: in the background with backoff for twice the query timeout, then from every
-/// maintenance and retention pass. A retry must never delete a path the catalog names again.</para>
+/// now retried: by one background loop with backoff for twice the query timeout after each path
+/// was parked, then from every maintenance and retention pass. A retry must never delete a path
+/// the catalog names again, the boot catalog scan must never name a parked path again, a file
+/// already gone is not parked at all, and the parked set is capped.</para>
 ///
 /// <para>Windows-only behaviour: elsewhere the unlink succeeds with the file still mapped, so
-/// there is nothing to retry and each test returns early.</para>
+/// there is nothing to retry and the tests that need a held file return early.</para>
 /// </summary>
 public sealed class SegmentDeleteRetryTests : IAsyncLifetime
 {
     private static readonly NodeId Peer = new(7);
 
     private readonly string _dir = Path.Combine(Path.GetTempPath(), "ameto-segdelete-" + Guid.NewGuid().ToString("N"));
+    private readonly CapturingLogger _log = new();
     private StorageEngine _engine = null!;
 
     private string SegDir => Path.Combine(_dir, "segments");
@@ -37,7 +40,7 @@ public sealed class SegmentDeleteRetryTests : IAsyncLifetime
         _engine = new StorageEngine(
             Options.Create(new ServerOptions { DataDirectory = _dir }),
             new RetentionStore(new ServerOptions { DataDirectory = _dir }, NullLogger<RetentionStore>.Instance),
-            NullLogger<StorageEngine>.Instance)
+            _log)
         {
             // Out of the way by default, so a test drives the retry itself and the background
             // attempt cannot race its assertions. The tests of the background path shorten it.
@@ -183,6 +186,229 @@ public sealed class SegmentDeleteRetryTests : IAsyncLifetime
             var sw = Stopwatch.StartNew();
             await _engine.DisposeAsync();
             Assert.True(sw.Elapsed < TimeSpan.FromSeconds(10), $"DisposeAsync took {sw.Elapsed}");
+        }
+    }
+
+    // ── Already gone ──────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task A_delete_whose_file_is_already_gone_is_done_and_not_parked()
+    {
+        var (path, key) = ImportPeerSegment(21);
+
+        // The file and its directory are gone before the delete (an operator, a lost mount).
+        // File.Delete is silent about a missing file but throws DirectoryNotFoundException for a
+        // missing directory, which is an IOException and was parked as "still open".
+        File.Delete(path);
+        Directory.Delete(SegDir);
+
+        await _engine.DeleteSegmentAsync(key);
+
+        Assert.False(InCatalog(key));
+        Assert.Equal(0, _engine.PendingSegmentDeleteCount);
+    }
+
+    [Fact]
+    public async Task A_parked_delete_whose_file_is_gone_by_the_retry_is_settled()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+
+        var (path, key) = ImportPeerSegment(22);
+        using (SegmentReader.Open(path))
+        {
+            await _engine.DeleteSegmentAsync(key);
+            Assert.Equal(1, _engine.PendingSegmentDeleteCount);
+        }
+
+        File.Delete(path);
+        Directory.Delete(SegDir);
+
+        Assert.Equal(0, _engine.RetryPendingSegmentDeletes());
+    }
+
+    // ── One loop, and a cap ───────────────────────────────────────────────────
+
+    [Fact]
+    public async Task One_background_loop_serves_every_parked_path()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+
+        _engine.SegmentDeleteRetryInitialDelay = TimeSpan.FromMilliseconds(20);
+        var segments = Enumerable.Range(0, 5).Select(i => ImportPeerSegment(30ul + (ulong)i)).ToList();
+        var readers  = segments.Select(s => SegmentReader.Open(s.Path)).ToList();
+
+        Task? loop = null;
+        try
+        {
+            foreach (var (_, key) in segments)
+            {
+                await _engine.DeleteSegmentAsync(key);
+                loop ??= _engine.SegmentDeleteRetryLoop;
+                Assert.Same(loop, _engine.SegmentDeleteRetryLoop);   // parking a path starts no task of its own
+            }
+            Assert.Equal(5, _engine.PendingSegmentDeleteCount);
+            Assert.False(loop!.IsCompleted, "the loop stood down while every path was still held and inside its window");
+        }
+        finally { foreach (var r in readers) r.Dispose(); }
+
+        // The same loop deletes all five once their readers are gone, then stands down.
+        await loop.WaitAsync(TimeSpan.FromSeconds(20));
+        Assert.All(segments, s => Assert.False(File.Exists(s.Path), $"{s.Path} outlived its reader"));
+        Assert.Equal(0, _engine.PendingSegmentDeleteCount);
+    }
+
+    [Fact]
+    public async Task Past_the_cap_a_failed_delete_is_not_parked_and_the_cap_is_warned_once_per_episode()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+
+        _engine.PendingSegmentDeleteCap = 2;
+
+        // Four deletes fail at once — a volume that refuses them looks the same.
+        var first   = Enumerable.Range(0, 4).Select(i => ImportPeerSegment(40ul + (ulong)i)).ToList();
+        var readers = first.Select(s => SegmentReader.Open(s.Path)).ToList();
+        try
+        {
+            foreach (var (_, key) in first) await _engine.DeleteSegmentAsync(key);
+
+            Assert.Equal(2, _engine.PendingSegmentDeleteCount);
+            Assert.All(first, s => Assert.False(InCatalog(s.Key), "the entry must go whether or not the path is parked"));
+            Assert.Single(CapWarnings());
+            Assert.Equal(2, _log.Entries.Count(e => e.Level == Microsoft.Extensions.Logging.LogLevel.Information &&
+                                                    e.Message.Contains("not retried", StringComparison.Ordinal)));
+        }
+        finally { foreach (var r in readers) r.Dispose(); }
+
+        // The two parked files are deleted; the two past the cap stay on disk for the next start.
+        Assert.Equal(0, _engine.RetryPendingSegmentDeletes());
+        Assert.Equal(2, first.Count(s => File.Exists(s.Path)));
+
+        // Drained, so a new episode is named again — once.
+        var second = Enumerable.Range(0, 3).Select(i => ImportPeerSegment(50ul + (ulong)i)).ToList();
+        readers    = second.Select(s => SegmentReader.Open(s.Path)).ToList();
+        try
+        {
+            foreach (var (_, key) in second) await _engine.DeleteSegmentAsync(key);
+            Assert.Equal(2, _engine.PendingSegmentDeleteCount);
+            Assert.Equal(2, CapWarnings().Count());
+        }
+        finally { foreach (var r in readers) r.Dispose(); }
+    }
+
+    [Fact]
+    public async Task After_the_window_a_path_stays_parked_and_a_later_pass_deletes_it()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+
+        _engine.SegmentDeleteRetryInitialDelay   = TimeSpan.FromMilliseconds(20);
+        _engine.SegmentDeleteRetryWindowOverride = TimeSpan.FromMilliseconds(150);
+        var (path, key) = ImportPeerSegment(60);
+
+        var reader = SegmentReader.Open(path);
+        try
+        {
+            await _engine.DeleteSegmentAsync(key);
+            var loop = _engine.SegmentDeleteRetryLoop;
+
+            // The loop gives up on the held path once the window is over, and stands down.
+            await loop.WaitAsync(TimeSpan.FromSeconds(20));
+            Assert.True(File.Exists(path));
+            Assert.Equal(1, _engine.PendingSegmentDeleteCount);
+            Assert.Contains(_log.Entries, e => e.Level == Microsoft.Extensions.Logging.LogLevel.Warning &&
+                                               e.Message.Contains("no longer retrying in the background", StringComparison.Ordinal));
+        }
+        finally { reader.Dispose(); }
+
+        // Nothing in the background tries again...
+        await Task.Delay(300);
+        Assert.True(File.Exists(path), "a background attempt ran after the loop gave the path up");
+        Assert.Equal(1, _engine.PendingSegmentDeleteCount);
+
+        // ...but the next maintenance or retention pass does, and the reader is gone now.
+        Assert.Equal(0, _engine.RetryPendingSegmentDeletes());
+        Assert.False(File.Exists(path));
+    }
+
+    // ── The boot catalog scan ─────────────────────────────────────────────────
+
+    [Fact]
+    public async Task The_catalog_scan_does_not_register_a_path_waiting_for_its_delete()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        await _engine.CatalogLoaded;
+
+        var (path, key) = ImportPeerSegment(70);
+        using (SegmentReader.Open(path))
+        {
+            // Retention expires the segment while a query holds it...
+            await _engine.DeleteSegmentAsync(key);
+            Assert.Equal(1, _engine.PendingSegmentDeleteCount);
+
+            // ...and the boot scan, still walking the directory, reaches the file.
+            _engine.LoadSegmentCatalog();
+            Assert.False(InCatalog(key), "the catalog scan put a segment back that retention had just deleted");
+        }
+
+        Assert.Equal(0, _engine.RetryPendingSegmentDeletes());
+        Assert.False(File.Exists(path), "the retry took the scan's registration for a re-import and kept the file");
+        Assert.False(InCatalog(key));
+    }
+
+    [Fact]
+    public async Task The_catalog_scan_cannot_register_a_path_between_its_entry_going_and_its_park()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        await _engine.CatalogLoaded;
+
+        var (path, key) = ImportPeerSegment(71);
+        using var scanned = new ManualResetEventSlim();
+        Task? scan = null;
+        bool  scanFinishedInside = false;
+
+        // Inside the delete, after the entry went and before the unlink fails and parks: the
+        // scan reaching the file right now must wait for the park, not register the path.
+        _engine._afterSegmentEntryRemoved = () =>
+        {
+            if (scan is not null) return;
+            scan = Task.Run(() => { try { _engine.LoadSegmentCatalog(); } finally { scanned.Set(); } });
+            scanFinishedInside = scanned.Wait(TimeSpan.FromMilliseconds(500));
+        };
+
+        using (SegmentReader.Open(path))
+        {
+            await _engine.DeleteSegmentAsync(key);
+            await scan!.WaitAsync(TimeSpan.FromSeconds(20));
+
+            Assert.False(scanFinishedInside, "the scan ran to completion inside the delete's remove-to-park step");
+            Assert.Equal(1, _engine.PendingSegmentDeleteCount);
+            Assert.False(InCatalog(key), "the catalog scan registered the path the delete was about to park");
+        }
+
+        Assert.Equal(0, _engine.RetryPendingSegmentDeletes());
+        Assert.False(File.Exists(path));
+    }
+
+    private IEnumerable<(Microsoft.Extensions.Logging.LogLevel Level, string Message, Exception? Error)> CapWarnings() =>
+        _log.Entries.Where(e => e.Level == Microsoft.Extensions.Logging.LogLevel.Warning &&
+                                e.Message.Contains("the most that are retried", StringComparison.Ordinal));
+
+    private sealed class CapturingLogger : Microsoft.Extensions.Logging.ILogger<StorageEngine>
+    {
+        private readonly List<(Microsoft.Extensions.Logging.LogLevel Level, string Message, Exception? Error)> _entries = [];
+
+        public IReadOnlyList<(Microsoft.Extensions.Logging.LogLevel Level, string Message, Exception? Error)> Entries
+        {
+            get { lock (_entries) return _entries.ToList(); }
+        }
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel level) => true;
+
+        public void Log<TState>(Microsoft.Extensions.Logging.LogLevel level,
+                                Microsoft.Extensions.Logging.EventId eventId, TState state,
+                                Exception? error, Func<TState, Exception?, string> formatter)
+        {
+            lock (_entries) _entries.Add((level, formatter(state, error), error));
         }
     }
 }

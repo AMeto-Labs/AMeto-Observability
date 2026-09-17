@@ -1150,13 +1150,21 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         // the merge's source cleanup also passes through here, deleting up to a batch in
         // sequence, so it can queue behind an import's rename -- brief and bounded, and the
         // waiting is the point.
+        //
+        // And under _scanDeleteGate, the one lock the boot catalog scan takes (it must never
+        // take _importLock -- see LoadSegmentCatalog). Removing the entry, unlinking the file
+        // and parking a failed unlink are then one step to the scan: it cannot register this
+        // path after the entry has gone but before the park that tells it to leave the path alone.
         lock (_importLock)
+        lock (_scanDeleteGate)
         {
             if (_segments.TryRemove(key, out var info))
             {
                 // Its place under the header aggregation's warning cap goes with it: the set
                 // bounds unreadable segments still SERVED, not every one this process has met.
                 _warnedUnreadableSegments.TryRemove(key, out _);
+
+                _afterSegmentEntryRemoved?.Invoke();
 
                 // The merge bookkeeping (_mergeDeferStrikes, _mergeSkip) is deliberately NOT
                 // touched here. Both are plain collections owned lock-free by the maintenance
@@ -1165,13 +1173,19 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 // that _importLock does not cover (the merge side never takes it). Keys the
                 // delete orphans are pruned at the top of the next merge pass, on the owner.
                 try { File.Delete(info.FilePath); }
+                catch (Exception ex) when (IsAlreadyGone(ex))
+                {
+                    // Gone is what the delete wanted. File.Delete is already silent about a
+                    // missing file; a missing DIRECTORY still throws, and is no reason to park.
+                }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                 {
                     // Windows: a query still maps the file (a prefilter reader lives for the
                     // whole query). The entry stays removed, so no NEW query picks the segment,
-                    // and the unlink is retried once the reader is gone. See ScheduleSegmentDeleteRetry.
-                    _logger.LogDebug(ex, "Segment {Key} is still open — its file delete is retried in the background", key);
-                    ScheduleSegmentDeleteRetry(key, info.FilePath);
+                    // and the unlink is retried once the reader is gone. The same exceptions
+                    // also mean a read-only volume or a denied ACL, which no retry fixes; the
+                    // pending set is capped for that. See ParkSegmentDelete.
+                    ParkSegmentDelete(key, info.FilePath, ex);
                 }
                 catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete segment {Key}", key); }
             }
@@ -1189,24 +1203,69 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// it any more, so nothing expired or deleted it, and after a restart the catalog scan
     /// loaded the expired segment back and served it until the next retention pass.
     ///
-    /// <para>A path is in here from the failed delete until an attempt deletes it or finds the
-    /// catalog naming it again. The background retry (<see cref="RetrySegmentDeleteAsync"/>)
-    /// covers the query timeout twice over; what outlasts even that is retried by
-    /// <see cref="RetryPendingSegmentDeletes"/> from every maintenance and retention pass.</para>
+    /// <para>A path is in here from the failed delete until an attempt deletes it, finds it
+    /// already gone, or finds the catalog naming it again. ONE background loop
+    /// (<see cref="RunSegmentDeleteRetryLoopAsync"/>) serves every path for
+    /// <see cref="SegmentDeleteRetryWindow"/> after it was parked; what outlasts that is retried
+    /// by <see cref="RetryPendingSegmentDeletes"/> from every maintenance and retention pass. It
+    /// used to be one task per path, each with its own 120 s of backoff.</para>
+    ///
+    /// <para>Bounded by <see cref="PendingSegmentDeleteCap"/>. The exceptions an open reader
+    /// causes are also what a read-only volume or a denied ACL throws, and nothing about the
+    /// failure tells them apart. Unbounded, such a volume parked every expired segment for the
+    /// life of the process, and every maintenance and retention pass retried them all, one
+    /// <c>_importLock</c> each. Past the cap a failed delete is logged and left on disk, where
+    /// the next start's catalog scan and retention pass find it again.</para>
+    ///
+    /// <para>Added only under <c>_importLock</c> and <see cref="_scanDeleteGate"/>, and removed
+    /// only under <c>_importLock</c>, so the cap check and the add are one step.</para>
     /// </summary>
-    private readonly ConcurrentDictionary<string, SegmentKey> _pendingSegmentDeletes = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, PendingSegmentDelete> _pendingSegmentDeletes = new(StringComparer.OrdinalIgnoreCase);
 
-    /// <summary>Background retry tasks, so DisposeAsync can wait out their (cancelled) delays.</summary>
-    private readonly ConcurrentDictionary<Task, byte> _segmentDeleteRetries = new();
+    /// <summary>One parked path: the key its entry had, and when its delete failed.</summary>
+    private sealed class PendingSegmentDelete(SegmentKey key, long parkedAtTimestamp)
+    {
+        public readonly SegmentKey Key               = key;
+        public readonly long       ParkedAtTimestamp = parkedAtTimestamp;
+
+        /// <summary>
+        /// Set once the background loop has given up on this path and said so; the maintenance
+        /// and retention passes still retry it. Written only by the loop, of which one runs at a
+        /// time, and read by it (a stale read costs one extra attempt at most).
+        /// </summary>
+        public bool LeftToMaintenance;
+    }
+
+    /// <summary>
+    /// Serialises the boot catalog scan's registration with <see cref="DeleteSegmentAsync"/>'s
+    /// remove, unlink and park. Its own lock and not <c>_importLock</c>, because an import holds
+    /// that one across its publish and the scan must still be able to land inside that window
+    /// (see <see cref="ImportSegment(string, string)"/>). Taken inside <c>_importLock</c> by the
+    /// delete; nothing is taken under it.
+    /// </summary>
+    private readonly System.Threading.Lock _scanDeleteGate = new();
+
+    /// <summary>
+    /// Test hook: called by <see cref="DeleteSegmentAsync"/> after the entry is removed and
+    /// before the file is unlinked, under both of its locks.
+    /// </summary>
+    internal Action? _afterSegmentEntryRemoved;
+
+    /// <summary>The running background retry loop, or the last one to have run.</summary>
+    private Task _segmentDeleteRetryLoop = Task.CompletedTask;
+
+    /// <summary>1 while a retry loop runs; a compare-and-swap from 0 is what starts one.</summary>
+    private int _segmentDeleteRetryLoopRunning;
 
     /// <summary>First pause of the background delete retry; it doubles up to <see cref="SegmentDeleteRetryMaxDelay"/>.</summary>
     internal TimeSpan SegmentDeleteRetryInitialDelay = TimeSpan.FromMilliseconds(500);
     private static readonly TimeSpan SegmentDeleteRetryMaxDelay = TimeSpan.FromSeconds(30);
 
     /// <summary>
-    /// How long the background retry keeps trying before parking the path: twice the query
-    /// timeout, since a query holding the mapping is bounded by it (60 s when unbounded).
-    /// Internal and settable so a test can make the give-up path fast.
+    /// How long after a path is parked the background loop keeps trying it before leaving it to
+    /// the maintenance and retention passes: twice the query timeout, since a query holding the
+    /// mapping is bounded by it (60 s when unbounded). Internal and settable so a test can make
+    /// the give-up path fast.
     /// </summary>
     internal TimeSpan? SegmentDeleteRetryWindowOverride;
 
@@ -1214,60 +1273,149 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         SegmentDeleteRetryWindowOverride
         ?? 2 * (_options.Query.Timeout > TimeSpan.Zero ? _options.Query.Timeout : TimeSpan.FromSeconds(60));
 
+    /// <summary>
+    /// Most paths parked at once. Reaching it takes a thousand deleted segment files held open at
+    /// one moment by queries, or a volume that refuses deletes, and the second is the likelier.
+    /// Past it a failed delete behaves as it did before deletes were retried: logged, and left
+    /// on disk, for the next start's catalog scan and retention pass to find (a merge's source
+    /// is also retried by the merge recovery sweep, from its manifest). Internal so a test can
+    /// lower it.
+    /// </summary>
+    internal int PendingSegmentDeleteCap = 1024;
+
+    /// <summary>1 once the cap's Warning is logged; cleared when the set drains to half the cap.</summary>
+    private int _pendingSegmentDeleteCapWarned;
+
     /// <summary>Paths still waiting for their file to be unlinked (tests).</summary>
     internal int PendingSegmentDeleteCount => _pendingSegmentDeletes.Count;
 
-    /// <summary>
-    /// Registers <paramref name="path"/> for deferred deletion and starts its background retry.
-    /// Never blocks: the caller holds <c>_importLock</c>, and the retry takes that lock only
-    /// around each attempt, never across a wait.
-    /// </summary>
-    private void ScheduleSegmentDeleteRetry(SegmentKey key, string path)
-    {
-        // Already pending: its retry, or the next maintenance pass, covers this failure too.
-        if (!_pendingSegmentDeletes.TryAdd(path, key)) return;
+    /// <summary>The running background retry loop, or the last one to have run (tests).</summary>
+    internal Task SegmentDeleteRetryLoop => Volatile.Read(ref _segmentDeleteRetryLoop);
 
-        // A delete after shutdown began (a late retention call) stays parked: nothing in this
-        // process retries it, and DisposeAsync makes one last attempt.
+    /// <summary>A delete that throws one of these found nothing to delete, which is success.</summary>
+    private static bool IsAlreadyGone(Exception ex) => ex is FileNotFoundException or DirectoryNotFoundException;
+
+    /// <summary>
+    /// Parks a failed delete and makes sure the background loop runs. The caller holds
+    /// <c>_importLock</c> and <see cref="_scanDeleteGate"/>. Never blocks.
+    /// </summary>
+    private void ParkSegmentDelete(SegmentKey key, string path, Exception ex)
+    {
+        // Already parked: that entry's retries cover this failure too.
+        if (_pendingSegmentDeletes.ContainsKey(path)) return;
+
+        if (_pendingSegmentDeletes.Count >= PendingSegmentDeleteCap)
+        {
+            if (Interlocked.Exchange(ref _pendingSegmentDeleteCapWarned, 1) == 0)
+                _logger.LogWarning(
+                    "{Count} segment files are already waiting to be deleted, the most that are retried. A segment " +
+                    "file whose delete fails from now on is not retried: each is logged at Information and stays on " +
+                    "disk until the next start's catalog scan and retention pass find it. This many failing at once " +
+                    "usually means the volume refuses deletes (read-only, permissions), not that queries hold the files.",
+                    _pendingSegmentDeletes.Count);
+            _logger.LogInformation(ex,
+                "Segment file {File} could not be deleted and is not retried: the pending-delete set is full", path);
+            return;
+        }
+
+        _pendingSegmentDeletes.TryAdd(path, new PendingSegmentDelete(key, System.Diagnostics.Stopwatch.GetTimestamp()));
+        _logger.LogDebug(ex, "Segment {Key} could not be deleted (still open?) — its file delete is retried in the background", key);
+        EnsureSegmentDeleteRetryLoop();
+    }
+
+    /// <summary>Starts the background retry loop unless one is running or shutdown has begun.</summary>
+    private void EnsureSegmentDeleteRetryLoop()
+    {
+        // A delete after shutdown began (a late retention call) stays parked: DisposeAsync makes
+        // one last attempt, and nothing else in this process will.
         if (Volatile.Read(ref _disposed) != 0) return;
+        if (Interlocked.CompareExchange(ref _segmentDeleteRetryLoopRunning, 1, 0) != 0) return;
+
         CancellationToken ct;
         try { ct = _cts.Token; }
-        catch (ObjectDisposedException) { return; }
+        catch (ObjectDisposedException)
+        {
+            Volatile.Write(ref _segmentDeleteRetryLoopRunning, 0);
+            return;
+        }
 
-        var t = Task.Run(() => RetrySegmentDeleteAsync(path, ct), CancellationToken.None);
-        _segmentDeleteRetries[t] = 0;
-        _ = t.ContinueWith(
-            static (x, s) => ((ConcurrentDictionary<Task, byte>)s!).TryRemove(x, out _),
-            _segmentDeleteRetries, CancellationToken.None,
-            TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+        Volatile.Write(ref _segmentDeleteRetryLoop,
+            Task.Run(() => RunSegmentDeleteRetryLoopAsync(ct), CancellationToken.None));
     }
 
     /// <summary>
-    /// Retries one deferred delete with exponential backoff for <see cref="SegmentDeleteRetryWindow"/>,
-    /// then parks it for the maintenance and retention passes, saying so once at Warning.
+    /// The one background retry loop. Each pass tries every path it has not yet left to
+    /// maintenance, with exponential backoff between passes; a path still failing
+    /// <see cref="SegmentDeleteRetryWindow"/> after it was parked is left to the maintenance and
+    /// retention passes, with one Warning. The loop ends when no path is left to it, and the next
+    /// park starts another. It holds <c>_importLock</c> only around each attempt.
     /// </summary>
-    private async Task RetrySegmentDeleteAsync(string path, CancellationToken ct)
+    private async Task RunSegmentDeleteRetryLoopAsync(CancellationToken ct)
     {
-        TimeSpan window  = SegmentDeleteRetryWindow;
-        TimeSpan delay   = SegmentDeleteRetryInitialDelay;
-        TimeSpan waited  = TimeSpan.Zero;
-        try
+        TimeSpan delay = SegmentDeleteRetryInitialDelay;
+        while (true)
         {
-            while (true)
+            try { await Task.Delay(delay, ct).ConfigureAwait(false); }
+            catch (OperationCanceledException)
             {
-                await Task.Delay(delay, ct).ConfigureAwait(false);
-                waited += delay;
-                if (TryCompletePendingSegmentDelete(path)) return;
-                if (waited >= window) break;
-                delay = delay * 2 < SegmentDeleteRetryMaxDelay ? delay * 2 : SegmentDeleteRetryMaxDelay;
+                Volatile.Write(ref _segmentDeleteRetryLoopRunning, 0);
+                return;   // shutdown: DisposeAsync makes one last attempt
             }
-        }
-        catch (OperationCanceledException) { return; }   // shutdown: DisposeAsync tries once more
 
-        _logger.LogWarning(
-            "Segment file {File} is still open {Seconds:F0}s after its catalog entry was removed — " +
-            "no longer retrying in the background; the next maintenance or retention pass retries it",
-            path, waited.TotalSeconds);
+            bool more;
+            try { more = RetrySegmentDeletesInBackground(); }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Deferred segment delete pass failed");
+                more = true;
+            }
+
+            if (more)
+            {
+                delay = delay * 2 < SegmentDeleteRetryMaxDelay ? delay * 2 : SegmentDeleteRetryMaxDelay;
+                continue;
+            }
+
+            // Nothing left to this loop. Stand down, then look once more: a path parked after the
+            // pass above saw this loop still running, and so did not start another.
+            Volatile.Write(ref _segmentDeleteRetryLoopRunning, 0);
+            if (!HasSegmentDeletesForBackground()
+                || Interlocked.CompareExchange(ref _segmentDeleteRetryLoopRunning, 1, 0) != 0)
+                return;
+            delay = SegmentDeleteRetryInitialDelay;
+        }
+    }
+
+    /// <summary>One background pass. True while some path is still inside its window.</summary>
+    private bool RetrySegmentDeletesInBackground()
+    {
+        TimeSpan window   = SegmentDeleteRetryWindow;
+        bool     inWindow = false;
+        foreach (var (path, pending) in _pendingSegmentDeletes)
+        {
+            if (pending.LeftToMaintenance || TryCompletePendingSegmentDelete(path)) continue;
+
+            TimeSpan waited = System.Diagnostics.Stopwatch.GetElapsedTime(pending.ParkedAtTimestamp);
+            if (waited < window)
+            {
+                inWindow = true;
+                continue;
+            }
+
+            pending.LeftToMaintenance = true;
+            _logger.LogWarning(
+                "Segment file {File} still could not be deleted {Seconds:F0}s after its catalog entry was removed — " +
+                "no longer retrying in the background; every maintenance and retention pass retries it",
+                path, waited.TotalSeconds);
+        }
+        return inWindow;
+    }
+
+    private bool HasSegmentDeletesForBackground()
+    {
+        foreach (var (_, pending) in _pendingSegmentDeletes)
+            if (!pending.LeftToMaintenance) return true;
+        return false;
     }
 
     /// <summary>
@@ -1277,7 +1425,8 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// <returns>How many paths are still pending afterwards.</returns>
     internal int RetryPendingSegmentDeletes()
     {
-        foreach (var path in _pendingSegmentDeletes.Keys)
+        if (_pendingSegmentDeletes.IsEmpty) return 0;   // the common case costs no enumeration
+        foreach (var (path, _) in _pendingSegmentDeletes)
             TryCompletePendingSegmentDelete(path);
         return _pendingSegmentDeletes.Count;
     }
@@ -1288,7 +1437,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// </summary>
     private bool TryCompletePendingSegmentDelete(string path)
     {
-        if (!_pendingSegmentDeletes.TryGetValue(path, out var key)) return true;   // settled elsewhere
+        if (!_pendingSegmentDeletes.TryGetValue(path, out var pending)) return true;   // settled elsewhere
 
         // Under _importLock, the lock DeleteSegmentAsync and ImportSegment take. An import
         // publishes its entry BEFORE its File.Move lands the file, so checking the catalog
@@ -1297,27 +1446,41 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         // Only the check and the unlink are under it; the waits between attempts are not.
         lock (_importLock)
         {
-            // Named again (re-imported, or re-created under the same name): the file is live
-            // and belongs to that entry now. A stale retry must not touch it.
-            if (_segments.TryGetValue(key, out var current)
+            // Named again: a re-import of the segment to the same path, and the file is live and
+            // belongs to that entry now. A stale retry must not touch it. (Not the boot catalog
+            // scan: it skips a parked path, and cannot slip in ahead of the park -- see
+            // LoadSegmentCatalog. Flushes and merges only ever write new names.)
+            if (_segments.TryGetValue(pending.Key, out var current)
                 && string.Equals(current.FilePath, path, StringComparison.OrdinalIgnoreCase))
             {
-                _pendingSegmentDeletes.TryRemove(path, out _);
+                Unpark(path);
                 return true;
             }
 
-            try { File.Delete(path); }   // no-op when the file is already gone
+            try { File.Delete(path); }   // silent when the file is already gone
+            catch (Exception ex) when (IsAlreadyGone(ex))
+            {
+                // Its directory is gone too, and with it the file: settled.
+            }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
-                return false;            // still held open — try again later
+                return false;            // still held open, or refused — try again later
             }
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "Failed to delete segment file {File} — not retried", path);
             }
-            _pendingSegmentDeletes.TryRemove(path, out _);
+            Unpark(path);
             return true;
         }
+    }
+
+    /// <summary>Removes a settled path, re-arming the cap's Warning once the set has drained to half.</summary>
+    private void Unpark(string path)
+    {
+        _pendingSegmentDeletes.TryRemove(path, out _);
+        if (_pendingSegmentDeletes.Count <= PendingSegmentDeleteCap / 2)
+            Volatile.Write(ref _pendingSegmentDeleteCapWarned, 0);
     }
 
     public IReadOnlyList<SegmentInfo> ListSegments() => _segments.Values.ToList();
@@ -2936,7 +3099,31 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 using var reader = SegmentReader.Open(file, computeUncompressedBytes: true);
                 var info = reader.Info;
                 var key  = SegmentKey.Of(info);
-                if (_segments.TryAdd(key, info)) continue;
+
+                // A path parked for deletion is a segment the catalog already let go -- retention
+                // runs while this scan is still walking the directory -- whose unlink failed
+                // because something held the file open, a query or this very scan's reader.
+                // Registering it again put the expired segment back in service, and the parked
+                // retry then found the catalog naming its path, took that for a re-import and
+                // dropped the delete: the segment was back until the next retention pass.
+                //
+                // Under _scanDeleteGate, which DeleteSegmentAsync holds from removing the entry to
+                // parking the path, so this check and the add are one step to it: a check before
+                // that section and an add after the entry went would otherwise re-register the
+                // path it was about to park. Not under _importLock, which an import holds across
+                // its publish while this scan must still be able to land (see ImportSegment).
+                bool parked, added;
+                lock (_scanDeleteGate)
+                {
+                    parked = _pendingSegmentDeletes.ContainsKey(file);
+                    added  = !parked && _segments.TryAdd(key, info);
+                }
+                if (parked)
+                {
+                    _logger.LogDebug("Segment {File} is waiting for its delete to complete; the catalog scan skips it", file);
+                    continue;
+                }
+                if (added) continue;
 
                 // A live flush or import may have registered this very file while the scan was
                 // running — the scan is a background task, not a barrier — so only a genuinely
@@ -3752,10 +3939,10 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         try { await _maintenanceLoop; }
         catch (OperationCanceledException) { }
         catch (ObjectDisposedException) { }
-        // Deferred segment deletes: cancellation ends their delays at once, so this waits out
-        // at most one attempt in progress, never a backoff. Then one last attempt each; what is
-        // still held stays on disk and the next start's retention pass expires it again.
-        try { await Task.WhenAll(_segmentDeleteRetries.Keys.ToArray()); } catch { /* best-effort */ }
+        // Deferred segment deletes: cancellation ends the retry loop's delay at once, so this
+        // waits out at most one pass in progress, never a backoff. Then one last attempt each;
+        // what is still held stays on disk and the next start's retention pass expires it again.
+        try { await Volatile.Read(ref _segmentDeleteRetryLoop); } catch { /* best-effort */ }
         try { RetryPendingSegmentDeletes(); } catch { /* best-effort */ }
 
         // Await all in-flight parallel flushes before freeing the frozen tiers they
