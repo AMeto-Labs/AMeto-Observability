@@ -699,18 +699,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
         while (!ct.IsCancellationRequested)
         {
-            // Finish any merge whose source deletion was blocked by an open reader
-            // (the manifest survives until every source file is gone).
-            try { RecoverInterruptedMerges(); }
-            catch (Exception ex) { _logger.LogWarning(ex, "Merge recovery sweep failed"); }
-
-            // Segment files whose delete outlasted the background retry (see DeleteSegmentAsync).
-            try { RetryPendingSegmentDeletes(); }
-            catch (Exception ex) { _logger.LogWarning(ex, "Deferred segment delete sweep failed"); }
-
             // One batch per iteration, short pause while a backlog exists.
             bool merged;
-            try { merged = await TryMergeSmallSegmentsOnceAsync(ct); }
+            try { merged = await RunColdMaintenancePassAsync(ct); }
             catch (OperationCanceledException) { break; }
             catch (Exception ex) { _logger.LogError(ex, "Segment merge pass failed"); merged = false; }
             if (merged)
@@ -737,6 +728,31 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             try { await Task.Delay(TimeSpan.FromSeconds(600), ct); }
             catch (OperationCanceledException) { break; }
         }
+    }
+
+    /// <summary>
+    /// One pass of <see cref="RunColdMaintenanceLoopAsync"/>: the two sweeps, then one merge batch.
+    /// True when a batch was merged. The merge's exceptions, cancellation included, reach the
+    /// loop; the sweeps log their own and never stop the merge behind them.
+    ///
+    /// <para>Internal so a test can run a pass without the loop's three-minute settle. Past the
+    /// background retry's window the deferred-delete sweep below and retention's are the only
+    /// retries a parked file gets, so dropping either must fail a test and not only a stand.</para>
+    /// </summary>
+    internal Task<bool> RunColdMaintenancePassAsync(CancellationToken ct)
+    {
+        // Finish any merge whose source deletion was blocked by an open reader
+        // (the manifest survives until every source file is gone).
+        try { RecoverInterruptedMerges(); }
+        catch (Exception ex) { _logger.LogWarning(ex, "Merge recovery sweep failed"); }
+
+        // Segment files whose delete outlasted the background retry (see DeleteSegmentAsync).
+        try { RetryPendingSegmentDeletes(); }
+        catch (Exception ex) { _logger.LogWarning(ex, "Deferred segment delete sweep failed"); }
+
+        // Handed back, not awaited: the merge is already async, and a second state machine around
+        // it would add only its own allocation.
+        return TryMergeSmallSegmentsOnceAsync(ct);
     }
 
     /// <summary>

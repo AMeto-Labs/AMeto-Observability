@@ -471,6 +471,57 @@ public sealed class SegmentDeleteRetryTests : IAsyncLifetime
         Assert.False(File.Exists(path));
     }
 
+    // ── The passes that retry ─────────────────────────────────────────────────
+
+    // Past the background loop's window, a maintenance pass and a retention pass are the only
+    // retries a parked file gets until shutdown, and every other test here calls the retry itself.
+    // These two go through the passes, so a pass that stops calling it fails here rather than
+    // leaking files on a stand. The path is parked through the unlink seam, so both run on every
+    // platform, and the background loop is an hour away (see InitializeAsync).
+
+    [Fact]
+    public async Task A_maintenance_pass_retries_a_parked_delete()
+    {
+        await _engine.CatalogLoaded;
+        var (path, key) = ParkThroughTheSeam(17);
+
+        Assert.False(await _engine.RunColdMaintenancePassAsync(CancellationToken.None));   // setup: nothing to merge
+
+        Assert.Equal(0, _engine.PendingSegmentDeleteCount);
+        Assert.False(File.Exists(path), "a maintenance pass left a parked segment file on disk");
+        Assert.False(InCatalog(key));
+    }
+
+    [Fact]
+    public async Task A_retention_pass_retries_a_parked_delete()
+    {
+        await _engine.CatalogLoaded;
+        var (path, key) = ParkThroughTheSeam(18);
+
+        var result = await _engine.EnforceRetentionAsync();
+        Assert.Equal(0, result.DeletedSegments);   // setup: nothing expired, so only the retry can delete it
+
+        Assert.Equal(0, _engine.PendingSegmentDeleteCount);
+        Assert.False(File.Exists(path), "a retention pass left a parked segment file on disk");
+        Assert.False(InCatalog(key));
+    }
+
+    /// <summary>
+    /// Imports a segment and deletes it with the unlink failing as an open reader makes it fail,
+    /// then puts the real unlink back: parked, with nothing holding the file any more.
+    /// </summary>
+    private (string Path, SegmentKey Key) ParkThroughTheSeam(ulong segId)
+    {
+        var (path, key) = ImportPeerSegment(segId);
+        _engine._deleteSegmentFile = static p => throw new IOException($"The process cannot access the file '{p}'.");
+        Assert.True(_engine.DeleteSegmentAsync(key).IsCompletedSuccessfully);
+        _engine._deleteSegmentFile = File.Delete;
+
+        Assert.Equal(1, _engine.PendingSegmentDeleteCount);   // setup
+        Assert.True(File.Exists(path));
+        return (path, key);
+    }
+
     // ── The boot catalog scan ─────────────────────────────────────────────────
 
     [Fact]
