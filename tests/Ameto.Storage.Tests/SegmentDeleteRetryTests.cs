@@ -197,14 +197,20 @@ public sealed class SegmentDeleteRetryTests : IAsyncLifetime
 
     // ── Already gone ──────────────────────────────────────────────────────────
 
+    // These two never reach the engine's already-gone rule. File.Delete returns without throwing
+    // for a missing file whose directory exists (the runtime swallows ERROR_FILE_NOT_FOUND and
+    // ENOENT), so the engine's unlink simply succeeds. They pin that runtime behaviour, which the
+    // engine relies on, and that neither the delete nor the retry parks such a path.
+
     [Fact]
-    public async Task A_delete_whose_file_is_already_gone_is_done_and_not_parked()
+    public async Task The_runtime_deletes_a_missing_file_silently_and_the_delete_does_not_park_it()
     {
         var (path, key) = ImportPeerSegment(21);
 
         // The file is gone before the delete (an operator), and its directory is still there.
         File.Delete(path);
         Assert.True(Directory.Exists(SegDir));
+        Assert.Null(Record.Exception(() => File.Delete(path)));   // the runtime is silent about it
 
         await _engine.DeleteSegmentAsync(key);
 
@@ -213,7 +219,7 @@ public sealed class SegmentDeleteRetryTests : IAsyncLifetime
     }
 
     [Fact]
-    public async Task A_parked_delete_whose_file_is_gone_by_the_retry_is_settled()
+    public async Task The_runtime_deletes_a_missing_file_silently_and_the_retry_settles_it()
     {
         if (!OperatingSystem.IsWindows()) return;
 
@@ -226,6 +232,7 @@ public sealed class SegmentDeleteRetryTests : IAsyncLifetime
 
         File.Delete(path);
         Assert.True(Directory.Exists(SegDir));
+        Assert.Null(Record.Exception(() => File.Delete(path)));   // the runtime is silent about it
 
         Assert.Equal(0, _engine.RetryPendingSegmentDeletes());
     }
@@ -259,6 +266,34 @@ public sealed class SegmentDeleteRetryTests : IAsyncLifetime
         finally { Directory.Move(away, SegDir); }
 
         // The volume is back, and so is the file; the next pass deletes it.
+        Assert.True(File.Exists(path), "setup: the file must have survived the outage");
+        Assert.Equal(0, _engine.RetryPendingSegmentDeletes());
+        Assert.False(File.Exists(path), "the expired segment's file outlived the outage");
+    }
+
+    [Fact]
+    public async Task A_delete_whose_directory_is_unreachable_while_its_link_still_exists_is_parked()
+    {
+        await _engine.CatalogLoaded;
+
+        var (path, key) = ImportPeerSegment(24);
+
+        // The segments directory is a junction or symlink whose target volume went offline. The
+        // link still answers Directory.Exists, and File.Delete throws DirectoryNotFoundException
+        // for the file behind it. Nothing on disk stages that on every platform, so the unlink
+        // seam throws it, with the directory really there.
+        _engine._deleteSegmentFile = static p => throw new DirectoryNotFoundException($"Could not find a part of the path '{p}'.");
+        Assert.True(Directory.Exists(SegDir));   // setup: the parent "exists"
+
+        await _engine.DeleteSegmentAsync(key);
+        Assert.False(InCatalog(key), "the entry must go at once");
+        Assert.Equal(1, _engine.PendingSegmentDeleteCount);   // parked, not taken for gone
+
+        // Still unreachable: the retry keeps the path too.
+        Assert.Equal(1, _engine.RetryPendingSegmentDeletes());
+
+        // The volume is back, and so is the file; the next pass deletes it.
+        _engine._deleteSegmentFile = File.Delete;
         Assert.True(File.Exists(path), "setup: the file must have survived the outage");
         Assert.Equal(0, _engine.RetryPendingSegmentDeletes());
         Assert.False(File.Exists(path), "the expired segment's file outlived the outage");

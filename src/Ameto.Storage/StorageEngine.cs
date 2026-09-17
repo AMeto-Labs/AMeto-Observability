@@ -1178,13 +1178,12 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 // service and an HTTP endpoint — where a Remove would be a concurrent mutation
                 // that _importLock does not cover (the merge side never takes it). Keys the
                 // delete orphans are pruned at the top of the next merge pass, on the owner.
-                try { File.Delete(info.FilePath); }
-                catch (Exception ex) when (IsAlreadyGone(ex, info.FilePath))
+                try { _deleteSegmentFile(info.FilePath); }
+                catch (Exception ex) when (IsAlreadyGone(ex))
                 {
                     // Gone is what the delete wanted. File.Delete is already silent about a
-                    // missing file. A missing DIRECTORY throws, and is gone only while the
-                    // segments directory itself is there; an unreachable volume falls through
-                    // to the park below.
+                    // missing file; this only guards against a runtime that is not. A missing
+                    // DIRECTORY is not "gone": it is an unreachable one, and parks below.
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                 {
@@ -1317,7 +1316,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
     /// <summary>
     /// Most paths parked at once. Reaching it takes a thousand deleted segment files held open at
-    /// one moment by queries, or a volume that refuses deletes, and the second is the likelier.
+    /// one moment by queries, a volume that refuses deletes, or a segments directory an operator
+    /// deleted outright (on Windows every delete under it throws DirectoryNotFoundException, and
+    /// parks: see <see cref="IsAlreadyGone"/>); the last two are the likelier.
     /// Past it a failed delete behaves as it did before deletes were retried: logged, and left
     /// on disk, for the next start's catalog scan and retention pass to find (a merge's source
     /// is also retried by the merge recovery sweep, from its manifest). Internal so a test can
@@ -1335,19 +1336,33 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     internal Task SegmentDeleteRetryLoop => Volatile.Read(ref _segmentDeleteRetryLoop);
 
     /// <summary>
-    /// Whether a delete of <paramref name="path"/> that threw <paramref name="ex"/> found nothing
-    /// to delete, which is success.
+    /// Whether a segment-file delete that threw <paramref name="ex"/> found nothing to delete,
+    /// which is success. Only <see cref="FileNotFoundException"/>, and File.Delete does not
+    /// normally throw even that: the runtime swallows ERROR_FILE_NOT_FOUND and ENOENT and returns.
+    /// It is kept so a runtime that does throw it is still not parked.
     ///
-    /// <para>FileNotFoundException always. DirectoryNotFoundException only while the segment's
-    /// directory still exists: on Windows a missing drive letter or a broken junction during a
-    /// volume outage throws it too (ERROR_PATH_NOT_FOUND), and the file is still there, behind a
-    /// directory that will come back. Counted as gone, that path was dropped with no park and
-    /// no log, the file leaked until restart, and the boot scan then served the expired segment
-    /// again until the first retention pass. Otherwise it is parked like any other IO failure.</para>
+    /// <para>NEVER <see cref="DirectoryNotFoundException"/>. With a missing file under a directory
+    /// that exists, File.Delete returns without throwing, so this exception already means a
+    /// directory on the path could not be reached: a missing drive letter, or a broken junction or
+    /// symlink during a volume outage (ERROR_PATH_NOT_FOUND), with the file still there behind a
+    /// directory that will come back. It is parked like any other IO failure. Counted as gone,
+    /// the path was dropped with no park and no log, the file leaked until restart, and the boot
+    /// scan then served the expired segment again until the first retention pass.</para>
+    ///
+    /// <para>It used to count as gone while <c>Directory.Exists</c> said the parent was there.
+    /// That probe cannot tell: when the segments directory is itself a junction or symlink whose
+    /// target volume went offline, Windows reports on the link, the parent "exists", and the file
+    /// leaked all the same. A segments directory an operator deleted outright now parks every
+    /// delete instead, which <see cref="PendingSegmentDeleteCap"/> bounds.</para>
     /// </summary>
-    private static bool IsAlreadyGone(Exception ex, string path) =>
-        ex is FileNotFoundException
-        || (ex is DirectoryNotFoundException && Directory.Exists(Path.GetDirectoryName(path)));
+    private static bool IsAlreadyGone(Exception ex) => ex is FileNotFoundException;
+
+    /// <summary>
+    /// Unlinks a segment file for <see cref="DeleteSegmentAsync"/> and the parked retry: File.Delete,
+    /// except in a test that swaps in a failure it cannot stage on disk, such as an unreachable
+    /// directory whose link still resolves. Costs production one field read.
+    /// </summary>
+    internal Action<string> _deleteSegmentFile = File.Delete;
 
     /// <summary>
     /// Parks a failed delete and makes sure the background loop runs. The caller holds
@@ -1511,11 +1526,11 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 return true;
             }
 
-            try { File.Delete(path); }   // silent when the file is already gone
-            catch (Exception ex) when (IsAlreadyGone(ex, path))
+            try { _deleteSegmentFile(path); }   // silent when the file is already gone
+            catch (Exception ex) when (IsAlreadyGone(ex))
             {
-                // Nothing left to delete: settled. (A missing directory counts only while the
-                // segments directory exists; an unreachable volume stays parked below.)
+                // Nothing left to delete: settled. (A missing directory is an unreachable one,
+                // and stays parked below.)
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
