@@ -122,8 +122,13 @@ public sealed class PeerProberIdleTests
         // What ReplicationEndpointMapper does when a peer pings this node.
         registry.Upsert(new PeerPayload { NodeId = 7, Address = "http://peer:5341", Timestamp = DateTimeOffset.UtcNow });
 
-        var deadline = DateTime.UtcNow.AddSeconds(5);
-        while (Volatile.Read(ref handler.Requests) == 0 && DateTime.UtcNow < deadline) await Task.Delay(20);
+        // Wait for the CYCLE, not the request. The handler counts a request before the probe has
+        // read the response, and the cycle is counted only after it has; stopping in between
+        // cancels that read, and the cancellation ends the loop before it counts. A descheduled
+        // loop thread in that gap was enough to fail the assertion on a correct prober. A counted
+        // cycle implies the request was made, so the second assertion still holds by construction.
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        while (prober.ProbeCycles == 0 && DateTime.UtcNow < deadline) await Task.Delay(20);
 
         await prober.StopAsync(CancellationToken.None);
         prober.Dispose();
