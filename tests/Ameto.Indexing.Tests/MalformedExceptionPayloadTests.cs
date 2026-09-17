@@ -140,4 +140,63 @@ public sealed class MalformedExceptionPayloadTests
         Assert.Equal(2, builder.MalformedExceptionPayloads);     // the truncated map and the non-string type only
         Assert.Equal(2, hints.MalformedExceptionPayloads);
     }
+
+    /// <summary>
+    /// <see cref="ExceptionInfo.IsPresent"/> answers from the header, so a string header too short
+    /// to hold its own length (<c>D9</c>, <c>DA 00</c>, <c>DB 00 00 00</c>) and a scalar or array
+    /// cut short are ABSENT to it — yet <see cref="ExceptionInfo.FromBytes(ReadOnlyMemory{byte})"/>
+    /// throws on every one at delivery. They are counted and warned about like a truncated map.
+    /// The readable no-exception shapes beside them, including empty str8/16/32 and a whole
+    /// array, still count nothing.
+    /// </summary>
+    [Fact]
+    public void CutHeaders_AbsentToIsPresent_AreStillCounted_WhileReadableAbsencesAreNot()
+    {
+        byte[][] readable =
+        [
+            [0xC0],                          // nil
+            [0xD9, 0x00],                    // empty str8
+            [0xDA, 0x00, 0x00],              // empty str16
+            [0xDB, 0x00, 0x00, 0x00, 0x00],  // empty str32
+            [0x2A],                          // positive fixint
+            [0x91, 0x01],                    // a whole one-element array
+        ];
+        byte[][] cut =
+        [
+            [0xD9],                          // str8 without its length
+            [0xDA, 0x00],                    // str16 with half its length
+            [0xDB, 0x00, 0x00, 0x00],        // str32 one length byte short
+            [0xCC],                          // uint8 without its byte
+            [0xDC, 0x00, 0x01],              // array16 announcing one element, holding none
+        ];
+
+        // The premise, from the reader's side: all eleven are absent to the presence probe, and
+        // delivery reads the first six as no exception and throws on the other five.
+        foreach (var b in readable)
+        {
+            Assert.False(ExceptionInfo.IsPresent(b));
+            Assert.Null(ExceptionInfo.FromBytes(b.AsMemory()));
+        }
+        foreach (var b in cut)
+        {
+            Assert.False(ExceptionInfo.IsPresent(b));
+            Assert.Throws<EndOfStreamException>(() => ExceptionInfo.FromBytes(b.AsMemory()));
+        }
+
+        var hints = new IndexBuildHints();
+        var log   = new ListLogger();
+        using var builder = new SegmentIndexBuilder(readable.Length + cut.Length, 5, 0, hints, log);
+        var src = new BytesSource([.. readable, .. cut]);
+        uint i = 0;
+        while (src.TryReadNext(out var ev)) builder.Add(i++, in ev);
+
+        Assert.Equal(cut.Length, builder.MalformedExceptionPayloads);
+        Assert.Equal(cut.Length, hints.MalformedExceptionPayloads);
+
+        _ = builder.Serialise();
+        var entry = Assert.Single(log.Entries);
+        Assert.Equal(Microsoft.Extensions.Logging.LogLevel.Warning, entry.Level);
+        Assert.Contains($"{cut.Length} exception payload", entry.Message);
+        Assert.Contains($"file ordinal {readable.Length}", entry.Message);   // the first cut one
+    }
 }

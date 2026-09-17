@@ -267,8 +267,14 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
         // nil, an empty legacy string and any non-string, non-map value are "no exception" to
         // ExceptionInfo.FromBytes, not a malformed one. TryReadIndexFields answers false for all
         // three as it does for a broken map, so they are told apart here, before the count below
-        // could take them for a producer writing exceptions this reader cannot read.
-        if (!ExceptionInfo.IsPresent(ev.ExceptionPayload)) return;
+        // could take them for a producer writing exceptions this reader cannot read. An empty
+        // column — every row this server writes without an exception — leaves on the first test.
+        if (!ExceptionInfo.IsPresent(ev.ExceptionPayload))
+        {
+            if (!ev.ExceptionPayload.IsEmpty && !ReadsAsNoException(ev.ExceptionPayload))
+                NoteMalformedException(offset, ev.ExceptionPayload.Length);
+            return;
+        }
 
         // Merge path: the raw msgpack. Read only the three fields the index wants, in place —
         // the stack trace, 1-5 KB of UTF-16 nobody here reads, is skipped, not decoded. That
@@ -288,12 +294,7 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
                     // compaction over. It is reported at Warning ONCE, when the group seals (see
                     // RecordHints), with the group's count — not per row, and not at Debug, which
                     // the production level never prints.
-                    if (_malformedExceptions++ == 0)
-                    {
-                        _firstMalformedOrdinal = offset;
-                        _firstMalformedBytes   = ev.ExceptionPayload.Length;
-                    }
-                    _hints?.NoteMalformedException();
+                    NoteMalformedException(offset, ev.ExceptionPayload.Length);
                     return;
                 }
                 AddExists(offset);
@@ -321,6 +322,59 @@ public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
     }
 
     private readonly PinnedSpanMemoryManager _exception = new();
+
+    /// <summary>
+    /// Whether a payload <see cref="ExceptionInfo.IsPresent"/> calls absent really is "no
+    /// exception" to delivery, rather than a torn header delivery throws on.
+    ///
+    /// <para>IsPresent answers from the lead byte and, for a string, the length that follows it —
+    /// on purpose, since it runs per scanned row. So a str8/16/32 header too short to hold its own
+    /// length (<c>D9</c>, <c>DA 00</c>, <c>DB 00 00 00</c>), or a scalar cut short, is ABSENT to it
+    /// while <see cref="ExceptionInfo.FromBytes(ReadOnlyMemory{byte})"/> throws
+    /// <see cref="EndOfStreamException"/>. Before IsPresent was consulted here those reached the
+    /// malformed count, as everything TryReadIndexFields cannot read does; returning on IsPresent
+    /// alone lost them from it, and only delivery noticed.</para>
+    ///
+    /// <para>FromBytes itself is asked, so the two cannot disagree. Over the shapes that get here
+    /// it builds nothing — nil, an empty string and a skipped value are all null — so a readable
+    /// one costs a header walk and no allocation, and none get here at all from a segment this
+    /// server wrote, where a row without an exception has an empty column. IsPresent and
+    /// FromBytes are unchanged: a presence probe still answers from the header, and delivery
+    /// still throws.</para>
+    /// </summary>
+    private bool ReadsAsNoException(ReadOnlySpan<byte> payload)
+    {
+        fixed (byte* p = payload)
+        {
+            _exception.Set(p, payload.Length);
+            try
+            {
+                return ExceptionInfo.FromBytes(_exception.Memory) is null;
+            }
+            catch (Exception ex) when (ex is MessagePackSerializationException or EndOfStreamException)
+            {
+                return false;
+            }
+            finally
+            {
+                _exception.Set(null, 0);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Counts a row whose exception column delivery cannot read, remembering where the group's
+    /// first one is for the Warning <see cref="RecordHints"/> writes.
+    /// </summary>
+    private void NoteMalformedException(uint offset, int bytes)
+    {
+        if (_malformedExceptions++ == 0)
+        {
+            _firstMalformedOrdinal = offset;
+            _firstMalformedBytes   = bytes;
+        }
+        _hints?.NoteMalformedException();
+    }
 
     private void AddExists(uint offset)
     {
