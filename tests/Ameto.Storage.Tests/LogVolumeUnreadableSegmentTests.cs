@@ -378,6 +378,43 @@ public sealed class LogVolumeUnreadableSegmentTests : IDisposable
         Assert.Contains(second.FilePath, warnings[1].Message);
     }
 
+    /// <summary>
+    /// The catalog check and the place under the cap were two steps, and the delete's eviction
+    /// was not in step with either: a delete landing between them evicted a key not yet added,
+    /// and the add then kept a key for a segment nothing would ever delete again — one capped
+    /// place gone for the life of the process, and a Warning about a segment already removed.
+    /// The hook deletes the torn segment exactly there.
+    /// </summary>
+    [Fact]
+    public async Task A_segment_deleted_between_the_catalog_check_and_the_warning_gives_its_place_back()
+    {
+        var (first, second) = await TwoSegmentsAsync();
+        _engine.WarnedUnreadableSegmentCap = 1;
+        Tear(first);
+
+        int deleted = 0;
+        _engine._beforeUnreadableSegmentWarned = info =>
+        {
+            if (Interlocked.Exchange(ref deleted, 1) == 0)
+                _engine.DeleteSegmentAsync(SegmentKey.Of(info)).GetAwaiter().GetResult();
+        };
+        var raced = await CountAsync();
+        _engine._beforeUnreadableSegmentWarned = null;
+        var warnedAboutTheDeleted = HeaderWarnings().Any(w => w.Message.Contains(first.FilePath, StringComparison.Ordinal));
+
+        Tear(second);
+        var later = await CountAsync();
+
+        Assert.Equal(1, deleted);
+        Assert.Equal(1, raced.SkippedSegments);   // it was still served when its read failed
+        Assert.Equal(1, later.SkippedSegments);
+
+        // The one place under the cap is free for the next torn segment…
+        Assert.Contains(second.FilePath, Assert.Single(HeaderWarnings()).Message);
+        // …and nothing was said at Warning about the segment already gone.
+        Assert.False(warnedAboutTheDeleted, "the deleted segment was named at Warning");
+    }
+
     private sealed class CapturingLogger : Microsoft.Extensions.Logging.ILogger<StorageEngine>
     {
         private readonly List<(Microsoft.Extensions.Logging.LogLevel Level, string Message, Exception? Error)> _entries = [];

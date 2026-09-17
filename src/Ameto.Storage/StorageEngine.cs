@@ -144,8 +144,10 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// <para>Bounded by <see cref="WarnedUnreadableSegmentCap"/>, and never cleared to make room:
     /// clearing it once full made every unreadable segment past the cap warn again on every poll.
     /// Once full, a segment not already in it is logged at Debug only (the count still reports
-    /// it). A key leaves when <see cref="DeleteSegmentAsync"/> removes its segment, so the set
-    /// holds segments the catalog still serves, not every torn file this process ever met.</para>
+    /// it). A key leaves when <see cref="DeleteSegmentAsync"/> removes its segment, and an add
+    /// that finds its segment already removed takes itself back (see
+    /// <see cref="LogUnreadableSegment"/>), so the set holds segments the catalog still serves,
+    /// not every torn file this process ever met.</para>
     /// </summary>
     private readonly ConcurrentDictionary<SegmentKey, byte> _warnedUnreadableSegments = new();
     /// <summary>Makes the cap check and the add in <see cref="LogUnreadableSegment"/> one step.</summary>
@@ -237,6 +239,12 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// from its catalog snapshot, so a test can remove the segment in between, as a merge does.
     /// </summary>
     internal Action<SegmentInfo>? _beforeHeaderSegmentOpen;
+    /// <summary>
+    /// Test hook: called by the header aggregation for a segment it could not read and that the
+    /// catalog still served, before it takes a place under the warning cap — the window in which
+    /// a delete can remove the segment after the catalog was checked.
+    /// </summary>
+    internal Action<SegmentInfo>? _beforeUnreadableSegmentWarned;
     /// <summary>Test hook: first id of the block reserved for the live WAL (see <see cref="WriteState.WalSegId"/>).</summary>
     internal ulong LiveWalSegmentId => _write.WalSegId;
     /// <summary>
@@ -991,8 +999,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     private void OnHeaderSegmentUnreadable(Exception ex, SegmentInfo info, LogVolumeAggregator local, long mergedAwayMark)
     {
         var key = SegmentKey.Of(info);
-        if (!_segments.TryGetValue(key, out var current)
-            || !string.Equals(current.FilePath, info.FilePath, StringComparison.OrdinalIgnoreCase))
+        if (!CatalogServes(key, info))
         {
             // The catalog first and the record second, never the other way round: the merge
             // records a key before it deletes the segment, so an entry seen gone by a merge is
@@ -1015,6 +1022,11 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         local.AddSkippedSegment();
         LogUnreadableSegment(ex, info);
     }
+
+    /// <summary>Whether the catalog still holds this segment under its key AND at its path.</summary>
+    private bool CatalogServes(SegmentKey key, SegmentInfo info) =>
+        _segments.TryGetValue(key, out var current)
+        && string.Equals(current.FilePath, info.FilePath, StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
     /// Records that a merge is about to delete <paramref name="key"/>, whose events its published
@@ -1085,6 +1097,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// </summary>
     private void LogUnreadableSegment(Exception ex, SegmentInfo info)
     {
+        var key = SegmentKey.Of(info);
+        _beforeUnreadableSegmentWarned?.Invoke(info);
+
         // Count first: a full set never grows and is never cleared, so past the cap each poll
         // costs a Debug line rather than a Warning per segment. The check and the add are one
         // step under a gate, or parallel workers would all see room and all add: this runs only
@@ -1093,7 +1108,23 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         bool warn;
         lock (_warnedUnreadableGate)
             warn = _warnedUnreadableSegments.Count < WarnedUnreadableSegmentCap
-                && _warnedUnreadableSegments.TryAdd(SegmentKey.Of(info), 0);
+                && _warnedUnreadableSegments.TryAdd(key, 0);
+
+        // Added, THEN checked against the catalog, and taken back if the segment has gone. The
+        // caller's catalog check came before the add, and DeleteSegmentAsync evicts the key
+        // without the gate: a delete landing between the two evicted a key not yet added, and
+        // the add then left a key nothing would ever remove, holding one of the capped places
+        // for a segment that no longer exists. In this order a delete either evicts after the
+        // add or removed the entry before this check, which sees it gone.
+        //
+        // Rather than the delete evicting under the gate and the check moving inside it: that
+        // closes the same window, but only by adding a lock to DeleteSegmentAsync's nest for a
+        // log line, and the ordering here needs no lock at all. The gate stays a leaf.
+        if (warn && !CatalogServes(key, info))
+        {
+            _warnedUnreadableSegments.TryRemove(key, out _);
+            warn = false;
+        }
 
         if (warn)
             _logger.LogWarning(ex,
