@@ -270,15 +270,44 @@ public sealed class IngestionDrainer : IAsyncDisposable
         return true;
     }
 
+    /// <summary>
+    /// Completed once the drain loop — its final drain included — has exited. Every
+    /// <see cref="DisposeAsync"/> caller after the first awaits this.
+    /// </summary>
+    private readonly TaskCompletionSource _disposeCompleted =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>The drain loop, final drain included. Test-facing: a dispose must not complete before it does.</summary>
+    internal Task DrainLoop => _loop;
+
+    /// <summary>
+    /// Stops the drain loop and returns once it has exited — for EVERY caller, not only the first.
+    ///
+    /// <para>Host shutdown calls this more than once, and not always in sequence: disposing a
+    /// <c>WebApplicationFactory</c> stops the host while <c>app.Run()</c>, woken by
+    /// ApplicationStopping, stops it again, and both reach
+    /// <see cref="IngestionDrainerService.StopAsync"/>. The second call used to return on the
+    /// exchange at once, and the chain behind it went on to dispose the container: the ring was
+    /// freed under the final drain still dequeuing from it (AccessViolation in TryDequeue), and
+    /// the storage engine was disposed under the final drain's writes. A later caller now awaits
+    /// the same completion the first caller does.</para>
+    /// </summary>
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            await _disposeCompleted.Task.ConfigureAwait(false);
             return;
+        }
 
-        await _cts.CancelAsync();
-        try { await _loop.ConfigureAwait(false); }
-        catch (OperationCanceledException) { }
-        catch (ObjectDisposedException) { }
-        _cts.Dispose();
+        try
+        {
+            await _cts.CancelAsync();
+            try { await _loop.ConfigureAwait(false); }
+            catch (OperationCanceledException) { }
+            catch (ObjectDisposedException) { }
+            _cts.Dispose();
+        }
+        finally { _disposeCompleted.TrySetResult(); }
     }
 }
