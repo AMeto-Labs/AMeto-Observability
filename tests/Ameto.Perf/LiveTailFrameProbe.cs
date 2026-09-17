@@ -1,5 +1,7 @@
 using System.Buffers;
 using System.Diagnostics;
+using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Text.Json;
 using System.Text.Json.Serialization.Metadata;
 using Ameto.Core;
@@ -105,22 +107,74 @@ public sealed class LiveTailFrameProbe
 
         for (int i = 0; i < 20; i++) { RunInline(dto()); RunInline(row()); }
 
-        var (dtoUs, dtoBytes) = Measure(dto);
-        var (rowUs, rowBytes) = Measure(row);
+        var (dtoUs, dtoBytes, _)        = Measure(dto, dtoSink);
+        var (rowUs, rowBytes, rowSends) = Measure(row, rowSink);
 
         dtoSink.Reset(); RunInline(dto());
         rowSink.Reset(); RunInline(row());
 
-        _out.WriteLine($"{shape}: {PollRows}-row poll, {frameBytes / 1024.0:F0} KB of frames ({frameBytes / (double)PollRows:F0} B/frame)");
-        _out.WriteLine($"  DTO frame per row  : {dtoUs * 1000 / PollRows,6:F0} ns/frame | {dtoBytes / (double)PollRows,6:F1} B/frame | {dtoUs / 1000,6:F2} ms/poll | {dtoBytes / 1024.0,7:F1} KB/poll | {dtoSink.Writes} writes + {dtoSink.Flushes} flushes");
-        _out.WriteLine($"  row writer + flush : {rowUs * 1000 / PollRows,6:F0} ns/frame | {rowBytes / (double)PollRows,6:F1} B/frame | {rowUs / 1000,6:F2} ms/poll | {rowBytes / 1024.0,7:F1} KB/poll | {rowSink.Writes} writes + {rowSink.Flushes} flushes");
-        _out.WriteLine($"  gain               : {dtoUs / rowUs:F1}x faster, {(double)dtoBytes / Math.Max(rowBytes, 1):F0}x less allocated, {dtoSink.Writes / (double)Math.Max(rowSink.Writes, 1):F0}x fewer sends");
+        // Every async call on the row road, weighed as the build compiled it: the poll, the source
+        // loop, one WriteLogEventAsync a row, and one SendAsync a send the sink counted. A closing
+        // FlushFramesAsync that finds the last row already sent calls SendAsync without writing, and
+        // is the one call this misses — at most one a poll.
+        double asyncBoxes = AsyncBoxBytes(typeof(LiveTailFrameProbe), nameof(RowPollAsync))
+                          + AsyncBoxBytes(typeof(SseJsonWriter), nameof(SseJsonWriter.WriteLogEventsAsync))
+                          + AsyncBoxBytes(typeof(SseJsonWriter), nameof(SseJsonWriter.WriteLogEventAsync)) * PollRows
+                          + AsyncBoxBytes(typeof(SseJsonWriter), "SendAsync") * rowSends;
+        double ownPerRow  = (rowBytes - asyncBoxes) / PollRows;
 
-        // GC.GetAllocatedBytesForCurrentThread is deterministic, so this holds on any machine: the DTO
-        // road allocates a DTO, an exception-tree copy and four strings per row, the row writer nothing
-        // per row. The timings are reported, not asserted.
-        Assert.True(rowBytes * 10 < dtoBytes,
-            $"the row writer should allocate ~nothing per frame: dto={dtoBytes} B/poll, row writer={rowBytes} B/poll");
+        _out.WriteLine($"{shape}: {PollRows}-row poll, {frameBytes / 1024.0:F0} KB of frames ({frameBytes / (double)PollRows:F0} B/frame)");
+        _out.WriteLine($"  DTO frame per row  : {dtoUs * 1000 / PollRows,6:F0} ns/frame | {dtoBytes / PollRows,6:F1} B/frame | {dtoUs / 1000,6:F2} ms/poll | {dtoBytes / 1024.0,7:F1} KB/poll | {dtoSink.Writes} writes + {dtoSink.Flushes} flushes");
+        _out.WriteLine($"  row writer + flush : {rowUs * 1000 / PollRows,6:F0} ns/frame | {rowBytes / PollRows,6:F1} B/frame | {rowUs / 1000,6:F2} ms/poll | {rowBytes / 1024.0,7:F1} KB/poll | {rowSink.Writes} writes + {rowSink.Flushes} flushes");
+        _out.WriteLine($"    async state machines built as classes: {asyncBoxes / PollRows,6:F1} B/frame; the writer's own: {ownPerRow,6:F1} B/frame");
+        _out.WriteLine($"  gain               : {dtoUs / rowUs:F1}x faster, {dtoBytes / Math.Max(rowBytes, 1):F0}x less allocated, {dtoSink.Writes / (double)Math.Max(rowSink.Writes, 1):F0}x fewer sends");
+
+        // GC.GetAllocatedBytesForCurrentThread is deterministic, so this holds on any machine, and with
+        // the compiler's state machines taken out (AsyncBoxBytes) it holds in any build. The DTO road
+        // allocates a DTO, an exception-tree copy and four strings per row; the row writer, nothing.
+        //
+        // A BOUND PER ROW, NOT A RATIO TO THE DTO ROAD. The ratio this replaced compared raw totals, and
+        // it went red on CI's Debug build over code that allocates nothing: 101.9 B/frame, every byte of
+        // it state machines. A ratio is also not the claim — it lets the row road allocate anything up
+        // to a tenth of whatever the old road happened to cost.
+        //
+        // 2 B a row: the smallest object on a 64-bit heap is 24 B, so one allocation on every row is
+        // twelve times over it and one on every tenth row is still over, while the call the count above
+        // can miss is 80 B a poll in Debug — 0.16 B a row. The timings are reported, not asserted.
+        Assert.True(ownPerRow < 2,
+            $"the row writer should allocate nothing per row: {ownPerRow:F1} B/frame of its own " +
+            $"({rowBytes:F0} B/poll, of which {asyncBoxes:F0} B async state machines built as classes)");
+    }
+
+    /// <summary>
+    /// The heap bytes one call of <paramref name="method"/> costs before its body runs: its async
+    /// state machine when the compiler built that as a CLASS, and nothing when it built a struct.
+    ///
+    /// <para>The build decides, not the code. An optimising build makes the state machine a struct on
+    /// the caller's stack, boxed only if the method really suspends, so a call that completes inline
+    /// allocates nothing. A Debug build makes it a class, for Edit and Continue, and every call
+    /// allocates one whether it suspends or not: 88 B for WriteLogEventAsync, 80 B for SendAsync and
+    /// 152 B for WriteLogEventsAsync when this was written — which on the fat rows was all of CI's
+    /// 101.9 B/frame.</para>
+    ///
+    /// <para>Read from the method's own <see cref="AsyncStateMachineAttribute"/> and weighed by
+    /// allocating one, so it follows the build it runs in and the method as it is now. A method that
+    /// stops being async weighs nothing here, which only makes the bound stricter; one that is renamed
+    /// fails loudly rather than quietly weighing nothing.</para>
+    /// </summary>
+    private static long AsyncBoxBytes(Type owner, string method)
+    {
+        var m = owner.GetMethod(method, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static)
+             ?? throw new InvalidOperationException($"{owner.Name}.{method} is gone; the probe's async accounting must follow it");
+
+        Type? stateMachine = m.GetCustomAttribute<AsyncStateMachineAttribute>()?.StateMachineType;
+        if (stateMachine is null || stateMachine.IsValueType) return 0;
+
+        // The first call fills the runtime's allocator cache for the type; the second is the object alone.
+        RuntimeHelpers.GetUninitializedObject(stateMachine);
+        long b0 = GC.GetAllocatedBytesForCurrentThread();
+        RuntimeHelpers.GetUninitializedObject(stateMachine);
+        return GC.GetAllocatedBytesForCurrentThread() - b0;
     }
 
     private static async ValueTask DtoPollAsync(SseJsonWriter sse, IAsyncEnumerable<LogEvent> poll)
@@ -146,16 +200,24 @@ public sealed class LiveTailFrameProbe
         poll.GetAwaiter().GetResult();
     }
 
-    private static (double UsPerPoll, long BytesPerPoll) Measure(Func<ValueTask> poll)
+    /// <summary>
+    /// Time, bytes and sends per poll over <see cref="Polls"/> polls. The sends are counted over the
+    /// same polls as the bytes, not taken from a poll of their own: the writer's quiet-stream rule can
+    /// add a send the first time a poll follows a pause, and each send is an async call whose state
+    /// machine the bytes include.
+    /// </summary>
+    private static (double UsPerPoll, double BytesPerPoll, double SendsPerPoll) Measure(Func<ValueTask> poll, SinkStream sink)
     {
         GC.Collect();
         GC.WaitForPendingFinalizers();
+        sink.Reset();
         long b0 = GC.GetAllocatedBytesForCurrentThread();
         var sw = Stopwatch.StartNew();
         for (int i = 0; i < Polls; i++) RunInline(poll());
         sw.Stop();
         return (sw.Elapsed.TotalMilliseconds * 1000 / Polls,
-                (GC.GetAllocatedBytesForCurrentThread() - b0) / Polls);
+                (GC.GetAllocatedBytesForCurrentThread() - b0) / (double)Polls,
+                sink.Writes / (double)Polls);
     }
 
     private static List<LogEvent> FatRows(List<LogEvent> decoded)
