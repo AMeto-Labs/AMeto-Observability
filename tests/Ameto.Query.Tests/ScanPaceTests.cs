@@ -19,22 +19,37 @@ namespace Ameto.Query.Tests;
 /// </summary>
 public sealed class ScanPaceTests
 {
-    private static readonly TimeSpan StretchLimit = TimeSpan.FromSeconds(3);
+    /// <summary>
+    /// Bounds the stretch only against a hang. Whether the pace handed the writer a moment is decided
+    /// without a clock (see <see cref="StepWatch"/>); once it has, the send is made on the writer's
+    /// own thread straight away, so the stretch reaching this bound means the send never came.
+    /// </summary>
+    private static readonly TimeSpan HangGuard = TimeSpan.FromSeconds(30);
 
     /// <summary>
     /// A ROW FOUND BEFORE A LONG SYNCHRONOUS STRETCH OF SCANNING IS ON THE WIRE BEFORE THAT
-    /// STRETCH ENDS: the real executor, the real 50 ms pace, the real writer. The hot tier yields
-    /// two matching rows back to back (the second is buffered by every on-write rule), then
-    /// rejected events for as long as it takes the client to have the second row, or three
-    /// seconds, then a third match. Nothing in the stretch waits; only the pace can give the
-    /// writer a moment to send in.
+    /// STRETCH ENDS: the real executor, the real pace, the real writer. The hot tier yields two
+    /// matching rows back to back (the second is buffered by every on-write rule), then rejected
+    /// events until the client has the second row, then a third match. Nothing in the stretch waits;
+    /// only the pace can give the writer a moment to send in.
+    ///
+    /// <para>The pace is set to yield at every clock read (64 events), as the cold-scan theory below
+    /// does, so the test can tell a pace that never yields from a slow runner WITHOUT a clock: if the
+    /// stretch is still running inside the writer's own <c>MoveNextAsync</c> call, on the writer's
+    /// thread, hundreds of events after the pace was due, the scan never went pending and the writer
+    /// never had its moment. The real 50 ms pace was raced against a 3 s Stopwatch instead, which a
+    /// writer thread stalled at the wrong instant on a loaded runner could lose.</para>
     /// </summary>
     [Fact]
     public async Task A_row_found_before_a_long_synchronous_scan_is_on_the_wire_before_that_scan_ends()
     {
         var body  = new RecordingBody();
-        var tier  = new StretchedHotTier(body, Row("hit 1"), StretchLimit);
-        var query = new QueryExecutor(new HotTierOnly(tier), new SegmentIndexReaderFactory(), NullLogger<QueryExecutor>.Instance);
+        var steps = new StepWatch();
+        var tier  = new StretchedHotTier(body, Row("hit 1"), steps);
+        var query = new QueryExecutor(new HotTierOnly(tier), new SegmentIndexReaderFactory(), NullLogger<QueryExecutor>.Instance)
+        {
+            ScanYieldInterval = TimeSpan.Zero,
+        };
         using var sse = new SseJsonWriter(body);
 
         var request = new QueryRequest
@@ -43,11 +58,12 @@ public sealed class ScanPaceTests
             Count     = 100,
             Direction = QueryDirection.Forward,
         };
-        await sse.WriteLogEventsAsync(query.ExecuteAsync(request), default);
+        await sse.WriteLogEventsAsync(steps.Watch(query.ExecuteAsync(request)), default);
         await sse.WriteDoneAsync(default);
 
         Assert.True(tier.ClientHadRowDuringStretch,
-            $"hit 1 was still unsent after {tier.MissesServed} rejected events and {StretchLimit.TotalSeconds:0} s of scanning");
+            $"hit 1 was still unsent after {tier.MissesServed} rejected events: "
+          + (tier.StretchStayedInsideTheCall ? "the scan never went pending, so the writer had no moment to send" : "the hang guard ran out"));
 
         string all = body.All();
         Assert.Equal(3, Count(all, "data: {\"@t\""));
@@ -128,13 +144,53 @@ public sealed class ScanPaceTests
     };
 
     /// <summary>
+    /// Sits between the executor and the writer and records the call the writer is inside: the thread
+    /// that called <c>MoveNextAsync</c>, until that call returns. Code running on that thread while the
+    /// call is open is running SYNCHRONOUSLY inside the step — the writer cannot have looked at a
+    /// pending step yet, let alone sent in it. Code running anywhere else, or after the call returned,
+    /// runs after the step went pending. The wrapper hands the executor's own <c>ValueTask</c> through
+    /// untouched, so the writer sees exactly what it would have.
+    /// </summary>
+    private sealed class StepWatch
+    {
+        private volatile bool _inCall;
+        private volatile int  _callThread;
+
+        public bool InsideTheCallOnThisThread => _inCall && _callThread == Environment.CurrentManagedThreadId;
+
+        public IAsyncEnumerable<LogEvent> Watch(IAsyncEnumerable<LogEvent> source) => new Watched(source, this);
+
+        private sealed class Watched(IAsyncEnumerable<LogEvent> source, StepWatch watch) : IAsyncEnumerable<LogEvent>
+        {
+            public IAsyncEnumerator<LogEvent> GetAsyncEnumerator(CancellationToken ct = default) =>
+                new Enumerator(source.GetAsyncEnumerator(ct), watch);
+        }
+
+        private sealed class Enumerator(IAsyncEnumerator<LogEvent> inner, StepWatch watch) : IAsyncEnumerator<LogEvent>
+        {
+            public LogEvent Current => inner.Current;
+
+            public ValueTask<bool> MoveNextAsync()
+            {
+                watch._callThread = Environment.CurrentManagedThreadId;
+                watch._inCall     = true;
+                try     { return inner.MoveNextAsync(); }
+                finally { watch._inCall = false; }
+            }
+
+            public ValueTask DisposeAsync() => inner.DisposeAsync();
+        }
+    }
+
+    /// <summary>
     /// A hot tier whose sorted read is one long synchronous stretch between the second and third
     /// match. It watches the body from inside the stretch, so it can tell the send happened while
     /// the scan was still working, not after.
     /// </summary>
-    private sealed class StretchedHotTier(RecordingBody body, string awaitedRow, TimeSpan limit) : IHotTierReader
+    private sealed class StretchedHotTier(RecordingBody body, string awaitedRow, StepWatch steps) : IHotTierReader
     {
         public volatile bool ClientHadRowDuringStretch;
+        public volatile bool StretchStayedInsideTheCall;
         public long MissesServed;
 
         public IEnumerable<LogEvent> ReadAll() => throw new NotSupportedException("the executor reads the hot tier sorted");
@@ -149,11 +205,17 @@ public sealed class ScanPaceTests
             var      stretch = Stopwatch.StartNew();
             while (true)
             {
+                // 256 events: four times the 64 after which a pace at interval zero is due.
                 for (int i = 0; i < 256; i++) yield return miss;
                 MissesServed += 256;
 
                 if (body.Contains(awaitedRow)) { ClientHadRowDuringStretch = true; break; }
-                if (stretch.Elapsed > limit) break;
+
+                // Still synchronous inside the writer's call after the pace was due: it never yielded,
+                // and nothing will send the row until this stretch ends. No clock decides this.
+                if (steps.InsideTheCallOnThisThread) { StretchStayedInsideTheCall = true; break; }
+
+                if (stretch.Elapsed > HangGuard) break;
             }
 
             yield return Event(3, LogLevel.Error, "hit 2");
