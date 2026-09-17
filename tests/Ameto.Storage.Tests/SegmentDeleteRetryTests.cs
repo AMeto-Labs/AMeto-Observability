@@ -388,6 +388,32 @@ public sealed class SegmentDeleteRetryTests : IAsyncLifetime
         Assert.False(File.Exists(path));
     }
 
+    [Fact]
+    public async Task The_catalog_scan_does_not_register_a_file_deleted_after_it_read_it()
+    {
+        await _engine.CatalogLoaded;
+
+        var (path, key) = ImportPeerSegment(72);
+        bool deleted = false;
+
+        // Retention deletes the segment after the scan has read the file and before it registers
+        // it. Nothing holds the file, so the unlink succeeds and nothing is parked: the scan has
+        // no park to find, only a file that is no longer there.
+        _engine._beforeScanRegistersSegment = file =>
+        {
+            if (deleted || !string.Equals(file, path, StringComparison.OrdinalIgnoreCase)) return;
+            deleted = true;
+            Assert.True(_engine.DeleteSegmentAsync(key).IsCompletedSuccessfully);
+        };
+
+        _engine.LoadSegmentCatalog();
+
+        Assert.True(deleted, "setup: the scan never reached the file");
+        Assert.False(File.Exists(path), "setup: the delete should have unlinked the file (is the scan still holding it open?)");
+        Assert.Equal(0, _engine.PendingSegmentDeleteCount);
+        Assert.False(InCatalog(key), "the catalog scan registered a segment whose file a delete had just removed");
+    }
+
     private IEnumerable<(Microsoft.Extensions.Logging.LogLevel Level, string Message, Exception? Error)> CapWarnings() =>
         _log.Entries.Where(e => e.Level == Microsoft.Extensions.Logging.LogLevel.Warning &&
                                 e.Message.Contains("the most that are retried", StringComparison.Ordinal));
