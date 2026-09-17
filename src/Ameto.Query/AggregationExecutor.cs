@@ -40,7 +40,8 @@ public sealed class AggregationResult
 
     /// <summary>
     /// True when the answer is a floor rather than a count: the scan hit its time budget, its
-    /// event budget, or the cap on distinct groups. A partial aggregation that says it is
+    /// event budget, or the cap on distinct groups, or the header scan met a segment in the
+    /// window it could not read. A partial aggregation that says it is
     /// complete is worse than no aggregation at all — it looks like an answer.
     /// </summary>
     public required bool Partial { get; init; }
@@ -338,6 +339,17 @@ public sealed class AggregationExecutor(
         bool hitGroupCap = rows.Count > AggregationParser.MaxGroups;
         if (hitGroupCap) rows.RemoveRange(AggregationParser.MaxGroups, rows.Count - AggregationParser.MaxGroups);
 
+        // A segment the header scan could not read is left out of every count, and the scan
+        // carries on — right for a volume chart, wrong for an answer read as a fact. The event
+        // scan would have failed the query outright over the same file; a total that is quietly
+        // low is worse than that, so it is reported as the floor it is.
+        string? reason =
+            counts.SkippedSegments > 0
+                ? $"{counts.SkippedSegments:N0} storage segment(s) in the window could not be read — the counts are a floor; the server log names the segments"
+                : hitGroupCap
+                    ? $"more than {AggregationParser.MaxGroups:N0} distinct groups — group by something coarser"
+                    : null;
+
         return new AggregationResult
         {
             KeyColumns    = keys.Select(k => k.Alias).ToArray(),
@@ -345,10 +357,8 @@ public sealed class AggregationExecutor(
             Rows          = OrderAndLimit(rows, query.Limit),
             Scanned       = counts.Scanned,
             GroupsFound   = rows.Count,
-            Partial       = hitGroupCap,
-            PartialReason = hitGroupCap
-                ? $"more than {AggregationParser.MaxGroups:N0} distinct groups — group by something coarser"
-                : null,
+            Partial       = reason is not null,
+            PartialReason = reason,
         };
 
         static AggregationRow Row(string?[] key, long count, int columns)

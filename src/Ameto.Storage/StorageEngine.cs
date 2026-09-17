@@ -137,6 +137,14 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     // In-flight parallel cold-flush tasks, so DisposeAsync can await them before the
     // tiers they read are freed. Self-pruning via ContinueWith on completion.
     private readonly ConcurrentDictionary<Task, byte>    _inFlightFlushes = new();
+    /// <summary>
+    /// Segments the header aggregation has already warned it could not read, so a torn file is
+    /// named at Warning ONCE rather than on every histogram poll and alert tick that meets it.
+    /// Cleared wholesale at <see cref="MaxWarnedUnreadableSegments"/>: the population that
+    /// matters is the handful of damaged files, and forgetting one only repeats its warning.
+    /// </summary>
+    private readonly ConcurrentDictionary<SegmentKey, byte> _warnedUnreadableSegments = new();
+    private const int MaxWarnedUnreadableSegments = 1024;
     /// <summary>Pause between attempts to persist a frozen tier whose flush failed.</summary>
     private static readonly TimeSpan FlushRetryDelay = TimeSpan.FromSeconds(15);
     /// <summary>True while the live WAL is refusing appends — gates the once-per-episode error log (writer thread only).</summary>
@@ -756,6 +764,11 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// <c>[fromUtc, toUtc]</c>, never materialising a <see cref="LogEvent"/>. Backs
     /// <c>GET /api/events/counts</c>. Bucketing parameters are supplied by the caller so the axis
     /// matches the endpoint's column-cap logic.
+    ///
+    /// <para>A cold segment that throws while being read is skipped rather than failing the
+    /// whole aggregate, and counted in <see cref="LogVolumeCounts.SkippedSegments"/>: when that
+    /// is non-zero every total is a floor, and a caller that reports a count as a fact must say
+    /// so.</para>
     /// </summary>
     /// <param name="totalsOnly">
     /// Opt-in shortcut for a caller that wants ONE number (the alert evaluator, which runs this
@@ -835,8 +848,12 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                             }
                             catch (Exception ex)
                             {
-                                // Never lose the whole aggregate over one bad/racing segment file.
-                                _logger.LogDebug(ex, "Header aggregation skipped segment {Id}", info.Id);
+                                // Never lose the whole aggregate over one bad/racing segment file —
+                                // but never HIDE it either: the skip is counted, so a caller that
+                                // presents the total as a fact can say it is a floor. Whatever the
+                                // segment yielded before the throw stays in; it is real data.
+                                local.AddSkippedSegment();
+                                LogUnreadableSegment(ex, info);
                             }
                             return local;
                         },
@@ -850,6 +867,26 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         }
 
         return agg.Build();
+    }
+
+    /// <summary>
+    /// A segment the header aggregation could not read is now visible to users — the query
+    /// language reports the count as partial because of it — so its cause has to be findable in
+    /// the server log at a level that is kept: Warning, with the segment id and the exception.
+    /// Once per segment, because the histogram polls every few seconds and every alert rule ticks
+    /// every 15 s, and a torn file stays in the catalog until the next start quarantines it; a
+    /// warning per poll would bury everything else. Repeats go to Debug, as before.
+    /// </summary>
+    private void LogUnreadableSegment(Exception ex, SegmentInfo info)
+    {
+        if (_warnedUnreadableSegments.Count >= MaxWarnedUnreadableSegments) _warnedUnreadableSegments.Clear();
+
+        if (_warnedUnreadableSegments.TryAdd(SegmentKey.Of(info), 0))
+            _logger.LogWarning(ex,
+                "Header aggregation could not read segment {NodeId}-{Id} ({File}); counts over its window are partial",
+                info.NodeId, info.Id, info.FilePath);
+        else
+            _logger.LogDebug(ex, "Header aggregation skipped segment {Id}", info.Id);
     }
 
     private void OnReaderDisposed()

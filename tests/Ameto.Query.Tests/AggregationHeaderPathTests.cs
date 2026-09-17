@@ -224,6 +224,63 @@ public sealed class AggregationHeaderPathTests : IDisposable
         Assert.Equal(400d, viaHeader.Rows.Sum(r => r.Values[0] ?? 0));
     }
 
+    // ── A segment the header road cannot read ─────────────────────────────────
+
+    /// <summary>
+    /// A COUNT OVER AN UNREADABLE SEGMENT IS A FLOOR, AND SAYS SO. The header aggregator skips a
+    /// cold segment that throws — right for a volume chart, which must not go blank over one bad
+    /// file — and the header road used to present what was left as the complete answer. The
+    /// event scan fails the query over the same file; a total that is quietly low reads as a
+    /// fact and is worse than that error.
+    ///
+    /// <para>Two segments of different levels are torn, so the skips come from different
+    /// parallel workers and the count in the reason proves they were merged, not raced. The
+    /// fixture flushes one segment per level, and tearing a segment's FIRST block frame means
+    /// nothing of it is counted — so the rows must be exactly the readable data: the
+    /// untouched totals minus each torn segment's catalog event count, in its own level.</para>
+    /// </summary>
+    [Fact]
+    public async Task A_segment_the_header_road_cannot_read_makes_the_count_partial()
+    {
+        Assert.True(AggregationParser.TryParse("select count(*) group by @l", out var byLevel));
+        Assert.True(AggregationParser.TryParse("select count(*)", out var total));
+
+        var healthy = await _withHeader.ExecuteAsync(byLevel!, From, To);
+        Assert.False(healthy.Partial);
+
+        var segments = _engine.ListSegments();
+        var tornA = Assert.Single(segments, s => s.MinLevel == LogLevel.Error);
+        var tornB = Assert.Single(segments, s => s.MinLevel == LogLevel.Debug);
+        TearFirstBlockFrame(tornA.FilePath);
+        TearFirstBlockFrame(tornB.FilePath);
+
+        var grouped = await _withHeader.ExecuteAsync(byLevel!, From, To);
+        Assert.True(grouped.Partial, "a count missing two unreadable segments was reported as complete");
+        Assert.NotNull(grouped.PartialReason);
+        Assert.Contains("2 storage segment(s) in the window could not be read", grouped.PartialReason);
+
+        var expected = healthy.Rows.ToDictionary(r => r.Key[0]!, r => r.Values[0]!.Value);
+        expected["Error"] -= tornA.EventCount;
+        expected["Debug"] -= tornB.EventCount;
+        Assert.Equal(expected, grouped.Rows.ToDictionary(r => r.Key[0]!, r => r.Values[0]!.Value));
+
+        var single = await _withHeader.ExecuteAsync(total!, From, To);
+        Assert.True(single.Partial);
+        Assert.Equal(400d - tornA.EventCount - tornB.EventCount, Assert.Single(single.Rows).Values[0]);
+    }
+
+    /// <summary>
+    /// The first block's <c>uncompressedSize</c> sits right after the 46-byte segment header;
+    /// torn to a negative it fails <c>ValidateBlockFrame</c> with InvalidDataException before a
+    /// single header of the segment is counted (the same tear SegmentCatalogKeyTests uses).
+    /// </summary>
+    private static void TearFirstBlockFrame(string path)
+    {
+        using var f = File.Open(path, FileMode.Open, FileAccess.Write);
+        f.Position = 46;
+        f.Write([0xF9, 0xFF, 0xFF, 0xFF]);
+    }
+
     // ── Which road a shape takes ──────────────────────────────────────────────
 
     /// <summary>

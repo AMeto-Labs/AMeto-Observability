@@ -21,6 +21,13 @@ public sealed class LogVolumeCounts
     public required int  NBuckets       { get; init; }
     public required IReadOnlyList<LogSeries> Services { get; init; }
     public required IReadOnlyList<LogSeries> Levels   { get; init; }
+
+    /// <summary>
+    /// Cold segments in the window that could not be read and were left out (a torn block, a
+    /// file gone mid-scan). Zero means every count above is exact; anything else means each is a
+    /// floor. Not required, so a caller that only draws a chart can ignore it.
+    /// </summary>
+    public int SkippedSegments { get; init; }
 }
 
 /// <summary>
@@ -72,9 +79,11 @@ public sealed class LogVolumeAggregator
 
     private long _total;
     private long _scanned;
+    private int  _skippedSegments;
 
-    public long Total   => _total;
-    public long Scanned => _scanned;
+    public long Total           => _total;
+    public long Scanned         => _scanned;
+    public int  SkippedSegments => _skippedSegments;
 
     /// <param name="fromTicks">Inclusive lower bound (UTC ticks); events outside are ignored.</param>
     /// <param name="toTicks">Inclusive upper bound (UTC ticks).</param>
@@ -148,6 +157,13 @@ public sealed class LogVolumeAggregator
         _total   += eventCount;
         _scanned += eventCount;
     }
+
+    /// <summary>
+    /// Records a segment that could not be read. Like every other counter here it is per
+    /// aggregator and unsynchronised: the parallel cold scan gives each worker its own and
+    /// <see cref="MergeFrom"/> folds them under the caller's lock.
+    /// </summary>
+    public void AddSkippedSegment() => _skippedSegments++;
 
     // ── Recording ─────────────────────────────────────────────────────────────────
 
@@ -251,8 +267,9 @@ public sealed class LogVolumeAggregator
     /// </summary>
     public void MergeFrom(LogVolumeAggregator other)
     {
-        _total   += other._total;
-        _scanned += other._scanned;
+        _total           += other._total;
+        _scanned         += other._scanned;
+        _skippedSegments += other._skippedSegments;
 
         for (int l = 0; l < LevelCount; l++)
         {
@@ -292,13 +309,14 @@ public sealed class LogVolumeAggregator
 
         return new LogVolumeCounts
         {
-            Total         = _total,
-            Scanned       = _scanned,
-            MinBucket     = _minBucket,
-            BucketSeconds = _bucketSeconds,
-            NBuckets      = _nBuckets,
-            Services      = services,
-            Levels        = levels,
+            Total           = _total,
+            Scanned         = _scanned,
+            MinBucket       = _minBucket,
+            BucketSeconds   = _bucketSeconds,
+            NBuckets        = _nBuckets,
+            Services        = services,
+            Levels          = levels,
+            SkippedSegments = _skippedSegments,
         };
     }
 }
