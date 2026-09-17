@@ -1538,6 +1538,14 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// </summary>
     internal Action<string>? _beforeScanRegistersSegment;
 
+    /// <summary>
+    /// Test hook: called by <see cref="LoadSegmentCatalog"/> with a listed file's path just before
+    /// it opens the file: the window in which a delete can remove the file under the scan before
+    /// the scan has read it. It runs inside the scan's per-file try, so a throw from it is handled
+    /// as an unreadable file.
+    /// </summary>
+    internal Action<string>? _beforeScanOpensSegment;
+
     /// <summary>The running background retry loop, or the last one to have run.</summary>
     private Task _segmentDeleteRetryLoop = Task.CompletedTask;
 
@@ -3443,6 +3451,8 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         {
             try
             {
+                _beforeScanOpensSegment?.Invoke(file);
+
                 // Closed before the gate: nothing below reads the file, and on Windows a mapping
                 // held while waiting for the gate is what made a delete of this very file fail
                 // its unlink and park.
@@ -3486,23 +3496,14 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 // until the next start, as it does when no scan runs.) Not under _importLock,
                 // which an import holds across its publish while this scan must still be able to
                 // land (see ImportSegment).
-                bool parked, deleted, added;
+                ScanSkip skip;
+                bool     added;
                 lock (_scanDeleteGate)
                 {
-                    parked  = _pendingSegmentDeletes.ContainsKey(file);
-                    deleted = !parked && _deletedDuringCatalogScan?.Contains(file) == true;
-                    added   = !parked && !deleted && _segments.TryAdd(key, info);
+                    skip  = ScanSkipUnderGate(file);
+                    added = skip == ScanSkip.None && _segments.TryAdd(key, info);
                 }
-                if (parked)
-                {
-                    _logger.LogDebug("Segment {File} is waiting for its delete to complete; the catalog scan skips it", file);
-                    continue;
-                }
-                if (deleted)
-                {
-                    _logger.LogDebug("Segment {File} was deleted while the catalog scan was running; the scan skips it", file);
-                    continue;
-                }
+                if (LogScanSkip(skip, file, error: null)) continue;
                 if (added) continue;
 
                 // A live flush or import may have registered this very file while the scan was
@@ -3530,6 +3531,22 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             }
             catch (Exception ex)
             {
+                // Not unreadable: a delete got there first. Retention runs beside this scan, so a
+                // delete can reach a file between the listing above and the open, unlink it
+                // (always on Linux; on Windows whenever no query holds it) and record it, or park
+                // it. The open then throws, FileNotFoundException for the unlinked file, and this
+                // branch used to quarantine it: an Error calling a segment "served by nobody" that
+                // the delete had just meant to serve nobody, then a Warning when the rename found no
+                // file. One false pair per expired file on a big catalog whose retention starts
+                // right after boot. The park and the record decide it, read under the same gate as
+                // the registration above and by the same rule. Not FileNotFoundException, and not
+                // File.Exists: a file that vanished with no delete of ours, or a probe a failing NFS
+                // or SMB mount answers false for a live segment, would then be skipped at Debug and
+                // nobody told. The record says what a delete did and nothing else.
+                ScanSkip skip;
+                lock (_scanDeleteGate) skip = ScanSkipUnderGate(file);
+                if (LogScanSkip(skip, file, ex)) continue;
+
                 // Renamed aside, NOT deleted. The delete was written when "unreadable" meant a
                 // header or footer that nothing could ever parse; the reader now also throws on
                 // one torn block FRAME -- four bad bytes in a file whose every other block is
@@ -3548,6 +3565,35 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             }
         }
         _logger.LogInformation("Loaded {Count} segments from {Dir} in {Ms} ms", _segments.Count, _segDir, sw.ElapsedMilliseconds);
+    }
+
+    /// <summary>Why the catalog scan leaves a file alone, if it does.</summary>
+    private enum ScanSkip : byte { None, Parked, Deleted }
+
+    /// <summary>
+    /// The catalog scan's one rule for a file the catalog has let go of, whether the scan read the
+    /// file or failed to: its delete is parked, or a delete removed it while the scan was running
+    /// (see <see cref="_deletedDuringCatalogScan"/>). The caller holds <see cref="_scanDeleteGate"/>.
+    /// </summary>
+    private ScanSkip ScanSkipUnderGate(string file) =>
+        _pendingSegmentDeletes.ContainsKey(file)            ? ScanSkip.Parked
+        : _deletedDuringCatalogScan?.Contains(file) == true ? ScanSkip.Deleted
+        : ScanSkip.None;
+
+    /// <summary>Says at Debug why the scan skips <paramref name="file"/>; false when it does not.</summary>
+    private bool LogScanSkip(ScanSkip skip, string file, Exception? error)
+    {
+        switch (skip)
+        {
+            case ScanSkip.Parked:
+                _logger.LogDebug(error, "Segment {File} is waiting for its delete to complete; the catalog scan skips it", file);
+                return true;
+            case ScanSkip.Deleted:
+                _logger.LogDebug(error, "Segment {File} was deleted while the catalog scan was running; the scan skips it", file);
+                return true;
+            default:
+                return false;
+        }
     }
 
     /// <summary>

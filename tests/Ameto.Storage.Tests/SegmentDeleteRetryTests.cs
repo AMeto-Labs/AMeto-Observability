@@ -675,6 +675,94 @@ public sealed class SegmentDeleteRetryTests : IAsyncLifetime
     }
 
     [Fact]
+    public async Task The_catalog_scan_does_not_quarantine_a_file_deleted_before_it_opened_it()
+    {
+        await _engine.CatalogLoaded;
+
+        var (path, key) = ImportPeerSegment(76);
+        bool deleted = false, deleteCompleted = false;
+        int  recordedInsideScan = -1;
+
+        // Retention deletes the segment after the scan has listed the directory and before it opens
+        // the file. Nothing holds the file, so the unlink succeeds and nothing is parked. The scan's
+        // open then throws for the missing file, and only the delete's record tells that apart from
+        // a segment nothing can read. (Nothing in the hook may throw: see the tests above.)
+        _engine._beforeScanOpensSegment = file =>
+        {
+            if (deleted || !string.Equals(file, path, StringComparison.OrdinalIgnoreCase)) return;
+            deleted            = true;
+            deleteCompleted    = _engine.DeleteSegmentAsync(key).IsCompletedSuccessfully;
+            recordedInsideScan = _engine.DeletedDuringCatalogScanCount;
+        };
+
+        _engine.LoadSegmentCatalog();
+
+        Assert.True(deleted, "setup: the scan never reached the file");
+        Assert.True(deleteCompleted, "setup: the delete did not complete synchronously");
+        Assert.Equal(1, recordedInsideScan);   // setup: the delete recorded its path for the scan
+        Assert.False(File.Exists(path), "setup: the delete should have unlinked the file");
+        Assert.Equal(0, _engine.PendingSegmentDeleteCount);
+        Assert.False(InCatalog(key));
+
+        // Skipped at Debug, not quarantined at Error with a Warning for the rename of a missing file.
+        AssertSkippedAsDeleted(path);
+    }
+
+    [Fact]
+    public async Task The_catalog_scan_does_not_quarantine_a_parked_file_its_retry_unlinked_before_the_scan_opened_it()
+    {
+        await _engine.CatalogLoaded;
+
+        var (path, key) = ParkThroughTheSeam(77);
+        using var atFile   = new ManualResetEventSlim();
+        using var released = new ManualResetEventSlim();
+        using var scanned  = new ManualResetEventSlim();
+        bool held = false, scannedInside = false;
+
+        // The scan is held where it has listed the parked file and not opened it. The delete was
+        // parked before the scan began, so the scan has no record of it, only the park.
+        _engine._beforeScanOpensSegment = file =>
+        {
+            if (held || !string.Equals(file, path, StringComparison.OrdinalIgnoreCase)) return;
+            held = true;
+            atFile.Set();
+            released.Wait(TimeSpan.FromSeconds(20));
+        };
+
+        // The reader has closed and a retry unlinks the file. Right after the unlink, while the path
+        // is still parked, the scan is released and runs to its end: its open fails on the missing
+        // file, and the park is what says why.
+        _engine._deleteSegmentFile = p =>
+        {
+            File.Delete(p);
+            released.Set();
+            scannedInside = scanned.Wait(TimeSpan.FromSeconds(20));
+        };
+
+        var scan = Task.Run(() => { try { _engine.LoadSegmentCatalog(); } finally { scanned.Set(); } });
+        try
+        {
+            Assert.True(atFile.Wait(TimeSpan.FromSeconds(20)), "setup: the scan never reached the file");
+            Assert.Equal(0, _engine.RetryPendingSegmentDeletes());
+        }
+        finally
+        {
+            released.Set();
+            await scan.WaitAsync(TimeSpan.FromSeconds(20));
+        }
+
+        Assert.True(scannedInside, "setup: the scan did not finish between the retry's unlink and the end of its attempt");
+        Assert.False(File.Exists(path));
+        Assert.False(InCatalog(key));
+
+        var entries = _log.Entries;
+        Assert.Contains(entries, e => e.Level == Microsoft.Extensions.Logging.LogLevel.Debug &&
+                                      e.Message.Contains("is waiting for its delete to complete", StringComparison.Ordinal) &&
+                                      e.Message.Contains(path, StringComparison.OrdinalIgnoreCase));
+        AssertNotQuarantined(path);
+    }
+
+    [Fact]
     public async Task The_catalog_scan_skips_a_deleted_segment_by_the_delete_s_record_not_by_the_file_and_registers_one_nobody_deleted()
     {
         await _engine.CatalogLoaded;
@@ -742,9 +830,15 @@ public sealed class SegmentDeleteRetryTests : IAsyncLifetime
         Assert.Contains(entries, e => e.Level == Microsoft.Extensions.Logging.LogLevel.Debug &&
                                       e.Message.Contains("was deleted while the catalog scan was running", StringComparison.Ordinal) &&
                                       e.Message.Contains(path, StringComparison.OrdinalIgnoreCase));
-        Assert.DoesNotContain(entries, e => e.Message.Contains("Quarantining unreadable segment", StringComparison.Ordinal) ||
-                                            e.Message.Contains("Failed to quarantine corrupt segment", StringComparison.Ordinal));
-        Assert.False(File.Exists(path + ".corrupt"), "the scan quarantined the file instead of skipping it as deleted");
+        AssertNotQuarantined(path);
+    }
+
+    /// <summary>The scan neither quarantined <paramref name="path"/> nor tried to.</summary>
+    private void AssertNotQuarantined(string path)
+    {
+        Assert.DoesNotContain(_log.Entries, e => e.Message.Contains("Quarantining unreadable segment", StringComparison.Ordinal) ||
+                                                 e.Message.Contains("Failed to quarantine corrupt segment", StringComparison.Ordinal));
+        Assert.False(File.Exists(path + ".corrupt"), "the scan quarantined the file instead of skipping it");
     }
 
     private IEnumerable<(Microsoft.Extensions.Logging.LogLevel Level, string Message, Exception? Error)> CapWarnings() =>
