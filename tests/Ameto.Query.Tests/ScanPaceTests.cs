@@ -33,23 +33,29 @@ public sealed class ScanPaceTests
     /// events until the client has the second row, then a third match. Nothing in the stretch waits;
     /// only the pace can give the writer a moment to send in.
     ///
-    /// <para>The pace is set to yield at every clock read (64 events), as the cold-scan theory below
-    /// does, so the test can tell a pace that never yields from a slow runner WITHOUT a clock: if the
+    /// <para>The test tells a pace that yields LATE from a slow runner without racing a clock: if the
     /// stretch is still running inside the writer's own <c>MoveNextAsync</c> call, on the writer's
-    /// thread, hundreds of events after the pace was due, the scan never went pending and the writer
-    /// never had its moment. The real 50 ms pace was raced against a 3 s Stopwatch instead, which a
-    /// writer thread stalled at the wrong instant on a loaded runner could lose.</para>
+    /// thread, after the pace has read the clock past its interval, the scan never went pending and
+    /// the writer never had its moment (see <see cref="StretchedHotTier"/> for why that cannot happen
+    /// to a correct pace however slow the runner). The real 50 ms pace used to be raced against a
+    /// 3 s Stopwatch instead, which a writer thread stalled at the wrong instant could lose.</para>
+    ///
+    /// <para>Twice: at the executor's DEFAULT pace, which is what a search gets and the only case
+    /// that can see the interval converted to the wrong units (50 ms read as 50 s still yields at
+    /// zero), and at an interval of zero, where the pace is due from the stretch's first event.</para>
     /// </summary>
-    [Fact]
-    public async Task A_row_found_before_a_long_synchronous_scan_is_on_the_wire_before_that_scan_ends()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task A_row_found_before_a_long_synchronous_scan_is_on_the_wire_before_that_scan_ends(bool atTheDefaultPace)
     {
         var body  = new RecordingBody();
         var steps = new StepWatch();
-        var tier  = new StretchedHotTier(body, Row("hit 1"), steps);
-        var query = new QueryExecutor(new HotTierOnly(tier), new SegmentIndexReaderFactory(), NullLogger<QueryExecutor>.Instance)
-        {
-            ScanYieldInterval = TimeSpan.Zero,
-        };
+        var tier  = new StretchedHotTier(body, Row("hit 1"), steps, atTheDefaultPace ? ScanPace.DefaultInterval : TimeSpan.Zero);
+        var hot   = new HotTierOnly(tier);
+        var query = atTheDefaultPace
+            ? new QueryExecutor(hot, new SegmentIndexReaderFactory(), NullLogger<QueryExecutor>.Instance)
+            : new QueryExecutor(hot, new SegmentIndexReaderFactory(), NullLogger<QueryExecutor>.Instance) { ScanYieldInterval = TimeSpan.Zero };
         using var sse = new SseJsonWriter(body);
 
         var request = new QueryRequest
@@ -63,7 +69,9 @@ public sealed class ScanPaceTests
 
         Assert.True(tier.ClientHadRowDuringStretch,
             $"hit 1 was still unsent after {tier.MissesServed} rejected events: "
-          + (tier.StretchStayedInsideTheCall ? "the scan never went pending, so the writer had no moment to send" : "the hang guard ran out"));
+          + (tier.StretchStayedInsideTheCall
+                ? $"the pace was due ({tier.PaceDueAfter.TotalMilliseconds:0} ms) and the scan still never went pending, so the writer had no moment to send"
+                : "the hang guard ran out"));
 
         string all = body.All();
         Assert.Equal(3, Count(all, "data: {\"@t\""));
@@ -186,12 +194,27 @@ public sealed class ScanPaceTests
     /// A hot tier whose sorted read is one long synchronous stretch between the second and third
     /// match. It watches the body from inside the stretch, so it can tell the send happened while
     /// the scan was still working, not after.
+    ///
+    /// <para>WHEN A PACE THAT HAS NOT YIELDED IS LATE. The pace reads the clock once every 64 events it
+    /// sees, and every event this tier serves passes through it, so each batch of 256 misses below
+    /// holds four clock reads, all taken after the check that ended the previous batch. The writer's
+    /// call that is open during the stretch began before it (the executor hands over hit 1 and only
+    /// pulls the next event on the call after), and no other call can begin inside it: that needs a
+    /// row. So if a check finds the stretch still inside that call on the writer's thread, nothing
+    /// yielded since the call began, and the pace's last yield (or its start) is older than the
+    /// stretch. If the check before it had already seen the stretch past <c>paceDueAfter</c>,
+    /// the four reads in between each saw at least that much since the last yield, and a correct pace
+    /// yields on the first of them. A slow runner only moves those reads later, which makes the pace
+    /// due sooner, never the test fail. The mark is taken strictly past the interval so rounding
+    /// between the Stopwatch's TimeSpan and the pace's raw timestamps cannot decide it.</para>
     /// </summary>
-    private sealed class StretchedHotTier(RecordingBody body, string awaitedRow, StepWatch steps) : IHotTierReader
+    private sealed class StretchedHotTier(RecordingBody body, string awaitedRow, StepWatch steps, TimeSpan paceDueAfter) : IHotTierReader
     {
         public volatile bool ClientHadRowDuringStretch;
         public volatile bool StretchStayedInsideTheCall;
         public long MissesServed;
+
+        public TimeSpan PaceDueAfter => paceDueAfter;
 
         public IEnumerable<LogEvent> ReadAll() => throw new NotSupportedException("the executor reads the hot tier sorted");
 
@@ -203,19 +226,26 @@ public sealed class ScanPaceTests
 
             LogEvent miss    = Event(2, LogLevel.Information, "miss");   // the filter rejects it
             var      stretch = Stopwatch.StartNew();
+
+            // Whether the pace was already due before the batch about to be served, whose clock reads
+            // must then yield. At an interval of zero every clock read yields, from the first.
+            bool dueBeforeThisBatch = paceDueAfter <= TimeSpan.Zero;
             while (true)
             {
-                // 256 events: four times the 64 after which a pace at interval zero is due.
+                // 256 events: four of the pace's clock reads, one every 64 events.
                 for (int i = 0; i < 256; i++) yield return miss;
                 MissesServed += 256;
 
                 if (body.Contains(awaitedRow)) { ClientHadRowDuringStretch = true; break; }
 
-                // Still synchronous inside the writer's call after the pace was due: it never yielded,
-                // and nothing will send the row until this stretch ends. No clock decides this.
-                if (steps.InsideTheCallOnThisThread) { StretchStayedInsideTheCall = true; break; }
+                // Still synchronous inside the writer's call, after four clock reads that were all past
+                // the interval: the pace yields late or never, and nothing will send the row until this
+                // stretch ends. A clock only decides when to START asking, never the answer.
+                if (dueBeforeThisBatch && steps.InsideTheCallOnThisThread) { StretchStayedInsideTheCall = true; break; }
 
-                if (stretch.Elapsed > HangGuard) break;
+                TimeSpan elapsed = stretch.Elapsed;
+                if (elapsed > paceDueAfter) dueBeforeThisBatch = true;
+                if (elapsed > HangGuard) break;
             }
 
             yield return Event(3, LogLevel.Error, "hit 2");
