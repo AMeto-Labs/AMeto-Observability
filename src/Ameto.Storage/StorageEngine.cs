@@ -1620,6 +1620,21 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     internal Action<string> _deleteSegmentFile = File.Delete;
 
     /// <summary>
+    /// Test hook: called by <see cref="TryCompletePendingSegmentDelete"/> with the parked path just
+    /// before it reads the catalog for an entry naming that path, inside the same hold of
+    /// <c>_importLock</c> as the unlink it then makes through <see cref="_deleteSegmentFile"/>.
+    /// From the two a test asserts, on every run, that the read and the unlink are both under the
+    /// lock (<see cref="ImportLockIsHeldByCurrentThread"/>); a re-import landing between them is
+    /// otherwise only caught when the scheduler lets it in inside the test's wait. It runs outside
+    /// the attempt's catch, so a throw from it leaves the retry. Costs production one field read
+    /// per attempt, and attempts are made only for parked paths.
+    /// </summary>
+    internal Action<string>? _beforePendingDeleteCatalogCheck;
+
+    /// <summary>Whether the calling thread holds <c>_importLock</c> (tests, from inside a hook).</summary>
+    internal bool ImportLockIsHeldByCurrentThread => _importLock.IsHeldByCurrentThread;
+
+    /// <summary>
     /// Parks a failed delete and makes sure the background loop runs. The caller holds
     /// <c>_importLock</c> and <see cref="_scanDeleteGate"/>. Never blocks.
     /// </summary>
@@ -1774,6 +1789,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             // belongs to that entry now. A stale retry must not touch it. (Not the boot catalog
             // scan: it skips a parked path, and cannot slip in ahead of the park -- see
             // LoadSegmentCatalog. Flushes and merges only ever write new names.)
+            _beforePendingDeleteCatalogCheck?.Invoke(path);
             if (_segments.TryGetValue(pending.Key, out var current)
                 && string.Equals(current.FilePath, path, StringComparison.OrdinalIgnoreCase))
             {

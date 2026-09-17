@@ -193,12 +193,28 @@ public sealed class SegmentDeleteRetryTests : IAsyncLifetime
         // the unlink is done, and its move then lands the file on a free path. Without the lock it
         // registers the old file here, and the unlink below removes the file its entry names.
         // (Nothing in this hook may throw: the retry's catch would take it for a failed unlink.)
+        //
+        // That half depends on the scheduler: under load the import can miss the half second, the
+        // unlink runs first, and a retry without the lock passes. The half that does not is what
+        // the lock is for, recorded from the retry's own thread: it holds _importLock at the
+        // catalog read, still holds it at the unlink, and made exactly one read before that
+        // unlink. Removing the lock, or narrowing it to either step, fails that on every run.
+        int checks = 0, checkThread = -1;
+        bool heldAtCheck = false, heldAtUnlink = false, unlinkFollowsItsCheck = false;
+        _engine._beforePendingDeleteCatalogCheck = p =>
+        {
+            checks++;
+            checkThread = Environment.CurrentManagedThreadId;
+            heldAtCheck = _engine.ImportLockIsHeldByCurrentThread;
+        };
         bool attempted = false, publishedInside = false;
         _engine._deleteSegmentFile = p =>
         {
             if (!attempted)
             {
                 attempted = true;
+                heldAtUnlink          = _engine.ImportLockIsHeldByCurrentThread;
+                unlinkFollowsItsCheck = checks == 1 && checkThread == Environment.CurrentManagedThreadId;
                 go.Set();
                 publishedInside = published.Wait(TimeSpan.FromMilliseconds(500));
                 if (publishedInside) import.Join(TimeSpan.FromSeconds(20));
@@ -212,6 +228,9 @@ public sealed class SegmentDeleteRetryTests : IAsyncLifetime
 
         Assert.Null(importError);
         Assert.True(attempted, "setup: the retry never reached its unlink");
+        Assert.True(unlinkFollowsItsCheck, "setup: the unlink did not follow one catalog read on the same thread");
+        Assert.True(heldAtCheck, "the retry read the catalog for the parked path without holding _importLock");
+        Assert.True(heldAtUnlink, "the retry unlinked the parked path without holding _importLock");
         Assert.False(publishedInside, "the re-import published its entry between the retry's catalog check and its unlink");
         Assert.Equal(SegmentImportOutcome.Registered, outcome);
         Assert.Equal(0, left);
