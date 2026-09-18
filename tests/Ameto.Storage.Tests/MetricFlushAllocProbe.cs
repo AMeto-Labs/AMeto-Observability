@@ -26,9 +26,32 @@ public sealed class MetricFlushAllocProbe
     private readonly ITestOutputHelper _out;
     public MetricFlushAllocProbe(ITestOutputHelper o) => _out = o;
 
-    private const int SeriesCount     = 2_000;
-    private const int PointsPerSeries = 50;      // 100 000 points: under the byte threshold for both shapes
-    private const int Buckets         = 16;
+    private const int SeriesCount = 2_000;
+    private const int Buckets     = 16;
+
+    /// <summary>The engine's own cost function for this probe's heavier shape — 216 B today.</summary>
+    private static readonly int HistogramPointBytes =
+        MetricStorageEngine.EstimatedPointBytes(new MetricDataPoint { BucketCounts = new long[Buckets] });
+
+    /// <summary>
+    /// Three quarters of whatever the tier's byte budget is on THIS host, charged at the HEAVIER
+    /// of the two shapes, so neither arm can trip the engine's own threshold mid-burst — the same
+    /// derivation <see cref="MetricHotTierRetentionProbe"/> makes, for the same reason.
+    ///
+    /// <para>A fixed 50 could not: 2 000 x 50 histogram points charge 21.6 MB, which only fits
+    /// under a budget of <c>0.05 x managed limit</c> above a ~432 MB heap. Under
+    /// <c>DOTNET_GCHeapHardLimit=0x18000000</c> — the stand, the default for a 512 MB container,
+    /// and the setting this file's own doc tells the reader to use — the budget is 20.1 MB and
+    /// the last chunk trips the threshold as it lands, so <c>HotPointCount</c> below became a
+    /// race with the drain. Lower still (0x13000000, or the <c>GCHeapHardLimitPercent=60</c> the
+    /// background-memory recon recommends for the stand) the crossing moves two chunks earlier
+    /// and the assertion fails outright: measured Actual 20 000 against Expected 100 000. When it
+    /// did NOT fail, a live flush was polluting the very numbers the probe exists to print —
+    /// <c>GC.GetTotalAllocatedBytes</c> is process-wide.</para>
+    /// </summary>
+    private static readonly int PointsPerSeries = (int)Math.Clamp(
+        new MetricsOptions().EffectiveHotTierBytes * 3 / 4 / (SeriesCount * (long)HistogramPointBytes),
+        5, 50);
 
     [Theory]
     [InlineData(false)]
@@ -44,7 +67,15 @@ public sealed class MetricFlushAllocProbe
 
             Feed(engine, baseNano, SeriesCount, PointsPerSeries, histogram);
 
-            int points = SeriesCount * PointsPerSeries;
+            int  points  = SeriesCount * PointsPerSeries;
+            long charged = (long)points * (histogram ? HistogramPointBytes : MetricStorageEngine.HotPointBytes);
+            long budget  = new MetricsOptions().EffectiveHotTierBytes;
+
+            // Stated, not assumed: a burst over the budget schedules a flush from inside Ingest,
+            // and then this probe measures a drain it did not start and a tier it does not own.
+            Assert.True(charged < budget,
+                $"the burst charges {charged / 1048576.0:N1} MB against a tier budget of "
+              + $"{budget / 1048576.0:N1} MB — the engine flushes it out from under the probe");
             Assert.Equal(points, engine.HotPointCount);   // the whole burst must still be in the tier
 
             long tierBytes = engine.HotByteCount;
