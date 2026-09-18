@@ -90,6 +90,35 @@ public readonly struct MemoryBudgets
     /// </summary>
     public const long IngestArenaCapBytes = 512L * 1024 * 1024;
 
+    /// <summary>
+    /// The metric hot tier between flushes — <b>exactly today's threshold, restated in bytes</b>:
+    /// 500 000 points at the 64 B a scalar point costs in the tier (see
+    /// <c>MetricStorageEngine.HotPointBytes</c>). So a host large enough for this cap flushes on
+    /// the same cadence it always did, which is what keeps the existing flush tests' point counts
+    /// meaning what they say, and a smaller one gets a tier it can hold.
+    ///
+    /// <para>The unit is the whole point of the change. A 16-bucket histogram point carries its
+    /// own <c>long[]</c> and is 4.3x a scalar point, so the flat 500 000-POINT threshold was
+    /// 20 MB of gauges or 84 MB of histograms — on a 512 MB container whose GC heap hard limit
+    /// is 384 MB, decided without asking the host anything.</para>
+    /// </summary>
+    public const long MetricHotTierCapBytes = 32L * 1000 * 1000;
+
+    /// <summary>
+    /// The trace hot tier between flushes. 64 MB is what 50 000 spans weighed before this round
+    /// (1 117 B a span, measured), so a large host keeps the ceiling it had; WP8 is what spends
+    /// this instead of a span count. Defined here rather than in the traces package because this
+    /// file is cut once per round — see the note on <see cref="MetricHotTierFraction"/>.
+    /// </summary>
+    public const long TraceHotTierCapBytes = 64L * 1024 * 1024;
+
+    /// <summary>
+    /// One trace compaction pass's working set — <c>CompactOnePass</c>'s <c>allSpans</c>, which
+    /// at <c>MaxSpansPerPass</c> 120 000 x 1 740 B retained peaked at <b>199 MB</b> measured,
+    /// against a 128 MB ceiling here and a byte budget instead of a span count in WP8.
+    /// </summary>
+    public const long TraceMergeCapBytes = 128L * 1024 * 1024;
+
     // ── The shares, when that is the smaller number ──
     //
     // Managed builds and the index cache together take 45 % of the managed-heap limit; the rest
@@ -210,6 +239,40 @@ public readonly struct MemoryBudgets
     public const double IngestArenaFraction = 0.15;
 
     /// <summary>
+    /// Share of the MANAGED-HEAP limit the metric hot tier may hold between flushes.
+    ///
+    /// <para><b>Why the metric tier is here at all.</b> Nothing in <c>Ameto.Metrics</c> consulted
+    /// this class: every sizing constant was a literal, identical on a 512 MB container and a
+    /// 64 GB host, and the tier could legally claim more than the LOG tier is allowed
+    /// (<c>HotTier.MaxSizeBytes</c> 16 MB on the stand) while the index cache held 48 MB beside
+    /// it.</para>
+    ///
+    /// <para><b>THIS IS AN APPEND, AND THE ROUND'S PLAN ASKED FOR A RE-CUT.</b> The logs shares
+    /// claim 0.55 of the managed limit (0.30 + 0.15 + 0.10) and the three new tiers add 0.16, for
+    /// 0.71 of ceilings that are not all reached at once — a build peak, a cache, a parked buffer
+    /// pool and three tiers that each trigger a flush when they fill. Lowering the logs fractions
+    /// to make room is the right shape, and it is not done here because the assertions that pin
+    /// them (<c>MemoryBudgetTests</c>, which spells 0.30 / 0.25 / 0.15 / 0.10 / 0.05 / 0.15 as
+    /// literals) belong to a file this work package does not own. The re-cut is owed, with those
+    /// tests re-stated in the same commit; <c>MetricBudgetWiringTests</c> holds the sum to 0.75
+    /// so the debt cannot quietly grow past it in the meantime.</para>
+    /// </summary>
+    public const double MetricHotTierFraction = 0.05;
+
+    /// <summary>
+    /// Share of the MANAGED-HEAP limit the trace hot tier may hold between flushes. Consumed by
+    /// WP8, defined here because this file gets exactly one owner per round.
+    /// </summary>
+    public const double TraceHotTierFraction = 0.05;
+
+    /// <summary>
+    /// Share of the MANAGED-HEAP limit one trace compaction pass may hold. Larger than a tier's
+    /// share because a pass reads whole segments back; still a fraction, because 199 MB of it on
+    /// a 384 MB heap limit is how the traces OOM happened.
+    /// </summary>
+    public const double TraceMergeFraction = 0.06;
+
+    /// <summary>
     /// A guard for a runtime that does not report <c>GCHighMemPercent</c>. The .NET 10 runtime
     /// reports the EFFECTIVE percentage, whether configured or chosen by default, including the
     /// higher default at 80 GB of physical memory or more. Measured on 10.0.11: 90 with nothing set,
@@ -227,9 +290,19 @@ public readonly struct MemoryBudgets
     private const long MinIngestBufferBytes     =  8L * 1024 * 1024;
     private const long MinIngestArenaBytes      = 16L * 1024 * 1024;   // ~256 slabs at the 64 KB default
 
+    /// <summary>
+    /// 4 MB is ~62 500 scalar points, and a tier that cannot hold a minute of a small exporter
+    /// writes a file per metric name per minute instead — the cost the write-ahead log exists to
+    /// avoid. A host too small for this floor has a file-count problem, not a memory one.
+    /// </summary>
+    private const long MinMetricHotTierBytes    =  4L * 1000 * 1000;
+    private const long MinTraceHotTierBytes     =  8L * 1024 * 1024;
+    private const long MinTraceMergeBytes       = 16L * 1024 * 1024;
+
     private MemoryBudgets(
         long managedLimit, long physicalLimit, long managed, long native, long indexCache,
-        long indexCacheNative, long ingestBuffers, long ingestArena)
+        long indexCacheNative, long ingestBuffers, long ingestArena,
+        long metricHotTier, long traceHotTier, long traceMerge)
     {
         ManagedLimitBytes     = managedLimit;
         PhysicalLimitBytes    = physicalLimit;
@@ -239,6 +312,9 @@ public readonly struct MemoryBudgets
         IndexCacheNativeBytes = indexCacheNative;
         IngestBufferBytes     = ingestBuffers;
         IngestArenaBytes      = ingestArena;
+        MetricHotTierBytes    = metricHotTier;
+        TraceHotTierBytes     = traceHotTier;
+        TraceMergeBytes       = traceMerge;
     }
 
     /// <summary>
@@ -284,6 +360,19 @@ public readonly struct MemoryBudgets
     /// </summary>
     public long IngestArenaBytes { get; }
 
+    /// <summary>
+    /// Ceiling on the metric hot tier between flushes — the budget
+    /// <c>MetricsOptions.EffectiveHotTierBytes</c> spends. See
+    /// <see cref="MetricHotTierFraction"/>.
+    /// </summary>
+    public long MetricHotTierBytes { get; }
+
+    /// <summary>Ceiling on the trace hot tier between flushes. Consumed by WP8.</summary>
+    public long TraceHotTierBytes { get; }
+
+    /// <summary>Ceiling on one trace compaction pass's working set. Consumed by WP8.</summary>
+    public long TraceMergeBytes { get; }
+
     /// <summary>True when a share of a limit, not the constant, set a ceiling.</summary>
     public bool IsConstrained =>
         ManagedBuildBytes < ManagedBuildCapBytes ||
@@ -316,7 +405,10 @@ public readonly struct MemoryBudgets
             Share(managedBase,  IndexCacheFraction,   IndexCacheCapBytes,   MinIndexCacheBytes),
             Share(physicalBase, IndexCacheNativeFraction, IndexCacheNativeCapBytes, MinIndexCacheNativeBytes),
             Share(managedBase,  IngestBufferFraction, IngestBufferCapBytes, MinIngestBufferBytes),
-            Share(physicalBase, IngestArenaFraction,  IngestArenaCapBytes,  MinIngestArenaBytes));
+            Share(physicalBase, IngestArenaFraction,  IngestArenaCapBytes,  MinIngestArenaBytes),
+            Share(managedBase,  MetricHotTierFraction, MetricHotTierCapBytes, MinMetricHotTierBytes),
+            Share(managedBase,  TraceHotTierFraction,  TraceHotTierCapBytes,  MinTraceHotTierBytes),
+            Share(managedBase,  TraceMergeFraction,    TraceMergeCapBytes,    MinTraceMergeBytes));
 
         static long Share(long limit, double fraction, long cap, long floor)
         {
