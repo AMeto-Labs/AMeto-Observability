@@ -188,14 +188,19 @@ public static class TraceQLExecutor
         // Fetch spans using indexed filters; multiply limit for grouping headroom.
         //
         // WHAT THIS RETAINS, MEASURED, because ten times a caller-supplied number is worth
-        // writing down. A SpanRecord with an ordinary eight-attribute OTel attribute map weighs
-        // about 1,800 bytes once decoded (SpanSearchBoundTests measures 1,749 B on its fixture),
-        // so this list peaks at spanLimit × ~1.8 KB:
+        // writing down. A SpanRecord carrying an ordinary eight-attribute OTel attribute map
+        // weighs about 607 bytes — the 375-byte msgpack blob, two strings and the record
+        // (SpanSearchBoundTests measures it on its fixture) — so this list peaks at
+        // spanLimit × ~0.6 KB:
         //   * the SSE route (GET /api/traces/query/stream) pages at QlStreamPageSize = 200, so
-        //     2 000 spans ≈ 3.6 MB per connected client, and the stream is one page at a time;
-        //   * POST /api/traces/query clamps limit to 1 000, so 10 000 spans ≈ 17 MB — PER
+        //     2 000 spans ≈ 1.2 MB per connected client, and the stream is one page at a time;
+        //   * POST /api/traces/query clamps limit to 1 000, so 10 000 spans ≈ 5.8 MB — PER
         //     CONCURRENT REQUEST, and the trace endpoints take no slot from QueryGuard by
         //     design, so nothing serialises them.
+        //
+        // It was 1,749 B, 3.6 MB and 17 MB until the attribute map stopped being decoded into a
+        // dictionary for every span a scan touched; the predicate now reads its one key straight
+        // out of the bytes (AttributePredicate.Evaluate).
         //
         // LEFT AS IT IS, deliberately. The peak is proportional to what the caller asked for and
         // bounded by it — this is not the unbounded-in-the-match-count shape that killed the
