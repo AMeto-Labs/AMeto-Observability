@@ -144,6 +144,53 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
         Assert.Equal(fromBlob, fromDict);
     }
 
+    /// <summary>
+    /// TS#13: THE KEY LIST IS A CONSTANT, SO IT MUST NOT BE AN ALLOCATION. <c>BuildRow</c> asks for
+    /// the HTTP method and path of every row it returns, and each ask went through a
+    /// <c>params string[]</c> parameter with literal arguments — a fresh <c>string[]</c> per call,
+    /// two per row, on a page that may return a thousand rows, and invisible to every caller.
+    ///
+    /// <para>Measured directly on the helper, because the arrays are 80 B per row against a page
+    /// that allocates megabytes: at this call count they are unmistakable, and at page scale they
+    /// would be noise. Restore the <c>params string[]</c> signature and its literal arguments and
+    /// this fails at about 80 B per call instead of 0.</para>
+    /// </summary>
+    [Fact]
+    public void Reading_the_http_attributes_of_a_row_allocates_nothing()
+    {
+        const int Calls = 200_000;
+
+        var attrs = new Dictionary<string, object?>(2, StringComparer.Ordinal)
+        {
+            ["http.request.method"] = "GET",
+            ["url.path"]            = "/api/v1/payments",
+        };
+
+        // Warm the JIT before the counter is read.
+        for (int i = 0; i < 1_000; i++)
+        {
+            _ = TraceQLExecutor.GetAttr(attrs, TraceQLExecutor.MethodKeys);
+            _ = TraceQLExecutor.GetAttr(attrs, TraceQLExecutor.PathKeys);
+        }
+
+        long before = GC.GetTotalAllocatedBytes(precise: true);
+        string method = string.Empty, path = string.Empty;
+        for (int i = 0; i < Calls; i++)
+        {
+            method = TraceQLExecutor.GetAttr(attrs, TraceQLExecutor.MethodKeys);
+            path   = TraceQLExecutor.GetAttr(attrs, TraceQLExecutor.PathKeys);
+        }
+        long allocated = GC.GetTotalAllocatedBytes(precise: true) - before;
+
+        _out.WriteLine($"{Calls:N0} rows x 2 attribute lookups: {allocated:N0} B "
+                     + $"({(double)allocated / Calls:N1} B/row)");
+
+        Assert.Equal("GET", method);
+        Assert.Equal("/api/v1/payments", path);
+        Assert.True(allocated < 8 * Calls,
+            $"{allocated / (double)Calls:N1} B allocated per row to read two constant key lists");
+    }
+
     /// <summary>A blob that will not decode answers UNKNOWN, never "no" — issue #74's rule, on bytes.</summary>
     [Fact]
     public void An_unreadable_blob_cannot_answer_either_way()

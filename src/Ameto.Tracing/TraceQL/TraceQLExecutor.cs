@@ -322,8 +322,8 @@ public static class TraceQLExecutor
             ServiceName       = root.ServiceName,
             Services          = [.. services],
             Status            = hasErr ? "Error" : root.Status.ToString(),
-            HttpMethod        = GetAttr(root.Attributes, "http.request.method", "http.method"),
-            HttpPath          = GetAttr(root.Attributes, "url.path", "http.target", "http.route"),
+            HttpMethod        = GetAttr(root.Attributes, MethodKeys),
+            HttpPath          = GetAttr(root.Attributes, PathKeys),
             HttpStatusCode    = root.HttpStatusCode != 0 ? root.HttpStatusCode : null,
             StartTimeUnixNano = root.StartTimeUnixNano,
             DurationNanos     = root.DurationNanos,
@@ -331,11 +331,24 @@ public static class TraceQLExecutor
         };
     }
 
-    private static string GetAttr(IReadOnlyDictionary<string, object?>? attrs, params string[] keys)
+    /// <summary>
+    /// The semconv key lists, allocated ONCE for the process rather than once per returned row.
+    /// A <c>params string[]</c> parameter with literal arguments is a fresh <c>string[]</c> on
+    /// every call, and this is called twice per row of every TraceQL page — the arrays were the
+    /// row's own allocation, not the caller's, and no caller could see them to hoist them out.
+    /// </summary>
+    internal static readonly string[] MethodKeys = ["http.request.method", "http.method"];
+    internal static readonly string[] PathKeys   = ["url.path", "http.target", "http.route"];
+
+    /// <summary>
+    /// First key that is present with a value, as text. A <c>ReadOnlySpan&lt;string&gt;</c> so the
+    /// key list is passed, never built.
+    /// </summary>
+    internal static string GetAttr(IReadOnlyDictionary<string, object?>? attrs, ReadOnlySpan<string> keys)
     {
         if (attrs is null) return string.Empty;
-        foreach (var k in keys)
-            if (attrs.TryGetValue(k, out var v) && v is not null)
+        for (int i = 0; i < keys.Length; i++)
+            if (attrs.TryGetValue(keys[i], out var v) && v is not null)
                 return v.ToString() ?? string.Empty;
         return string.Empty;
     }
