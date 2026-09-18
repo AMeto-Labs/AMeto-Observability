@@ -382,6 +382,93 @@ internal static class SpanAttributeBlob
         }
     }
 
+    /// <summary>The most keys <see cref="FindValues"/> will resolve in one walk.</summary>
+    internal const int MaxKeyAlternatives = 8;
+
+    /// <summary>
+    /// SEVERAL KEYS, ONE WALK OF THE MAP. Fills <paramref name="slots"/> with the value of every
+    /// key of <paramref name="keysUtf8"/> the map holds, and returns a bit per filled rank.
+    ///
+    /// <para>The semconv lookups this exists for ask LISTS, not keys: the HTTP path of a root span
+    /// is <c>url.path</c>, else <c>http.target</c>, else <c>http.route</c>, else <c>url.full</c>,
+    /// else <c>http.url</c>, and the method is two more. Asking <see cref="TryFind"/> once per key
+    /// walks the whole map once per key — seven walks per root span to establish that an ordinary
+    /// database span has no HTTP anything — and on the trace-list path those walks happen with the
+    /// engine read lock held. One walk answers the whole question.</para>
+    ///
+    /// <para>The same answers a <see cref="Decode"/>d dictionary gives when it is probed key by
+    /// key: the LAST copy of a key wins (the OTLP mapper writes resource attributes before span
+    /// attributes precisely so a span attribute shadows a resource one), and a key whose value is
+    /// msgpack nil, an array or a nested map is a key whose dictionary value is <c>null</c> — so
+    /// its bit stays clear and the caller's next key gets its turn, exactly as a <c>v is not
+    /// null</c> test would have let it. Zero means nothing was found, or the map is unreadable:
+    /// one answer for both, because a blob that cannot be read cannot say which it is.</para>
+    /// </summary>
+    internal static int FindValues(
+        ReadOnlyMemory<byte> blob, ReadOnlySpan<byte[]> keysUtf8, Span<SpanAttrValue> slots)
+    {
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(keysUtf8.Length, MaxKeyAlternatives);
+        ArgumentOutOfRangeException.ThrowIfLessThan(slots.Length, keysUtf8.Length);
+
+        if (blob.IsEmpty || keysUtf8.Length == 0) return 0;
+
+        int seen = 0;   // bit per rank
+        try
+        {
+            var reader = new MessagePackReader(blob);
+            int count  = reader.ReadMapHeader();
+            for (int i = 0; i < count; i++)
+            {
+                // TWO SKIPS IN THE ELSE BRANCH, NOT ONE, and that is the whole of the care this
+                // loop needs. TryReadStringSpan is the reader's fast path — a direct slice of the
+                // current span, against ReadStringSequence's SequencePosition arithmetic — but it
+                // DOES NOT ADVANCE when it declines (a msgpack-nil key; a string spanning
+                // segments, which cannot happen over one ReadOnlyMemory but is not this loop's to
+                // assume). Falling through to the single Skip below would then consume the KEY and
+                // leave the VALUE to be read as the next key, putting every remaining pair one
+                // slot out of step — an ordinary `url.path` sitting after such a key vanishes. So
+                // the key gets its own Skip here, and the value still gets the one below. A key
+                // that is neither a string nor nil throws, exactly as Decode's ReadString does.
+                int rank = -1;
+                if (reader.TryReadStringSpan(out var k))
+                {
+                    // Length first: SequenceEqual is an out-of-line call into SpanHelpers and this
+                    // inner loop runs once per candidate key per pair, so an eight-attribute map
+                    // asks it 56 times. The semconv key lengths are distinctive enough that the
+                    // length test leaves ONE of those calls for an ordinary database span. It did
+                    // not move the eight-attribute probe below its noise; it is what keeps the
+                    // walk linear in the attribute count on a span that carries fifty.
+                    for (int j = 0; j < keysUtf8.Length; j++)
+                    {
+                        var candidate = keysUtf8[j];
+                        if (candidate.Length == k.Length && k.SequenceEqual(candidate)) { rank = j; break; }
+                    }
+                }
+                else
+                {
+                    reader.Skip();   // the key itself
+                }
+
+                if (rank < 0) { reader.Skip(); continue; }   // the value
+
+                slots[rank] = default;                  // a later copy of the key replaces the earlier
+                ReadValue(ref reader, ref slots[rank]);
+                seen |= 1 << rank;
+            }
+        }
+        catch
+        {
+            return 0;
+        }
+
+        // A value a dictionary would hold as null is not an answer — see the summary.
+        for (int j = 0; j < keysUtf8.Length; j++)
+            if ((seen & (1 << j)) != 0 && slots[j].Kind is SpanAttrKind.Null or SpanAttrKind.Other)
+                seen &= ~(1 << j);
+
+        return seen;
+    }
+
     /// <summary>
     /// Finds one key without building anything. False means the key is not in the map, or the map
     /// is not readable — the two cases a caller must treat the same way, because a blob that
@@ -468,4 +555,16 @@ internal static class SpanAttributeBlob
             default:                      v.Kind = SpanAttrKind.Other;   r.Skip();                    break;
         }
     }
+}
+
+/// <summary>
+/// One <see cref="SpanAttrValue"/> slot per candidate key of a
+/// <see cref="SpanAttributeBlob.FindValues"/> lookup, inline in the caller's frame. A
+/// <c>stackalloc</c> cannot hold these — the type carries a <c>ReadOnlyMemory&lt;byte&gt;</c>
+/// window onto the blob, which is exactly what makes reading a string attribute out of it free.
+/// </summary>
+[System.Runtime.CompilerServices.InlineArray(SpanAttributeBlob.MaxKeyAlternatives)]
+internal struct AttrSlots
+{
+    private SpanAttrValue _element0;
 }

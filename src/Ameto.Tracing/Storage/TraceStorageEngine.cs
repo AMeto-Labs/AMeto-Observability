@@ -2978,6 +2978,33 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     private static readonly string[] PathKeys   = { "url.path", "http.target", "http.route", "url.full", "http.url" };
 
     /// <summary>
+    /// BOTH key lists, in one array, as UTF-8 — <see cref="MethodKeys"/> first and then
+    /// <see cref="PathKeys"/>, so ranks <c>[0, MethodKeys.Length)</c> answer the method question
+    /// and the rest answer the path one. Derived from the string lists at type-init, so the two
+    /// spellings of one semconv list cannot drift apart, and one array so that a root span's two
+    /// questions cost ONE walk of its attribute map rather than seven.
+    /// </summary>
+    private static readonly byte[][] HttpKeysUtf8 = Utf8Keys(MethodKeys, PathKeys);
+
+    private static byte[][] Utf8Keys(string[] first, string[] second)
+    {
+        var utf8 = new byte[first.Length + second.Length][];
+        for (int i = 0; i < first.Length;  i++) utf8[i]                = System.Text.Encoding.UTF8.GetBytes(first[i]);
+        for (int i = 0; i < second.Length; i++) utf8[first.Length + i] = System.Text.Encoding.UTF8.GetBytes(second[i]);
+
+        // A key in both lists would be found at its FIRST rank only — the walk stops comparing at
+        // the first match — and the second list would then read as if the key were absent. The two
+        // semconv lists are disjoint and this is what keeps them so.
+        for (int i = 0; i < utf8.Length; i++)
+            for (int j = i + 1; j < utf8.Length; j++)
+                if (utf8[i].AsSpan().SequenceEqual(utf8[j]))
+                    throw new InvalidOperationException(
+                        $"the HTTP semconv key lists share the key '{(i < first.Length ? first[i] : second[i - first.Length])}'");
+
+        return utf8;
+    }
+
+    /// <summary>
     /// Trace volume + sparkline over [from,to]. Cold tiers are served purely from the
     /// tiny <c>.tracesum</c> volume headers (no span deserialisation); the hot tier is
     /// grouped live. Bounded by (segments × grid-cells) — cheap for any window width.
@@ -3364,8 +3391,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             m.HttpStatusCode = s.HttpStatusCode;
             m.Name           = s.Name;
             m.ServiceName    = s.ServiceName;
-            m.HttpMethod     = GetAttr(s.Attributes, MethodKeys);
-            m.HttpPath       = GetAttr(s.Attributes, PathKeys);
+            SetHttpAttrs(s, m);
         }
     }
 
@@ -3397,6 +3423,81 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         foreach (var sv in m.Services)
             if (sv.Equals(service, StringComparison.OrdinalIgnoreCase)) return true;
         return false;
+    }
+
+    /// <summary>
+    /// THE TRACE LIST READS TWO KEYS, SO IT READS TWO KEYS — not a whole attribute map, and above
+    /// all not a whole attribute map from inside <c>_lock.EnterReadLock()</c>.
+    ///
+    /// <para><see cref="MergeSpanInto"/> runs under the read lock over every unflushed span and
+    /// asks this for the first root span of each trace. Reaching the answer through
+    /// <see cref="SpanRecord.Attributes"/> made that ask the FIRST touch of the record's blob, so
+    /// the lazy decode ran right there: a <c>Dictionary</c>, a key string and a box per attribute
+    /// per root span of the tier, inside a lock the drainer's <c>WriteSpan</c> has to wait out —
+    /// and memoised on the record afterwards, so a tier that had been listed once stayed that much
+    /// heavier until it flushed. Release, 20 000-span tier, 2 000 traces: 2 023 → 623 B allocated
+    /// per root span, and 1 888 → 498 B LEFT ON THE TIER, which at the 50 000-span threshold is
+    /// 9,0 → 2,4 MB the tier never gives back, on the first page after every flush.</para>
+    ///
+    /// <para>WHAT IT COSTS, because it is not free: the decode was memoised and this walk is not,
+    /// so a second page over the same tier pays it again — the probe measures page 2 at 5,1 ms
+    /// against the memoised path's 3,0 ms, ≈ 1 µs per root span of read-lock hold per page, and
+    /// 96 B per root span for the one <c>GetString</c> the dictionary had already paid for. The
+    /// trade is deliberate and it is the round's stated order — resident memory first, and the
+    /// 512 MB stand died of the live set, not of a millisecond. Memoising the two strings on the
+    /// record instead is the SSE hot-tier re-walk, which the plan gives to WP9.</para>
+    ///
+    /// <para>ONE WALK, BOTH QUESTIONS. <see cref="HttpKeysUtf8"/> is the two lists end to end, so
+    /// the map is read once and the method answer is picked from the leading ranks and the path
+    /// answer from the trailing ones — against seven walks if each key were asked separately, or
+    /// one decode plus two dictionary probes as before.</para>
+    ///
+    /// <para>IDENTICAL ANSWERS, by construction: the same key order, the same
+    /// first-key-present-with-a-non-null-value rule (msgpack nil, arrays and nested maps box to
+    /// <c>null</c> on the dictionary path and are skipped here too), the same last-copy-of-a-key
+    /// wins, and the same <c>ToString()</c> text for every value shape a dictionary can hold. A
+    /// record built from a dictionary rather than from bytes — every test fixture, and the cold
+    /// summary rows — takes the dictionary path below, unchanged.</para>
+    /// </summary>
+    private static void SetHttpAttrs(SpanRecord s, MergedTrace m)
+    {
+        var blob = s.AttributesBytes;
+        if (blob.IsEmpty)
+        {
+            m.HttpMethod = GetAttr(s.Attributes, MethodKeys);
+            m.HttpPath   = GetAttr(s.Attributes, PathKeys);
+            return;
+        }
+
+        AttrSlots slots = default;
+        Span<SpanAttrValue> found = slots;
+        int mask = SpanAttributeBlob.FindValues(blob, HttpKeysUtf8, found);
+
+        m.HttpMethod = AttrText(found, mask, 0, MethodKeys.Length);
+        m.HttpPath   = AttrText(found, mask, MethodKeys.Length, HttpKeysUtf8.Length);
+    }
+
+    /// <summary>
+    /// The first rank in <c>[lo, hi)</c> the walk found, as the text a boxed <c>ToString()</c>
+    /// would have produced. Nothing found is the empty string — what the dictionary path returns
+    /// for a key list none of whose keys are on the span.
+    /// </summary>
+    private static string AttrText(ReadOnlySpan<SpanAttrValue> found, int mask, int lo, int hi)
+    {
+        for (int j = lo; j < hi; j++)
+        {
+            if ((mask & (1 << j)) == 0) continue;
+            ref readonly var v = ref found[j];
+            return v.Kind switch
+            {
+                SpanAttrKind.Utf8String => System.Text.Encoding.UTF8.GetString(v.Utf8.Span),
+                SpanAttrKind.Integer    => v.Integer.ToString(),
+                SpanAttrKind.Float      => v.Float.ToString(),
+                SpanAttrKind.Boolean    => v.Boolean ? bool.TrueString : bool.FalseString,
+                _                       => string.Empty,   // unreachable: FindValues clears these bits
+            };
+        }
+        return string.Empty;
     }
 
     /// <summary>
