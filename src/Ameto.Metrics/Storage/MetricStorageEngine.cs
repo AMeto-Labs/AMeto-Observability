@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 using K4os.Compression.LZ4;
@@ -543,7 +544,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                 // Exemplars are not logged (see MetricWriteAheadLog) — a flush never
                 // persisted them either, so replay restores exactly what a flush would have.
             };
-            ApplyToHotTier(item, r.Point);
+            ApplyToHotTier(item, r.Point, out _);
             if (r.Point.TimestampUnixNano > 0 && r.Point.TimestampUnixNano < oldestNano)
                 oldestNano = r.Point.TimestampUnixNano;
         }
@@ -596,79 +597,112 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         long futureLimit   = FutureLimitNanos();
         int  droppedFuture = 0;
 
-        // Whether the exemplar pass below has anything to do. Exemplars are optional in OTLP and
-        // most exporters send none, but the pass re-walked the WHOLE batch regardless — re-testing
-        // every item's timestamp against the future limit a second time to discover, item by item,
-        // that there was nothing there. The main loop already looks at each item; this is what it
-        // costs to remember what it saw. (Folding the pass INTO that loop is the change that
-        // cannot be made: the loop runs under _snapshotLock, and the exemplar ring must not.)
-        bool anyExemplars = false;
+        // WHAT THE EXEMPLAR PASS BELOW NEEDS FROM THIS LOOP, BY ITEM ORDINAL. Exemplars are
+        // optional in OTLP and most exporters send none, but the pass re-walked the WHOLE batch
+        // regardless — re-testing every item's timestamp against the future limit a second time
+        // to discover, item by item, that there was nothing there. Worse, for an item that DID
+        // carry one it re-resolved the series with a second _hot.TryGetValue on a rebuilt
+        // SeriesKey, whose hash is uncached (a string hash of the name and one of the unit) —
+        // work ApplyToHotTier had just done for that same item. The loop already holds both
+        // answers; this is what it costs to remember them. Null while the batch has shown no
+        // exemplar, which is the common case and the one that must stay free. (Folding the pass
+        // INTO this loop is the change that cannot be made: the loop runs under _snapshotLock,
+        // and the exemplar ring must not.)
+        HotSeries?[]? resolved = null;
 
-        // Logging a point and making it visible must be one step with respect to a flush's
-        // snapshot, or a point that lands between the two would be in neither the files nor
-        // (after the commit) the log — durable nowhere despite the guarantee above. Held
-        // shared: this excludes the drain, not other ingests, which need no exclusion.
-        _snapshotLock.EnterReadLock();
         try
         {
-            // The log is gone or is about to be. MetricWriteAheadLog.Append returns SILENTLY
-            // once disposed, so carrying on would file every remaining point of this batch
-            // into a hot tier nobody will flush again and then return normally — the caller is
-            // told a batch was accepted that is durable nowhere. Throwing is what an exporter
-            // reads as a failed export and retries. Checked under the read lock, which the
-            // teardown takes exclusively before it sets this: no Append can straddle the two.
-            ObjectDisposedException.ThrowIf(Volatile.Read(ref _ingestClosed) != 0, this);
-
-            foreach (var item in items)
+            // Logging a point and making it visible must be one step with respect to a flush's
+            // snapshot, or a point that lands between the two would be in neither the files nor
+            // (after the commit) the log — durable nowhere despite the guarantee above. Held
+            // shared: this excludes the drain, not other ingests, which need no exclusion.
+            _snapshotLock.EnterReadLock();
+            try
             {
-                // See MaxFutureSkewNanos. Before the WAL append, so garbage never becomes the
-                // durable copy of anything; counted here, reported once outside the lock.
-                if (item.TimestampUnixNano > futureLimit) { droppedFuture++; continue; }
+                // The log is gone or is about to be. MetricWriteAheadLog.Append returns SILENTLY
+                // once disposed, so carrying on would file every remaining point of this batch
+                // into a hot tier nobody will flush again and then return normally — the caller is
+                // told a batch was accepted that is durable nowhere. Throwing is what an exporter
+                // reads as a failed export and retries. Checked under the read lock, which the
+                // teardown takes exclusively before it sets this: no Append can straddle the two.
+                ObjectDisposedException.ThrowIf(Volatile.Read(ref _ingestClosed) != 0, this);
 
-                var point = new MetricDataPoint
+                for (int i = 0; i < items.Length; i++)
                 {
-                    TimestampUnixNano = item.TimestampUnixNano,
-                    Value             = item.Kind == MetricKind.Histogram
-                                            ? (item.HistogramCount > 0 ? item.HistogramSum / item.HistogramCount : 0)
-                                            : item.ScalarValue,
-                    Count             = item.HistogramCount,
-                    Sum               = item.HistogramSum,
-                    BucketCounts      = item.BucketCounts,   // preserved for real percentiles + heatmap
-                };
+                    var item = items[i];
 
-                _wal.Append(item, in point);
-                hotBytes = ApplyToHotTier(item, in point);
-                anyExemplars |= item.Exemplars is { Length: > 0 };
+                    // See MaxFutureSkewNanos. Before the WAL append, so garbage never becomes the
+                    // durable copy of anything; counted here, reported once outside the lock.
+                    if (item.TimestampUnixNano > futureLimit) { droppedFuture++; continue; }
+
+                    var point = new MetricDataPoint
+                    {
+                        TimestampUnixNano = item.TimestampUnixNano,
+                        Value             = item.Kind == MetricKind.Histogram
+                                                ? (item.HistogramCount > 0 ? item.HistogramSum / item.HistogramCount : 0)
+                                                : item.ScalarValue,
+                        Count             = item.HistogramCount,
+                        Sum               = item.HistogramSum,
+                        BucketCounts      = item.BucketCounts,   // preserved for real percentiles + heatmap
+                    };
+
+                    _wal.Append(item, in point);
+                    hotBytes = ApplyToHotTier(item, in point, out var series);
+
+                    if (item.Exemplars is { Length: > 0 })
+                    {
+                        // Rented, not allocated: an exemplar-carrying batch is a steady-state shape,
+                        // not a one-off, and this must not put a per-batch array in front of the GC.
+                        resolved ??= ArrayPool<HotSeries?>.Shared.Rent(items.Length);
+                        resolved[i] = series;
+                    }
+                }
             }
+            finally { _snapshotLock.ExitReadLock(); }
+
+            if (droppedFuture > 0) ReportFutureDrops(droppedFuture, "ingest");
+
+            if (resolved is not null) AddExemplars(items, futureLimit, resolved);
+
+            if (hotBytes >= _hotFlushBytes
+                && System.Threading.Interlocked.CompareExchange(ref _thresholdFlushScheduled, 1, 0) == 0)
+            {
+                // Discarded, necessarily — an ingest call cannot wait on a flush. What the flush
+                // has to say about itself is therefore said by the continuation inside, not here.
+                _ = ScheduleThresholdFlush();
+            }
+
+            return droppedFuture;
         }
-        finally { _snapshotLock.ExitReadLock(); }
-
-        if (droppedFuture > 0) ReportFutureDrops(droppedFuture, "ingest");
-
-        if (anyExemplars) AddExemplars(items, futureLimit);
-
-        if (hotBytes >= _hotFlushBytes
-            && System.Threading.Interlocked.CompareExchange(ref _thresholdFlushScheduled, 1, 0) == 0)
+        finally
         {
-            // Discarded, necessarily — an ingest call cannot wait on a flush. What the flush
-            // has to say about itself is therefore said by the continuation inside, not here.
-            _ = ScheduleThresholdFlush();
+            // Cleared on the way back: a HotSeries reference left in a pooled slot would keep a
+            // series — its points, its label set, its catalog entry — alive for as long as the
+            // pool holds the array, long after a stale sweep had evicted it.
+            if (resolved is not null) ArrayPool<HotSeries?>.Shared.Return(resolved, clearArray: true);
         }
-
-        return droppedFuture;
     }
 
     /// <summary>
     /// Files the batch's exemplars into their per-metric rings. Reached only when the ingest loop
-    /// saw at least one — see <c>anyExemplars</c> in <see cref="Ingest"/> — because the rings are
+    /// saw at least one — see <c>resolved</c> in <see cref="Ingest"/> — because the rings are
     /// optional in OTLP, most exporters send none, and this walk used to run over every batch
     /// regardless, re-testing each item's timestamp to find nothing.
     ///
     /// <para>Outside <c>_snapshotLock</c> on purpose: exemplars are not written to the log and a
     /// ring takes a lock of its own, so they have no business inside the window that excludes the
     /// flush drain.</para>
+    ///
+    /// <para><paramref name="resolved"/> is the ingest loop's own answer, by item ordinal: the
+    /// <see cref="HotSeries"/> each exemplar-carrying item was filed into. It is here because
+    /// this pass needs the series' canonical label set and used to go and find it again — a
+    /// second <c>_hot</c> probe, on a <see cref="SeriesKey"/> whose record-struct hash is
+    /// recomputed from scratch (the name's string hash, the unit's, the label set's cached one),
+    /// per exemplar-carrying item, for an answer the caller had already computed. Only the
+    /// ordinals this pass will read are written, and the array is pooled, so the handover costs
+    /// no allocation.</para>
     /// </summary>
-    private void AddExemplars(ReadOnlySpan<MetricIngestItem> items, long futureLimit)
+    private void AddExemplars(ReadOnlySpan<MetricIngestItem> items, long futureLimit, HotSeries?[] resolved)
     {
         Interlocked.Increment(ref _exemplarPasses);
 
@@ -678,8 +712,10 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         string?       lastName = null;
         ExemplarRing? lastRing = null;
 
-        foreach (var item in items)
+        for (int i = 0; i < items.Length; i++)
         {
+            var item = items[i];
+
             // See MaxFutureSkewNanos. A refused point's exemplars are stamped by the same
             // broken clock, and GetExemplars sorts newest-first — an admitted far-future
             // exemplar would sort to the TOP of every answer until the ring rotates it out.
@@ -721,13 +757,12 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
             // MetricsOptions.ExemplarBytes = 208 — every derived ring 4.1x the budget it was
             // sized against, inside the heap this whole package exists to fit.
             //
-            // The series is already there: the ingest loop above filed this very point into it.
-            // The lookup misses only if the stale sweep evicted the series between the two, and
-            // the point's own set is then the honest answer for one entry.
-            var labels = _hot.TryGetValue(new SeriesKey(item.Name, item.Kind, item.Unit, item.Labels),
-                                          out var series)
-                ? series.Labels
-                : item.Labels;
+            // The ingest loop filed this very point into that series and left the reference in
+            // `resolved`, so there is nothing to look up: the second _hot probe this used to do
+            // re-hashed a SeriesKey the caller had just hashed. Holding the reference is also
+            // stricter than the lookup was — a stale sweep between the two passes could make the
+            // lookup miss and fall back to the point's own (uncanonical, uniquely owned) set.
+            var labels = resolved[i] is { } series ? series.Labels : item.Labels;
 
             foreach (var ex in exs)
             {
@@ -870,11 +905,15 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     /// size IN BYTES — the figure the flush threshold is spent in. Shared by live ingest and WAL
     /// replay: replay must not write back into the log it is reading from, and must not trigger
     /// a flush from the constructor.
+    ///
+    /// <para><paramref name="series"/> is the series the point landed on, handed out because the
+    /// exemplar pass needs exactly that instance and resolving it is the expensive half of this
+    /// method — see <see cref="AddExemplars"/>. Replay discards it.</para>
     /// </summary>
-    private long ApplyToHotTier(MetricIngestItem item, in MetricDataPoint point)
+    private long ApplyToHotTier(MetricIngestItem item, in MetricDataPoint point, out HotSeries series)
     {
-        var key    = new SeriesKey(item.Name, item.Kind, item.Unit, item.Labels);
-        var series = _hot.GetOrAdd(key, static k => new HotSeries(k.Labels));
+        var key = new SeriesKey(item.Name, item.Kind, item.Unit, item.Labels);
+        series  = _hot.GetOrAdd(key, static k => new HotSeries(k.Labels));
 
         series.Append(point, item.BucketBounds, _time.GetUtcNow().UtcTicks);
         UpdateMeta(item, series);
