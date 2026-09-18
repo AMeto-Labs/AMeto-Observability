@@ -145,6 +145,7 @@ public sealed class OtlpTraceProtoLimitsTests
         for (int i = 0; i < dom.Count; i++)
         {
             Assert.Equal(dom[i].Name, streamed[i].Name);
+            Assert.Equal(dom[i].ServiceName, streamed[i].ServiceName);
             Assert.True(dom[i].AttributesBytes.AsSpan().SequenceEqual(streamed[i].AttributesBytes),
                 $"span {i} ({dom[i].Name}): attribute bytes differ\n"
               + $"  dom: {Convert.ToHexString(dom[i].AttributesBytes)}\n"
@@ -182,6 +183,40 @@ public sealed class OtlpTraceProtoLimitsTests
         AssertJsonMatchesDom(EscapedBatch(longValueChars: 100_000));
         AssertJsonMatchesDom(EscapedBatch(longValueChars: 8));
     }
+
+    /// <summary>
+    /// A resource that states <c>service.name</c> three times — an int, then two strings. The
+    /// DOM's <c>ExtractServiceName</c> skips the non-string one and returns the FIRST string;
+    /// the protobuf parser matches it (pinned in <c>OtlpTraceProtoParityTests</c>), and the JSON
+    /// parser used to take the LAST string instead, so the two streaming parsers disagreed with
+    /// each other on the same resource with nothing to catch it. Every <c>service.name</c> entry
+    /// is excluded from the attribute pairs by key alone on both paths, so the msgpack must stay
+    /// byte-identical as well — which <c>AssertJsonMatchesDom</c> checks.
+    /// </summary>
+    [Fact]
+    public void Json_the_first_string_service_name_wins_like_the_dom()
+    {
+        AssertJsonMatchesDom(DuplicateServiceNameBatch);
+
+        var streamed = OtlpTraceStreamParser.Parse(Encoding.UTF8.GetBytes(DuplicateServiceNameBatch));
+        Assert.Equal("Wins.Second", Assert.Single(streamed).ServiceName);
+        Assert.Equal("Test", Attrs(streamed[0].AttributesBytes)["deployment.environment"]);
+    }
+
+    private const string DuplicateServiceNameBatch = """
+    {"resourceSpans":[{"resource":{"attributes":[
+        {"key":"service.name","value":{"intValue":"7"}},
+        {"key":"service.name","value":{"stringValue":"Wins.Second"}},
+        {"key":"service.name","value":{"stringValue":"Loses.Third"}},
+        {"key":"deployment.environment","value":{"stringValue":"Test"}}
+      ]},
+      "scopeSpans":[{"spans":[
+        {"traceId":"f6f6f098569a7f2ba54f3c734aa563f0","spanId":"a1b2c3d4e5f60718",
+         "name":"duplicate-service","kind":2,
+         "startTimeUnixNano":"1783953780000000000","endTimeUnixNano":"1783953780250000000"}
+      ]}]
+    }]}
+    """;
 
     /// <summary>
     /// The self-ingest guard reads an escaped URL through its own buffer, and the endpoint

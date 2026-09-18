@@ -13,11 +13,14 @@ namespace Ameto.Otel;
 /// directly — no <c>OtlpSpan</c>/<c>OtlpKeyValue</c>/<c>OtlpAnyValue</c> object graph, no
 /// intermediate hex/nano strings, attributes serialised to msgpack in one pass. Replaces
 /// the reflection <c>JsonSerializer.Deserialize&lt;ExportTraceServiceRequest&gt;</c> +
-/// <c>OtlpTraceMapper.Map</c> path for the JSON content type (protobuf keeps the DOM path).
+/// <c>OtlpTraceMapper.Map</c> path for the JSON content type. The protobuf content type has
+/// its own span parser, <see cref="OtlpTraceProtoParser"/>, and no longer goes through the DOM
+/// either; <c>OtlpProtoDecoder.DecodeTraces</c> survives only as the parity oracle for it.
 ///
 /// Behaviour is pinned to the DOM path by <c>OtlpTraceStreamingParityTests</c>: identical
 /// items (including byte-identical attribute msgpack) for the same body, the same drop
-/// rules (missing/invalid ids; outbound CLIENT spans targeting Ameto's own endpoints).
+/// rules (missing/invalid ids; outbound CLIENT spans targeting Ameto's own endpoints), and
+/// the same duplicate-<c>service.name</c> rule as the protobuf parser (first string wins).
 ///
 /// Assumes standard OTLP document order (<c>resource</c> precedes <c>scopeSpans</c>;
 /// a KeyValue's <c>key</c> precedes its <c>value</c>) — true for conformant exporters.
@@ -183,6 +186,12 @@ public static class OtlpTraceStreamParser
                 {
                     if (reader.TokenType != JsonTokenType.StartObject) { reader.Skip(); continue; }
                     bool isService = false, wroteKey = false, wroteValue = false;
+                    // Held per ENTRY, folded into `service` with ??= once the entry closes: the
+                    // first STRING-valued service.name in the list wins, as OtlpTraceMapper's
+                    // ExtractServiceName and OtlpTraceProtoParser do. Within one entry the last
+                    // stringValue still wins, because that is a duplicate JSON property and
+                    // JsonSerializer — the oracle — overwrites on those.
+                    string? entryService = null;
                     while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
                     {
                         if (reader.TokenType != JsonTokenType.PropertyName) { reader.Skip(); continue; }
@@ -213,7 +222,7 @@ public static class OtlpTraceStreamParser
                                         {
                                             reader.Read();
                                             if (reader.TokenType == JsonTokenType.String)
-                                                service = reader.GetString();
+                                                entryService = reader.GetString();
                                         }
                                         else reader.Skip();
                                     }
@@ -235,6 +244,7 @@ public static class OtlpTraceStreamParser
                     }
                     if (wroteKey && !wroteValue) w.WriteNil();
                     if (wroteKey) resCount++;
+                    if (isService) service ??= entryService;
                 }
             }
             else reader.Skip();
