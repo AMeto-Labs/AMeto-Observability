@@ -68,35 +68,107 @@ public sealed class MetricBudgetWiringTests
     /// process. The derivation used to divide by a private assumption of 32 "active" names while
     /// <c>MaxExemplarMetrics</c> admitted 256, so the stand's real ceiling was 140 MB of rings
     /// sized against a 10 MB budget — inside the 384 MB heap this package exists to fit.</para>
+    ///
+    /// <para><b>The product, not the depth.</b> This fact used to allow
+    /// <c>Math.Max(half, MaxExemplarMetrics * 64 * ExemplarBytes)</c>, which is the same product
+    /// as <c>worst</c> the moment the depth hits its 64-slot floor — so on exactly the hosts and
+    /// settings where the bound was needed it compared a figure to itself. The floor binds at
+    /// about 756 rings on the stand, and the cap is operator-settable: 5 000 rings x 64 slots x
+    /// 208 B is 66 MB, uncatchable by a tautology. The allowance is gone and the rows that raise
+    /// the cap are the ones that would have been silent.</para>
     /// </summary>
     [Fact]
     public void Every_ring_the_cap_admits_fits_the_budget_the_derivation_names()
     {
-        var o = new MetricsOptions();
-
-        foreach (var (label, b) in new (string, MemoryBudgets)[]
+        foreach (var (label, o, b) in new (string, MetricsOptions, MemoryBudgets)[]
                  {
-                     ("16 GB host",  Large),
-                     ("512 MB stand", Stand),
-                     ("128 MB heap", MemoryBudgets.Derive(128 * MB, 160 * MB)),
-                     ("16 MB heap",  MemoryBudgets.Derive(16 * MB, 16 * MB)),
+                     ("16 GB host",   new MetricsOptions(), Large),
+                     ("512 MB stand", new MetricsOptions(), Stand),
+                     ("128 MB heap",  new MetricsOptions(), MemoryBudgets.Derive(128 * MB, 160 * MB)),
+                     ("16 MB heap",   new MetricsOptions(), MemoryBudgets.Derive(16 * MB, 16 * MB)),
+
+                     // The cases the floor rules, which is where the old form went blind.
+                     ("stand, cap 5k",  new MetricsOptions { MaxExemplarMetrics = 5_000 },  Stand),
+                     ("stand, cap 50k", new MetricsOptions { MaxExemplarMetrics = 50_000 }, Stand),
+                     ("16 MB, cap 5k",  new MetricsOptions { MaxExemplarMetrics = 5_000 },
+                                        MemoryBudgets.Derive(16 * MB, 16 * MB)),
+
+                     // An explicit depth is bought out of the ring count, not out of the budget.
+                     ("stand, 4k deep", new MetricsOptions { ExemplarsPerMetric = 4_000 }, Stand),
                  })
         {
             long perRing = o.ExemplarsPerMetricFor(b);
-            long worst   = o.MaxExemplarMetrics * perRing * MetricsOptions.ExemplarBytes;
+            long rings   = o.MaxExemplarMetricsFor(b);
+            long worst   = rings * perRing * MetricsOptions.ExemplarBytes;
             long half    = o.HotTierBytesFor(b) / 2;
 
-            // The floor is the one case the budget cannot honour: 64 slots is the shallowest ring
-            // worth keeping, and 256 of them is 3.4 MB on any host. Everywhere else the
-            // derivation itself is the bound.
-            long allowed = Math.Max(half, o.MaxExemplarMetrics * 64L * MetricsOptions.ExemplarBytes);
+            _out.WriteLine($"{label,-14}: tier {o.HotTierBytesFor(b) / 1048576.0,6:N1} MB, "
+                         + $"{perRing,5:N0} slots x {rings,6:N0} rings (cap {o.MaxExemplarMetrics:N0}) "
+                         + $"= {worst / 1048576.0,6:N1} MB retained against {half / 1048576.0,5:N1} MB");
 
-            _out.WriteLine($"{label,-13}: tier {o.HotTierBytesFor(b) / 1048576.0,6:N1} MB, "
-                         + $"{perRing,5:N0} slots x {o.MaxExemplarMetrics} rings = {worst / 1048576.0,6:N1} MB retained");
-            Assert.True(worst <= allowed,
-                $"{label}: {o.MaxExemplarMetrics} rings of {perRing} exemplars retain "
-              + $"{worst / 1048576.0:N1} MB against a budget of {allowed / 1048576.0:N1} MB");
+            // No allowance and no floor escape: half the tier budget is the whole of it.
+            Assert.True(worst <= half,
+                $"{label}: {rings:N0} rings of {perRing:N0} exemplars retain "
+              + $"{worst / 1048576.0:N1} MB against a budget of {half / 1048576.0:N1} MB");
+
+            // And the clamp may only ever take rings AWAY — it is a ceiling on the operator's
+            // ceiling, never a way to exceed it.
+            Assert.InRange(rings, 1, o.MaxExemplarMetrics);
         }
+    }
+
+    /// <summary>
+    /// THE CLAMP IS WHAT THE ENGINE ENFORCES, not just what the options compute. A ring is
+    /// allocated at full depth the first time a metric name carries an exemplar, so "admits" has
+    /// to mean "creates", and the refusal counter is the engine's own record of having said no.
+    /// </summary>
+    [Fact]
+    public async Task An_engine_refuses_the_rings_its_budget_cannot_afford()
+    {
+        // A tier small enough that the 64-slot floor binds hard: half of 4 MB, at 208 B a slot,
+        // is 150 rings of 64 — against a cap asking for 1 000.
+        var options = new MetricsOptions { HotTierBytes = 4_000_000, MaxExemplarMetrics = 1_000 };
+        var budgets = MemoryBudgets.Current();
+
+        int perRing   = options.ExemplarsPerMetricFor(budgets);
+        int affordable = options.MaxExemplarMetricsFor(budgets);
+        Assert.Equal(64, perRing);
+        Assert.InRange(affordable, 1, 999);
+        _out.WriteLine($"cap 1 000 rings x {perRing} slots would be "
+                     + $"{1_000L * perRing * MetricsOptions.ExemplarBytes / 1048576.0:N1} MB; "
+                     + $"the budget affords {affordable} rings = "
+                     + $"{affordable * (long)perRing * MetricsOptions.ExemplarBytes / 1048576.0:N1} MB");
+
+        string dir = Path.Combine(Path.GetTempPath(), "ameto-mringcap-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            await using var engine = new MetricStorageEngine(dir, NullLogger<MetricStorageEngine>.Instance, options);
+            long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+
+            int names = affordable + 50;
+            var items = new MetricIngestItem[names];
+            for (int i = 0; i < names; i++)
+                items[i] = new MetricIngestItem
+                {
+                    Name              = "ringcap.metric." + i,
+                    Kind              = MetricKind.Gauge,
+                    Labels            = LabelSet.Empty,
+                    TimestampUnixNano = baseNano,
+                    ScalarValue       = i,
+                    Exemplars         = [new MetricExemplar { TimestampUnixNano = baseNano, Value = i }],
+                };
+            engine.Ingest(items);
+
+            // The names past the affordable count were refused — under the raw cap of 1 000 all
+            // 200-odd of them would have taken a ring.
+            Assert.True(engine.ExemplarMetricsRefused > 0,
+                $"{names} exemplar-carrying names against an affordable {affordable} rings and the "
+              + "engine refused none of them — it is still sizing itself by the raw cap");
+            Assert.NotEmpty(engine.GetExemplars("ringcap.metric.0", null, null, null));
+            Assert.Empty(engine.GetExemplars("ringcap.metric." + (names - 1), null, null, null));
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
     }
 
     [Fact]

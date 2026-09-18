@@ -507,7 +507,18 @@ public sealed class MetricsOptions
     ///
     /// <para>This is the divisor <see cref="ExemplarsPerMetricFor"/> spends the exemplar budget
     /// against, so raising it makes every ring proportionally shallower rather than claiming more
-    /// memory, and lowering it makes them deeper.</para>
+    /// memory, and lowering it makes them deeper. <b>Past the point where that would take a ring
+    /// below <c>MinExemplarsPerMetric</c></b> — 64 slots, under which a ring stops being worth
+    /// keeping — the depth cannot give way any further and the COUNT does instead: see
+    /// <see cref="MaxExemplarMetricsFor"/>, which is the number of rings the engine really
+    /// admits. Names past THAT are refused exactly as they are past this cap.</para>
+    ///
+    /// <para>Without that second clamp the sentence above was false wherever the floor binds —
+    /// about 756 rings on the 512 MB stand. An operator raising this to 5 000 to admit more
+    /// exemplar-carrying instruments, which is the case the cap exists for, got
+    /// 5 000 x 64 x 208 B = 66 MB of rings on a 384 MB heap: resident for the life of the
+    /// process, never pruned or aged out, invisible to <c>ShedableBytes</c> and unreachable by
+    /// <c>Shed()</c>. The same setting now claims the 10 MB the derivation names.</para>
     /// </summary>
     public int MaxExemplarMetrics { get; init; } = 256;
 
@@ -592,6 +603,34 @@ public sealed class MetricsOptions
         long rings   = Math.Max(1, MaxExemplarMetrics);
         long perRing = HotTierBytesFor(in budgets) / 2 / (ExemplarBytes * rings);
         return (int)Math.Clamp(perRing, MinExemplarsPerMetric, MaxExemplarsPerMetricCap);
+    }
+
+    /// <inheritdoc cref="MaxExemplarMetricsFor"/>
+    public int EffectiveMaxExemplarMetrics => MaxExemplarMetricsFor(MemoryBudgets.Current());
+
+    /// <summary>
+    /// HOW MANY RINGS THE ENGINE WILL ACTUALLY LET EXIST — <see cref="MaxExemplarMetrics"/>, or
+    /// as many as the budget can afford at the depth <see cref="ExemplarsPerMetricFor"/> settled
+    /// on, whichever is smaller.
+    ///
+    /// <para>The two knobs MULTIPLY, and only their product is memory. Spending the budget on
+    /// depth alone stops bounding anything the moment the depth hits its 64-slot floor: past
+    /// there every further ring is 64 x <see cref="ExemplarBytes"/> = 13 KB of permanently
+    /// resident heap that nothing prunes, ages out, sheds or even counts, and the cap is
+    /// operator-settable. So the leftover goes on the count. Below the floor point this returns
+    /// <see cref="MaxExemplarMetrics"/> unchanged and nothing moves.</para>
+    ///
+    /// <para>An explicit <see cref="ExemplarsPerMetric"/> is honoured here too, and therefore
+    /// buys its depth out of the ring count: the budget is a quantity of BYTES, and an operator
+    /// who asks for deeper rings on a tier that cannot hold more of them is asking for fewer.
+    /// </para>
+    /// </summary>
+    public int MaxExemplarMetricsFor(in MemoryBudgets budgets)
+    {
+        long rings      = Math.Max(1, MaxExemplarMetrics);
+        long perRing    = ExemplarsPerMetricFor(in budgets);
+        long affordable = HotTierBytesFor(in budgets) / 2 / (perRing * ExemplarBytes);
+        return (int)Math.Clamp(affordable, 1, rings);
     }
 }
 

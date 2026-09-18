@@ -238,12 +238,17 @@ public sealed class MetricHotTierRetentionProbe
         Directory.CreateDirectory(dir);
         try
         {
+            // Pinned, and large: this fact is about what one entry weighs, so all 256 rings have
+            // to be admitted. MetricsOptions.MaxExemplarMetricsFor sizes the ring COUNT to what
+            // half the tier budget can afford at this depth, and 256 x 1 000 x 208 B = 50.8 MB
+            // needs 101.6 MB of tier to be affordable.
             var options = new MetricsOptions
             {
-                HotTierBytes       = 32_000_000,   // pinned: this fact is about rings, not cadence
+                HotTierBytes       = 128_000_000,
                 ExemplarsPerMetric = depth,
                 MaxExemplarMetrics = rings,
             };
+            Assert.Equal(rings, options.MaxExemplarMetricsFor(MemoryBudgets.Current()));
             await using var engine = new MetricStorageEngine(dir, NullLogger<MetricStorageEngine>.Instance, options);
 
             long before = Live();
@@ -318,6 +323,7 @@ public sealed class MetricHotTierRetentionProbe
                 ExemplarsPerMetric = depth,
                 MaxExemplarMetrics = rings,
             };
+            Assert.Equal(rings, options.MaxExemplarMetricsFor(MemoryBudgets.Current()));
             await using var engine = new MetricStorageEngine(dir, NullLogger<MetricStorageEngine>.Instance, options);
 
             long before = Live();

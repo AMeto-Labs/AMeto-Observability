@@ -457,7 +457,11 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         _maxLabelValuesPerKey      = Math.Max(1, _options.MaxLabelValuesPerKey);
         _maxTrackedSeriesPerMetric = Math.Max(1, _options.MaxTrackedSeriesPerMetric);
         _exemplarsPerMetric        = _options.ExemplarsPerMetricFor(in budgets);
-        _maxExemplarMetrics        = Math.Max(1, _options.MaxExemplarMetrics);
+        // Not MaxExemplarMetrics: that is the operator's ceiling, and the BUDGET is the other
+        // one. Once the depth has hit its 64-slot floor the cap alone bounds nothing — every
+        // further ring is 13 KB of heap nothing can ever take back — so the ring count gives way
+        // instead. See MetricsOptions.MaxExemplarMetricsFor.
+        _maxExemplarMetrics        = _options.MaxExemplarMetricsFor(in budgets);
 
         // The WAL, unlike cold-segment discovery, must be open and replayed before the first
         // point is accepted, or a restart would interleave recovered and live data. Replay is
