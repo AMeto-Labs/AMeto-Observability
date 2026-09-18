@@ -523,7 +523,22 @@ internal static class OtlpProtoPayloads
             Nested(rs, 2, Msg(ss => Nested(ss, 2, HugeSpan(valueChars))));
         })));
 
-    private static byte[] HugeSpan(int valueChars) => Msg(sp =>
+    /// <summary>
+    /// The same span, with a value nested one level past the bound after the huge attribute — so
+    /// the scratch is grown and THEN the parse throws, which is the shape that leaves it pinned
+    /// when the release only runs on the success path.
+    /// </summary>
+    public static byte[] Traces_HugeAttributeThenOverDeepValue(int valueChars) => Msg(c =>
+        Nested(c, 1, Msg(rs =>
+        {
+            Nested(rs, 1, Msg(res => Nested(res, 1, StringAttr("service.name", "Wallet.API"))));
+            Nested(rs, 2, Msg(ss => Nested(ss, 2, HugeSpan(valueChars, overDeep: true))));
+        })));
+
+    /// <summary>Mirrors <c>OtlpTraceProtoParser.MaxValueDepth</c>.</summary>
+    private const int MaxTraceValueDepth = 64;
+
+    private static byte[] HugeSpan(int valueChars, bool overDeep = false) => Msg(sp =>
     {
         sp.WriteTag(1, WireFormat.WireType.LengthDelimited);
         sp.WriteBytes(ByteString.CopyFrom(Convert.FromHexString("9af7651916cd43dd8448eb211c80319c")));
@@ -533,6 +548,12 @@ internal static class OtlpProtoPayloads
         sp.WriteTag(7, WireFormat.WireType.Fixed64); sp.WriteFixed64(1_785_300_060_000_000_000UL);
         sp.WriteTag(8, WireFormat.WireType.Fixed64); sp.WriteFixed64(1_785_300_060_100_000_000UL);
         Nested(sp, 9, StringAttr("big", new string('x', valueChars)));
+        if (!overDeep) return;
+        Nested(sp, 9, Msg(kv =>
+        {
+            kv.WriteTag(1, WireFormat.WireType.LengthDelimited); kv.WriteString("nest");
+            Nested(kv, 2, NestedValue(MaxTraceValueDepth + 1, Nesting.Arrays));
+        }));
     });
 
     /// <summary>

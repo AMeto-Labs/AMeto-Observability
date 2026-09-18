@@ -139,11 +139,17 @@ public static class OtlpTraceProtoParser
 
     private enum KeyKind : byte { Plain, HttpStatusNew, HttpStatusOld, Url }
 
+    /// <summary>
+    /// The <c>finally</c> is the point: a truncated length prefix, a malformed varint and a value
+    /// past <see cref="MaxValueDepth"/> all throw out of the middle of a span whose attribute
+    /// pairs are already in the scratch, and both receivers catch that and answer
+    /// 400 / INVALID_ARGUMENT before the thread goes back into the pool. A refused body must not
+    /// be the one shape that keeps its scratch.
+    /// </summary>
     public static List<SpanIngestItem> Parse(ReadOnlySpan<byte> payload)
     {
-        var result = ParseBatch(payload);
-        ReleaseScratch();
-        return result;
+        try { return ParseBatch(payload); }
+        finally { ReleaseScratch(); }
     }
 
     /// <summary>

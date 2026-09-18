@@ -225,6 +225,48 @@ public sealed class OtlpTraceProtoLimitsTests
     }
 
     /// <summary>
+    /// The refused body is the one that used to keep everything. The scratch is only released
+    /// where the value it holds is SPLICED, and a malformed document never gets there: the
+    /// reader is built with <c>isFinalBlock: true</c>, so a truncated one throws out of the
+    /// middle of a nested value, <c>OtlpEndpointMapper</c> catches it and answers 400, and the
+    /// thread goes back into the pool still holding the buffers. Repeating the POST across the
+    /// pool rebuilt exactly the state the ceiling was added to prevent, and nothing on the
+    /// well-formed path could see it.
+    ///
+    /// <para>So the body here completes one ~320 KB nested value — which is what grows the span
+    /// attribute writer — and then opens three more levels and stops mid-array.</para>
+    /// </summary>
+    [Fact]
+    public void Json_a_truncated_body_does_not_leave_its_scratch_pinned()
+    {
+        string json = TruncatedHead
+                    + Leaves(leafChars: 4_000, leaves: 80)
+                    + TruncatedMiddle
+                    + Leaves(leafChars: 4_000, leaves: 80);   // the document simply stops here
+
+        Assert.ThrowsAny<JsonException>(
+            () => OtlpTraceStreamParser.Parse(Encoding.UTF8.GetBytes(json)));
+
+        AssertJsonScratchReleased();
+    }
+
+    /// <summary>
+    /// The protobuf path refuses a body for its own reasons — a truncated length prefix, a
+    /// malformed varint, a value past the depth bound — and both receivers turn that into
+    /// 400 / INVALID_ARGUMENT the same way. The payload grows the span writer with a 256 KB
+    /// attribute and only then nests one level too deep.
+    /// </summary>
+    [Fact]
+    public void Proto_a_refused_body_does_not_leave_its_scratch_pinned()
+    {
+        Assert.Throws<InvalidDataException>(
+            () => OtlpTraceProtoParser.Parse(
+                      OtlpProtoPayloads.Traces_HugeAttributeThenOverDeepValue(valueChars: 256 * 1024)));
+
+        AssertProtoScratchReleased();
+    }
+
+    /// <summary>
     /// Everything the JSON path pins to the calling thread is back under the 64 KB keep-it
     /// ceiling: the three top-level writers and every open nesting level. Reflection because
     /// they are private and [ThreadStatic] — the assertion runs synchronously on the same thread
@@ -317,6 +359,28 @@ public sealed class OtlpTraceProtoLimitsTests
          "startTimeUnixNano":"1783953780000000000","endTimeUnixNano":"1783953780250000000",
          "attributes":[
            {"key":"huge","value":{"arrayValue":{"values":[
+              {"kvlistValue":{"values":[{"key":"blob","value":{"arrayValue":{"values":[
+    """;
+
+    private const string TruncatedHead = """
+    {"resourceSpans":[{"resource":{"attributes":[
+        {"key":"service.name","value":{"stringValue":"Wallet.API"}}
+      ]},
+      "scopeSpans":[{"spans":[
+        {"traceId":"f6f6f098569a7f2ba54f3c734aa563f0","spanId":"a1b2c3d4e5f60718",
+         "name":"truncated","kind":2,
+         "startTimeUnixNano":"1783953780000000000","endTimeUnixNano":"1783953780250000000",
+         "attributes":[
+           {"key":"first","value":{"arrayValue":{"values":[
+    """;
+
+    /// <summary>
+    /// Closes the first nested value — which splices it into the span attribute writer and grows
+    /// that — and opens three levels of a second one that the body never closes.
+    /// </summary>
+    private const string TruncatedMiddle = """
+           ]}}},
+           {"key":"second","value":{"arrayValue":{"values":[
               {"kvlistValue":{"values":[{"key":"blob","value":{"arrayValue":{"values":[
     """;
 

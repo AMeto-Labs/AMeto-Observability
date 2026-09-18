@@ -92,8 +92,8 @@ public static class OtlpTraceStreamParser
     private const int MaxKeptAttrScratch = 64 * 1024;
 
     /// <summary>
-    /// Drops the top-level writers that grew past <see cref="MaxKeptAttrScratch"/>, so the next
-    /// request on this thread starts from the small default again.
+    /// Drops every scratch buffer that grew past its ceiling, so the next request on this thread
+    /// starts from the small defaults again.
     ///
     /// <para>Runs once per batch, not per span: an ordinary span never trips the ceiling, and a
     /// batch of them must keep the buffer it has grown to.</para>
@@ -101,12 +101,23 @@ public static class OtlpTraceStreamParser
     /// <para>Safe because every consumer has copied by then — the assembled map leaves as
     /// <c>WrittenSpan.ToArray()</c>, and <c>MessagePackWriter.WriteRaw</c> copies the pairs into
     /// it.</para>
+    ///
+    /// <para>The nesting levels are swept here as well as released at their splice, because a
+    /// splice is the ONE thing a malformed body never reaches: the reader is constructed with
+    /// <c>isFinalBlock: true</c>, so a truncated document throws out of the middle of a nested
+    /// value with that level's buffer full and <see cref="ReleaseNestBuffer"/> skipped. This
+    /// sweep is the backstop that runs anyway, which is why it is called from a
+    /// <c>finally</c>.</para>
     /// </summary>
     private static void ReleaseScratch()
     {
         if (_tAttr is { Capacity: > MaxKeptAttrScratch }) _tAttr = null;
         if (_tRes  is { Capacity: > MaxKeptAttrScratch }) _tRes  = null;
         if (_tOut  is { Capacity: > MaxKeptAttrScratch }) _tOut  = null;
+
+        if (_tNest is not { } nest) return;
+        for (int d = 0; d < nest.Length; d++)
+            if (nest[d] is { Capacity: > MaxKeptNestScratch }) nest[d] = null;
     }
 
     /// <summary>The scratch writer for one nesting level, emptied and ready to write.</summary>
@@ -151,11 +162,15 @@ public static class OtlpTraceStreamParser
         return buf;
     }
 
+    /// <summary>
+    /// The <c>finally</c> is the point: <c>OtlpEndpointMapper</c> catches whatever this throws
+    /// and answers 400, then the thread goes back into the pool — so a body that is refused must
+    /// not be the one shape that keeps its scratch.
+    /// </summary>
     public static List<SpanIngestItem> Parse(ReadOnlySpan<byte> json)
     {
-        var result = ParseBatch(json);
-        ReleaseScratch();
-        return result;
+        try { return ParseBatch(json); }
+        finally { ReleaseScratch(); }
     }
 
     private static List<SpanIngestItem> ParseBatch(ReadOnlySpan<byte> json)
