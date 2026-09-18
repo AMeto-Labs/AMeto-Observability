@@ -382,6 +382,49 @@ public sealed class TraceHotTierProbe : IDisposable
                     + "blob walk stops at the first match, so the second list would read it as absent");
     }
 
+    /// <summary>
+    /// THE TWO LISTS ARE WALKED END TO END, SO IT IS THEIR SUM THAT IS BOUNDED — and nothing but
+    /// this test says so. <c>TraceStorageEngine.HttpKeysUtf8</c> is <c>MethodKeys</c> followed by
+    /// <c>PathKeys</c> in ONE array, handed to <c>SpanAttributeBlob.FindValues</c> for every root
+    /// span of the trace list, and <c>FindValues</c> opens with
+    /// <c>ArgumentOutOfRangeException.ThrowIfGreaterThan(keysUtf8.Length, MaxKeyAlternatives)</c>.
+    /// The lists are 2 + 5 = 7 against a ceiling of 8: ONE key of headroom, on a constant whose
+    /// whole purpose is to grow as semconv does.
+    ///
+    /// <para>WHERE THE EIGHTH KEY WOULD LAND. Nothing about adding one looks dangerous — it is a
+    /// string literal in a list of string literals, the build stays green, the disjointness test
+    /// above stays green, and every unit test that builds a <c>SpanRecord</c> from a DICTIONARY
+    /// never reaches <c>FindValues</c> at all. The throw arrives at run time, from inside
+    /// <c>_lock.EnterReadLock()</c>, on every page of the trace list — the endpoint the whole list
+    /// screen is built on — for any trace with an unflushed root span carrying attribute bytes.
+    /// A one-line list edit, and the trace list stops answering.</para>
+    ///
+    /// <para>Add a ninth key to either list and this fails HERE, at build time, naming the
+    /// constant to raise and the two other places that are sized from it.</para>
+    /// </summary>
+    [Fact]
+    public void The_semconv_key_lists_fit_one_blob_walk()
+    {
+        int method = HttpSemconvKeys.MethodKeys.Length;
+        int path   = HttpSemconvKeys.PathKeys.Length;
+        int keys   = method + path;
+
+        _out.WriteLine($"{method} method + {path} path = {keys} keys in one walk, "
+                     + $"against SpanAttributeBlob.MaxKeyAlternatives = {SpanAttributeBlob.MaxKeyAlternatives} "
+                     + $"({SpanAttributeBlob.MaxKeyAlternatives - keys} spare)");
+
+        Assert.True(keys <= SpanAttributeBlob.MaxKeyAlternatives,
+            $"the HTTP semconv key lists are now {method} + {path} = {keys} keys, walked end to end "
+            + $"as one array, against SpanAttributeBlob.MaxKeyAlternatives = "
+            + $"{SpanAttributeBlob.MaxKeyAlternatives}. TO FIX: raise that constant in "
+            + $"src/Ameto.Tracing/SpanRecord.cs to at least {keys} — it sizes the AttrSlots inline "
+            + "array the callers pass as their slot span, so it is the only edit needed, and its "
+            + "own ceiling is 32 because FindValues returns one found-bit per rank in an int. "
+            + "DO NOT ship this unraised: FindValues throws ArgumentOutOfRangeException above the "
+            + "limit, under the engine read lock, on every trace-list page that has an unflushed "
+            + "root span with attribute bytes.");
+    }
+
     private static string Quote(string s) => s.Length == 0 ? "(empty)" : "\"" + s + "\"";
 
     /// <summary>What a dictionary probe of the same key list would have returned. The four lines

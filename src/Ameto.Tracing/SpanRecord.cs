@@ -336,6 +336,12 @@ internal struct SpanAttrValue
 /// <para>The lists must stay DISJOINT — a key in both would be found at its first rank only, and
 /// the second list would read it as absent. <c>TraceHotTierProbe.The_semconv_key_lists_are_disjoint</c>
 /// is what holds them so.</para>
+///
+/// <para>THE TWO ARE WALKED END TO END, so it is their SUM that must fit
+/// <see cref="SpanAttributeBlob.MaxKeyAlternatives"/> — 2 + 5 = 7 of 8, one key of headroom. An
+/// eighth is free; a ninth needs that constant raised, or <c>FindValues</c> throws under the engine
+/// read lock on every trace-list page. <c>TraceHotTierProbe.The_semconv_key_lists_fit_one_blob_walk</c>
+/// says so at build time and names the fix.</para>
 /// </summary>
 internal static class HttpSemconvKeys
 {
