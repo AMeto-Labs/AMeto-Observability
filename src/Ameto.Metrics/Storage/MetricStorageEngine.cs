@@ -206,9 +206,10 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     //     file the orphan did manage to write — duplicates.
     // Nothing warned about either. MetricWriteAheadLog.CommitFlush returned NOTHING once the
     // log was disposed — indistinguishable from a commit that moved the watermark — so the
-    // catch around it never fired; and in the more common interleaving the commit is not even
-    // reached, because _coldLock.EnterWriteLock() throws ObjectDisposedException first and the
-    // restore path re-enters the other disposed lock. The silence is gone: the commit answers
+    // catch around it never fired; and in the more common interleaving the commit was not even
+    // reached, because _coldLock.EnterWriteLock() threw ObjectDisposedException first (the lock
+    // is no longer disposed — see _coldClosed — so that particular throw is gone, and a late
+    // publish is refused by the fence instead). The silence is gone too: the commit answers
     // MetricWalCommit, and a Refused answer takes the flush's own files back rather than
     // leaving them to be replayed beside (see UnwriteRefusedFlush).
     //
@@ -275,6 +276,55 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     // ── Cold tier ─────────────────────────────────────────────────────────────
     private readonly List<MetricSegmentInfo>      _coldSegments = new();
     private readonly ReaderWriterLockSlim          _coldLock     = new();
+
+    /// <summary>
+    /// 1 once the cold list is closed for good, set inside <see cref="_coldLock"/>'s WRITE lock
+    /// at the very end of the teardown. Every taker of that lock checks it and answers empty.
+    ///
+    /// <para><b>What this replaces.</b> The teardown used to <c>Dispose</c> the lock, and four
+    /// callers take it — <see cref="QueryAsync"/>, <see cref="GetMetricNames"/>,
+    /// <c>PerformRollupAsync</c> and <see cref="PruneAsync"/> — of which the first two are
+    /// reached from Kestrel, which is STILL SERVING: hosted services stop in reverse
+    /// registration order and the HTTP pipeline outlives <c>MetricStorageHostedService.StopAsync</c>.
+    /// A query holding the read lock at that moment got an <see cref="ObjectDisposedException"/>
+    /// out of the middle of its response. A query WAITING on it was worse:
+    /// <see cref="ReaderWriterLockSlim.Dispose"/> throws
+    /// <see cref="SynchronizationLockException"/> when a thread is waiting, nothing caught around
+    /// that line, and the <c>finally</c> completed <c>_disposeCompleted</c> anyway — so the other
+    /// two disposers returned believing the teardown had finished, with the fault still
+    /// propagating out of the first.</para>
+    ///
+    /// <para>So the lock is NOT disposed, for the same reason <see cref="_snapshotLock"/> is not:
+    /// it is a process-lifetime singleton whose wait handles are finalizable, and a fence costs
+    /// one volatile read per acquisition where disposal costs an exception nobody can prevent.
+    /// The fence is what makes "no reader touches the list after this" true rather than likely.</para>
+    /// </summary>
+    private int _coldClosed;
+
+    /// <summary>
+    /// Takes the cold read lock, or answers false because the tier is closed — in which case the
+    /// caller must behave as though there were no cold segments. Checked twice on purpose: once
+    /// before waiting, so a late caller never queues behind the teardown's write lock, and once
+    /// after acquiring, because the fence can be set while this one waits.
+    /// </summary>
+    private bool TryEnterColdRead()
+    {
+        if (Volatile.Read(ref _coldClosed) != 0) return false;
+        _coldLock.EnterReadLock();
+        if (Volatile.Read(ref _coldClosed) == 0) return true;
+        _coldLock.ExitReadLock();
+        return false;
+    }
+
+    /// <summary>The same for the write lock. A refused writer must not publish or unlink.</summary>
+    private bool TryEnterColdWrite()
+    {
+        if (Volatile.Read(ref _coldClosed) != 0) return false;
+        _coldLock.EnterWriteLock();
+        if (Volatile.Read(ref _coldClosed) == 0) return true;
+        _coldLock.ExitWriteLock();
+        return false;
+    }
 
     // Cold discovery is deliberately off the startup path (see the constructor), so for a
     // window after construction a query legitimately sees no cold data at all. Without a
@@ -820,16 +870,18 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         foreach (var (name, _) in _meta)
             if (Matches(name, prefix) && seen.Add(name)) names.Add(name);
 
-        _coldLock.EnterReadLock();
-        try
+        if (TryEnterColdRead())
         {
-            for (int i = 0; i < _coldSegments.Count; i++)
+            try
             {
-                string name = _coldSegments[i].MetricName;
-                if (Matches(name, prefix) && seen.Add(name)) names.Add(name);
+                for (int i = 0; i < _coldSegments.Count; i++)
+                {
+                    string name = _coldSegments[i].MetricName;
+                    if (Matches(name, prefix) && seen.Add(name)) names.Add(name);
+                }
             }
+            finally { _coldLock.ExitReadLock(); }
         }
-        finally { _coldLock.ExitReadLock(); }
 
         names.Sort();
         return names;
@@ -870,17 +922,21 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
             };
         }
 
-        // Cold tier
-        List<MetricSegmentInfo> coldCandidates;
-        _coldLock.EnterReadLock();
-        try
+        // Cold tier. A closed tier answers empty rather than throwing out of the middle of a
+        // response: this enumerator is driven by Kestrel, which serves for a while after the
+        // engine's hosted service has stopped.
+        List<MetricSegmentInfo> coldCandidates = [];
+        if (TryEnterColdRead())
         {
-            coldCandidates = _coldSegments
-                .Where(s => s.MetricName.Equals(metricName, StringComparison.OrdinalIgnoreCase)
-                         && s.MaxNano >= fromNano && s.MinNano <= toNano)
-                .ToList();
+            try
+            {
+                coldCandidates = _coldSegments
+                    .Where(s => s.MetricName.Equals(metricName, StringComparison.OrdinalIgnoreCase)
+                             && s.MaxNano >= fromNano && s.MinNano <= toNano)
+                    .ToList();
+            }
+            finally { _coldLock.ExitReadLock(); }
         }
-        finally { _coldLock.ExitReadLock(); }
 
         foreach (var seg in coldCandidates)
         {
@@ -1189,9 +1245,14 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                         return;
                     }
 
-                    _coldLock.EnterWriteLock();
-                    try { _coldSegments.AddRange(infos); }
-                    finally { _coldLock.ExitWriteLock(); }
+                    // A closed tier cannot be published to. The files are complete and durable
+                    // where they are; the next start's LoadColdSegments finds them, which is the
+                    // same cost the catch below already accepts.
+                    if (TryEnterColdWrite())
+                    {
+                        try { _coldSegments.AddRange(infos); }
+                        finally { _coldLock.ExitWriteLock(); }
+                    }
 
                     _logger.LogDebug("Flushed {SeriesCount} metric series to {FileCount} .mts files",
                         snapshot.Count, infos.Count);
@@ -1420,7 +1481,10 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         List<MetricSegmentInfo> toMerge1h;
         List<MetricSegmentInfo> toRollup5m;
         List<MetricSegmentInfo> toRollup1h;
-        _coldLock.EnterReadLock();
+
+        // A closed tier has no work: this pass would otherwise rewrite and unlink .mts files
+        // after the engine has been torn down.
+        if (!TryEnterColdRead()) return Task.CompletedTask;
         try
         {
             toCompact  = _coldSegments
@@ -1576,7 +1640,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                 var newInfos = RewriteMetricInChunks(
                     segs, granularity, static (pts, _) => DedupeByTimestamp(pts));
 
-                _coldLock.EnterWriteLock();
+                if (!TryEnterColdWrite()) return;      // closed mid-pass: leave both sets on disk
                 try
                 {
                     foreach (var s in segs) _coldSegments.Remove(s);
@@ -1711,7 +1775,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                     (pts, kind) => Downsample(
                         pts.OrderBy(p => p.TimestampUnixNano).ToList(), bucketSize, kind).ToList());
 
-                _coldLock.EnterWriteLock();
+                if (!TryEnterColdWrite()) return;      // closed mid-pass: leave both sets on disk
                 try
                 {
                     foreach (var s in group) _coldSegments.Remove(s);
@@ -1832,7 +1896,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
         // Runs in the background, so flushes may already have registered new
         // segments — merge, don't overwrite (dedup by path).
-        _coldLock.EnterWriteLock();
+        if (!TryEnterColdWrite()) return;   // disposed before the background scan finished
         try
         {
             var known = new HashSet<string>(_coldSegments.Select(s => s.FilePath), StringComparer.Ordinal);
@@ -1960,7 +2024,15 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
             // not be able to skip the unmap. After the loop's final flush, which commits it.
             _wal.Dispose();
             _cts.Dispose();
-            _coldLock.Dispose();
+
+            // The cold tier closes behind a FENCE, and the lock is not disposed — see the note
+            // on _coldClosed for what disposing it did to a query that was holding or waiting on
+            // it while Kestrel was still serving. Taken exclusively so that every reader is
+            // either already finished or has yet to start, and the ones yet to start answer
+            // empty.
+            _coldLock.EnterWriteLock();
+            try { Volatile.Write(ref _coldClosed, 1); }
+            finally { _coldLock.ExitWriteLock(); }
 
             // _snapshotLock is deliberately NOT disposed. Its only two users are Ingest and
             // FlushHotTierAsync; both are shut above, and the gate turns a late ingest away by
@@ -1990,11 +2062,17 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
     public Task<int> PruneAsync(TimeSpan ttl, CancellationToken ct = default)
     {
+        // RetentionService holds this engine as an IRetentionTarget and is a hosted service of
+        // its own, so its stop order against this one is a registration detail, not a guarantee.
+        // Ungated, a prune that arrived after the teardown unlinked .mts files from a directory
+        // this process had finished with — and did it through a lock the teardown had disposed.
+        if (Volatile.Read(ref _disposed) != 0) return Task.FromResult(0);
+
         Interlocked.Exchange(ref _lastPruneTtlTicks, ttl.Ticks);
         var cutoffNano = DateTimeOffset.UtcNow.Subtract(ttl).ToUnixTimeMilliseconds() * 1_000_000L;
 
         List<MetricSegmentInfo> toDelete;
-        _coldLock.EnterWriteLock();
+        if (!TryEnterColdWrite()) return Task.FromResult(0);
         try
         {
             toDelete = _coldSegments.Where(s => s.MaxNano < cutoffNano).ToList();
