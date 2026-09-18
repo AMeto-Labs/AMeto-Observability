@@ -525,8 +525,18 @@ public sealed class MetricsOptions
     /// the 56-byte <c>ExemplarSample</c> it points at (a sealed class — 16 B header, a
     /// <c>long</c>, a <c>double</c> and three references), and the two id strings the OTLP parser
     /// hex-encodes fresh for every exemplar and the sample then holds alive — 88 B for a 32-char
-    /// trace id and 56 B for a 16-char span id. <c>ExemplarSample.Labels</c> is the ingest item's
-    /// own <c>LabelSet</c> and is not counted here: it is shared with the point.
+    /// trace id and 56 B for a 16-char span id. 8 + 56 + 88 + 56 = 208.
+    ///
+    /// <para><c>ExemplarSample.Labels</c> is not in the figure because the ring retains no label
+    /// set of its own: <c>MetricStorageEngine.AddExemplars</c> files the SERIES' canonical
+    /// <c>LabelSet</c> — <c>HotSeries.Labels</c>, the instance the series' key already holds —
+    /// rather than the fresh instance the OTLP parser builds per data point. That was not true
+    /// when this constant was written: the ring took <c>item.Labels</c>, nothing else kept it,
+    /// and an entry really cost 860 B here — weighed, 52.5 MB for 64 000 entries where the
+    /// canonical set reads 13.5 MB. The claim is now the engine's behaviour and
+    /// <c>MetricHotTierRetentionProbe.An_exemplar_does_not_retain_its_points_label_set</c> holds
+    /// it there by feeding a distinct, freshly-stringed label set per point and weighing the
+    /// heap.</para>
     ///
     /// <para>This was 120 — the slot and the two ids with the sample itself forgotten, 1.7x low
     /// on a figure the ring budget divides by. <c>MetricHotTierRetentionProbe</c> now fills rings

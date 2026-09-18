@@ -687,6 +687,25 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
             lastName = item.Name;
             lastRing = ring;
 
+            // THE SERIES' CANONICAL LABEL SET, NOT THE POINT'S OWN INSTANCE. A ring entry is the
+            // one piece of metric memory nothing prunes, ages out, sheds or counts, and it used
+            // to be handed `item.Labels` — the LabelSet the OTLP parser builds FRESH for every
+            // data point (~480 B for the five-label HTTP shape, strings included). Nothing else
+            // keeps that instance: `_hot` keeps only the first batch's key, `_meta` keeps only
+            // the first instance of each string, and `MetricDataPoint` carries no labels at all.
+            // So from the second batch on the ring was the sole owner of one distinct label set
+            // per exemplar, and an entry cost 860 B weighed against a budget divisor of
+            // MetricsOptions.ExemplarBytes = 208 — every derived ring 4.1x the budget it was
+            // sized against, inside the heap this whole package exists to fit.
+            //
+            // The series is already there: the ingest loop above filed this very point into it.
+            // The lookup misses only if the stale sweep evicted the series between the two, and
+            // the point's own set is then the honest answer for one entry.
+            var labels = _hot.TryGetValue(new SeriesKey(item.Name, item.Kind, item.Unit, item.Labels),
+                                          out var series)
+                ? series.Labels
+                : item.Labels;
+
             foreach (var ex in exs)
             {
                 // The exemplar's OWN clock, not the point's: OTLP parses time_unix_nano per
@@ -700,7 +719,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                     Value             = ex.Value,
                     TraceId           = ex.TraceId,
                     SpanId            = ex.SpanId,
-                    Labels            = item.Labels,
+                    Labels            = labels,
                 });
             }
         }
@@ -832,7 +851,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     private long ApplyToHotTier(MetricIngestItem item, in MetricDataPoint point)
     {
         var key    = new SeriesKey(item.Name, item.Kind, item.Unit, item.Labels);
-        var series = _hot.GetOrAdd(key, static _ => new HotSeries());
+        var series = _hot.GetOrAdd(key, static k => new HotSeries(k.Labels));
 
         series.Append(point, item.BucketBounds, _time.GetUtcNow().UtcTicks);
         UpdateMeta(item, series);
@@ -1331,7 +1350,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                             // fresh one it left behind — two different lists, which is what makes
                             // appending into one while reading the other sound. GetOrAdd rather
                             // than a lookup because the stale sweep above may have evicted the key.
-                            var live = _hot.GetOrAdd(key, static _ => new HotSeries());
+                            var live = _hot.GetOrAdd(key, static k => new HotSeries(k.Labels));
                             foreach (var p in snap.GetPoints(long.MinValue, long.MaxValue))
                             {
                                 live.Append(p, snap.Bounds, nowTicks);
@@ -2373,13 +2392,37 @@ internal sealed class HotSeries
     /// list grows by doubling from its first add, which is a handful of small arrays per series
     /// per flush and nothing that survives one.
     /// </summary>
-    public HotSeries() => _points = [];
+    public HotSeries(LabelSet labels)
+    {
+        _points = [];
+        Labels  = labels;
+    }
 
     public HotSeries(List<MetricDataPoint> points, double[]? bounds = null)
     {
         _points = points;
         Bounds  = bounds;
     }
+
+    /// <summary>
+    /// THE ONE <see cref="LabelSet"/> INSTANCE THIS SERIES IS KNOWN BY — the same object the
+    /// series' <see cref="SeriesKey"/> holds, taken from the first point that created the series
+    /// and shared by everything that needs a label set for it afterwards.
+    ///
+    /// <para>It exists because <c>ConcurrentDictionary</c> will not hand a stored KEY back, and
+    /// the exemplar rings need exactly that. <c>OtlpMetricProtoParser.BuildLabels</c> allocates a
+    /// FRESH <c>LabelSet</c> per data point — a 32 B object, a 104 B pair array and ten strings
+    /// decoded straight out of the protobuf, ~480 B for the five-label HTTP shape — and every one
+    /// of them is garbage the moment its point is filed, because the label set IS the series
+    /// identity and this one already stands for it. A ring entry, by contrast, outlives its point
+    /// by the life of the process; see <c>AddExemplars</c>.</para>
+    ///
+    /// <para>Eight bytes a series, pointing at an object the key holds anyway, so it retains
+    /// nothing new — it is inside the structural estimate <c>EmptySeriesBytes</c> already makes.
+    /// Empty on the snapshot instances the drain and the rollup build, which are never published
+    /// into <c>_hot</c> and are never asked.</para>
+    /// </summary>
+    public LabelSet Labels { get; } = LabelSet.Empty;
 
     /// <summary>When this series last took a point. See <see cref="_lastAppendUtcTicks"/>.</summary>
     public long LastAppendUtcTicks => Volatile.Read(ref _lastAppendUtcTicks);

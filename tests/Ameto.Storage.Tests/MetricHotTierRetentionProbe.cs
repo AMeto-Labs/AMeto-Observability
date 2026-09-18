@@ -222,8 +222,11 @@ public sealed class MetricHotTierRetentionProbe
     /// <para>The rings are filled from a handful of POINTS carrying many exemplars each, so the
     /// hot tier holds nothing worth measuring and no flush has to be provoked to get it out of
     /// the way. The ids are freshly built per exemplar, exactly as <c>OtlpMetricProtoParser</c>
-    /// hex-encodes them; the label set is shared, exactly as the parser shares it with the point,
-    /// which is why the constant does not count it.</para>
+    /// hex-encodes them. One label set for the whole fill, which is what a ring retains now that
+    /// <c>AddExemplars</c> files the series' canonical set — the case where the INPUT carries a
+    /// distinct set per point is
+    /// <see cref="An_exemplar_does_not_retain_its_points_label_set"/>, and that is the fact that
+    /// makes this one's divisor honest.</para>
     /// </summary>
     [Fact]
     public async Task An_exemplar_costs_what_the_ring_budget_is_divided_by()
@@ -274,6 +277,151 @@ public sealed class MetricHotTierRetentionProbe
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
+
+    /// <summary>
+    /// WHAT A RING KEEPS OF THE POINT THAT FILED IT.
+    ///
+    /// <para><c>OtlpMetricProtoParser.BuildLabels</c> builds a <b>fresh</b> <c>LabelSet</c> for
+    /// every data point — a 32 B object, a 104 B pair array and ten strings decoded out of the
+    /// protobuf, ~500 B for the five-label HTTP shape — and <c>AddExemplars</c> used to hand that
+    /// instance straight to the ring. Nothing else keeps it: <c>_hot</c> keeps only the first
+    /// batch's key, <c>_meta</c> keeps only the first instance of each string, and
+    /// <c>MetricDataPoint</c> carries no labels. So from the second batch on the ring was the
+    /// sole owner of one distinct label set per exemplar, and
+    /// <see cref="MetricsOptions.ExemplarBytes"/> — the divisor the ring budget is spent with —
+    /// was low by 4.1x, in the one piece of metric memory nothing prunes, ages out, sheds or
+    /// counts.</para>
+    ///
+    /// <para>The input is deliberately the WORST honest case and the one the parser actually
+    /// produces: a distinct <c>LabelSet</c> instance, with freshly allocated key AND value
+    /// strings, for every single point — all of them equal in content, so all of them are the
+    /// same series and one canonical set stands for the lot. The tier is drained before the
+    /// weighing, so what is on the scale is the rings.</para>
+    ///
+    /// <para>ON REVERT (<c>Labels = labels</c> back to <c>Labels = item.Labels</c> in
+    /// <c>AddExemplars</c>): 64 000 entries retain 52.5 MB (860 B each) instead of 13.5 MB
+    /// (221 B each), against a bound of 18.7 MB. Measured, both ways.</para>
+    /// </summary>
+    [Fact]
+    public async Task An_exemplar_does_not_retain_its_points_label_set()
+    {
+        const int rings = 64, depth = 1_000;
+        const long entries = rings * (long)depth;
+
+        string dir = Path.Combine(Path.GetTempPath(), "ameto-mexlabels-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var options = new MetricsOptions
+            {
+                HotTierBytes       = 32_000_000,   // pinned: this fact is about rings, not cadence
+                ExemplarsPerMetric = depth,
+                MaxExemplarMetrics = rings,
+            };
+            await using var engine = new MetricStorageEngine(dir, NullLogger<MetricStorageEngine>.Instance, options);
+
+            long before = Live();
+            FillRingsOnePointEach(engine, rings, depth);
+
+            // The points go, the rings stay. 64 000 scalar points is 4 MB of tier — a third of
+            // the figure being measured — and leaving them in would put the tier on the scale
+            // next to the rings.
+            await engine.ScheduleThresholdFlushForTest();
+            Assert.Equal(0, engine.HotPointCount);
+
+            long after = Live();
+
+            long   held     = after - before;
+            double perEntry = held / (double)entries;
+
+            _out.WriteLine($"{rings} rings x {depth} exemplars = {entries:N0} exemplars, one point and one distinct LabelSet each");
+            _out.WriteLine($"  heap held  : {held / 1048576.0,7:N1} MB = {perEntry,6:N0} B/exemplar");
+            _out.WriteLine($"  constant   : {MetricsOptions.ExemplarBytes} B/exemplar "
+                         + $"=> {entries * MetricsOptions.ExemplarBytes / 1048576.0:N1} MB budgeted");
+
+            // Same named, additive floor as the facts above, and a flush ran inside this one —
+            // rented buffers left in ArrayPool.Shared, LZ4 and msgpack scratch, the 64 cold
+            // segments' write path and its JIT'd code. It cannot absorb the regression it is
+            // guarding: one retained label set per entry is 652 B against a 208 B divisor, so
+            // the revert reads 860 B an entry and overshoots this bound by 2.8x.
+            const long poolAndJitAllowance = 6L * 1024 * 1024;
+
+            Assert.True(held <= entries * MetricsOptions.ExemplarBytes + poolAndJitAllowance,
+                $"an exemplar retains {perEntry:N0} B against a budget divisor of "
+              + $"{MetricsOptions.ExemplarBytes} B — the ring is still keeping its point's LabelSet");
+
+            // And the exemplars are really there, with the right labels: a ring that dropped
+            // them would pass the weighing trivially.
+            var got = engine.GetExemplars("exemplar.labels.metric.0", null, null, null);
+            Assert.NotEmpty(got);
+            Assert.Equal("checkout", got[0].Labels.Pairs.Single(p => p.Key == "service.name").Value);
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    /// <summary>
+    /// One POINT per exemplar, each point carrying its own freshly built label set — the shape
+    /// the OTLP parser produces and the one the ring used to retain a copy of. Fed in chunks for
+    /// the reason the class header gives.
+    /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static void FillRingsOnePointEach(MetricStorageEngine engine, int rings, int depth)
+    {
+        long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+        const int chunk = 500;
+
+        for (int r = 0; r < rings; r++)
+        {
+            string name = "exemplar.labels.metric." + r;
+            for (int off = 0; off < depth; off += chunk)
+            {
+                int take  = Math.Min(chunk, depth - off);
+                var items = new MetricIngestItem[take];
+                for (int i = 0; i < take; i++)
+                {
+                    long id = r * (long)depth + off + i;
+                    items[i] = new MetricIngestItem
+                    {
+                        Name              = name,
+                        Kind              = MetricKind.Gauge,
+                        Labels            = FreshHttpLabels(),
+                        TimestampUnixNano = baseNano + id * 1_000L,
+                        ScalarValue       = id,
+                        Exemplars         =
+                        [
+                            new MetricExemplar
+                            {
+                                TimestampUnixNano = baseNano + id * 1_000L,
+                                Value             = id,
+                                TraceId           = id.ToString("x32"),
+                                SpanId            = id.ToString("x16"),
+                            },
+                        ],
+                    };
+                }
+                engine.Ingest(items);
+            }
+        }
+    }
+
+    /// <summary>
+    /// The five-label HTTP shape, a NEW <see cref="LabelSet"/> with newly allocated key and value
+    /// strings on every call and identical content every time — which is exactly what
+    /// <c>OtlpMetricProtoParser.BuildLabels</c> hands each data point of one series, since every
+    /// string comes off the wire through <c>ProtoReader.ReadString()</c> with no pooling or
+    /// interning. <c>new string(span)</c> rather than a literal: literals are interned, and one
+    /// shared instance is the very thing this must not hand the engine.
+    /// </summary>
+    private static LabelSet FreshHttpLabels() => new(new Dictionary<string, string>
+    {
+        [Fresh("service.name")]              = Fresh("checkout"),
+        [Fresh("http.route")]                = Fresh("/api/v1/resource/7"),
+        [Fresh("http.request.method")]       = Fresh("GET"),
+        [Fresh("http.response.status_code")] = Fresh("200"),
+        [Fresh("server.address")]            = Fresh("host-3"),
+    });
+
+    private static string Fresh(string s) => new(s.AsSpan());
 
     /// <summary>
     /// Its own frame, and never inlined: in Debug a local stays rooted to the end of the method
