@@ -273,6 +273,23 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
     private long _exemplarMetricsRefused;
 
+    /// <summary>
+    /// Test hook: batches that actually needed the exemplar pass. One increment per BATCH that
+    /// carries an exemplar, which is what makes "the pass no longer re-walks every batch"
+    /// assertable rather than a claim about a loop nobody can see.
+    /// </summary>
+    internal long ExemplarPasses => Volatile.Read(ref _exemplarPasses);
+
+    private long _exemplarPasses;
+
+    /// <summary>
+    /// Test hook: series whose catalog entry was walked in full — once per series, where the
+    /// walk used to run once per POINT.
+    /// </summary>
+    internal long MetaRegistrations => Volatile.Read(ref _metaRegistrations);
+
+    private long _metaRegistrations;
+
     // ── Cold tier ─────────────────────────────────────────────────────────────
     private readonly List<MetricSegmentInfo>      _coldSegments = new();
     private readonly ReaderWriterLockSlim          _coldLock     = new();
@@ -540,6 +557,14 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         long futureLimit   = FutureLimitNanos();
         int  droppedFuture = 0;
 
+        // Whether the exemplar pass below has anything to do. Exemplars are optional in OTLP and
+        // most exporters send none, but the pass re-walked the WHOLE batch regardless — re-testing
+        // every item's timestamp against the future limit a second time to discover, item by item,
+        // that there was nothing there. The main loop already looks at each item; this is what it
+        // costs to remember what it saw. (Folding the pass INTO that loop is the change that
+        // cannot be made: the loop runs under _snapshotLock, and the exemplar ring must not.)
+        bool anyExemplars = false;
+
         // Logging a point and making it visible must be one step with respect to a flush's
         // snapshot, or a point that lands between the two would be in neither the files nor
         // (after the commit) the log — durable nowhere despite the guarantee above. Held
@@ -574,13 +599,46 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
                 _wal.Append(item, in point);
                 hotBytes = ApplyToHotTier(item, in point);
+                anyExemplars |= item.Exemplars is { Length: > 0 };
             }
         }
         finally { _snapshotLock.ExitReadLock(); }
 
         if (droppedFuture > 0) ReportFutureDrops(droppedFuture, "ingest");
 
-        // Exemplars live in their own ring and are not logged, so they stay off that path.
+        if (anyExemplars) AddExemplars(items, futureLimit);
+
+        if (hotBytes >= _hotFlushBytes
+            && System.Threading.Interlocked.CompareExchange(ref _thresholdFlushScheduled, 1, 0) == 0)
+        {
+            // Discarded, necessarily — an ingest call cannot wait on a flush. What the flush
+            // has to say about itself is therefore said by the continuation inside, not here.
+            _ = ScheduleThresholdFlush();
+        }
+
+        return droppedFuture;
+    }
+
+    /// <summary>
+    /// Files the batch's exemplars into their per-metric rings. Reached only when the ingest loop
+    /// saw at least one — see <c>anyExemplars</c> in <see cref="Ingest"/> — because the rings are
+    /// optional in OTLP, most exporters send none, and this walk used to run over every batch
+    /// regardless, re-testing each item's timestamp to find nothing.
+    ///
+    /// <para>Outside <c>_snapshotLock</c> on purpose: exemplars are not written to the log and a
+    /// ring takes a lock of its own, so they have no business inside the window that excludes the
+    /// flush drain.</para>
+    /// </summary>
+    private void AddExemplars(ReadOnlySpan<MetricIngestItem> items, long futureLimit)
+    {
+        Interlocked.Increment(ref _exemplarPasses);
+
+        // The ring handle is carried across items: an OTLP batch arrives grouped by instrument,
+        // so consecutive items share a name and the reference test replaces a dictionary lookup
+        // per point with a pointer comparison.
+        string?       lastName = null;
+        ExemplarRing? lastRing = null;
+
         foreach (var item in items)
         {
             // See MaxFutureSkewNanos. A refused point's exemplars are stamped by the same
@@ -588,18 +646,31 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
             // exemplar would sort to the TOP of every answer until the ring rotates it out.
             if (item.TimestampUnixNano > futureLimit) continue;
             if (item.Exemplars is not { Length: > 0 } exs) continue;
-            // The ring cap is checked before GetOrAdd creates one: past it a NEW name is refused,
-            // while names that already have a ring keep working. GetOrAdd's factory can run more
-            // than once under contention, so the count is the gate, not the allocation.
-            if (!_exemplars.TryGetValue(item.Name, out var ring))
+
+            ExemplarRing? ring;
+            if (ReferenceEquals(item.Name, lastName))
             {
+                ring = lastRing;
+                if (ring is null) continue;                 // the same name, refused above
+            }
+            else if (!_exemplars.TryGetValue(item.Name, out ring))
+            {
+                // The ring cap is checked before GetOrAdd creates one: past it a NEW name is
+                // refused, while names that already have a ring keep working. GetOrAdd's factory
+                // can run more than once under contention, so the count is the gate, not the
+                // allocation.
                 if (_exemplars.Count >= _maxExemplarMetrics)
                 {
                     Interlocked.Increment(ref _exemplarMetricsRefused);
+                    lastName = item.Name;
+                    lastRing = null;
                     continue;
                 }
                 ring = _exemplars.GetOrAdd(item.Name, static (_, s) => new ExemplarRing(s), _exemplarsPerMetric);
             }
+            lastName = item.Name;
+            lastRing = ring;
+
             foreach (var ex in exs)
             {
                 // The exemplar's OWN clock, not the point's: OTLP parses time_unix_nano per
@@ -617,16 +688,6 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                 });
             }
         }
-
-        if (hotBytes >= _hotFlushBytes
-            && System.Threading.Interlocked.CompareExchange(ref _thresholdFlushScheduled, 1, 0) == 0)
-        {
-            // Discarded, necessarily — an ingest call cannot wait on a flush. What the flush
-            // has to say about itself is therefore said by the continuation inside, not here.
-            _ = ScheduleThresholdFlush();
-        }
-
-        return droppedFuture;
     }
 
     /// <summary>
@@ -729,7 +790,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         var series = _hot.GetOrAdd(key, static _ => new HotSeries());
 
         series.Append(point, item.BucketBounds, _time.GetUtcNow().UtcTicks);
-        UpdateMeta(item);
+        UpdateMeta(item, series);
 
         long bytes = System.Threading.Interlocked.Add(ref _hotPointBytes, EstimatedPointBytes(in point));
         int  total = System.Threading.Interlocked.Increment(ref _hotPointCount);
@@ -760,26 +821,61 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
             ? HotPointBytes + BucketArrayOverhead + buckets.Length * sizeof(long)
             : HotPointBytes;
 
-    private void UpdateMeta(MetricIngestItem item)
+    /// <summary>
+    /// Keeps the Explore catalog current for one ingested point.
+    ///
+    /// <para><b>The steady state is "this series is already known", and it now costs one field
+    /// read.</b> This used to run <c>_meta.GetOrAdd</c> plus a nested <c>GetOrAdd</c> and a
+    /// <c>ContainsKey</c> PER LABEL PER POINT — four to eight concurrent-dictionary lookups on
+    /// every data point, on the ingest hot path, in a state where by construction nothing can
+    /// have changed: a label set IS the series identity, so a point with different labels is a
+    /// different series and lands on a different <see cref="HotSeries"/>. The same argument
+    /// covers <c>Kind</c> and <c>Unit</c>, which <c>SeriesKey</c> also carries.</para>
+    ///
+    /// <para>So the catalog entry is cached on the series the first time it is registered, and
+    /// after that only <c>LastSeenMs</c> — the one field that genuinely moves — is touched. A
+    /// series evicted by the stale sweep and re-created registers again, which is correct and
+    /// idempotent: <c>AddSeries</c> is keyed on the label-set hash and the label values are a
+    /// set.</para>
+    ///
+    /// <para>The race between two threads first seeing the same new series is benign: both do
+    /// the full walk, both write the same <c>MetricMeta</c> instance (it comes from a
+    /// <c>GetOrAdd</c>), and every step of the walk is idempotent.</para>
+    /// </summary>
+    private void UpdateMeta(MetricIngestItem item, HotSeries series)
+    {
+        var meta = series.Meta;
+        if (meta is null)
+        {
+            meta = RegisterMeta(item);
+            series.Meta = meta;
+        }
+
+        long ms = item.TimestampUnixNano / 1_000_000L;
+        if (ms > meta.LastSeenMs) meta.LastSeenMs = ms;
+    }
+
+    /// <summary>
+    /// The full catalog walk — once per series, not once per point. See <see cref="UpdateMeta"/>.
+    /// </summary>
+    private MetricMeta RegisterMeta(MetricIngestItem item)
     {
         var meta = _meta.GetOrAdd(item.Name, static (_, cap) => new MetricMeta(cap), _maxTrackedSeriesPerMetric);
         meta.Kind = item.Kind;
         if (!string.IsNullOrEmpty(item.Unit)) meta.Unit = item.Unit;
 
-        long ms = item.TimestampUnixNano / 1_000_000L;
-        if (ms > meta.LastSeenMs) meta.LastSeenMs = ms;
-
         foreach (var (k, v) in item.Labels.Pairs)
         {
             var values = meta.LabelValues.GetOrAdd(k, static _ => new ConcurrentDictionary<string, byte>(StringComparer.Ordinal));
             // ContainsKey first: ConcurrentDictionary.Count acquires EVERY lock in the
-            // table, and this ran once per label per data point. In the steady state the
-            // value is already known, so the cap only needs checking for a new one.
+            // table, and the cap only needs checking for a value that is actually new.
             if (values.ContainsKey(v)) continue;
             if (values.Count < _maxLabelValuesPerKey) values.TryAdd(v, 0);
         }
 
         meta.AddSeries(item.Labels.GetHashCode());
+        Interlocked.Increment(ref _metaRegistrations);
+        return meta;
     }
 
     // ── IMetricCatalog ────────────────────────────────────────────────────────
@@ -2212,6 +2308,17 @@ internal sealed class HotSeries
     /// histogram point; null for scalar series.
     /// </summary>
     public double[]? Bounds { get; private set; }
+
+    /// <summary>
+    /// This series' catalog entry, cached after the first point. The series identity carries the
+    /// metric name, kind, unit and label set, so once it is known nothing the catalog records
+    /// about this series can change again — see <c>MetricStorageEngine.UpdateMeta</c>, which the
+    /// cache turns from four to eight concurrent-dictionary lookups per POINT into one field
+    /// read. Not volatile: a thread that misses another's write does the full walk a second time,
+    /// which is idempotent, and every path that reads it holds the series' own lock moments
+    /// before or after.
+    /// </summary>
+    public MetricMeta? Meta { get; set; }
 
     /// <summary>
     /// A new series starts with NO array, not with 64 slots. Sixty-four
