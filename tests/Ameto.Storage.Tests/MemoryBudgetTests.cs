@@ -33,7 +33,7 @@ public sealed class MemoryBudgetTests
     {
         var b = MemoryBudgets.Derive(managedLimitBytes: 384 * MB, physicalLimitBytes: 512 * MB);
 
-        Assert.Equal((long)(384 * MB * 0.22), b.ManagedBuildBytes);   //  84 MB
+        Assert.Equal((long)(384 * MB * 0.25), b.ManagedBuildBytes);   //  96 MB
         Assert.Equal((long)(512 * MB * 0.25), b.NativeTierBytes);     // 128 MB
         Assert.Equal((long)(384 * MB * 0.12), b.IndexCacheBytes);     //  46 MB
         Assert.True(b.IsConstrained);
@@ -67,14 +67,14 @@ public sealed class MemoryBudgetTests
     {
         var stand = MemoryBudgets.Derive(managedLimitBytes: 384 * MB, physicalLimitBytes: 512 * MB);
 
-        Assert.Equal((long)(384 * MB * 0.06), stand.IngestBufferBytes);            // 23 MB
+        Assert.Equal((long)(384 * MB * 0.05), stand.IngestBufferBytes);            // 19 MB
         Assert.True(stand.IngestBufferBytes < MemoryBudgets.IngestBufferCapBytes);
 
         // Every managed ceiling together still has to leave the heap room for queries, ASP.NET
         // and the GC itself — the sum the pool used to sit outside of. The three logs ceilings
-        // are 0.40 of the heap limit since the re-cut, and the three tier ceilings that share it
-        // with them take it to 0.56 (MetricBudgetWiringTests holds that total).
-        Assert.True(stand.ManagedBuildBytes + stand.IndexCacheBytes + stand.IngestBufferBytes < 384 * MB * 0.42);
+        // are 0.42 of the heap limit since the re-cut, and the three tier ceilings that share it
+        // with them take it to 0.58 (MetricBudgetWiringTests holds that total).
+        Assert.True(stand.ManagedBuildBytes + stand.IndexCacheBytes + stand.IngestBufferBytes < 384 * MB * 0.43);
 
         // A host with room keeps the absolute ceiling, and an unknown limit falls back to it
         // rather than strangling a healthy machine.
@@ -184,7 +184,7 @@ public sealed class MemoryBudgetTests
     {
         var b = MemoryBudgets.Derive(managedLimitBytes: 512 * MB, physicalLimitBytes: 64 * GB);
 
-        Assert.Equal((long)(512 * MB * 0.22), b.ManagedBuildBytes);
+        Assert.Equal((long)(512 * MB * 0.25), b.ManagedBuildBytes);
         Assert.Equal(MemoryBudgets.NativeTierCapBytes, b.NativeTierBytes);
         Assert.Equal((long)(512 * MB * 0.12), b.IndexCacheBytes);
 
@@ -201,7 +201,7 @@ public sealed class MemoryBudgetTests
     {
         var b = MemoryBudgets.Derive(4 * GB);
 
-        Assert.Equal(MemoryBudgets.ManagedBuildCapBytes, b.ManagedBuildBytes);  // 22 % = 901 MB > cap
+        Assert.Equal(MemoryBudgets.ManagedBuildCapBytes, b.ManagedBuildBytes);  // 25 % = 1.0 GB > cap
         Assert.Equal(MemoryBudgets.NativeTierCapBytes,   b.NativeTierBytes);    // 25 % = 1.0 GB > cap
         Assert.Equal(MemoryBudgets.IndexCacheCapBytes,   b.IndexCacheBytes);    // 12 % = 491 MB > cap
         Assert.Equal(MemoryBudgets.IndexCacheNativeCapBytes, b.IndexCacheNativeBytes); // 5 % = 205 MB > cap
@@ -210,7 +210,7 @@ public sealed class MemoryBudgetTests
 
     /// <summary>
     /// THE RE-CUT IS FREE ABOVE THE STAND, which is the claim that made it safe to make. The
-    /// managed logs shares went 0.30 / 0.15 / 0.10 -> 0.22 / 0.12 / 0.06 to pay for the metric
+    /// managed logs shares went 0.30 / 0.15 / 0.10 -> 0.25 / 0.12 / 0.05 to pay for the metric
     /// and trace tiers that WP3 appended beside them, and a fraction change is only ever a
     /// behaviour change where the fraction BINDS. Every one of the nine ceilings is
     /// <c>min(cap, share)</c>, and the first share to stop binding is the largest — 640 MB of a
@@ -270,16 +270,17 @@ public sealed class MemoryBudgetTests
     /// <para><b>The three-term form was not giving a wrong answer, and that was a coincidence.</b>
     /// Every managed share comes off the same base, so the budget cut first and capped last is
     /// whichever cap is the largest multiple of its own fraction: index builds, at
-    /// 640 MB / 0.22 = 2 909 MB of managed limit, against 610 MB for the metric tier, 515 MB for
+    /// 640 MB / 0.25 = 2 560 MB of managed limit, against 610 MB for the metric tier, 515 MB for
     /// the trace tier and 1 160 MB for the merge pass. Every host small enough to have a tier cut
-    /// had its build budget cut too. One fraction change breaks that, which is why the last row
-    /// here is the 2.5 GB host where the build budget is still a share while all three tiers are
-    /// already at their caps — the narrowest gap the ordering leaves — and why the sweep below
-    /// compares the property against the ceilings themselves rather than restating its terms.</para>
+    /// had its build budget cut too. One fraction change breaks that, which is why the second row
+    /// here is a 2 GB host — where the build budget is still a share at 512 of 640 MB while all
+    /// three tier budgets are already at their caps, the narrowest gap the ordering leaves — and
+    /// why the sweep below compares the property against the ceilings themselves rather than
+    /// restating its terms.</para>
     /// </summary>
     [Theory]
     [InlineData( 384,  512, true)]    // the stand: every managed ceiling and the native one are shares
-    [InlineData(2560, 2560, true)]    // builds still a share (563 of 640 MB) with all three tiers capped
+    [InlineData(2048, 2048, true)]    // builds still a share (512 of 640 MB) with all three tiers capped
     [InlineData(4096, 4096, false)]   // nothing is a share
     [InlineData(65536, 65536, false)] // 64 GB
     [InlineData(   0,    0, false)]   // a runtime that could not say falls back to the constants
@@ -522,7 +523,7 @@ public sealed class MemoryBudgetTests
         Assert.Equal(512 * MB, child.PhysicalLimit);
 
         var expected = MemoryBudgets.Derive(384 * MB, 512 * MB);
-        Assert.Equal(expected.ManagedBuildBytes, child.ManagedBuild);   //  84 MB
+        Assert.Equal(expected.ManagedBuildBytes, child.ManagedBuild);   //  96 MB
         Assert.Equal(expected.NativeTierBytes,   child.NativeTier);     // 128 MB
         Assert.Equal(expected.IndexCacheBytes,   child.IndexCache);     //  46 MB
 

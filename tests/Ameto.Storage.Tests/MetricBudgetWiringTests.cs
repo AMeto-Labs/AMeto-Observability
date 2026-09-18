@@ -266,13 +266,13 @@ public sealed class MetricBudgetWiringTests
     /// THE SUM, AFTER THE RE-CUT. These ceilings went in as an APPEND beside logs shares of
     /// 0.30 + 0.15 + 0.10, for 0.71 of the managed limit, and this bound was 0.75 — a holding
     /// figure, so the debt could not quietly grow while it was owed. The re-cut has been made:
-    /// logs are 0.22 + 0.12 + 0.06, the six total 0.56, and the bound is that total.
+    /// logs are 0.25 + 0.12 + 0.05, the six total 0.58, and the bound is that total.
     ///
     /// <para>Which is the point of holding it THERE and not at a round number with slack in it.
     /// Every one of the six is a ceiling and they are not all reached at once, so the sum is a
     /// worst case rather than a forecast — but a worst case is exactly what a heap hard limit
     /// enforces, and the stand's 384 MB has to keep 40 % of itself for queries, ASP.NET, the
-    /// drainer and the room the GC collects in. At 0.56 there is 44 %. A seventh share, or a
+    /// drainer and the room the GC collects in. At 0.58 there is 42 %. A seventh share, or a
     /// raise to one of these six, therefore has to be paid for out of another one here.</para>
     /// </summary>
     [Fact]
@@ -287,10 +287,10 @@ public sealed class MetricBudgetWiringTests
 
         _out.WriteLine($"managed shares total {managed:P0} of the heap limit, leaving {1 - managed:P0}");
 
-        // Rounded, because these are decimal fractions summed in binary: 0.56 is 0.5600000000000001.
-        Assert.True(Math.Round(managed, 4) <= 0.56,
+        // Rounded, because these are decimal fractions summed in binary and need not land on 0.58.
+        Assert.True(Math.Round(managed, 4) <= 0.58,
             $"the managed ceilings claim {managed:P0} of the heap limit — the re-cut left them at "
-          + "56 %, so a new share comes out of one of the six (MemoryBudgetTests pins them), not "
+          + "58 %, so a new share comes out of one of the six (MemoryBudgetTests pins them), not "
           + "out of the heap's slack");
 
         // The invariant the figure was chosen to satisfy, stated on its own so a later cut that

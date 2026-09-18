@@ -150,24 +150,31 @@ public readonly struct MemoryBudgets
     // tier, the trace tier and the trace merge pass were appended beside them at 0.05 + 0.05 +
     // 0.06. Six shares of 0.71 leave a 384 MB heap 0.29 of itself for every query, every ASP.NET
     // request, the drainer and the slack the GC needs to collect in at all, which is not a heap
-    // that can collect. The logs shares are now 0.22 + 0.12 + 0.06 and the six together claim
-    // 0.56, leaving 44 % — clear of the 40 % the stand has to keep back.
+    // that can collect. The logs shares are now 0.25 + 0.12 + 0.05 and the six together claim
+    // 0.58, leaving 42 % — clear of the 40 % the stand has to keep back.
     //
     // WHAT WAS CUT, AND WHY IT WAS THESE THREE. The distinction that decides it is peak against
     // resting. The three logs ceilings bound bursts; the three tier ceilings bound a level that
     // a flush resets.
-    //   * builds  0.30 -> 0.22 (115 -> 84 MB on the stand). A peak of peaks: the budget is what
-    //     ALL concurrent flushes may hold AT ONCE, and FlushConcurrency derives its slot count
-    //     from it, so a smaller share costs one simultaneous flush on a constrained host, not a
-    //     smaller flush. One build against the default 64 MB tier still fits with room over.
+    //   * builds  0.30 -> 0.25 (115 -> 96 MB on the stand). A peak of peaks: the budget is what
+    //     ALL concurrent flushes may hold AT ONCE, and StorageEngine derives its flush WIDTH
+    //     from it, so a smaller share costs a simultaneous flush rather than a smaller flush.
+    //     Which is also the hard floor under this share, and it is closer than it looks: the
+    //     stand's 16 MB tier costs 43.75 MB of index-build state, so anything below 0.228 of a
+    //     384 MB heap limit takes that host from two concurrent builds to ONE and halves its
+    //     flush throughput. 0.25 keeps two with ~10 % to spare (a third would need 0.342), and
+    //     StorageEngineBudgetWiringTests is what fails when a later cut forgets this — as this
+    //     very re-cut did at 0.22, before that test caught it.
     //   * cache   0.15 -> 0.12 (57 -> 46 MB). The one ceiling here whose loss costs latency and
     //     not correctness, and the only one with a path that already hands its bytes back
     //     (IndexCacheIdleEvict, and the RAM-pressure shed). 46 MB on the stand still sits at the
     //     48 MB that CONFIGURATION.md recommends pinning there by hand.
-    //   * buffers 0.10 -> 0.06 (38 -> 23 MB). The furthest of all of them from a resting level:
+    //   * buffers 0.10 -> 0.05 (38 -> 19 MB). The furthest of all of them from a resting level:
     //     it bounds what is PARKED between requests and never what is live, so a body over the
     //     pool's reach is still read — just allocated and dropped. What a smaller share changes
-    //     is how much of a burst's LOH churn the pool absorbs, and nothing else.
+    //     is how much of a burst's LOH churn the pool absorbs, and nothing else. Its own floor is
+    //     one full set of buckets, ~2 x the 8 MB largest array = 16 MB (IngestBufferPool says so
+    //     in those words), which 19 MB clears and 0.04 would not.
     // The three tier shares were left where WP3 put them. Each is a ceiling that TRIGGERS A
     // FLUSH when it fills, so it is a resting level by construction, and cutting one buys a file
     // per metric name per minute — the cost the write-ahead logs exist to avoid — rather than
@@ -182,8 +189,8 @@ public readonly struct MemoryBudgets
     // Native tiers take 25 % of the physical limit; the rest of the process's native memory is
     // the runtime itself (~60-90 MB of JIT'd code and runtime data on a self-contained build),
     // the ingest ring, the live hot tier and the WAL mapping — and the managed heap, which sits
-    // inside the same container. In a 512 MB container that is 84 + 46 MB managed and 128 MB
-    // native: 258 MB, 50 % of the container -- not counting the ingest arena, whose default is
+    // inside the same container. In a 512 MB container that is 96 + 46 MB managed and 128 MB
+    // native: 270 MB, 53 % of the container -- not counting the ingest arena, whose default is
     // floored at 8 192 slabs rather than taken as a share and can reach 512 MB by itself (see
     // IngestArenaFraction). Native is the largest single share because a frozen tier is bytes
     // already written that cannot be given back until its cold segment is; the index cache is
@@ -195,10 +202,11 @@ public readonly struct MemoryBudgets
     /// <summary>
     /// Share of the MANAGED-HEAP limit concurrent index builds may hold. <b>0.30 until the
     /// managed cut was re-made</b> — see the note above: this is a peak across all flushes at
-    /// once, and the slot count derives from it, so the 8 points came out of how many flushes a
-    /// constrained host runs side by side rather than out of any one of them.
+    /// once, and the flush width derives from it, so the 5 points came out of how many flushes a
+    /// constrained host runs side by side rather than out of any one of them. It cannot go much
+    /// further: below 0.228 the 512 MB stand drops from two concurrent builds to one.
     /// </summary>
-    public const double ManagedBuildFraction = 0.22;
+    public const double ManagedBuildFraction = 0.25;
 
     /// <summary>
     /// Share of the MANAGED-HEAP limit the segment-index cache may hold. <b>0.15 until the
@@ -265,9 +273,11 @@ public readonly struct MemoryBudgets
     ///
     /// <para><b>0.10 until the managed cut was re-made.</b> That last sentence is why this share
     /// gave up the largest proportion of itself: what it buys is how much of a burst's LOH churn
-    /// the pool absorbs, and a request that outruns it still succeeds.</para>
+    /// the pool absorbs, and a request that outruns it still succeeds. Its floor is one full set
+    /// of buckets — about twice the 8 MB largest array, 16 MB — which 0.05 of a 384 MB heap limit
+    /// clears at 19 MB.</para>
     /// </summary>
-    public const double IngestBufferFraction = 0.06;
+    public const double IngestBufferFraction = 0.05;
 
     /// <summary>
     /// Share of the PHYSICAL limit the ingest payload arena may reserve — native, like the frozen
@@ -319,13 +329,14 @@ public readonly struct MemoryBudgets
     ///
     /// <para><b>The re-cut this append owed has been made.</b> The three tier shares went in
     /// beside logs shares of 0.30 + 0.15 + 0.10, for 0.71 of the managed limit; the logs shares
-    /// are now 0.22 + 0.12 + 0.06 and the six total 0.56. What paid for the tiers was 8 points
-    /// of the index-build peak, 3 of the index cache and 4 of the parked ingest buffers — three
+    /// are now 0.25 + 0.12 + 0.05 and the six total 0.58. What paid for the tiers was 5 points
+    /// of the index-build peak, 3 of the index cache and 5 of the parked ingest buffers — three
     /// ceilings that bound a burst, where a tier ceiling is a flush trigger and therefore a
-    /// resting level. The reasoning is set out in full above the fractions;
-    /// <c>MemoryBudgetTests</c> spells the new literals and asserts that nothing on a large host
-    /// moved, and <c>MetricBudgetWiringTests</c> holds the sum at 0.56 so the next share has to
-    /// come out of one of these rather than out of the heap's slack.</para>
+    /// resting level. The reasoning is set out in full above the fractions, including the floor
+    /// each one stopped at; <c>MemoryBudgetTests</c> spells the new literals and asserts that
+    /// nothing on a large host moved, and <c>MetricBudgetWiringTests</c> holds the sum at 0.58
+    /// so the next share has to come out of one of these rather than out of the heap's
+    /// slack.</para>
     /// </summary>
     public const double MetricHotTierFraction = 0.05;
 
@@ -453,7 +464,7 @@ public readonly struct MemoryBudgets
     /// being added here. <b>That did not give a wrong answer, and the reason is a coincidence
     /// worth removing:</b> every managed share is taken of the same base, so the budget cut
     /// FIRST and capped LAST is whichever cap is the largest multiple of its own fraction — the
-    /// index builds, at 640 MB / 0.22 = 2 909 MB of managed limit, against 610 MB for the metric
+    /// index builds, at 640 MB / 0.25 = 2 560 MB of managed limit, against 610 MB for the metric
     /// tier, 515 MB for the trace tier and 1 160 MB for the merge pass. Any host small enough to
     /// have a tier cut therefore had its build budget cut too, and the three-term form agreed
     /// with this one on every host that exists. It was one fraction change away from not, on a

@@ -97,7 +97,7 @@ its dependencies.
   `NativeTierFraction` 0.25 + `IngestArenaFraction` 0.15). A traces and a metrics share had to be
   a **re-cut, not an append**: WP3 defined the three new fractions (`MetricHotTierFraction` 0.05,
   `TraceHotTierFraction` 0.05, `TraceMergeFraction` 0.06) and appended them at 0.71, and the
-  fixup made the re-cut — logs to **0.22 / 0.12 / 0.06**, six managed shares totalling **0.56**,
+  fixup made the re-cut — logs to **0.25 / 0.12 / 0.05**, six managed shares totalling **0.58**,
   with `MemoryBudgetTests`' literals re-stated and `MetricBudgetWiringTests` holding that total in
   the same commit. The physical shares are untouched. The fixup also re-calibrated
   `TraceHotTierCapBytes` (64 MB → **27 MB**, 50 000 spans × the 540 B WP2 left a hot-tier span at)
@@ -248,8 +248,8 @@ can reclaim, in a container whose GC heap limit is 384 MB**.
 **This package owns `MemoryBudgets.cs` for the whole round** (see the ownership rules): it defines
 `MetricHotTierFraction`, `TraceHotTierFraction` and `TraceMergeFraction` and re-balances the
 existing logs fractions in one commit, so WP8 can consume the traces share in wave 3 without
-reopening the file. *(Delivered as an append; the re-balance — logs to 0.22 / 0.12 / 0.06, six
-shares at 0.56 — was made by the wave-1 integration fixup, which also re-calibrated the two trace
+reopening the file. *(Delivered as an append; the re-balance — logs to 0.25 / 0.12 / 0.05, six
+shares at 0.58 — was made by the wave-1 integration fixup, which also re-calibrated the two trace
 caps against WP2's span weights. The file is closed for the rest of the round.)*
 
 **Tests that must pin it.** `MetricWalTests`, `MetricFormatV3Tests`, `MetricChunkedRewriteTests`
