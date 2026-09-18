@@ -2985,6 +2985,15 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// and the rest answer the path one. Derived from the string lists at type-init, so the two
     /// spellings of one semconv list cannot drift apart, and one array so that a root span's two
     /// questions cost ONE walk of its attribute map rather than seven.
+    ///
+    /// <para>The two lists MUST be disjoint: a key in both would be found at its first rank only —
+    /// the walk stops comparing at the first match — and the second list would read it as absent.
+    /// That is checked by <c>TraceHotTierProbe.The_semconv_key_lists_are_disjoint</c> and NOT here.
+    /// A throw from a static field initializer is a <see cref="TypeInitializationException"/> that
+    /// kills this whole type for the life of the process — no ingest, no query, no trace list, and
+    /// logs and metrics dragged down with the first request that touches tracing — over two
+    /// compile-time constants that cannot change after a build. A build-time mistake belongs in a
+    /// test.</para>
     /// </summary>
     private static readonly byte[][] HttpKeysUtf8 = Utf8Keys(MethodKeys, PathKeys);
 
@@ -2993,16 +3002,6 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         var utf8 = new byte[first.Length + second.Length][];
         for (int i = 0; i < first.Length;  i++) utf8[i]                = System.Text.Encoding.UTF8.GetBytes(first[i]);
         for (int i = 0; i < second.Length; i++) utf8[first.Length + i] = System.Text.Encoding.UTF8.GetBytes(second[i]);
-
-        // A key in both lists would be found at its FIRST rank only — the walk stops comparing at
-        // the first match — and the second list would then read as if the key were absent. The two
-        // semconv lists are disjoint and this is what keeps them so.
-        for (int i = 0; i < utf8.Length; i++)
-            for (int j = i + 1; j < utf8.Length; j++)
-                if (utf8[i].AsSpan().SequenceEqual(utf8[j]))
-                    throw new InvalidOperationException(
-                        $"the HTTP semconv key lists share the key '{(i < first.Length ? first[i] : second[i - first.Length])}'");
-
         return utf8;
     }
 

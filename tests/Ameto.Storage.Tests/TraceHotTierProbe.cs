@@ -348,6 +348,40 @@ public sealed class TraceHotTierProbe : IDisposable
         }
     }
 
+    /// <summary>
+    /// THE TWO SEMCONV KEY LISTS ARE DISJOINT, and this is where that is held — not in a static
+    /// field initializer.
+    ///
+    /// <para><c>TraceStorageEngine.HttpKeysUtf8</c> is the method list and the path list end to
+    /// end, walked ONCE per root span, and <c>SpanAttributeBlob.FindValues</c> stops comparing a
+    /// key at its first match. A key present in both lists would therefore be found at its first
+    /// rank only and the second list would read it as absent — the method or the path would go
+    /// quietly missing from every row that carries it under that key.</para>
+    ///
+    /// <para>The check used to be a <c>throw</c> inside <c>Utf8Keys</c>, which runs as part of
+    /// <c>HttpKeysUtf8</c>'s initializer: a TypeInitializationException that takes
+    /// <c>TraceStorageEngine</c> out for the life of the process — no ingest, no query, no trace
+    /// list — over two constants that cannot change after a build. Add "url.path" to
+    /// <c>HttpSemconvKeys.MethodKeys</c> and this fails naming the key and both its ranks, at
+    /// build time, instead of a server failing to answer at run time.</para>
+    /// </summary>
+    [Fact]
+    public void The_semconv_key_lists_are_disjoint()
+    {
+        string[] all = [.. HttpSemconvKeys.MethodKeys, .. HttpSemconvKeys.PathKeys];
+
+        _out.WriteLine($"{HttpSemconvKeys.MethodKeys.Length} method + {HttpSemconvKeys.PathKeys.Length} path: "
+                     + string.Join(", ", all));
+
+        Assert.All(all, static k => Assert.False(string.IsNullOrEmpty(k), "an empty semconv key matches nothing"));
+
+        for (int i = 0; i < all.Length; i++)
+            for (int j = i + 1; j < all.Length; j++)
+                Assert.False(string.Equals(all[i], all[j], StringComparison.Ordinal),
+                    $"the HTTP semconv key lists share the key '{all[i]}' (ranks {i} and {j}) — the "
+                    + "blob walk stops at the first match, so the second list would read it as absent");
+    }
+
     private static string Quote(string s) => s.Length == 0 ? "(empty)" : "\"" + s + "\"";
 
     /// <summary>What a dictionary probe of the same key list would have returned. The four lines
