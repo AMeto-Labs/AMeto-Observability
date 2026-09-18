@@ -332,8 +332,8 @@ public sealed class TraceHotTierProbe : IDisposable
 
         Assert.Equal(shapes.Count, page.Rows.Count);
 
-        string[] methodKeys = EngineKeys("MethodKeys");
-        string[] pathKeys   = EngineKeys("PathKeys");
+        string[] methodKeys = HttpSemconvKeys.MethodKeys;
+        string[] pathKeys   = HttpSemconvKeys.PathKeys;
 
         foreach (var row in page.Rows)
         {
@@ -361,12 +361,6 @@ public sealed class TraceHotTierProbe : IDisposable
                 return v.ToString() ?? string.Empty;
         return string.Empty;
     }
-
-    /// <summary>The engine's own semconv key list, so the oracle asks exactly what the code asks.</summary>
-    private static string[] EngineKeys(string field) =>
-        (string[])typeof(TraceStorageEngine)
-            .GetField(field, System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!
-            .GetValue(null)!;
 
     /// <summary>Every attribute-map shape the two lookups have to survive, worst ones first.</summary>
     private static List<(string Label, byte[] Blob)> AttrShapes()

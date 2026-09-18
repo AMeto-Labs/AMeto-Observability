@@ -291,6 +291,74 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
     }
 
     /// <summary>
+    /// ONE TRACE, TWO READERS, ONE ANSWER. The trace list reaches a root span's HTTP path through
+    /// <c>TraceStorageEngine.MergeSpanInto</c> and a TraceQL row reaches the same span's through
+    /// <c>TraceQLExecutor.BuildRow</c>, and each used to carry its own copy of the semconv key
+    /// list. The copies had drifted: the engine looked under five path keys and the executor under
+    /// three, so a span whose path arrived as <c>url.full</c> or <c>http.url</c> — which is what an
+    /// HTTP CLIENT span emits, semconv has no <c>url.path</c> for it — showed a path in the trace
+    /// list and an empty one in a TraceQL row FOR THE SAME TRACE, on the same screen.
+    ///
+    /// <para>Shorten <c>HttpSemconvKeys.PathKeys</c> back to its first three entries and the
+    /// second assert fails with an empty string against the URL; give either reader its own list
+    /// again and it fails the same way.</para>
+    /// </summary>
+    [Theory]
+    [InlineData("url.full", "https://api.example.com/v1/payments?id=7")]
+    [InlineData("http.url", "https://api.example.com/v1/refunds")]
+    public async Task The_trace_list_and_a_traceql_row_read_the_same_path_key(string key, string url)
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "ameto-keyparity-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        _dirs.Add(dir);
+
+        using var engine = new TraceStorageEngine(dir, NullLogger<TraceStorageEngine>.Instance);
+
+        var  at       = ColdSpanSegmentFixture.Base;
+        long baseNano = at.ToUnixTimeMilliseconds() * 1_000_000L;
+
+        engine.WriteSpan(new SpanIngestItem
+        {
+            TraceId           = new TraceId(0xC11E27, 1),
+            SpanId            = new SpanId(1),
+            ParentSpanId      = default,
+            StartTimeUnixNano = baseNano,
+            DurationNanos     = 5_000_000_000L,
+            Name              = "GET",
+            ServiceName       = "checkout",
+            Kind              = SpanKind.Client,
+            Status            = SpanStatusCode.Unset,
+            HttpStatusCode    = 200,
+            AttributesBytes   = OneAttr(key, url),
+        });
+
+        var from = at.AddMinutes(-1);
+        var to   = at.AddDays(1);
+
+        var list = await engine.GetTraceListAsync(from, to, null, null, null, null, null, 10);
+        var page = await TraceQLExecutor.ExecuteAsync(
+            engine, TraceQLParser.Parse("{ duration > 1s }"), from, to, 10, CancellationToken.None);
+
+        string fromList = Assert.Single(list.Rows).HttpPath;
+        string fromQl   = Assert.Single(page.Rows).HttpPath;
+        _out.WriteLine($"{key,-10} trace list \"{fromList}\"   traceql \"{fromQl}\"");
+
+        Assert.Equal(url, fromList);
+        Assert.Equal(fromList, fromQl);
+    }
+
+    /// <summary>A one-key attribute map.</summary>
+    private static byte[] OneAttr(string key, string value)
+    {
+        var buf = new ArrayBufferWriter<byte>(128);
+        var w   = new MessagePackWriter(buf);
+        w.WriteMapHeader(1);
+        w.Write(key); w.Write(value);
+        w.Flush();
+        return buf.WrittenMemory.ToArray();
+    }
+
+    /// <summary>
     /// What two literal semconv key arrays cost per row — the allocation TS#13 removed, weighed on
     /// the runtime the gate is about to run on.
     ///

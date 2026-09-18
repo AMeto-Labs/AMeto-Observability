@@ -336,9 +336,14 @@ public static class TraceQLExecutor
     /// A <c>params string[]</c> parameter with literal arguments is a fresh <c>string[]</c> on
     /// every call, and this is called twice per row of every TraceQL page — the arrays were the
     /// row's own allocation, not the caller's, and no caller could see them to hoist them out.
+    ///
+    /// <para>They are <see cref="HttpSemconvKeys"/>' lists and not this file's own: the trace list
+    /// reads the same two attributes of the same span through
+    /// <c>TraceStorageEngine.MergeSpanInto</c>, and a second copy here had already drifted two path
+    /// keys short of the engine's.</para>
     /// </summary>
-    internal static readonly string[] MethodKeys = ["http.request.method", "http.method"];
-    internal static readonly string[] PathKeys   = ["url.path", "http.target", "http.route"];
+    internal static readonly string[] MethodKeys = HttpSemconvKeys.MethodKeys;
+    internal static readonly string[] PathKeys   = HttpSemconvKeys.PathKeys;
 
     /// <summary>
     /// First key that is present with a value, as text. A <c>ReadOnlySpan&lt;string&gt;</c> so the

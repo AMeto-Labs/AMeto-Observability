@@ -2974,8 +2974,10 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
 
     // ── ITraceSummaryProvider ──────────────────────────────────────────────────
 
-    private static readonly string[] MethodKeys = { "http.request.method", "http.method" };
-    private static readonly string[] PathKeys   = { "url.path", "http.target", "http.route", "url.full", "http.url" };
+    // ONE list, shared with TraceQLExecutor.BuildRow — see HttpSemconvKeys for why the two readers
+    // are not allowed their own copies.
+    private static readonly string[] MethodKeys = HttpSemconvKeys.MethodKeys;
+    private static readonly string[] PathKeys   = HttpSemconvKeys.PathKeys;
 
     /// <summary>
     /// BOTH key lists, in one array, as UTF-8 — <see cref="MethodKeys"/> first and then

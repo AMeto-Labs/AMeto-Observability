@@ -319,6 +319,27 @@ internal struct SpanAttrValue
 }
 
 /// <summary>
+/// THE HTTP SEMCONV KEY LISTS, IN ONE PLACE, because two places is two answers. A trace row's
+/// method and path are read on two paths — <c>TraceStorageEngine.MergeSpanInto</c> builds the
+/// trace list, <c>TraceQLExecutor.BuildRow</c> builds a TraceQL page — and each kept its own copy
+/// of the lists. They had drifted: the engine looked under five path keys and the executor under
+/// three, so a span whose path arrived as <c>url.full</c> or <c>http.url</c> showed its path in
+/// the trace list and an empty path in a TraceQL row FOR THE SAME TRACE.
+///
+/// <para>Order is the semantics: the first key present with a non-null value wins, so these are
+/// most-specific-first. Adding a key means adding it here, and both readers get it.</para>
+///
+/// <para>The lists must stay DISJOINT — a key in both would be found at its first rank only, and
+/// the second list would read it as absent. <c>TraceHotTierProbe.The_semconv_key_lists_are_disjoint</c>
+/// is what holds them so.</para>
+/// </summary>
+internal static class HttpSemconvKeys
+{
+    internal static readonly string[] MethodKeys = ["http.request.method", "http.method"];
+    internal static readonly string[] PathKeys   = ["url.path", "http.target", "http.route", "url.full", "http.url"];
+}
+
+/// <summary>
 /// Reads a span's msgpack attribute map — either into a dictionary, or one key at a time with
 /// neither a dictionary nor a boxed value in sight.
 ///
