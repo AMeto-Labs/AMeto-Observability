@@ -179,24 +179,38 @@ internal static class OtlpProtoPayloads
             }))));
         }))));
 
-    /// <summary>Realistic trace export: one resource, <paramref name="spans"/> server spans
-    /// with the attribute set ASP.NET Core instrumentation emits.</summary>
-    public static byte[] Traces_Realistic(int spans = 200) => Msg(c =>
+    /// <summary>
+    /// Realistic trace export: one resource, <paramref name="spans"/> server spans with the
+    /// attribute set ASP.NET Core instrumentation emits — plus what the DOM decoder used to
+    /// materialise and throw away, because leaving it out understates the decode cost of real
+    /// SDK traffic: a <c>trace_state</c>, the dropped counts, <c>flags</c>, an exception
+    /// <c>events[]</c> entry on every error span (field 11, four attributes of its own) and a
+    /// <c>links[]</c> entry on every fourth (field 13).
+    /// </summary>
+    /// <param name="nestedAttr">
+    /// Adds an <c>array_value</c> attribute — the one value type on which the two paths
+    /// deliberately disagree (the DOM never modelled fields 5 and 6 and wrote nil). On for the
+    /// probe, because real exporters send header arrays and the baseline has to include the
+    /// cost; off for the byte-parity test, which has a dedicated payload for the divergence.
+    /// </param>
+    public static byte[] Traces_Realistic(int spans = 200, bool nestedAttr = true) => Msg(c =>
         Nested(c, 1, Msg(rs =>
         {
             Nested(rs, 1, StandardResource());
             Nested(rs, 2, Msg(ss =>
             {
-                for (int i = 0; i < spans; i++) Nested(ss, 2, Span(i));
+                for (int i = 0; i < spans; i++) Nested(ss, 2, Span(i, nestedAttr));
             }));
         })));
 
-    private static byte[] Span(int i) => Msg(c =>
+    private static byte[] Span(int i, bool nestedAttr = true) => Msg(c =>
     {
         c.WriteTag(1, WireFormat.WireType.LengthDelimited);
         c.WriteBytes(ByteString.CopyFrom(Convert.FromHexString($"0af7651916cd43dd8448eb211c80{i % 100:x2}9c")));
         c.WriteTag(2, WireFormat.WireType.LengthDelimited);
         c.WriteBytes(ByteString.CopyFrom(Convert.FromHexString($"b7ad6b71692033{i % 100:x2}")));
+        c.WriteTag(3, WireFormat.WireType.LengthDelimited);                          // field 3: trace_state
+        c.WriteString("congo=t61rcWkgMzE,rojo=00f067aa0ba902b7");
         c.WriteTag(4, WireFormat.WireType.LengthDelimited);
         c.WriteBytes(ByteString.CopyFrom(Convert.FromHexString("00f067aa0ba902b7")));
         c.WriteTag(5, WireFormat.WireType.LengthDelimited); c.WriteString($"GET /api/v1/resource/{i % 7}");
@@ -210,6 +224,15 @@ internal static class OtlpProtoPayloads
         Nested(c, 9, StringAttr("network.protocol.version", "1.1"));
         Nested(c, 9, StringAttr("server.address", $"node-{i % 3}"));
         Nested(c, 9, StringAttr("user_agent.original", "k6/0.49 (https://k6.io/)"));
+        if (nestedAttr)
+            Nested(c, 9, ArrayAttr("http.request.header.accept", "application/json", "text/html"));
+
+        c.WriteTag(10, WireFormat.WireType.Varint); c.WriteUInt32(0);                // dropped_attributes_count
+
+        if (i % 5 == 0) Nested(c, 11, ExceptionEvent(i));                            // field 11: events
+        c.WriteTag(12, WireFormat.WireType.Varint); c.WriteUInt32(0);                // dropped_events_count
+        if (i % 4 == 0) Nested(c, 13, SpanLink(i));                                  // field 13: links
+        c.WriteTag(14, WireFormat.WireType.Varint); c.WriteUInt32(0);                // dropped_links_count
 
         Nested(c, 15, Msg(st =>                                                      // field 15: status
         {
@@ -223,7 +246,325 @@ internal static class OtlpProtoPayloads
                 st.WriteTag(3, WireFormat.WireType.Varint); st.WriteEnum(1);
             }
         }));
+
+        c.WriteTag(16, WireFormat.WireType.Fixed32); c.WriteFixed32(0x0000_0101);    // flags
     });
+
+    /// <summary>The event an instrumented error span carries — four attributes the mapper never read.</summary>
+    private static byte[] ExceptionEvent(int i) => Msg(e =>
+    {
+        e.WriteTag(1, WireFormat.WireType.Fixed64);
+        e.WriteFixed64(1_785_300_000_006_000_000UL + (ulong)i * 1_000_000UL);
+        e.WriteTag(2, WireFormat.WireType.LengthDelimited); e.WriteString("exception");
+        Nested(e, 3, StringAttr("exception.type", "System.InvalidOperationException"));
+        Nested(e, 3, StringAttr("exception.message", "The connection pool has been exhausted."));
+        Nested(e, 3, StringAttr("exception.stacktrace",
+            "   at Wallet.Api.PayController.PostAsync(PayRequest r)\n"
+          + "   at lambda_method7(Closure, Object, Object[])\n"
+          + "   at Microsoft.AspNetCore.Mvc.Infrastructure.ActionMethodExecutor.Execute()"));
+        Nested(e, 3, BoolAttr("exception.escaped", false));
+        e.WriteTag(4, WireFormat.WireType.Varint); e.WriteUInt32(0);                 // dropped_attributes_count
+    });
+
+    /// <summary>One span link — the shape a messaging consumer span carries.</summary>
+    private static byte[] SpanLink(int i) => Msg(l =>
+    {
+        l.WriteTag(1, WireFormat.WireType.LengthDelimited);
+        l.WriteBytes(ByteString.CopyFrom(Convert.FromHexString($"4bf92f3577b34da6a3ce929d0e0e47{i % 100:x2}")));
+        l.WriteTag(2, WireFormat.WireType.LengthDelimited);
+        l.WriteBytes(ByteString.CopyFrom(Convert.FromHexString("00f067aa0ba902b7")));
+        l.WriteTag(3, WireFormat.WireType.LengthDelimited); l.WriteString("congo=t61rcWkgMzE");
+        Nested(l, 4, StringAttr("messaging.operation", "publish"));
+        l.WriteTag(5, WireFormat.WireType.Varint); l.WriteUInt32(0);                 // dropped_attributes_count
+    });
+
+    private static byte[] ArrayAttr(string key, params string[] values) => Msg(c =>
+    {
+        c.WriteTag(1, WireFormat.WireType.LengthDelimited); c.WriteString(key);
+        Nested(c, 2, Msg(v => Nested(v, 5, Msg(arr =>
+        {
+            foreach (string s in values)
+            {
+                string t = s;
+                Nested(arr, 1, Msg(e => { e.WriteTag(1, WireFormat.WireType.LengthDelimited); e.WriteString(t); }));
+            }
+        }))));
+    });
+
+    /// <summary>An empty ExportTraceServiceRequest.</summary>
+    public static byte[] EmptyTraces() => Msg(_ => { });
+
+    /// <summary>
+    /// One span carrying every scalar AnyValue type and the three malformed KeyValue shapes
+    /// (key with no value, value with no key, AnyValue with no field set), under a resource that
+    /// has no <c>service.name</c> at all — so the service falls back to the literal "unknown".
+    /// No status message and no parent.
+    /// </summary>
+    public static byte[] Traces_ScalarAttributeTypes() => Msg(c =>
+        Nested(c, 1, Msg(rs =>
+        {
+            Nested(rs, 1, Msg(res =>
+            {
+                Nested(res, 1, StringAttr("host.name", "sandbox-kz02"));
+                Nested(res, 1, IntAttr("host.cpu.count", 8));
+            }));
+            Nested(rs, 2, Msg(ss => Nested(ss, 2, Msg(sp =>
+            {
+                sp.WriteTag(1, WireFormat.WireType.LengthDelimited);
+                sp.WriteBytes(ByteString.CopyFrom(Convert.FromHexString("0af7651916cd43dd8448eb211c80319c")));
+                sp.WriteTag(2, WireFormat.WireType.LengthDelimited);
+                sp.WriteBytes(ByteString.CopyFrom(Convert.FromHexString("b7ad6b7169203331")));
+                sp.WriteTag(5, WireFormat.WireType.LengthDelimited); sp.WriteString("mixed");
+                sp.WriteTag(7, WireFormat.WireType.Fixed64); sp.WriteFixed64(1_785_300_060_000_000_000UL);
+                sp.WriteTag(8, WireFormat.WireType.Fixed64); sp.WriteFixed64(1_785_300_060_500_000_000UL);
+
+                Nested(sp, 9, IntAttr("int.attr", 42));
+                Nested(sp, 9, IntAttr("negative.attr", -7));
+                Nested(sp, 9, BoolAttr("bool.attr", true));
+                Nested(sp, 9, BoolAttr("false.attr", false));
+                Nested(sp, 9, DoubleAttr("double.attr", 1.5));
+                Nested(sp, 9, StringAttr("empty.attr", ""));
+                Nested(sp, 9, Msg(kv =>                                        // key with no value message
+                {
+                    kv.WriteTag(1, WireFormat.WireType.LengthDelimited); kv.WriteString("no.value");
+                }));
+                Nested(sp, 9, Msg(kv =>                                        // value with no key — dropped
+                    Nested(kv, 2, Msg(v => { v.WriteTag(1, WireFormat.WireType.LengthDelimited); v.WriteString("orphan"); }))));
+                Nested(sp, 9, Msg(kv =>                                        // empty AnyValue → nil
+                {
+                    kv.WriteTag(1, WireFormat.WireType.LengthDelimited); kv.WriteString("empty.value");
+                    Nested(kv, 2, Msg(_ => { }));
+                }));
+                Nested(sp, 9, Msg(kv =>                                        // bytes_value → nil on both paths
+                {
+                    kv.WriteTag(1, WireFormat.WireType.LengthDelimited); kv.WriteString("blob");
+                    Nested(kv, 2, Msg(v =>
+                    {
+                        v.WriteTag(7, WireFormat.WireType.LengthDelimited);
+                        v.WriteBytes(ByteString.CopyFrom(new byte[] { 1, 2, 3 }));
+                    }));
+                }));
+            }))));
+        })));
+
+    /// <summary>
+    /// The spans the mapper drops, and the ones it must not: a short trace id, a missing span
+    /// id, a short span id, a CLIENT span exporting to this server's own receiver, the same URL
+    /// on a SERVER span, a raw kind of 11 (which masks to CLIENT but is not CLIENT), a
+    /// non-conformant parent id, a URL on a non-promoted key, and one ordinary survivor.
+    /// </summary>
+    public static byte[] Traces_DropRules() => Msg(c =>
+        Nested(c, 1, Msg(rs =>
+        {
+            Nested(rs, 1, Msg(res => Nested(res, 1, StringAttr("service.name", "Wallet.API"))));
+            Nested(rs, 2, Msg(ss =>
+            {
+                Nested(ss, 2, DropSpan("short-trace-id", "0af7651916cd43dd", "b7ad6b7169203331", 2, null, null));
+                Nested(ss, 2, DropSpan("no-span-id",     "0af7651916cd43dd8448eb211c80319c", null, 2, null, null));
+                Nested(ss, 2, DropSpan("short-span-id",  "0af7651916cd43dd8448eb211c80319c", "b7ad6b71", 2, null, null));
+                Nested(ss, 2, DropSpan("self-ingest-client", "1af7651916cd43dd8448eb211c80319c", "b7ad6b7169203332", 3,
+                                       "http://ameto-host:8555/v1/traces", null));
+                Nested(ss, 2, DropSpan("self-ingest-server", "2af7651916cd43dd8448eb211c80319c", "b7ad6b7169203333", 2,
+                                       "http://ameto-host:8555/v1/traces", null));
+                Nested(ss, 2, DropSpan("kind-eleven", "3af7651916cd43dd8448eb211c80319c", "b7ad6b7169203334", 11,
+                                       "http://ameto-host:8555/otlp/v1/traces", null));
+                Nested(ss, 2, DropSpan("short-parent", "4af7651916cd43dd8448eb211c80319c", "b7ad6b7169203335", 1,
+                                       null, "00f067aa"));
+                Nested(ss, 2, DropSpan("ordinary", "5af7651916cd43dd8448eb211c80319c", "b7ad6b7169203336", 1,
+                                       null, "00f067aa0ba902b7"));
+            }));
+        })));
+
+    private static byte[] DropSpan(string name, string traceHex, string? spanHex, int kind,
+                                   string? url, string? parentHex) => Msg(sp =>
+    {
+        sp.WriteTag(1, WireFormat.WireType.LengthDelimited);
+        sp.WriteBytes(ByteString.CopyFrom(Convert.FromHexString(traceHex)));
+        if (spanHex is not null)
+        {
+            sp.WriteTag(2, WireFormat.WireType.LengthDelimited);
+            sp.WriteBytes(ByteString.CopyFrom(Convert.FromHexString(spanHex)));
+        }
+        if (parentHex is not null)
+        {
+            sp.WriteTag(4, WireFormat.WireType.LengthDelimited);
+            sp.WriteBytes(ByteString.CopyFrom(Convert.FromHexString(parentHex)));
+        }
+        sp.WriteTag(5, WireFormat.WireType.LengthDelimited); sp.WriteString(name);
+        sp.WriteTag(6, WireFormat.WireType.Varint);          sp.WriteEnum(kind);
+        sp.WriteTag(7, WireFormat.WireType.Fixed64);         sp.WriteFixed64(1_785_300_060_000_000_000UL);
+        sp.WriteTag(8, WireFormat.WireType.Fixed64);         sp.WriteFixed64(1_785_300_060_250_000_000UL);
+        if (url is not null) Nested(sp, 9, StringAttr("url.full", url));
+    });
+
+    /// <summary>
+    /// A CLIENT span whose <c>url.full</c> is longer than the 512 bytes the UTF-8 endpoint
+    /// matcher will look at, and which names this server's own receiver. The DOM path compared
+    /// it as chars, with no cap, and dropped the span; the JSON parser has always kept it.
+    /// </summary>
+    public static byte[] Traces_OversizedSelfIngestUrl() => Msg(c =>
+        Nested(c, 1, Msg(rs =>
+        {
+            Nested(rs, 1, Msg(res => Nested(res, 1, StringAttr("service.name", "Wallet.API"))));
+            Nested(rs, 2, Msg(ss => Nested(ss, 2, DropSpan(
+                "oversized-self-ingest", "6af7651916cd43dd8448eb211c80319c", "b7ad6b7169203337", 3,
+                "http://ameto-host:8555/v1/traces?q=" + new string('x', 520), null))));
+        })));
+
+    /// <summary>
+    /// The wire shapes that arrive in an order the msgpack encoding cannot: <c>scope_spans</c>
+    /// before its <c>resource</c>, a resource whose first <c>service.name</c> is not a string
+    /// followed by one that is, a KeyValue whose value precedes its key, an AnyValue with four
+    /// oneof cases set, a repeated key field, a start timestamp past <c>long.MaxValue</c>, and
+    /// both HTTP status keys with the new one last. A second resourceSpans with no resource at
+    /// all follows, so nothing may carry over from the first.
+    /// </summary>
+    public static byte[] Traces_OutOfOrderAndAmbiguous() => Msg(c =>
+    {
+        Nested(c, 1, Msg(rs =>
+        {
+            // scope_spans (field 2) written first — legal protobuf, and the reason the parser
+            // reads the resource in a pass of its own.
+            Nested(rs, 2, Msg(ss => Nested(ss, 2, Msg(sp =>
+            {
+                sp.WriteTag(1, WireFormat.WireType.LengthDelimited);
+                sp.WriteBytes(ByteString.CopyFrom(Convert.FromHexString("7af7651916cd43dd8448eb211c80319c")));
+                sp.WriteTag(2, WireFormat.WireType.LengthDelimited);
+                sp.WriteBytes(ByteString.CopyFrom(Convert.FromHexString("b7ad6b7169203338")));
+                sp.WriteTag(5, WireFormat.WireType.LengthDelimited); sp.WriteString("ambiguous");
+                sp.WriteTag(6, WireFormat.WireType.Varint);  sp.WriteEnum(11);        // masks to CLIENT
+                sp.WriteTag(7, WireFormat.WireType.Fixed64); sp.WriteFixed64(0xFFFF_FFFF_FFFF_FFFFUL);
+                sp.WriteTag(8, WireFormat.WireType.Fixed64); sp.WriteFixed64(1_785_300_060_000_000_000UL);
+
+                Nested(sp, 9, Msg(kv =>                                      // value BEFORE key
+                {
+                    Nested(kv, 2, Msg(v => { v.WriteTag(1, WireFormat.WireType.LengthDelimited); v.WriteString("backwards"); }));
+                    kv.WriteTag(1, WireFormat.WireType.LengthDelimited); kv.WriteString("reversed");
+                }));
+                Nested(sp, 9, Msg(kv =>                                      // oneof with four cases set
+                {
+                    kv.WriteTag(1, WireFormat.WireType.LengthDelimited); kv.WriteString("oneof");
+                    Nested(kv, 2, Msg(v =>
+                    {
+                        v.WriteTag(3, WireFormat.WireType.Varint);  v.WriteInt64(11);
+                        v.WriteTag(4, WireFormat.WireType.Fixed64); v.WriteDouble(2.5);
+                        v.WriteTag(2, WireFormat.WireType.Varint);  v.WriteBool(true);
+                        v.WriteTag(1, WireFormat.WireType.LengthDelimited); v.WriteString("string wins");
+                    }));
+                }));
+                Nested(sp, 9, Msg(kv =>                                      // key stated twice
+                {
+                    kv.WriteTag(1, WireFormat.WireType.LengthDelimited); kv.WriteString("ignored");
+                    kv.WriteTag(1, WireFormat.WireType.LengthDelimited); kv.WriteString("repeated");
+                    Nested(kv, 2, Msg(v => { v.WriteTag(1, WireFormat.WireType.LengthDelimited); v.WriteString("last key wins"); }));
+                }));
+                Nested(sp, 9, IntAttr("http.status_code", 301));             // old key first…
+                Nested(sp, 9, StringAttr("http.response.status_code", "200"));  // …new key last, and it wins
+
+                Nested(sp, 15, Msg(stt => { stt.WriteTag(3, WireFormat.WireType.Varint); stt.WriteEnum(7); }));  // unknown code
+            }))));
+            Nested(rs, 1, Msg(res =>
+            {
+                Nested(res, 1, IntAttr("service.name", 7));                  // first, and not a string
+                Nested(res, 1, StringAttr("service.name", "Wins.Second"));   // the mapper takes THIS one
+                Nested(res, 1, StringAttr("service.name", "Loses.Third"));   // …and a later STRING one does not
+                Nested(res, 1, StringAttr("deployment.environment", "Test"));
+            }));
+        }));
+        // No resource at all: the previous block's attributes and service must not carry over.
+        Nested(c, 1, Msg(rs =>
+            Nested(rs, 2, Msg(ss => Nested(ss, 2, Msg(sp =>
+            {
+                sp.WriteTag(1, WireFormat.WireType.LengthDelimited);
+                sp.WriteBytes(ByteString.CopyFrom(Convert.FromHexString("8af7651916cd43dd8448eb211c80319c")));
+                sp.WriteTag(2, WireFormat.WireType.LengthDelimited);
+                sp.WriteBytes(ByteString.CopyFrom(Convert.FromHexString("b7ad6b7169203339")));
+                sp.WriteTag(5, WireFormat.WireType.LengthDelimited); sp.WriteString("orphan-resource");
+                sp.WriteTag(7, WireFormat.WireType.Fixed64); sp.WriteFixed64(1_785_300_061_000_000_000UL);
+                sp.WriteTag(8, WireFormat.WireType.Fixed64); sp.WriteFixed64(1_785_300_061_000_000_000UL);
+            }))))));
+    });
+
+    /// <summary>
+    /// One span whose single attribute value is <paramref name="depth"/> nested levels with a
+    /// string at the bottom — the shape that recurses through the parser's value writer, and a
+    /// stack overflow if nothing bounds it.
+    /// </summary>
+    public static byte[] Traces_NestedToDepth(int depth, Nesting nesting = Nesting.Arrays) => Msg(c =>
+        Nested(c, 1, Msg(rs =>
+        {
+            Nested(rs, 1, Msg(res => Nested(res, 1, StringAttr("service.name", "Wallet.API"))));
+            Nested(rs, 2, Msg(ss => Nested(ss, 2, Msg(sp =>
+            {
+                sp.WriteTag(1, WireFormat.WireType.LengthDelimited);
+                sp.WriteBytes(ByteString.CopyFrom(Convert.FromHexString("9af7651916cd43dd8448eb211c80319c")));
+                sp.WriteTag(2, WireFormat.WireType.LengthDelimited);
+                sp.WriteBytes(ByteString.CopyFrom(Convert.FromHexString("b7ad6b716920333a")));
+                sp.WriteTag(5, WireFormat.WireType.LengthDelimited); sp.WriteString("deep");
+                sp.WriteTag(7, WireFormat.WireType.Fixed64); sp.WriteFixed64(1_785_300_060_000_000_000UL);
+                sp.WriteTag(8, WireFormat.WireType.Fixed64); sp.WriteFixed64(1_785_300_060_100_000_000UL);
+                Nested(sp, 9, Msg(kv =>
+                {
+                    kv.WriteTag(1, WireFormat.WireType.LengthDelimited); kv.WriteString("nest");
+                    Nested(kv, 2, NestedValue(depth, nesting));
+                }));
+            }))));
+        })));
+
+    /// <summary>
+    /// One span carrying one <paramref name="valueChars"/>-character string attribute: an
+    /// in-limits POST (<c>MaxOtlpBatchBytes</c> is 8 MiB) big enough to grow the parser's
+    /// per-thread msgpack scratch far past any keep-it ceiling.
+    /// </summary>
+    public static byte[] Traces_HugeAttribute(int valueChars) => Msg(c =>
+        Nested(c, 1, Msg(rs =>
+        {
+            Nested(rs, 1, Msg(res => Nested(res, 1, StringAttr("service.name", "Wallet.API"))));
+            Nested(rs, 2, Msg(ss => Nested(ss, 2, HugeSpan(valueChars))));
+        })));
+
+    /// <summary>
+    /// The same span, with a value nested one level past the bound after the huge attribute — so
+    /// the scratch is grown and THEN the parse throws, which is the shape that leaves it pinned
+    /// when the release only runs on the success path.
+    /// </summary>
+    public static byte[] Traces_HugeAttributeThenOverDeepValue(int valueChars) => Msg(c =>
+        Nested(c, 1, Msg(rs =>
+        {
+            Nested(rs, 1, Msg(res => Nested(res, 1, StringAttr("service.name", "Wallet.API"))));
+            Nested(rs, 2, Msg(ss => Nested(ss, 2, HugeSpan(valueChars, overDeep: true))));
+        })));
+
+    /// <summary>Mirrors <c>OtlpTraceProtoParser.MaxValueDepth</c>.</summary>
+    private const int MaxTraceValueDepth = 64;
+
+    private static byte[] HugeSpan(int valueChars, bool overDeep = false) => Msg(sp =>
+    {
+        sp.WriteTag(1, WireFormat.WireType.LengthDelimited);
+        sp.WriteBytes(ByteString.CopyFrom(Convert.FromHexString("9af7651916cd43dd8448eb211c80319c")));
+        sp.WriteTag(2, WireFormat.WireType.LengthDelimited);
+        sp.WriteBytes(ByteString.CopyFrom(Convert.FromHexString("b7ad6b716920333a")));
+        sp.WriteTag(5, WireFormat.WireType.LengthDelimited); sp.WriteString("huge");
+        sp.WriteTag(7, WireFormat.WireType.Fixed64); sp.WriteFixed64(1_785_300_060_000_000_000UL);
+        sp.WriteTag(8, WireFormat.WireType.Fixed64); sp.WriteFixed64(1_785_300_060_100_000_000UL);
+        Nested(sp, 9, StringAttr("big", new string('x', valueChars)));
+        if (!overDeep) return;
+        Nested(sp, 9, Msg(kv =>
+        {
+            kv.WriteTag(1, WireFormat.WireType.LengthDelimited); kv.WriteString("nest");
+            Nested(kv, 2, NestedValue(MaxTraceValueDepth + 1, Nesting.Arrays));
+        }));
+    });
+
+    /// <summary>
+    /// A resource_spans whose length prefix claims more bytes than the payload holds — a
+    /// truncated upload, or a hostile one.
+    /// </summary>
+    public static byte[] Traces_TruncatedLengthPrefix()
+    {
+        byte[] whole = Traces_Realistic(spans: 2);
+        return whole[..(whole.Length - 32)];       // the outer length now overruns the buffer
+    }
 
     // ── Logs ──────────────────────────────────────────────────────────────────
 
