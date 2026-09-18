@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Diagnostics;
+using System.Runtime.CompilerServices;
 using MessagePack;
 using Microsoft.Extensions.Logging.Abstractions;
 using Ameto.Tracing;
@@ -246,16 +247,59 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
         Assert.Equal("GET",              page.Rows[0].HttpMethod);
         Assert.Equal("/api/v1/payments", page.Rows[0].HttpPath);
 
-        // THE GATE, 44 B from the figure it guards, which is only sound because the figure is
-        // deterministic to the BYTE and not merely stable: 1 018 368 B in Release run alone, run
-        // beside its own class and run inside the whole parallel suite, against 1 106 368 B with
-        // the two params arrays back — exactly 88 000 B more for 1 000 rows, the two key arrays
-        // and nothing else. The row's own TraceRowDto, service set, id strings and services array
-        // are the 1 018. The gate is the midpoint of the two measured figures.
-        Assert.True(allocated / Rows < 1_062,
-            $"a returned row cost {allocated / (double)Rows:N0} B — BuildRow is building its "
-            + "semconv key lists per row again (a params string[] is 88 B a row)");
+        // WHAT THE DEFECT WEIGHS, MEASURED ON THIS RUNTIME AND NOT ASSUMED. Restoring
+        // `params string[]` on GetAttr puts two literal key arrays back on every row; this loop
+        // allocates exactly those two arrays a thousand times and weighs them the same way the
+        // page above was weighed. On x64 it is 88 B a row — a string[2] (24 B header + 2×8) and a
+        // string[3] (24 + 3×8) — which is precisely the 88 000 B separating the two measured
+        // pages. Measuring it is what keeps the gate's margin honest on a runtime whose object
+        // header or reference width differs, instead of hard-coding half of 88.
+        double defectPerRow = MeasureTwoKeyArraysPerRow(Rows);
+        _out.WriteLine($"              two params key arrays weigh {defectPerRow:N0} B/row here");
+        Assert.InRange(defectPerRow, 40, 200);   // the calibration itself must have measured something
+
+        // THE GATE: the measured page plus half of the measured defect. Both halves of the margin
+        // are numbers this run took, and the only constant is the baseline — which is sound to the
+        // BYTE and not merely stable, because it is one thread's allocation over a deterministic
+        // code path. Measured with the per-thread counter: 1 018,368 B/row in Release and
+        // 1 018,976 B/row in Debug, the SAME figure run alone, run beside its own class, run inside
+        // the whole suite and with DOTNET_PROCESSOR_COUNT=2 (which is what CI gives it). The row's
+        // own TraceRowDto, service set, id strings and services array are that 1 019.
+        //
+        // So the gate sits 44 B above the worst measured figure and 44 B below the defect, and CI's
+        // Debug 2-core run is the configuration the baseline was taken in.
+        const double Baseline = 1_019;   // the Debug figure, rounded up to the byte
+        double gate    = Baseline + defectPerRow / 2;
+        double perRow  = allocated / (double)Rows;
+
+        Assert.True(perRow < gate,
+            $"a returned row cost {perRow:N0} B against a gate of {gate:N0} — BuildRow is building "
+            + $"its semconv key lists per row again (two params string[] is {defectPerRow:N0} B a row)");
     }
+
+    /// <summary>
+    /// What two literal semconv key arrays cost per row — the allocation TS#13 removed, weighed on
+    /// the runtime the gate is about to run on.
+    ///
+    /// <para><c>Escape</c> is not inlined, so the two arrays escape the loop exactly as
+    /// <c>BuildRow</c>'s did into <c>GetAttr</c>; a runtime that stack-allocates a non-escaping
+    /// <c>string[]</c> would otherwise weigh nothing and the calibration would read zero. The
+    /// <c>Assert.InRange</c> at the call site is what catches that if it ever does.</para>
+    /// </summary>
+    private static double MeasureTwoKeyArraysPerRow(int rows)
+    {
+        Escape(["warm", "up"], ["warm", "up", "too"]);   // type handles and this frame, not the figure
+
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        for (int i = 0; i < rows; i++)
+            Escape(["http.request.method", "http.method"], ["url.path", "http.target", "http.route"]);
+        return (GC.GetAllocatedBytesForCurrentThread() - before) / (double)rows;
+    }
+
+    private static int _sink;
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void Escape(string[] method, string[] path) => _sink = method.Length + path.Length;
 
     /// <summary>An HTTP server root span's attribute map: the two keys <c>BuildRow</c> asks for.</summary>
     private static byte[] HttpRootBlob()
