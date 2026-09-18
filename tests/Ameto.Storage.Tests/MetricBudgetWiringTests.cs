@@ -297,6 +297,49 @@ public sealed class MetricBudgetWiringTests
     }
 
     /// <summary>
+    /// A TRACE CEILING IS A SPAN COUNT TIMES A SPAN'S WEIGHT, AND THE WEIGHT MOVED UNDER IT.
+    ///
+    /// <para>64 MB and 128 MB were cut against 1 117 B a span in the hot tier and 1 740 B a span
+    /// read back out of a segment — both of which were almost entirely the attribute
+    /// <c>Dictionary</c>. WP2 removed it in this same wave and neither ceiling followed, so a
+    /// large host would have flushed at 124 000 spans where every trace test says 50 000, and
+    /// admitted a merge pass 1.8x the one <c>MaxSpansPerPass</c> builds. A cap that no longer
+    /// buys the cadence it was written for is not a cap, it is a number.</para>
+    ///
+    /// <para>The weights are <c>TraceHotTierProbe</c>'s and <c>TraceCompactionMemoryProbe</c>'s,
+    /// which print them and gate them at 700 B/span. Restated here as literals so this fact is
+    /// pure arithmetic over constants — it cannot fail because of the machine it runs on, only
+    /// because someone changed a weight or a ceiling without changing the other.</para>
+    /// </summary>
+    [Fact]
+    public void The_trace_ceilings_still_buy_the_span_counts_they_were_cut_for()
+    {
+        // TraceHotTierProbe: an eight-attribute span, RETAINED in the tier.
+        const int HotTierBytesPerSpan = 540;
+        // TraceCompactionMemoryProbe: a span SpanReader.ReadAll materialises, RETAINED.
+        const int MergeBytesPerSpan = 607;
+        // TraceStorageEngine.HotFlushThreshold and MaxSpansPerPass, the cadences being bought.
+        const int HotFlushThreshold = 50_000;
+        const int MaxSpansPerPass   = 120_000;
+
+        double tierSpans  = MemoryBudgets.TraceHotTierCapBytes / (double)HotTierBytesPerSpan;
+        double mergeSpans = MemoryBudgets.TraceMergeCapBytes   / (double)MergeBytesPerSpan;
+
+        _out.WriteLine($"hot tier cap {MemoryBudgets.TraceHotTierCapBytes / 1048576.0:N1} MB = "
+                     + $"{tierSpans:N0} spans at {HotTierBytesPerSpan} B; merge cap "
+                     + $"{MemoryBudgets.TraceMergeCapBytes / 1048576.0:N1} MB = {mergeSpans:N0} spans "
+                     + $"at {MergeBytesPerSpan} B");
+
+        Assert.InRange(tierSpans,  HotFlushThreshold * 0.9, HotFlushThreshold * 1.1);
+        Assert.InRange(mergeSpans, MaxSpansPerPass   * 0.9, MaxSpansPerPass   * 1.1);
+
+        // Rounded UP and never down: a host large enough for the cap must afford the WHOLE
+        // cadence, not 98 % of it and a flush that arrives early for no stated reason.
+        Assert.True(MemoryBudgets.TraceHotTierCapBytes >= (long)HotFlushThreshold * HotTierBytesPerSpan);
+        Assert.True(MemoryBudgets.TraceMergeCapBytes   >= (long)MaxSpansPerPass   * MergeBytesPerSpan);
+    }
+
+    /// <summary>
     /// The engine spends the budget it was given, in bytes, and a histogram point costs what it
     /// weighs. This drives the REAL trigger — points go in until the engine's own threshold
     /// flush drains the tier — rather than reading the counter the change added, because a

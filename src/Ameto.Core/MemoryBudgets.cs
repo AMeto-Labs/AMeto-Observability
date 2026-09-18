@@ -105,19 +105,43 @@ public readonly struct MemoryBudgets
     public const long MetricHotTierCapBytes = 32L * 1000 * 1000;
 
     /// <summary>
-    /// The trace hot tier between flushes. 64 MB is what 50 000 spans weighed before this round
-    /// (1 117 B a span, measured), so a large host keeps the ceiling it had; WP8 is what spends
-    /// this instead of a span count. Defined here rather than in the traces package because this
-    /// file is cut once per round — see the note on <see cref="MetricHotTierFraction"/>.
+    /// The trace hot tier between flushes — <b>50 000 spans at what a span in the tier now
+    /// weighs</b>, the same shape as <see cref="MetricHotTierCapBytes"/>: today's flush cadence,
+    /// restated in the only unit that can bound memory. WP8 is what spends it instead of a span
+    /// count. Defined here rather than in the traces package because this file is cut once per
+    /// round — see the note on <see cref="MetricHotTierFraction"/>.
+    ///
+    /// <para><b>Re-calibrated, because the unit moved under it.</b> 64 MB was 50 000 x 1 117 B,
+    /// the weight of a <c>SpanRecord</c> that had inflated its attributes into a
+    /// <c>Dictionary</c> on the ingest path. WP2, in this same wave, made the tier hold the
+    /// msgpack blob and decode lazily, and <c>TraceHotTierProbe</c> measures an eight-attribute
+    /// span at <b>540 B retained</b> (166 B/span allocated, 148 B with no attributes at all). At
+    /// that weight the old ceiling buys 124 000 spans between flushes, not 50 000 — so a large
+    /// host would have silently flushed at 2.5x the cadence every trace test names.</para>
+    ///
+    /// <para>50 000 x 540 B = 27 MB, which is this. The probe's own gate (a span must retain
+    /// under 700 B) is the drift guard beneath it, and <c>MetricBudgetWiringTests</c> pins
+    /// cap ÷ 540 B to 50 000 ± 10 % so the next change to a span's weight has to move this
+    /// constant instead of the cadence.</para>
     /// </summary>
-    public const long TraceHotTierCapBytes = 64L * 1024 * 1024;
+    public const long TraceHotTierCapBytes = 27L * 1000 * 1000;
 
     /// <summary>
-    /// One trace compaction pass's working set — <c>CompactOnePass</c>'s <c>allSpans</c>, which
-    /// at <c>MaxSpansPerPass</c> 120 000 x 1 740 B retained peaked at <b>199 MB</b> measured,
-    /// against a 128 MB ceiling here and a byte budget instead of a span count in WP8.
+    /// One trace compaction pass's working set — <c>CompactOnePass</c>'s <c>allSpans</c> at
+    /// <c>MaxSpansPerPass</c> = 120 000, at what a span read back out of a segment now weighs.
+    ///
+    /// <para>128 MB was calibrated on 1 740 B retained a span, which made a full pass
+    /// <b>199 MB</b> measured — the figure that OOM'd the 512 MB stand, and the reason the
+    /// ceiling was deliberately set BELOW a whole pass. WP2's <c>SpanReader</c> yields the blob,
+    /// and <c>TraceCompactionMemoryProbe</c> measures <b>607 B/span retained</b>: a full pass is
+    /// 69 MB. So 128 MB no longer bounds anything a pass can do — it would admit 221 000 spans,
+    /// 1.8x the pass the planner actually builds.</para>
+    ///
+    /// <para>120 000 x 607 B = 72.8 MB, rounded UP to 73 MB so that a host large enough for the
+    /// cap still affords a whole pass rather than 98 % of one. Pinned to ± 10 % of
+    /// <c>MaxSpansPerPass</c> in <c>MetricBudgetWiringTests</c> alongside the tier.</para>
     /// </summary>
-    public const long TraceMergeCapBytes = 128L * 1024 * 1024;
+    public const long TraceMergeCapBytes = 73L * 1000 * 1000;
 
     // ── The shares, when that is the smaller number ──
     //
