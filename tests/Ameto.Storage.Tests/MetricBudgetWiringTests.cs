@@ -1,3 +1,4 @@
+using System.Reflection;
 using Ameto.Core;
 using Ameto.Metrics;
 using Ameto.Metrics.Storage;
@@ -353,6 +354,55 @@ public sealed class MetricBudgetWiringTests
         // cadence, not 98 % of it and a flush that arrives early for no stated reason.
         Assert.True(MemoryBudgets.TraceHotTierCapBytes >= (long)HotFlushThreshold * HotTierBytesPerSpan);
         Assert.True(MemoryBudgets.TraceMergeCapBytes   >= (long)MaxSpansPerPass   * MergeBytesPerSpan);
+    }
+
+    /// <summary>
+    /// AN OPTION AN OPERATOR CANNOT FIND IS AN OPTION THEY DO NOT HAVE. <c>Ameto:Metrics</c>
+    /// arrived as nine settable knobs with no <c>Metrics:</c> block in the shipped
+    /// <c>config.yml</c> and not one row in <c>docs/CONFIGURATION.md</c> — which README points at
+    /// and nothing else — so the whole group was undiscoverable, including the two that decide
+    /// how much of a 384 MB heap the exemplar rings pin for the life of the process.
+    ///
+    /// <para><c>Ameto.Core.Tests.ConfigurationDocsTests</c> is the same drift guard for
+    /// <c>QueryOptions</c> and <c>IngestionOptions</c>; it does not enumerate this group, so this
+    /// is where the metrics half of it lives. It asks only that every settable option appears BY
+    /// NAME in the reference and that the file an operator copies from carries the block.
+    /// Computed <c>…For</c> methods and <c>Effective…</c> properties are not settings.</para>
+    /// </summary>
+    [Fact]
+    public void Every_settable_metrics_option_is_documented_and_shipped_in_config_yml()
+    {
+        string root = RepoRoot();
+        string doc  = File.ReadAllText(Path.Combine(root, "docs", "CONFIGURATION.md"));
+        string yml  = File.ReadAllText(Path.Combine(root, "src", "Ameto.Server", "config.yml"));
+
+        var missingFromDoc = new List<string>();
+        var missingFromYml = new List<string>();
+        foreach (var p in typeof(MetricsOptions).GetProperties(BindingFlags.Public | BindingFlags.Instance))
+        {
+            if (!p.CanWrite) continue;                    // computed, not a setting
+            if (!doc.Contains(p.Name, StringComparison.Ordinal)) missingFromDoc.Add(p.Name);
+            if (!yml.Contains(p.Name, StringComparison.Ordinal)) missingFromYml.Add(p.Name);
+        }
+
+        Assert.True(missingFromDoc.Count == 0, "docs/CONFIGURATION.md does not mention " + string.Join(", ", missingFromDoc));
+        Assert.True(missingFromYml.Count == 0, "src/Ameto.Server/config.yml does not mention " + string.Join(", ", missingFromYml));
+
+        // The section header and the block, so the rows cannot be smuggled in under another
+        // group's heading or left as a bare list of keys nobody can paste anywhere.
+        Assert.Contains("## Metrics options (`Ameto:Metrics`)", doc, StringComparison.Ordinal);
+        Assert.Contains("\n  Metrics:", yml, StringComparison.Ordinal);
+    }
+
+    /// <summary>Walks up from the test binary to the repo root, the way ConfigurationDocsTests does.</summary>
+    private static string RepoRoot()
+    {
+        var d = new DirectoryInfo(AppContext.BaseDirectory);
+        while (d is not null && !File.Exists(Path.Combine(d.FullName, "docs", "CONFIGURATION.md")))
+            d = d.Parent;
+
+        Assert.NotNull(d);
+        return d!.FullName;
     }
 
     /// <summary>

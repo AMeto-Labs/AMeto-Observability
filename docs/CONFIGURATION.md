@@ -209,6 +209,30 @@ Search budgets, and the cross-query cache of decoded segment indexes.
 
 ---
 
+## Metrics options (`Ameto:Metrics`)
+
+The metric hot tier is the in-RAM point buffer; it is flushed to `.mts` files on size, on age, or under memory pressure, and every point in it is already durable in `metrics.wal` before the flush happens.
+
+Every ceiling here is a quantity of **bytes** or of objects, and the ones left unset derive from the memory this process may actually use rather than being the same number on a 512 MB container and a 64 GB host. Managed shares are taken of the GC's own heap hard limit, which in a 512 MB container is 384 MB — not 512. An explicit value always wins.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `HotTierBytes` | long | *unset* → `min(32 MB, 5 % of the managed-heap limit)` | Bytes the hot tier may hold before a flush is forced — ~19 MB in a 512 MB container, 32 MB anywhere with room. **Points are not the unit:** a 16-bucket histogram point carries its own `long[]` and weighs 3.4× a gauge point, so the flat 500 000-*point* threshold this replaces was 20 MB of one or 84 MB of the other, decided without asking the host anything. The 32 MB cap *is* that old threshold restated in bytes (500 000 × the 64 B a scalar point costs), so a host large enough for it flushes on exactly the cadence it always did. |
+| `MinFlushBytes` | long | *unset* → a tenth of `HotTierBytes` | The bar a **periodic** flush tick has to clear to write files at all. Below it the tier keeps accumulating: the points are already in the write-ahead log, and a file per metric name is not worth writing for a handful of them. The forced flush at `HotTierBytes` ignores this. |
+| `WalInitialBytes` | long | *unset* → `min(HotTierBytes, 8 MB)`, floored at 1 MB | Initial capacity of `metrics.wal`. Deriving it can only make the file **smaller** than the 8 MB it has always been, never larger, because a log never shrinks below the capacity it was opened with and a pre-sized one would leave every quiet install a 20–32 MB file at rest for ever. Set it explicitly to pre-size the log and save two unmap/remap cycles under the append lock on a busy host. |
+| `MaxHotAge` | TimeSpan | `"01:00:00"` (1 h) | Flush a non-empty tier at least this often whatever its size. Matches the rollup's own first cutoff, so nothing waits longer because of this. |
+| `FlushCheckInterval` | TimeSpan | `"00:01:00"` (60 s) | How often the flush loop **asks** whether the tier has earned its files. A check interval, not a flush interval — durability belongs to the log, not to this. |
+| `ExemplarsPerMetric` | int | *unset* → derived so `MaxExemplarMetrics` full rings fit half the tier budget, clamped to `[64, 4000]` | Exemplars kept per metric name, for metric-to-trace jumps. **A value set here is bought out of the ring count, not out of the budget:** 1 000 slots on a 512 MB stand's ~19 MB tier admits 48 rings rather than the 256 the cap names, and names past the 48th get no exemplars at all. Lower it, or raise `HotTierBytes`, to get the count back. Past the point where even one ring of that depth would not fit, the depth itself gives way instead. Was a flat `4000`, which is the one default that does not survive on a large host. |
+| `MaxExemplarMetrics` | int | `256` | How many metric names may own an exemplar ring. Past it, exemplars for further names are dropped — a correlation hint, never data; `GET /api/diagnostics` counts the refusals. Raising it makes every ring proportionally **shallower** rather than claiming more memory; lowering it makes them deeper. |
+| `MaxLabelValuesPerKey` | int | `2000` | Distinct values remembered per label key, per metric, for the Explore catalog. |
+| `MaxTrackedSeriesPerMetric` | int | `50000` | Distinct label-set hashes counted per metric before the reported cardinality stops rising. |
+
+**The exemplar rings are the one piece of metric memory nothing takes back.** A ring is allocated at full depth the first time a metric name carries an exemplar, and it is never pruned, never aged out, invisible to the tier's byte accounting and out of reach of the RAM-pressure shed — so `MaxExemplarMetrics` × `ExemplarsPerMetric` × 208 B is resident for the life of the process. That is why the two knobs trade against each other inside one budget (half the hot tier) instead of multiplying freely: at the old defaults, 4 000 slots × 256 names was 213 MB pinned inside a 384 MB heap limit. If a deployment wants deeper rings, it lowers the count.
+
+**Upgrading — the flush cadence is now a byte budget.** An install that never set anything keeps the same cadence on a host with room (32 MB *is* the old 500 000 points at 64 B a point) and flushes earlier on a constrained one, which is the point. `ExemplarsPerMetric` is the exception that changes everywhere: it derives now, to ~300 slots at the 32 MB tier. To pin the old behaviour, set `HotTierBytes: 32000000`, `MinFlushBytes: 3200000` and `ExemplarsPerMetric: 4000` — and on a 512 MB host, expect the exemplar rings to claim the heap that the derivation exists to protect.
+
+---
+
 ## Resource attributes (env, deployment id, …)
 
 Attach shared attributes to everything a service sends by setting OTLP **resource attributes** on the sender — one env var, no code:
@@ -346,6 +370,17 @@ Ameto:
     Timeout: "00:01:00"
     MaxConcurrent: 0              # 0 = auto (cores, 2-16); negative = unlimited
     QueueWait: "00:00:05"
+
+  Metrics:
+    # HotTierBytes:               # unset = min(32 MB, 5% of the managed-heap limit)
+    # MinFlushBytes:              # unset = a tenth of the tier budget
+    # WalInitialBytes:            # unset = the tier budget, capped at 8 MB
+    MaxHotAge: "01:00:00"
+    FlushCheckInterval: "00:01:00"
+    # ExemplarsPerMetric:         # unset = derived to fit half the tier, clamped [64, 4000]
+    MaxExemplarMetrics: 256       # names that may own an exemplar ring
+    MaxLabelValuesPerKey: 2000
+    MaxTrackedSeriesPerMetric: 50000
 
   Retention:
     VerboseDays: 90
