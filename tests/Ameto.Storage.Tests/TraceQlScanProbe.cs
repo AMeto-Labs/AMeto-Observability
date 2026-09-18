@@ -30,6 +30,13 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
     private readonly ITestOutputHelper      _out;
     private readonly List<string>           _dirs = [];
 
+    /// <summary>
+    /// How many times every per-thread allocation figure in this class is taken. The verdict is the
+    /// SMALLEST of them: the counter's only noise term is a GC landing inside the window, which
+    /// adds this thread's unused allocation context to the reading and can never subtract.
+    /// </summary>
+    private const int MeasuredPasses = 3;
+
     public TraceQlScanProbe(ColdSpanSegmentFixture fx, ITestOutputHelper output)
     {
         _fx  = fx;
@@ -87,6 +94,14 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
         // THE GATE. main allocated 913 B per span scanned; the dictionary was ~1,5 KB of it and
         // the scan's own SpanRecord and blob copy are the rest. A predicate that reads one key out
         // of the bytes cannot come near the old figure.
+        //
+        // NO SAME-RUN CONTROL HERE, AND THE DENOMINATOR IS WHY. The row-building term the gate
+        // below has to subtract — a trace id and a span id per RETURNED ROW, 144 B or 216 B
+        // depending on whether the runtime is running an optimised body of
+        // DefaultInterpolatedStringHandler.AppendFormatted<ulong> — arrives on this figure divided
+        // by the 50 000 spans SCANNED for 200 rows: 0,29 B per span of swing, next to xUnit's
+        // ~3 B/span of output drain and a 320 B margin. Measured 380 and 381 B/span scanned with
+        // and without DOTNET_ReadyToRun=0.
         Assert.True(allocated / scanned < 700,
             $"a TraceQL page allocated {allocated / scanned:N0} B per span scanned — the attribute "
             + "dictionary is being built for spans the predicate only reads one key from");
@@ -165,11 +180,21 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
     /// arguments go on building two arrays a row with no one watching. The only caller that can
     /// tell the difference is the real one.</para>
     ///
-    /// <para>THE THIRD PAGE IS THE MEASURED ONE. <c>BuildRow</c> reaches the row's attributes
+    /// <para>THE THIRD PAGE IS THE FIRST MEASURED ONE. <c>BuildRow</c> reaches the row's attributes
     /// through <c>SpanRecord.Attributes</c>, whose decode is memoised ON THE RECORD, and the hot
     /// tier hands out the same records to every query — so the first page pays a decode per row
     /// and the 104 B this test exists for would be noise inside it. Two warm pages leave a page
     /// whose per-row cost is <c>BuildRow</c>'s own objects and nothing else.</para>
+    ///
+    /// <para>NOTHING IN THE VERDICT IS INHERITED FROM THE RUN. Two terms of the raw figure are the
+    /// process's history and not the code's, and each is dealt with where it lives: a GC inside the
+    /// measured window (worth +384 B, and it landed in one pass of every eight-pass Debug suite run
+    /// it was measured over) can only ADD, so every figure is the best of
+    /// <see cref="MeasuredPasses"/>; and the row's two id strings cost
+    /// 144 B/row or 216 B/row depending on whether the runtime has an optimised body for the
+    /// interpolated-string handler (worth +72 000 B, seen in 1 full Debug suite run in 5 and in
+    /// every measured pass of it), so they are measured in the same run and subtracted from both
+    /// the figure and the baseline. The gate's own comment carries both measurements.</para>
     ///
     /// <para>Restore the <c>params string[]</c> signature and its literal arguments at
     /// <c>TraceQLExecutor.cs:BuildRow</c> and this fails at 104 B a row above the gate.</para>
@@ -231,9 +256,32 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
         // with an engine alive and no query running, and with no engine at all.
         //
         // GC.GetAllocatedBytesForCurrentThread cannot see any of it: the drain is another thread.
-        // Over twelve consecutive pages it reads the SAME value to the byte — 1 018 368 B Release,
-        // 1 018 976 B Debug — run alone, run inside the whole suite, and with
-        // DOTNET_PROCESSOR_COUNT=2. The check below is what makes that claim checkable.
+        // Over twelve consecutive pages run ALONE it reads the SAME value to the byte —
+        // 1 018 368 B Release, 1 018 976 B Debug — and with DOTNET_PROCESSOR_COUNT=2 as well.
+        //
+        // IT IS NOT, HOWEVER, INDEPENDENT OF THE RUN, and an earlier version of this comment said
+        // it was. Inside the whole suite the raw figure has two further terms, both of them the
+        // process's history rather than the page's code; the two blocks below are what removes
+        // them, and each carries what it was measured at.
+        //
+        // THREE MEASURED PAGES AND THE SMALLEST IS THE READING, because the per-thread counter has
+        // one noise term of its own and it is strictly additive. A GC that lands INSIDE the window
+        // makes the counter jump by whatever was left unused in this thread's allocation context:
+        // the remainder is turned into a free object and the context zeroed, so the
+        // `alloc_bytes − (alloc_limit − alloc_ptr)` the counter computes loses its subtrahend.
+        // Measured here: every pass with `GC.CollectionCount(0)` unchanged reads 1 018 976 B to the
+        // byte, and a pass that took one gen0 collection read 1 019 360 — +384 B, once in each of
+        // three eight-pass full Debug suite runs and in a different pass every time. It cannot be
+        // predicted and it cannot be subtracted, but it can only ever ADD, so a minimum over a few
+        // passes is exactly the reading with no GC in it. The pass that took one is printed as
+        // such, so a run whose minimum is not a clean pass says so rather than hiding it.
+        //
+        // A MINIMUM IS ONLY HONEST FOR A COST THAT IS PAID ON EVERY PAGE, and this one is: two
+        // `params string[]` per row are built afresh by every call of BuildRow. Its sibling
+        // TraceHotTierProbe.A_trace_list_page_does_not_inflate_the_hot_tier_it_walks must NOT be
+        // given this treatment for the opposite reason — the decode it gates is memoised on the
+        // record, so it is paid on the FIRST page only and a minimum over pages would read a later
+        // page and see nothing.
         //
         // THE PRECONDITION THE FIGURE RESTS ON, asserted and not assumed: the page must complete
         // SYNCHRONOUSLY, because only then is every byte it allocated this thread's. It holds here
@@ -244,11 +292,22 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
         // over: a page that yields can resume on the very thread it left, passing the check with
         // half its work billed elsewhere, and its failure message blames threads for what is
         // really a changed execution shape.
-        long before   = GC.GetAllocatedBytesForCurrentThread();
-        var  pageTask = TraceQLExecutor.ExecuteAsync(engine, pred, from, to, Rows, CancellationToken.None);
-        bool ranHere  = pageTask.IsCompleted;   // read BEFORE the await: nothing has resumed yet
-        var  page     = await pageTask;
-        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+        long           allocated = long.MaxValue;
+        bool           ranHere   = true;
+        TraceQueryPage page      = default;
+        for (int pass = 0; pass < MeasuredPasses; pass++)
+        {
+            int  gen0     = GC.CollectionCount(0);
+            long before   = GC.GetAllocatedBytesForCurrentThread();
+            var  pageTask = TraceQLExecutor.ExecuteAsync(engine, pred, from, to, Rows, CancellationToken.None);
+            ranHere      &= pageTask.IsCompleted;   // read BEFORE the await: nothing has resumed yet
+            page          = await pageTask;
+            long a        = GC.GetAllocatedBytesForCurrentThread() - before;
+            int  gcs      = GC.CollectionCount(0) - gen0;
+            _out.WriteLine($"              pass {pass}: {a:N0} B ({a / (double)Rows:N0} B/row)"
+                         + (gcs > 0 ? $"   ({gcs} gen0 collection(s) inside the window)" : ""));
+            if (a < allocated) allocated = a;
+        }
 
         Assert.True(ranHere,
             "the TraceQL page did not complete synchronously, so the per-thread figure below is "
@@ -258,8 +317,8 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
             + "the gate — and note that ITestOutputHelper.WriteLine costs 6 288 B on another "
             + "thread per printed line, so that baseline has to be taken the same way.");
 
-        _out.WriteLine($"TRACEQL PAGE  {Rows:N0} rows, one root span each, warm: "
-                     + $"{allocated:N0} B ({allocated / (double)Rows:N0} B/row)");
+        _out.WriteLine($"TRACEQL PAGE  {Rows:N0} rows, one root span each, warm, best of "
+                     + $"{MeasuredPasses}: {allocated:N0} B ({allocated / (double)Rows:N0} B/row)");
 
         Assert.Equal(Rows, page.Rows.Count);
         Assert.Equal("GET",              page.Rows[0].HttpMethod);
@@ -284,26 +343,55 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
         _out.WriteLine($"              two params key arrays weigh {defectPerRow:N0} B/row here");
         Assert.InRange(defectPerRow, 40, 200);   // the calibration itself must have measured something
 
-        // THE GATE: the measured page plus half of the measured defect. Both halves of the margin
-        // are numbers this run took, and the only constant is the baseline — which is sound to the
-        // BYTE and not merely stable, because it is one thread's allocation over a deterministic
-        // code path. Measured with the per-thread counter: 1 018,368 B/row in Release and
-        // 1 018,976 B/row in Debug, the SAME figure run alone, run beside its own class, run inside
-        // the whole suite and with DOTNET_PROCESSOR_COUNT=2 (which is what CI gives it). The row's
-        // own TraceRowDto, service set, id strings and services array are that 1 019. Re-measured
-        // for this calibration: ten consecutive Debug runs and ten Release runs, every one of them
-        // 1 018 976 B and 1 018 368 B to the byte.
+        // WHAT THE ROW'S TWO ID STRINGS COST, MEASURED IN THE SAME RUN, because that is the one
+        // part of the figure the RUNTIME gets to choose — and it chose differently often enough to
+        // turn this gate red on an unchanged tree.
         //
-        // So the gate is 1 071, sitting 52 B above the worst measured figure and 52 B below the
-        // defect page's 1 123 B/row (measured: 1 122 976 B Debug, 1 122 368 B Release), and CI's
-        // Debug 2-core run is the configuration the baseline was taken in.
-        const double Baseline = 1_019;   // the Debug figure, rounded up to the byte
-        double gate    = Baseline + defectPerRow / 2;
-        double perRow  = allocated / (double)Rows;
+        // THE FAILURE. One full Debug suite run in five read 1 090 976 B where every other run,
+        // and every run of this class alone, read 1 018 976 B to the byte: +72 000 B, exactly
+        // 72 B on every one of the thousand rows, present in EVERY measured pass of that run and
+        // in none of another's. The 72 is three boxed `ulong`s at 24 B each, and the three are
+        // BuildRow's `root.TraceId.ToString()` (two holes) and `root.SpanId.ToString()` (one):
+        // both are `$"{_hi:x16}{_lo:x16}"`, and `DefaultInterpolatedStringHandler.AppendFormatted<T>`
+        // tests `value is IFormattable` / `is ISpanFormattable` on its generic argument. Compiled
+        // OPTIMISED — the ReadyToRun body in System.Private.CoreLib, or a tier-1 rejit — the JIT
+        // folds those type tests against the known `ulong` and the box disappears. Compiled
+        // UNOPTIMISED — tier-0, which is where an instantiation lives until the runtime promotes
+        // it — the box is a real 24-byte allocation per hole.
+        //
+        // Measured on this tree, same binaries, same machine, per-thread counter:
+        //   optimised body     TraceId.ToString 88 B/row   SpanId.ToString 56 B/row   page 1 018 976 B
+        //   unoptimised body   TraceId.ToString 136 B/row  SpanId.ToString 80 B/row   page 1 090 976 B
+        // (Pinned deterministically with DOTNET_ReadyToRun=0, which denies the instantiation its
+        // precompiled body; the second column reproduces the failing run's figure to the byte, and
+        // does so in EVERY pass, which is why the minimum above cannot help here — the term is
+        // state, not warm-up. It also arrives unprompted: 1 of the 10 full Debug suite runs this
+        // change was verified over read the raw 1 090 976 B with the control at 216 B/row, and the
+        // verdict below still came out at 874,976 B/row and green.)
+        //
+        // SO THE GATE MEASURES THE ROW WITHOUT THEM. The page builds exactly one TraceId string and
+        // one SpanId string per row, so subtracting what that pair costs IN THIS RUN removes both
+        // the strings and whatever the runtime decided to box around them. What is left is the
+        // row's own TraceRowDto, service set and services array: 874,976 B/row in Debug and
+        // 874,368 B/row in Release — and 874,976 again with the boxes present, identical to the
+        // byte, which is the check that the two ToString calls are the whole of the variable term.
+        //
+        // The margin is unchanged by the subtraction, because both ends move together: the gate is
+        // 875 + 52 = 927, sitting 52 B above the measured 875 and 52 B below the defect page's
+        // 1 122 976 − 144 000 = 978,976 B/row.
+        double idsPerRow = MeasureRowIdStringsPerRow(Rows);
+        _out.WriteLine($"              a row's two id strings weigh {idsPerRow:N0} B/row here "
+                     + $"({(idsPerRow >= 200 ? "boxed: the handler is running unoptimised" : "unboxed")})");
+        Assert.InRange(idsPerRow, 144, 400);   // 144 is the two strings themselves; anything less is a mis-measurement
+
+        const double Baseline = 875;   // the Debug figure less the id strings, rounded up to the byte
+        double gate   = Baseline + defectPerRow / 2;
+        double perRow = allocated / (double)Rows - idsPerRow;
 
         Assert.True(perRow < gate,
-            $"a returned row cost {perRow:N0} B against a gate of {gate:N0} — BuildRow is building "
-            + $"its semconv key lists per row again (two params string[] is {defectPerRow:N0} B a row)");
+            $"a returned row cost {perRow:N0} B beyond its two id strings, against a gate of "
+            + $"{gate:N0} — BuildRow is building its semconv key lists per row again (two params "
+            + $"string[] is {defectPerRow:N0} B a row)");
     }
 
     /// <summary>
@@ -451,6 +539,8 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
     /// </summary>
     private static double MeasureTwoKeyArraysPerRow(int rows)
     {
+        // Best of MeasuredPasses, for the same reason the page above is: a gen0 collection inside
+        // the window adds this thread's unused allocation context to the reading and can only add.
         // THE LENGTHS ARE READ, NOT WRITTEN. A `params string[]` restored on GetAttr would take
         // BuildRow's literal arguments — which are the semconv lists — so the arrays it built per
         // row are exactly these two lengths, whatever they are today. Written out as literals this
@@ -463,16 +553,56 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
 
         Escape(new string[methodLen], new string[pathLen]);   // type handles and this frame, not the figure
 
-        long before = GC.GetAllocatedBytesForCurrentThread();
-        for (int i = 0; i < rows; i++)
-            Escape(new string[methodLen], new string[pathLen]);
-        return (GC.GetAllocatedBytesForCurrentThread() - before) / (double)rows;
+        long best = long.MaxValue;
+        for (int pass = 0; pass < MeasuredPasses; pass++)
+        {
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < rows; i++)
+                Escape(new string[methodLen], new string[pathLen]);
+            long a = GC.GetAllocatedBytesForCurrentThread() - before;
+            if (a < best) best = a;
+        }
+        return best / (double)rows;
+    }
+
+    /// <summary>
+    /// WHAT A ROW'S TWO ID STRINGS COST ON THIS RUNTIME, IN THIS PROCESS, RIGHT NOW — the 32-char
+    /// trace id and the 16-char span id <c>BuildRow</c> writes into every <c>TraceRowDto</c>.
+    ///
+    /// <para>88 + 56 = 144 B of string, plus 0 or 72 B of boxing depending on whether the runtime
+    /// is running an optimised body of <c>DefaultInterpolatedStringHandler.AppendFormatted&lt;ulong&gt;</c>
+    /// — see the gate's comment for the measurement and for why that is not this test's business to
+    /// judge. Measured the same way the page is, best of <see cref="MeasuredPasses"/>, so a gen0
+    /// collection cannot inflate the control and deflate the verdict.</para>
+    ///
+    /// <para><c>Escape</c> keeps the two strings alive past the loop body, exactly as the row they
+    /// are written into would.</para>
+    /// </summary>
+    private static double MeasureRowIdStringsPerRow(int rows)
+    {
+        var trace = new TraceId(0x5EED, 1);
+        var span  = new SpanId(1);
+        Escape(trace.ToString(), span.ToString());   // jit, and the interpolation handler's pooled buffer
+
+        long best = long.MaxValue;
+        for (int pass = 0; pass < MeasuredPasses; pass++)
+        {
+            long before = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < rows; i++)
+                Escape(trace.ToString(), span.ToString());
+            long a = GC.GetAllocatedBytesForCurrentThread() - before;
+            if (a < best) best = a;
+        }
+        return best / (double)rows;
     }
 
     private static int _sink;
 
     [MethodImpl(MethodImplOptions.NoInlining)]
     private static void Escape(string[] method, string[] path) => _sink = method.Length + path.Length;
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static void Escape(string traceId, string spanId) => _sink = traceId.Length + spanId.Length;
 
     /// <summary>An HTTP server root span's attribute map: the two keys <c>BuildRow</c> asks for.</summary>
     private static byte[] HttpRootBlob()

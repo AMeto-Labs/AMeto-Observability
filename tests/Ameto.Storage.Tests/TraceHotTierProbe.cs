@@ -66,6 +66,14 @@ public sealed class TraceHotTierProbe : IDisposable
         // it. A tier that holds the blob has no dictionary, no eight key strings and no eight
         // boxes, so it cannot come near that number — if this trips, the ingest path has started
         // decoding attributes again.
+        //
+        // RETAINED, AND THEREFORE ALREADY IMMUNE to the two things that move an ALLOCATION figure
+        // between runs. It is a difference of two live-set samples taken the same way — a
+        // compacting gen2 collect either side of Measure — so a collection inside the window is
+        // what the figure is made of rather than noise on it, and it counts what SURVIVES, which
+        // no amount of transient boxing on the ingest path could reach. Measured 540 B/span in
+        // three consecutive full Debug suite runs and again with DOTNET_ReadyToRun=0, against a
+        // 700 gate and the 1 117 it exists to catch.
         Assert.True(eight.RetainedPerSpan < 700,
             $"an eight-attribute span retains {eight.RetainedPerSpan:N0} B in the hot tier — the "
             + "attribute map is being decoded on the ingest path again");
@@ -228,6 +236,23 @@ public sealed class TraceHotTierProbe : IDisposable
             + "than trusting these numbers — and take that baseline the same way, because "
             + "ITestOutputHelper.WriteLine costs 6 288 B on another thread per printed line.");
 
+        //
+        // THE TWO RUN-HISTORY TERMS THE SIBLING PROBE HAD TO REMOVE ARE BOTH BELOW THE NOISE HERE,
+        // and the denominator is why: this gate divides by ROOT SPANS (2 000) and not by returned
+        // rows (100), so anything the page pays per ROW arrives here divided by twenty.
+        //   * A row's trace-id and span-id strings cost 144 B/row when the runtime has an optimised
+        //     body for DefaultInterpolatedStringHandler.AppendFormatted<ulong> and 216 B/row when
+        //     it does not — see TraceQlScanProbe's gate, which reads 1 019 B/row or 1 091 B/row on
+        //     one unchanged tree for exactly that reason. Here that swing is 100 × 72 / 2 000 =
+        //     3,6 B per root span. Measured: 623 both ways, with and without DOTNET_ReadyToRun=0.
+        //   * A GC landing inside the window adds this thread's unused allocation context, at most
+        //     8 kB, i.e. 4 B per root span.
+        // Together under 8 B against a 377 B margin, so this figure is taken ONCE and taken FIRST.
+        //
+        // TAKEN FIRST IS NOT A DETAIL: the defect this gate exists to catch is a decode that is
+        // MEMOISED on the record, so it is paid on the first page over a fresh tier and never
+        // again. A best-of-N over repeated pages — which is right for the sibling, whose defect is
+        // rebuilt per page — would read a later page here and see nothing at all.
         Assert.True(allocated / Roots < 1_000,
             $"a trace-list page allocated {allocated / Roots:N0} B per root span — MergeSpanInto is "
             + "decoding whole attribute maps under the engine read lock again");
