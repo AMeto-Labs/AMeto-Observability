@@ -152,17 +152,20 @@ public sealed class TraceHotTierProbe : IDisposable
         // of pure reporting noise on a gate whose whole signal is 623 against 2 023.
         //
         // Per thread the page reads the same value to the byte over twelve consecutive runs, and
-        // the same value again with DOTNET_PROCESSOR_COUNT=2. The thread-identity checks below are
-        // what make that claim checkable: this tier is hot-only, so GetTraceListAsync never reaches
-        // its `await foreach` over cold segments and the whole page runs on this thread.
-        int  callerThread = Environment.CurrentManagedThreadId;
-        long allocBefore  = GC.GetAllocatedBytesForCurrentThread();
+        // the same value again with DOTNET_PROCESSOR_COUNT=2. The checks below are what make that
+        // claim checkable: the figure is only the whole page if the page completed SYNCHRONOUSLY,
+        // which holds here by construction — this tier is hot-only, nothing has been flushed, so
+        // GetTraceListAsync never reaches its `await foreach` over SpanReader.SearchAsync. Thread
+        // identity would be the wrong question: a page that yields can resume on the thread it
+        // left and pass such a check with half its work billed elsewhere.
+        long allocBefore = GC.GetAllocatedBytesForCurrentThread();
 
-        var sw   = Stopwatch.StartNew();
-        var page = await engine.GetTraceListAsync(from, to, null, null, null, null, null, 100);
+        var  sw       = Stopwatch.StartNew();
+        var  pageTask = engine.GetTraceListAsync(from, to, null, null, null, null, null, 100);
+        bool ranHere1 = pageTask.IsCompleted;   // read BEFORE the await: nothing has resumed yet
+        var  page     = await pageTask;
         sw.Stop();
         long allocated = GC.GetAllocatedBytesForCurrentThread() - allocBefore;
-        bool sameThread1 = callerThread == Environment.CurrentManagedThreadId;
 
         // A SECOND PAGE OVER THE SAME TIER, because the two paths differ in kind and not only in
         // size. The dictionary is MEMOISED on the record, so the decode is paid on the first page
@@ -170,13 +173,13 @@ public sealed class TraceHotTierProbe : IDisposable
         // per page and retains nothing. An SSE client pages this tier twice a second, so both
         // columns belong in the report.
         var  page2  = await engine.GetTraceListAsync(from, to, null, null, null, null, null, 100);
-        int  thread2 = Environment.CurrentManagedThreadId;
-        long alloc2  = GC.GetAllocatedBytesForCurrentThread();
-        var  sw2     = Stopwatch.StartNew();
-        page2 = await engine.GetTraceListAsync(from, to, null, null, null, null, null, 100);
+        long alloc2 = GC.GetAllocatedBytesForCurrentThread();
+        var  sw2    = Stopwatch.StartNew();
+        var  task2  = engine.GetTraceListAsync(from, to, null, null, null, null, null, 100);
+        bool ranHere2 = task2.IsCompleted;
+        page2 = await task2;
         sw2.Stop();
-        long allocated2  = GC.GetAllocatedBytesForCurrentThread() - alloc2;
-        bool sameThread2 = thread2 == Environment.CurrentManagedThreadId;
+        long allocated2 = GC.GetAllocatedBytesForCurrentThread() - alloc2;
 
         // The parity check runs on the rows, but AFTER the numbers are taken and BEFORE they are
         // printed is the wrong order for a probe: a failing parity assert would hide the figures
@@ -217,10 +220,13 @@ public sealed class TraceHotTierProbe : IDisposable
         // (the page's own MergedTrace, service set and summary rows — the floor), 623 B for the
         // blob scan, 2 023 B when MergeSpanInto reaches the same two keys through
         // SpanRecord.Attributes. The decoded map is all of the difference.
-        Assert.True(sameThread1 && sameThread2,
-            "a trace-list page resumed on another thread, so the per-thread allocation figures are "
-            + "only part of what it cost — this tier is hot-only and the page is supposed to "
-            + "complete synchronously; measure it differently rather than trusting these numbers");
+        Assert.True(ranHere1 && ranHere2,
+            "a trace-list page did not complete synchronously, so the per-thread figures above are "
+            + "only the part of it that ran on this thread. This tier is HOT-ONLY and nothing has "
+            + "been flushed, so the page has no yielding await; if the hot-tier path has gained "
+            + "one, measure it with GC.GetTotalAllocatedBytes minus a baseline idle sample rather "
+            + "than trusting these numbers — and take that baseline the same way, because "
+            + "ITestOutputHelper.WriteLine costs 6 288 B on another thread per printed line.");
 
         Assert.True(allocated / Roots < 1_000,
             $"a trace-list page allocated {allocated / Roots:N0} B per root span — MergeSpanInto is "

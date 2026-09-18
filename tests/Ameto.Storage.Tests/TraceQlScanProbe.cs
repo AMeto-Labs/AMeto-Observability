@@ -228,17 +228,30 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
         // GC.GetAllocatedBytesForCurrentThread cannot see any of it: the drain is another thread.
         // Over twelve consecutive pages it reads the SAME value to the byte — 1 018 368 B Release,
         // 1 018 976 B Debug — run alone, run inside the whole suite, and with
-        // DOTNET_PROCESSOR_COUNT=2. The thread-identity check below is what makes that claim
-        // checkable: the whole page completes synchronously over a hot tier, and if it ever stops
-        // doing so the test says so instead of quietly measuring a fraction of the work.
-        int  thread    = Environment.CurrentManagedThreadId;
-        long before    = GC.GetAllocatedBytesForCurrentThread();
-        var  page      = await TraceQLExecutor.ExecuteAsync(engine, pred, from, to, Rows, CancellationToken.None);
+        // DOTNET_PROCESSOR_COUNT=2. The check below is what makes that claim checkable.
+        //
+        // THE PRECONDITION THE FIGURE RESTS ON, asserted and not assumed: the page must complete
+        // SYNCHRONOUSLY, because only then is every byte it allocated this thread's. It holds here
+        // by construction — the directory is fresh and 1 000 spans is far under the 50 000-span
+        // flush threshold, so there are no cold segments and ExecuteAsync never reaches its
+        // `await foreach` over SpanReader.SearchAsync — and IsCompleted, read before the await, is
+        // what says so. Thread identity was the old check and it asks the wrong question twice
+        // over: a page that yields can resume on the very thread it left, passing the check with
+        // half its work billed elsewhere, and its failure message blames threads for what is
+        // really a changed execution shape.
+        long before   = GC.GetAllocatedBytesForCurrentThread();
+        var  pageTask = TraceQLExecutor.ExecuteAsync(engine, pred, from, to, Rows, CancellationToken.None);
+        bool ranHere  = pageTask.IsCompleted;   // read BEFORE the await: nothing has resumed yet
+        var  page     = await pageTask;
         long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
 
-        Assert.True(thread == Environment.CurrentManagedThreadId,
-            "the page resumed on another thread, so the per-thread allocation figure below is "
-            + "only part of it — measure it differently rather than trusting this number");
+        Assert.True(ranHere,
+            "the TraceQL page did not complete synchronously, so the per-thread figure below is "
+            + "only the part of it that ran on this thread. This probe measures a HOT-TIER page, "
+            + "which has no yielding await; if the hot-tier path has gained one, measure the page "
+            + "with GC.GetTotalAllocatedBytes minus a baseline idle sample rather than widening "
+            + "the gate — and note that ITestOutputHelper.WriteLine costs 6 288 B on another "
+            + "thread per printed line, so that baseline has to be taken the same way.");
 
         _out.WriteLine($"TRACEQL PAGE  {Rows:N0} rows, one root span each, warm: "
                      + $"{allocated:N0} B ({allocated / (double)Rows:N0} B/row)");
