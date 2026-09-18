@@ -135,14 +135,21 @@ public sealed class AttributePredicate(string key, TraceQLOp op, TraceQLValue va
     /// <c>.foo = "bar"</c>, and folding that into <c>false</c> made <c>{ !(.foo = "bar") }</c>
     /// select every span in the system that had never heard of <c>.foo</c>.
     ///
-    /// <para>PRESENT BUT INCOMPARABLE STAYS FALSE, deliberately and narrowly. A string attribute
-    /// met by a numeric comparison (<c>{ .foo &gt; 5 }</c> where <c>.foo</c> is "bananas") is a
-    /// span that HAS the field, so "unknown" would be the wrong word for it, and changing that
-    /// answer is a separate semantic decision from the one this class was fixed for. It leaves a
-    /// smaller version of the same asymmetry standing on type mismatch alone, pinned by
-    /// <c>TraceQLThreeValuedTests.A_type_mismatch_is_still_two_valued</c> and carried as issue #76
-    /// — a docstring is read only by somebody already in this file, which is how the original
-    /// defect lasted as long as it did.</para>
+    /// <para>PRESENT BUT INCOMPARABLE IS ALSO UNKNOWN — issue #76, and the argument that decided it
+    /// is that "has the field" was never the question. What <c>null</c> reports is that THIS SPAN
+    /// CANNOT ANSWER THIS COMPARISON, and a tenant of "bananas" cannot answer <c>&gt; 5</c> any more
+    /// than a missing tenant can. Reading it as false left the #66 shape standing in a narrower
+    /// place: <c>{ !(.tenant &gt; 5) }</c> returned every span whose tenant is a name.</para>
+    ///
+    /// <para>Nothing changes for the plain form — <c>{ .tenant &gt; 5 }</c> selected no such span
+    /// before and selects none now, because unknown does not match at the top level either. The
+    /// answers that move are the negated and composed ones, which is the whole point.</para>
+    ///
+    /// <para>THE MIRROR CASE IS NOT THE SAME QUESTION and is deliberately untouched: a numeric
+    /// attribute met by a STRING comparison (<c>{ .count &gt; "5" }</c>) is compared as text, and
+    /// lexical order on "42" versus "5" may surprise — but the span can and does answer, so there
+    /// is no third value to give. That is a complaint about what comparison MEANS, not about
+    /// three-valued logic, and it is not what #76 asked.</para>
     /// </summary>
     public override bool? Evaluate(SpanRecord s)
     {
@@ -157,18 +164,32 @@ public sealed class AttributePredicate(string key, TraceQLOp op, TraceQLValue va
 
         if (qv.IsNumber)
         {
-            double attrNum = raw switch
+            // NULL RATHER THAN NaN AS THE "NOT A NUMBER HERE" SIGNAL, because the two are different
+            // facts and the old code spelled them the same. `_ => double.NaN` meant "this value has
+            // no numeric reading", but an attribute whose value genuinely IS NaN reached the same
+            // branch, and both were answered false. Only the first is a span that cannot answer.
+            double? attrNum = raw switch
             {
-                long   l => (double)l,
-                int    i => (double)i,
+                long   l => l,
+                int    i => i,
                 double d => d,
                 string str when double.TryParse(str,
                     System.Globalization.NumberStyles.Any,
                     System.Globalization.CultureInfo.InvariantCulture, out var v) => v,
-                _ => double.NaN,
+                _ => null,
             };
-            if (double.IsNaN(attrNum)) return false;
-            return CompareOp(attrNum, op, qv.Number);
+
+            // The attribute is there but has no numeric reading — issue #76. Answering false here
+            // put the #66 shape back in a narrower place: `{ .tenant > 5 }` on "bananas" was false,
+            // so `{ !(.tenant > 5) }` was TRUE and a query for "not the big tenants" returned every
+            // span whose tenant is a name. A comparison the span cannot answer is unknown, exactly
+            // as an absent field is, and negation then carries it.
+            if (attrNum is null) return null;
+
+            // A real NaN, on the other hand, IS an answer, and IEEE gives a self-consistent one:
+            // `NaN = 5` is false, `NaN != 5` is true, and `!(NaN = 5)` is true — so the two
+            // spellings agree and nothing has to be special-cased.
+            return CompareOp(attrNum.Value, op, qv.Number);
         }
 
         string attrStr = raw.ToString() ?? string.Empty;

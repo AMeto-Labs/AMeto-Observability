@@ -41,8 +41,23 @@ public sealed class TraceQLThreeValuedTests
         Attributes  = new Dictionary<string, object?> { ["tenant"] = tenant },
     };
 
+    /// <summary>Same span shape, but with a numeric tenant — the comparable side of #76.</summary>
+    private static SpanRecord WithNumericTenant(long tenant) => new()
+    {
+        TraceId     = new TraceId(1, 2),
+        SpanId      = new SpanId(3),
+        Name        = "SELECT orders",
+        ServiceName = "billing",
+        Kind        = SpanKind.Client,
+        Status      = SpanStatusCode.Ok,
+        Attributes  = new Dictionary<string, object?> { ["tenant"] = tenant },
+    };
+
     private static bool? Eval(string query, SpanRecord span) =>
         TraceQLParser.Parse(query).Evaluate(span);
+
+    private static bool Matches(string query, SpanRecord span) =>
+        TraceQLParser.Parse(query).Evaluate(span) == true;
 
     // Building blocks, chosen so each is unambiguous against WithTenant("acme"):
     private const string True    = ".tenant = \"acme\"";      // present and equal
@@ -116,20 +131,75 @@ public sealed class TraceQLThreeValuedTests
     }
 
     /// <summary>
-    /// PRESENT BUT INCOMPARABLE IS STILL TWO-VALUED, and this test exists so that stays a decision
-    /// rather than an oversight. A span that HAS the attribute is not a span that cannot answer, so
-    /// a type mismatch keeps returning false — which does leave a narrower version of the same
-    /// asymmetry standing, visible in the second pair below. Changing it is a separate semantic
-    /// question from the one #74 asked; if it is ever changed, this test is where it announces
-    /// itself.
+    /// A COMPARISON THE SPAN CANNOT ANSWER IS UNKNOWN, whether the field is missing or merely of
+    /// the wrong shape — issue #76.
+    ///
+    /// <para>This replaces <c>A_type_mismatch_is_still_two_valued</c>, which pinned the opposite
+    /// expectation and existed to fail here. It did, and per its own acceptance criterion it was
+    /// deleted rather than adjusted.</para>
     /// </summary>
     [Fact]
-    public void A_type_mismatch_is_still_two_valued()
+    public void A_type_mismatch_answers_no_comparison_and_no_negation_of_one()
     {
         var span = WithTenant("bananas");
 
-        Assert.False(Eval("{ .tenant > 5 }",    span));
-        Assert.True (Eval("{ !(.tenant > 5) }", span));   // the residual asymmetry, pinned
+        Assert.Null(Eval("{ .tenant > 5 }",    span));
+        Assert.Null(Eval("{ !(.tenant > 5) }", span));   // was True: "not the big tenants" caught it
+        Assert.Null(Eval("{ .tenant <= 5 }",   span));
+    }
+
+    /// <summary>
+    /// The plain form is unchanged, which is what says #76 narrowed nothing a user relied on:
+    /// unknown and false both fail to select at the top level, so only negated and composed
+    /// queries move.
+    /// </summary>
+    [Fact]
+    public void A_type_mismatch_still_selects_nothing_on_its_own()
+    {
+        Assert.False(Matches("{ .tenant > 5 }",  WithTenant("bananas")));
+        Assert.True (Matches("{ .tenant > 5 }",  WithNumericTenant(42)));
+        Assert.False(Matches("{ .tenant > 50 }", WithNumericTenant(42)));
+    }
+
+    /// <summary>
+    /// A numeric string still reads as a number — the mismatch is about values with no numeric
+    /// reading at all, not about how they were stored.
+    /// </summary>
+    [Fact]
+    public void A_numeric_string_is_not_a_type_mismatch()
+    {
+        var span = new SpanRecord
+        {
+            TraceId    = new TraceId(1, 2),
+            SpanId     = new SpanId(3),
+            Attributes = new Dictionary<string, object?> { ["tenant"] = "42" },
+        };
+
+        Assert.True (Eval("{ .tenant > 5 }",  span));
+        Assert.False(Eval("{ .tenant > 50 }", span));
+    }
+
+    /// <summary>
+    /// AN ATTRIBUTE THAT IS GENUINELY NaN IS NOT A TYPE MISMATCH. The old code used <c>NaN</c> as
+    /// its "no numeric reading" sentinel, so a real NaN and a string were answered identically;
+    /// separating them is what let the mismatch become unknown without dragging NaN with it.
+    /// IEEE then gives a self-consistent answer of its own — <c>= 5</c> false, <c>!= 5</c> true —
+    /// so the two spellings agree here too.
+    /// </summary>
+    [Fact]
+    public void A_NaN_attribute_answers_by_IEEE_rather_than_by_unknown()
+    {
+        var span = new SpanRecord
+        {
+            TraceId    = new TraceId(1, 2),
+            SpanId     = new SpanId(3),
+            Attributes = new Dictionary<string, object?> { ["ratio"] = double.NaN },
+        };
+
+        Assert.False(Eval("{ .ratio = 5 }",     span));
+        Assert.True (Eval("{ .ratio != 5 }",    span));
+        Assert.True (Eval("{ !(.ratio = 5) }",  span));   // agrees with the line above
+        Assert.False(Eval("{ .ratio > 5 }",     span));
     }
 
     // ── Presence, the question three-valued logic makes necessary ─────────────
