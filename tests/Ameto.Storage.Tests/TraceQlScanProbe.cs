@@ -347,6 +347,72 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
         Assert.Equal(fromList, fromQl);
     }
 
+    /// <summary>
+    /// THE SAME TRACE, BEFORE AND AFTER ITS TIER FLUSHED. The sibling above holds the two HOT
+    /// readers together; this one holds the COLD one. A flushed trace no longer answers out of
+    /// <c>MergeSpanInto</c> at all: <c>SpanWriter.Write</c> calls <c>TraceSummarySidecar.Write</c>,
+    /// which resolves the method and path ONCE at flush time into <c>TraceSummary.RootMethod</c>
+    /// and <c>RootPath</c>, and every later page reads those strings back through
+    /// <c>TraceStorageEngine.MergeSummaryInto</c>. The sidecar kept a THIRD private copy of the
+    /// semconv key lists, so a client span whose path arrived as <c>url.full</c> or <c>http.url</c>
+    /// had a path in the trace list while its tier was hot and an empty one from the flush onward —
+    /// the same row, on the same screen, changing its mind on a background timer.
+    ///
+    /// <para>Give <c>TraceSummarySidecar</c> its own three-key path list back and the second assert
+    /// fails with an empty string against the URL. The <c>.tracesum</c> precondition is what keeps
+    /// that honest: with no sidecar the cold read falls back to scanning spans through
+    /// <c>MergeSpanInto</c>, which shares the lists already and would pass either way.</para>
+    /// </summary>
+    [Theory]
+    [InlineData("url.full", "https://api.example.com/v1/payments?id=7")]
+    [InlineData("http.url", "https://api.example.com/v1/refunds")]
+    public async Task The_trace_list_reports_the_same_path_once_the_tier_has_flushed(string key, string url)
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "ameto-flushparity-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        _dirs.Add(dir);
+
+        using var engine = new TraceStorageEngine(dir, NullLogger<TraceStorageEngine>.Instance);
+
+        var  at       = ColdSpanSegmentFixture.Base;
+        long baseNano = at.ToUnixTimeMilliseconds() * 1_000_000L;
+
+        engine.WriteSpan(new SpanIngestItem
+        {
+            TraceId           = new TraceId(0xF105ED, 1),
+            SpanId            = new SpanId(1),
+            ParentSpanId      = default,
+            StartTimeUnixNano = baseNano,
+            DurationNanos     = 5_000_000_000L,
+            Name              = "GET",
+            ServiceName       = "checkout",
+            Kind              = SpanKind.Client,
+            Status            = SpanStatusCode.Unset,
+            HttpStatusCode    = 200,
+            AttributesBytes   = OneAttr(key, url),
+        });
+
+        var from = at.AddMinutes(-1);
+        var to   = at.AddDays(1);
+
+        var    hotList = await engine.GetTraceListAsync(from, to, null, null, null, null, null, 10);
+        string hot     = Assert.Single(hotList.Rows).HttpPath;
+
+        engine.FlushHotTier();   // the segment and its .tracesum, written on this thread
+
+        // THE PRECONDITION, ASSERTED AND NOT ASSUMED: a segment with no sidecar is read span by
+        // span through MergeSpanInto, which is the hot reader again and would prove nothing here.
+        Assert.NotEmpty(Directory.GetFiles(dir, "*.tracesum", SearchOption.AllDirectories));
+
+        var    coldList = await engine.GetTraceListAsync(from, to, null, null, null, null, null, 10);
+        string cold     = Assert.Single(coldList.Rows).HttpPath;
+
+        _out.WriteLine($"{key,-10} hot \"{hot}\"   flushed \"{cold}\"");
+
+        Assert.Equal(url, hot);
+        Assert.Equal(hot, cold);
+    }
+
     /// <summary>A one-key attribute map.</summary>
     private static byte[] OneAttr(string key, string value)
     {

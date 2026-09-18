@@ -319,15 +319,19 @@ internal struct SpanAttrValue
 }
 
 /// <summary>
-/// THE HTTP SEMCONV KEY LISTS, IN ONE PLACE, because two places is two answers. A trace row's
-/// method and path are read on two paths — <c>TraceStorageEngine.MergeSpanInto</c> builds the
-/// trace list, <c>TraceQLExecutor.BuildRow</c> builds a TraceQL page — and each kept its own copy
-/// of the lists. They had drifted: the engine looked under five path keys and the executor under
-/// three, so a span whose path arrived as <c>url.full</c> or <c>http.url</c> showed its path in
-/// the trace list and an empty path in a TraceQL row FOR THE SAME TRACE.
+/// THE HTTP SEMCONV KEY LISTS, IN ONE PLACE, because three places is three answers. A trace row's
+/// method and path are read on THREE paths — <c>TraceStorageEngine.MergeSpanInto</c> builds the
+/// trace list from a hot span, <c>TraceQLExecutor.BuildRow</c> builds a TraceQL page, and
+/// <c>TraceSummarySidecar.Write</c> resolves them ONCE at flush time into
+/// <c>TraceSummary.RootMethod</c>/<c>RootPath</c>, which is where every later trace-list page reads
+/// them back — and each kept its own copy of the lists. They had drifted: the engine looked under
+/// five path keys, the executor and the sidecar under three, so a span whose path arrived as
+/// <c>url.full</c> or <c>http.url</c> showed its path in the trace list and an empty path in a
+/// TraceQL row FOR THE SAME TRACE — and an empty one in the trace list too, from the moment its
+/// tier flushed.
 ///
 /// <para>Order is the semantics: the first key present with a non-null value wins, so these are
-/// most-specific-first. Adding a key means adding it here, and both readers get it.</para>
+/// most-specific-first. Adding a key means adding it here, and all three readers get it.</para>
 ///
 /// <para>The lists must stay DISJOINT — a key in both would be found at its first rank only, and
 /// the second list would read it as absent. <c>TraceHotTierProbe.The_semconv_key_lists_are_disjoint</c>
