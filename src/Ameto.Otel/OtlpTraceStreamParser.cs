@@ -27,9 +27,69 @@ public static class OtlpTraceStreamParser
 {
     // Thread-reused scratch: span attribute pairs, resource attribute pairs, and
     // the assembled header+pairs blob.
+    //
+    // All three are reset with ResetWrittenCount rather than Clear. Clear ZEROES everything the
+    // last span wrote before the next one starts — about 750 B of memset per span between the
+    // three of them — and nothing here ever reads past WrittenSpan.
     [ThreadStatic] private static ArrayBufferWriter<byte>? _tAttr;
     [ThreadStatic] private static ArrayBufferWriter<byte>? _tRes;
     [ThreadStatic] private static ArrayBufferWriter<byte>? _tOut;
+
+    /// <summary>
+    /// One scratch writer per open nesting level, reused across spans and requests.
+    ///
+    /// <para>msgpack needs an array's or a map's element count before its elements, and a
+    /// <c>Utf8JsonReader</c> cannot be rewound to count them first — so a nested value is
+    /// buffered and spliced. That buffer used to be <c>new ArrayBufferWriter&lt;byte&gt;(256)</c>,
+    /// allocated fresh FOR EVERY nested value: two objects and a 256-byte array per array or
+    /// kvlist attribute, on every span that carries one. Indexing by depth is what makes reuse
+    /// safe — a level's buffer is fully spliced into its parent before the next sibling opens,
+    /// and a child is always one level deeper.</para>
+    ///
+    /// <para>Depth is bounded by <c>Utf8JsonReader</c>'s own MaxDepth of 64, which each attribute
+    /// level costs two or three of, so the array settles at a couple of dozen entries at worst.
+    /// It still grows on demand rather than assuming that.</para>
+    /// </summary>
+    [ThreadStatic] private static ArrayBufferWriter<byte>[]? _tNest;
+
+    /// <summary>
+    /// Per-thread scratch for unescaping a JSON string, in place of an
+    /// <see cref="ArrayPool{T}"/> rent and return per escaped key or value.
+    /// </summary>
+    [ThreadStatic] private static byte[]? _tEsc;
+
+    /// <summary>
+    /// Above this, the unescape scratch is rented rather than kept: one pathological attribute
+    /// must not pin a large array to a request thread for the life of the process.
+    /// </summary>
+    private const int MaxKeptEscapeScratch = 64 * 1024;
+
+    /// <summary>The scratch writer for one nesting level, emptied and ready to write.</summary>
+    private static ArrayBufferWriter<byte> NestBuffer(int depth)
+    {
+        var pool = _tNest ??= new ArrayBufferWriter<byte>[8];
+        if (depth >= pool.Length)
+        {
+            Array.Resize(ref pool, Math.Max(depth + 1, pool.Length * 2));
+            _tNest = pool;
+        }
+        var buf = pool[depth] ??= new ArrayBufferWriter<byte>(256);
+        buf.ResetWrittenCount();
+        return buf;
+    }
+
+    /// <summary>Scratch of at least <paramref name="needed"/> bytes, kept per thread while it is small.</summary>
+    private static byte[] EscapeScratch(int needed)
+    {
+        var buf = _tEsc;
+        if (buf is not null && buf.Length >= needed) return buf;
+
+        // Rounded up so a batch of growing values reallocates a handful of times, not once each.
+        int size = Math.Max(256, (int)System.Numerics.BitOperations.RoundUpToPowerOf2((uint)needed));
+        buf = new byte[size];
+        if (size <= MaxKeptEscapeScratch) _tEsc = buf;
+        return buf;
+    }
 
     public static List<SpanIngestItem> Parse(ReadOnlySpan<byte> json)
     {
@@ -72,7 +132,7 @@ public static class OtlpTraceStreamParser
         // pairs and spliced into every span's attribute map.
         string serviceName = "unknown";
         int    resCount    = 0;
-        resBuf.Clear();
+        resBuf.ResetWrittenCount();
 
         while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
         {
@@ -223,7 +283,7 @@ public static class OtlpTraceStreamParser
         int     statusCode = 0;
         long    startNano  = 0, endNano = 0;
 
-        attrBuf.Clear();
+        attrBuf.ResetWrittenCount();
         var w = new MessagePackWriter(attrBuf);
         int   attrCount     = 0;
         short httpStatus    = 0;
@@ -285,7 +345,7 @@ public static class OtlpTraceStreamParser
         }
         else
         {
-            outBuf.Clear();
+            outBuf.ResetWrittenCount();
             var ow = new MessagePackWriter(outBuf);
             ow.WriteMapHeader(totalAttrs);
             if (resCount > 0) ow.WriteRaw(resBuf.WrittenSpan);
@@ -321,7 +381,7 @@ public static class OtlpTraceStreamParser
     /// </summary>
     private static bool WriteSpanKeyValue(
         ref Utf8JsonReader reader, ref MessagePackWriter w,
-        ref short httpStatus, ref bool httpFromNew, ref bool ametoInternal)
+        ref short httpStatus, ref bool httpFromNew, ref bool ametoInternal, int depth = 0)
     {
         if (reader.TokenType != JsonTokenType.StartObject) { reader.Skip(); return false; }
 
@@ -354,7 +414,7 @@ public static class OtlpTraceStreamParser
             {
                 if (!wroteKey) { reader.Skip(); continue; } // value before key (non-standard) — skip
                 if (reader.Read() && reader.TokenType == JsonTokenType.StartObject)
-                    WriteAnyValue(ref reader, ref w, keyKind, ref httpStatus, ref httpFromNew, ref ametoInternal);
+                    WriteAnyValue(ref reader, ref w, keyKind, ref httpStatus, ref httpFromNew, ref ametoInternal, depth);
                 else
                     w.WriteNil();
                 wroteValue = true;
@@ -369,7 +429,7 @@ public static class OtlpTraceStreamParser
     // ── AnyValue → msgpack (with promotion capture) ────────────────────────────
     private static void WriteAnyValue(
         ref Utf8JsonReader reader, ref MessagePackWriter w,
-        KeyKind keyKind, ref short httpStatus, ref bool httpFromNew, ref bool ametoInternal)
+        KeyKind keyKind, ref short httpStatus, ref bool httpFromNew, ref bool ametoInternal, int depth = 0)
     {
         bool wrote = false;
         while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
@@ -405,14 +465,14 @@ public static class OtlpTraceStreamParser
             else if (reader.ValueTextEquals("arrayValue"u8))
             {
                 if (reader.Read() && reader.TokenType == JsonTokenType.StartObject)
-                    WriteArrayValue(ref reader, ref w);
+                    WriteArrayValue(ref reader, ref w, depth);
                 else reader.Skip();
                 wrote = true;
             }
             else if (reader.ValueTextEquals("kvlistValue"u8))
             {
                 if (reader.Read() && reader.TokenType == JsonTokenType.StartObject)
-                    WriteKvlistValue(ref reader, ref w);
+                    WriteKvlistValue(ref reader, ref w, depth);
                 else reader.Skip();
                 wrote = true;
             }
@@ -446,12 +506,48 @@ public static class OtlpTraceStreamParser
         }
         else
         {
-            byte[] tmp = ArrayPool<byte>.Shared.Rent(reader.ValueSpan.Length);
-            int n = reader.CopyString(tmp);
-            ametoInternal = ContainsAmetoEndpoint(tmp.AsSpan(0, n));
-            ArrayPool<byte>.Shared.Return(tmp);
+            ametoInternal = EscapedUrlIsAmetoEndpoint(ref reader);
         }
     }
+
+    /// <summary>
+    /// The endpoint check for an escaped URL. Its buffer is a <c>stackalloc</c> — unlike the
+    /// msgpack writer, <see cref="ContainsAmetoEndpoint"/> is an ordinary static that cannot
+    /// keep the span — sized at the longest URL the matcher will look at at all. An escaped
+    /// value longer than that can still unescape to something shorter (<c>A</c> is six
+    /// bytes for one), so the long case keeps its pooled buffer rather than being skipped.
+    ///
+    /// <para>Separate method so the stack buffer is only in the frame of a call that takes this
+    /// branch, not in every frame of a deeply nested value.</para>
+    /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static bool EscapedUrlIsAmetoEndpoint(ref Utf8JsonReader reader)
+    {
+        int max = reader.ValueSpan.Length;
+        if (max <= MaxMatchableUrlBytes)
+        {
+            Span<byte> tmp = stackalloc byte[MaxMatchableUrlBytes];
+            int len = reader.CopyString(tmp);
+            return ContainsAmetoEndpoint(tmp[..len]);
+        }
+
+        byte[] rented = ArrayPool<byte>.Shared.Rent(max);
+        try
+        {
+            int n = reader.CopyString(rented);
+            return ContainsAmetoEndpoint(rented.AsSpan(0, n));
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(rented);
+        }
+    }
+
+    /// <summary>
+    /// The longest URL <see cref="AmetoIngestEndpoints.Matches(ReadOnlySpan{byte})"/> compares;
+    /// it refuses anything longer outright.
+    /// </summary>
+    private const int MaxMatchableUrlBytes = 512;
 
     private static void CaptureHttpStatus(KeyKind keyKind, long value, ref short httpStatus, ref bool httpFromNew)
     {
@@ -488,7 +584,7 @@ public static class OtlpTraceStreamParser
 
     // ── Nested array / kvlist (no promotion inside) ────────────────────────────
 
-    private static void WriteArrayValue(ref Utf8JsonReader reader, ref MessagePackWriter w)
+    private static void WriteArrayValue(ref Utf8JsonReader reader, ref MessagePackWriter w, int depth)
     {
         short s = 0; bool b = false, a = false;
         while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
@@ -496,14 +592,14 @@ public static class OtlpTraceStreamParser
             if (reader.TokenType != JsonTokenType.PropertyName) { reader.Skip(); continue; }
             if (reader.ValueTextEquals("values"u8) && reader.Read() && reader.TokenType == JsonTokenType.StartArray)
             {
-                var tmp = new ArrayBufferWriter<byte>(256);
+                var tmp = NestBuffer(depth);
                 var tw  = new MessagePackWriter(tmp);
                 int n = 0;
                 while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
                 {
                     if (reader.TokenType == JsonTokenType.StartObject)
                     {
-                        WriteAnyValue(ref reader, ref tw, KeyKind.Plain, ref s, ref b, ref a);
+                        WriteAnyValue(ref reader, ref tw, KeyKind.Plain, ref s, ref b, ref a, depth + 1);
                         n++;
                     }
                     else reader.Skip();
@@ -516,7 +612,7 @@ public static class OtlpTraceStreamParser
         }
     }
 
-    private static void WriteKvlistValue(ref Utf8JsonReader reader, ref MessagePackWriter w)
+    private static void WriteKvlistValue(ref Utf8JsonReader reader, ref MessagePackWriter w, int depth)
     {
         short s = 0; bool b = false, a = false;
         while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
@@ -524,11 +620,11 @@ public static class OtlpTraceStreamParser
             if (reader.TokenType != JsonTokenType.PropertyName) { reader.Skip(); continue; }
             if (reader.ValueTextEquals("values"u8) && reader.Read() && reader.TokenType == JsonTokenType.StartArray)
             {
-                var tmp = new ArrayBufferWriter<byte>(256);
+                var tmp = NestBuffer(depth);
                 var tw  = new MessagePackWriter(tmp);
                 int n = 0;
                 while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
-                    if (WriteSpanKeyValue(ref reader, ref tw, ref s, ref b, ref a)) n++;
+                    if (WriteSpanKeyValue(ref reader, ref tw, ref s, ref b, ref a, depth + 1)) n++;
                 tw.Flush();
                 w.WriteMapHeader(n);
                 w.WriteRaw(tmp.WrittenSpan);
@@ -539,16 +635,44 @@ public static class OtlpTraceStreamParser
 
     // ── Small helpers ──────────────────────────────────────────────────────────
 
-    /// <summary>Writes the current JSON string token to msgpack as a str, unescaping if needed.</summary>
+    /// <summary>
+    /// Writes the current JSON string token to msgpack as a str, unescaping if needed.
+    ///
+    /// <para>The unescape buffer is the per-thread scratch, not a pooled rent: renting and
+    /// returning per escaped key or value is two interlocked operations and a bucket walk for a
+    /// buffer whose life ends four lines later. Anything past
+    /// <see cref="MaxKeptEscapeScratch"/> still goes through the pool, so one enormous attribute
+    /// cannot pin a large array to a request thread.</para>
+    ///
+    /// <para>The scratch is an array rather than a <c>stackalloc</c> because
+    /// <see cref="MessagePackWriter"/> is a ref struct taken by ref, so ref-safety has to assume
+    /// a span handed to it could be stored in it and refuses a stack buffer outright.</para>
+    /// </summary>
     private static void WriteJsonStringToMsgpack(ref Utf8JsonReader reader, ref MessagePackWriter w)
     {
         if (reader.TokenType != JsonTokenType.String) { w.WriteNil(); return; }
         if (!reader.ValueIsEscaped) { w.WriteString(reader.ValueSpan); return; }
 
-        byte[] tmp = ArrayPool<byte>.Shared.Rent(reader.ValueSpan.Length);
-        int n = reader.CopyString(tmp);
-        w.WriteString(tmp.AsSpan(0, n));
-        ArrayPool<byte>.Shared.Return(tmp);
+        // Unescaping never grows the text, so the escaped length bounds the result.
+        int max = reader.ValueSpan.Length;
+        if (max <= MaxKeptEscapeScratch)
+        {
+            byte[] scratch = EscapeScratch(max);
+            int len = reader.CopyString(scratch);
+            w.WriteString(scratch.AsSpan(0, len));
+            return;
+        }
+
+        byte[] tmp = ArrayPool<byte>.Shared.Rent(max);
+        try
+        {
+            int n = reader.CopyString(tmp);
+            w.WriteString(tmp.AsSpan(0, n));
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(tmp);
+        }
     }
 
     /// <summary>Copies the current string token (unescaped) into a fixed span; returns length (0 if it doesn't fit).</summary>

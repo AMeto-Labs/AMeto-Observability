@@ -1,17 +1,23 @@
+using System.Text;
+using System.Text.Json;
 using Ameto.Core.Serialization;
 using Ameto.Otel;
+using Ameto.Otel.Models;
 using Ameto.Tracing;
 using Xunit;
 
 namespace Ameto.Perf;
 
 /// <summary>
-/// What the trace ingest parsers do with input no conformant exporter sends: hostile nesting,
-/// and a truncated upload.
+/// What the two trace ingest parsers do at their edges: for the protobuf one, hostile nesting
+/// and a truncated upload; for the JSON one, the nested-value scratch and the escaped strings
+/// that now share a per-thread buffer instead of renting one each.
 ///
-/// <para>These are not parity tests — the DOM decoder had no case for nested values and
-/// answered nil for all of them, so there is nothing to compare against. They pin the behaviour
-/// directly, and the first of them pins the difference between a 400 and a dead process.</para>
+/// <para>The protobuf half are not parity tests — the DOM decoder had no case for nested values
+/// and answered nil for all of them, so there is nothing to compare against. They pin the
+/// behaviour directly, and the first of them pins the difference between a 400 and a dead
+/// process. The JSON half ARE parity tests: the JSON DOM models nested values, so it is a real
+/// oracle for the buffer reuse.</para>
 /// </summary>
 public sealed class OtlpTraceProtoLimitsTests
 {
@@ -119,4 +125,187 @@ public sealed class OtlpTraceProtoLimitsTests
         Assert.Empty(spans[1].AttributesBytes);
         Assert.Equal(SpanKind.Unspecified, spans[1].Kind);
     }
+
+    // ── The JSON parser's shared scratch ──────────────────────────────────────
+
+    private static readonly JsonSerializerOptions DomOptions = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        AllowTrailingCommas  = true,
+    };
+
+    private static void AssertJsonMatchesDom(string json)
+    {
+        byte[] utf8 = Encoding.UTF8.GetBytes(json);
+        var streamed = OtlpTraceStreamParser.Parse(utf8);
+        var dom = OtlpTraceMapper.Map(
+            JsonSerializer.Deserialize<ExportTraceServiceRequest>(utf8, DomOptions)!);
+
+        Assert.Equal(dom.Count, streamed.Count);
+        for (int i = 0; i < dom.Count; i++)
+        {
+            Assert.Equal(dom[i].Name, streamed[i].Name);
+            Assert.True(dom[i].AttributesBytes.AsSpan().SequenceEqual(streamed[i].AttributesBytes),
+                $"span {i} ({dom[i].Name}): attribute bytes differ\n"
+              + $"  dom: {Convert.ToHexString(dom[i].AttributesBytes)}\n"
+              + $"  new: {Convert.ToHexString(streamed[i].AttributesBytes)}");
+        }
+    }
+
+    /// <summary>
+    /// msgpack needs an element count before the elements and a <c>Utf8JsonReader</c> cannot be
+    /// rewound, so a nested value is buffered and spliced. The buffer is now one per NESTING
+    /// LEVEL, reused across values and requests instead of allocated per value — which is only
+    /// safe while a level is spliced into its parent before the next sibling opens, and a child
+    /// always takes a deeper one. So the payload here nests an array inside a kvlist inside an
+    /// array, puts scalar siblings on both sides of the nested one, and gives the span a second
+    /// attribute that nests to the same depth all over again.
+    /// </summary>
+    [Fact]
+    public void Json_nested_values_splice_correctly_at_every_level()
+        => AssertJsonMatchesDom(NestedBatch);
+
+    /// <summary>
+    /// Escaped keys and values share one per-thread buffer that grows to the longest seen. A
+    /// short value after a long one must write only its own bytes, and a value past the
+    /// keep-it threshold must still come out whole.
+    /// </summary>
+    [Fact]
+    public void Json_escaped_keys_and_values_survive_the_shared_scratch()
+        => AssertJsonMatchesDom(EscapedBatch(longValueChars: 200_000));
+
+    [Fact]
+    public void Json_escaped_values_are_right_whatever_order_the_lengths_arrive_in()
+    {
+        // The scratch is [ThreadStatic] and survives between calls, so a batch that grew it must
+        // not change what the next batch writes.
+        AssertJsonMatchesDom(EscapedBatch(longValueChars: 100_000));
+        AssertJsonMatchesDom(EscapedBatch(longValueChars: 8));
+    }
+
+    /// <summary>
+    /// The self-ingest guard reads an escaped URL through its own buffer, and the endpoint
+    /// matcher refuses anything over 512 bytes. An escaped URL longer than that can still
+    /// unescape to something shorter — a unicode escape is six bytes for one character — so the
+    /// long case cannot simply be skipped, and this pins that it is not.
+    /// </summary>
+    [Fact]
+    public void Json_an_escaped_self_ingest_url_is_still_a_dropped_client_span()
+    {
+        string json = EscapedUrlBatch();
+
+        // Three CLIENT spans go in: a short escaped self-ingest URL, one whose escapes make it
+        // longer than 512 bytes but which unescapes to a self-ingest URL, and an ordinary one.
+        var kept = Assert.Single(OtlpTraceStreamParser.Parse(Encoding.UTF8.GetBytes(json)));
+        Assert.Equal("not-ours", kept.Name);
+
+        // And the DOM drops the same two: these URLs are short enough unescaped that its
+        // uncapped char comparison and the capped UTF-8 one agree.
+        AssertJsonMatchesDom(json);
+    }
+
+    private const string NestedBatch = """
+    {"resourceSpans":[{"resource":{"attributes":[
+        {"key":"service.name","value":{"stringValue":"Wallet.API"}}
+      ]},
+      "scopeSpans":[{"spans":[
+        {"traceId":"f6f6f098569a7f2ba54f3c734aa563f0","spanId":"a1b2c3d4e5f60718",
+         "name":"nested","kind":2,
+         "startTimeUnixNano":"1783953780000000000","endTimeUnixNano":"1783953780250000000",
+         "attributes":[
+           {"key":"deep","value":{"arrayValue":{"values":[
+              {"stringValue":"before"},
+              {"kvlistValue":{"values":[
+                 {"key":"inner","value":{"arrayValue":{"values":[
+                    {"intValue":"1"},
+                    {"kvlistValue":{"values":[{"key":"leaf","value":{"doubleValue":0.25}}]}},
+                    {"intValue":"2"}
+                 ]}}},
+                 {"key":"flag","value":{"boolValue":true}}
+              ]}},
+              {"stringValue":"after"}
+           ]}}},
+           {"key":"again","value":{"arrayValue":{"values":[
+              {"kvlistValue":{"values":[{"key":"k","value":{"stringValue":"v"}}]}},
+              {"stringValue":"tail"}
+           ]}}},
+           {"key":"plain","value":{"stringValue":"last"}}
+         ]}
+      ]}]
+    }]}
+    """;
+
+    /// <summary>Every character of <paramref name="s"/> written as a JSON \uXXXX escape.</summary>
+    private static string JsonEscaped(string s)
+    {
+        var sb = new StringBuilder(s.Length * 6);
+        foreach (char ch in s) sb.Append((char)0x5C).Append('u').Append(((int)ch).ToString("x4"));
+        return sb.ToString();
+    }
+
+    private static string EscapedBatch(int longValueChars)
+        // Every string below is fully \uXXXX-escaped, so every one goes through the unescape
+        // buffer, and the long one decides how far that buffer grows.
+        => EscapedBatchTemplate
+            .Replace("@@RESKEY@@",   JsonEscaped("res.key"))
+            .Replace("@@RESVAL@@",   JsonEscaped("res.value"))
+            .Replace("@@DBKEY@@",    JsonEscaped("db.statement"))
+            .Replace("@@LONG@@",     JsonEscaped(new string('x', longValueChars)))
+            .Replace("@@SHORTKEY@@", JsonEscaped("short.key"))
+            .Replace("@@SHORTVAL@@", JsonEscaped("aBc"))
+            .Replace("@@T1@@",       JsonEscaped("one two"))
+            .Replace("@@T2@@",       JsonEscaped("café"));
+
+    private const string EscapedBatchTemplate = """
+    {"resourceSpans":[{"resource":{"attributes":[
+        {"key":"service.name","value":{"stringValue":"Wallet.API"}},
+        {"key":"@@RESKEY@@","value":{"stringValue":"@@RESVAL@@"}}
+      ]},
+      "scopeSpans":[{"spans":[
+        {"traceId":"f6f6f098569a7f2ba54f3c734aa563f0","spanId":"a1b2c3d4e5f60718",
+         "name":"escaped","kind":2,
+         "startTimeUnixNano":"1783953780000000000","endTimeUnixNano":"1783953780250000000",
+         "attributes":[
+           {"key":"@@DBKEY@@","value":{"stringValue":"@@LONG@@"}},
+           {"key":"@@SHORTKEY@@","value":{"stringValue":"@@SHORTVAL@@"}},
+           {"key":"tags","value":{"arrayValue":{"values":[
+              {"stringValue":"@@T1@@"},{"stringValue":"@@T2@@"}
+           ]}}},
+           {"key":"plain","value":{"stringValue":"no escapes here"}}
+         ]}
+      ]}]
+    }]}
+    """;
+
+    /// <summary>
+    /// Three CLIENT spans: a fully escaped self-ingest URL, one whose ESCAPED form is past the
+    /// matcher's 512-byte ceiling but which unescapes to a 99-byte self-ingest URL, and one
+    /// pointing somewhere else. The first two are this server's own receiver and must go.
+    /// </summary>
+    private static string EscapedUrlBatch() =>
+        EscapedUrlTemplate
+            .Replace("@@URL1@@", JsonEscaped("http://ameto-host:8555/v1/traces"))
+            .Replace("@@URL2@@", JsonEscaped("http://ameto-host:8555/v1/traces?trace=" + new string('a', 60)))
+            .Replace("@@URL3@@", JsonEscaped("http://elsewhere:8555/api/pay"));
+
+    private const string EscapedUrlTemplate = """
+    {"resourceSpans":[{"resource":{"attributes":[
+        {"key":"service.name","value":{"stringValue":"Wallet.API"}}
+      ]},
+      "scopeSpans":[{"spans":[
+        {"traceId":"11111111111111111111111111111111","spanId":"1111111111111111",
+         "name":"short-escaped","kind":3,
+         "startTimeUnixNano":"1783953780000000000","endTimeUnixNano":"1783953780250000000",
+         "attributes":[{"key":"url.full","value":{"stringValue":"@@URL1@@"}}]},
+        {"traceId":"22222222222222222222222222222222","spanId":"2222222222222222",
+         "name":"long-escaped","kind":3,
+         "startTimeUnixNano":"1783953780000000000","endTimeUnixNano":"1783953780250000000",
+         "attributes":[{"key":"url.full","value":{"stringValue":"@@URL2@@"}}]},
+        {"traceId":"33333333333333333333333333333333","spanId":"3333333333333333",
+         "name":"not-ours","kind":3,
+         "startTimeUnixNano":"1783953780000000000","endTimeUnixNano":"1783953780250000000",
+         "attributes":[{"key":"url.full","value":{"stringValue":"@@URL3@@"}}]}
+      ]}]
+    }]}
+    """;
 }
