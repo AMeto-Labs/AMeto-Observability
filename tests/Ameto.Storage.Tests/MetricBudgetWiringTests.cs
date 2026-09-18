@@ -48,9 +48,55 @@ public sealed class MetricBudgetWiringTests
         // MinFlushPoints was 50 000 — a tenth of the threshold, and still is.
         Assert.Equal(50_000, o.MinFlushBytesFor(Large) / MetricStorageEngine.HotPointBytes);
 
-        // The old ExemplarsPerMetric and the old 8 MB log capacity, unchanged.
-        Assert.Equal(4_000, o.ExemplarsPerMetricFor(Large));
+        // The old 8 MB log capacity, unchanged.
         Assert.Equal(8 * MB, o.WalInitialBytesFor(Large));
+
+        // ExemplarsPerMetric is the ONE default that does not survive on a large host, and it is
+        // the cap that kills it, not the host: 4 000 slots x 256 rings x 208 B is 213 MB retained
+        // for the life of the process, and the old literal was only ever tenable because nothing
+        // bounded the number of rings. 300 slots is what half a 32 MB tier buys across 256 names,
+        // and GetExemplars answers at most 200 at a time anyway.
+        Assert.Equal(300, o.ExemplarsPerMetricFor(Large));
+    }
+
+    /// <summary>
+    /// THE BOUND THE DERIVATION CLAIMS IS THE BOUND THE ENGINE ENFORCES.
+    ///
+    /// <para>The rings are the one piece of metric memory nothing can take back: no ring is ever
+    /// pruned or aged out, <c>ShedableBytes</c> cannot see one and <c>Shed()</c> cannot release
+    /// one, so whatever the two exemplar knobs multiply out to is resident for the life of the
+    /// process. The derivation used to divide by a private assumption of 32 "active" names while
+    /// <c>MaxExemplarMetrics</c> admitted 256, so the stand's real ceiling was 140 MB of rings
+    /// sized against a 10 MB budget — inside the 384 MB heap this package exists to fit.</para>
+    /// </summary>
+    [Fact]
+    public void Every_ring_the_cap_admits_fits_the_budget_the_derivation_names()
+    {
+        var o = new MetricsOptions();
+
+        foreach (var (label, b) in new (string, MemoryBudgets)[]
+                 {
+                     ("16 GB host",  Large),
+                     ("512 MB stand", Stand),
+                     ("128 MB heap", MemoryBudgets.Derive(128 * MB, 160 * MB)),
+                     ("16 MB heap",  MemoryBudgets.Derive(16 * MB, 16 * MB)),
+                 })
+        {
+            long perRing = o.ExemplarsPerMetricFor(b);
+            long worst   = o.MaxExemplarMetrics * perRing * MetricsOptions.ExemplarBytes;
+            long half    = o.HotTierBytesFor(b) / 2;
+
+            // The floor is the one case the budget cannot honour: 64 slots is the shallowest ring
+            // worth keeping, and 256 of them is 3.4 MB on any host. Everywhere else the
+            // derivation itself is the bound.
+            long allowed = Math.Max(half, o.MaxExemplarMetrics * 64L * MetricsOptions.ExemplarBytes);
+
+            _out.WriteLine($"{label,-13}: tier {o.HotTierBytesFor(b) / 1048576.0,6:N1} MB, "
+                         + $"{perRing,5:N0} slots x {o.MaxExemplarMetrics} rings = {worst / 1048576.0,6:N1} MB retained");
+            Assert.True(worst <= allowed,
+                $"{label}: {o.MaxExemplarMetrics} rings of {perRing} exemplars retain "
+              + $"{worst / 1048576.0:N1} MB against a budget of {allowed / 1048576.0:N1} MB");
+        }
     }
 
     [Fact]

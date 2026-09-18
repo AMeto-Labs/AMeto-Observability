@@ -210,6 +210,110 @@ public sealed class MetricHotTierRetentionProbe
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
 
+    /// <summary>
+    /// WHAT AN EXEMPLAR ACTUALLY WEIGHS, WEIGHED.
+    ///
+    /// <para><see cref="MetricsOptions.ExemplarBytes"/> is the divisor the ring budget is spent
+    /// with, so a figure that is 1.7x low makes every ring 1.7x deeper than the budget it was
+    /// sized against — and a ring is the one piece of metric memory nothing prunes, ages out,
+    /// accounts for or sheds. It was 120: the ring slot and the two id strings, with the
+    /// <c>ExemplarSample</c> that holds them forgotten.</para>
+    ///
+    /// <para>The rings are filled from a handful of POINTS carrying many exemplars each, so the
+    /// hot tier holds nothing worth measuring and no flush has to be provoked to get it out of
+    /// the way. The ids are freshly built per exemplar, exactly as <c>OtlpMetricProtoParser</c>
+    /// hex-encodes them; the label set is shared, exactly as the parser shares it with the point,
+    /// which is why the constant does not count it.</para>
+    /// </summary>
+    [Fact]
+    public async Task An_exemplar_costs_what_the_ring_budget_is_divided_by()
+    {
+        const int rings = 256, depth = 1_000;
+        const long entries = rings * (long)depth;
+
+        string dir = Path.Combine(Path.GetTempPath(), "ameto-mexemplar-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var options = new MetricsOptions
+            {
+                HotTierBytes       = 32_000_000,   // pinned: this fact is about rings, not cadence
+                ExemplarsPerMetric = depth,
+                MaxExemplarMetrics = rings,
+            };
+            await using var engine = new MetricStorageEngine(dir, NullLogger<MetricStorageEngine>.Instance, options);
+
+            long before = Live();
+            FillRings(engine, rings, depth);
+            long after = Live();
+
+            long   held     = after - before;
+            double perEntry = held / (double)entries;
+
+            _out.WriteLine($"{rings} rings x {depth} exemplars = {entries:N0} exemplars");
+            _out.WriteLine($"  heap held  : {held / 1048576.0,7:N1} MB = {perEntry,6:N0} B/exemplar");
+            _out.WriteLine($"  constant   : {MetricsOptions.ExemplarBytes} B/exemplar "
+                         + $"=> {entries * MetricsOptions.ExemplarBytes / 1048576.0:N1} MB budgeted");
+
+            // The same kind of fixed floor the burst fact allows for — pool residue, JIT'd code,
+            // the engine's own log mapping — named and additive so it cannot absorb a per-entry
+            // regression. It is larger here (6 MB, 11 % of the figure) because that floor depends
+            // on what ran before this class: measured 199 B/exemplar with the whole class ahead
+            // of it and 213 B/exemplar run alone, a 3.6 MB spread on a constant that did not
+            // move. The old 120 reads 213 against a 34.7 MB bound and cannot hide in it.
+            const long poolAndJitAllowance = 6L * 1024 * 1024;
+
+            Assert.True(held <= entries * MetricsOptions.ExemplarBytes + poolAndJitAllowance,
+                $"an exemplar retains {perEntry:N0} B against a budget divisor of "
+              + $"{MetricsOptions.ExemplarBytes} B — every derived ring is deeper than its budget");
+
+            // And not wildly pessimistic either: a divisor far above the truth wastes the ring
+            // depth the Explore panel actually reads.
+            Assert.True(held >= entries * MetricsOptions.ExemplarBytes * 3 / 4,
+                $"an exemplar retains {perEntry:N0} B against a divisor of {MetricsOptions.ExemplarBytes} B");
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    /// <summary>
+    /// Its own frame, and never inlined: in Debug a local stays rooted to the end of the method
+    /// that declares it, so a batch built in the caller would still be alive at the measurement
+    /// and the exemplars' input objects would be weighed alongside the rings they were copied
+    /// into.
+    /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static void FillRings(MetricStorageEngine engine, int rings, int depth)
+    {
+        long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+        var  labels   = new LabelSet(new Dictionary<string, string> { ["service.name"] = "checkout" });
+
+        for (int r = 0; r < rings; r++)
+        {
+            var exemplars = new MetricExemplar[depth];
+            for (int e = 0; e < depth; e++)
+            {
+                long id = r * (long)depth + e;
+                exemplars[e] = new MetricExemplar
+                {
+                    TimestampUnixNano = baseNano + e * 1_000_000L,
+                    Value             = e,
+                    TraceId           = id.ToString("x32"),   // 32 hex chars, as Hex() produces
+                    SpanId            = id.ToString("x16"),   // 16 hex chars
+                };
+            }
+
+            engine.Ingest([new MetricIngestItem
+            {
+                Name              = "exemplar.metric." + r,
+                Kind              = MetricKind.Gauge,
+                Labels            = labels,
+                TimestampUnixNano = baseNano,
+                ScalarValue       = r,
+                Exemplars         = exemplars,
+            }]);
+        }
+    }
+
     private static MetricIngestItem Point(string series, long nano, double value = 1.0) => new()
     {
         Name              = "hot.sweep.metric",

@@ -421,14 +421,19 @@ public sealed class TracesOptions
 /// <c>MaxTrackedSeries = 50_000</c>, <c>MaxLabelValuesPerKey = 2_000</c> and the log's 8 MB
 /// initial capacity were the same number on a 512 MB container and a 64 GB host, and nothing in
 /// the metrics module consulted <see cref="MemoryBudgets"/> at all. Worst case at those defaults
-/// is 20 MB of gauge points or <b>84 MB of histogram points</b> before a flush, plus 480 KB of
-/// exemplars per metric NAME with no cap on the number of names — inside a GC heap hard limit of
-/// 384 MB, next to a 48 MB index cache and a 16 MB log tier.</para>
+/// is 20 MB of gauge points or <b>84 MB of histogram points</b> before a flush, plus 832 KB of
+/// exemplars per metric NAME (4 000 x <see cref="MetricsOptions.ExemplarBytes"/>) with no cap on
+/// the number of names — inside a GC heap hard limit of 384 MB, next to a 48 MB index cache and a
+/// 16 MB log tier.</para>
 ///
-/// <para><b>A host large enough for the caps behaves exactly as it did.</b> Every derived default
-/// below is <c>min(what it has always been, a share of what this process may use)</c>, and
-/// <see cref="MemoryBudgets.MetricHotTierCapBytes"/> is today's 500 000-point threshold restated
-/// in bytes. So the flush cadence changes on a constrained host and nowhere else.</para>
+/// <para><b>A host large enough for the caps behaves exactly as it did</b> — with one deliberate
+/// exception. Every derived default below is <c>min(what it has always been, a share of what this
+/// process may use)</c>, and <see cref="MemoryBudgets.MetricHotTierCapBytes"/> is today's
+/// 500 000-point threshold restated in bytes. So the flush cadence changes on a constrained host
+/// and nowhere else. <see cref="ExemplarsPerMetric"/> is the exception: 4 000 slots could only
+/// ever be a default while nothing bounded the number of rings, and 4 000 x
+/// <see cref="MaxExemplarMetrics"/> x <see cref="ExemplarBytes"/> is 213 MB of retained memory
+/// that no tier accounting and no <c>Shed()</c> can reach. It derives on every host.</para>
 ///
 /// <para><b>Points are not the unit.</b> A 16-bucket histogram point carries its own
 /// <c>long[]</c> and weighs 4.3x a scalar point, so a point count cannot bound memory. The tier
@@ -479,8 +484,18 @@ public sealed class MetricsOptions
 
     /// <summary>
     /// Exemplars kept per metric name, for metric-to-trace jumps. Unset: derived so that
-    /// <see cref="MaxExemplarMetrics"/> full rings fit in half the hot-tier budget, capped at the
-    /// 4 000 this has always been.
+    /// <see cref="MaxExemplarMetrics"/> full rings fit in half the hot-tier budget, clamped to
+    /// [64, 4 000].
+    ///
+    /// <para><b>The derivation spends against the ceiling the engine enforces, and that is the
+    /// whole point.</b> It used to divide by a private "this many names actually carry exemplars"
+    /// assumption of 32 while <see cref="MaxExemplarMetrics"/> let 256 rings exist — so the bound
+    /// in the sentence above was false by 8x, and by 13x once the real per-entry cost was counted.
+    /// A ring is never pruned, never aged out, invisible to the tier's byte accounting and out of
+    /// reach of <c>Shed()</c>, so <see cref="MaxExemplarMetrics"/> x this x
+    /// <see cref="ExemplarBytes"/> is memory retained for the life of the process. If a
+    /// deployment wants deeper rings, it lowers <see cref="MaxExemplarMetrics"/> — the product is
+    /// the budget, and the two knobs trade against each other inside it.</para>
     /// </summary>
     public int? ExemplarsPerMetric { get; init; }
 
@@ -489,6 +504,10 @@ public sealed class MetricsOptions
     /// ring is allocated at full capacity the first time a name carries an exemplar, so an
     /// instrumentation change could add rings until the heap ran out. Past this, exemplars for
     /// further names are dropped — a correlation hint, never data. Default: 256.
+    ///
+    /// <para>This is the divisor <see cref="ExemplarsPerMetricFor"/> spends the exemplar budget
+    /// against, so raising it makes every ring proportionally shallower rather than claiming more
+    /// memory, and lowering it makes them deeper.</para>
     /// </summary>
     public int MaxExemplarMetrics { get; init; } = 256;
 
@@ -501,11 +520,19 @@ public sealed class MetricsOptions
     /// <summary>One scalar point's cost in the tier. See <c>MetricStorageEngine.HotPointBytes</c>.</summary>
     private const int ScalarPointBytes = 64;
 
-    /// <summary>What one exemplar costs: the ring slot plus its trace and span id strings.</summary>
-    private const int ExemplarBytes = 120;
-
-    /// <summary>The exemplar budget assumes this many names actually carry exemplars.</summary>
-    private const int ExemplarActiveMetrics = 32;
+    /// <summary>
+    /// What ONE exemplar costs once it is in a ring, retained: the 8-byte slot in the ring array,
+    /// the 56-byte <c>ExemplarSample</c> it points at (a sealed class — 16 B header, a
+    /// <c>long</c>, a <c>double</c> and three references), and the two id strings the OTLP parser
+    /// hex-encodes fresh for every exemplar and the sample then holds alive — 88 B for a 32-char
+    /// trace id and 56 B for a 16-char span id. <c>ExemplarSample.Labels</c> is the ingest item's
+    /// own <c>LabelSet</c> and is not counted here: it is shared with the point.
+    ///
+    /// <para>This was 120 — the slot and the two ids with the sample itself forgotten, 1.7x low
+    /// on a figure the ring budget divides by. <c>MetricHotTierRetentionProbe</c> now fills rings
+    /// and weighs the heap rather than taking anyone's word for it.</para>
+    /// </summary>
+    public const int ExemplarBytes = 208;
 
     private const int  MaxExemplarsPerMetricCap = 4_000;
     private const int  MinExemplarsPerMetric    =    64;
@@ -549,7 +576,11 @@ public sealed class MetricsOptions
     {
         if (ExemplarsPerMetric is { } explicitCount && explicitCount > 0) return explicitCount;
 
-        long perRing = HotTierBytesFor(in budgets) / 2 / (ExemplarBytes * ExemplarActiveMetrics);
+        // MaxExemplarMetrics, not a smaller "actually active" guess: the divisor has to be the
+        // number of rings the engine will let exist, or the budget bounds nothing. long, because
+        // at a raised cap the product overflows int before the clamp gets a chance.
+        long rings   = Math.Max(1, MaxExemplarMetrics);
+        long perRing = HotTierBytesFor(in budgets) / 2 / (ExemplarBytes * rings);
         return (int)Math.Clamp(perRing, MinExemplarsPerMetric, MaxExemplarsPerMetricCap);
     }
 }
