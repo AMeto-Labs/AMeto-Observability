@@ -86,8 +86,9 @@ public sealed class TraceHotTierProbe : IDisposable
     /// on the first page after every flush, i.e. twice a second at 100 k spans/s.</para>
     ///
     /// <para>ALLOCATED IS THE ASSERTION, retained is printed beside it. Every byte of the
-    /// allocation is spent while the read lock is held, the counter behind it is exact, and this
-    /// assembly runs its tests sequentially — so the figure reads the same in every context.
+    /// allocation is spent while the read lock is held, and it is counted PER THREAD — the
+    /// process-wide counter carries xUnit's own output drain, measured at 6 288 B per printed line
+    /// on a thread of its own, and this class prints twenty-odd lines before this test runs.
     /// Reverting <c>MergeSpanInto</c> to <c>GetAttr(s.Attributes, …)</c> fails it at 2 023 B per
     /// root span against 623. The retained figure says the same thing louder (1 888 against 498)
     /// but cannot be gated here; the comment on it says why.</para>
@@ -141,12 +142,27 @@ public sealed class TraceHotTierProbe : IDisposable
         // tier compacted once and then measured after a NON-compacting collect reports its own
         // fragmentation as the page's retention, which is most of a megabyte of nothing.
         long liveBefore  = LiveBytes();
-        long allocBefore = GC.GetTotalAllocatedBytes(precise: true);
+
+        // THIS THREAD'S BYTES, NOT THE PROCESS'S, for the reason measured in TraceQlScanProbe:
+        // GC.GetTotalAllocatedBytes counts every thread, and the thread that pollutes it here is
+        // xUnit's own — it drains each ITestOutputHelper.WriteLine on a thread of its own at
+        // 6 288 B a line, and this class prints twenty-odd lines before this test runs. A window
+        // with no queued output behind it reads 40 B of other-thread allocation; one that follows
+        // a backlog of 22 lines measured 148 240 B, which over 2 000 root spans is 74 B/root span
+        // of pure reporting noise on a gate whose whole signal is 623 against 2 023.
+        //
+        // Per thread the page reads the same value to the byte over twelve consecutive runs, and
+        // the same value again with DOTNET_PROCESSOR_COUNT=2. The thread-identity checks below are
+        // what make that claim checkable: this tier is hot-only, so GetTraceListAsync never reaches
+        // its `await foreach` over cold segments and the whole page runs on this thread.
+        int  callerThread = Environment.CurrentManagedThreadId;
+        long allocBefore  = GC.GetAllocatedBytesForCurrentThread();
 
         var sw   = Stopwatch.StartNew();
         var page = await engine.GetTraceListAsync(from, to, null, null, null, null, null, 100);
         sw.Stop();
-        long allocated = GC.GetTotalAllocatedBytes(precise: true) - allocBefore;
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - allocBefore;
+        bool sameThread1 = callerThread == Environment.CurrentManagedThreadId;
 
         // A SECOND PAGE OVER THE SAME TIER, because the two paths differ in kind and not only in
         // size. The dictionary is MEMOISED on the record, so the decode is paid on the first page
@@ -154,11 +170,13 @@ public sealed class TraceHotTierProbe : IDisposable
         // per page and retains nothing. An SSE client pages this tier twice a second, so both
         // columns belong in the report.
         var  page2  = await engine.GetTraceListAsync(from, to, null, null, null, null, null, 100);
-        long alloc2 = GC.GetTotalAllocatedBytes(precise: true);
-        var  sw2    = Stopwatch.StartNew();
+        int  thread2 = Environment.CurrentManagedThreadId;
+        long alloc2  = GC.GetAllocatedBytesForCurrentThread();
+        var  sw2     = Stopwatch.StartNew();
         page2 = await engine.GetTraceListAsync(from, to, null, null, null, null, null, 100);
         sw2.Stop();
-        long allocated2 = GC.GetTotalAllocatedBytes(precise: true) - alloc2;
+        long allocated2  = GC.GetAllocatedBytesForCurrentThread() - alloc2;
+        bool sameThread2 = thread2 == Environment.CurrentManagedThreadId;
 
         // The parity check runs on the rows, but AFTER the numbers are taken and BEFORE they are
         // printed is the wrong order for a probe: a failing parity assert would hide the figures
@@ -199,6 +217,11 @@ public sealed class TraceHotTierProbe : IDisposable
         // (the page's own MergedTrace, service set and summary rows — the floor), 623 B for the
         // blob scan, 2 023 B when MergeSpanInto reaches the same two keys through
         // SpanRecord.Attributes. The decoded map is all of the difference.
+        Assert.True(sameThread1 && sameThread2,
+            "a trace-list page resumed on another thread, so the per-thread allocation figures are "
+            + "only part of what it cost — this tier is hot-only and the page is supposed to "
+            + "complete synchronously; measure it differently rather than trusting these numbers");
+
         Assert.True(allocated / Roots < 1_000,
             $"a trace-list page allocated {allocated / Roots:N0} B per root span — MergeSpanInto is "
             + "decoding whole attribute maps under the engine read lock again");
@@ -215,8 +238,8 @@ public sealed class TraceHotTierProbe : IDisposable
         //
         // The figures, taken alone: attribute-less tier 392, blob scan 498, decode 1 888 — at the
         // 50 000-span threshold, 2,4 MB against 9,0 MB per flush cycle. The gate above is the
-        // allocation, which is an exact per-process counter over a suite that runs sequentially
-        // (AssemblyInfo.cs disables test parallelisation) and reads 623 in every context measured.
+        // allocation, counted per thread, which carries no other thread's work at all and reads
+        // the same value to the byte in every context measured.
         _out.WriteLine($"  (retained is printed, not gated — see the comment: it carries the live "
                      + $"set of whatever ran before this test)");
     }

@@ -208,13 +208,28 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
         _ = await TraceQLExecutor.ExecuteAsync(engine, pred, from, to, Rows, CancellationToken.None);
         _ = await TraceQLExecutor.ExecuteAsync(engine, pred, from, to, Rows, CancellationToken.None);
 
-        // THIS THREAD'S BYTES, NOT THE PROCESS'S. GC.GetTotalAllocatedBytes counts every thread,
-        // and xUnit runs test collections in parallel — measured, the same page reads 1 018 368 B
-        // run alone and 1 089 328 or 1 192 256 B run beside its own class, a spread of ~175 B a row
-        // that would bury the 88 B this test exists for. GetAllocatedBytesForCurrentThread is
-        // immune to it, and the thread-identity check below is what makes that claim checkable:
-        // the whole page completes synchronously over a hot tier, and if it ever stops doing so
-        // the test says so instead of quietly measuring a fraction of the work.
+        // THIS THREAD'S BYTES, NOT THE PROCESS'S — and the source of the spread that forces it is
+        // THIS PROBE'S OWN PRINTING, not a parallel suite. AssemblyInfo.cs:17 disables test
+        // parallelisation, so no other class is allocating here at all; what lands in a
+        // process-wide reading is ITestOutputHelper.WriteLine. xUnit queues each line and drains it
+        // on its own thread, and that drain is what the counter sees. Measured: a window with no
+        // WriteLine before it carries 40 B of other-thread allocation (the Stopwatch, on this
+        // thread); every window that follows one WriteLine carries 6 288 B, and identically so for
+        // a 0,1 ms window and a 32 ms one — it is per line, not per millisecond. A backlog of 22
+        // queued lines drained into a single 1 ms idle window measured 148 240 B. Two consecutive
+        // precise readings with nothing between them differ by 0, so the counter itself is exact.
+        //
+        // That IS the ~175 B/row spread: 1 192 256 − 1 018 368 = 173 888 B ≈ 27 lines of this
+        // class's own output landing inside the measured page, and 1 089 328 − 1 018 368 = 70 960
+        // ≈ 11 of them. The engine is not the source — the same 6 288 B appears in an idle window
+        // with an engine alive and no query running, and with no engine at all.
+        //
+        // GC.GetAllocatedBytesForCurrentThread cannot see any of it: the drain is another thread.
+        // Over twelve consecutive pages it reads the SAME value to the byte — 1 018 368 B Release,
+        // 1 018 976 B Debug — run alone, run inside the whole suite, and with
+        // DOTNET_PROCESSOR_COUNT=2. The thread-identity check below is what makes that claim
+        // checkable: the whole page completes synchronously over a hot tier, and if it ever stops
+        // doing so the test says so instead of quietly measuring a fraction of the work.
         int  thread    = Environment.CurrentManagedThreadId;
         long before    = GC.GetAllocatedBytesForCurrentThread();
         var  page      = await TraceQLExecutor.ExecuteAsync(engine, pred, from, to, Rows, CancellationToken.None);
