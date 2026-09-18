@@ -1,3 +1,4 @@
+using Ameto.Core;
 using Ameto.Metrics;
 using Ameto.Metrics.Storage;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -29,9 +30,20 @@ public sealed class MetricHotTierRetentionProbe
     private readonly ITestOutputHelper _out;
     public MetricHotTierRetentionProbe(ITestOutputHelper o) => _out = o;
 
-    private const int SeriesCount     = 2_000;
-    private const int PointsPerSeries = 200;   // 400 000 points: deliberately under the automatic threshold
-    private const int ChunkPoints     = 10_000;   // one OTLP export's worth
+    private const int SeriesCount = 2_000;
+    private const int ChunkPoints = 10_000;   // one OTLP export's worth
+
+    /// <summary>
+    /// Three quarters of whatever the tier's byte budget is on THIS host, so the burst is the
+    /// largest one that provably does not trip the engine's own threshold. A fixed count cannot
+    /// do that: the budget is a share of the managed-heap limit, so the same 400 000 points sit
+    /// comfortably inside it on a developer box and flush themselves half way through under
+    /// <c>DOTNET_GCHeapHardLimit=0x18000000</c> — and a burst that flushed itself is measured as
+    /// whatever was left when the drain got there.
+    /// </summary>
+    private static readonly int PointsPerSeries = (int)Math.Clamp(
+        new MetricsOptions().EffectiveHotTierBytes * 3 / 4 / (SeriesCount * (long)MetricStorageEngine.HotPointBytes),
+        20, 400);
 
     [Fact]
     public async Task RetainedByAnEmptyTier_IsAFractionOfThePeak()
@@ -51,13 +63,13 @@ public sealed class MetricHotTierRetentionProbe
                 // THE BURST MUST STILL BE IN THE TIER. Above the automatic threshold Ingest
                 // schedules its own flush, which drains an unpredictable share of the burst
                 // before this line runs — and the probe then reports the remainder as the cost
-                // of the whole burst. Seen as 7 MB for 600 000 points on one run and 28 MB on
+                // of the whole burst. Seen as 7 MB for the burst on one run and 28 MB on
                 // the next, entirely according to how far that flush had got.
                 Assert.Equal(SeriesCount * PointsPerSeries, engine.HotPointCount);
                 loaded = Live();
 
-                // The real threshold needs 500 000 points; the seam takes the same path with
-                // the burst this probe can afford to build.
+                // The seam takes the same path the byte threshold does, with the burst this
+                // probe can afford to build.
                 await engine.ScheduleThresholdFlushForTest();
                 Assert.Equal(0, engine.HotPointCount);
 
@@ -90,8 +102,30 @@ public sealed class MetricHotTierRetentionProbe
         _out.WriteLine($"  heap AFTER the flush drain : {drained / 1048576.0,7:N1} MB  (+{(drained - empty) / 1048576.0:N1} still held) = {(drained - empty) / (double)SeriesCount,6:N0} B/series");
         _out.WriteLine($"  heap steady state          : {steady  / 1048576.0,7:N1} MB");
         _out.WriteLine($"  survived the drain         : {100.0 * (drained - empty) / (loaded - empty),6:N1} %");
+        _out.WriteLine($"  released by the drain      : {(loaded - drained) / 1048576.0,7:N1} MB against {points * 40L / 1048576.0:N1} MB of point structs");
 
-        Assert.True(drained - empty < (loaded - empty) / 4,
+        // THE FLOOR-FREE HALF, and the sharper of the two. A drain must hand back at least the
+        // points it drained — 40 B a MetricDataPoint, before the list slack that is the actual
+        // subject here. It needs no baseline at all, so nothing another test class left behind
+        // can move it: with the arrays retained the heap after the drain was HIGHER than with the
+        // burst in it (measured: -1.4 MB "released"), because the snapshot's copy and the
+        // series' own array were live at once and only the copy went away.
+        Assert.True(loaded - drained > points * 32L,
+            $"the drain released {(loaded - drained) / 1048576.0:N1} MB of a {points * 40L / 1048576.0:N1} MB "
+          + "burst — the series are still holding their point arrays");
+
+        // The round's bound: what an empty tier still holds must be under a quarter of the peak.
+        //
+        // Read against a floor, so it carries what a floor carries. A flush leaves rented buffers
+        // in ArrayPool.Shared, LZ4 and msgpack scratch, and newly JIT'd code — measured at 1.4 to
+        // 3.8 MB, none of it tier memory, all of it inside this figure. That is a FIXED cost, so
+        // it is allowed for as one: without the allowance the same healthy engine reads 12 % with
+        // a 21 MB budget and 27 % with the 11 MB budget a 384 MB heap limit derives, purely
+        // because the burst it is compared against got smaller. Additive and named, so it cannot
+        // absorb a proportional regression: before the change this figure was 22.4 MB against an
+        // allowance-inclusive bound of 9.3 MB.
+        const long poolAndJitAllowance = 4L * 1024 * 1024;
+        Assert.True(drained - empty < (loaded - empty) / 4 + poolAndJitAllowance,
             $"an empty hot tier still holds {(drained - empty) / (double)SeriesCount:N0} B per series — "
           + $"{100.0 * (drained - empty) / (loaded - empty):N1} % of the burst's heap survived the drain");
     }
@@ -110,7 +144,7 @@ public sealed class MetricHotTierRetentionProbe
         var clock = new MetricTestClock();
         try
         {
-            await using var engine = new MetricStorageEngine(dir, NullLogger<MetricStorageEngine>.Instance, clock);
+            await using var engine = new MetricStorageEngine(dir, NullLogger<MetricStorageEngine>.Instance, timeProvider: clock);
             long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
 
             engine.Ingest([Point("quiet", baseNano), Point("chatty", baseNano)]);
@@ -185,8 +219,10 @@ public sealed class MetricHotTierRetentionProbe
         ScalarValue       = value,
     };
 
-    private static void Feed(MetricStorageEngine engine, long baseNano, int pointsPerSeries = PointsPerSeries)
+    private static void Feed(MetricStorageEngine engine, long baseNano, int pointsPerSeries = 0)
     {
+        if (pointsPerSeries <= 0) pointsPerSeries = PointsPerSeries;
+
         var chunk = new List<MetricIngestItem>(ChunkPoints);
         for (int p = 0; p < pointsPerSeries; p++)
         {

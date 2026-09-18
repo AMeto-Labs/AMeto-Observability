@@ -16,8 +16,9 @@ namespace Ameto.Metrics.Storage;
 /// </para>
 ///
 /// <para>
-/// Flush policy: every <see cref="FlushIntervalSeconds"/> seconds (default 60 s)
-/// <em>or</em> when the hot-tier point count exceeds <see cref="HotFlushThreshold"/>.
+/// Flush policy: every <c>MetricsOptions.FlushCheckInterval</c> (default 60 s)
+/// <em>or</em> when the hot tier passes <c>MetricsOptions.HotTierBytes</c> — BYTES, because a
+/// 16-bucket histogram point is 4.3x a scalar one and a point count cannot bound memory.
 /// Flushed data is written as a <c>.mts</c> LZ4+msgpack file (see <see cref="MetricWriter"/>).
 /// </para>
 ///
@@ -30,20 +31,49 @@ namespace Ameto.Metrics.Storage;
 public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetricCatalog, IMetricExemplars, IRetentionTarget, IMemoryShedder, IAsyncDisposable
 {
     // ── Configuration ─────────────────────────────────────────────────────────
-    private const int HotFlushThreshold    = 500_000;   // total points before forced flush
-    // Durability belongs to the WAL now, so this is a CHECK interval, not a flush interval:
-    // a tick decides whether the tier has earned its files. It used to be a flush interval,
-    // sized at 60 s purely to bound crash loss to about a minute — and since a flush writes
-    // one .mts PER METRIC NAME, a 40-instrument deployment paid 40 files a minute for that.
-    private const int FlushCheckIntervalSeconds = 60;
-    private const int MaxLabelValuesPerKey  = 2_000;      // cap to bound catalog memory
+    //
+    // EVERY CEILING BELOW USED TO BE A LITERAL, identical on a 512 MB container and a 64 GB
+    // host, and nothing in this module consulted MemoryBudgets at all. They are now read from
+    // MetricsOptions, whose defaults are min(what they have always been, a share of what this
+    // process may use) — so a host large enough for the caps flushes on exactly the cadence it
+    // always did, and a 512 MB one gets a tier it can hold. See MetricsOptions.
 
-    // ── Flush policy ──────────────────────────────────────────────────────────
-    // Below the minimum the tier keeps accumulating: the points are already durable, and a
-    // file per metric name is not worth writing for a handful of them. The age bound still
-    // lands a trickle on disk so it becomes eligible for rollup and retention — one hour
-    // matches the rollup's own first cutoff, so nothing waits longer because of this.
-    private const int MinFlushPoints = 50_000;
+    private readonly MetricsOptions _options;
+
+    /// <summary>
+    /// BYTES, not points, before a flush is forced — see <see cref="EstimatedPointBytes"/>. The
+    /// default is 500 000 scalar points restated in bytes, which is what the threshold has always
+    /// been; a 16-bucket histogram point is 4.3x a scalar one and now costs 4.3x of it.
+    /// </summary>
+    private readonly long _hotFlushBytes;
+
+    /// <summary>
+    /// The bar a PERIODIC tick clears to write files at all. Below it the tier keeps
+    /// accumulating: the points are already durable in the log, and a file per metric name is not
+    /// worth writing for a handful of them. The age bound still lands a trickle on disk so it
+    /// becomes eligible for rollup and retention.
+    /// </summary>
+    private readonly long _minFlushBytes;
+
+    /// <summary>
+    /// How often a tick asks whether the tier has earned its files. A CHECK interval and not a
+    /// flush interval — durability belongs to the log. It used to be a flush interval, sized at
+    /// 60 s purely to bound crash loss to about a minute, and since a flush writes one .mts PER
+    /// METRIC NAME a 40-instrument deployment paid 40 files a minute for that.
+    /// </summary>
+    private readonly TimeSpan _flushCheckInterval;
+
+    /// <summary>
+    /// How long the tier may hold points before a flush is due whatever its size. One hour
+    /// matches the rollup's own first cutoff, so nothing waits longer because of this.
+    /// </summary>
+    private readonly TimeSpan _maxHotAge;
+
+    /// <summary>Distinct values remembered per label key, per metric — bounds catalog memory.</summary>
+    private readonly int _maxLabelValuesPerKey;
+
+    /// <summary>Distinct label-set hashes counted per metric before cardinality stops rising.</summary>
+    private readonly int _maxTrackedSeriesPerMetric;
 
     /// <summary>
     /// How far into the future a point's client-supplied timestamp may reach before it is
@@ -68,7 +98,6 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     /// </summary>
     private static long FutureLimitNanos()
         => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L + MaxFutureSkewNanos;
-    private static readonly TimeSpan MaxHotAge = TimeSpan.FromHours(1);
 
     /// <summary>When the hot tier last went from empty to holding points. Null = empty.</summary>
     private DateTime? _hotSince;
@@ -227,9 +256,21 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         new(StringComparer.Ordinal);
 
     // ── Exemplars (recent, in-memory ring per metric — for metric→trace jumps) ──
-    private const int ExemplarsPerMetric = 4_000;
+    //
+    // TWO ceilings, where there used to be one. A ring is allocated at FULL capacity the first
+    // time a name carries an exemplar — 4 000 slots is ~480 KB with the trace and span id
+    // strings — and nothing bounded the number of NAMES, so an instrumentation change could add
+    // rings until the heap ran out. An exemplar is a correlation hint, never data: past the cap
+    // they are dropped and the metric is unaffected.
+    private readonly int _exemplarsPerMetric;
+    private readonly int _maxExemplarMetrics;
     private readonly ConcurrentDictionary<string, ExemplarRing> _exemplars =
         new(StringComparer.Ordinal);
+
+    /// <summary>Test hook: exemplars refused because the ring cap was reached.</summary>
+    internal long ExemplarMetricsRefused => Volatile.Read(ref _exemplarMetricsRefused);
+
+    private long _exemplarMetricsRefused;
 
     // ── Cold tier ─────────────────────────────────────────────────────────────
     private readonly List<MetricSegmentInfo>      _coldSegments = new();
@@ -292,24 +333,42 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     private int _ingestClosed;
 
     public MetricStorageEngine(string dataDir, ILogger<MetricStorageEngine> logger,
-                               TimeProvider? timeProvider = null)
+                               MetricsOptions? options = null, TimeProvider? timeProvider = null)
     {
         _dataDir = dataDir;
         _logger  = logger;
         _time    = timeProvider ?? TimeProvider.System;
+        _options = options ?? new MetricsOptions();
         Directory.CreateDirectory(dataDir);
+
+        // ONE MemoryBudgets.Current() for the whole engine: it allocates (the GC's configuration
+        // dictionary) and the figures cannot change while the process runs, so reading it per
+        // derived cap would be five dictionaries for five identical answers.
+        var budgets                = MemoryBudgets.Current();
+        _hotFlushBytes             = Math.Max(HotPointBytes, _options.HotTierBytesFor(in budgets));
+        _minFlushBytes             = Math.Min(_hotFlushBytes, _options.MinFlushBytesFor(in budgets));
+        _flushCheckInterval        = _options.FlushCheckInterval > TimeSpan.Zero
+                                        ? _options.FlushCheckInterval : TimeSpan.FromSeconds(60);
+        _maxHotAge                 = _options.MaxHotAge > TimeSpan.Zero
+                                        ? _options.MaxHotAge : TimeSpan.FromHours(1);
+        _staleSeriesAge            = TimeSpan.FromTicks(_maxHotAge.Ticks * 2);
+        _maxLabelValuesPerKey      = Math.Max(1, _options.MaxLabelValuesPerKey);
+        _maxTrackedSeriesPerMetric = Math.Max(1, _options.MaxTrackedSeriesPerMetric);
+        _exemplarsPerMetric        = _options.ExemplarsPerMetricFor(in budgets);
+        _maxExemplarMetrics        = Math.Max(1, _options.MaxExemplarMetrics);
 
         // The WAL, unlike cold-segment discovery, must be open and replayed before the first
         // point is accepted, or a restart would interleave recovered and live data. Replay is
         // a sequential walk of one mmap'd file bounded by the flush thresholds.
-        _wal = MetricWriteAheadLog.Open(Path.Combine(dataDir, "metrics.wal"), logger: logger);
+        _wal = MetricWriteAheadLog.Open(Path.Combine(dataDir, "metrics.wal"),
+                                        _options.WalInitialBytesFor(in budgets), logger);
         RecoverFromWal();
 
         // Leftover builds from a flush or rollup killed between the write and the rename. HERE,
         // and not beside the cold scan that it was written next to: that scan runs in the flush
         // loop, in the background, while ingest is already being accepted, and a wildcard delete
         // over *.mts.tmp in a directory with live writers unlinks whatever a flush crossing
-        // HotFlushThreshold has open at that moment. On Linux the unlink succeeds under the open
+        // the flush threshold has open at that moment. On Linux the unlink succeeds under the open
         // handle — the writer goes on filling an inode with no name, then FileInfo(tmpPath) or
         // the rename throws — and the flush treats a healthy write as a failed one: the whole
         // snapshot back into the hot tier, the generation abandoned, "Failed to flush metric hot
@@ -426,7 +485,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
     public int Ingest(ReadOnlySpan<MetricIngestItem> items)
     {
-        int total = 0;
+        long hotBytes = 0;
 
         long futureLimit   = FutureLimitNanos();
         int  droppedFuture = 0;
@@ -464,7 +523,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                 };
 
                 _wal.Append(item, in point);
-                total = ApplyToHotTier(item, in point);
+                hotBytes = ApplyToHotTier(item, in point);
             }
         }
         finally { _snapshotLock.ExitReadLock(); }
@@ -479,7 +538,18 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
             // exemplar would sort to the TOP of every answer until the ring rotates it out.
             if (item.TimestampUnixNano > futureLimit) continue;
             if (item.Exemplars is not { Length: > 0 } exs) continue;
-            var ring = _exemplars.GetOrAdd(item.Name, static _ => new ExemplarRing(ExemplarsPerMetric));
+            // The ring cap is checked before GetOrAdd creates one: past it a NEW name is refused,
+            // while names that already have a ring keep working. GetOrAdd's factory can run more
+            // than once under contention, so the count is the gate, not the allocation.
+            if (!_exemplars.TryGetValue(item.Name, out var ring))
+            {
+                if (_exemplars.Count >= _maxExemplarMetrics)
+                {
+                    Interlocked.Increment(ref _exemplarMetricsRefused);
+                    continue;
+                }
+                ring = _exemplars.GetOrAdd(item.Name, static (_, s) => new ExemplarRing(s), _exemplarsPerMetric);
+            }
             foreach (var ex in exs)
             {
                 // The exemplar's OWN clock, not the point's: OTLP parses time_unix_nano per
@@ -498,7 +568,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
             }
         }
 
-        if (total >= HotFlushThreshold
+        if (hotBytes >= _hotFlushBytes
             && System.Threading.Interlocked.CompareExchange(ref _thresholdFlushScheduled, 1, 0) == 0)
         {
             // Discarded, necessarily — an ingest call cannot wait on a flush. What the flush
@@ -563,7 +633,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
     /// <summary>
     /// Test hook: schedules a threshold flush exactly as crossing
-    /// <see cref="HotFlushThreshold"/> does, without the 500k points needed to cross it.
+    /// the byte threshold does, without the points needed to cross it.
     /// </summary>
     internal Task ScheduleThresholdFlushForTest() => ScheduleThresholdFlush();
 
@@ -598,11 +668,12 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     }
 
     /// <summary>
-    /// Files one point into its series and the metadata catalog, returning the new hot-tier
-    /// point count. Shared by live ingest and WAL replay — replay must not write back into
-    /// the log it is reading from, and must not trigger a flush from the constructor.
+    /// Files one point into its series and the metadata catalog, returning the hot tier's new
+    /// size IN BYTES — the figure the flush threshold is spent in. Shared by live ingest and WAL
+    /// replay: replay must not write back into the log it is reading from, and must not trigger
+    /// a flush from the constructor.
     /// </summary>
-    private int ApplyToHotTier(MetricIngestItem item, in MetricDataPoint point)
+    private long ApplyToHotTier(MetricIngestItem item, in MetricDataPoint point)
     {
         var key    = new SeriesKey(item.Name, item.Kind, item.Unit, item.Labels);
         var series = _hot.GetOrAdd(key, static _ => new HotSeries());
@@ -610,10 +681,10 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         series.Append(point, item.BucketBounds, _time.GetUtcNow().UtcTicks);
         UpdateMeta(item);
 
-        System.Threading.Interlocked.Add(ref _hotPointBytes, EstimatedPointBytes(in point));
-        int total = System.Threading.Interlocked.Increment(ref _hotPointCount);
+        long bytes = System.Threading.Interlocked.Add(ref _hotPointBytes, EstimatedPointBytes(in point));
+        int  total = System.Threading.Interlocked.Increment(ref _hotPointCount);
         if (total == 1) _hotSince = _time.GetUtcNow().UtcDateTime;   // tier went from empty to holding data
-        return total;
+        return bytes;
     }
 
     /// <summary>
@@ -641,7 +712,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
     private void UpdateMeta(MetricIngestItem item)
     {
-        var meta = _meta.GetOrAdd(item.Name, static _ => new MetricMeta());
+        var meta = _meta.GetOrAdd(item.Name, static (_, cap) => new MetricMeta(cap), _maxTrackedSeriesPerMetric);
         meta.Kind = item.Kind;
         if (!string.IsNullOrEmpty(item.Unit)) meta.Unit = item.Unit;
 
@@ -655,7 +726,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
             // table, and this ran once per label per data point. In the steady state the
             // value is already known, so the cap only needs checking for a new one.
             if (values.ContainsKey(v)) continue;
-            if (values.Count < MaxLabelValuesPerKey) values.TryAdd(v, 0);
+            if (values.Count < _maxLabelValuesPerKey) values.TryAdd(v, 0);
         }
 
         meta.AddSeries(item.Labels.GetHashCode());
@@ -838,7 +909,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
         while (!ct.IsCancellationRequested)
         {
-            try { await Task.Delay(TimeSpan.FromSeconds(FlushCheckIntervalSeconds), ct); }
+            try { await Task.Delay(_flushCheckInterval, _time, ct); }
             catch (OperationCanceledException) { break; }
 
             // A tick that throws must cost one tick. Bare, this await made any escaping
@@ -867,8 +938,8 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         int points = Volatile.Read(ref _hotPointCount);
         if (points == 0) return;
 
-        bool due = points >= MinFlushPoints
-                || (_hotSince is { } since && _time.GetUtcNow().UtcDateTime - since >= MaxHotAge);
+        bool due = Volatile.Read(ref _hotPointBytes) >= _minFlushBytes
+                || (_hotSince is { } since && _time.GetUtcNow().UtcDateTime - since >= _maxHotAge);
         if (due) await FlushHotTierAsync().ConfigureAwait(false);
     }
 
@@ -956,7 +1027,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
                     // The stale sweep rides along with the drain: one pass over _hot, and the
                     // eviction happens where it is provably safe — see SweepStaleSeriesLocked.
-                    long staleBefore = _time.GetUtcNow().UtcTicks - StaleSeriesAge.Ticks;
+                    long staleBefore = _time.GetUtcNow().UtcTicks - _staleSeriesAge.Ticks;
                     List<SeriesKey>? stale = null;
 
                     foreach (var (k, v) in _hot)
@@ -1123,13 +1194,13 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
     /// <summary>
     /// How long a series may hold no points before the tier stops naming it. Twice
-    /// <see cref="MaxHotAge"/>, so a series is only evicted well after the flush that would
+    /// <c>MetricsOptions.MaxHotAge</c>, so a series is only evicted well after the flush that would
     /// have carried its points: a series still reporting at any cadence the tier is built for
     /// is never a candidate, and one that comes back is re-created for free — its cold data is
     /// untouched, and <c>_meta</c> (which the catalog and the names list are fed from) never
     /// forgets it at all.
     /// </summary>
-    private static readonly TimeSpan StaleSeriesAge = TimeSpan.FromTicks(MaxHotAge.Ticks * 2);
+    private readonly TimeSpan _staleSeriesAge;
 
     /// <summary>
     /// Drops the named series from the hot tier. <b>Call only under <c>_snapshotLock</c>'s WRITE
@@ -1156,7 +1227,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         if (evicted == 0) return;
         Interlocked.Add(ref _staleSeriesEvicted, evicted);
         _logger.LogDebug("Hot metric tier dropped {Count} series idle for over {Hours} h ({Named} still named)",
-            evicted, StaleSeriesAge.TotalHours, _hot.Count);
+            evicted, _staleSeriesAge.TotalHours, _hot.Count);
     }
 
     // ── IMemoryShedder ────────────────────────────────────────────────────────
@@ -1755,7 +1826,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
             {
                 foreach (var s in MetricReader.ReadAllSync(seg.FilePath))
                 {
-                    var meta = _meta.GetOrAdd(s.Name, static _ => new MetricMeta());
+                    var meta = _meta.GetOrAdd(s.Name, static (_, cap) => new MetricMeta(cap), _maxTrackedSeriesPerMetric);
                     meta.Kind = s.Kind;
                     if (!string.IsNullOrEmpty(s.Unit)) meta.Unit = s.Unit;
                     long lastMs = (s.Points.Count > 0 ? s.Points[^1].TimestampUnixNano : seg.MaxNano) / 1_000_000L;
@@ -1763,7 +1834,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                     foreach (var (k, v) in s.Labels.Pairs)
                     {
                         var values = meta.LabelValues.GetOrAdd(k, static _ => new ConcurrentDictionary<string, byte>(StringComparer.Ordinal));
-                        if (values.Count < MaxLabelValuesPerKey) values.TryAdd(v, 0);
+                        if (values.Count < _maxLabelValuesPerKey) values.TryAdd(v, 0);
                     }
                     meta.AddSeries(s.Labels.GetHashCode());
                     seeded++;
@@ -1963,7 +2034,15 @@ internal sealed class ExemplarRing
 /// </summary>
 internal sealed class MetricMeta
 {
-    private const int MaxTrackedSeries = 50_000;
+    /// <summary>
+    /// Distinct label-set hashes this metric counts before cardinality stops rising. From
+    /// <c>MetricsOptions.MaxTrackedSeriesPerMetric</c>, carried per instance because the engine
+    /// that owns the catalog is what was configured — a static would make one host's setting the
+    /// process's.
+    /// </summary>
+    private readonly int _maxTrackedSeries;
+
+    public MetricMeta(int maxTrackedSeries) => _maxTrackedSeries = maxTrackedSeries;
 
     public MetricKind Kind        { get; set; }
     public string     Unit        { get; set; } = string.Empty;
@@ -1989,7 +2068,7 @@ internal sealed class MetricMeta
     public void AddSeries(int labelSetHash)
     {
         if (_seriesHashes.ContainsKey(labelSetHash)) return;                   // hot path, no lock
-        if (Volatile.Read(ref _trackedCount) >= MaxTrackedSeries) return;
+        if (Volatile.Read(ref _trackedCount) >= _maxTrackedSeries) return;
         if (_seriesHashes.TryAdd(labelSetHash, 0))
             Interlocked.Increment(ref _trackedCount);
     }

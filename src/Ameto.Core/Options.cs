@@ -414,6 +414,147 @@ public sealed class TracesOptions
 }
 
 /// <summary>
+/// Metric storage sizing — every ceiling the metric engine used to spell as a literal.
+///
+/// <para><b>What was wrong with the literals.</b> <c>HotFlushThreshold = 500_000</c>,
+/// <c>MinFlushPoints = 50_000</c>, <c>ExemplarsPerMetric = 4_000</c>,
+/// <c>MaxTrackedSeries = 50_000</c>, <c>MaxLabelValuesPerKey = 2_000</c> and the log's 8 MB
+/// initial capacity were the same number on a 512 MB container and a 64 GB host, and nothing in
+/// the metrics module consulted <see cref="MemoryBudgets"/> at all. Worst case at those defaults
+/// is 20 MB of gauge points or <b>84 MB of histogram points</b> before a flush, plus 480 KB of
+/// exemplars per metric NAME with no cap on the number of names — inside a GC heap hard limit of
+/// 384 MB, next to a 48 MB index cache and a 16 MB log tier.</para>
+///
+/// <para><b>A host large enough for the caps behaves exactly as it did.</b> Every derived default
+/// below is <c>min(what it has always been, a share of what this process may use)</c>, and
+/// <see cref="MemoryBudgets.MetricHotTierCapBytes"/> is today's 500 000-point threshold restated
+/// in bytes. So the flush cadence changes on a constrained host and nowhere else.</para>
+///
+/// <para><b>Points are not the unit.</b> A 16-bucket histogram point carries its own
+/// <c>long[]</c> and weighs 4.3x a scalar point, so a point count cannot bound memory. The tier
+/// spends bytes; <c>MetricStorageEngine.EstimatedPointBytes</c> is what a point costs.</para>
+/// </summary>
+public sealed class MetricsOptions
+{
+    /// <summary>
+    /// Bytes the hot tier may hold before a flush is forced. Unset: a share of the managed-heap
+    /// limit, capped at <see cref="MemoryBudgets.MetricHotTierCapBytes"/>.
+    /// </summary>
+    public long? HotTierBytes { get; init; }
+
+    /// <summary>
+    /// The bar a PERIODIC tick has to clear to write files at all — below it the tier keeps
+    /// accumulating, because the points are already durable in the write-ahead log and a file per
+    /// metric name is not worth writing for a handful of them. Unset: a tenth of
+    /// <see cref="HotTierBytes"/>, which is exactly the old 50 000 points at the old threshold.
+    /// </summary>
+    public long? MinFlushBytes { get; init; }
+
+    /// <summary>
+    /// Initial capacity of <c>metrics.wal</c>. Unset: the hot-tier budget, <b>capped at the 8 MB
+    /// this has always been</b> — so it can only ever make the file smaller, on a host whose tier
+    /// budget is smaller than that.
+    ///
+    /// <para>Sizing it UP to the tier budget is the other half of the idea and is deliberately
+    /// not the default: it would save two unmap/remap cycles under the append lock on a busy
+    /// host, and leave every quiet install a 20-32 MB file at rest for the life of the
+    /// deployment, since the log never shrinks below the capacity it was opened with. The bound
+    /// that would make a pre-sized log a ceiling rather than a floor — a bounded growth increment
+    /// instead of doubling — belongs to the package that owns the log's locking. Set this
+    /// explicitly to pre-size.</para>
+    /// </summary>
+    public long? WalInitialBytes { get; init; }
+
+    /// <summary>
+    /// How long the tier may hold points before a flush becomes due regardless of size. Matches
+    /// the rollup's own first cutoff, so nothing waits longer because of this. Default: 1 h.
+    /// </summary>
+    public TimeSpan MaxHotAge { get; init; } = TimeSpan.FromHours(1);
+
+    /// <summary>
+    /// How often the flush loop asks whether the tier has earned its files. A CHECK interval, not
+    /// a flush interval — durability belongs to the log. Default: 60 s.
+    /// </summary>
+    public TimeSpan FlushCheckInterval { get; init; } = TimeSpan.FromSeconds(60);
+
+    /// <summary>
+    /// Exemplars kept per metric name, for metric-to-trace jumps. Unset: derived so that
+    /// <see cref="MaxExemplarMetrics"/> full rings fit in half the hot-tier budget, capped at the
+    /// 4 000 this has always been.
+    /// </summary>
+    public int? ExemplarsPerMetric { get; init; }
+
+    /// <summary>
+    /// How many metric names may own an exemplar ring. <b>New ceiling:</b> there was none, and a
+    /// ring is allocated at full capacity the first time a name carries an exemplar, so an
+    /// instrumentation change could add rings until the heap ran out. Past this, exemplars for
+    /// further names are dropped — a correlation hint, never data. Default: 256.
+    /// </summary>
+    public int MaxExemplarMetrics { get; init; } = 256;
+
+    /// <summary>Distinct values remembered per label key, per metric, for the Explore catalog.</summary>
+    public int MaxLabelValuesPerKey { get; init; } = 2_000;
+
+    /// <summary>Distinct label-set hashes counted per metric before cardinality stops rising.</summary>
+    public int MaxTrackedSeriesPerMetric { get; init; } = 50_000;
+
+    /// <summary>One scalar point's cost in the tier. See <c>MetricStorageEngine.HotPointBytes</c>.</summary>
+    private const int ScalarPointBytes = 64;
+
+    /// <summary>What one exemplar costs: the ring slot plus its trace and span id strings.</summary>
+    private const int ExemplarBytes = 120;
+
+    /// <summary>The exemplar budget assumes this many names actually carry exemplars.</summary>
+    private const int ExemplarActiveMetrics = 32;
+
+    private const int  MaxExemplarsPerMetricCap = 4_000;
+    private const int  MinExemplarsPerMetric    =    64;
+    private const long WalInitialCapBytes       = 8L * 1024 * 1024;
+    private const long MinWalInitialBytes       = 1L * 1024 * 1024;
+
+    /// <inheritdoc cref="HotTierBytes"/>
+    public long EffectiveHotTierBytes => HotTierBytesFor(MemoryBudgets.Current());
+
+    /// <summary>
+    /// The pure function behind <see cref="EffectiveHotTierBytes"/>, so the arithmetic can be
+    /// checked at 384 MB, 4 GB and 64 GB without a machine of each size — the shape
+    /// <see cref="MemoryBudgets.Derive(long, long)"/> already uses.
+    /// </summary>
+    public long HotTierBytesFor(in MemoryBudgets budgets) =>
+        HotTierBytes is { } explicitBytes && explicitBytes > 0 ? explicitBytes : budgets.MetricHotTierBytes;
+
+    /// <inheritdoc cref="MinFlushBytes"/>
+    public long EffectiveMinFlushBytes => MinFlushBytesFor(MemoryBudgets.Current());
+
+    /// <inheritdoc cref="MinFlushBytes"/>
+    public long MinFlushBytesFor(in MemoryBudgets budgets) =>
+        MinFlushBytes is { } explicitBytes && explicitBytes > 0
+            ? explicitBytes
+            : Math.Max(ScalarPointBytes, HotTierBytesFor(in budgets) / 10);
+
+    /// <inheritdoc cref="WalInitialBytes"/>
+    public long EffectiveWalInitialBytes => WalInitialBytesFor(MemoryBudgets.Current());
+
+    /// <inheritdoc cref="WalInitialBytes"/>
+    public long WalInitialBytesFor(in MemoryBudgets budgets) =>
+        WalInitialBytes is { } explicitBytes && explicitBytes > 0
+            ? explicitBytes
+            : Math.Clamp(HotTierBytesFor(in budgets), MinWalInitialBytes, WalInitialCapBytes);
+
+    /// <inheritdoc cref="ExemplarsPerMetric"/>
+    public int EffectiveExemplarsPerMetric => ExemplarsPerMetricFor(MemoryBudgets.Current());
+
+    /// <inheritdoc cref="ExemplarsPerMetric"/>
+    public int ExemplarsPerMetricFor(in MemoryBudgets budgets)
+    {
+        if (ExemplarsPerMetric is { } explicitCount && explicitCount > 0) return explicitCount;
+
+        long perRing = HotTierBytesFor(in budgets) / 2 / (ExemplarBytes * ExemplarActiveMetrics);
+        return (int)Math.Clamp(perRing, MinExemplarsPerMetric, MaxExemplarsPerMetricCap);
+    }
+}
+
+/// <summary>
 /// Top-level server configuration.
 /// </summary>
 public sealed class ServerOptions
@@ -429,6 +570,7 @@ public sealed class ServerOptions
     public UpdatesOptions   Updates          { get; init; } = new();
     public LoggingOptions   Logging          { get; init; } = new();
     public TracesOptions    Traces           { get; init; } = new();
+    public MetricsOptions   Metrics          { get; init; } = new();
     public int              HttpPort         { get; init; } = 5341;
 
     /// <summary>
