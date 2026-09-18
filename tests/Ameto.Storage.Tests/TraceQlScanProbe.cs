@@ -208,9 +208,21 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
         _ = await TraceQLExecutor.ExecuteAsync(engine, pred, from, to, Rows, CancellationToken.None);
         _ = await TraceQLExecutor.ExecuteAsync(engine, pred, from, to, Rows, CancellationToken.None);
 
-        long before    = GC.GetTotalAllocatedBytes(precise: true);
+        // THIS THREAD'S BYTES, NOT THE PROCESS'S. GC.GetTotalAllocatedBytes counts every thread,
+        // and xUnit runs test collections in parallel — measured, the same page reads 1 018 368 B
+        // run alone and 1 089 328 or 1 192 256 B run beside its own class, a spread of ~175 B a row
+        // that would bury the 88 B this test exists for. GetAllocatedBytesForCurrentThread is
+        // immune to it, and the thread-identity check below is what makes that claim checkable:
+        // the whole page completes synchronously over a hot tier, and if it ever stops doing so
+        // the test says so instead of quietly measuring a fraction of the work.
+        int  thread    = Environment.CurrentManagedThreadId;
+        long before    = GC.GetAllocatedBytesForCurrentThread();
         var  page      = await TraceQLExecutor.ExecuteAsync(engine, pred, from, to, Rows, CancellationToken.None);
-        long allocated = GC.GetTotalAllocatedBytes(precise: true) - before;
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+
+        Assert.True(thread == Environment.CurrentManagedThreadId,
+            "the page resumed on another thread, so the per-thread allocation figure below is "
+            + "only part of it — measure it differently rather than trusting this number");
 
         _out.WriteLine($"TRACEQL PAGE  {Rows:N0} rows, one root span each, warm: "
                      + $"{allocated:N0} B ({allocated / (double)Rows:N0} B/row)");
@@ -219,12 +231,12 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
         Assert.Equal("GET",              page.Rows[0].HttpMethod);
         Assert.Equal("/api/v1/payments", page.Rows[0].HttpPath);
 
-        // THE GATE. Allocated bytes on a warm, fixed workload are deterministic to the BYTE, not
-        // merely stable, which is what lets a gate sit 44 B from the figure it guards: measured in
-        // Release, 1 018 368 B as it stands and 1 106 368 B with the two params arrays back —
-        // exactly 88 000 B more for 1 000 rows, the two key arrays and nothing else. The row's own
-        // TraceRowDto, service set, id strings and services array are the 1 018. The gate is the
-        // midpoint, so neither figure's drift decides the outcome.
+        // THE GATE, 44 B from the figure it guards, which is only sound because the figure is
+        // deterministic to the BYTE and not merely stable: 1 018 368 B in Release run alone, run
+        // beside its own class and run inside the whole parallel suite, against 1 106 368 B with
+        // the two params arrays back — exactly 88 000 B more for 1 000 rows, the two key arrays
+        // and nothing else. The row's own TraceRowDto, service set, id strings and services array
+        // are the 1 018. The gate is the midpoint of the two measured figures.
         Assert.True(allocated / Rows < 1_062,
             $"a returned row cost {allocated / (double)Rows:N0} B — BuildRow is building its "
             + "semconv key lists per row again (a params string[] is 88 B a row)");
