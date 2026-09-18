@@ -95,6 +95,11 @@ public sealed class MetricBudgetWiringTests
 
                      // An explicit depth is bought out of the ring count, not out of the budget.
                      ("stand, 4k deep", new MetricsOptions { ExemplarsPerMetric = 4_000 }, Stand),
+
+                     // And where there is no ring count left to buy it out of, the DEPTH gives
+                     // way: the count clamps at 1, so an explicit 50 000 on a 4 MB tier was one
+                     // ring of 10.4 MB against a 2 MB budget — the last escape from the product.
+                     ("4 MB, 50k deep", new MetricsOptions { HotTierBytes = 4_000_000, ExemplarsPerMetric = 50_000 }, Stand),
                  })
         {
             long perRing = o.ExemplarsPerMetricFor(b);

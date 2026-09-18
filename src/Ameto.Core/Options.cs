@@ -487,6 +487,11 @@ public sealed class MetricsOptions
     /// <see cref="MaxExemplarMetrics"/> full rings fit in half the hot-tier budget, clamped to
     /// [64, 4 000].
     ///
+    /// <para><b>A value set here is honoured only as far as half the tier can hold ONE ring of
+    /// it</b>, and is lowered to that depth beyond — the budget is a quantity of bytes, and the
+    /// ring count cannot fall below 1 to pay for a deeper ring. 50 000 on a 4 MB tier is
+    /// 10.4 MB retained against a 2 MB budget; it is given the 9 615 slots the budget buys.</para>
+    ///
     /// <para><b>The derivation spends against the ceiling the engine enforces, and that is the
     /// whole point.</b> It used to divide by a private "this many names actually carry exemplars"
     /// assumption of 32 while <see cref="MaxExemplarMetrics"/> let 256 rings exist — so the bound
@@ -595,14 +600,30 @@ public sealed class MetricsOptions
     /// <inheritdoc cref="ExemplarsPerMetric"/>
     public int ExemplarsPerMetricFor(in MemoryBudgets budgets)
     {
-        if (ExemplarsPerMetric is { } explicitCount && explicitCount > 0) return explicitCount;
+        // THE DEEPEST RING HALF THE TIER CAN HOLD AT ALL — one ring, nothing beside it. It is
+        // the ceiling on BOTH branches below, because <see cref="MaxExemplarMetricsFor"/> clamps
+        // the ring count to at least 1: at a depth past this there is no count left to buy it
+        // out of, and the product escapes the budget outright. long, because an operator-set
+        // depth times ExemplarBytes overflows int well before it stops being affordable.
+        long deepestAffordable = Math.Max(1, HotTierBytesFor(in budgets) / 2 / ExemplarBytes);
+
+        // An explicit depth wins up to that ceiling and not past it. ExemplarsPerMetric = 50 000
+        // on a 4 MB tier used to be honoured whole: 1 ring x 50 000 x 208 B = 10.4 MB of
+        // permanently resident heap — never pruned, aged out, shed or counted — against a 2 MB
+        // budget, which was the one way left to spend more than the derivation names.
+        if (ExemplarsPerMetric is { } explicitCount && explicitCount > 0)
+            return (int)Math.Min(explicitCount, deepestAffordable);
 
         // MaxExemplarMetrics, not a smaller "actually active" guess: the divisor has to be the
         // number of rings the engine will let exist, or the budget bounds nothing. long, because
         // at a raised cap the product overflows int before the clamp gets a chance.
         long rings   = Math.Max(1, MaxExemplarMetrics);
         long perRing = HotTierBytesFor(in budgets) / 2 / (ExemplarBytes * rings);
-        return (int)Math.Clamp(perRing, MinExemplarsPerMetric, MaxExemplarsPerMetricCap);
+
+        // The 64-slot floor is a floor on what is WORTH keeping, not a licence to exceed the
+        // budget: on a tier too small to hold even one ring of 64 it gives way to the ceiling.
+        return (int)Math.Min(Math.Clamp(perRing, MinExemplarsPerMetric, MaxExemplarsPerMetricCap),
+                             deepestAffordable);
     }
 
     /// <inheritdoc cref="MaxExemplarMetricsFor"/>
