@@ -59,6 +59,11 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
 
         await TraceQLExecutor.ExecuteAsync(engine, pred, from, to, 200, CancellationToken.None); // warm
 
+        // PROCESS-WIDE ON PURPOSE, unlike the per-row gate below: this page reaches cold segments
+        // and so has a yielding await, which would bill part of itself to another thread. The
+        // other-thread noise it therefore admits is xUnit's output drain — 6 288 B a printed line,
+        // and even the whole suite's backlog (~24 lines ≈ 150 kB) is ~3 B per span scanned against
+        // a 700 B gate.
         long a0   = GC.GetTotalAllocatedBytes(precise: true);
         long loh0 = GC.GetGCMemoryInfo().GenerationInfo[^1].SizeAfterBytes;
         var  sw   = Stopwatch.StartNew();
@@ -163,11 +168,11 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
     /// <para>THE THIRD PAGE IS THE MEASURED ONE. <c>BuildRow</c> reaches the row's attributes
     /// through <c>SpanRecord.Attributes</c>, whose decode is memoised ON THE RECORD, and the hot
     /// tier hands out the same records to every query — so the first page pays a decode per row
-    /// and the 88 B this test exists for would be noise inside it. Two warm pages leave a page
+    /// and the 104 B this test exists for would be noise inside it. Two warm pages leave a page
     /// whose per-row cost is <c>BuildRow</c>'s own objects and nothing else.</para>
     ///
     /// <para>Restore the <c>params string[]</c> signature and its literal arguments at
-    /// <c>TraceQLExecutor.cs:BuildRow</c> and this fails at 88 B a row above the gate.</para>
+    /// <c>TraceQLExecutor.cs:BuildRow</c> and this fails at 104 B a row above the gate.</para>
     /// </summary>
     [Fact]
     public async Task Reading_the_http_attributes_of_a_row_allocates_nothing()
@@ -260,13 +265,21 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
         Assert.Equal("GET",              page.Rows[0].HttpMethod);
         Assert.Equal("/api/v1/payments", page.Rows[0].HttpPath);
 
-        // WHAT THE DEFECT WEIGHS, MEASURED ON THIS RUNTIME AND NOT ASSUMED. Restoring
-        // `params string[]` on GetAttr puts two literal key arrays back on every row; this loop
-        // allocates exactly those two arrays a thousand times and weighs them the same way the
-        // page above was weighed. On x64 it is 88 B a row — a string[2] (24 B header + 2×8) and a
-        // string[3] (24 + 3×8) — which is precisely the 88 000 B separating the two measured
-        // pages. Measuring it is what keeps the gate's margin honest on a runtime whose object
-        // header or reference width differs, instead of hard-coding half of 88.
+        // WHAT THE DEFECT WEIGHS, MEASURED ON THIS RUNTIME AND AGAINST TODAY'S KEY LISTS. Restoring
+        // `params string[]` on GetAttr puts two key arrays back on every row; this loop allocates
+        // exactly those two arrays a thousand times and weighs them the same way the page above was
+        // weighed. On x64 it is 104 B a row — a string[2] (24 B header + 2×8 = 40) and a string[5]
+        // (24 + 5×8 = 64) — and that is precisely the 104 000 B separating the two measured pages:
+        // restoring the params signature and BuildRow's literal arguments measures 1 122 976 B
+        // Debug and 1 122 368 B Release against this file's 1 018 976 / 1 018 368.
+        //
+        // IT USED TO SAY 88, AND THE SECOND LIST WAS THE REASON. The calibration wrote its key
+        // lists out as literals and kept the executor's OLD three-key path list, so it weighed a
+        // string[3] against the five-key list BuildRow actually passes — 88 B where the defect is
+        // 104, and a claim of "88 000 B separating the pages" that was never measured. Understating
+        // the defect does not loosen the gate, it thins the margin ABOVE the baseline: 44 B of
+        // headroom where 52 was earned. Reading the lengths off HttpSemconvKeys is what stops the
+        // next key added to PathKeys from thinning it again, silently.
         double defectPerRow = MeasureTwoKeyArraysPerRow(Rows);
         _out.WriteLine($"              two params key arrays weigh {defectPerRow:N0} B/row here");
         Assert.InRange(defectPerRow, 40, 200);   // the calibration itself must have measured something
@@ -277,9 +290,12 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
         // code path. Measured with the per-thread counter: 1 018,368 B/row in Release and
         // 1 018,976 B/row in Debug, the SAME figure run alone, run beside its own class, run inside
         // the whole suite and with DOTNET_PROCESSOR_COUNT=2 (which is what CI gives it). The row's
-        // own TraceRowDto, service set, id strings and services array are that 1 019.
+        // own TraceRowDto, service set, id strings and services array are that 1 019. Re-measured
+        // for this calibration: ten consecutive Debug runs and ten Release runs, every one of them
+        // 1 018 976 B and 1 018 368 B to the byte.
         //
-        // So the gate sits 44 B above the worst measured figure and 44 B below the defect, and CI's
+        // So the gate is 1 071, sitting 52 B above the worst measured figure and 52 B below the
+        // defect page's 1 123 B/row (measured: 1 122 976 B Debug, 1 122 368 B Release), and CI's
         // Debug 2-core run is the configuration the baseline was taken in.
         const double Baseline = 1_019;   // the Debug figure, rounded up to the byte
         double gate    = Baseline + defectPerRow / 2;
@@ -425,8 +441,8 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
     }
 
     /// <summary>
-    /// What two literal semconv key arrays cost per row — the allocation TS#13 removed, weighed on
-    /// the runtime the gate is about to run on.
+    /// What two per-row semconv key arrays cost — the allocation TS#13 removed, weighed on the
+    /// runtime the gate is about to run on and against the key lists as they stand TODAY.
     ///
     /// <para><c>Escape</c> is not inlined, so the two arrays escape the loop exactly as
     /// <c>BuildRow</c>'s did into <c>GetAttr</c>; a runtime that stack-allocates a non-escaping
@@ -435,11 +451,21 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
     /// </summary>
     private static double MeasureTwoKeyArraysPerRow(int rows)
     {
-        Escape(["warm", "up"], ["warm", "up", "too"]);   // type handles and this frame, not the figure
+        // THE LENGTHS ARE READ, NOT WRITTEN. A `params string[]` restored on GetAttr would take
+        // BuildRow's literal arguments — which are the semconv lists — so the arrays it built per
+        // row are exactly these two lengths, whatever they are today. Written out as literals this
+        // measured a string[3] path array against the real five-key list and understated the
+        // defect by 16 B a row; grow PathKeys again and a hard-coded calibration understates it
+        // again, silently, in the direction that loosens the gate. Only the element COUNT is the
+        // allocation, so nothing here needs the key strings themselves.
+        int methodLen = HttpSemconvKeys.MethodKeys.Length;   // 2
+        int pathLen   = HttpSemconvKeys.PathKeys.Length;     // 5
+
+        Escape(new string[methodLen], new string[pathLen]);   // type handles and this frame, not the figure
 
         long before = GC.GetAllocatedBytesForCurrentThread();
         for (int i = 0; i < rows; i++)
-            Escape(["http.request.method", "http.method"], ["url.path", "http.target", "http.route"]);
+            Escape(new string[methodLen], new string[pathLen]);
         return (GC.GetAllocatedBytesForCurrentThread() - before) / (double)rows;
     }
 
