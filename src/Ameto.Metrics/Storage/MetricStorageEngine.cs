@@ -789,21 +789,53 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
     // ── IMetricQuery ──────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Every metric name this server can answer for, hot and cold, filtered by
+    /// <paramref name="prefix"/> and sorted — the Explore page's first request.
+    ///
+    /// <para><b>The hot half comes from <c>_meta</c>, not from <c>_hot</c>.</b> Reading
+    /// <c>_hot.Keys</c> on a <see cref="ConcurrentDictionary{TKey,TValue}"/> acquires EVERY lock
+    /// in its table and materialises a list of every SERIES — at the sandbox's 38 741 series that
+    /// is ~1.2 MB allocated and every ingest thread in the process blocked for the duration, per
+    /// page load, to produce a few dozen distinct names. <c>_meta</c> is keyed by name, is
+    /// maintained on the same ingest path, is seeded from the cold segments at startup and
+    /// survives hot-tier drains, so it holds tens of entries where <c>_hot</c> holds tens of
+    /// thousands — and is enumerated without taking a lock at all.</para>
+    ///
+    /// <para>The answer is the same set: every name in <c>_hot</c> got there through
+    /// <c>ApplyToHotTier</c>, which registers it in <c>_meta</c> in the same call, and every name
+    /// only in <c>_meta</c> is a name the cold segments also carry. The one difference is a
+    /// window of a few instructions, on the very first point of a brand-new metric, between the
+    /// series being added and its metadata — where a caller could once have seen a name whose
+    /// catalog entry did not exist yet.</para>
+    ///
+    /// <para>The ordering is <c>Comparer&lt;string&gt;.Default</c>, as <c>OrderBy(n =&gt; n)</c>
+    /// was — culture-sensitive, and deliberately unchanged: this is the list the UI renders.</para>
+    /// </summary>
     public IEnumerable<string> GetMetricNames(string? prefix = null)
     {
-        var hotNames = _hot.Keys
-            .Select(k => k.Name)
-            .Distinct(StringComparer.Ordinal);
+        var names = new List<string>(_meta.Count + 16);
+        var seen  = new HashSet<string>(StringComparer.Ordinal);
+
+        foreach (var (name, _) in _meta)
+            if (Matches(name, prefix) && seen.Add(name)) names.Add(name);
 
         _coldLock.EnterReadLock();
-        IEnumerable<string> coldNames;
-        try { coldNames = _coldSegments.Select(s => s.MetricName).Distinct(StringComparer.Ordinal).ToList(); }
+        try
+        {
+            for (int i = 0; i < _coldSegments.Count; i++)
+            {
+                string name = _coldSegments[i].MetricName;
+                if (Matches(name, prefix) && seen.Add(name)) names.Add(name);
+            }
+        }
         finally { _coldLock.ExitReadLock(); }
 
-        return hotNames.Concat(coldNames)
-            .Distinct(StringComparer.Ordinal)
-            .Where(n => prefix is null || n.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
-            .OrderBy(n => n);
+        names.Sort();
+        return names;
+
+        static bool Matches(string name, string? prefix) =>
+            prefix is null || name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
     }
 
     public async IAsyncEnumerable<MetricSeries> QueryAsync(
