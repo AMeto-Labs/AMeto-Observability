@@ -1,3 +1,4 @@
+using MessagePack;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
@@ -210,6 +211,10 @@ public struct SpanHeader
 /// </summary>
 public sealed class SpanRecord
 {
+    private readonly ReadOnlyMemory<byte> _attributesBytes;
+    private IReadOnlyDictionary<string, object?>? _attributes;
+    private volatile bool _decoded;
+
     public TraceId        TraceId             { get; init; }
     public SpanId         SpanId              { get; init; }
     public SpanId         ParentSpanId        { get; init; }
@@ -223,11 +228,244 @@ public sealed class SpanRecord
     /// <summary>Promoted HTTP response status code (0 = not extracted from attributes).</summary>
     public short HttpStatusCode { get; init; }
 
-    /// <summary>Decoded key-value attributes (lazy — null until read).</summary>
-    public IReadOnlyDictionary<string, object?>? Attributes { get; init; }
+    /// <summary>
+    /// THE ATTRIBUTES AS THEY ARRIVED — one msgpack map, the bytes the OTLP mapper produced or the
+    /// bytes that sit in the <c>.trc</c> block, and the form the hot tier keeps them in.
+    ///
+    /// <para>375 bytes for an ordinary eight-attribute OTel span, against the ~987 bytes the
+    /// <see cref="Attributes"/> dictionary weighs for the same span — a <c>Dictionary</c>, eight
+    /// key strings and eight boxed values, which the ingest path used to build under the engine's
+    /// exclusive write lock, for a map the ingest path never reads. Empty when the span carries no
+    /// attributes, and empty on a record built from a dictionary directly.</para>
+    /// </summary>
+    public ReadOnlyMemory<byte> AttributesBytes
+    {
+        get => _attributesBytes;
+        init => _attributesBytes = value;
+    }
+
+    /// <summary>
+    /// Decoded key-value attributes — lazy, and now actually lazy: decoded from
+    /// <see cref="AttributesBytes"/> the first time somebody asks, null when there is nothing to
+    /// decode or the blob will not decode.
+    ///
+    /// <para>A BLOB THAT WILL NOT DECODE ANSWERS NULL FOREVER, never an empty map. TraceQL's
+    /// three-valued logic reads null as "this span cannot answer" (issue #74); an empty dictionary
+    /// reads as "this span has no such attribute", which is an answer, and
+    /// <c>{ !(.foo = "bar") }</c> would then select every span whose attributes were unreadable.
+    /// The failure is remembered, so the exception is paid once per record and not once per read.</para>
+    ///
+    /// <para>The decode is idempotent and its result immutable, so two threads racing here cost at
+    /// most one duplicated dictionary and never a torn one: the reference is published by the
+    /// volatile store to <c>_decoded</c>, and a second decode simply returns its own copy.</para>
+    /// </summary>
+    public IReadOnlyDictionary<string, object?>? Attributes
+    {
+        get
+        {
+            if (_decoded) return _attributes;
+
+            var decoded = _attributesBytes.IsEmpty ? null : SpanAttributeBlob.Decode(_attributesBytes);
+            _attributes = decoded;
+            _decoded    = true;   // volatile store — publishes _attributes with it
+            return decoded;
+        }
+        init
+        {
+            _attributes = value;
+            _decoded    = true;   // an explicitly supplied map IS the answer; never decode over it
+        }
+    }
 
     public DateTimeOffset StartTime =>
         DateTimeOffset.FromUnixTimeMilliseconds(StartTimeUnixNano / 1_000_000);
 
     public TimeSpan Duration => TimeSpan.FromTicks(DurationNanos / 100);
+}
+
+/// <summary>What one attribute in a msgpack blob turned out to be. See <see cref="SpanAttrValue"/>.</summary>
+internal enum SpanAttrKind : byte
+{
+    /// <summary>The key is not in the map at all.</summary>
+    Missing = 0,
+    /// <summary>Present, and msgpack-nil.</summary>
+    Null,
+    Utf8String,
+    Integer,
+    Float,
+    Boolean,
+    /// <summary>An array, a nested map, binary or an extension — anything the decoder boxes as null.</summary>
+    Other,
+}
+
+/// <summary>
+/// One attribute value read straight out of the blob. <see cref="Utf8"/> is a WINDOW ONTO the
+/// span's own attribute bytes, not a copy: reading a string attribute out of a blob allocates
+/// nothing and boxes nothing.
+///
+/// <para>A <c>Memory</c> rather than a <c>Span</c>, which is the difference between this being a
+/// plain struct and being a <c>ref struct</c>. The span it wraps comes from the blob's array and
+/// is perfectly safe to hand back, but a <c>ref struct</c> carrying it out of a method that also
+/// takes <c>ref MessagePackReader</c> cannot be proved so by the ref-safety rules, and the price
+/// of proving it would be a copy.</para>
+/// </summary>
+internal struct SpanAttrValue
+{
+    public SpanAttrKind         Kind;
+    public ReadOnlyMemory<byte> Utf8;      // Kind == Utf8String
+    public long                 Integer;   // Kind == Integer
+    public double               Float;     // Kind == Float
+    public bool                 Boolean;   // Kind == Boolean
+}
+
+/// <summary>
+/// Reads a span's msgpack attribute map — either into a dictionary, or one key at a time with
+/// neither a dictionary nor a boxed value in sight.
+///
+/// <para>THE BOXING RULES HERE ARE A COMPATIBILITY CONTRACT, not a choice. They are the rules
+/// <c>SpanReader</c>'s v3 block decoder has always applied — integer to <c>long</c>, float to
+/// <c>double</c>, everything it does not understand to <c>null</c> — so that a span read back out
+/// of a segment and the same span still sitting in the hot tier answer a TraceQL predicate
+/// identically. The hot tier used to go through <c>MessagePackSerializer.Deserialize</c> into a
+/// <c>Dictionary</c> instead, whose primitive formatter hands back the NARROWEST integer type
+/// (1433 comes back as <c>ushort</c>), and <c>AttributePredicate</c> has no case for <c>ushort</c>
+/// — so <c>{ .net.peer.port &gt; 1000 }</c> quietly answered "no" for a hot span and "yes" for the
+/// same span once flushed. One decoder, one answer.</para>
+///
+/// <para>LAST KEY WINS, because the OTLP mapper writes resource attributes first and span
+/// attributes second precisely so that a span attribute shadows a resource one of the same name
+/// (<c>OtlpTraceMapper.SerializeAttributes</c>). That is a duplicate key in the map, which is also
+/// why the hot tier could not use <c>Deserialize</c> honestly: that formatter calls
+/// <c>Dictionary.Add</c>, throws on the second copy of the key, and left such a span with NO
+/// attributes at all.</para>
+/// </summary>
+internal static class SpanAttributeBlob
+{
+    /// <summary>
+    /// Decodes the whole map. Null when the bytes are not a readable msgpack map — see
+    /// <see cref="SpanRecord.Attributes"/> for why null rather than an empty map.
+    /// </summary>
+    internal static IReadOnlyDictionary<string, object?>? Decode(ReadOnlyMemory<byte> blob)
+    {
+        try
+        {
+            var reader = new MessagePackReader(blob);
+            int count  = reader.ReadMapHeader();
+            var dict   = new Dictionary<string, object?>(count, StringComparer.Ordinal);
+            for (int i = 0; i < count; i++)
+            {
+                string key = reader.ReadString() ?? string.Empty;
+                dict[key]  = ReadBoxedValue(ref reader);   // indexer, not Add: last key wins
+            }
+            return dict;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// One attribute value, boxed exactly as <c>SpanReader</c>'s block decoder boxes it. Used by
+    /// <see cref="Decode"/> and by the flush path that feeds <c>SpanBloom</c>.
+    /// </summary>
+    internal static object? ReadBoxedValue(ref MessagePackReader r)
+    {
+        switch (r.NextMessagePackType)
+        {
+            case MessagePackType.String:  return r.ReadString();
+            case MessagePackType.Integer: return r.ReadInt64();
+            case MessagePackType.Float:   return r.ReadDouble();
+            case MessagePackType.Boolean: return r.ReadBoolean();
+            case MessagePackType.Nil:     r.ReadNil(); return null;
+            default:                      r.Skip();    return null;
+        }
+    }
+
+    /// <summary>
+    /// Finds one key without building anything. False means the key is not in the map, or the map
+    /// is not readable — the two cases a caller must treat the same way, because a blob that
+    /// cannot be read cannot say whether it holds the key either.
+    /// </summary>
+    internal static bool TryFind(
+        ReadOnlyMemory<byte> blob, ReadOnlySpan<byte> keyUtf8, out SpanAttrValue value)
+    {
+        value = default;
+        if (blob.IsEmpty) return false;
+
+        bool found = false;
+        try
+        {
+            var reader = new MessagePackReader(blob);
+            int count  = reader.ReadMapHeader();
+            for (int i = 0; i < count; i++)
+            {
+                var keySeq = reader.ReadStringSequence();
+                if (keySeq is { IsSingleSegment: true } ks && ks.First.Span.SequenceEqual(keyUtf8))
+                {
+                    ReadValue(ref reader, ref value);
+                    found = true;   // keep walking: the LAST copy of the key is the one that counts
+                }
+                else
+                {
+                    reader.Skip();
+                }
+            }
+        }
+        catch
+        {
+            return false;
+        }
+        return found;
+    }
+
+    /// <summary>
+    /// Walks the map and hands every pair to <paramref name="onPair"/>, boxing one value at a time
+    /// instead of a whole dictionary. False when the blob is not exactly one well-formed msgpack
+    /// map — which is what lets the flush decide whether the bytes are safe to copy through
+    /// verbatim.
+    /// </summary>
+    internal static bool TryWalk<TState>(
+        ReadOnlyMemory<byte> blob, TState state, Action<TState, string, object?> onPair)
+    {
+        try
+        {
+            var reader = new MessagePackReader(blob);
+            int count  = reader.ReadMapHeader();
+            for (int i = 0; i < count; i++)
+            {
+                string key = reader.ReadString() ?? string.Empty;
+                onPair(state, key, ReadBoxedValue(ref reader));
+            }
+            // Trailing bytes would be copied through by a verbatim write and would corrupt the
+            // span array around them, so "one map" has to mean the WHOLE blob and nothing after it.
+            return reader.End;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static void ReadValue(ref MessagePackReader r, ref SpanAttrValue v)
+    {
+        switch (r.NextMessagePackType)
+        {
+            case MessagePackType.String:
+            {
+                var seq = r.ReadStringSequence();
+                // The reader is always built over ONE ReadOnlyMemory, so a string is always one
+                // segment. A segmented one would need the copy this type exists to avoid; it is
+                // reported as Other, which reads as "cannot answer" rather than as a wrong answer.
+                if (seq is { IsSingleSegment: true } s) { v.Kind = SpanAttrKind.Utf8String; v.Utf8 = s.First; }
+                else                                    { v.Kind = SpanAttrKind.Other; }
+                break;
+            }
+            case MessagePackType.Integer: v.Kind = SpanAttrKind.Integer; v.Integer = r.ReadInt64();   break;
+            case MessagePackType.Float:   v.Kind = SpanAttrKind.Float;   v.Float   = r.ReadDouble();  break;
+            case MessagePackType.Boolean: v.Kind = SpanAttrKind.Boolean; v.Boolean = r.ReadBoolean(); break;
+            case MessagePackType.Nil:     v.Kind = SpanAttrKind.Null;    r.ReadNil();                 break;
+            default:                      v.Kind = SpanAttrKind.Other;   r.Skip();                    break;
+        }
+    }
 }

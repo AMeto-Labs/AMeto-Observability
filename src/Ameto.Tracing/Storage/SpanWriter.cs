@@ -433,7 +433,20 @@ internal static class SpanWriter
             writer.Write((byte)s.Status);
             writer.Write(s.HttpStatusCode);
 
-            if (s.Attributes is { Count: > 0 } attrs)
+            // THE BYTES THE MAPPER PRODUCED, COPIED THROUGH. The span arrived as one msgpack map
+            // and leaves as the same one: no decode on the way in, no type-switched re-encode on
+            // the way out. The one pass that remains is the bloom's, and it doubles as the
+            // validation — TryAddAttrBlobToBloom returns false unless the blob is exactly one
+            // well-formed map with nothing after it, because a verbatim copy of anything else
+            // would corrupt the span array around it. A blob that fails that test falls back to
+            // the dictionary path below, which is also where a record built from a dictionary
+            // (no blob at all — every test fixture, and SpanReader's legacy v2 path) goes.
+            var attrBlob = s.AttributesBytes;
+            if (!attrBlob.IsEmpty && TryAddAttrBlobToBloom(bloomHashes, attrBlob))
+            {
+                writer.WriteRaw(attrBlob.Span);
+            }
+            else if (s.Attributes is { Count: > 0 } attrs)
             {
                 WriteAttributes(ref writer, attrs);
                 foreach (var (k, v) in attrs)
@@ -455,6 +468,25 @@ internal static class SpanWriter
         var compressed = LZ4Pickler.Pickle(raw, LZ4Level.L09_HC);
         return (compressed, raw.Length);
     }
+
+    /// <summary>
+    /// Feeds one span's attribute blob to the block bloom, one boxed value at a time instead of a
+    /// whole dictionary, and says whether the blob is safe to copy through verbatim.
+    ///
+    /// <para>THE BLOOM IS FED FROM THE DECODE, NOT FROM THE UTF-8, on purpose. <c>SpanBloom</c>
+    /// hashes <c>lowercase(value.ToString())</c>; hashing from the bytes instead would have to
+    /// reproduce every <c>long</c> and <c>double</c> formatting decision exactly or turn existing
+    /// <c>.trc</c> blooms into a false-negative source — silent data loss on TraceQL attribute
+    /// predicates. That is TS#12 and it needs its own proof. What this move buys is the decode
+    /// leaving the ingest path's write lock for the flush thread, not the decode disappearing.</para>
+    ///
+    /// <para>A partial walk leaves the hashes it already added. Extra bloom bits only ever make a
+    /// block MORE likely to be read, so a blob that dies half way costs a wasted block read and
+    /// never a missing row.</para>
+    /// </summary>
+    private static bool TryAddAttrBlobToBloom(HashSet<ulong> hashes, ReadOnlyMemory<byte> blob) =>
+        SpanAttributeBlob.TryWalk(blob, hashes,
+            static (h, k, v) => SpanBloom.AddAttr(h, k, v));
 
     /// <summary>Inline typed attribute map — no nested serializer, no per-span buffers.</summary>
     private static void WriteAttributes(ref MessagePackWriter w, IReadOnlyDictionary<string, object?> attrs)

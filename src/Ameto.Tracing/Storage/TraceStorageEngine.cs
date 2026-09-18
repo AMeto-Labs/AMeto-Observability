@@ -600,9 +600,15 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             Kind              = item.Kind,
             Status            = item.Status,
             HttpStatusCode    = item.HttpStatusCode,  // promoted — no attrs deserialization
-            Attributes        = item.AttributesBytes.Length > 0
-                                    ? DeserializeAttributes(item.AttributesBytes)
-                                    : null,
+
+            // THE BLOB, NOT A DICTIONARY, AND THAT IS WHAT THIS LOCK HOLD IS. The mapper already
+            // produced these bytes; inflating them here into a Dictionary plus a string per key
+            // and a box per value cost 3.5 µs and 1 496 B per span — 68 % of the CPU and 91 % of
+            // the allocation of a WriteSpan — inside the engine's EXCLUSIVE write lock, to
+            // reproduce a map nothing on the ingest path ever reads. SpanRecord.Attributes decodes
+            // it on demand at the four sites that do (TraceQL, GetAttr on ROOT spans, the trace
+            // detail DTO), and the flush hands the same bytes to SpanWriter untouched.
+            AttributesBytes   = item.AttributesBytes,
         };
 
         int offset = _hotSpans.Count;
@@ -2779,18 +2785,6 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
-
-    private static IReadOnlyDictionary<string, object?>? DeserializeAttributes(byte[] bytes)
-    {
-        try
-        {
-            return MessagePackSerializer.Deserialize<Dictionary<string, object?>>(bytes);
-        }
-        catch
-        {
-            return null;
-        }
-    }
 
     // ── ITraceStatsProvider ────────────────────────────────────────────────────
 
