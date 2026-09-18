@@ -79,6 +79,36 @@ public static class OtlpTraceStreamParser
     /// </summary>
     private const int MaxKeptNestScratch = 64 * 1024;
 
+    /// <summary>
+    /// And the same rule for the three top-level writers. <c>ResetWrittenCount</c> keeps the
+    /// array, so <see cref="_tAttr"/> (one span's attribute pairs) and <see cref="_tOut"/> (that
+    /// span's assembled map) each hold a copy of the largest attribute blob the thread ever saw,
+    /// for the life of the process. A single in-limits POST — <c>Ingestion.MaxOtlpBatchBytes</c>
+    /// is 8 MiB — whose one span carries a multi-megabyte attribute map therefore pins twice its
+    /// size on the request thread, and again on every other thread-pool thread that serves one.
+    /// Every other large ingest buffer in the server is bounded (<c>IngestBufferPool</c>); these
+    /// were the exception.
+    /// </summary>
+    private const int MaxKeptAttrScratch = 64 * 1024;
+
+    /// <summary>
+    /// Drops the top-level writers that grew past <see cref="MaxKeptAttrScratch"/>, so the next
+    /// request on this thread starts from the small default again.
+    ///
+    /// <para>Runs once per batch, not per span: an ordinary span never trips the ceiling, and a
+    /// batch of them must keep the buffer it has grown to.</para>
+    ///
+    /// <para>Safe because every consumer has copied by then — the assembled map leaves as
+    /// <c>WrittenSpan.ToArray()</c>, and <c>MessagePackWriter.WriteRaw</c> copies the pairs into
+    /// it.</para>
+    /// </summary>
+    private static void ReleaseScratch()
+    {
+        if (_tAttr is { Capacity: > MaxKeptAttrScratch }) _tAttr = null;
+        if (_tRes  is { Capacity: > MaxKeptAttrScratch }) _tRes  = null;
+        if (_tOut  is { Capacity: > MaxKeptAttrScratch }) _tOut  = null;
+    }
+
     /// <summary>The scratch writer for one nesting level, emptied and ready to write.</summary>
     private static ArrayBufferWriter<byte> NestBuffer(int depth)
     {
@@ -122,6 +152,13 @@ public static class OtlpTraceStreamParser
     }
 
     public static List<SpanIngestItem> Parse(ReadOnlySpan<byte> json)
+    {
+        var result = ParseBatch(json);
+        ReleaseScratch();
+        return result;
+    }
+
+    private static List<SpanIngestItem> ParseBatch(ReadOnlySpan<byte> json)
     {
         var reader  = new Utf8JsonReader(json, isFinalBlock: true, state: default);
         var result  = new List<SpanIngestItem>();

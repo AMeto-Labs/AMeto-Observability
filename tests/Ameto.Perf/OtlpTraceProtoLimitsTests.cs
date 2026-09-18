@@ -187,14 +187,15 @@ public sealed class OtlpTraceProtoLimitsTests
     }
 
     /// <summary>
-    /// The per-level nested-value scratch is per THREAD and only ever emptied, never shrunk, so
-    /// whatever the biggest nested value a thread ever saw was, that thread keeps the array for
-    /// the life of the process. And because every open level buffers the whole subtree below it
-    /// before splicing, one in-limits POST with a large nested attribute grows the scratch at
-    /// EVERY level it passes through, not just the innermost — the sibling escape scratch has
-    /// had a keep-it ceiling since the day it was added, and this one had none. Both halves are
-    /// pinned here: the buffers come back small, and the values still come out identical to the
-    /// DOM's, which is what proves the release happens after the splice and not before it.
+    /// Every scratch buffer on the JSON path is per THREAD and only ever emptied, never shrunk,
+    /// so whatever the biggest value a thread ever saw was, that thread keeps an array that size
+    /// for the life of the process. The per-level nested-value scratch is the worst of them —
+    /// every open level buffers the whole subtree below it before splicing, so one in-limits POST
+    /// grows it at EVERY level it passes through — but the three top-level writers keep the same
+    /// blob just as long: the spliced value lands whole in the span-attribute writer, and the
+    /// assembled map lands whole in the output writer. So this measures PER-THREAD RETENTION, not
+    /// one field of it. The other half is that the values still come out identical to the DOM's,
+    /// which is what proves a release happens after its splice and not before it.
     /// </summary>
     [Fact]
     public void Json_a_huge_nested_value_is_not_kept_on_the_thread()
@@ -205,12 +206,86 @@ public sealed class OtlpTraceProtoLimitsTests
 
         AssertJsonMatchesDom(json);
 
+        AssertJsonScratchReleased();
+    }
+
+    /// <summary>
+    /// The protobuf path has the same three writers, no ceiling on any of them either, and it is
+    /// the content type every SDK exporter and the collector actually send — so the same body
+    /// posted as protobuf pinned the same megabytes. One span, one ~256 KB string attribute.
+    /// </summary>
+    [Fact]
+    public void Proto_a_huge_attribute_is_not_kept_on_the_thread()
+    {
+        var span = Assert.Single(OtlpTraceProtoParser.Parse(
+            OtlpProtoPayloads.Traces_HugeAttribute(valueChars: 256 * 1024)));
+        Assert.Equal(256 * 1024, ((string)Attrs(span.AttributesBytes)["big"]!).Length);
+
+        AssertProtoScratchReleased();
+    }
+
+    /// <summary>
+    /// Everything the JSON path pins to the calling thread is back under the 64 KB keep-it
+    /// ceiling: the three top-level writers and every open nesting level. Reflection because
+    /// they are private and [ThreadStatic] — the assertion runs synchronously on the same thread
+    /// as the parse above it, and each of these tests sweeps only the parser it exercised so a
+    /// failure names the path that leaked.
+    /// </summary>
+    private static void AssertJsonScratchReleased()
+    {
+        var kept = new Scratch();
+        kept.Add(typeof(OtlpTraceStreamParser), "_tAttr");
+        kept.Add(typeof(OtlpTraceStreamParser), "_tRes");
+        kept.Add(typeof(OtlpTraceStreamParser), "_tOut");
+
         var pool = NestScratch();
-        for (int d = 0; d < pool.Length; d++)
+        for (int d = 0; d < pool.Length; d++) kept.Add($"_tNest[{d}]", pool[d]?.Capacity ?? 0);
+
+        kept.AssertAllUnderCeiling();
+    }
+
+    /// <summary>The same for the protobuf path's three writers.</summary>
+    private static void AssertProtoScratchReleased()
+    {
+        var kept = new Scratch();
+        kept.Add(typeof(OtlpTraceProtoParser), "_tRes");
+        kept.Add(typeof(OtlpTraceProtoParser), "_tSpan");
+        kept.Add(typeof(OtlpTraceProtoParser), "_tOut");
+
+        kept.AssertAllUnderCeiling();
+    }
+
+    private const int MaxKeptScratch = 64 * 1024;
+
+    /// <summary>
+    /// What one parser's [ThreadStatic] buffers still hold on the calling thread. The invariant
+    /// is per buffer — none above the ceiling — but the failure reports the TOTAL as well,
+    /// because three buffers each holding one copy of the payload is what the per-field number
+    /// hid.
+    /// </summary>
+    private sealed class Scratch
+    {
+        private readonly List<(string Name, int Bytes)> _kept = [];
+
+        public void Add(Type parser, string field)
+            => Add($"{parser.Name}.{field}",
+                   ((ArrayBufferWriter<byte>?)parser
+                        .GetField(field, BindingFlags.NonPublic | BindingFlags.Static)!
+                        .GetValue(null))?.Capacity ?? 0);
+
+        public void Add(string name, int bytes)
         {
-            int kept = pool[d]?.Capacity ?? 0;
-            Assert.True(kept <= 64 * 1024,
-                $"nesting level {d} kept {kept} B of scratch pinned to this thread");
+            if (bytes > 0) _kept.Add((name, bytes));
+        }
+
+        public void AssertAllUnderCeiling()
+        {
+            int total = 0, worst = 0;
+            foreach ((_, int bytes) in _kept) { total += bytes; if (bytes > worst) worst = bytes; }
+
+            Assert.True(worst <= MaxKeptScratch,
+                $"{total} B of scratch stayed pinned to this thread: "
+              + string.Join(", ", _kept.Select(static k => $"{k.Name}={k.Bytes} B")));
         }
     }
 

@@ -93,6 +93,20 @@ public static class OtlpTraceProtoParser
     private const int MaxValueDepth = 64;
 
     /// <summary>
+    /// Above this a scratch writer is dropped at the end of the batch rather than kept.
+    ///
+    /// <para><c>ResetWrittenCount</c> empties a writer but never shrinks it, so without a ceiling
+    /// <see cref="_tSpan"/> (one span's attribute pairs) and <see cref="_tOut"/> (that span's
+    /// assembled map) each keep a copy of the largest attribute blob the thread ever saw, for the
+    /// life of the process. A single in-limits POST — <c>Ingestion.MaxOtlpBatchBytes</c> is 8 MiB
+    /// — whose one span carries a multi-megabyte attribute map pins twice its size on the request
+    /// thread, and this is the route every SDK exporter uses, so every thread-pool thread that
+    /// serves one keeps its own copy. The JSON parser's escape and nesting scratch already work
+    /// this way; these writers were outside every bound in the server.</para>
+    /// </summary>
+    private const int MaxKeptAttrScratch = 64 * 1024;
+
+    /// <summary>
     /// Per-call state. A ref struct so it can hold spans of the caller's request buffer without
     /// the parser allocating anything per batch.
     /// </summary>
@@ -126,6 +140,29 @@ public static class OtlpTraceProtoParser
     private enum KeyKind : byte { Plain, HttpStatusNew, HttpStatusOld, Url }
 
     public static List<SpanIngestItem> Parse(ReadOnlySpan<byte> payload)
+    {
+        var result = ParseBatch(payload);
+        ReleaseScratch();
+        return result;
+    }
+
+    /// <summary>
+    /// Drops the scratch writers that grew past <see cref="MaxKeptAttrScratch"/>, so the next
+    /// request on this thread starts from the small defaults again.
+    ///
+    /// <para>Once per batch, not per span: an ordinary span never trips the ceiling and a batch
+    /// of them must keep the buffer it has grown to. Safe because everything that leaves the
+    /// parser has been copied by then — the assembled map leaves as <c>WrittenSpan.ToArray()</c>
+    /// and <c>MessagePackWriter.WriteRaw</c> copies the pairs into it.</para>
+    /// </summary>
+    private static void ReleaseScratch()
+    {
+        if (_tRes  is { Capacity: > MaxKeptAttrScratch }) _tRes  = null;
+        if (_tSpan is { Capacity: > MaxKeptAttrScratch }) _tSpan = null;
+        if (_tOut  is { Capacity: > MaxKeptAttrScratch }) _tOut  = null;
+    }
+
+    private static List<SpanIngestItem> ParseBatch(ReadOnlySpan<byte> payload)
     {
         var st = new ParseState
         {

@@ -512,6 +512,30 @@ internal static class OtlpProtoPayloads
         })));
 
     /// <summary>
+    /// One span carrying one <paramref name="valueChars"/>-character string attribute: an
+    /// in-limits POST (<c>MaxOtlpBatchBytes</c> is 8 MiB) big enough to grow the parser's
+    /// per-thread msgpack scratch far past any keep-it ceiling.
+    /// </summary>
+    public static byte[] Traces_HugeAttribute(int valueChars) => Msg(c =>
+        Nested(c, 1, Msg(rs =>
+        {
+            Nested(rs, 1, Msg(res => Nested(res, 1, StringAttr("service.name", "Wallet.API"))));
+            Nested(rs, 2, Msg(ss => Nested(ss, 2, HugeSpan(valueChars))));
+        })));
+
+    private static byte[] HugeSpan(int valueChars) => Msg(sp =>
+    {
+        sp.WriteTag(1, WireFormat.WireType.LengthDelimited);
+        sp.WriteBytes(ByteString.CopyFrom(Convert.FromHexString("9af7651916cd43dd8448eb211c80319c")));
+        sp.WriteTag(2, WireFormat.WireType.LengthDelimited);
+        sp.WriteBytes(ByteString.CopyFrom(Convert.FromHexString("b7ad6b716920333a")));
+        sp.WriteTag(5, WireFormat.WireType.LengthDelimited); sp.WriteString("huge");
+        sp.WriteTag(7, WireFormat.WireType.Fixed64); sp.WriteFixed64(1_785_300_060_000_000_000UL);
+        sp.WriteTag(8, WireFormat.WireType.Fixed64); sp.WriteFixed64(1_785_300_060_100_000_000UL);
+        Nested(sp, 9, StringAttr("big", new string('x', valueChars)));
+    });
+
+    /// <summary>
     /// A resource_spans whose length prefix claims more bytes than the payload holds — a
     /// truncated upload, or a hostile one.
     /// </summary>
