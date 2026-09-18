@@ -455,11 +455,21 @@ public sealed class TraceHotTierProbe : IDisposable
         return buf.WrittenMemory.ToArray();
     }
 
-    /// <summary>The live set, sampled the same way every time it is sampled.</summary>
+    /// <summary>
+    /// The live set, sampled the same way every time it is sampled — ONE compacting gen2 collect,
+    /// then the number.
+    ///
+    /// <para>Compacting is the part that has to stay: a 10 MB tier compacted once and then measured
+    /// after a non-compacting collect reports its own fragmentation as the page's retention, which
+    /// is most of a megabyte of nothing. Aggressive mode and <c>GetTotalMemory</c>'s own
+    /// <c>forceFullCollection</c> loop are not — between them they ran a decommitting gen2 and then
+    /// a collect-and-wait-for-finalizers loop per sample, two samples a test, to produce a figure
+    /// this test only PRINTS. The gate beside it is the allocation.</para>
+    /// </summary>
     private static long LiveBytes()
     {
-        GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
-        return GC.GetTotalMemory(forceFullCollection: true);
+        GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+        return GC.GetTotalMemory(forceFullCollection: false);
     }
 
     private readonly record struct Result(double MicrosPerSpan, long AllocPerSpan, long RetainedPerSpan);
