@@ -987,12 +987,48 @@ public sealed class MetricWalTests : IAsyncLifetime
     /// derived threshold made it a property of the host — at <c>MemoryBudgets</c>' own floor the
     /// tier is 4 MB and <see cref="SlowFlushBatch"/> is 19.2 MB, so <c>Ingest</c> would schedule
     /// a flush before the test that called it reached its next line.
+    ///
+    /// <para>Three separable things have to hold, and the fact used to check only the third —
+    /// against a constant, on a constant, which made it a tautology: <c>PinnedThresholds</c>
+    /// names <c>HotTierBytes</c> explicitly, <c>HotTierBytesFor</c> returns an explicit value
+    /// whatever budget it is handed, so all four host rows evaluated the identical
+    /// 19.2 MB &lt; 32 MB and the fact would have stayed green with the injection at
+    /// <see cref="NewEngine"/> deleted — the exact regression it exists to catch.</para>
+    ///
+    /// <para>(1) the engines of this class really are built from <c>PinnedThresholds</c>, asked
+    /// by REFERENCE because on a large host the derived ceilings equal the pinned literals by
+    /// design and no comparison of figures can tell the two apart; (2) the threshold that
+    /// reaches the engine's own <c>Ingest</c> is that pinned figure; (3) the batch — measured
+    /// from a real <see cref="SlowFlushBatch"/>, not from a copy of its default arguments — fits
+    /// under it on every host the derivation can produce.</para>
     /// </summary>
     [Fact]
     public void The_batches_this_class_ingests_stay_in_the_tier_on_every_host()
     {
         const long MB = 1024 * 1024;
-        long batchBytes = 2_000L * 150 * MetricStorageEngine.HotPointBytes;   // SlowFlushBatch's default
+
+        // (1) and (2): an engine built exactly the way every fact in this file builds one, and
+        // the batch itself rather than a second copy of its default arguments — widening
+        // SlowFlushBatch used to be invisible here.
+        var  engine     = NewEngine();
+        var  batch      = SlowFlushBatch(1_700_000_000_000_000_000L);
+        long batchBytes = batch.Length * (long)MetricStorageEngine.HotPointBytes;
+
+        Assert.Same(PinnedThresholds, engine.ConfiguredOptions);
+        Assert.Equal(MemoryBudgets.MetricHotTierCapBytes, engine.HotFlushThresholdBytes);
+        Assert.True(batchBytes < engine.HotFlushThresholdBytes,
+            $"on THIS host SlowFlushBatch charges {batchBytes / 1048576.0:N1} MB against the "
+          + $"{engine.HotFlushThresholdBytes / 1048576.0:N1} MB this engine flushes above");
+
+        // …and the premise itself, on the engine: ingest the batch and the tier still holds
+        // every point of it, with no flush of the engine's own in between.
+        engine.Ingest(batch);
+        Assert.Equal(batch.Length, engine.HotPointCount);
+
+        // (3): and it would on any host — which is what the pin is for, and what inheriting
+        // would cost. The derived column is the counter-example, printed as the reason.
+        var derived = new MetricsOptions();
+        bool inheritingWouldBreak = false;
 
         foreach (var (label, budgets) in new (string, MemoryBudgets)[]
                  {
@@ -1006,7 +1042,13 @@ public sealed class MetricWalTests : IAsyncLifetime
             Assert.True(batchBytes < tier,
                 $"{label}: SlowFlushBatch charges {batchBytes / 1048576.0:N1} MB against a tier budget of "
               + $"{tier / 1048576.0:N1} MB — the engine flushes it before the test that ingested it does");
+
+            inheritingWouldBreak |= derived.HotTierBytesFor(budgets) <= batchBytes;
         }
+
+        Assert.True(inheritingWouldBreak,
+            "no host in the table would flush this batch under the DERIVED threshold, so the "
+          + "injection this fact pins is no longer buying anything — re-check the table or drop it");
     }
 
     private static MetricIngestItem[] SlowFlushBatch(

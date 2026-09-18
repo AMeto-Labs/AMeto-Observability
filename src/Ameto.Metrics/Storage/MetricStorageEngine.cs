@@ -250,6 +250,25 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     /// <summary>Test hook: series the stale sweep has evicted since start.</summary>
     internal long StaleSeriesEvicted => Volatile.Read(ref _staleSeriesEvicted);
 
+    /// <summary>
+    /// Test hook: the <see cref="MetricsOptions"/> instance this engine was built from — the
+    /// object, not a copy of its figures.
+    ///
+    /// <para>A suite that pins its thresholds so its premises hold on every host can only assert
+    /// that pinning by comparing constants, and two constants that happen to be equal on the
+    /// host running them prove nothing about the wiring: on a large host the derived ceilings ARE
+    /// the pinned literals by design, so the check passes whether or not anything was injected.
+    /// Reference identity is the one form of the question that has the same answer everywhere.
+    /// See <c>MetricWalTests.The_batches_this_class_ingests_stay_in_the_tier_on_every_host</c>.</para>
+    /// </summary>
+    internal MetricsOptions ConfiguredOptions => _options;
+
+    /// <summary>
+    /// Test hook: the tier size in bytes that <see cref="Ingest"/> actually schedules a flush
+    /// above — the derivation's answer for THIS host, after the explicit-value and floor rules.
+    /// </summary>
+    internal long HotFlushThresholdBytes => _hotFlushBytes;
+
     private long _staleSeriesEvicted;
 
     // ── Metadata catalog (maintained at ingestion, survives hot-tier drains) ───
