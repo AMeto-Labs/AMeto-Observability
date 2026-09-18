@@ -1,3 +1,4 @@
+using System.Reflection;
 using Ameto.Core;
 using Ameto.Metrics;
 using Ameto.Metrics.Storage;
@@ -262,10 +263,17 @@ public sealed class MetricBudgetWiringTests
     }
 
     /// <summary>
-    /// The ceilings this file adds are an APPEND to a cut the round's plan wanted re-made, and
-    /// the debt is written down in <c>MemoryBudgets.MetricHotTierFraction</c>. This is the bound
-    /// on it: the managed shares are ceilings that are not all reached at once, but they cannot
-    /// be allowed to grow past the point where the heap has no room left to collect in.
+    /// THE SUM, AFTER THE RE-CUT. These ceilings went in as an APPEND beside logs shares of
+    /// 0.30 + 0.15 + 0.10, for 0.71 of the managed limit, and this bound was 0.75 — a holding
+    /// figure, so the debt could not quietly grow while it was owed. The re-cut has been made:
+    /// logs are 0.25 + 0.12 + 0.05, the six total 0.58, and the bound is that total.
+    ///
+    /// <para>Which is the point of holding it THERE and not at a round number with slack in it.
+    /// Every one of the six is a ceiling and they are not all reached at once, so the sum is a
+    /// worst case rather than a forecast — but a worst case is exactly what a heap hard limit
+    /// enforces, and the stand's 384 MB has to keep 40 % of itself for queries, ASP.NET, the
+    /// drainer and the room the GC collects in. At 0.58 there is 42 %. A seventh share, or a
+    /// raise to one of these six, therefore has to be paid for out of another one here.</para>
     /// </summary>
     [Fact]
     public void The_managed_shares_still_leave_the_heap_room_to_work_in()
@@ -277,10 +285,19 @@ public sealed class MetricBudgetWiringTests
                        + MemoryBudgets.TraceHotTierFraction
                        + MemoryBudgets.TraceMergeFraction;
 
-        _out.WriteLine($"managed shares total {managed:P0} of the heap limit");
-        Assert.True(managed <= 0.75,
-            $"the managed ceilings now claim {managed:P0} of the heap limit — re-cut the logs "
-          + "fractions (MemoryBudgetTests pins them) before adding another");
+        _out.WriteLine($"managed shares total {managed:P0} of the heap limit, leaving {1 - managed:P0}");
+
+        // Rounded, because these are decimal fractions summed in binary and need not land on 0.58.
+        Assert.True(Math.Round(managed, 4) <= 0.58,
+            $"the managed ceilings claim {managed:P0} of the heap limit — the re-cut left them at "
+          + "58 %, so a new share comes out of one of the six (MemoryBudgetTests pins them), not "
+          + "out of the heap's slack");
+
+        // The invariant the figure was chosen to satisfy, stated on its own so a later cut that
+        // moves the bound above has to face it.
+        Assert.True(1 - managed >= 0.40,
+            $"a {1 - managed:P0} remainder of the heap limit is not enough for queries, ASP.NET, "
+          + "the drainer and the slack the GC needs to collect at all");
     }
 
     /// <summary>
@@ -294,6 +311,98 @@ public sealed class MetricBudgetWiringTests
         Assert.Equal((long)(384 * MB * MemoryBudgets.TraceMergeFraction),   Stand.TraceMergeBytes);
         Assert.Equal(MemoryBudgets.TraceHotTierCapBytes, Large.TraceHotTierBytes);
         Assert.Equal(MemoryBudgets.TraceMergeCapBytes,   Large.TraceMergeBytes);
+    }
+
+    /// <summary>
+    /// A TRACE CEILING IS A SPAN COUNT TIMES A SPAN'S WEIGHT, AND THE WEIGHT MOVED UNDER IT.
+    ///
+    /// <para>64 MB and 128 MB were cut against 1 117 B a span in the hot tier and 1 740 B a span
+    /// read back out of a segment — both of which were almost entirely the attribute
+    /// <c>Dictionary</c>. WP2 removed it in this same wave and neither ceiling followed, so a
+    /// large host would have flushed at 124 000 spans where every trace test says 50 000, and
+    /// admitted a merge pass 1.8x the one <c>MaxSpansPerPass</c> builds. A cap that no longer
+    /// buys the cadence it was written for is not a cap, it is a number.</para>
+    ///
+    /// <para>The weights are <c>TraceHotTierProbe</c>'s and <c>TraceCompactionMemoryProbe</c>'s,
+    /// which print them and gate them at 700 B/span. Restated here as literals so this fact is
+    /// pure arithmetic over constants — it cannot fail because of the machine it runs on, only
+    /// because someone changed a weight or a ceiling without changing the other.</para>
+    /// </summary>
+    [Fact]
+    public void The_trace_ceilings_still_buy_the_span_counts_they_were_cut_for()
+    {
+        // TraceHotTierProbe: an eight-attribute span, RETAINED in the tier.
+        const int HotTierBytesPerSpan = 540;
+        // TraceCompactionMemoryProbe: a span SpanReader.ReadAll materialises, RETAINED.
+        const int MergeBytesPerSpan = 607;
+        // TraceStorageEngine.HotFlushThreshold and MaxSpansPerPass, the cadences being bought.
+        const int HotFlushThreshold = 50_000;
+        const int MaxSpansPerPass   = 120_000;
+
+        double tierSpans  = MemoryBudgets.TraceHotTierCapBytes / (double)HotTierBytesPerSpan;
+        double mergeSpans = MemoryBudgets.TraceMergeCapBytes   / (double)MergeBytesPerSpan;
+
+        _out.WriteLine($"hot tier cap {MemoryBudgets.TraceHotTierCapBytes / 1048576.0:N1} MB = "
+                     + $"{tierSpans:N0} spans at {HotTierBytesPerSpan} B; merge cap "
+                     + $"{MemoryBudgets.TraceMergeCapBytes / 1048576.0:N1} MB = {mergeSpans:N0} spans "
+                     + $"at {MergeBytesPerSpan} B");
+
+        Assert.InRange(tierSpans,  HotFlushThreshold * 0.9, HotFlushThreshold * 1.1);
+        Assert.InRange(mergeSpans, MaxSpansPerPass   * 0.9, MaxSpansPerPass   * 1.1);
+
+        // Rounded UP and never down: a host large enough for the cap must afford the WHOLE
+        // cadence, not 98 % of it and a flush that arrives early for no stated reason.
+        Assert.True(MemoryBudgets.TraceHotTierCapBytes >= (long)HotFlushThreshold * HotTierBytesPerSpan);
+        Assert.True(MemoryBudgets.TraceMergeCapBytes   >= (long)MaxSpansPerPass   * MergeBytesPerSpan);
+    }
+
+    /// <summary>
+    /// AN OPTION AN OPERATOR CANNOT FIND IS AN OPTION THEY DO NOT HAVE. <c>Ameto:Metrics</c>
+    /// arrived as nine settable knobs with no <c>Metrics:</c> block in the shipped
+    /// <c>config.yml</c> and not one row in <c>docs/CONFIGURATION.md</c> — which README points at
+    /// and nothing else — so the whole group was undiscoverable, including the two that decide
+    /// how much of a 384 MB heap the exemplar rings pin for the life of the process.
+    ///
+    /// <para><c>Ameto.Core.Tests.ConfigurationDocsTests</c> is the same drift guard for
+    /// <c>QueryOptions</c> and <c>IngestionOptions</c>; it does not enumerate this group, so this
+    /// is where the metrics half of it lives. It asks only that every settable option appears BY
+    /// NAME in the reference and that the file an operator copies from carries the block.
+    /// Computed <c>…For</c> methods and <c>Effective…</c> properties are not settings.</para>
+    /// </summary>
+    [Fact]
+    public void Every_settable_metrics_option_is_documented_and_shipped_in_config_yml()
+    {
+        string root = RepoRoot();
+        string doc  = File.ReadAllText(Path.Combine(root, "docs", "CONFIGURATION.md"));
+        string yml  = File.ReadAllText(Path.Combine(root, "src", "Ameto.Server", "config.yml"));
+
+        var missingFromDoc = new List<string>();
+        var missingFromYml = new List<string>();
+        foreach (var p in typeof(MetricsOptions).GetProperties(BindingFlags.Public | BindingFlags.Instance))
+        {
+            if (!p.CanWrite) continue;                    // computed, not a setting
+            if (!doc.Contains(p.Name, StringComparison.Ordinal)) missingFromDoc.Add(p.Name);
+            if (!yml.Contains(p.Name, StringComparison.Ordinal)) missingFromYml.Add(p.Name);
+        }
+
+        Assert.True(missingFromDoc.Count == 0, "docs/CONFIGURATION.md does not mention " + string.Join(", ", missingFromDoc));
+        Assert.True(missingFromYml.Count == 0, "src/Ameto.Server/config.yml does not mention " + string.Join(", ", missingFromYml));
+
+        // The section header and the block, so the rows cannot be smuggled in under another
+        // group's heading or left as a bare list of keys nobody can paste anywhere.
+        Assert.Contains("## Metrics options (`Ameto:Metrics`)", doc, StringComparison.Ordinal);
+        Assert.Contains("\n  Metrics:", yml, StringComparison.Ordinal);
+    }
+
+    /// <summary>Walks up from the test binary to the repo root, the way ConfigurationDocsTests does.</summary>
+    private static string RepoRoot()
+    {
+        var d = new DirectoryInfo(AppContext.BaseDirectory);
+        while (d is not null && !File.Exists(Path.Combine(d.FullName, "docs", "CONFIGURATION.md")))
+            d = d.Parent;
+
+        Assert.NotNull(d);
+        return d!.FullName;
     }
 
     /// <summary>
