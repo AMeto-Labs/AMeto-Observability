@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using Microsoft.Extensions.Logging;
 using Ameto.Otel;
 using Xunit;
 using Xunit.Abstractions;
@@ -70,6 +71,59 @@ public sealed class OtlpTraceProtoProbe
         // it is printed, not gated, because a flaky guard is a guard that gets deleted.
         Assert.True(spanBytes * 4 < domBytes,
             $"{label}: expected >=4x less allocation, got dom={domBytes} span={spanBytes}");
+    }
+
+    /// <summary>
+    /// The other per-request cost on this route, and the one that did not depend on the encoding:
+    /// the decoded-span-count line.
+    ///
+    /// <para><c>logger.LogDebug("… {SpanCount} spans", spans.Count)</c> binds to the
+    /// <c>params object?[]</c> overload, which allocates the array and boxes the int at the call
+    /// site — BEFORE <c>IsEnabled</c> is consulted. So it cost on every request at production log
+    /// levels, where the line is never written. The pre-compiled
+    /// <see cref="LoggerMessage.Define{T}"/> delegate asks first and formats nothing.</para>
+    ///
+    /// <para>It lives here rather than in an integration test because the difference is
+    /// allocation, not behaviour, and measuring it needs no host.</para>
+    /// </summary>
+    [Fact]
+    public void TheDecodedSpanCountLineCostsNothingWhenDebugIsOff()
+    {
+        var logger = new LevelLogger(enabled: false);
+        for (int i = 0; i < 100; i++) OtlpEndpointMapper.LogTracesDecoded(logger, 200);
+
+        const int iters = 10_000;
+        long b0 = GC.GetAllocatedBytesForCurrentThread();
+        for (int i = 0; i < iters; i++) OtlpEndpointMapper.LogTracesDecoded(logger, 200);
+        long bytes = GC.GetAllocatedBytesForCurrentThread() - b0;
+
+        _out.WriteLine($"debug off  : {bytes / (double)iters:F1} B per request ({bytes} B over {iters})");
+        Assert.Equal(0, bytes);
+        Assert.Equal(0, logger.Written);
+
+        // And it still writes the line when Debug IS on — an allocation-free logger that logs
+        // nothing would pass the assertion above and lose the diagnostic.
+        var on = new LevelLogger(enabled: true);
+        OtlpEndpointMapper.LogTracesDecoded(on, 200);
+        Assert.Equal(1, on.Written);
+        Assert.Contains("200 spans", on.Last);
+    }
+
+    /// <summary>An <see cref="ILogger"/> that answers one question and records what it was told.</summary>
+    private sealed class LevelLogger(bool enabled) : ILogger
+    {
+        public int Written;
+        public string Last = string.Empty;
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => enabled;
+
+        public void Log<TState>(Microsoft.Extensions.Logging.LogLevel logLevel, EventId eventId, TState state,
+                                Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            Written++;
+            Last = formatter(state, exception);
+        }
     }
 
     // The closure is built before the byte counter is sampled, so it is not in the measurement.
