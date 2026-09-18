@@ -90,13 +90,19 @@ its dependencies.
 
 - `Ameto.Tracing/Storage/TraceStorageEngine.cs`: WP2 (w1) → WP4 (w2) → WP8 (w3). Never two in a wave.
 - `Ameto.Metrics/Storage/MetricStorageEngine.cs`: WP3 (w1) → WP6 (w2) → WP7 (w3).
-- `Ameto.Core/MemoryBudgets.cs` is owned **once in the whole round, by WP3**. The existing cut
-  already claims 0.55 of the managed limit and 0.40 of the physical one for logs
-  (`ManagedBuildFraction` 0.30 + `IndexCacheFraction` 0.15 + `IngestBufferFraction` 0.10;
-  `NativeTierFraction` 0.25 + `IngestArenaFraction` 0.15). A traces and a metrics share are a
-  **re-cut, not an append** — so WP3 defines *both* new fractions (`MetricHotTierFraction`,
-  `TraceHotTierFraction`, `TraceMergeFraction`) and re-balances the existing ones in one commit
-  with the logs budget tests green. WP8 only consumes the traces fractions.
+- `Ameto.Core/MemoryBudgets.cs` was owned **once in the whole round, by WP3**, plus the wave-1
+  integration fixup that finished WP3's job. **Closed after that — no later work package opens
+  this file.** The cut it inherited claimed 0.55 of the managed limit and 0.40 of the physical one
+  for logs (`ManagedBuildFraction` 0.30 + `IndexCacheFraction` 0.15 + `IngestBufferFraction` 0.10;
+  `NativeTierFraction` 0.25 + `IngestArenaFraction` 0.15). A traces and a metrics share had to be
+  a **re-cut, not an append**: WP3 defined the three new fractions (`MetricHotTierFraction` 0.05,
+  `TraceHotTierFraction` 0.05, `TraceMergeFraction` 0.06) and appended them at 0.71, and the
+  fixup made the re-cut — logs to **0.22 / 0.12 / 0.06**, six managed shares totalling **0.56**,
+  with `MemoryBudgetTests`' literals re-stated and `MetricBudgetWiringTests` holding that total in
+  the same commit. The physical shares are untouched. The fixup also re-calibrated
+  `TraceHotTierCapBytes` (64 MB → **27 MB**, 50 000 spans × the 540 B WP2 left a hot-tier span at)
+  and `TraceMergeCapBytes` (128 MB → **73 MB**, 120 000 × 607 B), which WP2 had invalidated in the
+  same wave. WP8 only consumes the traces fractions and caps.
 - `Ameto.Core/Options.cs`: WP3 (w1, `MetricsOptions`) → WP8 (w3, `TracesOptions` memory knobs).
 - `Ameto.Tracing/Storage/SpanWriteAheadLog.cs` is WP4's alone. WP4 lands the UTF-8
   `Append(… ReadOnlySpan<byte> nameUtf8, ReadOnlySpan<byte> serviceUtf8, ReadOnlySpan<byte> attrs)`
@@ -242,7 +248,9 @@ can reclaim, in a container whose GC heap limit is 384 MB**.
 **This package owns `MemoryBudgets.cs` for the whole round** (see the ownership rules): it defines
 `MetricHotTierFraction`, `TraceHotTierFraction` and `TraceMergeFraction` and re-balances the
 existing logs fractions in one commit, so WP8 can consume the traces share in wave 3 without
-reopening the file.
+reopening the file. *(Delivered as an append; the re-balance — logs to 0.22 / 0.12 / 0.06, six
+shares at 0.56 — was made by the wave-1 integration fixup, which also re-calibrated the two trace
+caps against WP2's span weights. The file is closed for the rest of the round.)*
 
 **Tests that must pin it.** `MetricWalTests`, `MetricFormatV3Tests`, `MetricChunkedRewriteTests`
 (72 facts across the three) stay green — if the flush cadence changes, inject explicit thresholds

@@ -262,10 +262,17 @@ public sealed class MetricBudgetWiringTests
     }
 
     /// <summary>
-    /// The ceilings this file adds are an APPEND to a cut the round's plan wanted re-made, and
-    /// the debt is written down in <c>MemoryBudgets.MetricHotTierFraction</c>. This is the bound
-    /// on it: the managed shares are ceilings that are not all reached at once, but they cannot
-    /// be allowed to grow past the point where the heap has no room left to collect in.
+    /// THE SUM, AFTER THE RE-CUT. These ceilings went in as an APPEND beside logs shares of
+    /// 0.30 + 0.15 + 0.10, for 0.71 of the managed limit, and this bound was 0.75 — a holding
+    /// figure, so the debt could not quietly grow while it was owed. The re-cut has been made:
+    /// logs are 0.22 + 0.12 + 0.06, the six total 0.56, and the bound is that total.
+    ///
+    /// <para>Which is the point of holding it THERE and not at a round number with slack in it.
+    /// Every one of the six is a ceiling and they are not all reached at once, so the sum is a
+    /// worst case rather than a forecast — but a worst case is exactly what a heap hard limit
+    /// enforces, and the stand's 384 MB has to keep 40 % of itself for queries, ASP.NET, the
+    /// drainer and the room the GC collects in. At 0.56 there is 44 %. A seventh share, or a
+    /// raise to one of these six, therefore has to be paid for out of another one here.</para>
     /// </summary>
     [Fact]
     public void The_managed_shares_still_leave_the_heap_room_to_work_in()
@@ -277,10 +284,19 @@ public sealed class MetricBudgetWiringTests
                        + MemoryBudgets.TraceHotTierFraction
                        + MemoryBudgets.TraceMergeFraction;
 
-        _out.WriteLine($"managed shares total {managed:P0} of the heap limit");
-        Assert.True(managed <= 0.75,
-            $"the managed ceilings now claim {managed:P0} of the heap limit — re-cut the logs "
-          + "fractions (MemoryBudgetTests pins them) before adding another");
+        _out.WriteLine($"managed shares total {managed:P0} of the heap limit, leaving {1 - managed:P0}");
+
+        // Rounded, because these are decimal fractions summed in binary: 0.56 is 0.5600000000000001.
+        Assert.True(Math.Round(managed, 4) <= 0.56,
+            $"the managed ceilings claim {managed:P0} of the heap limit — the re-cut left them at "
+          + "56 %, so a new share comes out of one of the six (MemoryBudgetTests pins them), not "
+          + "out of the heap's slack");
+
+        // The invariant the figure was chosen to satisfy, stated on its own so a later cut that
+        // moves the bound above has to face it.
+        Assert.True(1 - managed >= 0.40,
+            $"a {1 - managed:P0} remainder of the heap limit is not enough for queries, ASP.NET, "
+          + "the drainer and the slack the GC needs to collect at all");
     }
 
     /// <summary>

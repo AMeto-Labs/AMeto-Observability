@@ -33,9 +33,9 @@ public sealed class MemoryBudgetTests
     {
         var b = MemoryBudgets.Derive(managedLimitBytes: 384 * MB, physicalLimitBytes: 512 * MB);
 
-        Assert.Equal((long)(384 * MB * 0.30), b.ManagedBuildBytes);   // 115 MB
+        Assert.Equal((long)(384 * MB * 0.22), b.ManagedBuildBytes);   //  84 MB
         Assert.Equal((long)(512 * MB * 0.25), b.NativeTierBytes);     // 128 MB
-        Assert.Equal((long)(384 * MB * 0.15), b.IndexCacheBytes);     //  57 MB
+        Assert.Equal((long)(384 * MB * 0.12), b.IndexCacheBytes);     //  46 MB
         Assert.True(b.IsConstrained);
 
         // The index cache's NATIVE share (bloom bits) is the second budget taken of the
@@ -67,12 +67,14 @@ public sealed class MemoryBudgetTests
     {
         var stand = MemoryBudgets.Derive(managedLimitBytes: 384 * MB, physicalLimitBytes: 512 * MB);
 
-        Assert.Equal((long)(384 * MB * 0.10), stand.IngestBufferBytes);            // 38 MB
+        Assert.Equal((long)(384 * MB * 0.06), stand.IngestBufferBytes);            // 23 MB
         Assert.True(stand.IngestBufferBytes < MemoryBudgets.IngestBufferCapBytes);
 
         // Every managed ceiling together still has to leave the heap room for queries, ASP.NET
-        // and the GC itself — the sum the pool used to sit outside of.
-        Assert.True(stand.ManagedBuildBytes + stand.IndexCacheBytes + stand.IngestBufferBytes < 384 * MB * 0.60);
+        // and the GC itself — the sum the pool used to sit outside of. The three logs ceilings
+        // are 0.40 of the heap limit since the re-cut, and the three tier ceilings that share it
+        // with them take it to 0.56 (MetricBudgetWiringTests holds that total).
+        Assert.True(stand.ManagedBuildBytes + stand.IndexCacheBytes + stand.IngestBufferBytes < 384 * MB * 0.42);
 
         // A host with room keeps the absolute ceiling, and an unknown limit falls back to it
         // rather than strangling a healthy machine.
@@ -182,9 +184,9 @@ public sealed class MemoryBudgetTests
     {
         var b = MemoryBudgets.Derive(managedLimitBytes: 512 * MB, physicalLimitBytes: 64 * GB);
 
-        Assert.Equal((long)(512 * MB * 0.30), b.ManagedBuildBytes);
+        Assert.Equal((long)(512 * MB * 0.22), b.ManagedBuildBytes);
         Assert.Equal(MemoryBudgets.NativeTierCapBytes, b.NativeTierBytes);
-        Assert.Equal((long)(512 * MB * 0.15), b.IndexCacheBytes);
+        Assert.Equal((long)(512 * MB * 0.12), b.IndexCacheBytes);
 
         // Including the cache's own native share, which is the sharpest reading of the rule:
         // on a 64 GB host it takes the fixed ceiling, where the managed base would have given
@@ -199,11 +201,51 @@ public sealed class MemoryBudgetTests
     {
         var b = MemoryBudgets.Derive(4 * GB);
 
-        Assert.Equal(MemoryBudgets.ManagedBuildCapBytes, b.ManagedBuildBytes);  // 30 % = 1.2 GB > cap
+        Assert.Equal(MemoryBudgets.ManagedBuildCapBytes, b.ManagedBuildBytes);  // 22 % = 901 MB > cap
         Assert.Equal(MemoryBudgets.NativeTierCapBytes,   b.NativeTierBytes);    // 25 % = 1.0 GB > cap
-        Assert.Equal(MemoryBudgets.IndexCacheCapBytes,   b.IndexCacheBytes);    // 15 % = 614 MB > cap
+        Assert.Equal(MemoryBudgets.IndexCacheCapBytes,   b.IndexCacheBytes);    // 12 % = 491 MB > cap
         Assert.Equal(MemoryBudgets.IndexCacheNativeCapBytes, b.IndexCacheNativeBytes); // 5 % = 205 MB > cap
         Assert.False(b.IsConstrained);
+    }
+
+    /// <summary>
+    /// THE RE-CUT IS FREE ABOVE THE STAND, which is the claim that made it safe to make. The
+    /// managed logs shares went 0.30 / 0.15 / 0.10 -> 0.22 / 0.12 / 0.06 to pay for the metric
+    /// and trace tiers that WP3 appended beside them, and a fraction change is only ever a
+    /// behaviour change where the fraction BINDS. Every one of the nine ceilings is
+    /// <c>min(cap, share)</c>, and the first share to stop binding is the largest — 640 MB of a
+    /// 16 GB limit is 3.9 %, six times below the smallest fraction here — so every derived figure
+    /// on a host with room is its constant, before and after.
+    ///
+    /// <para>Asserted at both ends of "large": 16 GB, which is a CI runner or a developer box and
+    /// the smallest host where this has to hold, and 64 GB. If a later cut takes a fraction below
+    /// its cap's share of 16 GB, this fails rather than quietly re-sizing every real deployment.</para>
+    /// </summary>
+    [Theory]
+    [InlineData(16)]
+    [InlineData(64)]
+    public void The_re_cut_of_the_managed_shares_moves_nothing_on_a_large_host(int hostGb)
+    {
+        var b = MemoryBudgets.Derive(hostGb * GB);
+
+        Assert.Equal(MemoryBudgets.ManagedBuildCapBytes,     b.ManagedBuildBytes);
+        Assert.Equal(MemoryBudgets.IndexCacheCapBytes,       b.IndexCacheBytes);
+        Assert.Equal(MemoryBudgets.IngestBufferCapBytes,     b.IngestBufferBytes);
+        Assert.Equal(MemoryBudgets.NativeTierCapBytes,       b.NativeTierBytes);
+        Assert.Equal(MemoryBudgets.IndexCacheNativeCapBytes, b.IndexCacheNativeBytes);
+        Assert.Equal(MemoryBudgets.IngestArenaCapBytes,      b.IngestArenaBytes);
+        Assert.Equal(MemoryBudgets.MetricHotTierCapBytes,    b.MetricHotTierBytes);
+        Assert.Equal(MemoryBudgets.TraceHotTierCapBytes,     b.TraceHotTierBytes);
+        Assert.Equal(MemoryBudgets.TraceMergeCapBytes,       b.TraceMergeBytes);
+        Assert.False(b.IsConstrained);
+
+        // And the margin, so the next cut can see how much room it is spending: the largest cap
+        // as a share of this host is the bar every managed fraction has to stay above.
+        double bar = MemoryBudgets.ManagedBuildCapBytes / (double)(hostGb * GB);
+        foreach (double f in (double[])[MemoryBudgets.ManagedBuildFraction, MemoryBudgets.IndexCacheFraction,
+                                        MemoryBudgets.IngestBufferFraction, MemoryBudgets.MetricHotTierFraction,
+                                        MemoryBudgets.TraceHotTierFraction, MemoryBudgets.TraceMergeFraction])
+            Assert.True(f > bar, $"a fraction of {f:P0} is below {bar:P1}, so a {hostGb} GB host no longer takes the caps");
     }
 
     [Fact]
@@ -425,9 +467,9 @@ public sealed class MemoryBudgetTests
         Assert.Equal(512 * MB, child.PhysicalLimit);
 
         var expected = MemoryBudgets.Derive(384 * MB, 512 * MB);
-        Assert.Equal(expected.ManagedBuildBytes, child.ManagedBuild);   // 115 MB
+        Assert.Equal(expected.ManagedBuildBytes, child.ManagedBuild);   //  84 MB
         Assert.Equal(expected.NativeTierBytes,   child.NativeTier);     // 128 MB
-        Assert.Equal(expected.IndexCacheBytes,   child.IndexCache);     //  57 MB
+        Assert.Equal(expected.IndexCacheBytes,   child.IndexCache);     //  46 MB
 
         // The index cache's native share is the other budget this test exists for: bloom bits are
         // NativeMemory, so they are bounded by the CONTAINER, not by the heap limit the rest of

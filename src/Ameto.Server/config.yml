@@ -161,8 +161,8 @@ Ameto:
   # Search budgets and the cross-query cache of decoded segment indexes.
   Query:
     # Cache of decoded index sections, charged at each entry's RETAINED size (expanded
-    # postings + dictionaries + bloom bits). Unset = min(256 MB, 15% of the managed-heap
-    # limit) — in a 512 MB container the GC's heap limit is 384 MB, so ~57 MB. 0 disables
+    # postings + dictionaries + bloom bits). Unset = min(256 MB, 12% of the managed-heap
+    # limit) — in a 512 MB container the GC's heap limit is 384 MB, so ~46 MB. 0 disables
     # the cache entirely (every query re-reads and re-decodes what it consults).
     # For a 512 MB stand an explicit 48 MB is a reasonable floor to pin:
     # IndexCacheBytes: 50331648
