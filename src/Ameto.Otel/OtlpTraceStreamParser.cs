@@ -52,8 +52,11 @@ public static class OtlpTraceStreamParser
     /// <para>Depth is bounded by <c>Utf8JsonReader</c>'s own MaxDepth of 64, which each attribute
     /// level costs two or three of, so the array settles at a couple of dozen entries at worst.
     /// It still grows on demand rather than assuming that.</para>
+    ///
+    /// <para>Entries are dropped again past <see cref="MaxKeptNestScratch"/> — see
+    /// <see cref="ReleaseNestBuffer"/>.</para>
     /// </summary>
-    [ThreadStatic] private static ArrayBufferWriter<byte>[]? _tNest;
+    [ThreadStatic] private static ArrayBufferWriter<byte>?[]? _tNest;
 
     /// <summary>
     /// Per-thread scratch for unescaping a JSON string, in place of an
@@ -67,10 +70,19 @@ public static class OtlpTraceStreamParser
     /// </summary>
     private const int MaxKeptEscapeScratch = 64 * 1024;
 
+    /// <summary>
+    /// The same rule for a nesting level's scratch, and it matters more here: every OPEN level
+    /// buffers the whole subtree below it before splicing, so one in-limits POST carrying a
+    /// multi-megabyte nested attribute would pin a copy of it at EVERY open level — arrays that
+    /// <see cref="ArrayBufferWriter{T}.ResetWrittenCount"/> empties but never shrinks, on every
+    /// thread-pool thread that ever served such a request.
+    /// </summary>
+    private const int MaxKeptNestScratch = 64 * 1024;
+
     /// <summary>The scratch writer for one nesting level, emptied and ready to write.</summary>
     private static ArrayBufferWriter<byte> NestBuffer(int depth)
     {
-        var pool = _tNest ??= new ArrayBufferWriter<byte>[8];
+        var pool = _tNest ??= new ArrayBufferWriter<byte>?[8];
         if (depth >= pool.Length)
         {
             Array.Resize(ref pool, Math.Max(depth + 1, pool.Length * 2));
@@ -79,6 +91,21 @@ public static class OtlpTraceStreamParser
         var buf = pool[depth] ??= new ArrayBufferWriter<byte>(256);
         buf.ResetWrittenCount();
         return buf;
+    }
+
+    /// <summary>
+    /// Releases a nesting level's scratch once its value has been spliced into the parent,
+    /// dropping it if it has grown past <see cref="MaxKeptNestScratch"/> so the next value at
+    /// that level starts from 256 bytes again.
+    ///
+    /// <para>Safe to drop here because <c>MessagePackWriter.WriteRaw</c> COPIES: by the time
+    /// this runs the bytes are already in the parent's buffer, and the level is closed.</para>
+    /// </summary>
+    private static void ReleaseNestBuffer(int depth)
+    {
+        var pool = _tNest;
+        if (pool is null || (uint)depth >= (uint)pool.Length) return;
+        if (pool[depth] is { } buf && buf.Capacity > MaxKeptNestScratch) pool[depth] = null;
     }
 
     /// <summary>Scratch of at least <paramref name="needed"/> bytes, kept per thread while it is small.</summary>
@@ -617,6 +644,7 @@ public static class OtlpTraceStreamParser
                 tw.Flush();
                 w.WriteArrayHeader(n);
                 w.WriteRaw(tmp.WrittenSpan);
+                ReleaseNestBuffer(depth);
             }
             else reader.Skip();
         }
@@ -638,6 +666,7 @@ public static class OtlpTraceStreamParser
                 tw.Flush();
                 w.WriteMapHeader(n);
                 w.WriteRaw(tmp.WrittenSpan);
+                ReleaseNestBuffer(depth);
             }
             else reader.Skip();
         }

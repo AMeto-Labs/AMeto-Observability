@@ -1,3 +1,5 @@
+using System.Buffers;
+using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using Ameto.Core.Serialization;
@@ -183,6 +185,78 @@ public sealed class OtlpTraceProtoLimitsTests
         AssertJsonMatchesDom(EscapedBatch(longValueChars: 100_000));
         AssertJsonMatchesDom(EscapedBatch(longValueChars: 8));
     }
+
+    /// <summary>
+    /// The per-level nested-value scratch is per THREAD and only ever emptied, never shrunk, so
+    /// whatever the biggest nested value a thread ever saw was, that thread keeps the array for
+    /// the life of the process. And because every open level buffers the whole subtree below it
+    /// before splicing, one in-limits POST with a large nested attribute grows the scratch at
+    /// EVERY level it passes through, not just the innermost — the sibling escape scratch has
+    /// had a keep-it ceiling since the day it was added, and this one had none. Both halves are
+    /// pinned here: the buffers come back small, and the values still come out identical to the
+    /// DOM's, which is what proves the release happens after the splice and not before it.
+    /// </summary>
+    [Fact]
+    public void Json_a_huge_nested_value_is_not_kept_on_the_thread()
+    {
+        // ~320 KB of leaf text inside array → kvlist → array, then a small nested sibling and a
+        // scalar, so every level has to be usable again after the big one is dropped.
+        string json = HugeNestedHead + Leaves(leafChars: 4_000, leaves: 80) + HugeNestedTail;
+
+        AssertJsonMatchesDom(json);
+
+        var pool = NestScratch();
+        for (int d = 0; d < pool.Length; d++)
+        {
+            int kept = pool[d]?.Capacity ?? 0;
+            Assert.True(kept <= 64 * 1024,
+                $"nesting level {d} kept {kept} B of scratch pinned to this thread");
+        }
+    }
+
+    /// <summary>The calling thread's nested-value scratch — [ThreadStatic], so read it here.</summary>
+    private static ArrayBufferWriter<byte>?[] NestScratch()
+        => (ArrayBufferWriter<byte>?[]?)typeof(OtlpTraceStreamParser)
+               .GetField("_tNest", BindingFlags.NonPublic | BindingFlags.Static)!
+               .GetValue(null) ?? [];
+
+    private static string Leaves(int leafChars, int leaves)
+    {
+        var sb = new StringBuilder((leafChars + 24) * leaves);
+        string leaf = new('x', leafChars);
+        for (int i = 0; i < leaves; i++)
+        {
+            if (i > 0) sb.Append(',');
+            sb.Append("{\"stringValue\":\"").Append(leaf).Append("\"}");
+        }
+        return sb.ToString();
+    }
+
+    private const string HugeNestedHead = """
+    {"resourceSpans":[{"resource":{"attributes":[
+        {"key":"service.name","value":{"stringValue":"Wallet.API"}}
+      ]},
+      "scopeSpans":[{"spans":[
+        {"traceId":"f6f6f098569a7f2ba54f3c734aa563f0","spanId":"a1b2c3d4e5f60718",
+         "name":"huge","kind":2,
+         "startTimeUnixNano":"1783953780000000000","endTimeUnixNano":"1783953780250000000",
+         "attributes":[
+           {"key":"huge","value":{"arrayValue":{"values":[
+              {"kvlistValue":{"values":[{"key":"blob","value":{"arrayValue":{"values":[
+    """;
+
+    private const string HugeNestedTail = """
+              ]}}}]}}
+           ]}}},
+           {"key":"small","value":{"arrayValue":{"values":[
+              {"kvlistValue":{"values":[{"key":"k","value":{"stringValue":"v"}}]}},
+              {"stringValue":"tail"}
+           ]}}},
+           {"key":"plain","value":{"stringValue":"last"}}
+         ]}
+      ]}]
+    }]}
+    """;
 
     /// <summary>
     /// A resource that states <c>service.name</c> three times — an int, then two strings. The
