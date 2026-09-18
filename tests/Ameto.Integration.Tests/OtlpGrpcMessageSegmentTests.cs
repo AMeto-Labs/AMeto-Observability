@@ -10,22 +10,23 @@ using Xunit;
 namespace Ameto.Integration.Tests;
 
 /// <summary>
-/// The gRPC receiver's one remaining per-signal difference: where each decoder reads the
-/// request message from.
+/// Where each parser reads the request message from — and, since the trace DOM decoder came
+/// off this route, the same place for all three signals.
 ///
 /// <para>An inflated message is alone in its own buffer. An uncompressed one sits five bytes
-/// into the request buffer, behind the frame header — which the span parsers take in their
-/// stride, and which the trace DOM decoder, taking (buffer, length) and reading from index 0,
-/// cannot. So the trace path memmoves the message down and the others do not, and getting
-/// that backwards hands a decoder five bytes of frame header and then truncates the tail.
-/// On protobuf that is not a parse error: it is a batch that silently loses its last record,
-/// or a span whose last attribute vanishes.</para>
+/// into the request buffer, behind the frame header, and every parser on these routes takes
+/// the segment where it lies. The trace route used to be the exception: its DOM decoder took
+/// (buffer, length) and read from index 0, so the whole message was memmoved down first — a
+/// megabyte of copy per megabyte batch for nothing. The last test here is what that cost
+/// bought, kept as the record of why the flag existed.</para>
 ///
 /// <para><b>What these tests prove:</b> that a real framed body — identity and gzip, for all
-/// three signals — reaches each signal's real decoder as exactly the bytes the client sent,
-/// and that the records come out. They run the same <c>TryUnframe</c> →
-/// <c>MessageSegment</c> → decoder sequence the route handler runs, over the same buffer
-/// shape the body reader produces.</para>
+/// three signals — reaches each signal's real parser as exactly the bytes the client sent, and
+/// that the records come out. They run the same <c>TryUnframe</c> → <c>MessageSegment</c> →
+/// parser sequence the route handler runs, over the same buffer shape the body reader
+/// produces. Getting the offset wrong hands a parser five bytes of frame header and then
+/// truncates the tail, which on protobuf is not a parse error: it is a batch that silently
+/// loses its last record, or a span whose last attribute vanishes.</para>
 ///
 /// <para><b>What they do NOT prove:</b> anything about the transport — routing, the API-key
 /// check, HTTP/2 negotiation, or the grpc-status trailer. TestServer cannot honestly test
@@ -34,13 +35,6 @@ namespace Ameto.Integration.Tests;
 /// server does not have — which is exactly what once hid a success path that answered with no
 /// grpc-status at all. The transport is verified against a real Kestrel instead (docs/API.md
 /// carries the curl).</para>
-///
-/// <para>They also do not prove the WIRING — which route passes
-/// <c>decodeReadsFromZero: true</c> — because that is inside <c>MapOtlpGrpcEndpoints</c> and
-/// needs a host to reach. Worth knowing that both ways of getting it wrong are loud rather
-/// than silent: a trace route without the memmove refuses every batch with "invalid tag
-/// (zero)" (the last test here), and a log or metric route WITH it is merely a redundant copy
-/// of bytes the span parsers would have read where they lay.</para>
 /// </summary>
 public sealed class OtlpGrpcMessageSegmentTests
 {
@@ -64,14 +58,17 @@ public sealed class OtlpGrpcMessageSegmentTests
     /// Frames a message the way a client does, into a buffer shaped like the one the body
     /// reader hands over (rented, so longer than the request), then unframes and places it.
     /// </summary>
-    private static ArraySegment<byte> Deliver(byte[] message, bool gzip, bool decodeReadsFromZero,
-                                              out byte[]? inflated)
+    private static ArraySegment<byte> Deliver(byte[] message, bool gzip, out byte[]? inflated)
+        => Deliver(message, gzip, out inflated, out _);
+
+    private static ArraySegment<byte> Deliver(byte[] message, bool gzip,
+                                              out byte[]? inflated, out byte[] body)
     {
         byte[] payload = gzip ? Gzip(message) : message;
 
         // A pooled buffer is bigger than the body it holds, and holds rubbish past it — if a
         // decoder is handed a length rather than a slice, that rubbish is what it reads.
-        byte[] body = new byte[payload.Length + 5 + 97];
+        body = new byte[payload.Length + 5 + 97];
         body.AsSpan().Fill(0xCC);
         body[0] = gzip ? (byte)1 : (byte)0;
         BinaryPrimitives.WriteUInt32BigEndian(body.AsSpan(1), (uint)payload.Length);
@@ -82,8 +79,7 @@ public sealed class OtlpGrpcMessageSegmentTests
                                                 out var unframed, out inflated, out int inflatedLen);
         Assert.Equal(UnframeResult.Ok, result);
 
-        return OtlpGrpcEndpointMapper.MessageSegment(
-            body, unframed.Length, inflated, inflatedLen, decodeReadsFromZero);
+        return OtlpGrpcEndpointMapper.MessageSegment(body, unframed.Length, inflated, inflatedLen);
     }
 
     private static byte[] Gzip(byte[] data)
@@ -101,7 +97,7 @@ public sealed class OtlpGrpcMessageSegmentTests
     public void Logs_arrive_whole_at_the_offset_the_parser_is_given(bool gzip)
     {
         byte[] message = LogsRequest(records: 5);
-        var segment = Deliver(message, gzip, decodeReadsFromZero: false, out byte[]? inflated);
+        var segment = Deliver(message, gzip, out byte[]? inflated);
         try
         {
             if (!gzip) Assert.Equal(OtlpGrpcFraming.HeaderBytes, segment.Offset);   // NOT memmoved
@@ -124,23 +120,29 @@ public sealed class OtlpGrpcMessageSegmentTests
         }
     }
 
-    // ── Traces: the DOM decoder, memmoved to index 0 ──────────────────────────
+    // ── Traces: the span parser, at offset 5 ──────────────────────────────────
 
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public void Traces_arrive_whole_at_index_zero(bool gzip)
+    public void Traces_arrive_whole_at_the_offset_the_parser_is_given(bool gzip)
     {
         byte[] message = TracesRequest(spans: 4);
-        var segment = Deliver(message, gzip, decodeReadsFromZero: true, out byte[]? inflated);
+        var segment = Deliver(message, gzip, out byte[]? inflated, out byte[] body);
         try
         {
-            Assert.Equal(0, segment.Offset);                                        // memmoved down
+            if (!gzip)
+            {
+                Assert.Equal(OtlpGrpcFraming.HeaderBytes, segment.Offset);          // NOT memmoved
+                // And the frame header is still where the client put it: nothing was copied
+                // over it, which is the megabyte-per-megabyte-batch this route used to pay.
+                Assert.Equal(0, body[0]);
+                Assert.Equal((uint)message.Length, BinaryPrimitives.ReadUInt32BigEndian(body.AsSpan(1)));
+            }
             Assert.Equal(message.Length, segment.Count);
 
             // Exactly the call the route's decode lambda makes.
-            var request = OtlpProtoDecoder.DecodeTraces(segment.Array!, segment.Offset + segment.Count);
-            var spans   = OtlpTraceMapper.Map(request);
+            var spans = OtlpTraceProtoParser.Parse(segment.AsSpan());
 
             Assert.Equal(4, spans.Count);
             Assert.Equal("span 3", spans[3].Name);                                  // the truncated one
@@ -160,7 +162,7 @@ public sealed class OtlpGrpcMessageSegmentTests
     public void Metrics_arrive_whole_at_the_offset_the_parser_is_given(bool gzip)
     {
         byte[] message = MetricsRequest();
-        var segment = Deliver(message, gzip, decodeReadsFromZero: false, out byte[]? inflated);
+        var segment = Deliver(message, gzip, out byte[]? inflated);
         try
         {
             if (!gzip) Assert.Equal(OtlpGrpcFraming.HeaderBytes, segment.Offset);
@@ -176,21 +178,25 @@ public sealed class OtlpGrpcMessageSegmentTests
     }
 
     /// <summary>
-    /// The reason the memmove is still there, stated as a test: hand the trace DOM decoder the
-    /// segment the SPAN parsers get — offset 5, header still in front — and it reads the frame's
-    /// compression flag as a field tag and refuses the whole batch. So the flag on
-    /// <c>HandleAsync</c> is load-bearing, and this is what happens if it is set wrong.
+    /// What the memmove used to buy, kept as the record of why the flag existed: hand the trace
+    /// DOM decoder the segment every parser now gets — offset 5, header still in front — and it
+    /// reads the frame's compression flag as a field tag and refuses the whole batch. It took a
+    /// megabyte of copy per megabyte batch to avoid that. The span parser reads the same bytes
+    /// where they lie, which is why the copy is gone.
     /// </summary>
     [Fact]
-    public void The_trace_decoder_cannot_read_an_unmoved_frame()
+    public void The_decoder_the_memmove_existed_for_could_not_read_an_unmoved_frame()
     {
         byte[] message = TracesRequest(spans: 4);
-        var wrong = Deliver(message, gzip: false, decodeReadsFromZero: false, out _);
+        var segment = Deliver(message, gzip: false, out _);
 
         // (buffer, length) from index 0 over a body that still carries its 5-byte header: the
         // identity flag is 0x00, and a zero tag is not a field number.
         Assert.Throws<InvalidProtocolBufferException>(
-            () => OtlpProtoDecoder.DecodeTraces(wrong.Array!, wrong.Offset + wrong.Count));
+            () => OtlpProtoDecoder.DecodeTraces(segment.Array!, segment.Offset + segment.Count));
+
+        // The parser that replaced it, over exactly the same segment.
+        Assert.Equal(4, OtlpTraceProtoParser.Parse(segment.AsSpan()).Count);
     }
 
     // ── Payloads ──────────────────────────────────────────────────────────────

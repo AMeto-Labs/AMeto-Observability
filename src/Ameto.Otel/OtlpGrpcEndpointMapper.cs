@@ -53,14 +53,12 @@ public static class OtlpGrpcEndpointMapper
             app.MapPost("/opentelemetry.proto.collector.trace.v1.TraceService/Export",
                 (HttpContext ctx) => HandleAsync(ctx, ApiKeyPermissions.Traces, static (c, msg) =>
                 {
-                    var request = OtlpProtoDecoder.DecodeTraces(msg.Array!, msg.Offset + msg.Count);
-                    if (request is null) return (false, 0, null);
-                    var spans = OtlpTraceMapper.Map(request);
+                    var spans = OtlpTraceProtoParser.Parse(msg.AsSpan());
                     if (spans.Count == 0) return (true, 0, null);
                     c.RequestServices.GetRequiredService<ISpanIngester>()
                      .TryIngest(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(spans), out int accepted);
                     return (true, spans.Count - accepted, BufferFullReason);
-                }, decodeReadsFromZero: true));
+                }));
 
         if (enableMetrics)
             app.MapPost("/opentelemetry.proto.collector.metrics.v1.MetricsService/Export",
@@ -77,17 +75,10 @@ public static class OtlpGrpcEndpointMapper
     /// The shape every Export call shares: check the content type, check the key, unframe, hand
     /// the protobuf to that signal's own decoder, and answer in trailers.
     /// </summary>
-    /// <param name="decodeReadsFromZero">
-    /// True only for the one decoder left that takes (buffer, length) and reads from index 0 —
-    /// the trace DOM decoder. An uncompressed message sits five bytes into the request buffer,
-    /// so for that one the message is memmoved down to the start first. The span parsers take
-    /// the segment where it lies and pay nothing, which on a megabyte batch is the copy itself.
-    /// </param>
     private static async Task HandleAsync(
         HttpContext ctx,
         ApiKeyPermissions required,
-        Func<HttpContext, ArraySegment<byte>, (bool Ok, int Rejected, string? Why)> decode,
-        bool decodeReadsFromZero = false)
+        Func<HttpContext, ArraySegment<byte>, (bool Ok, int Rejected, string? Why)> decode)
     {
         // Committed up front: gRPC needs the headers out before trailers can be written, and a
         // client that never sees 200 + application/grpc treats the call as a transport failure
@@ -162,7 +153,7 @@ public static class OtlpGrpcEndpointMapper
                 return;
             }
 
-            var segment = MessageSegment(body, message.Length, inflated, inflatedLen, decodeReadsFromZero);
+            var segment = MessageSegment(body, message.Length, inflated, inflatedLen);
 
             bool ok;
             int rejected;
@@ -205,28 +196,23 @@ public static class OtlpGrpcEndpointMapper
     /// Where the decoder should read the request message from.
     ///
     /// <para>An inflated message is already alone in its own buffer. An uncompressed one sits
-    /// five bytes into the request buffer, behind the frame header — which is fine for the span
-    /// parsers, and wrong for the one decoder left that takes (buffer, length) and reads from
-    /// index 0, so for that one the message is memmoved down first. Getting this backwards
-    /// feeds a decoder five bytes of frame header and then truncates the tail, which on
-    /// protobuf is not a parse error: it is a silently short batch.</para>
+    /// five bytes into the request buffer, behind the frame header, and every decoder on these
+    /// routes is now a span parser that takes the segment where it lies.</para>
+    ///
+    /// <para>It did not used to be. The trace DOM decoder took (buffer, length) and read from
+    /// index 0, so the whole message was memmoved down five bytes before it ran — a megabyte
+    /// of copy per megabyte batch, on the busiest route in the process, to move bytes past a
+    /// header the parser could simply have been pointed after. That decoder is off the route
+    /// (<c>OtlpTraceProtoParser</c>), and the flag, the branch and the copy went with it.</para>
     ///
     /// <para>Internal so it can be tested without a host; <c>OtlpGrpcMessageSegmentTests</c>
-    /// runs each signal's real decoder over what this returns.</para>
+    /// runs each signal's real parser over what this returns.</para>
     /// </summary>
     internal static ArraySegment<byte> MessageSegment(
-        byte[] body, int messageLength, byte[]? inflated, int inflatedLength, bool decodeReadsFromZero)
-    {
-        if (inflated is not null) return new ArraySegment<byte>(inflated, 0, inflatedLength);
-
-        if (decodeReadsFromZero)
-        {
-            body.AsSpan(OtlpGrpcFraming.HeaderBytes, messageLength).CopyTo(body);
-            return new ArraySegment<byte>(body, 0, messageLength);
-        }
-
-        return new ArraySegment<byte>(body, OtlpGrpcFraming.HeaderBytes, messageLength);
-    }
+        byte[] body, int messageLength, byte[]? inflated, int inflatedLength)
+        => inflated is not null
+               ? new ArraySegment<byte>(inflated, 0, inflatedLength)
+               : new ArraySegment<byte>(body, OtlpGrpcFraming.HeaderBytes, messageLength);
 
     private static async Task WriteMessageAsync(HttpContext ctx, byte[] message)
     {
