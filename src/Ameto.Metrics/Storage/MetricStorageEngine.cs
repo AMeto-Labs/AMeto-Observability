@@ -268,10 +268,26 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     private readonly ConcurrentDictionary<string, ExemplarRing> _exemplars =
         new(StringComparer.Ordinal);
 
+    /// <summary>
+    /// 1 once <see cref="_exemplars"/> has reached <see cref="_maxExemplarMetrics"/>. Sticky on
+    /// purpose: nothing ever removes a ring, so the count is monotone and the cap, once reached,
+    /// can never be un-reached. See <see cref="ExemplarRingsFull"/> for what that saves.
+    /// </summary>
+    private int _exemplarRingsFull;
+
     /// <summary>Test hook: exemplars refused because the ring cap was reached.</summary>
     internal long ExemplarMetricsRefused => Volatile.Read(ref _exemplarMetricsRefused);
 
     private long _exemplarMetricsRefused;
+
+    /// <summary>
+    /// Test hook: how many times the ring cap has cost a full <c>ConcurrentDictionary.Count</c>.
+    /// Bounded by the number of rings plus one for the life of the process — the one that latches
+    /// the cap — where it used to be one per refused NAME per batch, forever.
+    /// </summary>
+    internal long ExemplarCapCounts => Volatile.Read(ref _exemplarCapCounts);
+
+    private long _exemplarCapCounts;
 
     /// <summary>
     /// Test hook: batches that actually needed the exemplar pass. One increment per BATCH that
@@ -659,7 +675,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                 // refused, while names that already have a ring keep working. GetOrAdd's factory
                 // can run more than once under contention, so the count is the gate, not the
                 // allocation.
-                if (_exemplars.Count >= _maxExemplarMetrics)
+                if (ExemplarRingsFull())
                 {
                     Interlocked.Increment(ref _exemplarMetricsRefused);
                     lastName = item.Name;
@@ -688,6 +704,35 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                 });
             }
         }
+    }
+
+    /// <summary>
+    /// Whether a metric name that has no ring may still take one.
+    ///
+    /// <para><b>The count is asked at most once more than there are rings.</b>
+    /// <c>ConcurrentDictionary.Count</c> acquires EVERY lock in the table — the reason
+    /// <see cref="RegisterMeta"/> tests <c>ContainsKey</c> before it counts — and this dictionary
+    /// is built with the default <c>growLockArray</c>, so a table holding the 256-name cap
+    /// carries 64-128 monitors, taken from lock 0 upwards, on the ingest path. Nothing ever
+    /// removes a ring, so the count is monotone and the answer past the cap is permanently yes:
+    /// a deployment with more exemplar-carrying instruments than the cap was paying one full
+    /// all-locks sweep per REFUSED NAME per batch, for the life of the process, with every
+    /// concurrent ingest thread's exemplar pass serialising against the others inside it.</para>
+    ///
+    /// <para>The latch is deliberately set only here and never cleared. <c>GetOrAdd</c>'s factory
+    /// can run more than once under contention and the count is the gate rather than the
+    /// allocation, so the table may end a race a ring or two over the cap — which is what the
+    /// cap has always allowed, and one more reason the answer cannot come back down.</para>
+    /// </summary>
+    private bool ExemplarRingsFull()
+    {
+        if (Volatile.Read(ref _exemplarRingsFull) != 0) return true;
+
+        Interlocked.Increment(ref _exemplarCapCounts);
+        if (_exemplars.Count < _maxExemplarMetrics) return false;
+
+        Volatile.Write(ref _exemplarRingsFull, 1);
+        return true;
     }
 
     /// <summary>

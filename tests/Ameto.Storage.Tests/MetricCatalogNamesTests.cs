@@ -1,3 +1,4 @@
+using Ameto.Core;
 using Ameto.Metrics;
 using Ameto.Metrics.Storage;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -181,6 +182,68 @@ public sealed class MetricCatalogNamesTests
             Assert.Equal(7.0, Assert.Single(exemplars).Value);
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    /// <summary>
+    /// THE RING CAP IS NOT RE-PROVED ONCE IT IS REACHED.
+    ///
+    /// <para><c>ConcurrentDictionary.Count</c> acquires every lock in the table, and nothing ever
+    /// removes an exemplar ring — so past the cap the check was permanently true and permanently
+    /// paid: one full all-locks sweep per refused metric NAME per batch, on the ingest path, with
+    /// concurrent ingest threads' exemplar passes serialising against each other inside it. The
+    /// count is monotone, so a sticky flag is exactly equivalent.</para>
+    ///
+    /// <para>Counted rather than timed: a wall-clock assertion on a lock sweep is a flake, and
+    /// the number of times the engine asks the question is the thing that changed.</para>
+    /// </summary>
+    [Fact]
+    public async Task A_full_exemplar_table_stops_counting_the_dictionary_it_cannot_shrink()
+    {
+        const int cap = 16, refusedNames = 40, batches = 3;
+
+        string dir = Path.Combine(Path.GetTempPath(), "ameto-mexemcap-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var options = new MetricsOptions { MaxExemplarMetrics = cap, ExemplarsPerMetric = 8 };
+            await using var engine = new MetricStorageEngine(dir, NullLogger<MetricStorageEngine>.Instance, options);
+            long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+
+            // Fill the table: one count per new name, which is the price of admission.
+            engine.Ingest(WithExemplars(baseNano, 0, cap));
+            Assert.Equal(cap, engine.ExemplarCapCounts);
+            Assert.Equal(0, engine.ExemplarMetricsRefused);
+
+            // Now names that can never be admitted, over and over. Exactly one more count — the
+            // one that sees the table full and latches it.
+            for (int b = 0; b < batches; b++) engine.Ingest(WithExemplars(baseNano + b + 1, cap, refusedNames));
+
+            Assert.Equal(cap + 1, engine.ExemplarCapCounts);
+            Assert.Equal(batches * refusedNames, engine.ExemplarMetricsRefused);
+
+            // And the cap still caps: the admitted names kept their exemplars, the refused ones
+            // have none, and no ring was created for them.
+            Assert.Single(engine.GetExemplars("capped.metric.0", null, null, null));
+            Assert.Empty(engine.GetExemplars("capped.metric." + cap, null, null, null));
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    /// <summary>One point per name, each carrying one exemplar — the shape that takes a ring.</summary>
+    private static MetricIngestItem[] WithExemplars(long baseNano, int firstName, int count)
+    {
+        var items = new MetricIngestItem[count];
+        for (int i = 0; i < count; i++)
+            items[i] = new MetricIngestItem
+            {
+                Name              = "capped.metric." + (firstName + i),
+                Kind              = MetricKind.Gauge,
+                Labels            = new LabelSet(new Dictionary<string, string> { ["series"] = "s" }),
+                TimestampUnixNano = baseNano,
+                ScalarValue       = i,
+                Exemplars         = [new MetricExemplar { TimestampUnixNano = baseNano, Value = i, TraceId = "a", SpanId = "b" }],
+            };
+        return items;
     }
 
     private static MetricIngestItem Point(string name, long nano, string series = "s") => new()
