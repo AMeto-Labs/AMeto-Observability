@@ -85,10 +85,12 @@ public sealed class TraceHotTierProbe : IDisposable
     /// threshold and ten spans a trace that is 5 000 decodes and 9,0 MB the tier never gives back,
     /// on the first page after every flush, i.e. twice a second at 100 k spans/s.</para>
     ///
-    /// <para>RETAINED IS THE ASSERTION because it is the unambiguous one: the page itself is
-    /// dropped before the live set is sampled, so anything still alive is something the page hung
-    /// on the tier. Reverting <c>MergeSpanInto</c> to <c>GetAttr(s.Attributes, …)</c> fails both
-    /// gates: 2 023 B allocated and 1 888 B retained per root span, against 623 and 498.</para>
+    /// <para>ALLOCATED IS THE ASSERTION, retained is printed beside it. Every byte of the
+    /// allocation is spent while the read lock is held, the counter behind it is exact, and this
+    /// assembly runs its tests sequentially — so the figure reads the same in every context.
+    /// Reverting <c>MergeSpanInto</c> to <c>GetAttr(s.Attributes, …)</c> fails it at 2 023 B per
+    /// root span against 623. The retained figure says the same thing louder (1 888 against 498)
+    /// but cannot be gated here; the comment on it says why.</para>
     ///
     /// <para>PAGE 2 IS PRINTED AND NOT ASSERTED, and it is the half of the trade that is a cost
     /// rather than a saving: the decode was memoised on the record and the blob walk is not, so a
@@ -201,15 +203,22 @@ public sealed class TraceHotTierProbe : IDisposable
             $"a trace-list page allocated {allocated / Roots:N0} B per root span — MergeSpanInto is "
             + "decoding whole attribute maps under the engine read lock again");
 
-        // AND WHAT IT LEAVES BEHIND, which is the half that outlives the request: a decode is
-        // memoised on the record, so a tier listed once stays that much heavier until it flushes.
-        // The floor here is not zero and the gate has to sit above it — the same page over an
-        // ATTRIBUTE-LESS tier of this shape measures 392 B per root span, which is the rows the
-        // page returns plus what a full collect cannot tell apart from them. Blob scan 498,
-        // decode 1 888.
-        Assert.True(retained / Roots < 900,
-            $"a trace-list page left {retained / Roots:N0} B per root span on the hot tier — "
-            + "the attribute maps it decoded are memoised on the records and never go away");
+        // AND WHAT IT LEAVES BEHIND, PRINTED AND NOT ASSERTED. This is the half that outlives the
+        // request — a decode is memoised on the record, so a tier listed once stays that much
+        // heavier until it flushes — and it is also the half that cannot carry a gate at this
+        // denominator. GC.GetTotalMemory is the whole process's live set, so whatever the class
+        // that happened to run before this one left behind lands on the figure, and 2 000 root
+        // spans divide a fixed offset into a large per-row number: measured over two full Release
+        // suites, the SAME code read 493 and 1 372 B per root span, while run alone it reads 498
+        // every time. An 900-B gate over that is a coin toss, and a gate loose enough to survive
+        // the offset no longer separates the blob scan from the decode it replaced.
+        //
+        // The figures, taken alone: attribute-less tier 392, blob scan 498, decode 1 888 — at the
+        // 50 000-span threshold, 2,4 MB against 9,0 MB per flush cycle. The gate above is the
+        // allocation, which is an exact per-process counter over a suite that runs sequentially
+        // (AssemblyInfo.cs disables test parallelisation) and reads 623 in every context measured.
+        _out.WriteLine($"  (retained is printed, not gated — see the comment: it carries the live "
+                     + $"set of whatever ran before this test)");
     }
 
     /// <summary>A throwaway tier of the same shape, listed once, so nothing below is jitting.</summary>
