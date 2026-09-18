@@ -261,6 +261,61 @@ public sealed class MemoryBudgetTests
     }
 
     /// <summary>
+    /// IS-CONSTRAINED IS A DISJUNCTION OVER EVERY CEILING A HOST CAN CUT, and it listed three of
+    /// the six that <c>Derive</c> can cut: the metric tier, the trace tier and the trace merge
+    /// pass went into the struct without going into it. The word is what <c>StorageEngine</c>
+    /// prints beside the budgets at startup — "host-constrained" or "fixed ceilings" — and its
+    /// reader is an operator asking why this install behaves unlike the last one.
+    ///
+    /// <para><b>The three-term form was not giving a wrong answer, and that was a coincidence.</b>
+    /// Every managed share comes off the same base, so the budget cut first and capped last is
+    /// whichever cap is the largest multiple of its own fraction: index builds, at
+    /// 640 MB / 0.22 = 2 909 MB of managed limit, against 610 MB for the metric tier, 515 MB for
+    /// the trace tier and 1 160 MB for the merge pass. Every host small enough to have a tier cut
+    /// had its build budget cut too. One fraction change breaks that, which is why the last row
+    /// here is the 2.5 GB host where the build budget is still a share while all three tiers are
+    /// already at their caps — the narrowest gap the ordering leaves — and why the sweep below
+    /// compares the property against the ceilings themselves rather than restating its terms.</para>
+    /// </summary>
+    [Theory]
+    [InlineData( 384,  512, true)]    // the stand: every managed ceiling and the native one are shares
+    [InlineData(2560, 2560, true)]    // builds still a share (563 of 640 MB) with all three tiers capped
+    [InlineData(4096, 4096, false)]   // nothing is a share
+    [InlineData(65536, 65536, false)] // 64 GB
+    [InlineData(   0,    0, false)]   // a runtime that could not say falls back to the constants
+    public void Is_constrained_answers_for_every_ceiling_a_host_can_cut(long managedMb, long physicalMb, bool expected)
+    {
+        var b = MemoryBudgets.Derive(managedMb * MB, physicalMb * MB);
+        Assert.Equal(expected, b.IsConstrained);
+    }
+
+    /// <summary>
+    /// ...and the guard that outlives the ordering above: across four decades of limit, the
+    /// property agrees with the ceilings. Recomputed from the budgets and their constants, not
+    /// restated from the property's terms, so dropping one of them is caught the moment some
+    /// host can tell the two forms apart.
+    /// </summary>
+    [Fact]
+    public void Is_constrained_agrees_with_the_ceilings_at_every_size()
+    {
+        for (long limit = 16 * MB; limit <= 64 * GB; limit = limit * 3 / 2)
+        {
+            var b = MemoryBudgets.Derive(limit, limit);
+
+            bool cut = b.ManagedBuildBytes  < MemoryBudgets.ManagedBuildCapBytes
+                    || b.NativeTierBytes    < MemoryBudgets.NativeTierCapBytes
+                    || b.IndexCacheBytes    < MemoryBudgets.IndexCacheCapBytes
+                    || b.MetricHotTierBytes < MemoryBudgets.MetricHotTierCapBytes
+                    || b.TraceHotTierBytes  < MemoryBudgets.TraceHotTierCapBytes
+                    || b.TraceMergeBytes    < MemoryBudgets.TraceMergeCapBytes;
+
+            Assert.True(cut == b.IsConstrained,
+                $"at a {limit / MB} MB limit some ceiling is {(cut ? "cut" : "at its constant")} "
+              + $"and IsConstrained says {b.IsConstrained}");
+        }
+    }
+
+    /// <summary>
     /// A figure the runtime could not produce must not be read as "almost no memory" — that
     /// would silently strangle a healthy host. Fall back to the constants, which is what the
     /// engine did before any of this existed.

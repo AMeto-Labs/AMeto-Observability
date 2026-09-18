@@ -443,11 +443,34 @@ public readonly struct MemoryBudgets
     /// <summary>Ceiling on one trace compaction pass's working set. Consumed by WP8.</summary>
     public long TraceMergeBytes { get; }
 
-    /// <summary>True when a share of a limit, not the constant, set a ceiling.</summary>
+    /// <summary>
+    /// True when a share of a limit, not the constant, set a ceiling — what
+    /// <c>StorageEngine</c> prints beside the budgets at startup as "host-constrained" rather
+    /// than "fixed ceilings".
+    ///
+    /// <para><b>It has to name every budget a host can cut, and it named three of nine.</b> The
+    /// metric tier, the trace tier and the trace merge pass were added to this struct without
+    /// being added here. <b>That did not give a wrong answer, and the reason is a coincidence
+    /// worth removing:</b> every managed share is taken of the same base, so the budget cut
+    /// FIRST and capped LAST is whichever cap is the largest multiple of its own fraction — the
+    /// index builds, at 640 MB / 0.22 = 2 909 MB of managed limit, against 610 MB for the metric
+    /// tier, 515 MB for the trace tier and 1 160 MB for the merge pass. Any host small enough to
+    /// have a tier cut therefore had its build budget cut too, and the three-term form agreed
+    /// with this one on every host that exists. It was one fraction change away from not, on a
+    /// line whose reader is an operator asking why this install behaves unlike the last one.</para>
+    ///
+    /// <para>The ingest buffer pool and the payload arena are deliberately still absent: the
+    /// arena's default is not this struct's figure at all (a slab-count floor usually decides
+    /// it — see <see cref="IngestArenaFraction"/>), and the pool bounds what is PARKED rather
+    /// than any ceiling a flush runs into.</para>
+    /// </summary>
     public bool IsConstrained =>
-        ManagedBuildBytes < ManagedBuildCapBytes ||
-        NativeTierBytes   < NativeTierCapBytes   ||
-        IndexCacheBytes   < IndexCacheCapBytes;
+        ManagedBuildBytes  < ManagedBuildCapBytes  ||
+        NativeTierBytes    < NativeTierCapBytes    ||
+        IndexCacheBytes    < IndexCacheCapBytes    ||
+        MetricHotTierBytes < MetricHotTierCapBytes ||
+        TraceHotTierBytes  < TraceHotTierCapBytes  ||
+        TraceMergeBytes    < TraceMergeCapBytes;
 
     /// <summary>
     /// One figure for both limits — what a process with no GC hard limit sees, where the heap
