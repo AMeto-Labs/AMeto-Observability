@@ -113,7 +113,11 @@ public sealed class OtlpTraceProtoParityTests
 
         var amb = spans[0];
         // The resource is read in a pass of its own, so scope_spans written first still sees it.
-        Assert.Equal("Wins.Second", amb.ServiceName);               // the first service.name is an int
+        // Three service.name entries: an int, then two strings. The mapper skips the non-string
+        // one and keeps the FIRST string — so this pins both halves of the rule, and a parser
+        // that took the last string would answer "Loses.Third" here.
+        Assert.Equal("Wins.Second", amb.ServiceName);
+        Assert.Equal("Wins.Second", ViaDom(OtlpProtoPayloads.Traces_OutOfOrderAndAmbiguous())[0].ServiceName);
         Assert.Equal(SpanKind.Client, amb.Kind);                    // raw 11 masks to 3…
         Assert.Equal(0L, amb.StartTimeUnixNano);                    // fixed64 past long.MaxValue
         Assert.Equal(1_785_300_060_000_000_000L, amb.DurationNanos);

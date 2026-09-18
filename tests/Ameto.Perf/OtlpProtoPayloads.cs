@@ -467,6 +467,7 @@ internal static class OtlpProtoPayloads
             {
                 Nested(res, 1, IntAttr("service.name", 7));                  // first, and not a string
                 Nested(res, 1, StringAttr("service.name", "Wins.Second"));   // the mapper takes THIS one
+                Nested(res, 1, StringAttr("service.name", "Loses.Third"));   // …and a later STRING one does not
                 Nested(res, 1, StringAttr("deployment.environment", "Test"));
             }));
         }));
