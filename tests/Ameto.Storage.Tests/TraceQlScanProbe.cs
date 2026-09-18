@@ -148,47 +148,98 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
     /// TS#13: THE KEY LIST IS A CONSTANT, SO IT MUST NOT BE AN ALLOCATION. <c>BuildRow</c> asks for
     /// the HTTP method and path of every row it returns, and each ask went through a
     /// <c>params string[]</c> parameter with literal arguments — a fresh <c>string[]</c> per call,
-    /// two per row, on a page that may return a thousand rows, and invisible to every caller.
+    /// two per row, on a page that clamps at a thousand rows, and invisible to every caller because
+    /// the array is the callee's signature and not the caller's expression.
     ///
-    /// <para>Measured directly on the helper, because the arrays are 80 B per row against a page
-    /// that allocates megabytes: at this call count they are unmistakable, and at page scale they
-    /// would be noise. Restore the <c>params string[]</c> signature and its literal arguments and
-    /// this fails at about 80 B per call instead of 0.</para>
+    /// <para>MEASURED THROUGH <c>ExecuteAsync</c>, WHICH IS THE POINT. The first version of this
+    /// test called <c>GetAttr</c> directly with the new static lists, so it measured the new call
+    /// SHAPE and not the allocation the item removed: restore <c>params string[]</c> on the helper
+    /// and hand it those same static arrays and a params parameter passes an existing array
+    /// through untouched — nothing allocates, the test stays green, and <c>BuildRow</c>'s literal
+    /// arguments go on building two arrays a row with no one watching. The only caller that can
+    /// tell the difference is the real one.</para>
+    ///
+    /// <para>THE THIRD PAGE IS THE MEASURED ONE. <c>BuildRow</c> reaches the row's attributes
+    /// through <c>SpanRecord.Attributes</c>, whose decode is memoised ON THE RECORD, and the hot
+    /// tier hands out the same records to every query — so the first page pays a decode per row
+    /// and the 88 B this test exists for would be noise inside it. Two warm pages leave a page
+    /// whose per-row cost is <c>BuildRow</c>'s own objects and nothing else.</para>
+    ///
+    /// <para>Restore the <c>params string[]</c> signature and its literal arguments at
+    /// <c>TraceQLExecutor.cs:BuildRow</c> and this fails at 88 B a row above the gate.</para>
     /// </summary>
     [Fact]
-    public void Reading_the_http_attributes_of_a_row_allocates_nothing()
+    public async Task Reading_the_http_attributes_of_a_row_allocates_nothing()
     {
-        const int Calls = 200_000;
+        const int Rows = 1_000;   // the clamp POST /api/traces/query applies
 
-        var attrs = new Dictionary<string, object?>(2, StringComparer.Ordinal)
-        {
-            ["http.request.method"] = "GET",
-            ["url.path"]            = "/api/v1/payments",
-        };
+        string dir = Path.Combine(Path.GetTempPath(), "ameto-qlrows-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        _dirs.Add(dir);
 
-        // Warm the JIT before the counter is read.
-        for (int i = 0; i < 1_000; i++)
-        {
-            _ = TraceQLExecutor.GetAttr(attrs, TraceQLExecutor.MethodKeys);
-            _ = TraceQLExecutor.GetAttr(attrs, TraceQLExecutor.PathKeys);
-        }
+        using var engine = new TraceStorageEngine(dir, NullLogger<TraceStorageEngine>.Instance);
 
-        long before = GC.GetTotalAllocatedBytes(precise: true);
-        string method = string.Empty, path = string.Empty;
-        for (int i = 0; i < Calls; i++)
-        {
-            method = TraceQLExecutor.GetAttr(attrs, TraceQLExecutor.MethodKeys);
-            path   = TraceQLExecutor.GetAttr(attrs, TraceQLExecutor.PathKeys);
-        }
+        var  baseAt   = ColdSpanSegmentFixture.Base;
+        long baseNano = baseAt.ToUnixTimeMilliseconds() * 1_000_000L;
+        var  attrs    = HttpRootBlob();
+
+        // One root span per trace, so a row is a row is a span: the page's per-row figure is not
+        // diluted by the spans of a trace that did not produce one.
+        for (int i = 0; i < Rows; i++)
+            engine.WriteSpan(new SpanIngestItem
+            {
+                TraceId           = new TraceId(0x5EED, (ulong)(i + 1)),
+                SpanId            = new SpanId((ulong)(i + 1)),
+                ParentSpanId      = default,
+                StartTimeUnixNano = baseNano + i * 1_000_000L,
+                DurationNanos     = 5_000_000_000L,
+                Name              = "GET /payments",
+                ServiceName       = "billing",
+                Kind              = SpanKind.Server,
+                Status            = SpanStatusCode.Unset,
+                HttpStatusCode    = 200,
+                AttributesBytes   = attrs,
+            });
+
+        var from = baseAt.AddMinutes(-1);
+        var to   = baseAt.AddDays(1);
+        var pred = TraceQLParser.Parse("{ duration > 1s }");
+
+        _ = await TraceQLExecutor.ExecuteAsync(engine, pred, from, to, Rows, CancellationToken.None);
+        _ = await TraceQLExecutor.ExecuteAsync(engine, pred, from, to, Rows, CancellationToken.None);
+
+        long before    = GC.GetTotalAllocatedBytes(precise: true);
+        var  page      = await TraceQLExecutor.ExecuteAsync(engine, pred, from, to, Rows, CancellationToken.None);
         long allocated = GC.GetTotalAllocatedBytes(precise: true) - before;
 
-        _out.WriteLine($"{Calls:N0} rows x 2 attribute lookups: {allocated:N0} B "
-                     + $"({(double)allocated / Calls:N1} B/row)");
+        _out.WriteLine($"TRACEQL PAGE  {Rows:N0} rows, one root span each, warm: "
+                     + $"{allocated:N0} B ({allocated / (double)Rows:N0} B/row)");
 
-        Assert.Equal("GET", method);
-        Assert.Equal("/api/v1/payments", path);
-        Assert.True(allocated < 8 * Calls,
-            $"{allocated / (double)Calls:N1} B allocated per row to read two constant key lists");
+        Assert.Equal(Rows, page.Rows.Count);
+        Assert.Equal("GET",              page.Rows[0].HttpMethod);
+        Assert.Equal("/api/v1/payments", page.Rows[0].HttpPath);
+
+        // THE GATE. Allocated bytes on a warm, fixed workload are deterministic to the BYTE, not
+        // merely stable, which is what lets a gate sit 44 B from the figure it guards: measured in
+        // Release, 1 018 368 B as it stands and 1 106 368 B with the two params arrays back —
+        // exactly 88 000 B more for 1 000 rows, the two key arrays and nothing else. The row's own
+        // TraceRowDto, service set, id strings and services array are the 1 018. The gate is the
+        // midpoint, so neither figure's drift decides the outcome.
+        Assert.True(allocated / Rows < 1_062,
+            $"a returned row cost {allocated / (double)Rows:N0} B — BuildRow is building its "
+            + "semconv key lists per row again (a params string[] is 88 B a row)");
+    }
+
+    /// <summary>An HTTP server root span's attribute map: the two keys <c>BuildRow</c> asks for.</summary>
+    private static byte[] HttpRootBlob()
+    {
+        var buf = new ArrayBufferWriter<byte>(64);
+        var w   = new MessagePackWriter(buf);
+        w.WriteMapHeader(2);
+        w.Write("http.request.method"); w.Write("GET");
+        w.Write("url.path");            w.Write("/api/v1/payments");
+        w.Flush();
+        return buf.WrittenMemory.ToArray();
     }
 
     /// <summary>A blob that will not decode answers UNKNOWN, never "no" — issue #74's rule, on bytes.</summary>
