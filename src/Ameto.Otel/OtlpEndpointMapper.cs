@@ -61,19 +61,14 @@ public static class OtlpEndpointMapper
             try
             {
                 bool isProto = ctx.Request.ContentType?.StartsWith(ProtobufContentType, StringComparison.OrdinalIgnoreCase) ?? false;
-                if (isProto)
-                {
-                    // Protobuf still decodes into the object model, then maps to items.
-                    var request = OtlpProtoDecoder.DecodeTraces(body, bodyLen);
-                    if (request is null) { ctx.Response.StatusCode = 400; return; }
-                    spans = OtlpTraceMapper.Map(request);
-                }
-                else
-                {
-                    // JSON: streaming parse straight to SpanIngestItems — no OTLP object
-                    // graph, no per-field hex/nano strings (see OtlpTraceStreamParser).
-                    spans = OtlpTraceStreamParser.Parse(body.AsSpan(0, bodyLen));
-                }
+
+                // Both encodings parse straight to SpanIngestItems — no OTLP object graph, no
+                // parser object per nested message, no per-field hex/nano strings. Protobuf is
+                // what SDK exporters and the collector send, so it is the one that had to stop
+                // decoding to a DOM first (see OtlpTraceProtoParser).
+                spans = isProto
+                    ? OtlpTraceProtoParser.Parse(body.AsSpan(0, bodyLen))
+                    : OtlpTraceStreamParser.Parse(body.AsSpan(0, bodyLen));
             }
             catch (Exception ex)
             {
