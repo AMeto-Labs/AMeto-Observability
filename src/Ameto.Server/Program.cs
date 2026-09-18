@@ -75,10 +75,20 @@ if (serverOptions.Logging.FileEnabled)
         ? lvl
         : Microsoft.Extensions.Logging.LogLevel.Information;
 
-    builder.Logging.AddProvider(new FileLoggerProvider(
-        Path.Combine(serverOptions.DataDirectory, "logs"),
-        fileLevel,
-        serverOptions.Logging.FileRetainDays));
+    // Registered as a factory, NOT handed over as an instance (AddProvider(new …)): the container
+    // disposes the singletons it creates and never the instances it is given, and LoggerFactory
+    // disposes only providers added to it directly. The instance was therefore never disposed,
+    // and every host left its drain parked in GetConsumingEnumerable on a pool thread — thirty of
+    // them in one integration-test dump, starving the pool the shutdown path runs on — with the
+    // log file still open under a data directory the test fixture then failed to delete.
+    //
+    // Late shutdown lines are kept: the provider is created with the logger factory, before
+    // anything that logs, and the container disposes in reverse creation order, so everything
+    // that logs while being disposed is gone before this is — and Dispose drains the queue.
+    string fileLogDir    = Path.Combine(serverOptions.DataDirectory, "logs");
+    int    fileRetainDays = serverOptions.Logging.FileRetainDays;
+    builder.Services.AddSingleton<Microsoft.Extensions.Logging.ILoggerProvider>(
+        _ => new FileLoggerProvider(fileLogDir, fileLevel, fileRetainDays));
 }
 
 
@@ -310,9 +320,27 @@ if (serverOptions.TrustForwardedHeaders)
 if (!basePath.IsRoot) app.UsePathBase(basePath.PathBase);
 app.UseRouting();
 
-app.UseRateLimiter();
-app.UseAuthentication();
-app.UseAuthorization();
+// Auth runs for the whole application EXCEPT the telemetry receivers. On an ingest POST the
+// JwtBearer handler had nothing to do and still did it: an ActivatorUtilities-built handler
+// instance, InitializeAsync, a logger from the factory (which takes a lock), the
+// OnMessageReceived event, and finally NoResult — a couple of KB and a few microseconds per
+// request, ahead of the endpoint's own ApiKeyCache check, which is the check that actually
+// decides. At 100k events/s in 1000-event batches that is the whole auth stack running 100
+// times a second for no result.
+//
+// The endpoint's API-key check is untouched and still rejects: the bypass skips the JWT
+// middleware, not authorisation. The predicate is deliberately exact — a path that is NOT an
+// ingest route but slipped through would reach an endpoint carrying authorization metadata,
+// and ASP.NET Core throws rather than serving it.
+//
+// GET /api/events is the SSE search and shares its path with the CLEF ingest POST, so the
+// method is part of the match.
+app.UseWhen(static ctx => !IngestRoutes.IsIngestRequest(ctx), static branch =>
+{
+    branch.UseRateLimiter();
+    branch.UseAuthentication();
+    branch.UseAuthorization();
+});
 // The SPA entry document is the one file whose bytes depend on configuration, so it does not
 // come from the static-file middleware — see SpaIndex. This also replaces UseDefaultFiles,
 // whose only job here was mapping "/" to it.
@@ -407,3 +435,55 @@ app.Run();
 
 // Make the implicit Program class accessible to integration tests
 public partial class Program { }
+
+/// <summary>
+/// The telemetry receiver paths, and nothing else. Used to keep the authentication /
+/// authorization / rate-limiter stack off the ingest hot path, where it produces no result the
+/// endpoint then uses — each receiver validates its own API key through
+/// <c>ApiKeyCache</c>.
+///
+/// <para>Matching is by WHOLE path plus method. Substring or prefix matching here would hand a
+/// customer's own route the same bypass; an exact list cannot. The deployment prefix
+/// (<c>Ameto:BasePath</c>) is already stripped by <c>UsePathBase</c>, which runs above this.</para>
+/// </summary>
+internal static class IngestRoutes
+{
+    /// <summary>
+    /// Internal so a test can hold this list against the routes the application actually maps.
+    /// It is hand-maintained and it has a sibling (<c>AmetoIngestEndpoints</c>) that is also
+    /// hand-maintained; adding a spelling to one and not the other is exactly what happened once
+    /// already, and drift in either direction here is silent — a receiver that stops matching
+    /// quietly puts the whole auth stack back on the ingest hot path, and a path that matches but
+    /// is NOT a receiver reaches an endpoint carrying authorization metadata, which ASP.NET Core
+    /// answers with a 500 rather than serving.
+    /// </summary>
+    internal static readonly string[] Paths =
+    [
+        "/api/events",
+        "/otlp/v1/logs", "/otlp/v1/traces", "/otlp/v1/metrics",
+        "/v1/logs",      "/v1/traces",      "/v1/metrics",
+    ];
+
+    /// <summary>The single segment every OTLP/gRPC Export method path begins with.</summary>
+    internal const string GrpcPrefix = "/opentelemetry.proto.collector";
+
+    public static bool IsIngestRequest(HttpContext ctx)
+    {
+        // Every receiver is a POST. GET /api/events is the SSE search and must keep its user
+        // authentication; so must every other read route that happens to share a path.
+        if (!HttpMethods.IsPost(ctx.Request.Method)) return false;
+
+        string? path = ctx.Request.Path.Value;
+        if (string.IsNullOrEmpty(path)) return false;
+
+        // A gRPC method path is one long segment ("/opentelemetry.proto.collector.logs.v1.
+        // LogsService/Export"), so this prefix cannot overlap a segment-shaped route.
+        if (path.StartsWith(GrpcPrefix, StringComparison.OrdinalIgnoreCase)) return true;
+
+        foreach (string candidate in Paths)
+            if (path.Equals(candidate, StringComparison.OrdinalIgnoreCase))
+                return true;
+
+        return false;
+    }
+}

@@ -21,6 +21,25 @@ public sealed class LogVolumeCounts
     public required int  NBuckets       { get; init; }
     public required IReadOnlyList<LogSeries> Services { get; init; }
     public required IReadOnlyList<LogSeries> Levels   { get; init; }
+
+    /// <summary>
+    /// Cold segments in the window that the catalog still serves but that could not be read, and
+    /// so were left out (a torn block, a file missing under a live entry). A segment that a merge
+    /// or retention removed while the scan ran is not one of them: nothing is damaged (a merge's
+    /// removals are in <see cref="MergedAwaySegments"/>). Non-zero means each count above is a
+    /// floor. Not required, so a caller that only draws a chart can ignore it.
+    /// </summary>
+    public int SkippedSegments { get; init; }
+
+    /// <summary>
+    /// Cold segments in the window that a merge rewrote after the scan took its snapshot and
+    /// before it read them, and so were left out. Nothing is damaged — their events are in the
+    /// merged output — but that output is not in the snapshot, so non-zero means each count
+    /// above is a floor, and running the same scan again reads the output instead. A segment
+    /// retention removed is not counted here or anywhere: its events are gone, so the count
+    /// without them is exact. Not required, like <see cref="SkippedSegments"/>.
+    /// </summary>
+    public int MergedAwaySegments { get; init; }
 }
 
 /// <summary>
@@ -72,9 +91,13 @@ public sealed class LogVolumeAggregator
 
     private long _total;
     private long _scanned;
+    private int  _skippedSegments;
+    private int  _mergedAwaySegments;
 
-    public long Total   => _total;
-    public long Scanned => _scanned;
+    public long Total              => _total;
+    public long Scanned            => _scanned;
+    public int  SkippedSegments    => _skippedSegments;
+    public int  MergedAwaySegments => _mergedAwaySegments;
 
     /// <param name="fromTicks">Inclusive lower bound (UTC ticks); events outside are ignored.</param>
     /// <param name="toTicks">Inclusive upper bound (UTC ticks).</param>
@@ -124,6 +147,44 @@ public sealed class LogVolumeAggregator
         int svc = ResolveByUtf8(serviceUtf8);
         if (svc >= 0) Record(timestampTicks, level, svc);
     }
+
+    // ── Whole-segment shortcut (TOTAL ONLY) ───────────────────────────────────────
+
+    /// <summary>
+    /// Counts a whole cold segment from its catalog entry, without opening the file.
+    ///
+    /// <para>A cold segment is immutable and its <c>SegmentInfo.EventCount</c> is exact, so when
+    /// the segment lies entirely inside the window every one of its events is in the answer and
+    /// there is nothing to decide per event. What the catalog does NOT record is which service
+    /// each event belongs to, and — for the legacy mixed-level files that predate level-pure
+    /// flushing — which level. So this adds to <see cref="Total"/> and <see cref="Scanned"/> and
+    /// to nothing else: after any call to it, the per-service and per-level series no longer sum
+    /// to the total.</para>
+    ///
+    /// <para>That is why it is not reachable from <c>/api/events/counts</c>: only a caller that
+    /// wants a single number may ask for it, and <see cref="StorageEngine"/> gates it behind an
+    /// explicit opt-in with no service filter.</para>
+    /// </summary>
+    public void AddWholeSegment(long eventCount)
+    {
+        if (eventCount <= 0) return;
+        _total   += eventCount;
+        _scanned += eventCount;
+    }
+
+    /// <summary>
+    /// Records a segment that could not be read. Like every other counter here it is per
+    /// aggregator and unsynchronised: the parallel cold scan gives each worker its own and
+    /// <see cref="MergeFrom"/> folds them under the caller's lock.
+    /// </summary>
+    public void AddSkippedSegment() => _skippedSegments++;
+
+    /// <summary>
+    /// Records a segment a merge rewrote before this scan could read it. Kept apart from
+    /// <see cref="AddSkippedSegment"/> because it is not damage — a caller may report it
+    /// differently — and unsynchronised for the same reason.
+    /// </summary>
+    public void AddMergedAwaySegment() => _mergedAwaySegments++;
 
     // ── Recording ─────────────────────────────────────────────────────────────────
 
@@ -227,8 +288,10 @@ public sealed class LogVolumeAggregator
     /// </summary>
     public void MergeFrom(LogVolumeAggregator other)
     {
-        _total   += other._total;
-        _scanned += other._scanned;
+        _total              += other._total;
+        _scanned            += other._scanned;
+        _skippedSegments    += other._skippedSegments;
+        _mergedAwaySegments += other._mergedAwaySegments;
 
         for (int l = 0; l < LevelCount; l++)
         {
@@ -268,13 +331,15 @@ public sealed class LogVolumeAggregator
 
         return new LogVolumeCounts
         {
-            Total         = _total,
-            Scanned       = _scanned,
-            MinBucket     = _minBucket,
-            BucketSeconds = _bucketSeconds,
-            NBuckets      = _nBuckets,
-            Services      = services,
-            Levels        = levels,
+            Total              = _total,
+            Scanned            = _scanned,
+            MinBucket          = _minBucket,
+            BucketSeconds      = _bucketSeconds,
+            NBuckets           = _nBuckets,
+            Services           = services,
+            Levels             = levels,
+            SkippedSegments    = _skippedSegments,
+            MergedAwaySegments = _mergedAwaySegments,
         };
     }
 }

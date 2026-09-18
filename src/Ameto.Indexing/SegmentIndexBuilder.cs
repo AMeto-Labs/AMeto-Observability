@@ -18,20 +18,30 @@ namespace Ameto.Indexing;
 /// <see cref="MessagePackReader"/> and feeds the indexes directly — no per-event
 /// <c>Dictionary</c>, no boxing, no per-attribute strings. This is the flush-path allocation hot
 /// spot (index build was ~16 KB/event); the streaming walk is byte-parity with the old dictionary
-/// path (see <see cref="BuildReference"/>, exercised by the parity test).
+/// path (see <see cref="BuildReference"/>, exercised by the parity test) for every valid UTF-8
+/// input. A key or value that is NOT valid UTF-8 is indexed as its raw bytes, where the
+/// char-based walk indexed the U+FFFD-replaced decoding — see <see cref="SegmentInvertedIndex"/>.
 /// </summary>
-public sealed class SegmentIndexBuilder : ISegmentIndexSink
+public sealed unsafe class SegmentIndexBuilder : ISegmentIndexSink
 {
-    private readonly SegmentInvertedIndex _inverted = new();
-    private readonly SegmentTrigramIndex  _trigram  = new();
+    private readonly SegmentInvertedIndex _inverted;
+    private readonly SegmentTrigramIndex  _trigram;
     private readonly SegmentBloomFilter   _bloom;
+    private readonly IndexBuildHints?     _hints;
 
     private readonly int _maxFlattenDepth;
 
-    // Per-build scratch (Build is single-threaded per flush). Grown on demand.
-    private byte[] _mp  = new byte[512];   // payload copy for MessagePackReader (needs a sequence)
-    private char[] _key = new char[256];   // accumulated flat (dot-notation) key
-    private char[] _val = new char[128];   // formatted value (serialised form, prefix at [0..2])
+    // Per-build scratch (Build is single-threaded per flush). Grown on demand. Everything is
+    // UTF-8: keys are the payload's own bytes copied behind their prefix, numbers are formatted
+    // as UTF-8, and a value is case-folded ONCE (byte-wise, ASCII) for the bloom and the
+    // trigram together. The old walk decoded every key and every value to UTF-16, folded them
+    // as chars, encoded them back for the bloom, and lowered them again for the trigram — six
+    // passes over each value's bytes per event.
+    private readonly PinnedSpanMemoryManager _payload = new();   // MessagePackReader needs a sequence
+    private byte[] _key  = new byte[256];   // accumulated flat (dot-notation) key, UTF-8
+    private byte[] _val  = new byte[64];    // formatted numeric value (serialised form, prefix at [0..2])
+    private byte[] _fold = new byte[256];   // case-folded ASCII value for bloom + trigram
+    private char[] _wide = new char[256];   // non-ASCII value decoded for the UTF-16 fold path
 
     /// <summary>
     /// Terms per event assumed when the caller has nothing measured to offer. The filter is a
@@ -66,12 +76,21 @@ public sealed class SegmentIndexBuilder : ISegmentIndexSink
     /// first group of a file has no sealed group behind it to measure. It must not be read as
     /// "no terms" — a filter sized for one term per event saturates instantly.</para>
     /// </param>
+    /// <param name="hints">
+    /// What the previous group measured (distinct terms and trigrams), to pre-size the
+    /// accumulators; the builder writes its own counts back when it seals. Optional.
+    /// </param>
     public SegmentIndexBuilder(int expectedEventCount, int maxFlattenDepth = 5,
-                               int estimatedTermsPerEvent = EstimatedBloomTermsPerEvent)
+                               int estimatedTermsPerEvent = EstimatedBloomTermsPerEvent,
+                               IndexBuildHints? hints = null, Microsoft.Extensions.Logging.ILogger? log = null)
     {
         long termsPerEvent = estimatedTermsPerEvent > 0 ? estimatedTermsPerEvent : EstimatedBloomTermsPerEvent;
         _bloom            = SegmentBloomFilter.Create((long)Math.Max(1, expectedEventCount) * termsPerEvent);
         _maxFlattenDepth  = maxFlattenDepth;
+        _hints            = hints;
+        _log              = log;
+        _inverted         = new SegmentInvertedIndex(hints?.LastTerms ?? 0);
+        _trigram          = new SegmentTrigramIndex(hints?.LastTrigrams ?? 0);
     }
 
     // ── Build ─────────────────────────────────────────────────────────────────
@@ -136,7 +155,7 @@ public sealed class SegmentIndexBuilder : ISegmentIndexSink
         {
             int  i      = order?[pos] ?? pos;
             uint offset = (uint)pos;
-            IndexHeaderFields(HotTierEventSource.EventAt(hot, pool, i), offset);
+            IndexHeaderFieldsReference(HotTierEventSource.EventAt(hot, pool, i), offset);
 
             var props = hot.ReadPropertiesPayload(i, pool);
             if (props is not null)
@@ -144,35 +163,294 @@ public sealed class SegmentIndexBuilder : ISegmentIndexSink
         }
     }
 
-    // ── Per-event header fields (shared by both paths) ─────────────────────────
+    // ── Per-event header fields ────────────────────────────────────────────────
+    //
+    // BLOOM ADDS HAPPEN ON FIRST SIGHT ONLY. The filter is a set: adding a term it already
+    // holds sets bits that are already set, and costs a case fold, a UTF-8 encode, three
+    // Murmur passes and two random writes into a multi-MB array. The inverted index already
+    // knows whether a (property, value) is new — IndexAddOutcome — so the level, the service,
+    // the exception fields and every property key and value go to the bloom exactly once per
+    // distinct term. The template is not in the inverted index and is memoised by reference
+    // (a 256-slot direct-mapped cache: templates are interned, and a miss only costs the add
+    // the old code made every time). The bits are identical to adding on every event —
+    // IndexBuildParityTests pins that against the reference build, which still adds every
+    // time on purpose. What the writer sizes the next group's filter from is the number of
+    // terms PRESENTED (_bloomPresented), repeats included, exactly the count it saw before.
+
+    private static readonly byte[][] LevelUtf8 = BuildLevelTable();
+
+    private static byte[][] BuildLevelTable()
+    {
+        var t = new byte[8][];
+        for (int i = 0; i < t.Length; i++)
+            t[i] = System.Text.Encoding.UTF8.GetBytes(((LogLevel)i).ToSeqString());
+        return t;
+    }
+
     private void IndexHeaderFields(in SegmentEventRef ev, uint offset)
     {
-        // Level — inverted + bloom
-        string levelStr = ev.Level.ToSeqString();
-        _inverted.Add(offset, "@l", levelStr);
-        _bloom.Add(levelStr);
+        // Level — inverted + bloom. Six spellings, pre-encoded once for the process.
+        int lvl = (int)ev.Level;
+        var levelUtf8 = (uint)lvl < (uint)LevelUtf8.Length ? LevelUtf8[lvl] : LevelUtf8[(int)LogLevel.Information];
+        if (_inverted.AddUtf8(offset, "@l"u8, levelUtf8) != IndexAddOutcome.Existing) _bloom.AddUtf8(levelUtf8);
+        _bloomPresented++;
 
         // Message template — trigram only.
         string template = ev.MessageTemplate;
         if (!string.IsNullOrEmpty(template))
         {
             _trigram.Add(offset, template);
-            _bloom.Add(template);
+            BloomAddTemplate(template);
         }
 
-        // Exception (structured). The index is the ONLY consumer that needs the object graph —
-        // it indexes type, message and inner type as strings — so this is where the decode
-        // belongs. On the merge path the writer copies the same bytes through untouched.
+        // Exception (structured). The index is the ONLY consumer that needs anything of it —
+        // type, message and inner type — so this is where the decode belongs. On the merge
+        // path that is a span read that skips the stack trace; the writer copies the same
+        // bytes through untouched.
+        IndexException(in ev, offset);
+
+        // TraceId / SpanId — 32 / 16 lowercase hex digits, formatted straight into stack scratch.
+        Span<byte> hex = stackalloc byte[32];
+        if (ev.HasTraceId)
+        {
+            ev.TraceIdHi.TryFormat(hex,       out _, "x16");
+            ev.TraceIdLo.TryFormat(hex[16..], out _, "x16");
+            if (_inverted.AddUtf8(offset, "@tr"u8, hex) != IndexAddOutcome.Existing) _bloom.Add(hex);   // already folded
+            _bloomPresented++;
+        }
+        if (ev.HasSpanId)
+        {
+            ev.SpanId.TryFormat(hex, out _, "x16");
+            if (_inverted.AddUtf8(offset, "@sp"u8, hex[..16]) != IndexAddOutcome.Existing) _bloom.Add(hex[..16]);
+            _bloomPresented++;
+        }
+
+        // ServiceName — interned, so memoised by reference: one transcode per distinct service.
+        string? service = ev.ServiceName;
+        if (!string.IsNullOrEmpty(service))
+        {
+            if (!ReferenceEquals(service, _serviceRef))
+            {
+                int max = System.Text.Encoding.UTF8.GetMaxByteCount(service.Length);
+                if (max > _serviceUtf8.Length) _serviceUtf8 = new byte[Math.Max(max, _serviceUtf8.Length * 2)];
+                _serviceLen = System.Text.Encoding.UTF8.GetBytes(service, _serviceUtf8);
+                _serviceRef = service;
+            }
+            var svc = _serviceUtf8.AsSpan(0, _serviceLen);
+            if (_inverted.AddUtf8(offset, "service.name"u8, svc) != IndexAddOutcome.Existing) _bloom.AddUtf8(svc);
+            _bloomPresented++;
+        }
+    }
+
+    private string? _serviceRef;
+    private byte[]  _serviceUtf8 = new byte[64];
+    private int     _serviceLen;
+
+    private void IndexException(in SegmentEventRef ev, uint offset)
+    {
+        if (ev.Exception is { } exception)
+        {
+            // Flush path: the hot tier holds the decoded object.
+            AddExists(offset);
+            if (!string.IsNullOrEmpty(exception.Type))
+            {
+                AddString(offset, "@x.type"u8, exception.Type);
+                if (exception.Type.Length >= 3) _trigram.Add(offset, exception.Type);
+            }
+            if (!string.IsNullOrEmpty(exception.Message) && exception.Message.Length >= 3)
+                _trigram.Add(offset, exception.Message);
+            if (exception.Inner is { Type.Length: > 0 } inner)
+                AddString(offset, "@x.inner.type"u8, inner.Type);
+            return;
+        }
+
+        // nil, an empty legacy string and any non-string, non-map value are "no exception" to
+        // ExceptionInfo.FromBytes, not a malformed one. TryReadIndexFields answers false for all
+        // three as it does for a broken map, so they are told apart here, before the count below
+        // could take them for a producer writing exceptions this reader cannot read. An empty
+        // column — every row this server writes without an exception — leaves on the first test.
+        if (!ExceptionInfo.IsPresent(ev.ExceptionPayload))
+        {
+            if (!ev.ExceptionPayload.IsEmpty && !ReadsAsNoException(ev.ExceptionPayload))
+                NoteMalformedException(offset, ev.ExceptionPayload.Length);
+            return;
+        }
+
+        // Merge path: the raw msgpack. Read only the three fields the index wants, in place —
+        // the stack trace, 1-5 KB of UTF-16 nobody here reads, is skipped, not decoded. That
+        // decode cost an Error-level merge 4 879 B per row for three short strings.
+        fixed (byte* p = ev.ExceptionPayload)
+        {
+            _exception.Set(p, ev.ExceptionPayload.Length);
+            try
+            {
+                if (!ExceptionInfo.TryReadIndexFields(_exception.Memory, out var type, out var message, out var innerType))
+                {
+                    // The row is written whatever its exception column holds; what is lost is
+                    // the row's place in the @x.* buckets. The old full decode threw here and
+                    // failed the merge, so this is counted rather than silent: a non-zero count
+                    // is a producer writing exception maps this reader cannot read (a non-string
+                    // type, a truncated map), which is worth knowing about and not worth losing a
+                    // compaction over. It is reported at Warning ONCE, when the group seals (see
+                    // RecordHints), with the group's count — not per row, and not at Debug, which
+                    // the production level never prints.
+                    NoteMalformedException(offset, ev.ExceptionPayload.Length);
+                    return;
+                }
+                AddExists(offset);
+                if (!type.IsEmpty)
+                {
+                    if (_inverted.AddUtf8(offset, "@x.type"u8, type) != IndexAddOutcome.Existing) _bloom.AddUtf8(type);
+                    _bloomPresented++;
+                    TrigramUtf8(offset, type);
+                }
+                // ExceptionInfo.Read keeps an empty message as "" and the object path indexes
+                // only a message of 3+ chars; a UTF-8 length of 3+ can be a 1-char non-ASCII
+                // message, which the trigram then ignores itself — same outcome.
+                if (!message.IsEmpty) TrigramUtf8(offset, message);
+                if (!innerType.IsEmpty)
+                {
+                    if (_inverted.AddUtf8(offset, "@x.inner.type"u8, innerType) != IndexAddOutcome.Existing) _bloom.AddUtf8(innerType);
+                    _bloomPresented++;
+                }
+            }
+            finally
+            {
+                _exception.Set(null, 0);
+            }
+        }
+    }
+
+    private readonly PinnedSpanMemoryManager _exception = new();
+
+    /// <summary>
+    /// Whether a payload <see cref="ExceptionInfo.IsPresent"/> calls absent really is "no
+    /// exception" to delivery, rather than a torn header delivery throws on.
+    ///
+    /// <para>IsPresent answers from the lead byte and, for a string, the length that follows it —
+    /// on purpose, since it runs per scanned row. So a str8/16/32 header too short to hold its own
+    /// length (<c>D9</c>, <c>DA 00</c>, <c>DB 00 00 00</c>), or a scalar cut short, is ABSENT to it
+    /// while <see cref="ExceptionInfo.FromBytes(ReadOnlyMemory{byte})"/> throws
+    /// <see cref="EndOfStreamException"/>. Before IsPresent was consulted here those reached the
+    /// malformed count, as everything TryReadIndexFields cannot read does; returning on IsPresent
+    /// alone lost them from it, and only delivery noticed.</para>
+    ///
+    /// <para>FromBytes itself is asked, so the two cannot disagree. Over the shapes that get here
+    /// it builds nothing — nil, an empty string and a skipped value are all null — so a readable
+    /// one costs a header walk and no allocation, and none get here at all from a segment this
+    /// server wrote, where a row without an exception has an empty column. IsPresent and
+    /// FromBytes are unchanged: a presence probe still answers from the header, and delivery
+    /// still throws.</para>
+    ///
+    /// <para>What counts as "throws" is <see cref="FileBounds.DescribesContent"/>, not a list of its
+    /// own. The first version caught only MessagePackSerializationException and
+    /// EndOfStreamException, and MessagePack 3.1.7 has a third answer for a torn header: a count
+    /// of 2^31 or more (<c>DD 80 00 00 00</c>, or the same one array down) reaches a checked
+    /// uint→int conversion in <c>TrySkip</c> / <c>TryReadArrayHeader</c> /
+    /// <c>TryReadMapHeader</c> and throws <see cref="OverflowException"/>. That escaped
+    /// <c>Add</c> and failed the merge, which the engine did not classify as corruption, so the
+    /// same batch was re-selected every pass — where before this check the row was simply
+    /// written. The shared list is also the list the engine quarantines a batch by, so what this
+    /// lets escape is exactly what the engine will retry. Probed with two million byte-flipped
+    /// exception maps and two million random 1-8 byte payloads, FromBytes threw nothing outside
+    /// it (and a skip nested two million arrays deep did not recurse).</para>
+    /// </summary>
+    private bool ReadsAsNoException(ReadOnlySpan<byte> payload)
+    {
+        fixed (byte* p = payload)
+        {
+            _exception.Set(p, payload.Length);
+            try
+            {
+                return ExceptionInfo.FromBytes(_exception.Memory) is null;
+            }
+            catch (Exception ex) when (FileBounds.DescribesContent(ex))
+            {
+                return false;
+            }
+            finally
+            {
+                _exception.Set(null, 0);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Counts a row whose exception column delivery cannot read, remembering where the group's
+    /// first one is for the Warning <see cref="RecordHints"/> writes.
+    /// </summary>
+    private void NoteMalformedException(uint offset, int bytes)
+    {
+        if (_malformedExceptions++ == 0)
+        {
+            _firstMalformedOrdinal = offset;
+            _firstMalformedBytes   = bytes;
+        }
+        _hints?.NoteMalformedException();
+    }
+
+    private void AddExists(uint offset)
+    {
+        if (_inverted.AddUtf8(offset, "@x.exists"u8, "true"u8) != IndexAddOutcome.Existing) _bloom.Add("@x.exists"u8);
+        _bloomPresented++;
+    }
+
+    /// <summary>A header string through the transcoding overload — exception fields on the flush path.</summary>
+    private void AddString(uint offset, ReadOnlySpan<byte> property, string value)
+    {
+        int max = System.Text.Encoding.UTF8.GetMaxByteCount(value.Length);
+        byte[]? rented = max > 512 ? ArrayPool<byte>.Shared.Rent(max) : null;
+        Span<byte> buf = rented ?? stackalloc byte[512];
+        try
+        {
+            int n = System.Text.Encoding.UTF8.GetBytes(value, buf);
+            if (_inverted.AddUtf8(offset, property, buf[..n]) != IndexAddOutcome.Existing) _bloom.AddUtf8(buf[..n]);
+            _bloomPresented++;
+        }
+        finally
+        {
+            if (rented is not null) ArrayPool<byte>.Shared.Return(rented);
+        }
+    }
+
+    /// <summary>Trigram of a UTF-8 value: byte-wise fold when ASCII, the UTF-16 path otherwise.</summary>
+    private void TrigramUtf8(uint offset, ReadOnlySpan<byte> utf8)
+    {
+        if (utf8.Length < 3) return;
+        EnsureFold(utf8.Length);
+        if (System.Text.Ascii.ToLower(utf8, _fold, out int n) == OperationStatus.Done)
+            _trigram.AddFoldedAscii(offset, _fold.AsSpan(0, n));
+        else
+            _trigram.Add(offset, utf8);
+    }
+
+    /// <summary>The reference oracle's header path: strings, adding to the bloom every time.</summary>
+    private void IndexHeaderFieldsReference(in SegmentEventRef ev, uint offset)
+    {
+        string levelStr = ev.Level.ToSeqString();
+        _inverted.Add(offset, "@l", levelStr);
+        _bloom.Add(levelStr);
+        _bloomPresented++;
+
+        string template = ev.MessageTemplate;
+        if (!string.IsNullOrEmpty(template))
+        {
+            _trigram.Add(offset, template);
+            _bloom.Add(template);
+            _bloomPresented++;
+        }
+
         var exception = ev.DecodeException();
         if (exception is not null)
         {
             _inverted.Add(offset, ClefFields.ExceptionExists, "true");
             _bloom.Add(ClefFields.ExceptionExists);
-
+            _bloomPresented++;
             if (!string.IsNullOrEmpty(exception.Type))
             {
                 _inverted.Add(offset, ClefFields.ExceptionType, exception.Type);
                 _bloom.Add(exception.Type);
+                _bloomPresented++;
                 if (exception.Type.Length >= 3) _trigram.Add(offset, exception.Type);
             }
             if (!string.IsNullOrEmpty(exception.Message) && exception.Message.Length >= 3)
@@ -181,40 +459,67 @@ public sealed class SegmentIndexBuilder : ISegmentIndexSink
             {
                 _inverted.Add(offset, ClefFields.ExceptionInnerType, inner.Type);
                 _bloom.Add(inner.Type);
+                _bloomPresented++;
             }
         }
 
-        // TraceId / SpanId
         if (ev.HasTraceId)
         {
             string traceHex = TraceIdHelper.FormatTraceId(ev.TraceIdHi, ev.TraceIdLo)!;
             _inverted.Add(offset, ClefFields.TraceId, traceHex);
             _bloom.Add(traceHex);
+            _bloomPresented++;
         }
         if (ev.HasSpanId)
         {
             string spanHex = TraceIdHelper.FormatSpanId(ev.SpanId)!;
             _inverted.Add(offset, ClefFields.SpanId, spanHex);
             _bloom.Add(spanHex);
+            _bloomPresented++;
         }
-
-        // ServiceName
         if (!string.IsNullOrEmpty(ev.ServiceName))
         {
             _inverted.Add(offset, ClefFields.ServiceName, ev.ServiceName);
             _bloom.Add(ev.ServiceName);
+            _bloomPresented++;
         }
     }
+
+    private void BloomAddTemplate(string template)
+    {
+        _bloomPresented++;
+        int slot = System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(template) & (TemplateMemoSlots - 1);
+        if (ReferenceEquals(_templateMemo[slot], template)) return;
+        _templateMemo[slot] = template;
+        _bloom.Add(template);
+    }
+
+    private const int TemplateMemoSlots = 256;
+    private readonly string?[] _templateMemo = new string?[TemplateMemoSlots];
+
+    /// <summary>Terms handed to the bloom, repeats included — see <see cref="BloomTermsAdded"/>.</summary>
+    private long _bloomPresented;
 
     // ── Streaming property walk (msgpack → indexes, no Dictionary/boxing) ───────
     private void IndexPropertiesStreaming(ReadOnlySpan<byte> payload, uint offset)
     {
         if (payload.IsEmpty) return;
-        if (payload.Length > _mp.Length) _mp = new byte[Math.Max(payload.Length, _mp.Length * 2)];
-        payload.CopyTo(_mp);
-        var reader = new MessagePackReader(new ReadOnlySequence<byte>(_mp, 0, payload.Length));
-        try { WalkMap(ref reader, 0, offset, 0); }
-        catch { /* malformed payload — index what we could, mirror old try/catch tolerance */ }
+        // Read in place: the hot tier's native arena or the merge's block buffer, pinned for the
+        // walk. Nothing is copied.
+        fixed (byte* p = payload)
+        {
+            _payload.Set(p, payload.Length);
+            try
+            {
+                var reader = new MessagePackReader(new ReadOnlySequence<byte>(_payload.Memory));
+                try { WalkMap(ref reader, 0, offset, 0); }
+                catch { /* malformed payload — index what we could, mirror old try/catch tolerance */ }
+            }
+            finally
+            {
+                _payload.Set(null, 0);
+            }
+        }
     }
 
     private void WalkMap(ref MessagePackReader reader, int prefixLen, uint offset, int depth)
@@ -224,10 +529,9 @@ public sealed class SegmentIndexBuilder : ISegmentIndexSink
         for (int e = 0; e < count; e++)
         {
             ReadOnlySpan<byte> keyUtf8 = ReadStr(ref reader);
-            int keyChars = System.Text.Encoding.UTF8.GetCharCount(keyUtf8);
-            EnsureKey(prefixLen + keyChars + 1);
-            System.Text.Encoding.UTF8.GetChars(keyUtf8, _key.AsSpan(prefixLen));
-            WalkValue(ref reader, prefixLen + keyChars, offset, depth);
+            EnsureKey(prefixLen + keyUtf8.Length + 1);
+            keyUtf8.CopyTo(_key.AsSpan(prefixLen));
+            WalkValue(ref reader, prefixLen + keyUtf8.Length, offset, depth);
         }
     }
 
@@ -237,7 +541,7 @@ public sealed class SegmentIndexBuilder : ISegmentIndexSink
         {
             case MessagePackType.Map:
                 EnsureKey(flatLen + 1);
-                _key[flatLen] = ClefFields.PropertyPathSeparator;
+                _key[flatLen] = (byte)ClefFields.PropertyPathSeparator;
                 WalkMap(ref reader, flatLen + 1, offset, depth + 1);
                 break;
 
@@ -260,15 +564,12 @@ public sealed class SegmentIndexBuilder : ISegmentIndexSink
         {
             case MessagePackType.String:
             {
-                ReadOnlySpan<byte> vUtf8 = ReadStr(ref reader);
-                int vc = System.Text.Encoding.UTF8.GetCharCount(vUtf8);
-                EnsureVal(vc);
-                System.Text.Encoding.UTF8.GetChars(vUtf8, _val);
-                var v = _val.AsSpan(0, vc);
-                _inverted.AddSpan(offset, flatKey, v);   // serialised == plain for strings
-                _bloom.Add(flatKey);
-                _bloom.Add(v);
-                if (vc >= 3) _trigram.Add(offset, v);
+                ReadOnlySpan<byte> v = ReadStr(ref reader);
+                int prop = _inverted.PropertyId(flatKey, out bool newKey);
+                var r    = _inverted.AddValue(offset, prop, v);          // serialised == plain for strings
+                _bloomPresented += 2;
+                if (newKey) _bloom.AddUtf8(flatKey);
+                FoldValue(offset, v, bloom: r == IndexAddOutcome.NewValue, trigram: v.Length >= 3);
                 break;
             }
             case MessagePackType.Integer:
@@ -276,7 +577,13 @@ public sealed class SegmentIndexBuilder : ISegmentIndexSink
                 if (reader.NextCode == MessagePackCode.UInt64)
                 {
                     ulong u = reader.ReadUInt64();
-                    if (u > (ulong)long.MaxValue) { WriteUnsigned(u, out var pl, out var sr); AddNumeric(offset, flatKey, pl, sr); break; }
+                    if (u > (ulong)long.MaxValue)
+                    {
+                        // ulong > long.Max: SerialiseValue default → plain ToString(), no prefix.
+                        u.TryFormat(_val, out int uw, default, System.Globalization.CultureInfo.InvariantCulture);
+                        AddNumeric(offset, flatKey, _val.AsSpan(0, uw), _val.AsSpan(0, uw));
+                        break;
+                    }
                     AddLong((long)u, offset, flatKey); break;
                 }
                 AddLong(reader.ReadInt64(), offset, flatKey);
@@ -286,8 +593,7 @@ public sealed class SegmentIndexBuilder : ISegmentIndexSink
             {
                 double d = reader.ReadDouble();
                 // serialised = "\0d" + R-format; plain = same digits (default ToString == R in modern .NET).
-                _val[0] = '\0'; _val[1] = 'd';
-                EnsureVal(2 + 40);
+                _val[0] = 0; _val[1] = (byte)'d';
                 d.TryFormat(_val.AsSpan(2), out int w, "R", System.Globalization.CultureInfo.InvariantCulture);
                 AddNumeric(offset, flatKey, _val.AsSpan(2, w), _val.AsSpan(0, 2 + w));
                 break;
@@ -295,17 +601,22 @@ public sealed class SegmentIndexBuilder : ISegmentIndexSink
             case MessagePackType.Boolean:
             {
                 bool b = reader.ReadBoolean();
-                if (b) { _bloom.Add(flatKey); _bloom.Add("True");  _inverted.AddSpan(offset, flatKey, "\0true");  }
-                else   { _bloom.Add(flatKey); _bloom.Add("False"); _inverted.AddSpan(offset, flatKey, "\0false"); }
-                _trigram.Add(offset, b ? "True" : "False");
+                int prop = _inverted.PropertyId(flatKey, out bool newKey);
+                var r    = _inverted.AddValue(offset, prop, b ? "\0true"u8 : "\0false"u8);
+                _bloomPresented += 2;
+                if (newKey) _bloom.AddUtf8(flatKey);
+                if (r == IndexAddOutcome.NewValue) _bloom.Add(b ? "true"u8 : "false"u8);   // "True"/"False" folded
+                _trigram.AddFoldedAscii(offset, b ? "true"u8 : "false"u8);
                 break;
             }
             case MessagePackType.Nil:
             {
                 reader.ReadNil();
-                _bloom.Add(flatKey);
-                _bloom.Add(ReadOnlySpan<char>.Empty);          // v?.ToString() ?? "" → ""
-                _inverted.AddSpan(offset, flatKey, "\0null");
+                int prop = _inverted.PropertyId(flatKey, out bool newKey);
+                var r    = _inverted.AddValue(offset, prop, "\0null"u8);
+                _bloomPresented += 2;
+                if (newKey) _bloom.AddUtf8(flatKey);
+                if (r == IndexAddOutcome.NewValue) _bloom.Add(ReadOnlySpan<byte>.Empty);   // v?.ToString() ?? "" → ""
                 break;
             }
             default:
@@ -314,20 +625,11 @@ public sealed class SegmentIndexBuilder : ISegmentIndexSink
         }
     }
 
-    private void AddLong(long l, uint offset, ReadOnlySpan<char> flatKey)
+    private void AddLong(long l, uint offset, ReadOnlySpan<byte> flatKey)
     {
-        _val[0] = '\0'; _val[1] = 'l';
-        EnsureVal(2 + 24);
+        _val[0] = 0; _val[1] = (byte)'l';
         l.TryFormat(_val.AsSpan(2), out int w, default, System.Globalization.CultureInfo.InvariantCulture);
         AddNumeric(offset, flatKey, _val.AsSpan(2, w), _val.AsSpan(0, 2 + w));
-    }
-
-    private void WriteUnsigned(ulong u, out ReadOnlySpan<char> plain, out ReadOnlySpan<char> serialised)
-    {
-        // ulong > long.Max: SerialiseValue default → plain ToString(), no prefix.
-        EnsureVal(24);
-        u.TryFormat(_val, out int w, default, System.Globalization.CultureInfo.InvariantCulture);
-        plain = serialised = _val.AsSpan(0, w);
     }
 
     /// <summary>
@@ -348,12 +650,40 @@ public sealed class SegmentIndexBuilder : ISegmentIndexSink
     /// a re-check, never a row. Cost is bounded: <c>SegmentTrigramIndex.Add</c> ignores
     /// anything shorter than three characters, so one- and two-digit values add nothing.</para>
     /// </summary>
-    private void AddNumeric(uint offset, ReadOnlySpan<char> flatKey, ReadOnlySpan<char> plain, ReadOnlySpan<char> serialised)
+    private void AddNumeric(uint offset, ReadOnlySpan<byte> flatKey, ReadOnlySpan<byte> plain, ReadOnlySpan<byte> serialised)
     {
-        _inverted.AddSpan(offset, flatKey, serialised);
-        _bloom.Add(flatKey);
-        _bloom.Add(plain);
-        _trigram.Add(offset, plain);
+        int prop = _inverted.PropertyId(flatKey, out bool newKey);
+        var r    = _inverted.AddValue(offset, prop, serialised);
+        _bloomPresented += 2;
+        if (newKey) _bloom.AddUtf8(flatKey);
+        FoldValue(offset, plain, bloom: r == IndexAddOutcome.NewValue, trigram: true);
+    }
+
+    /// <summary>
+    /// Case-folds a value once and feeds the bloom (if asked) and the trigram from the same
+    /// bytes. ASCII — every number, id and the vast majority of strings — is lowered byte-wise
+    /// by <c>Ascii.ToLower</c>, which is what <c>ToLowerInvariant</c> does to ASCII, so the
+    /// bloom hashes and trigram keys are the ones the UTF-16 path produces. Anything else is
+    /// decoded and goes through that UTF-16 path unchanged.
+    /// </summary>
+    private void FoldValue(uint offset, ReadOnlySpan<byte> v, bool bloom, bool trigram)
+    {
+        if (!bloom && !trigram) return;
+        EnsureFold(v.Length);
+        if (System.Text.Ascii.ToLower(v, _fold, out int n) == OperationStatus.Done)
+        {
+            var folded = _fold.AsSpan(0, n);
+            if (bloom)   _bloom.Add(folded);
+            if (trigram) _trigram.AddFoldedAscii(offset, folded);
+            return;
+        }
+
+        int chars = System.Text.Encoding.UTF8.GetCharCount(v);
+        if (chars > _wide.Length) _wide = new char[Math.Max(chars, _wide.Length * 2)];
+        System.Text.Encoding.UTF8.GetChars(v, _wide);
+        var text = _wide.AsSpan(0, chars);
+        if (bloom)   _bloom.Add(text);
+        if (trigram) _trigram.Add(offset, text);
     }
 
     private static ReadOnlySpan<byte> ReadStr(ref MessagePackReader reader)
@@ -368,8 +698,8 @@ public sealed class SegmentIndexBuilder : ISegmentIndexSink
         return seq.HasValue ? seq.Value.ToArray() : _empty;
     }
 
-    private void EnsureKey(int len) { if (len > _key.Length) System.Array.Resize(ref _key, Math.Max(len, _key.Length * 2)); }
-    private void EnsureVal(int len) { if (len > _val.Length) System.Array.Resize(ref _val, Math.Max(len, _val.Length * 2)); }
+    private void EnsureKey(int len)  { if (len > _key.Length)  System.Array.Resize(ref _key,  Math.Max(len, _key.Length * 2)); }
+    private void EnsureFold(int len) { if (len > _fold.Length) System.Array.Resize(ref _fold, Math.Max(len, _fold.Length * 2)); }
 
     // ── Reference recursive flatten (used only by BuildReference) ──────────────
     private void FlattenProperties(string prefix, Dictionary<string, object?> dict, uint offset, int depth)
@@ -394,7 +724,11 @@ public sealed class SegmentIndexBuilder : ISegmentIndexSink
                 break;
             default:
                 _inverted.Add(offset, flatKey, v);
+                // Added on EVERY event here, deliberately: the streaming path adds on first
+                // sight only, and the byte-for-byte parity of the two bloom sections is what
+                // proves that a set does not care.
                 _bloom.Add(flatKey);
+                _bloomPresented += 2;
                 // Invariant, exactly like the streaming path's `plain` — the parity test
                 // compares the two builds byte for byte, and a ru-KZ host formats 2.5 as "2,5".
                 string valStr = IndexValueForms.PlainText(v);
@@ -409,11 +743,17 @@ public sealed class SegmentIndexBuilder : ISegmentIndexSink
     // ── Serialise ─────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Bloom terms added so far — see <see cref="ISegmentIndexSink.BloomTermsAdded"/>. Counted
-    /// by the filter itself, so it costs one increment on a path that was already hashing
-    /// three times, and it stays readable after <see cref="Dispose"/>.
+    /// Bloom terms PRESENTED so far, repeats included — see
+    /// <see cref="ISegmentIndexSink.BloomTermsAdded"/>. Counted by the builder rather than the
+    /// filter since the builder started skipping repeats (see <see cref="IndexHeaderFields"/>):
+    /// the writer's next-group forecast and its group-full check were calibrated on the
+    /// presented count, and this keeps both exactly where they were. The filter's own
+    /// <see cref="SegmentBloomFilter.AddedTermCount"/> is the de-duplicated number — sizing
+    /// by THAT (10 bits per distinct term is the design point) would shrink every bloom
+    /// section after the first and is a deliberate follow-up, not a side effect of this.
+    /// Managed state, readable after <see cref="Dispose"/>.
     /// </summary>
-    public long BloomTermsAdded => _bloom.AddedTermCount;
+    public long BloomTermsAdded => _bloomPresented;
 
     /// <summary>
     /// Terms the filter was actually able to buy — see
@@ -423,6 +763,31 @@ public sealed class SegmentIndexBuilder : ISegmentIndexSink
     /// capacity taken from the request would have the writer fill bits that were never allocated.
     /// </summary>
     public long BloomTermCapacity => _bloom.Capacity;
+
+    /// <summary>
+    /// Pooled managed bytes the two accumulators hold right now — term slabs, tables, entries,
+    /// posting slabs. This is the number to read for "what does one in-flight group retain":
+    /// a GC-heap delta cannot tell a buffer this builder holds from one parked in the
+    /// <c>ArrayPool</c> by a builder that already sealed.
+    /// </summary>
+    public long BuildRetainedBytes => _inverted.BuildRetainedBytes + _trigram.BuildRetainedBytes;
+
+    /// <summary>
+    /// Exception payloads this group could not read as an exception map (merge path only; the
+    /// flush path holds decoded objects). Each is a row written without its @x.* terms. The
+    /// process-wide total is on <see cref="IndexBuildHints.MalformedExceptionPayloads"/>.
+    ///
+    /// <para>ENCOUNTERS, not distinct rows. The merged segment keeps the raw payload, so the same
+    /// row is met and counted again at every later merge level, and a merge that fails after this
+    /// group was added counts its rows again on the retry. The figure therefore grows with
+    /// compaction depth rather than with ingest, and a fully compacted store reports 0 after a
+    /// restart while <c>@x.type</c> queries still miss those rows. Read it as "how much unreadable
+    /// exception data the merges are meeting", never as a count of affected rows.</para>
+    /// </summary>
+    public long MalformedExceptionPayloads => _malformedExceptions;
+
+    private long _malformedExceptions;
+    private readonly Microsoft.Extensions.Logging.ILogger? _log;
 
     /// <summary>
     /// The three sections one at a time, for probes and tests that want to compare or size just
@@ -441,14 +806,111 @@ public sealed class SegmentIndexBuilder : ISegmentIndexSink
     public byte[] SerialisedBloomFilter    => _bloom.Serialise();
 
     public (byte[] Inverted, byte[] Trigram, byte[] Bloom) Serialise()
-        => (_inverted.Serialise(), _trigram.Serialise(), _bloom.Serialise());
+    {
+        RecordHints();
+        return (_inverted.Serialise(), _trigram.Serialise(), _bloom.Serialise());
+    }
+
+    /// <summary>What this group measured, for the next one to size itself by — once, however
+    /// many of the section accessors are called (a probe calls both paths). Also where a group
+    /// that met unreadable exception maps is reported: once per group, at Warning, with its
+    /// count, the first one's file ordinal and the process-wide total.</summary>
+    private void RecordHints()
+    {
+        if (_hintsRecorded) return;
+        _hintsRecorded = true;
+        _hints?.Record(_inverted.TermCount, _trigram.BucketCount);
+        if (_malformedExceptions > 0 && _log is { } log && log.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Warning))
+            LogMalformedExceptions(log, _malformedExceptions, _firstMalformedOrdinal, _firstMalformedBytes,
+                                   _hints?.MalformedExceptionPayloads ?? _malformedExceptions, null);
+    }
+
+    private bool _hintsRecorded;
+    private uint _firstMalformedOrdinal;
+    private int  _firstMalformedBytes;
+
+    /// <summary>Pre-compiled so the report formats without boxing its arguments.</summary>
+    private static readonly Action<Microsoft.Extensions.Logging.ILogger, long, uint, int, long, Exception?> LogMalformedExceptions =
+        Microsoft.Extensions.Logging.LoggerMessage.Define<long, uint, int, long>(
+            Microsoft.Extensions.Logging.LogLevel.Warning,
+            new Microsoft.Extensions.Logging.EventId(0, "IndexMalformedExceptionPayloads"),
+            "Index build: {Count} exception payload(s) in this group are not readable exception maps (first at file ordinal {Ordinal}, {Bytes} B); the rows are written but their @x.* terms are not indexed, so @x.type filters and free-text search over the merged segment miss them. Process total: {Total}");
 
     /// <summary>
-    /// Frees the bloom filter's bits. They live in <c>NativeMemory</c> and
-    /// <see cref="SegmentBloomFilter"/> has no finaliser, so before the sink contract made the
-    /// builder's lifetime explicit every sealed group leaked its filter off-heap — ~10 MB per
-    /// group at the documented ~10 bits/term sizing, invisible to every managed-heap probe.
-    /// <see cref="Serialise"/> copies the bits out, so disposing right after it is safe.
+    /// The production path — see <see cref="ISegmentIndexSink.WriteSections"/>. The inverted
+    /// and trigram sections stream through one pooled 1 MB buffer straight into the file; the
+    /// bloom goes from its native bits to the stream with no managed copy at all. Where a
+    /// section's length is known up front it is written first; otherwise a placeholder is
+    /// patched once the section is out (the file is seekable, and the seek is per group).
+    /// Same bytes as <see cref="Serialise"/> framed by the writer — pinned by
+    /// <c>SectionStreamingTests</c>.
     /// </summary>
-    public void Dispose() => _bloom.Dispose();
+    public void WriteSections(Stream destination, out long invertedOffset, out long trigramOffset, out long bloomOffset)
+    {
+        RecordHints();
+        using var w = new StreamSectionWriter(destination);
+
+        invertedOffset = destination.Position;
+        WritePlaceholder(destination);
+        w.ResetCount();
+        _inverted.WriteTo(w);
+        w.Flush();
+        PatchLength(destination, invertedOffset, w.Total);
+
+        trigramOffset = destination.Position;
+        long trigramLen = _trigram.ExactSerialisedSize();
+        WriteLength(destination, trigramLen);
+        w.ResetCount();
+        _trigram.WriteTo(w);
+        w.Flush();
+        if (w.Total != trigramLen)
+            throw new InvalidOperationException($"trigram section wrote {w.Total} bytes against a computed {trigramLen}");
+
+        bloomOffset = destination.Position;
+        WriteLength(destination, _bloom.SerialisedLength);
+        _bloom.WriteTo(destination);
+    }
+
+    private static void WritePlaceholder(Stream s)
+    {
+        Span<byte> z = stackalloc byte[4];
+        z.Clear();
+        s.Write(z);
+    }
+
+    private static void WriteLength(Stream s, long len)
+    {
+        Span<byte> b = stackalloc byte[4];
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(b, checked((uint)len));
+        s.Write(b);
+    }
+
+    private static void PatchLength(Stream s, long at, long len)
+    {
+        long end = s.Position;
+        s.Position = at;
+        WriteLength(s, len);
+        s.Position = end;
+    }
+
+    /// <summary>
+    /// Frees the bloom filter's bits and hands the accumulators' pooled buffers back.
+    ///
+    /// <para>The bits live in <c>NativeMemory</c> and <see cref="SegmentBloomFilter"/> has no
+    /// finaliser, so before the sink contract made the builder's lifetime explicit every sealed
+    /// group leaked its filter off-heap — ~10 MB per group at the documented ~10 bits/term
+    /// sizing, invisible to every managed-heap probe. The trigram accumulator's slot table,
+    /// buckets and posting slabs are <c>ArrayPool</c> rentals for the same reason in reverse:
+    /// tens of MB per group that would otherwise be fresh LOH allocations every flush. Both are
+    /// released here, so <see cref="Serialise"/> and the per-section accessors throw
+    /// <see cref="ObjectDisposedException"/> afterwards — a returned pooled array is somebody
+    /// else's the moment they rent it, which is exactly the freed-memory read the bloom guard
+    /// exists for.</para>
+    /// </summary>
+    public void Dispose()
+    {
+        _bloom.Dispose();
+        _trigram.ReleaseBuildBuffers();
+        _inverted.ReleaseBuildBuffers();
+    }
 }

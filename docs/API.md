@@ -149,8 +149,21 @@ Ingest a batch of log events.
 { "ingested": 42, "dropped": 0 }
 ```
 
-**Response `413 Payload Too Large`:** body > 4 MB.  
-**Response `400 Bad Request`:** invalid MessagePack.
+**Response `413 Payload Too Large`:** body > 4 MB.
+
+**Response `400 Bad Request`** — two shapes, and they must not be treated alike:
+
+```json
+{ "ingested": 742, "dropped": 0, "failedAtElement": 742 }
+```
+
+The body stopped being a CLEF array at element `failedAtElement`. **The events before it are already ingested and stay so.** The server has no de-duplication, so resending the whole batch stores that prefix a second time — and again on every retry. Retry from element `failedAtElement` onward, or drop the batch.
+
+```json
+{ "ingested": 0, "dropped": 0 }
+```
+
+Nothing landed — the body was not a MessagePack array at all, or it ended short of its `Content-Length`, which is refused whole for exactly this reason. Safe to retry entire. Note that `failedAtElement` is **absent** here: a failure at the array header is deliberately distinguishable from a failure inside element 0, which reports `"failedAtElement": 0`.
 
 ### `POST /v1/logs`, `POST /v1/traces`, `POST /v1/metrics`
 
@@ -164,6 +177,10 @@ to its configured endpoint. The older `/otlp/v1/…` spellings still work and ar
 
 **Response `200 OK`:** `{ "ingested": N, "dropped": M }`.  
 `resource.attributes["service.name"]` becomes the event's service; `traceId` / `spanId` are indexed for log↔trace correlation.
+
+**Response `413 Payload Too Large`:** the body is over `Ingestion.MaxOtlpBatchBytes` (8 MB by default) — whether it declared the size in `Content-Length` or proved it by arriving. The batch is refused **whole**, before any decoding, so nothing was ingested; the response body is empty. The same refusal over gRPC is `RESOURCE_EXHAUSTED` (8). Split the batch or raise the limit; retrying the same bytes will always be refused.
+
+**Response `400 Bad Request`:** the payload could not be decoded — malformed protobuf or JSON, or an attribute value nested deeper than 64 levels. The response body is **empty**: there are no counts on this road. As with `/api/events`, **records decoded before the bad byte may already be ingested** — both parsers write into the ring as they walk — so treat a 400 as "some prefix may have landed", not as a no-op. Logs sent as kvlist or array attribute values are encoded rather than dropped (they used to be silently lost on the protobuf road only).
 
 ### OTLP over gRPC
 
@@ -326,9 +343,39 @@ Server health snapshot.
   "processStartedAt": "2026-05-20T09:00:00Z",
   "segmentCount": 7,
   "totalEventCount": 462345,
-  "totalCompressedBytes": 134217728
+  "totalCompressedBytes": 134217728,
+
+  "logsStorageBytes": 134217728,
+  "logsQuarantinedBytes": 0,
+
+  "indexCacheEntries": 12,
+  "indexCacheBytes": 41943040,
+  "indexCacheBudgetBytes": 60129542,
+  "indexCacheHits": 1843,
+  "indexCacheMisses": 57,
+  "indexCacheIdleEvicted": 3,
+  "indexCacheNativeBytes": 6291456,
+  "indexCacheNativeBudgetBytes": 26843545,
+  "indexCacheShedEvicted": 0,
+
+  "ingestBufferPooledBytes": 4194304,
+  "ingestBufferBudgetBytes": 134217728,
+  "ingestArenaBytes": 80530636,
+  "ingestArenaResidentBytes": 655360,
+  "indexBuildPooledBytes": 8388608,
+  "indexMalformedExceptionPayloads": 0
 }
 ```
+
+The response carries more fields than are shown here (disk, GC, per-signal storage, ingest counters); **new fields are added without notice**, so parse it permissively.
+
+The memory figures are the ones worth watching on a constrained host, and each is a ceiling paired with what is held against it: `indexCacheBytes` / `indexCacheBudgetBytes` is the decoded-index cache (the budget is what the cache was BUILT with, not a fresh derivation), `ingestBufferPooledBytes` / `ingestBufferBudgetBytes` is request bodies parked between requests, and `ingestArenaResidentBytes` / `ingestArenaBytes` is how far into the payload arena the ring has ever reached — the deepest slab ever used times the slab size, never given back, so it is a resting level rather than a peak. On Windows that figure is the arena's commit charge (what a job object's memory limit counts). On Linux it is an upper bound on the arena's resident memory, not a measurement of it: pages become resident only when written, and a small event writes only the first page of its slab. `logsQuarantinedBytes` is inside `logsStorageBytes` and is the one part retention will never free.
+
+`indexCacheNativeBytes` / `indexCacheNativeBudgetBytes` is the part of that same cache held **off the managed heap** — the segment bloom filters' bits, 4–8 % of a cached entry — with its own ceiling. It is reported separately because those bytes behave differently from the rest: no garbage collection returns them, and they do not count against the GC's heap limit that `indexCacheBudgetBytes` is a share of, so on a small host they are the part of the cache that can push the process past its container limit. `indexCacheShedEvicted` counts entries dropped because the server was **under RAM pressure** (the same condition that flushes the hot tier); a number that keeps climbing means queries are repeatedly paying to re-decode indexes on a host that does not have room for them. `indexCacheNativeEvicted` counts entries dropped because that native ceiling was reached **while the total budget still had room** — the only visible sign of a cache bounded by its bloom bits rather than by the budget you set, which otherwise looks merely like `indexCacheBytes` resting far below `indexCacheBudgetBytes` with a hit rate that never improves.
+
+`indexMalformedExceptionPayloads` counts exception payloads a merge could not read as an exception map. Those rows are written but their `@x.*` terms are not indexed, so `@x.type` filters and free-text search over the merged segment miss them — a non-zero value means a producer is writing exception maps this reader cannot read. It counts **encounters, not distinct rows**: the raw payload survives into the merged segment, so the same row is counted again at every later merge level and again on a retried merge, and the counter resets on restart. Watch whether it moves, not how large it is.
+
+> **Changed in this release — `processThreads` counts thread-pool threads.** It now reports `ThreadPool.ThreadCount`; it used to report `Process.Threads.Count`, which snapshots every process on the machine on Windows and allocated a `ProcessThread` object per thread — the single largest allocation in this endpoint. Dedicated threads (the drainer, the flushers, the GC) are **not** in the new figure, so it is smaller than before for the same load. A scrape, alert threshold or runbook calibrated against the old meaning will see a step change after upgrading.
 
 ---
 

@@ -73,7 +73,7 @@ public sealed class HeaderCountEquivalenceTests : IDisposable
     public void Dispose()
     {
         try { _engine.DisposeAsync().AsTask().GetAwaiter().GetResult(); } catch { }
-        try { Directory.Delete(_dir, true); } catch { }
+        QuerySegmentFixtures.DeleteDataDirectory(_dir);
     }
 
     /// <summary>What the alert evaluator's fast path computes.</summary>

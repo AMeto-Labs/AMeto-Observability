@@ -64,7 +64,7 @@ public sealed class IndexBuildBreakdownProbe
 
     private static long MeasureInverted(Ev[] ev, bool includeTrace)
     {
-        long before = GC.GetTotalMemory(true);
+
         var idx = new SegmentInvertedIndex();
         for (uint i = 0; i < ev.Length; i++)
         {
@@ -85,15 +85,15 @@ public sealed class IndexBuildBreakdownProbe
             idx.Add(i, "region",           "ae-dxb");
             idx.Add(i, "RequestId",        e.RequestId);
         }
-        long after = GC.GetTotalMemory(true);
-        GC.KeepAlive(idx);
-        return after - before;
+        long held = idx.BuildRetainedBytes;   // pooled: read what the index holds, not a heap delta
+        idx.ReleaseBuildBuffers();
+        return held;
     }
 
     private static (long Bytes, int Distinct) MeasureSingleProperty(Ev[] ev, string name)
     {
         var distinct = new HashSet<string>(StringComparer.Ordinal);
-        long before = GC.GetTotalMemory(true);
+
         var idx = new SegmentInvertedIndex();
         for (uint i = 0; i < ev.Length; i++)
         {
@@ -116,10 +116,10 @@ public sealed class IndexBuildBreakdownProbe
             idx.Add(i, name, v);
             distinct.Add(v?.ToString() ?? "");
         }
-        long after = GC.GetTotalMemory(true);
-        GC.KeepAlive(idx);
+        long held = idx.BuildRetainedBytes;
+        idx.ReleaseBuildBuffers();
         // Subtract the distinct-set's own cost so we report only the index.
-        return (after - before, distinct.Count);
+        return (held, distinct.Count);
     }
 
     private static long MeasureTrigram(Ev[] ev) => MeasureTrigramSubset(ev, tmpl: true, values: true);
@@ -127,7 +127,7 @@ public sealed class IndexBuildBreakdownProbe
     private static long MeasureTrigramSubset(Ev[] ev, bool tmpl, bool values)
     {
         const string template = "HTTP {Method} {Route} responded {Status} in {Elapsed} ms";
-        long before = GC.GetTotalMemory(true);
+
         var idx = new SegmentTrigramIndex();
         for (uint i = 0; i < ev.Length; i++)
         {
@@ -145,9 +145,9 @@ public sealed class IndexBuildBreakdownProbe
                 idx.Add(i, e.RequestId);
             }
         }
-        long after = GC.GetTotalMemory(true);
-        GC.KeepAlive(idx);
-        return after - before;
+        long held = idx.BuildRetainedBytes;
+        idx.ReleaseBuildBuffers();
+        return held;
     }
 
     // ── data ──────────────────────────────────────────────────────────────────

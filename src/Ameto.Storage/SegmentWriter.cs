@@ -1,7 +1,9 @@
 using System.Buffers;
 using System.Buffers.Binary;
+using System.Runtime.InteropServices;
 using System.Text;
 using K4os.Compression.LZ4;
+using MessagePack;
 using Ameto.Core;
 
 namespace Ameto.Storage;
@@ -232,19 +234,113 @@ public sealed class SegmentWriter : IDisposable
     /// where a mistake silently drops rows. File-global keeps the block index (which already
     /// maps file ordinal → block) as the single translation table for candidates.</para>
     /// </summary>
+    /// <remarks>
+    /// ONE SEQUENTIAL PASS over the headers, then a sort against the extracted keys — not a
+    /// delegate introsort over the tier. <c>Array.Sort(int[], Comparison&lt;int&gt;)</c> called
+    /// back into a closure ~n·log n times and every call did TWO random <c>GetHeader</c> reads
+    /// (div/mod, chunk-arena load, a 64 B header out of a ~12.5 MB header set): ~3.5M
+    /// comparisons and ~7M cache-missing reads for a 200 k tier. Here each header is read once,
+    /// in address order, into a flat 16-byte key; the sort then compares inside that array with
+    /// a STRUCT comparer, which the JIT devirtualises — no delegate, no arena indirection.
+    ///
+    /// <para>It is the INDICES that are sorted, not the keys, which is not an implementation
+    /// detail: the indices are what the caller wants and they are 4 bytes, so the ~1.7 M element
+    /// moves an introsort makes move 4 bytes each instead of a 16-byte key. Sorting the keys
+    /// themselves and reading the order out afterwards MEASURED SLOWER than the delegate version
+    /// it replaced (50 ms against 33 on a jittered 200 k tier) for exactly that reason.</para>
+    ///
+    /// <para>IDENTITY FAST PATH, AND IT ALLOCATES NOTHING. The first pass only ASKS whether the
+    /// tier is already ascending — which it very nearly always is, since a tier is filled in
+    /// arrival order and timestamps are stamped on arrival — and on the way out it has touched
+    /// no buffer but the caller's result array. The keys are extracted in a second pass, on the
+    /// unsorted path only. Extracting them during the first pass looked cheaper (one pass over
+    /// the headers rather than two) and was the wrong trade: it rents 16 bytes an event whatever
+    /// the answer turns out to be, so a 1 M-event tier parks a 16 MB array in the shared pool —
+    /// per concurrent flush — to answer a question that did not need it. The second header pass
+    /// costs the rare unsorted tier one more sequential read of memory it has just walked.</para>
+    ///
+    /// <para>The tie-break on the tier index makes the result STABLE, which matters only because
+    /// this is a public function over an arbitrary tier: THE ENGINE CANNOT PRODUCE A TIE. Ids are
+    /// assigned by <c>StorageEngine.TryWrite</c> from a generator that clamps to <c>prevMs+1</c>,
+    /// so they are strictly monotonic per node and no two events of one tier share one. What the
+    /// tie-break buys is that the two routes below cannot disagree about an input neither of them
+    /// should ever see: the identity path keeps tied rows in tier order, and the introsort — which
+    /// is not stable — would otherwise put them in whatever order partitioning left them.
+    /// <c>SegmentSortOrderTests.TiedKeys_KeepTierOrder_OnBothRoutes</c> pins it.</para>
+    /// </remarks>
     public static int[] ComputeSortOrder(HotTierSegment hot)
     {
         int count = hot.Count;
         var order = new int[count];
-        for (int i = 0; i < count; i++) order[i] = i;
-        Array.Sort(order, (a, b) =>
+        if (count <= 1)
         {
-            ref var ha = ref hot.GetHeader(a);
-            ref var hb = ref hot.GetHeader(b);
-            int c = ha.TimestampUtcTicks.CompareTo(hb.TimestampUtcTicks);
-            return c != 0 ? c : ha.Id.CompareTo(hb.Id);
-        });
-        return order;
+            if (count == 1) order[0] = 0;
+            return order;
+        }
+
+        for (int i = 0; i < count; i++) order[i] = i;
+        if (IsAscending(hot, count)) return order;
+
+        SortKey[] keys = ArrayPool<SortKey>.Shared.Rent(count);
+        try
+        {
+            for (int i = 0; i < count; i++)
+            {
+                ref readonly LogEventHeader h = ref hot.GetHeader(i);
+                keys[i] = new SortKey(h.TimestampUtcTicks, h.Id);
+            }
+
+            order.AsSpan().Sort(new SortKeyComparer(keys));
+            return order;
+        }
+        finally
+        {
+            ArrayPool<SortKey>.Shared.Return(keys);
+        }
+    }
+
+    /// <summary>Is the tier already in (timestamp, id) order — i.e. is the identity permutation
+    /// the answer? One sequential pass, no buffer of any kind.</summary>
+    private static bool IsAscending(HotTierSegment hot, int count)
+    {
+        ref readonly LogEventHeader first = ref hot.GetHeader(0);
+        long  prevTs = first.TimestampUtcTicks;
+        ulong prevId = first.Id;
+        for (int i = 1; i < count; i++)
+        {
+            ref readonly LogEventHeader h = ref hot.GetHeader(i);
+            long  ts = h.TimestampUtcTicks;
+            ulong id = h.Id;
+            if (ts < prevTs || (ts == prevTs && id < prevId)) return false;
+            prevTs = ts;
+            prevId = id;
+        }
+        return true;
+    }
+
+    /// <summary>The sort key of one tier event: what the order is decided on, and nothing else.</summary>
+    private readonly struct SortKey(long ticks, ulong id)
+    {
+        public readonly long  Ticks = ticks;
+        public readonly ulong Id    = id;
+    }
+
+    /// <summary>
+    /// Orders tier indices by their extracted key. A STRUCT, so the sort specialises on it and
+    /// inlines the comparison rather than calling through a <c>Comparison&lt;int&gt;</c>.
+    /// </summary>
+    private readonly struct SortKeyComparer(SortKey[] keys) : IComparer<int>
+    {
+        private readonly SortKey[] _keys = keys;
+
+        public int Compare(int a, int b)
+        {
+            ref SortKey ka = ref _keys[a];
+            ref SortKey kb = ref _keys[b];
+            if (ka.Ticks != kb.Ticks) return ka.Ticks < kb.Ticks ? -1 : 1;
+            if (ka.Id    != kb.Id)    return ka.Id    < kb.Id    ? -1 : 1;
+            return a.CompareTo(b);          // stable: equal keys keep tier order
+        }
     }
 
     public void WriteEvents(HotTierSegment hot, StringInternPool templatePool)
@@ -293,12 +389,25 @@ public sealed class SegmentWriter : IDisposable
 
         while (source.TryReadNext(out var ev))
         {
-            int tmplBytes = Encoding.UTF8.GetByteCount(ev.MessageTemplate);
-            int svcBytes  = ev.ServiceName is null ? 0 : Encoding.UTF8.GetByteCount(ev.ServiceName);
+            // ENCODED ONCE, not counted and then encoded. Both of these are low-cardinality by
+            // construction — the tier hands out an interned instance per distinct template and
+            // service, and the merge's dedup table does the same across source files — so the
+            // memo turns the transcode into a reference check and a memcpy for every event after
+            // the first of its kind. What it replaced ran Encoding.UTF8.GetByteCount over the
+            // template HERE and Encoding.UTF8.GetBytes over the same string again in StageEvent.
+            //
+            // A MISS IS ALWAYS POSSIBLE and costs only what the old code paid unconditionally
+            // (one transcode), which is why the memo needs no fallback. Two sources of misses
+            // are expected rather than pathological: a template built by interpolation is a
+            // distinct string per event, and MergingSegmentEventSource's dedup table EMPTIES
+            // itself at 65 536 entries (see MaxDedupEntries), so a merge whose vocabulary
+            // exceeds that hands out fresh instances for values it had already collapsed.
+            ReadOnlySpan<byte> tmplUtf8 = _tmplUtf8.Encode(ev.MessageTemplate);
+            ReadOnlySpan<byte> svcUtf8  = _svcUtf8.Encode(ev.ServiceName);
             // Approximate: the exception blob is only serialised once, at staging time (and on
             // the merge path not at all — its bytes are copied straight through).
             int rowCost   = (int)FixedRowCostBytes
-                          + tmplBytes + svcBytes + ev.Properties.Length
+                          + tmplUtf8.Length + svcUtf8.Length + ev.Properties.Length
                           + (ev.HasException ? Math.Max(64, ev.ExceptionPayload.Length) : 0);
 
             if (_stagedCount > 0 && _stagedBytes + rowCost > BlockSize)
@@ -318,13 +427,18 @@ public sealed class SegmentWriter : IDisposable
             // a block boundary, so a group's postings never straddle the sink that owns them.
             EnsureSink(rowCost, source.RemainingEventHint)?.Add((uint)_eventsWritten, in ev);
 
-            StageEvent(in ev, tmplBytes, svcBytes);
+            StageEvent(in ev, tmplUtf8, svcUtf8);
             _eventsWritten++;
         }
 
         if (_stagedCount > 0) EmitBlock();
         if (_sinkFactory is not null) SealGroup();
     }
+
+    // ── Test seam ─────────────────────────────────────────────────────────────
+    // The three section writers below are how tests and probes write sections they built by
+    // hand. Production never calls them: SealGroup has the sink stream its sections straight
+    // into the file (ISegmentIndexSink.WriteSections), with exactly this framing.
 
     public void WriteInvertedIndex(ReadOnlySpan<byte> indexBytes)
     {
@@ -496,10 +610,14 @@ public sealed class SegmentWriter : IDisposable
         {
             if (_groupEventCount > 0)
             {
-                var (inverted, trigram, bloom) = _sink.Serialise();
-                WriteInvertedIndex(inverted);
-                WriteTrigramIndex(trigram);
-                WriteBloomFilter(bloom);
+                // The sink writes its three sections straight into the file (same framing as
+                // WriteInvertedIndex / WriteTrigramIndex / WriteBloomFilter) instead of
+                // handing back three blobs to copy: those were 70-110 MB of immediately dead
+                // LOH per group. BinaryWriter holds nothing back, but flushing it first keeps
+                // the file position the sink reads honest by construction, not by knowledge
+                // of BinaryWriter's internals.
+                _bw.Flush();
+                _sink.WriteSections(_fs, out _invertedIndexOffset, out _trigramIndexOffset, out _bloomFilterOffset);
 
                 // What this group cost, banked for the next one's forecast. Here and not in
                 // CloseGroup because this is the last moment the sink is in hand and the group's
@@ -656,11 +774,23 @@ public sealed class SegmentWriter : IDisposable
     private uint[] _excOffsets = [];
     private uint[] _propsOffsets = [];
     private uint[] _svcOffsets = [];
-    private readonly MemoryStream _tmplBytes  = new(1024);
-    private readonly MemoryStream _excBytes   = new(256);
-    private readonly MemoryStream _propsBytes = new(4096);
-    private readonly MemoryStream _svcBytes   = new(256);
-    private readonly MemoryStream _blk        = new(BlockSize + 4096);
+    // Plain byte[] + length, not MemoryStream. The block is assembled by appending spans and
+    // reading the result back as one — the two things a MemoryStream charges a virtual call, a
+    // position update and a capacity re-check for, per append, of which there were eight per
+    // event. GetBuffer()/SetLength(0) were already the only stream API in use here.
+    private readonly ScratchBuffer _tmplBytes  = new(1024);
+    private readonly ScratchBuffer _excBytes   = new(256);
+    private readonly ScratchBuffer _propsBytes = new(4096);
+    private readonly ScratchBuffer _svcBytes   = new(256);
+    private readonly ScratchBuffer _blk        = new(BlockSize + 4096);
+
+    // UTF-8 of the last distinct template / service name — see the call site in WriteEvents.
+    private readonly Utf8Memo _tmplUtf8 = new();
+    private readonly Utf8Memo _svcUtf8  = new();
+
+    /// <summary>Adapter that lets a <see cref="MessagePackWriter"/> serialise into the exception
+    /// column's scratch. Allocated on the first exception-carrying event, never after.</summary>
+    private ScratchBufferWriter? _excWriter;
 
     private int   _stagedCount;
     private int   _stagedBytes;
@@ -679,7 +809,7 @@ public sealed class SegmentWriter : IDisposable
     }
 
     /// <summary>Appends one event to the open block's columns.</summary>
-    private void StageEvent(in SegmentEventRef ev, int tmplByteLen, int svcByteLen)
+    private void StageEvent(in SegmentEventRef ev, ReadOnlySpan<byte> tmplUtf8, ReadOnlySpan<byte> svcUtf8)
     {
         int k = _stagedCount;
         Ensure(ref _stgTs, k + 1);
@@ -708,7 +838,7 @@ public sealed class SegmentWriter : IDisposable
         BinaryPrimitives.WriteUInt64LittleEndian(_colSp.AsSpan(k * 8),      ev.SpanId);
 
         _tmplOffsets[k] = (uint)_tmplBytes.Length;
-        AppendUtf8(_tmplBytes, ev.MessageTemplate, tmplByteLen);
+        _tmplBytes.Append(tmplUtf8);
 
         _excOffsets[k] = (uint)_excBytes.Length;
         // Prefer the raw payload: on the merge path the bytes are already in the shape this
@@ -716,35 +846,30 @@ public sealed class SegmentWriter : IDisposable
         // identical result. Only a producer that holds the decoded form (the hot tier) pays it.
         if (!ev.ExceptionPayload.IsEmpty)
         {
-            _excBytes.Write(ev.ExceptionPayload);
+            _excBytes.Append(ev.ExceptionPayload);
         }
         else if (ev.Exception is not null)
         {
-            var b = ev.Exception.ToBytes();
-            _excBytes.Write(b, 0, b.Length);
+            // Serialised STRAIGHT INTO the column. ToBytes() built an ArrayBufferWriter, grew
+            // it (a fresh array each doubling), copied the result out with ToArray() and copied
+            // that into the column — four allocations and two copies of a blob that can be
+            // kilobytes of stack trace, on every exception-carrying event. A level-split flush
+            // makes an Error tier 100 % of those.
+            _excWriter ??= new ScratchBufferWriter(_excBytes);
+            var mp = new MessagePackWriter(_excWriter);
+            ev.Exception.Write(ref mp);
+            mp.Flush();
         }
 
         _propsOffsets[k] = (uint)_propsBytes.Length;
-        if (!ev.Properties.IsEmpty) _propsBytes.Write(ev.Properties);
+        _propsBytes.Append(ev.Properties);
 
         _svcOffsets[k] = (uint)_svcBytes.Length;
-        AppendUtf8(_svcBytes, ev.ServiceName, svcByteLen);
+        _svcBytes.Append(svcUtf8);
 
         _stagedCount = k + 1;
-        _stagedBytes += 8 + 1 + 8 + 16 + 8 + 16 + tmplByteLen + svcByteLen
-                      + ev.Properties.Length + (int)(_excBytes.Length - _excOffsets[k]);
-    }
-
-    private static void AppendUtf8(MemoryStream dst, string? value, int byteLen)
-    {
-        if (byteLen == 0 || string.IsNullOrEmpty(value)) return;
-        var tmp = ArrayPool<byte>.Shared.Rent(byteLen);
-        try
-        {
-            int written = Encoding.UTF8.GetBytes(value, 0, value.Length, tmp, 0);
-            dst.Write(tmp, 0, written);
-        }
-        finally { ArrayPool<byte>.Shared.Return(tmp); }
+        _stagedBytes += 8 + 1 + 8 + 16 + 8 + 16 + tmplUtf8.Length + svcUtf8.Length
+                      + ev.Properties.Length + (_excBytes.Length - (int)_excOffsets[k]);
     }
 
     /// <summary>Delta-encodes, frames, compresses and writes the staged block, then resets staging.</summary>
@@ -762,11 +887,11 @@ public sealed class SegmentWriter : IDisposable
         ulong blockMinId = _blockMinId;
 
         var blk = _blk;
-        blk.SetLength(0);
+        blk.Reset();
         WriteUInt32(blk, (uint)n);
         WriteInt64(blk, blockMinTs);
         WriteUInt64(blk, blockMinId);
-        blk.WriteByte(9);
+        blk.AppendByte(9);
 
         WriteInt64DeltaColumn(blk, 1, _stgTs, n, blockMinTs);
         WriteColumn(blk, 2, _colL, n);
@@ -778,9 +903,9 @@ public sealed class SegmentWriter : IDisposable
         WriteColumn(blk, 8, _colSp, n * 8);
         WriteStringColumn(blk, 9, _svcOffsets, n + 1, _svcBytes);
 
-        // Compress straight from the stream's internal buffer — no ToArray copy.
-        int    uncompressedLen = (int)blk.Length;
-        byte[] uncompressed    = blk.GetBuffer();
+        // Compress straight from the scratch buffer — no ToArray copy.
+        int    uncompressedLen = blk.Length;
+        byte[] uncompressed    = blk.Buffer;
         int    maxOut          = LZ4Codec.MaximumOutputSize(uncompressedLen);
         byte[] compBuf         = ArrayPool<byte>.Shared.Rent(maxOut);
         try
@@ -814,80 +939,210 @@ public sealed class SegmentWriter : IDisposable
         _blockMinTs  = long.MaxValue;
         _blockMaxTs  = long.MinValue;
         _blockMinId  = ulong.MaxValue;
-        _tmplBytes.SetLength(0);
-        _excBytes.SetLength(0);
-        _propsBytes.SetLength(0);
-        _svcBytes.SetLength(0);
+        _tmplBytes.Reset();
+        _excBytes.Reset();
+        _propsBytes.Reset();
+        _svcBytes.Reset();
     }
 
-    private static void WriteColumn(MemoryStream dst, byte id, byte[] payload, int length)
+    private static void WriteColumn(ScratchBuffer dst, byte id, byte[] payload, int length)
     {
-        dst.WriteByte(id);
+        dst.AppendByte(id);
         WriteUInt32(dst, (uint)length);
-        dst.Write(payload, 0, length);
+        dst.Append(payload.AsSpan(0, length));
     }
 
-    private static void WriteInt64DeltaColumn(MemoryStream dst, byte id, long[] src, int n, long baseValue)
+    // ── Column emission: ONE reservation per column, not one write per row ───────────────────
+    //
+    // Each of these used to loop `BinaryPrimitives.Write…(stackalloc tmp); dst.Write(tmp)`, so a
+    // block's six variable columns cost SIX MemoryStream.Write calls per event — ~1.2M of them
+    // per flushed tier, each one a virtual call, a capacity check and a position update to move
+    // eight bytes. Reserving the column's whole length once and filling it in place turns that
+    // into one bounds check per column and a tight store loop the JIT can keep in registers.
+
+    private static void WriteInt64DeltaColumn(ScratchBuffer dst, byte id, long[] src, int n, long baseValue)
     {
-        dst.WriteByte(id);
+        dst.AppendByte(id);
         WriteUInt32(dst, (uint)(n * 8));
-        Span<byte> tmp = stackalloc byte[8];
+        Span<byte> outBytes = dst.Reserve(n * 8);
         for (int k = 0; k < n; k++)
-        {
-            BinaryPrimitives.WriteInt64LittleEndian(tmp, src[k] - baseValue);
-            dst.Write(tmp);
-        }
+            BinaryPrimitives.WriteInt64LittleEndian(outBytes.Slice(k * 8, 8), src[k] - baseValue);
+        dst.Commit(n * 8);
     }
 
-    private static void WriteUInt64DeltaColumn(MemoryStream dst, byte id, ulong[] src, int n, ulong baseValue)
+    private static void WriteUInt64DeltaColumn(ScratchBuffer dst, byte id, ulong[] src, int n, ulong baseValue)
     {
-        dst.WriteByte(id);
+        dst.AppendByte(id);
         WriteUInt32(dst, (uint)(n * 8));
-        Span<byte> tmp = stackalloc byte[8];
+        Span<byte> outBytes = dst.Reserve(n * 8);
         for (int k = 0; k < n; k++)
-        {
-            BinaryPrimitives.WriteUInt64LittleEndian(tmp, src[k] - baseValue);
-            dst.Write(tmp);
-        }
+            BinaryPrimitives.WriteUInt64LittleEndian(outBytes.Slice(k * 8, 8), src[k] - baseValue);
+        dst.Commit(n * 8);
     }
 
-    private static void WriteStringColumn(MemoryStream dst, byte id, uint[] offsets, int offsetCount, MemoryStream payload)
+    private static void WriteStringColumn(ScratchBuffer dst, byte id, uint[] offsets, int offsetCount, ScratchBuffer payload)
     {
         int offsetsByteLen = offsetCount * 4;
-        int totalLen       = offsetsByteLen + (int)payload.Length;
-        dst.WriteByte(id);
+        int totalLen       = offsetsByteLen + payload.Length;
+        dst.AppendByte(id);
         WriteUInt32(dst, (uint)totalLen);
 
-        Span<byte> tmp4 = stackalloc byte[4];
-        for (int i = 0; i < offsetCount; i++)
+        // The offset array is ALREADY little-endian uint32 in memory on a little-endian
+        // machine, which every platform this runs on is — so the column is one memcpy.
+        //
+        // The else branch is therefore DEAD on every platform .NET currently supports, and it
+        // stays anyway: the format is little-endian by specification, not by accident of the
+        // host, and the reader (SegmentReader, BinaryPrimitives.ReadUInt32LittleEndian) already
+        // reads it that way on any machine. Deleting the branch would leave the writer silently
+        // emitting a file its own reader cannot read, on the day that machine exists. Asserting
+        // instead of branching would turn the same day into a crash rather than a slow path.
+        if (BitConverter.IsLittleEndian)
         {
-            BinaryPrimitives.WriteUInt32LittleEndian(tmp4, offsets[i]);
-            dst.Write(tmp4);
+            dst.Append(MemoryMarshal.AsBytes(offsets.AsSpan(0, offsetCount)));
         }
-        // Write from the payload stream's internal buffer — Stream.CopyTo allocates
-        // an 80 KB transfer buffer per call (four calls per block before this).
-        dst.Write(payload.GetBuffer(), 0, (int)payload.Length);
+        else
+        {
+            Span<byte> outBytes = dst.Reserve(offsetsByteLen);
+            for (int i = 0; i < offsetCount; i++)
+                BinaryPrimitives.WriteUInt32LittleEndian(outBytes.Slice(i * 4, 4), offsets[i]);
+            dst.Commit(offsetsByteLen);
+        }
+
+        dst.Append(payload.Written);
     }
 
-    private static void WriteUInt32(MemoryStream s, uint v)
+    private static void WriteUInt32(ScratchBuffer s, uint v)
     {
-        Span<byte> tmp = stackalloc byte[4];
-        BinaryPrimitives.WriteUInt32LittleEndian(tmp, v);
-        s.Write(tmp);
+        BinaryPrimitives.WriteUInt32LittleEndian(s.Reserve(4), v);
+        s.Commit(4);
     }
 
-    private static void WriteInt64(MemoryStream s, long v)
+    private static void WriteInt64(ScratchBuffer s, long v)
     {
-        Span<byte> tmp = stackalloc byte[8];
-        BinaryPrimitives.WriteInt64LittleEndian(tmp, v);
-        s.Write(tmp);
+        BinaryPrimitives.WriteInt64LittleEndian(s.Reserve(8), v);
+        s.Commit(8);
     }
 
-    private static void WriteUInt64(MemoryStream s, ulong v)
+    private static void WriteUInt64(ScratchBuffer s, ulong v)
     {
-        Span<byte> tmp = stackalloc byte[8];
-        BinaryPrimitives.WriteUInt64LittleEndian(tmp, v);
-        s.Write(tmp);
+        BinaryPrimitives.WriteUInt64LittleEndian(s.Reserve(8), v);
+        s.Commit(8);
+    }
+
+    /// <summary>
+    /// A growable byte buffer: what the writer actually needed from the five
+    /// <see cref="MemoryStream"/>s it used to hold — append spans, read the whole thing back.
+    ///
+    /// <para>Appends are made through <see cref="Reserve"/>/<see cref="Commit"/> so a caller
+    /// can format straight into the tail instead of into a stack or pooled buffer and copying.
+    /// Nothing here is thread-safe and nothing needs to be: one writer serialises one segment
+    /// on one thread.</para>
+    /// </summary>
+    private sealed class ScratchBuffer(int capacity)
+    {
+        public byte[] Buffer = new byte[capacity];
+        public int    Length;
+
+        public ReadOnlySpan<byte> Written => Buffer.AsSpan(0, Length);
+
+        public void Reset() => Length = 0;
+
+        /// <summary>Room for <paramref name="count"/> bytes at the end — NOT yet part of the
+        /// buffer; the caller fills it and calls <see cref="Commit"/>.</summary>
+        public Span<byte> Reserve(int count)
+        {
+            EnsureCapacity(Length + count);
+            return Buffer.AsSpan(Length, count);
+        }
+
+        public void Commit(int count) => Length += count;
+
+        /// <remarks>
+        /// NOT SELF-APPEND SAFE: <paramref name="src"/> must not point into <see cref="Buffer"/>.
+        /// <see cref="Reserve"/> can resize, which leaves the caller's span over the OLD array —
+        /// it would copy the right bytes from a buffer nothing reads again — and even without a
+        /// resize the destination may overlap the source. No caller does this (every source is
+        /// another buffer, a memo, or the producer's own payload) and none should; a buffer that
+        /// needs to repeat itself should <see cref="Reserve"/> and copy under its own eye.
+        /// </remarks>
+        public void Append(ReadOnlySpan<byte> src)
+        {
+            if (src.IsEmpty) return;
+            src.CopyTo(Reserve(src.Length));
+            Length += src.Length;
+        }
+
+        public void AppendByte(byte value)
+        {
+            EnsureCapacity(Length + 1);
+            Buffer[Length++] = value;
+        }
+
+        public void EnsureCapacity(int needed)
+        {
+            if (Buffer.Length >= needed) return;
+            long grown = Math.Max(needed, Math.Min((long)Buffer.Length * 2, int.MaxValue));
+            Array.Resize(ref Buffer, (int)grown);
+        }
+    }
+
+    /// <summary>
+    /// <see cref="IBufferWriter{T}"/> over a <see cref="ScratchBuffer"/>, so a
+    /// <see cref="MessagePackWriter"/> serialises an exception into the column it is bound for
+    /// rather than into a buffer of its own that is then copied twice.
+    /// </summary>
+    private sealed class ScratchBufferWriter(ScratchBuffer target) : IBufferWriter<byte>
+    {
+        /// <summary>Free tail handed to a writer that asked for no particular size. Large
+        /// enough that msgpack's token-at-a-time writing does not re-enter per field.</summary>
+        private const int MinFreeTail = 256;
+
+        private readonly ScratchBuffer _target = target;
+
+        public void Advance(int count) => _target.Commit(count);
+
+        public Memory<byte> GetMemory(int sizeHint = 0)
+        {
+            Grow(sizeHint);
+            return _target.Buffer.AsMemory(_target.Length);
+        }
+
+        public Span<byte> GetSpan(int sizeHint = 0)
+        {
+            Grow(sizeHint);
+            return _target.Buffer.AsSpan(_target.Length);
+        }
+
+        private void Grow(int sizeHint)
+            => _target.EnsureCapacity(_target.Length + Math.Max(sizeHint, MinFreeTail));
+    }
+
+    /// <summary>
+    /// The UTF-8 spelling of the last string this column was given, keyed by REFERENCE.
+    ///
+    /// <para>A one-entry memo is the right size because of who fills these columns: the hot tier
+    /// hands out one interned instance per distinct template and per distinct service name, and
+    /// the merge's dedup table does the same across its source files, so consecutive events
+    /// overwhelmingly carry the same instance. A miss costs one transcode — what the caller paid
+    /// unconditionally before, twice over, since it counted the bytes and then encoded them.</para>
+    /// </summary>
+    private sealed class Utf8Memo
+    {
+        private string? _value;
+        private byte[]  _bytes = [];
+        private int     _length;
+
+        public ReadOnlySpan<byte> Encode(string? value)
+        {
+            if (string.IsNullOrEmpty(value)) return default;
+            if (ReferenceEquals(value, _value)) return _bytes.AsSpan(0, _length);
+
+            int max = Encoding.UTF8.GetMaxByteCount(value.Length);
+            if (_bytes.Length < max) _bytes = new byte[Math.Max(max, 256)];
+            _length = Encoding.UTF8.GetBytes(value.AsSpan(), _bytes);
+            _value  = value;
+            return _bytes.AsSpan(0, _length);
+        }
     }
 
     private void WriteFileHeader(in SegmentFileHeader h)

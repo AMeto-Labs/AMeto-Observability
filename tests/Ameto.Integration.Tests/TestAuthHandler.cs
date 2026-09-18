@@ -31,6 +31,15 @@ internal sealed class TestAuthHandler : AuthenticationHandler<AuthenticationSche
     /// </summary>
     public const string RoleHeader = "X-Test-Role";
 
+    /// <summary>
+    /// <see cref="RoleHeader"/> value meaning "nobody is signed in": the handler returns
+    /// NoResult, so an endpoint behind <c>RequireAuthorization()</c> challenges with 401. It is
+    /// the only way to tell, from outside, that the authentication middleware actually RAN for
+    /// a request — if it were skipped, an endpoint carrying authorization metadata makes
+    /// ASP.NET Core throw (500) instead of answering 401.
+    /// </summary>
+    public const string AnonymousRole = "anonymous";
+
     public TestAuthHandler(
         IOptionsMonitor<AuthenticationSchemeOptions> options,
         ILoggerFactory                               logger,
@@ -45,6 +54,9 @@ internal sealed class TestAuthHandler : AuthenticationHandler<AuthenticationSche
                 && !string.IsNullOrWhiteSpace(hdr[0])
             ? hdr[0]!
             : "admin";
+
+        if (string.Equals(role, AnonymousRole, StringComparison.OrdinalIgnoreCase))
+            return Task.FromResult(AuthenticateResult.NoResult());
 
         // ClaimTypes.Role = "admin" satisfies every RequireRole policy the app
         // defines (admin / manager / viewer). Lesser roles carry the full view

@@ -9,7 +9,7 @@ namespace Ameto.Query.Filtering;
 /// segments without decompressing blocks when the segment index says there are no
 /// matching events.
 /// </summary>
-public sealed class CompiledFilter
+public sealed class CompiledFilter : IPreparedFilter
 {
     private readonly FilterNode _root;
 
@@ -23,13 +23,17 @@ public sealed class CompiledFilter
     private readonly string  _hintProperty;
     private readonly object? _hintValue;
 
-    private CompiledFilter(FilterNode root)
+    private readonly HeaderPredicate? _headerPredicate;
+
+    private CompiledFilter(string? expression, FilterNode root)
     {
+        Expression     = expression;
         root           = RewriteTimeCompares(root);
         _root          = root;
         _trigramHints  = BuildTrigramHints(root);
         _invertedHints = BuildInvertedHints(root);
         _hasHint       = TryExtract(root, out _hintProperty, out _hintValue);
+        _headerPredicate = Filtering.HeaderPredicate.TryBuild(root);
 
         long? min = null, max = null;
         CollectTimeBounds(root, ref min, ref max);
@@ -38,7 +42,31 @@ public sealed class CompiledFilter
     }
 
     public static CompiledFilter Compile(string? expression) =>
-        new(FilterParser.Parse(expression));
+        new(expression, FilterParser.Parse(expression));
+
+    /// <inheritdoc/>
+    public string? Expression { get; }
+
+    // ── Header pushdown ───────────────────────────────────────────────────────
+
+    /// <summary>
+    /// The part of this filter the hot-tier scan can answer from the event HEADER before it
+    /// materialises anything — level, trace / span id, service — or null when the AND-chain
+    /// constrains none of those. Three-valued: it only ever says "cannot match"; every event
+    /// it lets through is still put to <see cref="Matches"/>. See <see cref="HeaderPredicate"/>.
+    /// </summary>
+    public IHotHeaderPredicate? HeaderPredicate => _headerPredicate;
+
+    /// <summary>
+    /// The set of levels the filter's AND-chain admits, or null when it does not constrain
+    /// the level. Exact — computed by running the evaluator's own comparison per level — so
+    /// it can stand in for a <c>levels</c> parameter the caller did not pass: the cold
+    /// prefilter then prunes level-split segments through their posting lists for
+    /// <c>@l in ('Error', 'Fatal')</c> or <c>not @l = 'Debug'</c> the way it already does for
+    /// an explicit level list. May be empty (<c>@l = 'Info'</c> matches nothing: the alias
+    /// is not the spelling the evaluator compares against).
+    /// </summary>
+    public HashSet<LogLevel>? DerivedLevels => _headerPredicate?.DerivedLevels;
 
     // ── @t bounds ─────────────────────────────────────────────────────────────
 
@@ -71,6 +99,17 @@ public sealed class CompiledFilter
                   && TryParseTimeLiteral(s, out long ticks):
                 return new TimeCompareNode(cmp.Op, ticks);
 
+            // `@tr = 'hex32'` / `@sp = 'hex16'` (and !=): the id is compared as the integers
+            // the header stores (see TraceIdCompareNode). Only a literal that IS the exact
+            // rendering — fixed width, every character a hex digit — is rewritten; the
+            // helper's parser tolerates whitespace, so the shape is checked here first.
+            case CompareNode { RightProperty: null, Op: CompareOp.Eq or CompareOp.Ne } idCmp
+                when idCmp.Value is string idText
+                  && BuiltinFields.TryResolve(idCmp.Property, out var idField)
+                  && (idField is BuiltinField.TraceId or BuiltinField.SpanId)
+                  && TryParseIdLiteral(idText, idField == BuiltinField.SpanId, out ulong hi, out ulong lo):
+                return new TraceIdCompareNode(idCmp.Op, idField == BuiltinField.SpanId, hi, lo, idCmp.Property);
+
             case AndNode and:
             {
                 var l = RewriteTimeCompares(and.Left);
@@ -91,6 +130,22 @@ public sealed class CompiledFilter
             default:
                 return node;
         }
+    }
+
+    /// <summary>
+    /// Exactly 32 (trace) or 16 (span) hex digits, nothing else — the shape
+    /// <c>TraceIdHelper.FormatTraceId</c> / <c>FormatSpanId</c> render, so an ordinal-ignore-case
+    /// string equality against the rendering and an integer equality agree.
+    /// </summary>
+    private static bool TryParseIdLiteral(string s, bool isSpan, out ulong hi, out ulong lo)
+    {
+        hi = lo = 0;
+        if (s.Length != (isSpan ? 16 : 32)) return false;
+        foreach (char c in s)
+            if (!char.IsAsciiHexDigit(c)) return false;
+        return isSpan
+            ? TraceIdHelper.TryParseSpanId(s, out lo)
+            : TraceIdHelper.TryParseTraceId(s, out hi, out lo);
     }
 
     /// <summary>Invariant, offset-less literals assumed UTC — matching how events are stored.</summary>
@@ -168,6 +223,12 @@ public sealed class CompiledFilter
             case CompareNode { Op: CompareOp.Eq, RightProperty: null } cmp when cmp.Value is not null:
                 if (!TryBloomHintKey(cmp.Property, out prop)) { prop = string.Empty; return false; }
                 val = cmp.Value;
+                return true;
+
+            // The hint the CompareNode it replaced would have given, in the index's spelling.
+            case TraceIdCompareNode { Op: CompareOp.Eq } tid:
+                if (!TryBloomHintKey(tid.Property, out prop)) { prop = string.Empty; return false; }
+                val = tid.Canonical;
                 return true;
 
             case LevelNode lvl:
@@ -414,6 +475,9 @@ public sealed class CompiledFilter
             // either — its right side is read off the event, so there is no value to look up.
             case CompareNode { Op: CompareOp.Eq, RightProperty: null } cmp when cmp.Value is not null:
                 if (TryIndexKey(cmp.Property, out string cmpKey)) out_.Add((cmpKey, cmp.Value));
+                break;
+            case TraceIdCompareNode { Op: CompareOp.Eq } tid:
+                if (TryIndexKey(tid.Property, out string tidKey)) out_.Add((tidKey, tid.Canonical));
                 break;
             case LevelNode lvl:
                 out_.Add((ClefFields.Level, lvl.Level.ToSeqString()));

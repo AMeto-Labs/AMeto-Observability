@@ -49,7 +49,7 @@ public sealed class TierMergeOrderTests : IAsyncLifetime
     public async Task DisposeAsync()
     {
         await _engine.DisposeAsync();
-        try { Directory.Delete(_dir, true); } catch { }
+        QuerySegmentFixtures.DeleteDataDirectory(_dir);
     }
 
     private void WriteBatch(int secondOffset, string tag)

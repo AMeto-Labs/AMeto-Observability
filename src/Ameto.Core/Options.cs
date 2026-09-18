@@ -134,11 +134,80 @@ public sealed class IngestionOptions
     /// <summary>
     /// Payload slab arena budget for the ring: slabCount = min(RingCapacity, this /
     /// MaxEventPayloadBytes). Slabs — not ring slots — are the true drop threshold when
-    /// the drainer stalls. The arena is reserved virtual memory: resident pages track the
-    /// bytes actually written (typical events touch one 4 KB page per slab), not the
-    /// budget, so a generous value is cheap. Default: 512 MB (= 8192 slabs of 64 KB).
+    /// the drainer stalls: a pending event holds one slab whatever its size.
+    ///
+    /// <para><b>The default, when unset, is the larger of two terms:</b></para>
+    /// <list type="bullet">
+    /// <item>a slab floor — <see cref="DefaultArenaMinSlabs"/> (8 192) slabs of
+    /// <see cref="MaxEventPayloadBytes"/>, capped at <see cref="MemoryBudgets.IngestArenaCapBytes"/>
+    /// (512 MB) so a raised slab size cannot balloon the reservation; and</item>
+    /// <item>the byte share — <c>min(512 MB, 15 % of the physical limit)</c>, see
+    /// <see cref="MemoryBudgets.IngestArenaFraction"/>.</item>
+    /// </list>
+    /// <para>At the 64 KB default slab the floor is exactly 512 MB, so every host, the 512 MB
+    /// container included, gets 8 192 slabs. The floor is there because an OpenTelemetry collector
+    /// sends batches of 8 192 records by default and the parser fills the ring faster than the
+    /// drainer empties it: the byte share alone gave a 512 MB container ~1 200 slabs, so one
+    /// ordinary batch could run out of slabs part way through (HTTP 200 with a non-zero
+    /// <c>dropped</c>, gRPC partial success). The byte share decides the size only when the slab
+    /// is small enough that 8 192 of them come to less than it.</para>
+    ///
+    /// <para><b>What that costs, which depends on the operating system.</b> The arena is reserved
+    /// virtual memory, and what it takes is never given back, so its high-water mark is a resting
+    /// level, not a peak.</para>
+    /// <list type="bullet">
+    /// <item><b>Linux</b>: the allocation is lazily paged, so residency is per touched PAGE, not
+    /// per slab. The arena opts out of transparent huge pages (<c>MADV_NOHUGEPAGE</c>), so that
+    /// page stays 4 KB even where <c>transparent_hugepage</c> is <c>always</c>, as on RHEL; without
+    /// it, the first write in each 2 MB range could make the whole 2 MB resident. A typical
+    /// 0.3-2 KB event touches one 4 KB page at the start of its slab, so a full default batch of
+    /// small events rests at about 32 MB. Only events near the maximum size fill their slabs, which
+    /// is the same 512 MB worst case the flat default always had. (If the opt-out fails, the server
+    /// logs it once at startup.)</item>
+    /// <item><b>Windows</b>: the range is reserved and COMMITTED, in 1 MB chunks, up to the
+    /// deepest slab ever handed out, whatever the events in it weigh, and never decommitted. One
+    /// batch that outruns the drainer by ~8 192 events therefore commits ~512 MB even at 300 B an
+    /// event. The working set still grows only by the pages written, but commit charge is what a
+    /// job object's memory limit counts, and what counts against the system commit limit. <b>Under a
+    /// Windows job or container memory limit, set this explicitly</b> to what that limit can
+    /// carry.</item>
+    /// </list>
+    /// <para>Under a container memory limit, on EITHER platform, set this explicitly for a hard
+    /// ceiling: the ~32 MB on Linux is what small events cost, not a bound, and large events still
+    /// fill their slabs. A host that expects large events, or needs a ceiling below 512 MB, likewise
+    /// sets it, and accepts that a burst then meets back-pressure earlier (counted as
+    /// <c>ingestDroppedNoSlab</c>). <c>/api/diagnostics</c> reports
+    /// <c>ingestArenaResidentBytes</c>: the deepest slab ever handed out times the slab size. On
+    /// Windows that is the commit charge (to within 1 MB); on Linux it is an upper bound on the
+    /// arena's resident memory, not a measurement of it. An explicit value always wins.</para>
     /// </summary>
-    public long PayloadPoolBytes { get; init; } = 512L * 1024 * 1024;
+    public long? PayloadPoolBytes { get; init; }
+
+    /// <summary>
+    /// Slabs the DEFAULT arena holds at least: one OpenTelemetry collector batch at its default
+    /// size (8 192 records), so an ordinary batch does not run out of slabs before the drainer
+    /// catches up. See <see cref="PayloadPoolBytes"/>.
+    /// </summary>
+    public const int DefaultArenaMinSlabs = 8192;
+
+    /// <summary>The configured arena budget, or the default rule applied to this host when unset.</summary>
+    public long EffectivePayloadPoolBytes =>
+        PayloadPoolBytes ?? DefaultPayloadPoolBytesFor(MemoryBudgets.Current(), MaxEventPayloadBytes);
+
+    /// <summary>
+    /// The default arena rule as a pure function of the host's budgets and the slab size, so it
+    /// can be checked at 512 MB and at 64 GB without a machine of each size — the shape
+    /// <see cref="MemoryBudgets.Derive(long, long)"/> uses. It lives here, not in
+    /// <see cref="MemoryBudgets"/>, because the slab size is an ingestion setting.
+    /// </summary>
+    public static long DefaultPayloadPoolBytesFor(in MemoryBudgets budgets, int maxEventPayloadBytes)
+    {
+        long slabFloor = Math.Min(
+            MemoryBudgets.IngestArenaCapBytes,
+            (long)DefaultArenaMinSlabs * Math.Max(1, maxEventPayloadBytes));
+
+        return Math.Max(slabFloor, budgets.IngestArenaBytes);
+    }
 }
 
 /// <summary>
@@ -180,9 +249,81 @@ public sealed class QueryOptions
     /// entry's RETAINED size (expanded postings + dictionaries + bloom bits — several
     /// times the packed sections they decode from). Zero or negative disables it —
     /// every query then re-reads and re-decodes the sections it consults, the
-    /// pre-cache behaviour. Default: 256 MB.
+    /// pre-cache behaviour.
+    ///
+    /// <para>Unset (the default) derives it from memory this process may use:
+    /// <c>min(256 MB, 15 % of the managed-heap limit)</c> — the cache is mostly managed postings,
+    /// so it is a share of the GC's limit (384 MB in a 512 MB container, giving 57 MB), not of
+    /// the container — see <see cref="MemoryBudgets"/>. The flat
+    /// 256 MB this replaces was half of a 512 MB host on its own, before the engine's own
+    /// tiers and index builds asked for anything. An explicit value always wins, including
+    /// a value larger than the derived one.</para>
     /// </summary>
-    public long IndexCacheBytes { get; init; } = 256 * 1024 * 1024;
+    public long? IndexCacheBytes { get; init; }
+
+    /// <summary>The configured budget, or the one derived from available memory when unset.</summary>
+    public long EffectiveIndexCacheBytes => IndexCacheBytes ?? MemoryBudgets.Current().IndexCacheBytes;
+
+    /// <summary>
+    /// Ceiling on the NATIVE part of the cache — the segment bloom filters' bits, which are
+    /// <c>NativeMemory</c> and so sit outside the GC's hard limit that
+    /// <see cref="EffectiveIndexCacheBytes"/> is a share of. Whichever ceiling is reached first
+    /// evicts from the LRU tail.
+    ///
+    /// <para><b>The rule: an explicitly configured <see cref="IndexCacheBytes"/> may raise this
+    /// ceiling — to 20 % of the budget set — but never above
+    /// <see cref="MemoryBudgets.IndexCacheNativeMaxFraction"/> of the PHYSICAL limit, because a
+    /// budget says how much memory this component may hold and only the host says how much of it
+    /// may be pinned where no collection can reach it.</b></para>
+    ///
+    /// <para>Both halves are needed. Held fixed, the ceiling silently capped the cache of anyone
+    /// who deliberately raised the budget — at the measured worst-case native share of an entry
+    /// (8.3 %) a 96 MB ceiling starts binding at roughly 1.2 GB of configured cache, and past that
+    /// every insert evicts the LRU tail while <c>indexCacheBytes</c> sits far below
+    /// <c>indexCacheBudgetBytes</c> and the hit rate never improves. Scaled without a reference to
+    /// the host, it let the managed knob move NATIVE bytes without bound: in a 512 MB container a
+    /// 1 GB budget asked for 204 MB of bloom bits — 40 % of the box, outside the GC's hard limit
+    /// and unreclaimable by the RAM pressure path, which is the class of defect the backstop
+    /// exists for.</para>
+    ///
+    /// <para>It never follows the budget DOWN — a small configured cache keeps the derived
+    /// backstop — and every figure in the rule is a share of the PHYSICAL limit, because that is
+    /// where these bytes live. An eviction this ceiling causes is counted separately
+    /// (<c>indexCacheNativeEvicted</c>), since it is otherwise invisible. See
+    /// <see cref="MemoryBudgets"/>.</para>
+    /// </summary>
+    public long EffectiveIndexCacheNativeBytes => IndexCacheNativeBytesFor(MemoryBudgets.Current());
+
+    /// <summary>
+    /// That same rule as a pure function of the host's budgets, so it can be checked at 512 MB and
+    /// at 64 GB without a machine of each size — the shape
+    /// <see cref="MemoryBudgets.Derive(long, long)"/> already uses for the budgets themselves.
+    ///
+    /// <para>A host that could not report a physical limit gets no scaling at all: with nothing
+    /// real to clamp against, the backstop is the only figure anchored to anything.</para>
+    /// </summary>
+    public long IndexCacheNativeBytesFor(in MemoryBudgets budgets)
+    {
+        long derived = budgets.IndexCacheNativeBytes;
+        if (IndexCacheBytes is not > 0) return derived;
+
+        long scaled = (long)(IndexCacheBytes.Value * MemoryBudgets.IndexCacheNativeEntryShare);
+        long host   = budgets.PhysicalLimitBytes > 0
+            ? (long)(budgets.PhysicalLimitBytes * MemoryBudgets.IndexCacheNativeMaxFraction)
+            : derived;
+
+        // Max last: the clamp may only lower a SCALED ceiling, never cut into the backstop.
+        return Math.Max(derived, Math.Min(scaled, host));
+    }
+
+    /// <summary>
+    /// Drop cached segment indexes that no query has read for this long. Without it the only
+    /// thing that ever removes an entry is budget pressure, so a server that answers one wide
+    /// query and then goes quiet keeps those postings and native bloom bits resident for the
+    /// rest of its life — the single biggest avoidable chunk of steady-state RSS on a small
+    /// host. Zero or negative turns it off (budget pressure only). Default: 10 minutes.
+    /// </summary>
+    public TimeSpan IndexCacheIdleEvict { get; init; } = TimeSpan.FromMinutes(10);
 
     /// <summary>
     /// Wall-clock budget for one search. A query that exceeds it is stopped and the client

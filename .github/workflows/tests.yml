@@ -80,7 +80,9 @@ jobs:
           # framework — Assert.Skip, [SkippableFact], a Skip= on the attribute. A test that
           # self-skips by RETURNING EARLY is reported as Passed, is absent from this tally, and is
           # invisible here. If you add a probe that stands down under some condition, make it skip
-          # through xUnit or this gate will not know it went quiet.
+          # through xUnit or this gate will not know it went quiet. (The Linux huge-page test still
+          # returns early here, by design, on Windows; the backend-linux job below is what holds it
+          # to account.)
           #
           # The tally itself must fail closed. Summing zero matches yields $null, and $null -gt 0
           # is false, so a change in the runner's summary format (a move to Microsoft.Testing
@@ -101,6 +103,49 @@ jobs:
             exit 1
           }
           Write-Host "no skipped tests across $($summaries.Count) test projects"
+
+  # THE LINUX INGEST ARENA, ON LINUX.
+  #
+  # The server runs in Linux containers (install/docker), and on Linux its ingest payload arena is
+  # advised MADV_NOHUGEPAGE so transparent huge pages cannot make a 512 MB arena resident. The test
+  # that checks the kernel took that advice — On_Linux_the_arena_is_opted_out_of_transparent_huge_pages
+  # — runs in the backend job above on Windows, takes its off-Linux branch and passes, so the madvise
+  # call, its errno and the smaps check behind it were exercised by no CI run at all.
+  #
+  # This job runs that test's class and nothing else. The whole suite already runs above; this job
+  # exists for the code that only does anything on Linux.
+  #
+  # The THP test stands down by RETURNING EARLY — off Linux, on a kernel without THP, with no smaps
+  # to read — and the skip guard above explains why that is invisible: an early return is reported
+  # as Passed. AMETO_REQUIRE_THP=1 turns each of those roads into a failure, so a runner image that
+  # loses THP turns this job red instead of leaving it green over a check it no longer makes. The
+  # grep afterwards covers the road the variable cannot: a filter that matches nothing is not an
+  # error to `dotnet test` (it exits 0), so a renamed class would pass here by running no test, and a
+  # renamed test method by running only its neighbours.
+  backend-linux:
+    runs-on: ubuntu-latest
+    # Restore, a Debug build of Ameto.Perf and its references, and a few seconds of tests.
+    timeout-minutes: 15
+    env:
+      AMETO_REQUIRE_THP: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Test the arena's huge-page opt-out (Debug)
+        shell: bash
+        run: |
+          set -o pipefail
+          dotnet test tests/Ameto.Perf -c Debug --nologo -v minimal \
+            --filter "FullyQualifiedName~SlabArenaCommitTests" \
+            --logger "console;verbosity=normal" 2>&1 | tee test-output.txt
+
+          if ! grep -q "Passed Ameto.Perf.SlabArenaCommitTests.On_Linux_the_arena_is_opted_out_of_transparent_huge_pages" test-output.txt; then
+            echo "::error::On_Linux_the_arena_is_opted_out_of_transparent_huge_pages did not run and pass; the filter no longer reaches it."
+            exit 1
+          fi
 
   client:
     runs-on: ubuntu-latest

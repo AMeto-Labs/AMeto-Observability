@@ -28,6 +28,13 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
     /// <summary>Total bytes the shared payload pool may commit at most (back-pressure ceiling).</summary>
     private const long DefaultPayloadPoolBytes = 512L * 1024 * 1024; // virtual worst case; pages fault in on demand
 
+    /// <summary>
+    /// Granularity the payload arena is committed in as it grows. One syscall per 1 MB rather
+    /// than one per 64 KB slab, and small enough that a server whose drainer keeps up is
+    /// holding kilobytes of payload and one megabyte of commit.
+    /// </summary>
+    private const long SlabCommitChunkBytes = 1L * 1024 * 1024;
+
     // ── Slot layout (64 bytes = one cache line) ────────────────────────────────
     [StructLayout(LayoutKind.Explicit, Size = 64)]
     private struct Slot
@@ -55,11 +62,16 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
     // One contiguous arena of _slabCount × _slabBytes. Slabs are handed out by index
     // through a lock-free free-list; the arena is sized to PayloadPoolBytes, NOT to
     // capacity, so payload memory no longer scales with the ring size.
-    private readonly byte*       _payloadArena;
+    private readonly SlabArena   _arena;         // owns the address range; commits as we grow into it
+    private readonly byte*       _payloadArena;  // _arena.Base, cached so the hot path stays a field read
     private readonly nuint       _payloadArenaBytes;
     private readonly int         _slabBytes;     // max payload bytes per event
     private readonly int         _slabCount;
     private readonly int*        _slabNext;      // free-list chain: _slabNext[i] = next free slab, or -1
+    // Deepest slab index ever handed out, +1. Managed, so it survives disposal and can be read
+    // without touching freed native memory — and it is the arena's RESIDENCY on every platform:
+    // pages are never given back, and the free list hands slabs out in increasing index order.
+    private          long        _slabHighWater;
     private          PaddedLong* _freeHead;      // packed (version:hi32 | index:lo32); index -1 ⇒ empty
 
     // Per-slot message-template strings + structured exceptions (managed, parallel to slots).
@@ -88,8 +100,12 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
     /// Slab arena budget. slabCount = min(capacity, budget / slabSize) — this, not the ring
     /// capacity, is the true absorption window when the drainer stalls: once slabs run out,
     /// events with payloads are dropped even with free ring slots. The arena is reserved
-    /// virtual memory; only pages actually written become resident (~real payload bytes,
-    /// not slabCount × slabSize), so a generous budget costs little RSS.
+    /// virtual memory. On Linux only pages actually written become resident (~real payload
+    /// bytes, not slabCount × slabSize; the arena opts out of transparent huge pages so a written
+    /// page stays 4 KB), so a generous budget costs little RSS. On Windows
+    /// (see <see cref="SlabArena"/>) it is committed up to the deepest slab ever handed out,
+    /// whatever the payloads weigh, and never decommitted — commit charge a job object's memory
+    /// limit counts.
     /// </param>
     public IngestionRingBuffer(int capacity = 1 << 16, int maxPayloadBytesPerSlot = 64 * 1024, long payloadPoolBytes = DefaultPayloadPoolBytes)
     {
@@ -111,7 +127,16 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
         _slabCount = (int)Math.Min(capacity, Math.Max(1, payloadPoolBytes / _slabBytes));
 
         _payloadArenaBytes = (nuint)((long)_slabCount * _slabBytes);
-        _payloadArena      = (byte*)NativeMemory.Alloc(_payloadArenaBytes); // reserve only; pages fault in on demand
+
+        // Reserved, not committed. The claim above — "pages fault in on demand" — held on
+        // Linux, where a large NativeMemory.Alloc is an anonymous mapping, but not on Windows,
+        // where a block this size is VirtualAlloc(MEM_COMMIT) and the server took a 512 MB
+        // commit charge at startup before a single event arrived. SlabArena reserves the range
+        // and commits as the high-water mark advances; the free list below hands slabs out in
+        // increasing index order, so the high-water mark is the deepest the buffer has ever
+        // been rather than the ceiling it is allowed to reach.
+        _arena        = SlabArena.Create(_payloadArenaBytes, (nuint)SlabCommitChunkBytes);
+        _payloadArena = _arena.Base;
 
         // Free-list: chain every slab, head = slab 0 (version 0).
         _slabNext = (int*)NativeMemory.Alloc((nuint)(_slabCount * sizeof(int)));
@@ -162,6 +187,42 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
     /// </summary>
     public int SlabCapacity => _slabCount;
 
+    /// <summary>
+    /// Bytes of the payload arena committed on demand — the ingest high-water mark, not the
+    /// ceiling — or -1 where the platform already faults pages in lazily (everything but
+    /// Windows) and nothing is counted.
+    /// </summary>
+    public long ArenaCommittedBytes => _arena.CommittedBytes;
+
+    /// <summary>True when arena pages are committed as the buffer grows rather than at startup.</summary>
+    public bool ArenaCommitsOnDemand => _arena.IsCommitOnDemand;
+
+    /// <summary>
+    /// The arena's <c>madvise(MADV_NOHUGEPAGE)</c> outcome: 0 when it succeeded, else see
+    /// <see cref="SlabArena.HugePageOptOutErrno"/>. Only Linux attempts it; the host logs it once, and only when
+    /// <see cref="SlabArena.IsHugePageOptOutFailure"/> calls it a failure (EINVAL, no THP in the kernel, is not).
+    /// </summary>
+    internal int ArenaHugePageOptOutErrno => _arena.HugePageOptOutErrno;
+
+    /// <summary>
+    /// The whole arena — what <c>Ingestion.PayloadPoolBytes</c> bought, derived from the physical
+    /// memory this process may use when it is not set.
+    /// </summary>
+    public long ArenaCapacityBytes => (long)_payloadArenaBytes;
+
+    /// <summary>
+    /// Bytes of the arena the buffer has ever reached: the deepest slab handed out, times the
+    /// slab size. The one arena figure that exists on every platform —
+    /// <see cref="ArenaCommittedBytes"/> is -1 wherever pages fault in lazily, which is
+    /// everywhere but Windows, so on the Linux containers this matters most for there was no
+    /// figure at all. What it means differs: on Windows it is the commit charge (which
+    /// <see cref="ArenaCommittedBytes"/> rounds up to the next commit chunk); on Linux it is an
+    /// UPPER BOUND on the arena's resident memory, not a measurement of it, because a page
+    /// becomes resident only when written and a small event writes only the first page of its
+    /// slab. Nothing below it is ever given back, so this is a resting level and not a peak.
+    /// </summary>
+    public long ArenaHighWaterBytes => Volatile.Read(ref _slabHighWater) * _slabBytes;
+
     /// <summary>Events ever accepted into the ring (monotonic). Zero once disposed.</summary>
     public long AcceptedTotal => Volatile.Read(ref _disposed) ? 0 : Volatile.Read(ref _enqueuePos->Value);
 
@@ -185,13 +246,52 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
     /// <summary>Rejected because every ring slot was still unread.</summary>
     public long DroppedRingFull => Interlocked.Read(ref _droppedRingFull);
 
+    /// <summary>
+    /// Rejected because a free slab's pages could not be committed — the HOST is out of commit
+    /// charge (Windows), not this buffer out of room. Counted apart from
+    /// <see cref="DroppedNoSlab"/> because the remedy is different: memory on the machine, not
+    /// a bigger arena or a faster drainer.
+    /// </summary>
+    public long DroppedNoCommit => Interlocked.Read(ref _droppedNoCommit);
+
+    /// <summary>
+    /// Test hook: makes every commit past the arena's high-water mark fail. On a plain allocation
+    /// the mark is lowered to <paramref name="plainCommittedBytes"/> while it is set;
+    /// <paramref name="onFailure"/> runs inside each failing commit, under the arena's grow lock.
+    /// </summary>
+    internal void SimulateArenaCommitFailure(bool fail, long plainCommittedBytes = 0, Action? onFailure = null) =>
+        _arena.SimulateCommitFailure(fail, (nuint)plainCommittedBytes, onFailure);
+
     private long _droppedOversized;
     private long _droppedNoSlab;
     private long _droppedRingFull;
+    private long _droppedNoCommit;
 
     // ── Slab pool (lock-free Treiber stack, ABA-safe via versioned head) ────────
 
-    /// <summary>Pops a free slab index, or -1 when the payload pool is exhausted.</summary>
+    /// <summary>AcquireSlab: the free list is empty.</summary>
+    private const int NoFreeSlab   = -1;
+    /// <summary>AcquireSlab: a slab was free but its pages could not be committed.</summary>
+    private const int NoCommitSlab = -2;
+
+    /// <summary>
+    /// Pops a free slab index whose pages are writable, or <see cref="NoFreeSlab"/> when the
+    /// payload pool is exhausted, or <see cref="NoCommitSlab"/> when the slab on top of the free
+    /// list could not have its pages committed.
+    ///
+    /// <para>The commit happens BEFORE the pop, so a slab whose pages cannot be written never
+    /// leaves the free list. The earlier version popped first and, on failure, pushed the slab
+    /// back on top; a committed slab the drainer freed in between then sat UNDER the uncommitted
+    /// one, and the ring refused events with committed slabs free. Under sustained commit
+    /// exhaustion every slab freed in such a window was buried for as long as the pressure lasted.
+    /// Now only popped, and therefore committed, slabs are ever pushed, and the untouched tail
+    /// of the list is in index order, so every committed free slab sits above every uncommitted
+    /// one. An uncommitted slab is on top only when no committed slab is free.</para>
+    ///
+    /// <para>Committing for an index another thread pops first is harmless, because commits only
+    /// grow. On the hot path the commit check is one volatile read and a branch, taken only when
+    /// the buffer reaches deeper than it ever has.</para>
+    /// </summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private int AcquireSlab()
     {
@@ -199,11 +299,42 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
         {
             long head = Volatile.Read(ref _freeHead->Value);
             int  idx  = unchecked((int)head);          // low 32 bits; -1 ⇒ empty
-            if (idx < 0) return -1;
+            if (idx < 0) return NoFreeSlab;
+
+            if (!_arena.TryEnsureCommitted((nuint)(((long)idx + 1) * _slabBytes)))
+            {
+                // Out of commit charge. A failed commit can take long enough for the drainer to
+                // push a committed slab on top meanwhile; if the head moved, look again rather
+                // than refuse an event a free slab could take. The head changes only when
+                // another thread made progress, so this retry cannot spin on its own.
+                if (Volatile.Read(ref _freeHead->Value) != head) continue;
+                return NoCommitSlab;
+            }
+
             int  next = _slabNext[idx];
             long newHead = unchecked((((head >> 32) + 1) << 32) | (uint)next); // bump version, swing to next
             if (Interlocked.CompareExchange(ref _freeHead->Value, newHead, head) == head)
+            {
+                // One predicted-false branch on the hot path. The interlocked update below runs
+                // only on a NEW high — O(slabCount) times in the life of the process, because the
+                // free list hands slabs out in increasing index order and reuses them LIFO.
+                if (idx >= Volatile.Read(ref _slabHighWater)) RecordHighWater(idx);
                 return idx;
+            }
+        }
+    }
+
+    /// <summary>Raises the high-water mark to <paramref name="idx"/> + 1, losing no concurrent riser.</summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void RecordHighWater(int idx)
+    {
+        long mark = idx + 1L;
+        long seen = Volatile.Read(ref _slabHighWater);
+        while (mark > seen)
+        {
+            long prev = Interlocked.CompareExchange(ref _slabHighWater, mark, seen);
+            if (prev == seen) return;
+            seen = prev;
         }
     }
 
@@ -251,7 +382,8 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
         int slab = AcquireSlab();
         if (slab < 0)
         {
-            Interlocked.Increment(ref _droppedNoSlab);
+            if (slab == NoFreeSlab) Interlocked.Increment(ref _droppedNoSlab);
+            else                    Interlocked.Increment(ref _droppedNoCommit);
             return false;
         }
 
@@ -400,7 +532,7 @@ public sealed unsafe class IngestionRingBuffer : IDisposable
         if (_disposed) return;
         Volatile.Write(ref _disposed, true);
 
-        NativeMemory.Free(_payloadArena);
+        _arena.Dispose();               // releases the whole reservation, committed or not
         NativeMemory.Free(_slabNext);
         NativeMemory.Free(_freeHead);
         NativeMemory.Free(_slots);

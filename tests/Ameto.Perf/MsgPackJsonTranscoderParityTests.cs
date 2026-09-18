@@ -187,7 +187,10 @@ public sealed class MsgPackJsonTranscoderParityTests
     }
 }
 
-/// <summary>Copy of the server's DynamicObjectConverter — the output being matched.</summary>
+/// <summary>
+/// Copy of the server's old DynamicObjectConverter — the output being matched. The original left
+/// src with the live tail's DTO road; the integration tests keep the other copy, in LegacyDtoRoad.
+/// </summary>
 internal sealed class TestDynamicObjectConverter : System.Text.Json.Serialization.JsonConverter<object>
 {
     public override object? Read(ref Utf8JsonReader reader, Type t, JsonSerializerOptions o)

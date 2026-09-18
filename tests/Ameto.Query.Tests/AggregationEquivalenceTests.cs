@@ -76,7 +76,7 @@ public sealed class AggregationEquivalenceTests : IDisposable
     public void Dispose()
     {
         try { _engine.DisposeAsync().AsTask().GetAwaiter().GetResult(); } catch { }
-        try { Directory.Delete(_dir, true); } catch { }
+        QuerySegmentFixtures.DeleteDataDirectory(_dir);
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

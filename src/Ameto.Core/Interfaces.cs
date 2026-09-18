@@ -74,6 +74,20 @@ public interface IHotTierReader : IDisposable
     }
 
     /// <summary>
+    /// <see cref="ReadSorted(long, long, long?, ulong?, bool, IReadOnlySet{LogLevel}?)"/> with a
+    /// header-level pre-check the scan may apply BEFORE materialising an event (see
+    /// <see cref="IHotHeaderPredicate"/>). The default ignores it: the predicate can only skip
+    /// work, so a reader that materialises everything is still correct — the caller runs the
+    /// full filter on every event returned either way.
+    /// </summary>
+    IEnumerable<LogEvent> ReadSorted(
+        long fromTicks, long toTicks,
+        long? afterTsTicks, ulong? afterIdRaw, bool forward,
+        IReadOnlySet<LogLevel>? levels,
+        IHotHeaderPredicate? headerPredicate)
+        => ReadSorted(fromTicks, toTicks, afterTsTicks, afterIdRaw, forward, levels);
+
+    /// <summary>
     /// Cold-tier segments whose events are already returned by this hot reader.
     /// When a hot-tier segment is frozen and being flushed to cold storage, its
     /// future segment key is reserved here so the query layer can skip the cold
@@ -137,6 +151,19 @@ public interface ISegmentReader : IDisposable
 public interface IQueryExecutor
 {
     IAsyncEnumerable<LogEvent> ExecuteAsync(QueryRequest request, CancellationToken ct = default);
+}
+
+/// <summary>
+/// A filter expression compiled once and carried on <see cref="QueryRequest.Prepared"/> so a
+/// caller that issues the SAME query repeatedly — the live tail, once per poll — does not
+/// re-parse and re-compile it every time. <see cref="Expression"/> is the text it was
+/// compiled from; an executor uses the prepared form only when that matches
+/// <see cref="QueryRequest.Filter"/>, so a mismatched pair degrades to a compile, never
+/// to the wrong filter.
+/// </summary>
+public interface IPreparedFilter
+{
+    string? Expression { get; }
 }
 
 /// <summary>

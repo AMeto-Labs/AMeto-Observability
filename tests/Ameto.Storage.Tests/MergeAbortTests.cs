@@ -241,4 +241,47 @@ public sealed class MergeAbortTests : IAsyncLifetime
         Assert.False(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None));
         Assert.Equal(4, _engine.ListSegments().Count);
     }
+
+    /// <summary>An index sink that fails on the first row, the way a builder reading a torn payload did.</summary>
+    private sealed class ThrowingSink(Exception thrown) : ISegmentIndexSink
+    {
+        public void Add(uint fileOrdinal, in SegmentEventRef ev) => throw thrown;
+        public long BloomTermsAdded   => 0;
+        public long BloomTermCapacity => 0;
+        public void WriteSections(Stream destination, out long invertedOffset, out long trigramOffset, out long bloomOffset) =>
+            throw thrown;
+        public void Dispose() { }
+    }
+
+    /// <summary>
+    /// CORRUPTION DOES NOT ONLY SAY <see cref="InvalidDataException"/>. A count of 2^31 or more
+    /// reaches MessagePack's checked uint→int conversion and throws
+    /// <see cref="OverflowException"/>; a flipped column offset slices out of range. Both are
+    /// thrown from INSIDE the writer, on a source that opened cleanly, and fail identically on
+    /// every pass — yet the classifier knew only two types, so such a batch was logged at Debug
+    /// and re-selected by the next pass, oldest bucket first, stalling compaction for it and
+    /// every younger bucket until retention removed the source. It is quarantined like any
+    /// other corrupt batch.
+    /// </summary>
+    [Theory]
+    [InlineData("overflow")]
+    [InlineData("range")]
+    public async Task AContentExceptionFromInsideTheWriter_QuarantinesTheBatchUntilRestart(string kind)
+    {
+        var sources = await WriteFourSourcesAsync();
+
+        Exception thrown = kind == "overflow"
+            ? new OverflowException("Arithmetic operation resulted in an overflow.")
+            : new ArgumentOutOfRangeException("start");
+        _engine.IndexSinkFactory = (_, _) => new ThrowingSink(thrown);
+        Assert.False(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None));
+        AssertUntouched(SegDir, sources);
+        foreach (var s in _engine.ListSegments()) Assert.Contains(SegmentKey.Of(s), _engine._mergeSkip);
+
+        // A pass that COULD merge them — no sink at all — must still leave them alone: that is
+        // what tells a quarantined batch from one merely left for the next pass.
+        _engine.IndexSinkFactory = null;
+        Assert.False(await _engine.TryMergeSmallSegmentsOnceAsync(CancellationToken.None));
+        Assert.Equal(4, _engine.ListSegments().Count);
+    }
 }

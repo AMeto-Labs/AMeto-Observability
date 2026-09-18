@@ -17,9 +17,17 @@ namespace Ameto.Perf;
 /// the merge budgets were 32 MB / 100k events: they were a MEMORY bound wearing a policy hat.</para>
 ///
 /// <para>The writer now pulls from a k-way merged stream and holds one block plus one index
-/// group. This probe merges the same source shape at 1×, 2× and 4× the size and shows the peak
-/// live heap staying flat, against the cost of merely MATERIALISING the same events — which is
-/// the first and cheapest of the three stages the old pipeline paid for.</para>
+/// group. This probe merges the same source shape at 1×, 2×, 4×, 8× and 16× the size and shows
+/// what the merge keeps reachable at its peak staying flat — stated as an absolute ceiling on
+/// that state at every size, an absolute bound on what each further merged event may add, and
+/// ratios against the smaller merges.</para>
+///
+/// <para>Beside it, for scale, the cost of merely MATERIALISING the same events: the first and
+/// cheapest of the three stages the old pipeline paid for. It is checked only for scaling with
+/// the data. It used to be the yardstick (the peak had to undercut it), which tied a merge guard
+/// to the query decoder's cost: the decoder then got cheaper (template and service strings
+/// shared per enumeration, a lazy exception column), materialising 96k events fell from 44.9 to
+/// 29.5 MB, and the guard failed with the merge unchanged.</para>
 /// </summary>
 public sealed class StreamingMergeMemoryProbe : IDisposable
 {
@@ -90,7 +98,7 @@ public sealed class StreamingMergeMemoryProbe : IDisposable
         for (int s = 0; s < Sources; s++)
             paths.Add(WriteSource(sub, s, eventsPerSource, distinctTemplates: true));
 
-        long baseline = GC.GetTotalMemory(forceFullCollection: true);
+        long baseline = SettledBaseline();
         using var source = MergingSegmentEventSource.Open(paths);
         int n = 0;
         while (source.TryReadNext(out var ev)) { if (ev.Id != 0) n++; else n++; }
@@ -99,47 +107,148 @@ public sealed class StreamingMergeMemoryProbe : IDisposable
         return (n, live);
     }
 
+    /// <summary>
+    /// What one further merged event may add to the merge's peak reachable state, over the
+    /// 168 000 events from the 2× merge to the 16× one.
+    ///
+    /// <para>What legitimately grows with the merged size is per BLOCK or per GROUP (the block
+    /// index, the group directory): well under a byte an event here. The measured slope is about
+    /// 1 B. What moves it is group shape, not events: the state at the peak seal differs by up to
+    /// about 1 MB from one size to the next (21.2 MB at 24 000 events and 21.7 MB at 48 000; with a
+    /// 20 MB array held through the merge, 41.4 MB at 24 000 and 42.4 MB at 96 000), which over
+    /// this span is up to 6 B an event. Over 24 000 to 96 000 events, the span this was first
+    /// measured on, the same noise read up to 14.6 B. That is why the span is 16× and not 8×.</para>
+    ///
+    /// <para>The floor, measured with throwaway retention in <c>SegmentWriter.WriteEvents</c>, one
+    /// entry per merged event held for the whole merge. An 8 B id in an array sized up front reads
+    /// 8.9 B and passes. The same id appended to a <c>List</c>, which over-allocates as it
+    /// doubles, reads 12.6 B: right at the bound, so it can go either way. A 16 B record in an
+    /// array sized up front reads 17.3 B and fails; a 24 B one reads 24.5 B. So a leak of 8 B an
+    /// event gets through, 16 B does not, and what lies between depends on how the leak
+    /// allocates. Under the previous span and bound (32 B over 24 000 to 96 000 events) a 16 B
+    /// record read 16.8 to 19.8 B and a 24 B one 24.6 to 27.6 B, and both passed.</para>
+    /// </summary>
+    private const double MaxMarginalBytesPerEvent = 12;
+
+    /// <summary>
+    /// Ceiling on what <see cref="IndexBuildPool"/> may hold parked at a seal of these 4 MB groups:
+    /// the previous group's returned arrays and this one's growth leftovers, about one group's
+    /// worth. The pool's own caps are size-independent and far larger; this is the workload's.
+    /// </summary>
+    private const long MaxParkedBytes = 32L << 20;
+
+    /// <summary>
+    /// Ceiling on what the merge keeps reachable at a group seal, at every size.
+    ///
+    /// <para>What that is, measured from 12 000 to 192 000 events: the index build state of the
+    /// group being sealed, as <see cref="SegmentIndexBuilder.BuildRetainedBytes"/> counts it,
+    /// 19.5 to 20.5 MB (the table prints it); and 0.6 to 1.3 MB of everything else the merge holds
+    /// beside it — the source cursors, the writer's buffers, the group's bloom filter. 20.1 to
+    /// 21.8 MB in all. The ceiling is 32 MB, about 1.47× the largest of those readings — a little
+    /// under the 1.6× the ratios below allow. What that slack lets through, measured rather than
+    /// asserted: a flat 10 MB held for the whole merge fails this only narrowly (32.5 MB at 48 000
+    /// events in Release, 32.8 in Debug), so roughly 9 MB of flat retention — about 45 % of the
+    /// working state — passes every assertion in this probe.</para>
+    ///
+    /// <para>This is the absolute half of the guard, the role the old crossover played: the peak
+    /// had to stay under two thirds of what materialising the 96 000 events cost — 29.9 MB of the
+    /// 44.9 that cost at base, and 19.7 MB of the 29.5 it costs now that the query decoder got
+    /// cheaper. (Those are the LIMITS two thirds gives; the materialising costs themselves are the
+    /// 44.9 and 29.5 MB in the class summary above.) The slope and the ratios compare this probe's
+    /// merges with each other, so a cost that is flat in the merged size passes them however large
+    /// it is. Simulated with a 20 MB array held for the whole merge (throwaway, in
+    /// <c>SegmentWriter.WriteEvents</c>): 40.7 to 42.5 MB at every size, a slope of 3.2 B/event,
+    /// 1.03× from 1× to 16×. Only this ceiling fails it.</para>
+    /// </summary>
+    private const long MaxMergeStateBytes = 32L << 20;
+
     [Fact]
     public void PeakMergeMemoryIsFlatInTheMergedSegmentSize()
     {
         const double MB = 1048576.0;
 
-        Measure(250, "warm");   // JIT + ArrayPool growth out of the way
+        // One for every merge of the run, as the storage engine's sink factory shares one: each
+        // builder pre-sizes from the group sealed before it, which is how production builds.
+        var hints = new IndexBuildHints();
 
-        var m1 = Measure(1_000, "merge 1x");
-        var m2 = Measure(2_000, "merge 2x");
-        var m4 = Measure(4_000, "merge 4x");
-        var m8 = Measure(8_000, "merge 8x");
+        Measure(250, "warm", hints);   // JIT + ArrayPool growth out of the way
 
-        _out.WriteLine("  events | groups | peak live merge state | materialising the same |  bytes/event");
-        _out.WriteLine("  -------+--------+-----------------------+------------------------+-------------");
-        foreach (var r in new[] { m1, m2, m4, m8 })
-            _out.WriteLine($"  {r.Events,6:N0} | {r.Groups,6} | {r.PeakBytes / MB,17:F1} MB | " +
-                           $"{r.MaterialisedBytes / MB,18:F1} MB | {r.PeakBytes / (double)r.Events,10:F0} B");
+        var m1  = Measure(1_000,  "merge 1x",  hints);
+        var m2  = Measure(2_000,  "merge 2x",  hints);
+        var m4  = Measure(4_000,  "merge 4x",  hints);
+        var m8  = Measure(8_000,  "merge 8x",  hints);
+        var m16 = Measure(16_000, "merge 16x", hints);
 
-        Assert.True(m8.Groups >= 6, $"budget did not cut the merged file: {m8.Groups} group(s)");
-        Assert.Equal(m1.Events * 8, m8.Events);
+        _out.WriteLine("   events | groups | merge state at peak | of it index build | parked in pool | gross heap at peak | materialising the same");
+        _out.WriteLine("  --------+--------+---------------------+-------------------+----------------+--------------------+-----------------------");
+        foreach (var r in new[] { m1, m2, m4, m8, m16 })
+            _out.WriteLine($"  {r.Events,7:N0} | {r.Groups,6} | {r.PeakBytes / MB,16:F1} MB | {r.BuildStateAtPeakBytes / MB,14:F1} MB | " +
+                           $"{r.ParkedBytes / MB,11:F1} MB | {r.GrossPeakBytes / MB,15:F1} MB | {r.MaterialisedBytes / MB,18:F1} MB");
 
-        // The claim: 8× the merged data does not cost 8× the peak. Only one block per source
-        // plus the open group's accumulators is live, so the peak is flat up to heap slack.
-        Assert.True(m8.PeakBytes < m1.PeakBytes * 1.6,
-            $"peak grew with the merged file: {m1.PeakBytes / MB:F1} MB at {m1.Events:N0} events " +
-            $"vs {m8.PeakBytes / MB:F1} MB at {m8.Events:N0} — the merge is not streaming");
-        Assert.True(m8.PeakBytes < m4.PeakBytes * 1.6);
+        double mergePerEvent = (m16.PeakBytes - m2.PeakBytes) / (double)(m16.Events - m2.Events);
+        double matPerEvent   = (m16.MaterialisedBytes - m2.MaterialisedBytes) / (double)(m16.Events - m2.Events);
+        _out.WriteLine($"  each merged event from {m2.Events:N0} to {m16.Events:N0}: merge state {mergePerEvent:F1} B " +
+                       $"(bound {MaxMarginalBytesPerEvent} B), materialising {matPerEvent:F1} B");
 
-        // Materialising the batch — the FIRST stage of the old pipeline, before the tier copy
-        // and the whole-batch index build — already scales with the merged size, and by 8× it
-        // has overtaken the entire streaming peak on its own.
-        Assert.True(m8.MaterialisedBytes > m1.MaterialisedBytes * 5,
+        Assert.True(m16.Groups >= 12, $"budget did not cut the merged file: {m16.Groups} group(s)");
+        Assert.Equal(m1.Events * 16, m16.Events);
+
+        // The sources must hold data that scales, or a flat merge proves nothing.
+        Assert.True(m16.MaterialisedBytes > m1.MaterialisedBytes * 10,
             "the materialised baseline is not scaling — the probe is measuring nothing");
-        Assert.True(m8.PeakBytes * 1.5 < m8.MaterialisedBytes,
-            $"streaming peak {m8.PeakBytes / MB:F1} MB is no better than materialising " +
-            $"{m8.MaterialisedBytes / MB:F1} MB");
+
+        // The absolute half: however flat, the merge's working state has a size. A cost that does
+        // not grow with the merged file passes the slope and the ratios below, and this catches it.
+        foreach (var r in new[] { m1, m2, m4, m8, m16 })
+            Assert.True(r.PeakBytes < MaxMergeStateBytes,
+                $"the {r.Events:N0}-event merge held {r.PeakBytes / MB:F1} MB at a seal (ceiling {MaxMergeStateBytes / MB:F0} MB; " +
+                $"the group's index build state was {r.BuildStateAtPeakBytes / MB:F1} MB of it)");
+
+        // The claim, as a slope: between two multi-group merges, 8× the events apart, each further
+        // event adds at most a few bytes to what the merge holds at its peak. The bound is
+        // absolute, so a change to another code path's cost cannot move it.
+        Assert.True(mergePerEvent < MaxMarginalBytesPerEvent,
+            $"each merged event adds {mergePerEvent:F1} B to the merge's peak (bound {MaxMarginalBytesPerEvent} B; " +
+            $"materialising adds {matPerEvent:F1} B) — the merge is not streaming");
+
+        // And as ratios: 16× the merged data does not cost 16× the peak.
+        Assert.True(m16.PeakBytes < m1.PeakBytes * 1.6,
+            $"peak grew with the merged file: {m1.PeakBytes / MB:F1} MB at {m1.Events:N0} events " +
+            $"vs {m16.PeakBytes / MB:F1} MB at {m16.Events:N0} — the merge is not streaming");
+        Assert.True(m16.PeakBytes < m4.PeakBytes * 1.6,
+            $"peak grew with the merged file: {m4.PeakBytes / MB:F1} MB at {m4.Events:N0} events " +
+            $"vs {m16.PeakBytes / MB:F1} MB at {m16.Events:N0} — the merge is not streaming");
+
+        // The pool is bounded apart: reusable, but memory the process holds all the same.
+        Assert.True(m16.ParkedBytes < MaxParkedBytes,
+            $"{m16.ParkedBytes / MB:F1} MB parked in IndexBuildPool at a seal of the {m16.Events:N0}-event merge");
     }
 
-    private readonly record struct Result(int Events, int Groups, long PeakBytes, long MaterialisedBytes);
+    /// <param name="PeakBytes">The most the merge kept reachable at any group seal, above a settled baseline.</param>
+    /// <param name="ParkedBytes">The most <see cref="IndexBuildPool"/> held parked at any seal.</param>
+    /// <param name="GrossPeakBytes">The most of the two together at one seal: what a heap sample blind to the pool reads.</param>
+    /// <param name="BuildStateAtPeakBytes">The sealing group's index build state at the seal <paramref name="PeakBytes"/> was read at, as the builder counts it.</param>
+    private readonly record struct Result(int Events, int Groups, long PeakBytes, long ParkedBytes, long GrossPeakBytes,
+                                          long MaterialisedBytes, long BuildStateAtPeakBytes);
 
-    private Result Measure(int eventsPerSource, string name, bool distinctTemplates = false)
+    /// <summary>
+    /// A heap baseline nothing is about to drop.
+    ///
+    /// <para><see cref="IndexBuildPool"/> trims itself from a gen2 callback on the finaliser
+    /// thread. A plain <c>GC.GetTotalMemory(true)</c> baseline can count parked arrays that a
+    /// collection in the NEXT sample frees, and the delta comes out short: below zero on the
+    /// materialising side, after a merge had left 20 MB parked.</para>
+    /// </summary>
+    private static long SettledBaseline()
+    {
+        IndexBuildPool.TrimAll();
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+        return GC.GetTotalMemory(forceFullCollection: true);
+    }
+
+    private Result Measure(int eventsPerSource, string name, IndexBuildHints hints, bool distinctTemplates = false)
     {
         string sub = Path.Combine(_dir, name.Replace(' ', '-'));
         Directory.CreateDirectory(sub);
@@ -149,22 +258,33 @@ public sealed class StreamingMergeMemoryProbe : IDisposable
             paths.Add(WriteSource(sub, s, eventsPerSource, distinctTemplates));
 
         int totalEvents = Sources * eventsPerSource;
-        long peak = 0;
+        long peak = 0, parkedPeak = 0, grossPeak = 0, buildAtPeak = 0;
         int  groups = 0;
 
         string mergedPath = Path.Combine(sub, "merged.seg");
-        long baseline = GC.GetTotalMemory(forceFullCollection: true);
+        long baseline = SettledBaseline();
         using (var source = MergingSegmentEventSource.Open(paths))
         using (var writer = new SegmentWriter(mergedPath, GroupBudget))
         {
             writer.WriteEvents(source, (count, termsPerEvent) => new PeakSink(
-                new SegmentIndexBuilder(count, 5, termsPerEvent),
-                () =>
+                new SegmentIndexBuilder(count, 5, termsPerEvent, hints),
+                buildState =>
                 {
                     // Sampled at the seal: the group's accumulators at their fullest, with
                     // everything from earlier groups already unreachable.
+                    //
+                    // What IndexBuildPool has parked for the next builder is read first and then
+                    // dropped, so the heap sample holds exactly what the merge can reach. Left in,
+                    // it is counted or not depending on whether the pool's gen2 hook runs inside
+                    // this collection: 0 MB at one size, 7 MB at the next. Dropping it here does
+                    // not starve the next group, because this group's arrays go back to the pool
+                    // after the seal and the next group rents those.
+                    long parked = IndexBuildPool.PooledBytes;
+                    IndexBuildPool.TrimAll();
                     long live = GC.GetTotalMemory(forceFullCollection: true) - baseline;
-                    if (live > peak) peak = live;
+                    if (live          > peak)       { peak = live; buildAtPeak = buildState; }
+                    if (parked        > parkedPeak) parkedPeak = parked;
+                    if (live + parked > grossPeak)  grossPeak  = live + parked;
                     groups++;
                 }));
             var info = writer.Finalise(new NodeId(0), new SegmentId(1UL));
@@ -172,16 +292,15 @@ public sealed class StreamingMergeMemoryProbe : IDisposable
         }
 
         // What the old pipeline's FIRST stage costs: every event of the batch in managed
-        // memory, properties as a byte[] each. The tier copy and the batch-wide index build
-        // came on top of this.
+        // memory. The tier copy and the batch-wide index build came on top of this.
         long materialised = MeasureMaterialised(paths);
 
-        return new Result(totalEvents, groups, peak, materialised);
+        return new Result(totalEvents, groups, peak, parkedPeak, grossPeak, materialised, buildAtPeak);
     }
 
     private static long MeasureMaterialised(List<string> paths)
     {
-        long baseline = GC.GetTotalMemory(forceFullCollection: true);
+        long baseline = SettledBaseline();
         var  held     = new List<List<LogEvent>>(paths.Count);
         foreach (var p in paths)
         {
@@ -202,8 +321,8 @@ public sealed class StreamingMergeMemoryProbe : IDisposable
         return list;
     }
 
-    /// <summary>Samples the live heap the instant a group seals, then delegates.</summary>
-    private sealed class PeakSink(SegmentIndexBuilder inner, Action onSeal) : ISegmentIndexSink
+    /// <summary>Samples the live heap, and the builder's own count of its state, the instant a group seals, then delegates.</summary>
+    private sealed class PeakSink(SegmentIndexBuilder inner, Action<long> onSeal) : ISegmentIndexSink
     {
         public void Add(uint fileOrdinal, in SegmentEventRef ev) => inner.Add(fileOrdinal, in ev);
 
@@ -212,10 +331,10 @@ public sealed class StreamingMergeMemoryProbe : IDisposable
         public long BloomTermsAdded   => inner.BloomTermsAdded;
         public long BloomTermCapacity => inner.BloomTermCapacity;
 
-        public (byte[] Inverted, byte[] Trigram, byte[] Bloom) Serialise()
+        public void WriteSections(Stream destination, out long invertedOffset, out long trigramOffset, out long bloomOffset)
         {
-            onSeal();
-            return inner.Serialise();
+            onSeal(inner.BuildRetainedBytes);
+            inner.WriteSections(destination, out invertedOffset, out trigramOffset, out bloomOffset);
         }
 
         public void Dispose() => inner.Dispose();

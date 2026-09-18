@@ -3,7 +3,24 @@ namespace Ameto.Query.Filtering;
 // ── Abstract base ─────────────────────────────────────────────────────────────
 
 /// <summary>Base class for all filter expression AST nodes.</summary>
-public abstract class FilterNode { }
+public abstract class FilterNode
+{
+    /// <summary>
+    /// Dispatch tag for <see cref="FilterEvaluator.Matches"/>, resolved from the concrete type
+    /// once per node — that is, once per filter compile. See <see cref="NodeKind"/> for why the
+    /// evaluator reads a tag instead of running a chain of type tests per event, and why a node
+    /// type absent from the map still evaluates correctly.
+    ///
+    /// <para>Named <c>DispatchKind</c> rather than <c>Kind</c> because a node already has one:
+    /// <see cref="FromJsonPathStringPredicateNode.Kind"/> says WHICH string predicate it is.
+    /// A base member called <c>Kind</c> was hidden by it (CS0108), which is not only a warning
+    /// — it is a trap, because <c>switch (node.Kind)</c> written against a derived-typed
+    /// variable would silently compile against the wrong member.</para>
+    /// </summary>
+    internal readonly NodeKind DispatchKind;
+
+    protected FilterNode() => DispatchKind = NodeKinds.Of(GetType());
+}
 
 // ── Logical ───────────────────────────────────────────────────────────────────
 
@@ -79,6 +96,48 @@ public sealed class TimeCompareNode : FilterNode
     public TimeCompareNode(CompareOp op, long ticks) { Op = op; Ticks = ticks; }
 }
 
+/// <summary>
+/// <c>@tr = 'hex32'</c> / <c>@sp = 'hex16'</c> (and <c>!=</c>) whose literal is exactly the
+/// hex spelling the event would render — rewritten from <see cref="CompareNode"/> at compile
+/// time (see <c>CompiledFilter</c>) so the literal is parsed ONCE and the evaluator compares
+/// the stored integers, instead of formatting every scanned event's id to a 32-character
+/// string for an ordinal-ignore-case compare. Same answer: the rendering is lowercase hex of
+/// fixed width and null when the id is absent, so equality holds exactly when the ids are
+/// equal and the event has one; <c>!=</c> is that negated (an absent id is "not equal").
+/// A literal of any other shape keeps its CompareNode and the string semantics.
+/// </summary>
+public sealed class TraceIdCompareNode : FilterNode
+{
+    /// <summary>Only <see cref="CompareOp.Eq"/> and <see cref="CompareOp.Ne"/> are rewritten.</summary>
+    public CompareOp Op     { get; }
+    /// <summary>True for <c>@sp</c> (64-bit, held in <see cref="Lo"/>); false for <c>@tr</c>.</summary>
+    public bool      IsSpan { get; }
+    public ulong     Hi     { get; }
+    public ulong     Lo     { get; }
+
+    /// <summary>
+    /// The property spelling of the <see cref="CompareNode"/> this replaced and the
+    /// CANONICAL rendering of its literal (lowercase hex, the spelling
+    /// <c>SegmentIndexBuilder</c> files under), so the index-hint builders emit the value
+    /// the posting list and bloom actually hold — the cold prefilter still prunes
+    /// segments by the <c>@tr</c> posting list, whatever case the user typed.
+    /// </summary>
+    public string    Property  { get; }
+    public string    Canonical { get; }
+
+    public TraceIdCompareNode(CompareOp op, bool isSpan, ulong hi, ulong lo, string property)
+    {
+        Op        = op;
+        IsSpan    = isSpan;
+        Hi        = hi;
+        Lo        = lo;
+        Property  = property;
+        Canonical = isSpan
+            ? Ameto.Core.TraceIdHelper.FormatSpanId(lo) ?? new string('0', 16)
+            : Ameto.Core.TraceIdHelper.FormatTraceId(hi, lo) ?? new string('0', 32);
+    }
+}
+
 // ── String predicates ─────────────────────────────────────────────────────────
 
 /// <summary>@mt like '%hello%'  or  Prop like 'prefix%'</summary>
@@ -92,6 +151,26 @@ public sealed class LikeNode : FilterNode
     internal readonly bool   IsMatchAll;   // pattern == "%"
     internal readonly bool   IsLiteral;    // no % or _ wildcards — plain equality
 
+    /// <summary>Which vectorisable shape the pattern reduced to, or <c>None</c>.</summary>
+    internal readonly LikeShape Shape;
+
+    /// <summary>The literal between the leading/trailing <c>%</c>, already lowercased.</summary>
+    internal readonly string Affix;
+
+    /// <summary>
+    /// Whether <see cref="Affix"/> is pure ASCII. Only then may the evaluator answer with
+    /// <c>Contains/StartsWith/EndsWith(OrdinalIgnoreCase)</c>: over ASCII the two foldings
+    /// agree exactly (A–Z ↔ a–z and nothing else), so the fast answer is the same answer.
+    /// Outside ASCII they do NOT agree — <c>OrdinalIgnoreCase</c> leaves the Kelvin sign
+    /// unequal to <c>k</c> while <c>ToLowerInvariant</c>, which lowered this pattern, folds
+    /// them together — so anything non-ASCII on either side keeps the folding matcher.
+    ///
+    /// <para>Note this is computed from the LOWERED pattern, not the one the user typed: a
+    /// non-ASCII character can lower to an ASCII one (U+0130 → <c>i</c>), and it is the
+    /// lowered form the comparison actually uses.</para>
+    /// </summary>
+    internal readonly bool AffixAscii;
+
     public LikeNode(string property, string pattern)
     {
         Property     = property;
@@ -99,7 +178,53 @@ public sealed class LikeNode : FilterNode
         PatternLower = pattern.ToLowerInvariant();
         IsMatchAll   = PatternLower == "%";
         IsLiteral    = !IsMatchAll && !PatternLower.Contains('%') && !PatternLower.Contains('_');
+
+        (Shape, Affix) = Classify(PatternLower, IsMatchAll);
+        AffixAscii     = System.Text.Ascii.IsValid(Affix);
     }
+
+    /// <summary>
+    /// Reduces <c>%lit%</c> / <c>lit%</c> / <c>%lit</c> / <c>lit</c> to a shape plus its
+    /// literal. Anything with a wildcard left INSIDE the literal — <c>%a%b%</c>, <c>%a_b%</c> —
+    /// is <see cref="LikeShape.None"/> and keeps the general matcher; there is no escape
+    /// character in this dialect, so a <c>_</c> in the middle is always a wildcard.
+    /// </summary>
+    private static (LikeShape Shape, string Affix) Classify(string patternLower, bool isMatchAll)
+    {
+        if (isMatchAll) return (LikeShape.None, string.Empty);
+
+        bool lead  = patternLower.Length > 0 && patternLower[0]  == '%';
+        bool trail = patternLower.Length > 1 && patternLower[^1] == '%';
+
+        int start = lead  ? 1 : 0;
+        int end   = trail ? patternLower.Length - 1 : patternLower.Length;
+        if (end < start) return (LikeShape.None, string.Empty);
+
+        var core = patternLower.AsSpan(start, end - start);
+        if (core.IndexOfAny('%', '_') >= 0) return (LikeShape.None, string.Empty);
+
+        string affix = core.ToString();
+        return (lead, trail) switch
+        {
+            (true,  true)  => (LikeShape.Contains,   affix),
+            (false, true)  => (LikeShape.StartsWith, affix),
+            (true,  false) => (LikeShape.EndsWith,   affix),
+            _              => (LikeShape.Equals,     affix),
+        };
+    }
+}
+
+/// <summary>
+/// The shape a LIKE pattern reduced to at compile time. <c>None</c> means "it has wildcards
+/// the span operations cannot express" and sends the value to the general matcher.
+/// </summary>
+internal enum LikeShape : byte
+{
+    None = 0,
+    Equals,
+    StartsWith,
+    EndsWith,
+    Contains,
 }
 
 /// <summary>@mt ci_startsWith 'Hello'  (case-insensitive prefix)</summary>

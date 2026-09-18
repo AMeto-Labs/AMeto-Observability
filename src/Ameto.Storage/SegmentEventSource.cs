@@ -74,10 +74,13 @@ public readonly ref struct SegmentEventRef
     /// <summary>
     /// The exception as an object graph, decoding the raw payload if that is all we have.
     ///
-    /// <para>Only the INDEX BUILD needs this — it indexes the type, the message and the inner
-    /// type as strings. The writer does not, and asking for it there is what put a decode plus a
+    /// <para>Only the INDEX BUILD needs anything of it — the type, the message and the inner
+    /// type. The writer does not, and asking for it there is what put a decode plus a
     /// re-encode on every exception-carrying row of every merge. A merge that runs without an
-    /// index sink now never decodes at all.</para>
+    /// index sink never decodes at all, and the streaming builder no longer decodes on a merge
+    /// either: it reads the three fields as spans out of <see cref="ExceptionPayload"/>
+    /// (<see cref="ExceptionInfo.TryReadIndexFields"/>), skipping the stack trace. This full
+    /// decode remains for the builder's reference oracle and any caller that wants the graph.</para>
     /// </summary>
     public ExceptionInfo? DecodeException() =>
         Exception ?? (ExceptionPayload.IsEmpty ? null : ExceptionInfo.FromBytes(ExceptionPayload));
@@ -162,8 +165,47 @@ public interface ISegmentIndexSink : IDisposable
     /// </summary>
     long BloomTermCapacity { get; }
 
-    /// <summary>Serialises the group's sections. Called once, after the last <see cref="Add"/>.</summary>
-    (byte[] Inverted, byte[] Trigram, byte[] Bloom) Serialise();
+    /// <summary>
+    /// Writes the group's three sections to <paramref name="destination"/> at its current
+    /// position — each as <c>uint32 length</c> + bytes (<see cref="WriteFramed"/>), the framing
+    /// the segment reader expects — and reports where each one starts. Called once, after the
+    /// last <see cref="Add"/>. This is the production call: a sink that can stream writes its
+    /// accumulators straight into the file instead of handing back three multi-MB blobs that
+    /// die as soon as they are copied. <paramref name="destination"/> must be seekable: a
+    /// streaming sink writes a length placeholder and patches it once the section's size is
+    /// known.
+    /// </summary>
+    void WriteSections(Stream destination, out long invertedOffset, out long trigramOffset, out long bloomOffset);
+
+    /// <summary>
+    /// The three sections as blobs — a test and probe seam, never called by the writer. The
+    /// default runs <see cref="WriteSections"/> into memory and slices the frames back out; a
+    /// sink with its own blobs may override it to skip the round trip.
+    /// </summary>
+    (byte[] Inverted, byte[] Trigram, byte[] Bloom) Serialise()
+    {
+        var ms = new MemoryStream();
+        WriteSections(ms, out long inv, out long tri, out long bloom);
+        var all = ms.GetBuffer();
+        return (Unframe(all, inv), Unframe(all, tri), Unframe(all, bloom));
+
+        static byte[] Unframe(byte[] all, long at)
+        {
+            uint len = System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(all.AsSpan((int)at));
+            return all.AsSpan((int)at + 4, (int)len).ToArray();
+        }
+    }
+
+    /// <summary>Writes one section as <c>uint32 length</c> + bytes and returns where it starts.</summary>
+    static long WriteFramed(Stream destination, ReadOnlySpan<byte> section)
+    {
+        long at = destination.Position;
+        Span<byte> len = stackalloc byte[4];
+        System.Buffers.Binary.BinaryPrimitives.WriteUInt32LittleEndian(len, (uint)section.Length);
+        destination.Write(len);
+        destination.Write(section);
+        return at;
+    }
 }
 
 /// <summary>
@@ -210,12 +252,15 @@ public sealed class HotTierEventSource : ISegmentEventSource
 
     public long RemainingEventHint => Math.Max(0, _end - _pos);
 
+    /// <summary>Carried across events so the pool is asked only when the answer changes.</summary>
+    private InternMemo _memo;
+
     public bool TryReadNext(out SegmentEventRef ev)
     {
         if (_pos >= _end) { ev = default; return false; }
         int i = _order is null ? _pos : _order[_pos];
         _pos++;
-        ev = EventAt(_hot, _pool, i);
+        ev = EventAt(_hot, _pool, i, ref _memo);
         return true;
     }
 
@@ -226,15 +271,69 @@ public sealed class HotTierEventSource : ISegmentEventSource
     /// </summary>
     public static SegmentEventRef EventAt(HotTierSegment hot, StringInternPool pool, int i)
     {
+        InternMemo none = default;
+        return EventAt(hot, pool, i, ref none);
+    }
+
+    // `scoped`: the memo is read and updated here and nothing about it reaches the returned ref
+    // struct, so it must not be treated as a reference the result could capture.
+    private static SegmentEventRef EventAt(HotTierSegment hot, StringInternPool pool, int i, scoped ref InternMemo memo)
+    {
         ref readonly LogEventHeader h = ref hot.GetHeader(i);
         // The tier-local template wins over the pool: it survives a pool miss (WAL recovery
         // restores the pool separately), which is why the tier stores it at all.
-        string template = hot.GetTemplate(i) ?? pool.Get(h.MessageTemplatePoolIndex) ?? string.Empty;
-        string? service = h.ServiceNamePoolIndex >= 0 ? pool.Get(h.ServiceNamePoolIndex) : null;
+        string template = hot.GetTemplate(i)
+                       ?? memo.Template.Resolve(pool, h.MessageTemplatePoolIndex)
+                       ?? string.Empty;
+        string? service = h.ServiceNamePoolIndex >= 0
+            ? memo.Service.Resolve(pool, h.ServiceNamePoolIndex)
+            : null;
         return new SegmentEventRef(
             h.Id, h.TimestampUtcTicks, h.Level,
             h.TraceIdHi, h.TraceIdLo, h.SpanId,
             template, service, hot.GetException(i),
             hot.GetPropertiesPayload(i));
+    }
+
+    /// <summary>
+    /// The last (pool index → string) answer for each interned column.
+    ///
+    /// <para><see cref="StringInternPool.Get"/> is a <c>ConcurrentDictionary</c> probe — a hash,
+    /// a bucket walk and a volatile read — and a tier's templates and service names are a handful
+    /// of values repeated across every one of its events, so it was asked the same question a
+    /// quarter of a million times per flush. A pool index is assigned once and never reassigned,
+    /// so a remembered answer cannot go stale.</para>
+    ///
+    /// <para>The index is held PLUS ONE so that <c>default</c> — every field zero — is an EMPTY
+    /// memo rather than one claiming to know some real index. Only non-negative indices are ever
+    /// memoised, which is what makes that encoding unambiguous: were a negative index allowed in,
+    /// -1 would store a plus-one of 0 and a fresh memo would then "match" it and answer null,
+    /// while a memo warmed on anything else would ask the pool and be told <see cref="string.Empty"/>.
+    /// Both answers reach the same place today — the only caller that can pass a negative index is
+    /// the template, whose result goes through <c>?? string.Empty</c> — but the two routes
+    /// disagreeing about the same input is exactly the kind of thing that stops being harmless
+    /// when someone adds a third caller.</para>
+    /// </summary>
+    private struct InternMemo
+    {
+        public Slot Template;
+        public Slot Service;
+
+        public struct Slot
+        {
+            private int     _indexPlusOne;
+            private string? _value;
+
+            public string? Resolve(StringInternPool pool, int index)
+            {
+                // "No index" (-1: the event carries no template / no service) is not worth a memo
+                // slot and must not occupy one — the pool answers it from a branch, not a probe.
+                if (index < 0) return pool.Get(index);
+                if (_indexPlusOne == index + 1) return _value;
+                _value        = pool.Get(index);
+                _indexPlusOne = index + 1;
+                return _value;
+            }
+        }
     }
 }

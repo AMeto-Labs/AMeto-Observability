@@ -136,6 +136,49 @@ Ameto:
     MaxEventPayloadBytes: 65536   # 64 KB — max properties per event (larger events dropped + logged)
     MaxOtlpBatchBytes: 8388608    # 8 MB  — max OTLP /otlp/v1/* body (larger → 413)
 
+    # Payload slab arena — the absorption window when the drainer stalls (slabs, not ring
+    # slots, are what a burst runs out of; a pending event holds one slab whatever its size).
+    # Left unset it is the larger of 8192 slabs of MaxEventPayloadBytes (one OpenTelemetry
+    # collector batch) and 15% of the physical limit, both capped at 512 MB. At the 64 KB
+    # default slab that is 512 MB on every host, a 512 MB container included.
+    # The arena is reserved, and what it takes is never given back. On Linux that is per
+    # touched page, not per slab, and the arena opts out of transparent huge pages
+    # (MADV_NOHUGEPAGE) so the page stays 4 KB even with transparent_hugepage=always (the RHEL
+    # default): a typical small event touches one 4 KB page of its slab, so a full batch of
+    # them rests at ~32 MB, and only events near the maximum size approach 512 MB. On Windows
+    # it is committed (1 MB chunks) up to the deepest slab ever used, whatever the events
+    # weigh: one batch that outruns the drainer by ~8192 events commits ~512 MB even for
+    # 300-byte events, and a job object's memory limit counts commit. Under a container or job
+    # memory limit, on either platform, set it explicitly for a hard ceiling (~32 MB is what
+    # small events cost on Linux, not a bound). Likewise on a small host that expects large
+    # events (an explicit value always wins), and accept earlier, counted drops under a
+    # burst. Watch ingestArenaResidentBytes (deepest slab x slab size: the commit charge on
+    # Windows, an upper bound on resident memory on Linux) and ingestDroppedNoSlab in
+    # /api/diagnostics.
+    # PayloadPoolBytes: 536870912
+
+  # ── Query ────────────────────────────────────────────────────────────────────
+  # Search budgets and the cross-query cache of decoded segment indexes.
+  Query:
+    # Cache of decoded index sections, charged at each entry's RETAINED size (expanded
+    # postings + dictionaries + bloom bits). Unset = min(256 MB, 15% of the managed-heap
+    # limit) — in a 512 MB container the GC's heap limit is 384 MB, so ~57 MB. 0 disables
+    # the cache entirely (every query re-reads and re-decodes what it consults).
+    # For a 512 MB stand an explicit 48 MB is a reasonable floor to pin:
+    # IndexCacheBytes: 50331648
+    #
+    # Drop cached indexes nothing has read for this long. 0 = off, which is how servers
+    # behaved before this setting existed: then only budget pressure ever evicts, and a
+    # server that answers one wide query and goes quiet keeps those postings for ever.
+    # IndexCacheIdleEvict: "00:10:00"
+    #
+    # Wall-clock budget for one search; 0 or negative removes it.
+    Timeout: "00:01:00"
+    # Searches at once: 0 = auto (cores, clamped 2-16), negative = unlimited. Past the
+    # limit a request is refused quickly (503 + Retry-After) rather than everything crawling.
+    MaxConcurrent: 0
+    QueueWait: "00:00:05"
+
   # Per-level default retention (days).
   # These are only used the very first time — after that the values live in SQLite.
   Retention:

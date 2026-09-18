@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Buffers.Binary;
 using System.IO.Compression;
+using Ameto.Core;
 using Ameto.Otel;
 
 namespace Ameto.Integration.Tests;
@@ -42,7 +43,7 @@ public sealed class OtlpGrpcFramingTests
     {
         var result = OtlpGrpcFraming.TryUnframe(framed, encoding, limit, out var span, out var rented, out _);
         message = span.ToArray();
-        if (rented is not null) ArrayPool<byte>.Shared.Return(rented);
+        if (rented is not null) IngestBufferPool.Return(rented);
         return result;
     }
 
@@ -143,6 +144,44 @@ public sealed class OtlpGrpcFramingTests
     {
         var bomb = new byte[limit * 4L > int.MaxValue ? int.MaxValue / 2 : limit * 4];
         Assert.Equal(UnframeResult.TooLarge, Unframe(Frame(bomb, gzip: true), "gzip", out _, limit));
+    }
+
+    [Fact]
+    public void A_stream_that_understates_its_length_still_inflates_whole()
+    {
+        // The inflate buffer is sized from the gzip trailer's ISIZE — an exporter's single
+        // member declares its real length, so the usual case is one right-sized rent. Two
+        // concatenated members, which GZipStream reads as one stream, declare only the LAST
+        // one's length, so this is the path where the read loop has to grow the buffer instead.
+        // The output has to be identical either way, which is the whole point of never trusting
+        // that number for more than a first guess.
+        byte[] first  = Pattern(300_000, seed: 1);
+        byte[] second = Pattern(200_000, seed: 2);
+        byte[] both   = [.. first, .. second];
+
+        byte[] payload = [.. Deflate(first), .. Deflate(second)];
+        var framed = new byte[5 + payload.Length];
+        framed[0] = 1;
+        BinaryPrimitives.WriteUInt32BigEndian(framed.AsSpan(1), (uint)payload.Length);
+        payload.CopyTo(framed.AsSpan(5));
+
+        Assert.Equal(UnframeResult.Ok, Unframe(framed, "gzip", out var message));
+        Assert.Equal(both, message);
+    }
+
+    private static byte[] Deflate(byte[] data)
+    {
+        using var ms = new MemoryStream();
+        using (var z = new GZipStream(ms, CompressionMode.Compress, leaveOpen: true)) z.Write(data);
+        return ms.ToArray();
+    }
+
+    /// <summary>Compressible but verifiable — a wrong offset anywhere shows up as a wrong byte.</summary>
+    private static byte[] Pattern(int length, int seed)
+    {
+        var data = new byte[length];
+        for (int i = 0; i < length; i++) data[i] = (byte)((i / 7 + seed) % 251);
+        return data;
     }
 
     [Fact]

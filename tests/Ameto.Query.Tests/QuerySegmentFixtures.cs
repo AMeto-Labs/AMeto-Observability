@@ -1,5 +1,6 @@
 using System.Buffers;
 using MessagePack;
+using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Ameto.Core;
@@ -163,4 +164,50 @@ internal static class QuerySegmentFixtures
 
     /// <summary>Identity by payload, not by EventId — the engine assigns ids itself.</summary>
     public static string OrderIdOf(LogEvent ev) => ev.Properties?["OrderId"] as string ?? "<none>";
+
+    // ── Teardown ──────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Removes a test's data directory once its engine is disposed. Use this rather than a bare
+    /// <c>Directory.Delete</c>, everywhere in this suite.
+    ///
+    /// <para>Disposing the engine does NOT close <c>Ameto.db</c>. <see cref="RetentionStore"/>
+    /// opens it through Microsoft.Data.Sqlite, whose connection pool parks the underlying handle
+    /// for reuse and outlives the store that opened it — so on Windows the delete fails with the
+    /// file still mapped, the <c>catch { }</c> every teardown wrapped it in swallowed that, and
+    /// each run left an <c>ameto-*</c> directory in TEMP for ever. The suite leaked one per test
+    /// class, which is how this week's disk-full incidents were fed.</para>
+    ///
+    /// <para>Clearing the pool first is what makes the delete succeed; the retries cover a
+    /// segment file a finishing background read still has mapped. Still best-effort at the end of
+    /// it: a teardown is not the place to fail a green test. <c>FixtureCleanupTests</c> is where
+    /// the outcome is asserted.</para>
+    ///
+    /// <para>The retries are bounded by <see cref="DeleteRetryLimit"/> in total, backing off from
+    /// 10 ms, not by a count. Four tries 50 ms apart gave a late handle about 150 ms, and on a loaded
+    /// Windows runner a background read, or an antivirus or indexer scan of the fresh .seg files in
+    /// TEMP, can hold one longer than that — which failed <c>FixtureCleanupTests</c> on a directory
+    /// that was gone a moment later. A handle nothing will release, the parked SQLite pool this exists
+    /// for, still outlasts any bound, so that failure stays deterministic. A delete that succeeds at
+    /// once, the normal case, costs nothing extra.</para>
+    /// </summary>
+    public static void DeleteDataDirectory(string dir)
+    {
+        SqliteConnection.ClearAllPools();
+
+        long started = Environment.TickCount64;
+        for (int backoffMs = 10; ; backoffMs = Math.Min(backoffMs * 2, 500))
+        {
+            try { Directory.Delete(dir, recursive: true); return; }
+            catch (DirectoryNotFoundException) { return; }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                if (Environment.TickCount64 - started >= (long)DeleteRetryLimit.TotalMilliseconds) return;
+                Thread.Sleep(backoffMs);
+            }
+        }
+    }
+
+    /// <summary>How long <see cref="DeleteDataDirectory"/> keeps retrying a delete that a handle blocks.</summary>
+    public static readonly TimeSpan DeleteRetryLimit = TimeSpan.FromSeconds(10);
 }

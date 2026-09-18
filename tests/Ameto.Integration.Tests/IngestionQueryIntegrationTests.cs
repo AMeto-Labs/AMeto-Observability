@@ -132,6 +132,25 @@ public class AmetoWebAppFactory : WebApplicationFactory<Program>
     /// </summary>
     protected virtual bool SeedSpaStub => true;
 
+    /// <summary>
+    /// The search bounds this host runs under. Defaults for every suite but the one that needs
+    /// a budget small enough to run out on purpose; see LiveTailTimeoutTests.
+    /// </summary>
+    protected virtual QueryOptions ConfiguredQuery => new();
+
+    /// <summary>
+    /// The live-tail pacing this host runs under. Defaults for every suite but the one that needs a
+    /// parked tail to stay parked for longer than the test runs; see LiveTailRowWriterTests.
+    /// </summary>
+    protected virtual LiveTailOptions ConfiguredLiveTail => new();
+
+    /// <summary>
+    /// The ingest limits this host runs under. Defaults for every suite but the one that needs a
+    /// body ceiling small enough to cross without posting megabytes through TestServer; see
+    /// <see cref="OtlpHttpOversizedBodyStatusTests"/>.
+    /// </summary>
+    protected virtual IngestionOptions ConfiguredIngestion => new();
+
     /// <summary>The per-run wwwroot, so a test can populate it after the host has started.</summary>
     public string WebRootPath { get; private set; } = "";
 
@@ -185,6 +204,9 @@ public class AmetoWebAppFactory : WebApplicationFactory<Program>
                     MaxAge       = TimeSpan.FromMinutes(60),
                 },
                 Retention = new RetentionConfig(),
+                Query     = ConfiguredQuery,
+                LiveTail  = ConfiguredLiveTail,
+                Ingestion = ConfiguredIngestion,
             };
 
             services.AddSingleton(opts);
@@ -243,13 +265,74 @@ public class AmetoWebAppFactory : WebApplicationFactory<Program>
         }
     }
 
+    /// <summary>
+    /// The engines that write under <see cref="_tempDir"/> while they are disposed (a final flush),
+    /// for every host this factory started. Each one's DisposeAsync hands every caller the same
+    /// teardown, so awaiting it waits for whichever chain is running it. They are captured when the
+    /// host starts because the container is gone by the time <see cref="Dispose(bool)"/> needs them.
+    /// </summary>
+    private readonly List<IAsyncDisposable> _dataDirectoryWriters = [];
+
+    /// <summary>
+    /// Bound on the wait for those teardowns. Each engine gives up on its own waits after its 30 s
+    /// shutdown budget, so only a hang reaches this. Past it, the directory is deleted anyway.
+    /// </summary>
+    private static readonly TimeSpan TeardownPatience = TimeSpan.FromSeconds(60);
+
+    protected override Microsoft.Extensions.Hosting.IHost CreateHost(Microsoft.Extensions.Hosting.IHostBuilder builder)
+    {
+        var host = base.CreateHost(builder);
+        lock (_seedGate)
+        {
+            if (host.Services.GetService<StorageEngine>() is { } storage)
+                _dataDirectoryWriters.Add(storage);
+            if (host.Services.GetService<Ameto.Metrics.Storage.MetricStorageEngine>() is { } metrics)
+                _dataDirectoryWriters.Add(metrics);
+        }
+        return host;
+    }
+
     protected override void Dispose(bool disposing)
     {
         base.Dispose(disposing);
-        if (disposing && Directory.Exists(_tempDir))
+        if (!disposing) return;
+
+        // Wait for the engines' teardown before deleting their directory. Two chains dispose a
+        // WebApplicationFactory host at once: this factory's chain, and app.Run()'s once
+        // ApplicationStopping wakes it. The container's disposal returns immediately to whichever
+        // chain arrives second. So base.Dispose can return while the OTHER chain is still inside
+        // StorageEngine's final flush, and deleting the directory under that flush logged
+        // "Segment flush failed ... DirectoryNotFoundException" (61 times in 12 full-suite runs).
+        //
+        // MetricStorageEngine is already torn down in its hosted service's StopAsync, which the
+        // factory's own stop awaits. It is listed anyway, so that stays covered if that changes.
+        // TraceStorageEngine is not listed: its Dispose is synchronous and returns at once to a
+        // second caller, so there is nothing to wait on.
+        WaitForDataDirectoryWriters();
+
+        if (Directory.Exists(_tempDir))
         {
             try { Directory.Delete(_tempDir, recursive: true); }
             catch { /* best-effort cleanup */ }
         }
+    }
+
+    private void WaitForDataDirectoryWriters()
+    {
+        IAsyncDisposable[] writers;
+        lock (_seedGate)
+        {
+            writers = [.. _dataDirectoryWriters];
+            _dataDirectoryWriters.Clear();
+        }
+        if (writers.Length == 0) return;
+
+        // Run on the pool rather than blocking the caller's synchronization context on a teardown
+        // that might have to resume on it. That happens only if this call is the one that starts
+        // the teardown.
+        var teardown = Task.Run(async () =>
+            await Task.WhenAll(writers.Select(static w => w.DisposeAsync().AsTask())).ConfigureAwait(false));
+        try { teardown.Wait(TeardownPatience); }
+        catch { /* a teardown that threw has still ended */ }
     }
 }

@@ -44,6 +44,11 @@ public sealed class QueryRequest
     public long?           AfterTimestampTicks { get; init; }
     /// <summary>Optional allow-list of log levels. Null = all levels.</summary>
     public HashSet<LogLevel>? Levels      { get; init; }
+    /// <summary>
+    /// <see cref="Filter"/> compiled ahead of time by a caller that reuses the request shape
+    /// across many executions (the live tail). Optional; see <see cref="IPreparedFilter"/>.
+    /// </summary>
+    public IPreparedFilter?   Prepared    { get; init; }
 }
 
 public enum QueryDirection

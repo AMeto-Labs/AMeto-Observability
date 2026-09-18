@@ -83,8 +83,14 @@ public sealed class RamPressureService : BackgroundService
                     // would flush its tier, force a blocking compacting gen2 and empty its
                     // working set every cooldown forever, no matter how little it held: a
                     // self-inflicted CPU-and-RSS sawtooth caused entirely by OTHER processes.
-                    long reclaimable = _storage.HotTierAllocatedBytes + gc.HeapSizeBytes;
-                    long floor       = Math.Max(64L * 1024 * 1024, _options.HotTier.MaxSizeBytes);
+                    // Off-heap only, deliberately: gc.HeapSizeBytes already counts the managed
+                    // half of what the shedders hold (decoded postings), so adding their total
+                    // would count it twice. The native half — segment bloom bits — is invisible
+                    // to every managed instrument in this method, which is precisely why this
+                    // guard used to weigh the process without it.
+                    long shedableNative = MemoryShedRegistry.ShedableNativeBytes;
+                    long reclaimable    = _storage.HotTierAllocatedBytes + gc.HeapSizeBytes + shedableNative;
+                    long floor          = Math.Max(64L * 1024 * 1024, _options.HotTier.MaxSizeBytes);
 
                     // A tier's worth of reclaimable memory is necessary but nowhere near
                     // sufficient on a host-wide reading: this server's managed heap alone
@@ -109,10 +115,18 @@ public sealed class RamPressureService : BackgroundService
                     }
                     else if (DateTimeOffset.UtcNow - lastFlush >= _cooldown)
                     {
+                        // Shed FIRST: the decoded postings this drops are garbage before the
+                        // collection below runs, and the native bloom bits are back with the
+                        // allocator immediately — no collection frees those, however aggressive.
+                        // Nothing else in the process can do it either: they belong to the
+                        // segment-index cache, in an assembly this one cannot reference.
+                        long shed = MemoryShedRegistry.Shed();
+
                         _logger.LogWarning(
                             "RAM pressure: system memory at {Pct}% (target {Target}%), " +
-                            "{Reclaimable} MB reclaimable. Flushing hot tier to release memory.",
-                            pct, _options.RamTargetPercent, reclaimable / MB);
+                            "{Reclaimable} MB reclaimable ({Native} MB of it off-heap). " +
+                            "Shed {Shed} MB of cached indexes; flushing hot tier to release memory.",
+                            pct, _options.RamTargetPercent, reclaimable / MB, shedableNative / MB, shed / MB);
 
                         await _storage.FlushHotTierAsync(stoppingToken);
 

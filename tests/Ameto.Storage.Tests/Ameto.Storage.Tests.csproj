@@ -6,6 +6,9 @@
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- ChildProcessEntry.Main replaces the test SDK's empty generated one, so a test can start
+         this assembly as a child process under a GC setting the test host cannot take on. -->
+    <GenerateProgramFile>false</GenerateProgramFile>
   </PropertyGroup>
 
   <ItemGroup>

@@ -69,7 +69,7 @@ public sealed class IndexCacheEquivalenceTests : IDisposable
     public void Dispose()
     {
         try { _engine.DisposeAsync().AsTask().GetAwaiter().GetResult(); } catch { }
-        try { Directory.Delete(_dir, true); } catch { }
+        QuerySegmentFixtures.DeleteDataDirectory(_dir);
     }
 
     private static async Task<List<long>> RunAsync(QueryExecutor q, string? filter, HashSet<LogLevel>? levels = null)
@@ -119,6 +119,35 @@ public sealed class IndexCacheEquivalenceTests : IDisposable
 
         // And the upgraded full entry now serves both shapes.
         Assert.Equal(eq, await RunAsync(_cached, "Customer = 'cust-3'"));
+    }
+
+    /// <summary>
+    /// Shedding the cache under RAM pressure is a memory decision and must never be a
+    /// correctness one. Pressure can empty it between queries — or, as here, while an executor
+    /// is live over the same segments — and everything after that must still return exactly what
+    /// the uncached executor returns, on the cold query that follows and on the hot one after it.
+    /// </summary>
+    [Fact]
+    public async Task Pressure_shedding_the_cache_does_not_change_any_result()
+    {
+        var expected = await RunAsync(_plain, "Customer = 'cust-3'");
+        Assert.Equal(expected, await RunAsync(_cached, "Customer = 'cust-3'"));
+        Assert.True(_cache.EntryCount > 0, "the query should have populated the cache");
+
+        long shed = _cache.Shed();
+
+        Assert.True(shed > 0, "a populated cache should have had bytes to give back");
+        Assert.Equal(0, _cache.EntryCount);
+        Assert.Equal(0L, _cache.TotalBytes);
+        Assert.Equal(0L, _cache.NativeBytes);
+
+        // Cold again — every section re-read and re-decoded — then hot again.
+        Assert.Equal(expected, await RunAsync(_cached, "Customer = 'cust-3'"));
+        Assert.Equal(expected, await RunAsync(_cached, "Customer = 'cust-3'"));
+
+        // And a shape that needs the trigram sections the shed also dropped.
+        Assert.Equal(await RunAsync(_plain,  "contains(@mt, 'shipped')"),
+                     await RunAsync(_cached, "contains(@mt, 'shipped')"));
     }
 
     [Fact]

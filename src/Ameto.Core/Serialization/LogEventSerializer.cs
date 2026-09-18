@@ -1,4 +1,5 @@
 using System.Buffers;
+using System.Buffers.Text;
 using System.Text;
 using MessagePack;
 
@@ -77,6 +78,263 @@ public static class LogEventSerializer
         }
 
         return count;
+    }
+
+    // ── Streaming batch read (no LogEvent per event) ─────────────────────────
+
+    /// <summary>
+    /// Receives one CLEF event straight off the wire — no <see cref="LogEvent"/>, no
+    /// strings except the structured exception. Every span points into the caller's body
+    /// buffer (or into per-thread scratch) and is valid only for the duration of the call.
+    /// </summary>
+    public interface IClefBatchSink
+    {
+        /// <returns>True when the event was ingested; false when it was dropped.</returns>
+        bool TryIngestClef(
+            long tsTicks,
+            byte level,
+            ReadOnlySpan<byte> templateUtf8,
+            ExceptionInfo? exception,
+            ReadOnlySpan<byte> msgpackProps,
+            ulong traceHi, ulong traceLo, ulong spanId,
+            ReadOnlySpan<byte> serviceUtf8);
+    }
+
+    // Second scratch for the streaming path: map header + raw pairs, contiguous, so the
+    // sink gets exactly the bytes DeserializeBatch would have put in RawProperties —
+    // without the per-event byte[] that array used to be.
+    [ThreadStatic] private static ArrayBufferWriter<byte>? _tPropsOut;
+
+    /// <summary>
+    /// Streaming counterpart of <see cref="DeserializeBatch"/>: walks the CLEF array and
+    /// hands each event to <paramref name="sink"/> as spans, with zero managed allocation
+    /// per event (the only exception is a structured <c>@x</c>, which has to be an object).
+    ///
+    /// <para>Takes contiguous memory, not a sequence: the ingest body is always one pooled
+    /// array, and contiguity is what lets every string be read as a span.</para>
+    ///
+    /// <para>A body that is not a CLEF array is rejected before any event is seen (the
+    /// array header is read first). A body that turns malformed PART WAY THROUGH throws
+    /// with the events before that point already handed to the sink — unlike the old
+    /// materialise-the-list-first read, which discarded the whole batch. Validating the
+    /// whole body up front to restore that costs a second full msgpack walk (measured at
+    /// roughly the price of the decode itself), and the events before the fault are
+    /// perfectly good ones the caller would otherwise throw away on a status the client
+    /// does not retry.</para>
+    /// </summary>
+    /// <returns>The number of events the sink accepted.</returns>
+    /// <remarks>
+    /// Any exception may escape. A malformed body throws whatever <c>MessagePackReader</c>
+    /// chooses (<c>MessagePackSerializationException</c>, <c>EndOfStreamException</c> and
+    /// <c>OverflowException</c> among them), and whatever the sink throws passes through. To
+    /// tell a bad body from a sink fault, use the <see cref="ClefBatchProgress"/> overload and
+    /// read <see cref="ClefBatchProgress.InSink"/> — never a list of exception types.
+    /// </remarks>
+    public static int StreamBatch(ReadOnlyMemory<byte> body, IClefBatchSink sink, out int dropped)
+    {
+        var progress = default(ClefBatchProgress);
+        StreamBatch(body, sink, ref progress);
+        dropped = progress.Dropped;
+        return progress.Ingested;
+    }
+
+    /// <summary>
+    /// How far a batch got. A struct passed by ref, so the counts SURVIVE the exception a
+    /// malformed element throws — the caller needs them: events already handed to the sink
+    /// are in the ring and their drainer still has to be woken, and an operator reading the
+    /// 400 needs to know that some of the batch landed, and where it stopped.
+    /// </summary>
+    public struct ClefBatchProgress
+    {
+        /// <summary>Events the sink accepted.</summary>
+        public int Ingested;
+        /// <summary>Events the sink refused (oversized, or back-pressure).</summary>
+        public int Dropped;
+        /// <summary>
+        /// Index of the element being read — where a throw happened, if one did. -1 while the
+        /// array header itself is being read, so a body that is not a CLEF array at all is not
+        /// reported the same as one that failed inside element 0.
+        /// </summary>
+        public int ElementIndex;
+        /// <summary>Elements the array header declared. Zero until the header is read.</summary>
+        public int ElementCount;
+        /// <summary>
+        /// True for exactly the duration of the sink call, and left true when the sink throws.
+        /// That is how a caller tells whose fault a throw was WITHOUT listing exception types:
+        /// set, it came from the sink (the server's side — ring, pool, logger, shutdown); clear,
+        /// it came from reading the body, whatever MessagePackReader chose to throw for it.
+        /// </summary>
+        public bool InSink;
+    }
+
+    /// <summary>
+    /// As <see cref="StreamBatch(ReadOnlyMemory{byte}, IClefBatchSink, out int)"/>, but
+    /// reporting progress through <paramref name="progress"/> so the counts — and
+    /// <see cref="ClefBatchProgress.InSink"/> — are readable after a throw.
+    /// </summary>
+    /// <remarks>
+    /// Any exception may escape, exactly as on the counting overload: a malformed body throws
+    /// whatever <c>MessagePackReader</c> chooses, and whatever the sink throws passes through.
+    /// This overload returns nothing — what the batch achieved is in <paramref name="progress"/>,
+    /// and <see cref="ClefBatchProgress.InSink"/> is what says whose fault a throw was.
+    /// </remarks>
+    // No whole-method <inheritdoc> here: it pulled the other overload's <returns> onto a void
+    // method, and its remark "use the ClefBatchProgress overload" onto the overload that IS one.
+    public static void StreamBatch(ReadOnlyMemory<byte> body, IClefBatchSink sink, ref ClefBatchProgress progress)
+    {
+        var reader = new MessagePackReader(body);
+        progress.ElementIndex = -1;   // the header read below is not "element 0"
+        progress.ElementCount = reader.ReadArrayHeader();
+
+        for (int i = 0; i < progress.ElementCount; i++)
+        {
+            progress.ElementIndex = i;
+            if (StreamEvent(ref reader, sink, ref progress)) progress.Ingested++;
+            else                                             progress.Dropped++;
+        }
+    }
+
+    private static bool StreamEvent(ref MessagePackReader reader, IClefBatchSink sink, ref ClefBatchProgress progress)
+    {
+        var sourceSequence = reader.Sequence;
+        int mapCount       = reader.ReadMapHeader();
+
+        ReadOnlySpan<byte> tsUtf8    = default;
+        ReadOnlySpan<byte> tmplUtf8  = default;
+        ReadOnlySpan<byte> levelUtf8 = default;
+        ReadOnlySpan<byte> msgUtf8   = default;   // CLEF @m — template fallback only
+        ReadOnlySpan<byte> svcUtf8   = default;
+        ExceptionInfo? exception     = null;
+        ulong traceIdHi = 0, traceIdLo = 0, spanId = 0;
+
+        ArrayBufferWriter<byte>? rawPropsBuf = null;
+        int                      rawPropsCount = 0;
+
+        for (int i = 0; i < mapCount; i++)
+        {
+            SequencePosition pairStart = reader.Position;
+
+            ClefField field = reader.TryReadStringSpan(out ReadOnlySpan<byte> keySpan)
+                ? ClassifyKey(keySpan)
+                : ClassifyKey(reader.ReadString()); // rare: nil / non-contiguous key
+
+            switch (field)
+            {
+                case ClefField.Timestamp:       tsUtf8    = ReadUtf8Value(ref reader); break;
+                case ClefField.MessageTemplate: tmplUtf8  = ReadUtf8Value(ref reader); break;
+                case ClefField.Level:           levelUtf8 = ReadUtf8Value(ref reader); break;
+                case ClefField.Message:         msgUtf8   = ReadUtf8Value(ref reader); break;
+                case ClefField.ServiceName:     svcUtf8   = ReadUtf8Value(ref reader); break;
+                case ClefField.Exception:
+                    exception = ExceptionInfo.Read(ref reader);
+                    break;
+                case ClefField.TraceId:
+                    TraceIdHelper.TryParseTraceId(ReadUtf8Value(ref reader), out traceIdHi, out traceIdLo);
+                    break;
+                case ClefField.SpanId:
+                    TraceIdHelper.TryParseSpanId(ReadUtf8Value(ref reader), out spanId);
+                    break;
+                default:
+                    // Unrecognised key: copy the (key, value) pair verbatim — the bytes that
+                    // end up in the ring must be identical to the non-streaming path's.
+                    reader.Skip();
+                    SequencePosition pairEnd = reader.Position;
+                    if (rawPropsBuf is null)
+                    {
+                        rawPropsBuf = _tRawPairs ??= new ArrayBufferWriter<byte>(256);
+                        rawPropsBuf.ResetWrittenCount();
+                    }
+                    foreach (var segment in sourceSequence.Slice(pairStart, pairEnd))
+                        rawPropsBuf.Write(segment.Span);
+                    rawPropsCount++;
+                    break;
+            }
+        }
+
+        LogLevel level = LogLevel.Information;
+        if (!levelUtf8.IsEmpty)
+            TryParseLevelUtf8(levelUtf8, out level);
+
+        long tsTicks = TryParseTimestampUtf8(tsUtf8, out DateTimeOffset parsed)
+            ? parsed.UtcTicks
+            : DateTimeOffset.UtcNow.UtcTicks;
+
+        // header(N) + raw pairs, contiguous in per-thread scratch — no per-event byte[].
+        ReadOnlySpan<byte> props = default;
+        if (rawPropsBuf is not null && rawPropsCount > 0)
+        {
+            var outBuf = _tPropsOut ??= new ArrayBufferWriter<byte>(512);
+            outBuf.ResetWrittenCount();
+            var hw = new MessagePackWriter(outBuf);
+            hw.WriteMapHeader(rawPropsCount);
+            hw.Flush();
+            outBuf.Write(rawPropsBuf.WrittenSpan);
+            props = outBuf.WrittenSpan;
+        }
+
+        // CLEF @m fallback: a client that sent only a rendered message gets it as template.
+        ReadOnlySpan<byte> template = tmplUtf8.IsEmpty ? msgUtf8 : tmplUtf8;
+
+        // Every read of the body is behind us: from here to the end of the call, a throw is the
+        // sink's. Deliberately not cleared in a finally — the caller reads the flag AFTER the
+        // exception, and a sink fault must still say so there.
+        progress.InSink = true;
+        bool accepted = sink.TryIngestClef(
+            tsTicks, (byte)level, template, exception, props,
+            traceIdHi, traceIdLo, spanId, svcUtf8);
+        progress.InSink = false;
+        return accepted;
+    }
+
+    /// <summary>
+    /// Reads a string value as raw UTF-8 with no allocation. Nil yields an empty span
+    /// (matching <c>ReadString()</c> returning null); a non-string value throws, exactly as
+    /// <c>ReadString()</c> does, so a malformed field still rejects the batch.
+    /// </summary>
+    private static ReadOnlySpan<byte> ReadUtf8Value(scoped ref MessagePackReader reader)
+    {
+        if (reader.TryReadStringSpan(out ReadOnlySpan<byte> span)) return span;
+        // Nil, or a truncated string (Skip then throws — the batch is rejected). A string
+        // spanning segments cannot occur: StreamBatch reads from contiguous memory.
+        reader.Skip();
+        return default;
+    }
+
+    /// <summary>UTF-8 twin of <see cref="LogLevelExtensions.TryParse(ReadOnlySpan{char}, out LogLevel)"/>.</summary>
+    private static bool TryParseLevelUtf8(ReadOnlySpan<byte> value, out LogLevel level)
+    {
+        if (Ascii.EqualsIgnoreCase(value, "Verbose"u8))     { level = LogLevel.Verbose;     return true; }
+        if (Ascii.EqualsIgnoreCase(value, "Debug"u8))       { level = LogLevel.Debug;       return true; }
+        if (Ascii.EqualsIgnoreCase(value, "Information"u8)) { level = LogLevel.Information; return true; }
+        if (Ascii.EqualsIgnoreCase(value, "Info"u8))        { level = LogLevel.Information; return true; }
+        if (Ascii.EqualsIgnoreCase(value, "Warning"u8))     { level = LogLevel.Warning;     return true; }
+        if (Ascii.EqualsIgnoreCase(value, "Warn"u8))        { level = LogLevel.Warning;     return true; }
+        if (Ascii.EqualsIgnoreCase(value, "Error"u8))       { level = LogLevel.Error;       return true; }
+        if (Ascii.EqualsIgnoreCase(value, "Fatal"u8))       { level = LogLevel.Fatal;       return true; }
+        level = LogLevel.Information;
+        return false;
+    }
+
+    /// <summary>
+    /// Parses a CLEF <c>@t</c> straight from UTF-8. The round-trip ("O") shape that every
+    /// .NET client emits goes through <see cref="Utf8Parser"/> — no string, no culture
+    /// machinery, ~10x cheaper than the general parser. Anything else (notably the 3-digit
+    /// fractional seconds other Seq clients send) falls back to the exact call the
+    /// non-streaming path makes, so the set of accepted inputs is unchanged.
+    /// </summary>
+    private static bool TryParseTimestampUtf8(ReadOnlySpan<byte> value, out DateTimeOffset result)
+    {
+        if (value.IsEmpty) { result = default; return false; }
+
+        if (Utf8Parser.TryParse(value, out result, out int consumed, 'O') && consumed == value.Length)
+            return true;
+
+        // Non-"O" shape: decode and use the general parser, which is what the batch path
+        // has always used. Short and rare, so the transient string is acceptable.
+        Span<char> chars = value.Length <= 64 ? stackalloc char[64] : new char[value.Length];
+        int written = Encoding.UTF8.GetChars(value, chars);
+        return DateTimeOffset.TryParse(
+            chars[..written], null, System.Globalization.DateTimeStyles.RoundtripKind, out result);
     }
 
 
@@ -382,20 +640,77 @@ public static class LogEventSerializer
     /// </summary>
     /// <returns>True when the key was present; <paramref name="value"/> is then its decoded value.</returns>
     public static bool TryReadProperty(ReadOnlyMemory<byte> map, ReadOnlySpan<char> key, out object? value)
-        => Probe(map, key, decode: true, out value, out _);
+        => Probe(map, key, ProbeWant.Decode, out value, out _, default, out _, out _, out _);
 
     /// <summary>
     /// Presence of a key WITHOUT decoding its value — used where only "is there anything
     /// under this name" matters, so a nested subtree is never built just to be discarded.
     /// </summary>
     public static bool HasProperty(ReadOnlyMemory<byte> map, ReadOnlySpan<char> key, out bool isNil)
-        => Probe(map, key, decode: false, out _, out isNil);
+        => Probe(map, key, ProbeWant.Presence, out _, out isNil, default, out _, out _, out _);
+
+    /// <summary>
+    /// A string-valued property decoded straight into the CALLER'S buffer — no string, no box,
+    /// nothing on the heap at all.
+    ///
+    /// <para>This is what a text predicate wants per scanned event. <see cref="TryReadProperty"/>
+    /// already avoided building the whole map, but it still handed back <c>object?</c>, so every
+    /// candidate event a <c>like '%…%'</c> touched allocated one string for the value and threw
+    /// it away — ~62 B per event, per predicate, on a scan that evaluates hundreds of thousands
+    /// of them to return a few hundred rows.</para>
+    ///
+    /// <para>Deliberately narrow. It answers only for a top-level key whose value is a msgpack
+    /// STRING that fits <paramref name="destination"/>; an array, a nested map, a number and an
+    /// over-long value all return false with <paramref name="keyPresent"/> telling the caller
+    /// which it was, so the caller can fall back to the general road for the first three and
+    /// stop immediately for a key the event does not carry. The last-wins duplicate-key rule is
+    /// the one walk below, shared with every other probe, so the two can never disagree.</para>
+    /// </summary>
+    /// <param name="destination">Buffer the value's UTF-16 characters are written into.</param>
+    /// <param name="charsWritten">Length of the value in <paramref name="destination"/>.</param>
+    /// <param name="keyPresent">
+    /// True when the key WAS on the event, whatever its value turned out to be. False is a
+    /// positive statement — this event does not carry the key — so a caller that has already
+    /// established the key is a plain top-level name needs no second lookup to answer null.
+    /// </param>
+    public static bool TryReadPropertyText(
+        ReadOnlyMemory<byte> map, ReadOnlySpan<char> key,
+        Span<char> destination, out int charsWritten, out bool keyPresent)
+        => Probe(map, key, ProbeWant.Text, out _, out _, destination, out charsWritten, out _, out keyPresent);
+
+    /// <summary>
+    /// A numeric property as a <see cref="double"/> without the box <see cref="TryReadProperty"/>
+    /// would hand back. Integers, unsigned integers and floats all answer; anything else returns
+    /// false and leaves the caller on the general road.
+    /// </summary>
+    /// <param name="keyPresent">As for <see cref="TryReadPropertyText"/>.</param>
+    public static bool TryReadPropertyNumber(
+        ReadOnlyMemory<byte> map, ReadOnlySpan<char> key, out double number, out bool keyPresent)
+        => Probe(map, key, ProbeWant.Number, out _, out _, default, out _, out number, out keyPresent);
+
+    /// <summary>What the caller wants out of the one walk below.</summary>
+    private enum ProbeWant : byte
+    {
+        /// <summary>Is the key there at all (and is its value nil)?</summary>
+        Presence,
+        /// <summary>Decode the value to <c>object?</c>, boxing as the dictionary would.</summary>
+        Decode,
+        /// <summary>Write a string value into the caller's char buffer.</summary>
+        Text,
+        /// <summary>Read a numeric value as a double.</summary>
+        Number,
+    }
 
     private static bool Probe(
-        ReadOnlyMemory<byte> map, ReadOnlySpan<char> key, bool decode, out object? value, out bool isNil)
+        ReadOnlyMemory<byte> map, ReadOnlySpan<char> key, ProbeWant want,
+        out object? value, out bool isNil,
+        Span<char> destination, out int charsWritten, out double number, out bool keyPresent)
     {
-        value = null;
-        isNil = false;
+        value        = null;
+        isNil        = false;
+        charsWritten = 0;
+        number       = 0;
+        keyPresent   = false;
         if (map.IsEmpty) return false;
 
         int byteCount = Encoding.UTF8.GetByteCount(key);
@@ -443,8 +758,64 @@ public static class LogEventSerializer
 
             if (found)
             {
-                if (decode) value = ReadDynamic(ref hit);
-                return true;
+                keyPresent = true;
+                switch (want)
+                {
+                    case ProbeWant.Decode:
+                        value = ReadDynamic(ref hit);
+                        return true;
+
+                    case ProbeWant.Text:
+                        // Only a msgpack string answers here, and only when it fits. Anything
+                        // else leaves keyPresent true and the result false, which is the
+                        // caller's signal to take the general road rather than to conclude the
+                        // event has no such property.
+                        if (hit.NextMessagePackType != MessagePackType.String) return false;
+                        if (!hit.TryReadStringSpan(out ReadOnlySpan<byte> utf8))
+                        {
+                            // Defensive: properties arrive as one contiguous buffer, so a value
+                            // that spans segments does not occur here. Hand it to the caller's
+                            // fallback rather than growing a second decode path for it.
+                            return false;
+                        }
+                        // ONE pass, not two: GetCharCount followed by GetChars walks the bytes
+                        // twice to answer a question the transcode answers on its own. Utf8
+                        // .ToUtf16 reports DestinationTooSmall instead, which is the "it does
+                        // not fit, use the general road" answer this method already owes its
+                        // caller. Nothing is written into `destination` that the caller can
+                        // see, because a false return means charsWritten stays 0.
+                        var status = System.Text.Unicode.Utf8.ToUtf16(
+                            utf8, destination, out _, out int chars, replaceInvalidSequences: true);
+                        if (status != System.Buffers.OperationStatus.Done) return false;
+                        charsWritten = chars;
+                        return true;
+
+                    case ProbeWant.Number:
+                        switch (hit.NextMessagePackType)
+                        {
+                            case MessagePackType.Integer:
+                                // Mirrors ReadInteger: only a true uint64 above long.MaxValue
+                                // is read unsigned, so the value is the one the boxing road
+                                // would have produced, converted the same way.
+                                if (hit.NextCode == MessagePackCode.UInt64)
+                                {
+                                    ulong u = hit.ReadUInt64();
+                                    number = u <= (ulong)long.MaxValue ? (long)u : u;
+                                }
+                                else number = hit.ReadInt64();
+                                return true;
+
+                            case MessagePackType.Float:
+                                number = hit.ReadDouble();
+                                return true;
+
+                            default:
+                                return false;
+                        }
+
+                    default:                       // ProbeWant.Presence
+                        return true;
+                }
             }
         }
         catch { /* malformed map — same answer as the full deserialiser: nothing */ }

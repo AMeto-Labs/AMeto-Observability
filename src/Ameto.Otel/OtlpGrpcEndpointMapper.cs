@@ -7,6 +7,7 @@ using System.Buffers;
 using Ameto.Ingestion;
 using Ameto.Metrics;
 using Ameto.Tracing;
+using Ameto.Core;
 
 namespace Ameto.Otel;
 
@@ -43,10 +44,8 @@ public static class OtlpGrpcEndpointMapper
         app.MapPost("/opentelemetry.proto.collector.logs.v1.LogsService/Export",
             (HttpContext ctx) => HandleAsync(ctx, ApiKeyPermissions.Logs, static (c, msg) =>
             {
-                var request = OtlpProtoDecoder.DecodeLogs(msg.Array!, msg.Offset + msg.Count);
-                if (request is null) return (false, 0, null);
-                var events = OtlpLogMapper.Map(request, Ameto.Core.NodeId.Local.Value);
-                var (_, dropped) = c.RequestServices.GetRequiredService<IngestionEndpoint>().IngestEvents(events);
+                var (_, dropped) = OtlpLogProtoParser.Parse(
+                    msg.AsSpan(), c.RequestServices.GetRequiredService<IngestionEndpoint>());
                 return (true, dropped, BufferFullReason);
             }));
 
@@ -61,7 +60,7 @@ public static class OtlpGrpcEndpointMapper
                     c.RequestServices.GetRequiredService<ISpanIngester>()
                      .TryIngest(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(spans), out int accepted);
                     return (true, spans.Count - accepted, BufferFullReason);
-                }));
+                }, decodeReadsFromZero: true));
 
         if (enableMetrics)
             app.MapPost("/opentelemetry.proto.collector.metrics.v1.MetricsService/Export",
@@ -78,10 +77,17 @@ public static class OtlpGrpcEndpointMapper
     /// The shape every Export call shares: check the content type, check the key, unframe, hand
     /// the protobuf to that signal's own decoder, and answer in trailers.
     /// </summary>
+    /// <param name="decodeReadsFromZero">
+    /// True only for the one decoder left that takes (buffer, length) and reads from index 0 —
+    /// the trace DOM decoder. An uncompressed message sits five bytes into the request buffer,
+    /// so for that one the message is memmoved down to the start first. The span parsers take
+    /// the segment where it lies and pay nothing, which on a megabyte batch is the copy itself.
+    /// </param>
     private static async Task HandleAsync(
         HttpContext ctx,
         ApiKeyPermissions required,
-        Func<HttpContext, ArraySegment<byte>, (bool Ok, int Rejected, string? Why)> decode)
+        Func<HttpContext, ArraySegment<byte>, (bool Ok, int Rejected, string? Why)> decode,
+        bool decodeReadsFromZero = false)
     {
         // Committed up front: gRPC needs the headers out before trailers can be written, and a
         // client that never sees 200 + application/grpc treats the call as a transport failure
@@ -128,7 +134,7 @@ public static class OtlpGrpcEndpointMapper
         {
             int maxBytes = ctx.RequestServices.GetRequiredService<Ameto.Core.ServerOptions>().Ingestion.MaxOtlpBatchBytes;
             string? encoding = ctx.Request.Headers["grpc-encoding"];
-            var unframed = OtlpGrpcFraming.TryUnframe(body.AsSpan(0, bodyLen), encoding, maxBytes,
+            var unframed = OtlpGrpcFraming.TryUnframe(body.AsMemory(0, bodyLen), encoding, maxBytes,
                                                       out var message, out inflated, out int inflatedLen);
             if (unframed != UnframeResult.Ok)
             {
@@ -156,19 +162,7 @@ public static class OtlpGrpcEndpointMapper
                 return;
             }
 
-            // The decoders take (buffer, length) and read from index 0, so an uncompressed
-            // message — which sits five bytes into the request buffer — is copied down rather
-            // than handed over at an offset they would misread.
-            ArraySegment<byte> segment;
-            if (inflated is not null)
-            {
-                segment = new ArraySegment<byte>(inflated, 0, inflatedLen);
-            }
-            else
-            {
-                body.AsSpan(OtlpGrpcFraming.HeaderBytes, message.Length).CopyTo(body);
-                segment = new ArraySegment<byte>(body, 0, message.Length);
-            }
+            var segment = MessageSegment(body, message.Length, inflated, inflatedLen, decodeReadsFromZero);
 
             bool ok;
             int rejected;
@@ -202,9 +196,36 @@ public static class OtlpGrpcEndpointMapper
         }
         finally
         {
-            ArrayPool<byte>.Shared.Return(body);
-            if (inflated is not null) ArrayPool<byte>.Shared.Return(inflated);
+            IngestBufferPool.Return(body);
+            if (inflated is not null) IngestBufferPool.Return(inflated);
         }
+    }
+
+    /// <summary>
+    /// Where the decoder should read the request message from.
+    ///
+    /// <para>An inflated message is already alone in its own buffer. An uncompressed one sits
+    /// five bytes into the request buffer, behind the frame header — which is fine for the span
+    /// parsers, and wrong for the one decoder left that takes (buffer, length) and reads from
+    /// index 0, so for that one the message is memmoved down first. Getting this backwards
+    /// feeds a decoder five bytes of frame header and then truncates the tail, which on
+    /// protobuf is not a parse error: it is a silently short batch.</para>
+    ///
+    /// <para>Internal so it can be tested without a host; <c>OtlpGrpcMessageSegmentTests</c>
+    /// runs each signal's real decoder over what this returns.</para>
+    /// </summary>
+    internal static ArraySegment<byte> MessageSegment(
+        byte[] body, int messageLength, byte[]? inflated, int inflatedLength, bool decodeReadsFromZero)
+    {
+        if (inflated is not null) return new ArraySegment<byte>(inflated, 0, inflatedLength);
+
+        if (decodeReadsFromZero)
+        {
+            body.AsSpan(OtlpGrpcFraming.HeaderBytes, messageLength).CopyTo(body);
+            return new ArraySegment<byte>(body, 0, messageLength);
+        }
+
+        return new ArraySegment<byte>(body, OtlpGrpcFraming.HeaderBytes, messageLength);
     }
 
     private static async Task WriteMessageAsync(HttpContext ctx, byte[] message)
@@ -248,44 +269,18 @@ public static class OtlpGrpcEndpointMapper
         return key is not null && validator.Validate(key.AsSpan(), required);
     }
 
-    private static async ValueTask<(byte[]? Buffer, int Length)> ReadBodyAsync(HttpContext ctx)
-    {
-        int maxBytes = ctx.RequestServices.GetRequiredService<Ameto.Core.ServerOptions>().Ingestion.MaxOtlpBatchBytes;
-
-        long? declared = ctx.Request.ContentLength;
-        if (declared > maxBytes) return (null, 0);
-
-        // HTTP/2 rarely declares a length, so the usual path here is grow-by-doubling from
-        // 64 KiB rather than the exact-size rent the HTTP receivers normally get.
-        int initial = declared.HasValue ? (int)declared.Value : 65_536;
-        byte[] buf = ArrayPool<byte>.Shared.Rent(Math.Max(initial, 256));
-        int total = 0;
-        try
-        {
-            while (true)
-            {
-                if (total == buf.Length)
-                {
-                    var bigger = ArrayPool<byte>.Shared.Rent(buf.Length * 2);
-                    buf.AsSpan(0, total).CopyTo(bigger);
-                    ArrayPool<byte>.Shared.Return(buf);
-                    buf = bigger;
-                }
-                int read = await ctx.Request.Body.ReadAsync(buf.AsMemory(total), ctx.RequestAborted);
-                if (read == 0) break;
-                total += read;
-                if (total > maxBytes) { ArrayPool<byte>.Shared.Return(buf); return (null, 0); }
-            }
-        }
-        catch
-        {
-            // A reset stream, a client deadline, a dropped connection. Without this the rented
-            // array is simply dropped: not a leak, but a permanent withdrawal from the pool the
-            // CLEF path, the HTTP OTLP path and storage all share — and a collector timing out
-            // mid-upload is an everyday event, not an exceptional one.
-            ArrayPool<byte>.Shared.Return(buf);
-            throw;
-        }
-        return (buf, total);
-    }
+    /// <summary>
+    /// Reads the full request body into a buffer from <see cref="IngestBufferPool"/> — the same
+    /// <see cref="OtlpBodyReader"/> the HTTP receivers read through, including its rule that a
+    /// body over <c>Ingestion.MaxOtlpBatchBytes</c> is never given a buffer past that ceiling.
+    /// HTTP/2 rarely declares a length, so the usual path here is grow-by-doubling from 64 KiB
+    /// rather than the exact-size rent a declared body gets.
+    ///
+    /// <para>Null means the batch is over the limit; the caller answers RESOURCE_EXHAUSTED,
+    /// because a status code would go unread on a gRPC call. On success the caller owns the
+    /// buffer and returns it in a finally.</para>
+    /// </summary>
+    private static ValueTask<(byte[]? Buffer, int Length)> ReadBodyAsync(HttpContext ctx)
+        => OtlpBodyReader.ReadAsync(
+            ctx, ctx.RequestServices.GetRequiredService<Ameto.Core.ServerOptions>().Ingestion.MaxOtlpBatchBytes);
 }

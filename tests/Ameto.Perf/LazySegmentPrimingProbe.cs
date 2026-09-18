@@ -60,6 +60,77 @@ public sealed class LazySegmentPrimingProbe : IAsyncLifetime
             $"a 5-event page still costs like a full read: {small} B vs {full} B — lazy priming is not working");
     }
 
+    /// <summary>
+    /// OPENS PER QUERY, over the same 40 segments. A filter that survives every segment's
+    /// prefilter used to map each survivor TWICE — once to read its index sections, once to
+    /// read its blocks — and the second mapping is the one lazy priming was supposed to have
+    /// avoided. The prefilter's reader is handed to the scan now.
+    ///
+    /// <para>Reported per query and per SURVIVING segment; the count is what the assertion is
+    /// about, so unlike the allocation ratio above it is exact.</para>
+    /// </summary>
+    [Fact]
+    public async Task AFilteredPageMapsEachSurvivingSegmentOnce()
+    {
+        const string Filter = "@mt like '%evt%'";   // every segment holds it: all 40 survive
+
+        await FilteredPageAsync(5);                 // warm
+
+        long b0 = SegmentReader.Opens;
+        var page = await FilteredPageAsync(5);
+        long pageOpens = SegmentReader.Opens - b0;
+
+        long b1 = SegmentReader.Opens;
+        var all = await FilteredPageAsync(Segments * EventsPerSeg);
+        long fullOpens = SegmentReader.Opens - b1;
+
+        Assert.Equal(5, page.Count);
+        Assert.Equal(Segments * EventsPerSeg, all.Count);
+
+        _out.WriteLine($"{Segments} segments, filter {Filter}");
+        _out.WriteLine($"page of 5 : {pageOpens} opens");
+        _out.WriteLine($"full read : {fullOpens} opens");
+
+        // The prefilter maps every segment once; the scan borrows. Nothing is mapped twice,
+        // however much of the catalog the query ends up draining.
+        Assert.Equal(Segments, fullOpens);
+        Assert.Equal(Segments, pageOpens);
+
+        // …AND EVERY ONE OF THEM IS CLOSED. This is the half a single-segment test cannot
+        // reach: a page of 5 primes one or two of the 40, so ~38 readers were opened by the
+        // prefilter, handed to a scan that never ran, and have no iterator to close them —
+        // only the merge's finally does. On Windows a mapping keeps the file undeletable, and
+        // retention and the merge delete segments while queries run, so an escaped reader here
+        // is not a leak that shows up as memory, it is a file that never goes away.
+        //
+        // COUNTED, not renamed. A rename is the honest end-to-end question ("can retention
+        // delete this?") but it answers it for the wrong reason as soon as a collection runs:
+        // a leaked reader is unreachable, so the finaliser behind MemoryMappedFile releases
+        // the handle and the rename succeeds over a bug that is really there. Closes against
+        // Opens is the same claim without the GC in it.
+        long o0 = SegmentReader.Opens, c0 = SegmentReader.Closes;
+        await FilteredPageAsync(5);
+        long opened = SegmentReader.Opens - o0, closed = SegmentReader.Closes - c0;
+
+        _out.WriteLine($"page of 5 : {opened} opened, {closed} closed");
+        Assert.Equal(Segments, opened);
+        Assert.Equal(opened, closed);
+
+        // Belt and braces, and the operation the merge's source cleanup actually needs.
+        var files = _engine.ListSegments().Select(s => s.FilePath).ToArray();
+        Assert.Equal(Segments, files.Length);
+        foreach (var path in files)
+        {
+            string moved = path + ".moved";
+            File.Move(path, moved);      // throws IOException if anything still holds it
+            File.Move(moved, path);
+        }
+        _out.WriteLine($"all {files.Length} segment files renameable — no reader outlived the query");
+
+        Task<List<LogEvent>> FilteredPageAsync(int count) =>
+            QuerySegmentFixtures.RunAsync(_query, Filter, count);
+    }
+
     private Task<List<LogEvent>> PageAsync(int count) =>
         QuerySegmentFixtures.RunAsync(_query, null, count);
 }

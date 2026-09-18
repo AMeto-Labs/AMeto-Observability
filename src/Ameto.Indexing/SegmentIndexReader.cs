@@ -28,10 +28,29 @@ public sealed class SegmentIndexReader : ISegmentIndex, IDisposable
         _inverted = inverted;
         _trigram  = trigram;
         _bloom    = bloom;
+        ApproxNativeBytes   = bloom.RetainedBytes;
         ApproxRetainedBytes = inverted.ApproxRetainedBytes()
                             + trigram.ApproxRetainedBytes()
-                            + bloom.RetainedBytes;
+                            + ApproxNativeBytes;
     }
+
+    /// <summary>
+    /// The part of <see cref="ApproxRetainedBytes"/> that is NOT on the managed heap: the bloom
+    /// filter's bits, held in <c>NativeMemory</c> and freed only by <see cref="Dispose"/>.
+    ///
+    /// <para>Reported apart from the total because the two are bounded by different limits and
+    /// reclaimed by different means. No collection frees these bytes, and they do not count
+    /// against the GC's hard limit — which is what made charging them silently against a
+    /// managed-heap-derived cache budget wrong. Measured by <c>BloomSizingProbe</c> at 4.1 % of a
+    /// prop-dense group's retained entry and 8.3 % of a thin one's: a real share, not a rounding
+    /// error — and not the 15.6-26.6 % those same shapes' packed SECTIONS give, because
+    /// <see cref="ApproxRetainedBytes"/> expands the inverted and trigram halves 3-4x and leaves
+    /// these bits exactly as they were on disk.</para>
+    /// </summary>
+    public long ApproxNativeBytes { get; }
+
+    /// <summary>The managed part: decoded postings, dictionaries and their strings.</summary>
+    public long ApproxManagedBytes => ApproxRetainedBytes - ApproxNativeBytes;
 
     /// <summary>
     /// Approximate bytes this reader keeps alive (decoded postings + dictionaries + the

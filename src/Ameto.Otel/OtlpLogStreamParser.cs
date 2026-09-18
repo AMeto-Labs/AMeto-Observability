@@ -29,6 +29,14 @@ public static class OtlpLogStreamParser
     [ThreadStatic] private static ArrayBufferWriter<byte>? _tRes;
     [ThreadStatic] private static ArrayBufferWriter<byte>? _tRec;
     [ThreadStatic] private static ArrayBufferWriter<byte>? _tOut;
+    [ThreadStatic] private static byte[]? _tEsc;
+
+    /// <summary>
+    /// Unescape scratch for one attribute value. Long enough that a message, a path or a stack
+    /// frame fits — the values that carry escapes at all — so the pool fallback below is for the
+    /// genuinely large ones only. One array per request thread, so its size costs nothing.
+    /// </summary>
+    private const int UnescapeScratchBytes = 1024;
 
     public static (int Ingested, int Dropped) Parse(ReadOnlySpan<byte> json, IOtlpLogSink sink)
     {
@@ -38,7 +46,7 @@ public static class OtlpLogStreamParser
         var resBuf = _tRes ??= new ArrayBufferWriter<byte>(4096);   // resource attrs (msgpack KV pairs)
         var recBuf = _tRec ??= new ArrayBufferWriter<byte>(8192);   // record attrs + @tr/@sp (msgpack KV pairs)
         var outBuf = _tOut ??= new ArrayBufferWriter<byte>(8192);   // assembled map: header + resBuf + recBuf
-        resBuf.Clear(); recBuf.Clear(); outBuf.Clear();
+        resBuf.ResetWrittenCount(); recBuf.ResetWrittenCount(); outBuf.ResetWrittenCount();
         byte[] svcBuf  = ArrayPool<byte>.Shared.Rent(256);   // captured service.name bytes (per resource)
         byte[] tmplBuf = ArrayPool<byte>.Shared.Rent(4096);  // captured body/template bytes (per record)
         byte[] trBuf   = ArrayPool<byte>.Shared.Rent(32);    // traceId bytes (per record)
@@ -66,11 +74,16 @@ public static class OtlpLogStreamParser
                 }
             }
 
-            if (ingested > 0) sink.NotifyBatchEnqueued();
             return (ingested, dropped);
         }
         finally
         {
+            // IN A FINALLY for the reason the protobuf parser states: this parser ingests as
+            // it walks, so a malformed tail throws out of the reader with the prefix already
+            // in the ring. The caller answers 400 and never returns here, leaving those events
+            // to wait out the drain loop's 1 s missed-signal timeout.
+            if (ingested > 0) sink.NotifyBatchEnqueued();
+
             ArrayPool<byte>.Shared.Return(svcBuf);
             ArrayPool<byte>.Shared.Return(tmplBuf);
             ArrayPool<byte>.Shared.Return(trBuf);
@@ -87,9 +100,12 @@ public static class OtlpLogStreamParser
     {
         if (reader.TokenType != JsonTokenType.StartObject) { reader.Skip(); return; }
 
-        resBuf.Clear();
+        resBuf.ResetWrittenCount();
         int resKeyCount = 0;
         int svcLen      = 0; // >0 ⇒ service.name captured in svcBuf
+        // The service name is a property of THIS resource, shared by every record under it:
+        // intern it once here instead of re-hashing the same bytes per record.
+        int svcIdx      = -1;
 
         while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
         {
@@ -98,7 +114,10 @@ public static class OtlpLogStreamParser
             if (reader.ValueTextEquals("resource"u8))
             {
                 if (reader.Read() && reader.TokenType == JsonTokenType.StartObject)
+                {
                     ParseResourceAttributes(ref reader, resBuf, ref resKeyCount, svcBuf, ref svcLen);
+                    svcIdx = svcLen > 0 ? sink.InternService(svcBuf.AsSpan(0, svcLen)) : -1;
+                }
                 else
                     reader.Skip();
             }
@@ -107,7 +126,7 @@ public static class OtlpLogStreamParser
                 if (reader.Read() && reader.TokenType == JsonTokenType.StartArray)
                 {
                     while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
-                        ParseScopeLogs(ref reader, sink, resBuf, resKeyCount, svcBuf, svcLen,
+                        ParseScopeLogs(ref reader, sink, resBuf, resKeyCount, svcBuf, svcLen, svcIdx,
                             recBuf, outBuf, ref tmplBuf, trBuf, spBuf, ref ingested, ref dropped);
                 }
                 else reader.Skip();
@@ -140,7 +159,7 @@ public static class OtlpLogStreamParser
     // ── scopeLogs[] element ────────────────────────────────────────────────────
     private static void ParseScopeLogs(
         ref Utf8JsonReader reader, IOtlpLogSink sink,
-        ArrayBufferWriter<byte> resBuf, int resKeyCount, byte[] svcBuf, int svcLen,
+        ArrayBufferWriter<byte> resBuf, int resKeyCount, byte[] svcBuf, int svcLen, int svcIdx,
         ArrayBufferWriter<byte> recBuf, ArrayBufferWriter<byte> outBuf,
         ref byte[] tmplBuf, byte[] trBuf, byte[] spBuf,
         ref int ingested, ref int dropped)
@@ -154,7 +173,7 @@ public static class OtlpLogStreamParser
             {
                 while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
                 {
-                    bool ok = ParseLogRecord(ref reader, sink, resBuf, resKeyCount, svcBuf, svcLen,
+                    bool ok = ParseLogRecord(ref reader, sink, resBuf, resKeyCount, svcBuf, svcLen, svcIdx,
                         recBuf, outBuf, ref tmplBuf, trBuf, spBuf);
                     if (ok) ingested++; else dropped++;
                 }
@@ -166,7 +185,7 @@ public static class OtlpLogStreamParser
     // ── one logRecord → one ring entry ─────────────────────────────────────────
     private static bool ParseLogRecord(
         ref Utf8JsonReader reader, IOtlpLogSink sink,
-        ArrayBufferWriter<byte> resBuf, int resKeyCount, byte[] svcBuf, int svcLen,
+        ArrayBufferWriter<byte> resBuf, int resKeyCount, byte[] svcBuf, int svcLen, int svcIdx,
         ArrayBufferWriter<byte> recBuf, ArrayBufferWriter<byte> outBuf,
         ref byte[] tmplBuf, byte[] trBuf, byte[] spBuf)
     {
@@ -179,7 +198,7 @@ public static class OtlpLogStreamParser
         int  trLen     = 0;
         int  spLen     = 0;
 
-        recBuf.Clear();
+        recBuf.ResetWrittenCount();
         var w = new MessagePackWriter(recBuf);
         int recKeyCount = 0;
         int svcDummy = 0; // record attrs never capture service.name (that comes from the resource)
@@ -243,7 +262,7 @@ public static class OtlpLogStreamParser
 
         // Assemble the final msgpack map: header(total) + resource KV bytes + record KV bytes.
         int total = resKeyCount + recKeyCount;
-        outBuf.Clear();
+        outBuf.ResetWrittenCount();
         var ow = new MessagePackWriter(outBuf);
         ow.WriteMapHeader(total);
         if (resKeyCount > 0) ow.WriteRaw(resBuf.WrittenSpan);
@@ -261,7 +280,8 @@ public static class OtlpLogStreamParser
             tmplLen > 0 ? tmplBuf.AsSpan(0, tmplLen) : default,
             outBuf.WrittenSpan,
             trHi, trLo, spanId,
-            svcLen > 0 ? svcBuf.AsSpan(0, svcLen) : default);
+            svcLen > 0 ? svcBuf.AsSpan(0, svcLen) : default,
+            svcIdx);
     }
 
     // ── KeyValue { "key": "...", "value": { AnyValue } } → msgpack key + value ──
@@ -420,17 +440,36 @@ public static class OtlpLogStreamParser
         return len;
     }
 
-    /// <summary>Writes the current JSON string token to msgpack as a str, unescaping if needed.</summary>
+    /// <summary>
+    /// Writes the current JSON string token to msgpack as a str, unescaping if needed.
+    ///
+    /// <para>An escaped value has to be unescaped somewhere before it can be written, and that
+    /// used to be a rent and a return from the shared pool per value — not an allocation, but a
+    /// pool round trip on a path that runs once per attribute, and every quoted message, Windows
+    /// path or accented name in a log line takes it. The per-thread buffer below covers every
+    /// attribute value anyone writes; longer ones still fall back to the pool, now with the
+    /// return in a finally so a malformed token cannot lose the array.</para>
+    ///
+    /// <para>A <c>stackalloc</c> would be the obvious buffer and is not usable here:
+    /// <c>MessagePackWriter</c> is a ref struct taken by ref, so ref-safety has to assume a span
+    /// handed to it could be stored in it, and refuses a stack buffer outright.</para>
+    /// </summary>
     private static void WriteJsonStringToMsgpack(ref Utf8JsonReader reader, ref MessagePackWriter w)
     {
         if (reader.TokenType != JsonTokenType.String) { w.WriteNil(); return; }
         if (!reader.ValueIsEscaped) { w.WriteString(reader.ValueSpan); return; }
 
         int max = reader.ValueSpan.Length;
+        byte[] scratch = _tEsc ??= new byte[UnescapeScratchBytes];
+        if (max <= scratch.Length)
+        {
+            w.WriteString(scratch.AsSpan(0, reader.CopyString(scratch)));
+            return;
+        }
+
         byte[] tmp = ArrayPool<byte>.Shared.Rent(max);
-        int n = reader.CopyString(tmp);
-        w.WriteString(tmp.AsSpan(0, n));
-        ArrayPool<byte>.Shared.Return(tmp);
+        try { w.WriteString(tmp.AsSpan(0, reader.CopyString(tmp))); }
+        finally { ArrayPool<byte>.Shared.Return(tmp); }
     }
 
     /// <summary>Copies the current string token (unescaped) into a fixed buffer; returns length (0 if it doesn't fit).</summary>

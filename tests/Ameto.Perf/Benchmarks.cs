@@ -88,6 +88,8 @@ public sealed class StringInternPoolBenchmark
                                .Select(i => $"Template {{Arg{i}}} number {i}")
                                .ToArray();
 
+        _templatesUtf8 = _templates.Select(System.Text.Encoding.UTF8.GetBytes).ToArray();
+
         // Pre-warm
         foreach (var t in _templates) _pool.Intern(t);
     }
@@ -99,6 +101,33 @@ public sealed class StringInternPoolBenchmark
         foreach (var t in _templates)
             _pool.Intern(t);
     }
+
+    [Benchmark]
+    public void InternExistingTemplatesUtf8()
+    {
+        // The ingest path's shape: UTF-8 off the wire, no string on a hit.
+        foreach (var t in _templatesUtf8)
+            _pool.Intern(t);
+    }
+
+    [Benchmark]
+    public void InternExistingTemplatesUtf8WithCanonical()
+    {
+        // Same lookup, but the pool's own string comes back with it instead of costing a
+        // second Get() — what the ingest path needs so the hot tier can share the instance.
+        foreach (var t in _templatesUtf8)
+            _pool.Intern(t, out _);
+    }
+
+    [Benchmark]
+    public void InternThenGet()
+    {
+        // What the ingest path used to do: intern, then a separate index→string lookup.
+        foreach (var t in _templatesUtf8)
+            _pool.Get(_pool.Intern(t));
+    }
+
+    private byte[][] _templatesUtf8 = null!;
 }
 
 // ── Filter evaluation throughput ─────────────────────────────────────────────

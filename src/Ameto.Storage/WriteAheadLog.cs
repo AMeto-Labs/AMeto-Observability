@@ -13,11 +13,25 @@ namespace Ameto.Storage;
 /// Format:
 ///   [WAL Header   — 32 bytes]
 ///   [Entry 0 …]
-///     [Entry Header — 24 bytes: payloadLen uint32, timestamp int64, level byte, pad byte,
+///     [Entry Header — 24 bytes: payloadLen uint32, timestamp int64, level byte, flags byte,
 ///      templateIndex uint16, exceptionLen uint32, crc32c uint32]
 ///     [Entry Payload — raw msgpack bytes][Exception — msgpack ExceptionInfo]
 ///   [Entry 1 …]
 ///   ...
+///
+/// Flags (byte 13 of the entry header, inside the checksummed range):
+///   bit 0 — Unpooled: the event's template was outside the template pool (the pool was full,
+///           or the index was past its 65 536 ids). templateIndex is then 0 and meaningless,
+///           no pool row was written, and the template TEXT is not in the WAL at all, so
+///           recovery yields the event with no template. Without the bit, a replay whose pool
+///           file held any row resolved index 0 and gave the event index 0's template.
+///   Other bits are reserved and written as zero.
+/// The byte was unwritten padding before this flag existed, and the format is still v4: the
+/// previous build never set it, and the engine opens every WAL as a fresh file named after a
+/// newly reserved segment block and extends it with SetLength, which zero-fills. Entries that
+/// build wrote therefore read back with no flag and replay exactly as they did. (Only a
+/// same-name reopen that reset the write offset over older entries could leave a stale byte
+/// there, and the engine never reuses a WAL name.) Append now writes the byte explicitly.
 ///
 /// The WAL is append-only. On crash recovery, the storage layer replays complete entries
 /// and rebuilds the hot-tier up to the last entry whose checksum verifies.
@@ -27,7 +41,7 @@ namespace Ameto.Storage;
 /// CRC32C means a crash mid-write-back — pages reaching disk in any order — truncates
 /// replay at the first torn entry instead of manufacturing garbage events.
 /// </summary>
-public sealed unsafe class WriteAheadLog : IDisposable
+public sealed unsafe partial class WriteAheadLog : IDisposable
 {
     // ── WAL file header ──────────────────────────────────────────────────────
     private const uint   MagicNumber    = 0x52_44_57_41; // "RDWA"
@@ -48,6 +62,8 @@ public sealed unsafe class WriteAheadLog : IDisposable
     private const int    EntryHeaderSizeV3 = 20;
     // Bytes of the entry header covered by the checksum (everything except the crc itself).
     private const int    ChecksummedHeaderBytes = EntryHeaderSize - 4;
+    // WalEntryHeader.Flags: the event's template is outside the pool (see the class doc).
+    private const byte   EntryFlagUnpooled = 0x01;
 
     [StructLayout(LayoutKind.Sequential, Size = FileHeaderSize)]
     private struct WalFileHeader
@@ -70,8 +86,8 @@ public sealed unsafe class WriteAheadLog : IDisposable
         public uint   PayloadLength;
         public long   TimestampTicks;
         public byte   Level;
-        private byte  _pad;
-        public ushort TemplateIndex;   // index into companion .pool file
+        public byte   Flags;           // EntryFlag* bits; was never-written padding (see the class doc)
+        public ushort TemplateIndex;   // index into companion .pool file; 0 and meaningless when Unpooled
         public uint   ExceptionLength; // bytes of msgpack ExceptionInfo appended after payload
         public uint   Checksum;        // CRC32C over header[0..20) + payload + exception (v4+)
     }
@@ -89,6 +105,10 @@ public sealed unsafe class WriteAheadLog : IDisposable
     private          byte*               _ptr;
     private          long                _capacity;
     private          long                _writeOffset; // logical, excludes file header
+    // Absolute file offset (header included) up to which the mapping has been msynced AND the
+    // file handle flushed. Everything past it is not yet durable; when it equals the write
+    // offset the tick has nothing to do.
+    private          long                _lastFlushedOffset = FileHeaderSize;
     private readonly object              _writeLock = new();
     private          FileStream?          _poolStream;
     private          bool                 _poolDirty;
@@ -167,6 +187,10 @@ public sealed unsafe class WriteAheadLog : IDisposable
             }
         }
 
+        // Whatever came back from the file is already on disk, so the first tick has nothing
+        // to msync up to here. A fresh file starts at the header, which Flush always covers.
+        _lastFlushedOffset = FileHeaderSize + _writeOffset;
+
         // Open companion pool file (template index → string) for crash recovery
         _poolStream = new FileStream(_filePath + ".pool",
             FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.Read);
@@ -175,17 +199,26 @@ public sealed unsafe class WriteAheadLog : IDisposable
 
     // ── Append ───────────────────────────────────────────────────────────────
 
-    /// <summary>
-    /// Appends a single event payload to the WAL. Thread-safe via lock.
-    /// Fast path: a single Span copy into the mmap region.
-    /// </summary>
     // Reused per thread: exception msgpack scratch — the bytes are copied into the mmap
     // below, so nothing outlives the call. Avoids a byte[] per exception-carrying event.
     [ThreadStatic] private static System.Buffers.ArrayBufferWriter<byte>? _tExc;
 
-    public unsafe void Append(long timestampTicks, LogLevel level, ushort templateIndex, string template, ReadOnlySpan<byte> payload, ExceptionInfo? exception = null)
+    /// <summary>
+    /// Appends a single event payload to the WAL. Thread-safe via lock.
+    /// Fast path: a single Span copy into the mmap region.
+    /// </summary>
+    /// <param name="templateIndex">
+    /// The event's template-pool index. Anything outside <c>[0, 65 535]</c> (-1 once the pool
+    /// is full, or a claim past its cap) is logged as UNPOOLED: the entry carries the Unpooled
+    /// flag with index 0, and <paramref name="template"/> is ignored, so no pool row is written
+    /// for it. Recovery then yields that event with no template.
+    /// </param>
+    public unsafe void Append(long timestampTicks, LogLevel level, int templateIndex, string template, ReadOnlySpan<byte> payload, ExceptionInfo? exception = null)
     {
-        EnsureTemplateInPool(templateIndex, template);
+        // One unsigned compare covers both -1 and anything past the pool's 65 536 ids.
+        bool   pooled = (uint)templateIndex <= ushort.MaxValue;
+        ushort index  = pooled ? (ushort)templateIndex : (ushort)0;
+        if (pooled) EnsureTemplateInPool(index, template);
 
         ReadOnlySpan<byte> excBytes = default;
         if (exception is not null)
@@ -220,7 +253,10 @@ public sealed unsafe class WriteAheadLog : IDisposable
             eh.PayloadLength   = (uint)payload.Length;
             eh.TimestampTicks  = timestampTicks;
             eh.Level           = (byte)level;
-            eh.TemplateIndex   = templateIndex;
+            // Written explicitly, set or not: the bytes under a reset write offset are not
+            // guaranteed zero, and the checksum below covers whatever is here.
+            eh.Flags           = pooled ? (byte)0 : EntryFlagUnpooled;
+            eh.TemplateIndex   = index;
             eh.ExceptionLength = (uint)excBytes.Length;
 
             // Checksum the header bytes (crc field excluded — it is the last 4 bytes)
@@ -267,31 +303,255 @@ public sealed unsafe class WriteAheadLog : IDisposable
     // ── Durability ───────────────────────────────────────────────────────────
 
     /// <summary>
-    /// msyncs the mapped view and fsyncs the template pool if it grew. Called on a timer
-    /// by the storage engine: acknowledged events are durable within one interval of
-    /// power loss instead of "whenever the OS writes back" (up to the tier's whole life).
-    /// Runs under the write lock — bounded stall for the single writer; the ingest ring
-    /// absorbs it.
+    /// msyncs the bytes appended since the previous tick and fsyncs the template pool if it
+    /// grew. Called on a timer by the storage engine: acknowledged events are durable within
+    /// one interval of power loss instead of "whenever the OS writes back" (up to the tier's
+    /// whole life).
+    ///
+    /// <para>Three things this does NOT do any more. It does not msync the WHOLE mapping —
+    /// <c>MemoryMappedViewAccessor.Flush</c> hands FlushViewOfFile/msync the entire 64 MB+
+    /// view, and that cost scales with the mapping, not with what was written, so a tick that
+    /// appended 40 KB walked 64 MB of page tables. It does not hold <see cref="_writeLock"/>
+    /// across the file-handle flush, which is the part that waits out the drive cache and the
+    /// part the single appender was stalled behind. And it does no I/O at all on a tick where
+    /// nothing was appended since the last SUCCESSFUL flush — the idle case, which used to
+    /// msync and fsync regardless. A tick whose handle flush threw is not a success: the
+    /// following tick repeats it even if nothing new arrived.</para>
+    ///
+    /// <para>The first page is always in the range: <see cref="Append"/> updates the file
+    /// header's WriteOffset in place, and recovery replays only up to that value, so a durable
+    /// tail under a stale header is a tail that is never read back.</para>
+    ///
+    /// <para>The pool fsync runs even when the WAL half throws. If both fail, the WAL's
+    /// exception is the one that propagates (see <see cref="FlushPool"/>).</para>
     /// </summary>
     public void Flush()
     {
+        // The pool is fsynced in a finally because the WAL half can throw on EVERY tick: a drive
+        // whose FlushFileBuffers keeps failing leaves the watermark where it was, so each tick,
+        // idle or not, retries the handle flush and throws again. With the pool after it in
+        // straight-line code, a dirty pool on an idle WAL was then never fsynced, and after power
+        // loss replay brought the WAL's events back with no template or another event's. (Before
+        // the watermark waited for the handle flush, the idle tick after a failure skipped the
+        // handle and reached the pool by accident.) The finally runs after FlushTail has released
+        // _writeLock, so the pool fsync still never holds up the appender.
+        bool walFlushed = false;
+        try
+        {
+            FlushTail();
+            walFlushed = true;
+        }
+        finally
+        {
+            FlushPool(walFailed: !walFlushed);
+        }
+    }
+
+    /// <summary>The WAL half of <see cref="Flush"/>: msync the un-synced tail, then flush the file handle.</summary>
+    private void FlushTail()
+    {
+        FileStream? handle   = null;
+        long        writeEnd = 0;
         lock (_writeLock)
         {
             if (_disposed || _accessor is null) return;
-            _accessor.Flush();
-            // FlushViewOfFile (which the accessor flush is on Windows) queues the pages to
-            // the filesystem but does not wait for the drive — FlushFileBuffers does. On
-            // Linux the accessor flush is already msync(MS_SYNC); the extra fsync is cheap.
-            _fileStream?.Flush(flushToDisk: true);
+
+            writeEnd = FileHeaderSize + _writeOffset;
+            if (writeEnd > _lastFlushedOffset)
+            {
+                if (!TryFlushRange(_lastFlushedOffset, writeEnd))
+                {
+                    // Correct, just slower — and silent, which is the trap: a platform where
+                    // the range call always fails would msync the whole mapping every tick
+                    // for ever and look exactly like a working one. The counter records it,
+                    // but only tests read it today. The WAL has no logger and no diagnostics
+                    // surface exposes the counter, so on a live host this is still invisible.
+                    // Surfacing it (a log once, or a StorageEngine diagnostic) is follow-up work.
+                    Interlocked.Increment(ref _rangeFlushFailures);
+                    _accessor.Flush();     // fallback: whole view, as before
+                }
+
+                // The watermark is NOT advanced here. It means "durable up to", and nothing is
+                // durable until the handle flush below returns. Advancing it first made a failed
+                // FlushFileBuffers permanent while the WAL sat idle: the next tick saw
+                // writeEnd == watermark and did nothing, so the acknowledged tail stayed in the
+                // drive cache until another event arrived or the WAL rotated.
+                handle = _fileStream;
+            }
         }
+
+        // Outside the lock on purpose: FlushViewOfFile only queues the pages to the
+        // filesystem, FlushFileBuffers is what waits for the drive — milliseconds on a
+        // spinning disk, and the appender has no reason to wait with it. On Linux the
+        // msync above is already MS_SYNC and this fsync is cheap.
+        if (handle is not null)
+        {
+            // Dispose may have closed the handle between the lock and here (rotation runs
+            // on this same thread today, but the flag is the contract, not the thread).
+            // An IOException propagates to the flush loop, which logs it. The watermark stays
+            // where it was, so the next tick, idle or not, re-issues both flushes; the pool
+            // fsync in Flush's finally still runs on every one of those ticks.
+            bool flushed = false;
+            try
+            {
+                if (HandleFlushHookForTest is { } hook) hook(handle);
+                else handle.Flush(flushToDisk: true);
+                flushed = true;
+            }
+            catch (ObjectDisposedException) { /* Dispose fsyncs it on its way out */ }
+
+            if (flushed)
+            {
+                Interlocked.Increment(ref _handleFlushCount);
+                lock (_writeLock)
+                {
+                    // Never backwards: a concurrent Flush may already have advanced it further.
+                    if (writeEnd > _lastFlushedOffset) _lastFlushedOffset = writeEnd;
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// fsyncs the template pool if a row was written since its last successful fsync. A failed
+    /// fsync leaves it dirty, whatever it threw, so the next tick retries it.
+    /// </summary>
+    /// <param name="walFailed">
+    /// The WAL half's exception is already on its way out of <see cref="Flush"/>. That is the
+    /// one the flush loop logs: a pool failure thrown from the finally would replace it, and
+    /// the log would name the pool while the WAL tail went on failing unreported. So a pool
+    /// failure is swallowed here and the pool stays dirty for the next tick. (An IOException
+    /// from the pool was already swallowed and retried; this extends the retry to whatever else
+    /// it throws, which reaches the loop only on a tick where the WAL half succeeded.)
+    /// </param>
+    private void FlushPool(bool walFailed)
+    {
         lock (_poolLock)
         {
             if (!_poolDirty || _poolStream is null) return;
-            _poolDirty = false;
-            try { _poolStream.Flush(flushToDisk: true); }
-            catch (IOException) { _poolDirty = true; } // retried next interval
+            try
+            {
+                if (PoolFlushHookForTest is { } hook) hook(_poolStream);
+                else _poolStream.Flush(flushToDisk: true);
+                // Cleared only on success. Rows are written under this same lock, so nothing
+                // can dirty the pool between the fsync returning and this line.
+                _poolDirty = false;
+                Interlocked.Increment(ref _poolFlushCount);
+            }
+            catch (IOException) { /* retried next interval */ }
+            catch when (walFailed) { /* retried next interval; the WAL's exception is the one reported */ }
         }
     }
+
+    /// <summary>
+    /// msyncs <c>[from, to)</c> of the mapping, page-aligned outwards, plus the first page
+    /// (the file header). Returns false if the platform call fails or the platform is one we
+    /// have no range call for — the caller then flushes the whole view, which is always
+    /// correct, just slower.
+    /// </summary>
+    private bool TryFlushRange(long from, long to)
+    {
+        if (_ptr is null) return false;
+
+        long pageSize  = Environment.SystemPageSize;
+        long fileSize  = FileHeaderSize + _capacity;
+        long alignedTo = Math.Min(fileSize, (to + pageSize - 1) / pageSize * pageSize);
+
+        // The header page, unless the tail range already starts inside it.
+        long tailStart = from / pageSize * pageSize;
+        if (tailStart >= pageSize && !FlushRegion(0, Math.Min(pageSize, fileSize)))
+            return false;
+
+        return FlushRegion(tailStart, alignedTo - tailStart);
+    }
+
+    private bool FlushRegion(long offset, long length)
+    {
+        if (length <= 0) return true;
+
+        nint addr = (nint)(_ptr + offset);
+        bool ok;
+        if (OperatingSystem.IsWindows())
+            ok = Native.FlushViewOfFile(addr, (nuint)length);
+        else if (OperatingSystem.IsLinux() || OperatingSystem.IsMacOS())
+            ok = Native.Msync(addr, (nuint)length, OperatingSystem.IsMacOS() ? MsyncSyncMacOS : MsyncSyncLinux) == 0;
+        else
+            return false;   // unknown platform: let the caller flush the whole view
+
+        if (ok)
+        {
+            Interlocked.Increment(ref _rangeFlushCount);
+            Interlocked.Exchange(ref _lastRangeFlushBytes, length);
+        }
+        return ok;
+    }
+
+    // MS_SYNC. Different numbers on the two Unixes, and passing the wrong one makes msync
+    // fail with EINVAL rather than do the wrong thing — which the fallback would then cover,
+    // silently, with a whole-view flush every tick.
+    private const int MsyncSyncLinux = 4;
+    private const int MsyncSyncMacOS = 0x0010;
+
+    private static partial class Native
+    {
+        [System.Runtime.InteropServices.LibraryImport("kernel32.dll", SetLastError = true)]
+        [return: System.Runtime.InteropServices.MarshalAs(System.Runtime.InteropServices.UnmanagedType.Bool)]
+        internal static partial bool FlushViewOfFile(nint lpBaseAddress, nuint dwNumberOfBytesToFlush);
+
+        [System.Runtime.InteropServices.LibraryImport("libc", EntryPoint = "msync", SetLastError = true)]
+        internal static partial int Msync(nint addr, nuint len, int flags);
+    }
+
+    // ── Flush diagnostics (tests) ────────────────────────────────────────────
+
+    private long _rangeFlushCount;
+    private long _lastRangeFlushBytes;
+    private long _rangeFlushFailures;
+
+    /// <summary>Number of successful range msyncs issued. A clean tick must not raise it.</summary>
+    internal long RangeFlushCount => Interlocked.Read(ref _rangeFlushCount);
+
+    /// <summary>
+    /// Ticks that fell back to flushing the whole view because the range call failed.
+    /// Expected to stay at zero; anything else means every tick is paying the old cost.
+    /// </summary>
+    internal long RangeFlushFailures => Interlocked.Read(ref _rangeFlushFailures);
+
+    /// <summary>Bytes covered by the most recent range msync.</summary>
+    internal long LastRangeFlushBytes => Interlocked.Read(ref _lastRangeFlushBytes);
+
+    private long _handleFlushCount;
+
+    /// <summary>File-handle flushes (FlushFileBuffers / fsync) that returned successfully.</summary>
+    internal long HandleFlushCount => Interlocked.Read(ref _handleFlushCount);
+
+    /// <summary>
+    /// Test seam: when set, <see cref="Flush"/> calls this instead of
+    /// <c>handle.Flush(flushToDisk: true)</c>, so a test can make the drive flush fail.
+    /// Never set in production.
+    /// </summary>
+    internal Action<FileStream>? HandleFlushHookForTest;
+
+    private long _poolFlushCount;
+
+    /// <summary>Template-pool fsyncs that returned successfully.</summary>
+    internal long PoolFlushCount => Interlocked.Read(ref _poolFlushCount);
+
+    /// <summary>
+    /// Test seam: when set, <see cref="Flush"/> calls this instead of the pool's
+    /// <c>Flush(flushToDisk: true)</c>, so a test can watch or fail the pool fsync.
+    /// Never set in production.
+    /// </summary>
+    internal Action<FileStream>? PoolFlushHookForTest;
+
+    /// <summary>
+    /// Absolute file offset up to which this WAL is durable: msynced AND its file handle
+    /// flushed. It stays behind a failed handle flush, so the next tick retries it.
+    /// </summary>
+    internal long LastFlushedOffset { get { lock (_writeLock) return _lastFlushedOffset; } }
+
+    /// <summary>Bytes appended so far, excluding the file header.</summary>
+    internal long WrittenBytes { get { lock (_writeLock) return _writeOffset; } }
 
     // ── Recovery ─────────────────────────────────────────────────────────────
 
@@ -379,6 +639,8 @@ public sealed unsafe class WriteAheadLog : IDisposable
             TimestampTicks = eh.TimestampTicks,
             Level          = (LogLevel)eh.Level,
             TemplateIndex  = eh.TemplateIndex,
+            // v3 entries predate the flag and their byte 13 was never written: never unpooled.
+            Unpooled       = !v3Layout && (eh.Flags & EntryFlagUnpooled) != 0,
             Payload        = payload,
             Exception      = exception,
         };
@@ -556,6 +818,14 @@ public sealed class WalEntry
     public long           TimestampTicks { get; init; }
     public LogLevel       Level          { get; init; }
     public ushort         TemplateIndex  { get; init; }
+
+    /// <summary>
+    /// The event's template was outside the template pool when it was logged.
+    /// <see cref="TemplateIndex"/> is then 0 and names nothing, and the WAL never stored the
+    /// template text, so the event is recovered with no template.
+    /// </summary>
+    public bool           Unpooled       { get; init; }
+
     public byte[]         Payload        { get; init; } = [];
     public ExceptionInfo? Exception      { get; init; }
 }

@@ -93,6 +93,28 @@ public sealed class EmptyIndexSemanticsTests
         Assert.Equal([0u, 1u], idx.LookupIntersect([("region", "AE-DXB")]));
     }
 
+    /// <summary>
+    /// Property names are keyed by raw UTF-8 while building, so two different invalid names
+    /// are two entries on disk, and both decode to one string on read. The second must not
+    /// replace the first: a lookup of the first's value would find the property but not the
+    /// value, prove the segment empty and drop a row the scan returns.
+    /// </summary>
+    [Fact]
+    public void PropertyNames_ThatDecodeAlike_MergeInsteadOfOverwriting()
+    {
+        var build = new SegmentInvertedIndex();
+        build.AddUtf8(0u, [(byte)'a', 0xFF], "x"u8);
+        build.AddUtf8(1u, [(byte)'a', 0xFE], "y"u8);
+        build.AddUtf8(2u, [(byte)'a', 0xFE], "x"u8);
+        var idx = SegmentInvertedIndex.Deserialise(build.Serialise());
+
+        const string decoded = "a�";
+        Assert.Equal([0u, 2u], idx.LookupIntersect([(decoded, "x")])!);
+        Assert.Equal([1u],     idx.LookupIntersect([(decoded, "y")])!);
+        Assert.True(idx.MightContain(decoded, "x"));
+        Assert.True(idx.MightContain(decoded, "y"));
+    }
+
     [Fact]
     public void BloomFilter_MatchesRegardlessOfValueCasing()
     {

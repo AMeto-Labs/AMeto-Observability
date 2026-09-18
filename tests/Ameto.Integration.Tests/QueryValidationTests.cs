@@ -207,7 +207,29 @@ public sealed class QueryValidationTests : IClassFixture<AmetoWebAppFactory>
                      "ingestAcceptedTotal", "ingestDrainedTotal", "ingestPending", "ingestCapacity",
                      "ingestSlabCapacity",
                      "ingestDroppedOversized", "ingestDroppedNoSlab", "ingestDroppedRingFull",
+                     "ingestDroppedNoCommit",
                      "ingestWriteErrorDrops",
+                     // Request bodies parked by IngestBufferPool, and the budget that caps them.
+                     "ingestBufferPooledBytes", "ingestBufferBudgetBytes",
+                     // The payload arena's size and how far into it the buffer has ever reached.
+                     "ingestArenaBytes", "ingestArenaResidentBytes",
+                     // Index build: merge rows written without their @x.* terms, and pooled build memory.
+                     "indexMalformedExceptionPayloads", "indexBuildPooledBytes",
+                     // The decoded-index cache: what it holds, what it may hold, and whether it is
+                     // earning its keep. Six fields the endpoint promises that nothing guarded —
+                     // a refactor could drop any of them and leave the whole suite green.
+                     "indexCacheEntries", "indexCacheBytes", "indexCacheBudgetBytes",
+                     "indexCacheHits", "indexCacheMisses", "indexCacheIdleEvicted",
+                     // The native share of that cache, its own ceiling, and what pressure has
+                     // dropped: bloom bits are NativeMemory, so they are invisible to every GC
+                     // figure beside them and are the part that can push a small host past its
+                     // container limit.
+                     "indexCacheNativeBytes", "indexCacheNativeBudgetBytes", "indexCacheShedEvicted",
+                     // And the eviction that ceiling causes while the total budget still has room,
+                     // which no other figure reveals: the cache just rests below its budget.
+                     "indexCacheNativeEvicted",
+                     // Inside logsStorageBytes, and the one part of it retention will never free.
+                     "logsQuarantinedBytes",
                  })
         {
             Assert.True(json.TryGetProperty(field, out var value), $"missing '{field}'");

@@ -31,16 +31,33 @@ public sealed class IndexingWiring : Microsoft.Extensions.Hosting.IHostedService
 {
     private readonly StorageEngine  _storage;
     private readonly IndexingOptions _opts;
+    private readonly Microsoft.Extensions.Logging.ILogger<IndexingWiring> _log;
 
-    public IndexingWiring(StorageEngine storage, IOptions<ServerOptions> options)
+    public IndexingWiring(StorageEngine storage, IOptions<ServerOptions> options,
+                          Microsoft.Extensions.Logging.ILogger<IndexingWiring> log)
     {
         _storage = storage;
         _opts    = options.Value.Indexing;
+        _log     = log;
     }
+
+    /// <summary>The hints (and counters) every group this process builds shares — see <see cref="IndexBuildHints"/>.</summary>
+    public IndexBuildHints Hints { get; } = new();
+
+    /// <summary>
+    /// Bytes parked right now in the index build pools (term and posting slabs, hash tables,
+    /// entry arrays) — for diagnostics. Transient after a gen2 trim, but counted in no memory
+    /// budget, so it is the figure to read when the build side's resting memory is in question.
+    /// </summary>
+    public long IndexBuildPooledBytes => IndexBuildPool.PooledBytes;
 
     public Task StartAsync(CancellationToken cancellationToken)
     {
         int maxDepth = _opts.MaxPropertyFlattenDepth;
+        // One hints object for every group this process builds: each builder pre-sizes its
+        // term and trigram tables from what the last sealed group measured (see IndexBuildHints).
+        var hints = Hints;
+        var log   = _log;
         // A FRESH builder per index group — that is the mechanism, not an accident. The
         // accumulators (trigram especially, ~7.6 B/posting scaling with indexed text bytes)
         // die with the builder as soon as its sections are serialised, so peak index-build
@@ -51,7 +68,7 @@ public sealed class IndexingWiring : Microsoft.Extensions.Hosting.IHostedService
         // are the writer's forecast for the group — events from the payload budget, terms per
         // event from what the file's already-sealed groups measured. See SegmentWriter.EnsureSink.
         _storage.IndexSinkFactory = (estimatedEventCount, estimatedTermsPerEvent) =>
-            new SegmentIndexBuilder(estimatedEventCount, maxDepth, estimatedTermsPerEvent);
+            new SegmentIndexBuilder(estimatedEventCount, maxDepth, estimatedTermsPerEvent, hints, log);
         return Task.CompletedTask;
     }
 

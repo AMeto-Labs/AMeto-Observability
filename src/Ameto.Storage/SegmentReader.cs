@@ -90,7 +90,9 @@ public sealed class SegmentReader : ISegmentReader
         try
         {
             view = mmf.CreateViewAccessor(0, fileSize, MemoryMappedFileAccess.Read);
-            return new SegmentReader(filePath, mmf, view, fileSize, computeUncompressedBytes);
+            var reader = new SegmentReader(filePath, mmf, view, fileSize, computeUncompressedBytes);
+            Interlocked.Increment(ref Opens);
+            return reader;
         }
         catch
         {
@@ -274,19 +276,30 @@ public sealed class SegmentReader : ISegmentReader
         // candidate rows — the dominant query-path saving (no Dictionary/string per
         // rejected event). Candidates may arrive unsorted (trigram set → array).
         //
-        // The sort below is REQUIRED, not defensive. Everything downstream — the
+        // ASCENDING CANDIDATES ARE REQUIRED, not merely tidy. Everything downstream — the
         // LowerBound block window and the single-cursor walk in DecodeColumnarBlock —
-        // assumes ascending candidates, so one out-of-order pair makes the cursor step
-        // past a candidate and drop a row the caller's index proved matches. The caller
-        // makes no ordering promise: QueryExecutor's trigram narrowing returns a
-        // HashSet's enumeration order. The clone is what lets that stay true without
-        // mutating an array the caller still owns.
+        // assumes them, so one out-of-order pair makes the cursor step past a candidate and
+        // drop a row the caller's index proved matches. The caller still makes no ordering
+        // promise, so the check stays; what is gone is paying a clone and an O(n log n) sort
+        // to learn what a single pass can prove. QueryExecutor's narrowing now merges sorted
+        // posting lists rather than draining a HashSet, so the ordered case is the norm and
+        // costs one scan; anything else is copied and sorted exactly as before, because the
+        // array belongs to the caller and must not be mutated.
         uint[]? cands = null;
         if (candidateOffsets is { Length: > 0 } && _blockOrdinals is not null)
         {
-            cands = (uint[])candidateOffsets.Clone();
-            Array.Sort(cands);
+            cands = candidateOffsets;
+            if (!IsNonDescending(cands))
+            {
+                cands = (uint[])candidateOffsets.Clone();
+                Array.Sort(cands);
+            }
         }
+
+        // One vocabulary table for the whole read — blocks of one segment share their
+        // templates and service names, so the table is what makes string allocation
+        // proportional to DISTINCT values instead of to rows. See BlockStringDedup.
+        var dedup = new BlockStringDedup();
 
         int blockCount = _blocks.Length;
         for (int bi = 0; bi < blockCount; bi++)
@@ -307,8 +320,8 @@ public sealed class SegmentReader : ISegmentReader
             }
 
             var events = cands is null
-                ? ReadBlock(_blocks[idx].FileOffset, reversed)
-                : ReadBlock(_blocks[idx].FileOffset, reversed, cands, candStart, candEnd, _blockOrdinals![idx]);
+                ? ReadBlock(_blocks[idx].FileOffset, reversed, dedup)
+                : ReadBlock(_blocks[idx].FileOffset, reversed, dedup, cands, candStart, candEnd, _blockOrdinals![idx]);
             foreach (var evt in events)
             {
                 long ts = evt.Timestamp.UtcTicks;
@@ -347,6 +360,19 @@ public sealed class SegmentReader : ISegmentReader
             if (nextMinTs != UnknownBlockMinTs && nextMinTs < fromTicks) return true;
         }
         return false;
+    }
+
+    /// <summary>
+    /// True when <paramref name="a"/> is already in the order the candidate walk needs.
+    /// Non-DESCENDING, not strictly ascending: a repeated ordinal is harmless — the walk's
+    /// cursor steps past both copies on the next row — and rejecting it would cost a sort for
+    /// nothing.
+    /// </summary>
+    private static bool IsNonDescending(uint[] a)
+    {
+        for (int i = 1; i < a.Length; i++)
+            if (a[i] < a[i - 1]) return false;
+        return true;
     }
 
     /// <summary>First index in ascending <paramref name="a"/> whose value is ≥ <paramref name="key"/>.</summary>
@@ -464,38 +490,106 @@ public sealed class SegmentReader : ISegmentReader
 
     // ── Block reading ─────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Collapses repeated template / service strings inside ONE read. A block holds a couple
+    /// of thousand rows drawn from a vocabulary of a few dozen templates, and the decoder used
+    /// to run <c>Encoding.UTF8.GetString</c> per row per column — two strings per candidate,
+    /// nearly all of them equal to one already on the heap and most of them belonging to rows
+    /// the filter then rejected.
+    ///
+    /// <para>Probed BY UTF-8 through <see cref="Utf8StringComparer"/>, straight off the block
+    /// buffer, so a repeat costs a hash of bytes that are already there and builds nothing.
+    /// The merge's <c>SegmentEventCursor._stringDedup</c> is the same table for the same
+    /// reason and carries the measurement, including why the insert goes through the string
+    /// key rather than the alternate lookup.</para>
+    ///
+    /// <para>Scoped to one <see cref="ReadEventsAsync"/> enumeration, not to the reader: a
+    /// reader is now shared between a query's prefilter and its scan, and a table shared by
+    /// two concurrent enumerations would need a lock on the hottest loop in the decoder to buy
+    /// a dedup window nothing uses — segments are scanned by one iterator each.</para>
+    /// </summary>
+    private sealed class BlockStringDedup
+    {
+        /// <summary>The same ceiling as the merge's <c>SegmentEventCursor.MaxDedupEntries</c>,
+        /// for the same reason: past it the values are not a vocabulary any more (a template
+        /// built by interpolation is distinct per event), and dedup is a pure allocation
+        /// optimisation, so the table simply empties and refills with what it is seeing
+        /// now.</summary>
+        private const int MaxEntries = 65_536;
+
+        private readonly Dictionary<string, string> _byString = new(Utf8StringComparer.Instance);
+        private readonly Dictionary<string, string>.AlternateLookup<ReadOnlySpan<byte>> _byUtf8;
+
+        public BlockStringDedup() => _byUtf8 = _byString.GetAlternateLookup<ReadOnlySpan<byte>>();
+
+        public string? Get(ReadOnlySpan<byte> utf8)
+        {
+            if (utf8.IsEmpty) return null;
+            if (_byUtf8.TryGetValue(utf8, out var pooled)) return pooled;
+            if (_byString.Count >= MaxEntries) _byString.Clear();
+
+            string created = Encoding.UTF8.GetString(utf8);
+            _byString[created] = created;
+            return created;
+        }
+    }
+
     private IEnumerable<LogEvent> ReadBlock(
-        long blockOffset, bool reversed,
+        long blockOffset, bool reversed, BlockStringDedup? dedup,
         uint[]? cands = null, int candStart = 0, int candEnd = 0, uint firstOrdinal = 0)
+    {
+        // The decode lives in its own method because it reads the compressed bytes straight
+        // out of the mapping, and C# forbids unsafe code inside an iterator (CS1629).
+        var events = DecodeBlockAt(blockOffset, dedup, cands, candStart, candEnd, firstOrdinal);
+        if (events is null) yield break;
+
+        if (reversed) events.Reverse();
+        foreach (var ev in events) yield return ev;
+    }
+
+    /// <summary>
+    /// Decompresses one block and decodes it. Null when the block does not decompress to its
+    /// declared size — the caller's "stop reading this block" answer, unchanged.
+    ///
+    /// <para>LZ4 reads the compressed bytes WHERE THEY LIE, through the mapped pointer. They
+    /// used to be copied into a second pooled buffer by
+    /// <c>MemoryMappedViewAccessor.ReadArray</c> first, which is a memcpy of the whole
+    /// compressed block — per block, per segment, per query — to hand the decoder bytes it
+    /// could already see. The rent for that buffer goes with it.</para>
+    ///
+    /// <para>The pointer is held only across the decode. That is a smaller window than the
+    /// enclosing iterator would have given it: an iterator's consumer decides when the next
+    /// block is read, so acquiring there would keep the view pinned across the caller's
+    /// filtering and delivery.</para>
+    /// </summary>
+    private unsafe List<LogEvent>? DecodeBlockAt(
+        long blockOffset, BlockStringDedup? dedup,
+        uint[]? cands, int candStart, int candEnd, uint firstOrdinal)
     {
         int uncompressedSize = ReadInt32At(blockOffset);
         int compressedSize   = ReadInt32At(blockOffset + 4);
         ValidateBlockFrame(Info.FilePath, blockOffset, uncompressedSize, compressedSize);
 
-        byte[]? rentedComp   = null;
-        byte[]? rentedUncomp = null;
-        List<LogEvent> events;
+        byte[] rentedUncomp = ArrayPool<byte>.Shared.Rent(uncompressedSize);
         try
         {
-            rentedComp   = ArrayPool<byte>.Shared.Rent(compressedSize);
-            rentedUncomp = ArrayPool<byte>.Shared.Rent(uncompressedSize);
+            byte* basePtr = null;
+            var handle = _view.SafeMemoryMappedViewHandle;
+            handle.AcquirePointer(ref basePtr);
+            try
+            {
+                var src = new ReadOnlySpan<byte>(
+                    basePtr + _view.PointerOffset + blockOffset + 8, compressedSize);
 
-            _view.ReadArray(blockOffset + 8, rentedComp, 0, compressedSize);
+                int decoded = LZ4Codec.Decode(src, rentedUncomp.AsSpan(0, uncompressedSize));
+                if (decoded != uncompressedSize) return null;
 
-            int decoded = LZ4Codec.Decode(rentedComp, 0, compressedSize, rentedUncomp, 0, uncompressedSize);
-            if (decoded != uncompressedSize)
-                yield break;
-
-            events = DecodeColumnarBlock(rentedUncomp.AsSpan(0, decoded), cands, candStart, candEnd, firstOrdinal);
+                return DecodeColumnarBlock(
+                    rentedUncomp.AsSpan(0, decoded), dedup, cands, candStart, candEnd, firstOrdinal);
+            }
+            finally { if (basePtr is not null) handle.ReleasePointer(); }
         }
-        finally
-        {
-            if (rentedComp   is not null) ArrayPool<byte>.Shared.Return(rentedComp);
-            if (rentedUncomp is not null) ArrayPool<byte>.Shared.Return(rentedUncomp);
-        }
-
-        if (reversed) events.Reverse();
-        foreach (var ev in events) yield return ev;
+        finally { ArrayPool<byte>.Shared.Return(rentedUncomp); }
     }
 
     /// <summary>
@@ -505,7 +599,7 @@ public sealed class SegmentReader : ISegmentReader
     /// comparisons, no Dictionary / string / ExceptionInfo allocation.
     /// </summary>
     private static List<LogEvent> DecodeColumnarBlock(
-        ReadOnlySpan<byte> span,
+        ReadOnlySpan<byte> span, BlockStringDedup? dedup = null,
         uint[]? cands = null, int candStart = 0, int candEnd = 0, uint firstOrdinal = 0)
     {
         int    pos        = 0;
@@ -581,18 +675,33 @@ public sealed class SegmentReader : ISegmentReader
                 uint sStart = BinaryPrimitives.ReadUInt32LittleEndian(svcOffsets.Slice(i * 4, 4));
                 uint sEnd   = BinaryPrimitives.ReadUInt32LittleEndian(svcOffsets.Slice((i + 1) * 4, 4));
                 if (sEnd > sStart)
-                    svcName = Encoding.UTF8.GetString(svcPayload.Slice((int)sStart, (int)(sEnd - sStart)));
+                {
+                    var svcUtf8 = svcPayload.Slice((int)sStart, (int)(sEnd - sStart));
+                    svcName = dedup is null ? Encoding.UTF8.GetString(svcUtf8) : dedup.Get(svcUtf8);
+                }
             }
 
             uint mtStart = BinaryPrimitives.ReadUInt32LittleEndian(mtOffsets.Slice(i * 4, 4));
             uint mtEnd   = BinaryPrimitives.ReadUInt32LittleEndian(mtOffsets.Slice((i + 1) * 4, 4));
-            string mt    = mtEnd > mtStart ? Encoding.UTF8.GetString(mtPayload.Slice((int)mtStart, (int)(mtEnd - mtStart))) : string.Empty;
+            string mt    = string.Empty;
+            if (mtEnd > mtStart)
+            {
+                var mtUtf8 = mtPayload.Slice((int)mtStart, (int)(mtEnd - mtStart));
+                mt = (dedup is null ? Encoding.UTF8.GetString(mtUtf8) : dedup.Get(mtUtf8)) ?? string.Empty;
+            }
 
             uint exStart = BinaryPrimitives.ReadUInt32LittleEndian(exOffsets.Slice(i * 4, 4));
             uint exEnd   = BinaryPrimitives.ReadUInt32LittleEndian(exOffsets.Slice((i + 1) * 4, 4));
-            ExceptionInfo? exc = exEnd > exStart
-                ? ExceptionInfo.FromBytes(exPayload.Slice((int)exStart, (int)(exEnd - exStart)))
-                : null;
+            // Carried as BYTES, like properties, and for the same reason one level up: an
+            // Error segment is ~100 % exception-bearing, a stack trace is 1-5 KB, and the
+            // candidate set a trigram hint produces is a SUPERSET of the matches — so
+            // decoding here built an object tree and a UTF-16 copy of every frame for rows
+            // the evaluator was about to reject. LogEvent.Exception decodes on first touch.
+            // The copy is required: exPayload points into the pooled block buffer, which is
+            // returned as soon as this block is decoded.
+            ReadOnlyMemory<byte> rawExc = exEnd > exStart
+                ? exPayload.Slice((int)exStart, (int)(exEnd - exStart)).ToArray()
+                : default;
 
             uint prStart = BinaryPrimitives.ReadUInt32LittleEndian(prOffsets.Slice(i * 4, 4));
             uint prEnd   = BinaryPrimitives.ReadUInt32LittleEndian(prOffsets.Slice((i + 1) * 4, 4));
@@ -611,7 +720,7 @@ public sealed class SegmentReader : ISegmentReader
                 Timestamp       = new DateTimeOffset(blockMinTs + tDelta, TimeSpan.Zero),
                 Level           = (LogLevel)lvl,
                 MessageTemplate = mt,
-                Exception       = exc,
+                RawException    = rawExc,
                 RawProperties   = rawProps,
                 TraceIdHi       = trHi,
                 TraceIdLo       = trLo,
@@ -896,6 +1005,35 @@ public sealed class SegmentReader : ISegmentReader
     /// </summary>
     internal static long PooledSectionRents;
 
+    /// <summary>
+    /// Process-wide count of successful <see cref="Open"/> calls, in the same spirit and with
+    /// the same caveats as <see cref="PooledSectionRents"/> — a test that reads it needs the
+    /// assembly's parallelisation switched off.
+    ///
+    /// <para>Opening a segment is a <c>FileInfo</c> stat, a <c>CreateFromFile</c>, a
+    /// <c>CreateViewAccessor</c> over the whole file and a block-index read and parse. A query
+    /// used to do all of it TWICE per surviving segment — once to prefilter, once to scan —
+    /// which is invisible in a wall clock next to the decode but is 40 mappings for a
+    /// 20-segment query, and every one of them a handle that blocks deletion on Windows. This
+    /// counter is how a test states "once per segment" as a number instead of a hope.</para>
+    /// </summary>
+    internal static long Opens;
+
+    /// <summary>
+    /// The other half of <see cref="Opens"/>: successful <see cref="Dispose"/> calls, counted
+    /// exactly once per reader however many times it is disposed and from however many threads
+    /// — the claim is an atomic exchange, so a second owner disposing concurrently cannot push
+    /// Closes past Opens.
+    ///
+    /// <para>It exists because "the mapping was released" is otherwise only observable by
+    /// trying to delete or rename the file, and that test passes for the WRONG reason as soon
+    /// as a collection runs — an unreachable reader gets finalised and the handle goes with
+    /// it, so a genuine leak of an un-primed survivor's reader can look fixed. Comparing
+    /// Closes against Opens over a query is deterministic and does not care what the GC
+    /// did.</para>
+    /// </summary>
+    internal static long Closes;
+
     private PooledSection RentSection(long offset)
     {
         if (offset <= 0) return default;
@@ -911,13 +1049,16 @@ public sealed class SegmentReader : ISegmentReader
     private short ReadInt16At(long offset)  { short v = 0; _view.Read(offset, out v); return v; }
     private byte  ReadByteAt(long offset)   { byte  v = 0; _view.Read(offset, out v); return v; }
 
-    private bool _disposed;
+    /// <summary>0 while the mapping is held, 1 once a <see cref="Dispose"/> has claimed it. An
+    /// int so the claim is one atomic exchange: a bool check-then-set lets two concurrent
+    /// Dispose calls both pass the check and count the close twice.</summary>
+    private int _disposed;
     public void Dispose()
     {
-        if (_disposed) return;
-        _disposed = true;
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
         _view.Dispose();
         _mmf.Dispose();
+        Interlocked.Increment(ref Closes);
     }
 }
 

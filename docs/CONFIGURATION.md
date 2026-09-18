@@ -175,11 +175,37 @@ Request/size limits, in bytes. Oversized requests are rejected with `413` before
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `MaxBatchBytes` | int | `4194304` (4 MB) | Max body for a CLEF batch (`POST /api/events`). |
+| `MaxBatchBytes` | int | `4194304` (4 MB) | Max body for a CLEF batch (`POST /api/events`). Raising it past 8 MB stops the body being pooled — see below. |
 | `MaxEventPayloadBytes` | int | `65536` (64 KB) | Max serialised properties for a single event (also the ring-buffer slab size). An oversized event is dropped (and logged) while the rest of the batch ingests. |
-| `MaxOtlpBatchBytes` | int | `8388608` (8 MB) | Max body for the OTLP endpoints (`POST /otlp/v1/*`). |
+| `MaxOtlpBatchBytes` | int | `8388608` (8 MB) | Max body for the OTLP endpoints (`POST /otlp/v1/*`). Raising it past 8 MB stops the body being pooled — see below. |
 | `RingCapacity` | int | `65536` | Ring-buffer slots between the HTTP ingest endpoints and the storage drainer (rounded up to a power of two, ~64 B each). Together with `PayloadPoolBytes` this is the absorption window for flush stalls before events drop. |
-| `PayloadPoolBytes` | long | `536870912` (512 MB) | Payload slab arena budget: slab count = min(`RingCapacity`, this / `MaxEventPayloadBytes`). Reserved virtual memory — resident pages track the payload bytes actually written, not the budget. Slabs, not ring slots, are the true drop threshold under stall. |
+| `PayloadPoolBytes` | long | *unset* → the larger of `min(512 MB, 8192 × MaxEventPayloadBytes)` and `min(512 MB, 15 % of the physical limit)` | Payload slab arena budget: slab count = min(`RingCapacity`, this / `MaxEventPayloadBytes`). Slabs, not ring slots, are the true drop threshold under stall: a pending event holds one slab whatever its size. The default holds at least 8 192 slabs — one OpenTelemetry collector batch at its default size — capped at 512 MB so a raised `MaxEventPayloadBytes` cannot balloon it; at the 64 KB default slab that is 512 MB on every host, a 512 MB container included. The 15 % share only decides the size when a lowered slab size makes 8 192 slabs smaller than it. Reserved virtual memory, and what it takes is **never given back**, so the high-water mark is a resting level. What that costs depends on the OS. **Linux** pages it lazily and opts the arena out of transparent huge pages (`MADV_NOHUGEPAGE`), so residency is per touched 4 KB page, not per slab, even where `transparent_hugepage` is `always` (the RHEL default), which would otherwise make each touched 2 MB range resident whole: a typical 0.3–2 KB event touches one 4 KB page of its slab, so 8 192 small events rest at ~32 MB, and only events near the maximum size approach the 512 MB worst case (if the opt-out fails, the server logs it once at startup). **Windows** commits it in 1 MB chunks up to the deepest slab ever used, whatever the events weigh, and never decommits: one batch that outruns the drainer by ~8 192 events commits ~512 MB even at 300 B an event, and commit is what a job object's memory limit counts — **under a Windows job or container memory limit, set this explicitly**. Set it under a Linux container memory limit too, for a hard ceiling: ~32 MB is what small events cost, not a bound. Also set it explicitly on a small host that expects large events or needs a hard ceiling, accepting that a batch then meets back-pressure (counted drops) earlier; an explicit value always wins. `GET /api/diagnostics` reports `ingestArenaBytes` and `ingestArenaResidentBytes`, the deepest slab ever used × the slab size: the commit charge on Windows, an upper bound on the arena's resident memory (not its RSS) on Linux. |
+
+> **A body over 8 MB is not pooled.** Request bodies are rented from a dedicated pool whose
+> largest bucket is 8 MB, chosen to cover the defaults of both receivers. Raising `MaxBatchBytes`
+> or `MaxOtlpBatchBytes` past that still behaves correctly, but every request above 8 MB then
+> allocates an array of exactly its size straight on the large object heap and drops it again on
+> return — the per-request LOH churn the pool exists to remove, on hosts that are usually the
+> ones least able to afford it. Nothing reports the cliff and `ingestBufferPooledBytes` will
+> simply stop growing, so raise these ceilings only as far as the traffic actually needs.
+
+---
+
+## Query options (`Ameto:Query`)
+
+Search budgets, and the cross-query cache of decoded segment indexes.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `IndexCacheBytes` | long | *unset* → `min(256 MB, 15 % of the managed-heap limit)` | Budget for the cache of decoded segment indexes, charged at each entry's **retained** size (expanded postings + dictionaries + bloom bits, several times the packed sections they decode from). Unset derives it from the memory this process may use: in a 512 MB container the GC's own heap limit is 384 MB, giving ~57 MB. `0` disables the cache — every query then re-reads and re-decodes the sections it consults. An explicit value always wins, including one larger than the derived figure. |
+| `IndexCacheIdleEvict` | TimeSpan | `"00:10:00"` | Drop cached segment indexes that no query has read for this long. Without it the only thing that ever removes an entry is budget pressure, so a server that answers one wide query and then goes quiet keeps those postings and bloom bits resident for the rest of its life. `0` turns it off (budget pressure only); the first wide query after an eviction pays to re-read and re-decode. |
+| `Timeout` | TimeSpan | `"00:01:00"` | Wall-clock budget for one search. A query that exceeds it is stopped and the client told so, rather than occupying a core until the browser tab is closed. Zero or negative removes the budget. |
+| `MaxConcurrent` | int | `0` | Searches allowed to run at once — each memory-maps segments and decompresses blocks in parallel. `0` = auto (processor count, clamped 2–16); negative = unlimited. Past the limit a request is refused quickly (`503` + `Retry-After`) instead of everything crawling. |
+| `QueueWait` | TimeSpan | `"00:00:05"` | How long a request waits for a search slot before it is refused. |
+
+**The cache has a second, native ceiling — not settable.** An entry is not all one kind of memory: its decoded postings are managed, but the bloom filter's bits are native (4–8 % of an entry — the postings expand 3–4× when decoded and the bloom's bits do not, so its share of a cached entry is far smaller than its share of the packed sections on disk), so they sit outside the GC heap limit that `IndexCacheBytes` is a share of when unset. That native share is bounded separately at `min(96 MB, 5 % of the physical limit)` — 25.6 MB in a 512 MB container — and whichever ceiling is reached first evicts from the least-recently-used end. Setting `IndexCacheBytes` explicitly raises it too, to `max(that ceiling, min(20 % of the budget you set, 10 % of the physical limit))` — **a budget you set may raise this ceiling, but never past 10 % of what the host has**, because a budget says how much memory this component may hold and only the host says how much of it may be pinned where no collection can reach it. It never moves *down*: a small configured cache keeps the derived ceiling, and in a 512 MB container the ceiling stops at 51 MB however large the budget. Both figures are reported by `GET /api/diagnostics` as `indexCacheNativeBytes` and `indexCacheNativeBudgetBytes`, and `indexCacheNativeEvicted` counts the entries this ceiling has dropped while the total budget still had room — if that number climbs, the cache is bounded by its bloom bits rather than by `IndexCacheBytes`. Under RAM pressure (see `RamTargetPercent`) the whole cache is now dropped along with the hot-tier flush — queries re-read what they need — and `indexCacheShedEvicted` counts how many entries that has cost.
+
+**Upgrading — both cache settings changed behaviour.** `IndexCacheBytes` was a flat 256 MB and is now derived when unset, so an existing install that never set it gets less (~153 MB on a 1 GB VM, ~57 MB in a 512 MB container); and `IndexCacheIdleEvict` is new and **on by default**. To keep the previous behaviour exactly, set `IndexCacheBytes: 268435456` and `IndexCacheIdleEvict: "00:00:00"` — note that in a 512 MB container that budget also raises the native ceiling above, from 25.6 MB to 51.2 MB, where the host clamp rather than the 20 % is what stops it. The effective figures are printed at startup on the `Flush budgets:` line and exposed by `GET /api/diagnostics` as `indexCacheBudgetBytes`, `indexCacheBytes` and `indexCacheIdleEvicted`.
 
 ---
 
@@ -310,7 +336,16 @@ Ameto:
   Ingestion:
     MaxBatchBytes: 4194304        # 4 MB  (CLEF /api/events)
     MaxEventPayloadBytes: 65536   # 64 KB (per-event properties)
-    MaxOtlpBatchBytes: 8388608    # 8 MB  (/otlp/v1/*)
+    MaxOtlpBatchBytes: 8388608    # 8 MB  (/otlp/v1/*); above 8 MB bodies are no longer pooled
+    # RingCapacity: 65536         # ring slots between the receivers and the drainer
+    # PayloadPoolBytes:           # unset = max(8192 slabs, 15% of physical), capped at 512 MB; set it under a container or job memory limit
+
+  Query:
+    # IndexCacheBytes:            # unset = min(256 MB, 15% of the managed-heap limit); 0 disables
+    # IndexCacheIdleEvict: "00:10:00"   # 0 = off (budget pressure only)
+    Timeout: "00:01:00"
+    MaxConcurrent: 0              # 0 = auto (cores, 2-16); negative = unlimited
+    QueueWait: "00:00:05"
 
   Retention:
     VerboseDays: 90

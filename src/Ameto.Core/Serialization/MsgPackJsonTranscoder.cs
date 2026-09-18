@@ -15,7 +15,8 @@ namespace Ameto.Core.Serialization;
 /// behind most of the GC polling on top of it. Nothing ever read the dictionary; it
 /// existed only to be re-serialised.</para>
 ///
-/// <para>Output must match <c>DynamicObjectConverter</c> exactly, quirks included:
+/// <para>Output must match the server's old <c>DynamicObjectConverter</c> exactly (the
+/// converter itself is gone from src; its copies live in the parity tests), quirks included:
 /// a nil INSIDE an array becomes the string <c>"&lt;null&gt;"</c> (the old reader
 /// substituted it while materialising), while a nil map VALUE stays JSON null; and a
 /// msgpack binary value renders as <c>"System.Byte[]"</c>, because the old path decoded

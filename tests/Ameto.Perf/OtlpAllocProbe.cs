@@ -61,7 +61,65 @@ public sealed class OtlpAllocProbe
         Assert.True(streamBytes * 8 < domBytes, $"streaming ({streamBytes} B) should allocate far less than DOM ({domBytes} B)");
     }
 
-    private static string BuildBatch(int records)
+    /// <summary>
+    /// The streaming parser's own cost per record, on a batch whose attribute values carry JSON
+    /// escapes — a quoted message, a Windows path, a newline, an accented name. That is the
+    /// ordinary shape of a structured log line, and it is the path that has to unescape into a
+    /// scratch buffer before the value can be written as msgpack.
+    /// </summary>
+    [Fact]
+    public void StreamingParseCostPerRecord()
+    {
+        const int records = 1000;
+        byte[] plain   = Encoding.UTF8.GetBytes(BuildBatch(records));
+        byte[] escaped = Encoding.UTF8.GetBytes(BuildBatch(records, escapes: true));
+        var sink = new NullSink();
+
+        for (int i = 0; i < 20; i++) { OtlpLogStreamParser.Parse(plain, sink); OtlpLogStreamParser.Parse(escaped, sink); }
+        Measure(plain, sink, records);                 // a full measured pass of each before
+        Measure(escaped, sink, records);               // either counts — tiered JIT otherwise
+                                                       // charges the first one for both
+        var (plainNs,   plainB)   = Measure(plain, sink, records);
+        var (escapedNs, escapedB) = Measure(escaped, sink, records);
+
+        _out.WriteLine($"streaming JSON parse, {records}-record batches (best of 9 rounds):");
+        _out.WriteLine($"  plain attributes  : {plainNs:F0} ns/record | {plainB:F1} B/record "
+                     + $"| {1_000_000.0 / plainNs:F0} k records/s/core");
+        _out.WriteLine($"  escaped attributes: {escapedNs:F0} ns/record | {escapedB:F1} B/record "
+                     + $"| {1_000_000.0 / escapedNs:F0} k records/s/core");
+
+        // The scratch is per THREAD, not per record or per escaped value.
+        Assert.True(escapedB < 1.0, $"expected no per-record allocation, got {escapedB:F1} B/record");
+    }
+
+    /// <summary>
+    /// Best of several rounds, not the mean: the interference here is other work on the machine,
+    /// which can only ever make a round slower. A mean over a shared box moves by 40 % between
+    /// runs and would hide a change this size completely.
+    /// </summary>
+    private static (double Ns, double Bytes) Measure(byte[] utf8, NullSink sink, int records)
+    {
+        const int rounds = 9, iters = 30;
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+
+        double best = double.MaxValue;
+        long bytes  = 0;
+        for (int r = 0; r < rounds; r++)
+        {
+            long b0 = GC.GetAllocatedBytesForCurrentThread();
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            for (int i = 0; i < iters; i++) OtlpLogStreamParser.Parse(utf8, sink);
+            sw.Stop();
+            long allocated = GC.GetAllocatedBytesForCurrentThread() - b0;
+
+            double ns = sw.Elapsed.TotalMilliseconds * 1_000_000.0 / iters / records;
+            if (ns < best) { best = ns; bytes = allocated; }
+        }
+        return (best, bytes / (double)iters / records);
+    }
+
+    private static string BuildBatch(int records, bool escapes = false)
     {
         var sb = new StringBuilder(records * 400);
         sb.Append("""{"resourceLogs":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"Etisalat.API"}},{"key":"host.name","value":{"stringValue":"load-gen"}}]},"scopeLogs":[{"scope":{"name":"k6"},"logRecords":[""");
@@ -70,6 +128,12 @@ public sealed class OtlpAllocProbe
             if (i > 0) sb.Append(',');
             sb.Append("""{"timeUnixNano":"1783953780000000000","severityNumber":9,"body":{"stringValue":"HTTP request handled"},"attributes":[""");
             sb.Append("""{"key":"orderId","value":{"intValue":"12345"}},{"key":"customerId","value":{"stringValue":"cust-42"}},{"key":"http.method","value":{"stringValue":"GET"}},{"key":"http.route","value":{"stringValue":"/api/pay"}},{"key":"http.status_code","value":{"intValue":"200"}},{"key":"duration_ms","value":{"doubleValue":12.5}},{"key":"region","value":{"stringValue":"ae-dxb"}},{"key":"RequestId","value":{"stringValue":"0HN123abc"}}""");
+            if (escapes)
+                // A quoted message, a Windows path, a newline and an accented name: what a
+                // structured log line looks like once anyone puts real text in it.
+                sb.Append("""
+                          ,{"key":"message","value":{"stringValue":"order \"A-42\" accepted"}},{"key":"file","value":{"stringValue":"C:\\svc\\logs\\app.log"}},{"key":"detail","value":{"stringValue":"line one\nline two"}},{"key":"customer","value":{"stringValue":"Beno\u00eet Dupr\u00e9"}}
+                          """);
             sb.Append("]}");
         }
         sb.Append("]}]}]}");

@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Numerics;
 using Microsoft.Extensions.Logging;
@@ -135,7 +136,171 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     private readonly SemaphoreSlim                        _flushSlots;
     // In-flight parallel cold-flush tasks, so DisposeAsync can await them before the
     // tiers they read are freed. Self-pruning via ContinueWith on completion.
+    //
+    // NOT what makes freeing a tier safe: a task is registered only after Task.Run has
+    // already handed it to the pool, so its body can swap and start reading a tier before any
+    // snapshot of this dictionary can see it, and FlushHotTierAsync's inline flush is never
+    // registered at all. _heavyPhases is the count that shutdown waits on.
     private readonly ConcurrentDictionary<Task, byte>    _inFlightFlushes = new();
+
+    // ── Shutdown fences ─────────────────────────────────────────────────────────
+    //
+    // THE INVARIANT: a hot tier's native memory is freed only once every flush that swapped it
+    // has ended and no reader snapshot holds it. DisposeAsync used to ASSUME the first half ("no
+    // writes remain") and ignore the second. When a late write filled the tier after
+    // DisposeAsync's in-flight snapshot, the flush it scheduled read the tier while DisposeAsync
+    // freed it: AccessViolation in HotTierEventSource.EventAt. And since freed chunk arenas and
+    // pooled slot arrays can be handed straight to a successor tier, the losing flush could
+    // also write another tier's rows into a segment without crashing.
+
+    /// <summary>
+    /// 1 once <see cref="DisposeAsync"/> has shut the write path. <see cref="TryWrite"/> refuses
+    /// from then on (a volatile read, the only cost on the ingest path), and no flush but
+    /// DisposeAsync's own may swap a tier. Set with a full fence; see <see cref="DisposeCoreAsync"/>.
+    /// </summary>
+    private int _writesClosed;
+
+    /// <summary>
+    /// Frozen tiers whose HEAVY PHASE has not ended — the cold write in
+    /// <see cref="TryFlushAsync"/>, or the background retry that took it over. Incremented under
+    /// <see cref="_flushLock"/> in the same step that publishes the tier to
+    /// <see cref="_frozenHot"/>, and decremented when that phase ends, whoever started it: the
+    /// flush loop, a write that found the tier full, <see cref="FlushHotTierAsync"/>, or a retry.
+    /// Since only the swap increments it, a shutdown holding <see cref="_flushLock"/> after
+    /// <see cref="_writesClosed"/> sees it only fall.
+    /// </summary>
+    private int _heavyPhases;
+
+    /// <summary>Installed by DisposeAsync; completed by the decrement that takes <see cref="_heavyPhases"/> to zero.</summary>
+    private TaskCompletionSource? _heavyPhasesDrained;
+
+    /// <summary>Installed by DisposeAsync; completed by the reader release that takes <see cref="_activeReaders"/> to zero.</summary>
+    private TaskCompletionSource? _readersDrained;
+
+    /// <summary>
+    /// Set under <see cref="_frozenLock"/> once DisposeAsync has collected the tiers it will free.
+    /// A reader snapshot is taken under the same lock, so after it no reader can capture a tier
+    /// and <see cref="_activeReaders"/> only falls.
+    /// </summary>
+    private bool _snapshotsClosed;
+
+    /// <summary>
+    /// How long shutdown waits, in total, for its turn at the flush lock and a flush slot, for
+    /// running flushes and for open readers. Past it a tier that may still be in use is LEFT
+    /// ALLOCATED and an Error says so — never freed under its user. Internal so a test can
+    /// shorten it.
+    /// </summary>
+    internal TimeSpan _shutdownWaitBudget = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// Test hook: called by <see cref="DisposeAsync"/> after the write path is closed, the writer
+    /// fenced, flushes drained and readers drained — immediately before tiers are freed.
+    /// </summary>
+    internal Action? _beforeTiersFreed;
+
+    /// <summary>
+    /// Test hook: called by <see cref="TryWrite"/> right after the shutdown gate let it through,
+    /// before it captures the write state — the window in which the tier's Freeze, not the gate,
+    /// is what fences the write. Costs the ingest path one field read while unset.
+    /// </summary>
+    internal Action? _afterWriteGate;
+
+    /// <summary>
+    /// Test hook: called by <see cref="TryFlushAsync"/> holding <see cref="_flushLock"/>, after the
+    /// in-lock close re-check and before the swap reads the live tier — the window in which a flush
+    /// has committed to swapping but has not yet counted a heavy phase.
+    /// </summary>
+    internal Action? _beforeSwap;
+
+    /// <summary>
+    /// Test hook: called by <see cref="DisposeAsync"/>, after closing the write path, when its take
+    /// of <see cref="_flushLock"/> has to wait for a flush that holds it.
+    /// </summary>
+    internal Action? _onWaitingForFlushLock;
+
+    /// <summary>
+    /// Test hook: called by <see cref="DisposeAsync"/> as it starts waiting for running heavy
+    /// phases — only when there is one to wait for, so a test can tell "shutdown is waiting for the
+    /// flush" from "shutdown went straight on" by which happens first, with no timer.
+    /// </summary>
+    internal Action? _onWaitingForHeavyPhases;
+
+    /// <summary>
+    /// Test hook: called by <see cref="DisposeAsync"/> as it starts waiting for open readers — only
+    /// when one is open. Reader snapshots are already closed by then, and nothing is freed.
+    /// </summary>
+    internal Action? _onWaitingForReaders;
+
+    /// <summary>Test hook: the live hot tier.</summary>
+    internal HotTierSegment LiveHotTier => _write.Hot;
+
+    /// <summary>Test hook: heavy phases in flight (see <see cref="_heavyPhases"/>).</summary>
+    internal int HeavyPhasesInFlight => Volatile.Read(ref _heavyPhases);
+
+    /// <summary>Test hook: the scheduled flush tasks registered right now.</summary>
+    internal Task[] InFlightFlushTasks() => _inFlightFlushes.Keys.ToArray();
+    /// <summary>
+    /// Segments the header aggregation has already warned it could not read, so a torn file is
+    /// named at Warning ONCE rather than on every histogram poll and alert tick that meets it.
+    ///
+    /// <para>Bounded by <see cref="WarnedUnreadableSegmentCap"/>, and never cleared to make room:
+    /// clearing it once full made every unreadable segment past the cap warn again on every poll.
+    /// Once full, a segment not already in it is logged at Debug only (the count still reports
+    /// it). A key leaves when <see cref="DeleteSegmentAsync"/> removes its segment, and an add
+    /// that finds its segment already removed takes itself back (see
+    /// <see cref="LogUnreadableSegment"/>), so the set holds segments the catalog still serves,
+    /// not every torn file this process ever met.</para>
+    /// </summary>
+    private readonly ConcurrentDictionary<SegmentKey, byte> _warnedUnreadableSegments = new();
+    /// <summary>Makes the cap check and the add in <see cref="LogUnreadableSegment"/> one step.</summary>
+    private readonly System.Threading.Lock _warnedUnreadableGate = new();
+    /// <summary>How many unreadable segments are named at Warning; internal so a test can lower it.</summary>
+    internal int WarnedUnreadableSegmentCap = 1024;
+    /// <summary>
+    /// Segments a merge has taken out of the catalog, by key, with the number of the record that
+    /// named each and the key of the output that now holds its events. The header aggregation
+    /// consults it when a segment in its snapshot is gone by the time a worker opens it, because
+    /// the two ways a segment leaves mid-scan mean opposite things for the count. Retention's
+    /// removal took the events out of the store, so leaving them out IS the answer. A merge's
+    /// removal moved them into its output, which a snapshot taken before the merge published
+    /// does not list, so leaving them out gives a low total — and presented as complete, a wrong
+    /// one.
+    ///
+    /// <para>The output is kept because "before the merge published" is not every snapshot that
+    /// lists a source. The merge publishes its output first and deletes its sources after, so a
+    /// snapshot taken in between lists both — and a scan over it reads the source's events in
+    /// the output. Missing the source there loses nothing, and calling the total a floor would
+    /// make an exact count look partial.</para>
+    ///
+    /// <para>Written by the merge (<see cref="RecordMergedAwaySegment"/>), not by
+    /// <see cref="DeleteSegmentAsync"/>: every caller of the delete — retention, the merge's source
+    /// cleanup, anything calling the public method — arrives with nothing but a key. And written
+    /// BEFORE the delete, so a scan that finds the entry gone always finds the record too.</para>
+    ///
+    /// <para>Bounded by <see cref="MergedAwaySegmentCap"/>, oldest record out first. Eviction is
+    /// not allowed to turn a merge back into a silent low count: <see cref="_mergedAwayEvictedThrough"/>
+    /// says how far it has reached, and a scan that may have lost a record to it reports the
+    /// removal as a merge (see <see cref="MayHaveBeenMergedAway"/>). Everything here is under
+    /// <see cref="_mergedAwayGate"/>, a leaf, taken only by the merge's cleanup and by a scan
+    /// that has already failed to read a segment.</para>
+    /// </summary>
+    private readonly Dictionary<SegmentKey, MergedAwayRecord> _mergedAwaySegments = new();
+    /// <summary>One entry of <see cref="_mergedAwaySegments"/>: which record named the source, and where its events went.</summary>
+    private readonly record struct MergedAwayRecord(long Number, SegmentKey Output);
+    /// <summary>Record <c>n</c>'s key at <c>[(n - 1) % Length]</c>; allocated by the first merge.</summary>
+    private SegmentKey[]? _mergedAwayRing;
+    /// <summary>Records ever made. Written under the gate; a scan reads it without, as its mark.</summary>
+    private long _mergedAwayRecorded;
+    /// <summary>Number of the newest record evicted from <see cref="_mergedAwaySegments"/>; 0 while none has been.</summary>
+    private long _mergedAwayEvictedThrough;
+    private readonly System.Threading.Lock _mergedAwayGate = new();
+    /// <summary>
+    /// How many merged-away keys are kept: eight full merge batches, a few hundred KB once full. A
+    /// record only has to outlive the scans already running when it was made, and a scan that
+    /// outlives this many records calls any removal it meets a merge rather than guess. Internal
+    /// so a test can lower it before the first merge.
+    /// </summary>
+    internal int MergedAwaySegmentCap = 8 * MergeMaxSources;
     /// <summary>Pause between attempts to persist a frozen tier whose flush failed.</summary>
     private static readonly TimeSpan FlushRetryDelay = TimeSpan.FromSeconds(15);
     /// <summary>True while the live WAL is refusing appends — gates the once-per-episode error log (writer thread only).</summary>
@@ -174,6 +339,23 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// sequence passes either way.
     /// </summary>
     internal Action? _beforeImportPublish;
+    /// <summary>
+    /// Test hook: called inside <see cref="ImportSegment(string, string)"/> after the entry is
+    /// published and before <c>File.Move</c> lands the file, under <c>_importLock</c> — the window
+    /// in which the catalog names a path that does not exist yet.
+    /// </summary>
+    internal Action? _afterImportPublish;
+    /// <summary>
+    /// Test hook: called by the header aggregation's cold scan just before it opens a segment
+    /// from its catalog snapshot, so a test can remove the segment in between, as a merge does.
+    /// </summary>
+    internal Action<SegmentInfo>? _beforeHeaderSegmentOpen;
+    /// <summary>
+    /// Test hook: called by the header aggregation for a segment it could not read and that the
+    /// catalog still served, before it takes a place under the warning cap — the window in which
+    /// a delete can remove the segment after the catalog was checked.
+    /// </summary>
+    internal Action<SegmentInfo>? _beforeUnreadableSegmentWarned;
     /// <summary>Test hook: first id of the block reserved for the live WAL (see <see cref="WriteState.WalSegId"/>).</summary>
     internal ulong LiveWalSegmentId => _write.WalSegId;
     /// <summary>
@@ -194,17 +376,55 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     private const long IndexBuildBytesPerEvent = 1_400;
 
     /// <summary>
-    /// Ceiling on managed index-build state across all concurrent flushes. At the default
-    /// 64 MB tier (131,072 events ⇒ ~184 MB per build) this yields a width of 3 — enough to
-    /// stay ahead of ingest (a tier fills in ~0.9 s at 150k events/s, a build takes ~1.3 s,
-    /// so 3 in flight clears one every ~0.44 s) while capping the burst near 550 MB instead
-    /// of the 8 × 300 MB the old core-count heuristic allowed. Override with
-    /// <c>HotTier.FlushConcurrency</c> when trading RAM for throughput deliberately.
+    /// Managed index-build state ONE MERGE holds per byte of its group payload budget.
+    ///
+    /// <para>A merge takes the same flush slot as an ingest flush (see <c>MergeToColdAsync</c>)
+    /// but is not sized by the tier: its writer forecasts a group from the GROUP PAYLOAD BUDGET,
+    /// and its source hint is every source segment's event count, so the tier-shaped figure above
+    /// does not bound it. MEASURED (<c>tests/Ameto.Perf/IndexBuildPoolProbe</c>, prop-dense
+    /// trace-carrying events): 30 MB held for 16 MB groups and 90 MB for 64 MB ones — about
+    /// 1.5 bytes of build state per byte of group payload.</para>
     /// </summary>
-    private const long FlushManagedBudgetBytes = 640L * 1024 * 1024;
+    private const double MergeBuildBytesPerGroupByte = 1.5;
 
-    /// <summary>Ceiling on native memory held by frozen-but-not-yet-persisted tiers.</summary>
-    private const long FlushNativeBudgetBytes = 512L * 1024 * 1024;
+    /// <summary>
+    /// Share of the managed build budget one merge's GROUP may be worth — a quarter, so that at
+    /// the ratio above a merge build costs about a third of the budget and stays inside the slot
+    /// the admission arithmetic priced. The default 64 MB group is the ceiling, so a host with
+    /// room merges exactly as it always did.
+    /// </summary>
+    private const int MergeGroupBudgetDivisor = 4;
+
+    /// <summary>Floor on the group payload budget: below this a group stops being worth its index sections.</summary>
+    private const long MinGroupPayloadBudgetBytes = 8L * 1024 * 1024;
+
+    /// <summary>
+    /// Ceilings on managed index-build state and on native frozen-tier memory, derived once at
+    /// construction from what this process may actually use — see <see cref="MemoryBudgets"/>.
+    ///
+    /// <para>On a host with room they are the constants they always were: 640 MB of concurrent
+    /// builds, which at the default 64 MB tier (131,072 events ⇒ ~184 MB per build) yields a
+    /// width of 3 — enough to stay ahead of ingest (a tier fills in ~0.9 s at 150k events/s, a
+    /// build takes ~1.3 s, so 3 in flight clears one every ~0.44 s) — and 512 MB of frozen
+    /// tiers. In a 512 MB container they become 115 MB (30 % of the GC's 384 MB heap limit —
+    /// index builds are managed) and 128 MB (25 % of the container — frozen tiers are native and
+    /// not under the heap limit), which is the difference between back-pressure and an OOM kill.
+    /// Override the width with <c>HotTier.FlushConcurrency</c>
+    /// when trading RAM for throughput deliberately.</para>
+    /// </summary>
+    private readonly MemoryBudgets _budgets;
+
+    /// <summary>
+    /// Concurrent index builds the constructor settled on (the <c>_flushConcurrency</c> count).
+    /// Internal so a test can see the budgets actually reach the engine.
+    /// </summary>
+    internal int FlushWidth { get; }
+
+    /// <summary>
+    /// Frozen tiers allowed in flight at once (the <c>_flushSlots</c> count). Internal for the
+    /// same reason as <see cref="FlushWidth"/>.
+    /// </summary>
+    internal int FlushSlots { get; }
     /// <summary>
     /// Window anchors that produced no usable merge batch — excluded so the sweep advances
     /// (reset on restart). Keyed by <see cref="SegmentKey"/> for the same reason the catalog is:
@@ -274,7 +494,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     // served, never expired and never compacted — disk held for the life of the install, with
     // nothing logged. LoadSegmentCatalog re-ran the same collision on every restart in
     // directory-enumeration order, so which of the two survived could change from boot to boot.
-    private readonly ConcurrentDictionary<SegmentKey, SegmentInfo> _segments = new();
+    private readonly SegmentCatalog _segments = new();
     /// <summary>Background catalog scan started by the ctor (kept to observe faults).</summary>
     private readonly Task _catalogLoad;
 
@@ -372,10 +592,23 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     public StringInternPool TemplatePool { get; } = new();
 
     public StorageEngine(IOptions<ServerOptions> options, RetentionStore retentionStore, ILogger<StorageEngine> logger)
+        : this(options, retentionStore, logger, MemoryBudgets.Current())
+    {
+    }
+
+    /// <summary>
+    /// Takes the memory budgets instead of reading them from this process, so a test can build
+    /// the engine a 512 MB container would get on a machine that is not one. Not public: the DI
+    /// container only sees the constructor above.
+    /// </summary>
+    internal StorageEngine(
+        IOptions<ServerOptions> options, RetentionStore retentionStore, ILogger<StorageEngine> logger,
+        MemoryBudgets budgets)
     {
         _options        = options.Value;
         _retentionStore = retentionStore;
         _logger         = logger;
+        _budgets        = budgets;
         // ── Flush RAM budgets ────────────────────────────────────────────────────
         // A flush costs memory in two separate places, and each needs its own bound:
         //
@@ -397,7 +630,21 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         int  eventCapacity  = HotTierSegment.EventCapacityFor(Math.Max(1, _options.HotTier.MaxSizeBytes));
         long perFlushManaged = Math.Max(1L, (long)eventCapacity * IndexBuildBytesPerEvent);
 
-        int widthByMemory = (int)Math.Clamp(FlushManagedBudgetBytes / perFlushManaged, 1, 64);
+        // The OTHER workload this semaphore admits. A merge runs the same index build through the
+        // same slot, but its size comes from the group payload budget rather than from the tier:
+        // at the 64 MB default that is a heavier build than the stand's whole 16 MB tier, so the
+        // width — which exists to bound concurrent builds — was computed for the lighter of the
+        // two, and the ceiling logged below was not the ceiling enforced. Both halves are fixed
+        // here: the group budget is scaled by what the managed budget affords, and the width is
+        // taken from the HEAVIER build.
+        _groupPayloadBudgetBytes = Math.Clamp(
+            _budgets.ManagedBuildBytes / MergeGroupBudgetDivisor,
+            MinGroupPayloadBudgetBytes,
+            SegmentWriter.DefaultGroupPayloadBudgetBytes);
+        long perMergeManaged = Math.Max(1L, (long)(_groupPayloadBudgetBytes * MergeBuildBytesPerGroupByte));
+        long perBuildManaged = Math.Max(perFlushManaged, perMergeManaged);
+
+        int widthByMemory = (int)Math.Clamp(_budgets.ManagedBuildBytes / perBuildManaged, 1, 64);
         int flushWidth = _options.HotTier.FlushConcurrency > 0
             ? Math.Min(_options.HotTier.FlushConcurrency, 64)
             : Math.Clamp(Math.Min(Environment.ProcessorCount / 2, widthByMemory), 1, 8);
@@ -407,35 +654,63 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         // The previous 1.4 × MaxSizeBytes estimate under-counted by up to 17x on small
         // events, so the "1 GB" budget it computed could hold multiple GB in practice.
         // Floored at the flush width so every concurrent flush can still hold a slot.
-        int flushSlots = Math.Clamp((int)(FlushNativeBudgetBytes / tierFootprint), flushWidth, 64);
+        int flushSlots = Math.Clamp((int)(_budgets.NativeTierBytes / tierFootprint), flushWidth, 64);
         _flushSlots = new SemaphoreSlim(flushSlots, flushSlots);
+        FlushWidth  = flushWidth;
+        FlushSlots  = flushSlots;
 
         // Report the ceilings these settings actually produce, not just the inputs — an
         // explicit HotTier.FlushConcurrency override raises them, and that should be
         // visible in the journal rather than inferred.
-        long managedCeiling = (long)flushWidth * perFlushManaged;
+        long managedCeiling = (long)flushWidth * perBuildManaged;
         long nativeCeiling  = (long)flushSlots * tierFootprint;
 
         _logger.LogInformation(
-            "Flush budgets: width={Width} (×{PerFlush} MB managed = {ManagedCeiling} MB), " +
-            "slots={Slots} (×{Tier} MB native = {NativeCeiling} MB), tier={Events} events / {Payload} MB payload",
-            flushWidth, perFlushManaged / 1048576, managedCeiling / 1048576,
+            "Flush budgets: width={Width} (×{PerBuild} MB managed = {ManagedCeiling} MB; " +
+            "a flush holds {PerFlush} MB, a merge {PerMerge} MB in {GroupBudget} MB groups), " +
+            "slots={Slots} (×{Tier} MB native = {NativeCeiling} MB), tier={Events} events / {Payload} MB payload; " +
+            "derived from a {ManagedLimit} MB managed-heap limit and {PhysicalLimit} MB physical: " +
+            "managed≤{ManagedBudget} MB, native≤{NativeBudget} MB ({Source}); " +
+            "index cache≤{CacheBudget} MB ({CacheSource}), native≤{CacheNativeBudget} MB, idle evict {IdleEvict}",
+            flushWidth, perBuildManaged / 1048576, managedCeiling / 1048576,
+            perFlushManaged / 1048576, perMergeManaged / 1048576, _groupPayloadBudgetBytes / 1048576,
             flushSlots, tierFootprint / 1048576, nativeCeiling / 1048576,
-            eventCapacity, _options.HotTier.MaxSizeBytes / 1048576);
+            eventCapacity, _options.HotTier.MaxSizeBytes / 1048576,
+            _budgets.ManagedLimitBytes / 1048576,
+            _budgets.PhysicalLimitBytes / 1048576,
+            _budgets.ManagedBuildBytes / 1048576,
+            _budgets.NativeTierBytes / 1048576,
+            _budgets.IsConstrained ? "host-constrained" : "fixed ceilings",
+            // The EFFECTIVE figure, not the derivation: Query.IndexCacheBytes overrides it, and
+            // this line is the only place an operator is told what the cache will hold. Reporting
+            // the derivation meant a stand configured to 48 MB was told 57, and a big host
+            // configured to 4 GB was told 256 — under-reporting, which is the direction that
+            // ends in an OOM kill. /api/diagnostics was given exactly this treatment in this same
+            // round (indexCacheBudgetBytes reports what the cache was BUILT with); the startup
+            // line was not. Resolving SegmentIndexCache itself is not available here: storage is
+            // registered before the query services that construct it.
+            _options.Query.EffectiveIndexCacheBytes / 1048576,
+            _options.Query.IndexCacheBytes.HasValue ? "configured" : "derived",
+            // The cache's OTHER ceiling, on the same line for the same reason: an operator can now
+            // move it — a configured budget raises it, clamped to the host's share — and these are
+            // the bytes the GC cannot see. Reading it off a running server's /api/diagnostics is
+            // the harder road on exactly the constrained hosts this line was added for.
+            _options.Query.EffectiveIndexCacheNativeBytes / 1048576,
+            _options.Query.IndexCacheIdleEvict);
 
         // Both clamps are floored so at least one flush can always proceed. That floor
         // WINS over the budget: at a large MaxSizeBytes a single tier no longer fits, and
         // the engine quietly runs above the ceiling rather than refusing to start. The
         // budget is a target, not a guarantee — say so instead of letting the line above
         // read like one.
-        if (perFlushManaged > FlushManagedBudgetBytes || tierFootprint > FlushNativeBudgetBytes)
+        if (perBuildManaged > _budgets.ManagedBuildBytes || tierFootprint > _budgets.NativeTierBytes)
             _logger.LogWarning(
-                "A single flush of a {Payload} MB tier ({PerFlush} MB managed + {Tier} MB native) does not fit " +
+                "A single build of a {Payload} MB tier ({PerFlush} MB managed + {Tier} MB native) does not fit " +
                 "the flush budget ({ManagedBudget} MB managed / {NativeBudget} MB native). One flush must always " +
                 "be allowed to run, so these budgets cannot be honoured at this tier size — peak RAM will exceed " +
                 "them. Lower HotTier.MaxSizeBytes to bring the peak down.",
-                _options.HotTier.MaxSizeBytes / 1048576, perFlushManaged / 1048576, tierFootprint / 1048576,
-                FlushManagedBudgetBytes / 1048576, FlushNativeBudgetBytes / 1048576);
+                _options.HotTier.MaxSizeBytes / 1048576, perBuildManaged / 1048576, tierFootprint / 1048576,
+                _budgets.ManagedBuildBytes / 1048576, _budgets.NativeTierBytes / 1048576);
         _idGen    = new EventIdGenerator(_options.NodeId);
         _dataDir  = _options.DataDirectory;
         _walDir   = Path.Combine(_dataDir, "wal");
@@ -526,14 +801,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
         while (!ct.IsCancellationRequested)
         {
-            // Finish any merge whose source deletion was blocked by an open reader
-            // (the manifest survives until every source file is gone).
-            try { RecoverInterruptedMerges(); }
-            catch (Exception ex) { _logger.LogWarning(ex, "Merge recovery sweep failed"); }
-
             // One batch per iteration, short pause while a backlog exists.
             bool merged;
-            try { merged = await TryMergeSmallSegmentsOnceAsync(ct); }
+            try { merged = await RunColdMaintenancePassAsync(ct); }
             catch (OperationCanceledException) { break; }
             catch (Exception ex) { _logger.LogError(ex, "Segment merge pass failed"); merged = false; }
             if (merged)
@@ -563,6 +833,31 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     }
 
     /// <summary>
+    /// One pass of <see cref="RunColdMaintenanceLoopAsync"/>: the two sweeps, then one merge batch.
+    /// True when a batch was merged. The merge's exceptions, cancellation included, reach the
+    /// loop; the sweeps log their own and never stop the merge behind them.
+    ///
+    /// <para>Internal so a test can run a pass without the loop's three-minute settle. Past the
+    /// background retry's window the deferred-delete sweep below and retention's are the only
+    /// retries a parked file gets, so dropping either must fail a test and not only a stand.</para>
+    /// </summary>
+    internal Task<bool> RunColdMaintenancePassAsync(CancellationToken ct)
+    {
+        // Finish any merge whose source deletion was blocked by an open reader
+        // (the manifest survives until every source file is gone).
+        try { RecoverInterruptedMerges(); }
+        catch (Exception ex) { _logger.LogWarning(ex, "Merge recovery sweep failed"); }
+
+        // Segment files whose delete outlasted the background retry (see DeleteSegmentAsync).
+        try { RetryPendingSegmentDeletes(); }
+        catch (Exception ex) { _logger.LogWarning(ex, "Deferred segment delete sweep failed"); }
+
+        // Handed back, not awaited: the merge is already async, and a second state machine around
+        // it would add only its own allocation.
+        return TryMergeSmallSegmentsOnceAsync(ct);
+    }
+
+    /// <summary>
     /// Returns the memory a maintenance burst just used. The TRIGGER is background,
     /// but the pause is not: a blocking compacting gen2 stops every thread, ingest
     /// and query included, so this is visible to clients no matter which thread asks
@@ -579,16 +874,14 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
     // ── ISegmentProvider ──────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Newest MaxTs first. Off the catalog's cached sorted snapshot (see
+    /// <see cref="SegmentCatalog"/>): the walk + LINQ sort + list per call used to be
+    /// paid by every query and every live-tail poll for an answer that changes only
+    /// when a segment is added or removed.
+    /// </summary>
     public IReadOnlyList<SegmentInfo> GetSegments(DateTimeOffset? from, DateTimeOffset? to)
-    {
-        long fromTicks = from?.UtcTicks ?? long.MinValue;
-        long toTicks   = to?.UtcTicks   ?? long.MaxValue;
-
-        return _segments.Values
-            .Where(s => s.MaxTimestampTicks >= fromTicks && s.MinTimestampTicks <= toTicks)
-            .OrderByDescending(s => s.MaxTimestampTicks)
-            .ToList();
-    }
+        => _segments.GetOverlapping(from?.UtcTicks ?? long.MinValue, to?.UtcTicks ?? long.MaxValue);
 
     /// <summary>
     /// Total native bytes held by the hot tier right now: the live segment plus
@@ -622,23 +915,30 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// captured tier's native memory while it is being scanned — callers <b>must</b> pair this
     /// with exactly one <see cref="OnReaderDisposed"/> when finished.
     /// </summary>
-    private (HotTierSegment Current, HotTierSegment[] Frozen, HashSet<SegmentKey> Covered) SnapshotTiers()
+    private (HotTierSegment Current, HotTierSegment[] Frozen, IReadOnlySet<SegmentKey> Covered) SnapshotTiers()
     {
         HotTierSegment    current;
         HotTierSegment[]  frozen;
-        HashSet<SegmentKey> covered;
+        IReadOnlySet<SegmentKey> covered;
         lock (_frozenLock)
         {
+            // After shutdown collected the tiers it frees, a snapshot would capture memory that
+            // is about to go — and its reader count would arrive after the wait that honours it.
+            ObjectDisposedException.ThrowIf(_snapshotsClosed, this);
+
             current = _write.Hot;
             if (_frozenHot.Count == 0)
             {
+                // The common case — no flush in progress — covers nothing, and every poll
+                // took this branch and allocated an empty set to say so.
                 frozen  = Array.Empty<HotTierSegment>();
-                covered = new HashSet<SegmentKey>();
+                covered = EmptyCoveredSet.Instance;
             }
             else
             {
                 frozen  = new HotTierSegment[_frozenHot.Count];
-                covered = new HashSet<SegmentKey>(_frozenHot.Count * LevelSegmentSlots);
+                var set = new HashSet<SegmentKey>(_frozenHot.Count * LevelSegmentSlots);
+                covered = set;
                 for (int i = 0; i < _frozenHot.Count; i++)
                 {
                     frozen[i] = _frozenHot[i].Tier;
@@ -647,7 +947,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                     // already-registered per-level segments AND the still-frozen tier.
                     ulong first = _frozenHot[i].SegId;
                     for (int s = 0; s < LevelSegmentSlots; s++)
-                        covered.Add(new SegmentKey(_options.NodeId, new SegmentId(first + (ulong)s)));
+                        set.Add(new SegmentKey(_options.NodeId, new SegmentId(first + (ulong)s)));
                 }
             }
             Interlocked.Increment(ref _activeReaders);
@@ -661,14 +961,39 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// <c>[fromUtc, toUtc]</c>, never materialising a <see cref="LogEvent"/>. Backs
     /// <c>GET /api/events/counts</c>. Bucketing parameters are supplied by the caller so the axis
     /// matches the endpoint's column-cap logic.
+    ///
+    /// <para>A cold segment that throws while being read is skipped rather than failing the
+    /// whole aggregate, and counted in <see cref="LogVolumeCounts.SkippedSegments"/> when the
+    /// catalog still serves it: when that is non-zero every total is a floor, and a caller that
+    /// reports a count as a fact must say so. A segment that left the catalog while the scan ran
+    /// is a race, not damage, and is never counted there. A retention delete is not counted at
+    /// all, because its events are gone; a merge's source is counted in
+    /// <see cref="LogVolumeCounts.MergedAwaySegments"/>, because its events are in an output this
+    /// scan's snapshot does not list. See <see cref="OnHeaderSegmentUnreadable"/>.</para>
     /// </summary>
+    /// <param name="totalsOnly">
+    /// Opt-in shortcut for a caller that wants ONE number (the alert evaluator, which runs this
+    /// every 15 s per rule over a window that can span hundreds of segments). A cold segment is
+    /// immutable and its catalog <c>EventCount</c> is exact, so a segment lying entirely inside
+    /// the window contributes that count with no mmap and no LZ4 decode at all — for a 24 h
+    /// window only the two boundary segments and the hot tier are still read. In exchange
+    /// <see cref="LogVolumeCounts.Services"/> and <see cref="LogVolumeCounts.Levels"/> stop
+    /// summing to <see cref="LogVolumeCounts.Total"/>, which is why it is off by default and
+    /// ignored whenever a <paramref name="serviceFilter"/> is set — the catalog cannot say how
+    /// many of a segment's events belong to one service, so the shortcut would over-count.
+    /// </param>
     public async ValueTask<LogVolumeCounts> AggregateLogVolumeAsync(
         DateTimeOffset fromUtc, DateTimeOffset toUtc,
         long minBucket, int bucketSeconds, int nBuckets,
-        string? serviceFilter, CancellationToken ct = default)
+        string? serviceFilter, CancellationToken ct = default, bool totalsOnly = false)
     {
         long fromTicks = fromUtc.UtcTicks;
         long toTicks   = toUtc.UtcTicks;
+
+        // Taken BEFORE the segment snapshot below, so a merge that removes a segment the snapshot
+        // lists has recorded it at or after this mark; MayHaveBeenMergedAway relies on that when
+        // the record has had to evict.
+        long mergedAwayMark = Interlocked.Read(ref _mergedAwayRecorded);
 
         var agg = new LogVolumeAggregator(
             fromTicks, toTicks, minBucket, bucketSeconds, nBuckets, serviceFilter, TemplatePool);
@@ -693,6 +1018,14 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             if (segInfos.Count > 0)
             {
                 string? svcFilter = serviceFilter;
+                // Whole-segment counting is only sound when nothing per-service or per-level is
+                // read back out — see the totalsOnly parameter. With a service filter the
+                // catalog cannot answer at all, so the shortcut turns itself off.
+                bool wholeSegments = totalsOnly && svcFilter is null;
+                // The snapshot's keys as a set, built only if a worker meets a merged-away source
+                // (see SnapshotLists). Declared beside the other captured locals so it shares
+                // their closure rather than adding one.
+                HashSet<SegmentKey>? snapshotKeys = null;
                 await Task.Run(() =>
                 {
                     int degree = Math.Clamp(Environment.ProcessorCount / 2, 2, 8);
@@ -705,15 +1038,31 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                         {
                             if (covered.Contains(SegmentKey.Of(info))) return local;
                             if (info.MaxTimestampTicks < fromTicks || info.MinTimestampTicks > toTicks) return local;
+
+                            // Entirely inside the window: every event in it is in the answer, and
+                            // the catalog already knows how many there are. No mmap, no block
+                            // index read, no LZ4 decode — the whole cost of this segment is one
+                            // comparison. Boundary segments still have to be decoded, because
+                            // only the headers say which of their events fall in the window.
+                            if (wholeSegments &&
+                                info.MinTimestampTicks >= fromTicks && info.MaxTimestampTicks <= toTicks)
+                            {
+                                local.AddWholeSegment(info.EventCount);
+                                return local;
+                            }
+
                             try
                             {
-                                using var reader = SegmentReader.Open(info.FilePath);
+                                _beforeHeaderSegmentOpen?.Invoke(info);
+                                using var reader = OpenForHeaderScan(info);
                                 reader.AggregateHeaders(local, fromTicks, toTicks);
                             }
                             catch (Exception ex)
                             {
-                                // Never lose the whole aggregate over one bad/racing segment file.
-                                _logger.LogDebug(ex, "Header aggregation skipped segment {Id}", info.Id);
+                                // Never lose the whole aggregate over one bad/racing segment file —
+                                // but never HIDE a bad one either. Whatever the segment yielded
+                                // before the throw stays in; it is real data.
+                                OnHeaderSegmentUnreadable(ex, info, local, mergedAwayMark, segInfos, ref snapshotKeys);
                             }
                             return local;
                         },
@@ -729,10 +1078,262 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         return agg.Build();
     }
 
+    /// <summary>
+    /// Opens a cold segment for the header scan, waiting out an import that has published the
+    /// entry but not yet landed its file.
+    ///
+    /// <para><see cref="ImportSegment(string, string)"/> publishes the catalog entry BEFORE its
+    /// <c>File.Move</c> (see the comment there for why that order), and holds <c>_importLock</c>
+    /// across both. A scan whose snapshot caught the entry in that window finds no file. Waiting
+    /// for the lock waits the rename out, and one more open then reads the segment that was
+    /// always going to be there. If that open fails too, the caller decides what it means: the
+    /// import may have withdrawn its entry, or a delete (which takes the same lock) may have
+    /// removed it in the meantime.</para>
+    ///
+    /// <para>Only a missing file waits. A torn file is not something an import can be in the
+    /// middle of fixing, and every other caller that removes a file removes its entry first.</para>
+    /// </summary>
+    private SegmentReader OpenForHeaderScan(SegmentInfo info)
+    {
+        try { return SegmentReader.Open(info.FilePath); }
+        catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
+        {
+            lock (_importLock) { }   // wait out an import between its publish and its move
+            return SegmentReader.Open(info.FilePath);
+        }
+    }
+
+    /// <summary>
+    /// Sorts a failed header read into a race or a real unreadable segment, and the race into
+    /// the two kinds that mean opposite things for the count.
+    ///
+    /// <para><b>A race</b>: the catalog no longer holds this segment under its key and path. The
+    /// scan works from a snapshot, and a merge publishes its output and then deletes its sources,
+    /// and retention deletes expired ones, while a poll is still walking that snapshot. Nothing
+    /// is damaged, so neither kind is a skip and neither warns: counting every race as a skip made
+    /// every merge that overlapped a histogram poll warn about a corruption that did not exist,
+    /// and the once-per-key warning could not help, since each merge removes new keys.</para>
+    ///
+    /// <para>But the kinds differ in where the events went. <b>Retention</b> removed them from the
+    /// store: leaving them out is the right answer, so the race is only logged at Debug.
+    /// <b>A merge</b> moved them into its output. When this snapshot does not list that output
+    /// the total is low; it is counted in <see cref="LogVolumeCounts.MergedAwaySegments"/> for a
+    /// caller that presents the total as a fact to call it a floor. Silencing that case too made
+    /// <c>select count(*)</c> over a wide window report a low number as complete whenever a merge
+    /// landed under it. When the snapshot DOES list the output — taken after the merge published
+    /// and before it deleted this source — the scan reads the events there, so the race is as
+    /// silent as retention's: counted, it turned an exact total into a floor.</para>
+    ///
+    /// <para>Told apart, rather than answered by scanning the window again with a fresh snapshot.
+    /// A rescan doubles the decode cost of exactly the wide windows a merge is most likely to land
+    /// under. It can race too — while a backlog lasts the maintenance loop merges again every
+    /// 15 s — so it would still need this verdict. And the next poll, or a rerun, reads the merged
+    /// output anyway.</para>
+    ///
+    /// <para><b>Unreadable</b>: the catalog still serves it — checked again once its place under
+    /// the warning cap is taken, since a delete can land in between. The skip is counted, so a
+    /// caller that presents the total as a fact can say it is a floor, and named once at
+    /// Warning.</para>
+    /// </summary>
+    private void OnHeaderSegmentUnreadable(
+        Exception ex, SegmentInfo info, LogVolumeAggregator local,
+        long mergedAwayMark, IReadOnlyList<SegmentInfo> snapshot, ref HashSet<SegmentKey>? snapshotKeys)
+    {
+        var key = SegmentKey.Of(info);
+
+        // Counted as a skip only AFTER LogUnreadableSegment has taken the segment's place under
+        // the warning cap and found it still served. A delete can land between this catalog
+        // check and that place; counted up front, a segment retention removed in that window was
+        // a skip, and the partial reason pointed at a Warning the take-back never let be written,
+        // for a count that was exact. It is the same race the check here catches, one step
+        // later, so it is sorted the same way.
+        if (CatalogServes(key, info) && LogUnreadableSegment(ex, info, key))
+        {
+            local.AddSkippedSegment();
+            return;
+        }
+
+        // The catalog first and the record second, never the other way round: the merge
+        // records a key before it deletes the segment, so an entry seen gone by a merge is
+        // always already recorded. Read in the opposite order, a merge landing between the
+        // two reads would be found in neither and pass for retention.
+        if (MayHaveBeenMergedAway(key, mergedAwayMark, snapshot, ref snapshotKeys))
+        {
+            local.AddMergedAwaySegment();
+            _logger.LogDebug(ex,
+                "Header aggregation skipped segment {NodeId}-{Id}: a merge rewrote it while the scan ran, so counts over its window are a floor",
+                info.NodeId, info.Id);
+        }
+        else
+            _logger.LogDebug(ex,
+                "Header aggregation skipped segment {NodeId}-{Id}: it left the catalog while the scan ran (retention, delete, or a merge whose output the scan reads)",
+                info.NodeId, info.Id);
+    }
+
+    /// <summary>Whether the catalog still holds this segment under its key AND at its path.</summary>
+    private bool CatalogServes(SegmentKey key, SegmentInfo info) =>
+        _segments.TryGetValue(key, out var current)
+        && string.Equals(current.FilePath, info.FilePath, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Records that a merge is about to delete <paramref name="key"/>, whose events its published
+    /// output <paramref name="output"/> now holds. Called for each source immediately before its
+    /// delete, so the record is in place before the catalog entry goes (see
+    /// <see cref="_mergedAwaySegments"/>).
+    /// </summary>
+    private void RecordMergedAwaySegment(SegmentKey key, SegmentKey output)
+    {
+        lock (_mergedAwayGate)
+        {
+            var  ring = _mergedAwayRing ??= new SegmentKey[Math.Max(1, MergedAwaySegmentCap)];
+            long n    = _mergedAwayRecorded + 1;
+            int  slot = (int)((n - 1) % ring.Length);
+
+            if (n > ring.Length)
+            {
+                // The slot holds the oldest record kept. Its key leaves the lookup only if no
+                // later record names it again, and the eviction point moves either way: what a
+                // scan needs to know is how far eviction has reached, not whether this key
+                // survived it.
+                long evicted = n - ring.Length;
+                var  old     = ring[slot];
+                if (_mergedAwaySegments.TryGetValue(old, out var at) && at.Number == evicted)
+                    _mergedAwaySegments.Remove(old);
+                _mergedAwayEvictedThrough = evicted;
+            }
+
+            ring[slot] = key;
+            _mergedAwaySegments[key] = new MergedAwayRecord(n, output);
+            Interlocked.Exchange(ref _mergedAwayRecorded, n);   // the scan's mark reads it without the gate
+        }
+    }
+
+    /// <summary>
+    /// Whether a segment that left the catalog during the scan whose mark is
+    /// <paramref name="mark"/> and whose snapshot is <paramref name="snapshot"/> may have been a
+    /// merge's source whose events that scan does not read — rather than a retention delete, or
+    /// a merge whose output the snapshot lists.
+    ///
+    /// <para>True when the record names it and the snapshot does not list the output it names.
+    /// A listed output was published before the snapshot was taken, so the scan reads the
+    /// source's events there (or, if the output cannot be read either, sorts THAT failure on its
+    /// own). The snapshot's keys are looked up only here, after the record has named an output,
+    /// so a scan that meets no merged-away source builds nothing.</para>
+    ///
+    /// <para>Also true when eviction may have dropped its record,
+    /// which is the conservative direction: a retention delete called a merge makes one count a
+    /// floor that was exact, where a merge called retention makes a low count look exact.</para>
+    ///
+    /// <para>"May have" is decided by the mark, not by whether anything was ever evicted — on a
+    /// server that has merged more than <see cref="MergedAwaySegmentCap"/> sources in its life
+    /// something always has been, and every retention delete racing a scan would then be called
+    /// a merge. Merges run one at a time on the maintenance loop, and each records a source
+    /// immediately before deleting it, with nothing between the two (the delete completes
+    /// synchronously), so no other record is made between a key's record and its entry leaving
+    /// the catalog. The scan read its mark before its snapshot listed the key, so before the
+    /// entry left. If the key's record came before the mark, the mark was read in that gap and
+    /// equals the record's number; otherwise the number is above the mark. Either way it is at
+    /// least the mark, and eviction that has not reached the mark cannot have dropped it.</para>
+    /// </summary>
+    private bool MayHaveBeenMergedAway(
+        SegmentKey key, long mark, IReadOnlyList<SegmentInfo> snapshot, ref HashSet<SegmentKey>? snapshotKeys)
+    {
+        SegmentKey output;
+        lock (_mergedAwayGate)
+        {
+            // An evicted record took its output with it: no telling whether the snapshot lists
+            // it, so the cautious answer stands.
+            if (!_mergedAwaySegments.TryGetValue(key, out var record))
+                return _mergedAwayEvictedThrough > 0 && _mergedAwayEvictedThrough >= mark;
+            output = record.Output;
+        }
+
+        // Outside the gate: the first lookup a scan makes builds a set of its snapshot, and the
+        // merge's cleanup must not wait on that.
+        return !SnapshotLists(snapshot, output, ref snapshotKeys);
+    }
+
+    /// <summary>
+    /// Whether <paramref name="snapshot"/> lists <paramref name="key"/>. The key set is built by
+    /// the first call a scan makes and shared by its parallel workers: published whole by a
+    /// compare-exchange and never written after, so concurrent lookups are safe. Two workers
+    /// racing to build it each build one and one wins, and both answer from a complete set.
+    /// A merge output's key is freshly allocated, so the key alone names it.
+    /// </summary>
+    private static bool SnapshotLists(IReadOnlyList<SegmentInfo> snapshot, SegmentKey key, ref HashSet<SegmentKey>? keys)
+    {
+        var set = Volatile.Read(ref keys);
+        if (set is null)
+        {
+            var built = new HashSet<SegmentKey>(snapshot.Count);
+            for (int i = 0; i < snapshot.Count; i++) built.Add(SegmentKey.Of(snapshot[i]));
+            set = Interlocked.CompareExchange(ref keys, built, null) ?? built;
+        }
+        return set.Contains(key);
+    }
+
+    /// <summary>
+    /// A segment the header aggregation could not read is now visible to users — the query
+    /// language reports the count as partial because of it — so its cause has to be findable in
+    /// the server log at a level that is kept: Warning, with the segment id and the exception.
+    /// Once per segment, because the histogram polls every few seconds and every alert rule ticks
+    /// every 15 s, and a torn file stays in the catalog until the next start quarantines it; a
+    /// warning per poll would bury everything else. Repeats go to Debug, as before, and so does
+    /// every segment past <see cref="WarnedUnreadableSegmentCap"/>.
+    ///
+    /// <para>Returns whether the catalog still served the segment once its place was taken: true
+    /// means a real skip, logged here; false means it left the catalog after the caller's check,
+    /// nothing is logged, and the caller sorts the race as it sorts one its own check caught.</para>
+    /// </summary>
+    private bool LogUnreadableSegment(Exception ex, SegmentInfo info, SegmentKey key)
+    {
+        _beforeUnreadableSegmentWarned?.Invoke(info);
+
+        // Count first: a full set never grows and is never cleared, so past the cap each poll
+        // costs a Debug line rather than a Warning per segment. The check and the add are one
+        // step under a gate, or parallel workers would all see room and all add: this runs only
+        // for a segment that failed to read, so the gate costs the scan nothing. A delete
+        // removing a key outside it can only make room.
+        bool warn;
+        lock (_warnedUnreadableGate)
+            warn = _warnedUnreadableSegments.Count < WarnedUnreadableSegmentCap
+                && _warnedUnreadableSegments.TryAdd(key, 0);
+
+        // Added, THEN checked against the catalog, and taken back if the segment has gone. The
+        // caller's catalog check came before the add, and DeleteSegmentAsync evicts the key
+        // without the gate: a delete landing between the two evicted a key not yet added, and
+        // the add then left a key nothing would ever remove, holding one of the capped places
+        // for a segment that no longer exists. In this order a delete either evicts after the
+        // add or removed the entry before this check, which sees it gone.
+        //
+        // Rather than the delete evicting under the gate and the check moving inside it: that
+        // closes the same window, but only by adding a lock to DeleteSegmentAsync's nest for a
+        // log line, and the ordering here needs no lock at all. The gate stays a leaf.
+        //
+        // Checked whether or not a place was taken: a segment gone by now is gone for the count
+        // too, cap or no cap, and giving the place back is only the half of it that needs one.
+        if (!CatalogServes(key, info))
+        {
+            if (warn) _warnedUnreadableSegments.TryRemove(key, out _);
+            return false;
+        }
+
+        if (warn)
+            _logger.LogWarning(ex,
+                "Header aggregation could not read segment {NodeId}-{Id} ({File}); counts over its window are partial",
+                info.NodeId, info.Id, info.FilePath);
+        else
+            _logger.LogDebug(ex, "Header aggregation skipped segment {Id}", info.Id);
+        return true;
+    }
+
     private void OnReaderDisposed()
     {
         if (Interlocked.Decrement(ref _activeReaders) == 0)
+        {
             DrainRetired();
+            Volatile.Read(ref _readersDrained)?.TrySetResult();
+        }
     }
 
     /// <summary>
@@ -745,7 +1346,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     private sealed class HotTierReaderSnapshot(
         HotTierSegment   current,
         HotTierSegment[] frozen,
-        HashSet<SegmentKey> covered,
+        IReadOnlySet<SegmentKey> covered,
         StringInternPool pool,
         StorageEngine    owner) : IHotTierReader
     {
@@ -771,6 +1372,14 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             IReadOnlySet<Ameto.Core.LogLevel>? levels)
             => HotTierScan.ReadSorted(current, frozen, pool, fromTicks, toTicks, afterTsTicks, afterIdRaw, forward, levels);
 
+        /// <summary>Same scan, with the filter's header-level part applied before materialisation.</summary>
+        public IEnumerable<LogEvent> ReadSorted(
+            long fromTicks, long toTicks,
+            long? afterTsTicks, ulong? afterIdRaw, bool forward,
+            IReadOnlySet<Ameto.Core.LogLevel>? levels,
+            IHotHeaderPredicate? headerPredicate)
+            => HotTierScan.ReadSorted(current, frozen, pool, fromTicks, toTicks, afterTsTicks, afterIdRaw, forward, levels, headerPredicate);
+
         public IReadOnlySet<SegmentKey> CoveredSegmentKeys => covered;
 
         public void Dispose()
@@ -792,6 +1401,14 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// </summary>
     public bool TryWrite(in LogEventHeader header, ReadOnlySpan<byte> propertiesPayload, string? template = null, ExceptionInfo? exception = null)
     {
+        // Shut by DisposeAsync. Refused like back-pressure — the caller keeps the event — and
+        // before anything else, so a refused write neither takes an id nor schedules a flush.
+        // A write already past this line when the path closes is fenced by the tier's Freeze.
+        if (Volatile.Read(ref _writesClosed) != 0)
+            return false;
+
+        _afterWriteGate?.Invoke();
+
         // Assign time-sortable, monotonic event id.
         // Time component is derived from the event's own @t (TimestampUtcTicks), not
         // server ingest time, so sorting by Id matches the timestamp shown in the UI.
@@ -815,12 +1432,18 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         // ── The event is COMMITTED from here on. Nothing below may throw out of TryWrite:
         //    the drainer treats a thrown TryWrite as "not written" and retries the same
         //    event — which would insert another copy (fresh id) into the tier per attempt.
-        ushort tmplIdx = h.MessageTemplatePoolIndex >= 0 ? (ushort)h.MessageTemplatePoolIndex : (ushort)0;
+        // The WAL entry's index is 16 bits and all 65 536 values are real pool ids, so an event
+        // outside the pool (-1 once it is full, or a claim at/past 65 536) is passed through
+        // as-is and Append logs it with the Unpooled flag instead of an index. It writes NO
+        // pool row for it: a row 0 carrying the unpooled text would be force-interned by
+        // recovery and become every genuine index-0 event's template. And without the flag,
+        // recovery gave the unpooled event itself index 0's template whenever the pool file
+        // held any row. The hook still gets the attached text; the WAL never stores it.
         string tmplStr = template
                          ?? (h.MessageTemplatePoolIndex >= 0 ? TemplatePool.Get(h.MessageTemplatePoolIndex) : string.Empty);
         try
         {
-            w.Wal?.Append(h.TimestampUtcTicks, h.Level, tmplIdx, tmplStr, propertiesPayload, exception);
+            w.Wal?.Append(h.TimestampUtcTicks, h.Level, h.MessageTemplatePoolIndex, tmplStr, propertiesPayload, exception);
             _walFaulted = false;
         }
         catch (ObjectDisposedException)
@@ -868,6 +1491,11 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
     // ── ISegmentManager ───────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Flushes the live hot tier inline. Not registered in <see cref="_inFlightFlushes"/>, and
+    /// does not need to be: its heavy phase is counted in <see cref="_heavyPhases"/> like every
+    /// other, so shutdown waits for it. After shutdown has begun it does nothing.
+    /// </summary>
     public async Task FlushHotTierAsync(CancellationToken ct = default) =>
         await TryFlushAsync(ct);
 
@@ -890,21 +1518,442 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         // the merge's source cleanup also passes through here, deleting up to a batch in
         // sequence, so it can queue behind an import's rename -- brief and bounded, and the
         // waiting is the point.
+        //
+        // And under _scanDeleteGate, the one lock the boot catalog scan takes (it must never
+        // take _importLock -- see LoadSegmentCatalog). Removing the entry, recording the path for
+        // a running scan, unlinking the file and parking a failed unlink are then one step to the
+        // scan: it cannot register this path after the entry has gone but before the record or
+        // the park that tells it to leave the path alone.
         lock (_importLock)
+        lock (_scanDeleteGate)
         {
             if (_segments.TryRemove(key, out var info))
             {
+                // Whatever the unlink below does -- succeeds, parks, or fails outright -- a
+                // running catalog scan must not register this path again. Null, and so free,
+                // once no scan runs (see _deletedDuringCatalogScan).
+                _deletedDuringCatalogScan?.Add(info.FilePath);
+
+                // Its place under the header aggregation's warning cap goes with it: the set
+                // bounds unreadable segments still SERVED, not every one this process has met.
+                _warnedUnreadableSegments.TryRemove(key, out _);
+
+                _afterSegmentEntryRemoved?.Invoke();
+
                 // The merge bookkeeping (_mergeDeferStrikes, _mergeSkip) is deliberately NOT
                 // touched here. Both are plain collections owned lock-free by the maintenance
                 // thread, and this method also runs on retention's threads — a background
                 // service and an HTTP endpoint — where a Remove would be a concurrent mutation
                 // that _importLock does not cover (the merge side never takes it). Keys the
                 // delete orphans are pruned at the top of the next merge pass, on the owner.
-                try { File.Delete(info.FilePath); }
+                try { _deleteSegmentFile(info.FilePath); }
+                catch (Exception ex) when (IsAlreadyGone(ex))
+                {
+                    // Gone is what the delete wanted. File.Delete is already silent about a
+                    // missing file; this only guards against a runtime that is not. A missing
+                    // DIRECTORY is not "gone": it is an unreachable one, and parks below.
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    // Windows: a query still maps the file (a prefilter reader lives for the
+                    // whole query). The entry stays removed, so no NEW query picks the segment,
+                    // and the unlink is retried once the reader is gone. The same exceptions
+                    // also mean a read-only volume or a denied ACL, which no retry fixes; the
+                    // pending set is capped for that. See ParkSegmentDelete.
+                    ParkSegmentDelete(key, info.FilePath, ex);
+                }
                 catch (Exception ex) { _logger.LogWarning(ex, "Failed to delete segment {Key}", key); }
             }
         }
         return Task.CompletedTask;
+    }
+
+    // ── Deferred segment-file deletes ─────────────────────────────────────────
+
+    /// <summary>
+    /// Segment files whose catalog entry is gone but whose <c>File.Delete</c> failed, by path,
+    /// with the key the entry had. On Windows a file cannot be unlinked while any reader maps
+    /// it, and a query holds its readers for its whole duration, so a retention or merge delete
+    /// racing a query used to log a warning and leave the file behind for good. No entry named
+    /// it any more, so nothing expired or deleted it, and after a restart the catalog scan
+    /// loaded the expired segment back and served it until the next retention pass.
+    ///
+    /// <para>A path is in here from the failed delete until an attempt deletes it, finds it
+    /// already gone, or finds the catalog naming it again. ONE background loop
+    /// (<see cref="RunSegmentDeleteRetryLoopAsync"/>) serves every path for
+    /// <see cref="SegmentDeleteRetryWindow"/> after it was parked; what outlasts that is retried
+    /// by <see cref="RetryPendingSegmentDeletes"/> from every maintenance and retention pass. It
+    /// used to be one task per path, each with its own 120 s of backoff.</para>
+    ///
+    /// <para>Bounded by <see cref="PendingSegmentDeleteCap"/>. The exceptions an open reader
+    /// causes are also what a read-only volume or a denied ACL throws, and nothing about the
+    /// failure tells them apart. Unbounded, such a volume parked every expired segment for the
+    /// life of the process, and every maintenance and retention pass retried them all, one
+    /// <c>_importLock</c> each. Past the cap a failed delete is logged and left on disk, where
+    /// the next start's catalog scan and retention pass find it again.</para>
+    ///
+    /// <para>Added only under <c>_importLock</c> and <see cref="_scanDeleteGate"/>, and removed
+    /// only under <c>_importLock</c>, so the cap check and the add are one step.</para>
+    /// </summary>
+    private readonly ConcurrentDictionary<string, PendingSegmentDelete> _pendingSegmentDeletes = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>One parked path: the key its entry had, and when its delete failed.</summary>
+    private sealed class PendingSegmentDelete(SegmentKey key, long parkedAtTimestamp)
+    {
+        public readonly SegmentKey Key               = key;
+        public readonly long       ParkedAtTimestamp = parkedAtTimestamp;
+
+        /// <summary>
+        /// Set once the background loop has given up on this path and said so; the maintenance
+        /// and retention passes still retry it. Written only by the loop, of which one runs at a
+        /// time, and read by it (a stale read costs one extra attempt at most).
+        /// </summary>
+        public bool LeftToMaintenance;
+    }
+
+    /// <summary>
+    /// Serialises the boot catalog scan's check-and-register with <see cref="DeleteSegmentAsync"/>'s
+    /// remove, record, unlink and park, and guards <see cref="_deletedDuringCatalogScan"/> and
+    /// <see cref="_catalogScansRunning"/>. Its own lock and not <c>_importLock</c>, because an
+    /// import holds that one across its publish and the scan must still be able to land inside
+    /// that window (see <see cref="ImportSegment(string, string)"/>). Taken inside
+    /// <c>_importLock</c> by the delete and by the parked retry's record; nothing is taken under it.
+    /// </summary>
+    private readonly System.Threading.Lock _scanDeleteGate = new();
+
+    /// <summary>
+    /// Paths whose catalog entry <see cref="DeleteSegmentAsync"/> removed while a catalog scan was
+    /// running, whatever became of the unlink, and parked paths a retry settled while one was
+    /// running (see <see cref="TryCompletePendingSegmentDelete"/>); null while none runs. The scan
+    /// skips a path in here, as it skips a parked one, whether it read the file or failed to.
+    ///
+    /// <para>A record the delete keeps, not a question put to the filesystem. The scan used to
+    /// skip a path when <c>File.Exists</c> said false, and that says false for any error too: EIO
+    /// or ESTALE on NFS, a bad network path during an SMB hiccup. A LIVE segment skipped on such an
+    /// answer stayed out of queries, retention and merges until the next restart. Only a delete
+    /// and its retry write here, so a path in here was deleted.</para>
+    ///
+    /// <para>Created when a scan starts and dropped when the last one ends, both under
+    /// <see cref="_scanDeleteGate"/>, so it holds one boot scan's deletes and cannot grow for the
+    /// life of the process.</para>
+    /// </summary>
+    private HashSet<string>? _deletedDuringCatalogScan;
+
+    /// <summary>Catalog scans running: the boot scan, and any a test runs beside it. Under <see cref="_scanDeleteGate"/>.</summary>
+    private int _catalogScansRunning;
+
+    /// <summary>Paths recorded for running catalog scans (tests); 0 once none runs.</summary>
+    internal int DeletedDuringCatalogScanCount
+    {
+        get { lock (_scanDeleteGate) return _deletedDuringCatalogScan?.Count ?? 0; }
+    }
+
+    /// <summary>
+    /// Test hook: called by <see cref="DeleteSegmentAsync"/> after the entry is removed and
+    /// before the file is unlinked, under both of its locks.
+    /// </summary>
+    internal Action? _afterSegmentEntryRemoved;
+
+    /// <summary>
+    /// Test hook: called by <see cref="LoadSegmentCatalog"/> with a file's path after it has read
+    /// and closed the file and before it takes <see cref="_scanDeleteGate"/> to register it: the
+    /// window in which retention can delete the segment under the scan.
+    /// </summary>
+    internal Action<string>? _beforeScanRegistersSegment;
+
+    /// <summary>
+    /// Test hook: called by <see cref="LoadSegmentCatalog"/> with a listed file's path just before
+    /// it opens the file: the window in which a delete can remove the file under the scan before
+    /// the scan has read it. It runs inside the scan's per-file try, so a throw from it is handled
+    /// as an unreadable file.
+    /// </summary>
+    internal Action<string>? _beforeScanOpensSegment;
+
+    /// <summary>The running background retry loop, or the last one to have run.</summary>
+    private Task _segmentDeleteRetryLoop = Task.CompletedTask;
+
+    /// <summary>1 while a retry loop runs; a compare-and-swap from 0 is what starts one.</summary>
+    private int _segmentDeleteRetryLoopRunning;
+
+    /// <summary>First pause of the background delete retry; it doubles up to <see cref="SegmentDeleteRetryMaxDelay"/>.</summary>
+    internal TimeSpan SegmentDeleteRetryInitialDelay = TimeSpan.FromMilliseconds(500);
+    private static readonly TimeSpan SegmentDeleteRetryMaxDelay = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// How long after a path is parked the background loop keeps trying it before leaving it to
+    /// the maintenance and retention passes: twice the query timeout, since a query holding the
+    /// mapping is bounded by it (60 s when unbounded). Internal and settable so a test can make
+    /// the give-up path fast.
+    /// </summary>
+    internal TimeSpan? SegmentDeleteRetryWindowOverride;
+
+    private TimeSpan SegmentDeleteRetryWindow =>
+        SegmentDeleteRetryWindowOverride
+        ?? 2 * (_options.Query.Timeout > TimeSpan.Zero ? _options.Query.Timeout : TimeSpan.FromSeconds(60));
+
+    /// <summary>
+    /// Most paths parked at once. Reaching it takes a thousand deleted segment files held open at
+    /// one moment by queries, a volume that refuses deletes, or a segments directory an operator
+    /// deleted outright (on Windows every delete under it throws DirectoryNotFoundException, and
+    /// parks: see <see cref="IsAlreadyGone"/>); the last two are the likelier.
+    /// Past it a failed delete behaves as it did before deletes were retried: logged, and left
+    /// on disk, for the next start's catalog scan and retention pass to find (a merge's source
+    /// is also retried by the merge recovery sweep, from its manifest). Internal so a test can
+    /// lower it.
+    /// </summary>
+    internal int PendingSegmentDeleteCap = 1024;
+
+    /// <summary>1 once the cap's Warning is logged; cleared when the set drains to half the cap.</summary>
+    private int _pendingSegmentDeleteCapWarned;
+
+    /// <summary>Paths still waiting for their file to be unlinked (tests).</summary>
+    internal int PendingSegmentDeleteCount => _pendingSegmentDeletes.Count;
+
+    /// <summary>The running background retry loop, or the last one to have run (tests).</summary>
+    internal Task SegmentDeleteRetryLoop => Volatile.Read(ref _segmentDeleteRetryLoop);
+
+    /// <summary>
+    /// Whether a segment-file delete that threw <paramref name="ex"/> found nothing to delete,
+    /// which is success. Only <see cref="FileNotFoundException"/>, and File.Delete does not
+    /// normally throw even that: the runtime swallows ERROR_FILE_NOT_FOUND and ENOENT and returns.
+    /// It is kept so a runtime that does throw it is still not parked.
+    ///
+    /// <para>NEVER <see cref="DirectoryNotFoundException"/>. With a missing file under a directory
+    /// that exists, File.Delete returns without throwing, so this exception already means a
+    /// directory on the path could not be reached: a missing drive letter, or a broken junction or
+    /// symlink during a volume outage (ERROR_PATH_NOT_FOUND), with the file still there behind a
+    /// directory that will come back. It is parked like any other IO failure. Counted as gone,
+    /// the path was dropped with no park and no log, the file leaked until restart, and the boot
+    /// scan then served the expired segment again until the first retention pass.</para>
+    ///
+    /// <para>It used to count as gone while <c>Directory.Exists</c> said the parent was there.
+    /// That probe cannot tell: when the segments directory is itself a junction or symlink whose
+    /// target volume went offline, Windows reports on the link, the parent "exists", and the file
+    /// leaked all the same. A segments directory an operator deleted outright now parks every
+    /// delete instead, which <see cref="PendingSegmentDeleteCap"/> bounds.</para>
+    /// </summary>
+    private static bool IsAlreadyGone(Exception ex) => ex is FileNotFoundException;
+
+    /// <summary>
+    /// Unlinks a segment file for <see cref="DeleteSegmentAsync"/> and the parked retry: File.Delete,
+    /// except in a test that swaps in a failure it cannot stage on disk, such as an unreachable
+    /// directory whose link still resolves. Costs production one field read.
+    /// </summary>
+    internal Action<string> _deleteSegmentFile = File.Delete;
+
+    /// <summary>
+    /// Test hook: called by <see cref="TryCompletePendingSegmentDelete"/> with the parked path just
+    /// before it reads the catalog for an entry naming that path, inside the same hold of
+    /// <c>_importLock</c> as the unlink it then makes through <see cref="_deleteSegmentFile"/>.
+    /// From the two a test asserts, on every run, that the read and the unlink are both under the
+    /// lock (<see cref="ImportLockIsHeldByCurrentThread"/>); a re-import landing between them is
+    /// otherwise only caught when the scheduler lets it in inside the test's wait. It runs outside
+    /// the attempt's catch, so a throw from it leaves the retry. Costs production one field read
+    /// per attempt, and attempts are made only for parked paths.
+    /// </summary>
+    internal Action<string>? _beforePendingDeleteCatalogCheck;
+
+    /// <summary>Whether the calling thread holds <c>_importLock</c> (tests, from inside a hook).</summary>
+    internal bool ImportLockIsHeldByCurrentThread => _importLock.IsHeldByCurrentThread;
+
+    /// <summary>
+    /// Parks a failed delete and makes sure the background loop runs. The caller holds
+    /// <c>_importLock</c> and <see cref="_scanDeleteGate"/>. Never blocks.
+    /// </summary>
+    private void ParkSegmentDelete(SegmentKey key, string path, Exception ex)
+    {
+        // Already parked: that entry's retries cover this failure too.
+        if (_pendingSegmentDeletes.ContainsKey(path)) return;
+
+        if (_pendingSegmentDeletes.Count >= PendingSegmentDeleteCap)
+        {
+            if (Interlocked.Exchange(ref _pendingSegmentDeleteCapWarned, 1) == 0)
+                _logger.LogWarning(
+                    "{Count} segment files are already waiting to be deleted, the most that are retried. A segment " +
+                    "file whose delete fails from now on is not retried: each is logged at Information and stays on " +
+                    "disk until the next start's catalog scan and retention pass find it. This many failing at once " +
+                    "usually means the volume refuses deletes (read-only, permissions), not that queries hold the files.",
+                    _pendingSegmentDeletes.Count);
+            _logger.LogInformation(ex,
+                "Segment file {File} could not be deleted and is not retried: the pending-delete set is full", path);
+            return;
+        }
+
+        _pendingSegmentDeletes.TryAdd(path, new PendingSegmentDelete(key, System.Diagnostics.Stopwatch.GetTimestamp()));
+        _logger.LogDebug(ex, "Segment {Key} could not be deleted (still open?) — its file delete is retried in the background", key);
+        EnsureSegmentDeleteRetryLoop();
+    }
+
+    /// <summary>Starts the background retry loop unless one is running or shutdown has begun.</summary>
+    private void EnsureSegmentDeleteRetryLoop()
+    {
+        // A delete after shutdown began (a late retention call) stays parked: DisposeAsync makes
+        // one last attempt, and nothing else in this process will.
+        if (Volatile.Read(ref _disposed) != 0) return;
+        if (Interlocked.CompareExchange(ref _segmentDeleteRetryLoopRunning, 1, 0) != 0) return;
+
+        CancellationToken ct;
+        try { ct = _cts.Token; }
+        catch (ObjectDisposedException)
+        {
+            Volatile.Write(ref _segmentDeleteRetryLoopRunning, 0);
+            return;
+        }
+
+        Volatile.Write(ref _segmentDeleteRetryLoop,
+            Task.Run(() => RunSegmentDeleteRetryLoopAsync(ct), CancellationToken.None));
+    }
+
+    /// <summary>
+    /// The one background retry loop. Each pass tries every path it has not yet left to
+    /// maintenance, with exponential backoff between passes; a path still failing
+    /// <see cref="SegmentDeleteRetryWindow"/> after it was parked is left to the maintenance and
+    /// retention passes, with one Warning. The loop ends when no path is left to it, and the next
+    /// park starts another. It holds <c>_importLock</c> only around each attempt.
+    /// </summary>
+    private async Task RunSegmentDeleteRetryLoopAsync(CancellationToken ct)
+    {
+        TimeSpan delay = SegmentDeleteRetryInitialDelay;
+        while (true)
+        {
+            try { await Task.Delay(delay, ct).ConfigureAwait(false); }
+            catch (OperationCanceledException)
+            {
+                Volatile.Write(ref _segmentDeleteRetryLoopRunning, 0);
+                return;   // shutdown: DisposeAsync makes one last attempt
+            }
+
+            bool more;
+            try { more = RetrySegmentDeletesInBackground(); }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Deferred segment delete pass failed");
+                more = true;
+            }
+
+            if (more)
+            {
+                delay = delay * 2 < SegmentDeleteRetryMaxDelay ? delay * 2 : SegmentDeleteRetryMaxDelay;
+                continue;
+            }
+
+            // Nothing left to this loop. Stand down, then look once more: a path parked after the
+            // pass above saw this loop still running, and so did not start another.
+            Volatile.Write(ref _segmentDeleteRetryLoopRunning, 0);
+            if (!HasSegmentDeletesForBackground()
+                || Interlocked.CompareExchange(ref _segmentDeleteRetryLoopRunning, 1, 0) != 0)
+                return;
+            delay = SegmentDeleteRetryInitialDelay;
+        }
+    }
+
+    /// <summary>One background pass. True while some path is still inside its window.</summary>
+    private bool RetrySegmentDeletesInBackground()
+    {
+        TimeSpan window   = SegmentDeleteRetryWindow;
+        bool     inWindow = false;
+        foreach (var (path, pending) in _pendingSegmentDeletes)
+        {
+            if (pending.LeftToMaintenance || TryCompletePendingSegmentDelete(path)) continue;
+
+            TimeSpan waited = System.Diagnostics.Stopwatch.GetElapsedTime(pending.ParkedAtTimestamp);
+            if (waited < window)
+            {
+                inWindow = true;
+                continue;
+            }
+
+            pending.LeftToMaintenance = true;
+            _logger.LogWarning(
+                "Segment file {File} still could not be deleted {Seconds:F0}s after its catalog entry was removed — " +
+                "no longer retrying in the background; every maintenance and retention pass retries it",
+                path, waited.TotalSeconds);
+        }
+        return inWindow;
+    }
+
+    private bool HasSegmentDeletesForBackground()
+    {
+        foreach (var (_, pending) in _pendingSegmentDeletes)
+            if (!pending.LeftToMaintenance) return true;
+        return false;
+    }
+
+    /// <summary>
+    /// Retries every parked segment-file delete once. Called from the maintenance loop, from
+    /// retention, and at shutdown; internal so tests can drive it deterministically.
+    /// </summary>
+    /// <returns>How many paths are still pending afterwards.</returns>
+    internal int RetryPendingSegmentDeletes()
+    {
+        if (_pendingSegmentDeletes.IsEmpty) return 0;   // the common case costs no enumeration
+        foreach (var (path, _) in _pendingSegmentDeletes)
+            TryCompletePendingSegmentDelete(path);
+        return _pendingSegmentDeletes.Count;
+    }
+
+    /// <summary>
+    /// One attempt at a deferred delete. True when the path is settled: deleted, already gone,
+    /// failed for a reason a retry will not fix, or named by the catalog again.
+    /// </summary>
+    private bool TryCompletePendingSegmentDelete(string path)
+    {
+        if (!_pendingSegmentDeletes.TryGetValue(path, out var pending)) return true;   // settled elsewhere
+
+        // Under _importLock, the lock DeleteSegmentAsync and ImportSegment take. An import
+        // publishes its entry BEFORE its File.Move lands the file, so checking the catalog
+        // outside the lock could pass, let a re-import of the same segment to the same path
+        // publish and land its file, and then unlink the file that import just registered.
+        // Only the check and the unlink are under it; the waits between attempts are not.
+        lock (_importLock)
+        {
+            // Named again: a re-import of the segment to the same path, and the file is live and
+            // belongs to that entry now. A stale retry must not touch it. (Not the boot catalog
+            // scan: it skips a parked path, and cannot slip in ahead of the park -- see
+            // LoadSegmentCatalog. Flushes and merges only ever write new names.)
+            _beforePendingDeleteCatalogCheck?.Invoke(path);
+            if (_segments.TryGetValue(pending.Key, out var current)
+                && string.Equals(current.FilePath, path, StringComparison.OrdinalIgnoreCase))
+            {
+                Unpark(path);
+                return true;
+            }
+
+            try { _deleteSegmentFile(path); }   // silent when the file is already gone
+            catch (Exception ex) when (IsAlreadyGone(ex))
+            {
+                // Nothing left to delete: settled. (A missing directory is an unreachable one,
+                // and stays parked below.)
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                return false;            // still held open, or refused — try again later
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to delete segment file {File} — not retried", path);
+            }
+
+            // Settled, and no entry names the path. A catalog scan running now may have listed it,
+            // and the park is what has kept the scan off it; the record takes over BEFORE the park
+            // goes, both under the gate the scan reads them under, so the scan never sees neither.
+            // A path parked before the scan began has no record of the delete's, and without this
+            // one the scan registered a file it had read just before this unlink (an entry for a
+            // missing file), or quarantined it at Error when its open came after the unlink.
+            // Recorded for an exception no retry fixes too, as the delete records it: that file
+            // stays on disk unserved until the next start.
+            lock (_scanDeleteGate) _deletedDuringCatalogScan?.Add(path);
+            Unpark(path);
+            return true;
+        }
+    }
+
+    /// <summary>Removes a settled path, re-arming the cap's Warning once the set has drained to half.</summary>
+    private void Unpark(string path)
+    {
+        _pendingSegmentDeletes.TryRemove(path, out _);
+        if (_pendingSegmentDeletes.Count <= PendingSegmentDeleteCap / 2)
+            Volatile.Write(ref _pendingSegmentDeleteCapWarned, 0);
     }
 
     public IReadOnlyList<SegmentInfo> ListSegments() => _segments.Values.ToList();
@@ -937,6 +1986,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// <summary>Fire-and-forget a parallel flush, tracked so shutdown can await it.</summary>
     private void ScheduleFlush()
     {
+        // After shutdown shut the write path there is nothing a new flush may swap.
+        if (Volatile.Read(ref _writesClosed) != 0) return;
+
         var t = Task.Run(() => TryFlushAsync());
         _inFlightFlushes[t] = 0;
         _ = t.ContinueWith(
@@ -945,7 +1997,13 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
     }
 
-    private async Task TryFlushAsync(CancellationToken ct = default)
+    /// <param name="waitDeadline">
+    /// 0 for every caller but shutdown's final flush: a busy swap lock or an exhausted slot budget
+    /// means someone else is flushing, so the call drops out. The final flush instead WAITS for
+    /// both until this <see cref="Environment.TickCount64"/> deadline — dropping out there left
+    /// the live tier unflushed whenever a racing flush held the lock.
+    /// </param>
+    private async Task TryFlushAsync(CancellationToken ct = default, long waitDeadline = 0)
     {
         // ── SWAP PHASE — serialised (via _flushLock) and fast. Freezes the current
         //    hot tier, publishes it to the frozen list, installs a fresh hot tier and
@@ -956,16 +2014,36 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         string?         oldWalPath = null;
         ulong           reservedSegId = 0;
 
-        if (!await _flushLock.WaitAsync(0, ct)) return; // a swap is already in progress
+        bool finalFlush = waitDeadline != 0;
+        if (!finalFlush && Volatile.Read(ref _writesClosed) != 0) return; // shutdown owns the tiers now
+
+        if (!await _flushLock.WaitAsync(finalFlush ? Until(waitDeadline) : TimeSpan.Zero, ct))
+            return; // a swap is already in progress
         try
         {
+            // Again under the lock: shutdown takes this lock after closing, so a flush that got
+            // here first either sees the close or swaps before shutdown counts what is running.
+            if (!finalFlush && Volatile.Read(ref _writesClosed) != 0) return;
+
+            _beforeSwap?.Invoke();
+
             var oldState = _write;
             if (oldState.Hot.Count == 0) return;
 
             // Back-pressure gate: if the in-flight tier budget is exhausted, skip the swap.
             // The hot tier stays full → TryWrite returns false → the drainer parks (ring
             // back-pressure) rather than letting frozen tiers pile up unbounded in RAM.
-            if (!_flushSlots.Wait(0)) return;
+            // The final flush waits for a slot instead: every holder is a heavy phase or a retry
+            // that shutdown's cancellation has already ended, and none of them takes this lock.
+            if (!_flushSlots.Wait(0) &&
+                (!finalFlush || !await _flushSlots.WaitAsync(Until(waitDeadline), ct).ConfigureAwait(false)))
+            {
+                if (finalFlush)
+                    _logger.LogWarning(
+                        "Final hot-tier flush skipped: no flush slot came free within the shutdown budget — " +
+                        "the WAL replays the tier on the next start");
+                return;
+            }
             try
             {
                 // Open the SUCCESSOR first, so the swap installs a complete (tier, WAL)
@@ -984,6 +2062,12 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
                 reservedSegId = oldState.WalSegId;
                 oldState.Hot.Freeze();
+
+                // Counted in the step that publishes the tier to the frozen list, and under
+                // _flushLock: from here on the heavy phase below owns reading this tier, and the
+                // decrement at its end is what lets shutdown free it. Nothing between this line
+                // and the try that decrements can throw.
+                Interlocked.Increment(ref _heavyPhases);
 
                 // Publish oldHot AND install the successor under the lock queries snapshot
                 // from, so a concurrent query sees oldHot exactly once — as current before
@@ -1015,17 +2099,19 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
         if (oldHot is null) return; // hot tier was empty — nothing swapped (no slot taken)
 
-        // Nobody writes to the old WAL any more (writers see the new _wal) — close its
-        // handles before the flush so File.Delete below succeeds afterwards.
-        oldWal?.Dispose();
-
         // ── HEAVY PHASE — parallel, bounded by _flushConcurrency. Builds the inverted/
         //    trigram/bloom indexes, compresses and writes the cold segment. Runs off the
         //    swap lock so several segments persist at once on otherwise idle cores. The
-        //    back-pressure slot (taken at swap) is held until the tier is fully persisted.
+        //    back-pressure slot (taken at swap) is held until the tier is fully persisted,
+        //    and so is the heavy-phase count; a retry that takes the slot over takes both.
         bool slotTransferred = false;
         try
         {
+            // Nobody writes to the old WAL any more (writers see the new _wal) — close its
+            // handles before the flush so File.Delete below succeeds afterwards. Inside the
+            // try, so a WAL that throws on close still hands back the slot and the count.
+            oldWal?.Dispose();
+
             await _flushConcurrency.WaitAsync(ct).ConfigureAwait(false);
             List<SegmentInfo> written;
             try
@@ -1053,8 +2139,26 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
             PublishFlushedTier(written, oldHot, oldWalPath, reservedSegId);
         }
-        finally { if (!slotTransferred) _flushSlots.Release(); }
+        finally
+        {
+            if (!slotTransferred)
+            {
+                _flushSlots.Release();
+                EndHeavyPhase();
+            }
+        }
     }
+
+    /// <summary>Ends one counted heavy phase and wakes shutdown if it was the last.</summary>
+    private void EndHeavyPhase()
+    {
+        if (Interlocked.Decrement(ref _heavyPhases) == 0)
+            Volatile.Read(ref _heavyPhasesDrained)?.TrySetResult();
+    }
+
+    /// <summary>Time left until a <see cref="Environment.TickCount64"/> deadline, never negative.</summary>
+    private static TimeSpan Until(long deadline) =>
+        TimeSpan.FromMilliseconds(Math.Max(0, deadline - Environment.TickCount64));
 
     /// <summary>
     /// Registers a persisted tier's cold segments, unlists the frozen tier, deletes its WAL
@@ -1091,9 +2195,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
     /// <summary>
     /// Background retry for a frozen tier whose flush failed. Owns the tier's back-pressure
-    /// slot until the tier is persisted or the engine shuts down (then the slot is released
-    /// and the tier's WAL replays it on the next start). Tracked in
-    /// <see cref="_inFlightFlushes"/> so DisposeAsync awaits it after cancelling.
+    /// slot AND its heavy-phase count until the tier is persisted or the engine shuts down
+    /// (then both are released and the tier's WAL replays it on the next start). Tracked in
+    /// <see cref="_inFlightFlushes"/> as well, so DisposeAsync awaits it after cancelling.
     /// </summary>
     private void ScheduleFlushRetry(HotTierSegment oldHot, string? oldWalPath, ulong reservedSegId)
     {
@@ -1138,9 +2242,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             catch (ObjectDisposedException)    { /* raced DisposeAsync's CTS teardown — same outcome */ }
             finally
             {
-                // The slot semaphore can already be disposed when this task was spawned by a
-                // late ScheduleFlush during shutdown; the release is then moot, not an error.
+                // DisposeAsync no longer disposes the slot semaphore; the catch stays as defence.
                 try { _flushSlots.Release(); } catch (ObjectDisposedException) { }
+                EndHeavyPhase();
             }
         });
         _inFlightFlushes[t] = 0;
@@ -1999,6 +3103,13 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         foreach (var seg in consumed)
         {
             _mergeDeferStrikes.Remove(SegmentKey.Of(seg));
+            // Before the delete, so a header scan that finds the entry gone finds the record
+            // too, and calls the count it gives a floor rather than presenting it as complete:
+            // this source's events are in the output just published, which a scan already
+            // running does not list. The output is named with it, because a scan that started
+            // after the publish above DOES list it and reads the events there. Retention deletes
+            // are not recorded; their events are gone.
+            RecordMergedAwaySegment(SegmentKey.Of(seg), SegmentKey.Of(info));
             await DeleteSegmentAsync(SegmentKey.Of(seg), ct);
         }
 
@@ -2036,8 +3147,21 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// payload is torn. It was removed from this list once on the strength of a grep over src/,
     /// which does not see into dependencies; the streaming merge then retried such a file
     /// forever, warning every pass.</para>
+    ///
+    /// <para>The list is <see cref="FileBounds.DescribesContent"/>, because those two were not the
+    /// whole of it and the retry had since gone quiet. MessagePack answers a count of 2^31 or more
+    /// with <see cref="OverflowException"/> (a checked uint→int conversion), a flipped column
+    /// offset slices with <see cref="ArgumentOutOfRangeException"/>, and both come out of the
+    /// writer on a source that opened cleanly. Classified as circumstance, such a batch was
+    /// logged at Debug and picked again by the next pass — the planner is deterministic, oldest
+    /// bucket first — so compaction for that bucket and every younger one stopped without a
+    /// Warning until retention removed the source. Nothing in the shared list is a condition of
+    /// the machine: an I/O error, a full disk, a sharing violation or a missing file is none of
+    /// them, and still gets another attempt. A writer BUG throwing one of them on healthy bytes
+    /// is quarantined too, at Warning and until restart, which is the louder of the two
+    /// outcomes.</para>
     /// </summary>
-    private static bool IsSourceCorruption(Exception ex) => ex is InvalidDataException or EndOfStreamException;
+    private static bool IsSourceCorruption(Exception ex) => FileBounds.DescribesContent(ex);
 
     /// <summary>
     /// Streams the sources through a k-way merge straight into a new segment file.
@@ -2216,33 +3340,42 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     {
         int[] order = SegmentWriter.ComputeSortOrder(hot);
 
-        var perLevel = new List<int>[LevelSegmentSlots];
-        for (int oi = 0; oi < order.Length; oi++)
+        var perLevel = new int[LevelSegmentSlots][];
+        var counts   = new int[LevelSegmentSlots];
+        var written  = new List<SegmentInfo>(LevelSegmentSlots);
+        try
         {
-            int lvl = (int)hot.GetHeader(order[oi]).Level;
-            if ((uint)lvl >= LevelSegmentSlots) lvl = (int)Ameto.Core.LogLevel.Information;   // defensive
-            (perLevel[lvl] ??= new List<int>()).Add(order[oi]);
-        }
+            SplitOrderByLevel(hot, order, perLevel, counts);
 
-        var written = new List<SegmentInfo>(LevelSegmentSlots);
-        for (int lvl = 0; lvl < LevelSegmentSlots; lvl++)
-        {
-            var idx = perLevel[lvl];
-            if (idx is null || idx.Count == 0) continue;
-
-            var segId = new SegmentId(firstSegId + (ulong)lvl);
-            if (skipPublishedLevels && SegmentFileExists(segId.Value))
+            for (int lvl = 0; lvl < LevelSegmentSlots; lvl++)
             {
-                _logger.LogInformation(
-                    "WAL recovery: level {Level} is already published as segment {Id} — {Count} event(s) not rewritten",
-                    (Ameto.Core.LogLevel)lvl, segId.Value, idx.Count);
-                continue;
-            }
+                int n = counts[lvl];
+                if (n == 0) continue;
 
-            var subset  = idx.ToArray();
-            var segPath = BuildSegmentPath(segId, hot, subset);
-            written.Add(await FlushToColdAsync(hot, segId, segPath, ct, subset));
-            _afterLevelPublished?.Invoke(lvl);
+                var segId = new SegmentId(firstSegId + (ulong)lvl);
+                if (skipPublishedLevels && SegmentFileExists(segId.Value))
+                {
+                    _logger.LogInformation(
+                        "WAL recovery: level {Level} is already published as segment {Id} — {Count} event(s) not rewritten",
+                        (Ameto.Core.LogLevel)lvl, segId.Value, n);
+                    continue;
+                }
+
+                // A RENTED array is longer than its level's event count, so every consumer
+                // below is told how much of it is real. The writer would otherwise stage the
+                // rent's tail — stale tier indices from a previous flush — as events.
+                var subset  = perLevel[lvl];
+                var segPath = BuildSegmentPath(segId, hot, subset, n);
+                written.Add(await FlushToColdAsync(hot, segId, segPath, ct, subset, n));
+                _afterLevelPublished?.Invoke(lvl);
+            }
+        }
+        finally
+        {
+            // Returned only here: each level's array is read by the write it was handed to,
+            // and that write is awaited inside the loop, so nothing below still holds one.
+            for (int lvl = 0; lvl < LevelSegmentSlots; lvl++)
+                if (perLevel[lvl] is { } a) ArrayPool<int>.Shared.Return(a);
         }
 
         // ── MARKER LAST. Every level is on disk and fsynced (SegmentWriter.Finalise flushes to
@@ -2252,6 +3385,52 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         //    ordering only the page cache observes does not survive a power loss.
         WriteFlushCompletionMarker(firstSegId, written);
         return written;
+    }
+
+    /// <summary>
+    /// Partitions a tier's sort order by log level: <paramref name="perLevel"/>[l] comes back
+    /// holding <paramref name="counts"/>[l] tier indices, still ascending by (timestamp, id).
+    ///
+    /// <para>COUNT, THEN FILL, into POOLED arrays. The straightforward
+    /// <c>(perLevel[lvl] ??= new List&lt;int&gt;()).Add(…)</c> followed by <c>ToArray()</c> cost
+    /// the dominant level three large-object copies per flush: the list doubling its way up to
+    /// ~800 KB — every step past 85 KB an LOH allocation of immediately-dead bytes — and then
+    /// one more full-size copy to hand the writer an array. Counting first costs one extra pass
+    /// over a rented BYTE array, which is where the first pass parks each event's level, so the
+    /// expensive part (a random <c>GetHeader</c> into a ~12.5 MB header set) still happens
+    /// exactly once per event.</para>
+    ///
+    /// <para>The arrays come from <see cref="ArrayPool{T}"/> and are therefore LONGER than their
+    /// level's count — every consumer must be told how much of one is real, or it stages the
+    /// rent's tail (stale tier indices from an earlier flush) as events. The caller returns them.</para>
+    /// </summary>
+    internal static void SplitOrderByLevel(HotTierSegment hot, int[] order, int[]?[] perLevel, int[] counts)
+    {
+        var levels = ArrayPool<byte>.Shared.Rent(order.Length);
+        try
+        {
+            for (int oi = 0; oi < order.Length; oi++)
+            {
+                int lvl = (int)hot.GetHeader(order[oi]).Level;
+                if ((uint)lvl >= LevelSegmentSlots) lvl = (int)Ameto.Core.LogLevel.Information;   // defensive
+                levels[oi] = (byte)lvl;
+                counts[lvl]++;
+            }
+
+            for (int lvl = 0; lvl < LevelSegmentSlots; lvl++)
+                if (counts[lvl] > 0) perLevel[lvl] = ArrayPool<int>.Shared.Rent(counts[lvl]);
+
+            Span<int> fill = stackalloc int[LevelSegmentSlots];
+            for (int oi = 0; oi < order.Length; oi++)
+            {
+                int lvl = levels[oi];
+                perLevel[lvl]![fill[lvl]++] = order[oi];
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(levels);
+        }
     }
 
     /// <summary>True when a segment file carrying <paramref name="segId"/> is on disk.</summary>
@@ -2298,8 +3477,13 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         }
     }
 
+    /// <param name="orderCount">
+    /// How many of <paramref name="order_"/>'s entries are this segment's, or -1 for all of it.
+    /// A level-split flush hands over a POOLED array, which is longer than the level it holds.
+    /// </param>
     private Task<SegmentInfo> FlushToColdAsync(
-        HotTierSegment hot, SegmentId segId, string segPath, CancellationToken ct, int[]? order_ = null)
+        HotTierSegment hot, SegmentId segId, string segPath, CancellationToken ct,
+        int[]? order_ = null, int orderCount = -1)
     {
         // Capture delegate reference before entering Task.Run
         var sinkFactory  = IndexSinkFactory;
@@ -2310,6 +3494,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             // offsets become file ordinals, which the reader maps back to blocks/rows.
             // A caller-supplied order may be a SUBSET of the tier (level-split flush).
             int[] order = order_ ?? SegmentWriter.ComputeSortOrder(hot);
+            int   count = orderCount >= 0 ? orderCount : order.Length;
 
             // The writer drives the index build now, one INDEX GROUP at a time: it knows
             // where the group's payload budget falls, and only it can interleave a group's
@@ -2325,7 +3510,7 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 SegmentInfo info;
                 using (var writer = new SegmentWriter(tmpPath, groupBudget))
                 {
-                    writer.WriteEvents(new HotTierEventSource(hot, TemplatePool, order), sinkFactory);
+                    writer.WriteEvents(new HotTierEventSource(hot, TemplatePool, order, 0, count), sinkFactory);
                     info = writer.Finalise(_options.NodeId, segId);
                 } // FileStream closed here before Move
                 File.Move(tmpPath, segPath, overwrite: false);
@@ -2358,6 +3543,9 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
     public async Task<RetentionRunResult> EnforceRetentionAsync(CancellationToken ct = default)
     {
+        // Files an earlier pass could not unlink because a query held them open.
+        RetryPendingSegmentDeletes();
+
         var now     = DateTimeOffset.UtcNow;
         var policy  = _retentionStore.GetPolicy();
         var expired = _segments.Values
@@ -2424,6 +3612,30 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// </summary>
     internal void LoadSegmentCatalog()
     {
+        // From before the directory is listed until the scan ends, every delete records its path
+        // for it (see _deletedDuringCatalogScan). A delete before this line either unlinked its
+        // file before the listing or parked it, and the scan sees both.
+        lock (_scanDeleteGate)
+        {
+            _catalogScansRunning++;
+            _deletedDuringCatalogScan ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        }
+        try
+        {
+            LoadSegmentCatalogCore();
+        }
+        finally
+        {
+            // Recording stops with the last scan, and what it recorded goes with it.
+            lock (_scanDeleteGate)
+            {
+                if (--_catalogScansRunning == 0) _deletedDuringCatalogScan = null;
+            }
+        }
+    }
+
+    private void LoadSegmentCatalogCore()
+    {
         var sw = System.Diagnostics.Stopwatch.StartNew();
 
         // Finish merges interrupted between publishing the merged segment and
@@ -2456,10 +3668,62 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         {
             try
             {
-                using var reader = SegmentReader.Open(file, computeUncompressedBytes: true);
-                var info = reader.Info;
-                var key  = SegmentKey.Of(info);
-                if (_segments.TryAdd(key, info)) continue;
+                _beforeScanOpensSegment?.Invoke(file);
+
+                // Closed before the gate: nothing below reads the file, and on Windows a mapping
+                // held while waiting for the gate is what made a delete of this very file fail
+                // its unlink and park.
+                SegmentInfo info;
+                using (var reader = SegmentReader.Open(file, computeUncompressedBytes: true))
+                    info = reader.Info;
+                var key = SegmentKey.Of(info);
+
+                _beforeScanRegistersSegment?.Invoke(file);
+
+                // Retention runs while this scan is still walking the directory, so a segment the
+                // catalog has already let go can reach this line in two states, and neither may
+                // be registered again:
+                // - PARKED: the delete removed the entry, but its unlink failed because a query,
+                //   or this scan while reading the file, held it open. Registering it put the
+                //   expired segment back in service, and the parked retry then found the catalog
+                //   naming its path, took that for a re-import and dropped the delete, until the
+                //   next retention pass.
+                // - DELETED: the delete ran while this scan was running, and recorded the path
+                //   in _deletedDuringCatalogScan whatever its unlink did. Typically the unlink
+                //   succeeded after this scan opened the file (Linux unlinks a mapped file;
+                //   everywhere, once the reader above is closed), so nothing was parked, and
+                //   registering it added an entry for a file that no longer exists: every header
+                //   count over its window was Partial and every merge that picked it failed,
+                //   until the next retention pass removed the entry. The record, not File.Exists,
+                //   is what tells: File.Exists also says false when NFS or SMB fails the probe,
+                //   and a live segment skipped on that stayed unserved until the next restart.
+                //
+                // Under _scanDeleteGate, which DeleteSegmentAsync holds across removing the entry,
+                // recording the path, unlinking the file and parking a failed unlink. What that
+                // gives is atomicity against a delete, not a fresh reading: the info above was
+                // read before the gate and says nothing about a delete since. A delete of this key
+                // is instead either wholly before these checks -- and left a park or a record,
+                // both seen here -- or wholly after the add, and removes the entry the add made.
+                // A delete from before the scan began recorded nothing: its unlink either
+                // succeeded before the directory was listed, or was parked, and a retry that
+                // settles the parked path during the scan records it before unparking it (see
+                // TryCompletePendingSegmentDelete). What that does not
+                // cover is such a delete whose unlink failed and was NOT parked (past
+                // PendingSegmentDeleteCap, or an exception no retry fixes): the file is still on
+                // disk, is registered again, and the next retention pass deletes it again. (The
+                // same failure during the scan is recorded, so the file stays on disk unserved
+                // until the next start, as it does when no scan runs.) Not under _importLock,
+                // which an import holds across its publish while this scan must still be able to
+                // land (see ImportSegment).
+                ScanSkip skip;
+                bool     added;
+                lock (_scanDeleteGate)
+                {
+                    skip  = ScanSkipUnderGate(file);
+                    added = skip == ScanSkip.None && _segments.TryAdd(key, info);
+                }
+                if (LogScanSkip(skip, file, error: null)) continue;
+                if (added) continue;
 
                 // A live flush or import may have registered this very file while the scan was
                 // running — the scan is a background task, not a barrier — so only a genuinely
@@ -2486,6 +3750,22 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             }
             catch (Exception ex)
             {
+                // Not unreadable: a delete got there first. Retention runs beside this scan, so a
+                // delete can reach a file between the listing above and the open, unlink it
+                // (always on Linux; on Windows whenever no query holds it) and record it, or park
+                // it. The open then throws, FileNotFoundException for the unlinked file, and this
+                // branch used to quarantine it: an Error calling a segment "served by nobody" that
+                // the delete had just meant to serve nobody, then a Warning when the rename found no
+                // file. One false pair per expired file on a big catalog whose retention starts
+                // right after boot. The park and the record decide it, read under the same gate as
+                // the registration above and by the same rule. Not FileNotFoundException, and not
+                // File.Exists: a file that vanished with no delete of ours, or a probe a failing NFS
+                // or SMB mount answers false for a live segment, would then be skipped at Debug and
+                // nobody told. The record says what a delete did and nothing else.
+                ScanSkip skip;
+                lock (_scanDeleteGate) skip = ScanSkipUnderGate(file);
+                if (LogScanSkip(skip, file, ex)) continue;
+
                 // Renamed aside, NOT deleted. The delete was written when "unreadable" meant a
                 // header or footer that nothing could ever parse; the reader now also throws on
                 // one torn block FRAME -- four bad bytes in a file whose every other block is
@@ -2504,6 +3784,35 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             }
         }
         _logger.LogInformation("Loaded {Count} segments from {Dir} in {Ms} ms", _segments.Count, _segDir, sw.ElapsedMilliseconds);
+    }
+
+    /// <summary>Why the catalog scan leaves a file alone, if it does.</summary>
+    private enum ScanSkip : byte { None, Parked, Deleted }
+
+    /// <summary>
+    /// The catalog scan's one rule for a file the catalog has let go of, whether the scan read the
+    /// file or failed to: its delete is parked, or a delete removed it while the scan was running
+    /// (see <see cref="_deletedDuringCatalogScan"/>). The caller holds <see cref="_scanDeleteGate"/>.
+    /// </summary>
+    private ScanSkip ScanSkipUnderGate(string file) =>
+        _pendingSegmentDeletes.ContainsKey(file)            ? ScanSkip.Parked
+        : _deletedDuringCatalogScan?.Contains(file) == true ? ScanSkip.Deleted
+        : ScanSkip.None;
+
+    /// <summary>Says at Debug why the scan skips <paramref name="file"/>; false when it does not.</summary>
+    private bool LogScanSkip(ScanSkip skip, string file, Exception? error)
+    {
+        switch (skip)
+        {
+            case ScanSkip.Parked:
+                _logger.LogDebug(error, "Segment {File} is waiting for its delete to complete; the catalog scan skips it", file);
+                return true;
+            case ScanSkip.Deleted:
+                _logger.LogDebug(error, "Segment {File} was deleted while the catalog scan was running; the scan skips it", file);
+                return true;
+            default:
+                return false;
+        }
     }
 
     /// <summary>
@@ -2576,15 +3885,23 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
             return;
         }
 
-        // Load template pool. An empty pool (its writes are only fsynced periodically, so
-        // power loss can zero it) used to discard the ENTIRE WAL — dropping events whose
-        // payloads DID reach disk because their template strings did not. Replay them
+        // Load template pool. An empty pool used to discard the ENTIRE WAL — dropping events
+        // whose payloads DID reach disk because their template strings did not. Replay them
         // template-less instead: timestamp, level, properties and exception all survive,
         // only @mt is lost, and the index below must not alias a live pool entry.
+        //
+        // Empty has TWO causes and the warning must name both. Pool writes are only fsynced
+        // periodically, so power loss can zero the file — that is the one this started as. But
+        // since the template pool stopped writing a row for an event it could not intern, a WAL
+        // every one of whose events arrived past a SATURATED pool writes no rows either, and its
+        // .pool file stays at 0 bytes with nothing wrong. The replay is right in both cases;
+        // only an operator reading "no template pool" as corruption would be wrong.
         var pool         = WriteAheadLog.LoadPool(poolPath);
         bool poolMissing = pool.Count == 0;
         if (poolMissing)
-            _logger.LogWarning("Orphaned WAL {File}: no template pool — replaying {Count} events without templates",
+            _logger.LogWarning(
+                "Orphaned WAL {File}: no template pool rows — either power loss before the pool was fsynced, "
+              + "or every event in it was outside a saturated template pool. Replaying {Count} events without templates",
                 walFile, entries.Count);
 
         // Restore templates into TemplatePool
@@ -2600,6 +3917,10 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         int replayed = 0;
         foreach (var entry in entries)
         {
+            // Unpooled: the event was outside a saturated pool when it was logged. Its index
+            // field is 0 and names nothing, and its template text was never stored, so it
+            // replays with no template. Resolving the 0 attached index 0's template to it.
+            bool noTemplate = poolMissing || entry.Unpooled;
             var header = new LogEventHeader
             {
                 Id                       = _idGen.Next(entry.TimestampTicks),
@@ -2608,11 +3929,21 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
                 // With no pool the stored index points at whatever the LIVE pool holds
                 // at that slot — resolving it would stamp a random template onto every
                 // recovered event. -1 = "no template", persisted as an empty @mt.
-                MessageTemplatePoolIndex = poolMissing ? -1 : entry.TemplateIndex,
+                MessageTemplatePoolIndex = noTemplate ? -1 : entry.TemplateIndex,
+                // EXPLICITLY -1. The WAL entry format carries no service name, so "absent" is
+                // the only honest value — but the field is a plain int on a struct, and its
+                // default of 0 is a VALID pool index, not the sentinel every reader tests for
+                // (`ServiceNamePoolIndex >= 0`). The pool is shared by templates and service
+                // names and recovery force-interns this WAL's own rows into it, so slot 0 is
+                // ordinarily this WAL's first template: every recovered event was stamped with
+                // it, and the flush below wrote that string permanently into the recovery
+                // segment's @svc column, where it answers service.name queries and skews
+                // per-service counts.
+                ServiceNamePoolIndex     = -1,
             };
             // Resolve template via the freshly restored pool and attach it
             // to the hot tier so the recovery flush persists @mt correctly.
-            string tmpl = poolMissing ? string.Empty : TemplatePool.Get(entry.TemplateIndex);
+            string tmpl = noTemplate ? string.Empty : TemplatePool.Get(entry.TemplateIndex);
             if (recoveredHot.TryWrite(header, entry.Payload, tmpl, entry.Exception))
                 replayed++;
         }
@@ -2864,8 +4195,10 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         // deciding it on the stale probe is what let a refusal arrive with the other peer's bytes
         // already destroyed. Registering first opens a window in the other direction, where the
         // entry names a path the file has not reached. For the two QUERY consumers that is
-        // harmless -- QueryExecutor yields nothing for an unreadable path, the aggregator logs
-        // and moves on -- but retention and the merge planner act on the ENTRY, not the file:
+        // harmless -- QueryExecutor yields nothing for an unreadable path, and the header
+        // aggregation waits for this lock on a missing file and opens it again (see
+        // OpenForHeaderScan), so it neither drops the segment nor calls its count partial --
+        // but retention and the merge planner act on the ENTRY, not the file:
         // retention could remove it and orphan the file the move then lands, and the planner
         // could quarantine the not-yet-arrived path until restart. Both are held off explicitly
         // instead of argued away: DeleteSegmentAsync takes this same lock, and the planner
@@ -2947,6 +4280,8 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
                 break;
             }
+
+            _afterImportPublish?.Invoke();
 
             if (!inPlace)
             {
@@ -3210,10 +4545,14 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     /// carries the range, and retention reads MaxTimestamp out of it, so a level-split
     /// segment must be named from ITS OWN events rather than the tier's.
     /// </param>
-    private string BuildSegmentPath(SegmentId segId, HotTierSegment hot, int[]? order = null)
+    /// <param name="orderCount">
+    /// How many of <paramref name="order"/>'s entries belong to this segment, or -1 for all of
+    /// it. A level-split flush passes a POOLED array whose tail is another flush's leftovers.
+    /// </param>
+    private string BuildSegmentPath(SegmentId segId, HotTierSegment hot, int[]? order = null, int orderCount = -1)
     {
         long minTs = long.MaxValue, maxTs = long.MinValue;
-        int n = order?.Length ?? hot.Count;
+        int n = order is null ? hot.Count : (orderCount >= 0 ? orderCount : order.Length);
         for (int k = 0; k < n; k++)
         {
             int i = order?[k] ?? k;
@@ -3230,10 +4569,37 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
 
     private int _disposed;
 
+    /// <summary>
+    /// Completed once the teardown has finished. A later <see cref="DisposeAsync"/> caller awaits
+    /// it: host shutdown can dispose this engine from two chains at once, and the one that
+    /// returned on the exchange used to let the process — or a test fixture deleting the data
+    /// directory — run on top of a flush still writing.
+    /// </summary>
+    private readonly TaskCompletionSource _disposeCompleted =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
     public async ValueTask DisposeAsync()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            await _disposeCompleted.Task.ConfigureAwait(false);
             return;
+        }
+
+        try { await DisposeCoreAsync().ConfigureAwait(false); }
+        finally { _disposeCompleted.TrySetResult(); }
+    }
+
+    /// <summary>
+    /// The teardown, in the order the tier-lifetime invariant needs (see <see cref="_writesClosed"/>):
+    /// stop the background loops → final flush, waiting its turn → close the write path → take the
+    /// swap lock for good → fence the writer → wait for every heavy phase → close reader snapshots
+    /// → wait for readers → free. Each wait shares one budget, and running out of it leaves the
+    /// tier that might still be in use allocated, with an Error, rather than freeing it.
+    /// </summary>
+    private async Task DisposeCoreAsync()
+    {
+        long deadline = Environment.TickCount64 + (long)_shutdownWaitBudget.TotalMilliseconds;
 
         await _cts.CancelAsync();
         try { await _flushLoop; }
@@ -3245,35 +4611,138 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         try { await _maintenanceLoop; }
         catch (OperationCanceledException) { }
         catch (ObjectDisposedException) { }
+        // Deferred segment deletes: cancellation ends the retry loop's delay at once, so this
+        // waits out at most one pass in progress, never a backoff. Then one last attempt each;
+        // what is still held stays on disk and the next start's retention pass expires it again.
+        try { await Volatile.Read(ref _segmentDeleteRetryLoop); } catch { /* best-effort */ }
+        try { RetryPendingSegmentDeletes(); } catch { /* best-effort */ }
 
-        // Await all in-flight parallel flushes before freeing the frozen tiers they
-        // read — disposing their native memory mid-flush faults (AccessViolation).
-        // No new flush can start: the age loop is stopped and no writes remain.
+        // Flushes scheduled before shutdown. Not the guarantee (see _inFlightFlushes) — only a
+        // way to let them finish before the final flush competes with them for the lock.
         try { await Task.WhenAll(_inFlightFlushes.Keys.ToArray()); } catch { /* best-effort */ }
 
+        // ── Final flush. Waits for its turn at the lock and for a slot rather than dropping out
+        //    when a racing flush holds either: dropping out left the live tier to the WAL replay.
         if (_write.Hot.Count > 0)
         {
-            try { await TryFlushAsync(); } catch { /* best-effort final flush */ }
-            // TryFlushAsync's heavy phase runs to completion inline here (we awaited it),
-            // but a concurrent trigger may have scheduled another — drain those too.
-            try { await Task.WhenAll(_inFlightFlushes.Keys.ToArray()); } catch { }
+            try { await TryFlushAsync(waitDeadline: deadline); }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Final hot-tier flush failed — the WAL replays the tier on the next start");
+            }
         }
 
-        _write.Hot.Dispose();
-        lock (_retireLock)
+        // ── Close the write path. A full fence, because the other half of this handshake is a
+        //    lock-free read: TryWrite and ScheduleFlush load the flag, and a store that sank below
+        //    those loads could let a flush swap a tier after shutdown stopped counting.
+        Interlocked.Exchange(ref _writesClosed, 1);
+        Interlocked.MemoryBarrier();
+
+        // ── Take the swap lock and KEEP it. A flush that holds it now finishes its swap (and is
+        //    counted) first; every later one finds the close, or the lock taken, and swaps nothing.
+        var swapLockTaken = _flushLock.WaitAsync(Until(deadline));
+        if (!swapLockTaken.IsCompleted)
+            _onWaitingForFlushLock?.Invoke();
+        if (!await swapLockTaken.ConfigureAwait(false))
         {
-            foreach (var t in _retired) t.Dispose();
-            _retired.Clear();
+            _logger.LogError(
+                "Shutdown could not take the hot-tier swap lock within {Budget}s — every hot tier is left " +
+                "allocated rather than freed under a flush that may still be swapping it",
+                _shutdownWaitBudget.TotalSeconds);
+            return;
         }
+
+        // ── Fence the writer. A TryWrite that passed the close check before it was set is either
+        //    finished with the tier when Freeze returns, or finds it frozen and refuses.
+        var live = _write;
+        live.Hot.Freeze();
+
+        // ── Wait for every heavy phase: the ones scheduled after the snapshot above, the inline
+        //    FlushHotTierAsync one, the retries shutdown's cancellation is ending. Only the swap
+        //    increments the count, under the lock now held, so it can only fall.
+        bool flushesEnded = true;
+        var heavyDrained = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Volatile.Write(ref _heavyPhasesDrained, heavyDrained);
+        Interlocked.MemoryBarrier();   // the decrement's read of the source must see it, or this read must see the zero
+        if (Volatile.Read(ref _heavyPhases) != 0)
+        {
+            _onWaitingForHeavyPhases?.Invoke();
+            flushesEnded = await CompletesBy(heavyDrained.Task, deadline).ConfigureAwait(false);
+        }
+
+        // ── Collect what to free and close reader snapshots in the same step, under the lock
+        //    snapshots are taken under. From here _activeReaders only falls.
+        List<HotTierSegment> tiers;
+        int leftFrozen = 0;
         lock (_frozenLock)
         {
-            foreach (var (tier, _) in _frozenHot) tier.Dispose();
-            _frozenHot.Clear();
+            _snapshotsClosed = true;
+            tiers = new List<HotTierSegment>(1 + _frozenHot.Count) { live.Hot };
+            if (flushesEnded)
+            {
+                foreach (var (tier, _) in _frozenHot) tiers.Add(tier);
+                _frozenHot.Clear();
+            }
+            else
+            {
+                // Which of them a still-running flush reads cannot be told apart, so none is
+                // freed here. A flush that finishes later retires its own tier the usual way.
+                leftFrozen = _frozenHot.Count;
+            }
         }
-        _write.Wal?.Dispose();
-        _flushConcurrency.Dispose();
-        _flushSlots.Dispose();
-        _flushLock.Dispose();
+        if (!flushesEnded)
+            _logger.LogError(
+                "Shutdown: {Running} hot-tier flush(es) still running after {Budget}s — {Frozen} frozen tier(s) " +
+                "are left allocated rather than freed under them",
+                Volatile.Read(ref _heavyPhases), _shutdownWaitBudget.TotalSeconds, leftFrozen);
+
+        // ── Wait for open readers (queries still scanning a snapshot).
+        var readersDrained = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Volatile.Write(ref _readersDrained, readersDrained);
+        Interlocked.MemoryBarrier();
+        if (Volatile.Read(ref _activeReaders) != 0)
+        {
+            _onWaitingForReaders?.Invoke();
+            if (!await CompletesBy(readersDrained.Task, deadline).ConfigureAwait(false))
+            {
+                _logger.LogError(
+                    "Shutdown: {Readers} hot-tier reader(s) still open after {Budget}s — {Tiers} tier(s) stay " +
+                    "allocated until the last of them closes",
+                    Volatile.Read(ref _activeReaders), _shutdownWaitBudget.TotalSeconds, tiers.Count);
+            }
+        }
+
+        _beforeTiersFreed?.Invoke();
+
+        // ── Free, by the retire list's rule: now if no reader is open, otherwise when the last
+        //    one closes (OnReaderDisposed → DrainRetired). Tiers retired before shutdown too.
+        lock (_retireLock)
+        {
+            _retired.AddRange(tiers);
+            if (Volatile.Read(ref _activeReaders) == 0)
+            {
+                foreach (var t in _retired) t.Dispose();
+                _retired.Clear();
+            }
+        }
+
+        live.Wal?.Dispose();
+
+        // The three semaphores are deliberately NOT disposed. A SemaphoreSlim holds nothing to
+        // release unless its wait handle was asked for, and disposing one turns a late
+        // Release — a flush left running past the budget, a WaitAsync that read the close flag
+        // just before it was set — into an ObjectDisposedException on a pool thread.
         _cts.Dispose();
+    }
+
+    /// <summary>True if <paramref name="task"/> completes by the <see cref="Environment.TickCount64"/> deadline.</summary>
+    private static async Task<bool> CompletesBy(Task task, long deadline)
+    {
+        try
+        {
+            await task.WaitAsync(Until(deadline)).ConfigureAwait(false);
+            return true;
+        }
+        catch (TimeoutException) { return false; }
     }
 }

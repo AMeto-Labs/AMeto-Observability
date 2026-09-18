@@ -63,6 +63,37 @@ public sealed class WriteAheadLogTests
         }
     }
 
+    /// <summary>
+    /// An index outside the pool (-1, or past its 65 536 ids) is logged with the Unpooled flag
+    /// and writes no pool row, and a genuine index 0 beside it is not flagged. The WAL-level
+    /// half of WalUnpooledTemplateTests.
+    /// </summary>
+    [Fact]
+    public void Append_OutsideThePool_IsFlaggedUnpooled_AndWritesNoPoolRow()
+    {
+        string path = NewWalPath();
+        try
+        {
+            using (var wal = WriteAheadLog.Open(path, new NodeId(0), new SegmentId(1UL), initialCapacity: 1024 * 1024))
+            {
+                wal.Append(100, Ameto.Core.LogLevel.Information, -1,     "unpooled text", new byte[] { 1 });
+                wal.Append(200, Ameto.Core.LogLevel.Information, 0,      "Starting {App}", new byte[] { 2 });
+                wal.Append(300, Ameto.Core.LogLevel.Information, 65_536, "past the cap",  new byte[] { 3 });
+            }
+
+            var (_, entries) = WriteAheadLog.ReadForRecovery(path);
+            Assert.Equal(3, entries.Count);
+            Assert.True(entries[0].Unpooled);
+            Assert.False(entries[1].Unpooled);
+            Assert.Equal(0, entries[1].TemplateIndex);
+            Assert.True(entries[2].Unpooled);
+
+            var pool = WriteAheadLog.LoadPool(path + ".pool");
+            Assert.Equal("Starting {App}", Assert.Single(pool).Value);
+        }
+        finally { File.Delete(path); File.Delete(path + ".pool"); }
+    }
+
     // ── v4 corruption handling ────────────────────────────────────────────────
     //
     // Offsets used below: file header = 32 bytes, entry header = 24 bytes, so with
