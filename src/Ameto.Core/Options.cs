@@ -638,12 +638,21 @@ public sealed class MetricsOptions
     /// depth alone stops bounding anything the moment the depth hits its 64-slot floor: past
     /// there every further ring is 64 x <see cref="ExemplarBytes"/> = 13 KB of permanently
     /// resident heap that nothing prunes, ages out, sheds or even counts, and the cap is
-    /// operator-settable. So the leftover goes on the count. Below the floor point this returns
-    /// <see cref="MaxExemplarMetrics"/> unchanged and nothing moves.</para>
+    /// operator-settable. So the leftover goes on the count. While the DERIVED depth is in force
+    /// this returns <see cref="MaxExemplarMetrics"/> unchanged and nothing moves: the derivation
+    /// divided the budget by that very count, so it is affordable by construction, and only past
+    /// the floor, where the depth can give way no further, does the count begin to.</para>
     ///
-    /// <para>An explicit <see cref="ExemplarsPerMetric"/> is honoured here too, and therefore
-    /// buys its depth out of the ring count: the budget is a quantity of BYTES, and an operator
-    /// who asks for deeper rings on a tier that cannot hold more of them is asking for fewer.
+    /// <para><b>An explicit <see cref="ExemplarsPerMetric"/> moves the count immediately, at any
+    /// tier size — there is no floor point to reach first.</b> The depth was chosen rather than
+    /// derived, so the budget is divided by IT and the ring count is whatever is left over:
+    /// 1 000 slots on the 512 MB stand's 19.2 MB tier admits 48 rings, not the 256 the cap says,
+    /// and names past the 48th are refused their exemplars exactly as they are past the cap. An
+    /// operator who sets a depth is therefore setting both knobs — the budget is a quantity of
+    /// BYTES, and asking for deeper rings on a tier that cannot hold more of them is asking for
+    /// fewer of them. Lower the depth, or raise <see cref="HotTierBytes"/>, to get the count
+    /// back. (Past the point where even ONE ring of that depth would not fit,
+    /// <see cref="ExemplarsPerMetricFor"/> lowers the depth instead: the count stops at one.)
     /// </para>
     /// </summary>
     public int MaxExemplarMetricsFor(in MemoryBudgets budgets)

@@ -123,6 +123,31 @@ public sealed class MetricBudgetWiringTests
     }
 
     /// <summary>
+    /// THE FIGURES <c>MaxExemplarMetricsFor</c>'s OWN DOC QUOTES, so the sentence an operator
+    /// reads before setting a depth is one this file has to keep true. The doc used to say the
+    /// count moves only "below the floor point", which holds for the DERIVED depth and not at
+    /// all for an explicit one: nothing about 1 000 slots is near the 64-slot floor, and the
+    /// stand still loses 208 of its 256 rings for asking.
+    /// </summary>
+    [Fact]
+    public void An_explicit_depth_moves_the_ring_count_at_any_tier_size()
+    {
+        var deep = new MetricsOptions { ExemplarsPerMetric = 1_000 };
+
+        // The depth is affordable for one ring at both sizes, so it is honoured whole — and the
+        // count is what pays for it, nowhere near the floor.
+        Assert.Equal(1_000, deep.ExemplarsPerMetricFor(Stand));
+        Assert.Equal(1_000, deep.ExemplarsPerMetricFor(Large));
+        Assert.Equal(48, deep.MaxExemplarMetricsFor(Stand));   // 19.2 MB tier, not the cap's 256
+        Assert.Equal(76, deep.MaxExemplarMetricsFor(Large));   // 32 MB tier, not the cap's 256
+
+        // The derived depth, by contrast, leaves the count exactly where the cap put it: the
+        // derivation divided the budget by that count, so it is affordable by construction.
+        Assert.Equal(256, new MetricsOptions().MaxExemplarMetricsFor(Stand));
+        Assert.Equal(256, new MetricsOptions().MaxExemplarMetricsFor(Large));
+    }
+
+    /// <summary>
     /// THE CLAMP IS WHAT THE ENGINE ENFORCES, not just what the options compute. A ring is
     /// allocated at full depth the first time a metric name carries an exemplar, so "admits" has
     /// to mean "creates", and the refusal counter is the engine's own record of having said no.
