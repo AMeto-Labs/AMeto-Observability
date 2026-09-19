@@ -231,6 +231,69 @@ public sealed class MetricHotTierRetentionProbe
     }
 
     /// <summary>
+    /// PRESSURE LOWERS THE BAR; IT DOES NOT REMOVE IT.
+    ///
+    /// <para><c>Shed()</c> evicted every series holding zero points, and the state a tier is in
+    /// for most of its life is the state immediately after a flush — where that is ALL of them.
+    /// One pressure tick landing there wiped a busy 30 000-series table, every live series then
+    /// paid a fresh <c>RegisterMeta</c> walk on its next point, the log line called them "idle
+    /// for over 2 h" and the <c>released</c> figure the pressure loop reads counted bytes that
+    /// came back within the second.</para>
+    ///
+    /// <para>The three facts here are the rule: a series that reported inside one <c>MaxHotAge</c>
+    /// survives a shed however empty it is; one past that bar goes, EARLIER than the ordinary
+    /// sweep's twice-<c>MaxHotAge</c>, which is what makes a shed worth calling at all; and
+    /// <c>released</c> counts what actually left.</para>
+    ///
+    /// <para>Revert <c>Shed</c> to <c>if (v.PointCount == 0)</c> and the first assertion fails
+    /// with both series gone the moment the flush emptied them.</para>
+    /// </summary>
+    [Fact]
+    public async Task Shedding_under_pressure_keeps_a_series_that_reported_inside_the_hot_age()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "ameto-mhotshed-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        var clock = new MetricTestClock();
+        try
+        {
+            await using var engine = new MetricStorageEngine(dir, NullLogger<MetricStorageEngine>.Instance, timeProvider: clock);
+            long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+            var  hotAge   = engine.ConfiguredOptions.MaxHotAge;
+
+            engine.Ingest([Point("quiet", baseNano), Point("chatty", baseNano)]);
+            await engine.ScheduleThresholdFlushForTest();
+            Assert.Equal(0, engine.HotPointCount);      // every series in the table now holds nothing
+            Assert.Equal(2, engine.HotSeriesCount);
+
+            // THE PRESSURE TICK THAT USED TO TAKE THE WHOLE TABLE. Both series are empty and both
+            // reported seconds ago.
+            Assert.Equal(0L, engine.Shed());
+            Assert.Equal(2, engine.HotSeriesCount);
+            Assert.Equal(0, engine.StaleSeriesEvicted);
+
+            // An hour and a minute on, "chatty" reports again and "quiet" has not. Pressure sheds
+            // "quiet" at MaxHotAge — sooner than the drain's own sweep would have, which is the
+            // point of asking under pressure — and leaves the series that is still live.
+            clock.Advance(hotAge + TimeSpan.FromMinutes(1));
+            engine.Ingest([Point("chatty", baseNano + 1_000_000L)]);
+            await engine.ScheduleThresholdFlushForTest();
+
+            // The drain's own sweep does NOT take "quiet": at 1 h 1 min it is nowhere near the
+            // ordinary twice-MaxHotAge bar. Everything below is pressure's doing and nothing else's.
+            Assert.Equal(0, engine.StaleSeriesEvicted);
+            Assert.Equal(2, engine.HotSeriesCount);
+
+            long released = engine.Shed();
+
+            Assert.Equal(1, engine.StaleSeriesEvicted);
+            Assert.Equal(1, engine.HotSeriesCount);
+            Assert.True(released > 0 && released <= 2 * 384,
+                $"Shed() reported {released} B for one evicted series");
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    /// <summary>
     /// <c>Drain</c> hands the flush its list instead of copying it, so the restore path on a
     /// failed write appends into the series' NEW list while reading the drained one. Two
     /// different lists: if they were ever the same object this either duplicates every point or

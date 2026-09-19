@@ -1654,6 +1654,22 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     /// pressure loop and must never park behind a caller of its own, and an ingest batch holds
     /// the snapshot lock shared for a whole OTLP request. Losing the race costs nothing — the
     /// flush this schedules sweeps on its own way through.</para>
+    ///
+    /// <para><b>IDLE IS NOT "HOLDS NO POINTS RIGHT NOW".</b> It used to be, and the state every
+    /// tier is in for most of its life is the state immediately after a flush: the drain empties
+    /// every series, so a pressure tick landing there evicted the ENTIRE hot table — a busy
+    /// 30 000-series deployment reduced to nothing, every live series re-created on its next
+    /// point and paying a full <c>RegisterMeta</c> walk to do it, while the log line said they
+    /// had been "idle for over 2 h" and <c>released</c> counted bytes that came straight back.
+    /// It also hid the leak it was meant to relieve: a table emptied wholesale reports a large
+    /// <c>released</c> every time, so the pressure loop learns nothing from it.</para>
+    ///
+    /// <para>What pressure changes is the BAR, not the rule: <see cref="_staleSeriesAge"/> (twice
+    /// <c>MaxHotAge</c>) comes down to <c>MaxHotAge</c>, so a series that reported within one
+    /// hot-tier age — which is every series the tier is built for — is never a candidate, and
+    /// one that has said nothing for longer leaves sooner than the ordinary sweep would have let
+    /// it. Oldest-idle first falls out of that: a bar is a time, so the series furthest past it
+    /// go on every tick until none is.</para>
     /// </summary>
     public long Shed()
     {
@@ -1664,16 +1680,11 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         {
             try
             {
-                List<SeriesKey>? empty = null;
-                foreach (var (k, v) in _hot)
-                    if (v.PointCount == 0) (empty ??= []).Add(k);
-
-                if (empty is not null)
-                {
-                    int before = _hot.Count;
-                    SweepStaleSeriesLocked(empty, _staleSeriesAge);   // under pressure, idle is reason enough
-                    released = (long)(before - _hot.Count) * EmptySeriesBytes;
-                }
+                // The evicted COUNT, from the sweep that did the evicting — not a difference of
+                // two _hot.Count readings, each of which takes every lock in the table to answer
+                // a question the sweep already knew.
+                long idleBefore = _time.GetUtcNow().UtcTicks - _maxHotAge.Ticks;
+                released = (long)SweepIdleSeriesLocked(idleBefore, _maxHotAge) * EmptySeriesBytes;
             }
             finally { _snapshotLock.ExitWriteLock(); }
         }
