@@ -314,6 +314,15 @@ public static class TraceQLExecutor
         }
         root ??= spans.MinBy(s => s.StartTimeUnixNano)!;
 
+        // OUT OF THE BLOB, NOT OUT OF THE MEMOISED DICTIONARY — the same walk the trace list
+        // makes, for the same reason and over the same records. `root.Attributes` was the FIRST
+        // touch of a hot-tier record's blob here, so the lazy decode ran per page: a Dictionary,
+        // a key string and a box per attribute (~987 B against the blob's 375 B for an ordinary
+        // eight-attribute span), MEMOISED on the record, so the tier stayed that much heavier
+        // until it flushed. Every TraceQL page put back onto the live tier exactly what
+        // MergeSpanInto was rewritten to stop putting there.
+        HttpSemconvKeys.Resolve(root, out string httpMethod, out string httpPath);
+
         return new TraceRowDto
         {
             TraceId           = root.TraceId.ToString(),
@@ -322,8 +331,8 @@ public static class TraceQLExecutor
             ServiceName       = root.ServiceName,
             Services          = [.. services],
             Status            = hasErr ? "Error" : root.Status.ToString(),
-            HttpMethod        = GetAttr(root.Attributes, MethodKeys),
-            HttpPath          = GetAttr(root.Attributes, PathKeys),
+            HttpMethod        = httpMethod,
+            HttpPath          = httpPath,
             HttpStatusCode    = root.HttpStatusCode != 0 ? root.HttpStatusCode : null,
             StartTimeUnixNano = root.StartTimeUnixNano,
             DurationNanos     = root.DurationNanos,
@@ -346,15 +355,10 @@ public static class TraceQLExecutor
     internal static readonly string[] PathKeys   = HttpSemconvKeys.PathKeys;
 
     /// <summary>
-    /// First key that is present with a value, as text. A <c>ReadOnlySpan&lt;string&gt;</c> so the
-    /// key list is passed, never built.
+    /// First key that is present with a value, as text — <see cref="HttpSemconvKeys.GetAttr"/>,
+    /// which is where the rule now lives for all three readers of these lists. Kept as a name in
+    /// this file because the probes and the parity tests reach it by this one.
     /// </summary>
-    internal static string GetAttr(IReadOnlyDictionary<string, object?>? attrs, ReadOnlySpan<string> keys)
-    {
-        if (attrs is null) return string.Empty;
-        for (int i = 0; i < keys.Length; i++)
-            if (attrs.TryGetValue(keys[i], out var v) && v is not null)
-                return v.ToString() ?? string.Empty;
-        return string.Empty;
-    }
+    internal static string GetAttr(IReadOnlyDictionary<string, object?>? attrs, ReadOnlySpan<string> keys) =>
+        HttpSemconvKeys.GetAttr(attrs, keys);
 }

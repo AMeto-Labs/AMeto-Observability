@@ -273,9 +273,16 @@ public readonly struct MemoryBudgets
     ///
     /// <para><b>0.10 until the managed cut was re-made.</b> That last sentence is why this share
     /// gave up the largest proportion of itself: what it buys is how much of a burst's LOH churn
-    /// the pool absorbs, and a request that outruns it still succeeds. Its floor is one full set
-    /// of buckets — about twice the 8 MB largest array, 16 MB — which 0.05 of a 384 MB heap limit
-    /// clears at 19 MB.</para>
+    /// the pool absorbs, and a request that outruns it still succeeds.</para>
+    ///
+    /// <para><b>THE FLOOR IS WHAT MAKES THAT SAFE, and the floor is the pool's own arithmetic.</b>
+    /// One full set of buckets — the powers of two from 4 KiB to the 8 MiB largest array, 16 MiB
+    /// all told — is the smallest pool that can hold what a reader with no Content-Length leaves
+    /// on its way up, and a budget below it drops the LARGEST arrays first. The share alone does
+    /// not always clear it: the stand's 384 MB HEAP LIMIT gives 19.2 MB, but the 384 MB CONTAINER
+    /// an earlier version of this paragraph conflated it with gives a ~288 MB heap limit and
+    /// 14.4 MB. <see cref="IngestBufferPool.FullBucketSetBytes"/> is the floor, so the small host
+    /// gets the set and nobody has to restate the bucket arithmetic to know it.</para>
     /// </summary>
     public const double IngestBufferFraction = 0.05;
 
@@ -368,7 +375,25 @@ public readonly struct MemoryBudgets
     private const long MinNativeBytes           = 16L * 1024 * 1024;
     private const long MinIndexCacheBytes       =  8L * 1024 * 1024;
     private const long MinIndexCacheNativeBytes =  4L * 1024 * 1024;
-    private const long MinIngestBufferBytes     =  8L * 1024 * 1024;
+    /// <summary>
+    /// ONE FULL SET OF THE POOL'S OWN BUCKETS, asked of the pool rather than written down here.
+    ///
+    /// <para>It was 8 MiB, which is HALF a bucket set, and the docstring on
+    /// <see cref="IngestBufferFraction"/> was reading the stand's container size as its heap
+    /// limit when it said 0.05 cleared the floor. A 384 MB container gives the GC a ~288 MB hard
+    /// limit (75 % by default), 5 % of which is 14.4 MB — under the 16 MiB set, and the 8 MiB
+    /// floor did not lift it. Under the set <see cref="IngestBufferPool"/>'s
+    /// <c>BoundedByteArrayPool</c> drops on RETURN whatever would exceed the cap, and what a
+    /// 64 KiB-doubling reader returns LAST is its largest array: the 8 MiB OTLP bodies, the very
+    /// arrays on the large object heap this pool exists to keep off it, dropped on every request
+    /// while the small buckets stayed full.</para>
+    ///
+    /// <para>Derived from <see cref="IngestBufferPool.FullBucketSetBytes"/> — a compile-time
+    /// constant, so this introduces no type-initialization order between the two — which makes
+    /// raising the pool's largest array raise this floor with it instead of silently leaving it
+    /// behind.</para>
+    /// </summary>
+    private const long MinIngestBufferBytes     = IngestBufferPool.FullBucketSetBytes;
     private const long MinIngestArenaBytes      = 16L * 1024 * 1024;   // ~256 slabs at the 64 KB default
 
     /// <summary>

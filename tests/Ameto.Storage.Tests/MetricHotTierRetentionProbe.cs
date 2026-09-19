@@ -171,6 +171,275 @@ public sealed class MetricHotTierRetentionProbe
     }
 
     /// <summary>
+    /// THE TIER THAT CAN NEVER FLUSH AGAIN IS THE ONE THAT MOST NEEDS SWEEPING.
+    ///
+    /// <para>The sweep used to ride along with the drain and nowhere else, and both doors out of
+    /// the flush stand before it: <c>FlushIfDueAsync</c> returns on <c>points == 0</c> and
+    /// <c>FlushHotTierAsync</c> returns on <c>snapshot.Count == 0</c>. So a tier whose series
+    /// have ALL stopped reporting — an exporter removed, a fleet scaled to zero — never flushed
+    /// again, therefore never swept again, and kept every <c>HotSeries</c>, <c>SeriesKey</c>,
+    /// <c>LabelSet</c> and dictionary node for the life of the process. Nothing but
+    /// <c>Shed()</c> under RAM pressure could take them back, and pressure is the state the
+    /// sweep exists to keep the process out of.</para>
+    ///
+    /// <para>Revert <c>FlushIfDueAsync</c>'s <c>SweepStaleSeriesIfIdle()</c> to a bare
+    /// <c>return</c> and this fails with all four series still named after three hours of ticks.</para>
+    /// </summary>
+    [Fact]
+    public async Task An_idle_tier_sheds_its_series_on_a_tick_that_has_nothing_to_flush()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "ameto-mhotidle-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        var clock = new MetricTestClock();
+        try
+        {
+            await using var engine = new MetricStorageEngine(dir, NullLogger<MetricStorageEngine>.Instance, timeProvider: clock);
+            long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+
+            engine.Ingest([Point("a", baseNano), Point("b", baseNano), Point("c", baseNano), Point("d", baseNano)]);
+            await engine.ScheduleThresholdFlushForTest();
+            Assert.Equal(0, engine.HotPointCount);      // the tier is drained and EMPTY from here on
+            Assert.Equal(4, engine.HotSeriesCount);
+
+            // A tick before the bar: nothing has been idle long enough, so nothing goes. This is
+            // the half that says the tick sweeps on the AGE and not merely on being empty.
+            clock.Advance(engine.ConfiguredOptions.MaxHotAge);
+            await engine.FlushPeriodicForTest();
+            Assert.Equal(4, engine.HotSeriesCount);
+            Assert.Equal(0, engine.StaleSeriesEvicted);
+
+            // Past twice MaxHotAge, with not one point ingested since the flush — the case that
+            // never came back. No threshold flush is scheduled and none could be: there is
+            // nothing to flush.
+            clock.Advance(engine.ConfiguredOptions.MaxHotAge + TimeSpan.FromMinutes(1));
+            await engine.FlushPeriodicForTest();
+
+            Assert.Equal(4, engine.StaleSeriesEvicted);
+            Assert.Equal(0, engine.HotSeriesCount);
+
+            // The names survive the eviction: _meta feeds the catalog and the sweep does not
+            // touch it, so an evicted series is still discoverable and its cold data untouched.
+            Assert.Contains("hot.sweep.metric", engine.GetMetricNames());
+            Assert.Contains(engine.GetLabelValues("hot.sweep.metric", "series"), v => v == "a");
+
+            // And a series that comes back is re-created for free, at full strength.
+            engine.Ingest([Point("a", baseNano + 1_000_000L)]);
+            Assert.Equal(1, engine.HotSeriesCount);
+            Assert.Equal(1, engine.HotPointCount);
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    /// <summary>
+    /// PRESSURE LOWERS THE BAR; IT DOES NOT REMOVE IT.
+    ///
+    /// <para><c>Shed()</c> evicted every series holding zero points, and the state a tier is in
+    /// for most of its life is the state immediately after a flush — where that is ALL of them.
+    /// One pressure tick landing there wiped a busy 30 000-series table, every live series then
+    /// paid a fresh <c>RegisterMeta</c> walk on its next point, the log line called them "idle
+    /// for over 2 h" and the <c>released</c> figure the pressure loop reads counted bytes that
+    /// came back within the second.</para>
+    ///
+    /// <para>The three facts here are the rule: a series that reported inside one <c>MaxHotAge</c>
+    /// survives a shed however empty it is; one past that bar goes, EARLIER than the ordinary
+    /// sweep's twice-<c>MaxHotAge</c>, which is what makes a shed worth calling at all; and
+    /// <c>released</c> counts what actually left.</para>
+    ///
+    /// <para>Revert <c>Shed</c> to <c>if (v.PointCount == 0)</c> and the first assertion fails
+    /// with both series gone the moment the flush emptied them.</para>
+    /// </summary>
+    [Fact]
+    public async Task Shedding_under_pressure_keeps_a_series_that_reported_inside_the_hot_age()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "ameto-mhotshed-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        var clock = new MetricTestClock();
+        try
+        {
+            await using var engine = new MetricStorageEngine(dir, NullLogger<MetricStorageEngine>.Instance, timeProvider: clock);
+            long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+            var  hotAge   = engine.ConfiguredOptions.MaxHotAge;
+
+            engine.Ingest([Point("quiet", baseNano), Point("chatty", baseNano)]);
+            await engine.ScheduleThresholdFlushForTest();
+            Assert.Equal(0, engine.HotPointCount);      // every series in the table now holds nothing
+            Assert.Equal(2, engine.HotSeriesCount);
+
+            // THE PRESSURE TICK THAT USED TO TAKE THE WHOLE TABLE. Both series are empty and both
+            // reported seconds ago.
+            Assert.Equal(0L, engine.Shed());
+            Assert.Equal(2, engine.HotSeriesCount);
+            Assert.Equal(0, engine.StaleSeriesEvicted);
+
+            // An hour and a minute on, "chatty" reports again and "quiet" has not. Pressure sheds
+            // "quiet" at MaxHotAge — sooner than the drain's own sweep would have, which is the
+            // point of asking under pressure — and leaves the series that is still live.
+            clock.Advance(hotAge + TimeSpan.FromMinutes(1));
+            engine.Ingest([Point("chatty", baseNano + 1_000_000L)]);
+            await engine.ScheduleThresholdFlushForTest();
+
+            // The drain's own sweep does NOT take "quiet": at 1 h 1 min it is nowhere near the
+            // ordinary twice-MaxHotAge bar. Everything below is pressure's doing and nothing else's.
+            Assert.Equal(0, engine.StaleSeriesEvicted);
+            Assert.Equal(2, engine.HotSeriesCount);
+
+            long released = engine.Shed();
+
+            Assert.Equal(1, engine.StaleSeriesEvicted);
+            Assert.Equal(1, engine.HotSeriesCount);
+            Assert.True(released > 0 && released <= 2 * 384,
+                $"Shed() reported {released} B for one evicted series");
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    /// <summary>
+    /// AND THE ADVERTISEMENT IS THE SAME RULE, NOT THE OLD ONE.
+    ///
+    /// <para><c>ShedableBytes</c> kept offering <c>_hot.Count x 384 B</c> — the whole table —
+    /// after <c>Shed</c> had stopped taking the whole table. The state that makes the difference
+    /// is the one a busy tier is in for most of its life: every series drained by the last flush,
+    /// every series reporting inside one <c>MaxHotAge</c>. Thirty thousand of them advertise
+    /// 11 MB there and release nothing, and that figure is what
+    /// <c>MemoryShedRegistry.ShedableBytes</c> sums for the pressure loop's "is it worth asking
+    /// anybody" gate.</para>
+    ///
+    /// <para>Three readings of the same table, so the figure cannot be a constant either way:
+    /// nothing past the bar advertises nothing, everything past it advertises all of it, and one
+    /// series reporting again takes itself back out of the offer. The last is checked against
+    /// <c>Shed</c>'s own return, which is what "what it would actually release" means.</para>
+    ///
+    /// <para>Revert to <c>_hot.Count * EmptySeriesBytes</c> and the first reading is 19 200 B.</para>
+    /// </summary>
+    [Fact]
+    public async Task A_tier_whose_series_all_reported_recently_advertises_nothing_to_shed()
+    {
+        const int Series = 50;
+
+        string dir = Path.Combine(Path.GetTempPath(), "ameto-mhotadv-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        var clock = new MetricTestClock();
+        try
+        {
+            await using var engine = new MetricStorageEngine(dir, NullLogger<MetricStorageEngine>.Instance, timeProvider: clock);
+            long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+            var  hotAge   = engine.ConfiguredOptions.MaxHotAge;
+
+            var batch = new MetricIngestItem[Series];
+            for (int i = 0; i < Series; i++) batch[i] = Point("s" + i, baseNano + i * 1_000_000L);
+            engine.Ingest(batch);
+
+            await engine.ScheduleThresholdFlushForTest();
+            Assert.Equal(0, engine.HotPointCount);         // drained: no points left to offer
+            Assert.Equal(Series, engine.HotSeriesCount);   // and every one of them still named
+
+            // THE STEADY STATE. Nothing has been idle for a MaxHotAge, so a shed takes nothing —
+            // and the offer says so.
+            Assert.Equal(0L, engine.ShedableBytes);
+            Assert.Equal(0L, engine.Shed());
+            Assert.Equal(Series, engine.HotSeriesCount);
+
+            // Past the bar, the same table IS the offer.
+            clock.Advance(hotAge + TimeSpan.FromMinutes(1));
+            Assert.Equal(Series * 384L, engine.ShedableBytes);
+
+            // One series reports again and leaves the offer on its own — the points it brings are
+            // shedable through the flush, which is the other half of the figure.
+            engine.Ingest([Point("s0", baseNano + 1_000_000_000L)]);
+            Assert.Equal((Series - 1) * 384L + engine.HotByteCount, engine.ShedableBytes);
+
+            // And that is what a shed at this moment actually releases.
+            Assert.Equal((Series - 1) * 384L, engine.Shed());
+            Assert.Equal(1, engine.HotSeriesCount);
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    /// <summary>
+    /// A SWEEP THAT EVICTS COSTS NOTHING MORE THAN A SWEEP THAT DOES NOT, WITH DEBUG OFF.
+    ///
+    /// <para>The sweep's one log line was
+    /// <c>_logger.LogDebug("… {Count} … {Hours} … {Named} …", evicted, idleFor.TotalHours, _hot.Count)</c>,
+    /// which binds to <c>LogDebug(ILogger, string, params object?[])</c>: the <c>object[3]</c>
+    /// and the three boxes are built at the CALL SITE, before <c>IsEnabled</c> is consulted, and
+    /// Debug is off in every deployment this round exists for. The third argument was the worse
+    /// half — <c>ConcurrentDictionary.Count</c> takes EVERY lock in the table, and it was asked
+    /// from inside <c>_snapshotLock</c>'s write lock, the one that excludes all ingest.</para>
+    ///
+    /// <para>MEASURED AS A DIFFERENCE, which is what makes it a measurement of the LOGGING. Both
+    /// phases run the same number of sweeps over the same table through the same enumerator; the
+    /// only thing the second does that the first does not is evict a series and therefore reach
+    /// the log line. Everything else — the enumerator, the clock, the counters — cancels.</para>
+    ///
+    /// <para>Restore the <c>LogDebug</c> call and this fails at ~120 B a sweep: an
+    /// <c>object[3]</c> (48 B) and boxes for an <c>int</c>, a <c>double</c> and an <c>int</c>
+    /// (24 B each).</para>
+    /// </summary>
+    [Fact]
+    public async Task The_stale_sweep_allocates_nothing_for_its_log_line_with_debug_off()
+    {
+        const int Series = 200;   // one eviction per measured sweep
+
+        string dir = Path.Combine(Path.GetTempPath(), "ameto-mhotswalloc-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        var clock = new MetricTestClock();
+        try
+        {
+            await using var engine = new MetricStorageEngine(dir, NullLogger<MetricStorageEngine>.Instance, timeProvider: clock);
+            long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+            var  start    = clock.GetUtcNow();
+
+            // One series a second, so the stale bar crosses them one at a time and each measured
+            // sweep evicts exactly one.
+            for (int i = 0; i < Series; i++)
+            {
+                engine.Ingest([Point("s" + i, baseNano + i * 1_000_000L)]);
+                clock.Advance(TimeSpan.FromSeconds(1));
+            }
+            await engine.ScheduleThresholdFlushForTest();
+            Assert.Equal(Series, engine.HotSeriesCount);
+            Assert.Equal(0, engine.StaleSeriesEvicted);   // none is anywhere near the bar yet
+
+            _ = engine.SweepStaleSeriesForTest();         // JIT the whole path before either phase
+
+            // PHASE A — the same walk, nothing past the bar, so the log line is never reached.
+            long a0 = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < Series; i++)
+            {
+                _ = engine.SweepStaleSeriesForTest();
+                clock.Advance(TimeSpan.FromTicks(1));
+            }
+            long quiet = GC.GetAllocatedBytesForCurrentThread() - a0;
+            Assert.Equal(0, engine.StaleSeriesEvicted);
+
+            // PHASE B — the bar is put just past the oldest series and walks forward one second a
+            // sweep, so every sweep evicts exactly one and reaches the line.
+            var bar = start + engine.ConfiguredOptions.MaxHotAge * 2 + TimeSpan.FromMilliseconds(500);
+            clock.Advance(bar - clock.GetUtcNow());
+
+            long a1 = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < Series; i++)
+            {
+                _ = engine.SweepStaleSeriesForTest();
+                clock.Advance(TimeSpan.FromSeconds(1));
+            }
+            long evicting = GC.GetAllocatedBytesForCurrentThread() - a1;
+
+            _out.WriteLine($"STALE SWEEP  {Series} sweeps, Debug off");
+            _out.WriteLine($"  evicting nothing : {quiet,8:N0} B  ({quiet / (double)Series,6:N1} B/sweep)");
+            _out.WriteLine($"  evicting one     : {evicting,8:N0} B  ({evicting / (double)Series,6:N1} B/sweep)");
+            _out.WriteLine($"  the log line     : {(evicting - quiet) / (double)Series,6:N1} B/sweep");
+
+            Assert.Equal(Series, engine.StaleSeriesEvicted);
+            Assert.Equal(0, engine.HotSeriesCount);
+            Assert.True(evicting - quiet < Series * 8,
+                $"a sweep that evicts allocates {(evicting - quiet) / (double)Series:N1} B more than one that "
+              + "does not, with Debug off — the log line is still boxing its arguments at the call site");
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    /// <summary>
     /// <c>Drain</c> hands the flush its list instead of copying it, so the restore path on a
     /// failed write appends into the series' NEW list while reading the drained one. Two
     /// different lists: if they were ever the same object this either duplicates every point or

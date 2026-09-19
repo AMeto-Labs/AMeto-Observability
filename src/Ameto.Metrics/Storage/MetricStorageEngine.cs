@@ -610,6 +610,11 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         // and the exemplar ring must not.)
         HotSeries?[]? resolved = null;
 
+        // THE HIGHEST ORDINAL THIS BATCH WROTE, so the return path can clear what it wrote
+        // instead of the array it was given. See the finally below.
+        int  lastResolved      = -1;
+        bool exemplarsConsumed = false;
+
         try
         {
             // Logging a point and making it visible must be one step with respect to a flush's
@@ -654,7 +659,8 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                         // Rented, not allocated: an exemplar-carrying batch is a steady-state shape,
                         // not a one-off, and this must not put a per-batch array in front of the GC.
                         resolved ??= ArrayPool<HotSeries?>.Shared.Rent(items.Length);
-                        resolved[i] = series;
+                        resolved[i]  = series;
+                        lastResolved = i;
                     }
                 }
             }
@@ -662,7 +668,11 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
             if (droppedFuture > 0) ReportFutureDrops(droppedFuture, "ingest");
 
-            if (resolved is not null) AddExemplars(items, futureLimit, resolved);
+            if (resolved is not null)
+            {
+                AddExemplars(items, futureLimit, resolved);
+                exemplarsConsumed = true;   // every ordinal it read, it also cleared
+            }
 
             if (hotBytes >= _hotFlushBytes
                 && System.Threading.Interlocked.CompareExchange(ref _thresholdFlushScheduled, 1, 0) == 0)
@@ -676,10 +686,27 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         }
         finally
         {
-            // Cleared on the way back: a HotSeries reference left in a pooled slot would keep a
-            // series — its points, its label set, its catalog entry — alive for as long as the
-            // pool holds the array, long after a stale sweep had evicted it.
-            if (resolved is not null) ArrayPool<HotSeries?>.Shared.Return(resolved, clearArray: true);
+            // NOTHING THIS BATCH WROTE MAY OUTLIVE IT — and that is a statement about the
+            // ordinals it wrote, not about the array it happened to be handed.
+            //
+            // A HotSeries reference left in a pooled slot keeps a series — its points, its label
+            // set, its catalog entry — alive for as long as the pool holds the array, long after
+            // a stale sweep had evicted it, so it has to go. `clearArray: true` was the blunt way
+            // to say so and it says far too much: ArrayPool rounds a rent up to a power of two,
+            // so a 10 000-point batch is handed 16 384 slots and the return memset all of them
+            // — 128 KB of writes, per exemplar-carrying batch, to null a handful of references
+            // and then re-null 16 000 slots that were already null.
+            //
+            // <see cref="AddExemplars"/> nulls each slot as it consumes it, which is exactly the
+            // set that was written and costs one store per exemplar-carrying item. The span clear
+            // is the net under it: reached only when the pass did not run (an exception on the
+            // way there), bounded by the ordinals this batch actually wrote rather than by the
+            // rented length, and never by the whole array.
+            if (resolved is not null)
+            {
+                if (!exemplarsConsumed && lastResolved >= 0) resolved.AsSpan(0, lastResolved + 1).Clear();
+                ArrayPool<HotSeries?>.Shared.Return(resolved, clearArray: false);
+            }
         }
     }
 
@@ -722,6 +749,14 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
             if (item.TimestampUnixNano > futureLimit) continue;
             if (item.Exemplars is not { Length: > 0 } exs) continue;
 
+            // TAKEN AND CLEARED IN ONE STEP, HERE AND NOT BELOW, because the slot has to be
+            // cleared on every way out of this iteration and there are three of them (a refused
+            // ring, a full ring table, and the ordinary path). The ingest loop writes a slot
+            // exactly when both tests above pass, so this is precisely the written set — which
+            // is what lets the caller return the array without a memset of all 16 384 slots.
+            var series = resolved[i];
+            resolved[i] = null;
+
             ExemplarRing? ring;
             if (ReferenceEquals(item.Name, lastName))
             {
@@ -762,7 +797,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
             // re-hashed a SeriesKey the caller had just hashed. Holding the reference is also
             // stricter than the lookup was — a stale sweep between the two passes could make the
             // lookup miss and fall back to the point's own (uncanonical, uniquely owned) set.
-            var labels = resolved[i] is { } series ? series.Labels : item.Labels;
+            var labels = series is not null ? series.Labels : item.Labels;
 
             foreach (var ex in exs)
             {
@@ -877,6 +912,14 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     /// to earn its files exactly as it does in the loop.
     /// </summary>
     internal Task FlushPeriodicForTest() => FlushIfDueAsync();
+
+    /// <summary>
+    /// Test hook: the flush-check tick's stale sweep on its own, synchronously, with its evicted
+    /// count returned. What <see cref="FlushPeriodicForTest"/> reaches on an idle tier, minus the
+    /// async machinery around it — so a measurement of what the sweep costs is a measurement of
+    /// the sweep.
+    /// </summary>
+    internal int SweepStaleSeriesForTest() => SweepStaleSeriesIfIdle();
 
     private async Task RunThresholdFlushAsync(Task gate)
     {
@@ -1242,11 +1285,26 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     /// <c>.mts</c> per metric name, or old enough that it should become rollup- and
     /// retention-eligible regardless. Points below both bars stay in memory, durable through
     /// the WAL and fully queryable — every read path consults the hot tier.
+    ///
+    /// <para><b>THE STALE SWEEP RUNS ON THE TICK, NOT ONLY ON A FLUSH THAT CARRIES POINTS.</b>
+    /// It used to ride along with the drain and nowhere else, so the one tier that could never
+    /// shed a series was the one with nothing left to report: the early return below, and the
+    /// <c>snapshot.Count == 0</c> return inside <see cref="FlushHotTierAsync"/>, both stand
+    /// BEFORE the sweep. A deployment whose 30 000 series stop arriving — an exporter removed, a
+    /// fleet scaled to zero, a label that stopped being emitted — then keeps every
+    /// <c>HotSeries</c>, <c>SeriesKey</c>, <c>LabelSet</c> and dictionary node for the life of
+    /// the process, because a tier with no points never flushes again. Nothing but
+    /// <see cref="Shed"/> under RAM pressure could take them back, and pressure is exactly the
+    /// state this is supposed to keep the process out of.</para>
+    ///
+    /// <para>The cost of running it on every tick instead is one pass over <c>_hot</c> under the
+    /// write lock — the same pass the drain was already making — and it is only ever paid when
+    /// there is nothing else for the tick to do.</para>
     /// </summary>
     private async Task FlushIfDueAsync()
     {
         int points = Volatile.Read(ref _hotPointCount);
-        if (points == 0) return;
+        if (points == 0) { SweepStaleSeriesIfIdle(); return; }
 
         bool due = Volatile.Read(ref _hotPointBytes) >= _minFlushBytes
                 || (_hotSince is { } since && _time.GetUtcNow().UtcDateTime - since >= _maxHotAge);
@@ -1359,6 +1417,11 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                         // a non-zero count seen from inside the WRITE lock means some series holds
                         // points. Kept because the two are separate pieces of state and this costs
                         // one comparison.
+                        //
+                        // The sweep happens FIRST: the scan above has already named the candidates
+                        // and this return is the other door out of the drain, so leaving through it
+                        // without evicting is how an idle tier kept its series for ever.
+                        if (stale is not null) SweepStaleSeriesLocked(stale, _staleSeriesAge);
                         _wal.AbandonFlush(flushedGeneration);
                         return;
                     }
@@ -1369,7 +1432,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
                     // AFTER the counters are zeroed, as the drain itself is: a series evicted
                     // here holds nothing that either of them still counts.
-                    if (stale is not null) SweepStaleSeriesLocked(stale);
+                    if (stale is not null) SweepStaleSeriesLocked(stale, _staleSeriesAge);
                 }
                 finally { _snapshotLock.ExitWriteLock(); }
 
@@ -1530,31 +1593,148 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     /// overload is here because <see cref="Shed"/> holds the same lock on a try-basis and the
     /// cost of being right anyway is one reference comparison per evicted series.</para>
     /// </summary>
-    private void SweepStaleSeriesLocked(List<SeriesKey> stale)
+    private int SweepStaleSeriesLocked(List<SeriesKey> stale, TimeSpan idleFor)
     {
         int evicted = 0;
         foreach (var key in stale)
-        {
-            if (!_hot.TryGetValue(key, out var series) || series.PointCount != 0) continue;
-            if (_hot.TryRemove(new KeyValuePair<SeriesKey, HotSeries>(key, series))) evicted++;
-        }
+            if (_hot.TryGetValue(key, out var series) && TryEvictLocked(key, series)) evicted++;
 
+        ReportSweep(evicted, idleFor);
+        return evicted;
+    }
+
+    /// <summary>
+    /// The same eviction, over a tier NOBODY has just drained: it finds its own candidates. This
+    /// is the form the flush-check tick and <see cref="Shed"/> need, because neither has a drain's
+    /// list to ride along with.
+    ///
+    /// <para>Removing from a <see cref="System.Collections.Concurrent.ConcurrentDictionary{TKey,TValue}"/>
+    /// while enumerating it is defined — the enumerator is a moment-in-time walk, not a snapshot —
+    /// so the candidate list the drain has to build (it is scanning for something else at the same
+    /// time) is not needed here. What it costs is ONE object: a concurrent dictionary's
+    /// <c>GetEnumerator</c> returns the interface and not a struct, so <c>foreach</c> allocates
+    /// that enumerator however few series it then walks. Nothing per series and nothing per
+    /// eviction, which is the part that scales; a sweep is a per-minute tick, not a per-point
+    /// path, and one enumerator is cheaper than the list it replaces.</para>
+    ///
+    /// <para><b>Call only under <c>_snapshotLock</c>'s WRITE lock</b>, for the reason
+    /// <see cref="SweepStaleSeriesLocked(List{SeriesKey}, TimeSpan)"/> gives.</para>
+    /// </summary>
+    private int SweepIdleSeriesLocked(long idleBeforeTicks, TimeSpan idleFor)
+    {
+        int evicted = 0;
+        foreach (var (key, series) in _hot)
+            if (series.LastAppendUtcTicks < idleBeforeTicks && TryEvictLocked(key, series)) evicted++;
+
+        ReportSweep(evicted, idleFor);
+        return evicted;
+    }
+
+    /// <summary>
+    /// Takes the key out only while it still maps to the very object that was found empty, and
+    /// only while it IS empty — see the class remarks above for why both halves matter.
+    /// </summary>
+    private bool TryEvictLocked(SeriesKey key, HotSeries series) =>
+        series.PointCount == 0 && _hot.TryRemove(new KeyValuePair<SeriesKey, HotSeries>(key, series));
+
+    /// <summary>
+    /// What a sweep says about itself, AT THE PRICE OF WHAT IT SAYS WHEN NOBODY IS LISTENING.
+    ///
+    /// <para>This ran <c>_logger.LogDebug(…, evicted, idleFor.TotalHours, _hot.Count)</c>, which
+    /// binds to <c>LoggerExtensions.LogDebug(ILogger, string, params object?[])</c>: the
+    /// <c>object[3]</c> and the three boxes — an <c>int</c>, a <c>double</c>, an <c>int</c> —
+    /// are built at the CALL SITE, before <c>IsEnabled</c> is ever consulted, and Debug is off
+    /// in every deployment this round exists for. Worse than the 112 bytes was the third
+    /// argument: <see cref="System.Collections.Concurrent.ConcurrentDictionary{TKey,TValue}.Count"/>
+    /// acquires EVERY lock in the table to answer, and it was being asked from inside
+    /// <c>_snapshotLock</c>'s write lock — the lock that excludes all ingest — to fill a hole in
+    /// a string nobody would read.</para>
+    ///
+    /// <para><see cref="LoggerMessage.Define{T1,T2}"/> asks <c>IsEnabled</c> first and formats
+    /// nothing when the answer is no: 0 bytes, one virtual call. The count of still-named series
+    /// is gone rather than moved outside the lock — <c>StaleSeriesEvicted</c> and the sweep's own
+    /// figure are what an operator can act on, and the tier's size is <c>/api/diagnostics</c>'
+    /// question, asked where no lock is held.</para>
+    /// </summary>
+    private static readonly Action<ILogger, int, double, Exception?> _staleSeriesSwept =
+        LoggerMessage.Define<int, double>(
+            Microsoft.Extensions.Logging.LogLevel.Debug,
+            new Microsoft.Extensions.Logging.EventId(1, "MetricStaleSeriesSwept"),
+            "Hot metric tier dropped {Count} series idle for over {Hours} h");
+
+    private void ReportSweep(int evicted, TimeSpan idleFor)
+    {
         if (evicted == 0) return;
         Interlocked.Add(ref _staleSeriesEvicted, evicted);
-        _logger.LogDebug("Hot metric tier dropped {Count} series idle for over {Hours} h ({Named} still named)",
-            evicted, _staleSeriesAge.TotalHours, _hot.Count);
+        _staleSeriesSwept(_logger, evicted, idleFor.TotalHours, null);
+    }
+
+    /// <summary>
+    /// The flush-check tick's sweep, for a tier that has no points to flush — see
+    /// <see cref="FlushIfDueAsync"/> for why the drain's own sweep is not enough.
+    ///
+    /// <para>Try-enter, not enter: this runs on the flush loop, which must not park behind an
+    /// ingest batch holding the snapshot lock shared, and a sweep that is skipped costs nothing —
+    /// the next tick makes the same pass, and a series one tick staler is still stale.</para>
+    /// </summary>
+    private int SweepStaleSeriesIfIdle()
+    {
+        if (Volatile.Read(ref _disposed) != 0 || _hot.IsEmpty) return 0;
+
+        long idleBefore = _time.GetUtcNow().UtcTicks - _staleSeriesAge.Ticks;
+        if (!_snapshotLock.TryEnterWriteLock(0)) return 0;
+        try { return SweepIdleSeriesLocked(idleBefore, _staleSeriesAge); }
+        finally { _snapshotLock.ExitWriteLock(); }
     }
 
     // ── IMemoryShedder ────────────────────────────────────────────────────────
 
     /// <summary>
-    /// What a flush plus a sweep would hand back: the points in the tier, plus what the series
-    /// that hold none are still costing. All of it managed, hence
+    /// What a flush plus a sweep would hand back: the points in the tier, plus the series
+    /// <see cref="Shed"/> IS ALLOWED TO TAKE. All of it managed, hence
     /// <see cref="ShedableNativeBytes"/> = 0 — the pressure loop already counts the managed heap
     /// through <c>GC.GetGCMemoryInfo</c>, and reporting these bytes there as well would count
     /// them twice.
     /// </summary>
-    public long ShedableBytes => Volatile.Read(ref _hotPointBytes) + (long)_hot.Count * EmptySeriesBytes;
+    ///
+    /// <remarks>
+    /// <para>The second term was <c>_hot.Count * EmptySeriesBytes</c> — the WHOLE table — and
+    /// that stopped being true when <c>Shed</c> learned that idle is not "holds no points right
+    /// now": it evicts only what has said nothing for a <c>MaxHotAge</c>, so on the tier a busy
+    /// deployment actually runs — thirty thousand series, every one of them reporting, every one
+    /// of them empty between flushes — this advertised 11 MB that a shed would not release one
+    /// byte of. The figure is what <c>MemoryShedRegistry.ShedableBytes</c> sums for the pressure
+    /// loop's "is it worth asking anybody" gate, so over-reporting there is a decision to shed
+    /// taken on memory that is not coming back.</para>
+    ///
+    /// <para><b>An upper bound, and honestly one.</b> It counts the series past the bar without
+    /// asking whether each is empty, because <see cref="TryEvictLocked"/> also requires that and
+    /// a series holding points is evicted only after the flush this same <c>Shed</c> schedules —
+    /// so the bytes are real, one tick later. It cannot be a lower bound and be cheap.</para>
+    ///
+    /// <para>The walk is the price: <c>Count</c> takes every lock in the table to answer, this
+    /// takes none and reads every entry instead, and the pressure loop asks about once a tick.
+    /// The empty tier — the one the loop asks about most, and the one <c>Count</c> was no
+    /// cheaper for — is answered without walking at all.</para>
+    /// </remarks>
+    public long ShedableBytes => Volatile.Read(ref _hotPointBytes) + (long)IdleSeriesCount() * EmptySeriesBytes;
+
+    /// <summary>
+    /// The series a <see cref="Shed"/> right now would be allowed to evict: those whose last
+    /// append is further back than <see cref="_maxHotAge"/>, which is the bar <c>Shed</c> itself
+    /// computes. Lock-free, and it must stay that way — <see cref="ShedableBytes"/> is read from
+    /// the RAM pressure loop, which may not park behind an ingest batch.
+    /// </summary>
+    private int IdleSeriesCount()
+    {
+        if (_hot.IsEmpty) return 0;
+
+        long idleBefore = _time.GetUtcNow().UtcTicks - _maxHotAge.Ticks;
+        int  idle       = 0;
+        foreach (var (_, series) in _hot)
+            if (series.LastAppendUtcTicks < idleBefore) idle++;
+        return idle;
+    }
 
     /// <inheritdoc/>
     public long ShedableNativeBytes => 0;
@@ -1575,6 +1755,22 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     /// pressure loop and must never park behind a caller of its own, and an ingest batch holds
     /// the snapshot lock shared for a whole OTLP request. Losing the race costs nothing — the
     /// flush this schedules sweeps on its own way through.</para>
+    ///
+    /// <para><b>IDLE IS NOT "HOLDS NO POINTS RIGHT NOW".</b> It used to be, and the state every
+    /// tier is in for most of its life is the state immediately after a flush: the drain empties
+    /// every series, so a pressure tick landing there evicted the ENTIRE hot table — a busy
+    /// 30 000-series deployment reduced to nothing, every live series re-created on its next
+    /// point and paying a full <c>RegisterMeta</c> walk to do it, while the log line said they
+    /// had been "idle for over 2 h" and <c>released</c> counted bytes that came straight back.
+    /// It also hid the leak it was meant to relieve: a table emptied wholesale reports a large
+    /// <c>released</c> every time, so the pressure loop learns nothing from it.</para>
+    ///
+    /// <para>What pressure changes is the BAR, not the rule: <see cref="_staleSeriesAge"/> (twice
+    /// <c>MaxHotAge</c>) comes down to <c>MaxHotAge</c>, so a series that reported within one
+    /// hot-tier age — which is every series the tier is built for — is never a candidate, and
+    /// one that has said nothing for longer leaves sooner than the ordinary sweep would have let
+    /// it. Oldest-idle first falls out of that: a bar is a time, so the series furthest past it
+    /// go on every tick until none is.</para>
     /// </summary>
     public long Shed()
     {
@@ -1585,16 +1781,11 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         {
             try
             {
-                List<SeriesKey>? empty = null;
-                foreach (var (k, v) in _hot)
-                    if (v.PointCount == 0) (empty ??= []).Add(k);
-
-                if (empty is not null)
-                {
-                    int before = _hot.Count;
-                    SweepStaleSeriesLocked(empty);      // under pressure, idle is reason enough
-                    released = (long)(before - _hot.Count) * EmptySeriesBytes;
-                }
+                // The evicted COUNT, from the sweep that did the evicting — not a difference of
+                // two _hot.Count readings, each of which takes every lock in the table to answer
+                // a question the sweep already knew.
+                long idleBefore = _time.GetUtcNow().UtcTicks - _maxHotAge.Ticks;
+                released = (long)SweepIdleSeriesLocked(idleBefore, _maxHotAge) * EmptySeriesBytes;
             }
             finally { _snapshotLock.ExitWriteLock(); }
         }

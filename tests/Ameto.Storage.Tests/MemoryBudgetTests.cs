@@ -80,7 +80,58 @@ public sealed class MemoryBudgetTests
         // rather than strangling a healthy machine.
         Assert.Equal(MemoryBudgets.IngestBufferCapBytes, MemoryBudgets.Derive(64 * GB).IngestBufferBytes);
         Assert.Equal(MemoryBudgets.IngestBufferCapBytes, MemoryBudgets.Derive(0).IngestBufferBytes);
-        Assert.True(MemoryBudgets.Derive(32 * MB).IngestBufferBytes >= 8 * MB);    // the floor
+        Assert.Equal(IngestBufferPool.FullBucketSetBytes, MemoryBudgets.Derive(32 * MB).IngestBufferBytes);
+    }
+
+    /// <summary>
+    /// THE FLOOR IS THE POOL'S OWN BUCKET SET, AND THE SHARE DOES NOT ALWAYS CLEAR IT.
+    ///
+    /// <para><c>IngestBufferPool</c>'s buckets are the powers of two from 4 KiB to its 8 MiB
+    /// largest array, so ONE array in each weighs <c>2 x 8 MiB - 4 KiB</c> = 16 773 120 B — and
+    /// that ladder is the ordinary shape, not a pathological one: the two readers with no
+    /// Content-Length (gRPC, a chunked CLEF post) start at 64 KiB and double, leaving an array in
+    /// every bucket on the way up. Below the set, <c>BoundedByteArrayPool.Return</c> drops
+    /// whatever would exceed the cap, and what such a reader returns LAST is its LARGEST array:
+    /// the 8 MiB OTLP bodies, the arrays on the large object heap this pool exists to keep off
+    /// it, dropped on every request while the small buckets stayed full.</para>
+    ///
+    /// <para>THE HOST THAT SHOWED IT is one size below the stand. A 384 MB CONTAINER — not the
+    /// stand's 384 MB heap limit — gives the GC a ~288 MB hard limit at the default 75 %, and
+    /// 5 % of that is 14.4 MB. The floor was 8 MiB, half a set, so it did not lift it.</para>
+    ///
+    /// <para>Put <c>MinIngestBufferBytes</c> back to <c>8L * 1024 * 1024</c> and the first row
+    /// fails at 14 417 920 B.</para>
+    /// </summary>
+    [Theory]
+    [InlineData(288)]    // a 384 MB container: the share is 14.4 MB, under the set
+    [InlineData(192)]    // a 256 MB container
+    [InlineData( 32)]    // pathologically small, which the floor exists for
+    public void A_small_heap_limit_still_clears_one_full_set_of_the_pools_buckets(long managedMb)
+    {
+        var b = MemoryBudgets.Derive(managedMb * MB, managedMb * 4 / 3 * MB);
+
+        Assert.True(managedMb * MB * MemoryBudgets.IngestBufferFraction < IngestBufferPool.FullBucketSetBytes,
+            $"a {managedMb} MB heap limit no longer needs the floor — this row is measuring nothing");
+        Assert.Equal(IngestBufferPool.FullBucketSetBytes, b.IngestBufferBytes);
+    }
+
+    /// <summary>
+    /// The floor is DERIVED from the pool, not copied from it: raise
+    /// <c>IngestBufferPool.MaxPooledBytes</c> and the floor follows, instead of being left behind
+    /// by a constant nobody thought to edit. Stated as the bucket arithmetic as well as the
+    /// constant, so swapping the derivation for a literal fails here.
+    /// </summary>
+    [Fact]
+    public void The_pools_full_bucket_set_is_one_array_in_every_bucket()
+    {
+        Assert.Equal(2L * IngestBufferPool.MaxPooledBytes - 4096, IngestBufferPool.FullBucketSetBytes);
+        Assert.Equal(16_773_120L, IngestBufferPool.FullBucketSetBytes);
+
+        // And a pool given exactly that budget really does hold the whole ladder — the claim the
+        // floor rests on, asked of the pool rather than of the arithmetic.
+        long parked = 0;
+        for (int len = 4096; len <= IngestBufferPool.MaxPooledBytes; len <<= 1) parked += len;
+        Assert.Equal(IngestBufferPool.FullBucketSetBytes, parked);
     }
 
     /// <summary>
