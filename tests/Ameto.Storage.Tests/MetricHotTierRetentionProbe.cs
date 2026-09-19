@@ -294,6 +294,90 @@ public sealed class MetricHotTierRetentionProbe
     }
 
     /// <summary>
+    /// A SWEEP THAT EVICTS COSTS NOTHING MORE THAN A SWEEP THAT DOES NOT, WITH DEBUG OFF.
+    ///
+    /// <para>The sweep's one log line was
+    /// <c>_logger.LogDebug("… {Count} … {Hours} … {Named} …", evicted, idleFor.TotalHours, _hot.Count)</c>,
+    /// which binds to <c>LogDebug(ILogger, string, params object?[])</c>: the <c>object[3]</c>
+    /// and the three boxes are built at the CALL SITE, before <c>IsEnabled</c> is consulted, and
+    /// Debug is off in every deployment this round exists for. The third argument was the worse
+    /// half — <c>ConcurrentDictionary.Count</c> takes EVERY lock in the table, and it was asked
+    /// from inside <c>_snapshotLock</c>'s write lock, the one that excludes all ingest.</para>
+    ///
+    /// <para>MEASURED AS A DIFFERENCE, which is what makes it a measurement of the LOGGING. Both
+    /// phases run the same number of sweeps over the same table through the same enumerator; the
+    /// only thing the second does that the first does not is evict a series and therefore reach
+    /// the log line. Everything else — the enumerator, the clock, the counters — cancels.</para>
+    ///
+    /// <para>Restore the <c>LogDebug</c> call and this fails at ~120 B a sweep: an
+    /// <c>object[3]</c> (48 B) and boxes for an <c>int</c>, a <c>double</c> and an <c>int</c>
+    /// (24 B each).</para>
+    /// </summary>
+    [Fact]
+    public async Task The_stale_sweep_allocates_nothing_for_its_log_line_with_debug_off()
+    {
+        const int Series = 200;   // one eviction per measured sweep
+
+        string dir = Path.Combine(Path.GetTempPath(), "ameto-mhotswalloc-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        var clock = new MetricTestClock();
+        try
+        {
+            await using var engine = new MetricStorageEngine(dir, NullLogger<MetricStorageEngine>.Instance, timeProvider: clock);
+            long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+            var  start    = clock.GetUtcNow();
+
+            // One series a second, so the stale bar crosses them one at a time and each measured
+            // sweep evicts exactly one.
+            for (int i = 0; i < Series; i++)
+            {
+                engine.Ingest([Point("s" + i, baseNano + i * 1_000_000L)]);
+                clock.Advance(TimeSpan.FromSeconds(1));
+            }
+            await engine.ScheduleThresholdFlushForTest();
+            Assert.Equal(Series, engine.HotSeriesCount);
+            Assert.Equal(0, engine.StaleSeriesEvicted);   // none is anywhere near the bar yet
+
+            _ = engine.SweepStaleSeriesForTest();         // JIT the whole path before either phase
+
+            // PHASE A — the same walk, nothing past the bar, so the log line is never reached.
+            long a0 = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < Series; i++)
+            {
+                _ = engine.SweepStaleSeriesForTest();
+                clock.Advance(TimeSpan.FromTicks(1));
+            }
+            long quiet = GC.GetAllocatedBytesForCurrentThread() - a0;
+            Assert.Equal(0, engine.StaleSeriesEvicted);
+
+            // PHASE B — the bar is put just past the oldest series and walks forward one second a
+            // sweep, so every sweep evicts exactly one and reaches the line.
+            var bar = start + engine.ConfiguredOptions.MaxHotAge * 2 + TimeSpan.FromMilliseconds(500);
+            clock.Advance(bar - clock.GetUtcNow());
+
+            long a1 = GC.GetAllocatedBytesForCurrentThread();
+            for (int i = 0; i < Series; i++)
+            {
+                _ = engine.SweepStaleSeriesForTest();
+                clock.Advance(TimeSpan.FromSeconds(1));
+            }
+            long evicting = GC.GetAllocatedBytesForCurrentThread() - a1;
+
+            _out.WriteLine($"STALE SWEEP  {Series} sweeps, Debug off");
+            _out.WriteLine($"  evicting nothing : {quiet,8:N0} B  ({quiet / (double)Series,6:N1} B/sweep)");
+            _out.WriteLine($"  evicting one     : {evicting,8:N0} B  ({evicting / (double)Series,6:N1} B/sweep)");
+            _out.WriteLine($"  the log line     : {(evicting - quiet) / (double)Series,6:N1} B/sweep");
+
+            Assert.Equal(Series, engine.StaleSeriesEvicted);
+            Assert.Equal(0, engine.HotSeriesCount);
+            Assert.True(evicting - quiet < Series * 8,
+                $"a sweep that evicts allocates {(evicting - quiet) / (double)Series:N1} B more than one that "
+              + "does not, with Debug off — the log line is still boxing its arguments at the call site");
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    /// <summary>
     /// <c>Drain</c> hands the flush its list instead of copying it, so the restore path on a
     /// failed write appends into the series' NEW list while reading the drained one. Two
     /// different lists: if they were ever the same object this either duplicates every point or

@@ -1598,12 +1598,36 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     private bool TryEvictLocked(SeriesKey key, HotSeries series) =>
         series.PointCount == 0 && _hot.TryRemove(new KeyValuePair<SeriesKey, HotSeries>(key, series));
 
+    /// <summary>
+    /// What a sweep says about itself, AT THE PRICE OF WHAT IT SAYS WHEN NOBODY IS LISTENING.
+    ///
+    /// <para>This ran <c>_logger.LogDebug(…, evicted, idleFor.TotalHours, _hot.Count)</c>, which
+    /// binds to <c>LoggerExtensions.LogDebug(ILogger, string, params object?[])</c>: the
+    /// <c>object[3]</c> and the three boxes — an <c>int</c>, a <c>double</c>, an <c>int</c> —
+    /// are built at the CALL SITE, before <c>IsEnabled</c> is ever consulted, and Debug is off
+    /// in every deployment this round exists for. Worse than the 112 bytes was the third
+    /// argument: <see cref="System.Collections.Concurrent.ConcurrentDictionary{TKey,TValue}.Count"/>
+    /// acquires EVERY lock in the table to answer, and it was being asked from inside
+    /// <c>_snapshotLock</c>'s write lock — the lock that excludes all ingest — to fill a hole in
+    /// a string nobody would read.</para>
+    ///
+    /// <para><see cref="LoggerMessage.Define{T1,T2}"/> asks <c>IsEnabled</c> first and formats
+    /// nothing when the answer is no: 0 bytes, one virtual call. The count of still-named series
+    /// is gone rather than moved outside the lock — <c>StaleSeriesEvicted</c> and the sweep's own
+    /// figure are what an operator can act on, and the tier's size is <c>/api/diagnostics</c>'
+    /// question, asked where no lock is held.</para>
+    /// </summary>
+    private static readonly Action<ILogger, int, double, Exception?> _staleSeriesSwept =
+        LoggerMessage.Define<int, double>(
+            Microsoft.Extensions.Logging.LogLevel.Debug,
+            new Microsoft.Extensions.Logging.EventId(1, "MetricStaleSeriesSwept"),
+            "Hot metric tier dropped {Count} series idle for over {Hours} h");
+
     private void ReportSweep(int evicted, TimeSpan idleFor)
     {
         if (evicted == 0) return;
         Interlocked.Add(ref _staleSeriesEvicted, evicted);
-        _logger.LogDebug("Hot metric tier dropped {Count} series idle for over {Hours} h ({Named} still named)",
-            evicted, idleFor.TotalHours, _hot.Count);
+        _staleSeriesSwept(_logger, evicted, idleFor.TotalHours, null);
     }
 
     /// <summary>
