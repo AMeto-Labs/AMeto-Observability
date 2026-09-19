@@ -377,14 +377,24 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
         // byte, which is the check that the two ToString calls are the whole of the variable term.
         //
         // The margin is unchanged by the subtraction, because both ends move together: the gate is
-        // 875 + 52 = 927, sitting 52 B above the measured 875 and 52 B below the defect page's
-        // 1 122 976 − 144 000 = 978,976 B/row.
+        // the baseline + 52, sitting 52 B above the measured baseline and 52 B below the defect
+        // page, which is that baseline plus the 104 B the two params arrays weigh.
+        //
+        // THE BASELINE MOVED FROM 875 TO 963 WHEN BuildRow LEFT THE MEMOISED DICTIONARY, and the
+        // 88 B is the whole of the move — the two strings a blob walk builds per page
+        // (Encoding.UTF8.GetString of "GET" and of "/api/v1/payments", 24 + 56 = 80 B, plus the
+        // walk's own rounding), where the memoised dictionary handed back the SAME two instances
+        // it had decoded on page 1. That is the stated half of the trade and the reason the gate
+        // for this item is an ALLOCATION gate while the one for that item is a RETENTION gate:
+        // A_traceql_page_does_not_inflate_the_hot_tier_it_paged_over measures 368 B per root span
+        // left on the tier where the dictionary left 1 545, i.e. 1 177 B of permanent tier memory
+        // bought for 88 B of per-page allocation.
         double idsPerRow = MeasureRowIdStringsPerRow(Rows);
         _out.WriteLine($"              a row's two id strings weigh {idsPerRow:N0} B/row here "
                      + $"({(idsPerRow >= 200 ? "boxed: the handler is running unoptimised" : "unboxed")})");
         Assert.InRange(idsPerRow, 144, 400);   // 144 is the two strings themselves; anything less is a mis-measurement
 
-        const double Baseline = 875;   // the Debug figure less the id strings, rounded up to the byte
+        const double Baseline = 963;   // the Debug figure less the id strings, rounded up to the byte
         double gate   = Baseline + defectPerRow / 2;
         double perRow = allocated / (double)Rows - idsPerRow;
 
@@ -392,6 +402,164 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
             $"a returned row cost {perRow:N0} B beyond its two id strings, against a gate of "
             + $"{gate:N0} — BuildRow is building its semconv key lists per row again (two params "
             + $"string[] is {defectPerRow:N0} B a row)");
+    }
+
+    /// <summary>
+    /// A TRACEQL PAGE DOES NOT INFLATE THE HOT TIER IT PAGED OVER.
+    ///
+    /// <para><c>BuildRow</c> read its row's method and path through
+    /// <see cref="SpanRecord.Attributes"/>, which on a hot-tier record is the FIRST touch of its
+    /// msgpack blob: the lazy decode runs right there and builds a <c>Dictionary</c>, a key
+    /// string and a box per attribute — ~987 B against the blob's 375 B for an ordinary
+    /// eight-attribute span — and MEMOISES it on the record. The records belong to the TIER, not
+    /// to the page, so the page's dictionaries outlive it and the tier stays that much heavier
+    /// until it flushes. This is the very thing <c>TraceStorageEngine.SetHttpAttrs</c> was
+    /// rewritten to stop doing for the trace list (<c>TraceHotTierProbe.A_trace_list_page_does_
+    /// not_inflate_the_hot_tier_it_walks</c>) — over the same records of the same tier, so every
+    /// TraceQL page put straight back what that item had taken away.</para>
+    ///
+    /// <para>RETAINED IS THE ASSERTION HERE, and it is the right one BECAUSE the cost is
+    /// memoised: the decode is paid on the first page and never again, so a per-page allocation
+    /// figure reads whatever page it happens to measure while the retention is permanent. It is
+    /// measured against a baseline taken with the tier already built and already warmed — the
+    /// spans, their blobs and the whole page path are live on both sides — so the delta is what
+    /// the PAGE left behind and nothing else. Both samples take a compacting gen2 collect, or a
+    /// tier's own fragmentation reads as the page's retention.</para>
+    ///
+    /// <para>Revert <c>BuildRow</c> to <c>GetAttr(root.Attributes, …)</c> and this fails: 368 B
+    /// per root span becomes 1 545 B, which is 1 000 memoised eight-entry dictionaries the tier
+    /// cannot give back until it flushes.</para>
+    /// </summary>
+    [Fact]
+    public async Task A_traceql_page_does_not_inflate_the_hot_tier_it_paged_over()
+    {
+        const int Rows = 1_000;
+
+        string dir = Path.Combine(Path.GetTempPath(), "ameto-qlretain-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        _dirs.Add(dir);
+
+        using var engine = new TraceStorageEngine(dir, NullLogger<TraceStorageEngine>.Instance);
+
+        var  baseAt   = ColdSpanSegmentFixture.Base;
+        long baseNano = baseAt.ToUnixTimeMilliseconds() * 1_000_000L;
+        var  attrs    = SqlRootBlob();
+
+        for (int i = 0; i < Rows; i++)
+            engine.WriteSpan(new SpanIngestItem
+            {
+                TraceId           = new TraceId(0xC0FFEE, (ulong)(i + 1)),
+                SpanId            = new SpanId((ulong)(i + 1)),
+                ParentSpanId      = default,
+                StartTimeUnixNano = baseNano + i * 1_000_000L,
+                DurationNanos     = 5_000_000_000L,
+                Name              = "GET /payments",
+                ServiceName       = "billing",
+                Kind              = SpanKind.Server,
+                Status            = SpanStatusCode.Unset,
+                HttpStatusCode    = 200,
+                AttributesBytes   = attrs,
+            });
+
+        var from = baseAt.AddMinutes(-1);
+        var to   = baseAt.AddDays(1);
+        var pred = TraceQLParser.Parse("{ duration > 1s }");
+
+        // WARM ON A DIFFERENT TIER, so the jitting of several hundred lines of first-call-in-the-
+        // process page code is not billed to the measured tier's retention.
+        await WarmPageAsync(pred);
+
+        long liveBefore = LiveBytes();
+
+        var page = await TraceQLExecutor.ExecuteAsync(engine, pred, from, to, Rows, CancellationToken.None);
+
+        int    rows   = page.Rows.Count;
+        string method = page.Rows[0].HttpMethod, path = page.Rows[0].HttpPath;
+        page = default;                       // the rows belong to the caller, not to the tier
+
+        long retained = LiveBytes() - liveBefore;
+        GC.KeepAlive(engine);
+
+        _out.WriteLine("");
+        _out.WriteLine($"TRACEQL PAGE RETENTION  {Rows:N0} root spans, 8 attributes each, one page");
+        _out.WriteLine($"  left on the tier  {retained / 1024.0,10:N1} KB   {retained / (double)Rows,8:N0} B/root span");
+
+        Assert.Equal(Rows, rows);
+        Assert.Equal("GET", method);
+        Assert.Equal("/api/v1/payments", path);
+
+        // THE GATE, AND THE RESIDUAL IT SITS ABOVE. A page over the blob does not retain NOTHING:
+        // measured here at 368 B a root span, which is the same order as the 498 B
+        // TraceHotTierProbe reports for the trace list on the same path (the tier's own lazily
+        // built per-span state, not a decoded map) and is what a blob page costs. Reverting
+        // BuildRow to `GetAttr(root.Attributes, …)` measures 1 545 B a root span in the same run
+        // — the 987 B memoised dictionary on top of that residual. 700 B sits between the two
+        // with ~90 % headroom above today's figure and better than 2x below the defect.
+        Assert.True(retained < Rows * 700L,
+            $"a TraceQL page left {retained / (double)Rows:N0} B per root span on the hot tier — "
+          + "BuildRow is decoding and memoising the attribute dictionary again");
+    }
+
+    /// <summary>A throwaway tier of the same shape, purely to jit the page path.</summary>
+    private async Task WarmPageAsync(SpanPredicate pred)
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "ameto-qlwarm-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        _dirs.Add(dir);
+
+        using var engine = new TraceStorageEngine(dir, NullLogger<TraceStorageEngine>.Instance);
+
+        var  at       = ColdSpanSegmentFixture.Base;
+        long baseNano = at.ToUnixTimeMilliseconds() * 1_000_000L;
+        var  attrs    = SqlRootBlob();
+
+        for (int i = 0; i < 200; i++)
+            engine.WriteSpan(new SpanIngestItem
+            {
+                TraceId           = new TraceId(0xBEEF, (ulong)(i + 1)),
+                SpanId            = new SpanId((ulong)(i + 1)),
+                ParentSpanId      = default,
+                StartTimeUnixNano = baseNano + i * 1_000_000L,
+                DurationNanos     = 5_000_000_000L,
+                Name              = "GET /payments",
+                ServiceName       = "billing",
+                Kind              = SpanKind.Server,
+                Status            = SpanStatusCode.Unset,
+                HttpStatusCode    = 200,
+                AttributesBytes   = attrs,
+            });
+
+        for (int i = 0; i < 2; i++)
+            _ = await TraceQLExecutor.ExecuteAsync(
+                engine, pred, at.AddMinutes(-1), at.AddDays(1), 200, CancellationToken.None);
+    }
+
+    private static long LiveBytes()
+    {
+        GC.Collect(2, GCCollectionMode.Forced, blocking: true, compacting: true);
+        return GC.GetTotalMemory(forceFullCollection: false);
+    }
+
+    /// <summary>
+    /// The eight-attribute SqlClient span this round is measured on, with the two semconv keys a
+    /// row reads sitting where a real server span puts them — LAST, after the resource
+    /// attributes, which is also what makes the walk do its whole job.
+    /// </summary>
+    private static byte[] SqlRootBlob()
+    {
+        var buf = new ArrayBufferWriter<byte>(512);
+        var w   = new MessagePackWriter(buf);
+        w.WriteMapHeader(8);
+        w.Write("db.system");            w.Write("mssql");
+        w.Write("db.name");              w.Write("payments");
+        w.Write("db.statement");         w.Write("SELECT id, amount, status FROM payments WHERE tenant = @p0");
+        w.Write("net.peer.name");        w.Write("sql-primary.internal");
+        w.Write("net.peer.port");        w.Write(1433);
+        w.Write("server.address");       w.Write("node-3");
+        w.Write("http.request.method");  w.Write("GET");
+        w.Write("url.path");             w.Write("/api/v1/payments");
+        w.Flush();
+        return buf.WrittenMemory.ToArray();
     }
 
     /// <summary>

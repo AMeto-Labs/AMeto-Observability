@@ -2980,32 +2980,6 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     private static readonly string[] PathKeys   = HttpSemconvKeys.PathKeys;
 
     /// <summary>
-    /// BOTH key lists, in one array, as UTF-8 — <see cref="MethodKeys"/> first and then
-    /// <see cref="PathKeys"/>, so ranks <c>[0, MethodKeys.Length)</c> answer the method question
-    /// and the rest answer the path one. Derived from the string lists at type-init, so the two
-    /// spellings of one semconv list cannot drift apart, and one array so that a root span's two
-    /// questions cost ONE walk of its attribute map rather than seven.
-    ///
-    /// <para>The two lists MUST be disjoint: a key in both would be found at its first rank only —
-    /// the walk stops comparing at the first match — and the second list would read it as absent.
-    /// That is checked by <c>TraceHotTierProbe.The_semconv_key_lists_are_disjoint</c> and NOT here.
-    /// A throw from a static field initializer is a <see cref="TypeInitializationException"/> that
-    /// kills this whole type for the life of the process — no ingest, no query, no trace list, and
-    /// logs and metrics dragged down with the first request that touches tracing — over two
-    /// compile-time constants that cannot change after a build. A build-time mistake belongs in a
-    /// test.</para>
-    /// </summary>
-    private static readonly byte[][] HttpKeysUtf8 = Utf8Keys(MethodKeys, PathKeys);
-
-    private static byte[][] Utf8Keys(string[] first, string[] second)
-    {
-        var utf8 = new byte[first.Length + second.Length][];
-        for (int i = 0; i < first.Length;  i++) utf8[i]                = System.Text.Encoding.UTF8.GetBytes(first[i]);
-        for (int i = 0; i < second.Length; i++) utf8[first.Length + i] = System.Text.Encoding.UTF8.GetBytes(second[i]);
-        return utf8;
-    }
-
-    /// <summary>
     /// Trace volume + sparkline over [from,to]. Cold tiers are served purely from the
     /// tiny <c>.tracesum</c> volume headers (no span deserialisation); the hot tier is
     /// grouped live. Bounded by (segments × grid-cells) — cheap for any window width.
@@ -3448,58 +3422,13 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// 512 MB stand died of the live set, not of a millisecond. Memoising the two strings on the
     /// record instead is the SSE hot-tier re-walk, which the plan gives to WP9.</para>
     ///
-    /// <para>ONE WALK, BOTH QUESTIONS. <see cref="HttpKeysUtf8"/> is the two lists end to end, so
-    /// the map is read once and the method answer is picked from the leading ranks and the path
-    /// answer from the trailing ones — against seven walks if each key were asked separately, or
-    /// one decode plus two dictionary probes as before.</para>
-    ///
-    /// <para>IDENTICAL ANSWERS, by construction: the same key order, the same
-    /// first-key-present-with-a-non-null-value rule (msgpack nil, arrays and nested maps box to
-    /// <c>null</c> on the dictionary path and are skipped here too), the same last-copy-of-a-key
-    /// wins, and the same <c>ToString()</c> text for every value shape a dictionary can hold. A
-    /// record built from a dictionary rather than from bytes — every test fixture, and the cold
-    /// summary rows — takes the dictionary path below, unchanged.</para>
+    /// <para>ONE WALK, BOTH QUESTIONS, AND ONE COPY OF IT: the walk itself is
+    /// <see cref="HttpSemconvKeys.Resolve"/>, beside the key lists it reads, because
+    /// <c>TraceQLExecutor.BuildRow</c> asks the same question of the same records of the same
+    /// tier and must not answer it a second way.</para>
     /// </summary>
-    private static void SetHttpAttrs(SpanRecord s, MergedTrace m)
-    {
-        var blob = s.AttributesBytes;
-        if (blob.IsEmpty)
-        {
-            m.HttpMethod = HttpSemconvKeys.GetAttr(s.Attributes, MethodKeys);
-            m.HttpPath   = HttpSemconvKeys.GetAttr(s.Attributes, PathKeys);
-            return;
-        }
-
-        AttrSlots slots = default;
-        Span<SpanAttrValue> found = slots;
-        int mask = SpanAttributeBlob.FindValues(blob, HttpKeysUtf8, found);
-
-        m.HttpMethod = AttrText(found, mask, 0, MethodKeys.Length);
-        m.HttpPath   = AttrText(found, mask, MethodKeys.Length, HttpKeysUtf8.Length);
-    }
-
-    /// <summary>
-    /// The first rank in <c>[lo, hi)</c> the walk found, as the text a boxed <c>ToString()</c>
-    /// would have produced. Nothing found is the empty string — what the dictionary path returns
-    /// for a key list none of whose keys are on the span.
-    /// </summary>
-    private static string AttrText(ReadOnlySpan<SpanAttrValue> found, int mask, int lo, int hi)
-    {
-        for (int j = lo; j < hi; j++)
-        {
-            if ((mask & (1 << j)) == 0) continue;
-            ref readonly var v = ref found[j];
-            return v.Kind switch
-            {
-                SpanAttrKind.Utf8String => System.Text.Encoding.UTF8.GetString(v.Utf8.Span),
-                SpanAttrKind.Integer    => v.Integer.ToString(),
-                SpanAttrKind.Float      => v.Float.ToString(),
-                SpanAttrKind.Boolean    => v.Boolean ? bool.TrueString : bool.FalseString,
-                _                       => string.Empty,   // unreachable: FindValues clears these bits
-            };
-        }
-        return string.Empty;
-    }
+    private static void SetHttpAttrs(SpanRecord s, MergedTrace m) =>
+        HttpSemconvKeys.Resolve(s, out m.HttpMethod, out m.HttpPath);
 
     private struct HotVolAcc
     {
