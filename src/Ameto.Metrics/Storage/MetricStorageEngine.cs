@@ -878,6 +878,14 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     /// </summary>
     internal Task FlushPeriodicForTest() => FlushIfDueAsync();
 
+    /// <summary>
+    /// Test hook: the flush-check tick's stale sweep on its own, synchronously, with its evicted
+    /// count returned. What <see cref="FlushPeriodicForTest"/> reaches on an idle tier, minus the
+    /// async machinery around it — so a measurement of what the sweep costs is a measurement of
+    /// the sweep.
+    /// </summary>
+    internal int SweepStaleSeriesForTest() => SweepStaleSeriesIfIdle();
+
     private async Task RunThresholdFlushAsync(Task gate)
     {
         await gate.ConfigureAwait(false);
@@ -1242,11 +1250,26 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     /// <c>.mts</c> per metric name, or old enough that it should become rollup- and
     /// retention-eligible regardless. Points below both bars stay in memory, durable through
     /// the WAL and fully queryable — every read path consults the hot tier.
+    ///
+    /// <para><b>THE STALE SWEEP RUNS ON THE TICK, NOT ONLY ON A FLUSH THAT CARRIES POINTS.</b>
+    /// It used to ride along with the drain and nowhere else, so the one tier that could never
+    /// shed a series was the one with nothing left to report: the early return below, and the
+    /// <c>snapshot.Count == 0</c> return inside <see cref="FlushHotTierAsync"/>, both stand
+    /// BEFORE the sweep. A deployment whose 30 000 series stop arriving — an exporter removed, a
+    /// fleet scaled to zero, a label that stopped being emitted — then keeps every
+    /// <c>HotSeries</c>, <c>SeriesKey</c>, <c>LabelSet</c> and dictionary node for the life of
+    /// the process, because a tier with no points never flushes again. Nothing but
+    /// <see cref="Shed"/> under RAM pressure could take them back, and pressure is exactly the
+    /// state this is supposed to keep the process out of.</para>
+    ///
+    /// <para>The cost of running it on every tick instead is one pass over <c>_hot</c> under the
+    /// write lock — the same pass the drain was already making — and it is only ever paid when
+    /// there is nothing else for the tick to do.</para>
     /// </summary>
     private async Task FlushIfDueAsync()
     {
         int points = Volatile.Read(ref _hotPointCount);
-        if (points == 0) return;
+        if (points == 0) { SweepStaleSeriesIfIdle(); return; }
 
         bool due = Volatile.Read(ref _hotPointBytes) >= _minFlushBytes
                 || (_hotSince is { } since && _time.GetUtcNow().UtcDateTime - since >= _maxHotAge);
@@ -1359,6 +1382,11 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                         // a non-zero count seen from inside the WRITE lock means some series holds
                         // points. Kept because the two are separate pieces of state and this costs
                         // one comparison.
+                        //
+                        // The sweep happens FIRST: the scan above has already named the candidates
+                        // and this return is the other door out of the drain, so leaving through it
+                        // without evicting is how an idle tier kept its series for ever.
+                        if (stale is not null) SweepStaleSeriesLocked(stale, _staleSeriesAge);
                         _wal.AbandonFlush(flushedGeneration);
                         return;
                     }
@@ -1369,7 +1397,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
                     // AFTER the counters are zeroed, as the drain itself is: a series evicted
                     // here holds nothing that either of them still counts.
-                    if (stale is not null) SweepStaleSeriesLocked(stale);
+                    if (stale is not null) SweepStaleSeriesLocked(stale, _staleSeriesAge);
                 }
                 finally { _snapshotLock.ExitWriteLock(); }
 
@@ -1530,19 +1558,70 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     /// overload is here because <see cref="Shed"/> holds the same lock on a try-basis and the
     /// cost of being right anyway is one reference comparison per evicted series.</para>
     /// </summary>
-    private void SweepStaleSeriesLocked(List<SeriesKey> stale)
+    private int SweepStaleSeriesLocked(List<SeriesKey> stale, TimeSpan idleFor)
     {
         int evicted = 0;
         foreach (var key in stale)
-        {
-            if (!_hot.TryGetValue(key, out var series) || series.PointCount != 0) continue;
-            if (_hot.TryRemove(new KeyValuePair<SeriesKey, HotSeries>(key, series))) evicted++;
-        }
+            if (_hot.TryGetValue(key, out var series) && TryEvictLocked(key, series)) evicted++;
 
+        ReportSweep(evicted, idleFor);
+        return evicted;
+    }
+
+    /// <summary>
+    /// The same eviction, over a tier NOBODY has just drained: it finds its own candidates. This
+    /// is the form the flush-check tick and <see cref="Shed"/> need, because neither has a drain's
+    /// list to ride along with.
+    ///
+    /// <para>Removing from a <see cref="System.Collections.Concurrent.ConcurrentDictionary{TKey,TValue}"/>
+    /// while enumerating it is defined — the enumerator is a moment-in-time walk, not a snapshot —
+    /// so the candidate list the drain has to build (it is scanning for something else at the same
+    /// time) is not needed here, and this allocates nothing at all.</para>
+    ///
+    /// <para><b>Call only under <c>_snapshotLock</c>'s WRITE lock</b>, for the reason
+    /// <see cref="SweepStaleSeriesLocked(List{SeriesKey}, TimeSpan)"/> gives.</para>
+    /// </summary>
+    private int SweepIdleSeriesLocked(long idleBeforeTicks, TimeSpan idleFor)
+    {
+        int evicted = 0;
+        foreach (var (key, series) in _hot)
+            if (series.LastAppendUtcTicks < idleBeforeTicks && TryEvictLocked(key, series)) evicted++;
+
+        ReportSweep(evicted, idleFor);
+        return evicted;
+    }
+
+    /// <summary>
+    /// Takes the key out only while it still maps to the very object that was found empty, and
+    /// only while it IS empty — see the class remarks above for why both halves matter.
+    /// </summary>
+    private bool TryEvictLocked(SeriesKey key, HotSeries series) =>
+        series.PointCount == 0 && _hot.TryRemove(new KeyValuePair<SeriesKey, HotSeries>(key, series));
+
+    private void ReportSweep(int evicted, TimeSpan idleFor)
+    {
         if (evicted == 0) return;
         Interlocked.Add(ref _staleSeriesEvicted, evicted);
         _logger.LogDebug("Hot metric tier dropped {Count} series idle for over {Hours} h ({Named} still named)",
-            evicted, _staleSeriesAge.TotalHours, _hot.Count);
+            evicted, idleFor.TotalHours, _hot.Count);
+    }
+
+    /// <summary>
+    /// The flush-check tick's sweep, for a tier that has no points to flush — see
+    /// <see cref="FlushIfDueAsync"/> for why the drain's own sweep is not enough.
+    ///
+    /// <para>Try-enter, not enter: this runs on the flush loop, which must not park behind an
+    /// ingest batch holding the snapshot lock shared, and a sweep that is skipped costs nothing —
+    /// the next tick makes the same pass, and a series one tick staler is still stale.</para>
+    /// </summary>
+    private int SweepStaleSeriesIfIdle()
+    {
+        if (Volatile.Read(ref _disposed) != 0 || _hot.IsEmpty) return 0;
+
+        long idleBefore = _time.GetUtcNow().UtcTicks - _staleSeriesAge.Ticks;
+        if (!_snapshotLock.TryEnterWriteLock(0)) return 0;
+        try { return SweepIdleSeriesLocked(idleBefore, _staleSeriesAge); }
+        finally { _snapshotLock.ExitWriteLock(); }
     }
 
     // ── IMemoryShedder ────────────────────────────────────────────────────────
@@ -1592,7 +1671,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                 if (empty is not null)
                 {
                     int before = _hot.Count;
-                    SweepStaleSeriesLocked(empty);      // under pressure, idle is reason enough
+                    SweepStaleSeriesLocked(empty, _staleSeriesAge);   // under pressure, idle is reason enough
                     released = (long)(before - _hot.Count) * EmptySeriesBytes;
                 }
             }

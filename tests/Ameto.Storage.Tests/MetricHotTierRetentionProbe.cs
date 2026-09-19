@@ -171,6 +171,66 @@ public sealed class MetricHotTierRetentionProbe
     }
 
     /// <summary>
+    /// THE TIER THAT CAN NEVER FLUSH AGAIN IS THE ONE THAT MOST NEEDS SWEEPING.
+    ///
+    /// <para>The sweep used to ride along with the drain and nowhere else, and both doors out of
+    /// the flush stand before it: <c>FlushIfDueAsync</c> returns on <c>points == 0</c> and
+    /// <c>FlushHotTierAsync</c> returns on <c>snapshot.Count == 0</c>. So a tier whose series
+    /// have ALL stopped reporting — an exporter removed, a fleet scaled to zero — never flushed
+    /// again, therefore never swept again, and kept every <c>HotSeries</c>, <c>SeriesKey</c>,
+    /// <c>LabelSet</c> and dictionary node for the life of the process. Nothing but
+    /// <c>Shed()</c> under RAM pressure could take them back, and pressure is the state the
+    /// sweep exists to keep the process out of.</para>
+    ///
+    /// <para>Revert <c>FlushIfDueAsync</c>'s <c>SweepStaleSeriesIfIdle()</c> to a bare
+    /// <c>return</c> and this fails with all four series still named after three hours of ticks.</para>
+    /// </summary>
+    [Fact]
+    public async Task An_idle_tier_sheds_its_series_on_a_tick_that_has_nothing_to_flush()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "ameto-mhotidle-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        var clock = new MetricTestClock();
+        try
+        {
+            await using var engine = new MetricStorageEngine(dir, NullLogger<MetricStorageEngine>.Instance, timeProvider: clock);
+            long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+
+            engine.Ingest([Point("a", baseNano), Point("b", baseNano), Point("c", baseNano), Point("d", baseNano)]);
+            await engine.ScheduleThresholdFlushForTest();
+            Assert.Equal(0, engine.HotPointCount);      // the tier is drained and EMPTY from here on
+            Assert.Equal(4, engine.HotSeriesCount);
+
+            // A tick before the bar: nothing has been idle long enough, so nothing goes. This is
+            // the half that says the tick sweeps on the AGE and not merely on being empty.
+            clock.Advance(engine.ConfiguredOptions.MaxHotAge);
+            await engine.FlushPeriodicForTest();
+            Assert.Equal(4, engine.HotSeriesCount);
+            Assert.Equal(0, engine.StaleSeriesEvicted);
+
+            // Past twice MaxHotAge, with not one point ingested since the flush — the case that
+            // never came back. No threshold flush is scheduled and none could be: there is
+            // nothing to flush.
+            clock.Advance(engine.ConfiguredOptions.MaxHotAge + TimeSpan.FromMinutes(1));
+            await engine.FlushPeriodicForTest();
+
+            Assert.Equal(4, engine.StaleSeriesEvicted);
+            Assert.Equal(0, engine.HotSeriesCount);
+
+            // The names survive the eviction: _meta feeds the catalog and the sweep does not
+            // touch it, so an evicted series is still discoverable and its cold data untouched.
+            Assert.Contains("hot.sweep.metric", engine.GetMetricNames());
+            Assert.Contains(engine.GetLabelValues("hot.sweep.metric", "series"), v => v == "a");
+
+            // And a series that comes back is re-created for free, at full strength.
+            engine.Ingest([Point("a", baseNano + 1_000_000L)]);
+            Assert.Equal(1, engine.HotSeriesCount);
+            Assert.Equal(1, engine.HotPointCount);
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    /// <summary>
     /// <c>Drain</c> hands the flush its list instead of copying it, so the restore path on a
     /// failed write appends into the series' NEW list while reading the drained one. Two
     /// different lists: if they were ever the same object this either duplicates every point or
