@@ -122,22 +122,7 @@ public static class OtlpTraceProtoParser
         public int Depth;                         // nested array_value / kvlist_value levels open
     }
 
-    /// <summary>Promotions captured from a span's own attributes (never a resource's).</summary>
-    private struct SpanPromo
-    {
-        public short HttpStatus;
-        /// <summary>
-        /// Set once a <c>http.response.status_code</c> has parsed. The mapper's loop
-        /// <c>break</c>s at that point, so nothing after it — old key or new — can change the
-        /// answer; this latch is that <c>break</c>.
-        /// </summary>
-        public bool HttpLatched;
-        public bool AmetoInternal;
-    }
-
     private enum AttrScope : byte { Resource, Span, Nested }
-
-    private enum KeyKind : byte { Plain, HttpStatusNew, HttpStatusOld, Url }
 
     /// <summary>
     /// The <c>finally</c> is the point: a truncated length prefix, a malformed varint and a value
@@ -223,7 +208,7 @@ public static class OtlpTraceProtoParser
 
     private static void ReadResource(ReadOnlySpan<byte> bytes, ref ParseState st)
     {
-        SpanPromo none = default;                 // resource attributes promote nothing
+        SpanPromotion none = default;                 // resource attributes promote nothing
         var w = new MessagePackWriter(st.ResBuf);
         var r = new ProtoReader(bytes);
         uint tag;
@@ -257,7 +242,7 @@ public static class OtlpTraceProtoParser
         ReadOnlySpan<byte> traceId = default, spanId = default, parentId = default, name = default;
         int   kind = 0, statusCode = 0;
         ulong startRaw = 0, endRaw = 0;
-        SpanPromo promo = default;
+        SpanPromotion promo = default;
 
         st.SpanBuf.ResetWrittenCount();
         var w = new MessagePackWriter(st.SpanBuf);
@@ -366,7 +351,7 @@ public static class OtlpTraceProtoParser
     /// </summary>
     private static bool TryWriteKeyValue(
         ReadOnlySpan<byte> bytes, ref MessagePackWriter w, ref ParseState st,
-        ref SpanPromo promo, AttrScope scope)
+        ref SpanPromotion promo, AttrScope scope)
     {
         ReadOnlySpan<byte> key = default, value = default;
         bool haveKey = false, haveValue = false;
@@ -398,22 +383,13 @@ public static class OtlpTraceProtoParser
             return false;
         }
 
-        var kind = scope == AttrScope.Span ? KindOf(key) : KeyKind.Plain;
+        var kind = scope == AttrScope.Span ? SpanPromotion.KindOf(key) : SpanKeyKind.Plain;
 
         WriteUtf8(ref w, key);
         if (haveValue) WriteAnyValue(value, ref w, ref st, ref promo, kind);
         else w.WriteNil();
         return true;
     }
-
-    /// <summary>The keys the mapper promotes out of a span's attributes into its own columns.</summary>
-    private static KeyKind KindOf(ReadOnlySpan<byte> key) =>
-        key.SequenceEqual("http.response.status_code"u8) ? KeyKind.HttpStatusNew :
-        key.SequenceEqual("http.status_code"u8)          ? KeyKind.HttpStatusOld :
-        key.SequenceEqual("url.full"u8) || key.SequenceEqual("url.path"u8) ||
-        key.SequenceEqual("http.url"u8) || key.SequenceEqual("http.target"u8)
-                                                         ? KeyKind.Url
-                                                         : KeyKind.Plain;
 
     /// <summary>
     /// The <c>string_value</c> of an AnyValue: true when field 1 was present, which is the
@@ -441,7 +417,7 @@ public static class OtlpTraceProtoParser
     /// </summary>
     private static void WriteAnyValue(
         ReadOnlySpan<byte> bytes, ref MessagePackWriter w, ref ParseState st,
-        ref SpanPromo promo, KeyKind kind)
+        ref SpanPromotion promo, SpanKeyKind kind)
     {
         ReadOnlySpan<byte> str = default, array = default, kvlist = default;
         long   intVal  = 0;
@@ -468,10 +444,10 @@ public static class OtlpTraceProtoParser
 
         // Promotion reads what the mapper read: StringValue ?? IntValue, and neither a bool nor
         // a double ever promoted.
-        if (kind != KeyKind.Plain)
+        if (kind != SpanKeyKind.Plain)
         {
-            if (haveStr) Promote(kind, str, ref promo);
-            else if (haveInt) Promote(kind, intVal, ref promo);
+            if (haveStr) promo.Capture(kind, str);
+            else if (haveInt) promo.Capture(kind, intVal);
         }
 
         if (haveStr)       WriteUtf8(ref w, str);
@@ -483,36 +459,6 @@ public static class OtlpTraceProtoParser
         else               w.WriteNil();
     }
 
-    private static void Promote(KeyKind kind, ReadOnlySpan<byte> text, ref SpanPromo promo)
-    {
-        if (kind == KeyKind.Url)
-        {
-            // The UTF-8 overload, as the JSON parser uses: it refuses a URL over 512 bytes
-            // outright, where the char overload the DOM used compared it. Same choice, same
-            // hole, one behaviour across the two streaming parsers.
-            if (!promo.AmetoInternal) promo.AmetoInternal = AmetoIngestEndpoints.Matches(text);
-            return;
-        }
-        // short.TryParse of the string the mapper held. Utf8Parser refuses what short.TryParse
-        // refused — a non-numeric value, and a value past short — and additionally refuses
-        // surrounding whitespace, which no exporter sends and which the JSON parser also refuses.
-        if (Utf8Parser.TryParse(text, out long v, out int consumed) && consumed == text.Length)
-            PromoteStatus(kind, v, ref promo);
-    }
-
-    private static void Promote(KeyKind kind, long value, ref SpanPromo promo)
-    {
-        if (kind != KeyKind.Url) PromoteStatus(kind, value, ref promo);
-    }
-
-    private static void PromoteStatus(KeyKind kind, long value, ref SpanPromo promo)
-    {
-        if (promo.HttpLatched) return;
-        if (value is < short.MinValue or > short.MaxValue) return;   // short.TryParse said no
-        promo.HttpStatus = (short)value;
-        if (kind == KeyKind.HttpStatusNew) promo.HttpLatched = true; // the mapper's break
-    }
-
     /// <summary>
     /// ArrayValue → msgpack array. msgpack needs the element count before the elements, so the
     /// values are counted in one pass and written in a second — a re-walk of a span already in
@@ -520,7 +466,7 @@ public static class OtlpTraceProtoParser
     /// <c>Utf8JsonReader</c> cannot be rewound.
     /// </summary>
     private static void WriteArrayValue(
-        ReadOnlySpan<byte> bytes, ref MessagePackWriter w, ref ParseState st, ref SpanPromo promo)
+        ReadOnlySpan<byte> bytes, ref MessagePackWriter w, ref ParseState st, ref SpanPromotion promo)
     {
         EnterValue(ref st);
 
@@ -537,7 +483,7 @@ public static class OtlpTraceProtoParser
         var r = new ProtoReader(bytes);
         while ((tag = r.ReadTag()) != 0)
         {
-            if (tag == 10) WriteAnyValue(r.ReadLengthDelimited(), ref w, ref st, ref promo, KeyKind.Plain);
+            if (tag == 10) WriteAnyValue(r.ReadLengthDelimited(), ref w, ref st, ref promo, SpanKeyKind.Plain);
             else r.SkipField(tag);
         }
 
@@ -546,7 +492,7 @@ public static class OtlpTraceProtoParser
 
     /// <summary>KvlistValue → msgpack map, counting only the entries that carry a key.</summary>
     private static void WriteKvlistValue(
-        ReadOnlySpan<byte> bytes, ref MessagePackWriter w, ref ParseState st, ref SpanPromo promo)
+        ReadOnlySpan<byte> bytes, ref MessagePackWriter w, ref ParseState st, ref SpanPromotion promo)
     {
         EnterValue(ref st);
 

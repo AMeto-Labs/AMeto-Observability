@@ -254,7 +254,7 @@ public static class OtlpTraceStreamParser
         string? service = null;
         var w = new MessagePackWriter(resBuf);
         // Promotion capture is span-level only — dummies for the shared AnyValue writer.
-        short dummyStatus = 0; bool dummyNew = false, dummyInternal = false;
+        SpanPromotion none = default;   // a RESOURCE attribute promotes nothing
 
         while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
         {
@@ -311,8 +311,7 @@ public static class OtlpTraceStreamParser
                             else if (wroteKey)
                             {
                                 if (reader.Read() && reader.TokenType == JsonTokenType.StartObject)
-                                    WriteAnyValue(ref reader, ref w, KeyKind.Plain,
-                                        ref dummyStatus, ref dummyNew, ref dummyInternal);
+                                    WriteAnyValue(ref reader, ref w, SpanKeyKind.Plain, ref none);
                                 else
                                     w.WriteNil();
                                 wroteValue = true;
@@ -374,10 +373,11 @@ public static class OtlpTraceStreamParser
 
         attrBuf.ResetWrittenCount();
         var w = new MessagePackWriter(attrBuf);
-        int   attrCount     = 0;
-        short httpStatus    = 0;
-        bool  httpFromNew   = false;
-        bool  ametoInternal = false;
+        int   attrCount = 0;
+
+        // Every promotion a span attribute makes, in one place shared with the protobuf parser —
+        // see SpanPromotion for the two divergences this route was carrying.
+        SpanPromotion promo = default;
 
         while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
         {
@@ -406,7 +406,7 @@ public static class OtlpTraceStreamParser
             else if (reader.ValueTextEquals("attributes"u8) && reader.Read() && reader.TokenType == JsonTokenType.StartArray)
             {
                 while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
-                    if (WriteSpanKeyValue(ref reader, ref w, ref httpStatus, ref httpFromNew, ref ametoInternal))
+                    if (WriteSpanKeyValue(ref reader, ref w, ref promo))
                         attrCount++;
             }
             else
@@ -419,7 +419,7 @@ public static class OtlpTraceStreamParser
         // Same drop rules as the DOM mapper.
         if (trLen != 32 || !TraceIdHelper.TryParseTraceId(trHex, out ulong trHi, out ulong trLo)) return;
         if (spLen != 16 || !TraceIdHelper.TryParseSpanId(spHex, out ulong spRaw))                 return;
-        if (kind == 3 /* CLIENT */ && ametoInternal)                                             return;
+        if (kind == 3 /* CLIENT */ && promo.AmetoInternal)                                          return;
 
         SpanId parentId = default;
         if (paLen == 16 && TraceIdHelper.TryParseSpanId(paHex, out ulong paRaw))
@@ -455,13 +455,11 @@ public static class OtlpTraceStreamParser
             Kind              = (SpanKind)(kind & 0x07),
             Status            = statusCode switch { 1 => SpanStatusCode.Ok, 2 => SpanStatusCode.Error, _ => SpanStatusCode.Unset },
             AttributesBytes   = attrBytes,
-            HttpStatusCode    = httpStatus,
+            HttpStatusCode    = promo.HttpStatus,
         });
     }
 
     // ── span attribute KeyValue with promotion hooks ───────────────────────────
-
-    private enum KeyKind : byte { Plain, HttpStatusNew, HttpStatusOld, Url }
 
     /// <summary>
     /// Writes one <c>{ "key": …, "value": { AnyValue } }</c> pair as msgpack key + value,
@@ -470,12 +468,12 @@ public static class OtlpTraceStreamParser
     /// </summary>
     private static bool WriteSpanKeyValue(
         ref Utf8JsonReader reader, ref MessagePackWriter w,
-        ref short httpStatus, ref bool httpFromNew, ref bool ametoInternal, int depth = 0)
+        ref SpanPromotion promo, int depth = 0)
     {
         if (reader.TokenType != JsonTokenType.StartObject) { reader.Skip(); return false; }
 
         bool wroteKey = false, wroteValue = false;
-        var  keyKind  = KeyKind.Plain;
+        var  keyKind  = SpanKeyKind.Plain;
 
         while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
         {
@@ -486,14 +484,13 @@ public static class OtlpTraceStreamParser
                 reader.Read();
                 if (reader.TokenType == JsonTokenType.String)
                 {
-                    keyKind =
-                        reader.ValueTextEquals("http.response.status_code"u8) ? KeyKind.HttpStatusNew :
-                        reader.ValueTextEquals("http.status_code"u8)          ? KeyKind.HttpStatusOld :
-                        reader.ValueTextEquals("url.full"u8)   ||
-                        reader.ValueTextEquals("url.path"u8)   ||
-                        reader.ValueTextEquals("http.url"u8)   ||
-                        reader.ValueTextEquals("http.target"u8)               ? KeyKind.Url
-                                                                              : KeyKind.Plain;
+                    // THE SHARED LIST, over the reader's own UTF-8 bytes. An escaped key
+                    // (http.url) is unescaped into a stack buffer first, because
+                    // ValueTextEquals — which this replaces — did compare the unescaped form and
+                    // dropping that would quietly stop promoting such a key.
+                    keyKind = reader.ValueIsEscaped
+                        ? KindOfEscapedKey(ref reader)
+                        : SpanPromotion.KindOf(reader.ValueSpan);
                     WriteJsonStringToMsgpack(ref reader, ref w);
                     wroteKey = true;
                 }
@@ -503,7 +500,7 @@ public static class OtlpTraceStreamParser
             {
                 if (!wroteKey) { reader.Skip(); continue; } // value before key (non-standard) — skip
                 if (reader.Read() && reader.TokenType == JsonTokenType.StartObject)
-                    WriteAnyValue(ref reader, ref w, keyKind, ref httpStatus, ref httpFromNew, ref ametoInternal, depth);
+                    WriteAnyValue(ref reader, ref w, keyKind, ref promo, depth);
                 else
                     w.WriteNil();
                 wroteValue = true;
@@ -518,7 +515,7 @@ public static class OtlpTraceStreamParser
     // ── AnyValue → msgpack (with promotion capture) ────────────────────────────
     private static void WriteAnyValue(
         ref Utf8JsonReader reader, ref MessagePackWriter w,
-        KeyKind keyKind, ref short httpStatus, ref bool httpFromNew, ref bool ametoInternal, int depth = 0)
+        SpanKeyKind keyKind, ref SpanPromotion promo, int depth = 0)
     {
         bool wrote = false;
         while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
@@ -528,7 +525,7 @@ public static class OtlpTraceStreamParser
             if (reader.ValueTextEquals("stringValue"u8))
             {
                 reader.Read();
-                CaptureString(ref reader, keyKind, ref httpStatus, ref httpFromNew, ref ametoInternal);
+                CaptureString(ref reader, keyKind, ref promo);
                 WriteJsonStringToMsgpack(ref reader, ref w);
                 wrote = true;
             }
@@ -538,7 +535,7 @@ public static class OtlpTraceStreamParser
                 long v = 0;
                 if (reader.TokenType == JsonTokenType.String) Utf8Parser.TryParse(reader.ValueSpan, out v, out _);
                 else reader.TryGetInt64(out v);
-                CaptureHttpStatus(keyKind, v, ref httpStatus, ref httpFromNew);
+                promo.Capture(keyKind, v);
                 w.Write(v); wrote = true;
             }
             else if (reader.ValueTextEquals("boolValue"u8))
@@ -573,58 +570,68 @@ public static class OtlpTraceStreamParser
         if (!wrote) w.WriteNil();
     }
 
+    /// <summary>
+    /// An escaped attribute key, unescaped far enough to classify. The longest promoted key is
+    /// <c>http.response.status_code</c> at 25 bytes, and unescaping only ever SHORTENS, so a
+    /// key whose escaped form is already past the buffer cannot become one of them.
+    ///
+    /// <para>Its own method so the stack buffer is in the frame of a call that takes this branch,
+    /// which no conformant exporter ever does, rather than in every attribute's frame.</para>
+    /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static SpanKeyKind KindOfEscapedKey(ref Utf8JsonReader reader)
+    {
+        const int MaxEscapedKeyBytes = 256;   // 25 bytes of key is at most 150 as \uXXXX
+
+        if (reader.ValueSpan.Length > MaxEscapedKeyBytes) return SpanKeyKind.Plain;
+
+        Span<byte> tmp = stackalloc byte[MaxEscapedKeyBytes];
+        int len = reader.CopyString(tmp);
+        return SpanPromotion.KindOf(tmp[..len]);
+    }
+
     /// <summary>String value of a promoted key: parse the HTTP status / run the URL check.</summary>
     private static void CaptureString(
-        ref Utf8JsonReader reader, KeyKind keyKind,
-        ref short httpStatus, ref bool httpFromNew, ref bool ametoInternal)
+        ref Utf8JsonReader reader, SpanKeyKind keyKind,
+        ref SpanPromotion promo)
     {
-        if (reader.TokenType != JsonTokenType.String || keyKind == KeyKind.Plain) return;
+        if (reader.TokenType != JsonTokenType.String || keyKind == SpanKeyKind.Plain) return;
 
-        if (keyKind is KeyKind.HttpStatusNew or KeyKind.HttpStatusOld)
-        {
-            if (Utf8Parser.TryParse(reader.ValueSpan, out long v, out _))
-                CaptureHttpStatus(keyKind, v, ref httpStatus, ref httpFromNew);
-            return;
-        }
-
-        // Url: does the value contain one of Ameto's own ingestion endpoints?
-        if (ametoInternal) return;
-        if (!reader.ValueIsEscaped)
-        {
-            ametoInternal = ContainsAmetoEndpoint(reader.ValueSpan);
-        }
-        else
-        {
-            ametoInternal = EscapedUrlIsAmetoEndpoint(ref reader);
-        }
+        // Unescaped is the ordinary case for both a status and a URL, and the reader's own bytes
+        // go straight to the shared rule. The escape branch is the one that has to make a copy,
+        // because the rule reads UTF-8 and an escaped value is not yet UTF-8.
+        if (!reader.ValueIsEscaped) { promo.Capture(keyKind, reader.ValueSpan); return; }
+        if (keyKind == SpanKeyKind.Url && promo.AmetoInternal) return;   // already decided
+        CaptureEscapedString(ref reader, keyKind, ref promo);
     }
 
     /// <summary>
-    /// The endpoint check for an escaped URL. Its buffer is a <c>stackalloc</c> — unlike the
-    /// msgpack writer, <see cref="ContainsAmetoEndpoint"/> is an ordinary static that cannot
-    /// keep the span — sized at the longest URL the matcher will look at at all. An escaped
-    /// value longer than that can still unescape to something shorter (<c>A</c> is six
-    /// bytes for one), so the long case keeps its pooled buffer rather than being skipped.
+    /// The escaped case, whose buffer is a <c>stackalloc</c> — sized at the longest URL the
+    /// matcher will look at at all, which also comfortably holds any numeric status. An escaped
+    /// value longer than that can still unescape to something shorter (<c>&amp;#65;</c> is six
+    /// bytes for one), so the long case keeps a pooled buffer rather than being skipped.
     ///
     /// <para>Separate method so the stack buffer is only in the frame of a call that takes this
     /// branch, not in every frame of a deeply nested value.</para>
     /// </summary>
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
-    private static bool EscapedUrlIsAmetoEndpoint(ref Utf8JsonReader reader)
+    private static void CaptureEscapedString(
+        ref Utf8JsonReader reader, SpanKeyKind keyKind, ref SpanPromotion promo)
     {
         int max = reader.ValueSpan.Length;
         if (max <= MaxMatchableUrlBytes)
         {
             Span<byte> tmp = stackalloc byte[MaxMatchableUrlBytes];
             int len = reader.CopyString(tmp);
-            return ContainsAmetoEndpoint(tmp[..len]);
+            promo.Capture(keyKind, tmp[..len]);
+            return;
         }
 
         byte[] rented = ArrayPool<byte>.Shared.Rent(max);
         try
         {
             int n = reader.CopyString(rented);
-            return ContainsAmetoEndpoint(rented.AsSpan(0, n));
+            promo.Capture(keyKind, rented.AsSpan(0, n));
         }
         finally
         {
@@ -634,48 +641,16 @@ public static class OtlpTraceStreamParser
 
     /// <summary>
     /// The longest URL <see cref="AmetoIngestEndpoints.Matches(ReadOnlySpan{byte})"/> compares;
-    /// it refuses anything longer outright.
+    /// it refuses anything longer outright. <see cref="SpanPromotion.MaxMatchableUrlBytes"/> is
+    /// where that fact lives now, for both parsers.
     /// </summary>
-    private const int MaxMatchableUrlBytes = 512;
-
-    private static void CaptureHttpStatus(KeyKind keyKind, long value, ref short httpStatus, ref bool httpFromNew)
-    {
-        if (keyKind is not (KeyKind.HttpStatusNew or KeyKind.HttpStatusOld)) return;
-        if (value is < short.MinValue or > short.MaxValue) return;
-        // The new semconv key wins over the old one, regardless of document order.
-        if (keyKind == KeyKind.HttpStatusNew) { httpStatus = (short)value; httpFromNew = true; }
-        else if (!httpFromNew)                { httpStatus = (short)value; }
-    }
-
-    /// <summary>
-    /// One list, shared with <c>OtlpTraceMapper</c> — see <see cref="AmetoIngestEndpoints"/>.
-    /// </summary>
-    private static bool ContainsAmetoEndpoint(ReadOnlySpan<byte> url) =>
-        AmetoIngestEndpoints.Matches(url);
-
-    /// <summary>ASCII case-insensitive substring search (needle must be lowercase ASCII).</summary>
-    private static bool ContainsAsciiIgnoreCase(ReadOnlySpan<byte> haystack, ReadOnlySpan<byte> needleLower)
-    {
-        if (needleLower.Length == 0 || haystack.Length < needleLower.Length) return false;
-        for (int i = 0; i <= haystack.Length - needleLower.Length; i++)
-        {
-            int j = 0;
-            for (; j < needleLower.Length; j++)
-            {
-                byte c = haystack[i + j];
-                if (c is >= (byte)'A' and <= (byte)'Z') c += 32;
-                if (c != needleLower[j]) break;
-            }
-            if (j == needleLower.Length) return true;
-        }
-        return false;
-    }
+    private const int MaxMatchableUrlBytes = SpanPromotion.MaxMatchableUrlBytes;
 
     // ── Nested array / kvlist (no promotion inside) ────────────────────────────
 
     private static void WriteArrayValue(ref Utf8JsonReader reader, ref MessagePackWriter w, int depth)
     {
-        short s = 0; bool b = false, a = false;
+        SpanPromotion none = default;   // a nested value promotes nothing
         while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
         {
             if (reader.TokenType != JsonTokenType.PropertyName) { reader.Skip(); continue; }
@@ -688,7 +663,7 @@ public static class OtlpTraceStreamParser
                 {
                     if (reader.TokenType == JsonTokenType.StartObject)
                     {
-                        WriteAnyValue(ref reader, ref tw, KeyKind.Plain, ref s, ref b, ref a, depth + 1);
+                        WriteAnyValue(ref reader, ref tw, SpanKeyKind.Plain, ref none, depth + 1);
                         n++;
                     }
                     else reader.Skip();
@@ -704,7 +679,7 @@ public static class OtlpTraceStreamParser
 
     private static void WriteKvlistValue(ref Utf8JsonReader reader, ref MessagePackWriter w, int depth)
     {
-        short s = 0; bool b = false, a = false;
+        SpanPromotion none = default;   // a nested kvlist entry promotes nothing
         while (reader.Read() && reader.TokenType != JsonTokenType.EndObject)
         {
             if (reader.TokenType != JsonTokenType.PropertyName) { reader.Skip(); continue; }
@@ -714,7 +689,7 @@ public static class OtlpTraceStreamParser
                 var tw  = new MessagePackWriter(tmp);
                 int n = 0;
                 while (reader.Read() && reader.TokenType != JsonTokenType.EndArray)
-                    if (WriteSpanKeyValue(ref reader, ref tw, ref s, ref b, ref a, depth + 1)) n++;
+                    if (WriteSpanKeyValue(ref reader, ref tw, ref none, depth + 1)) n++;
                 tw.Flush();
                 w.WriteMapHeader(n);
                 w.WriteRaw(tmp.WrittenSpan);
