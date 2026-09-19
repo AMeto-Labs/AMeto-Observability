@@ -1611,7 +1611,11 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     /// <para>Removing from a <see cref="System.Collections.Concurrent.ConcurrentDictionary{TKey,TValue}"/>
     /// while enumerating it is defined — the enumerator is a moment-in-time walk, not a snapshot —
     /// so the candidate list the drain has to build (it is scanning for something else at the same
-    /// time) is not needed here, and this allocates nothing at all.</para>
+    /// time) is not needed here. What it costs is ONE object: a concurrent dictionary's
+    /// <c>GetEnumerator</c> returns the interface and not a struct, so <c>foreach</c> allocates
+    /// that enumerator however few series it then walks. Nothing per series and nothing per
+    /// eviction, which is the part that scales; a sweep is a per-minute tick, not a per-point
+    /// path, and one enumerator is cheaper than the list it replaces.</para>
     ///
     /// <para><b>Call only under <c>_snapshotLock</c>'s WRITE lock</b>, for the reason
     /// <see cref="SweepStaleSeriesLocked(List{SeriesKey}, TimeSpan)"/> gives.</para>
@@ -1686,13 +1690,51 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     // ── IMemoryShedder ────────────────────────────────────────────────────────
 
     /// <summary>
-    /// What a flush plus a sweep would hand back: the points in the tier, plus what the series
-    /// that hold none are still costing. All of it managed, hence
+    /// What a flush plus a sweep would hand back: the points in the tier, plus the series
+    /// <see cref="Shed"/> IS ALLOWED TO TAKE. All of it managed, hence
     /// <see cref="ShedableNativeBytes"/> = 0 — the pressure loop already counts the managed heap
     /// through <c>GC.GetGCMemoryInfo</c>, and reporting these bytes there as well would count
     /// them twice.
     /// </summary>
-    public long ShedableBytes => Volatile.Read(ref _hotPointBytes) + (long)_hot.Count * EmptySeriesBytes;
+    ///
+    /// <remarks>
+    /// <para>The second term was <c>_hot.Count * EmptySeriesBytes</c> — the WHOLE table — and
+    /// that stopped being true when <c>Shed</c> learned that idle is not "holds no points right
+    /// now": it evicts only what has said nothing for a <c>MaxHotAge</c>, so on the tier a busy
+    /// deployment actually runs — thirty thousand series, every one of them reporting, every one
+    /// of them empty between flushes — this advertised 11 MB that a shed would not release one
+    /// byte of. The figure is what <c>MemoryShedRegistry.ShedableBytes</c> sums for the pressure
+    /// loop's "is it worth asking anybody" gate, so over-reporting there is a decision to shed
+    /// taken on memory that is not coming back.</para>
+    ///
+    /// <para><b>An upper bound, and honestly one.</b> It counts the series past the bar without
+    /// asking whether each is empty, because <see cref="TryEvictLocked"/> also requires that and
+    /// a series holding points is evicted only after the flush this same <c>Shed</c> schedules —
+    /// so the bytes are real, one tick later. It cannot be a lower bound and be cheap.</para>
+    ///
+    /// <para>The walk is the price: <c>Count</c> takes every lock in the table to answer, this
+    /// takes none and reads every entry instead, and the pressure loop asks about once a tick.
+    /// The empty tier — the one the loop asks about most, and the one <c>Count</c> was no
+    /// cheaper for — is answered without walking at all.</para>
+    /// </remarks>
+    public long ShedableBytes => Volatile.Read(ref _hotPointBytes) + (long)IdleSeriesCount() * EmptySeriesBytes;
+
+    /// <summary>
+    /// The series a <see cref="Shed"/> right now would be allowed to evict: those whose last
+    /// append is further back than <see cref="_maxHotAge"/>, which is the bar <c>Shed</c> itself
+    /// computes. Lock-free, and it must stay that way — <see cref="ShedableBytes"/> is read from
+    /// the RAM pressure loop, which may not park behind an ingest batch.
+    /// </summary>
+    private int IdleSeriesCount()
+    {
+        if (_hot.IsEmpty) return 0;
+
+        long idleBefore = _time.GetUtcNow().UtcTicks - _maxHotAge.Ticks;
+        int  idle       = 0;
+        foreach (var (_, series) in _hot)
+            if (series.LastAppendUtcTicks < idleBefore) idle++;
+        return idle;
+    }
 
     /// <inheritdoc/>
     public long ShedableNativeBytes => 0;

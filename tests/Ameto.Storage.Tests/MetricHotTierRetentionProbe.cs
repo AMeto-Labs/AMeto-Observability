@@ -294,6 +294,68 @@ public sealed class MetricHotTierRetentionProbe
     }
 
     /// <summary>
+    /// AND THE ADVERTISEMENT IS THE SAME RULE, NOT THE OLD ONE.
+    ///
+    /// <para><c>ShedableBytes</c> kept offering <c>_hot.Count x 384 B</c> — the whole table —
+    /// after <c>Shed</c> had stopped taking the whole table. The state that makes the difference
+    /// is the one a busy tier is in for most of its life: every series drained by the last flush,
+    /// every series reporting inside one <c>MaxHotAge</c>. Thirty thousand of them advertise
+    /// 11 MB there and release nothing, and that figure is what
+    /// <c>MemoryShedRegistry.ShedableBytes</c> sums for the pressure loop's "is it worth asking
+    /// anybody" gate.</para>
+    ///
+    /// <para>Three readings of the same table, so the figure cannot be a constant either way:
+    /// nothing past the bar advertises nothing, everything past it advertises all of it, and one
+    /// series reporting again takes itself back out of the offer. The last is checked against
+    /// <c>Shed</c>'s own return, which is what "what it would actually release" means.</para>
+    ///
+    /// <para>Revert to <c>_hot.Count * EmptySeriesBytes</c> and the first reading is 19 200 B.</para>
+    /// </summary>
+    [Fact]
+    public async Task A_tier_whose_series_all_reported_recently_advertises_nothing_to_shed()
+    {
+        const int Series = 50;
+
+        string dir = Path.Combine(Path.GetTempPath(), "ameto-mhotadv-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        var clock = new MetricTestClock();
+        try
+        {
+            await using var engine = new MetricStorageEngine(dir, NullLogger<MetricStorageEngine>.Instance, timeProvider: clock);
+            long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+            var  hotAge   = engine.ConfiguredOptions.MaxHotAge;
+
+            var batch = new MetricIngestItem[Series];
+            for (int i = 0; i < Series; i++) batch[i] = Point("s" + i, baseNano + i * 1_000_000L);
+            engine.Ingest(batch);
+
+            await engine.ScheduleThresholdFlushForTest();
+            Assert.Equal(0, engine.HotPointCount);         // drained: no points left to offer
+            Assert.Equal(Series, engine.HotSeriesCount);   // and every one of them still named
+
+            // THE STEADY STATE. Nothing has been idle for a MaxHotAge, so a shed takes nothing —
+            // and the offer says so.
+            Assert.Equal(0L, engine.ShedableBytes);
+            Assert.Equal(0L, engine.Shed());
+            Assert.Equal(Series, engine.HotSeriesCount);
+
+            // Past the bar, the same table IS the offer.
+            clock.Advance(hotAge + TimeSpan.FromMinutes(1));
+            Assert.Equal(Series * 384L, engine.ShedableBytes);
+
+            // One series reports again and leaves the offer on its own — the points it brings are
+            // shedable through the flush, which is the other half of the figure.
+            engine.Ingest([Point("s0", baseNano + 1_000_000_000L)]);
+            Assert.Equal((Series - 1) * 384L + engine.HotByteCount, engine.ShedableBytes);
+
+            // And that is what a shed at this moment actually releases.
+            Assert.Equal((Series - 1) * 384L, engine.Shed());
+            Assert.Equal(1, engine.HotSeriesCount);
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    /// <summary>
     /// A SWEEP THAT EVICTS COSTS NOTHING MORE THAN A SWEEP THAT DOES NOT, WITH DEBUG OFF.
     ///
     /// <para>The sweep's one log line was
