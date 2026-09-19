@@ -32,6 +32,13 @@ namespace Ameto.Perf;
 /// <c>"200abc"</c> promoted as 200 there and as nothing everywhere else.</item>
 /// </list>
 ///
+/// <para><b>Three oracles, not two.</b> Two parsers that agree can still be wrong together — one
+/// hand edits both, or edits one and the literal beside it — so the same protobuf payload also
+/// goes through the path neither of them is, <c>OtlpProtoDecoder.DecodeTraces</c> +
+/// <c>OtlpTraceMapper.Map</c>, and the promotions are read off that as well. It is the definition
+/// the streaming parsers reproduce, and the one shape it cannot state (an array attribute, which
+/// its decoder drops to nil) is asserted AS that difference rather than skipped.</para>
+///
 /// <para>The comparison is field by field and the attribute map is compared as BYTES, because key
 /// order and msgpack encoding are both part of what lands in a <c>.trc</c> segment. Both payloads
 /// are written out in full in this file, side by side, so that changing one and not the other is
@@ -45,7 +52,8 @@ public sealed class OtlpTraceRouteParityTests
     [Fact]
     public void The_two_streaming_parsers_agree_on_one_payload()
     {
-        var fromProto = OtlpTraceProtoParser.Parse(ProtoPayload());
+        byte[] proto  = ProtoPayload();
+        var fromProto = OtlpTraceProtoParser.Parse(proto);
         var fromJson  = OtlpTraceStreamParser.Parse(Encoding.UTF8.GetBytes(JsonPayload));
 
         _out.WriteLine($"protobuf {fromProto.Count} span(s), JSON {fromJson.Count} span(s)");
@@ -102,13 +110,51 @@ public sealed class OtlpTraceRouteParityTests
         Assert.Equal(true,     attrs["retry"]);
         Assert.Equal(12.75,    attrs["duration_ms"]);
         Assert.Equal("404",    attrs["http.response.status_code"]);  // promoted AND kept
+        Assert.Equal(new object?[] { "a", "b" }, attrs["tags"]);
+
+        // ── AND THE THIRD ORACLE ─────────────────────────────────────────────────
+        //
+        // The literals above are written here, which makes them a statement about this file and
+        // not yet about the mapper the parsers reproduce: the same hand that moves a parser can
+        // move a literal beside it. So the SAME protobuf bytes go through the path neither
+        // streaming parser is, OtlpProtoDecoder.DecodeTraces + OtlpTraceMapper.Map, and the three
+        // promotions are read off IT.
+        var fromDom = OtlpTraceMapper.Map(OtlpProtoDecoder.DecodeTraces(proto, proto.Length));
+
+        Assert.Equal(3, fromDom.Count);                             // the same self-ingest drop
+        Assert.Equal("latched",     fromDom[0].Name);
+        Assert.Equal((short)500,    fromDom[0].HttpStatusCode);     // the break, in the original
+        Assert.Equal("partial",     fromDom[1].Name);
+        Assert.Equal((short)0,      fromDom[1].HttpStatusCode);     // short.TryParse on "200abc"
+        Assert.Equal("last",        fromDom[2].Name);
+        Assert.Equal("Wallet.API",  fromDom[2].ServiceName);
+        Assert.Equal((short)404,    fromDom[2].HttpStatusCode);
+
+        // The blob as well, for the two spans whose values the DOM decoder can state at all.
+        for (int i = 0; i < 2; i++)
+            Assert.True(fromDom[i].AttributesBytes.AsSpan().SequenceEqual(fromProto[i].AttributesBytes),
+                $"attribute msgpack differs from the DOM on span #{i} ({fromDom[i].Name}):\n"
+              + $"  dom      {Convert.ToHexString(fromDom[i].AttributesBytes)}\n"
+              + $"  streamed {Convert.ToHexString(fromProto[i].AttributesBytes)}");
+
+        // The third span carries the ONE shape the DOM cannot state: its decoder has no case for
+        // AnyValue field 5, so `tags` arrives as nil where both streaming parsers encode the
+        // array — a deliberate divergence in the client's favour, recorded by
+        // OtlpTraceProtoParityTests.EncodesArrayValues_TheDomPathDroppedToNil and asserted here
+        // rather than skipped, so that a parser quietly REGRESSING to nil is still a failure.
+        // Every other pair in that map is compared by value.
+        var domAttrs = Attrs(fromDom[2].AttributesBytes);
+        Assert.Null(domAttrs["tags"]);
+        foreach (string key in (string[])["host.name", "retry", "duration_ms", "http.response.status_code"])
+            Assert.Equal(attrs[key], domAttrs[key]);
+        Assert.False(domAttrs.ContainsKey("service.name"));
     }
 
     /// <summary>
-    /// The same three promotion facts stated against the DOM mapper as well, so "the two agree"
-    /// cannot become "the two are wrong together". <c>ExtractHttpStatusCode</c> is the definition
-    /// both parsers reproduce and it is nine lines long; asserting it here is what stops a future
-    /// edit from moving all three at once.
+    /// The latch stated against the DOM mapper as well, so "the two agree" cannot become "the two
+    /// are wrong together". <c>ExtractHttpStatusCode</c> is the definition both parsers reproduce
+    /// and it is nine lines long; running it on the same bytes is what stops a future edit from
+    /// moving all three at once.
     /// </summary>
     [Theory]
     [InlineData(500, 503, 500)]   // first new-key value wins — the mapper breaks
@@ -134,6 +180,10 @@ public sealed class OtlpTraceRouteParityTests
 
         Assert.Equal((short)expected, Assert.Single(OtlpTraceProtoParser.Parse(proto)).HttpStatusCode);
         Assert.Equal((short)expected, Assert.Single(OtlpTraceStreamParser.Parse(Encoding.UTF8.GetBytes(json))).HttpStatusCode);
+
+        // The definition itself, on the same bytes.
+        Assert.Equal((short)expected,
+            Assert.Single(OtlpTraceMapper.Map(OtlpProtoDecoder.DecodeTraces(proto, proto.Length))).HttpStatusCode);
     }
 
     /// <summary>
@@ -372,6 +422,11 @@ public sealed class OtlpTraceRouteParityTests
             }))));
     });
 
+    /// <summary>
+    /// One span's attribute map, decoded far enough to compare. An ARRAY is decoded rather than
+    /// skipped because the DOM path writes nil where the streaming parsers write the array, and a
+    /// helper that answered null for both would hide exactly that.
+    /// </summary>
     private static Dictionary<string, object?> Attrs(byte[] msgpack)
     {
         var reader = new MessagePackReader(msgpack);
@@ -380,16 +435,27 @@ public sealed class OtlpTraceRouteParityTests
         for (int i = 0; i < count; i++)
         {
             string key = reader.ReadString() ?? string.Empty;
-            d[key] = reader.NextMessagePackType switch
-            {
-                MessagePackType.String  => reader.ReadString(),
-                MessagePackType.Integer => reader.ReadInt64(),
-                MessagePackType.Float   => reader.ReadDouble(),
-                MessagePackType.Boolean => reader.ReadBoolean(),
-                _                       => Skip(ref reader),
-            };
+            d[key] = Value(ref reader);
         }
         return d;
+
+        static object? Value(ref MessagePackReader r) => r.NextMessagePackType switch
+        {
+            MessagePackType.String  => r.ReadString(),
+            MessagePackType.Integer => r.ReadInt64(),
+            MessagePackType.Float   => r.ReadDouble(),
+            MessagePackType.Boolean => r.ReadBoolean(),
+            MessagePackType.Array   => Array(ref r),
+            _                       => Skip(ref r),
+        };
+
+        static object?[] Array(ref MessagePackReader r)
+        {
+            int n     = r.ReadArrayHeader();
+            var items = new object?[n];
+            for (int i = 0; i < n; i++) items[i] = Value(ref r);
+            return items;
+        }
 
         static object? Skip(ref MessagePackReader r) { r.Skip(); return null; }
     }
