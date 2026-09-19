@@ -1,7 +1,9 @@
 using System.Text;
+using System.Text.Json;
 using Google.Protobuf;
 using MessagePack;
 using Ameto.Otel;
+using Ameto.Otel.Models;
 using Ameto.Tracing;
 using Xunit;
 using Xunit.Abstractions;
@@ -133,6 +135,70 @@ public sealed class OtlpTraceRouteParityTests
         Assert.Equal((short)expected, Assert.Single(OtlpTraceProtoParser.Parse(proto)).HttpStatusCode);
         Assert.Equal((short)expected, Assert.Single(OtlpTraceStreamParser.Parse(Encoding.UTF8.GetBytes(json))).HttpStatusCode);
     }
+
+    /// <summary>
+    /// AN <c>intValue</c> THAT IS NOT AN INT, which is a JSON-only shape: protobuf's
+    /// <c>int_value</c> is a varint and cannot carry one, so the oracle here is the DOM mapper
+    /// alone — <c>JsonSerializer</c> + <c>OtlpTraceMapper.Map</c>, the path OTLP/JSON is held to.
+    ///
+    /// <para>proto3 JSON writes every 64-bit field as a QUOTED decimal, so the value under
+    /// <c>intValue</c> is a string on the ordinary road and whatever the exporter put there.
+    /// <c>Utf8Parser</c> answers such a string twice — a success flag and a consumed count
+    /// — and the JSON parser used to discard both and capture the <c>out</c> value anyway. Under
+    /// <c>http.response.status_code</c> that promoted 0 for <c>"abc"</c> and 200 for
+    /// <c>"200abc"</c>, and because the key is the NEW one it also LATCHED: the valid status
+    /// beside it could no longer be promoted, while the DOM's <c>short.TryParse</c> — which takes
+    /// the whole string or nothing — returned it.</para>
+    ///
+    /// <para>The attribute blob is compared as well, because the same answer decides what the map
+    /// carries: the mapper falls through to nil when <c>long.TryParse</c> says no, and a parser
+    /// that wrote the 0 or the 200 it had just refused would put a number in a <c>.trc</c> segment
+    /// that the span never sent.</para>
+    /// </summary>
+    [Theory]
+    [InlineData("abc")]                    // TryParse says false and hands back 0
+    [InlineData("200abc")]                 // it says true and stops after three bytes
+    [InlineData("")]                       // nothing at all
+    [InlineData("99999999999999999999")]   // past int64
+    [InlineData("\\u0032\\u0030\\u0030")]  // escaped "200": a whole int64 the DOM does read
+    public void A_non_numeric_int_value_neither_promotes_nor_blocks_the_next_status(string text)
+    {
+        // The garbage FIRST, so a parser that latched on it cannot reach the 503 behind it.
+        byte[] utf8 = Encoding.UTF8.GetBytes($$"""
+        { "resourceSpans": [ { "resource": { "attributes": [
+            { "key": "service.name", "value": { "stringValue": "svc" } } ] },
+          "scopeSpans": [ { "spans": [ {
+            "traceId": "aa000000000000000000000000000002", "spanId": "bb00000000000002",
+            "name": "not-an-int", "kind": 2,
+            "startTimeUnixNano": "1785300000000000000", "endTimeUnixNano": "1785300000001000000",
+            "attributes": [
+              { "key": "http.response.status_code", "value": { "intValue": "{{text}}" } },
+              { "key": "http.response.status_code", "value": { "intValue": "503" } } ]
+          } ] } ] } ] }
+        """);
+
+        var streamed = Assert.Single(OtlpTraceStreamParser.Parse(utf8));
+        var dom      = Assert.Single(OtlpTraceMapper.Map(
+            JsonSerializer.Deserialize<ExportTraceServiceRequest>(utf8, DomOptions)!));
+
+        // The literal first — "the two agree" is not enough when one of them is the subject.
+        // An escaped "200" IS an int64 once unescaped, and the latch then belongs to it.
+        short expected = text.StartsWith("\\u", StringComparison.Ordinal) ? (short)200 : (short)503;
+        Assert.Equal(expected, dom.HttpStatusCode);
+        Assert.Equal(expected, streamed.HttpStatusCode);
+
+        Assert.True(dom.AttributesBytes.AsSpan().SequenceEqual(streamed.AttributesBytes),
+            $"attribute msgpack differs for intValue \"{text}\":\n"
+          + $"  dom  {Convert.ToHexString(dom.AttributesBytes)}\n"
+          + $"  json {Convert.ToHexString(streamed.AttributesBytes)}");
+    }
+
+    /// <summary>Camel case and nothing else — <c>OtlpTraceStreamingParityTests</c>' options.</summary>
+    private static readonly JsonSerializerOptions DomOptions = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        AllowTrailingCommas  = true,
+    };
 
     // ── The payload, in both encodings ────────────────────────────────────────
 

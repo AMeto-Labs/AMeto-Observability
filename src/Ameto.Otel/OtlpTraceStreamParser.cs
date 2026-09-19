@@ -532,11 +532,8 @@ public static class OtlpTraceStreamParser
             else if (reader.ValueTextEquals("intValue"u8))
             {
                 reader.Read();
-                long v = 0;
-                if (reader.TokenType == JsonTokenType.String) Utf8Parser.TryParse(reader.ValueSpan, out v, out _);
-                else reader.TryGetInt64(out v);
-                promo.Capture(keyKind, v);
-                w.Write(v); wrote = true;
+                CaptureAndWriteInt(ref reader, ref w, keyKind, ref promo);
+                wrote = true;
             }
             else if (reader.ValueTextEquals("boolValue"u8))
             {
@@ -588,6 +585,77 @@ public static class OtlpTraceStreamParser
         Span<byte> tmp = stackalloc byte[MaxEscapedKeyBytes];
         int len = reader.CopyString(tmp);
         return SpanPromotion.KindOf(tmp[..len]);
+    }
+
+    /// <summary>
+    /// <c>intValue</c> — WHICH ARRIVES AS A STRING, and a string is whatever the exporter put in
+    /// it. proto3 JSON writes every 64-bit field as a quoted decimal, so this is the ordinary
+    /// shape, not the exotic one; the bare-number branch is the courtesy.
+    ///
+    /// <para><b>The whole text or nothing</b>, which is what the other two routes already do:
+    /// <see cref="SpanPromotion.Capture(SpanKeyKind, ReadOnlySpan{byte})"/> demands
+    /// <c>consumed == length</c>, and the DOM mapper's <c>short.TryParse</c> / <c>long.TryParse</c>
+    /// refuse a trailing remainder outright. This branch discarded BOTH of
+    /// <see cref="Utf8Parser"/>'s answers — the success flag and the count — and captured the
+    /// <c>out</c> value regardless, so <c>{"intValue":"abc"}</c> under
+    /// <c>http.response.status_code</c> promoted 0 and, being the new key, LATCHED it: a later,
+    /// valid status on the same span could no longer be promoted, while protobuf and the DOM both
+    /// returned it. <c>"200abc"</c> promoted 200 for the same reason.</para>
+    ///
+    /// <para>The map value follows the same answer, because the mapper is what OTLP/JSON is held
+    /// to and its <c>WriteAnyValue</c> falls through to nil when <c>long.TryParse</c> says no —
+    /// writing the 0 or the 200 that failed the test would put a number in the blob that the span
+    /// never carried.</para>
+    /// </summary>
+    private static void CaptureAndWriteInt(
+        ref Utf8JsonReader reader, ref MessagePackWriter w,
+        SpanKeyKind keyKind, ref SpanPromotion promo)
+    {
+        if (reader.TokenType == JsonTokenType.String)
+        {
+            if (!TryReadInt64Text(ref reader, out long parsed))
+            {
+                w.WriteNil();   // not an int64 — the DOM mapper writes nil here too
+                return;
+            }
+            promo.Capture(keyKind, parsed);
+            w.Write(parsed);
+            return;
+        }
+
+        reader.TryGetInt64(out long v);   // a bare JSON number: 0 when it does not fit
+        promo.Capture(keyKind, v);
+        w.Write(v);
+    }
+
+    /// <summary>
+    /// The current string token as an <c>int64</c>, whole or not at all.
+    ///
+    /// <para>The escape branch exists for the same reason <see cref="CaptureEscapedString"/> does
+    /// — the DOM path unescapes before it parses, so <c>"200"</c> is 200 there —
+    /// and its buffer needs no pooled fallback: an <c>int64</c> is at most 20 characters of text
+    /// and no character escapes to more than the six bytes of <c>\uXXXX</c>, so an escaped form
+    /// past this buffer cannot unescape to one.</para>
+    /// </summary>
+    private static bool TryReadInt64Text(ref Utf8JsonReader reader, out long value)
+    {
+        if (reader.ValueIsEscaped) return TryReadEscapedInt64(ref reader, out value);
+
+        ReadOnlySpan<byte> raw = reader.ValueSpan;
+        return Utf8Parser.TryParse(raw, out value, out int consumed) && consumed == raw.Length;
+    }
+
+    /// <summary>Its own frame, so the stack buffer is not in every attribute's.</summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static bool TryReadEscapedInt64(ref Utf8JsonReader reader, out long value)
+    {
+        const int MaxEscapedInt64Bytes = 20 * 6;   // 20 characters, \uXXXX each
+
+        if (reader.ValueSpan.Length > MaxEscapedInt64Bytes) { value = 0; return false; }
+
+        Span<byte> tmp = stackalloc byte[MaxEscapedInt64Bytes];
+        int len = reader.CopyString(tmp);
+        return Utf8Parser.TryParse(tmp[..len], out value, out int used) && used == len;
     }
 
     /// <summary>String value of a promoted key: parse the HTTP status / run the URL check.</summary>
