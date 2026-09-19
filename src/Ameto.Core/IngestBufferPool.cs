@@ -68,6 +68,26 @@ public static class IngestBufferPool
     /// </summary>
     public const int MaxPooledBytes = 8 * 1024 * 1024;
 
+    /// <summary>
+    /// ONE ARRAY IN EVERY BUCKET — the smallest pool that can serve a reader which has to double
+    /// its way up to <see cref="MaxPooledBytes"/>, and therefore the floor under
+    /// <see cref="MemoryBudgets.IngestBufferBytes"/>.
+    ///
+    /// <para>The buckets are the powers of two from <c>BoundedByteArrayPool.MinLength</c> (4 KiB)
+    /// to <see cref="MaxPooledBytes"/> (8 MiB) inclusive, so a full set weighs
+    /// <c>2 x MaxPooledBytes - MinLength</c> = 16 773 120 B, just under 16 MiB. That set is not a
+    /// pathological shape — it is the ORDINARY one for the two readers with no Content-Length
+    /// (gRPC, and a chunked CLEF post), which start at 64 KiB and double, leaving an array in
+    /// every bucket on the way up.</para>
+    ///
+    /// <para>A budget under this cannot hold even one such ladder: <see cref="Return"/> drops
+    /// what would exceed it, so the largest arrays — the 8 MiB OTLP bodies, the ones on the large
+    /// object heap this pool exists for — are the ones dropped, and they become LOH garbage on
+    /// every request. Derived here rather than written as a number in
+    /// <c>MemoryBudgets</c>, so raising <see cref="MaxPooledBytes"/> raises the floor with it.</para>
+    /// </summary>
+    public const long FullBucketSetBytes = 2L * MaxPooledBytes - BoundedByteArrayPool.MinLength;
+
     /// <summary>Ceiling on the per-bucket depth, whatever the core count says.</summary>
     public const int MaxArraysPerBucket = 32;
 

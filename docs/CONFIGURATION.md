@@ -197,7 +197,7 @@ Search budgets, and the cross-query cache of decoded segment indexes.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `IndexCacheBytes` | long | *unset* → `min(256 MB, 15 % of the managed-heap limit)` | Budget for the cache of decoded segment indexes, charged at each entry's **retained** size (expanded postings + dictionaries + bloom bits, several times the packed sections they decode from). Unset derives it from the memory this process may use: in a 512 MB container the GC's own heap limit is 384 MB, giving ~57 MB. `0` disables the cache — every query then re-reads and re-decodes the sections it consults. An explicit value always wins, including one larger than the derived figure. |
+| `IndexCacheBytes` | long | *unset* → `min(256 MB, 12 % of the managed-heap limit)` | Budget for the cache of decoded segment indexes, charged at each entry's **retained** size (expanded postings + dictionaries + bloom bits, several times the packed sections they decode from). Unset derives it from the memory this process may use: in a 512 MB container the GC's own heap limit is 384 MB, giving ~46 MB. `0` disables the cache — every query then re-reads and re-decodes the sections it consults. An explicit value always wins, including one larger than the derived figure. |
 | `IndexCacheIdleEvict` | TimeSpan | `"00:10:00"` | Drop cached segment indexes that no query has read for this long. Without it the only thing that ever removes an entry is budget pressure, so a server that answers one wide query and then goes quiet keeps those postings and bloom bits resident for the rest of its life. `0` turns it off (budget pressure only); the first wide query after an eviction pays to re-read and re-decode. |
 | `Timeout` | TimeSpan | `"00:01:00"` | Wall-clock budget for one search. A query that exceeds it is stopped and the client told so, rather than occupying a core until the browser tab is closed. Zero or negative removes the budget. |
 | `MaxConcurrent` | int | `0` | Searches allowed to run at once — each memory-maps segments and decompresses blocks in parallel. `0` = auto (processor count, clamped 2–16); negative = unlimited. Past the limit a request is refused quickly (`503` + `Retry-After`) instead of everything crawling. |
@@ -205,7 +205,31 @@ Search budgets, and the cross-query cache of decoded segment indexes.
 
 **The cache has a second, native ceiling — not settable.** An entry is not all one kind of memory: its decoded postings are managed, but the bloom filter's bits are native (4–8 % of an entry — the postings expand 3–4× when decoded and the bloom's bits do not, so its share of a cached entry is far smaller than its share of the packed sections on disk), so they sit outside the GC heap limit that `IndexCacheBytes` is a share of when unset. That native share is bounded separately at `min(96 MB, 5 % of the physical limit)` — 25.6 MB in a 512 MB container — and whichever ceiling is reached first evicts from the least-recently-used end. Setting `IndexCacheBytes` explicitly raises it too, to `max(that ceiling, min(20 % of the budget you set, 10 % of the physical limit))` — **a budget you set may raise this ceiling, but never past 10 % of what the host has**, because a budget says how much memory this component may hold and only the host says how much of it may be pinned where no collection can reach it. It never moves *down*: a small configured cache keeps the derived ceiling, and in a 512 MB container the ceiling stops at 51 MB however large the budget. Both figures are reported by `GET /api/diagnostics` as `indexCacheNativeBytes` and `indexCacheNativeBudgetBytes`, and `indexCacheNativeEvicted` counts the entries this ceiling has dropped while the total budget still had room — if that number climbs, the cache is bounded by its bloom bits rather than by `IndexCacheBytes`. Under RAM pressure (see `RamTargetPercent`) the whole cache is now dropped along with the hot-tier flush — queries re-read what they need — and `indexCacheShedEvicted` counts how many entries that has cost.
 
-**Upgrading — both cache settings changed behaviour.** `IndexCacheBytes` was a flat 256 MB and is now derived when unset, so an existing install that never set it gets less (~153 MB on a 1 GB VM, ~57 MB in a 512 MB container); and `IndexCacheIdleEvict` is new and **on by default**. To keep the previous behaviour exactly, set `IndexCacheBytes: 268435456` and `IndexCacheIdleEvict: "00:00:00"` — note that in a 512 MB container that budget also raises the native ceiling above, from 25.6 MB to 51.2 MB, where the host clamp rather than the 20 % is what stops it. The effective figures are printed at startup on the `Flush budgets:` line and exposed by `GET /api/diagnostics` as `indexCacheBudgetBytes`, `indexCacheBytes` and `indexCacheIdleEvicted`.
+**Upgrading — both cache settings changed behaviour.** `IndexCacheBytes` was a flat 256 MB and is now derived when unset, so an existing install that never set it gets less (~123 MB on a 1 GB VM, ~46 MB in a 512 MB container); and `IndexCacheIdleEvict` is new and **on by default**. To keep the previous behaviour exactly, set `IndexCacheBytes: 268435456` and `IndexCacheIdleEvict: "00:00:00"` — note that in a 512 MB container that budget also raises the native ceiling above, from 25.6 MB to 51.2 MB, where the host clamp rather than the 20 % is what stops it. The effective figures are printed at startup on the `Flush budgets:` line and exposed by `GET /api/diagnostics` as `indexCacheBudgetBytes`, `indexCacheBytes` and `indexCacheIdleEvicted`.
+
+---
+
+## Metrics options (`Ameto:Metrics`)
+
+The metric hot tier is the in-RAM point buffer; it is flushed to `.mts` files on size, on age, or under memory pressure, and every point in it is already durable in `metrics.wal` before the flush happens.
+
+Every ceiling here is a quantity of **bytes** or of objects, and the ones left unset derive from the memory this process may actually use rather than being the same number on a 512 MB container and a 64 GB host. Managed shares are taken of the GC's own heap hard limit, which in a 512 MB container is 384 MB — not 512. An explicit value always wins.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `HotTierBytes` | long | *unset* → `min(32 MB, 5 % of the managed-heap limit)` | Bytes the hot tier may hold before a flush is forced — ~19 MB in a 512 MB container, 32 MB anywhere with room. **Points are not the unit:** a 16-bucket histogram point carries its own `long[]` and weighs 3.4× a gauge point, so the flat 500 000-*point* threshold this replaces was 20 MB of one or 84 MB of the other, decided without asking the host anything. The 32 MB cap *is* that old threshold restated in bytes (500 000 × the 64 B a scalar point costs), so a host large enough for it flushes on exactly the cadence it always did. |
+| `MinFlushBytes` | long | *unset* → a tenth of `HotTierBytes` | The bar a **periodic** flush tick has to clear to write files at all. Below it the tier keeps accumulating: the points are already in the write-ahead log, and a file per metric name is not worth writing for a handful of them. The forced flush at `HotTierBytes` ignores this. |
+| `WalInitialBytes` | long | *unset* → `min(HotTierBytes, 8 MB)`, floored at 1 MB | Initial capacity of `metrics.wal`. Deriving it can only make the file **smaller** than the 8 MB it has always been, never larger, because a log never shrinks below the capacity it was opened with and a pre-sized one would leave every quiet install a 20–32 MB file at rest for ever. Set it explicitly to pre-size the log and save two unmap/remap cycles under the append lock on a busy host. |
+| `MaxHotAge` | TimeSpan | `"01:00:00"` (1 h) | Flush a non-empty tier at least this often whatever its size. Matches the rollup's own first cutoff, so nothing waits longer because of this. |
+| `FlushCheckInterval` | TimeSpan | `"00:01:00"` (60 s) | How often the flush loop **asks** whether the tier has earned its files. A check interval, not a flush interval — durability belongs to the log, not to this. |
+| `ExemplarsPerMetric` | int | *unset* → derived so `MaxExemplarMetrics` full rings fit half the tier budget, clamped to `[64, 4000]` | Exemplars kept per metric name, for metric-to-trace jumps. **A value set here is bought out of the ring count, not out of the budget:** 1 000 slots on a 512 MB stand's ~19 MB tier admits 48 rings rather than the 256 the cap names, and names past the 48th get no exemplars at all. Lower it, or raise `HotTierBytes`, to get the count back. Past the point where even one ring of that depth would not fit, the depth itself gives way instead. Was a flat `4000`, which is the one default that does not survive on a large host. |
+| `MaxExemplarMetrics` | int | `256` | How many metric names may own an exemplar ring. Past it, exemplars for further names are dropped — a correlation hint, never data; `GET /api/diagnostics` counts the refusals. Raising it makes every ring proportionally **shallower** rather than claiming more memory; lowering it makes them deeper. |
+| `MaxLabelValuesPerKey` | int | `2000` | Distinct values remembered per label key, per metric, for the Explore catalog. |
+| `MaxTrackedSeriesPerMetric` | int | `50000` | Distinct label-set hashes counted per metric before the reported cardinality stops rising. |
+
+**The exemplar rings are the one piece of metric memory nothing takes back.** A ring is allocated at full depth the first time a metric name carries an exemplar, and it is never pruned, never aged out, invisible to the tier's byte accounting and out of reach of the RAM-pressure shed — so `MaxExemplarMetrics` × `ExemplarsPerMetric` × 208 B is resident for the life of the process. That is why the two knobs trade against each other inside one budget (half the hot tier) instead of multiplying freely: at the old defaults, 4 000 slots × 256 names was 213 MB pinned inside a 384 MB heap limit. If a deployment wants deeper rings, it lowers the count.
+
+**Upgrading — the flush cadence is now a byte budget.** An install that never set anything keeps the same cadence on a host with room (32 MB *is* the old 500 000 points at 64 B a point) and flushes earlier on a constrained one, which is the point. `ExemplarsPerMetric` is the exception that changes everywhere: it derives now, to ~300 slots at the 32 MB tier. To pin the old behaviour, set `HotTierBytes: 32000000`, `MinFlushBytes: 3200000` and `ExemplarsPerMetric: 4000` — and on a 512 MB host, expect the exemplar rings to claim the heap that the derivation exists to protect.
 
 ---
 
@@ -341,11 +365,22 @@ Ameto:
     # PayloadPoolBytes:           # unset = max(8192 slabs, 15% of physical), capped at 512 MB; set it under a container or job memory limit
 
   Query:
-    # IndexCacheBytes:            # unset = min(256 MB, 15% of the managed-heap limit); 0 disables
+    # IndexCacheBytes:            # unset = min(256 MB, 12% of the managed-heap limit); 0 disables
     # IndexCacheIdleEvict: "00:10:00"   # 0 = off (budget pressure only)
     Timeout: "00:01:00"
     MaxConcurrent: 0              # 0 = auto (cores, 2-16); negative = unlimited
     QueueWait: "00:00:05"
+
+  Metrics:
+    # HotTierBytes:               # unset = min(32 MB, 5% of the managed-heap limit)
+    # MinFlushBytes:              # unset = a tenth of the tier budget
+    # WalInitialBytes:            # unset = the tier budget, capped at 8 MB
+    MaxHotAge: "01:00:00"
+    FlushCheckInterval: "00:01:00"
+    # ExemplarsPerMetric:         # unset = derived to fit half the tier, clamped [64, 4000]
+    MaxExemplarMetrics: 256       # names that may own an exemplar ring
+    MaxLabelValuesPerKey: 2000
+    MaxTrackedSeriesPerMetric: 50000
 
   Retention:
     VerboseDays: 90

@@ -90,28 +90,131 @@ public readonly struct MemoryBudgets
     /// </summary>
     public const long IngestArenaCapBytes = 512L * 1024 * 1024;
 
+    /// <summary>
+    /// The metric hot tier between flushes — <b>exactly today's threshold, restated in bytes</b>:
+    /// 500 000 points at the 64 B a scalar point costs in the tier (see
+    /// <c>MetricStorageEngine.HotPointBytes</c>). So a host large enough for this cap flushes on
+    /// the same cadence it always did, which is what keeps the existing flush tests' point counts
+    /// meaning what they say, and a smaller one gets a tier it can hold.
+    ///
+    /// <para>The unit is the whole point of the change. A 16-bucket histogram point carries its
+    /// own <c>long[]</c> and is 4.3x a scalar point, so the flat 500 000-POINT threshold was
+    /// 20 MB of gauges or 84 MB of histograms — on a 512 MB container whose GC heap hard limit
+    /// is 384 MB, decided without asking the host anything.</para>
+    /// </summary>
+    public const long MetricHotTierCapBytes = 32L * 1000 * 1000;
+
+    /// <summary>
+    /// The trace hot tier between flushes — <b>50 000 spans at what a span in the tier now
+    /// weighs</b>, the same shape as <see cref="MetricHotTierCapBytes"/>: today's flush cadence,
+    /// restated in the only unit that can bound memory. WP8 is what spends it instead of a span
+    /// count. Defined here rather than in the traces package because this file is cut once per
+    /// round — see the note on <see cref="MetricHotTierFraction"/>.
+    ///
+    /// <para><b>Re-calibrated, because the unit moved under it.</b> 64 MB was 50 000 x 1 117 B,
+    /// the weight of a <c>SpanRecord</c> that had inflated its attributes into a
+    /// <c>Dictionary</c> on the ingest path. WP2, in this same wave, made the tier hold the
+    /// msgpack blob and decode lazily, and <c>TraceHotTierProbe</c> measures an eight-attribute
+    /// span at <b>540 B retained</b> (166 B/span allocated, 148 B with no attributes at all). At
+    /// that weight the old ceiling buys 124 000 spans between flushes, not 50 000 — so a large
+    /// host would have silently flushed at 2.5x the cadence every trace test names.</para>
+    ///
+    /// <para>50 000 x 540 B = 27 MB, which is this. The probe's own gate (a span must retain
+    /// under 700 B) is the drift guard beneath it, and <c>MetricBudgetWiringTests</c> pins
+    /// cap ÷ 540 B to 50 000 ± 10 % so the next change to a span's weight has to move this
+    /// constant instead of the cadence.</para>
+    /// </summary>
+    public const long TraceHotTierCapBytes = 27L * 1000 * 1000;
+
+    /// <summary>
+    /// One trace compaction pass's working set — <c>CompactOnePass</c>'s <c>allSpans</c> at
+    /// <c>MaxSpansPerPass</c> = 120 000, at what a span read back out of a segment now weighs.
+    ///
+    /// <para>128 MB was calibrated on 1 740 B retained a span, which made a full pass
+    /// <b>199 MB</b> measured — the figure that OOM'd the 512 MB stand, and the reason the
+    /// ceiling was deliberately set BELOW a whole pass. WP2's <c>SpanReader</c> yields the blob,
+    /// and <c>TraceCompactionMemoryProbe</c> measures <b>607 B/span retained</b>: a full pass is
+    /// 69 MB. So 128 MB no longer bounds anything a pass can do — it would admit 221 000 spans,
+    /// 1.8x the pass the planner actually builds.</para>
+    ///
+    /// <para>120 000 x 607 B = 72.8 MB, rounded UP to 73 MB so that a host large enough for the
+    /// cap still affords a whole pass rather than 98 % of one. Pinned to ± 10 % of
+    /// <c>MaxSpansPerPass</c> in <c>MetricBudgetWiringTests</c> alongside the tier.</para>
+    /// </summary>
+    public const long TraceMergeCapBytes = 73L * 1000 * 1000;
+
     // ── The shares, when that is the smaller number ──
     //
-    // Managed builds and the index cache together take 45 % of the managed-heap limit; the rest
-    // of the heap is queries, ASP.NET, the drainer and the slack the GC needs to collect at all.
+    // THE MANAGED CUT, RE-MADE ONCE FOR THE WHOLE ROUND. These fractions were cut for the log
+    // path alone — 0.30 builds + 0.15 cache + 0.10 parked buffers = 0.55 — and then the metric
+    // tier, the trace tier and the trace merge pass were appended beside them at 0.05 + 0.05 +
+    // 0.06. Six shares of 0.71 leave a 384 MB heap 0.29 of itself for every query, every ASP.NET
+    // request, the drainer and the slack the GC needs to collect in at all, which is not a heap
+    // that can collect. The logs shares are now 0.25 + 0.12 + 0.05 and the six together claim
+    // 0.58, leaving 42 % — clear of the 40 % the stand has to keep back.
+    //
+    // WHAT WAS CUT, AND WHY IT WAS THESE THREE. The distinction that decides it is peak against
+    // resting. The three logs ceilings bound bursts; the three tier ceilings bound a level that
+    // a flush resets.
+    //   * builds  0.30 -> 0.25 (115 -> 96 MB on the stand). A peak of peaks: the budget is what
+    //     ALL concurrent flushes may hold AT ONCE, and StorageEngine derives its flush WIDTH
+    //     from it, so a smaller share costs a simultaneous flush rather than a smaller flush.
+    //     Which is also the hard floor under this share, and it is closer than it looks: the
+    //     stand's 16 MB tier costs 43.75 MB of index-build state, so anything below 0.228 of a
+    //     384 MB heap limit takes that host from two concurrent builds to ONE and halves its
+    //     flush throughput. 0.25 keeps two with ~10 % to spare (a third would need 0.342), and
+    //     StorageEngineBudgetWiringTests is what fails when a later cut forgets this — as this
+    //     very re-cut did at 0.22, before that test caught it.
+    //   * cache   0.15 -> 0.12 (57 -> 46 MB). The one ceiling here whose loss costs latency and
+    //     not correctness, and the only one with a path that already hands its bytes back
+    //     (IndexCacheIdleEvict, and the RAM-pressure shed). 46 MB on the stand still sits at the
+    //     48 MB that CONFIGURATION.md recommends pinning there by hand.
+    //   * buffers 0.10 -> 0.05 (38 -> 19 MB). The furthest of all of them from a resting level:
+    //     it bounds what is PARKED between requests and never what is live, so a body over the
+    //     pool's reach is still read — just allocated and dropped. What a smaller share changes
+    //     is how much of a burst's LOH churn the pool absorbs, and nothing else. Its own floor is
+    //     one full set of buckets, ~2 x the 8 MB largest array = 16 MB (IngestBufferPool says so
+    //     in those words), which 19 MB clears and 0.04 would not.
+    // The three tier shares were left where WP3 put them. Each is a ceiling that TRIGGERS A
+    // FLUSH when it fills, so it is a resting level by construction, and cutting one buys a file
+    // per metric name per minute — the cost the write-ahead logs exist to avoid — rather than
+    // memory.
+    //
+    // Nothing on a host with room moves, because every one of the six is min(cap, share) and the
+    // caps bind well below the sizes that matter: the first fraction to stop binding is the
+    // largest, and 640 MB of a 16 GB heap limit is 3.9 %. Asserted at 16 GB and 64 GB in
+    // MemoryBudgetTests, since "the re-cut is free above the stand" is the claim that makes it
+    // safe to make at all.
+    //
     // Native tiers take 25 % of the physical limit; the rest of the process's native memory is
     // the runtime itself (~60-90 MB of JIT'd code and runtime data on a self-contained build),
     // the ingest ring, the live hot tier and the WAL mapping — and the managed heap, which sits
-    // inside the same container. In a 512 MB container that is 115 + 57 MB managed and 128 MB
-    // native: 300 MB, 59 % of the container -- not counting the ingest arena, whose default is
+    // inside the same container. In a 512 MB container that is 96 + 46 MB managed and 128 MB
+    // native: 270 MB, 53 % of the container -- not counting the ingest arena, whose default is
     // floored at 8 192 slabs rather than taken as a share and can reach 512 MB by itself (see
     // IngestArenaFraction). Native is the largest single share because a frozen tier is bytes
-    // already written that cannot be given back until its cold segment is; the index cache is the
-    // smallest because losing it costs latency, not correctness.
+    // already written that cannot be given back until its cold segment is; the index cache is
+    // smaller because losing it costs latency, not correctness.
 
     /// <summary>Share of the PHYSICAL limit the frozen-tier backlog may hold.</summary>
     public const double NativeTierFraction = 0.25;
 
-    /// <summary>Share of the MANAGED-HEAP limit concurrent index builds may hold.</summary>
-    public const double ManagedBuildFraction = 0.30;
+    /// <summary>
+    /// Share of the MANAGED-HEAP limit concurrent index builds may hold. <b>0.30 until the
+    /// managed cut was re-made</b> — see the note above: this is a peak across all flushes at
+    /// once, and the flush width derives from it, so the 5 points came out of how many flushes a
+    /// constrained host runs side by side rather than out of any one of them. It cannot go much
+    /// further: below 0.228 the 512 MB stand drops from two concurrent builds to one.
+    /// </summary>
+    public const double ManagedBuildFraction = 0.25;
 
-    /// <summary>Share of the MANAGED-HEAP limit the segment-index cache may hold.</summary>
-    public const double IndexCacheFraction = 0.15;
+    /// <summary>
+    /// Share of the MANAGED-HEAP limit the segment-index cache may hold. <b>0.15 until the
+    /// managed cut was re-made</b>: the cache is the one managed ceiling whose loss costs
+    /// latency rather than correctness, and the only one that already gives bytes back on its
+    /// own (idle eviction, and the RAM-pressure shed).
+    /// </summary>
+    public const double IndexCacheFraction = 0.12;
 
     /// <summary>
     /// Share of the PHYSICAL limit the segment-index cache's NATIVE bloom bits may hold.
@@ -167,8 +270,21 @@ public readonly struct MemoryBudgets
     /// managed <c>byte[]</c> on the large object heap, so this is a share of the GC's limit like
     /// the two above. It bounds what is PARKED, never what is live: a body larger than the pool
     /// will serve is still read, just allocated and dropped rather than kept.
+    ///
+    /// <para><b>0.10 until the managed cut was re-made.</b> That last sentence is why this share
+    /// gave up the largest proportion of itself: what it buys is how much of a burst's LOH churn
+    /// the pool absorbs, and a request that outruns it still succeeds.</para>
+    ///
+    /// <para><b>THE FLOOR IS WHAT MAKES THAT SAFE, and the floor is the pool's own arithmetic.</b>
+    /// One full set of buckets — the powers of two from 4 KiB to the 8 MiB largest array, 16 MiB
+    /// all told — is the smallest pool that can hold what a reader with no Content-Length leaves
+    /// on its way up, and a budget below it drops the LARGEST arrays first. The share alone does
+    /// not always clear it: the stand's 384 MB HEAP LIMIT gives 19.2 MB, but the 384 MB CONTAINER
+    /// an earlier version of this paragraph conflated it with gives a ~288 MB heap limit and
+    /// 14.4 MB. <see cref="IngestBufferPool.FullBucketSetBytes"/> is the floor, so the small host
+    /// gets the set and nobody has to restate the bucket arithmetic to know it.</para>
     /// </summary>
-    public const double IngestBufferFraction = 0.10;
+    public const double IngestBufferFraction = 0.05;
 
     /// <summary>
     /// Share of the PHYSICAL limit the ingest payload arena may reserve — native, like the frozen
@@ -210,6 +326,41 @@ public readonly struct MemoryBudgets
     public const double IngestArenaFraction = 0.15;
 
     /// <summary>
+    /// Share of the MANAGED-HEAP limit the metric hot tier may hold between flushes.
+    ///
+    /// <para><b>Why the metric tier is here at all.</b> Nothing in <c>Ameto.Metrics</c> consulted
+    /// this class: every sizing constant was a literal, identical on a 512 MB container and a
+    /// 64 GB host, and the tier could legally claim more than the LOG tier is allowed
+    /// (<c>HotTier.MaxSizeBytes</c> 16 MB on the stand) while the index cache held 48 MB beside
+    /// it.</para>
+    ///
+    /// <para><b>The re-cut this append owed has been made.</b> The three tier shares went in
+    /// beside logs shares of 0.30 + 0.15 + 0.10, for 0.71 of the managed limit; the logs shares
+    /// are now 0.25 + 0.12 + 0.05 and the six total 0.58. What paid for the tiers was 5 points
+    /// of the index-build peak, 3 of the index cache and 5 of the parked ingest buffers — three
+    /// ceilings that bound a burst, where a tier ceiling is a flush trigger and therefore a
+    /// resting level. The reasoning is set out in full above the fractions, including the floor
+    /// each one stopped at; <c>MemoryBudgetTests</c> spells the new literals and asserts that
+    /// nothing on a large host moved, and <c>MetricBudgetWiringTests</c> holds the sum at 0.58
+    /// so the next share has to come out of one of these rather than out of the heap's
+    /// slack.</para>
+    /// </summary>
+    public const double MetricHotTierFraction = 0.05;
+
+    /// <summary>
+    /// Share of the MANAGED-HEAP limit the trace hot tier may hold between flushes. Consumed by
+    /// WP8, defined here because this file gets exactly one owner per round.
+    /// </summary>
+    public const double TraceHotTierFraction = 0.05;
+
+    /// <summary>
+    /// Share of the MANAGED-HEAP limit one trace compaction pass may hold. Larger than a tier's
+    /// share because a pass reads whole segments back; still a fraction, because 199 MB of it on
+    /// a 384 MB heap limit is how the traces OOM happened.
+    /// </summary>
+    public const double TraceMergeFraction = 0.06;
+
+    /// <summary>
     /// A guard for a runtime that does not report <c>GCHighMemPercent</c>. The .NET 10 runtime
     /// reports the EFFECTIVE percentage, whether configured or chosen by default, including the
     /// higher default at 80 GB of physical memory or more. Measured on 10.0.11: 90 with nothing set,
@@ -224,12 +375,40 @@ public readonly struct MemoryBudgets
     private const long MinNativeBytes           = 16L * 1024 * 1024;
     private const long MinIndexCacheBytes       =  8L * 1024 * 1024;
     private const long MinIndexCacheNativeBytes =  4L * 1024 * 1024;
-    private const long MinIngestBufferBytes     =  8L * 1024 * 1024;
+    /// <summary>
+    /// ONE FULL SET OF THE POOL'S OWN BUCKETS, asked of the pool rather than written down here.
+    ///
+    /// <para>It was 8 MiB, which is HALF a bucket set, and the docstring on
+    /// <see cref="IngestBufferFraction"/> was reading the stand's container size as its heap
+    /// limit when it said 0.05 cleared the floor. A 384 MB container gives the GC a ~288 MB hard
+    /// limit (75 % by default), 5 % of which is 14.4 MB — under the 16 MiB set, and the 8 MiB
+    /// floor did not lift it. Under the set <see cref="IngestBufferPool"/>'s
+    /// <c>BoundedByteArrayPool</c> drops on RETURN whatever would exceed the cap, and what a
+    /// 64 KiB-doubling reader returns LAST is its largest array: the 8 MiB OTLP bodies, the very
+    /// arrays on the large object heap this pool exists to keep off it, dropped on every request
+    /// while the small buckets stayed full.</para>
+    ///
+    /// <para>Derived from <see cref="IngestBufferPool.FullBucketSetBytes"/> — a compile-time
+    /// constant, so this introduces no type-initialization order between the two — which makes
+    /// raising the pool's largest array raise this floor with it instead of silently leaving it
+    /// behind.</para>
+    /// </summary>
+    private const long MinIngestBufferBytes     = IngestBufferPool.FullBucketSetBytes;
     private const long MinIngestArenaBytes      = 16L * 1024 * 1024;   // ~256 slabs at the 64 KB default
+
+    /// <summary>
+    /// 4 MB is ~62 500 scalar points, and a tier that cannot hold a minute of a small exporter
+    /// writes a file per metric name per minute instead — the cost the write-ahead log exists to
+    /// avoid. A host too small for this floor has a file-count problem, not a memory one.
+    /// </summary>
+    private const long MinMetricHotTierBytes    =  4L * 1000 * 1000;
+    private const long MinTraceHotTierBytes     =  8L * 1024 * 1024;
+    private const long MinTraceMergeBytes       = 16L * 1024 * 1024;
 
     private MemoryBudgets(
         long managedLimit, long physicalLimit, long managed, long native, long indexCache,
-        long indexCacheNative, long ingestBuffers, long ingestArena)
+        long indexCacheNative, long ingestBuffers, long ingestArena,
+        long metricHotTier, long traceHotTier, long traceMerge)
     {
         ManagedLimitBytes     = managedLimit;
         PhysicalLimitBytes    = physicalLimit;
@@ -239,6 +418,9 @@ public readonly struct MemoryBudgets
         IndexCacheNativeBytes = indexCacheNative;
         IngestBufferBytes     = ingestBuffers;
         IngestArenaBytes      = ingestArena;
+        MetricHotTierBytes    = metricHotTier;
+        TraceHotTierBytes     = traceHotTier;
+        TraceMergeBytes       = traceMerge;
     }
 
     /// <summary>
@@ -284,11 +466,47 @@ public readonly struct MemoryBudgets
     /// </summary>
     public long IngestArenaBytes { get; }
 
-    /// <summary>True when a share of a limit, not the constant, set a ceiling.</summary>
+    /// <summary>
+    /// Ceiling on the metric hot tier between flushes — the budget
+    /// <c>MetricsOptions.EffectiveHotTierBytes</c> spends. See
+    /// <see cref="MetricHotTierFraction"/>.
+    /// </summary>
+    public long MetricHotTierBytes { get; }
+
+    /// <summary>Ceiling on the trace hot tier between flushes. Consumed by WP8.</summary>
+    public long TraceHotTierBytes { get; }
+
+    /// <summary>Ceiling on one trace compaction pass's working set. Consumed by WP8.</summary>
+    public long TraceMergeBytes { get; }
+
+    /// <summary>
+    /// True when a share of a limit, not the constant, set a ceiling — what
+    /// <c>StorageEngine</c> prints beside the budgets at startup as "host-constrained" rather
+    /// than "fixed ceilings".
+    ///
+    /// <para><b>It has to name every budget a host can cut, and it named three of nine.</b> The
+    /// metric tier, the trace tier and the trace merge pass were added to this struct without
+    /// being added here. <b>That did not give a wrong answer, and the reason is a coincidence
+    /// worth removing:</b> every managed share is taken of the same base, so the budget cut
+    /// FIRST and capped LAST is whichever cap is the largest multiple of its own fraction — the
+    /// index builds, at 640 MB / 0.25 = 2 560 MB of managed limit, against 610 MB for the metric
+    /// tier, 515 MB for the trace tier and 1 160 MB for the merge pass. Any host small enough to
+    /// have a tier cut therefore had its build budget cut too, and the three-term form agreed
+    /// with this one on every host that exists. It was one fraction change away from not, on a
+    /// line whose reader is an operator asking why this install behaves unlike the last one.</para>
+    ///
+    /// <para>The ingest buffer pool and the payload arena are deliberately still absent: the
+    /// arena's default is not this struct's figure at all (a slab-count floor usually decides
+    /// it — see <see cref="IngestArenaFraction"/>), and the pool bounds what is PARKED rather
+    /// than any ceiling a flush runs into.</para>
+    /// </summary>
     public bool IsConstrained =>
-        ManagedBuildBytes < ManagedBuildCapBytes ||
-        NativeTierBytes   < NativeTierCapBytes   ||
-        IndexCacheBytes   < IndexCacheCapBytes;
+        ManagedBuildBytes  < ManagedBuildCapBytes  ||
+        NativeTierBytes    < NativeTierCapBytes    ||
+        IndexCacheBytes    < IndexCacheCapBytes    ||
+        MetricHotTierBytes < MetricHotTierCapBytes ||
+        TraceHotTierBytes  < TraceHotTierCapBytes  ||
+        TraceMergeBytes    < TraceMergeCapBytes;
 
     /// <summary>
     /// One figure for both limits — what a process with no GC hard limit sees, where the heap
@@ -316,7 +534,10 @@ public readonly struct MemoryBudgets
             Share(managedBase,  IndexCacheFraction,   IndexCacheCapBytes,   MinIndexCacheBytes),
             Share(physicalBase, IndexCacheNativeFraction, IndexCacheNativeCapBytes, MinIndexCacheNativeBytes),
             Share(managedBase,  IngestBufferFraction, IngestBufferCapBytes, MinIngestBufferBytes),
-            Share(physicalBase, IngestArenaFraction,  IngestArenaCapBytes,  MinIngestArenaBytes));
+            Share(physicalBase, IngestArenaFraction,  IngestArenaCapBytes,  MinIngestArenaBytes),
+            Share(managedBase,  MetricHotTierFraction, MetricHotTierCapBytes, MinMetricHotTierBytes),
+            Share(managedBase,  TraceHotTierFraction,  TraceHotTierCapBytes,  MinTraceHotTierBytes),
+            Share(managedBase,  TraceMergeFraction,    TraceMergeCapBytes,    MinTraceMergeBytes));
 
         static long Share(long limit, double fraction, long cap, long floor)
         {

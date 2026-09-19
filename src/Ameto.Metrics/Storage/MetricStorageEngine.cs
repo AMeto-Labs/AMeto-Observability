@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
 using K4os.Compression.LZ4;
@@ -16,8 +17,9 @@ namespace Ameto.Metrics.Storage;
 /// </para>
 ///
 /// <para>
-/// Flush policy: every <see cref="FlushIntervalSeconds"/> seconds (default 60 s)
-/// <em>or</em> when the hot-tier point count exceeds <see cref="HotFlushThreshold"/>.
+/// Flush policy: every <c>MetricsOptions.FlushCheckInterval</c> (default 60 s)
+/// <em>or</em> when the hot tier passes <c>MetricsOptions.HotTierBytes</c> — BYTES, because a
+/// 16-bucket histogram point is 4.3x a scalar one and a point count cannot bound memory.
 /// Flushed data is written as a <c>.mts</c> LZ4+msgpack file (see <see cref="MetricWriter"/>).
 /// </para>
 ///
@@ -27,23 +29,52 @@ namespace Ameto.Metrics.Storage;
 /// 1-hour-granularity aggregates. Raw files are deleted after rollup.
 /// </para>
 /// </summary>
-public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetricCatalog, IMetricExemplars, IRetentionTarget, IAsyncDisposable
+public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetricCatalog, IMetricExemplars, IRetentionTarget, IMemoryShedder, IAsyncDisposable
 {
     // ── Configuration ─────────────────────────────────────────────────────────
-    private const int HotFlushThreshold    = 500_000;   // total points before forced flush
-    // Durability belongs to the WAL now, so this is a CHECK interval, not a flush interval:
-    // a tick decides whether the tier has earned its files. It used to be a flush interval,
-    // sized at 60 s purely to bound crash loss to about a minute — and since a flush writes
-    // one .mts PER METRIC NAME, a 40-instrument deployment paid 40 files a minute for that.
-    private const int FlushCheckIntervalSeconds = 60;
-    private const int MaxLabelValuesPerKey  = 2_000;      // cap to bound catalog memory
+    //
+    // EVERY CEILING BELOW USED TO BE A LITERAL, identical on a 512 MB container and a 64 GB
+    // host, and nothing in this module consulted MemoryBudgets at all. They are now read from
+    // MetricsOptions, whose defaults are min(what they have always been, a share of what this
+    // process may use) — so a host large enough for the caps flushes on exactly the cadence it
+    // always did, and a 512 MB one gets a tier it can hold. See MetricsOptions.
 
-    // ── Flush policy ──────────────────────────────────────────────────────────
-    // Below the minimum the tier keeps accumulating: the points are already durable, and a
-    // file per metric name is not worth writing for a handful of them. The age bound still
-    // lands a trickle on disk so it becomes eligible for rollup and retention — one hour
-    // matches the rollup's own first cutoff, so nothing waits longer because of this.
-    private const int MinFlushPoints = 50_000;
+    private readonly MetricsOptions _options;
+
+    /// <summary>
+    /// BYTES, not points, before a flush is forced — see <see cref="EstimatedPointBytes"/>. The
+    /// default is 500 000 scalar points restated in bytes, which is what the threshold has always
+    /// been; a 16-bucket histogram point is 4.3x a scalar one and now costs 4.3x of it.
+    /// </summary>
+    private readonly long _hotFlushBytes;
+
+    /// <summary>
+    /// The bar a PERIODIC tick clears to write files at all. Below it the tier keeps
+    /// accumulating: the points are already durable in the log, and a file per metric name is not
+    /// worth writing for a handful of them. The age bound still lands a trickle on disk so it
+    /// becomes eligible for rollup and retention.
+    /// </summary>
+    private readonly long _minFlushBytes;
+
+    /// <summary>
+    /// How often a tick asks whether the tier has earned its files. A CHECK interval and not a
+    /// flush interval — durability belongs to the log. It used to be a flush interval, sized at
+    /// 60 s purely to bound crash loss to about a minute, and since a flush writes one .mts PER
+    /// METRIC NAME a 40-instrument deployment paid 40 files a minute for that.
+    /// </summary>
+    private readonly TimeSpan _flushCheckInterval;
+
+    /// <summary>
+    /// How long the tier may hold points before a flush is due whatever its size. One hour
+    /// matches the rollup's own first cutoff, so nothing waits longer because of this.
+    /// </summary>
+    private readonly TimeSpan _maxHotAge;
+
+    /// <summary>Distinct values remembered per label key, per metric — bounds catalog memory.</summary>
+    private readonly int _maxLabelValuesPerKey;
+
+    /// <summary>Distinct label-set hashes counted per metric before cardinality stops rising.</summary>
+    private readonly int _maxTrackedSeriesPerMetric;
 
     /// <summary>
     /// How far into the future a point's client-supplied timestamp may reach before it is
@@ -68,7 +99,6 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     /// </summary>
     private static long FutureLimitNanos()
         => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L + MaxFutureSkewNanos;
-    private static readonly TimeSpan MaxHotAge = TimeSpan.FromHours(1);
 
     /// <summary>When the hot tier last went from empty to holding points. Null = empty.</summary>
     private DateTime? _hotSince;
@@ -145,7 +175,15 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
     // ── Hot tier ─────────────────────────────────────────────────────────────
     private readonly ConcurrentDictionary<SeriesKey, HotSeries> _hot = new();
-    private          int _hotPointCount;
+    private          int  _hotPointCount;
+
+    /// <summary>
+    /// The same tier measured in bytes — see <see cref="EstimatedPointBytes"/> for why a point
+    /// count cannot be the memory bound. Kept beside the count rather than instead of it: the
+    /// count is what every existing test and log line speaks in, and the two are maintained by
+    /// the same three statements.
+    /// </summary>
+    private          long _hotPointBytes;
     // 1 while a threshold-triggered flush is queued/running. Without this gate, every
     // Ingest call past the threshold scheduled ANOTHER flush until the first finally
     // reset the counter — a stampede of concurrent flush tasks under load.
@@ -169,9 +207,10 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     //     file the orphan did manage to write — duplicates.
     // Nothing warned about either. MetricWriteAheadLog.CommitFlush returned NOTHING once the
     // log was disposed — indistinguishable from a commit that moved the watermark — so the
-    // catch around it never fired; and in the more common interleaving the commit is not even
-    // reached, because _coldLock.EnterWriteLock() throws ObjectDisposedException first and the
-    // restore path re-enters the other disposed lock. The silence is gone: the commit answers
+    // catch around it never fired; and in the more common interleaving the commit was not even
+    // reached, because _coldLock.EnterWriteLock() threw ObjectDisposedException first (the lock
+    // is no longer disposed — see _coldClosed — so that particular throw is gone, and a late
+    // publish is refused by the fence instead). The silence is gone too: the commit answers
     // MetricWalCommit, and a Refused answer takes the flush's own files back rather than
     // leaving them to be replayed beside (see UnwriteRefusedFlush).
     //
@@ -200,18 +239,145 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     /// <summary>Test hook: hot-tier point count — 0 once a flush has taken its snapshot.</summary>
     internal int HotPointCount => Volatile.Read(ref _hotPointCount);
 
+    /// <summary>Test hook: the same tier in bytes. See <see cref="EstimatedPointBytes"/>.</summary>
+    internal long HotByteCount => Volatile.Read(ref _hotPointBytes);
+
+    /// <summary>
+    /// Test hook: series NAMED by the tier, points or not. The figure the leak was in — it only
+    /// ever grew, because nothing removed a key once a series had been seen.
+    /// </summary>
+    internal int HotSeriesCount => _hot.Count;
+
+    /// <summary>Test hook: series the stale sweep has evicted since start.</summary>
+    internal long StaleSeriesEvicted => Volatile.Read(ref _staleSeriesEvicted);
+
+    /// <summary>
+    /// Test hook: the <see cref="MetricsOptions"/> instance this engine was built from — the
+    /// object, not a copy of its figures.
+    ///
+    /// <para>A suite that pins its thresholds so its premises hold on every host can only assert
+    /// that pinning by comparing constants, and two constants that happen to be equal on the
+    /// host running them prove nothing about the wiring: on a large host the derived ceilings ARE
+    /// the pinned literals by design, so the check passes whether or not anything was injected.
+    /// Reference identity is the one form of the question that has the same answer everywhere.
+    /// See <c>MetricWalTests.The_batches_this_class_ingests_stay_in_the_tier_on_every_host</c>.</para>
+    /// </summary>
+    internal MetricsOptions ConfiguredOptions => _options;
+
+    /// <summary>
+    /// Test hook: the tier size in bytes that <see cref="Ingest"/> actually schedules a flush
+    /// above — the derivation's answer for THIS host, after the explicit-value and floor rules.
+    /// </summary>
+    internal long HotFlushThresholdBytes => _hotFlushBytes;
+
+    private long _staleSeriesEvicted;
+
     // ── Metadata catalog (maintained at ingestion, survives hot-tier drains) ───
     private readonly ConcurrentDictionary<string, MetricMeta> _meta =
         new(StringComparer.Ordinal);
 
     // ── Exemplars (recent, in-memory ring per metric — for metric→trace jumps) ──
-    private const int ExemplarsPerMetric = 4_000;
+    //
+    // TWO ceilings, where there used to be one. A ring is allocated at FULL capacity the first
+    // time a name carries an exemplar — 4 000 slots is ~480 KB with the trace and span id
+    // strings — and nothing bounded the number of NAMES, so an instrumentation change could add
+    // rings until the heap ran out. An exemplar is a correlation hint, never data: past the cap
+    // they are dropped and the metric is unaffected.
+    private readonly int _exemplarsPerMetric;
+    private readonly int _maxExemplarMetrics;
     private readonly ConcurrentDictionary<string, ExemplarRing> _exemplars =
         new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// 1 once <see cref="_exemplars"/> has reached <see cref="_maxExemplarMetrics"/>. Sticky on
+    /// purpose: nothing ever removes a ring, so the count is monotone and the cap, once reached,
+    /// can never be un-reached. See <see cref="ExemplarRingsFull"/> for what that saves.
+    /// </summary>
+    private int _exemplarRingsFull;
+
+    /// <summary>Test hook: exemplars refused because the ring cap was reached.</summary>
+    internal long ExemplarMetricsRefused => Volatile.Read(ref _exemplarMetricsRefused);
+
+    private long _exemplarMetricsRefused;
+
+    /// <summary>
+    /// Test hook: how many times the ring cap has cost a full <c>ConcurrentDictionary.Count</c>.
+    /// Bounded by the number of rings plus one for the life of the process — the one that latches
+    /// the cap — where it used to be one per refused NAME per batch, forever.
+    /// </summary>
+    internal long ExemplarCapCounts => Volatile.Read(ref _exemplarCapCounts);
+
+    private long _exemplarCapCounts;
+
+    /// <summary>
+    /// Test hook: batches that actually needed the exemplar pass. One increment per BATCH that
+    /// carries an exemplar, which is what makes "the pass no longer re-walks every batch"
+    /// assertable rather than a claim about a loop nobody can see.
+    /// </summary>
+    internal long ExemplarPasses => Volatile.Read(ref _exemplarPasses);
+
+    private long _exemplarPasses;
+
+    /// <summary>
+    /// Test hook: series whose catalog entry was walked in full — once per series, where the
+    /// walk used to run once per POINT.
+    /// </summary>
+    internal long MetaRegistrations => Volatile.Read(ref _metaRegistrations);
+
+    private long _metaRegistrations;
 
     // ── Cold tier ─────────────────────────────────────────────────────────────
     private readonly List<MetricSegmentInfo>      _coldSegments = new();
     private readonly ReaderWriterLockSlim          _coldLock     = new();
+
+    /// <summary>
+    /// 1 once the cold list is closed for good, set inside <see cref="_coldLock"/>'s WRITE lock
+    /// at the very end of the teardown. Every taker of that lock checks it and answers empty.
+    ///
+    /// <para><b>What this replaces.</b> The teardown used to <c>Dispose</c> the lock, and four
+    /// callers take it — <see cref="QueryAsync"/>, <see cref="GetMetricNames"/>,
+    /// <c>PerformRollupAsync</c> and <see cref="PruneAsync"/> — of which the first two are
+    /// reached from Kestrel, which is STILL SERVING: hosted services stop in reverse
+    /// registration order and the HTTP pipeline outlives <c>MetricStorageHostedService.StopAsync</c>.
+    /// A query holding the read lock at that moment got an <see cref="ObjectDisposedException"/>
+    /// out of the middle of its response. A query WAITING on it was worse:
+    /// <see cref="ReaderWriterLockSlim.Dispose"/> throws
+    /// <see cref="SynchronizationLockException"/> when a thread is waiting, nothing caught around
+    /// that line, and the <c>finally</c> completed <c>_disposeCompleted</c> anyway — so the other
+    /// two disposers returned believing the teardown had finished, with the fault still
+    /// propagating out of the first.</para>
+    ///
+    /// <para>So the lock is NOT disposed, for the same reason <see cref="_snapshotLock"/> is not:
+    /// it is a process-lifetime singleton whose wait handles are finalizable, and a fence costs
+    /// one volatile read per acquisition where disposal costs an exception nobody can prevent.
+    /// The fence is what makes "no reader touches the list after this" true rather than likely.</para>
+    /// </summary>
+    private int _coldClosed;
+
+    /// <summary>
+    /// Takes the cold read lock, or answers false because the tier is closed — in which case the
+    /// caller must behave as though there were no cold segments. Checked twice on purpose: once
+    /// before waiting, so a late caller never queues behind the teardown's write lock, and once
+    /// after acquiring, because the fence can be set while this one waits.
+    /// </summary>
+    private bool TryEnterColdRead()
+    {
+        if (Volatile.Read(ref _coldClosed) != 0) return false;
+        _coldLock.EnterReadLock();
+        if (Volatile.Read(ref _coldClosed) == 0) return true;
+        _coldLock.ExitReadLock();
+        return false;
+    }
+
+    /// <summary>The same for the write lock. A refused writer must not publish or unlink.</summary>
+    private bool TryEnterColdWrite()
+    {
+        if (Volatile.Read(ref _coldClosed) != 0) return false;
+        _coldLock.EnterWriteLock();
+        if (Volatile.Read(ref _coldClosed) == 0) return true;
+        _coldLock.ExitWriteLock();
+        return false;
+    }
 
     // Cold discovery is deliberately off the startup path (see the constructor), so for a
     // window after construction a query legitimately sees no cold data at all. Without a
@@ -225,6 +391,22 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
     private readonly string                        _dataDir;
     private readonly ILogger<MetricStorageEngine>  _logger;
+
+    /// <summary>
+    /// The clock every age in this engine is read from — the hot tier's age, a series' last
+    /// append, the flush tick. A seam and not a convenience: the sweep below evicts a series
+    /// that has been silent for hours, and a test that has to wait hours, or sleep for a
+    /// proportional fraction of them, is a test nobody runs. <see cref="TimeProvider.System"/>
+    /// in production.
+    /// </summary>
+    private readonly TimeProvider _time;
+
+    /// <summary>
+    /// Registration with <see cref="MemoryShedRegistry"/>, or null when nothing registered this
+    /// engine. See <see cref="RegisterForMemoryPressure"/>.
+    /// </summary>
+    private readonly System.Threading.Lock _shedLock = new();
+    private IDisposable? _shedRegistration;
 
     // ── Background tasks ──────────────────────────────────────────────────────
     private readonly CancellationTokenSource _cts        = new();
@@ -253,23 +435,47 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     /// </summary>
     private int _ingestClosed;
 
-    public MetricStorageEngine(string dataDir, ILogger<MetricStorageEngine> logger)
+    public MetricStorageEngine(string dataDir, ILogger<MetricStorageEngine> logger,
+                               MetricsOptions? options = null, TimeProvider? timeProvider = null)
     {
         _dataDir = dataDir;
         _logger  = logger;
+        _time    = timeProvider ?? TimeProvider.System;
+        _options = options ?? new MetricsOptions();
         Directory.CreateDirectory(dataDir);
+
+        // ONE MemoryBudgets.Current() for the whole engine: it allocates (the GC's configuration
+        // dictionary) and the figures cannot change while the process runs, so reading it per
+        // derived cap would be five dictionaries for five identical answers.
+        var budgets                = MemoryBudgets.Current();
+        _hotFlushBytes             = Math.Max(HotPointBytes, _options.HotTierBytesFor(in budgets));
+        _minFlushBytes             = Math.Min(_hotFlushBytes, _options.MinFlushBytesFor(in budgets));
+        _flushCheckInterval        = _options.FlushCheckInterval > TimeSpan.Zero
+                                        ? _options.FlushCheckInterval : TimeSpan.FromSeconds(60);
+        _maxHotAge                 = _options.MaxHotAge > TimeSpan.Zero
+                                        ? _options.MaxHotAge : TimeSpan.FromHours(1);
+        _staleSeriesAge            = TimeSpan.FromTicks(_maxHotAge.Ticks * 2);
+        _maxLabelValuesPerKey      = Math.Max(1, _options.MaxLabelValuesPerKey);
+        _maxTrackedSeriesPerMetric = Math.Max(1, _options.MaxTrackedSeriesPerMetric);
+        _exemplarsPerMetric        = _options.ExemplarsPerMetricFor(in budgets);
+        // Not MaxExemplarMetrics: that is the operator's ceiling, and the BUDGET is the other
+        // one. Once the depth has hit its 64-slot floor the cap alone bounds nothing — every
+        // further ring is 13 KB of heap nothing can ever take back — so the ring count gives way
+        // instead. See MetricsOptions.MaxExemplarMetricsFor.
+        _maxExemplarMetrics        = _options.MaxExemplarMetricsFor(in budgets);
 
         // The WAL, unlike cold-segment discovery, must be open and replayed before the first
         // point is accepted, or a restart would interleave recovered and live data. Replay is
         // a sequential walk of one mmap'd file bounded by the flush thresholds.
-        _wal = MetricWriteAheadLog.Open(Path.Combine(dataDir, "metrics.wal"), logger: logger);
+        _wal = MetricWriteAheadLog.Open(Path.Combine(dataDir, "metrics.wal"),
+                                        _options.WalInitialBytesFor(in budgets), logger);
         RecoverFromWal();
 
         // Leftover builds from a flush or rollup killed between the write and the rename. HERE,
         // and not beside the cold scan that it was written next to: that scan runs in the flush
         // loop, in the background, while ingest is already being accepted, and a wildcard delete
         // over *.mts.tmp in a directory with live writers unlinks whatever a flush crossing
-        // HotFlushThreshold has open at that moment. On Linux the unlink succeeds under the open
+        // the flush threshold has open at that moment. On Linux the unlink succeeds under the open
         // handle — the writer goes on filling an inode with no name, then FileInfo(tmpPath) or
         // the rename throws — and the flush treats a healthy write as a failed one: the whole
         // snapshot back into the hot tier, the generation abandoned, "Failed to flush metric hot
@@ -338,7 +544,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                 // Exemplars are not logged (see MetricWriteAheadLog) — a flush never
                 // persisted them either, so replay restores exactly what a flush would have.
             };
-            ApplyToHotTier(item, r.Point);
+            ApplyToHotTier(item, r.Point, out _);
             if (r.Point.TimestampUnixNano > 0 && r.Point.TimestampUnixNano < oldestNano)
                 oldestNano = r.Point.TimestampUnixNano;
         }
@@ -350,7 +556,8 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         if (oldestNano is > 0 and < long.MaxValue)
         {
             var at = DateTimeOffset.FromUnixTimeMilliseconds(oldestNano / 1_000_000L).UtcDateTime;
-            _hotSince = at < DateTime.UtcNow ? at : DateTime.UtcNow;
+            var nowUtc = _time.GetUtcNow().UtcDateTime;
+            _hotSince = at < nowUtc ? at : nowUtc;
         }
 
         if (droppedFuture > 0) ReportFutureDrops(droppedFuture, "WAL recovery");
@@ -385,60 +592,213 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
     public int Ingest(ReadOnlySpan<MetricIngestItem> items)
     {
-        int total = 0;
+        long hotBytes = 0;
 
         long futureLimit   = FutureLimitNanos();
         int  droppedFuture = 0;
 
-        // Logging a point and making it visible must be one step with respect to a flush's
-        // snapshot, or a point that lands between the two would be in neither the files nor
-        // (after the commit) the log — durable nowhere despite the guarantee above. Held
-        // shared: this excludes the drain, not other ingests, which need no exclusion.
-        _snapshotLock.EnterReadLock();
+        // WHAT THE EXEMPLAR PASS BELOW NEEDS FROM THIS LOOP, BY ITEM ORDINAL. Exemplars are
+        // optional in OTLP and most exporters send none, but the pass re-walked the WHOLE batch
+        // regardless — re-testing every item's timestamp against the future limit a second time
+        // to discover, item by item, that there was nothing there. Worse, for an item that DID
+        // carry one it re-resolved the series with a second _hot.TryGetValue on a rebuilt
+        // SeriesKey, whose hash is uncached (a string hash of the name and one of the unit) —
+        // work ApplyToHotTier had just done for that same item. The loop already holds both
+        // answers; this is what it costs to remember them. Null while the batch has shown no
+        // exemplar, which is the common case and the one that must stay free. (Folding the pass
+        // INTO this loop is the change that cannot be made: the loop runs under _snapshotLock,
+        // and the exemplar ring must not.)
+        HotSeries?[]? resolved = null;
+
+        // THE HIGHEST ORDINAL THIS BATCH WROTE, so the return path can clear what it wrote
+        // instead of the array it was given. See the finally below.
+        int  lastResolved      = -1;
+        bool exemplarsConsumed = false;
+
         try
         {
-            // The log is gone or is about to be. MetricWriteAheadLog.Append returns SILENTLY
-            // once disposed, so carrying on would file every remaining point of this batch
-            // into a hot tier nobody will flush again and then return normally — the caller is
-            // told a batch was accepted that is durable nowhere. Throwing is what an exporter
-            // reads as a failed export and retries. Checked under the read lock, which the
-            // teardown takes exclusively before it sets this: no Append can straddle the two.
-            ObjectDisposedException.ThrowIf(Volatile.Read(ref _ingestClosed) != 0, this);
-
-            foreach (var item in items)
+            // Logging a point and making it visible must be one step with respect to a flush's
+            // snapshot, or a point that lands between the two would be in neither the files nor
+            // (after the commit) the log — durable nowhere despite the guarantee above. Held
+            // shared: this excludes the drain, not other ingests, which need no exclusion.
+            _snapshotLock.EnterReadLock();
+            try
             {
-                // See MaxFutureSkewNanos. Before the WAL append, so garbage never becomes the
-                // durable copy of anything; counted here, reported once outside the lock.
-                if (item.TimestampUnixNano > futureLimit) { droppedFuture++; continue; }
+                // The log is gone or is about to be. MetricWriteAheadLog.Append returns SILENTLY
+                // once disposed, so carrying on would file every remaining point of this batch
+                // into a hot tier nobody will flush again and then return normally — the caller is
+                // told a batch was accepted that is durable nowhere. Throwing is what an exporter
+                // reads as a failed export and retries. Checked under the read lock, which the
+                // teardown takes exclusively before it sets this: no Append can straddle the two.
+                ObjectDisposedException.ThrowIf(Volatile.Read(ref _ingestClosed) != 0, this);
 
-                var point = new MetricDataPoint
+                for (int i = 0; i < items.Length; i++)
                 {
-                    TimestampUnixNano = item.TimestampUnixNano,
-                    Value             = item.Kind == MetricKind.Histogram
-                                            ? (item.HistogramCount > 0 ? item.HistogramSum / item.HistogramCount : 0)
-                                            : item.ScalarValue,
-                    Count             = item.HistogramCount,
-                    Sum               = item.HistogramSum,
-                    BucketCounts      = item.BucketCounts,   // preserved for real percentiles + heatmap
-                };
+                    var item = items[i];
 
-                _wal.Append(item, in point);
-                total = ApplyToHotTier(item, in point);
+                    // See MaxFutureSkewNanos. Before the WAL append, so garbage never becomes the
+                    // durable copy of anything; counted here, reported once outside the lock.
+                    if (item.TimestampUnixNano > futureLimit) { droppedFuture++; continue; }
+
+                    var point = new MetricDataPoint
+                    {
+                        TimestampUnixNano = item.TimestampUnixNano,
+                        Value             = item.Kind == MetricKind.Histogram
+                                                ? (item.HistogramCount > 0 ? item.HistogramSum / item.HistogramCount : 0)
+                                                : item.ScalarValue,
+                        Count             = item.HistogramCount,
+                        Sum               = item.HistogramSum,
+                        BucketCounts      = item.BucketCounts,   // preserved for real percentiles + heatmap
+                    };
+
+                    _wal.Append(item, in point);
+                    hotBytes = ApplyToHotTier(item, in point, out var series);
+
+                    if (item.Exemplars is { Length: > 0 })
+                    {
+                        // Rented, not allocated: an exemplar-carrying batch is a steady-state shape,
+                        // not a one-off, and this must not put a per-batch array in front of the GC.
+                        resolved ??= ArrayPool<HotSeries?>.Shared.Rent(items.Length);
+                        resolved[i]  = series;
+                        lastResolved = i;
+                    }
+                }
+            }
+            finally { _snapshotLock.ExitReadLock(); }
+
+            if (droppedFuture > 0) ReportFutureDrops(droppedFuture, "ingest");
+
+            if (resolved is not null)
+            {
+                AddExemplars(items, futureLimit, resolved);
+                exemplarsConsumed = true;   // every ordinal it read, it also cleared
+            }
+
+            if (hotBytes >= _hotFlushBytes
+                && System.Threading.Interlocked.CompareExchange(ref _thresholdFlushScheduled, 1, 0) == 0)
+            {
+                // Discarded, necessarily — an ingest call cannot wait on a flush. What the flush
+                // has to say about itself is therefore said by the continuation inside, not here.
+                _ = ScheduleThresholdFlush();
+            }
+
+            return droppedFuture;
+        }
+        finally
+        {
+            // NOTHING THIS BATCH WROTE MAY OUTLIVE IT — and that is a statement about the
+            // ordinals it wrote, not about the array it happened to be handed.
+            //
+            // A HotSeries reference left in a pooled slot keeps a series — its points, its label
+            // set, its catalog entry — alive for as long as the pool holds the array, long after
+            // a stale sweep had evicted it, so it has to go. `clearArray: true` was the blunt way
+            // to say so and it says far too much: ArrayPool rounds a rent up to a power of two,
+            // so a 10 000-point batch is handed 16 384 slots and the return memset all of them
+            // — 128 KB of writes, per exemplar-carrying batch, to null a handful of references
+            // and then re-null 16 000 slots that were already null.
+            //
+            // <see cref="AddExemplars"/> nulls each slot as it consumes it, which is exactly the
+            // set that was written and costs one store per exemplar-carrying item. The span clear
+            // is the net under it: reached only when the pass did not run (an exception on the
+            // way there), bounded by the ordinals this batch actually wrote rather than by the
+            // rented length, and never by the whole array.
+            if (resolved is not null)
+            {
+                if (!exemplarsConsumed && lastResolved >= 0) resolved.AsSpan(0, lastResolved + 1).Clear();
+                ArrayPool<HotSeries?>.Shared.Return(resolved, clearArray: false);
             }
         }
-        finally { _snapshotLock.ExitReadLock(); }
+    }
 
-        if (droppedFuture > 0) ReportFutureDrops(droppedFuture, "ingest");
+    /// <summary>
+    /// Files the batch's exemplars into their per-metric rings. Reached only when the ingest loop
+    /// saw at least one — see <c>resolved</c> in <see cref="Ingest"/> — because the rings are
+    /// optional in OTLP, most exporters send none, and this walk used to run over every batch
+    /// regardless, re-testing each item's timestamp to find nothing.
+    ///
+    /// <para>Outside <c>_snapshotLock</c> on purpose: exemplars are not written to the log and a
+    /// ring takes a lock of its own, so they have no business inside the window that excludes the
+    /// flush drain.</para>
+    ///
+    /// <para><paramref name="resolved"/> is the ingest loop's own answer, by item ordinal: the
+    /// <see cref="HotSeries"/> each exemplar-carrying item was filed into. It is here because
+    /// this pass needs the series' canonical label set and used to go and find it again — a
+    /// second <c>_hot</c> probe, on a <see cref="SeriesKey"/> whose record-struct hash is
+    /// recomputed from scratch (the name's string hash, the unit's, the label set's cached one),
+    /// per exemplar-carrying item, for an answer the caller had already computed. Only the
+    /// ordinals this pass will read are written, and the array is pooled, so the handover costs
+    /// no allocation.</para>
+    /// </summary>
+    private void AddExemplars(ReadOnlySpan<MetricIngestItem> items, long futureLimit, HotSeries?[] resolved)
+    {
+        Interlocked.Increment(ref _exemplarPasses);
 
-        // Exemplars live in their own ring and are not logged, so they stay off that path.
-        foreach (var item in items)
+        // The ring handle is carried across items: an OTLP batch arrives grouped by instrument,
+        // so consecutive items share a name and the reference test replaces a dictionary lookup
+        // per point with a pointer comparison.
+        string?       lastName = null;
+        ExemplarRing? lastRing = null;
+
+        for (int i = 0; i < items.Length; i++)
         {
+            var item = items[i];
+
             // See MaxFutureSkewNanos. A refused point's exemplars are stamped by the same
             // broken clock, and GetExemplars sorts newest-first — an admitted far-future
             // exemplar would sort to the TOP of every answer until the ring rotates it out.
             if (item.TimestampUnixNano > futureLimit) continue;
             if (item.Exemplars is not { Length: > 0 } exs) continue;
-            var ring = _exemplars.GetOrAdd(item.Name, static _ => new ExemplarRing(ExemplarsPerMetric));
+
+            // TAKEN AND CLEARED IN ONE STEP, HERE AND NOT BELOW, because the slot has to be
+            // cleared on every way out of this iteration and there are three of them (a refused
+            // ring, a full ring table, and the ordinary path). The ingest loop writes a slot
+            // exactly when both tests above pass, so this is precisely the written set — which
+            // is what lets the caller return the array without a memset of all 16 384 slots.
+            var series = resolved[i];
+            resolved[i] = null;
+
+            ExemplarRing? ring;
+            if (ReferenceEquals(item.Name, lastName))
+            {
+                ring = lastRing;
+                if (ring is null) continue;                 // the same name, refused above
+            }
+            else if (!_exemplars.TryGetValue(item.Name, out ring))
+            {
+                // The ring cap is checked before GetOrAdd creates one: past it a NEW name is
+                // refused, while names that already have a ring keep working. GetOrAdd's factory
+                // can run more than once under contention, so the count is the gate, not the
+                // allocation.
+                if (ExemplarRingsFull())
+                {
+                    Interlocked.Increment(ref _exemplarMetricsRefused);
+                    lastName = item.Name;
+                    lastRing = null;
+                    continue;
+                }
+                ring = _exemplars.GetOrAdd(item.Name, static (_, s) => new ExemplarRing(s), _exemplarsPerMetric);
+            }
+            lastName = item.Name;
+            lastRing = ring;
+
+            // THE SERIES' CANONICAL LABEL SET, NOT THE POINT'S OWN INSTANCE. A ring entry is the
+            // one piece of metric memory nothing prunes, ages out, sheds or counts, and it used
+            // to be handed `item.Labels` — the LabelSet the OTLP parser builds FRESH for every
+            // data point (~480 B for the five-label HTTP shape, strings included). Nothing else
+            // keeps that instance: `_hot` keeps only the first batch's key, `_meta` keeps only
+            // the first instance of each string, and `MetricDataPoint` carries no labels at all.
+            // So from the second batch on the ring was the sole owner of one distinct label set
+            // per exemplar, and an entry cost 860 B weighed against a budget divisor of
+            // MetricsOptions.ExemplarBytes = 208 — every derived ring 4.1x the budget it was
+            // sized against, inside the heap this whole package exists to fit.
+            //
+            // The ingest loop filed this very point into that series and left the reference in
+            // `resolved`, so there is nothing to look up: the second _hot probe this used to do
+            // re-hashed a SeriesKey the caller had just hashed. Holding the reference is also
+            // stricter than the lookup was — a stale sweep between the two passes could make the
+            // lookup miss and fall back to the point's own (uncanonical, uniquely owned) set.
+            var labels = series is not null ? series.Labels : item.Labels;
+
             foreach (var ex in exs)
             {
                 // The exemplar's OWN clock, not the point's: OTLP parses time_unix_nano per
@@ -452,20 +812,39 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                     Value             = ex.Value,
                     TraceId           = ex.TraceId,
                     SpanId            = ex.SpanId,
-                    Labels            = item.Labels,
+                    Labels            = labels,
                 });
             }
         }
+    }
 
-        if (total >= HotFlushThreshold
-            && System.Threading.Interlocked.CompareExchange(ref _thresholdFlushScheduled, 1, 0) == 0)
-        {
-            // Discarded, necessarily — an ingest call cannot wait on a flush. What the flush
-            // has to say about itself is therefore said by the continuation inside, not here.
-            _ = ScheduleThresholdFlush();
-        }
+    /// <summary>
+    /// Whether a metric name that has no ring may still take one.
+    ///
+    /// <para><b>The count is asked at most once more than there are rings.</b>
+    /// <c>ConcurrentDictionary.Count</c> acquires EVERY lock in the table — the reason
+    /// <see cref="RegisterMeta"/> tests <c>ContainsKey</c> before it counts — and this dictionary
+    /// is built with the default <c>growLockArray</c>, so a table holding the 256-name cap
+    /// carries 64-128 monitors, taken from lock 0 upwards, on the ingest path. Nothing ever
+    /// removes a ring, so the count is monotone and the answer past the cap is permanently yes:
+    /// a deployment with more exemplar-carrying instruments than the cap was paying one full
+    /// all-locks sweep per REFUSED NAME per batch, for the life of the process, with every
+    /// concurrent ingest thread's exemplar pass serialising against the others inside it.</para>
+    ///
+    /// <para>The latch is deliberately set only here and never cleared. <c>GetOrAdd</c>'s factory
+    /// can run more than once under contention and the count is the gate rather than the
+    /// allocation, so the table may end a race a ring or two over the cap — which is what the
+    /// cap has always allowed, and one more reason the answer cannot come back down.</para>
+    /// </summary>
+    private bool ExemplarRingsFull()
+    {
+        if (Volatile.Read(ref _exemplarRingsFull) != 0) return true;
 
-        return droppedFuture;
+        Interlocked.Increment(ref _exemplarCapCounts);
+        if (_exemplars.Count < _maxExemplarMetrics) return false;
+
+        Volatile.Write(ref _exemplarRingsFull, 1);
+        return true;
     }
 
     /// <summary>
@@ -522,7 +901,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
     /// <summary>
     /// Test hook: schedules a threshold flush exactly as crossing
-    /// <see cref="HotFlushThreshold"/> does, without the 500k points needed to cross it.
+    /// the byte threshold does, without the points needed to cross it.
     /// </summary>
     internal Task ScheduleThresholdFlushForTest() => ScheduleThresholdFlush();
 
@@ -533,6 +912,14 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     /// to earn its files exactly as it does in the loop.
     /// </summary>
     internal Task FlushPeriodicForTest() => FlushIfDueAsync();
+
+    /// <summary>
+    /// Test hook: the flush-check tick's stale sweep on its own, synchronously, with its evicted
+    /// count returned. What <see cref="FlushPeriodicForTest"/> reaches on an idle tier, minus the
+    /// async machinery around it — so a measurement of what the sweep costs is a measurement of
+    /// the sweep.
+    /// </summary>
+    internal int SweepStaleSeriesForTest() => SweepStaleSeriesIfIdle();
 
     private async Task RunThresholdFlushAsync(Task gate)
     {
@@ -557,43 +944,107 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     }
 
     /// <summary>
-    /// Files one point into its series and the metadata catalog, returning the new hot-tier
-    /// point count. Shared by live ingest and WAL replay — replay must not write back into
-    /// the log it is reading from, and must not trigger a flush from the constructor.
+    /// Files one point into its series and the metadata catalog, returning the hot tier's new
+    /// size IN BYTES — the figure the flush threshold is spent in. Shared by live ingest and WAL
+    /// replay: replay must not write back into the log it is reading from, and must not trigger
+    /// a flush from the constructor.
+    ///
+    /// <para><paramref name="series"/> is the series the point landed on, handed out because the
+    /// exemplar pass needs exactly that instance and resolving it is the expensive half of this
+    /// method — see <see cref="AddExemplars"/>. Replay discards it.</para>
     /// </summary>
-    private int ApplyToHotTier(MetricIngestItem item, in MetricDataPoint point)
+    private long ApplyToHotTier(MetricIngestItem item, in MetricDataPoint point, out HotSeries series)
     {
-        var key    = new SeriesKey(item.Name, item.Kind, item.Unit, item.Labels);
-        var series = _hot.GetOrAdd(key, static _ => new HotSeries());
+        var key = new SeriesKey(item.Name, item.Kind, item.Unit, item.Labels);
+        series  = _hot.GetOrAdd(key, static k => new HotSeries(k.Labels));
 
-        series.Append(point, item.BucketBounds);
-        UpdateMeta(item);
+        series.Append(point, item.BucketBounds, _time.GetUtcNow().UtcTicks);
+        UpdateMeta(item, series);
 
-        int total = System.Threading.Interlocked.Increment(ref _hotPointCount);
-        if (total == 1) _hotSince = DateTime.UtcNow;   // tier went from empty to holding data
-        return total;
+        long bytes = System.Threading.Interlocked.Add(ref _hotPointBytes, EstimatedPointBytes(in point));
+        int  total = System.Threading.Interlocked.Increment(ref _hotPointCount);
+        if (total == 1) _hotSince = _time.GetUtcNow().UtcDateTime;   // tier went from empty to holding data
+        return bytes;
     }
 
-    private void UpdateMeta(MetricIngestItem item)
+    /// <summary>
+    /// What one point weighs in the tier, in the unit the memory budget is spent in.
+    ///
+    /// <para>A POINT COUNT IS THE WRONG UNIT and that is the whole reason this exists: a
+    /// 16-bucket histogram point carries its own <c>long[]</c> and is 4.3x a scalar point
+    /// (measured: 346 B against 185 B resident), so the same 500 000-point ceiling is 20 MB of
+    /// gauges or 84 MB of histograms — on a host that was never asked how much it had.</para>
+    ///
+    /// <para><see cref="HotPointBytes"/> is the marginal cost of a scalar point, not the 40 bytes
+    /// <see cref="MetricDataPoint"/> measures: the points live in a <see cref="List{T}"/> that
+    /// grows by doubling, so a series holding N points owns between N and 2N slots. Measured at
+    /// 300 points a series (capacity 512): 75 B a point including the series' own share. The
+    /// bucket array, by contrast, is exact — the reconnaissance's gauge-to-histogram delta was
+    /// 153 B a point for 16 buckets against the 152 B this computes.</para>
+    /// </summary>
+    internal const int HotPointBytes       = 64;
+    private  const int BucketArrayOverhead = 24;   // object header + length, on 64-bit
+
+    internal static int EstimatedPointBytes(in MetricDataPoint point) =>
+        point.BucketCounts is { Length: > 0 } buckets
+            ? HotPointBytes + BucketArrayOverhead + buckets.Length * sizeof(long)
+            : HotPointBytes;
+
+    /// <summary>
+    /// Keeps the Explore catalog current for one ingested point.
+    ///
+    /// <para><b>The steady state is "this series is already known", and it now costs one field
+    /// read.</b> This used to run <c>_meta.GetOrAdd</c> plus a nested <c>GetOrAdd</c> and a
+    /// <c>ContainsKey</c> PER LABEL PER POINT — four to eight concurrent-dictionary lookups on
+    /// every data point, on the ingest hot path, in a state where by construction nothing can
+    /// have changed: a label set IS the series identity, so a point with different labels is a
+    /// different series and lands on a different <see cref="HotSeries"/>. The same argument
+    /// covers <c>Kind</c> and <c>Unit</c>, which <c>SeriesKey</c> also carries.</para>
+    ///
+    /// <para>So the catalog entry is cached on the series the first time it is registered, and
+    /// after that only <c>LastSeenMs</c> — the one field that genuinely moves — is touched. A
+    /// series evicted by the stale sweep and re-created registers again, which is correct and
+    /// idempotent: <c>AddSeries</c> is keyed on the label-set hash and the label values are a
+    /// set.</para>
+    ///
+    /// <para>The race between two threads first seeing the same new series is benign: both do
+    /// the full walk, both write the same <c>MetricMeta</c> instance (it comes from a
+    /// <c>GetOrAdd</c>), and every step of the walk is idempotent.</para>
+    /// </summary>
+    private void UpdateMeta(MetricIngestItem item, HotSeries series)
     {
-        var meta = _meta.GetOrAdd(item.Name, static _ => new MetricMeta());
-        meta.Kind = item.Kind;
-        if (!string.IsNullOrEmpty(item.Unit)) meta.Unit = item.Unit;
+        var meta = series.Meta;
+        if (meta is null)
+        {
+            meta = RegisterMeta(item);
+            series.Meta = meta;
+        }
 
         long ms = item.TimestampUnixNano / 1_000_000L;
         if (ms > meta.LastSeenMs) meta.LastSeenMs = ms;
+    }
+
+    /// <summary>
+    /// The full catalog walk — once per series, not once per point. See <see cref="UpdateMeta"/>.
+    /// </summary>
+    private MetricMeta RegisterMeta(MetricIngestItem item)
+    {
+        var meta = _meta.GetOrAdd(item.Name, static (_, cap) => new MetricMeta(cap), _maxTrackedSeriesPerMetric);
+        meta.Kind = item.Kind;
+        if (!string.IsNullOrEmpty(item.Unit)) meta.Unit = item.Unit;
 
         foreach (var (k, v) in item.Labels.Pairs)
         {
             var values = meta.LabelValues.GetOrAdd(k, static _ => new ConcurrentDictionary<string, byte>(StringComparer.Ordinal));
             // ContainsKey first: ConcurrentDictionary.Count acquires EVERY lock in the
-            // table, and this ran once per label per data point. In the steady state the
-            // value is already known, so the cap only needs checking for a new one.
+            // table, and the cap only needs checking for a value that is actually new.
             if (values.ContainsKey(v)) continue;
-            if (values.Count < MaxLabelValuesPerKey) values.TryAdd(v, 0);
+            if (values.Count < _maxLabelValuesPerKey) values.TryAdd(v, 0);
         }
 
         meta.AddSeries(item.Labels.GetHashCode());
+        Interlocked.Increment(ref _metaRegistrations);
+        return meta;
     }
 
     // ── IMetricCatalog ────────────────────────────────────────────────────────
@@ -653,21 +1104,55 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
     // ── IMetricQuery ──────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// Every metric name this server can answer for, hot and cold, filtered by
+    /// <paramref name="prefix"/> and sorted — the Explore page's first request.
+    ///
+    /// <para><b>The hot half comes from <c>_meta</c>, not from <c>_hot</c>.</b> Reading
+    /// <c>_hot.Keys</c> on a <see cref="ConcurrentDictionary{TKey,TValue}"/> acquires EVERY lock
+    /// in its table and materialises a list of every SERIES — at the sandbox's 38 741 series that
+    /// is ~1.2 MB allocated and every ingest thread in the process blocked for the duration, per
+    /// page load, to produce a few dozen distinct names. <c>_meta</c> is keyed by name, is
+    /// maintained on the same ingest path, is seeded from the cold segments at startup and
+    /// survives hot-tier drains, so it holds tens of entries where <c>_hot</c> holds tens of
+    /// thousands — and is enumerated without taking a lock at all.</para>
+    ///
+    /// <para>The answer is the same set: every name in <c>_hot</c> got there through
+    /// <c>ApplyToHotTier</c>, which registers it in <c>_meta</c> in the same call, and every name
+    /// only in <c>_meta</c> is a name the cold segments also carry. The one difference is a
+    /// window of a few instructions, on the very first point of a brand-new metric, between the
+    /// series being added and its metadata — where a caller could once have seen a name whose
+    /// catalog entry did not exist yet.</para>
+    ///
+    /// <para>The ordering is <c>Comparer&lt;string&gt;.Default</c>, as <c>OrderBy(n =&gt; n)</c>
+    /// was — culture-sensitive, and deliberately unchanged: this is the list the UI renders.</para>
+    /// </summary>
     public IEnumerable<string> GetMetricNames(string? prefix = null)
     {
-        var hotNames = _hot.Keys
-            .Select(k => k.Name)
-            .Distinct(StringComparer.Ordinal);
+        var names = new List<string>(_meta.Count + 16);
+        var seen  = new HashSet<string>(StringComparer.Ordinal);
 
-        _coldLock.EnterReadLock();
-        IEnumerable<string> coldNames;
-        try { coldNames = _coldSegments.Select(s => s.MetricName).Distinct(StringComparer.Ordinal).ToList(); }
-        finally { _coldLock.ExitReadLock(); }
+        foreach (var (name, _) in _meta)
+            if (Matches(name, prefix) && seen.Add(name)) names.Add(name);
 
-        return hotNames.Concat(coldNames)
-            .Distinct(StringComparer.Ordinal)
-            .Where(n => prefix is null || n.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
-            .OrderBy(n => n);
+        if (TryEnterColdRead())
+        {
+            try
+            {
+                for (int i = 0; i < _coldSegments.Count; i++)
+                {
+                    string name = _coldSegments[i].MetricName;
+                    if (Matches(name, prefix) && seen.Add(name)) names.Add(name);
+                }
+            }
+            finally { _coldLock.ExitReadLock(); }
+        }
+
+        names.Sort();
+        return names;
+
+        static bool Matches(string name, string? prefix) =>
+            prefix is null || name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
     }
 
     public async IAsyncEnumerable<MetricSeries> QueryAsync(
@@ -702,17 +1187,21 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
             };
         }
 
-        // Cold tier
-        List<MetricSegmentInfo> coldCandidates;
-        _coldLock.EnterReadLock();
-        try
+        // Cold tier. A closed tier answers empty rather than throwing out of the middle of a
+        // response: this enumerator is driven by Kestrel, which serves for a while after the
+        // engine's hosted service has stopped.
+        List<MetricSegmentInfo> coldCandidates = [];
+        if (TryEnterColdRead())
         {
-            coldCandidates = _coldSegments
-                .Where(s => s.MetricName.Equals(metricName, StringComparison.OrdinalIgnoreCase)
-                         && s.MaxNano >= fromNano && s.MinNano <= toNano)
-                .ToList();
+            try
+            {
+                coldCandidates = _coldSegments
+                    .Where(s => s.MetricName.Equals(metricName, StringComparison.OrdinalIgnoreCase)
+                             && s.MaxNano >= fromNano && s.MinNano <= toNano)
+                    .ToList();
+            }
+            finally { _coldLock.ExitReadLock(); }
         }
-        finally { _coldLock.ExitReadLock(); }
 
         foreach (var seg in coldCandidates)
         {
@@ -773,7 +1262,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
         while (!ct.IsCancellationRequested)
         {
-            try { await Task.Delay(TimeSpan.FromSeconds(FlushCheckIntervalSeconds), ct); }
+            try { await Task.Delay(_flushCheckInterval, _time, ct); }
             catch (OperationCanceledException) { break; }
 
             // A tick that throws must cost one tick. Bare, this await made any escaping
@@ -796,14 +1285,29 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     /// <c>.mts</c> per metric name, or old enough that it should become rollup- and
     /// retention-eligible regardless. Points below both bars stay in memory, durable through
     /// the WAL and fully queryable — every read path consults the hot tier.
+    ///
+    /// <para><b>THE STALE SWEEP RUNS ON THE TICK, NOT ONLY ON A FLUSH THAT CARRIES POINTS.</b>
+    /// It used to ride along with the drain and nowhere else, so the one tier that could never
+    /// shed a series was the one with nothing left to report: the early return below, and the
+    /// <c>snapshot.Count == 0</c> return inside <see cref="FlushHotTierAsync"/>, both stand
+    /// BEFORE the sweep. A deployment whose 30 000 series stop arriving — an exporter removed, a
+    /// fleet scaled to zero, a label that stopped being emitted — then keeps every
+    /// <c>HotSeries</c>, <c>SeriesKey</c>, <c>LabelSet</c> and dictionary node for the life of
+    /// the process, because a tier with no points never flushes again. Nothing but
+    /// <see cref="Shed"/> under RAM pressure could take them back, and pressure is exactly the
+    /// state this is supposed to keep the process out of.</para>
+    ///
+    /// <para>The cost of running it on every tick instead is one pass over <c>_hot</c> under the
+    /// write lock — the same pass the drain was already making — and it is only ever paid when
+    /// there is nothing else for the tick to do.</para>
     /// </summary>
     private async Task FlushIfDueAsync()
     {
         int points = Volatile.Read(ref _hotPointCount);
-        if (points == 0) return;
+        if (points == 0) { SweepStaleSeriesIfIdle(); return; }
 
-        bool due = points >= MinFlushPoints
-                || (_hotSince is { } since && DateTime.UtcNow - since >= MaxHotAge);
+        bool due = Volatile.Read(ref _hotPointBytes) >= _minFlushBytes
+                || (_hotSince is { } since && _time.GetUtcNow().UtcDateTime - since >= _maxHotAge);
         if (due) await FlushHotTierAsync().ConfigureAwait(false);
     }
 
@@ -889,11 +1393,18 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                     // it the finally below would be held up by its comment alone.
                     OnGenerationOpenedForTest?.Invoke();
 
+                    // The stale sweep rides along with the drain: one pass over _hot, and the
+                    // eviction happens where it is provably safe — see SweepStaleSeriesLocked.
+                    long staleBefore = _time.GetUtcNow().UtcTicks - _staleSeriesAge.Ticks;
+                    List<SeriesKey>? stale = null;
+
                     foreach (var (k, v) in _hot)
                     {
                         var points = v.Drain();
                         if (points.Count > 0)
                             snapshot.Add((k, new HotSeries(points, v.Bounds)));
+                        else if (v.LastAppendUtcTicks < staleBefore)
+                            (stale ??= []).Add(k);
                     }
 
                     if (snapshot.Count == 0)
@@ -906,12 +1417,22 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                         // a non-zero count seen from inside the WRITE lock means some series holds
                         // points. Kept because the two are separate pieces of state and this costs
                         // one comparison.
+                        //
+                        // The sweep happens FIRST: the scan above has already named the candidates
+                        // and this return is the other door out of the drain, so leaving through it
+                        // without evicting is how an idle tier kept its series for ever.
+                        if (stale is not null) SweepStaleSeriesLocked(stale, _staleSeriesAge);
                         _wal.AbandonFlush(flushedGeneration);
                         return;
                     }
 
                     System.Threading.Interlocked.Exchange(ref _hotPointCount, 0);
+                    System.Threading.Interlocked.Exchange(ref _hotPointBytes, 0);
                     _hotSince = null;
+
+                    // AFTER the counters are zeroed, as the drain itself is: a series evicted
+                    // here holds nothing that either of them still counts.
+                    if (stale is not null) SweepStaleSeriesLocked(stale, _staleSeriesAge);
                 }
                 finally { _snapshotLock.ExitWriteLock(); }
 
@@ -942,21 +1463,29 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                     // leaves on disk — it deletes the files it had already written before it
                     // rethrows — so "the write failed" really does mean no file carries these
                     // points and putting every one of them back cannot duplicate anything.
-                    int restored = 0;
+                    int  restored      = 0;
+                    long restoredBytes = 0;
                     _snapshotLock.EnterWriteLock();
                     try
                     {
+                        long nowTicks = _time.GetUtcNow().UtcTicks;
                         foreach (var (key, snap) in snapshot)
                         {
-                            var live = _hot.GetOrAdd(key, static _ => new HotSeries());
+                            // The snapshot's list is the one Drain handed over, and `live`'s is the
+                            // fresh one it left behind — two different lists, which is what makes
+                            // appending into one while reading the other sound. GetOrAdd rather
+                            // than a lookup because the stale sweep above may have evicted the key.
+                            var live = _hot.GetOrAdd(key, static k => new HotSeries(k.Labels));
                             foreach (var p in snap.GetPoints(long.MinValue, long.MaxValue))
                             {
-                                live.Append(p, snap.Bounds);
+                                live.Append(p, snap.Bounds, nowTicks);
+                                restoredBytes += EstimatedPointBytes(in p);
                                 restored++;
                             }
                         }
                         System.Threading.Interlocked.Add(ref _hotPointCount, restored);
-                        if (restored > 0) _hotSince ??= DateTime.UtcNow;
+                        System.Threading.Interlocked.Add(ref _hotPointBytes, restoredBytes);
+                        if (restored > 0) _hotSince ??= _time.GetUtcNow().UtcDateTime;
 
                         // Inside the same lock as the restore, and that matters: the generation is
                         // given back only once the points it covers are visible again, so the next
@@ -1001,9 +1530,14 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                         return;
                     }
 
-                    _coldLock.EnterWriteLock();
-                    try { _coldSegments.AddRange(infos); }
-                    finally { _coldLock.ExitWriteLock(); }
+                    // A closed tier cannot be published to. The files are complete and durable
+                    // where they are; the next start's LoadColdSegments finds them, which is the
+                    // same cost the catch below already accepts.
+                    if (TryEnterColdWrite())
+                    {
+                        try { _coldSegments.AddRange(infos); }
+                        finally { _coldLock.ExitWriteLock(); }
+                    }
 
                     _logger.LogDebug("Flushed {SeriesCount} metric series to {FileCount} .mts files",
                         snapshot.Count, infos.Count);
@@ -1032,6 +1566,249 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
             }
         }
         finally { _flushGate.Release(); }
+    }
+
+    // ── Stale-series sweep ────────────────────────────────────────────────────
+
+    /// <summary>
+    /// How long a series may hold no points before the tier stops naming it. Twice
+    /// <c>MetricsOptions.MaxHotAge</c>, so a series is only evicted well after the flush that would
+    /// have carried its points: a series still reporting at any cadence the tier is built for
+    /// is never a candidate, and one that comes back is re-created for free — its cold data is
+    /// untouched, and <c>_meta</c> (which the catalog and the names list are fed from) never
+    /// forgets it at all.
+    /// </summary>
+    private readonly TimeSpan _staleSeriesAge;
+
+    /// <summary>
+    /// Drops the named series from the hot tier. <b>Call only under <c>_snapshotLock</c>'s WRITE
+    /// lock</b>: ingest holds that lock shared across a whole batch and does
+    /// <c>_hot.GetOrAdd</c> then <c>Append</c> as two steps, so evicting between them would file
+    /// a point into an object no query can reach — the point acknowledged, durable in the log,
+    /// and invisible until the next restart replays it.
+    ///
+    /// <para>The pair-wise <c>TryRemove</c> is a compare-and-remove: it takes the key out only
+    /// while it still maps to the very object that was found empty, so a series re-created
+    /// between the scan and the removal survives. Under the write lock nothing can do that; the
+    /// overload is here because <see cref="Shed"/> holds the same lock on a try-basis and the
+    /// cost of being right anyway is one reference comparison per evicted series.</para>
+    /// </summary>
+    private int SweepStaleSeriesLocked(List<SeriesKey> stale, TimeSpan idleFor)
+    {
+        int evicted = 0;
+        foreach (var key in stale)
+            if (_hot.TryGetValue(key, out var series) && TryEvictLocked(key, series)) evicted++;
+
+        ReportSweep(evicted, idleFor);
+        return evicted;
+    }
+
+    /// <summary>
+    /// The same eviction, over a tier NOBODY has just drained: it finds its own candidates. This
+    /// is the form the flush-check tick and <see cref="Shed"/> need, because neither has a drain's
+    /// list to ride along with.
+    ///
+    /// <para>Removing from a <see cref="System.Collections.Concurrent.ConcurrentDictionary{TKey,TValue}"/>
+    /// while enumerating it is defined — the enumerator is a moment-in-time walk, not a snapshot —
+    /// so the candidate list the drain has to build (it is scanning for something else at the same
+    /// time) is not needed here. What it costs is ONE object: a concurrent dictionary's
+    /// <c>GetEnumerator</c> returns the interface and not a struct, so <c>foreach</c> allocates
+    /// that enumerator however few series it then walks. Nothing per series and nothing per
+    /// eviction, which is the part that scales; a sweep is a per-minute tick, not a per-point
+    /// path, and one enumerator is cheaper than the list it replaces.</para>
+    ///
+    /// <para><b>Call only under <c>_snapshotLock</c>'s WRITE lock</b>, for the reason
+    /// <see cref="SweepStaleSeriesLocked(List{SeriesKey}, TimeSpan)"/> gives.</para>
+    /// </summary>
+    private int SweepIdleSeriesLocked(long idleBeforeTicks, TimeSpan idleFor)
+    {
+        int evicted = 0;
+        foreach (var (key, series) in _hot)
+            if (series.LastAppendUtcTicks < idleBeforeTicks && TryEvictLocked(key, series)) evicted++;
+
+        ReportSweep(evicted, idleFor);
+        return evicted;
+    }
+
+    /// <summary>
+    /// Takes the key out only while it still maps to the very object that was found empty, and
+    /// only while it IS empty — see the class remarks above for why both halves matter.
+    /// </summary>
+    private bool TryEvictLocked(SeriesKey key, HotSeries series) =>
+        series.PointCount == 0 && _hot.TryRemove(new KeyValuePair<SeriesKey, HotSeries>(key, series));
+
+    /// <summary>
+    /// What a sweep says about itself, AT THE PRICE OF WHAT IT SAYS WHEN NOBODY IS LISTENING.
+    ///
+    /// <para>This ran <c>_logger.LogDebug(…, evicted, idleFor.TotalHours, _hot.Count)</c>, which
+    /// binds to <c>LoggerExtensions.LogDebug(ILogger, string, params object?[])</c>: the
+    /// <c>object[3]</c> and the three boxes — an <c>int</c>, a <c>double</c>, an <c>int</c> —
+    /// are built at the CALL SITE, before <c>IsEnabled</c> is ever consulted, and Debug is off
+    /// in every deployment this round exists for. Worse than the 112 bytes was the third
+    /// argument: <see cref="System.Collections.Concurrent.ConcurrentDictionary{TKey,TValue}.Count"/>
+    /// acquires EVERY lock in the table to answer, and it was being asked from inside
+    /// <c>_snapshotLock</c>'s write lock — the lock that excludes all ingest — to fill a hole in
+    /// a string nobody would read.</para>
+    ///
+    /// <para><see cref="LoggerMessage.Define{T1,T2}"/> asks <c>IsEnabled</c> first and formats
+    /// nothing when the answer is no: 0 bytes, one virtual call. The count of still-named series
+    /// is gone rather than moved outside the lock — <c>StaleSeriesEvicted</c> and the sweep's own
+    /// figure are what an operator can act on, and the tier's size is <c>/api/diagnostics</c>'
+    /// question, asked where no lock is held.</para>
+    /// </summary>
+    private static readonly Action<ILogger, int, double, Exception?> _staleSeriesSwept =
+        LoggerMessage.Define<int, double>(
+            Microsoft.Extensions.Logging.LogLevel.Debug,
+            new Microsoft.Extensions.Logging.EventId(1, "MetricStaleSeriesSwept"),
+            "Hot metric tier dropped {Count} series idle for over {Hours} h");
+
+    private void ReportSweep(int evicted, TimeSpan idleFor)
+    {
+        if (evicted == 0) return;
+        Interlocked.Add(ref _staleSeriesEvicted, evicted);
+        _staleSeriesSwept(_logger, evicted, idleFor.TotalHours, null);
+    }
+
+    /// <summary>
+    /// The flush-check tick's sweep, for a tier that has no points to flush — see
+    /// <see cref="FlushIfDueAsync"/> for why the drain's own sweep is not enough.
+    ///
+    /// <para>Try-enter, not enter: this runs on the flush loop, which must not park behind an
+    /// ingest batch holding the snapshot lock shared, and a sweep that is skipped costs nothing —
+    /// the next tick makes the same pass, and a series one tick staler is still stale.</para>
+    /// </summary>
+    private int SweepStaleSeriesIfIdle()
+    {
+        if (Volatile.Read(ref _disposed) != 0 || _hot.IsEmpty) return 0;
+
+        long idleBefore = _time.GetUtcNow().UtcTicks - _staleSeriesAge.Ticks;
+        if (!_snapshotLock.TryEnterWriteLock(0)) return 0;
+        try { return SweepIdleSeriesLocked(idleBefore, _staleSeriesAge); }
+        finally { _snapshotLock.ExitWriteLock(); }
+    }
+
+    // ── IMemoryShedder ────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// What a flush plus a sweep would hand back: the points in the tier, plus the series
+    /// <see cref="Shed"/> IS ALLOWED TO TAKE. All of it managed, hence
+    /// <see cref="ShedableNativeBytes"/> = 0 — the pressure loop already counts the managed heap
+    /// through <c>GC.GetGCMemoryInfo</c>, and reporting these bytes there as well would count
+    /// them twice.
+    /// </summary>
+    ///
+    /// <remarks>
+    /// <para>The second term was <c>_hot.Count * EmptySeriesBytes</c> — the WHOLE table — and
+    /// that stopped being true when <c>Shed</c> learned that idle is not "holds no points right
+    /// now": it evicts only what has said nothing for a <c>MaxHotAge</c>, so on the tier a busy
+    /// deployment actually runs — thirty thousand series, every one of them reporting, every one
+    /// of them empty between flushes — this advertised 11 MB that a shed would not release one
+    /// byte of. The figure is what <c>MemoryShedRegistry.ShedableBytes</c> sums for the pressure
+    /// loop's "is it worth asking anybody" gate, so over-reporting there is a decision to shed
+    /// taken on memory that is not coming back.</para>
+    ///
+    /// <para><b>An upper bound, and honestly one.</b> It counts the series past the bar without
+    /// asking whether each is empty, because <see cref="TryEvictLocked"/> also requires that and
+    /// a series holding points is evicted only after the flush this same <c>Shed</c> schedules —
+    /// so the bytes are real, one tick later. It cannot be a lower bound and be cheap.</para>
+    ///
+    /// <para>The walk is the price: <c>Count</c> takes every lock in the table to answer, this
+    /// takes none and reads every entry instead, and the pressure loop asks about once a tick.
+    /// The empty tier — the one the loop asks about most, and the one <c>Count</c> was no
+    /// cheaper for — is answered without walking at all.</para>
+    /// </remarks>
+    public long ShedableBytes => Volatile.Read(ref _hotPointBytes) + (long)IdleSeriesCount() * EmptySeriesBytes;
+
+    /// <summary>
+    /// The series a <see cref="Shed"/> right now would be allowed to evict: those whose last
+    /// append is further back than <see cref="_maxHotAge"/>, which is the bar <c>Shed</c> itself
+    /// computes. Lock-free, and it must stay that way — <see cref="ShedableBytes"/> is read from
+    /// the RAM pressure loop, which may not park behind an ingest batch.
+    /// </summary>
+    private int IdleSeriesCount()
+    {
+        if (_hot.IsEmpty) return 0;
+
+        long idleBefore = _time.GetUtcNow().UtcTicks - _maxHotAge.Ticks;
+        int  idle       = 0;
+        foreach (var (_, series) in _hot)
+            if (series.LastAppendUtcTicks < idleBefore) idle++;
+        return idle;
+    }
+
+    /// <inheritdoc/>
+    public long ShedableNativeBytes => 0;
+
+    /// <summary>
+    /// A series with no points still costs a <c>HotSeries</c>, its lock, its list, its
+    /// <c>SeriesKey</c> + <c>LabelSet</c> + pair array and a concurrent-dictionary node.
+    /// Structural, and deliberately not the 12 565 B the reconnaissance measured per series —
+    /// that figure WAS the retained point array, which no longer survives a drain.
+    /// </summary>
+    private const int EmptySeriesBytes = 384;
+
+    /// <summary>
+    /// Lets go of what can be let go of without waiting for anybody: the empty series go now,
+    /// and the live points leave through a flush, which is the only thing that may move them.
+    ///
+    /// <para>Try-enter and not enter: <see cref="IMemoryShedder.Shed"/> is called from the RAM
+    /// pressure loop and must never park behind a caller of its own, and an ingest batch holds
+    /// the snapshot lock shared for a whole OTLP request. Losing the race costs nothing — the
+    /// flush this schedules sweeps on its own way through.</para>
+    ///
+    /// <para><b>IDLE IS NOT "HOLDS NO POINTS RIGHT NOW".</b> It used to be, and the state every
+    /// tier is in for most of its life is the state immediately after a flush: the drain empties
+    /// every series, so a pressure tick landing there evicted the ENTIRE hot table — a busy
+    /// 30 000-series deployment reduced to nothing, every live series re-created on its next
+    /// point and paying a full <c>RegisterMeta</c> walk to do it, while the log line said they
+    /// had been "idle for over 2 h" and <c>released</c> counted bytes that came straight back.
+    /// It also hid the leak it was meant to relieve: a table emptied wholesale reports a large
+    /// <c>released</c> every time, so the pressure loop learns nothing from it.</para>
+    ///
+    /// <para>What pressure changes is the BAR, not the rule: <see cref="_staleSeriesAge"/> (twice
+    /// <c>MaxHotAge</c>) comes down to <c>MaxHotAge</c>, so a series that reported within one
+    /// hot-tier age — which is every series the tier is built for — is never a candidate, and
+    /// one that has said nothing for longer leaves sooner than the ordinary sweep would have let
+    /// it. Oldest-idle first falls out of that: a bar is a time, so the series furthest past it
+    /// go on every tick until none is.</para>
+    /// </summary>
+    public long Shed()
+    {
+        if (Volatile.Read(ref _disposed) != 0) return 0;
+
+        long released = 0;
+        if (_snapshotLock.TryEnterWriteLock(0))
+        {
+            try
+            {
+                // The evicted COUNT, from the sweep that did the evicting — not a difference of
+                // two _hot.Count readings, each of which takes every lock in the table to answer
+                // a question the sweep already knew.
+                long idleBefore = _time.GetUtcNow().UtcTicks - _maxHotAge.Ticks;
+                released = (long)SweepIdleSeriesLocked(idleBefore, _maxHotAge) * EmptySeriesBytes;
+            }
+            finally { _snapshotLock.ExitWriteLock(); }
+        }
+
+        // The points themselves: only a flush moves them, and it must not run under this lock.
+        if (Volatile.Read(ref _hotPointCount) > 0
+            && System.Threading.Interlocked.CompareExchange(ref _thresholdFlushScheduled, 1, 0) == 0)
+            _ = ScheduleThresholdFlush();
+
+        return released;
+    }
+
+    /// <summary>
+    /// Registers this engine with <see cref="MemoryShedRegistry"/> and returns it, for chaining
+    /// from a DI factory. Explicit rather than automatic in the constructor, for the reason
+    /// <c>SegmentIndexCache.RegisterForMemoryPressure</c> gives: registration is a process-wide
+    /// effect, and an engine built by a test has no business being swept because something else
+    /// in the process reported pressure. Idempotent; undone by <see cref="DisposeAsync"/>.
+    /// </summary>
+    public MetricStorageEngine RegisterForMemoryPressure()
+    {
+        lock (_shedLock) _shedRegistration ??= MemoryShedRegistry.Register(this);
+        return this;
     }
 
     /// <summary>
@@ -1117,7 +1894,10 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         List<MetricSegmentInfo> toMerge1h;
         List<MetricSegmentInfo> toRollup5m;
         List<MetricSegmentInfo> toRollup1h;
-        _coldLock.EnterReadLock();
+
+        // A closed tier has no work: this pass would otherwise rewrite and unlink .mts files
+        // after the engine has been torn down.
+        if (!TryEnterColdRead()) return Task.CompletedTask;
         try
         {
             toCompact  = _coldSegments
@@ -1273,7 +2053,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                 var newInfos = RewriteMetricInChunks(
                     segs, granularity, static (pts, _) => DedupeByTimestamp(pts));
 
-                _coldLock.EnterWriteLock();
+                if (!TryEnterColdWrite()) return;      // closed mid-pass: leave both sets on disk
                 try
                 {
                     foreach (var s in segs) _coldSegments.Remove(s);
@@ -1408,7 +2188,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                     (pts, kind) => Downsample(
                         pts.OrderBy(p => p.TimestampUnixNano).ToList(), bucketSize, kind).ToList());
 
-                _coldLock.EnterWriteLock();
+                if (!TryEnterColdWrite()) return;      // closed mid-pass: leave both sets on disk
                 try
                 {
                     foreach (var s in group) _coldSegments.Remove(s);
@@ -1529,7 +2309,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
         // Runs in the background, so flushes may already have registered new
         // segments — merge, don't overwrite (dedup by path).
-        _coldLock.EnterWriteLock();
+        if (!TryEnterColdWrite()) return;   // disposed before the background scan finished
         try
         {
             var known = new HashSet<string>(_coldSegments.Select(s => s.FilePath), StringComparer.Ordinal);
@@ -1555,7 +2335,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
             {
                 foreach (var s in MetricReader.ReadAllSync(seg.FilePath))
                 {
-                    var meta = _meta.GetOrAdd(s.Name, static _ => new MetricMeta());
+                    var meta = _meta.GetOrAdd(s.Name, static (_, cap) => new MetricMeta(cap), _maxTrackedSeriesPerMetric);
                     meta.Kind = s.Kind;
                     if (!string.IsNullOrEmpty(s.Unit)) meta.Unit = s.Unit;
                     long lastMs = (s.Points.Count > 0 ? s.Points[^1].TimestampUnixNano : seg.MaxNano) / 1_000_000L;
@@ -1563,7 +2343,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                     foreach (var (k, v) in s.Labels.Pairs)
                     {
                         var values = meta.LabelValues.GetOrAdd(k, static _ => new ConcurrentDictionary<string, byte>(StringComparer.Ordinal));
-                        if (values.Count < MaxLabelValuesPerKey) values.TryAdd(v, 0);
+                        if (values.Count < _maxLabelValuesPerKey) values.TryAdd(v, 0);
                     }
                     meta.AddSeries(s.Labels.GetHashCode());
                     seeded++;
@@ -1596,6 +2376,15 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
         try
         {
+            // First, so the pressure loop cannot start a sweep or schedule a flush against an
+            // engine that is on its way down. The registry's weak reference is a backstop for a
+            // registrant that was dropped without this; it is not the mechanism.
+            lock (_shedLock)
+            {
+                _shedRegistration?.Dispose();
+                _shedRegistration = null;
+            }
+
             _cts.Cancel();
             try { await Task.WhenAll(_flushTask, _rollupTask); }
             catch (OperationCanceledException) { }
@@ -1648,7 +2437,15 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
             // not be able to skip the unmap. After the loop's final flush, which commits it.
             _wal.Dispose();
             _cts.Dispose();
-            _coldLock.Dispose();
+
+            // The cold tier closes behind a FENCE, and the lock is not disposed — see the note
+            // on _coldClosed for what disposing it did to a query that was holding or waiting on
+            // it while Kestrel was still serving. Taken exclusively so that every reader is
+            // either already finished or has yet to start, and the ones yet to start answer
+            // empty.
+            _coldLock.EnterWriteLock();
+            try { Volatile.Write(ref _coldClosed, 1); }
+            finally { _coldLock.ExitWriteLock(); }
 
             // _snapshotLock is deliberately NOT disposed. Its only two users are Ingest and
             // FlushHotTierAsync; both are shut above, and the gate turns a late ingest away by
@@ -1678,11 +2475,17 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
     public Task<int> PruneAsync(TimeSpan ttl, CancellationToken ct = default)
     {
+        // RetentionService holds this engine as an IRetentionTarget and is a hosted service of
+        // its own, so its stop order against this one is a registration detail, not a guarantee.
+        // Ungated, a prune that arrived after the teardown unlinked .mts files from a directory
+        // this process had finished with — and did it through a lock the teardown had disposed.
+        if (Volatile.Read(ref _disposed) != 0) return Task.FromResult(0);
+
         Interlocked.Exchange(ref _lastPruneTtlTicks, ttl.Ticks);
         var cutoffNano = DateTimeOffset.UtcNow.Subtract(ttl).ToUnixTimeMilliseconds() * 1_000_000L;
 
         List<MetricSegmentInfo> toDelete;
-        _coldLock.EnterWriteLock();
+        if (!TryEnterColdWrite()) return Task.FromResult(0);
         try
         {
             toDelete = _coldSegments.Where(s => s.MaxNano < cutoffNano).ToList();
@@ -1754,7 +2557,15 @@ internal sealed class ExemplarRing
 /// </summary>
 internal sealed class MetricMeta
 {
-    private const int MaxTrackedSeries = 50_000;
+    /// <summary>
+    /// Distinct label-set hashes this metric counts before cardinality stops rising. From
+    /// <c>MetricsOptions.MaxTrackedSeriesPerMetric</c>, carried per instance because the engine
+    /// that owns the catalog is what was configured — a static would make one host's setting the
+    /// process's.
+    /// </summary>
+    private readonly int _maxTrackedSeries;
+
+    public MetricMeta(int maxTrackedSeries) => _maxTrackedSeries = maxTrackedSeries;
 
     public MetricKind Kind        { get; set; }
     public string     Unit        { get; set; } = string.Empty;
@@ -1780,7 +2591,7 @@ internal sealed class MetricMeta
     public void AddSeries(int labelSetHash)
     {
         if (_seriesHashes.ContainsKey(labelSetHash)) return;                   // hot path, no lock
-        if (Volatile.Read(ref _trackedCount) >= MaxTrackedSeries) return;
+        if (Volatile.Read(ref _trackedCount) >= _maxTrackedSeries) return;
         if (_seriesHashes.TryAdd(labelSetHash, 0))
             Interlocked.Increment(ref _trackedCount);
     }
@@ -1788,8 +2599,26 @@ internal sealed class MetricMeta
 
 internal sealed class HotSeries
 {
-    private readonly List<MetricDataPoint> _points;
+    /// <summary>
+    /// The most slots a drained series carries into its next life. A series that held 500 000
+    /// points used to keep a 500 000-slot array until the process died (see <see cref="Drain"/>);
+    /// carrying the FULL drained count instead would only shorten that to one flush interval,
+    /// and at 2 000 series x 300 points it measured 4 333 B still held per series. So the carry
+    /// is capped at a fill a steady exporter actually reaches between flushes — 15-second
+    /// scrapes across a 60-second cadence is four points — and a burst re-grows by doubling from
+    /// there, which costs a handful of small arrays and no retention at all.
+    /// </summary>
+    private const int MaxCarriedCapacity = 16;
+
+    private List<MetricDataPoint> _points;
     private readonly object _lock = new();
+
+    /// <summary>
+    /// <c>DateTime.UtcNow.Ticks</c> of the last <see cref="Append"/>, from the engine's clock.
+    /// Read without the series lock — a sweep only needs to know the series has been idle for
+    /// hours, and one tick of staleness in that answer changes nothing.
+    /// </summary>
+    private long _lastAppendUtcTicks;
 
     /// <summary>
     /// Histogram bucket upper bounds shared by every point. Set once from the first
@@ -1797,7 +2626,30 @@ internal sealed class HotSeries
     /// </summary>
     public double[]? Bounds { get; private set; }
 
-    public HotSeries() => _points = new List<MetricDataPoint>(64);
+    /// <summary>
+    /// This series' catalog entry, cached after the first point. The series identity carries the
+    /// metric name, kind, unit and label set, so once it is known nothing the catalog records
+    /// about this series can change again — see <c>MetricStorageEngine.UpdateMeta</c>, which the
+    /// cache turns from four to eight concurrent-dictionary lookups per POINT into one field
+    /// read. Not volatile: a thread that misses another's write does the full walk a second time,
+    /// which is idempotent, and every path that reads it holds the series' own lock moments
+    /// before or after.
+    /// </summary>
+    public MetricMeta? Meta { get; set; }
+
+    /// <summary>
+    /// A new series starts with NO array, not with 64 slots. Sixty-four
+    /// <see cref="MetricDataPoint"/>s is 2 560 B reserved the moment a label set is first seen,
+    /// and the deployments this round exists for have tens of thousands of series that carry
+    /// four points a flush: 38 741 of them is ~99 MB of reservation for ~6 MB of points. The
+    /// list grows by doubling from its first add, which is a handful of small arrays per series
+    /// per flush and nothing that survives one.
+    /// </summary>
+    public HotSeries(LabelSet labels)
+    {
+        _points = [];
+        Labels  = labels;
+    }
 
     public HotSeries(List<MetricDataPoint> points, double[]? bounds = null)
     {
@@ -1805,22 +2657,67 @@ internal sealed class HotSeries
         Bounds  = bounds;
     }
 
-    public void Append(MetricDataPoint p, double[]? bounds = null)
+    /// <summary>
+    /// THE ONE <see cref="LabelSet"/> INSTANCE THIS SERIES IS KNOWN BY — the same object the
+    /// series' <see cref="SeriesKey"/> holds, taken from the first point that created the series
+    /// and shared by everything that needs a label set for it afterwards.
+    ///
+    /// <para>It exists because <c>ConcurrentDictionary</c> will not hand a stored KEY back, and
+    /// the exemplar rings need exactly that. <c>OtlpMetricProtoParser.BuildLabels</c> allocates a
+    /// FRESH <c>LabelSet</c> per data point — a 32 B object, a 104 B pair array and ten strings
+    /// decoded straight out of the protobuf, ~480 B for the five-label HTTP shape — and every one
+    /// of them is garbage the moment its point is filed, because the label set IS the series
+    /// identity and this one already stands for it. A ring entry, by contrast, outlives its point
+    /// by the life of the process; see <c>AddExemplars</c>.</para>
+    ///
+    /// <para>Eight bytes a series, pointing at an object the key holds anyway, so it retains
+    /// nothing new — it is inside the structural estimate <c>EmptySeriesBytes</c> already makes.
+    /// Empty on the snapshot instances the drain and the rollup build, which are never published
+    /// into <c>_hot</c> and are never asked.</para>
+    /// </summary>
+    public LabelSet Labels { get; } = LabelSet.Empty;
+
+    /// <summary>When this series last took a point. See <see cref="_lastAppendUtcTicks"/>.</summary>
+    public long LastAppendUtcTicks => Volatile.Read(ref _lastAppendUtcTicks);
+
+    /// <summary>Points held right now — 0 immediately after a <see cref="Drain"/>.</summary>
+    public int PointCount { get { lock (_lock) return _points.Count; } }
+
+    public void Append(MetricDataPoint p, double[]? bounds, long nowUtcTicks)
     {
         lock (_lock)
         {
             if (bounds is not null && Bounds is null) Bounds = bounds;
             _points.Add(p);
         }
+        Volatile.Write(ref _lastAppendUtcTicks, nowUtcTicks);
     }
 
+    /// <summary>
+    /// Hands the flush the list itself and starts this series over on a fresh one.
+    ///
+    /// <para>It used to copy — <c>new List&lt;MetricDataPoint&gt;(_points)</c> then
+    /// <c>_points.Clear()</c> — which paid for the snapshot twice over. Once in allocation: a
+    /// second full copy of every point, per flush, on the path that already holds the engine's
+    /// write lock. And once, permanently, in retention: <see cref="List{T}.Clear"/> does not
+    /// shrink the backing array, so the series kept an array sized to the largest burst it had
+    /// ever seen for the life of the process, whether or not it ever reported again. Measured at
+    /// 12 565 B retained per series by a tier holding ZERO points — 54 % of the burst's heap
+    /// surviving the drain, which on the sandbox's 38 741 series is ~470 MB of gen2 nothing can
+    /// reclaim, in a container whose GC heap limit is 384 MB.</para>
+    ///
+    /// <para>The handover is safe because the caller owns what it is given: the drained list goes
+    /// into a snapshot <see cref="HotSeries"/> that nothing else can reach, and the restore path
+    /// on a failed write appends into THIS object's new list while reading that one — two
+    /// different lists, which is the invariant the copy used to provide by brute force.</para>
+    /// </summary>
     public List<MetricDataPoint> Drain()
     {
         lock (_lock)
         {
-            var copy = new List<MetricDataPoint>(_points);
-            _points.Clear();
-            return copy;
+            var drained = _points;
+            _points = new List<MetricDataPoint>(Math.Min(drained.Count, MaxCarriedCapacity));
+            return drained;
         }
     }
 

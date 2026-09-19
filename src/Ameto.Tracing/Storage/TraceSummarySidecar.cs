@@ -78,8 +78,18 @@ internal static class TraceSummarySidecar
     /// <summary>Volume grid resolution — 10 s. Sparse, so idle gaps cost nothing.</summary>
     public const long GridNanos = 10_000_000_000L;
 
-    private static readonly string[] MethodKeys = { "http.request.method", "http.method" };
-    private static readonly string[] PathKeys   = { "url.path", "http.target", "http.route", "url.full", "http.url" };
+    /// <summary>
+    /// THE SHARED LISTS, not a third copy — see HttpSemconvKeys. This writer is the COLD source of
+    /// the very row the trace list builds from a hot span: <c>TraceSummary.RootMethod</c> and
+    /// <c>RootPath</c> are read back by <c>TraceStorageEngine.MergeSummaryInto</c> and become the
+    /// list row's <c>HttpMethod</c>/<c>HttpPath</c> — exactly where <c>MergeSpanInto</c> puts them
+    /// while the trace is still in the hot tier. A private copy here means the SAME trace shows a
+    /// path before its tier flushes and an empty one after: the drift issue #83 removed from the
+    /// two hot readers, left alive on the flush path. Adding a key means adding it to
+    /// <see cref="HttpSemconvKeys"/>, and all three readers get it.
+    /// </summary>
+    private static readonly string[] MethodKeys = HttpSemconvKeys.MethodKeys;
+    private static readonly string[] PathKeys   = HttpSemconvKeys.PathKeys;
 
     // ── Writer ──────────────────────────────────────────────────────────────────
 
@@ -124,8 +134,8 @@ internal static class TraceSummarySidecar
                 a.RootHttpStatus = s.HttpStatusCode;
                 a.RootName       = s.Name;
                 a.RootService    = s.ServiceName;
-                a.RootMethod     = GetAttr(s.Attributes, MethodKeys);
-                a.RootPath       = GetAttr(s.Attributes, PathKeys);
+                a.RootMethod     = HttpSemconvKeys.GetAttr(s.Attributes, MethodKeys);
+                a.RootPath       = HttpSemconvKeys.GetAttr(s.Attributes, PathKeys);
             }
         }
 
@@ -547,15 +557,6 @@ internal static class TraceSummarySidecar
 
     private static string ReadStr8(BinaryReader r)  => Encoding.UTF8.GetString(r.ReadBytes(r.ReadByte()));
     private static string ReadStr16(BinaryReader r) => Encoding.UTF8.GetString(r.ReadBytes(r.ReadUInt16()));
-
-    private static string GetAttr(IReadOnlyDictionary<string, object?>? attrs, string[] keys)
-    {
-        if (attrs is null) return string.Empty;
-        foreach (var k in keys)
-            if (attrs.TryGetValue(k, out var v) && v is not null)
-                return v.ToString() ?? string.Empty;
-        return string.Empty;
-    }
 
     private struct VolCell { public uint Traces; public uint Errors; }
 

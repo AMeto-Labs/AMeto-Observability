@@ -1,3 +1,4 @@
+using Ameto.Core;
 using Ameto.Metrics;
 using Ameto.Metrics.Storage;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -63,14 +64,41 @@ public sealed class MetricWalTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// THE THRESHOLDS THIS CLASS RUNS AT, INJECTED RATHER THAN INHERITED.
+    ///
+    /// <para>Every flush in this file is one a test schedules, and the batches are sized to stay
+    /// in the tier until it does. That used to be a property of a literal — <c>HotFlushThreshold
+    /// = 500 000</c> points, the same number everywhere — and is now a share of the managed-heap
+    /// limit, so the premise of half this file became a property of the machine running it. At
+    /// the 512 MB stand's 384 MB limit the tier budget is 20.1 MB against
+    /// <see cref="SlowFlushBatch"/>'s 19.2 MB: a 4.6 % margin. Below a ~488 MB container the
+    /// batch crosses it, <c>Ingest</c> schedules a flush of its own, and tests whose setup
+    /// asserts "the first flush must still be held at its seam" race a drain they did not start.
+    /// Measured before this was pinned: 2 failures in 7 runs of this class under
+    /// <c>DOTNET_GCHeapHardLimit=0x13000000</c>, in a different fact each time.</para>
+    ///
+    /// <para>These three are exactly the pre-<c>MemoryBudgets</c> literals — 500 000 points,
+    /// 50 000, and the log's 8 MB initial capacity — so the file behaves on every host the way it
+    /// behaved on all of them before the caps were derived.</para>
+    /// </summary>
+    private static readonly MetricsOptions PinnedThresholds = new()
+    {
+        HotTierBytes    = MemoryBudgets.MetricHotTierCapBytes,
+        MinFlushBytes   = MemoryBudgets.MetricHotTierCapBytes / 10,
+        WalInitialBytes = 8L * 1024 * 1024,
+    };
+
+    /// <summary>
     /// The only way this class builds an engine. Double disposal is what the registry relies on
     /// being free: most tests close their own engine mid-body, because closing it is how the log
     /// gets its final flush, and none of them should have to unregister it to do that.
     /// </summary>
     private MetricStorageEngine NewEngine(string? dir = null,
-                                          Microsoft.Extensions.Logging.ILogger<MetricStorageEngine>? logger = null)
+                                          Microsoft.Extensions.Logging.ILogger<MetricStorageEngine>? logger = null,
+                                          MetricsOptions? options = null)
     {
-        var engine = new MetricStorageEngine(dir ?? _dir, logger ?? NullLogger<MetricStorageEngine>.Instance);
+        var engine = new MetricStorageEngine(dir ?? _dir, logger ?? NullLogger<MetricStorageEngine>.Instance,
+                                             options ?? PinnedThresholds);
         _engines.Add(engine);
         return engine;
     }
@@ -947,10 +975,82 @@ public sealed class MetricWalTests : IAsyncLifetime
 
     /// <summary>
     /// A tier whose files take long enough to write that the flush is provably still running
-    /// while shutdown does its work — 300 000 points over 2 000 series, which is also
-    /// comfortably under <c>HotFlushThreshold</c>, so the only flushes in these tests are the
-    /// ones they schedule.
+    /// while shutdown does its work — 300 000 points over 2 000 series. At 64 B a scalar point
+    /// that charges 19.2 MB against the 32 MB <see cref="PinnedThresholds"/> gives every engine
+    /// in this class, so the only flushes in these tests are the ones they schedule — on every
+    /// host, which is what pinning the threshold buys.
     /// </summary>
+    /// <summary>
+    /// THE PREMISE OF THIS CLASS, ASSERTED RATHER THAN ASSUMED. Every seam test here holds a
+    /// flush at <c>OnSnapshotTakenForTest</c> and then asserts that nothing else has drained the
+    /// tier; that only holds while the engine's own threshold is above the batch. Inheriting the
+    /// derived threshold made it a property of the host — at <c>MemoryBudgets</c>' own floor the
+    /// tier is 4 MB and <see cref="SlowFlushBatch"/> is 19.2 MB, so <c>Ingest</c> would schedule
+    /// a flush before the test that called it reached its next line.
+    ///
+    /// <para>Three separable things have to hold, and the fact used to check only the third —
+    /// against a constant, on a constant, which made it a tautology: <c>PinnedThresholds</c>
+    /// names <c>HotTierBytes</c> explicitly, <c>HotTierBytesFor</c> returns an explicit value
+    /// whatever budget it is handed, so all four host rows evaluated the identical
+    /// 19.2 MB &lt; 32 MB and the fact would have stayed green with the injection at
+    /// <see cref="NewEngine"/> deleted — the exact regression it exists to catch.</para>
+    ///
+    /// <para>(1) the engines of this class really are built from <c>PinnedThresholds</c>, asked
+    /// by REFERENCE because on a large host the derived ceilings equal the pinned literals by
+    /// design and no comparison of figures can tell the two apart; (2) the threshold that
+    /// reaches the engine's own <c>Ingest</c> is that pinned figure; (3) the batch — measured
+    /// from a real <see cref="SlowFlushBatch"/>, not from a copy of its default arguments — fits
+    /// under it on every host the derivation can produce.</para>
+    /// </summary>
+    [Fact]
+    public void The_batches_this_class_ingests_stay_in_the_tier_on_every_host()
+    {
+        const long MB = 1024 * 1024;
+
+        // (1) and (2): an engine built exactly the way every fact in this file builds one, and
+        // the batch itself rather than a second copy of its default arguments — widening
+        // SlowFlushBatch used to be invisible here.
+        var  engine     = NewEngine();
+        var  batch      = SlowFlushBatch(1_700_000_000_000_000_000L);
+        long batchBytes = batch.Length * (long)MetricStorageEngine.HotPointBytes;
+
+        Assert.Same(PinnedThresholds, engine.ConfiguredOptions);
+        Assert.Equal(MemoryBudgets.MetricHotTierCapBytes, engine.HotFlushThresholdBytes);
+        Assert.True(batchBytes < engine.HotFlushThresholdBytes,
+            $"on THIS host SlowFlushBatch charges {batchBytes / 1048576.0:N1} MB against the "
+          + $"{engine.HotFlushThresholdBytes / 1048576.0:N1} MB this engine flushes above");
+
+        // …and the premise itself, on the engine: ingest the batch and the tier still holds
+        // every point of it, with no flush of the engine's own in between.
+        engine.Ingest(batch);
+        Assert.Equal(batch.Length, engine.HotPointCount);
+
+        // (3): and it would on any host — which is what the pin is for, and what inheriting
+        // would cost. The derived column is the counter-example, printed as the reason.
+        var derived = new MetricsOptions();
+        bool inheritingWouldBreak = false;
+
+        foreach (var (label, budgets) in new (string, MemoryBudgets)[]
+                 {
+                     ("16 GB host",   MemoryBudgets.Derive(16L * 1024 * MB, 16L * 1024 * MB)),
+                     ("512 MB stand", MemoryBudgets.Derive(384 * MB, 512 * MB)),
+                     ("128 MB heap",  MemoryBudgets.Derive(128 * MB, 160 * MB)),
+                     ("16 MB heap",   MemoryBudgets.Derive(16 * MB, 16 * MB)),
+                 })
+        {
+            long tier = PinnedThresholds.HotTierBytesFor(budgets);
+            Assert.True(batchBytes < tier,
+                $"{label}: SlowFlushBatch charges {batchBytes / 1048576.0:N1} MB against a tier budget of "
+              + $"{tier / 1048576.0:N1} MB — the engine flushes it before the test that ingested it does");
+
+            inheritingWouldBreak |= derived.HotTierBytesFor(budgets) <= batchBytes;
+        }
+
+        Assert.True(inheritingWouldBreak,
+            "no host in the table would flush this batch under the DERIVED threshold, so the "
+          + "injection this fact pins is no longer buying anything — re-check the table or drop it");
+    }
+
     private static MetricIngestItem[] SlowFlushBatch(
         long baseNano, string seriesPrefix = "s", int series = 2_000, int pointsPerSeries = 150)
     {

@@ -15,10 +15,25 @@ public static class MetricsServiceExtensions
         this IServiceCollection services,
         string dataDirectory)
     {
+        // RegisterForMemoryPressure HERE and not in the constructor: registration is a
+        // process-wide effect, so it belongs to the composition that means it, not to every
+        // engine a test builds. Until this, the only shedder in the process was the
+        // segment-index cache — the RAM pressure loop could flush the LOG tier and drop cached
+        // indexes while the metric tier, which is the larger of the two on a metrics-heavy
+        // deployment, sat there holding everything it had.
+        //
+        // The options come out of the container rather than through this method's signature, so
+        // `Ameto:Metrics` in config.yml reaches the engine without Program.cs having to know the
+        // block exists — ServerOptions is bound from the whole Ameto section and registered as a
+        // singleton there. A host that registers no ServerOptions (tests, an embedded use) gets
+        // the derived defaults, which is what it would have got anyway.
         services.AddSingleton(sp =>
             new MetricStorageEngine(
                 Path.Combine(dataDirectory, "metrics"),
-                sp.GetRequiredService<ILogger<MetricStorageEngine>>()));
+                sp.GetRequiredService<ILogger<MetricStorageEngine>>(),
+                sp.GetService<ServerOptions>()?.Metrics,
+                sp.GetService<TimeProvider>())
+            .RegisterForMemoryPressure());
 
         services.AddSingleton<IMetricIngester>(sp => sp.GetRequiredService<MetricStorageEngine>());
         services.AddSingleton<IMetricQuery>(sp => sp.GetRequiredService<MetricStorageEngine>());

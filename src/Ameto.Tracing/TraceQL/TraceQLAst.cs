@@ -144,11 +144,114 @@ public sealed class AttributePredicate(string key, TraceQLOp op, TraceQLValue va
     /// — a docstring is read only by somebody already in this file, which is how the original
     /// defect lasted as long as it did.</para>
     /// </summary>
+    /// <summary>
+    /// The key as UTF-8, encoded ONCE per parsed query rather than once per span. A TraceQL page
+    /// scans up to <c>limit*10</c> spans and this predicate is the reason the scan is happening,
+    /// so the per-span cost of it is the query's cost.
+    /// </summary>
+    private readonly byte[] _keyUtf8 = System.Text.Encoding.UTF8.GetBytes(key);
+
     public override bool? Evaluate(SpanRecord s)
     {
+        // THE BLOB IS SCANNED, NOT DECODED. A predicate reads ONE key; building the whole
+        // dictionary to read it cost 913 B per span SCANNED, for a page that returns 200 rows.
+        // Absent and unreadable both answer null, which is the same null the dictionary path
+        // answers for them — see the class docstring for why that has to be null and not false.
+        var blob = s.AttributesBytes;
+        if (!blob.IsEmpty)
+            return SpanAttributeBlob.TryFind(blob, _keyUtf8, out var v)
+                 ? CompareAttr(in v, Op, in Value)
+                 : null;
+
         if (s.Attributes is null) return null;
         s.Attributes.TryGetValue(Key, out var raw);
         return CompareAttr(raw, Op, Value);
+    }
+
+    /// <summary>
+    /// The blob-side twin of <see cref="CompareAttr(object?, TraceQLOp, in TraceQLValue)"/>, and it
+    /// has to give the same answer for every value either of them can see — a span in the hot tier
+    /// and the same span read back out of a segment are asked the same question by the same page.
+    ///
+    /// <para>Nothing here allocates. A string attribute is compared as UTF-8 decoded into the
+    /// stack; a number met by a string query is formatted into the stack with the same current-
+    /// culture <c>ToString()</c> the boxed path would have used; and a value no dictionary could
+    /// hold answers null exactly as the boxed path's <c>null</c> does.</para>
+    /// </summary>
+    internal static bool? CompareAttr(in SpanAttrValue v, TraceQLOp op, in TraceQLValue qv)
+    {
+        // Missing, msgpack-nil, and anything the decoder boxes as null (array, nested map, bin,
+        // ext) are the three shapes that reach the boxed path as `raw is null`.
+        if (v.Kind is SpanAttrKind.Missing or SpanAttrKind.Null or SpanAttrKind.Other) return null;
+
+        if (qv.IsNumber)
+        {
+            double attrNum = v.Kind switch
+            {
+                SpanAttrKind.Integer    => v.Integer,
+                SpanAttrKind.Float      => v.Float,
+                SpanAttrKind.Utf8String => double.TryParse(v.Utf8.Span,
+                    System.Globalization.NumberStyles.Any,
+                    System.Globalization.CultureInfo.InvariantCulture, out var parsed) ? parsed : double.NaN,
+                _                       => double.NaN,   // Boolean: present but incomparable
+            };
+            if (double.IsNaN(attrNum)) return false;
+            return CompareOp(attrNum, op, qv.Number);
+        }
+
+        int cmp = CompareToQueryString(in v, qv.StringVal ?? string.Empty);
+        return op switch
+        {
+            TraceQLOp.Eq  => cmp == 0,
+            TraceQLOp.Neq => cmp != 0,
+            TraceQLOp.Lt  => cmp <  0,
+            TraceQLOp.Lte => cmp <= 0,
+            TraceQLOp.Gt  => cmp >  0,
+            TraceQLOp.Gte => cmp >= 0,
+            _             => false,
+        };
+    }
+
+    private static int CompareToQueryString(in SpanAttrValue v, string queryText)
+    {
+        // UTF-8 never decodes to more chars than it has bytes, so the byte length is the bound.
+        Span<char> stack = stackalloc char[256];
+
+        if (v.Kind == SpanAttrKind.Utf8String)
+        {
+            var utf8 = v.Utf8.Span;
+            char[]? rented = utf8.Length > stack.Length
+                ? System.Buffers.ArrayPool<char>.Shared.Rent(utf8.Length)
+                : null;
+            try
+            {
+                Span<char> buf = rented is null ? stack : rented.AsSpan();
+                int n = System.Text.Encoding.UTF8.GetChars(utf8, buf);
+                return MemoryExtensions.CompareTo((ReadOnlySpan<char>)buf[..n],
+                                                  queryText.AsSpan(), StringComparison.OrdinalIgnoreCase);
+            }
+            finally
+            {
+                if (rented is not null) System.Buffers.ArrayPool<char>.Shared.Return(rented);
+            }
+        }
+
+        if (v.Kind == SpanAttrKind.Boolean)
+            return string.Compare(v.Boolean ? bool.TrueString : bool.FalseString,
+                                  queryText, StringComparison.OrdinalIgnoreCase);
+
+        // long.ToString() and double.ToString() with the ambient culture — the same text
+        // `raw.ToString()` produced on the boxed path, written into the stack instead of the heap.
+        bool ok = v.Kind == SpanAttrKind.Integer
+            ? v.Integer.TryFormat(stack, out int len)
+            : v.Float.TryFormat(stack, out len);
+        if (!ok) return string.Compare(v.Kind == SpanAttrKind.Integer
+                                           ? v.Integer.ToString()
+                                           : v.Float.ToString(),
+                                       queryText, StringComparison.OrdinalIgnoreCase);
+
+        return MemoryExtensions.CompareTo((ReadOnlySpan<char>)stack[..len],
+                                          queryText.AsSpan(), StringComparison.OrdinalIgnoreCase);
     }
 
     internal static bool? CompareAttr(object? raw, TraceQLOp op, in TraceQLValue qv)
@@ -351,11 +454,24 @@ public sealed class AttributePresencePredicate(string key, bool present) : SpanP
     /// <summary>True for <c>!= nil</c> (must be present), false for <c>= nil</c> (must be absent).</summary>
     public readonly bool   Present = present;
 
+    private readonly byte[] _keyUtf8 = System.Text.Encoding.UTF8.GetBytes(key);
+
+    /// <summary>
+    /// PRESENT MEANS "PRESENT WITH A VALUE THE DICTIONARY PATH WOULD HAVE HELD", which is why an
+    /// array or a nested map counts as absent here: the boxed path decodes both to <c>null</c> and
+    /// then reads <c>raw is not null</c> as absence. Answering "present" off the blob for a value
+    /// the dictionary calls absent would make <c>{ .foo != nil }</c> mean one thing for a hot span
+    /// and another for a flushed one.
+    /// </summary>
     public override bool? Evaluate(SpanRecord s)
     {
-        bool has = s.Attributes is not null
+        var blob = s.AttributesBytes;
+        bool has = blob.IsEmpty
+            ? s.Attributes is not null
                 && s.Attributes.TryGetValue(Key, out var raw)
-                && raw is not null;
+                && raw is not null
+            : SpanAttributeBlob.TryFind(blob, _keyUtf8, out var v)
+                && v.Kind is not (SpanAttrKind.Null or SpanAttrKind.Other);
         return has == Present;
     }
 }

@@ -48,11 +48,16 @@ public static class OtlpEndpointMapper
     {
         AmetoIngestEndpoints.BasePath = basePath;
 
+        // One logger for the life of the process, captured into the handler below. Taking
+        // ILoggerFactory as a handler parameter had Minimal APIs resolve it and the handler call
+        // CreateLogger on EVERY request — a lock and a walk of the provider list to hand back the
+        // same logger — on the busiest route in the server.
+        ILogger tracesLogger = app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("Ameto.Otel.Traces");
+
         // ── Traces ────────────────────────────────────────────────────────────
-        var traces = async (HttpContext ctx, ISpanIngester ingester, ILoggerFactory logFactory) =>
+        var traces = async (HttpContext ctx, ISpanIngester ingester) =>
         {
             if (!Authorized(ctx, ApiKeyPermissions.Traces)) return;
-            var logger = logFactory.CreateLogger("Ameto.Otel.Traces");
 
             var (body, bodyLen) = await ReadBodyAsync(ctx);
             if (body is null) return;
@@ -61,30 +66,24 @@ public static class OtlpEndpointMapper
             try
             {
                 bool isProto = ctx.Request.ContentType?.StartsWith(ProtobufContentType, StringComparison.OrdinalIgnoreCase) ?? false;
-                if (isProto)
-                {
-                    // Protobuf still decodes into the object model, then maps to items.
-                    var request = OtlpProtoDecoder.DecodeTraces(body, bodyLen);
-                    if (request is null) { ctx.Response.StatusCode = 400; return; }
-                    spans = OtlpTraceMapper.Map(request);
-                }
-                else
-                {
-                    // JSON: streaming parse straight to SpanIngestItems — no OTLP object
-                    // graph, no per-field hex/nano strings (see OtlpTraceStreamParser).
-                    spans = OtlpTraceStreamParser.Parse(body.AsSpan(0, bodyLen));
-                }
+
+                // Both encodings parse straight to SpanIngestItems — no OTLP object graph, no
+                // parser object per nested message, no per-field hex/nano strings. Protobuf is
+                // what SDK exporters and the collector send, so it is the one that had to stop
+                // decoding to a DOM first (see OtlpTraceProtoParser).
+                spans = isProto
+                    ? OtlpTraceProtoParser.Parse(body.AsSpan(0, bodyLen))
+                    : OtlpTraceStreamParser.Parse(body.AsSpan(0, bodyLen));
             }
             catch (Exception ex)
             {
-                logger.LogWarning(ex, "OTLP /v1/traces: failed to decode body ({Bytes} bytes, Content-Type: {Ct})",
-                    bodyLen, ctx.Request.ContentType);
+                LogTracesDecodeFailed(tracesLogger, bodyLen, ctx.Request.ContentType, ex);
                 ctx.Response.StatusCode = 400;
                 return;
             }
             finally { IngestBufferPool.Return(body); }
 
-            logger.LogDebug("OTLP /v1/traces: decoded {SpanCount} spans", spans.Count);
+            LogTracesDecoded(tracesLogger, spans.Count);
 
             if (spans.Count > 0)
             {
@@ -185,6 +184,40 @@ public static class OtlpEndpointMapper
         // Metric query endpoints live in Ameto.Metrics.MetricQueryEndpointMapper
         // (mapped via app.MapMetricEndpoints()).
     }
+
+    // ── Logging ───────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// The decoded-span-count line, pre-compiled.
+    ///
+    /// <para><c>logger.LogDebug("… {SpanCount} spans", spans.Count)</c> binds to
+    /// <c>LoggerExtensions.LogDebug(ILogger, string, params object?[])</c>, which allocates the
+    /// <c>object[1]</c> and boxes the int at the CALL SITE — before <c>IsEnabled</c> is ever
+    /// consulted. At production log levels that is pure cost on every request to the busiest
+    /// route in the process, for a line nobody will read.</para>
+    ///
+    /// <para><see cref="LoggerMessage.Define{T}"/> hands back a strongly typed delegate that
+    /// asks <c>IsEnabled</c> first and formats nothing when the answer is no: 0 bytes, one
+    /// virtual call. The same shape <c>SegmentIndexBuilder</c> already uses.</para>
+    /// </summary>
+    private static readonly Action<ILogger, int, Exception?> _tracesDecoded =
+        LoggerMessage.Define<int>(
+            Microsoft.Extensions.Logging.LogLevel.Debug,
+            new Microsoft.Extensions.Logging.EventId(1, "OtlpTracesDecoded"),
+            "OTLP /v1/traces: decoded {SpanCount} spans");
+
+    private static readonly Action<ILogger, int, string?, Exception?> _tracesDecodeFailed =
+        LoggerMessage.Define<int, string?>(
+            Microsoft.Extensions.Logging.LogLevel.Warning,
+            new Microsoft.Extensions.Logging.EventId(2, "OtlpTracesDecodeFailed"),
+            "OTLP /v1/traces: failed to decode body ({Bytes} bytes, Content-Type: {Ct})");
+
+    /// <summary>Internal so <c>OtlpTraceProtoProbe</c> can measure what it costs when Debug is off.</summary>
+    internal static void LogTracesDecoded(ILogger logger, int spanCount)
+        => _tracesDecoded(logger, spanCount, null);
+
+    internal static void LogTracesDecodeFailed(ILogger logger, int bytes, string? contentType, Exception ex)
+        => _tracesDecodeFailed(logger, bytes, contentType, ex);
 
     // ── API-key authorization ───────────────────────────────────────────────────
 

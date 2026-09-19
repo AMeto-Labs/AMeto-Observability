@@ -600,9 +600,15 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             Kind              = item.Kind,
             Status            = item.Status,
             HttpStatusCode    = item.HttpStatusCode,  // promoted — no attrs deserialization
-            Attributes        = item.AttributesBytes.Length > 0
-                                    ? DeserializeAttributes(item.AttributesBytes)
-                                    : null,
+
+            // THE BLOB, NOT A DICTIONARY, AND THAT IS WHAT THIS LOCK HOLD IS. The mapper already
+            // produced these bytes; inflating them here into a Dictionary plus a string per key
+            // and a box per value cost 3.5 µs and 1 496 B per span — 68 % of the CPU and 91 % of
+            // the allocation of a WriteSpan — inside the engine's EXCLUSIVE write lock, to
+            // reproduce a map nothing on the ingest path ever reads. SpanRecord.Attributes decodes
+            // it on demand at the four sites that do (TraceQL, GetAttr on ROOT spans, the trace
+            // detail DTO), and the flush hands the same bytes to SpanWriter untouched.
+            AttributesBytes   = item.AttributesBytes,
         };
 
         int offset = _hotSpans.Count;
@@ -2780,18 +2786,6 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    private static IReadOnlyDictionary<string, object?>? DeserializeAttributes(byte[] bytes)
-    {
-        try
-        {
-            return MessagePackSerializer.Deserialize<Dictionary<string, object?>>(bytes);
-        }
-        catch
-        {
-            return null;
-        }
-    }
-
     // ── ITraceStatsProvider ────────────────────────────────────────────────────
 
     public Task<IReadOnlyList<ServiceSegmentStats>> GetAggregateStatsAsync(
@@ -2980,8 +2974,10 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
 
     // ── ITraceSummaryProvider ──────────────────────────────────────────────────
 
-    private static readonly string[] MethodKeys = { "http.request.method", "http.method" };
-    private static readonly string[] PathKeys   = { "url.path", "http.target", "http.route", "url.full", "http.url" };
+    // ONE list, shared with TraceQLExecutor.BuildRow — see HttpSemconvKeys for why the two readers
+    // are not allowed their own copies.
+    private static readonly string[] MethodKeys = HttpSemconvKeys.MethodKeys;
+    private static readonly string[] PathKeys   = HttpSemconvKeys.PathKeys;
 
     /// <summary>
     /// Trace volume + sparkline over [from,to]. Cold tiers are served purely from the
@@ -3370,8 +3366,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             m.HttpStatusCode = s.HttpStatusCode;
             m.Name           = s.Name;
             m.ServiceName    = s.ServiceName;
-            m.HttpMethod     = GetAttr(s.Attributes, MethodKeys);
-            m.HttpPath       = GetAttr(s.Attributes, PathKeys);
+            SetHttpAttrs(s, m);
         }
     }
 
@@ -3405,14 +3400,35 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         return false;
     }
 
-    private static string GetAttr(IReadOnlyDictionary<string, object?>? attrs, string[] keys)
-    {
-        if (attrs is null) return string.Empty;
-        foreach (var k in keys)
-            if (attrs.TryGetValue(k, out var v) && v is not null)
-                return v.ToString() ?? string.Empty;
-        return string.Empty;
-    }
+    /// <summary>
+    /// THE TRACE LIST READS TWO KEYS, SO IT READS TWO KEYS — not a whole attribute map, and above
+    /// all not a whole attribute map from inside <c>_lock.EnterReadLock()</c>.
+    ///
+    /// <para><see cref="MergeSpanInto"/> runs under the read lock over every unflushed span and
+    /// asks this for the first root span of each trace. Reaching the answer through
+    /// <see cref="SpanRecord.Attributes"/> made that ask the FIRST touch of the record's blob, so
+    /// the lazy decode ran right there: a <c>Dictionary</c>, a key string and a box per attribute
+    /// per root span of the tier, inside a lock the drainer's <c>WriteSpan</c> has to wait out —
+    /// and memoised on the record afterwards, so a tier that had been listed once stayed that much
+    /// heavier until it flushed. Release, 20 000-span tier, 2 000 traces: 2 023 → 623 B allocated
+    /// per root span, and 1 888 → 498 B LEFT ON THE TIER, which at the 50 000-span threshold is
+    /// 9,0 → 2,4 MB the tier never gives back, on the first page after every flush.</para>
+    ///
+    /// <para>WHAT IT COSTS, because it is not free: the decode was memoised and this walk is not,
+    /// so a second page over the same tier pays it again — the probe measures page 2 at 5,1 ms
+    /// against the memoised path's 3,0 ms, ≈ 1 µs per root span of read-lock hold per page, and
+    /// 96 B per root span for the one <c>GetString</c> the dictionary had already paid for. The
+    /// trade is deliberate and it is the round's stated order — resident memory first, and the
+    /// 512 MB stand died of the live set, not of a millisecond. Memoising the two strings on the
+    /// record instead is the SSE hot-tier re-walk, which the plan gives to WP9.</para>
+    ///
+    /// <para>ONE WALK, BOTH QUESTIONS, AND ONE COPY OF IT: the walk itself is
+    /// <see cref="HttpSemconvKeys.Resolve"/>, beside the key lists it reads, because
+    /// <c>TraceQLExecutor.BuildRow</c> asks the same question of the same records of the same
+    /// tier and must not answer it a second way.</para>
+    /// </summary>
+    private static void SetHttpAttrs(SpanRecord s, MergedTrace m) =>
+        HttpSemconvKeys.Resolve(s, out m.HttpMethod, out m.HttpPath);
 
     private struct HotVolAcc
     {
