@@ -610,6 +610,11 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         // and the exemplar ring must not.)
         HotSeries?[]? resolved = null;
 
+        // THE HIGHEST ORDINAL THIS BATCH WROTE, so the return path can clear what it wrote
+        // instead of the array it was given. See the finally below.
+        int  lastResolved      = -1;
+        bool exemplarsConsumed = false;
+
         try
         {
             // Logging a point and making it visible must be one step with respect to a flush's
@@ -654,7 +659,8 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                         // Rented, not allocated: an exemplar-carrying batch is a steady-state shape,
                         // not a one-off, and this must not put a per-batch array in front of the GC.
                         resolved ??= ArrayPool<HotSeries?>.Shared.Rent(items.Length);
-                        resolved[i] = series;
+                        resolved[i]  = series;
+                        lastResolved = i;
                     }
                 }
             }
@@ -662,7 +668,11 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
             if (droppedFuture > 0) ReportFutureDrops(droppedFuture, "ingest");
 
-            if (resolved is not null) AddExemplars(items, futureLimit, resolved);
+            if (resolved is not null)
+            {
+                AddExemplars(items, futureLimit, resolved);
+                exemplarsConsumed = true;   // every ordinal it read, it also cleared
+            }
 
             if (hotBytes >= _hotFlushBytes
                 && System.Threading.Interlocked.CompareExchange(ref _thresholdFlushScheduled, 1, 0) == 0)
@@ -676,10 +686,27 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         }
         finally
         {
-            // Cleared on the way back: a HotSeries reference left in a pooled slot would keep a
-            // series — its points, its label set, its catalog entry — alive for as long as the
-            // pool holds the array, long after a stale sweep had evicted it.
-            if (resolved is not null) ArrayPool<HotSeries?>.Shared.Return(resolved, clearArray: true);
+            // NOTHING THIS BATCH WROTE MAY OUTLIVE IT — and that is a statement about the
+            // ordinals it wrote, not about the array it happened to be handed.
+            //
+            // A HotSeries reference left in a pooled slot keeps a series — its points, its label
+            // set, its catalog entry — alive for as long as the pool holds the array, long after
+            // a stale sweep had evicted it, so it has to go. `clearArray: true` was the blunt way
+            // to say so and it says far too much: ArrayPool rounds a rent up to a power of two,
+            // so a 10 000-point batch is handed 16 384 slots and the return memset all of them
+            // — 128 KB of writes, per exemplar-carrying batch, to null a handful of references
+            // and then re-null 16 000 slots that were already null.
+            //
+            // <see cref="AddExemplars"/> nulls each slot as it consumes it, which is exactly the
+            // set that was written and costs one store per exemplar-carrying item. The span clear
+            // is the net under it: reached only when the pass did not run (an exception on the
+            // way there), bounded by the ordinals this batch actually wrote rather than by the
+            // rented length, and never by the whole array.
+            if (resolved is not null)
+            {
+                if (!exemplarsConsumed && lastResolved >= 0) resolved.AsSpan(0, lastResolved + 1).Clear();
+                ArrayPool<HotSeries?>.Shared.Return(resolved, clearArray: false);
+            }
         }
     }
 
@@ -722,6 +749,14 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
             if (item.TimestampUnixNano > futureLimit) continue;
             if (item.Exemplars is not { Length: > 0 } exs) continue;
 
+            // TAKEN AND CLEARED IN ONE STEP, HERE AND NOT BELOW, because the slot has to be
+            // cleared on every way out of this iteration and there are three of them (a refused
+            // ring, a full ring table, and the ordinary path). The ingest loop writes a slot
+            // exactly when both tests above pass, so this is precisely the written set — which
+            // is what lets the caller return the array without a memset of all 16 384 slots.
+            var series = resolved[i];
+            resolved[i] = null;
+
             ExemplarRing? ring;
             if (ReferenceEquals(item.Name, lastName))
             {
@@ -762,7 +797,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
             // re-hashed a SeriesKey the caller had just hashed. Holding the reference is also
             // stricter than the lookup was — a stale sweep between the two passes could make the
             // lookup miss and fall back to the point's own (uncanonical, uniquely owned) set.
-            var labels = resolved[i] is { } series ? series.Labels : item.Labels;
+            var labels = series is not null ? series.Labels : item.Labels;
 
             foreach (var ex in exs)
             {

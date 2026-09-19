@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Diagnostics;
 
 using Ameto.Core;
@@ -113,6 +114,98 @@ public sealed class MetricExemplarIngestProbe
             WalInitialBytes    =  64 * MB,
             ExemplarsPerMetric = 256,
         });
+
+    /// <summary>
+    /// WHAT THE EXEMPLAR HANDOVER ARRAY COSTS TO GIVE BACK.
+    ///
+    /// <para>The ingest loop rents a <c>HotSeries?[]</c> of <c>items.Length</c> to hand the
+    /// exemplar pass the series it already resolved, and gave it back with
+    /// <c>Return(resolved, clearArray: true)</c>. <see cref="ArrayPool{T}"/> rounds a rent up to
+    /// a power of two, so a 10 000-point batch is handed 16 384 slots and that return memset
+    /// ALL of them — 128 KB of writes per exemplar-carrying batch, to null a handful of
+    /// references and then re-null 16 000 slots that were already null.</para>
+    ///
+    /// <para>The guarantee the memset was there for is narrower than the memset: nothing THIS
+    /// BATCH wrote may outlive it, because a <c>HotSeries</c> left in a pooled slot keeps a
+    /// series — its points, its label set, its catalog entry — alive for as long as the pool
+    /// holds the array, long after a stale sweep evicted it. Nothing is said about slots this
+    /// batch never touched; they are their previous owner's business and were dirty when it
+    /// arrived, which is what a pool means.</para>
+    ///
+    /// <para>BOTH HALVES ARE ASSERTED, and the pool is seeded with a sentinel so that they can
+    /// be told apart: every ordinal the batch wrote comes back null, and an ordinal it never
+    /// touched still holds the sentinel. Restore <c>clearArray: true</c> and the second half
+    /// fails — the sentinel is gone, which is the 16 384-slot memset showing itself.</para>
+    /// </summary>
+    [Fact]
+    public async Task The_exemplar_handover_array_is_returned_clear_of_its_own_writes_only()
+    {
+        const int Items = 10;   // rents a 16-slot array, so there are untouched slots to see
+
+        string root = Path.Combine(Path.GetTempPath(), "ameto-mexret-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            await using var engine = Open(root, "handover");
+
+            long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L - 60_000_000_000L;
+            var  items    = new MetricIngestItem[Items];
+            for (int i = 0; i < Items; i++)
+                items[i] = new MetricIngestItem
+                {
+                    Name              = "handover.metric",
+                    Unit              = "ms",
+                    Kind              = MetricKind.Gauge,
+                    Labels            = new LabelSet([new("series", "s" + i)]),
+                    TimestampUnixNano = baseNano + i,
+                    ScalarValue       = i,
+                    // Ordinals 0 and 2 only: the written set has to be a strict subset of the
+                    // batch, and the batch a strict subset of the rented array.
+                    Exemplars         = i is 0 or 2
+                        ? [new MetricExemplar
+                           {
+                               TimestampUnixNano = baseNano + i,
+                               Value             = i,
+                               TraceId           = "4bf92f3577b34da6a3ce929d0e0e4736",
+                               SpanId            = "00f067aa0ba902b7",
+                           }]
+                        : null,
+                };
+
+            // SEED THE POOL, so what the return did is legible. Everything below runs on this
+            // thread with no await in between, which is what makes the shared pool hand the same
+            // array back: Return parks it in this thread's slot for the bucket, and the next
+            // Rent of the same bucket on this thread takes it from there.
+            var sentinel = new HotSeries(new LabelSet([new("sentinel", "yes")]));
+            var seeded   = ArrayPool<HotSeries?>.Shared.Rent(Items);
+            seeded.AsSpan().Fill(sentinel);
+            ArrayPool<HotSeries?>.Shared.Return(seeded, clearArray: false);
+
+            engine.Ingest(items);
+
+            var back = ArrayPool<HotSeries?>.Shared.Rent(Items);
+            try
+            {
+                Assert.Same(seeded, back);   // otherwise the two halves below are about two arrays
+
+                _out.WriteLine($"EXEMPLAR HANDOVER  batch of {Items} items -> a {back.Length}-slot rented array, "
+                             + "2 ordinals written");
+
+                // Half one: nothing this batch wrote survived it.
+                Assert.Null(back[0]);
+                Assert.Null(back[2]);
+
+                // Half two: and nothing else was touched. The slots past the batch never belonged
+                // to it, and the memset that reached them is what this item removed.
+                for (int i = Items; i < back.Length; i++)
+                    Assert.True(ReferenceEquals(sentinel, back[i]),
+                        $"slot {i} of a {back.Length}-slot array was cleared by a {Items}-item batch — "
+                      + "the return is still memsetting the whole rented array");
+            }
+            finally { ArrayPool<HotSeries?>.Shared.Return(back, clearArray: true); }
+        }
+        finally { try { Directory.Delete(root, true); } catch { } }
+    }
 
     private static MetricIngestItem[] Batch(bool withExemplars)
     {
