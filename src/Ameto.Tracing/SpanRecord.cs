@@ -347,6 +347,36 @@ internal static class HttpSemconvKeys
 {
     internal static readonly string[] MethodKeys = ["http.request.method", "http.method"];
     internal static readonly string[] PathKeys   = ["url.path", "http.target", "http.route", "url.full", "http.url"];
+
+    /// <summary>
+    /// THE DICTIONARY READING OF ONE OF THOSE LISTS: the first key that is present with a
+    /// non-null value, as the text a boxed <c>ToString()</c> produces. Empty when no key of the
+    /// list is on the span, when every value is null, or when the record has no map at all —
+    /// three cases a caller has no reason to tell apart.
+    ///
+    /// <para><b>It lives here because the lists do.</b> The same nine lines stood in
+    /// <c>TraceStorageEngine</c>, <c>TraceSummarySidecar</c> and <c>TraceQLExecutor</c>, byte for
+    /// byte, each beside its own alias of <see cref="MethodKeys"/> / <see cref="PathKeys"/>. The
+    /// lists were pulled into one place because three copies had already drifted two keys apart
+    /// and put a different path on the same trace in the trace list and in a TraceQL row; the
+    /// RULE that reads them is the other half of that answer, and leaving it in three copies
+    /// leaves the same defect one edit away — first-match becomes last-match, or <c>v is not
+    /// null</c> becomes a null-or-empty test, in one reader and not the others.</para>
+    ///
+    /// <para>A <c>ReadOnlySpan&lt;string&gt;</c> and not <c>params string[]</c>, so the key list
+    /// is passed and never built: with a params parameter the literal arguments at a call site
+    /// are a fresh array per call, which on the TraceQL page was two arrays on every one of up
+    /// to a thousand rows and invisible to the caller (see
+    /// <c>TraceQlScanProbe.Reading_the_http_attributes_of_a_row_allocates_nothing</c>).</para>
+    /// </summary>
+    internal static string GetAttr(IReadOnlyDictionary<string, object?>? attrs, ReadOnlySpan<string> keys)
+    {
+        if (attrs is null) return string.Empty;
+        for (int i = 0; i < keys.Length; i++)
+            if (attrs.TryGetValue(keys[i], out var v) && v is not null)
+                return v.ToString() ?? string.Empty;
+        return string.Empty;
+    }
 }
 
 /// <summary>

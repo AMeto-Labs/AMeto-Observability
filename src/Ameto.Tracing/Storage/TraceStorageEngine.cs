@@ -3465,8 +3465,8 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         var blob = s.AttributesBytes;
         if (blob.IsEmpty)
         {
-            m.HttpMethod = GetAttr(s.Attributes, MethodKeys);
-            m.HttpPath   = GetAttr(s.Attributes, PathKeys);
+            m.HttpMethod = HttpSemconvKeys.GetAttr(s.Attributes, MethodKeys);
+            m.HttpPath   = HttpSemconvKeys.GetAttr(s.Attributes, PathKeys);
             return;
         }
 
@@ -3498,20 +3498,6 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                 _                       => string.Empty,   // unreachable: FindValues clears these bits
             };
         }
-        return string.Empty;
-    }
-
-    /// <summary>
-    /// First key that is present with a value, as text. A <c>ReadOnlySpan&lt;string&gt;</c> so the
-    /// key list is passed, never built — see <c>TraceQLExecutor.GetAttr</c> for the per-row
-    /// <c>params</c> array this shape removes.
-    /// </summary>
-    private static string GetAttr(IReadOnlyDictionary<string, object?>? attrs, ReadOnlySpan<string> keys)
-    {
-        if (attrs is null) return string.Empty;
-        for (int i = 0; i < keys.Length; i++)
-            if (attrs.TryGetValue(keys[i], out var v) && v is not null)
-                return v.ToString() ?? string.Empty;
         return string.Empty;
     }
 

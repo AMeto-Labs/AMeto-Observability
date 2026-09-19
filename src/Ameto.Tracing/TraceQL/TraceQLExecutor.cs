@@ -346,15 +346,10 @@ public static class TraceQLExecutor
     internal static readonly string[] PathKeys   = HttpSemconvKeys.PathKeys;
 
     /// <summary>
-    /// First key that is present with a value, as text. A <c>ReadOnlySpan&lt;string&gt;</c> so the
-    /// key list is passed, never built.
+    /// First key that is present with a value, as text — <see cref="HttpSemconvKeys.GetAttr"/>,
+    /// which is where the rule now lives for all three readers of these lists. Kept as a name in
+    /// this file because the probes and the parity tests reach it by this one.
     /// </summary>
-    internal static string GetAttr(IReadOnlyDictionary<string, object?>? attrs, ReadOnlySpan<string> keys)
-    {
-        if (attrs is null) return string.Empty;
-        for (int i = 0; i < keys.Length; i++)
-            if (attrs.TryGetValue(keys[i], out var v) && v is not null)
-                return v.ToString() ?? string.Empty;
-        return string.Empty;
-    }
+    internal static string GetAttr(IReadOnlyDictionary<string, object?>? attrs, ReadOnlySpan<string> keys) =>
+        HttpSemconvKeys.GetAttr(attrs, keys);
 }

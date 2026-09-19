@@ -134,8 +134,8 @@ internal static class TraceSummarySidecar
                 a.RootHttpStatus = s.HttpStatusCode;
                 a.RootName       = s.Name;
                 a.RootService    = s.ServiceName;
-                a.RootMethod     = GetAttr(s.Attributes, MethodKeys);
-                a.RootPath       = GetAttr(s.Attributes, PathKeys);
+                a.RootMethod     = HttpSemconvKeys.GetAttr(s.Attributes, MethodKeys);
+                a.RootPath       = HttpSemconvKeys.GetAttr(s.Attributes, PathKeys);
             }
         }
 
@@ -557,20 +557,6 @@ internal static class TraceSummarySidecar
 
     private static string ReadStr8(BinaryReader r)  => Encoding.UTF8.GetString(r.ReadBytes(r.ReadByte()));
     private static string ReadStr16(BinaryReader r) => Encoding.UTF8.GetString(r.ReadBytes(r.ReadUInt16()));
-
-    /// <summary>
-    /// First key that is present with a value, as text. A <c>ReadOnlySpan&lt;string&gt;</c> so the
-    /// key list is passed, never built — see <c>TraceQLExecutor.GetAttr</c> for the per-row
-    /// <c>params</c> array this shape removes.
-    /// </summary>
-    private static string GetAttr(IReadOnlyDictionary<string, object?>? attrs, ReadOnlySpan<string> keys)
-    {
-        if (attrs is null) return string.Empty;
-        for (int i = 0; i < keys.Length; i++)
-            if (attrs.TryGetValue(keys[i], out var v) && v is not null)
-                return v.ToString() ?? string.Empty;
-        return string.Empty;
-    }
 
     private struct VolCell { public uint Traces; public uint Errors; }
 
