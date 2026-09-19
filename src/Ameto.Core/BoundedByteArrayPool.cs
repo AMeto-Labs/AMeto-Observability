@@ -26,7 +26,7 @@ namespace Ameto.Core;
 internal sealed class BoundedByteArrayPool
 {
     /// <summary>Smallest bucket. Below this a rent allocates: the saving is not worth a slot.</summary>
-    private const int MinLength = 4096;
+    internal const int MinLength = 4096;
 
     private readonly byte[]?[][] _buckets;      // [bucket][depth]
     private readonly int[]       _counts;       // parked per bucket
