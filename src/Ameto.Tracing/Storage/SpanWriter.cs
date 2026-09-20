@@ -222,6 +222,11 @@ internal static class SpanWriter
         // red-black tree insertion per SPAN. The SortedSet was paying for an ordering the walk
         // already guaranteed, in a node per block per service.
         var svcBlockMap = new Dictionary<string, List<uint>>(StringComparer.Ordinal);
+        // span → service, built HERE because the block pass is already holding both. It is what
+        // .svcgraph needs to resolve a parent's service, and building it there cost a second full
+        // walk of the batch (6,3 ms and a 50 000-entry dictionary per flush, measured). Same walk
+        // order, same last-writer-wins for a duplicated span id, so the same map.
+        var spanSvc     = new Dictionary<SpanId, string>(count);
         // Per-service stats accumulators (service → mutable stats)
         var svcStats    = new Dictionary<string, MutableServiceStats>(StringComparer.Ordinal);
 
@@ -258,7 +263,7 @@ internal static class SpanWriter
                     int batchCount = Math.Min(BlockSize, count - written);
                     uint blockIdx  = (uint)(written / BlockSize);
                     var block      = WriteBlock(in spans, written, batchCount, blockBuf, blockIdx,
-                                                traceIndex, svcBlockMap, bloomHashes, svcStats, blooms);
+                                                traceIndex, svcBlockMap, spanSvc, bloomHashes, svcStats, blooms);
                     bw.Write((uint)block.UncompressedSize);
                     bw.Write((uint)block.CompressedBytes.Length);
                     bw.Write(block.CompressedBytes);
@@ -346,7 +351,7 @@ internal static class SpanWriter
             // ── Sidecars, at temp names (each fsyncs itself). Some legitimately write
             //    nothing — an empty stats/edge set produces no file at all.
             WriteStatsSidecar(statsFinal + ".tmp", svcStats);
-            ServiceGraphSidecar.WriteOrdered(trcPath, in spans, svcgraphFinal + ".tmp");
+            ServiceGraphSidecar.WriteOrdered(trcPath, in spans, svcgraphFinal + ".tmp", spanSvc);
             TraceSummarySidecar.WriteOrdered(trcPath, in spans, tracesumFinal + ".tmp");
 
             // ── Publish: sidecars first, the .trc last — a visible .trc implies its
@@ -419,6 +424,7 @@ internal static class SpanWriter
         uint                                     blockIdx,
         Dictionary<TraceId, List<uint>>          traceIndex,
         Dictionary<string, List<uint>>           svcBlockMap,
+        Dictionary<SpanId, string>               spanSvc,
         HashSet<ulong>                           bloomHashes,
         Dictionary<string, MutableServiceStats>  svcStats,
         List<byte[]>                             blooms)
@@ -460,6 +466,9 @@ internal static class SpanWriter
             }
             // Ascending and distinct by construction — see the map's declaration.
             if (blocks.Count == 0 || blocks[^1] != blockIdx) blocks.Add(blockIdx);
+
+            // ── span → service, for .svcgraph ────────────────────────────────
+            spanSvc[s.SpanId] = s.ServiceName;
 
             // ── Per-service stats ────────────────────────────────────────────
             if (!svcStats.TryGetValue(s.ServiceName, out var st))

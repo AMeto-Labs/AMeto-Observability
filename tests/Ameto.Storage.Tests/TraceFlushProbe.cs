@@ -310,6 +310,48 @@ public sealed class TraceFlushProbe : IDisposable
         return result;
     }
 
+    /// <summary>
+    /// TS#7(d)'S FAILURE MODE, NAMED: the span→service map the <c>.svcgraph</c> resolves parents
+    /// through is now built inside the writer's BLOCK pass, and a block pass is a natural place to
+    /// reset per-block state. A map that were reset per block would still produce a plausible
+    /// service graph — every edge whose two ends fall in the same block survives — and would
+    /// silently drop every edge that crosses a block boundary, which on a 4 096-span block is
+    /// every long trace in the segment.
+    ///
+    /// <para>So: 5 000 spans over two blocks, and every child in block 1 has its parent in block
+    /// 0, in a different service. The one edge must carry all of them.</para>
+    /// </summary>
+    [Fact]
+    public void The_service_graph_resolves_parents_from_an_earlier_block()
+    {
+        const int N = 5_000;                    // block 0 = 0..4095, block 1 = 4096..4999
+        const int Children = N - 4096;
+        var corpus = new List<SpanRecord>(N);
+        for (int i = 0; i < N; i++)
+        {
+            bool child = i >= 4096;
+            corpus.Add(new SpanRecord
+            {
+                TraceId           = new TraceId(0, (ulong)(i % 400)),
+                SpanId            = new SpanId((ulong)i + 1),
+                // Every child's parent is span 1 — the very first span of block 0.
+                ParentSpanId      = child ? new SpanId(1) : default,
+                StartTimeUnixNano = BaseNano + i,
+                DurationNanos     = 3_000_000,
+                Name              = "op",
+                ServiceName       = child ? "downstream" : "upstream",
+            });
+        }
+
+        string path = SpanWriter.Write(NewDir("svcgraph-blocks"), corpus).FilePath;
+        var edges = ServiceGraphSidecar.ReadEdges(path);
+
+        var edge = Assert.Single(edges);
+        Assert.Equal("upstream",   edge.From);
+        Assert.Equal("downstream", edge.To);
+        Assert.Equal((uint)Children, edge.CallCount);
+    }
+
     // ── The probe ───────────────────────────────────────────────────────────────
 
     /// <summary>
