@@ -149,6 +149,77 @@ public sealed class TraceFlushProbe : IDisposable
             Assert.Equal(a[i].SpanId.RawValue, b[i].SpanId.RawValue);
     }
 
+    /// <summary>
+    /// THE BATCH A FLUSH IS HANDED IS NOT THE FLUSH'S TO REORDER, and this is the fact that makes
+    /// TS#7(a) safe rather than merely cheap.
+    ///
+    /// <para>The plan says to sort the caller's list in place "because <c>CompleteFlush</c> hands
+    /// over a detached snapshot". It is detached from the HOT TIER, and from nothing else:
+    /// <c>TraceStorageEngine</c> parks the same reference in <c>_flushingSpans</c> for the whole
+    /// of the write and serves the by-trace lookup, the trace list, the volume sparkline, the
+    /// per-service stats and the service graph out of it while the flush runs — under the engine
+    /// READ lock, which the flush thread does not hold. A <c>List&lt;T&gt;.Sort</c> under those
+    /// readers bumps the list's version stamp and faults every live enumerator with "Collection
+    /// was modified"; the ones that got their element first would read a half-permuted tier.</para>
+    ///
+    /// <para>So the writer sorts a permutation instead, and this says so in a way that a later
+    /// "optimisation" back to an in-place sort cannot pass.</para>
+    /// </summary>
+    [Fact]
+    public void The_flush_does_not_reorder_the_batch_it_is_given()
+    {
+        var corpus = BuildCorpus();
+        var before = new ulong[corpus.Count];
+        for (int i = 0; i < corpus.Count; i++) before[i] = corpus[i].SpanId.RawValue;
+
+        SpanWriter.Write(NewDir("untouched"), corpus);
+
+        for (int i = 0; i < corpus.Count; i++)
+            Assert.Equal(before[i], corpus[i].SpanId.RawValue);
+    }
+
+    /// <summary>
+    /// TS#7(a)'S BYTE-IDENTITY ARGUMENT, AT THE SIZE THE ARGUMENT IS ABOUT — 50 000 spans, the
+    /// production flush threshold, where the copy the item removes is a 400 KB LOH array.
+    ///
+    /// <para>Introsort is UNSTABLE, so a tier full of ties (and this corpus is: 50 000 spans over
+    /// 500 start times) has its order decided by the algorithm's swap sequence and not by the
+    /// data. The claim is that sorting <c>int[] {0..n-1}</c> with a comparison that reads a
+    /// parallel key array performs exactly the comparisons the old <c>List&lt;SpanRecord&gt;.Sort</c>
+    /// performed, in the same sequence, over the same entry point — so the permutation is the same
+    /// one. That is a claim about the BCL, which is why it is asserted against the BCL rather than
+    /// reasoned about: the reference order below is produced by the code this item deleted.</para>
+    ///
+    /// <para>It prints what that deleted copy allocates, as a same-run control — the figure is
+    /// what TS#7(a) buys, measured on the machine that is reading it.</para>
+    /// </summary>
+    [Fact]
+    public void The_index_sort_picks_the_same_order_the_deleted_copy_did()
+    {
+        const int Large = 50_000;
+        var corpus = BuildCorpus(Large);
+
+        // THE DELETED CODE, VERBATIM, as the reference: this is SpanWriter.Write's first three
+        // lines at cb5780e. Measured while it runs, because what it costs IS the item.
+        GC.Collect(2, GCCollectionMode.Forced, blocking: true);
+        long loh0 = GC.GetGCMemoryInfo().GenerationInfo[^1].SizeAfterBytes;
+        long a0   = GC.GetAllocatedBytesForCurrentThread();
+        var ordered = new List<SpanRecord>(corpus);
+        ordered.Sort(static (a, b) => a.StartTimeUnixNano.CompareTo(b.StartTimeUnixNano));
+        long copyAlloc = GC.GetAllocatedBytesForCurrentThread() - a0;
+        long copyLoh   = GC.GetGCMemoryInfo().GenerationInfo[^1].SizeAfterBytes - loh0;
+
+        _out.WriteLine($"the copy TS#7(a) removed: {copyAlloc:N0} B allocated, "
+                     + $"{copyLoh:N0} B of it LOH, for {Large:N0} spans "
+                     + $"({copyAlloc / (double)Large:N1} B/span)");
+
+        var written = SpanReader.ReadAll(SpanWriter.Write(NewDir("perm"), corpus).FilePath);
+
+        Assert.Equal(ordered.Count, written.Count);
+        for (int i = 0; i < ordered.Count; i++)
+            Assert.Equal(ordered[i].SpanId.RawValue, written[i].SpanId.RawValue);
+    }
+
     // ── The probe ───────────────────────────────────────────────────────────────
 
     /// <summary>
@@ -261,12 +332,12 @@ public sealed class TraceFlushProbe : IDisposable
     /// on every call — the writer is allowed to reorder what it is handed, and a shared corpus
     /// would let one test's sort decide the next test's input.
     /// </summary>
-    private static List<SpanRecord> BuildCorpus()
+    private static List<SpanRecord> BuildCorpus(int howMany = Spans)
     {
-        var spans = new List<SpanRecord>(Spans);
+        var spans = new List<SpanRecord>(howMany);
         var buf   = new ArrayBufferWriter<byte>(1024);
 
-        for (int i = 0; i < Spans; i++)
+        for (int i = 0; i < howMany; i++)
         {
             int  trace   = i / SpansPerTrace;
             bool isRoot  = i % SpansPerTrace == 0;

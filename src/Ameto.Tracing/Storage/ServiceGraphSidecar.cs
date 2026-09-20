@@ -38,17 +38,32 @@ internal static class ServiceGraphSidecar
     /// </summary>
     public static void Write(string baseTrcPath, IList<SpanRecord> spans, string? outputPath = null)
     {
-        if (spans.Count == 0) return;
+        var batch = new OrderedSpans(spans);
+        WriteOrdered(baseTrcPath, in batch, outputPath);
+    }
+
+    /// <summary>
+    /// The same, for a batch the flush has already put in order — see <see cref="OrderedSpans"/>.
+    /// The order is not cosmetic here: <c>edges</c> is enumerated in INSERTION order when the file
+    /// is written, so the order the spans are walked in is the order the edges land on disk.
+    /// </summary>
+    internal static void WriteOrdered(string baseTrcPath, in OrderedSpans spans, string? outputPath = null)
+    {
+        int count = spans.Count;
+        if (count == 0) return;
 
         // spanId → serviceName lookup for the entire batch
-        var spanSvc = new Dictionary<SpanId, string>(spans.Count);
-        for (int i = 0; i < spans.Count; i++)
-            spanSvc[spans[i].SpanId] = spans[i].ServiceName;
+        var spanSvc = new Dictionary<SpanId, string>(count);
+        for (int i = 0; i < count; i++)
+        {
+            var s = spans[i];
+            spanSvc[s.SpanId] = s.ServiceName;
+        }
 
         // Accumulate edges
         var edges = new Dictionary<(string From, string To), MutableEdge>(16);
 
-        for (int i = 0; i < spans.Count; i++)
+        for (int i = 0; i < count; i++)
         {
             var s = spans[i];
             if (s.ParentSpanId.IsEmpty) continue;

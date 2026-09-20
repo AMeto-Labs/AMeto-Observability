@@ -95,13 +95,26 @@ internal static class TraceSummarySidecar
 
     public static void Write(string baseTrcPath, IList<SpanRecord> spans, string? outputPath = null)
     {
-        if (spans.Count == 0) return;
+        var batch = new OrderedSpans(spans);
+        WriteOrdered(baseTrcPath, in batch, outputPath);
+    }
+
+    /// <summary>
+    /// The same, for a batch the flush has already put in order — see <see cref="OrderedSpans"/>.
+    /// The order decides the file: <c>traces</c>, <c>vol</c> and the service pool are all written
+    /// in INSERTION order, and "the first empty-parent span wins the root slot" is a statement
+    /// about the walk.
+    /// </summary>
+    internal static void WriteOrdered(string baseTrcPath, in OrderedSpans spans, string? outputPath = null)
+    {
+        int spanCount = spans.Count;
+        if (spanCount == 0) return;
 
         // One pass: group spans by trace id into per-trace accumulators.
-        var traces = new Dictionary<TraceId, Acc>(spans.Count / 2 + 1);
+        var traces = new Dictionary<TraceId, Acc>(spanCount / 2 + 1);
         long segMin = long.MaxValue, segMax = long.MinValue;
 
-        for (int i = 0; i < spans.Count; i++)
+        for (int i = 0; i < spanCount; i++)
         {
             var s = spans[i];
             if (s.StartTimeUnixNano < segMin) segMin = s.StartTimeUnixNano;
