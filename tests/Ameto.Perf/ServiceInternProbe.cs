@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Text;
 using Ameto.Ingestion;
 using Ameto.Otel;
+using Ameto.Core;
 using Ameto.Storage;
 using Xunit;
 using Xunit.Abstractions;

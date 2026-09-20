@@ -1,7 +1,6 @@
 using System.Collections.Concurrent;
-using Ameto.Core;
 
-namespace Ameto.Storage;
+namespace Ameto.Core;
 
 /// <summary>
 /// Interns message template strings to avoid storing the same string for every event
