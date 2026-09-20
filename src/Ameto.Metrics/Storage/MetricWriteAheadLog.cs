@@ -620,18 +620,50 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     // ── Append ───────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Logs one data point. The series is registered in the pool on first sight and referred
-    /// to by index afterwards, so the per-point cost is a struct store plus the histogram
-    /// bucket counts — no managed allocation on the steady-state path.
+    /// Logs one data point, with the stored form supplied by the caller. Kept for the tests and
+    /// for any caller that genuinely has one point; it is the one-element case of
+    /// <see cref="Append(ReadOnlySpan{MetricIngestItem})"/> and runs the same code, so the two
+    /// cannot drift.
     /// </summary>
     public void Append(MetricIngestItem item, in MetricDataPoint point)
-    {
-        var key = new SeriesKey(item.Name ?? string.Empty, item.Kind, item.Unit ?? string.Empty,
-                                item.Labels ?? LabelSet.Empty);
+        => AppendCore(MemoryMarshal.CreateReadOnlySpan(ref item, 1),
+                      MemoryMarshal.CreateReadOnlySpan(ref Unsafe.AsRef(in point), 1));
 
-        long[]? buckets = point.BucketCounts;
-        int bucketCount = buckets is null ? 0 : Math.Min(buckets.Length, MaxBucketCounts);
-        int entrySize   = EntryHeaderSize + bucketCount * sizeof(long);
+    /// <summary>
+    /// Logs a whole ingest batch under ONE acquisition of the write lock.
+    ///
+    /// <para><b>The lock was taken per point, and it is the process-global one.</b> An OTLP
+    /// export is 500–1 000 points and every Kestrel thread handling a POST was queueing on this
+    /// monitor once per point: measured 714 ns/point on one thread and 4 091 ns/point each on
+    /// eight, with aggregate throughput flat — every core past the first bought nothing. Taking
+    /// it once per batch is the same work behind one uncontended acquisition, and it matches how
+    /// the caller actually calls: <c>MetricStorageEngine.Ingest</c> already has the whole batch
+    /// in hand.</para>
+    ///
+    /// <para><b>The file-header write offset is stored once, at the end.</b> That is what makes
+    /// this all-or-nothing rather than a prefix: recovery never walks past the offset the header
+    /// claims (<see cref="ReconcileDataEndLocked"/> only ever truncates DOWN from it), so a
+    /// throw part-way through — <see cref="Grow"/> on a full disk is the one that can — leaves
+    /// the entries written so far unclaimed and therefore unreadable, and <c>_writeOffset</c>
+    /// unmoved, so the next append overwrites them. The caller's contract is unchanged and
+    /// strictly cleaner: it applies NOTHING to the hot tier for a batch whose log append threw,
+    /// where the per-point shape left the prefix logged and visible and the rest neither.</para>
+    ///
+    /// <para>The stored point of each item is derived here, through
+    /// <see cref="MetricIngestItem.ToDataPoint"/> — the same one definition the hot tier uses,
+    /// so the log and the tier still agree to the bit without a 40-byte struct per point being
+    /// carried between them through a side array.</para>
+    /// </summary>
+    public void Append(ReadOnlySpan<MetricIngestItem> items) => AppendCore(items, default);
+
+    /// <summary>
+    /// The one append. <paramref name="points"/> empty means "derive each item's stored point";
+    /// non-empty means positional, <c>points[i]</c> for <c>items[i]</c>, which is the single-point
+    /// overload's contract.
+    /// </summary>
+    private void AppendCore(ReadOnlySpan<MetricIngestItem> items, ReadOnlySpan<MetricDataPoint> points)
+    {
+        if (items.IsEmpty) return;
 
         lock (_writeLock)
         {
@@ -640,27 +672,48 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
                 throw new InvalidOperationException(
                     "Metric WAL has no mapping; the log is not accepting appends.");
 
-            uint seriesIdx = RegisterSeriesLocked(key, item.BucketBounds);
+            // The running end of data, committed to the field and the header only once the whole
+            // batch is down. See the remarks above for why the partial state must stay unclaimed.
+            long offset = _writeOffset;
 
-            while (_writeOffset + entrySize > _capacity)
-                Grow();
+            for (int i = 0; i < items.Length; i++)
+            {
+                var item  = items[i];
+                var point = points.IsEmpty ? item.ToDataPoint() : points[i];
 
-            byte* dest = _ptr + FileHeaderSize + _writeOffset;
+                var key = new SeriesKey(item.Name ?? string.Empty, item.Kind, item.Unit ?? string.Empty,
+                                        item.Labels ?? LabelSet.Empty);
 
-            ref var eh = ref Unsafe.AsRef<MetricWalEntryHeader>(dest);
-            eh.Generation        = _generation;
-            eh.SeriesIndex       = seriesIdx;
-            eh.TimestampUnixNano = point.TimestampUnixNano;
-            eh.Value             = point.Value;
-            eh.Count             = point.Count;
-            eh.Sum               = point.Sum;
-            eh.BucketCount       = (ushort)bucketCount;
+                long[]? buckets = point.BucketCounts;
+                int bucketCount = buckets is null ? 0 : Math.Min(buckets.Length, MaxBucketCounts);
+                int entrySize   = EntryHeaderSize + bucketCount * sizeof(long);
 
-            if (bucketCount > 0)
-                buckets.AsSpan(0, bucketCount)
-                       .CopyTo(new Span<long>(dest + EntryHeaderSize, bucketCount));
+                uint seriesIdx = RegisterSeriesLocked(key, item.BucketBounds);
 
-            _writeOffset += entrySize;
+                while (offset + entrySize > _capacity)
+                    Grow();
+
+                // AFTER the grow loop, every iteration: Grow unmaps and re-maps, so a pointer
+                // taken before it is into a dead view.
+                byte* dest = _ptr + FileHeaderSize + offset;
+
+                ref var eh = ref Unsafe.AsRef<MetricWalEntryHeader>(dest);
+                eh.Generation        = _generation;
+                eh.SeriesIndex       = seriesIdx;
+                eh.TimestampUnixNano = point.TimestampUnixNano;
+                eh.Value             = point.Value;
+                eh.Count             = point.Count;
+                eh.Sum               = point.Sum;
+                eh.BucketCount       = (ushort)bucketCount;
+
+                if (bucketCount > 0)
+                    buckets.AsSpan(0, bucketCount)
+                           .CopyTo(new Span<long>(dest + EntryHeaderSize, bucketCount));
+
+                offset += entrySize;
+            }
+
+            _writeOffset = offset;
             Unsafe.AsRef<WalFileHeader>(_ptr).WriteOffset = FileHeaderSize + _writeOffset;
         }
     }

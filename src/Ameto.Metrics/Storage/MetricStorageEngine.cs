@@ -615,6 +615,16 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         int  lastResolved      = -1;
         bool exemplarsConsumed = false;
 
+        // THE BATCH AS THE LOG WANTS IT — see the three passes below. In the ordinary case
+        // (nothing refused by the future-skew guard) this is `items` itself and these stay null:
+        // the batch is already contiguous and its ordinals are already its indices, so there is
+        // nothing to build. Only a refused point makes the accepted set non-contiguous, and only
+        // then are the two arrays rented — `accepted` for the log's span and `accOrdinal` to map
+        // back, because the exemplar pass indexes `resolved` by the ORIGINAL ordinal.
+        MetricIngestItem[]? accepted   = null;
+        int[]?              accOrdinal = null;
+        int                 accCount   = 0;
+
         try
         {
             // Logging a point and making it visible must be one step with respect to a flush's
@@ -632,35 +642,60 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                 // teardown takes exclusively before it sets this: no Append can straddle the two.
                 ObjectDisposedException.ThrowIf(Volatile.Read(ref _ingestClosed) != 0, this);
 
+                // PASS 1 — decide. See MaxFutureSkewNanos: a refused point must not become the
+                // durable copy of anything, so the refusals are found BEFORE the log is touched.
+                // The scan stops at the first one and the common batch — which has none — walks
+                // out of here having rented nothing and copied nothing.
+                var logged = items;
+
+                int firstRefused = -1;
                 for (int i = 0; i < items.Length; i++)
+                    if (items[i].TimestampUnixNano > futureLimit) { firstRefused = i; break; }
+
+                if (firstRefused >= 0)
                 {
-                    var item = items[i];
+                    accepted   = ArrayPool<MetricIngestItem>.Shared.Rent(items.Length);
+                    accOrdinal = ArrayPool<int>.Shared.Rent(items.Length);
 
-                    // See MaxFutureSkewNanos. Before the WAL append, so garbage never becomes the
-                    // durable copy of anything; counted here, reported once outside the lock.
-                    if (item.TimestampUnixNano > futureLimit) { droppedFuture++; continue; }
+                    items[..firstRefused].CopyTo(accepted);
+                    for (int i = 0; i < firstRefused; i++) accOrdinal[i] = i;
+                    accCount      = firstRefused;
+                    droppedFuture = 1;
 
-                    var point = new MetricDataPoint
+                    for (int i = firstRefused + 1; i < items.Length; i++)
                     {
-                        TimestampUnixNano = item.TimestampUnixNano,
-                        Value             = item.Kind == MetricKind.Histogram
-                                                ? (item.HistogramCount > 0 ? item.HistogramSum / item.HistogramCount : 0)
-                                                : item.ScalarValue,
-                        Count             = item.HistogramCount,
-                        Sum               = item.HistogramSum,
-                        BucketCounts      = item.BucketCounts,   // preserved for real percentiles + heatmap
-                    };
+                        if (items[i].TimestampUnixNano > futureLimit) { droppedFuture++; continue; }
+                        accepted[accCount]   = items[i];
+                        accOrdinal[accCount] = i;
+                        accCount++;
+                    }
 
-                    _wal.Append(item, in point);
-                    hotBytes = ApplyToHotTier(item, in point, out var series);
+                    logged = accepted.AsSpan(0, accCount);
+                }
+
+                // PASS 2 — durable. ONE write-lock acquisition for the whole batch, and
+                // all-or-nothing: a throw here (Grow on a full disk) leaves nothing claimed in
+                // the log AND nothing in the tier, where the per-point shape left the prefix in
+                // both and the remainder in neither.
+                _wal.Append(logged);
+
+                // PASS 3 — visible. Ordering against a flush's snapshot is what _snapshotLock
+                // provides, and it is held across all three passes, so "logged, then published"
+                // is still one step as far as the drain is concerned.
+                for (int j = 0; j < logged.Length; j++)
+                {
+                    var item  = logged[j];
+                    var point = item.ToDataPoint();          // the same derivation the log used
+                    hotBytes  = ApplyToHotTier(item, in point, out var series);
 
                     if (item.Exemplars is { Length: > 0 })
                     {
                         // Rented, not allocated: an exemplar-carrying batch is a steady-state shape,
                         // not a one-off, and this must not put a per-batch array in front of the GC.
-                        resolved ??= ArrayPool<HotSeries?>.Shared.Rent(items.Length);
-                        resolved[i]  = series;
-                        lastResolved = i;
+                        int ordinal  = accOrdinal is null ? j : accOrdinal[j];
+                        resolved   ??= ArrayPool<HotSeries?>.Shared.Rent(items.Length);
+                        resolved[ordinal] = series;
+                        if (ordinal > lastResolved) lastResolved = ordinal;
                     }
                 }
             }
@@ -707,6 +742,20 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                 if (!exemplarsConsumed && lastResolved >= 0) resolved.AsSpan(0, lastResolved + 1).Clear();
                 ArrayPool<HotSeries?>.Shared.Return(resolved, clearArray: false);
             }
+
+            // The same argument for the compaction array, on the rarer path that rented one:
+            // `accepted` holds MetricIngestItem references, so a slot left set keeps a whole
+            // point graph — its labels, its bucket arrays, its exemplars — alive for as long as
+            // the pool holds the array, which is the life of the process. Cleared over the
+            // ordinals this batch wrote, not over the rounded-up rented length (a 10 000-item
+            // batch is handed 16 384 slots). `accOrdinal` is int[] and refers to nothing.
+            if (accepted is not null)
+            {
+                accepted.AsSpan(0, accCount).Clear();
+                ArrayPool<MetricIngestItem>.Shared.Return(accepted, clearArray: false);
+            }
+            if (accOrdinal is not null)
+                ArrayPool<int>.Shared.Return(accOrdinal, clearArray: false);
         }
     }
 

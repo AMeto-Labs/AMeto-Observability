@@ -129,6 +129,29 @@ public sealed class MetricIngestItem
 
     /// <summary>Sampled exemplars linking individual measurements to traces (may be null).</summary>
     public MetricExemplar[]? Exemplars   { get; init; }
+
+    /// <summary>
+    /// The stored form of this item — THE one definition of it.
+    ///
+    /// <para>The write-ahead log and the hot tier must agree on it to the bit, and they used to
+    /// agree by the ingest loop computing it once and handing the same struct to both. Once the
+    /// log takes a whole batch under one lock (see <c>MetricWriteAheadLog.Append(ReadOnlySpan&lt;
+    /// MetricIngestItem&gt;)</c>) the two no longer share a call frame, and carrying a 40-byte
+    /// struct per point through a pooled side array to keep them together cost more in memory
+    /// traffic than the lock acquisitions the batch saved — measured at +140 ns/point on one
+    /// thread. Deriving it twice from the item, which is in cache either way, costs a few field
+    /// reads; having it written down once is what keeps the two derivations the same.</para>
+    /// </summary>
+    internal MetricDataPoint ToDataPoint() => new()
+    {
+        TimestampUnixNano = TimestampUnixNano,
+        Value             = Kind == MetricKind.Histogram
+                                ? (HistogramCount > 0 ? HistogramSum / HistogramCount : 0)
+                                : ScalarValue,
+        Count             = HistogramCount,
+        Sum               = HistogramSum,
+        BucketCounts      = BucketCounts,   // preserved for real percentiles + heatmap
+    };
 }
 
 /// <summary>
