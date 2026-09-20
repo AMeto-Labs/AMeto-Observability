@@ -31,11 +31,26 @@ public sealed class SegmentCatalogKeyTests : IAsyncLifetime
 
     private string SegDir => Path.Combine(_dir, "segments");
 
-    public Task InitializeAsync()
+    /// <summary>
+    /// The engine's catalog scan is a background task started in its constructor, and this class
+    /// works by putting files on disk BEHIND that catalog — so a scan still running is a second
+    /// writer into the thing every fact here reads. Over an empty directory it finishes in under a
+    /// millisecond on an idle machine, which is why it was never waited for; on two cores in Debug
+    /// under load it does not, and it then keys the peer file a test has just dropped.
+    /// <see cref="A_push_landing_before_the_scan_reaches_the_file_cannot_overwrite_it"/> asserts
+    /// that exact entry is absent and failed on it in the full suite at <c>/affinity 3</c>.
+    ///
+    /// <para><see cref="StorageEngine.CatalogLoaded"/> exists for this and says so: awaiting it
+    /// here makes "no scan is in flight" a fact of the fixture rather than an assumption each fact
+    /// inherits. It does not weaken the window the two "before the scan" facts describe — a file
+    /// on disk with no catalog entry is still exactly that, and now nothing is racing to give it
+    /// one.</para>
+    /// </summary>
+    public async Task InitializeAsync()
     {
         Directory.CreateDirectory(_dir);
         _engine = NewEngine();
-        return Task.CompletedTask;
+        await _engine.CatalogLoaded;
     }
 
     public async Task DisposeAsync()
@@ -323,7 +338,7 @@ public sealed class SegmentCatalogKeyTests : IAsyncLifetime
         string peerPath = WritePeerSegment(Peer, shared, now, events: 4);
         _engine.ImportSegment(peerPath);
 
-        await RestartAsync(expectSegments: 2);
+        await RestartAsync();
 
         // Rebuilt from the directory, not from anything the previous process handed over.
         var all = _engine.ListSegments();
@@ -806,22 +821,20 @@ public sealed class SegmentCatalogKeyTests : IAsyncLifetime
     /// <summary>
     /// Restarts on the same directory and waits for the catalog scan to FINISH, rather than for a
     /// count to be reached: what a collision costs is an entry that never appears, so a wait that
-    /// stops at the first entry would be waiting for the wrong thing. The scan's closing log line
-    /// is the only signal it has published.
+    /// stops at the first entry would be waiting for the wrong thing.
+    ///
+    /// <para>The scan's closing log line is no longer the only signal it publishes:
+    /// <see cref="StorageEngine.CatalogLoaded"/> is the task itself, so this is the completion
+    /// rather than a 25 ms poll for a message about it — and the ten-second ceiling that used to
+    /// decide the verdict, on a machine whose only fault was being slow, is gone with it. A scan
+    /// that threw rethrows here, which the log poll reported as "did not finish".</para>
     /// </summary>
     private async Task RestartAndAwaitCatalogAsync()
     {
         await _engine.DisposeAsync();
         _log    = new CapturingLogger();
         _engine = NewEngine();
-
-        for (int i = 0; i < 400; i++)
-        {
-            foreach (var (message, _) in _log.Entries)
-                if (message.StartsWith("Loaded ", StringComparison.Ordinal)) return;
-            await Task.Delay(25);
-        }
-        Assert.Fail("the catalog scan did not finish");
+        await _engine.CatalogLoaded;
     }
 
     /// <summary>
@@ -1146,12 +1159,18 @@ public sealed class SegmentCatalogKeyTests : IAsyncLifetime
         }
     }
 
-    /// <summary>Restarts on the same directory and waits for the background catalog scan.</summary>
-    private async Task RestartAsync(int expectSegments)
+    /// <summary>
+    /// Restarts on the same directory and waits for the background catalog scan — the scan
+    /// itself, not for <c>ListSegments()</c> to reach a count. The count is what the caller is
+    /// about to assert, and a wait that stops when it is reached cannot tell a catalog that is
+    /// finished from one that is halfway: it would give up at its ceiling and hand the caller a
+    /// partial catalog to fail on, which is the loaded-runner failure
+    /// <see cref="StorageEngine.CatalogLoaded"/> was introduced to end.
+    /// </summary>
+    private async Task RestartAsync()
     {
         await _engine.DisposeAsync();
         _engine = NewEngine();
-        for (int i = 0; i < 400 && _engine.ListSegments().Count < expectSegments; i++)
-            await Task.Delay(25);
+        await _engine.CatalogLoaded;
     }
 }
