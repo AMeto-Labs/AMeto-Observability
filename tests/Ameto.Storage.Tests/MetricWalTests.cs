@@ -1062,15 +1062,49 @@ public sealed class MetricWalTests : IAsyncLifetime
         return [.. items];
     }
 
-    /// <summary>Waits until a scheduled flush has taken its snapshot and moved on to the files.</summary>
-    private static async Task DrainedAsync(MetricStorageEngine engine)
+    /// <summary>
+    /// Bounds a hang and decides nothing: every wait it guards is ended by a signal out of the
+    /// engine, so reaching this figure is a wedged test rather than a slow one.
+    /// </summary>
+    private static readonly TimeSpan HangGuard = TimeSpan.FromSeconds(30);
+
+    /// <summary>
+    /// Holds the FIRST flush this engine runs at the instant it is about to write its files, and
+    /// returns the task that says it is there. The caller owns <paramref name="held"/> and
+    /// releases it where the window it wanted has been opened.
+    ///
+    /// <para>What this replaces polled <see cref="MetricStorageEngine.HotPointCount"/> down to
+    /// nought and then asserted, one statement later, that the flush had not finished — two facts
+    /// read at two different instants with the entire file write sitting between them. The drain
+    /// and the write are adjacent inside <c>FlushHotTierAsync</c>, and the poll woke on
+    /// <c>Task.Delay(1)</c>, whose real floor is the platform timer: on two cores in Debug under
+    /// load the wake landed after all 2 000 <c>.mts</c> files were on disk and the flush was
+    /// complete, so the fact failed on its own setup line — <c>6 runs in 10</c> of this class at
+    /// <c>/affinity 3</c>, on <see cref="A_finished_flush_cannot_hide_one_that_is_still_writing"/>
+    /// and <see cref="Every_batch_ingest_returns_from_during_shutdown_is_durable"/>.</para>
+    ///
+    /// <para><see cref="MetricStorageEngine.OnSnapshotTakenForTest"/> IS that instant rather than a
+    /// sample of it: it fires inside the flush after the drain has zeroed the counters and the
+    /// log's generation is open, and before <c>MetricWriter.Write</c> has written one byte. A flush
+    /// parked there is drained AND unfinished on any machine at any speed, so the two facts the
+    /// poll guessed at are now true by construction, and the test chooses when the write starts
+    /// instead of hoping it has not finished.</para>
+    ///
+    /// <para>Only the first flush is held. The later ones — a second schedule, the shutdown loop's
+    /// final flush — reach this seam too whenever they have points of their own, and holding one of
+    /// those would wedge the very shutdown under test.</para>
+    /// </summary>
+    private static Task HoldTheFirstFlushAtItsFileWrite(MetricStorageEngine engine, TaskCompletionSource held)
     {
-        var sw = System.Diagnostics.Stopwatch.StartNew();
-        while (engine.HotPointCount > 0)
+        var reached = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int flushes = 0;
+        engine.OnSnapshotTakenForTest = () =>
         {
-            Assert.True(sw.Elapsed < TimeSpan.FromSeconds(30), "the scheduled flush never took its snapshot");
-            await Task.Delay(1);
-        }
+            if (Interlocked.Increment(ref flushes) != 1) return;
+            reached.TrySetResult();
+            held.Task.GetAwaiter().GetResult();
+        };
+        return reached.Task;
     }
 
     /// <summary>
@@ -1345,16 +1379,27 @@ public sealed class MetricWalTests : IAsyncLifetime
         var engine = NewEngine();
         long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
 
+        var held       = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var _    = Seam.ReleasedOnExit(held);  // a red assertion below must not strand a thread
+        var atItsWrite = HoldTheFirstFlushAtItsFileWrite(engine, held);
+
         engine.Ingest(SlowFlushBatch(baseNano));
         var writing = engine.ScheduleThresholdFlushForTest();
-        await DrainedAsync(engine);                          // past its snapshot, into the files
+        await atItsWrite.WaitAsync(HangGuard);               // past its snapshot, at its files
 
-        // Empty tier, so this returns at snapshot.Count == 0 — the flush that finishes first
-        // and publishes last.
+        // Empty tier, so this returns at the pre-check above the gate — the flush that finishes
+        // first and publishes last.
         await engine.ScheduleThresholdFlushForTest();
+        Assert.Equal(0, engine.HotPointCount);               // the seam stands past the drain
         Assert.False(writing.IsCompleted, "setup: the first flush must still be writing its files");
 
-        await engine.DisposeAsync();
+        // Released INTO the shutdown rather than ahead of it: the teardown is already under way
+        // when the first .mts is opened, so what follows measures a flush shutdown must notice
+        // rather than one it could have missed by a hair. What remains to be written is 300 000
+        // points of files — work that scales with the machine, unlike the window this stood on.
+        var dispose = engine.DisposeAsync();
+        held.SetResult();
+        await dispose;
         int running = engine.RunningThresholdFlushes;
 
         Assert.True(running == 0,
@@ -1400,17 +1445,25 @@ public sealed class MetricWalTests : IAsyncLifetime
         var engine = NewEngine();
         long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
 
+        var held       = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var _    = Seam.ReleasedOnExit(held);  // a red assertion below must not strand a thread
+        var atItsWrite = HoldTheFirstFlushAtItsFileWrite(engine, held);
+
         var flushed = SlowFlushBatch(baseNano);
         engine.Ingest(flushed);
         var writing = engine.ScheduleThresholdFlushForTest();
-        await DrainedAsync(engine);
+        await atItsWrite.WaitAsync(HangGuard);
         await engine.ScheduleThresholdFlushForTest();        // the handle a single field keeps
         Assert.False(writing.IsCompleted, "setup: the orphan must still be writing its files");
 
         var stillArriving = SlowFlushBatch(baseNano + 3_600_000_000_000L, "late", series: 200, pointsPerSeries: 10);
         engine.Ingest(stillArriving);                        // tier NOT empty at the final flush
 
-        await engine.DisposeAsync();
+        // The orphan starts its files with the teardown already running, so the final flush and
+        // the orphan's write overlap by construction rather than by how the poll above landed.
+        var dispose = engine.DisposeAsync();
+        held.SetResult();
+        await dispose;
         string frozen = FreezeDataDir();
 
         long expected = flushed.Length + stillArriving.Length;
@@ -1431,14 +1484,20 @@ public sealed class MetricWalTests : IAsyncLifetime
         var engine = NewEngine();
         long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
 
+        var held       = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var _    = Seam.ReleasedOnExit(held);  // a red assertion below must not strand a thread
+        var atItsWrite = HoldTheFirstFlushAtItsFileWrite(engine, held);
+
         var flushed = SlowFlushBatch(baseNano);
         engine.Ingest(flushed);
         var writing = engine.ScheduleThresholdFlushForTest();
-        await DrainedAsync(engine);
+        await atItsWrite.WaitAsync(HangGuard);
         await engine.ScheduleThresholdFlushForTest();        // the handle a single field keeps
         Assert.False(writing.IsCompleted, "setup: the orphan must still be writing its files");
 
-        await engine.DisposeAsync();                          // tier quiesced — no final flush data
+        var dispose = engine.DisposeAsync();                 // tier quiesced — no final flush data
+        held.SetResult();
+        await dispose;
         try { await writing; } catch (ObjectDisposedException) { /* the orphan's own end */ }
 
         long durable = await DurablePointsAsync(_dir, "instrument.0");
@@ -1461,14 +1520,26 @@ public sealed class MetricWalTests : IAsyncLifetime
         var engine = NewEngine();
         long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
 
+        var held       = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var _    = Seam.ReleasedOnExit(held);  // a red assertion below must not strand a thread
+        var atItsWrite = HoldTheFirstFlushAtItsFileWrite(engine, held);
+
         // Give the teardown real work to wait on, so the batches below straddle it rather than
         // arriving before or after: 2 000 series of files, with the tier emptied by the
         // snapshot so the loop's own final pass returns at snapshot.Count == 0.
         var first = SlowFlushBatch(baseNano);
         engine.Ingest(first);
         var writing = engine.ScheduleThresholdFlushForTest();
-        await DrainedAsync(engine);
+        await atItsWrite.WaitAsync(HangGuard);
         Assert.False(writing.IsCompleted, "setup: the flush must still be writing its files");
+
+        // Released HERE, before the batches below are even built: the write this shutdown has to
+        // wait on starts at a point the test chose rather than wherever a poll happened to land,
+        // and the twelve batches then straddle a teardown that is genuinely held up by it. Later
+        // than this and the ingest loop runs to its end while the flush is still parked, which is
+        // no straddle at all — measured: every batch accepted, and the fence mutation below goes
+        // undetected in 2 runs of 3.
+        held.SetResult();
 
         var late = new MetricIngestItem[12][];
         for (int i = 0; i < late.Length; i++)
@@ -1516,9 +1587,13 @@ public sealed class MetricWalTests : IAsyncLifetime
         var engine = NewEngine();
         long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
 
+        var held       = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var _    = Seam.ReleasedOnExit(held);  // a red assertion below must not strand a thread
+        var atItsWrite = HoldTheFirstFlushAtItsFileWrite(engine, held);
+
         engine.Ingest(SlowFlushBatch(baseNano));
         var writing = engine.ScheduleThresholdFlushForTest();
-        await DrainedAsync(engine);
+        await atItsWrite.WaitAsync(HangGuard);
         Assert.False(writing.IsCompleted, "setup: the flush must still be writing its files");
 
         // Observed AT each caller's return, not afterwards — the question is what a caller is
@@ -1530,8 +1605,10 @@ public sealed class MetricWalTests : IAsyncLifetime
             return (flush.IsCompleted, e.RunningThresholdFlushes);
         }
 
-        var seen = await Task.WhenAll(Task.Run(() => DisposeAndLook(engine, writing)),
-                                      Task.Run(() => DisposeAndLook(engine, writing)));
+        var both = Task.WhenAll(Task.Run(() => DisposeAndLook(engine, writing)),
+                                Task.Run(() => DisposeAndLook(engine, writing)));
+        held.SetResult();          // both callers are in flight before the first .mts is opened
+        var seen = await both;
 
         foreach (var (flushDone, running) in seen)
         {
@@ -1555,9 +1632,13 @@ public sealed class MetricWalTests : IAsyncLifetime
         var engine = NewEngine();
         long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
 
+        var held       = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var __   = Seam.ReleasedOnExit(held);  // a red assertion below must not strand a thread
+        var atItsWrite = HoldTheFirstFlushAtItsFileWrite(engine, held);
+
         engine.Ingest(SlowFlushBatch(baseNano));
         var writing = engine.ScheduleThresholdFlushForTest();
-        await DrainedAsync(engine);
+        await atItsWrite.WaitAsync(HangGuard);
 
         using var stop = new CancellationTokenSource();
         var scheduled = new List<Task>();
@@ -1570,7 +1651,9 @@ public sealed class MetricWalTests : IAsyncLifetime
             }
         });
 
-        await engine.DisposeAsync();
+        var dispose = engine.DisposeAsync();
+        held.SetResult();          // the flush opens its first .mts with the teardown under way
+        await dispose;
         int runningAtReturn = engine.RunningThresholdFlushes;
 
         await Task.Delay(50);          // and past the return, the worst moment of all
