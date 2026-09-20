@@ -65,8 +65,12 @@ internal sealed class SpanDrainer : IAsyncDisposable
                 for (int i = 0; i < count; i++)
                 {
                     var item = _batch[i]!;
-                    _storage.WriteSpan(item);
+                    bool taken = _storage.WriteSpan(item);
                     _batch[i] = null;
+                    // The engine has closed its write path. Every further span would be refused
+                    // too, so stop draining rather than spinning the ring empty into a closed
+                    // engine — and say so once, with the count, instead of once per span.
+                    if (!taken) { ReportRefused(count - i); return; }
                 }
             }
             catch (Exception ex)
@@ -84,11 +88,22 @@ internal sealed class SpanDrainer : IAsyncDisposable
             remaining = _ring.TryDequeueMany(_batch, BatchSize);
             for (int i = 0; i < remaining; i++)
             {
-                _storage.WriteSpan(_batch[i]!);
+                bool taken = _storage.WriteSpan(_batch[i]!);
                 _batch[i] = null;
+                if (!taken) { ReportRefused(remaining - i); return; }
             }
         } while (remaining > 0);
     }
+
+    /// <summary>
+    /// Says, once, that the engine stopped taking spans. It is not an error: the spans were
+    /// never durable, the refusal is what keeps them from being queryable-but-unrecoverable,
+    /// and by this point the process is going down anyway.
+    /// </summary>
+    private void ReportRefused(int dropped) =>
+        _logger.LogWarning(
+            "SpanDrainer: the trace engine has closed its write path — {Dropped} span(s) from "
+          + "this batch, and whatever is still in the ring, were not stored", dropped);
 
     /// <summary>Asks the engine to flush if the hot tier is due, every <see cref="FlushCheckInterval"/>.</summary>
     private void MaybeFlush()
