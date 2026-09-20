@@ -48,86 +48,227 @@ public sealed class MetricHotTierRetentionProbe
     [Fact]
     public async Task RetainedByAnEmptyTier_IsAFractionOfThePeak()
     {
-        string dir = Path.Combine(Path.GetTempPath(), "ameto-mhotret-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(dir);
-        long loaded, drained, steady;
-        long floorBefore = Live();
-        try
-        {
-            var engine = new MetricStorageEngine(dir, NullLogger<MetricStorageEngine>.Instance);
-            try
-            {
-                long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
-                Feed(engine, baseNano);
+        var w = await WeighAsync("ameto-mhotret-", BurstDrainAndDisposeAsync);
 
-                // THE BURST MUST STILL BE IN THE TIER. Above the automatic threshold Ingest
-                // schedules its own flush, which drains an unpredictable share of the burst
-                // before this line runs — and the probe then reports the remainder as the cost
-                // of the whole burst. Seen as 7 MB for the burst on one run and 28 MB on
-                // the next, entirely according to how far that flush had got.
-                Assert.Equal(SeriesCount * PointsPerSeries, engine.HotPointCount);
-                loaded = Live();
+        long loaded   = w.Alive[0];
+        long drained  = w.Alive[1];
+        long held     = w.HeldMin(1);          // what a drained tier and its engine still hold
+        long released = loaded - drained;      // what the drain gave back
+        long peak     = held + released;       // what the burst weighed, with no floor in it
+        int  points   = SeriesCount * PointsPerSeries;
 
-                // The seam takes the same path the byte threshold does, with the burst this
-                // probe can afford to build.
-                await engine.ScheduleThresholdFlushForTest();
-                Assert.Equal(0, engine.HotPointCount);
-
-                drained = Live();
-
-                // One more point per series: the steady state a live deployment is actually in,
-                // where every series is still named but holds almost nothing.
-                Feed(engine, baseNano + 10_000_000_000L, pointsPerSeries: 1);
-                steady = Live();
-            }
-            finally { await engine.DisposeAsync(); }
-        }
-        finally { try { Directory.Delete(dir, true); } catch { } }
-
-        // THE FLOOR IS MEASURED ON BOTH SIDES AND THE LOWER READING WINS. This suite runs its
-        // classes back to back, and the classes before this one leave megabytes that are dead
-        // but not yet collected — a floor taken only before the burst reads those as this
-        // engine's baseline and then watches them vanish mid-experiment, which turned a 28 MB
-        // tier into a 7 MB one and the figure into nonsense. Nothing ELSE in the process is
-        // allocating while this runs, so the contamination can only shrink: the smaller of two
-        // readings around the experiment is the true floor, and taking the second one after the
-        // engine is disposed is what makes it comparable.
-        long floorAfter = Live();
-        long empty      = Math.Min(floorBefore, floorAfter);
-
-        int points = SeriesCount * PointsPerSeries;
         _out.WriteLine($"{SeriesCount:N0} series x {PointsPerSeries} points = {points:N0} points, fed in {ChunkPoints:N0}-point chunks");
-        _out.WriteLine($"  heap floor (before / after): {floorBefore / 1048576.0,7:N1} / {floorAfter / 1048576.0:N1} MB");
-        _out.WriteLine($"  heap with the burst in tier: {loaded  / 1048576.0,7:N1} MB  (+{(loaded - empty) / 1048576.0:N1})  = {(loaded - empty) / (double)points,6:N0} B/point");
-        _out.WriteLine($"  heap AFTER the flush drain : {drained / 1048576.0,7:N1} MB  (+{(drained - empty) / 1048576.0:N1} still held) = {(drained - empty) / (double)SeriesCount,6:N0} B/series");
-        _out.WriteLine($"  heap steady state          : {steady  / 1048576.0,7:N1} MB");
-        _out.WriteLine($"  survived the drain         : {100.0 * (drained - empty) / (loaded - empty),6:N1} %");
-        _out.WriteLine($"  released by the drain      : {(loaded - drained) / 1048576.0,7:N1} MB against {points * 40L / 1048576.0:N1} MB of point structs");
+        _out.WriteLine($"  heap with the burst in tier: {loaded  / 1048576.0,7:N1} MB");
+        _out.WriteLine($"  heap AFTER the flush drain : {drained / 1048576.0,7:N1} MB");
+        _out.WriteLine($"  baselines (before / gone)  : {w.Before / 1048576.0,7:N1} / {w.Gone / 1048576.0:N1} MB");
+        _out.WriteLine($"  the burst weighed          : {peak    / 1048576.0,7:N1} MB  = {peak / (double)points,6:N0} B/point");
+        _out.WriteLine($"  still held by an empty tier: {held    / 1048576.0,7:N1} MB  = {held / (double)SeriesCount,6:N0} B/series "
+                     + $"(bracket {w.HeldMin(1) / 1048576.0:N1} .. {w.HeldMax(1) / 1048576.0:N1} MB)");
+        _out.WriteLine($"  survived the drain         : {100.0 * held / peak,6:N1} %");
+        _out.WriteLine($"  released by the drain      : {released / 1048576.0,7:N1} MB against {points * 40L / 1048576.0:N1} MB of point structs");
 
-        // THE FLOOR-FREE HALF, and the sharper of the two. A drain must hand back at least the
-        // points it drained — 40 B a MetricDataPoint, before the list slack that is the actual
-        // subject here. It needs no baseline at all, so nothing another test class left behind
-        // can move it: with the arrays retained the heap after the drain was HIGHER than with the
-        // burst in it (measured: -1.4 MB "released"), because the snapshot's copy and the
-        // series' own array were live at once and only the copy went away.
-        Assert.True(loaded - drained > points * 32L,
-            $"the drain released {(loaded - drained) / 1048576.0:N1} MB of a {points * 40L / 1048576.0:N1} MB "
+        // FLOOR-FREE OUTRIGHT, AND THE SHARPER OF THE TWO. Both readings are of the same process
+        // seconds apart with the same engine in them, so no baseline appears in this figure at
+        // all. A drain must hand back at least the points it drained — 40 B a MetricDataPoint,
+        // before the list slack that is the actual subject here. With the arrays retained the
+        // heap after the drain was HIGHER than with the burst in it (measured on the revert:
+        // -0.8 MB "released"), because the snapshot's copy and the series' own array were live at
+        // once and only the copy went away.
+        Assert.True(released > points * 32L,
+            $"the drain released {released / 1048576.0:N1} MB of a {points * 40L / 1048576.0:N1} MB "
           + "burst — the series are still holding their point arrays");
 
         // The round's bound: what an empty tier still holds must be under a quarter of the peak.
         //
-        // Read against a floor, so it carries what a floor carries. A flush leaves rented buffers
-        // in ArrayPool.Shared, LZ4 and msgpack scratch, and newly JIT'd code — measured at 1.4 to
-        // 3.8 MB, none of it tier memory, all of it inside this figure. That is a FIXED cost, so
-        // it is allowed for as one: without the allowance the same healthy engine reads 12 % with
-        // a 21 MB budget and 27 % with the 11 MB budget a 384 MB heap limit derives, purely
-        // because the burst it is compared against got smaller. Additive and named, so it cannot
-        // absorb a proportional regression: before the change this figure was 22.4 MB against an
-        // allowance-inclusive bound of 9.3 MB.
-        const long poolAndJitAllowance = 4L * 1024 * 1024;
-        Assert.True(drained - empty < (loaded - empty) / 4 + poolAndJitAllowance,
-            $"an empty hot tier still holds {(drained - empty) / (double)SeriesCount:N0} B per series — "
-          + $"{100.0 * (drained - empty) / (loaded - empty):N1} % of the burst's heap survived the drain");
+        // NO FLOOR AND NO ALLOWANCE, WHICH IS THE WHOLE POINT. `peak` is not read against a
+        // baseline taken outside the experiment: it is `held + released`. A flush leaves rented
+        // buffers in ArrayPool.Shared, LZ4 and msgpack scratch and newly JIT'd code — 1.4 to
+        // 3.8 MB, none of it tier memory — and every byte of it is in `drained` and in the
+        // baselines alike, so it cancels instead of needing the 4 MB allowance this bound used to
+        // carry. `held` is the LOW end of the bracket, so a host that moves under the measurement
+        // can only make this easier; on the revert it reads 20.7 MB against a limit of -0.3 MB.
+        //
+        // held < peak / 4  is  3 x held < released, with peak eliminated.
+        Assert.True(held * 3 < released,
+            $"an empty hot tier still holds {held / (double)SeriesCount:N0} B per series — "
+          + $"{100.0 * held / peak:N1} % of the burst's heap survived the drain");
+    }
+
+    /// <summary>
+    /// THE BURST, THE DRAIN AND THE DISPOSAL, IN A FRAME OF THEIR OWN.
+    ///
+    /// <para><b>Why the engine is weighed instead of a floor.</b> This fact used to be read
+    /// against <c>min(floor before, floor after)</c>, on the argument that nothing else in the
+    /// process allocates while it runs and that the contamination left by earlier classes can
+    /// therefore only shrink. The first half is true; the second is the trap. The contamination
+    /// does shrink — on a <b>wall clock</b>, and not on collections. Measured in this suite with
+    /// two cores: five back-to-back <c>Live()</c> calls all read 27.2 MB, then 12.4 MB twelve
+    /// seconds later and 11.0 MB at thirty-two, with no allocation in between and nothing that
+    /// renting <c>ArrayPool&lt;byte|int|long|double&gt;.Shared</c> dry could bring forward. So
+    /// <c>floorAfter</c> could land on the far side of a ~14 MB step that <c>loaded</c> and
+    /// <c>drained</c> were both read on the near side of, and <c>min</c> then subtracted 14 MB
+    /// too little from each. A common error of C inflates the left of
+    /// <c>held &lt; peak/4 + 4 MB</c> by C and the right by only C/4, which is exactly how the
+    /// CI runner read 8 977 B/series and 49.5 % where the same healthy engine is 1 677 B and
+    /// 13 %: its own printout has the step in it (floor 30.5 before, 16.5 after; steady state
+    /// 18.3 MB, BELOW the floor it was measured against).</para>
+    ///
+    /// <para>So there is no floor any more. Everything is a difference between two readings
+    /// seconds apart inside one run, and the baseline is the engine's own disappearance — which
+    /// is why the engine is created, drained and disposed HERE: a Debug build keeps every local
+    /// rooted to the end of the method that declares it, so an engine named by the frame that
+    /// weighs it cannot be weighed at all. <see cref="WeighAsync"/> is what proves the two
+    /// readings are comparable.</para>
+    /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static async Task<WeighedRun> BurstDrainAndDisposeAsync(string dir)
+    {
+        MetricStorageEngine? engine = new(dir, NullLogger<MetricStorageEngine>.Instance);
+        var  tracker = new WeakReference(engine);
+        long loaded, drained;
+        try
+        {
+            long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+            Feed(engine, baseNano);
+
+            // THE BURST MUST STILL BE IN THE TIER. Above the automatic threshold Ingest
+            // schedules its own flush, which drains an unpredictable share of the burst
+            // before this line runs — and the probe then reports the remainder as the cost
+            // of the whole burst. Seen as 7 MB for the burst on one run and 28 MB on
+            // the next, entirely according to how far that flush had got.
+            Assert.Equal(SeriesCount * PointsPerSeries, engine.HotPointCount);
+            QuiesceForWeighing(engine);
+            loaded = Live();
+
+            // The seam takes the same path the byte threshold does, with the burst this
+            // probe can afford to build, and the task it hands back completes only once
+            // FlushHotTierAsync has returned — past the write, the commit and the release of
+            // the flush gate.
+            await engine.ScheduleThresholdFlushForTest();
+
+            // AND THE STATE THE NEXT READING DEPENDS ON IS ASSERTED, NOT ASSUMED. A snapshot
+            // still in flight holds every drained point list and the writer's buffers, and a
+            // reading taken beside one measures the flush rather than the tier.
+            QuiesceForWeighing(engine);
+            Assert.Equal(0, engine.HotPointCount);
+            Assert.Equal(SeriesCount, engine.HotSeriesCount);
+
+            drained = Live();
+        }
+        finally { await engine.DisposeAsync(); }
+
+        // The state machine's own field, cleared before this method's task completes: the caller
+        // weighs the heap the instant it gets control back, and in Debug that field is the one
+        // reference that would keep the engine alive across the reading.
+        engine = null;
+        return new WeighedRun([loaded, drained], tracker);
+    }
+
+    /// <summary>
+    /// No flush is inside <c>FlushHotTierAsync</c>, so nothing but the tier itself is on the
+    /// scale. Only the THRESHOLD path can be there during these facts: the periodic loop's first
+    /// tick is a real 60-second <c>FlushCheckInterval</c> away on the engines that run on the
+    /// system clock, and the ones that run on <see cref="MetricTestClock"/> are only ticked by
+    /// the test that owns them.
+    /// </summary>
+    private static void QuiesceForWeighing(MetricStorageEngine engine)
+        => Assert.Equal(0, engine.RunningThresholdFlushes);
+
+    /// <summary>
+    /// What one run of a weighing hands back: the readings it took with the engine alive, and a
+    /// weak handle on the engine itself so the caller can establish that it really went.
+    /// </summary>
+    private readonly record struct WeighedRun(long[] Alive, WeakReference Engine);
+
+    /// <summary>
+    /// The readings one weighing is made of: the heap before the engine existed, whatever the run
+    /// itself measured with the engine alive, and the heap once the engine is gone.
+    ///
+    /// <para><b>Two baselines, and the answer is a bracket rather than a number.</b> What the
+    /// engine held at reading <c>i</c> is <c>Alive[i] - H</c>, where H is what this process would
+    /// have weighed at that instant with no engine in it — and H is not observable, only
+    /// straddled: <see cref="Before"/> is H a few seconds early and <see cref="Gone"/> is H a few
+    /// seconds late. Neither is H, because the rest of the process does not hold still. It drops
+    /// memory on a <b>wall clock</b> and not on a collection (five consecutive <see cref="Live"/>
+    /// calls in this suite all read 27.2 MB and the sixth, twelve seconds later, read 12.4 MB),
+    /// and a run that flushes ADDS to it by leaving rented buffers in <c>ArrayPool.Shared</c>. So
+    /// H can move either way and the honest statement is
+    /// <c>Min &lt;= held &lt;= Max</c>.</para>
+    ///
+    /// <para><b>Every bound is then asserted on the end of the bracket that cannot invent a
+    /// failure.</b> An upper bound ("the tier holds less than this") is asserted on
+    /// <see cref="HeldMin"/>, a lower bound on <see cref="HeldMax"/>. A host that moves under the
+    /// measurement can then only make a bound easier, never harder, so the fact cannot fail for a
+    /// reason it did not measure — which is exactly how the old <c>min(floor before, floor
+    /// after)</c> read 8 977 B/series on the CI runner against a true 1 677 B: that formula used
+    /// the LATE baseline for everything, so a 14 MB step landed whole in the figure, inflating
+    /// the left of <c>held &lt; peak/4 + 4 MB</c> by 14 MB and the right by 3.5 MB. The spread is
+    /// printed with each figure, so a wide bracket is visible rather than silent.</para>
+    /// </summary>
+    private readonly record struct Weighing(long Before, long[] Alive, long Gone)
+    {
+        /// <summary>How far the heap outside the engine moved while the run was in progress.</summary>
+        public long Drift => Before - Gone;
+
+        /// <summary>The least the engine can have held at reading <paramref name="i"/>.</summary>
+        public long HeldMin(int i = 0) => Alive[i] - Math.Max(Before, Gone);
+
+        /// <summary>The most it can have held.</summary>
+        public long HeldMax(int i = 0) => Alive[i] - Math.Min(Before, Gone);
+    }
+
+    /// <summary>
+    /// TAKES THE TWO BASELINES AROUND A RUN, AND ESTABLISHES THAT THE ENGINE REALLY WENT.
+    ///
+    /// <para>The bracket <see cref="Weighing"/> describes is only a bracket on what the ENGINE
+    /// held if the engine was actually collected by the second reading, and that is not a thing
+    /// to take on trust: the run is a Debug build's worth of hoisted locals, spilled arguments
+    /// and async state machines around an object graph of tens of megabytes, and one surviving
+    /// reference turns <c>Gone</c> into a second reading of <c>Alive</c> — seen once in ten runs
+    /// as 51.4 MB of exemplar rings weighing 0 B, which the ring facts' lower bound caught and no
+    /// arithmetic could have. A <see cref="WeakReference"/> settles it outright: after
+    /// <see cref="Live"/>'s collections an unreachable engine is a dead handle.</para>
+    ///
+    /// <para><b>There is deliberately no retry.</b> A second weighing inside this same frame
+    /// cannot produce one: measured, every attempt after the first found the engine still
+    /// reachable, four times out of four, on two separate runs — the loop's own hoisted state is
+    /// enough to keep it alive. So the run happens once, its bracket is used as it is, and the
+    /// bounds are asserted on the end of it that a moving host can only loosen.</para>
+    /// </summary>
+    private static async Task<Weighing> WeighAsync(string dirPrefix, Func<string, Task<WeighedRun>> runOnce)
+    {
+        string dir = Path.Combine(Path.GetTempPath(), dirPrefix + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+
+        Weighing w;
+        bool     stillHeld;
+        try
+        {
+            long before = Live();
+            var  run    = await runOnce(dir);
+
+            // Taken before the directory is removed: deleting a hundred .mts files and a mapped
+            // log is a second of disk on a two-core host, and every one of those seconds widens
+            // the bracket for no reason.
+            //
+            // Rounds, not one: an engine that has just been weighed is in gen2 with a graph of
+            // finalizable handles under it, and the machinery that ran the await above lets go of
+            // it a collection later than the collection that disposed it. Measured: the 256-ring
+            // engine survives the first round and is gone by the second. The loop ends on the
+            // reading that first sees a dead handle, so the baseline is always the EARLIEST
+            // engine-free reading — the one with the least of the process's own decay in it.
+            long gone = Live();
+            for (int round = 0; round < 8 && run.Engine.IsAlive; round++) gone = Live();
+
+            w         = new Weighing(before, run.Alive, gone);
+            stillHeld = run.Engine.IsAlive;
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+
+        Assert.False(stillHeld,
+            "the disposed engine was still reachable when the baseline was read, so that reading is a "
+          + "second reading of the engine rather than a baseline for it — nothing weighed here is its own");
+        return w;
     }
 
     /// <summary>
@@ -503,53 +644,38 @@ public sealed class MetricHotTierRetentionProbe
         const int rings = 256, depth = 1_000;
         const long entries = rings * (long)depth;
 
-        string dir = Path.Combine(Path.GetTempPath(), "ameto-mexemplar-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(dir);
-        try
-        {
-            // Pinned, and large: this fact is about what one entry weighs, so all 256 rings have
-            // to be admitted. MetricsOptions.MaxExemplarMetricsFor sizes the ring COUNT to what
-            // half the tier budget can afford at this depth, and 256 x 1 000 x 208 B = 50.8 MB
-            // needs 101.6 MB of tier to be affordable.
-            var options = new MetricsOptions
-            {
-                HotTierBytes       = 128_000_000,
-                ExemplarsPerMetric = depth,
-                MaxExemplarMetrics = rings,
-            };
-            Assert.Equal(rings, options.MaxExemplarMetricsFor(MemoryBudgets.Current()));
-            await using var engine = new MetricStorageEngine(dir, NullLogger<MetricStorageEngine>.Instance, options);
+        var w = await WeighAsync("ameto-mexemplar-",
+            static dir => FillRingsAndDisposeAsync(dir, rings, depth, flushFirst: false, distinctLabelSets: false));
 
-            long before = Live();
-            FillRings(engine, rings, depth);
-            long after = Live();
+        double perEntry = w.HeldMin() / (double)entries;
 
-            long   held     = after - before;
-            double perEntry = held / (double)entries;
+        _out.WriteLine($"{rings} rings x {depth} exemplars = {entries:N0} exemplars");
+        _out.WriteLine($"  heap held  : {w.HeldMin() / 1048576.0,7:N1} .. {w.HeldMax() / 1048576.0:N1} MB = {perEntry,6:N0} B/exemplar");
+        _out.WriteLine($"  constant   : {MetricsOptions.ExemplarBytes} B/exemplar "
+                     + $"=> {entries * MetricsOptions.ExemplarBytes / 1048576.0:N1} MB budgeted");
 
-            _out.WriteLine($"{rings} rings x {depth} exemplars = {entries:N0} exemplars");
-            _out.WriteLine($"  heap held  : {held / 1048576.0,7:N1} MB = {perEntry,6:N0} B/exemplar");
-            _out.WriteLine($"  constant   : {MetricsOptions.ExemplarBytes} B/exemplar "
-                         + $"=> {entries * MetricsOptions.ExemplarBytes / 1048576.0:N1} MB budgeted");
+        // WHAT THE ALLOWANCE IS NOW, AND WHAT IT IS NOT. It used to cover a floor: pool residue
+        // and JIT'd code left over from whatever ran before this class, read as part of the
+        // figure because the figure was a difference against a reading taken outside the
+        // experiment. That floor moves on a wall clock — see
+        // <see cref="BurstDrainAndDisposeAsync"/> for the measurement — and 6 MB of it was
+        // allowed for on the belief that it was fixed. Nothing of the sort is in this figure any
+        // more: `held` is what the ENGINE was holding, so every shared-pool byte is on both sides
+        // of the subtraction. What is left to allow for is the engine's own furniture — the
+        // catalog's 256 metric names, one hot series apiece, the log's managed state — which is
+        // small, additive and genuinely fixed.
+        const long engineBaseAllowance = 4L * 1024 * 1024;
 
-            // The same kind of fixed floor the burst fact allows for — pool residue, JIT'd code,
-            // the engine's own log mapping — named and additive so it cannot absorb a per-entry
-            // regression. It is larger here (6 MB, 11 % of the figure) because that floor depends
-            // on what ran before this class: measured 199 B/exemplar with the whole class ahead
-            // of it and 213 B/exemplar run alone, a 3.6 MB spread on a constant that did not
-            // move. The old 120 reads 213 against a 34.7 MB bound and cannot hide in it.
-            const long poolAndJitAllowance = 6L * 1024 * 1024;
+        // Each bound on the end of the bracket that cannot invent a failure — the upper bound on
+        // the low end, the lower bound on the high end. See Weighing.
+        Assert.True(w.HeldMin() <= entries * MetricsOptions.ExemplarBytes + engineBaseAllowance,
+            $"an exemplar retains {perEntry:N0} B against a budget divisor of "
+          + $"{MetricsOptions.ExemplarBytes} B — every derived ring is deeper than its budget");
 
-            Assert.True(held <= entries * MetricsOptions.ExemplarBytes + poolAndJitAllowance,
-                $"an exemplar retains {perEntry:N0} B against a budget divisor of "
-              + $"{MetricsOptions.ExemplarBytes} B — every derived ring is deeper than its budget");
-
-            // And not wildly pessimistic either: a divisor far above the truth wastes the ring
-            // depth the Explore panel actually reads.
-            Assert.True(held >= entries * MetricsOptions.ExemplarBytes * 3 / 4,
-                $"an exemplar retains {perEntry:N0} B against a divisor of {MetricsOptions.ExemplarBytes} B");
-        }
-        finally { try { Directory.Delete(dir, true); } catch { } }
+        // And not wildly pessimistic either: a divisor far above the truth wastes the ring
+        // depth the Explore panel actually reads.
+        Assert.True(w.HeldMax() >= entries * MetricsOptions.ExemplarBytes * 3 / 4,
+            $"an exemplar retains {w.HeldMax() / (double)entries:N0} B against a divisor of {MetricsOptions.ExemplarBytes} B");
     }
 
     /// <summary>
@@ -573,8 +699,8 @@ public sealed class MetricHotTierRetentionProbe
     /// weighing, so what is on the scale is the rings.</para>
     ///
     /// <para>ON REVERT (<c>Labels = labels</c> back to <c>Labels = item.Labels</c> in
-    /// <c>AddExemplars</c>): 64 000 entries retain 52.5 MB (860 B each) instead of 13.5 MB
-    /// (221 B each), against a bound of 18.7 MB. Measured, both ways.</para>
+    /// <c>AddExemplars</c>): 64 000 entries retain ~52 MB (860 B each) instead of 13.1 MB
+    /// (215 B each), against a bound of 16.7 MB.</para>
     /// </summary>
     [Fact]
     public async Task An_exemplar_does_not_retain_its_points_label_set()
@@ -582,56 +708,99 @@ public sealed class MetricHotTierRetentionProbe
         const int rings = 64, depth = 1_000;
         const long entries = rings * (long)depth;
 
-        string dir = Path.Combine(Path.GetTempPath(), "ameto-mexlabels-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(dir);
+        var w = await WeighAsync("ameto-mexlabels-",
+            static dir => FillRingsAndDisposeAsync(dir, rings, depth, flushFirst: true, distinctLabelSets: true));
+
+        double perEntry = w.HeldMin() / (double)entries;
+
+        _out.WriteLine($"{rings} rings x {depth} exemplars = {entries:N0} exemplars, one point and one distinct LabelSet each");
+        _out.WriteLine($"  heap held  : {w.HeldMin() / 1048576.0,7:N1} .. {w.HeldMax() / 1048576.0:N1} MB = {perEntry,6:N0} B/exemplar");
+        _out.WriteLine($"  constant   : {MetricsOptions.ExemplarBytes} B/exemplar "
+                     + $"=> {entries * MetricsOptions.ExemplarBytes / 1048576.0:N1} MB budgeted");
+
+        // The engine's own furniture, as above — the catalog's 64 names, the 64 cold segments
+        // this one's flush published, the log's managed state. The pool residue the old 6 MB
+        // allowance was mostly made of is gone from the figure entirely: the flush's rented
+        // buffers sit in ArrayPool.Shared, which the engine's disposal does not touch, so they
+        // are in both readings. It cannot absorb the regression it is guarding either: one
+        // retained label set per entry is 652 B against a 208 B divisor, so the revert reads
+        // ~860 B an entry against a bound of 208 B + 4 MB / 64 000.
+        const long engineBaseAllowance = 4L * 1024 * 1024;
+
+        Assert.True(w.HeldMin() <= entries * MetricsOptions.ExemplarBytes + engineBaseAllowance,
+            $"an exemplar retains {perEntry:N0} B against a budget divisor of "
+          + $"{MetricsOptions.ExemplarBytes} B — the ring is still keeping its point's LabelSet");
+
+        // The rings must really be there: 4.1x is the regression this guards and the other end of
+        // the bracket is what makes a ring that dropped its entries fail rather than pass.
+        Assert.True(w.HeldMax() >= entries * MetricsOptions.ExemplarBytes / 2,
+            $"64 000 ring entries weigh {w.HeldMax() / (double)entries:N0} B each — the rings are not holding them");
+    }
+
+    /// <summary>
+    /// Fills <paramref name="rings"/> exemplar rings and hands back the heap reading taken with
+    /// the engine alive — its other half is the caller's <see cref="Live"/> once this frame, and
+    /// with it the engine, is gone. Same construction and same reason as
+    /// <see cref="BurstDrainAndDisposeAsync"/>: no reading here is taken against a floor, so
+    /// nothing an earlier test class parked in a shared pool can move the figure.
+    /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static async Task<WeighedRun> FillRingsAndDisposeAsync(
+        string dir, int rings, int depth, bool flushFirst, bool distinctLabelSets)
+    {
+        var options = new MetricsOptions
+        {
+            // Pinned: these facts are about what one entry weighs, not about cadence.
+            // MetricsOptions.MaxExemplarMetricsFor sizes the ring COUNT to what half the tier
+            // budget can afford at this depth, and 256 x 1 000 x 208 B = 50.8 MB needs 101.6 MB
+            // of tier to be affordable.
+            HotTierBytes       = distinctLabelSets ? 32_000_000 : 128_000_000,
+            ExemplarsPerMetric = depth,
+            MaxExemplarMetrics = rings,
+        };
+        Assert.Equal(rings, options.MaxExemplarMetricsFor(MemoryBudgets.Current()));
+
+        MetricStorageEngine? engine = new(dir, NullLogger<MetricStorageEngine>.Instance, options);
+        var  tracker = new WeakReference(engine);
+        long alive;
         try
         {
-            var options = new MetricsOptions
+            if (distinctLabelSets) FillRingsOnePointEach(engine, rings, depth);
+            else                   FillRings(engine, rings, depth);
+
+            if (flushFirst)
             {
-                HotTierBytes       = 32_000_000,   // pinned: this fact is about rings, not cadence
-                ExemplarsPerMetric = depth,
-                MaxExemplarMetrics = rings,
-            };
-            Assert.Equal(rings, options.MaxExemplarMetricsFor(MemoryBudgets.Current()));
-            await using var engine = new MetricStorageEngine(dir, NullLogger<MetricStorageEngine>.Instance, options);
+                // The points go, the rings stay. 64 000 scalar points is 4 MB of tier — a third
+                // of the figure being measured — and leaving them in would put the tier on the
+                // scale next to the rings.
+                await engine.ScheduleThresholdFlushForTest();
+                QuiesceForWeighing(engine);
+                Assert.Equal(0, engine.HotPointCount);
 
-            long before = Live();
-            FillRingsOnePointEach(engine, rings, depth);
+                CheckOneRingReadsBack(engine);
+            }
+            else QuiesceForWeighing(engine);
 
-            // The points go, the rings stay. 64 000 scalar points is 4 MB of tier — a third of
-            // the figure being measured — and leaving them in would put the tier on the scale
-            // next to the rings.
-            await engine.ScheduleThresholdFlushForTest();
-            Assert.Equal(0, engine.HotPointCount);
-
-            long after = Live();
-
-            long   held     = after - before;
-            double perEntry = held / (double)entries;
-
-            _out.WriteLine($"{rings} rings x {depth} exemplars = {entries:N0} exemplars, one point and one distinct LabelSet each");
-            _out.WriteLine($"  heap held  : {held / 1048576.0,7:N1} MB = {perEntry,6:N0} B/exemplar");
-            _out.WriteLine($"  constant   : {MetricsOptions.ExemplarBytes} B/exemplar "
-                         + $"=> {entries * MetricsOptions.ExemplarBytes / 1048576.0:N1} MB budgeted");
-
-            // Same named, additive floor as the facts above, and a flush ran inside this one —
-            // rented buffers left in ArrayPool.Shared, LZ4 and msgpack scratch, the 64 cold
-            // segments' write path and its JIT'd code. It cannot absorb the regression it is
-            // guarding: one retained label set per entry is 652 B against a 208 B divisor, so
-            // the revert reads 860 B an entry and overshoots this bound by 2.8x.
-            const long poolAndJitAllowance = 6L * 1024 * 1024;
-
-            Assert.True(held <= entries * MetricsOptions.ExemplarBytes + poolAndJitAllowance,
-                $"an exemplar retains {perEntry:N0} B against a budget divisor of "
-              + $"{MetricsOptions.ExemplarBytes} B — the ring is still keeping its point's LabelSet");
-
-            // And the exemplars are really there, with the right labels: a ring that dropped
-            // them would pass the weighing trivially.
-            var got = engine.GetExemplars("exemplar.labels.metric.0", null, null, null);
-            Assert.NotEmpty(got);
-            Assert.Equal("checkout", got[0].Labels.Pairs.Single(p => p.Key == "service.name").Value);
+            alive = Live();
         }
-        finally { try { Directory.Delete(dir, true); } catch { } }
+        finally { await engine.DisposeAsync(); }
+
+        engine = null;   // see BurstDrainAndDisposeAsync
+        return new WeighedRun([alive], tracker);
+    }
+
+    /// <summary>
+    /// The exemplars are really there, with the right labels: a ring that dropped them would pass
+    /// the weighing trivially. Its own frame, and never inlined, for the reason
+    /// <see cref="FillRings"/> gives — the snapshot this takes is a thousand ring entries, and in
+    /// Debug it would otherwise still be rooted at the reading it is meant to make honest.
+    /// </summary>
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static void CheckOneRingReadsBack(MetricStorageEngine engine)
+    {
+        var got = engine.GetExemplars("exemplar.labels.metric.0", null, null, null);
+        Assert.NotEmpty(got);
+        Assert.Equal("checkout", got[0].Labels.Pairs.Single(p => p.Key == "service.name").Value);
     }
 
     /// <summary>
@@ -746,12 +915,10 @@ public sealed class MetricHotTierRetentionProbe
         ScalarValue       = value,
     };
 
-    private static void Feed(MetricStorageEngine engine, long baseNano, int pointsPerSeries = 0)
+    private static void Feed(MetricStorageEngine engine, long baseNano)
     {
-        if (pointsPerSeries <= 0) pointsPerSeries = PointsPerSeries;
-
         var chunk = new List<MetricIngestItem>(ChunkPoints);
-        for (int p = 0; p < pointsPerSeries; p++)
+        for (int p = 0; p < PointsPerSeries; p++)
         {
             for (int s = 0; s < SeriesCount; s++)
             {
@@ -794,10 +961,16 @@ public sealed class MetricHotTierRetentionProbe
     /// <para>Three rounds and not one: this suite runs its classes one after another (see
     /// <c>AssemblyInfo.cs</c>) and the metric classes before this one leave finalizable state
     /// behind — mapped logs, file streams, lock objects. A single collect QUEUES those
-    /// finalizers; the memory they hold is only released by the collect AFTER they have run. A
-    /// baseline taken before that second collect reads ~17 MB of other tests' corpses as this
-    /// engine's floor, and then watches them disappear mid-measurement — which is not noise
-    /// around the figure, it is a figure of the wrong sign.</para>
+    /// finalizers; the memory they hold is only released by the collect AFTER they have run.</para>
+    ///
+    /// <para><b>Settled is not the same as clean, and no number of rounds makes it so.</b> Some
+    /// of what an earlier class leaves behind comes back on a wall clock rather than on a
+    /// collection: measured in this suite, five consecutive calls to this method all read
+    /// 27.2 MB and the sixth, twelve seconds later, read 12.4 MB — with nothing allocating in
+    /// between and with <c>ArrayPool&lt;byte|int|long|double&gt;.Shared</c> rented dry beforehand
+    /// to no effect. That is why every figure in this class is now a difference between two
+    /// readings of the same run with the same residue in both, and why none of them is read
+    /// against a floor. See <see cref="BurstDrainAndDisposeAsync"/>.</para>
     /// </summary>
     private static long Live()
     {
