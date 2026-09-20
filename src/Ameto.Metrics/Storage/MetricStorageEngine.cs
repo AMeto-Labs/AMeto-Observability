@@ -625,6 +625,11 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         int[]?              accOrdinal = null;
         int                 accCount   = 0;
 
+        // One pool index per accepted point, resolved without the log's write lock; and the
+        // registry epoch they were resolved in, which the log re-checks under it.
+        uint[]?             seriesIndex = null;
+        long                walEpoch    = 0;
+
         try
         {
             // Logging a point and making it visible must be one step with respect to a flush's
@@ -642,42 +647,60 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                 // teardown takes exclusively before it sets this: no Append can straddle the two.
                 ObjectDisposedException.ThrowIf(Volatile.Read(ref _ingestClosed) != 0, this);
 
-                // PASS 1 — decide. See MaxFutureSkewNanos: a refused point must not become the
-                // durable copy of anything, so the refusals are found BEFORE the log is touched.
-                // The scan stops at the first one and the common batch — which has none — walks
-                // out of here having rented nothing and copied nothing.
+                // PASS 1 — decide, and resolve. Two things ride on this one traversal because a
+                // second one does not get the item graph back out of L2 at OTLP batch sizes:
+                //
+                //  * See MaxFutureSkewNanos: a refused point must not become the durable copy of
+                //    anything, so the refusals are found BEFORE the log is touched. The common
+                //    batch has none and walks out of here having copied nothing — `logged` is
+                //    the caller's own span and `accepted`/`accOrdinal` stay null.
+                //  * The log's series index is resolved here, OUTSIDE its write lock, so the
+                //    critical section holds no dictionary lookup per point. See
+                //    MetricWriteAheadLog.ResolveSeries / SeriesEpoch.
                 var logged = items;
 
-                int firstRefused = -1;
+                walEpoch     = _wal.SeriesEpoch;      // read BEFORE the first resolution
+                seriesIndex  = ArrayPool<uint>.Shared.Rent(items.Length);
+                int resolvedCount = 0;
+
                 for (int i = 0; i < items.Length; i++)
-                    if (items[i].TimestampUnixNano > futureLimit) { firstRefused = i; break; }
-
-                if (firstRefused >= 0)
                 {
-                    accepted   = ArrayPool<MetricIngestItem>.Shared.Rent(items.Length);
-                    accOrdinal = ArrayPool<int>.Shared.Rent(items.Length);
+                    var item = items[i];
 
-                    items[..firstRefused].CopyTo(accepted);
-                    for (int i = 0; i < firstRefused; i++) accOrdinal[i] = i;
-                    accCount      = firstRefused;
-                    droppedFuture = 1;
-
-                    for (int i = firstRefused + 1; i < items.Length; i++)
+                    if (item.TimestampUnixNano > futureLimit)
                     {
-                        if (items[i].TimestampUnixNano > futureLimit) { droppedFuture++; continue; }
-                        accepted[accCount]   = items[i];
-                        accOrdinal[accCount] = i;
+                        droppedFuture++;
+                        if (accepted is null)
+                        {
+                            // First refusal: the accepted set stops being the batch, so it has to
+                            // be compacted — and the original ordinal of every survivor carried,
+                            // because the exemplar pass indexes its handover by THAT.
+                            accepted   = ArrayPool<MetricIngestItem>.Shared.Rent(items.Length);
+                            accOrdinal = ArrayPool<int>.Shared.Rent(items.Length);
+                            items[..i].CopyTo(accepted);
+                            for (int j = 0; j < i; j++) accOrdinal[j] = j;
+                            accCount = i;
+                        }
+                        continue;
+                    }
+
+                    if (accepted is not null)
+                    {
+                        accepted[accCount]   = item;
+                        accOrdinal![accCount] = i;
                         accCount++;
                     }
 
-                    logged = accepted.AsSpan(0, accCount);
+                    seriesIndex[resolvedCount++] = _wal.ResolveSeries(item);
                 }
+
+                if (accepted is not null) logged = accepted.AsSpan(0, accCount);
 
                 // PASS 2 — durable. ONE write-lock acquisition for the whole batch, and
                 // all-or-nothing: a throw here (Grow on a full disk) leaves nothing claimed in
                 // the log AND nothing in the tier, where the per-point shape left the prefix in
                 // both and the remainder in neither.
-                _wal.Append(logged);
+                _wal.AppendResolved(logged, seriesIndex.AsSpan(0, resolvedCount), walEpoch);
 
                 // PASS 3 — visible. Ordering against a flush's snapshot is what _snapshotLock
                 // provides, and it is held across all three passes, so "logged, then published"
@@ -756,6 +779,8 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
             }
             if (accOrdinal is not null)
                 ArrayPool<int>.Shared.Return(accOrdinal, clearArray: false);
+            if (seriesIndex is not null)
+                ArrayPool<uint>.Shared.Return(seriesIndex, clearArray: false);
         }
     }
 

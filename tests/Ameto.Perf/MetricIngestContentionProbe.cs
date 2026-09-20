@@ -35,21 +35,44 @@ public sealed class MetricIngestContentionProbe
     private const int Names = 8, SeriesPerName = 250, Rounds = 12;
     private static readonly int[] ThreadCounts = [1, 2, 4, 8];
 
+    /// <summary>
+    /// Each sweep point runs this many times and the BEST is reported. A throughput figure is
+    /// bounded below by the work and above by nothing — a build on another core, a GC, the
+    /// scheduler — so the mean of a few runs measures the box's mood and the minimum measures
+    /// the code. Consecutive identical runs of this probe varied by 20 % until it did this.
+    /// </summary>
+    private const int Repeats = 5;
+
     [Fact]
     public void ConcurrentIngestThroughput()
     {
-        _out.WriteLine($"{Names} instruments x {SeriesPerName} known series, {Rounds} rounds per thread");
+        _out.WriteLine($"{Names} instruments x {SeriesPerName} known series, {Rounds} rounds per thread, "
+                     + $"best of {Repeats}");
         _out.WriteLine("threads | per-thread ns/point | total k points/s | scaling vs 1 thread");
+
+        // Discarded, and load-bearing: the one-thread point runs FIRST, and on a laptop or a
+        // cloud VM the first sweep point pays for a parked core stepping up its clock. Without
+        // this, one thread measured slower than two — every thread-count figure was then
+        // relative to a cold baseline and the scaling column was fiction.
+        RunSweepPoint(ThreadCounts[^1]);
 
         double oneThreadRate = 0;
 
         foreach (int threads in ThreadCounts)
         {
-            var (nsPerPointPerThread, totalRate) = RunSweepPoint(threads);
-            if (threads == 1) oneThreadRate = totalRate;
+            double bestNs   = double.MaxValue;
+            double bestRate = 0;
+            for (int r = 0; r < Repeats; r++)
+            {
+                var (ns, rate) = RunSweepPoint(threads);
+                if (ns   < bestNs)   bestNs   = ns;
+                if (rate > bestRate) bestRate = rate;
+            }
 
-            _out.WriteLine($"{threads,7} | {nsPerPointPerThread,19:F0} | {totalRate / 1000.0,16:F0} "
-                         + $"| {(oneThreadRate > 0 ? totalRate / oneThreadRate : 1),8:F2}x");
+            if (threads == 1) oneThreadRate = bestRate;
+
+            _out.WriteLine($"{threads,7} | {bestNs,19:F0} | {bestRate / 1000.0,16:F0} "
+                         + $"| {(oneThreadRate > 0 ? bestRate / oneThreadRate : 1),8:F2}x");
         }
     }
 

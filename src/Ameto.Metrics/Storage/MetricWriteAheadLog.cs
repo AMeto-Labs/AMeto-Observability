@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.IO.MemoryMappedFiles;
@@ -258,6 +259,27 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     private readonly ConcurrentDictionary<SeriesKey, uint> _seriesIndex = new();
     private uint        _nextSeriesIndex;
     private FileStream? _poolStream;
+
+    /// <summary>
+    /// Bumped whenever <see cref="Compact"/> empties the log and clears the registry. An index
+    /// resolved outside <c>_writeLock</c> (see <see cref="Append(ReadOnlySpan{MetricIngestItem})"/>)
+    /// is only usable if this has not moved since: past a clear the pool file is truncated and
+    /// indices are re-issued from 0, so a carried-over index names a record that is gone.
+    /// Written under the lock, read without it, hence <see cref="Volatile"/>.
+    /// </summary>
+    private long _seriesEpoch;
+
+    /// <summary>"Not in the registry when it was looked up" — <see cref="uint.MaxValue"/> is
+    /// beyond <see cref="SeriesIndexSanityCap"/>, so it can never be a real index.</summary>
+    private const uint Unregistered = uint.MaxValue;
+
+    /// <summary>
+    /// Test seam fired between the lock-free series lookups and the acquisition of the write
+    /// lock — the window in which a commit can clear the registry under a batch that has already
+    /// resolved its indices. Null in production. The alternative is a timing race, and a
+    /// concurrency test judged by a timer is not judged.
+    /// </summary>
+    internal Action? OnSeriesResolvedForTest;
 
     /// <summary>
     /// One past the highest <c>SeriesIndex</c> the reopen walk saw in the log's OWN entries;
@@ -627,7 +649,8 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// </summary>
     public void Append(MetricIngestItem item, in MetricDataPoint point)
         => AppendCore(MemoryMarshal.CreateReadOnlySpan(ref item, 1),
-                      MemoryMarshal.CreateReadOnlySpan(ref Unsafe.AsRef(in point), 1));
+                      MemoryMarshal.CreateReadOnlySpan(ref Unsafe.AsRef(in point), 1),
+                      default, 0);
 
     /// <summary>
     /// Logs a whole ingest batch under ONE acquisition of the write lock.
@@ -654,14 +677,68 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// so the log and the tier still agree to the bit without a 40-byte struct per point being
     /// carried between them through a side array.</para>
     /// </summary>
-    public void Append(ReadOnlySpan<MetricIngestItem> items) => AppendCore(items, default);
+    public void Append(ReadOnlySpan<MetricIngestItem> items)
+    {
+        if (items.IsEmpty) return;
+
+        uint[] rented = ArrayPool<uint>.Shared.Rent(items.Length);
+        try
+        {
+            long epoch = SeriesEpoch;
+            for (int i = 0; i < items.Length; i++) rented[i] = ResolveSeries(items[i]);
+            AppendResolved(items, rented.AsSpan(0, items.Length), epoch);
+        }
+        finally { ArrayPool<uint>.Shared.Return(rented); }
+    }
+
+    /// <summary>
+    /// SERIES LOOKUP WITHOUT THE LOCK. <c>_seriesIndex</c> is a <see cref="ConcurrentDictionary{
+    /// TKey,TValue}"/> and a hit needs no exclusion at all, yet it was probed from INSIDE the
+    /// exclusive lock, once per point — a hash of the name, a hash of the unit, a bucket walk and
+    /// a compare, all of it serialising every other ingest thread in the process. In the steady
+    /// state every point hits, so a batch that arrives here pre-resolved leaves the critical
+    /// section with no dictionary work and no <see cref="SeriesKey"/> construction in it: it
+    /// reads an int out of a span and stores 48 bytes.
+    ///
+    /// <para>Exposed so the CALLER can fold it into a pass it already makes over the batch — the
+    /// engine's future-skew scan. A pass of its own here re-touched every item's name, unit and
+    /// label set a second time, and at OTLP batch sizes that object graph does not stay in L2.</para>
+    ///
+    /// <para><see cref="Unregistered"/> when the series is not in the registry yet; the append
+    /// registers it under the lock.</para>
+    /// </summary>
+    public uint ResolveSeries(MetricIngestItem item) =>
+        _seriesIndex.TryGetValue(KeyOf(item), out uint known) ? known : Unregistered;
+
+    /// <summary>
+    /// The epoch a <see cref="ResolveSeries"/> answer is only valid in. Read it BEFORE the
+    /// resolutions and hand it back to <see cref="AppendResolved"/>, which re-checks it under
+    /// the lock: <see cref="Compact"/> clears the registry and truncates the pool file when a
+    /// commit empties the log, and re-issues indices from 0, so an index resolved before such a
+    /// clear names a pool record that no longer exists and replay could not resolve the series.
+    /// A bumped epoch throws the whole batch's pre-resolution away and re-registers under the
+    /// lock, which is correct rather than merely rare.
+    /// </summary>
+    public long SeriesEpoch => Volatile.Read(ref _seriesEpoch);
+
+    /// <inheritdoc cref="Append(ReadOnlySpan{MetricIngestItem})"/>
+    public void AppendResolved(ReadOnlySpan<MetricIngestItem> items, ReadOnlySpan<uint> resolved, long epoch)
+    {
+        OnSeriesResolvedForTest?.Invoke();
+        AppendCore(items, default, resolved, epoch);
+    }
+
+    private static SeriesKey KeyOf(MetricIngestItem item) =>
+        new(item.Name ?? string.Empty, item.Kind, item.Unit ?? string.Empty, item.Labels ?? LabelSet.Empty);
 
     /// <summary>
     /// The one append. <paramref name="points"/> empty means "derive each item's stored point";
     /// non-empty means positional, <c>points[i]</c> for <c>items[i]</c>, which is the single-point
-    /// overload's contract.
+    /// overload's contract. <paramref name="preResolved"/> empty means "resolve every series
+    /// under the lock"; otherwise <see cref="Unregistered"/> marks the ones that still must be.
     /// </summary>
-    private void AppendCore(ReadOnlySpan<MetricIngestItem> items, ReadOnlySpan<MetricDataPoint> points)
+    private void AppendCore(ReadOnlySpan<MetricIngestItem> items, ReadOnlySpan<MetricDataPoint> points,
+                            ReadOnlySpan<uint> preResolved, long resolvedAtEpoch)
     {
         if (items.IsEmpty) return;
 
@@ -676,19 +753,21 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
             // batch is down. See the remarks above for why the partial state must stay unclaimed.
             long offset = _writeOffset;
 
+            // Did the registry turn over between the caller's lock-free lookups and this lock?
+            bool staleResolution = preResolved.IsEmpty || _seriesEpoch != resolvedAtEpoch;
+
             for (int i = 0; i < items.Length; i++)
             {
                 var item  = items[i];
                 var point = points.IsEmpty ? item.ToDataPoint() : points[i];
 
-                var key = new SeriesKey(item.Name ?? string.Empty, item.Kind, item.Unit ?? string.Empty,
-                                        item.Labels ?? LabelSet.Empty);
-
                 long[]? buckets = point.BucketCounts;
                 int bucketCount = buckets is null ? 0 : Math.Min(buckets.Length, MaxBucketCounts);
                 int entrySize   = EntryHeaderSize + bucketCount * sizeof(long);
 
-                uint seriesIdx = RegisterSeriesLocked(key, item.BucketBounds);
+                uint seriesIdx = !staleResolution && preResolved[i] != Unregistered
+                    ? preResolved[i]
+                    : RegisterSeriesLocked(KeyOf(item), item.BucketBounds);
 
                 while (offset + entrySize > _capacity)
                     Grow();
@@ -1037,6 +1116,11 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
         {
             _seriesIndex.Clear();
             _nextSeriesIndex = 0;
+
+            // Every index any thread resolved without the lock is void from here: the pool
+            // records behind them are about to be truncated and the next registration re-issues
+            // index 0. See _seriesEpoch.
+            Volatile.Write(ref _seriesEpoch, _seriesEpoch + 1);
             try
             {
                 _poolStream?.SetLength(0);

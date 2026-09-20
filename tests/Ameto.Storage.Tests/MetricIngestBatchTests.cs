@@ -139,6 +139,56 @@ public sealed class MetricIngestBatchTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// The batch resolves its series indices from the concurrent registry WITHOUT the write
+    /// lock, which is the point of the change — a hit needs no exclusion. What it must not do is
+    /// carry an index across the one event that voids every index at once: a commit that empties
+    /// the log truncates the pool file and re-issues indices from zero.
+    ///
+    /// <para>Driven by the <c>OnSeriesResolvedForTest</c> seam, which IS the window between the
+    /// lock-free lookups and the lock, rather than by two threads and a hopeful sleep.</para>
+    /// </summary>
+    [Fact]
+    public void An_index_resolved_before_a_commit_emptied_the_log_is_not_reused()
+    {
+        string dir = Path.Combine(_dir, "epoch");
+        Directory.CreateDirectory(dir);
+        var wal = OpenWal(dir);
+
+        long nano = 1_785_300_000_000_000_000L;
+        var  s    = Scalar("m", nano,     1.0, Labels(("series", "s")));
+        var  t    = Scalar("m", nano + 1, 2.0, Labels(("series", "t")));
+        wal.Append(s, PointOf(s));                       // series index 0
+        wal.Append(t, PointOf(t));                       // series index 1
+
+        bool fired = false;
+        wal.OnSeriesResolvedForTest = () =>
+        {
+            if (fired) return;
+            fired = true;
+            // Empties the log: the registry is cleared, the pool file truncated, and the next
+            // registration starts again at 0 — so the index just resolved for "t" (1) now names
+            // a pool record that does not exist.
+            ulong g = wal.BeginFlush();
+            Assert.Equal(MetricWalCommit.Committed, wal.CommitFlush(g));
+        };
+
+        try
+        {
+            var again = new[] { Scalar("m", nano + 2, 3.0, Labels(("series", "t"))) };
+            wal.Append(again);
+        }
+        finally { wal.OnSeriesResolvedForTest = null; }
+
+        Assert.True(fired, "the seam never ran; the test proved nothing");
+
+        var recovered = wal.ReadAll(out int unresolved);
+        Assert.Equal(0, unresolved);                     // pre-fix: 1 — index 1 resolves to nothing
+        var point = Assert.Single(recovered);
+        Assert.Equal(3.0, point.Point.Value);
+        Assert.Contains(("series", "t"), point.Labels.Pairs);
+    }
+
+    /// <summary>
     /// A batch whose log append cannot grow the file publishes NONE of itself.
     ///
     /// <para>The engine logs the whole batch under one lock and only then walks it into the hot
