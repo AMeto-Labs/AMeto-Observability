@@ -216,7 +216,12 @@ internal static class SpanWriter
 
         // Accumulate service→block mapping and stats in a single pass through WriteBlock
         var traceIndex  = new Dictionary<TraceId, List<uint>>(capacity: count / 4);
-        var svcBlockMap = new Dictionary<string, SortedSet<uint>>(StringComparer.Ordinal);
+        // A LIST WITH A LAST-BLOCK GUARD, NOT A SET. Block indices are handed to WriteBlock in
+        // ascending order and are constant within a block, so "have I already recorded this block
+        // for this service" is answered by looking at the last element — one comparison against a
+        // red-black tree insertion per SPAN. The SortedSet was paying for an ordering the walk
+        // already guaranteed, in a node per block per service.
+        var svcBlockMap = new Dictionary<string, List<uint>>(StringComparer.Ordinal);
         // Per-service stats accumulators (service → mutable stats)
         var svcStats    = new Dictionary<string, MutableServiceStats>(StringComparer.Ordinal);
 
@@ -245,13 +250,15 @@ internal static class SpanWriter
                 int written  = 0;
                 var blockBuf = new ArrayBufferWriter<byte>(1024 * 1024);
                 var blooms   = new List<byte[]>();
+                // One bloom-hash set for the whole file, cleared per block — see WriteBlock.
+                var bloomHashes = new HashSet<ulong>();
 
                 while (written < count)
                 {
                     int batchCount = Math.Min(BlockSize, count - written);
                     uint blockIdx  = (uint)(written / BlockSize);
                     var block      = WriteBlock(in spans, written, batchCount, blockBuf, blockIdx,
-                                                traceIndex, svcBlockMap, svcStats, blooms);
+                                                traceIndex, svcBlockMap, bloomHashes, svcStats, blooms);
                     bw.Write((uint)block.UncompressedSize);
                     bw.Write((uint)block.CompressedBytes.Length);
                     bw.Write(block.CompressedBytes);
@@ -411,7 +418,8 @@ internal static class SpanWriter
         ArrayBufferWriter<byte>                  bufWriter,
         uint                                     blockIdx,
         Dictionary<TraceId, List<uint>>          traceIndex,
-        Dictionary<string, SortedSet<uint>>      svcBlockMap,
+        Dictionary<string, List<uint>>           svcBlockMap,
+        HashSet<ulong>                           bloomHashes,
         Dictionary<string, MutableServiceStats>  svcStats,
         List<byte[]>                             blooms)
     {
@@ -423,7 +431,13 @@ internal static class SpanWriter
 
         Span<byte> idBuf = stackalloc byte[16];
         long prevTs = 0;
-        var bloomHashes = new HashSet<ulong>();
+        // Caller-owned and CLEARED, not reallocated: a fresh HashSet per block threw away its
+        // whole bucket array every 4096 spans, and the set for an eight-attribute block holds
+        // ~8 000 hashes. Clear() keeps the capacity, so after the first block the set is free.
+        // The bloom it feeds is an OR of bit positions, so neither the set's iteration order nor
+        // its internal layout can reach the bytes — only its contents and its Count can, and both
+        // are exactly what a fresh set would have held.
+        bloomHashes.Clear();
 
         for (int i = 0; i < count; i++)
         {
@@ -441,10 +455,11 @@ internal static class SpanWriter
             // ── Service block map ────────────────────────────────────────────
             if (!svcBlockMap.TryGetValue(s.ServiceName, out var blocks))
             {
-                blocks = new SortedSet<uint>();
+                blocks = new List<uint>(4);
                 svcBlockMap[s.ServiceName] = blocks;
             }
-            blocks.Add(blockIdx);
+            // Ascending and distinct by construction — see the map's declaration.
+            if (blocks.Count == 0 || blocks[^1] != blockIdx) blocks.Add(blockIdx);
 
             // ── Per-service stats ────────────────────────────────────────────
             if (!svcStats.TryGetValue(s.ServiceName, out var st))

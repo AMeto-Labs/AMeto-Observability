@@ -220,6 +220,96 @@ public sealed class TraceFlushProbe : IDisposable
             Assert.Equal(ordered[i].SpanId.RawValue, written[i].SpanId.RawValue);
     }
 
+    /// <summary>
+    /// TS#7(b)'S PREMISE, STATED AS A FACT ABOUT THE FILE: a service's block list is ascending and
+    /// carries each block ONCE.
+    ///
+    /// <para>The <c>SortedSet</c> the item removes gave both properties for free; a
+    /// <c>List&lt;uint&gt;</c> with a "did I already record this block" guard gives them only
+    /// because block indices are handed to <c>WriteBlock</c> in ascending order and are constant
+    /// within a block. That is a property of the WALK, not of the type, so it belongs in a test —
+    /// a guard that compared against the FIRST element, or one that was dropped entirely, would
+    /// produce a service index with 4 096 copies of every block index in it and no reader would
+    /// complain: it would simply read the same block four thousand times per query.</para>
+    ///
+    /// <para>The corpus is chosen so a service is ABSENT from a middle block: `ghost` is in blocks
+    /// 0 and 2 only, which is the case a "last block seen" guard gets right and a "first block
+    /// seen" one does not.</para>
+    /// </summary>
+    [Fact]
+    public void Each_service_lists_its_blocks_once_and_in_ascending_order()
+    {
+        // 9 000 spans → blocks 0 (0..4095), 1 (4096..8191), 2 (8192..8999).
+        const int N = 9_000;
+        var corpus = new List<SpanRecord>(N);
+        for (int i = 0; i < N; i++)
+        {
+            // Sorted on the way in, so position i is block i / 4096 and the shape below is exact.
+            bool ghost = i < 4096 || i >= 8192;
+            corpus.Add(new SpanRecord
+            {
+                TraceId           = new TraceId(0, (ulong)i),
+                SpanId            = new SpanId((ulong)i + 1),
+                StartTimeUnixNano = BaseNano + i,
+                DurationNanos     = 1_000_000,
+                Name              = "op",
+                ServiceName       = ghost ? "ghost" : "everywhere",
+            });
+        }
+        // "everywhere" must be in all three blocks: give it one span in each.
+        corpus[0]     = Respan(corpus[0],     "everywhere");
+        corpus[8192]  = Respan(corpus[8192],  "everywhere");
+
+        string path = SpanWriter.Write(NewDir("svcidx"), corpus).FilePath;
+        var index = ReadServiceIndex(path);
+
+        Assert.Equal(new uint[] { 0, 1, 2 }, index["everywhere"]);
+        Assert.Equal(new uint[] { 0, 2 },    index["ghost"]);
+    }
+
+    private static SpanRecord Respan(SpanRecord s, string service) => new()
+    {
+        TraceId           = s.TraceId,
+        SpanId            = s.SpanId,
+        ParentSpanId      = s.ParentSpanId,
+        StartTimeUnixNano = s.StartTimeUnixNano,
+        DurationNanos     = s.DurationNanos,
+        Name              = s.Name,
+        ServiceName       = service,
+        Kind              = s.Kind,
+        Status            = s.Status,
+        HttpStatusCode    = s.HttpStatusCode,
+    };
+
+    /// <summary>
+    /// The <c>.trc</c> service index, straight out of the file: the footer's last 28 bytes carry
+    /// the section offsets, and the service index runs from its own offset to the bloom index's.
+    /// Read here rather than through <c>SpanReader</c> because no reader exposes the raw block
+    /// lists, and the block lists are the thing under test.
+    /// </summary>
+    private static Dictionary<string, uint[]> ReadServiceIndex(string path)
+    {
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        using var br = new BinaryReader(fs);
+
+        fs.Position = fs.Length - 28;
+        br.ReadUInt64();                      // traceIdxOffset
+        ulong svcIdxOffset = br.ReadUInt64();
+
+        fs.Position = (long)svcIdxOffset;
+        uint serviceCount = br.ReadUInt32();
+        var result = new Dictionary<string, uint[]>(StringComparer.Ordinal);
+        for (uint s = 0; s < serviceCount; s++)
+        {
+            string name = System.Text.Encoding.UTF8.GetString(br.ReadBytes(br.ReadUInt16()));
+            uint blockCount = br.ReadUInt32();
+            var blocks = new uint[blockCount];
+            for (uint b = 0; b < blockCount; b++) blocks[b] = br.ReadUInt32();
+            result[name] = blocks;
+        }
+        return result;
+    }
+
     // ── The probe ───────────────────────────────────────────────────────────────
 
     /// <summary>
