@@ -1,0 +1,434 @@
+using System.Buffers;
+using System.Diagnostics;
+using System.Security.Cryptography;
+using Ameto.Tracing;
+using Ameto.Tracing.Storage;
+using MessagePack;
+using Xunit;
+using Xunit.Abstractions;
+
+namespace Ameto.Storage.Tests;
+
+/// <summary>
+/// WHAT ONE FLUSH COSTS, AND THE PROOF THAT MAKING IT CHEAPER DID NOT MOVE A BYTE ON DISK.
+///
+/// <para>Two halves, in one file because they measure the same call. The GOLDEN facts pin
+/// <c>SpanWriter.Write</c>'s four output files — <c>.trc</c>, <c>.stats</c>, <c>.svcgraph</c>,
+/// <c>.tracesum</c> — to SHA-256 constants recorded from the writer as it stood at
+/// <c>cb5780e</c>, i.e. BEFORE work package WP5 opened it. Every item of TS#7(a)–(f) claims to be
+/// byte-identical on disk; this is where that claim is a claim rather than a hope. The PROBE
+/// prints µs/span, B/span and the LOH delta for the whole flush and for each sidecar separately,
+/// so the 599 ms the recon measured is attributable rather than a single number.</para>
+///
+/// <para>DETERMINISM is the whole value of the golden half, so <see cref="BuildCorpus"/> contains
+/// no clock, no <c>Guid</c> and no unseeded randomness: fixed nanos, derived ids, arithmetic
+/// payloads. The nonce in the segment's FILE NAME is a <c>Guid</c> and that is fine — the hash is
+/// over the file's contents, which carry no name.</para>
+///
+/// <para>The corpus is built to be hostile to every shortcut this package takes:</para>
+/// <list type="bullet">
+///   <item><b>500 distinct start times over 12 000 spans</b> — 24-way ties, out of order, so the
+///     sort really runs and the permutation it picks for ties is pinned. An index sort that
+///     produced a different tie order would move the block bytes and this test would say so.</item>
+///   <item><b>three blocks</b> (4096 + 4096 + 3808), so the per-block service map, the per-block
+///     bloom and the block-index arithmetic are all exercised more than once.</item>
+///   <item><b>twelve services, parents crossing them</b> — a non-trivial <c>.svcgraph</c>, and a
+///     service index whose blocks are a set rather than a singleton.</item>
+///   <item><b>every OTLP value shape</b> — string, int, double, bool, nil, a DUPLICATE key (the
+///     resource-then-span shadowing the OTLP mapper emits), a nested map and an array (both box
+///     to null), binary, a dictionary-only record with no blob (the <c>WriteAttributes</c>
+///     fallback, and <c>short</c>/<c>byte</c>/<c>float</c> with it), a TRUNCATED blob (the
+///     <c>TryWalk</c> rejection path), and a span with no attributes at all.</item>
+///   <item><b>HTTP semconv on the roots</b> — <c>http.request.method</c> and <c>url.path</c>, so
+///     <c>.tracesum</c>'s method/path resolution is in the hash.</item>
+/// </list>
+///
+/// <para>BOTH FORMAT VERSIONS, because they differ exactly where this package works: v3 writes the
+/// full trace-index block out of the writer's <c>Dictionary</c> — in the dictionary's INSERTION
+/// order — and v4 writes a four-byte stub. A change to how the trace index is accumulated is
+/// invisible in a v4 file and loud in a v3 one, and v3 is what <c>DefaultVersion</c> still is.</para>
+///
+/// <para>If a golden fact fails after a DELIBERATE format change: re-baseline the constant, say so
+/// in the commit body, and expect to bump the format version — an old reader will not understand
+/// the new bytes. It must never be edited to make a failure go away.</para>
+/// </summary>
+public sealed class TraceFlushProbe : IDisposable
+{
+    private const int  Spans        = 12_000;               // 4096 + 4096 + 3808 = three blocks
+    private const int  SpansPerTrace = 10;
+    private const long BaseNano     = 1_754_049_600_000_000_000L;   // 2025-08-01T12:00:00Z, a constant
+    private const int  DistinctTimestamps = 500;            // 24-way ties on every one of them
+
+    private static readonly string[] ServiceNames =
+    [
+        "wallet-api", "ledger-worker", "payments-gateway", "fraud-scorer",
+        "notification-fanout", "auth-edge", "catalog-api", "search-indexer",
+        "billing-cron", "webhook-relay", "session-store", "rate-limiter",
+    ];
+
+    private static readonly string[] SpanNames =
+    [
+        "GET /api/v1/orders", "SqlClient.Execute", "HTTP POST", "Kafka.Produce",
+        "redis.GET", "validate-token", "score", "fanout",
+    ];
+
+    private readonly List<string> _dirs = [];
+    private readonly ITestOutputHelper _out;
+
+    public TraceFlushProbe(ITestOutputHelper output) => _out = output;
+
+    public void Dispose()
+    {
+        foreach (var d in _dirs)
+            try { Directory.Delete(d, recursive: true); } catch { /* best effort */ }
+    }
+
+    // ── The golden constants ────────────────────────────────────────────────────
+    //
+    // SHA-256 of each file SpanWriter.Write produced for BuildCorpus() at cb5780e — the merge of
+    // wave 1, the writer as WP5 found it. Recomputed by running this test against those sources.
+
+    private const string V3Trc      = "D1BD639AC454E4F9AEBAE599953DC39A57503142CE707F54F4F68072E688EB0A";
+    private const string V3Stats    = "FAF48AB485397E0F3B65E3ADCE5413D6B8702E8AB8E3A044214D5CD0CB79C423";
+    private const string V3SvcGraph = "44BE43D931468E9C74F5177BA89CAA5D252FA87FDF744AA98BA4F848C56C5A9F";
+    private const string V3TraceSum = "BB5C2FD272B3D86F3DB50870847F530601D234AE373A33D4AD0FD524FA54C773";
+    private const string V4Trc      = "FBFA38194D919859E6B443601C6640650789BD13616A686EC9AA6EEF476A8262";
+
+    [Fact]
+    public void The_flush_still_produces_the_pre_change_bytes_v3()
+    {
+        var h = FlushAndHash(SpanWriter.DefaultVersion, "golden-v3");
+
+        _out.WriteLine($".trc      {h.TrcLength,10:N0} B  {h.Trc}");
+        _out.WriteLine($".stats    {h.StatsLength,10:N0} B  {h.Stats}");
+        _out.WriteLine($".svcgraph {h.SvcGraphLength,10:N0} B  {h.SvcGraph}");
+        _out.WriteLine($".tracesum {h.TraceSumLength,10:N0} B  {h.TraceSum}");
+
+        Assert.Equal(V3Trc,      h.Trc);
+        Assert.Equal(V3Stats,    h.Stats);
+        Assert.Equal(V3SvcGraph, h.SvcGraph);
+        Assert.Equal(V3TraceSum, h.TraceSum);
+    }
+
+    /// <summary>
+    /// The v4 <c>.trc</c> only — the three sidecars do not know the format version and are already
+    /// pinned above, so hashing them twice would pin nothing new.
+    /// </summary>
+    [Fact]
+    public void The_flush_still_produces_the_pre_change_bytes_v4()
+    {
+        var h = FlushAndHash(SpanWriter.NewestVersion, "golden-v4");
+        _out.WriteLine($".trc      {h.TrcLength,10:N0} B  {h.Trc}");
+        Assert.Equal(V4Trc, h.Trc);
+    }
+
+    /// <summary>
+    /// THE ONE STRUCTURAL FACT THE HASHES CANNOT STATE: that the segment is sorted by start time,
+    /// and that spans which TIE on it keep a stable, reproducible order. The hashes above would
+    /// catch a change to it, but they would report "the bytes moved" — this says which bytes and
+    /// why, which is the difference between a five-minute diagnosis and an afternoon.
+    /// </summary>
+    [Fact]
+    public void The_segment_is_sorted_by_start_time_and_ties_are_reproducible()
+    {
+        var corpus = BuildCorpus();
+        string dirA = NewDir("order-a");
+        string dirB = NewDir("order-b");
+
+        var a = SpanReader.ReadAll(SpanWriter.Write(dirA, corpus).FilePath);
+        var b = SpanReader.ReadAll(SpanWriter.Write(dirB, BuildCorpus()).FilePath);
+
+        Assert.Equal(Spans, a.Count);
+        for (int i = 1; i < a.Count; i++)
+            Assert.True(a[i - 1].StartTimeUnixNano <= a[i].StartTimeUnixNano,
+                $"span {i} starts before span {i - 1} — the flush did not sort");
+
+        // Two independent runs over two independently built copies of the same corpus must lay the
+        // ties down the same way, or the file is not a function of its input.
+        for (int i = 0; i < a.Count; i++)
+            Assert.Equal(a[i].SpanId.RawValue, b[i].SpanId.RawValue);
+    }
+
+    // ── The probe ───────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// µs/span, B/span and LOH for one flush, split so the cost is attributable: the whole
+    /// <c>SpanWriter.Write</c>, then each sidecar measured on its own call, then the <c>.trc</c>
+    /// itself by difference. The v4 run is printed beside the v3 one because their only difference
+    /// is the trace-index BLOCK, which isolates what writing that block costs from what
+    /// accumulating the map costs.
+    ///
+    /// <para>ALLOCATION IS PER-THREAD (<c>GC.GetAllocatedBytesForCurrentThread</c>): the flush is
+    /// synchronous here, so every byte of it is billed to this thread and xUnit's output drain on
+    /// another one cannot get into the figure. The LOH delta is process-wide — there is no
+    /// per-thread equivalent — so it admits whatever else the runtime does in the window; it is
+    /// printed as a trend, never asserted.</para>
+    /// </summary>
+    [Fact]
+    public void Flush_cost_per_span()
+    {
+        var corpus = BuildCorpus();
+
+        // Warm: JIT the writer, the sidecars, msgpack and LZ4 before anything is measured.
+        SpanWriter.Write(NewDir("warm"), corpus);
+        ServiceGraphSidecar.Write(Path.Combine(NewDir("warm-g"), "w.trc"), corpus);
+        TraceSummarySidecar.Write(Path.Combine(NewDir("warm-s"), "w.trc"), corpus);
+
+        var whole   = Measure("SpanWriter.Write  (v3)", d => SpanWriter.Write(d, corpus));
+        var wholeV4 = Measure("SpanWriter.Write  (v4)", d => SpanWriter.Write(d, corpus, version: SpanWriter.NewestVersion));
+        var graph   = Measure(".svcgraph", d => ServiceGraphSidecar.Write(Path.Combine(d, "p.trc"), corpus));
+        var summary = Measure(".tracesum", d => TraceSummarySidecar.Write(Path.Combine(d, "p.trc"), corpus));
+
+        _out.WriteLine($"FLUSH of {Spans:N0} spans, {SpansPerTrace} spans/trace, {ServiceNames.Length} services");
+        _out.WriteLine("");
+        Print("total (v3)", whole);
+        Print("total (v4)", wholeV4);
+        Print("  .svcgraph", graph);
+        Print("  .tracesum", summary);
+        Print("  .trc+.stats (by difference)", new Sample(
+            whole.Micros    - graph.Micros    - summary.Micros,
+            whole.Allocated - graph.Allocated - summary.Allocated,
+            whole.Loh       - graph.Loh       - summary.Loh));
+        _out.WriteLine("");
+        _out.WriteLine($"trace-index block (v3 − v4)   {whole.Micros - wholeV4.Micros,10:N0} us   "
+                     + $"{(whole.Allocated - wholeV4.Allocated) / (double)Spans,8:N1} B/span");
+
+        // NOT A GATE. Every number above is machine- and configuration-dependent (Debug doubles the
+        // wall time), and a probe that fails on a slow agent teaches nothing. The byte-identity
+        // facts above are the gate; this is the instrument.
+        Assert.True(whole.Allocated > 0);
+    }
+
+    private readonly record struct Sample(double Micros, long Allocated, long Loh);
+
+    private Sample Measure(string label, Action<string> flush)
+    {
+        string dir = NewDir(label.Replace(' ', '-').Replace('.', '-').Replace('(', '-').Replace(')', '-'));
+
+        GC.Collect(2, GCCollectionMode.Forced, blocking: true);
+        GC.WaitForPendingFinalizers();
+        GC.Collect(2, GCCollectionMode.Forced, blocking: true);
+
+        long loh0 = GC.GetGCMemoryInfo().GenerationInfo[^1].SizeAfterBytes;
+        long a0   = GC.GetAllocatedBytesForCurrentThread();
+        var  sw   = Stopwatch.StartNew();
+        flush(dir);
+        sw.Stop();
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - a0;
+        long loh       = GC.GetGCMemoryInfo().GenerationInfo[^1].SizeAfterBytes - loh0;
+        return new Sample(sw.Elapsed.TotalMicroseconds, allocated, loh);
+    }
+
+    private void Print(string label, in Sample s) =>
+        _out.WriteLine($"{label,-30} {s.Micros / 1000.0,8:N1} ms  {s.Micros / Spans,6:N2} us/span  "
+                     + $"{s.Allocated / 1048576.0,7:N2} MB  {s.Allocated / (double)Spans,7:N0} B/span  "
+                     + $"LOH {s.Loh / 1048576.0,6:N2} MB");
+
+    // ── The corpus ──────────────────────────────────────────────────────────────
+
+    private readonly record struct Hashes(
+        string Trc, long TrcLength,
+        string Stats, long StatsLength,
+        string SvcGraph, long SvcGraphLength,
+        string TraceSum, long TraceSumLength);
+
+    private Hashes FlushAndHash(ushort version, string label)
+    {
+        string dir  = NewDir(label);
+        string trc  = SpanWriter.Write(dir, BuildCorpus(), version: version).FilePath;
+        string bas  = Path.Combine(dir, Path.GetFileNameWithoutExtension(trc));
+
+        return new Hashes(
+            Sha(trc),                  new FileInfo(trc).Length,
+            Sha(bas + ".stats"),       new FileInfo(bas + ".stats").Length,
+            Sha(bas + ".svcgraph"),    new FileInfo(bas + ".svcgraph").Length,
+            Sha(bas + ".tracesum"),    new FileInfo(bas + ".tracesum").Length);
+    }
+
+    private static string Sha(string path) =>
+        Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(path)));
+
+    private string NewDir(string label)
+    {
+        string dir = Path.Combine(Path.GetTempPath(), $"Ameto-flush-{label}-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dir);
+        _dirs.Add(dir);
+        return dir;
+    }
+
+    /// <summary>
+    /// The fixed corpus. See the type docstring for what each shape is here to catch. Built fresh
+    /// on every call — the writer is allowed to reorder what it is handed, and a shared corpus
+    /// would let one test's sort decide the next test's input.
+    /// </summary>
+    private static List<SpanRecord> BuildCorpus()
+    {
+        var spans = new List<SpanRecord>(Spans);
+        var buf   = new ArrayBufferWriter<byte>(1024);
+
+        for (int i = 0; i < Spans; i++)
+        {
+            int  trace   = i / SpansPerTrace;
+            bool isRoot  = i % SpansPerTrace == 0;
+            var  traceId = new TraceId(0xA1B2C3D400000000UL | (uint)trace,
+                                       0x0F1E2D3C4B5A6978UL ^ ((ulong)(uint)trace * 2654435761UL));
+            var  spanId  = new SpanId((ulong)(i + 1) * 0x9E3779B97F4A7C15UL);
+            var  parent  = isRoot ? default : new SpanId((ulong)(trace * SpansPerTrace + 1) * 0x9E3779B97F4A7C15UL);
+
+            // 24-way ties, out of order: the sort has real work and real ambiguity.
+            long start = BaseNano + (long)(i % DistinctTimestamps) * 1_000_000L;
+            long dur   = (long)(i % 23) * 47_000_000L + 1;
+
+            // The parent's service is picked from a different stride than the child's, so most
+            // parent→child pairs cross a service boundary and the .svcgraph has real edges.
+            string svc = ServiceNames[(i * 7 + i / SpansPerTrace) % ServiceNames.Length];
+
+            var (blob, dict) = Attributes(i, isRoot, buf);
+
+            // THE DICTIONARY IS SET ONLY WHEN THERE IS ONE. `Attributes` is an init accessor that
+            // MEMOISES — assigning null to it marks the record decoded-as-nothing and kills the
+            // lazy decode of the blob for good. A corpus built with `Attributes = null` beside a
+            // real blob would therefore take the no-attributes branch everywhere and quietly stop
+            // testing the very paths this file exists for.
+            spans.Add(dict is null
+                ? new SpanRecord
+                {
+                    TraceId           = traceId,
+                    SpanId            = spanId,
+                    ParentSpanId      = parent,
+                    StartTimeUnixNano = start,
+                    DurationNanos     = dur,
+                    Name              = SpanNames[i % SpanNames.Length],
+                    ServiceName       = svc,
+                    Kind              = (SpanKind)(i % 6),
+                    Status            = StatusOf(i),
+                    HttpStatusCode    = (short)(200 + i % 5 * 100),
+                    AttributesBytes   = blob,
+                }
+                : new SpanRecord
+                {
+                    TraceId           = traceId,
+                    SpanId            = spanId,
+                    ParentSpanId      = parent,
+                    StartTimeUnixNano = start,
+                    DurationNanos     = dur,
+                    Name              = SpanNames[i % SpanNames.Length],
+                    ServiceName       = svc,
+                    Kind              = (SpanKind)(i % 6),
+                    Status            = StatusOf(i),
+                    HttpStatusCode    = (short)(200 + i % 5 * 100),
+                    Attributes        = dict,
+                });
+        }
+
+        return spans;
+    }
+
+    private static SpanStatusCode StatusOf(int i) =>
+        i % 13 == 0 ? SpanStatusCode.Error :
+        i % 3  == 0 ? SpanStatusCode.Ok    : SpanStatusCode.Unset;
+
+    /// <summary>
+    /// One span's attributes, in one of seven shapes. Returns the blob, the dictionary, or
+    /// neither — <c>SpanRecord.Attributes</c> is an <c>init</c> that MEMOISES, so handing it null
+    /// explicitly is not the same as not handing it anything, and shape 4 relies on the
+    /// difference: a record with a dictionary and no blob is the <c>WriteAttributes</c> fallback.
+    /// </summary>
+    private static (ReadOnlyMemory<byte> Blob, IReadOnlyDictionary<string, object?>? Dict) Attributes(
+        int i, bool isRoot, ArrayBufferWriter<byte> buf)
+    {
+        switch (i % 7)
+        {
+            case 0:   // the ordinary instrumented span, plus HTTP semconv on the roots
+            {
+                buf.ResetWrittenCount();
+                var w = new MessagePackWriter(buf);
+                w.WriteMapHeader(isRoot ? 10 : 8);
+                w.Write("db.system");        w.Write("mssql");
+                w.Write("db.statement");     w.Write("SELECT TOP 100 * FROM Orders WHERE CustomerId = @p0");
+                w.Write("net.peer.port");    w.Write((long)(1433 + i % 7));
+                w.Write("db.rows");          w.Write((long)(i % 4096));
+                w.Write("sampling.ratio");   w.Write(0.25 + i % 4 * 0.125);
+                w.Write("db.cached");        w.Write(i % 2 == 0);
+                w.Write("deployment.env");   w.Write("production");
+                // THE DUPLICATE KEY: the OTLP mapper writes resource attributes and then span
+                // attributes, so a span attribute shadows a resource one of the same name. Last
+                // copy wins, and the writer copies the blob through verbatim — both halves are in
+                // the hash.
+                w.Write("deployment.env");   w.Write("production-eu-west-1");
+                if (isRoot)
+                {
+                    w.Write("http.request.method"); w.Write(i % 3 == 0 ? "POST" : "GET");
+                    w.Write("url.path");            w.Write("/api/v1/orders/" + i % 97);
+                }
+                w.Flush();
+                return (buf.WrittenSpan.ToArray(), null);
+            }
+
+            case 1:   // present but empty — a map header and nothing after it
+            {
+                buf.ResetWrittenCount();
+                var w = new MessagePackWriter(buf);
+                w.WriteMapHeader(0);
+                w.Flush();
+                return (buf.WrittenSpan.ToArray(), null);
+            }
+
+            case 2:   // shapes the decoder boxes to null: a nested map, an array, and nil
+            {
+                buf.ResetWrittenCount();
+                var w = new MessagePackWriter(buf);
+                w.WriteMapHeader(4);
+                w.Write("peer.tags");    w.WriteArrayHeader(2); w.Write("a"); w.Write("b");
+                w.Write("exception");    w.WriteMapHeader(1); w.Write("type"); w.Write("TimeoutException");
+                w.Write("trace.flags");  w.WriteNil();
+                w.Write("service.tier"); w.Write("gold");
+                w.Flush();
+                return (buf.WrittenSpan.ToArray(), null);
+            }
+
+            case 3:   // binary, and a negative integer
+            {
+                buf.ResetWrittenCount();
+                var w = new MessagePackWriter(buf);
+                w.WriteMapHeader(3);
+                w.Write("payload.digest"); w.Write(new byte[] { 0xDE, 0xAD, 0xBE, 0xEF, (byte)i });
+                w.Write("clock.skew.ns");  w.Write(-(long)(i % 1000) * 1_000_000L);
+                w.Write("queue.depth");    w.Write((long)(i % 31));
+                w.Flush();
+                return (buf.WrittenSpan.ToArray(), null);
+            }
+
+            case 4:   // NO blob, a dictionary — the WriteAttributes fallback, every boxed type it switches on
+            {
+                var d = new Dictionary<string, object?>(StringComparer.Ordinal)
+                {
+                    ["messaging.system"]  = "kafka",
+                    ["messaging.partition"] = (int)(i % 16),
+                    ["retry.count"]       = (short)(i % 5),
+                    ["priority"]          = (byte)(i % 3),
+                    ["backoff.seconds"]   = (float)(i % 9) / 4f,
+                    ["latency.ms"]        = (double)(i % 900) / 3.0,
+                    ["was.retried"]       = i % 2 == 1,
+                    ["upstream"]          = null,
+                    ["correlation"]       = (long)i * 31L,
+                };
+                return (default, d);
+            }
+
+            case 5:   // A TRUNCATED BLOB: TryWalk must reject it and the writer must fall back
+            {
+                buf.ResetWrittenCount();
+                var w = new MessagePackWriter(buf);
+                w.WriteMapHeader(3);
+                w.Write("span.kind.hint"); w.Write("client");
+                w.Write("unterminated");   // the value never arrives
+                w.Flush();
+                return (buf.WrittenSpan.ToArray(), null);
+            }
+
+            default:  // no attributes of any kind
+                return (default, null);
+        }
+    }
+}
