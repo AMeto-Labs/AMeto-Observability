@@ -27,6 +27,29 @@ namespace Ameto.Storage.Tests;
 /// </summary>
 public sealed class SegmentBucketAdversarialProbe : IAsyncLifetime
 {
+    /// <summary>
+    /// The engine's own cold-maintenance loop is switched OFF for this class: every test here
+    /// drives compaction itself, through <see cref="StorageEngine.TryMergeSmallSegmentsOnceAsync"/>,
+    /// and then counts what the resulting segments serve.
+    ///
+    /// <para>Left at its production three minutes, the loop is not "later" — it is later than a
+    /// FAST run. This class takes 2 minutes on a 20-core box and 3 m 55 s on a 2-core CI runner,
+    /// so the settle delay expired mid-test there and nowhere else, and the loop then merged the
+    /// same buckets this test was merging, on its own thread, every 15 s. Two merges that pick
+    /// one batch both publish an output and both delete the sources, and the batch's events are
+    /// then served twice, permanently. MEASURED, by setting this to 5 s: 2 of the 12 tests fail,
+    /// <c>AmplificationAndFileCountSurviveNonUniformFlushSizes</c> serving 376 109 events against
+    /// 327 828 written (+48 281, after two background passes) and
+    /// <c>AnOpenBucketConvergesWhateverTheFlushSizeDistribution</c> 253 900 against 247 500
+    /// (+6 400, after one) — the same shape as the CI failure that prompted this, 813 282 against
+    /// 800 480. One pass is enough.</para>
+    ///
+    /// <para>Infinite rather than large, because "large" is what three minutes already was.
+    /// <see cref="ServedEvents"/> asserts the loop never got as far as a pass, so this cannot be
+    /// undone in silence.</para>
+    /// </summary>
+    private static readonly TimeSpan MaintenanceStartDelay = Timeout.InfiniteTimeSpan;
+
     private readonly string _dir = Path.Combine(Path.GetTempPath(), "ameto-adv-" + Guid.NewGuid().ToString("N"));
     private readonly ITestOutputHelper _out;
     private StorageEngine _engine = null!;
@@ -39,7 +62,8 @@ public sealed class SegmentBucketAdversarialProbe : IAsyncLifetime
         _engine = new StorageEngine(
             Options.Create(new ServerOptions { DataDirectory = _dir }),
             new RetentionStore(new ServerOptions { DataDirectory = _dir }, NullLogger<RetentionStore>.Instance),
-            NullLogger<StorageEngine>.Instance)
+            NullLogger<StorageEngine>.Instance,
+            MaintenanceStartDelay)
         {
             _allowIndexlessMerge = true,
         };
@@ -111,6 +135,11 @@ public sealed class SegmentBucketAdversarialProbe : IAsyncLifetime
 
     private int ServedEvents()
     {
+        // The precondition for this number meaning anything, asserted where it is relied on
+        // rather than once at construction: the engine's background merges are off (see
+        // MaintenanceStartDelay), and a pass having started says they are not.
+        Assert.Equal(0, _engine.ColdMaintenancePassesStarted);
+
         var dedup = new Dictionary<string, string>(StringComparer.Ordinal);
         int n = 0;
         foreach (var seg in _engine.ListSegments())

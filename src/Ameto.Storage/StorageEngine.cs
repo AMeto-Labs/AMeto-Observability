@@ -597,14 +597,35 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
     }
 
     /// <summary>
+    /// The engine a test gets when it intends to drive compaction ITSELF. Identical to the
+    /// public constructor but for <paramref name="maintenanceStartDelay"/> — how long
+    /// <see cref="RunColdMaintenanceLoopAsync"/> lets startup settle before its first pass.
+    /// <see cref="DefaultMaintenanceStartDelay"/> everywhere else, and nothing the production
+    /// path can reach any other way.
+    ///
+    /// <para>A constructor parameter rather than a settable field because the constructor is
+    /// what STARTS that loop: a field assigned from an object initialiser is assigned after the
+    /// constructor returns, and on an empty data directory the catalog scan the loop waits on
+    /// finishes in microseconds — so the loop can read the field before the test writes it. That
+    /// is the race this seam exists to remove, so the seam may not contain one.</para>
+    /// </summary>
+    internal StorageEngine(
+        IOptions<ServerOptions> options, RetentionStore retentionStore, ILogger<StorageEngine> logger,
+        TimeSpan maintenanceStartDelay)
+        : this(options, retentionStore, logger, MemoryBudgets.Current(), maintenanceStartDelay)
+    {
+    }
+
+    /// <summary>
     /// Takes the memory budgets instead of reading them from this process, so a test can build
     /// the engine a 512 MB container would get on a machine that is not one. Not public: the DI
     /// container only sees the constructor above.
     /// </summary>
     internal StorageEngine(
         IOptions<ServerOptions> options, RetentionStore retentionStore, ILogger<StorageEngine> logger,
-        MemoryBudgets budgets)
+        MemoryBudgets budgets, TimeSpan? maintenanceStartDelay = null)
     {
+        _maintenanceStartDelay = maintenanceStartDelay ?? DefaultMaintenanceStartDelay;
         _options        = options.Value;
         _retentionStore = retentionStore;
         _logger         = logger;
@@ -770,6 +791,28 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         _maintenanceLoop = RunColdMaintenanceLoopAsync(_cts.Token);
     }
 
+    /// <summary>How long the cold-maintenance loop lets startup settle before its first pass.</summary>
+    internal static readonly TimeSpan DefaultMaintenanceStartDelay = TimeSpan.FromMinutes(3);
+
+    /// <summary>
+    /// The settle delay THIS instance uses. Readonly and assigned in the constructor, so the
+    /// loop the constructor starts cannot observe it unwritten. Off every hot path: read once
+    /// per process, before the first pass.
+    /// </summary>
+    private readonly TimeSpan _maintenanceStartDelay;
+
+    private int _coldMaintenancePasses;
+
+    /// <summary>
+    /// How many passes <see cref="RunColdMaintenanceLoopAsync"/> has STARTED. A test that drives
+    /// <see cref="TryMergeSmallSegmentsOnceAsync"/> itself and then counts the events its
+    /// segments serve is only meaningful while this reads 0: the merge publishes its output
+    /// before it deletes the sources one by one, so a background pass running alongside such a
+    /// test shows it both copies. Asserting on it means a settle delay that quietly came back
+    /// cannot pass itself off as a flake.
+    /// </summary>
+    internal int ColdMaintenancePassesStarted => Volatile.Read(ref _coldMaintenancePasses);
+
     /// <summary>
     /// Cold-tier maintenance: finish any interrupted merge, then MERGE small segments into
     /// large ones. A long-running server accumulates thousands of ~100 KB age-flush segments
@@ -796,13 +839,14 @@ public sealed class StorageEngine : ISegmentProvider, ISegmentManager, IAsyncDis
         catch (OperationCanceledException) { return; }
         catch (Exception ex) { _logger.LogWarning(ex, "Segment catalog load faulted — maintenance continues"); }
 
-        try { await Task.Delay(TimeSpan.FromMinutes(3), ct); } // let startup settle
+        try { await Task.Delay(_maintenanceStartDelay, ct); } // let startup settle
         catch (OperationCanceledException) { return; }
 
         while (!ct.IsCancellationRequested)
         {
             // One batch per iteration, short pause while a backlog exists.
             bool merged;
+            Interlocked.Increment(ref _coldMaintenancePasses);
             try { merged = await RunColdMaintenancePassAsync(ct); }
             catch (OperationCanceledException) { break; }
             catch (Exception ex) { _logger.LogError(ex, "Segment merge pass failed"); merged = false; }
