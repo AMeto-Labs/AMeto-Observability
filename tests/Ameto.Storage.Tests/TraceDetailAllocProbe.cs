@@ -110,11 +110,13 @@ public sealed class TraceDetailAllocProbe : IDisposable
 
     private delegate Task Handler(HttpContext ctx, string traceId);
 
-    private static async Task<Reading> MeasureHandlerAsync(IServiceProvider services, Handler handler, string id)
+    private static async Task<Reading> MeasureHandlerAsync(
+        IServiceProvider services, Handler handler, string id, string? query = null)
     {
         var sink = new CountingSink();
         var ctx  = new DefaultHttpContext { RequestServices = services };
         ctx.Response.Body = sink;
+        if (query is not null) ctx.Request.QueryString = new QueryString(query);
 
         int  thread = Environment.CurrentManagedThreadId;
         long a0     = GC.GetAllocatedBytesForCurrentThread();
@@ -145,6 +147,11 @@ public sealed class TraceDetailAllocProbe : IDisposable
         return new Reading(a1 - a0, Stopwatch.GetElapsedTime(t0, t1).TotalMilliseconds, 0);
     }
 
+    /// <summary>The compare view over the trace and itself — two full traces through one request.</summary>
+    private static Task Compare(HttpContext ctx, string _) => TraceQueryEndpointMapper.WriteCompareAsync(ctx);
+
+    private static string CompareQuery(string id) => "?a=" + id + "&b=" + id;
+
     private static Reading Best(Reading a, Reading b) =>
         new(Math.Min(a.Bytes, b.Bytes), Math.Min(a.Ms, b.Ms), Math.Max(a.BodyBytes, b.BodyBytes));
 
@@ -164,18 +171,21 @@ public sealed class TraceDetailAllocProbe : IDisposable
             await MeasureEngineAsync(engine);
             await MeasureHandlerAsync(services, TraceQueryEndpointMapper.WriteTraceDetailAsync, id);
             await MeasureHandlerAsync(services, TraceQueryEndpointMapper.WriteFlamegraphAsync, id);
+            await MeasureHandlerAsync(services, Compare, id, CompareQuery(id));
         }
 
-        Reading eng = new(long.MaxValue, double.MaxValue, 0), det = eng, flame = eng;
+        Reading eng = new(long.MaxValue, double.MaxValue, 0), det = eng, flame = eng, cmp = eng;
         for (int p = 0; p < Passes; p++)
         {
             eng   = Best(eng,   await MeasureEngineAsync(engine));
             det   = Best(det,   await MeasureHandlerAsync(services, TraceQueryEndpointMapper.WriteTraceDetailAsync, id));
             flame = Best(flame, await MeasureHandlerAsync(services, TraceQueryEndpointMapper.WriteFlamegraphAsync, id));
+            cmp   = Best(cmp,   await MeasureHandlerAsync(services, Compare, id, CompareQuery(id)));
         }
 
         long detOwn   = det.Bytes   - eng.Bytes;
         long flameOwn = flame.Bytes - eng.Bytes;
+        long cmpOwn   = cmp.Bytes   - 2 * eng.Bytes;   // two lookups of the same trace
 
         _out.WriteLine($"TRACE DETAIL + FLAME GRAPH, one {Spans:N0}-span hot-tier trace, 8 SqlClient attributes/span "
                      + $"(best of {Passes}, per-thread)");
@@ -184,6 +194,8 @@ public sealed class TraceDetailAllocProbe : IDisposable
         _out.WriteLine($"    of which the endpoint      {detOwn,12:N0} B  {detOwn / Spans,7:N0} B/span");
         _out.WriteLine($"  GET .../flamegraph          {flame.Bytes,12:N0} B  {flame.Bytes / Spans,7:N0} B/span  {flame.Ms,8:N2} ms  body {flame.BodyBytes:N0} B");
         _out.WriteLine($"    of which the endpoint      {flameOwn,12:N0} B  {flameOwn / Spans,7:N0} B/span");
+        _out.WriteLine($"  GET .../compare (a = b)     {cmp.Bytes,12:N0} B  {cmp.Bytes / (2 * Spans),7:N0} B/span  {cmp.Ms,8:N2} ms  body {cmp.BodyBytes:N0} B");
+        _out.WriteLine($"    of which the endpoint      {cmpOwn,12:N0} B  {cmpOwn / (2 * Spans),7:N0} B/span");
 
         // THE GATE ON THE DETAIL. Before TS#11 the endpoint's own share was 978-1 074 B per span
         // (1 957 336-2 149 336 B per request, Release): a SpanDto, three id strings, a
@@ -201,6 +213,13 @@ public sealed class TraceDetailAllocProbe : IDisposable
         Assert.True(flameOwn < Spans * 256,
             $"GET .../flamegraph allocated {flameOwn:N0} B of its own for {Spans:N0} spans — the builder "
             + "is indexing the trace through dictionaries and per-span lists again");
+
+        // THE GATE ON THE COMPARE VIEW. Before it moved onto the detail's writer: 978 B per span of
+        // its own, over both traces (3 914 248 B for this trace compared with itself) — the DTO
+        // path, twice. What stays is the two span lists it collects before writing anything.
+        Assert.True(cmpOwn < 2 * Spans * 64,
+            $"GET /api/traces/compare allocated {cmpOwn:N0} B of its own for 2 x {Spans:N0} spans — "
+            + "the compare view is building a DTO per span again");
     }
 
     private static long LiveBytes()
@@ -210,7 +229,8 @@ public sealed class TraceDetailAllocProbe : IDisposable
     }
 
     /// <summary>
-    /// ONE LOOK AT A TRACE MUST NOT MAKE THE HOT TIER HEAVIER. <see cref="SpanRecord.Attributes"/>
+    /// ONE LOOK AT A TRACE — ITS DETAIL, OR THE COMPARE VIEW — MUST NOT MAKE THE HOT TIER HEAVIER.
+    /// <see cref="SpanRecord.Attributes"/>
     /// decodes a hot-tier record's blob on first touch and MEMOISES the dictionary on the record,
     /// and the records belong to the tier — so a detail view that reaches the attributes through
     /// it leaves every span of the trace carrying a decoded map (a Dictionary, a string per key, a
@@ -222,7 +242,7 @@ public sealed class TraceDetailAllocProbe : IDisposable
     /// request, so the delta is what the request left behind.</para>
     /// </summary>
     [Fact]
-    public async Task A_trace_detail_does_not_inflate_the_hot_tier_it_read()
+    public async Task A_trace_detail_or_compare_does_not_inflate_the_hot_tier_it_read()
     {
         using var engine = new TraceStorageEngine(_dir, NullLogger<TraceStorageEngine>.Instance);
         WriteTrace(engine);
@@ -239,7 +259,10 @@ public sealed class TraceDetailAllocProbe : IDisposable
             .BuildServiceProvider();
 
         for (int i = 0; i < 3; i++)
+        {
             await MeasureHandlerAsync(services, TraceQueryEndpointMapper.WriteTraceDetailAsync, warmTrace.ToString());
+            await MeasureHandlerAsync(services, Compare, warmTrace.ToString(), CompareQuery(warmTrace.ToString()));
+        }
 
         long before = LiveBytes();
         var  r      = await MeasureHandlerAsync(services, TraceQueryEndpointMapper.WriteTraceDetailAsync, Trace.ToString());
@@ -254,6 +277,21 @@ public sealed class TraceDetailAllocProbe : IDisposable
         Assert.True(perSpan < 256,
             $"one trace-detail request left {perSpan:N0} B per span on the hot tier — the handler is "
             + "reading attributes through SpanRecord.Attributes, which memoises its decode on the record");
+
+        // THE COMPARE VIEW, over the same untouched tier: it serialised the same DTO, through the
+        // same memoising property, for two traces at once.
+        long cmpBefore = LiveBytes();
+        var  c         = await MeasureHandlerAsync(services, Compare, Trace.ToString(), CompareQuery(Trace.ToString()));
+        long cmpAfter  = LiveBytes();
+
+        long cmpPerSpan = (cmpAfter - cmpBefore) / Spans;
+        _out.WriteLine($"ONE GET /api/traces/compare of that trace with itself: body {c.BodyBytes:N0} B, "
+                     + $"left on the tier {cmpAfter - cmpBefore:N0} B = {cmpPerSpan:N0} B/span");
+
+        // Before it moved onto the writer: 1 497 B per span left on the tier by one compare.
+        Assert.True(cmpPerSpan < 256,
+            $"one compare request left {cmpPerSpan:N0} B per span on the hot tier — it is reading "
+            + "attributes through SpanRecord.Attributes again");
         GC.KeepAlive(engine);
     }
 }

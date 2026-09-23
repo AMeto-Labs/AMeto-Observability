@@ -314,7 +314,14 @@ public static class TraceQueryEndpointMapper
         finally { json?.Dispose(); }
     }
 
-    /// <summary><c>GET /api/traces/compare?a=&amp;b=</c> — see <see cref="WriteTraceDetailAsync"/>.</summary>
+    /// <summary>
+    /// <c>GET /api/traces/compare?a=&amp;b=</c>: <c>{"traceA":[…],"traceB":[…]}</c>, each array exactly
+    /// the body <see cref="WriteTraceDetailAsync"/> writes for that trace — and for the same reasons
+    /// written from the records: it used to build a <see cref="SpanDto"/> per span of BOTH traces,
+    /// and to decode every hot-tier span's blob through the memoising
+    /// <see cref="SpanRecord.Attributes"/>, which left both traces ~1.5 KB per span heavier in the
+    /// live tier. <c>TraceDetailShapeTests</c> pins the body.
+    /// </summary>
     internal static async Task WriteCompareAsync(HttpContext ctx)
     {
         var provider = ctx.RequestServices.GetRequiredService<ITraceProvider>();
@@ -328,11 +335,14 @@ public static class TraceQueryEndpointMapper
             return;
         }
 
-        var taskA = CollectSpansAsync(provider, tidA, ctx.RequestAborted);
-        var taskB = CollectSpansAsync(provider, tidB, ctx.RequestAborted);
+        // Both traces are collected before anything is written, as before: a lookup that fails is
+        // still a 500 before the response has started. What is collected is the records the
+        // provider already holds — no DTO, no dictionary, no decode memoised onto the hot tier.
+        var taskA = CollectSpansRawAsync(provider, tidA, ctx.RequestAborted);
+        var taskB = CollectSpansRawAsync(provider, tidB, ctx.RequestAborted);
         await Task.WhenAll(taskA, taskB);
 
-        await ctx.Response.WriteAsJsonAsync(new { traceA = taskA.Result, traceB = taskB.Result });
+        await TraceDetailJson.WriteCompareAsync(ctx, taskA.Result, taskB.Result);
     }
 
     /// <summary><c>GET /api/traces/{traceId}/flamegraph</c> — see <see cref="WriteTraceDetailAsync"/>.</summary>
@@ -1371,15 +1381,6 @@ public static class TraceQueryEndpointMapper
 
     // ── Misc helpers ──────────────────────────────────────────────────────────
 
-    private static async Task<List<SpanDto>> CollectSpansAsync(
-        ITraceProvider provider, TraceId tid, CancellationToken ct)
-    {
-        var list = new List<SpanDto>();
-        await foreach (var s in provider.GetTraceAsync(tid, ct))
-            list.Add(SpanDto.From(s));
-        return list;
-    }
-
     private static async Task<List<SpanRecord>> CollectSpansRawAsync(
         ITraceProvider provider, TraceId tid, CancellationToken ct)
     {
@@ -1452,7 +1453,13 @@ public sealed class TraceRowDto
     public int      SpanCount         { get; init; }
 }
 
-/// <summary>JSON DTO for a single span, returned to the Angular client.</summary>
+/// <summary>
+/// JSON DTO for a single span — the shape the Angular client reads from the trace detail and the
+/// compare view. NO ENDPOINT SERIALISES IT ANY MORE: both are written by <see cref="TraceDetailJson"/>
+/// straight from the records. It stays as the definition of that shape and as the REFERENCE the
+/// writer is held to byte for byte (<c>TraceDetailTranscodeParityTests</c> serialises
+/// <see cref="From"/>'s output next to <see cref="TraceDetailJson.WriteSpan"/>'s).
+/// </summary>
 public sealed class SpanDto
 {
     public string                    TraceId           { get; init; } = string.Empty;
@@ -1565,6 +1572,51 @@ internal static class TraceDetailJson
         IndentSize      = o.IndentSize,
         NewLine         = o.NewLine,
     };
+
+    private static readonly JsonEncodedText PTraceA = JsonEncodedText.Encode("traceA");
+    private static readonly JsonEncodedText PTraceB = JsonEncodedText.Encode("traceB");
+
+    /// <summary>
+    /// The compare view's body: what serialising <c>new { traceA, traceB }</c> — two
+    /// <c>List&lt;SpanDto&gt;</c> — through the host's options produced.
+    /// </summary>
+    internal static async Task WriteCompareAsync(HttpContext ctx, List<SpanRecord> a, List<SpanRecord> b)
+    {
+        ctx.Response.ContentType = ContentType;
+        var body = ctx.Response.BodyWriter;
+        using var json = new Utf8JsonWriter(body, WriterOptions(ctx));
+
+        json.WriteStartObject();
+        json.WritePropertyName(PTraceA);
+        long flushed = await WriteArrayAsync(json, body, a, 0);
+        if (flushed < 0) return;
+        json.WritePropertyName(PTraceB);
+        flushed = await WriteArrayAsync(json, body, b, flushed);
+        if (flushed < 0) return;
+        json.WriteEndObject();
+        json.Flush();
+        await body.FlushAsync();
+    }
+
+    /// <summary>
+    /// One array of spans, flushed every <see cref="FlushThresholdBytes"/>. Returns the new flushed
+    /// mark, or -1 when the client has gone (the pipe completed) and nothing more should be written.
+    /// </summary>
+    private static async ValueTask<long> WriteArrayAsync(
+        Utf8JsonWriter json, System.IO.Pipelines.PipeWriter body, List<SpanRecord> spans, long flushed)
+    {
+        json.WriteStartArray();
+        foreach (var s in spans)
+        {
+            WriteSpan(json, s);
+            if (json.BytesCommitted + json.BytesPending - flushed < FlushThresholdBytes) continue;
+            json.Flush();
+            flushed = json.BytesCommitted;
+            if ((await body.FlushAsync()).IsCompleted) return -1;
+        }
+        json.WriteEndArray();
+        return flushed;
+    }
 
     /// <summary>Sets the content type, opens a writer on the response body and writes <c>[</c>.</summary>
     internal static Utf8JsonWriter BeginArray(HttpContext ctx)
