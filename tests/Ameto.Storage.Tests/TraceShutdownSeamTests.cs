@@ -145,6 +145,7 @@ public sealed class TraceShutdownSeamTests : IDisposable
         Assert.Equal(1, engine.HeavyPhasesInFlight);
 
         bool accepted = true;
+        int  batchTaken = -1;
         long walBefore = -1, walAfter = -1;
         int lateTraceSpans = -1;
         var atWait = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -153,6 +154,7 @@ public sealed class TraceShutdownSeamTests : IDisposable
             Assert.True(engine.WritesClosedForTest);
             walBefore = engine.WalWrittenBytesForTest;
             accepted  = engine.WriteSpan(Span(9_999));
+            batchTaken = engine.WriteSpans([Span(9_997), Span(9_998)]);   // the drainer's shape
             walAfter  = engine.WalWrittenBytesForTest;
             lateTraceSpans = engine.GetTraceAsync(Span(9_999).TraceId).ToBlockingEnumerable().Count();
             atWait.TrySetResult();
@@ -163,6 +165,7 @@ public sealed class TraceShutdownSeamTests : IDisposable
         await atWait.Task.WaitAsync(HangGuard);
 
         Assert.False(accepted);                     // refused, and the caller is told
+        Assert.Equal(0, batchTaken);                // a batch is refused whole, never split across the close
         Assert.Equal(walBefore, walAfter);          // nothing appended
         Assert.Equal(0, lateTraceSpans);            // and nothing queryable
 

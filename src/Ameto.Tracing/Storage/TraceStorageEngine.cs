@@ -696,37 +696,151 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// <summary>
     /// Takes one span into the log and the hot tier. Returns false when the teardown has closed
     /// the write path — the caller keeps the span, exactly as it keeps one the ring refused.
-    ///
-    /// <para>REFUSED BEFORE THE APPEND, AND THAT IS THE FIX. The log used to answer a
-    /// post-dispose append with <c>return;</c>, silently, while the very next line still added
-    /// the span to the hot tier: unrecoverable and queryable at the same instant. One gate above
-    /// both halves is the only arrangement in which the two cannot disagree.</para>
+    /// A batch of one: <see cref="WriteSpans"/> is the path, this is its single-span spelling.
     /// </summary>
-    internal bool WriteSpan(SpanIngestItem item)
+    internal bool WriteSpan(SpanIngestItem item) =>
+        WriteSpans(new ReadOnlySpan<SpanIngestItem>(in item)) == 1;
+
+    /// <summary>
+    /// The most spans taken under ONE hold of the engine's write lock (and of the log's append
+    /// lock inside it). See <see cref="WriteSpans"/> for why a drained batch is split at all.
+    /// </summary>
+    internal const int MaxSpansPerWriteHold = 128;
+
+    /// <summary>Test/probe seam: <see cref="MaxSpansPerWriteHold"/>, overridable so a probe can price the cap.</summary>
+    internal int _maxSpansPerWriteHold = MaxSpansPerWriteHold;
+
+    /// <summary>
+    /// Test seam: called after each write-lock hold of <see cref="WriteSpans"/> is RELEASED, with
+    /// the number of spans the call has taken so far. A reader can run from inside it — which is
+    /// the property the cap exists for.
+    /// </summary>
+    internal Action<int>? _afterWriteHoldForTest;
+
+    /// <summary>
+    /// Takes a drained batch into the log and the hot tier: ONE engine write lock and ONE log
+    /// append lock per <see cref="MaxSpansPerWriteHold"/> spans, instead of both locks — four
+    /// interlocked round trips and a point at which a reader could interleave — per span.
+    /// Returns how many spans were taken: all of them, or 0 when the teardown has closed the
+    /// write path (the gate is checked once, above both halves, so a batch is never split
+    /// across the close). A log failure part-way throws AFTER the spans already logged have
+    /// joined the hot tier, so the log and the tier still hold exactly the same spans.
+    ///
+    /// <para>WHY THE BATCH IS SPLIT. A write-lock hold is a wait for every reader:
+    /// <c>ReaderWriterLockSlim</c> lets a waiting writer block new readers, so a point lookup
+    /// that arrives behind the drainer waits out the whole hold. The drainer hands over up to
+    /// 512 spans; one hold for all of them is ~150 µs on the eight-attribute shape, 128 of them
+    /// ~40 µs. <c>TraceAggregateLockProbe</c> prices both against a concurrent reader: the cap
+    /// keeps nearly all of the amortisation (the locks are paid once per 128 spans instead of
+    /// once per span) and gives the reader a quarter of the worst-case wait. A cap alone is not
+    /// enough, though: holds back to back leave a sleeping reader no gap to wake into, so between
+    /// two holds <see cref="LetQueuedReadersIn"/> hands the lock to any reader already queued.</para>
+    ///
+    /// <para>WHAT ONE HOLD STILL GUARANTEES. The log's generation stamps are taken inside the
+    /// same engine hold as the hot-tier insert, and a flush's <c>BeginFlush</c> can only run
+    /// under that lock too — so no flush can open between a span's append and its insert, and
+    /// the stamp is still exactly what decides whether the span is replayed. The flush trigger
+    /// moves to the end of each hold, so a tier can pass <see cref="HotFlushThreshold"/> by at
+    /// most one hold's worth of spans before the flush starts.</para>
+    ///
+    /// <para>REFUSED BEFORE THE APPEND, AND THAT IS THE FIX FROM THE SHUTDOWN GATE. The log used
+    /// to answer a post-dispose append with <c>return;</c>, silently, while the very next line
+    /// still added the span to the hot tier: unrecoverable and queryable at the same instant.
+    /// One gate above both halves is the only arrangement in which the two cannot disagree.</para>
+    /// </summary>
+    internal int WriteSpans(ReadOnlySpan<SpanIngestItem> items)
     {
-        if (!TryEnterEngine()) return false;
+        if (items.IsEmpty) return 0;
+        if (!TryEnterEngine()) return 0;
+        int taken = 0;
         try
         {
-            _lock.EnterWriteLock();
-            try
+            int perHold = Math.Max(1, _maxSpansPerWriteHold);
+            while (taken < items.Length)
             {
-                // Write-ahead: the span is durable before it is queryable. Held under the same
-                // write lock as the hot tier so a flush's Begin can never interleave with an
-                // append — that ordering is what makes the generation stamps trustworthy.
-                _wal.Append(item);
-                AddToHotTierLocked(item);
+                var chunk    = items.Slice(taken, Math.Min(perHold, items.Length - taken));
+                int appended = 0;
+                _lock.EnterWriteLock();
+                try
+                {
+                    // Write-ahead: every span is in the log before it is queryable. If the log
+                    // fails part-way, the spans it did take still join the tier — the finally —
+                    // and the ones it did not stay out of both.
+                    try { _wal.AppendBatch(chunk, ref appended); }
+                    finally
+                    {
+                        for (int i = 0; i < appended; i++) AddToHotTierLocked(chunk[i]);
+                        taken += appended;
+                    }
 
-                if (_hotSpans.Count >= HotFlushThreshold)
-                    TryStartFlushLocked();
-            }
-            finally
-            {
-                _lock.ExitWriteLock();
+                    if (_hotSpans.Count >= HotFlushThreshold)
+                        TryStartFlushLocked();
+                    _insideWriteHoldForTest?.Invoke(taken);
+                }
+                finally
+                {
+                    _lock.ExitWriteLock();
+                }
+                LetQueuedReadersIn();
+                _afterWriteHoldForTest?.Invoke(taken);
             }
         }
         finally { ExitEngine(); }
-        return true;
+        return taken;
     }
+
+    /// <summary>
+    /// The longest <see cref="WriteSpans"/> waits, after a hold, for readers that queued up behind it
+    /// to get in — 100 µs, about one hold. See <see cref="LetQueuedReadersIn"/>.
+    /// </summary>
+    internal static readonly long ReaderHandoffTicks = System.Diagnostics.Stopwatch.Frequency / 10_000;
+
+    /// <summary>Test seam: <see cref="ReaderHandoffTicks"/>, so a test can make the hand-off wait as long as its reader needs.</summary>
+    internal long _readerHandoffTicks = ReaderHandoffTicks;
+
+    /// <summary>
+    /// Called between two write holds: if readers are queued on the engine lock, spins — never
+    /// sleeps — until one of them is in, or until <see cref="ReaderHandoffTicks"/> has passed.
+    ///
+    /// <para>WITHOUT IT A READER STARVES FOR AS LONG AS THE DRAINER IS BUSY, and that was measured,
+    /// not assumed: <c>TraceAggregateLockProbe</c> completed ONE point lookup in 29 ms of batched
+    /// ingest, against 881 with a hold per span. <c>ReaderWriterLockSlim</c> wakes the queued
+    /// readers when a writer exits, but a woken reader needs microseconds to run and the drainer
+    /// re-enters within nanoseconds — the lock has no fairness to stop it barging. A hold per span
+    /// hid this because the gaps between holds were as frequent as the holds, and a SPINNING reader
+    /// caught one; holds of 128 back to back leave no gap a sleeping reader can reach. Under
+    /// sustained overload, which is when the drainer never parks, the trace UI would stop answering.
+    /// </para>
+    ///
+    /// <para>ONE READER IN IS ENOUGH. The next <c>EnterWriteLock</c> then waits for it — and for every
+    /// reader the same wake-up let in — while blocking NEW readers, which is the lock's ordinary
+    /// writer preference. So readers and the drainer alternate in groups, and a reader waits for at
+    /// most one hold instead of for the whole backlog. Bounded, because a queued reader may have been
+    /// cancelled or descheduled, and the drainer must not idle for a reader that is not coming.</para>
+    /// </summary>
+    private void LetQueuedReadersIn()
+    {
+        if (_lock.WaitingReadCount == 0) return;
+        long deadline = System.Diagnostics.Stopwatch.GetTimestamp() + _readerHandoffTicks;
+        var  spin     = new SpinWait();
+        while (_lock.WaitingReadCount > 0 && _lock.CurrentReadCount == 0)
+        {
+            if (System.Diagnostics.Stopwatch.GetTimestamp() >= deadline) return;
+            spin.SpinOnce(sleep1Threshold: -1);   // never Sleep(1): a millisecond is ten holds
+        }
+    }
+
+    /// <summary>Test hook: the engine lock itself, so a test can queue a reader on it at an exact point.</summary>
+    internal ReaderWriterLockSlim LockForTest => _lock;
+
+    /// <summary>Test seam: called INSIDE each write hold of <see cref="WriteSpans"/>, after the spans joined the tier.</summary>
+    internal Action<int>? _insideWriteHoldForTest;
+
+    /// <summary>
+    /// Test hook: the live log. Lets a test hold the log and the hot tier side by side — the pair
+    /// the write path must keep equal — and reach the log's own seams.
+    /// </summary>
+    internal SpanWriteAheadLog WalForTest => _wal;
 
     /// <summary>
     /// Materialises a span into the hot tier and its trace index. Shared by live ingest

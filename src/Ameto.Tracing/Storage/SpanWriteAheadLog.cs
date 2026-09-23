@@ -216,6 +216,41 @@ internal sealed unsafe class SpanWriteAheadLog : IDisposable
     /// </summary>
     public void Append(SpanIngestItem item)
     {
+        lock (_writeLock)
+        {
+            if (_disposed) return;                          // shutdown race — dropping is correct
+            AppendLocked(item);
+        }
+    }
+
+    /// <summary>
+    /// Appends a drained batch under ONE hold of the append lock. <paramref name="appended"/> is
+    /// advanced after each entry lands, so when an append throws part-way the caller knows
+    /// exactly which spans the log holds — the engine adds precisely those to the hot tier.
+    ///
+    /// <para>A disposed log THROWS here rather than returning: the engine's shutdown gate refuses
+    /// a batch before it reaches the log, so arriving here disposed is a broken gate, and a
+    /// silent return is the queryable-but-unrecoverable shape that gate was built to end.</para>
+    /// </summary>
+    public void AppendBatch(ReadOnlySpan<SpanIngestItem> items, ref int appended)
+    {
+        lock (_writeLock)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            while (appended < items.Length)
+            {
+                _beforeBatchEntryForTest?.Invoke(appended);
+                AppendLocked(items[appended]);
+                appended++;
+            }
+        }
+    }
+
+    /// <summary>Test seam: called under the append lock before each entry of <see cref="AppendBatch"/>, with its index. Throwing from it is a log failure part-way through a batch.</summary>
+    internal Action<int>? _beforeBatchEntryForTest;
+
+    private void AppendLocked(SpanIngestItem item)
+    {
         string name    = item.Name        ?? string.Empty;
         string service = item.ServiceName ?? string.Empty;
 
@@ -230,43 +265,39 @@ internal sealed unsafe class SpanWriteAheadLog : IDisposable
 
         int entrySize = EntryHeaderSize + nameLen + svcLen + attrLen;
 
-        lock (_writeLock)
-        {
-            if (_disposed) return;                          // shutdown race — dropping is correct
-            if (_ptr is null)
-                throw new InvalidOperationException(
-                    "Span WAL has no mapping; the log is not accepting appends.");
+        if (_ptr is null)
+            throw new InvalidOperationException(
+                "Span WAL has no mapping; the log is not accepting appends.");
 
-            while (_writeOffset + entrySize > _capacity)
-                Grow();
+        while (_writeOffset + entrySize > _capacity)
+            Grow();
 
-            byte* dest = _ptr + FileHeaderSize + _writeOffset;
+        byte* dest = _ptr + FileHeaderSize + _writeOffset;
 
-            ref var eh = ref Unsafe.AsRef<SpanWalEntryHeader>(dest);
-            // TraceId sits at offset 0 of the entry, so the entry pointer addresses it
-            // directly — a fixed-size buffer reached through a ref into unmanaged memory
-            // would need a `fixed` statement for no benefit.
-            item.TraceId.WriteTo(new Span<byte>(dest, 16));
-            eh.SpanId            = item.SpanId.RawValue;
-            eh.ParentSpanId      = item.ParentSpanId.RawValue;
-            eh.StartTimeUnixNano = item.StartTimeUnixNano;
-            eh.DurationNanos     = item.DurationNanos;
-            eh.AttrLength        = (uint)attrLen;
-            eh.NameLength        = (ushort)nameLen;
-            eh.ServiceLength     = (ushort)svcLen;
-            eh.HttpStatusCode    = item.HttpStatusCode;
-            eh.Kind              = (byte)item.Kind;
-            eh.Status            = (byte)item.Status;
-            eh.Generation        = _generation;
+        ref var eh = ref Unsafe.AsRef<SpanWalEntryHeader>(dest);
+        // TraceId sits at offset 0 of the entry, so the entry pointer addresses it
+        // directly — a fixed-size buffer reached through a ref into unmanaged memory
+        // would need a `fixed` statement for no benefit.
+        item.TraceId.WriteTo(new Span<byte>(dest, 16));
+        eh.SpanId            = item.SpanId.RawValue;
+        eh.ParentSpanId      = item.ParentSpanId.RawValue;
+        eh.StartTimeUnixNano = item.StartTimeUnixNano;
+        eh.DurationNanos     = item.DurationNanos;
+        eh.AttrLength        = (uint)attrLen;
+        eh.NameLength        = (ushort)nameLen;
+        eh.ServiceLength     = (ushort)svcLen;
+        eh.HttpStatusCode    = item.HttpStatusCode;
+        eh.Kind              = (byte)item.Kind;
+        eh.Status            = (byte)item.Status;
+        eh.Generation        = _generation;
 
-            byte* p = dest + EntryHeaderSize;
-            if (nameLen > 0) { Encoding.UTF8.GetBytes(name,    new Span<byte>(p, nameLen)); p += nameLen; }
-            if (svcLen  > 0) { Encoding.UTF8.GetBytes(service, new Span<byte>(p, svcLen));  p += svcLen;  }
-            if (attrLen > 0) item.AttributesBytes.AsSpan().CopyTo(new Span<byte>(p, attrLen));
+        byte* p = dest + EntryHeaderSize;
+        if (nameLen > 0) { Encoding.UTF8.GetBytes(name,    new Span<byte>(p, nameLen)); p += nameLen; }
+        if (svcLen  > 0) { Encoding.UTF8.GetBytes(service, new Span<byte>(p, svcLen));  p += svcLen;  }
+        if (attrLen > 0) item.AttributesBytes.AsSpan().CopyTo(new Span<byte>(p, attrLen));
 
-            _writeOffset += entrySize;
-            Unsafe.AsRef<WalFileHeader>(_ptr).WriteOffset = FileHeaderSize + _writeOffset;
-        }
+        _writeOffset += entrySize;
+        Unsafe.AsRef<WalFileHeader>(_ptr).WriteOffset = FileHeaderSize + _writeOffset;
     }
 
     // ── Two-phase flush (Begin / Commit / Abandon) ───────────────────────────
