@@ -525,6 +525,9 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         long oldestNano    = long.MaxValue;
         long futureLimit   = FutureLimitNanos();
         int  droppedFuture = 0;
+        long nowTicks      = _time.GetUtcNow().UtcTicks;
+        long replayedBytes = 0;
+        int  replayed      = 0;
 
         foreach (var r in recovered)
         {
@@ -544,10 +547,12 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                 // Exemplars are not logged (see MetricWriteAheadLog) — a flush never
                 // persisted them either, so replay restores exactly what a flush would have.
             };
-            ApplyToHotTier(item, r.Point, out _);
+            replayedBytes += ApplyToHotTier(item, r.Point, nowTicks, out _);
+            replayed++;
             if (r.Point.TimestampUnixNano > 0 && r.Point.TimestampUnixNano < oldestNano)
                 oldestNano = r.Point.TimestampUnixNano;
         }
+        CountIntoTier(replayed, replayedBytes);   // dated below, by the data
 
         // Date the tier by the data, not by this restart: leaving _hotSince at "now" would
         // restart the MaxHotAge clock on every start, so a crash-restart loop could keep
@@ -704,12 +709,15 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
                 // PASS 3 — visible. Ordering against a flush's snapshot is what _snapshotLock
                 // provides, and it is held across all three passes, so "logged, then published"
-                // is still one step as far as the drain is concerned.
+                // is still one step as far as the drain is concerned. The tier's counters are
+                // added once for the whole batch, below — see CountIntoTier.
+                long nowTicks   = _time.GetUtcNow().UtcTicks;
+                long batchBytes = 0;
                 for (int j = 0; j < logged.Length; j++)
                 {
-                    var item  = logged[j];
-                    var point = item.ToDataPoint();          // the same derivation the log used
-                    hotBytes  = ApplyToHotTier(item, in point, out var series);
+                    var item    = logged[j];
+                    var point   = item.ToDataPoint();        // the same derivation the log used
+                    batchBytes += ApplyToHotTier(item, in point, nowTicks, out var series);
 
                     if (item.Exemplars is { Length: > 0 })
                     {
@@ -721,6 +729,8 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                         if (ordinal > lastResolved) lastResolved = ordinal;
                     }
                 }
+
+                hotBytes = CountIntoTier(logged.Length, batchBytes);
             }
             finally { _snapshotLock.ExitReadLock(); }
 
@@ -1018,27 +1028,54 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     }
 
     /// <summary>
-    /// Files one point into its series and the metadata catalog, returning the hot tier's new
-    /// size IN BYTES — the figure the flush threshold is spent in. Shared by live ingest and WAL
-    /// replay: replay must not write back into the log it is reading from, and must not trigger
-    /// a flush from the constructor.
+    /// Files one point into its series and the metadata catalog, returning what the point weighs
+    /// IN BYTES — the unit the flush threshold is spent in. Shared by live ingest and WAL replay:
+    /// replay must not write back into the log it is reading from, and must not trigger a flush
+    /// from the constructor.
+    ///
+    /// <para><b>It does not touch the tier's counters; the caller adds the whole batch once, with
+    /// <see cref="CountIntoTier"/>.</b> Two interlocked adds per POINT on two process-wide fields
+    /// were what was left serialising ingest once the log took its lock per batch: every Kestrel
+    /// thread's every point bounced the same cache lines between cores. See the commit that moved
+    /// them, and <c>MetricIngestContentionProbe</c>'s disjoint sweep.</para>
+    ///
+    /// <para><paramref name="nowUtcTicks"/> is the batch's clock reading, taken once: it only ever
+    /// feeds <see cref="HotSeries.LastAppendUtcTicks"/>, which the stale sweep compares against an
+    /// age measured in hours.</para>
     ///
     /// <para><paramref name="series"/> is the series the point landed on, handed out because the
     /// exemplar pass needs exactly that instance and resolving it is the expensive half of this
     /// method — see <see cref="AddExemplars"/>. Replay discards it.</para>
     /// </summary>
-    private long ApplyToHotTier(MetricIngestItem item, in MetricDataPoint point, out HotSeries series)
+    private int ApplyToHotTier(MetricIngestItem item, in MetricDataPoint point, long nowUtcTicks, out HotSeries series)
     {
         var key = new SeriesKey(item.Name, item.Kind, item.Unit, item.Labels);
         series  = _hot.GetOrAdd(key, static k => new HotSeries(k.Labels));
 
-        series.Append(point, item.BucketBounds, _time.GetUtcNow().UtcTicks);
+        series.Append(point, item.BucketBounds, nowUtcTicks);
         UpdateMeta(item, series);
 
-        long bytes = System.Threading.Interlocked.Add(ref _hotPointBytes, EstimatedPointBytes(in point));
-        int  total = System.Threading.Interlocked.Increment(ref _hotPointCount);
-        if (total == 1) _hotSince = _time.GetUtcNow().UtcDateTime;   // tier went from empty to holding data
-        return bytes;
+        return EstimatedPointBytes(in point);
+    }
+
+    /// <summary>
+    /// Adds a batch's points to the tier's counters — ONE interlocked add per counter per batch —
+    /// and returns the tier's new size in bytes. Dates the tier when this batch is the one that
+    /// took it from empty, which is the per-point rule (<c>total == 1</c>) stated for a batch: of
+    /// all concurrent adders, exactly one sees the total equal to its own contribution.
+    ///
+    /// <para>Call from inside <c>_snapshotLock</c>'s read section, after the batch's points are
+    /// in their series, as the per-point adds were: the drain zeroes these under the write lock,
+    /// so a batch's points and its counts land on the same side of it.</para>
+    /// </summary>
+    private long CountIntoTier(int points, long bytes)
+    {
+        if (points == 0) return Volatile.Read(ref _hotPointBytes);
+
+        long total = System.Threading.Interlocked.Add(ref _hotPointBytes, bytes);
+        if (System.Threading.Interlocked.Add(ref _hotPointCount, points) == points)
+            _hotSince = _time.GetUtcNow().UtcDateTime;   // tier went from empty to holding data
+        return total;
     }
 
     /// <summary>

@@ -43,18 +43,34 @@ public sealed class MetricIngestContentionProbe
     /// </summary>
     private const int Repeats = 5;
 
+    /// <summary>
+    /// Two sweeps, because "which lock is it" has two different answers depending on who shares
+    /// what. <b>shared</b>: every thread re-sends the SAME series — the worst case for anything
+    /// per series (HotSeries' lock and its point list bounce between cores). <b>disjoint</b>: each
+    /// thread is its own exporter with its own series, which is what a fleet looks like — only
+    /// process-wide state is contended there: the log's write lock, the tier's byte and point
+    /// counters, the snapshot lock's reader count. The gap between the two columns at the same
+    /// thread count is what the per-series state costs; what is left in the disjoint column is
+    /// the ceiling a lock-free WAL reservation (M#3b) could lift.
+    /// </summary>
     [Fact]
     public void ConcurrentIngestThroughput()
     {
-        _out.WriteLine($"{Names} instruments x {SeriesPerName} known series, {Rounds} rounds per thread, "
-                     + $"best of {Repeats}");
-        _out.WriteLine("threads | per-thread ns/point | total k points/s | scaling vs 1 thread");
+        Sweep(disjoint: false);
+        Sweep(disjoint: true);
+    }
+
+    private void Sweep(bool disjoint)
+    {
+        _out.WriteLine($"{(disjoint ? "DISJOINT" : "SHARED")} series: {Names} instruments x {SeriesPerName} known series, "
+                     + $"{Rounds} rounds per thread, best of {Repeats}");
+        _out.WriteLine("threads | per-thread ns/point | total k points/s | scaling vs 1 thread | GC pause in that run");
 
         // Discarded, and load-bearing: the one-thread point runs FIRST, and on a laptop or a
         // cloud VM the first sweep point pays for a parked core stepping up its clock. Without
         // this, one thread measured slower than two — every thread-count figure was then
         // relative to a cold baseline and the scaling column was fiction.
-        RunSweepPoint(ThreadCounts[^1]);
+        _ = RunSweepPoint(ThreadCounts[^1], disjoint);
 
         double oneThreadRate = 0;
 
@@ -62,17 +78,19 @@ public sealed class MetricIngestContentionProbe
         {
             double bestNs   = double.MaxValue;
             double bestRate = 0;
+            double bestGcMs = 0;
             for (int r = 0; r < Repeats; r++)
             {
-                var (ns, rate) = RunSweepPoint(threads);
-                if (ns   < bestNs)   bestNs   = ns;
+                var (ns, rate, gcMs) = RunSweepPoint(threads, disjoint);
+                if (ns   < bestNs)   { bestNs = ns; bestGcMs = gcMs; }
                 if (rate > bestRate) bestRate = rate;
             }
 
             if (threads == 1) oneThreadRate = bestRate;
 
             _out.WriteLine($"{threads,7} | {bestNs,19:F0} | {bestRate / 1000.0,16:F0} "
-                         + $"| {(oneThreadRate > 0 ? bestRate / oneThreadRate : 1),8:F2}x");
+                         + $"| {(oneThreadRate > 0 ? bestRate / oneThreadRate : 1),8:F2}x "
+                         + $"| {bestGcMs,6:F1} ms");
         }
     }
 
@@ -81,14 +99,21 @@ public sealed class MetricIngestContentionProbe
     /// carry the previous point's WAL capacity, series registry and hot-tier fill into the next
     /// one and the numbers would drift with the sweep order, not with the thread count.
     /// </summary>
-    private static (double NsPerPointPerThread, double TotalPointsPerSecond) RunSweepPoint(int threads)
+    /// <remarks>
+    /// The GC pause inside the timed window is reported beside the figure because at eight threads
+    /// it IS the figure: the hot tier's point lists grow under every series, so the allocation rate
+    /// scales with the thread count while the window does not, and one stop-the-world gen0 in a
+    /// ~20 ms window moves the per-thread number by a factor. Read a high per-thread cost with a
+    /// high pause as the collector, not as a lock.
+    /// </remarks>
+    private static (double NsPerPointPerThread, double TotalPointsPerSecond, double GcPauseMs) RunSweepPoint(int threads, bool disjoint)
     {
         string dir = Path.Combine(Path.GetTempPath(), "ameto-mcontention-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dir);
         try
         {
             var engine  = new MetricStorageEngine(dir, NullLogger<MetricStorageEngine>.Instance);
-            var batches = BuildBatches(threads);
+            var batches = BuildBatches(threads, disjoint);
 
             foreach (var b in batches) engine.Ingest(b);          // warm: register every series
 
@@ -112,10 +137,12 @@ public sealed class MetricIngestContentionProbe
                 workers[t].Start();
             }
 
-            var wall = Stopwatch.StartNew();
+            var gcPause0 = GC.GetTotalPauseDuration();
+            var wall     = Stopwatch.StartNew();
             start.SignalAndWait();
             for (int t = 0; t < threads; t++) workers[t].Join();
             wall.Stop();
+            double gcPauseMs = (GC.GetTotalPauseDuration() - gcPause0).TotalMilliseconds;
 
             long pointsPerThread = (long)Rounds * Names * SeriesPerName;
             long totalPoints     = pointsPerThread * threads;
@@ -129,7 +156,7 @@ public sealed class MetricIngestContentionProbe
 
             engine.DisposeAsync().AsTask().GetAwaiter().GetResult();
 
-            return (sumNsPerPoint / threads, totalPoints / wall.Elapsed.TotalSeconds);
+            return (sumNsPerPoint / threads, totalPoints / wall.Elapsed.TotalSeconds, gcPauseMs);
         }
         finally
         {
@@ -137,7 +164,7 @@ public sealed class MetricIngestContentionProbe
         }
     }
 
-    private static MetricIngestItem[][] BuildBatches(int threads)
+    private static MetricIngestItem[][] BuildBatches(int threads, bool disjoint)
     {
         var batches = new MetricIngestItem[threads][];
         for (int t = 0; t < threads; t++)
@@ -157,6 +184,7 @@ public sealed class MetricIngestContentionProbe
                         new("http.route",   $"/api/v1/resource/{s % 25}"),
                         new("http.request.method", s % 2 == 0 ? "GET" : "POST"),
                         new("server.address", $"node-{s % 3}"),
+                        new("exporter", disjoint ? $"exporter-{t}" : "one"),
                     ]),
                     TimestampUnixNano = 1_785_300_000_000_000_000L,
                     ScalarValue       = s,
