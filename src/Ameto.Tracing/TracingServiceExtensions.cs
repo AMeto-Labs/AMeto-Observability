@@ -83,7 +83,11 @@ public static class TracingServiceExtensions
 
         // THE CAPACITY FROM CONFIG. This was AddSingleton<SpanRingBuffer>() — the parameterless
         // constructor — so Traces:RingCapacity could not have reached the ring even had it existed.
-        services.AddSingleton(static sp => new SpanRingBuffer(TracesOptionsFrom(sp).EffectiveRingCapacity));
+        services.AddSingleton(static sp =>
+        {
+            var traces = TracesOptionsFrom(sp);
+            return new SpanRingBuffer(traces.EffectiveRingCapacity, traces.EffectiveRingMaxBytes);
+        });
         services.AddSingleton<SpanIngestionEndpoint>();
         services.AddSingleton<ISpanIngester>(sp => sp.GetRequiredService<SpanIngestionEndpoint>());
         services.AddSingleton<ITraceProvider>(sp => sp.GetRequiredService<TraceStorageEngine>());

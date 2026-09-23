@@ -447,6 +447,37 @@ public sealed class TracesOptions
     /// </summary>
     public int? RingCapacity { get; init; }
 
+    /// <summary>
+    /// The most the spans waiting in the ingest ring may weigh, in bytes: past it the ring refuses
+    /// a span whatever slots are free (back-pressure by bytes, not by count). 65 536 ordinary spans
+    /// weigh ~36 MB; the same slots of spans carrying 10 KB of attributes, ~650 MB.
+    ///
+    /// <para>Unset: <b>what the full ring held of ordinary spans, restated in bytes</b> —
+    /// <see cref="EffectiveRingCapacity"/> × <see cref="OrdinaryRingSpanBytes"/>, 36.7 MB at the
+    /// default 65 536 slots — so a host with room for the caps absorbs exactly the burst it always
+    /// did, and a heavy burst no longer buys eighteen times that. A host whose hot-tier budget is
+    /// below its cap gets the same fraction of it: 27.4 MB on the 512 MB stand.</para>
+    /// </summary>
+    public long? RingMaxBytes { get; init; }
+
+    /// <summary>
+    /// What one ordinary span (eight attributes, a 375-byte blob) weighs waiting in the ring —
+    /// <c>SpanRingBytesProbe</c> reads 560-562 B. The unit <see cref="RingMaxBytes"/>' default is
+    /// counted in.
+    /// </summary>
+    public const int OrdinaryRingSpanBytes = 560;
+
+    /// <inheritdoc cref="RingMaxBytes"/>
+    public long EffectiveRingMaxBytes => RingMaxBytesFor(MemoryBudgets.Current());
+
+    /// <inheritdoc cref="RingMaxBytes"/>
+    public long RingMaxBytesFor(in MemoryBudgets budgets)
+    {
+        if (RingMaxBytes is { } explicitBytes && explicitBytes > 0) return explicitBytes;
+        double hostShare = Math.Min(1.0, HotTierMaxBytesFor(in budgets) / (double)MemoryBudgets.TraceHotTierCapBytes);
+        return (long)((long)EffectiveRingCapacity * OrdinaryRingSpanBytes * hostShare);
+    }
+
     /// <summary>The ring's slot count when nothing is configured.</summary>
     public const int DefaultRingCapacity = 1 << 16;
 
