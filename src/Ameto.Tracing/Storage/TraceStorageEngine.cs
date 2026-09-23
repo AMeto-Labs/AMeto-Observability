@@ -108,6 +108,15 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// </summary>
     internal TimeSpan _shutdownWaitBudget = TimeSpan.FromSeconds(30);
 
+    /// <summary>
+    /// Test seam: when set, the shutdown budget is spent when THIS is cancelled rather than
+    /// <see cref="_shutdownWaitBudget"/> after the teardown begins. The budget is one span of time
+    /// the final flush and both waits share, so on a clock a slow final flush decides how much of it
+    /// the heavy-phase wait gets — a test that means to judge the wait cannot let a disk's fsync
+    /// latency decide that. Never set in production.
+    /// </summary>
+    internal CancellationTokenSource? _shutdownBudgetForTest;
+
     /// <summary>Test seam: the teardown is about to wait for running heavy phases. Only fires when there is one.</summary>
     internal Action? _onWaitingForHeavyPhases;
 
@@ -4161,18 +4170,32 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// improvement on it. The engine is left allocated with an Error naming what is still
     /// running — the process is on its way out, and a leaked lock for its last second costs
     /// nothing.</para>
+    ///
+    /// <para>ONE BUDGET, AND THE FINAL FLUSH SPENDS IT TOO — deliberately. What the budget bounds is
+    /// how long this teardown holds up the host's stop, and that is one number however the time is
+    /// divided. A slow final flush leaving the heavy-phase wait little or nothing is the right
+    /// trade: running out is SAFE by construction (the engine is left frozen, not freed, and the WAL
+    /// replays whatever the flush did not commit), and a disk slow enough to eat the budget in a
+    /// flush is the same disk the wedged compaction is on. A fresh budget per wait would double the
+    /// worst-case stop to a minute — twice what the host allots its whole shutdown, and far past a
+    /// container runtime's kill — to reach the same frozen state later. So the budget stays shared, and is a token rather
+    /// than a deadline only so that a test can decide the instant it is spent
+    /// (<see cref="_shutdownBudgetForTest"/>) instead of a disk's fsync latency deciding it.</para>
     /// </summary>
     private async Task DisposeCoreAsync()
     {
-        long deadline = Environment.TickCount64 + (long)_shutdownWaitBudget.TotalMilliseconds;
+        using var clockBudget = _shutdownBudgetForTest is null
+            ? new CancellationTokenSource(_shutdownWaitBudget > TimeSpan.Zero ? _shutdownWaitBudget : TimeSpan.Zero)
+            : null;
+        CancellationToken budget = (clockBudget ?? _shutdownBudgetForTest!).Token;
 
         // ── Final flush, BEFORE the close, so it goes through the ordinary heavy-phase path.
         //    It waits out an in-flight background flush and then drains the tier — a clean stop
         //    commits the WAL and leaves nothing to replay. A failure leaves every span in the
         //    log (Abandon keeps its generation live). Off this thread and bounded, because the
         //    wait inside it is a blocking Task.Wait on whatever flush is already running.
-        try { await Task.Run(FlushHotTier).WaitAsync(Until(deadline)).ConfigureAwait(false); }
-        catch (TimeoutException)
+        try { await Task.Run(FlushHotTier).WaitAsync(budget).ConfigureAwait(false); }
+        catch (OperationCanceledException) when (budget.IsCancellationRequested)
         {
             _logger.LogError(
                 "The final span flush did not finish within {Budget}s — the WAL replays the tier "
@@ -4199,7 +4222,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         if (Volatile.Read(ref _heavyPhases) != 0)
         {
             _onWaitingForHeavyPhases?.Invoke();
-            phasesEnded = await CompletesBy(heavyDrained.Task, deadline).ConfigureAwait(false);
+            phasesEnded = await CompletesBy(heavyDrained.Task, budget).ConfigureAwait(false);
         }
 
         // ── Wait for callers inside the engine: a query still scanning, a span still between
@@ -4211,7 +4234,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         if (Volatile.Read(ref _activeReaders) != 0)
         {
             _onWaitingForReaders?.Invoke();
-            callersEnded = await CompletesBy(readersDrained.Task, deadline).ConfigureAwait(false);
+            callersEnded = await CompletesBy(readersDrained.Task, budget).ConfigureAwait(false);
         }
 
         if (!phasesEnded || !callersEnded)
@@ -4235,20 +4258,16 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         finally { _wal.Dispose(); ResourcesFreedForTest = true; }
     }
 
-    /// <summary>True if <paramref name="task"/> completes by the <see cref="Environment.TickCount64"/> deadline.</summary>
-    private static async Task<bool> CompletesBy(Task task, long deadline)
+    /// <summary>True if <paramref name="task"/> completes before the shutdown <paramref name="budget"/> is spent.</summary>
+    private static async Task<bool> CompletesBy(Task task, CancellationToken budget)
     {
         try
         {
-            await task.WaitAsync(Until(deadline)).ConfigureAwait(false);
+            await task.WaitAsync(budget).ConfigureAwait(false);
             return true;
         }
-        catch (TimeoutException) { return false; }
+        catch (OperationCanceledException) when (budget.IsCancellationRequested) { return false; }
     }
-
-    /// <summary>What is left of the shutdown budget, never negative.</summary>
-    private static TimeSpan Until(long deadline) =>
-        TimeSpan.FromMilliseconds(Math.Max(0, deadline - Environment.TickCount64));
 
     // ── IRetentionTarget ───────────────────────────────────────────────────
 

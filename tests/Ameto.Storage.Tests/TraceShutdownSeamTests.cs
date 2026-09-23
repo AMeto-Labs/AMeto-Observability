@@ -180,6 +180,16 @@ public sealed class TraceShutdownSeamTests : IDisposable
     /// A compaction wedged on a slow volume. Shutdown must WAIT for it — the pass is holding the
     /// engine lock, the index and the manifest — and must then give up rather than hang the host,
     /// leaving all three allocated instead of freeing them underneath it.
+    ///
+    /// <para>THE FINAL FLUSH IS SLOW HERE ON PURPOSE, and that is the case that used to flake. The
+    /// teardown's budget is one span of time shared by the final flush and both waits, and this fact
+    /// ran it on a 250 ms clock over a flush of 20 spans with a real fsync: a slow disk spent the
+    /// budget inside the flush, the heavy-phase wait began with nothing left, and the flush — still
+    /// running, still holding its own heavy-phase slot — was counted beside the compaction
+    /// ("HeavyPhasesInFlight was 2"). Now the flush is parked at its segment write for as long as the
+    /// test likes, and the budget is spent when the test says so, at the heavy-phase wait. The clock
+    /// budget is set to zero: were the clock still in charge, it would be spent before the flush
+    /// even began, and every assertion below would fail — deterministically, not on a slow day.</para>
     /// </summary>
     [Fact]
     public async Task A_wedged_compaction_is_waited_for_and_then_left_frozen_rather_than_freed()
@@ -198,17 +208,37 @@ public sealed class TraceShutdownSeamTests : IDisposable
         var compaction = Task.Run(engine.CompactSmallSegments);
         await wedge.Task.WaitAsync(HangGuard);
 
+        // The final flush, parked inside its segment write: the slow fsync, held open.
+        var flushParked   = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var flushReleased = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var flushReleaseOnExit = Seam.ReleasedOnExit(flushReleased);
+        engine._beforeSegmentWrite = () =>
+        {
+            flushParked.TrySetResult();
+            flushReleased.Task.GetAwaiter().GetResult();
+        };
+
         var atWait = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         engine._onWaitingForHeavyPhases = () => atWait.TrySetResult();
-        engine._shutdownWaitBudget = TimeSpan.FromMilliseconds(250);
+        using var budget = new CancellationTokenSource();
+        engine._shutdownBudgetForTest = budget;
+        engine._shutdownWaitBudget    = TimeSpan.Zero;
 
         var dispose = engine.DisposeAsync().AsTask();
+
+        // However long the flush takes, the teardown waits it out: the budget is not spent.
+        await flushParked.Task.WaitAsync(HangGuard);
+        Assert.False(atWait.Task.IsCompleted, "the teardown gave up on the final flush while its budget was unspent");
+        Assert.False(dispose.IsCompleted);
+        flushReleased.TrySetResult();
 
         // The seam is the verdict: an engine that counts nothing never reaches the wait at all.
         Assert.Same(atWait.Task, await Task.WhenAny(atWait.Task, dispose, Task.Delay(HangGuard)));
         Assert.False(dispose.IsCompleted, "the teardown did not wait for the running compaction");
+        Assert.Equal(1, engine.HeavyPhasesInFlight);   // the compaction; the flush finished
 
         // The budget runs out and the teardown returns — a wedged pass must not hang the host.
+        budget.Cancel();
         await dispose.WaitAsync(HangGuard);
         Assert.False(engine.ResourcesFreedForTest,
             "the lock, the index and the WAL were freed while a compaction was still inside them");
