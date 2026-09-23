@@ -207,6 +207,119 @@ public struct SpanHeader
 }
 
 /// <summary>
+/// THE TWO INTERN POOLS SPAN TEXT GOES THROUGH on its way into the hot tier (TI#5): span names and
+/// service names, each held by the tier as ONE shared string per distinct value instead of one per
+/// span.
+///
+/// <para><b>Why.</b> A span name is a route template or an operation name — <c>GET
+/// /api/v1/orders/{id}</c> — repeated across essentially every span of a batch, and the parser
+/// hands every span its own fresh copy: ~56 B/span for an ordinary name, retained for the tier's
+/// whole life, gen2 garbage at every flush (<c>TraceSpanInternProbe</c>: 197 → 140 B/span for a
+/// record and its strings). A service name is one string per resource block, but a DIFFERENT
+/// object per request, so a tier spanning ten thousand requests held ten thousand
+/// <c>"Wallet.API"</c>s.</para>
+///
+/// <para><b>Only the shared INSTANCE is kept, never an index.</b> The tier stores the canonical
+/// string reference the pool hands back; no pool index is ever stored where it could outlive the
+/// pool that issued it. That is what makes shedding a pool safe at any moment — an index would
+/// name some other string after a reset, a reference cannot.</para>
+///
+/// <para><b>Bounded, and the name pool is shed on flush.</b> Names can be high-cardinality
+/// (<c>/api/user/12345</c> when an instrumentation forgets its route template), so the name pool
+/// holds at most <see cref="DefaultMaxNames"/> distinct names and is REPLACED by an empty one each
+/// time the tier is detached for a flush: it never holds more than one tier's worth, and a
+/// high-cardinality burst costs its dictionary once and is gone with its tier. Services are
+/// low-cardinality by nature and their pool is bounded and never shed; the span ring's producers
+/// intern into it once per resource block.</para>
+///
+/// <para><b>A full pool never drops a span.</b> <see cref="StringInternPool"/> answers −1 once it
+/// has reached its cap; the span then keeps its own string — the argument itself, or a fresh one
+/// built from the bytes — exactly as it would have with no pool at all, and the hot tier's byte
+/// budget charges that string to the span (see <see cref="UnpooledStringBytes"/>).</para>
+/// </summary>
+internal sealed class SpanStringPools
+{
+    /// <summary>Distinct span names one tier may pool. Past it, a span keeps its own name string.</summary>
+    internal const int DefaultMaxNames = 16_384;
+
+    /// <summary>Distinct service names the process may pool. Past it, a span keeps its own service string.</summary>
+    internal const int DefaultMaxServices = 4_096;
+
+    private readonly int _maxNames;
+    private volatile Ameto.Core.StringInternPool _names;
+    private long _unpooledNames;
+    private long _unpooledServices;
+
+    public SpanStringPools(int maxNames = DefaultMaxNames, int maxServices = DefaultMaxServices)
+    {
+        _maxNames = maxNames;
+        _names    = new Ameto.Core.StringInternPool(maxNames);
+        Services  = new Ameto.Core.StringInternPool(maxServices);
+    }
+
+    /// <summary>The service pool — bounded, never shed. Its indices are safe to carry through the ring.</summary>
+    public Ameto.Core.StringInternPool Services { get; }
+
+    /// <summary>Test hook: the name pool currently in use.</summary>
+    internal Ameto.Core.StringInternPool NamesForTest => _names;
+
+    /// <summary>Names that did not fit the pool, since the process started. Each kept its own string.</summary>
+    public long UnpooledNames => Interlocked.Read(ref _unpooledNames);
+
+    /// <summary>Services that did not fit the pool, since the process started. Each kept its own string.</summary>
+    public long UnpooledServices => Interlocked.Read(ref _unpooledServices);
+
+    /// <summary>
+    /// The pool's instance of <paramref name="name"/>, or <paramref name="name"/> itself when the
+    /// pool is full — <paramref name="pooled"/> says which. Allocation-free on a hit.
+    /// </summary>
+    public string Name(string name, out bool pooled)
+    {
+        if (name.Length == 0) { pooled = true; return string.Empty; }
+        pooled = _names.Intern(name, out string canonical) >= 0;
+        if (!pooled) Interlocked.Increment(ref _unpooledNames);
+        return canonical;
+    }
+
+    /// <summary>As <see cref="Name(string, out bool)"/>, from UTF-8 — no string is built on a hit.</summary>
+    public string Name(ReadOnlySpan<byte> nameUtf8, out bool pooled)
+    {
+        if (nameUtf8.IsEmpty) { pooled = true; return string.Empty; }
+        pooled = _names.Intern(nameUtf8, out string canonical) >= 0;
+        if (!pooled) Interlocked.Increment(ref _unpooledNames);
+        return canonical;
+    }
+
+    /// <summary>The service pool's instance of <paramref name="service"/>, or the argument when the pool is full.</summary>
+    public string Service(string service, out bool pooled)
+    {
+        if (service.Length == 0) { pooled = true; return string.Empty; }
+        pooled = Services.Intern(service, out string canonical) >= 0;
+        if (!pooled) Interlocked.Increment(ref _unpooledServices);
+        return canonical;
+    }
+
+    /// <summary>As <see cref="Service(string, out bool)"/>, from UTF-8.</summary>
+    public string Service(ReadOnlySpan<byte> serviceUtf8, out bool pooled)
+    {
+        if (serviceUtf8.IsEmpty) { pooled = true; return string.Empty; }
+        pooled = Services.Intern(serviceUtf8, out string canonical) >= 0;
+        if (!pooled) Interlocked.Increment(ref _unpooledServices);
+        return canonical;
+    }
+
+    /// <summary>
+    /// Replaces the name pool with an empty one — called as the tier is detached for a flush. The
+    /// strings already handed out stay valid (they are references, never indices); the next tier
+    /// interns afresh, so a high-cardinality burst lives exactly as long as its tier.
+    /// </summary>
+    public void ShedNames() => _names = new Ameto.Core.StringInternPool(_maxNames);
+
+    /// <summary>What a string the pool could not share costs the tier: the object, header and chars.</summary>
+    internal static long UnpooledStringBytes(string s) => (22L + 2L * s.Length + 7) & ~7L;
+}
+
+/// <summary>
 /// Fully materialised span — returned from queries, not stored on the hot path.
 /// </summary>
 public sealed class SpanRecord

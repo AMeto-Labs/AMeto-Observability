@@ -470,7 +470,9 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// by construction, one per resource block, and both through the intern pools — so charging
     /// them per span would count one string fifty thousand times; and a length-only sum would
     /// have missed the ~140 B a span costs with no bytes at all, which is a quarter of the
-    /// ordinary span.</para>
+    /// ordinary span. A name or service the pool could NOT share — a full pool keeps the span's own
+    /// string — is charged at its object size (<see cref="SpanStringPools.UnpooledStringBytes"/>),
+    /// because then it really is one string per span.</para>
     /// </summary>
     internal const int HotSpanOverheadBytes = 160;
 
@@ -527,6 +529,21 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// The candidate threshold is half of it (<see cref="CompactionThresholdBytesFor"/>).
     /// </summary>
     private readonly long _mergeBudgetBytes;
+
+    /// <summary>
+    /// The span-name and service intern pools (TI#5): the tier keeps one shared string per distinct
+    /// name and service instead of one per span. See <see cref="SpanStringPools"/>.
+    /// </summary>
+    private readonly SpanStringPools _pools;
+
+    /// <summary>Test hook: the intern pools this engine resolves names and services through.</summary>
+    internal SpanStringPools PoolsForTest => _pools;
+
+    /// <summary>Test hook: the live tier's records, copied under the read lock.</summary>
+    internal List<SpanRecord> HotSpansForTest
+    {
+        get { _lock.EnterReadLock(); try { return [.. _hotSpans]; } finally { _lock.ExitReadLock(); } }
+    }
 
     /// <summary>Bytes the live tier holds, by <see cref="HotSpanBytes"/>. Under the write lock.</summary>
     private long _hotBytes;
@@ -658,7 +675,19 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     public TraceStorageEngine(string dataDir, ILogger<TraceStorageEngine> logger,
                               bool writeSegmentFormatV4 = false, bool indexEnabled = true,
                               TracesOptions? options = null)
+        : this(dataDir, logger, writeSegmentFormatV4, indexEnabled, options, pools: null)
     {
+    }
+
+    /// <param name="pools">
+    /// The span-name and service intern pools, shared with the ingest ring when the container
+    /// builds both. Null: the engine keeps its own.
+    /// </param>
+    internal TraceStorageEngine(string dataDir, ILogger<TraceStorageEngine> logger,
+                                bool writeSegmentFormatV4, bool indexEnabled,
+                                TracesOptions? options, SpanStringPools? pools)
+    {
+        _pools = pools ?? new SpanStringPools();
         options ??= new TracesOptions();
         var budgets = MemoryBudgets.Current();
         _hotTierBudgetBytes = options.HotTierMaxBytesFor(budgets);
@@ -1065,6 +1094,12 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// </summary>
     private void AddToHotTierLocked(SpanIngestItem item)
     {
+        // ONE STRING PER DISTINCT NAME AND SERVICE IN THE TIER (TI#5), the pool's shared instance
+        // rather than the fresh copy every span arrives with. A full pool hands the span's own
+        // string back and the span is kept all the same; the budget then charges that string.
+        string name    = _pools.Name(item.Name ?? string.Empty, out bool namePooled);
+        string service = _pools.Service(item.ServiceName ?? string.Empty, out bool servicePooled);
+
         var record = new SpanRecord
         {
             TraceId           = item.TraceId,
@@ -1072,8 +1107,8 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             ParentSpanId      = item.ParentSpanId,
             StartTimeUnixNano = item.StartTimeUnixNano,
             DurationNanos     = item.DurationNanos,
-            Name              = item.Name,
-            ServiceName       = item.ServiceName,
+            Name              = name,
+            ServiceName       = service,
             Kind              = item.Kind,
             Status            = item.Status,
             HttpStatusCode    = item.HttpStatusCode,  // promoted — no attrs deserialization
@@ -1090,7 +1125,9 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
 
         int offset = _hotSpans.Count;
         _hotSpans.Add(record);
-        _hotBytes += HotSpanBytes(item.AttributesBytes.Length);
+        _hotBytes += HotSpanBytes(item.AttributesBytes.Length)
+                   + (namePooled    ? 0 : SpanStringPools.UnpooledStringBytes(name))
+                   + (servicePooled ? 0 : SpanStringPools.UnpooledStringBytes(service));
 
         if (!_traceIdx.TryGetValue(item.TraceId, out var offsets))
         {
@@ -2264,6 +2301,10 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         _hotSince = null;
         _flushingBytes = _hotBytes;       // travels with the snapshot, back into the tier if it fails
         _hotBytes      = 0;
+        // SHED ON FLUSH: the next tier interns into an empty name pool, so the pool never holds
+        // more than one tier's distinct names. Safe at any moment — the tier stores the shared
+        // instances, never pool indices, so nothing that was handed out can change meaning.
+        _pools.ShedNames();
         _flushInProgress = true;
         _flushingSpans   = snapshot;
         _unflushedGeneration++;           // the tier was swapped, not appended to: see AggregateKey

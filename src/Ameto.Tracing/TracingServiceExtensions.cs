@@ -58,13 +58,17 @@ public static class TracingServiceExtensions
         bool indexEnabled = true)
     {
         services.AddSingleton(new TraceIndexOptions(backfill));
+        // The span-name and service intern pools: one set per process, shared by the engine (which
+        // resolves names into them and sheds the name pool at every flush) and the ingest side.
+        services.AddSingleton(static _ => new SpanStringPools());
         services.AddSingleton(sp =>
             new TraceStorageEngine(
                 Path.Combine(dataDirectory, "traces"),
                 sp.GetRequiredService<ILogger<TraceStorageEngine>>(),
                 writeSegmentFormatV4,
                 indexEnabled,
-                TracesOptionsFrom(sp)));
+                TracesOptionsFrom(sp),
+                sp.GetRequiredService<SpanStringPools>()));
 
         // FIRST, SO IT STOPS LAST. Hosted services are stopped in reverse registration order, so
         // this one's StopAsync — the engine's teardown — runs after the drainer has handed over
