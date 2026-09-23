@@ -75,15 +75,20 @@ public sealed class TraceDetailShapeTests : IClassFixture<AmetoWebAppFactory>
 
     public TraceDetailShapeTests(AmetoWebAppFactory factory, ITestOutputHelper output)
     {
-        _client = factory.CreateClient();
-        _traces = factory.Services.GetRequiredService<TraceStorageEngine>();
-        _out    = output;
-
         // The request culture is the TEST's: TestServer carries the caller's ExecutionContext —
         // and CultureInfo.CurrentCulture with it — into the handler only when asked. Without it
         // the handler formats under the machine's culture, and these bodies would differ between
         // this dev box (ru-KZ) and CI (en-US).
+        //
+        // BEFORE CreateClient, not after: the flag is COPIED into the client's handler when the
+        // client is made. Set after, the class's FIRST test ran on a client that did not carry the
+        // culture and passed or failed depending on the machine's culture and on which test xUnit
+        // happened to run first — every later test got a client made after the flag was set.
         factory.Server.PreserveExecutionContext = true;
+
+        _client = factory.CreateClient();
+        _traces = factory.Services.GetRequiredService<TraceStorageEngine>();
+        _out    = output;
     }
 
     // ── The two cultures ─────────────────────────────────────────────────────
