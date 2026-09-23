@@ -219,7 +219,8 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
 
     /// <summary>
     /// Test seam invoked with the target file size just before a resize touches the file — the
-    /// disk that fills at exactly the wrong moment. Fired on BOTH legs of Grow and ShrinkLocked
+    /// disk that fills at exactly the wrong moment. Fired once by GrowTo (which touches nothing
+    /// before it, so has nothing to restore) and on BOTH legs of ShrinkLocked
     /// (the resize and its restore), because the state under test is the log that could do
     /// neither. It exists because the fault the tests used to inject died with the lifetime
     /// handle: marking the file read-only no longer bites, since Windows enforces the attribute
@@ -571,18 +572,18 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
 
     /// <summary>
     /// The capacity a log holding <paramref name="dataBytes"/> needs: what <see cref="Open"/>
-    /// was asked for, doubled until it fits — the same ladder <see cref="Grow"/> climbs, so
+    /// was asked for, climbed along <see cref="NextCapacity"/> until it fits — the ladder <see cref="GrowTo"/> climbs, so
     /// shrink and growth move along one set of sizes instead of two.
     /// </summary>
     private long FitCapacity(long dataBytes)
     {
         long capacity = _floorCapacity;
-        while (capacity < dataBytes) capacity *= 2;
+        while (capacity < dataBytes) capacity = NextCapacity(capacity);
         return capacity;
     }
 
     /// <summary>
-    /// Shrinks the file to <paramref name="targetCapacity"/> — <see cref="Grow"/> run downward,
+    /// Shrinks the file to <paramref name="targetCapacity"/> — <see cref="GrowTo"/> run downward,
     /// with one deliberate difference: a failure here is swallowed, not thrown. Growth failing
     /// means an append cannot proceed and the caller must hear it; a shrink is reclamation of
     /// space nothing references, and the log is exactly as correct at the old size.
@@ -666,7 +667,7 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// <para><b>The file-header write offset is stored once, at the end.</b> That is what makes
     /// this all-or-nothing rather than a prefix: recovery never walks past the offset the header
     /// claims (<see cref="ReconcileDataEndLocked"/> only ever truncates DOWN from it), so a
-    /// throw part-way through — <see cref="Grow"/> on a full disk is the one that can — leaves
+    /// throw part-way through — <see cref="GrowTo"/> on a full disk is the one that can — leaves
     /// the entries written so far unclaimed and therefore unreadable, and <c>_writeOffset</c>
     /// unmoved, so the next append overwrites them. The caller's contract is unchanged and
     /// strictly cleaner: it applies NOTHING to the hot tier for a batch whose log append threw,
@@ -742,13 +743,57 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     {
         if (items.IsEmpty) return;
 
-        lock (_writeLock)
+        // THE BATCH'S SIZE, KNOWN BEFORE THE LOCK — so the log is big enough before the batch
+        // starts, and growing it never happens inside the append's critical section. See Grow.
+        long batchBytes = 0;
+        for (int i = 0; i < items.Length; i++)
         {
-            if (_disposed) return;                          // shutdown race — dropping is correct
-            if (_ptr is null)
-                throw new InvalidOperationException(
-                    "Metric WAL has no mapping; the log is not accepting appends.");
+            long[]? b = points.IsEmpty ? items[i].BucketCounts : points[i].BucketCounts;
+            batchBytes += EntryHeaderSize + (b is null ? 0 : Math.Min(b.Length, MaxBucketCounts)) * sizeof(long);
+        }
 
+        while (true)
+        {
+            long needed;
+            bool written = false, preGrow = false;
+            lock (_writeLock)
+            {
+                if (_disposed) return;                      // shutdown race — dropping is correct
+                if (_ptr is null)
+                    throw new InvalidOperationException(
+                        "Metric WAL has no mapping; the log is not accepting appends.");
+
+                needed = _writeOffset + batchBytes;
+                if (needed <= _capacity)
+                {
+                    WriteBatchLocked(items, points, preResolved, resolvedAtEpoch);
+                    written = true;
+                    preGrow = WantsPreGrowLocked();
+                }
+            }
+
+            if (written)
+            {
+                if (preGrow) SchedulePreGrow();
+                return;
+            }
+
+            // Did not fit. Grow OUTSIDE the write lock — every other thread whose batch fits keeps
+            // appending into the mapping it has meanwhile — and try again: somebody else's batch
+            // may have taken the room in between, which the loop simply measures again.
+            lock (_resizeLock) GrowTo(needed);
+        }
+    }
+
+    /// <summary>
+    /// Writes a batch the caller has checked fits. Caller holds <c>_writeLock</c>. Nothing in here
+    /// can resize the mapping, so <c>_ptr</c> is taken once per entry off a view that stays put.
+    /// </summary>
+    private void WriteBatchLocked(ReadOnlySpan<MetricIngestItem> items, ReadOnlySpan<MetricDataPoint> points,
+                                  ReadOnlySpan<uint> preResolved, long resolvedAtEpoch)
+    {
+        // Block kept from the lock body this was lifted out of, so the diff stays reviewable.
+        {
             // The running end of data, committed to the field and the header only once the whole
             // batch is down. See the remarks above for why the partial state must stay unclaimed.
             long offset = _writeOffset;
@@ -769,11 +814,6 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
                     ? preResolved[i]
                     : RegisterSeriesLocked(KeyOf(item), item.BucketBounds);
 
-                while (offset + entrySize > _capacity)
-                    Grow();
-
-                // AFTER the grow loop, every iteration: Grow unmaps and re-maps, so a pointer
-                // taken before it is into a dead view.
                 byte* dest = _ptr + FileHeaderSize + offset;
 
                 ref var eh = ref Unsafe.AsRef<MetricWalEntryHeader>(dest);
@@ -852,7 +892,7 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// by an earlier <see cref="BeginFlush"/> has neither committed nor been abandoned —
     /// committing this one would reclaim that one's records while its files are still being
     /// written, the loss this guard exists to make impossible — or the log has no mapping to
-    /// stamp the new generation into (see <see cref="Grow"/>). Throwing happens BEFORE the
+    /// stamp the new generation into (see <see cref="GrowTo"/>). Throwing happens BEFORE the
     /// caller's snapshot is drained, so nothing is in flight to lose.
     /// </exception>
     /// <exception cref="ObjectDisposedException">
@@ -871,17 +911,17 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
             // loss — duplicates, once per start, for as long as the state lasts.
             //
             // _disposed alone is covered by the drain in MetricStorageEngine.DisposeAsync, which
-            // is why this was survivable in practice. _ptr null WITHOUT _disposed is not: Grow
-            // unmaps before it extends, and if the extend and the restoring re-map both fail
-            // (a full disk, which is when a log grows) the object stays alive with no mapping
+            // is why this was survivable in practice. _ptr null WITHOUT _disposed is not: a resize
+            // that unmaps first (the shrink; growth used to, see GrowTo), if the resize and the restoring re-map both fail
+            // (a full disk) leaves the object alive with no mapping
             // and no disposal, for good. Append throws from there, so ingest fails honestly
             // while a flush would have kept writing files nobody ever commits.
             ObjectDisposedException.ThrowIf(_disposed, this);
 
             if (_ptr is null)
                 throw new InvalidOperationException(
-                    "Metric WAL has no mapping; no generation can be opened. Grow could neither " +
-                    "extend the file nor restore the previous mapping, and appends are already " +
+                    "Metric WAL has no mapping; no generation can be opened. A resize could neither " +
+                    "change the file nor restore the previous mapping, and appends are already " +
                     "failing for the same reason.");
 
             ulong flushing = _generation;
@@ -959,7 +999,7 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// points that are still durable here — which the next start replays beside them unless the
     /// caller takes its files back. Returning nothing made those two states identical from the
     /// outside, and the second was reached by a real route: a flush opens a generation, the log
-    /// loses its mapping while the files are being written (see <see cref="Grow"/>), and the
+    /// loses its mapping while the files are being written (see <see cref="GrowTo"/>), and the
     /// commit then returned exactly as if it had succeeded.</para>
     ///
     /// <para>The boundary the answer is defined at is the watermark store, and this method
@@ -972,6 +1012,7 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// </summary>
     public MetricWalCommit CommitFlush(ulong flushedGeneration)
     {
+        lock (_resizeLock)   // the commit may shrink, i.e. replace the mapping; see _resizeLock
         lock (_writeLock)
         {
             // Not the flush that is writing: reclaims nothing AND leaves the open flush alone,
@@ -1007,9 +1048,9 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
             // moves inside this method's own success path — where it is set to the generation
             // that is open and the flush is closed in the same critical section. So an open flush
             // is always ABOVE the watermark. The dead-log test is dead in a different way: it can
-            // be reached (dispose or a failed Grow between BeginFlush and here), but a log in
+            // be reached (dispose or a failed shrink-and-restore between BeginFlush and here), but a log in
             // either state refuses the next BeginFlush on its own account and can never leave it
-            // — Append does not re-map and Grow is only called from Append — so a stuck flag has
+            // — growth never unmaps before it has a new mapping — so a stuck flag has
             // nothing left to wedge.
             //
             // It stays above them anyway, and is worth a paragraph rather than a shrug, because
@@ -1019,7 +1060,7 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
             // handed, makes the first reachable; and BeginFlush throwing forever is a failure
             // both flush paths merely LOG — the periodic loop catches it at Error once a tick,
             // the threshold continuation once per crossing — while no .mts is written again and
-            // the log grows by doubling until Grow throws into ingest.
+            // the log grows until GrowTo throws into ingest.
             _openFlush = 0;
 
             // Nothing left to reclaim: the watermark already names this generation or a later
@@ -1029,7 +1070,7 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
             // points are covered.
             if (flushedGeneration <= _committedGeneration) return MetricWalCommit.Committed;
 
-            // The log cannot record anything: closed, or left without a mapping by a Grow that
+            // The log cannot record anything: closed, or left without a mapping by a resize that
             // could neither extend the file nor restore what it had. Both leave the watermark
             // where it was, so this generation's records stay in the log, uncompacted — the
             // reclaim below is the only thing that removes them and it is not reached. The
@@ -1287,36 +1328,177 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     // ── Grow ─────────────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Doubles the mapped capacity. Windows refuses to resize a mapped file, so the old
-    /// mapping must go first — which means a failure here (a full disk, i.e. exactly when a
-    /// log grows) could leave the object alive with no mapping, silently refusing every
-    /// later append. The old mapping is therefore restored before the exception escapes.
+    /// Where growth stops doubling and starts adding. Doubling a 64 MiB log to 128 MiB, then 256,
+    /// 512 … reserves as much disk again as the log holds, on exactly the host whose flushes have
+    /// fallen behind; past this size the log grows by this much at a time instead.
     /// </summary>
-    private void Grow()
-    {
-        long oldFileSize = FileHeaderSize + _capacity;
-        long newCapacity = _capacity * 2;
-        long newFileSize = FileHeaderSize + newCapacity;
+    internal const long GrowthStepBytes = 64L * 1024 * 1024;
 
-        Unmap();
+    /// <summary>The growth ladder: doubling up to <see cref="GrowthStepBytes"/>, then linear.</summary>
+    internal static long NextCapacity(long capacity) =>
+        capacity < GrowthStepBytes ? capacity * 2 : capacity + GrowthStepBytes;
+
+    /// <summary>
+    /// Serialises everything that REPLACES the mapping — <see cref="GrowTo"/>, the commit-time
+    /// shrink (<see cref="CommitFlush"/>) and <see cref="Dispose"/> — WITHOUT holding
+    /// <c>_writeLock</c> while the new mapping is built. Lock order: this, then
+    /// <c>_writeLock</c>; nothing holding <c>_writeLock</c> ever waits for this.
+    /// </summary>
+    private readonly Lock _resizeLock = new();
+
+    /// <summary>1 while a background pre-grow is queued or running. See <see cref="SchedulePreGrow"/>.</summary>
+    private int _preGrowQueued;
+
+    /// <summary>
+    /// The capacity a background pre-grow last FAILED at, so a full disk is tried once per
+    /// capacity rather than once per append; the synchronous path still tries, and throws, when a
+    /// batch genuinely does not fit. -1 = none. Under <c>_writeLock</c>.
+    /// </summary>
+    private long _preGrowFailedAt = -1;
+
+    /// <summary>
+    /// Test seam fired by <see cref="GrowTo"/> with the new mapping built and the old one still in
+    /// use — the window in which other appends must keep going. Null in production.
+    /// </summary>
+    internal Action? OnGrowMappedForTest;
+
+    /// <summary>
+    /// Grows the mapped capacity to at least <paramref name="needed"/> bytes of data. <b>Caller
+    /// holds <c>_resizeLock</c> and NOT <c>_writeLock</c>.</b>
+    ///
+    /// <para><b>It used to run inside the append's <c>lock (_writeLock)</c></b> and unmap, resize
+    /// and re-map there, so every ingest thread in the process queued behind one file resize —
+    /// measured ~35 ms per growth for every thread appending at the time
+    /// (<c>MetricWalGrowthProbe</c>). Now the new, larger mapping is built beside the old one,
+    /// outside the write lock — two mappings of one file are coherent — and the write lock is
+    /// held only to swap the pointer. Every entry is written under the write lock through
+    /// <c>_ptr</c>, so after the swap nothing can still be using the old view, and it is released
+    /// outside the lock too.</para>
+    ///
+    /// <para><b>A failure leaves the log as it was.</b> The old mapping is never unmapped until a
+    /// new one exists, so a full disk (the moment a log grows) now fails the append that needed
+    /// the room and nothing else — where the unmap-first shape could lose the mapping altogether
+    /// and leave the log refusing every later append. <see cref="BeforeResize"/> fires with the
+    /// target size before anything is touched.</para>
+    /// </summary>
+    private void GrowTo(long needed)
+    {
+        long capacity;
+        lock (_writeLock)
+        {
+            if (_disposed || _ptr is null) return;         // the retry will say why, honestly
+            capacity = _capacity;
+        }
+        if (capacity >= needed) return;                     // somebody else grew it meanwhile
+
+        long target = capacity;
+        while (target < needed) target = NextCapacity(target);
+        long newFileSize = FileHeaderSize + target;
+
+        MemoryMappedFile?         mmf  = null;
+        MemoryMappedViewAccessor? view = null;
+        bool                      acquired = false;
         try
         {
             BeforeResize?.Invoke(newFileSize);
-            _file!.SetLength(newFileSize);
-            Map(newFileSize);
-            _capacity = newCapacity;
-        }
-        catch
-        {
-            try
+
+            // A capacity past the file's length extends the file (both platforms) — with the old
+            // mapping still in place, which an explicit SetLength could not be sure of on Windows.
+            mmf  = MemoryMappedFile.CreateFromFile(_file!, null, newFileSize, MemoryMappedFileAccess.ReadWrite,
+                                                   HandleInheritability.None, leaveOpen: true);
+            view = mmf.CreateViewAccessor(0, newFileSize, MemoryMappedFileAccess.ReadWrite);
+            byte* ptr = null;
+            view.SafeMemoryMappedViewHandle.AcquirePointer(ref ptr);
+            acquired = true;
+
+            OnGrowMappedForTest?.Invoke();
+
+            MemoryMappedFile?         oldMmf;
+            MemoryMappedViewAccessor? oldView;
+            lock (_writeLock)
             {
-                BeforeResize?.Invoke(oldFileSize);
-                if (_file!.Length < oldFileSize) _file.SetLength(oldFileSize);
-                Map(oldFileSize);
+                if (_disposed) return;                      // finally releases the new mapping
+                oldMmf    = _mmf;
+                oldView   = _accessor;
+                _mmf      = mmf;
+                _accessor = view;
+                _ptr      = ptr;
+                _capacity = target;
+                mmf  = null;                                // owned by the log now
+                view = null;
             }
-            catch { /* nothing left to restore to — the throw below is the honest signal */ }
-            throw;
+
+            if (oldView is not null)
+            {
+                try { oldView.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
+                oldView.Dispose();
+            }
+            oldMmf?.Dispose();
         }
+        finally
+        {
+            if (view is not null)
+            {
+                if (acquired) try { view.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
+                view.Dispose();
+            }
+            mmf?.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// A quarter of the log left: grow it now, in the background, while there is room for the
+    /// appends that arrive meanwhile — so under steady ingest no append waits for a growth at
+    /// all. Caller holds <c>_writeLock</c>; claims the one pre-grow slot if it answers true.
+    /// </summary>
+    private bool WantsPreGrowLocked()
+    {
+        long cap = _capacity;
+        if (cap - _writeOffset >= cap / 4 || cap == _preGrowFailedAt || _preGrowQueued != 0) return false;
+        _preGrowQueued = 1;
+        return true;
+    }
+
+    private void SchedulePreGrow() =>
+        ThreadPool.UnsafeQueueUserWorkItem(static wal => wal.PreGrow(), this, preferLocal: false);
+
+    private void PreGrow()
+    {
+        try
+        {
+            lock (_resizeLock)
+            {
+                long needed;
+                lock (_writeLock)
+                {
+                    if (_disposed || _ptr is null) return;
+                    if (_capacity - _writeOffset >= _capacity / 4) return;   // a commit emptied it
+                    needed = _capacity + 1;                                   // one rung up
+                }
+
+                try { GrowTo(needed); }
+                catch (Exception ex)
+                {
+                    lock (_writeLock) _preGrowFailedAt = _capacity;
+                    _logger?.LogWarning(ex,
+                        "Metric WAL could not grow ahead of need; appends that do not fit will retry the growth " +
+                        "themselves and fail if it still cannot be done.");
+                }
+            }
+        }
+        finally { Volatile.Write(ref _preGrowQueued, 0); }
+    }
+
+    /// <summary>
+    /// Test hook: drops the mapping the way a failed shrink-and-restore does, leaving the log
+    /// alive and refusing appends. Growth can no longer produce that state (see
+    /// <see cref="GrowTo"/>), and the dead-log paths it exercises still exist.
+    /// </summary>
+    internal void LoseMappingForTest()
+    {
+        lock (_resizeLock)
+        lock (_writeLock)
+            Unmap();
     }
 
     private void Unmap()
@@ -1336,6 +1518,7 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
 
     public void Dispose()
     {
+        lock (_resizeLock)   // waits out a growth in flight, which is using the file handle
         lock (_writeLock)
         {
             if (_disposed) return;

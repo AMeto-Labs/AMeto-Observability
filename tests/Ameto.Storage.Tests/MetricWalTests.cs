@@ -523,8 +523,9 @@ public sealed class MetricWalTests : IAsyncLifetime
     /// restart replayed them beside the file that already held them. Duplicates, not loss, and
     /// once per start for as long as the state lasts.</para>
     ///
-    /// <para>The state is built here by making the log file read-only: both of <c>Grow</c>'s
-    /// opens ask for write access, so both fail, which is what leaves the pointer null.</para>
+    /// <para>Growth no longer produces this state — it builds the larger mapping before it drops
+    /// the old one (M#10) — but a shrink that can neither resize nor restore still does, so the
+    /// state is built here directly through <c>LoseMappingForTest</c>.</para>
     /// </summary>
     [Fact]
     public void A_log_that_lost_its_mapping_refuses_to_open_a_flush()
@@ -534,28 +535,48 @@ public sealed class MetricWalTests : IAsyncLifetime
         using var wal = OpenWal(64 * 1024);   // ~1 365 entries
         Append(wal, Scalar("m", baseNano, 1));
 
-        // The disk that fills mid-run, injected through the seam: the ReadOnly-attribute trick
-        // this used died with the lifetime handle (Windows enforces the attribute at CreateFile
-        // time, and resizes no longer reopen the file).
+        wal.LoseMappingForTest();
+
+        // Alive, not disposed, and unable to log anything: this is the honest half.
+        var appended = Record.Exception(() => Append(wal, Scalar("m", baseNano, 1)));
+        Assert.IsType<InvalidOperationException>(appended);   // not ObjectDisposedException
+
+        // So a flush must fail the same way rather than be handed a generation nobody
+        // opened. Exact type: this is the unmapped log, not a disposed one.
+        var began = Record.Exception(() => wal.BeginFlush());
+        Assert.IsType<InvalidOperationException>(began);
+    }
+
+    /// <summary>
+    /// A GROWTH THAT FAILS FAILS ONE APPEND, NOT THE LOG. <c>Grow</c> used to unmap before it
+    /// extended, so a full disk at the moment of growth could leave the log alive with no mapping,
+    /// refusing every later append and every flush until a restart. <c>GrowTo</c> builds the new
+    /// mapping beside the old one, so the batch that needed the room is refused and everything
+    /// else carries on. Revert to unmap-first and the second append throws
+    /// <c>InvalidOperationException</c> ("no mapping").
+    /// </summary>
+    [Fact]
+    public void A_growth_that_fails_leaves_the_log_appending_and_flushing()
+    {
+        long baseNano = 1_700_000_000_000_000_000L;
+
+        using var wal = OpenWal(64 * 1024);   // ~1 365 entries
+        Append(wal, Scalar("m", baseNano, 1));
+
+        var big = new MetricIngestItem[5_000];
+        for (int i = 0; i < big.Length; i++) big[i] = Scalar("m", baseNano + i, i);
+
         wal.BeforeResize = static _ => throw new IOException("disk full (test seam)");
         try
         {
-            var grew = Record.Exception(() =>
-            {
-                for (int i = 1; i < 5_000; i++) Append(wal, Scalar("m", baseNano + i, i));
-            });
-            Assert.NotNull(grew);   // setup: Grow really did fail rather than extend the file
-
-            // Alive, not disposed, and unable to log anything: this is the honest half.
-            var appended = Record.Exception(() => Append(wal, Scalar("m", baseNano, 1)));
-            Assert.IsType<InvalidOperationException>(appended);   // not ObjectDisposedException
-
-            // So a flush must fail the same way rather than be handed a generation nobody
-            // opened. Exact type: this is the unmapped log, not a disposed one.
-            var began = Record.Exception(() => wal.BeginFlush());
-            Assert.IsType<InvalidOperationException>(began);
+            Assert.ThrowsAny<IOException>(() => wal.Append(big));
         }
         finally { wal.BeforeResize = null; }
+
+        Append(wal, Scalar("m", baseNano + 1, 2));            // the log is still alive
+        ulong gen = wal.BeginFlush();
+        Assert.Equal(MetricWalCommit.Committed, wal.CommitFlush(gen));
+        Assert.Empty(wal.ReadAll(out _));
     }
 
     /// <summary>
@@ -587,25 +608,16 @@ public sealed class MetricWalTests : IAsyncLifetime
         ulong flushing = wal.BeginFlush();
         long  logged   = wal.WrittenBytes;
 
-        // Same seam-injected disk-full as above; see A_log_that_lost_its_mapping.
-        wal.BeforeResize = static _ => throw new IOException("disk full (test seam)");
-        try
-        {
-            var grew = Record.Exception(() =>
-            {
-                for (int i = 1; i < 5_000; i++) Append(wal, Scalar("m", baseNano + i, i));
-            });
-            Assert.NotNull(grew);   // setup: the mapping is gone, mid-flush
+        // The mapping is gone, mid-flush; see A_log_that_lost_its_mapping for why directly.
+        wal.LoseMappingForTest();
 
-            Assert.Equal(MetricWalCommit.Refused, wal.CommitFlush(flushing));
+        Assert.Equal(MetricWalCommit.Refused, wal.CommitFlush(flushing));
 
-            // Nothing was reclaimed, so the generation is still replayable in full. This is the
-            // half the argument for deleting the files rests on: the log's copy is whole, so
-            // removing the flush's copy leaves the points durable exactly once rather than none.
-            Assert.True(wal.WrittenBytes >= logged,
-                "the refused commit reclaimed records it had not covered by a watermark");
-        }
-        finally { wal.BeforeResize = null; }
+        // Nothing was reclaimed, so the generation is still replayable in full. This is the
+        // half the argument for deleting the files rests on: the log's copy is whole, so
+        // removing the flush's copy leaves the points durable exactly once rather than none.
+        Assert.True(wal.WrittenBytes >= logged,
+            "the refused commit reclaimed records it had not covered by a watermark");
     }
 
     /// <summary>
@@ -669,11 +681,10 @@ public sealed class MetricWalTests : IAsyncLifetime
     /// unavoidable. It is not: a duplicate needs two copies, the reclaim never ran, so the
     /// log's copy is whole and the flush's is the deletable one.</para>
     ///
-    /// <para>Driven by filling the log to within a few thousand entries of its capacity and
-    /// then, from the seam that fires once the file is in place, arming the WAL's resize seam
-    /// to throw and ingesting past the end of it. <c>Grow</c> unmaps before it extends and can
-    /// re-map neither, which is the production state exactly: alive, unmapped, refusing every
-    /// append, with a flush's generation still open. The count is taken from a SECOND engine
+    /// <para>Driven by dropping the log's mapping from the seam that fires once the file is in
+    /// place — the state a shrink that can neither resize nor restore leaves: alive, unmapped,
+    /// refusing every append, with a flush's generation still open. (Growth used to be the way
+    /// in, by unmapping before it extended; it no longer can.) The count is taken from a SECOND engine
     /// over the same directory, because the question is what a restart sees.</para>
     /// </summary>
     [Fact]
@@ -697,23 +708,11 @@ public sealed class MetricWalTests : IAsyncLifetime
 
         try
         {
-            engine.OnFileWrittenForTest = _ =>
-            {
-                // Seam-injected: the ReadOnly trick died with the lifetime handle (see
-                // A_log_that_lost_its_mapping for the mechanics).
-                engine.WalForTest.BeforeResize = static _ => throw new IOException("disk full (test seam)");
-
-                // Past the capacity, so the append underneath has to Grow — and cannot. The
-                // throw is this batch's, not the flush's: ingest fails honestly from here,
-                // which is the loud half of the fault and not what is under test. Swallowed
-                // whatever it is (Grow rethrows the file system's own refusal), because a
-                // throw OUT of this seam is a failed write, and a failed write is the other
-                // path entirely — it restores, abandons, and never reaches a commit.
-                var poison = new MetricIngestItem[20_000];
-                for (int i = 0; i < poison.Length; i++)
-                    poison[i] = Scalar("poison.metric", baseNano + i * 1_000L, 1.0);
-                try { engine.Ingest(poison); } catch { /* the log is dead; that is the setup */ }
-            };
+            // The log loses its mapping once the file is in place — directly, because growth no
+            // longer can (see A_log_that_lost_its_mapping). Nothing is thrown OUT of this seam:
+            // a throw there is a failed write, which is the other path entirely — it restores,
+            // abandons, and never reaches a commit.
+            engine.OnFileWrittenForTest = _ => engine.WalForTest.LoseMappingForTest();
 
             await engine.ScheduleThresholdFlushForTest();
 
