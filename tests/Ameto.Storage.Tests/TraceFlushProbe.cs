@@ -423,6 +423,120 @@ public sealed class TraceFlushProbe : IDisposable
         Assert.Equal(0, decoded);
     }
 
+    /// <summary>
+    /// SHA-256 of the <c>.tracesum</c> <see cref="BuildOversizedSummaryCorpus"/> produces, recorded
+    /// from the writer at <c>76a6a08</c> — two MemoryStreams, a CopyTo, a ToArray — immediately
+    /// before TS#7(e) replaced that body writer.
+    /// </summary>
+    private const string OversizedTraceSum = "116F2A5168E4701CDA311CC1A840033C67F1856A36875653795299AB898CA411";
+
+    /// <summary>
+    /// TS#7(e)'S BYTE-IDENTITY WHERE THE GOLDEN CORPUS CANNOT REACH IT. The <c>.tracesum</c> body is
+    /// written front to back into one rented buffer sized from the trace count, and the golden
+    /// corpus fits the first rental — so the golden hash never sees the buffer GROW, and never sees
+    /// the byte cuts the old <c>GetBytes(s)[..max]</c> made, because none of its strings is long
+    /// enough to be cut.
+    ///
+    /// <para>This corpus reaches both: root names and paths of tens of kilobytes (the body outgrows
+    /// its first rental about ten times over), a method one byte past the 255-byte cut with a
+    /// two-byte character straddling it, a path past the 65 535-byte cut with a three-byte
+    /// character straddling THAT, a lone surrogate (UTF-8's replacement bytes), multi-byte service
+    /// names, an empty service name (pool index -1), a trace with no root at all — and a first
+    /// trace whose children arrive before its root, so the service pool is only right if it is
+    /// interned in the ROW's order (root first) rather than the order the set met the names. In the
+    /// golden corpus every root is its trace's earliest span and the two orders coincide.</para>
+    /// </summary>
+    [Fact]
+    public void The_summary_body_keeps_its_bytes_past_its_first_buffer_and_at_every_cut()
+    {
+        string trc = Path.Combine(NewDir("sum-oversized"), "p.trc");
+        TraceSummarySidecar.Write(trc, BuildOversizedSummaryCorpus());
+
+        string sum = Path.ChangeExtension(trc, ".tracesum");
+        string hash = Sha(sum);
+        _out.WriteLine($".tracesum {new FileInfo(sum).Length,10:N0} B  {hash}");
+
+        // Readable end to end — the hash says "the same bytes as before", this says those bytes
+        // are still a file: every row, the rootless one included.
+        Assert.Equal(OversizedTraces + 1, TraceSummarySidecar.ReadSummaries(trc).Count);
+        Assert.Equal(OversizedTraceSum, hash);
+    }
+
+    private const int OversizedTraces = 24;
+
+    private static List<SpanRecord> BuildOversizedSummaryCorpus()
+    {
+        string[] services = ["сервис-платежей", "ledger", "δ-service", ""];
+        var spans = new List<SpanRecord>();
+
+        for (int t = 0; t < OversizedTraces; t++)
+        {
+            var traceId = new TraceId(0xB0B0_0000_0000_0000UL | (uint)t, 0x5EED_0000_0000_0000UL ^ (ulong)t);
+            var rootId  = new SpanId(0x1000UL + (ulong)t * 16);
+
+            string method = (t % 3) switch
+            {
+                0 => new string('M', 254) + "é",        // 256 bytes: the 255-byte cut splits the é
+                1 => "GET",
+                _ => "\uD800X",                         // lone surrogate: EF BF BD on the way out
+            };
+            string path = t % 2 == 0
+                ? new string('p', 65_534) + "€"         // 65 537 bytes: the cut splits the €
+                : "/short/" + t;
+
+            var root = new SpanRecord
+            {
+                TraceId           = traceId,
+                SpanId            = rootId,
+                StartTimeUnixNano = BaseNano + t * 1_000L,
+                DurationNanos     = 5_000_000L + t,
+                Name              = "корень-" + new string('н', 20_000 + t),   // ~40 KB of two-byte text
+                ServiceName       = services[t % 3],
+                Status            = t % 5 == 0 ? SpanStatusCode.Error : SpanStatusCode.Ok,
+                HttpStatusCode    = (short)(200 + t),
+                Attributes        = new Dictionary<string, object?>(StringComparer.Ordinal)
+                {
+                    ["http.request.method"] = method,
+                    ["url.path"]            = path,
+                },
+            };
+
+            // THE FIRST TRACE LISTS ITS CHILDREN BEFORE ITS ROOT, and its three service names are
+            // new to the pool. Its service set therefore meets them child-first while its row
+            // interns root-first — the one ordering the pre-pass must reproduce and the one no
+            // other trace here would notice getting wrong.
+            if (t != 0) spans.Add(root);
+            for (int c = 1; c <= 2; c++)
+                spans.Add(new SpanRecord
+                {
+                    TraceId           = traceId,
+                    SpanId            = new SpanId(rootId.RawValue + (ulong)c),
+                    ParentSpanId      = rootId,
+                    StartTimeUnixNano = BaseNano + t * 1_000L + c,
+                    DurationNanos     = 1_000_000L,
+                    Name              = "child",
+                    ServiceName       = services[(t + c) % services.Length],   // "" on some
+                });
+            if (t == 0) spans.Add(root);
+        }
+
+        // A trace with no root in this segment: its row takes the EARLIEST span's service.
+        var orphan = new TraceId(0xDEAD_0000_0000_0000UL, 1);
+        for (int c = 0; c < 3; c++)
+            spans.Add(new SpanRecord
+            {
+                TraceId           = orphan,
+                SpanId            = new SpanId(0xF000UL + (ulong)c),
+                ParentSpanId      = new SpanId(0xEEEEUL),
+                StartTimeUnixNano = BaseNano + 900_000L - c,
+                DurationNanos     = 2_000_000L,
+                Name              = "orphan",
+                ServiceName       = services[c],
+            });
+
+        return spans;
+    }
+
     // ── The probe ───────────────────────────────────────────────────────────────
 
     /// <summary>
