@@ -2096,6 +2096,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         _hotSince = null;
         _flushInProgress = true;
         _flushingSpans   = snapshot;
+        _unflushedGeneration++;           // the tier was swapped, not appended to: see AggregateKey
         return snapshot;
     }
 
@@ -2243,6 +2244,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                     RestoreSnapshotLocked(snapshot);
                 }
                 _flushingSpans = null;            // the segment (or the restored tier) now carries them
+                _unflushedGeneration++;
             }
             finally { _lock.ExitWriteLock(); }
 
@@ -2323,6 +2325,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         combined.AddRange(snapshot);
         combined.AddRange(_hotSpans);
         _hotSpans = combined;
+        _unflushedGeneration++;
 
         _traceIdx.Clear();
         for (int i = 0; i < _hotSpans.Count; i++)
@@ -3200,84 +3203,218 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
 
     // ── ITraceStatsProvider ────────────────────────────────────────────────────
 
+    // ── Aggregates off the read lock (TS#6) ───────────────────────────────────
+    //
+    // The four aggregate reads — per-service stats, the service graph, the volume sparkline and
+    // the trace list — used to walk every unflushed span INSIDE the read lock: up to two flush
+    // thresholds' worth, with a uint[19] allocated per span for the stats and the graph and a
+    // copy of the whole tier for the graph's two passes. Every one of those milliseconds is a
+    // wait for the drainer, whose write hold ReaderWriterLockSlim queues behind any reader already
+    // in. Now the lock is held only to take the view below and the cold array; the passes run
+    // after it is released, accumulating into one histogram per service or edge.
+
+    /// <summary>
+    /// The unflushed spans as two runs — the detached flush snapshot, then the live tier — taken
+    /// UNDER the read lock and walked AFTER it. Taking it is O(1) and allocates nothing.
+    ///
+    /// <para><b>WHY A RUN IS SAFE TO WALK WITHOUT THE LOCK.</b> Each is a prefix of a
+    /// <c>List&lt;SpanRecord&gt;</c>'s backing array, and nothing ever writes inside that prefix:
+    /// <c>_hotSpans</c> only grows (an <c>Add</c> writes past the captured count, or into a NEW
+    /// array, leaving this one as it was); a flush SWAPS it for a fresh list instead of clearing it,
+    /// and <see cref="RestoreSnapshotLocked"/> builds a new list too; the detached snapshot is never
+    /// mutated — the segment writer sorts a copy (<c>SpanWriter.Write</c>), which readers already
+    /// rely on when they take <see cref="_flushingSpans"/> lock-free. A <c>SpanRecord</c> is
+    /// init-only. So the elements a run covers cannot change while it is walked.</para>
+    /// </summary>
+    private readonly ref struct UnflushedRuns(ReadOnlySpan<SpanRecord> flushing, ReadOnlySpan<SpanRecord> hot)
+    {
+        public readonly ReadOnlySpan<SpanRecord> Flushing = flushing;
+        public readonly ReadOnlySpan<SpanRecord> Hot      = hot;
+    }
+
+    /// <summary>See <see cref="UnflushedRuns"/>. Caller holds the read lock.</summary>
+    private UnflushedRuns UnflushedRunsLocked() => new(
+        _flushingSpans is { } flushing ? CollectionsMarshal.AsSpan(flushing) : default,
+        CollectionsMarshal.AsSpan(_hotSpans));
+
+    /// <summary>
+    /// Bumped (under the write lock) whenever the unflushed spans change other than by an append:
+    /// a flush detaching the tier, a failed flush restoring it, a publish dropping the snapshot.
+    /// Together with the live tier's count and the cold array's identity it names one state of
+    /// everything an aggregate reads — the memo key below.
+    /// </summary>
+    private long _unflushedGeneration;
+
+    /// <summary>
+    /// What an aggregate was computed over: the window, the cold array (every change to the cold
+    /// tier publishes a NEW array, so identity is enough), and the unflushed state. Two calls with
+    /// equal keys would read exactly the same spans and sidecars.
+    /// </summary>
+    private readonly record struct AggregateKey(
+        long FromMs, long ToMs, SpanSegmentInfo[] Cold, long UnflushedGeneration, int HotCount);
+
+    private sealed class AggregateMemo<T>(AggregateKey key, T value, long storedAt)
+    {
+        public readonly AggregateKey Key      = key;
+        public readonly T            Value    = value;
+        public readonly long         StoredAt = storedAt;
+    }
+
+    /// <summary>
+    /// How long a memoised aggregate is served, 1 s. The key is exact, so this is not a staleness
+    /// bound — an append changes the key at once — but a bound on how long one result (and a cold
+    /// sidecar that failed to read into it) is kept.
+    /// </summary>
+    internal long _aggregateMemoTicks = System.Diagnostics.Stopwatch.Frequency;
+
+    private AggregateMemo<IReadOnlyList<ServiceSegmentStats>>? _statsMemo;
+    private AggregateMemo<ServiceGraphDto>?                    _graphMemo;
+
+    /// <summary>
+    /// Test seam: called at the start of each aggregate's pass over the unflushed spans, with the
+    /// read lock already released — a test asserts from inside it that the calling thread holds no
+    /// read lock. Names the aggregate.
+    /// </summary>
+    internal Action<string>? _aggregatePassForTest;
+
+    private bool TryMemo<T>(AggregateMemo<T>? memo, in AggregateKey key, out T value)
+    {
+        if (memo is not null && memo.Key == key
+            && System.Diagnostics.Stopwatch.GetTimestamp() - memo.StoredAt < _aggregateMemoTicks)
+        {
+            value = memo.Value;
+            return true;
+        }
+        value = default!;
+        return false;
+    }
+
+    private static AggregateMemo<T> NewMemo<T>(in AggregateKey key, T value) =>
+        new(key, value, System.Diagnostics.Stopwatch.GetTimestamp());
+
+    /// <summary>One service's running totals. The histogram is this accumulator's own array — never a sidecar's.</summary>
+    private sealed class ServiceAcc
+    {
+        public readonly uint[] Buckets = new uint[HistogramBuckets.Count];
+        public uint Spans, Errors;
+        public long MinDur = long.MaxValue, MaxDur = long.MinValue;
+    }
+
+    /// <summary>One directed edge's running totals. Same ownership rule as <see cref="ServiceAcc"/>.</summary>
+    private sealed class EdgeAcc
+    {
+        public readonly uint[] Buckets = new uint[HistogramBuckets.Count];
+        public uint Calls, Errors;
+    }
+
+    private static ServiceAcc AccFor(Dictionary<string, ServiceAcc> agg, string service)
+    {
+        ref var slot = ref CollectionsMarshal.GetValueRefOrAddDefault(agg, service, out _);
+        return slot ??= new ServiceAcc();
+    }
+
+    private static EdgeAcc EdgeFor(Dictionary<(string, string), EdgeAcc> agg, string from, string to)
+    {
+        ref var slot = ref CollectionsMarshal.GetValueRefOrAddDefault(agg, (from, to), out _);
+        return slot ??= new EdgeAcc();
+    }
+
+    /// <summary>
+    /// Adds the in-window spans of a run to the per-service totals, in place: a bucket increment
+    /// where there used to be a <c>new uint[19]</c> per span. Runs of one service skip the lookup.
+    /// </summary>
+    private static void AccumulateStats(
+        Dictionary<string, ServiceAcc> agg, ReadOnlySpan<SpanRecord> spans, long fromNano, long toNano)
+    {
+        string?     lastService = null;
+        ServiceAcc? last        = null;
+        foreach (var s in spans)
+        {
+            if (s.StartTimeUnixNano < fromNano || s.StartTimeUnixNano > toNano) continue;
+            if (!ReferenceEquals(s.ServiceName, lastService))
+            {
+                lastService = s.ServiceName;
+                last        = AccFor(agg, lastService);
+            }
+            var a = last!;
+            a.Spans++;
+            if (s.Status == SpanStatusCode.Error) a.Errors++;
+            if (s.DurationNanos < a.MinDur) a.MinDur = s.DurationNanos;
+            if (s.DurationNanos > a.MaxDur) a.MaxDur = s.DurationNanos;
+            a.Buckets[BucketIndex(s.DurationNanos)]++;
+        }
+    }
+
     public Task<IReadOnlyList<ServiceSegmentStats>> GetAggregateStatsAsync(
         DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default)
     {
         if (!TryEnterEngine()) return Task.FromResult<IReadOnlyList<ServiceSegmentStats>>([]);
-        try { return GetAggregateStatsCore(from, to, ct); }
+        try { return Task.FromResult(GetAggregateStatsCore(from, to)); }
         finally { ExitEngine(); }   // the core is synchronous to its last statement
     }
 
-    private Task<IReadOnlyList<ServiceSegmentStats>> GetAggregateStatsCore(
-        DateTimeOffset from, DateTimeOffset to, CancellationToken ct)
+    private IReadOnlyList<ServiceSegmentStats> GetAggregateStatsCore(DateTimeOffset from, DateTimeOffset to)
     {
         long fromNano = from.ToUnixTimeMilliseconds() * 1_000_000L;
         long toNano   = to.ToUnixTimeMilliseconds()   * 1_000_000L;
 
-        // Accumulator: service name → mutable bucket array + counters
-        var agg = new Dictionary<string, (uint[] Buckets, uint Spans, uint Errors, long MinDur, long MaxDur)>(
-            StringComparer.OrdinalIgnoreCase);
-
-        void Merge(ServiceSegmentStats s)
-        {
-            if (!agg.TryGetValue(s.ServiceName, out var a))
-            {
-                var b = new uint[HistogramBuckets.Count];
-                a = (b, 0, 0, long.MaxValue, long.MinValue);
-            }
-            for (int i = 0; i < HistogramBuckets.Count; i++) a.Buckets[i] += s.Buckets[i];
-            a.Spans  += s.SpanCount;
-            a.Errors += s.ErrorCount;
-            if (s.MinDurationNanos < a.MinDur) a.MinDur = s.MinDurationNanos;
-            if (s.MaxDurationNanos > a.MaxDur) a.MaxDur = s.MaxDurationNanos;
-            agg[s.ServiceName] = a;
-        }
-
-        // Hot tier — compute on demand (≤50K spans, fast). The cold array is snapshotted
-        // under the SAME lock hold: taken separately, a flush publishing in between would
-        // be counted twice (once from the in-flight snapshot, once from its sidecar).
+        // The cold array and the unflushed view come from ONE hold: taken separately, a flush
+        // publishing in between would be counted twice (once from the detached snapshot, once from
+        // its sidecar). That is all the lock is held for.
         SpanSegmentInfo[] statsSegs;
+        UnflushedRuns     runs;
+        AggregateKey      key;
         _lock.EnterReadLock();
         try
         {
             statsSegs = _coldSegments;
-            foreach (var s in UnflushedSpansLocked())
-            {
-                if (s.StartTimeUnixNano < fromNano || s.StartTimeUnixNano > toNano) continue;
-                Merge(new ServiceSegmentStats
-                {
-                    ServiceName      = s.ServiceName,
-                    SpanCount        = 1,
-                    ErrorCount       = s.Status == SpanStatusCode.Error ? 1u : 0u,
-                    MinDurationNanos = s.DurationNanos,
-                    MaxDurationNanos = s.DurationNanos,
-                    Buckets          = BucketOf(s.DurationNanos),
-                });
-            }
+            runs      = UnflushedRunsLocked();
+            key       = new(from.ToUnixTimeMilliseconds(), to.ToUnixTimeMilliseconds(),
+                            statsSegs, _unflushedGeneration, _hotSpans.Count);
         }
         finally { _lock.ExitReadLock(); }
 
-        // Cold tier — read .stats sidecar files only (no span deserialization)
+        if (TryMemo(_statsMemo, in key, out var memoised)) return memoised;
+
+        _aggregatePassForTest?.Invoke(nameof(GetAggregateStatsAsync));
+        var agg = new Dictionary<string, ServiceAcc>(StringComparer.OrdinalIgnoreCase);
+        AccumulateStats(agg, runs.Flushing, fromNano, toNano);
+        AccumulateStats(agg, runs.Hot,      fromNano, toNano);
+
+        // Cold tier — the .stats sidecars only (no span deserialisation). Their arrays are ADDED
+        // into this call's own accumulators, never adopted: a sidecar's array must not become a
+        // total that the next segment is then summed into.
         foreach (var seg in statsSegs)
         {
             if (seg.MaxStartNano < fromNano || seg.MinStartNano > toNano) continue;
             foreach (var s in SpanReader.ReadStats(seg.FilePath))
-                Merge(s);
+            {
+                var a = AccFor(agg, s.ServiceName);
+                var b = s.Buckets;
+                for (int i = 0; i < HistogramBuckets.Count; i++) a.Buckets[i] += b[i];
+                a.Spans  += s.SpanCount;
+                a.Errors += s.ErrorCount;
+                if (s.MinDurationNanos < a.MinDur) a.MinDur = s.MinDurationNanos;
+                if (s.MaxDurationNanos > a.MaxDur) a.MaxDur = s.MaxDurationNanos;
+            }
         }
 
         var result = new List<ServiceSegmentStats>(agg.Count);
-        foreach (var (name, (buckets, spans, errors, minDur, maxDur)) in agg)
+        foreach (var (name, a) in agg)
             result.Add(new ServiceSegmentStats
             {
                 ServiceName      = name,
-                SpanCount        = spans,
-                ErrorCount       = errors,
-                MinDurationNanos = minDur == long.MaxValue ? 0 : minDur,
-                MaxDurationNanos = maxDur == long.MinValue ? 0 : maxDur,
-                Buckets          = buckets,
+                SpanCount        = a.Spans,
+                ErrorCount       = a.Errors,
+                MinDurationNanos = a.MinDur == long.MaxValue ? 0 : a.MinDur,
+                MaxDurationNanos = a.MaxDur == long.MinValue ? 0 : a.MaxDur,
+                Buckets          = a.Buckets,
             });
 
-        return Task.FromResult<IReadOnlyList<ServiceSegmentStats>>(result);
+        // SHARED between callers for as long as it is memoised: every consumer (the stats and
+        // latency endpoints, the alert evaluator, the graph's nodes) only reads it.
+        _statsMemo = NewMemo(in key, (IReadOnlyList<ServiceSegmentStats>)result);
+        return result;
     }
 
     // ── IServiceGraphProvider ──────────────────────────────────────────────────
@@ -3286,118 +3423,129 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default)
     {
         if (!TryEnterEngine()) return Task.FromResult(new ServiceGraphDto());
-        try { return GetServiceGraphCore(from, to, ct); }
+        try { return Task.FromResult(GetServiceGraphCore(from, to)); }
         finally { ExitEngine(); }
     }
 
-    private Task<ServiceGraphDto> GetServiceGraphCore(
-        DateTimeOffset from, DateTimeOffset to, CancellationToken ct)
+    /// <summary>Records each in-window span's service by span id — the parents an edge is drawn from.</summary>
+    private static void IndexServices(
+        Dictionary<SpanId, string> spanSvc, ReadOnlySpan<SpanRecord> spans, long fromNano, long toNano)
+    {
+        foreach (var s in spans)
+            if (s.StartTimeUnixNano >= fromNano && s.StartTimeUnixNano <= toNano)
+                spanSvc[s.SpanId] = s.ServiceName;
+    }
+
+    /// <summary>Adds an edge for every in-window span whose parent is known and in another service, in place.</summary>
+    private static void AccumulateEdges(
+        Dictionary<(string, string), EdgeAcc> edges, Dictionary<SpanId, string> spanSvc,
+        ReadOnlySpan<SpanRecord> spans, long fromNano, long toNano)
+    {
+        foreach (var s in spans)
+        {
+            if (s.StartTimeUnixNano < fromNano || s.StartTimeUnixNano > toNano) continue;
+            if (s.ParentSpanId.IsEmpty) continue;
+            if (!spanSvc.TryGetValue(s.ParentSpanId, out var psvc)) continue;
+            if (string.Equals(psvc, s.ServiceName, StringComparison.Ordinal)) continue;
+            var e = EdgeFor(edges, psvc, s.ServiceName);
+            e.Calls++;
+            if (s.Status == SpanStatusCode.Error) e.Errors++;
+            e.Buckets[BucketIndex(s.DurationNanos)]++;
+        }
+    }
+
+    private ServiceGraphDto GetServiceGraphCore(DateTimeOffset from, DateTimeOffset to)
     {
         long fromNano = from.ToUnixTimeMilliseconds() * 1_000_000L;
         long toNano   = to.ToUnixTimeMilliseconds()   * 1_000_000L;
 
-        // Accumulate edges: (from, to) → (calls, errors, buckets)
-        var edgeAgg = new Dictionary<(string, string), (uint Calls, uint Errors, uint[] Buckets)>(32);
-
-        void MergeEdge(string f, string t, uint calls, uint errors, uint[] buckets)
-        {
-            var key = (f, t);
-            if (!edgeAgg.TryGetValue(key, out var acc))
-                acc = (0, 0, new uint[HistogramBuckets.Count]);
-            acc.Calls  += calls;
-            acc.Errors += errors;
-            for (int i = 0; i < HistogramBuckets.Count; i++) acc.Buckets[i] += buckets[i];
-            edgeAgg[key] = acc;
-        }
-
-        // Hot tier: derive edges on-demand (all spans in memory, accurate). Includes the
-        // in-flight flush snapshot, and snapshots the cold array under the same hold — see
-        // GetAggregateStatsAsync for why both halves must come from one instant.
+        // Includes the in-flight flush snapshot, and takes the cold array under the same hold —
+        // see GetAggregateStatsCore for why both halves must come from one instant.
         SpanSegmentInfo[] graphSegs;
+        UnflushedRuns     runs;
+        AggregateKey      key;
         _lock.EnterReadLock();
         try
         {
             graphSegs = _coldSegments;
-            if (UnflushedCountLocked() > 0)
-            {
-                // Materialised ONCE. The graph needs two passes — parents have to be known
-                // before edges can be drawn — and calling the iterator twice allocated a second
-                // one for no reason, inside the read lock, in the window that is effectively
-                // permanent when flushes run back to back.
-                var unflushed = new List<SpanRecord>(UnflushedCountLocked());
-                unflushed.AddRange(UnflushedSpansLocked());
-
-                var spanSvc = new Dictionary<SpanId, string>(unflushed.Count);
-                foreach (var s in unflushed)
-                    if (s.StartTimeUnixNano >= fromNano && s.StartTimeUnixNano <= toNano)
-                        spanSvc[s.SpanId] = s.ServiceName;
-
-                foreach (var s in unflushed)
-                {
-                    if (s.StartTimeUnixNano < fromNano || s.StartTimeUnixNano > toNano) continue;
-                    if (s.ParentSpanId.IsEmpty) continue;
-                    if (!spanSvc.TryGetValue(s.ParentSpanId, out var psvc)) continue;
-                    if (string.Equals(psvc, s.ServiceName, StringComparison.Ordinal)) continue;
-                    MergeEdge(psvc, s.ServiceName, 1,
-                              s.Status == SpanStatusCode.Error ? 1u : 0u,
-                              BucketOf(s.DurationNanos));
-                }
-            }
+            runs      = UnflushedRunsLocked();
+            key       = new(from.ToUnixTimeMilliseconds(), to.ToUnixTimeMilliseconds(),
+                            graphSegs, _unflushedGeneration, _hotSpans.Count);
         }
         finally { _lock.ExitReadLock(); }
 
-        // Cold tier — read .svcgraph sidecars (no span deserialization)
+        if (TryMemo(_graphMemo, in key, out var memoised)) return memoised;
+
+        _aggregatePassForTest?.Invoke(nameof(GetServiceGraphAsync));
+        var edgeAgg = new Dictionary<(string, string), EdgeAcc>(32);
+
+        // Two passes over the unflushed spans — parents must be known before edges can be drawn —
+        // straight over the two runs, where the locked version first copied the whole tier into a
+        // list so that it could walk it twice.
+        if (runs.Flushing.Length + runs.Hot.Length > 0)
+        {
+            var spanSvc = new Dictionary<SpanId, string>(runs.Flushing.Length + runs.Hot.Length);
+            IndexServices(spanSvc, runs.Flushing, fromNano, toNano);
+            IndexServices(spanSvc, runs.Hot,      fromNano, toNano);
+            AccumulateEdges(edgeAgg, spanSvc, runs.Flushing, fromNano, toNano);
+            AccumulateEdges(edgeAgg, spanSvc, runs.Hot,      fromNano, toNano);
+        }
+
+        // Cold tier — read .svcgraph sidecars (no span deserialization). Added, never adopted.
         foreach (var seg in graphSegs)
         {
             if (seg.MaxStartNano < fromNano || seg.MinStartNano > toNano) continue;
             foreach (var e in ServiceGraphSidecar.ReadEdges(seg.FilePath))
-                MergeEdge(e.From, e.To, e.CallCount, e.ErrorCount, e.Buckets);
+            {
+                var acc = EdgeFor(edgeAgg, e.From, e.To);
+                acc.Calls  += e.CallCount;
+                acc.Errors += e.ErrorCount;
+                var b = e.Buckets;
+                for (int i = 0; i < HistogramBuckets.Count; i++) acc.Buckets[i] += b[i];
+            }
         }
 
-        // Build edges list
-        var edgeDtos = new List<ServiceEdgeDto>(edgeAgg.Count);
-        foreach (var ((from2, to2), (calls, errors, buckets)) in edgeAgg)
-            edgeDtos.Add(new ServiceEdgeDto
-            {
-                From      = from2,
-                To        = to2,
-                CallCount = calls,
-                ErrorCount= errors,
-                ErrorRate = calls > 0 ? (double)errors / calls : 0,
-                P95Ms     = HistogramBuckets.Percentile(buckets, 0.95),
-            });
-
-        // Derive nodes from edges + stats provider
-        // Union all service names from edges
+        var edgeDtos  = new ServiceEdgeDto[edgeAgg.Count];
         var nodeNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var e in edgeDtos) { nodeNames.Add(e.From); nodeNames.Add(e.To); }
+        int k = 0;
+        foreach (var ((from2, to2), e) in edgeAgg)
+        {
+            edgeDtos[k++] = new ServiceEdgeDto
+            {
+                From       = from2,
+                To         = to2,
+                CallCount  = e.Calls,
+                ErrorCount = e.Errors,
+                ErrorRate  = e.Calls > 0 ? (double)e.Errors / e.Calls : 0,
+                P95Ms      = HistogramBuckets.Percentile(e.Buckets, 0.95),
+            };
+            nodeNames.Add(from2);
+            nodeNames.Add(to2);
+        }
 
-        // Load per-service stats for node metrics (reuse existing stats aggregation)
-        // We call GetAggregateStatsAsync synchronously since it's Task.FromResult internally
-        var statsTask = GetAggregateStatsAsync(from, to, ct);
-        var statsMap  = new Dictionary<string, ServiceSegmentStats>(StringComparer.OrdinalIgnoreCase);
-        // statsTask is already completed (Task.FromResult)
-        foreach (var s in statsTask.Result)
+        // Node metrics from the per-service stats — the same window, so on a dashboard that asked
+        // for the stats first this is the memoised result rather than a second pass over the tier.
+        var statsMap = new Dictionary<string, ServiceSegmentStats>(StringComparer.OrdinalIgnoreCase);
+        foreach (var s in GetAggregateStatsCore(from, to))
             statsMap[s.ServiceName] = s;
 
-        var nodeDtos = new List<ServiceNodeDto>(nodeNames.Count);
+        var nodeDtos = new ServiceNodeDto[nodeNames.Count];
+        k = 0;
         foreach (var name in nodeNames)
         {
             statsMap.TryGetValue(name, out var st);
-            nodeDtos.Add(new ServiceNodeDto
+            nodeDtos[k++] = new ServiceNodeDto
             {
                 ServiceName = name,
                 SpanCount   = st?.SpanCount ?? 0,
                 ErrorRate   = st is { SpanCount: > 0 } ? (double)st.ErrorCount / st.SpanCount : 0,
                 P95Ms       = st is not null ? HistogramBuckets.Percentile(st.Buckets, 0.95) : 0,
-            });
+            };
         }
 
-        return Task.FromResult(new ServiceGraphDto
-        {
-            Nodes = [.. nodeDtos],
-            Edges = [.. edgeDtos],
-        });
+        var graph = new ServiceGraphDto { Nodes = nodeDtos, Edges = edgeDtos };
+        _graphMemo = NewMemo(in key, graph);
+        return graph;
     }
 
     // ── ITraceSummaryProvider ──────────────────────────────────────────────────
@@ -3442,23 +3590,32 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             errorTraces += (int)errors;
         }
 
-        // Snapshot cold segments + aggregate hot tier under one short read-lock.
+        // The cold array and the unflushed view under one short read-lock; the grouping after it.
+        // Includes the in-flight flush snapshot: without it a refresh mid-build shows a dip in the
+        // sparkline exactly where the newest traces are.
         SpanSegmentInfo[] segs;
+        UnflushedRuns     runs;
+        int               hotTraces;
         _lock.EnterReadLock();
         try
         {
-            segs = _coldSegments.ToArray();
-
-            // Includes the in-flight flush snapshot: without it a refresh mid-build shows a
-            // dip in the sparkline exactly where the newest traces are.
-            if (UnflushedCountLocked() > 0)
-            {
-                var hot = new Dictionary<TraceId, HotVolAcc>(_traceIdx.Count);
-                foreach (var s in UnflushedSpansLocked()) AccumulateVolume(hot, s);
-                foreach (var a in hot.Values) Add(a.HasRoot ? a.RootStart : a.Earliest, 1, a.Err ? 1u : 0u);
-            }
+            segs      = _coldSegments;       // published whole and never mutated: no copy needed
+            runs      = UnflushedRunsLocked();
+            hotTraces = _traceIdx.Count;
         }
         finally { _lock.ExitReadLock(); }
+
+        if (runs.Flushing.Length + runs.Hot.Length > 0)
+        {
+            _aggregatePassForTest?.Invoke(nameof(GetTraceVolumeAsync));
+            // Presized to the live trace index's count, read under the lock above: an in-memory
+            // figure, not a file field (the FileBounds scan cannot tell a captured local apart).
+            var hot = new Dictionary<TraceId, HotVolAcc>();
+            hot.EnsureCapacity(hotTraces);
+            foreach (var s in runs.Flushing) AccumulateVolume(hot, s);
+            foreach (var s in runs.Hot)      AccumulateVolume(hot, s);
+            foreach (var a in hot.Values) Add(a.HasRoot ? a.RootStart : a.Earliest, 1, a.Err ? 1u : 0u);
+        }
 
         long half = TraceSummarySidecar.GridNanos / 2;
         foreach (var seg in segs)
@@ -3549,24 +3706,28 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
 
         var merged = new Dictionary<TraceId, MergedTrace>(scanCap);
 
-        // Hot tier — group live spans (newest data) under read-lock. Snapshot cold too.
-        // The snapshot is taken AS IT IS: `_coldSegments` is maintained sorted by MaxStartNano
-        // DESCENDING wherever it is built, so neither this walk nor SearchSpansAsync has to
-        // clone-and-sort an array of every segment on the box on every page of every stream.
+        // The cold array and the unflushed view under one short read-lock; the grouping of the live
+        // spans after it (see UnflushedRuns). The cold snapshot is taken AS IT IS: `_coldSegments`
+        // is maintained sorted by MaxStartNano DESCENDING wherever it is built, so neither this walk
+        // nor SearchSpansAsync has to clone-and-sort an array of every segment on the box on every
+        // page of every stream.
         SpanSegmentInfo[] segs;
+        UnflushedRuns     runs;
         _lock.EnterReadLock();
         try
         {
             segs = _coldSegments;
-            // Includes the in-flight flush snapshot — otherwise the newest rows disappear
-            // from the trace list for the duration of every segment build.
-            foreach (var s in UnflushedSpansLocked())
-            {
-                if (s.StartTimeUnixNano < fromNano || s.StartTimeUnixNano > toNano) continue;
-                MergeSpanInto(merged, s);
-            }
+            runs = UnflushedRunsLocked();
         }
         finally { _lock.ExitReadLock(); }
+
+        // Includes the in-flight flush snapshot — otherwise the newest rows disappear from the
+        // trace list for the duration of every segment build.
+        if (runs.Flushing.Length + runs.Hot.Length > 0) _aggregatePassForTest?.Invoke(nameof(GetTraceListAsync));
+        foreach (var s in runs.Flushing)
+            if (s.StartTimeUnixNano >= fromNano && s.StartTimeUnixNano <= toNano) MergeSpanInto(merged, s);
+        foreach (var s in runs.Hot)
+            if (s.StartTimeUnixNano >= fromNano && s.StartTimeUnixNano <= toNano) MergeSpanInto(merged, s);
 
         // THE HEIGHT ABOVE WHICH THIS PAGE SETTLED ITS WINDOW — never a minimum over what it
         // merged, and the difference is the whole finding. Cold segments OVERLAP in time, so one
@@ -3938,11 +4099,21 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         };
     }
 
-    private static uint[] BucketOf(long durationNanos)
+    /// <summary>
+    /// The histogram bounds, read ONCE. <c>HistogramBuckets.Bounds</c> is a <c>ReadOnlySpan&lt;long&gt;</c> property
+    /// over <c>new long[] { ... }</c>, and measured it allocates on every access: 72 B per
+    /// <c>HistogramBuckets.IndexOf</c>, 720 KB for the stats pass over 10 000 spans. The values still come
+    /// from that one list; only the access is cached.
+    /// </summary>
+    private static readonly long[] BucketBounds = HistogramBuckets.Bounds.ToArray();
+
+    /// <summary><c>HistogramBuckets.IndexOf</c> without the allocation — see <see cref="BucketBounds"/>.</summary>
+    private static int BucketIndex(long durationNanos)
     {
-        var b = new uint[HistogramBuckets.Count];
-        b[HistogramBuckets.IndexOf(durationNanos)] = 1;
-        return b;
+        var bounds = BucketBounds;
+        for (int i = 0; i < bounds.Length; i++)
+            if (durationNanos < bounds[i]) return i;
+        return bounds.Length;
     }
 
     /// <summary>
