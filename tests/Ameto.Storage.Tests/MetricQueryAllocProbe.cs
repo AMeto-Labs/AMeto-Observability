@@ -143,6 +143,78 @@ public sealed class MetricQueryAllocProbe
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
 
+    /// <summary>Hands the aggregator the same fragments on every query — the merge, measured alone.</summary>
+    private sealed class FixedFragments(List<MetricSeries> fragments) : IMetricQuery
+    {
+        public IEnumerable<string> GetMetricNames(string? prefix = null) => [];
+
+        public async IAsyncEnumerable<MetricSeries> QueryAsync(
+            string metricName, DateTimeOffset? from = null, DateTimeOffset? to = null, TimeSpan? step = null,
+            IReadOnlyDictionary<string, string>? labelMatchers = null,
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+        {
+            await Task.CompletedTask;
+            foreach (var f in fragments) yield return f;
+        }
+
+        public async IAsyncEnumerable<MetricSeries> GetLatestAsync(
+            string metricName, IReadOnlyDictionary<string, string>? labelMatchers = null,
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+        {
+            await Task.CompletedTask;
+            yield break;
+        }
+    }
+
+    /// <summary>
+    /// The aggregator's own share, with storage out of the picture: 2 000 series arriving as three
+    /// fragments each (the hot tier and two cold files, the hot one first and newest, the cold ones
+    /// overlapping at their edges) — what MergeFragments and the reductions allocate beyond the
+    /// fragments they are handed.
+    /// </summary>
+    [Fact]
+    public void Probe_fragment_merge_and_reductions()
+    {
+        var fragments = new List<MetricSeries>();
+        long t0 = 1_784_800_020_000_000_000L;
+        for (int part = 0; part < 3; part++)
+            for (int s = 0; s < SeriesCount; s++)
+            {
+                var labels = new LabelSet(new Dictionary<string, string>
+                {
+                    ["service.name"] = "svc-" + (s % 10).ToString(CultureInfo.InvariantCulture),
+                    ["replica"]      = s.ToString(CultureInfo.InvariantCulture),
+                });
+                // part 0 = the newest (hot, first); parts 1 and 2 older, overlapping by one point.
+                int first = part == 0 ? 40 : part == 1 ? 0 : 19;
+                var pts = new List<MetricDataPoint>(21);
+                for (int p = first; p < first + 21 && p < 60; p++)
+                    pts.Add(new MetricDataPoint { TimestampUnixNano = t0 + p * 15 * S, Value = p + s });
+                fragments.Add(new MetricSeries { Name = Metric, Kind = MetricKind.Counter, Unit = "1", Labels = labels, Points = pts });
+            }
+        long handed = fragments.Sum(f => (long)f.Points.Count);
+        var agg = new MetricAggregator(new FixedFragments(fragments));
+
+        var none = Measure(() => Sync(agg.QueryAsync(new MetricQueryRequest { Metric = Metric })));
+        var sum  = Measure(() => Sync(agg.QueryAsync(new MetricQueryRequest
+        {
+            Metric = Metric, Aggregation = MetricAggregation.Sum, GroupBy = ["service.name"],
+        })));
+        var rate = Measure(() => Sync(agg.QueryAsync(new MetricQueryRequest
+        {
+            Metric = Metric, Aggregation = MetricAggregation.Rate, GroupBy = ["service.name"],
+        })));
+
+        _out.WriteLine($"AGGREGATOR ALONE  {SeriesCount:N0} series x 3 fragments, {handed:N0} points handed in; best of {Runs}");
+        Print("merge only (None)              ", none, handed);
+        Print("Sum by service.name            ", sum, handed);
+        Print("Rate by service.name           ", rate, handed);
+
+        Assert.Equal((SeriesCount, (long)SeriesCount * 60), (none.Series, none.Points));
+        Assert.Equal((10, 10L * 60), (sum.Series, sum.Points));
+        Assert.Equal((10, 10L * 59), (rate.Series, rate.Points));
+    }
+
     private void Print(string what, Cost c, long stored) =>
         _out.WriteLine($"  {what} {c.Ms,8:N1} ms | {c.Bytes / 1048576.0,7:N2} MB | {(double)c.Bytes / stored,7:N1} B/point | " +
                        $"{(double)c.Bytes / SeriesCount,8:N0} B/stored-series  ({c.Series} series, {c.Points:N0} points out)");
