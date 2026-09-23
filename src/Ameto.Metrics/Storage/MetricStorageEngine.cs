@@ -1478,10 +1478,16 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         {
             try
             {
-                coldCandidates = _coldSegments
-                    .Where(s => s.MetricName.Equals(metricName, StringComparison.OrdinalIgnoreCase)
-                             && s.MaxNano >= fromNano && s.MinNano <= toNano)
-                    .ToList();
+                // A loop, not Where().ToList(): the same segments in the same order (the order the
+                // fragments come back in, which the aggregator's merge tie-break depends on),
+                // without a closure and an iterator per query.
+                for (int i = 0; i < _coldSegments.Count; i++)
+                {
+                    var s = _coldSegments[i];
+                    if (s.MetricName.Equals(metricName, StringComparison.OrdinalIgnoreCase)
+                        && s.MaxNano >= fromNano && s.MinNano <= toNano)
+                        coldCandidates.Add(s);
+                }
             }
             finally { _coldLock.ExitReadLock(); }
         }
@@ -1491,7 +1497,9 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
             ct.ThrowIfCancellationRequested();
             await foreach (var series in MetricReader.ReadAsync(seg.FilePath, metricName, fromNano, toNano, labelMatchers, ct))
             {
-                var points = step.HasValue ? Downsample(series.Points, step.Value, series.Kind) : series.Points;
+                // The reader's series is already this query's answer — its points are the ones in
+                // range, in a list nothing else holds — so without a step it is handed on as is.
+                if (!step.HasValue) { yield return series; continue; }
                 yield return new MetricSeries
                 {
                     Name         = series.Name,
@@ -1499,7 +1507,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                     Unit         = series.Unit,
                     Labels       = series.Labels,
                     BucketBounds = series.BucketBounds,
-                    Points       = points,
+                    Points       = Downsample(series.Points, step.Value, series.Kind),
                 };
             }
         }

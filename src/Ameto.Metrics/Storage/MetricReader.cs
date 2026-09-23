@@ -55,6 +55,24 @@ internal static class MetricReader
         };
     }
 
+    /// <summary>
+    /// The series of <paramref name="metricName"/> in one file whose labels pass
+    /// <paramref name="labelMatchers"/>, each carrying only its points in
+    /// <c>[fromNano, toNano]</c>; a series left with none is not returned.
+    ///
+    /// <para><b>The range is applied WHILE the points are decoded, not after.</b> This used to
+    /// decode every point of every series into a list and then copy the in-range ones into a
+    /// second list with <c>Where().ToList()</c> — a full copy of every series even when the whole
+    /// series was in range, and a full decode of every point that was not. Now an out-of-range
+    /// point is walked (its timestamp delta has to be summed) but never stored, its bucket array is
+    /// skipped rather than built (see <see cref="ReadPointsV3"/>), the list the caller gets is the
+    /// one the decoder filled, and the label filter is applied as soon as the labels are read —
+    /// before the points, which the writer puts after them — so a series the filter rejects costs
+    /// its labels and a structural skip, not a decode.</para>
+    ///
+    /// <para>The name test is made once per file: every series in a <c>.mts</c> carries the one
+    /// name in its index, which is what the per-series test compared.</para>
+    /// </summary>
     public static async IAsyncEnumerable<MetricSeries> ReadAsync(
         string filePath,
         string metricName,
@@ -63,31 +81,36 @@ internal static class MetricReader
         IReadOnlyDictionary<string, string>? labelMatchers,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct)
     {
-        foreach (var series in ReadAllSync(filePath))
-        {
-            ct.ThrowIfCancellationRequested();
-            if (!series.Name.Equals(metricName, StringComparison.OrdinalIgnoreCase)) continue;
-            if (labelMatchers is not null && !MatchesLabels(series.Labels, labelMatchers)) continue;
-
-            var filtered = series.Points
-                .Where(p => p.TimestampUnixNano >= fromNano && p.TimestampUnixNano <= toNano)
-                .ToList();
-            if (filtered.Count == 0) continue;
-
-            yield return new MetricSeries
-            {
-                Name         = series.Name,
-                Kind         = series.Kind,
-                Unit         = series.Unit,
-                Labels       = series.Labels,
-                BucketBounds = series.BucketBounds,
-                Points       = filtered,
-            };
-        }
+        foreach (var series in Read(filePath, metricName, new ReadWindow(fromNano, toNano, labelMatchers), ct))
+            if (series.Points.Count > 0) yield return series;
         await Task.CompletedTask;
     }
 
-    public static IEnumerable<MetricSeries> ReadAllSync(string filePath)
+    /// <summary>Every series in the file, every point, labels unfiltered — the rollup's and the catalog seed's read.</summary>
+    public static IEnumerable<MetricSeries> ReadAllSync(string filePath) =>
+        Read(filePath, metricName: null, ReadWindow.All, CancellationToken.None);
+
+    /// <summary>
+    /// What a read keeps: points in <c>[FromNano, ToNano]</c> (inclusive, as the range test always
+    /// was), from series whose labels pass <see cref="Matchers"/> when there are any.
+    /// </summary>
+    internal readonly struct ReadWindow(long fromNano, long toNano, IReadOnlyDictionary<string, string>? matchers)
+    {
+        public static ReadWindow All => new(long.MinValue, long.MaxValue, null);
+
+        public long FromNano { get; } = fromNano;
+        public long ToNano   { get; } = toNano;
+        public IReadOnlyDictionary<string, string>? Matchers { get; } = matchers;
+
+        public bool Keeps(long ts) => ts >= FromNano && ts <= ToNano;
+
+        /// <summary>Whether every point a file whose header spans [min, max] can hold is in range —
+        /// a sizing hint only (a v3 point reads back up to a millisecond below the header's min).</summary>
+        public bool Covers(long minNano, long maxNano) =>
+            FromNano == long.MinValue ? ToNano >= maxNano : FromNano <= minNano - 1_000_000 && ToNano >= maxNano;
+    }
+
+    private static IEnumerable<MetricSeries> Read(string filePath, string? metricName, ReadWindow window, CancellationToken ct)
     {
         using var fs = OpenRead(filePath);
         using var br = new BinaryReader(fs);
@@ -99,8 +122,8 @@ internal static class MetricReader
         if (version is not (2 or 3)) yield break; // v1 — incompatible, skipped (deleted on load)
         br.ReadByte();   // granularity
         int seriesCount = (int)br.ReadUInt32();
-        br.ReadInt64();  // minNano
-        br.ReadInt64();  // maxNano
+        long minNano = br.ReadInt64();
+        long maxNano = br.ReadInt64();
         br.ReadByte();   // flags
 
         long nameIdxOffset = ReadNameIdxOffset(fs, br);
@@ -109,7 +132,14 @@ internal static class MetricReader
         fs.Seek(nameIdxOffset, SeekOrigin.Begin);
         br.ReadUInt32(); // nameCount
         ushort nameLen = br.ReadUInt16();
-        string metricName = System.Text.Encoding.UTF8.GetString(br.ReadBytes(nameLen));
+        string fileMetric = System.Text.Encoding.UTF8.GetString(br.ReadBytes(nameLen));
+
+        // One name per file, so the per-series name test is a per-file one. (The engine only asks
+        // for a file its catalog already matched by this name; a direct caller asking for another
+        // gets the same nothing, without the file being inflated to find that out.)
+        if (metricName is not null && !fileMetric.Equals(metricName, StringComparison.OrdinalIgnoreCase)) yield break;
+
+        bool covers = window.Covers(minNano, maxNano);
 
         // Reset to after header (28 bytes)
         fs.Seek(28, SeekOrigin.Begin);
@@ -145,7 +175,8 @@ internal static class MetricReader
                 int offset = 0;
                 for (int i = 0; i < seriesCount && offset < rawLen; i++)
                 {
-                    var series = DeserializeNext(metricName, raw, offset, rawLen, deltaMs: true, out offset);
+                    ct.ThrowIfCancellationRequested();
+                    var series = DeserializeNext(fileMetric, raw, offset, rawLen, deltaMs: true, in window, covers, out offset);
                     if (series is not null) yield return series;
                 }
             }
@@ -160,6 +191,7 @@ internal static class MetricReader
             // v2: per-series LZ4 blocks.
             for (int i = 0; i < seriesCount && fs.Position < nameIdxOffset; i++)
             {
+                ct.ThrowIfCancellationRequested();
                 br.ReadUInt32(); // uncompSize
                 uint compSize = br.ReadUInt32();
                 FileBounds.RequireLengthFits(compSize, fs.Length - fs.Position, $"Series {i} block", filePath);
@@ -174,7 +206,7 @@ internal static class MetricReader
                     FileBounds.RequireLengthFits(rawLen, MaxBlockBytes, $"Series {i} uncompressed", filePath);
                     raw = ArrayPool<byte>.Shared.Rent(rawLen);
                     LZ4Pickler.Unpickle(comp.AsSpan(0, (int)compSize), raw.AsSpan(0, rawLen));
-                    series = DeserializeNext(metricName, raw, 0, rawLen, deltaMs: false, out _);
+                    series = DeserializeNext(fileMetric, raw, 0, rawLen, deltaMs: false, in window, covers, out _);
                 }
                 finally
                 {
@@ -193,18 +225,21 @@ internal static class MetricReader
     /// Decodes the series starting at <paramref name="offset"/> and reports where the next
     /// one begins. Non-iterator by necessity: <see cref="MessagePackReader"/> is a ref struct
     /// and cannot live across a <c>yield</c>, so the cursor is carried out as a plain int and
-    /// the reader is rebuilt per call (it is a span wrapper — no allocation).
+    /// the reader is rebuilt per call (it is a span wrapper — no allocation). Null when the
+    /// window's label filter rejects the series.
     /// </summary>
     private static MetricSeries? DeserializeNext(
-        string metricName, byte[] raw, int offset, int length, bool deltaMs, out int next)
+        string metricName, byte[] raw, int offset, int length, bool deltaMs,
+        in ReadWindow window, bool covers, out int next)
     {
         var r = new MessagePackReader(new ReadOnlyMemory<byte>(raw, offset, length - offset));
-        var series = DeserializeSeries(metricName, ref r, deltaMs);
+        var series = DeserializeSeries(metricName, ref r, deltaMs, in window, covers);
         next = offset + (int)r.Consumed;
         return series;
     }
 
-    private static MetricSeries? DeserializeSeries(string metricName, ref MessagePackReader r, bool deltaMs)
+    private static MetricSeries? DeserializeSeries(
+        string metricName, ref MessagePackReader r, bool deltaMs, in ReadWindow window, bool covers)
     {
         int fields = r.ReadMapHeader();
 
@@ -212,7 +247,7 @@ internal static class MetricReader
         string     unit    = string.Empty;
         LabelSet   labels  = LabelSet.Empty;
         double[]?  bounds  = null;
-        var        points  = new List<MetricDataPoint>();
+        List<MetricDataPoint>? points = null;
 
         for (int i = 0; i < fields; i++)
         {
@@ -223,11 +258,22 @@ internal static class MetricReader
             ReadOnlySpan<byte> key = ReadKey(ref r);
             if      (key.SequenceEqual("k"u8))    kind   = (MetricKind)r.ReadByte();
             else if (key.SequenceEqual("u"u8))    unit   = ReadInterned(ref r, MetricLabelInterner.Shared, out _);
-            else if (key.SequenceEqual("lbs"u8))  labels = ReadLabels(ref r);
+            else if (key.SequenceEqual("lbs"u8))
+            {
+                labels = ReadLabels(ref r);
+                // Rejected here, before the points the writer puts after the labels: the rest of
+                // the map is walked, not decoded, so the reader ends where the next series starts.
+                if (window.Matchers is not null && !MatchesLabels(labels, window.Matchers))
+                {
+                    for (int j = i + 1; j < fields; j++) { r.Skip(); r.Skip(); }
+                    return null;
+                }
+            }
             else if (key.SequenceEqual("bnds"u8)) bounds = ReadBounds(ref r);
-            else if (key.SequenceEqual("pts"u8))  points = deltaMs ? ReadPointsV3(ref r) : ReadPointsV2(ref r);
+            else if (key.SequenceEqual("pts"u8))  points = deltaMs ? ReadPointsV3(ref r, in window, covers) : ReadPointsV2(ref r, in window, covers);
             else r.Skip();
         }
+        points ??= [];
 
         // v3 stores idle histogram points (count=0, sum=0, all buckets 0) in the
         // slim scalar shape; reconstruct their all-zero bucket arrays here so the
@@ -380,50 +426,69 @@ internal static class MetricReader
     /// previous point's histogram state (count / sum / buckets) — for scalar
     /// series that state is always zero, for histograms it run-length-encodes
     /// idle stretches losslessly.
+    ///
+    /// <para><b>Only the points in the window are stored.</b> Every point is still walked — a
+    /// timestamp is a running sum of deltas, and a slim point's state is the last full point's —
+    /// but one outside the window is not added, and its bucket array is not BUILT: its position
+    /// is remembered instead, and it is materialised only if a later slim point that IS in the
+    /// window inherits it. So the kept points see exactly the state they always did, sharing one
+    /// array per full point as they always did, and a point nobody asked for costs no
+    /// allocation.</para>
     /// </summary>
-    private static List<MetricDataPoint> ReadPointsV3(ref MessagePackReader r)
+    private static List<MetricDataPoint> ReadPointsV3(ref MessagePackReader r, in ReadWindow window, bool covers)
     {
         // A MessagePack array header is a number out of the file like any other: the block it
         // lives in is bounded, but the header can still claim far more points than the block
         // holds, and a capacity is reserved before a single one is read. Reserve modestly and
-        // let the list grow into whatever is really there.
+        // let the list grow into whatever is really there — and reserve at all only when the
+        // whole file is inside the window, since otherwise the header says nothing about how
+        // many of its points will be kept.
         int count  = r.ReadArrayHeader();
-        var pts    = new List<MetricDataPoint>(FileBounds.PreallocFor(count, heapBytesPerElement: 64));
+        var pts    = new List<MetricDataPoint>(covers ? FileBounds.PreallocFor(count, heapBytesPerElement: 64) : 0);
         long ms    = 0;
         long    cnt = 0;
         double  sum = 0;
-        long[]? buckets = null;
+        long[]? buckets   = null;
+        long    pendingAt = -1;   // the state's bucket array, walked past but not yet built
         for (int i = 0; i < count; i++)
         {
             int n = r.ReadArrayHeader(); // 2 = slim (state unchanged), 5 = full
             ms = i == 0 ? r.ReadInt64() : ms + r.ReadInt64();
+            long ts   = ms * 1_000_000;
+            bool keep = window.Keeps(ts);
 
             double val = r.ReadDouble(); // transparently accepts msgpack ints
             if (n >= 5)
             {
                 cnt = r.ReadInt64();
                 sum = r.ReadDouble();
+                pendingAt = -1;
                 if (r.TryReadNil())
                 {
                     buckets = null; // state set but no buckets recorded
                 }
+                else if (keep)
+                {
+                    buckets = ReadBuckets(ref r);
+                }
                 else
                 {
-                    int bn = r.ReadArrayHeader();
-                    FileBounds.RequireCountFits(bn, r.Sequence.Length - r.Consumed,
-                        fileBytesPerElement: 1, "Histogram buckets", "the series block");
-                    var bk = new long[FileBounds.PreallocFor(bn, heapBytesPerElement: sizeof(long))];
-                    for (int j = 0; j < bn; j++)
-                    {
-                        if (j == bk.Length) Array.Resize(ref bk, Math.Min(bn, Math.Max(4, bk.Length * 2)));
-                        bk[j] = r.ReadInt64();
-                    }
-                    buckets = bk;
+                    buckets   = null;
+                    pendingAt = r.Consumed;
+                    SkipBuckets(ref r);
                 }
+            }
+            if (!keep) continue;
+
+            if (pendingAt >= 0)
+            {
+                var at  = new MessagePackReader(r.Sequence.Slice(pendingAt));
+                buckets = ReadBuckets(ref at);
+                pendingAt = -1;
             }
             pts.Add(new MetricDataPoint
             {
-                TimestampUnixNano = ms * 1_000_000,
+                TimestampUnixNano = ts,
                 Value             = val,
                 Count             = cnt,
                 Sum               = sum,
@@ -433,11 +498,11 @@ internal static class MetricReader
         return pts;
     }
 
-    /// <summary>v2 points: absolute nanosecond timestamps; always 5 fields.</summary>
-    private static List<MetricDataPoint> ReadPointsV2(ref MessagePackReader r)
+    /// <summary>v2 points: absolute nanosecond timestamps; always 5 fields. Only the window's are stored.</summary>
+    private static List<MetricDataPoint> ReadPointsV2(ref MessagePackReader r, in ReadWindow window, bool covers)
     {
         int count = r.ReadArrayHeader();
-        var pts   = new List<MetricDataPoint>(FileBounds.PreallocFor(count, heapBytesPerElement: 64));
+        var pts   = new List<MetricDataPoint>(covers ? FileBounds.PreallocFor(count, heapBytesPerElement: 64) : 0);
         for (int i = 0; i < count; i++)
         {
             int n = r.ReadArrayHeader(); // 5 fields in v2
@@ -445,6 +510,7 @@ internal static class MetricReader
             double val = r.ReadDouble();
             long   cnt = r.ReadInt64();
             double sum = r.ReadDouble();
+            bool   keep = window.Keeps(ts);
             long[]? buckets = null;
             if (n >= 5)
             {
@@ -452,20 +518,16 @@ internal static class MetricReader
                 {
                     // scalar point — no buckets
                 }
+                else if (keep)
+                {
+                    buckets = ReadBuckets(ref r);
+                }
                 else
                 {
-                    int bn = r.ReadArrayHeader();
-                    FileBounds.RequireCountFits(bn, r.Sequence.Length - r.Consumed,
-                        fileBytesPerElement: 1, "Histogram buckets", "the series block");
-                    var bk = new long[FileBounds.PreallocFor(bn, heapBytesPerElement: sizeof(long))];
-                    for (int j = 0; j < bn; j++)
-                    {
-                        if (j == bk.Length) Array.Resize(ref bk, Math.Min(bn, Math.Max(4, bk.Length * 2)));
-                        bk[j] = r.ReadInt64();
-                    }
-                    buckets = bk;
+                    SkipBuckets(ref r);
                 }
             }
+            if (!keep) continue;
             pts.Add(new MetricDataPoint
             {
                 TimestampUnixNano = ts,
@@ -476,6 +538,34 @@ internal static class MetricReader
             });
         }
         return pts;
+    }
+
+    /// <summary>A point's bucket-count array, built.</summary>
+    private static long[] ReadBuckets(ref MessagePackReader r)
+    {
+        int bn = r.ReadArrayHeader();
+        FileBounds.RequireCountFits(bn, r.Sequence.Length - r.Consumed,
+            fileBytesPerElement: 1, "Histogram buckets", "the series block");
+        var bk = new long[FileBounds.PreallocFor(bn, heapBytesPerElement: sizeof(long))];
+        for (int j = 0; j < bn; j++)
+        {
+            if (j == bk.Length) Array.Resize(ref bk, Math.Min(bn, Math.Max(4, bk.Length * 2)));
+            bk[j] = r.ReadInt64();
+        }
+        return bk;
+    }
+
+    /// <summary>
+    /// A point's bucket-count array, walked past with every check <see cref="ReadBuckets"/> makes —
+    /// the count against the block, each element read as the integer it must be — and nothing
+    /// kept, so a torn array fails a skipped point exactly as it fails a built one.
+    /// </summary>
+    private static void SkipBuckets(ref MessagePackReader r)
+    {
+        int bn = r.ReadArrayHeader();
+        FileBounds.RequireCountFits(bn, r.Sequence.Length - r.Consumed,
+            fileBytesPerElement: 1, "Histogram buckets", "the series block");
+        for (int j = 0; j < bn; j++) r.ReadInt64();
     }
 
     /// <summary>
