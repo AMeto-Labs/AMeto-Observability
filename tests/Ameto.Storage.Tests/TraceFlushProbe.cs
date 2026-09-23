@@ -4,6 +4,7 @@ using System.Reflection;
 using System.Security.Cryptography;
 using Ameto.Tracing;
 using Ameto.Tracing.Storage;
+using K4os.Compression.LZ4;
 using MessagePack;
 using Xunit;
 using Xunit.Abstractions;
@@ -586,6 +587,213 @@ public sealed class TraceFlushProbe : IDisposable
         // wall time), and a probe that fails on a slow agent teaches nothing. The byte-identity
         // facts above are the gate; this is the instrument.
         Assert.True(whole.Allocated > 0);
+    }
+
+    /// <summary>
+    /// TS#7(g), MEASURED AND NOT ADOPTED. The plan's instruction was "measure the file-size delta
+    /// first; do not adopt blind": the flush compresses every span block (and v3's trace-index
+    /// block) at <c>LZ4Level.L09_HC</c>, and the proposal was L03_HC for the flush — on the critical
+    /// path for releasing tier memory — keeping HC for compaction. This is the measurement, kept so
+    /// the decision can be re-taken on numbers rather than re-argued.
+    ///
+    /// <para>Measured on the writer's OWN bytes rather than a model of them: the segment is written
+    /// as a flush writes it, every LZ4 section is read back out of the file and inflated, and each
+    /// is re-pickled at every candidate level. So the sizes are exactly what that level puts on disk
+    /// for the corpus, section for section, and the times are the compressor's alone (best of three
+    /// passes; K4os ships Release-built, so this holds in a Debug test run too).</para>
+    ///
+    /// <para>THREE CORPORA, because the answer depends on the data. The golden one is synthetic and
+    /// repetitive. The varied one gives every span its own statement parameters, a 32-hex-digit URL
+    /// id, a user id, a latency and a port — high entropy, where HC's search is most expensive and
+    /// finds least. The resource-shaped one is the stored shape <c>SpanFormatV3Tests</c> uses —
+    /// resource attributes merged onto EVERY span, a route per root — and it is where the levels
+    /// part: long matches repeated across spans are what L09_HC's deeper search exists to find.
+    /// MEASURED: L03_HC is +1,9-2,1 % on the golden corpus and +1,3 % on the varied one, but +7,1 %
+    /// on the resource-shaped one, which also pushed <c>V3_IsMuchSmallerThanV2</c> over its bound.
+    /// Material, so the flush stays at L09_HC.</para>
+    ///
+    /// <para>A PROBE, NOT A GATE: the only assertion is that the instrument reads the file it
+    /// measures (L09_HC re-pickled is what is on disk).</para>
+    /// </summary>
+    [Fact]
+    public void Lz4_level_of_the_flush_blocks_measured()
+    {
+        MeasureLz4Levels("golden",   BuildCorpus(Spans));
+        MeasureLz4Levels("golden",   BuildCorpus(50_000));
+        MeasureLz4Levels("varied",   BuildVariedCorpus(50_000));
+        MeasureLz4Levels("resource", BuildResourceShapedCorpus(50_000));
+    }
+
+    private void MeasureLz4Levels(string corpusName, List<SpanRecord> corpus)
+    {
+        LZ4Level[] levels = [LZ4Level.L09_HC, LZ4Level.L03_HC, LZ4Level.L00_FAST];
+        int n = corpus.Count;
+
+        string trc = SpanWriter.Write(NewDir($"lz4-{corpusName}-{n}"), corpus).FilePath;
+        var raws   = ReadCompressedSections(trc, out long onDisk);
+        long fileBytes = new FileInfo(trc).Length;
+
+        _out.WriteLine($"{corpusName} {n:N0} spans: {raws.Count} LZ4 sections (span blocks + trace index), "
+                     + $"{onDisk:N0} B of a {fileBytes:N0} B .trc");
+        long hcBytes = 0;
+        foreach (var level in levels)
+        {
+            long bytes  = 0;
+            double best = double.MaxValue;
+            for (int pass = 0; pass < 3; pass++)
+            {
+                long b = 0;
+                var sw = Stopwatch.StartNew();
+                foreach (var raw in raws) b += LZ4Pickler.Pickle(raw, level).Length;
+                sw.Stop();
+                bytes = b;
+                best  = Math.Min(best, sw.Elapsed.TotalMicroseconds);
+            }
+            if (level == LZ4Level.L09_HC) hcBytes = bytes;
+
+            long file = fileBytes - hcBytes + bytes;
+            _out.WriteLine($"  {level,-9} {bytes,11:N0} B  .trc {file,11:N0} B "
+                         + $"({(file - fileBytes) * 100.0 / fileBytes,5:+0.0;-0.0} %)  "
+                         + $"{best / 1000.0,7:N1} ms  {best / n,5:N2} us/span");
+        }
+
+        Assert.Equal(onDisk, hcBytes);
+    }
+
+    /// <summary>
+    /// A higher-entropy corpus for the LZ4 measurement only — see
+    /// <see cref="Lz4_level_of_the_flush_blocks_measured"/>. Seeded, so the same every run; not part
+    /// of any golden fact.
+    /// </summary>
+    private static List<SpanRecord> BuildVariedCorpus(int howMany)
+    {
+        var rnd   = new Random(42);
+        var spans = new List<SpanRecord>(howMany);
+        var buf   = new ArrayBufferWriter<byte>(512);
+        string[] ops = ["GET /api/v1/orders/{id}", "POST /api/v1/payments", "SqlClient.Execute", "redis.GET", "Kafka.Produce"];
+
+        for (int i = 0; i < howMany; i++)
+        {
+            buf.ResetWrittenCount();
+            var w = new MessagePackWriter(buf);
+            w.WriteMapHeader(8);
+            w.Write("db.system");        w.Write(i % 3 == 0 ? "mssql" : "postgresql");
+            w.Write("db.statement");     w.Write($"SELECT * FROM Orders WHERE CustomerId = {rnd.Next(1_000_000)} AND Status = {rnd.Next(5)}");
+            w.Write("net.peer.port");    w.Write((long)rnd.Next(1024, 65535));
+            w.Write("http.url");         w.Write($"https://api.example.com/v1/orders/{rnd.NextInt64():x16}{rnd.NextInt64():x16}?page={rnd.Next(100)}");
+            w.Write("user.id");          w.Write(rnd.NextInt64().ToString("x16"));
+            w.Write("latency.ms");       w.Write(rnd.NextDouble() * 1000);
+            w.Write("http.status_code"); w.Write((long)(rnd.Next(10) == 0 ? 500 : 200));
+            w.Write("deployment.env");   w.Write("production");
+            w.Flush();
+
+            spans.Add(new SpanRecord
+            {
+                TraceId           = new TraceId((ulong)rnd.NextInt64(), (ulong)(i / 8)),
+                SpanId            = new SpanId((ulong)rnd.NextInt64() | 1),
+                ParentSpanId      = i % 8 == 0 ? default : new SpanId((ulong)rnd.NextInt64() | 1),
+                StartTimeUnixNano = BaseNano + (long)i * 1_000_000 + rnd.Next(1_000_000),
+                DurationNanos     = rnd.Next(1, 2_000_000_000),
+                Name              = ops[rnd.Next(ops.Length)],
+                ServiceName       = ServiceNames[rnd.Next(ServiceNames.Length)],
+                Kind              = (SpanKind)rnd.Next(6),
+                Status            = rnd.Next(20) == 0 ? SpanStatusCode.Error : SpanStatusCode.Ok,
+                AttributesBytes   = buf.WrittenSpan.ToArray(),
+            });
+        }
+        return spans;
+    }
+
+    /// <summary>
+    /// The shape <c>SpanFormatV3Tests</c> calls "the real stored shape", for the LZ4 measurement
+    /// only: resource attributes (environment, PR, instance id) merged onto EVERY span, as the
+    /// server does at ingest, with HTTP semconv on the roots, a statement on every third span and a
+    /// retry counter on the rest. Eight spans per trace, seeded jitter.
+    /// </summary>
+    private static List<SpanRecord> BuildResourceShapedCorpus(int howMany)
+    {
+        var rnd   = new Random(42);
+        var spans = new List<SpanRecord>(howMany);
+        var buf   = new ArrayBufferWriter<byte>(512);
+        string[] routes   = ["console/api/{provider}/ProviderPayment/{providerPaymentId}", "api/payments/{id}/status",
+                             "api/kiosk/{kioskId}/heartbeat", "api/providers/{providerId}/balance"];
+        string[] services = ["MintRoute.API", "KioskAgent.API", "Etisalat.API"];
+        string[] ops      = ["GET {route}", "SELECT payments", "publish PaymentAccepted", "HTTP POST"];
+
+        for (int n = 0; n < howMany; n++)
+        {
+            int t = n / 8, i = n % 8;
+            buf.ResetWrittenCount();
+            var w = new MessagePackWriter(buf);
+            w.WriteMapHeader(3 + (i == 0 ? 6 : i % 3 == 0 ? 3 : 2));
+            w.Write("Environment");         w.Write("Development");
+            w.Write("PR");                  w.Write("pr7170");
+            w.Write("service.instance.id"); w.Write(new Guid(t % 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0).ToString());
+            if (i == 0)
+            {
+                w.Write("http.route");                w.Write(routes[t % routes.Length]);
+                w.Write("http.request.method");       w.Write("GET");
+                w.Write("http.response.status_code"); w.Write(200L);
+                w.Write("network.protocol.version");  w.Write("1.1");
+                w.Write("url.scheme");                w.Write("http");
+                w.Write("url.path");                  w.Write("/" + routes[t % routes.Length].Replace("{provider}", "prov" + t % 9));
+            }
+            else if (i % 3 == 0)
+            {
+                w.Write("db.system");    w.Write("mssql");
+                w.Write("db.statement"); w.Write("SELECT * FROM payments WHERE provider_id = @p" + t % 5);
+                w.Write("db.rows");      w.Write(12.5 + i);
+            }
+            else
+            {
+                w.Write("retry.count"); w.Write((long)(i % 3));
+                w.Write("cache.hit");   w.Write(i % 4 == 0);
+            }
+            w.Flush();
+
+            long traceStart = BaseNano + t * 50_000_000L;
+            spans.Add(new SpanRecord
+            {
+                TraceId           = new TraceId((ulong)(t + 1) * 0x9E3779B97F4A7C15UL, (ulong)(t + 17) * 0xC2B2AE3D27D4EB4FUL),
+                SpanId            = new SpanId((ulong)(t * 100 + 1 + i)),
+                ParentSpanId      = i == 0 ? default : new SpanId((ulong)(t * 100 + 1 + (i - 1) / 2)),
+                StartTimeUnixNano = traceStart + i * 2_000_000L + rnd.Next(0, 500) * 1_000L,
+                DurationNanos     = 1_000_000L + rnd.Next(0, 60_000) * 1_000L,
+                Name              = ops[i % ops.Length],
+                ServiceName       = services[(t + i / 3) % services.Length],
+                Kind              = i == 0 ? SpanKind.Server : (i % 3 == 0 ? SpanKind.Client : SpanKind.Internal),
+                Status            = rnd.Next(0, 50) == 0 ? SpanStatusCode.Error : SpanStatusCode.Unset,
+                HttpStatusCode    = (short)(i == 0 ? 200 : 0),
+                AttributesBytes   = buf.WrittenSpan.ToArray(),
+            });
+        }
+        return spans;
+    }
+
+    /// <summary>
+    /// Every LZ4 section of a v3 <c>.trc</c>, inflated: the span blocks (header to the trace-index
+    /// offset) and the trace-index block itself. <paramref name="onDiskBytes"/> is their pickled
+    /// size as written.
+    /// </summary>
+    private static List<byte[]> ReadCompressedSections(string trcPath, out long onDiskBytes)
+    {
+        byte[] file = File.ReadAllBytes(trcPath);
+        var span = file.AsSpan();
+        long traceIdxOffset = (long)System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(span[^28..]);
+
+        var sections = new List<byte[]>();
+        onDiskBytes = 0;
+        int pos = 27;                                      // the fixed header
+        while (true)
+        {
+            int comp = (int)System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(span[(pos + 4)..]);
+            sections.Add(LZ4Pickler.Unpickle(span.Slice(pos + 8, comp)));
+            onDiskBytes += comp;
+            bool wasIndex = pos == traceIdxOffset;
+            pos += 8 + comp;
+            if (wasIndex) break;                           // the trace-index block is the last one
+        }
+        return sections;
     }
 
     private readonly record struct Sample(double Micros, long Allocated, long Loh);
