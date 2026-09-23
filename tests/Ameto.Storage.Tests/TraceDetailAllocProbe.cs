@@ -58,13 +58,15 @@ public sealed class TraceDetailAllocProbe : IDisposable
     /// A four-way tree, so the flame graph has real structure (seven levels) and stays well under
     /// the depth at which today's serialiser refuses it.
     /// </summary>
-    private static void WriteTrace(TraceStorageEngine engine)
+    private static void WriteTrace(TraceStorageEngine engine) => WriteTrace(engine, Trace);
+
+    private static void WriteTrace(TraceStorageEngine engine, TraceId trace)
     {
         long baseNano = new DateTimeOffset(2026, 9, 1, 12, 0, 0, TimeSpan.Zero).ToUnixTimeMilliseconds() * 1_000_000L;
         for (int i = 0; i < Spans; i++)
             engine.WriteSpan(new SpanIngestItem
             {
-                TraceId           = Trace,
+                TraceId           = trace,
                 SpanId            = new SpanId((ulong)(i + 1)),
                 ParentSpanId      = i == 0 ? default : new SpanId((ulong)((i - 1) / 4 + 1)),
                 StartTimeUnixNano = baseNano + i * 10_000L,
@@ -230,22 +232,27 @@ public sealed class TraceDetailAllocProbe : IDisposable
 
     /// <summary>
     /// ONE LOOK AT A TRACE — ITS DETAIL, OR THE COMPARE VIEW — MUST NOT MAKE THE HOT TIER HEAVIER.
-    /// <see cref="SpanRecord.Attributes"/>
-    /// decodes a hot-tier record's blob on first touch and MEMOISES the dictionary on the record,
-    /// and the records belong to the tier — so a detail view that reaches the attributes through
-    /// it leaves every span of the trace carrying a decoded map (a Dictionary, a string per key, a
-    /// box per value) until the tier flushes: the shape <c>TraceQlScanProbe.A_traceql_page_does_
-    /// not_inflate_the_hot_tier_it_paged_over</c> closed for TraceQL rows.
+    /// <see cref="SpanRecord.Attributes"/> decodes a hot-tier record's blob on first touch and
+    /// MEMOISES the dictionary on the record, and the records belong to the tier — so a view that
+    /// reaches the attributes through it leaves every span of the trace carrying a decoded map (a
+    /// Dictionary, a string per key, a box per value) until the tier flushes: the shape
+    /// <c>TraceQlScanProbe.A_traceql_page_does_not_inflate_the_hot_tier_it_paged_over</c> closed for
+    /// TraceQL rows.
     ///
-    /// <para>Measured the way that probe measures it: the tier built, the handler warmed on ANOTHER
-    /// trace of the same engine, then live bytes with a compacting gen2 collect on both sides of one
-    /// request, so the delta is what the request left behind.</para>
+    /// <para>LIVE BYTES ARE PROCESS-WIDE, so the reading is made hard to disturb rather than trusted:
+    /// the engine is this fact's own and nothing else in it runs (a <c>TraceStorageEngine</c> starts
+    /// no timer; its flush and maintenance are driven by a drainer this fact does not create), the
+    /// handlers are warmed on another trace first, every sample takes a compacting gen2 collect, and
+    /// each view is measured over <see cref="RetentionTraces"/> traces of its own — a trace a view
+    /// has already inflated cannot be inflated twice — keeping the SMALLEST delta. Work on another
+    /// thread can only add to a window; to pass a regression it would have to free ~3 MB of its own
+    /// inside every one of them, while a flake has to land in all of them to fail the gate.</para>
     /// </summary>
     [Fact]
     public async Task A_trace_detail_or_compare_does_not_inflate_the_hot_tier_it_read()
     {
         using var engine = new TraceStorageEngine(_dir, NullLogger<TraceStorageEngine>.Instance);
-        WriteTrace(engine);
+        for (int k = 0; k < 2 * RetentionTraces; k++) WriteTrace(engine, RetentionTrace(k));
 
         var warmTrace = new TraceId(0x5DE7A11000000002UL, 1);
         engine.WriteSpan(new SpanIngestItem
@@ -264,34 +271,42 @@ public sealed class TraceDetailAllocProbe : IDisposable
             await MeasureHandlerAsync(services, Compare, warmTrace.ToString(), CompareQuery(warmTrace.ToString()));
         }
 
-        long before = LiveBytes();
-        var  r      = await MeasureHandlerAsync(services, TraceQueryEndpointMapper.WriteTraceDetailAsync, Trace.ToString());
-        long after  = LiveBytes();
+        var detail  = new long[RetentionTraces];
+        var compare = new long[RetentionTraces];
+        for (int k = 0; k < RetentionTraces; k++)
+        {
+            string d = RetentionTrace(k).ToString();
+            long before = LiveBytes();
+            await MeasureHandlerAsync(services, TraceQueryEndpointMapper.WriteTraceDetailAsync, d);
+            detail[k] = LiveBytes() - before;
 
-        long perSpan = (after - before) / Spans;
-        _out.WriteLine($"ONE GET /api/traces/{{id}} over a {Spans:N0}-span hot-tier trace: body {r.BodyBytes:N0} B, "
-                     + $"left on the tier {after - before:N0} B = {perSpan:N0} B/span");
-
-        // Before TS#11: 1 484-1 489 B per span left on the tier — the memoised decode of every span
-        // of the trace, ~3 MB for one look at a 2 000-span trace, held until the tier flushed.
-        Assert.True(perSpan < 256,
-            $"one trace-detail request left {perSpan:N0} B per span on the hot tier — the handler is "
-            + "reading attributes through SpanRecord.Attributes, which memoises its decode on the record");
-
-        // THE COMPARE VIEW, over the same untouched tier: it serialised the same DTO, through the
-        // same memoising property, for two traces at once.
-        long cmpBefore = LiveBytes();
-        var  c         = await MeasureHandlerAsync(services, Compare, Trace.ToString(), CompareQuery(Trace.ToString()));
-        long cmpAfter  = LiveBytes();
-
-        long cmpPerSpan = (cmpAfter - cmpBefore) / Spans;
-        _out.WriteLine($"ONE GET /api/traces/compare of that trace with itself: body {c.BodyBytes:N0} B, "
-                     + $"left on the tier {cmpAfter - cmpBefore:N0} B = {cmpPerSpan:N0} B/span");
-
-        // Before it moved onto the writer: 1 497 B per span left on the tier by one compare.
-        Assert.True(cmpPerSpan < 256,
-            $"one compare request left {cmpPerSpan:N0} B per span on the hot tier — it is reading "
-            + "attributes through SpanRecord.Attributes again");
+            string c = RetentionTrace(RetentionTraces + k).ToString();
+            before = LiveBytes();
+            await MeasureHandlerAsync(services, Compare, c, CompareQuery(c));
+            compare[k] = LiveBytes() - before;
+        }
         GC.KeepAlive(engine);
+
+        long detailPerSpan  = detail.Min()  / Spans;
+        long comparePerSpan = compare.Min() / Spans;
+        _out.WriteLine($"ONE GET /api/traces/{{id}} over a {Spans:N0}-span hot-tier trace left on the tier "
+                     + $"{string.Join(" / ", detail.Select(b => b.ToString("N0")))} B -> smallest {detailPerSpan:N0} B/span");
+        _out.WriteLine($"ONE GET /api/traces/compare of such a trace with itself left "
+                     + $"{string.Join(" / ", compare.Select(b => b.ToString("N0")))} B -> smallest {comparePerSpan:N0} B/span");
+
+        // Before TS#11: 1 484-1 491 B per span left on the tier by one detail view and 1 495-1 497 by
+        // one compare — the memoised decode of every span of the trace, ~3 MB for one look at a
+        // 2 000-span trace, held until the tier flushed.
+        Assert.True(detailPerSpan < 256,
+            $"one trace-detail request left {detailPerSpan:N0} B per span on the hot tier — the handler is "
+            + "reading attributes through SpanRecord.Attributes, which memoises its decode on the record");
+        Assert.True(comparePerSpan < 256,
+            $"one compare request left {comparePerSpan:N0} B per span on the hot tier — it is reading "
+            + "attributes through SpanRecord.Attributes again");
     }
+
+    /// <summary>Traces per view in the retention fact — see there for why more than one.</summary>
+    private const int RetentionTraces = 3;
+
+    private static TraceId RetentionTrace(int k) => new(0x5DE7A11000000100UL + (ulong)k, 0x2000);
 }
