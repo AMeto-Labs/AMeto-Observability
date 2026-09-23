@@ -215,16 +215,17 @@ internal static class MetricReader
 
         for (int i = 0; i < fields; i++)
         {
-            var key = r.ReadString();
-            switch (key)
-            {
-                case "k":    kind   = (MetricKind)r.ReadByte(); break;
-                case "u":    unit   = r.ReadString() ?? string.Empty; break;
-                case "lbs":  labels = ReadLabels(ref r); break;
-                case "bnds": bounds = ReadBounds(ref r); break;
-                case "pts":  points = deltaMs ? ReadPointsV3(ref r) : ReadPointsV2(ref r); break;
-                default:     r.Skip(); break;
-            }
+            // The map key compared as the UTF-8 bytes it is on disk. ReadString() materialised a
+            // string per key — six per series (k, u, lbs, bnds, pts, cnt), every one garbage the
+            // moment the switch had looked at it. A nil key read as null there and matched no
+            // case; here it is the empty span and matches none either — its value is skipped.
+            ReadOnlySpan<byte> key = ReadKey(ref r);
+            if      (key.SequenceEqual("k"u8))    kind   = (MetricKind)r.ReadByte();
+            else if (key.SequenceEqual("u"u8))    unit   = r.ReadString() ?? string.Empty;
+            else if (key.SequenceEqual("lbs"u8))  labels = ReadLabels(ref r);
+            else if (key.SequenceEqual("bnds"u8)) bounds = ReadBounds(ref r);
+            else if (key.SequenceEqual("pts"u8))  points = deltaMs ? ReadPointsV3(ref r) : ReadPointsV2(ref r);
+            else r.Skip();
         }
 
         // v3 stores idle histogram points (count=0, sum=0, all buckets 0) in the
@@ -257,6 +258,19 @@ internal static class MetricReader
             BucketBounds = bounds,
             Points       = points,
         };
+    }
+
+    /// <summary>
+    /// A map key's UTF-8 bytes, in place in the decompressed block — no string. Nil answers the
+    /// empty span (ReadString's null). A key that is not a string throws, as ReadString did. The
+    /// block is one contiguous buffer, so the span read always succeeds; the copy below is only
+    /// for a reader over a segmented sequence, which nothing here builds.
+    /// </summary>
+    private static ReadOnlySpan<byte> ReadKey(ref MessagePackReader r)
+    {
+        if (r.TryReadNil()) return default;
+        if (r.TryReadStringSpan(out ReadOnlySpan<byte> key)) return key;
+        return r.ReadStringSequence() is { } seq ? seq.ToArray() : default;
     }
 
     private static double[]? ReadBounds(ref MessagePackReader r)
