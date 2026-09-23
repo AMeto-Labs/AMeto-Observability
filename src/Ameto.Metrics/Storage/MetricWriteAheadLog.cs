@@ -296,17 +296,27 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// <summary>Bytes of point data currently held. Diagnostics and tests only.</summary>
     public long WrittenBytes { get { lock (_writeLock) return _writeOffset; } }
 
-    private MetricWriteAheadLog(string filePath, ILogger? logger)
+    /// <summary>
+    /// What the pool's strings and label sets are replayed through: <see cref="MetricLabelInterner.Shared"/>,
+    /// the instance the OTLP parsers use, unless <see cref="Open"/> was handed another — which
+    /// only a test does, so that what it checks about the replay does not hang on how full the
+    /// rest of its process has made the shared one.
+    /// </summary>
+    internal MetricLabelInterner Interner { get; }
+
+    private MetricWriteAheadLog(string filePath, ILogger? logger, MetricLabelInterner? interner)
     {
         _filePath = filePath;
         _poolPath = filePath + ".pool";
         _logger   = logger;
+        Interner  = interner ?? MetricLabelInterner.Shared;
     }
 
     public static MetricWriteAheadLog Open(string filePath, long initialCapacity = DefaultCapacity,
-                                           ILogger? logger = null, Action<long>? beforeResize = null)
+                                           ILogger? logger = null, Action<long>? beforeResize = null,
+                                           MetricLabelInterner? interner = null)
     {
-        var wal = new MetricWriteAheadLog(filePath, logger);
+        var wal = new MetricWriteAheadLog(filePath, logger, interner);
         // Armed before OpenOrCreate, or the open-time shrink would be the one resize the seam
         // cannot reach — and its double-failure path is exactly what needs the coverage.
         wal.BeforeResize = beforeResize;
@@ -1301,7 +1311,7 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
                 // very strings — and, when they are all pooled, the very label set — that the
                 // live path builds for it: its SeriesKey then matches the next live point by
                 // reference, and the process does not keep a second copy of every label.
-                var interner = MetricLabelInterner.Shared;
+                var interner = Interner;
                 var r = new SpanCursor(body);
                 var kind = (MetricKind)r.ReadByte();
                 string name = r.ReadString(interner, out _);

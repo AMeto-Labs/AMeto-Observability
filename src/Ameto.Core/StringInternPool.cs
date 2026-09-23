@@ -200,9 +200,19 @@ public sealed class StringInternPool
         return (uint)index < (uint)slots.Length ? slots[index] ?? string.Empty : string.Empty;
     }
 
+    /// <summary>
+    /// Every miss on a full pool comes here, for the life of the process — and a pool that
+    /// never evicts stays full once it gets there (the metric label pool does, on a cluster whose
+    /// pods and containers churn their ids into it). The exchange that claims the one
+    /// <see cref="PoolExhausted"/> signal is a WRITE, even when it writes the 1 already there: it
+    /// takes the cache line exclusive, and the line is the one every other ingest thread reads
+    /// <c>_nextIndex</c> and the dictionary reference from on its own way through. So it is
+    /// asked only while the answer can still be "first": a plain read once signalled.
+    /// </summary>
     private int Exhausted()
     {
-        if (Interlocked.Exchange(ref _exhaustedSignalled, 1) == 0)
+        if (Volatile.Read(ref _exhaustedSignalled) == 0
+            && Interlocked.Exchange(ref _exhaustedSignalled, 1) == 0)
             PoolExhausted?.Invoke(_maxPoolSize);
         return -1; // pool full — caller stores -1, template resolved differently
     }
