@@ -1675,9 +1675,11 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
                     foreach (var (k, v) in _hot)
                     {
-                        var points = v.Drain();
+                        // FromDrain, not the list constructor: the order is the series' own answer,
+                        // so nothing walks the points a second time under this lock.
+                        var points = v.Drain(out bool outOfOrder);
                         if (points.Count > 0)
-                            snapshot.Add((k, new HotSeries(points, v.Bounds)));
+                            snapshot.Add((k, HotSeries.FromDrain(points, v.Bounds, outOfOrder)));
                         else if (v.LastAppendUtcTicks < staleBefore)
                             (stale ??= []).Add(k);
                     }
@@ -2963,10 +2965,10 @@ internal sealed class HotSeries
     }
 
     /// <summary>
-    /// A series over a list somebody else built — the drain's snapshot, the rollup's batch, a
-    /// test's. Nothing says that list is in order (a drained one is in ARRIVAL order), and
-    /// <see cref="GetPoints"/> is how <c>MetricWriter</c> reads it, so the order is established
-    /// here with one pass, not assumed.
+    /// A series over a list somebody else built — the rollup's batch, a test's. Nothing says that
+    /// list is in order, and <see cref="GetPoints"/> is how <c>MetricWriter</c> reads it, so the
+    /// order is established here with one pass, not assumed. (The drain's snapshot, whose list is
+    /// in ARRIVAL order, is built by <see cref="FromDrain"/> with the order the series reported.)
     /// </summary>
     public HotSeries(List<MetricDataPoint> points, double[]? bounds = null)
     {
@@ -2977,6 +2979,29 @@ internal sealed class HotSeries
         for (int i = 1; i < all.Length; i++)
             if (all[i].TimestampUnixNano < all[i - 1].TimestampUnixNano) { _outOfOrder = true; break; }
     }
+
+    private HotSeries(List<MetricDataPoint> points, double[]? bounds, bool outOfOrder)
+    {
+        _points     = points;
+        Bounds      = bounds;
+        _outOfOrder = outOfOrder;
+    }
+
+    /// <summary>
+    /// The flush's snapshot of a series: the list <see cref="Drain"/> handed over, with the order
+    /// Drain REPORTED for it rather than one found by walking it again.
+    ///
+    /// <para>The public constructor walks every point to learn whether the list is sorted, and
+    /// the drain calls this once per series while holding <c>_snapshotLock</c>'s WRITE lock —
+    /// the one lock ingest cannot get past — so a 500 000-point tier paid a second full pass over
+    /// its points there, for a fact the series already held: <see cref="_outOfOrder"/> is set by
+    /// exactly the <see cref="Append"/> whose timestamp goes backwards on the list being drained,
+    /// and cleared only when Drain starts a fresh one, so it IS "this list is unsorted", the
+    /// question the walk asked. The walking constructor stays for lists nobody has vouched for —
+    /// the rollup's batch, the tests'.</para>
+    /// </summary>
+    public static HotSeries FromDrain(List<MetricDataPoint> drained, double[]? bounds, bool outOfOrder) =>
+        new(drained, bounds, outOfOrder);
 
     /// <summary>
     /// THE ONE <see cref="LabelSet"/> INSTANCE THIS SERIES IS KNOWN BY — the same object the
@@ -3049,12 +3074,17 @@ internal sealed class HotSeries
     /// into a snapshot <see cref="HotSeries"/> that nothing else can reach, and the restore path
     /// on a failed write appends into THIS object's new list while reading that one — two
     /// different lists, which is the invariant the copy used to provide by brute force.</para>
+    ///
+    /// <para><paramref name="outOfOrder"/> is whether the list handed over is out of timestamp
+    /// order — hand it to <see cref="FromDrain"/>, which then need not walk the list to find
+    /// out.</para>
     /// </summary>
-    public List<MetricDataPoint> Drain()
+    public List<MetricDataPoint> Drain(out bool outOfOrder)
     {
         lock (_lock)
         {
             var drained = _points;
+            outOfOrder  = _outOfOrder;
             _points     = new List<MetricDataPoint>(Math.Min(drained.Count, MaxCarriedCapacity));
             _outOfOrder = false;
             return drained;

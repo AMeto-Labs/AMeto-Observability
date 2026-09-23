@@ -147,8 +147,9 @@ public sealed class MetricHotQueryIndexTests
 
     /// <summary>
     /// The drain hands the writer a list in ARRIVAL order, wrapped in a new <c>HotSeries</c>, and
-    /// the writer reads it through <c>GetPoints</c>. Revert the constructor's order scan and the
-    /// file is written unsorted: the cold answer comes back 5, 1, 3, 2.
+    /// the writer reads it through <c>GetPoints</c>. Drop the order <c>Drain</c> reports on its
+    /// way into <c>HotSeries.FromDrain</c> (the snapshot trusted as sorted) and the file is
+    /// written unsorted: the cold answer comes back 5, 1, 3, 2.
     /// </summary>
     [Fact]
     public async Task A_drained_out_of_order_series_is_written_in_order()
@@ -170,6 +171,43 @@ public sealed class MetricHotQueryIndexTests
             Assert.Equal([10.0, 20, 30, 50], await Values(engine.QueryAsync("ooow")));
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
+    /// <summary>
+    /// THE SNAPSHOT TAKES THE ORDER THE SERIES REPORTS; IT DOES NOT WALK THE POINTS AGAIN. The
+    /// drain runs under the snapshot write lock, so <c>Drain</c> hands over whether its list is
+    /// unsorted and <c>HotSeries.FromDrain</c> believes it. An unsorted drain must still take the
+    /// slow path — sorted, ties in arrival order — and the series' next life starts over in
+    /// order. Make <c>FromDrain</c> drop the flag and the full-range answer comes back in arrival
+    /// order; make <c>Drain</c> stop clearing it and the second drain reports a sorted list
+    /// unsorted.
+    /// </summary>
+    [Fact]
+    public void A_drained_series_hands_its_order_to_the_snapshot()
+    {
+        var live = new HotSeries(LabelSet.Empty);
+        // Arrival: 5, 1, 3 (value 30), 3 (value 31), 2.
+        foreach (var (ts, v) in ((long, double)[])[(5, 50), (1, 10), (3, 30), (3, 31), (2, 20)])
+            live.Append(new MetricDataPoint { TimestampUnixNano = ts, Value = v }, null, 0);
+
+        var drained = live.Drain(out bool outOfOrder);
+        Assert.True(outOfOrder);
+        var snap = HotSeries.FromDrain(drained, null, outOfOrder);
+        Assert.Equal([10.0, 20, 30, 31, 50], ValuesOf(snap.GetPoints(long.MinValue, long.MaxValue)));
+        Assert.Equal([20.0, 30, 31],         ValuesOf(snap.GetPoints(2, 3)));
+
+        live.Append(new MetricDataPoint { TimestampUnixNano = 7, Value = 70 }, null, 0);
+        live.Append(new MetricDataPoint { TimestampUnixNano = 8, Value = 80 }, null, 0);
+        var next = live.Drain(out bool nextOutOfOrder);
+        Assert.False(nextOutOfOrder);
+        Assert.Equal([70.0, 80], ValuesOf(HotSeries.FromDrain(next, null, nextOutOfOrder).GetPoints(2, 9)));
+
+        static List<double> ValuesOf(List<MetricDataPoint> points)
+        {
+            var values = new List<double>(points.Count);
+            foreach (var p in points) values.Add(p.Value);
+            return values;
+        }
     }
 
     /// <summary>
