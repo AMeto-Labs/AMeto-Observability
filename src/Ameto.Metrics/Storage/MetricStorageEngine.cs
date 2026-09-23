@@ -2548,32 +2548,16 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// The hot tier's and the exemplar ring's filter: no matchers (null OR empty) match
+    /// everything WITHOUT looking at the labels — which is why an empty filter never reached the
+    /// repeated-key throw here and still does not — and anything else is
+    /// <see cref="MetricReader.MatchesLabels"/>, the scan the cold reader uses.
+    /// </summary>
     private static bool MatchesLabels(
         LabelSet labels,
-        IReadOnlyDictionary<string, string>? matchers)
-    {
-        if (matchers is null || matchers.Count == 0) return true;
-        var pairs = labels.Pairs.ToDictionary(t => t.Key, t => t.Value, StringComparer.Ordinal);
-        foreach (var (k, v) in matchers)
-        {
-            if (!pairs.TryGetValue(k, out var actual)) return false;
-            if (!LabelValueMatches(actual, v)) return false;
-        }
-        return true;
-    }
-
-    /// <summary>
-    /// Exact match, or OR-match when the matcher value is '|'-delimited
-    /// (e.g. <c>service.name=A|B|C</c>) — lets the multi-service filter merge
-    /// several series server-side so quantiles aggregate over the union.
-    /// </summary>
-    private static bool LabelValueMatches(string actual, string matcher)
-    {
-        if (matcher.IndexOf('|') < 0) return actual == matcher;
-        foreach (var opt in matcher.Split('|'))
-            if (actual == opt) return true;
-        return false;
-    }
+        IReadOnlyDictionary<string, string>? matchers) =>
+        matchers is null || matchers.Count == 0 || MetricReader.MatchesLabels(labels, matchers);
 
     /// <summary>
     /// Type-aware downsample into fixed time buckets:

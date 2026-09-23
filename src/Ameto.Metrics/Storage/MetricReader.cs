@@ -408,25 +408,81 @@ internal static class MetricReader
         return pts;
     }
 
-    private static bool MatchesLabels(
-        LabelSet labels,
-        IReadOnlyDictionary<string, string> matchers)
+    /// <summary>
+    /// Whether <paramref name="labels"/> satisfies every matcher: the key present, and its value
+    /// equal to the matcher's — or to one of its '|'-separated options (multi-select, e.g.
+    /// <c>service.name=A|B|C</c>). Ordinal throughout. The ONE matcher for the cold reader, the hot
+    /// tier and the exemplar ring; callers decide, as they always did, whether a null or empty
+    /// matcher set reaches it at all.
+    ///
+    /// <para><b>A scan of the sorted pairs, not a dictionary per series.</b> Both call sites used to
+    /// build <c>labels.Pairs.ToDictionary(...)</c> — a dictionary, its buckets and entries, a pair
+    /// view and a LINQ iterator, per series per query — to look up two or three keys in a set of
+    /// five. The pairs are already sorted by key (ordinal), so a walk that stops at the first key
+    /// past the one sought answers the same lookup with no allocation at all.</para>
+    ///
+    /// <para><b>A repeated key still throws, deliberately.</b> <c>ToDictionary</c> threw
+    /// <see cref="ArgumentException"/> on a label set with a key twice (the OTLP parser can build
+    /// one — a point attribute named <c>service.name</c>, a duplicate attribute) before any matcher
+    /// was looked at, failing the whole query. That is a latent bug, but this change is a
+    /// performance change and the answer is part of what it must keep: a query that failed still
+    /// fails, the same way (<c>MetricQueryGoldenTests</c> pins it). Repeats are adjacent in the
+    /// sorted pairs, so finding one is a compare per pair.</para>
+    /// </summary>
+    internal static bool MatchesLabels(LabelSet labels, IReadOnlyDictionary<string, string> matchers)
     {
-        var dict = labels.Pairs.ToDictionary(t => t.Key, t => t.Value, StringComparer.Ordinal);
-        foreach (var (k, v) in matchers)
+        ReadOnlySpan<string> kv = labels.Interleaved;
+        for (int i = 2; i < kv.Length; i += 2)
+            if (string.Equals(kv[i], kv[i - 2])) ThrowRepeatedKey(kv[i]);
+
+        // The concrete dictionary's struct enumerator, when that is what came in (it is, from every
+        // endpoint and the alert rules): the interface's would be a boxed enumerator per series.
+        if (matchers is Dictionary<string, string> dict)
         {
-            if (!dict.TryGetValue(k, out var actual)) return false;
-            // Exact, or '|'-delimited OR (e.g. service.name=A|B|C) for multi-select.
-            if (v.IndexOf('|') < 0) { if (actual != v) return false; }
-            else
-            {
-                bool any = false;
-                foreach (var opt in v.Split('|')) if (actual == opt) { any = true; break; }
-                if (!any) return false;
-            }
+            foreach (var (k, v) in dict)
+                if (!Matches(kv, k, v)) return false;
+            return true;
         }
+        foreach (var (k, v) in matchers)
+            if (!Matches(kv, k, v)) return false;
         return true;
     }
+
+    /// <summary>The value under <paramref name="key"/> in canonically sorted pairs, tested against the matcher.</summary>
+    private static bool Matches(ReadOnlySpan<string> kv, string key, string matcher)
+    {
+        for (int i = 0; i < kv.Length; i += 2)
+        {
+            int c = string.CompareOrdinal(kv[i], key);
+            if (c < 0) continue;
+            return c == 0 && LabelValueMatches(kv[i + 1], matcher);   // past it: the key is absent
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Exact match, or OR-match when the matcher value is '|'-delimited (e.g.
+    /// <c>service.name=A|B|C</c>) — lets the multi-service filter merge several series server-side
+    /// so quantiles aggregate over the union. The options are walked in place: <c>Split('|')</c>
+    /// allocated an array and a string per option per series, for the same answer — empty options
+    /// included (<c>"A||B"</c> and <c>"A|"</c> both accept the empty value).
+    /// </summary>
+    internal static bool LabelValueMatches(string actual, string matcher)
+    {
+        if (matcher.IndexOf('|') < 0) return actual == matcher;
+        ReadOnlySpan<char> rest = matcher;
+        while (true)
+        {
+            int bar = rest.IndexOf('|');
+            if ((bar < 0 ? rest : rest[..bar]).SequenceEqual(actual)) return true;
+            if (bar < 0) return false;
+            rest = rest[(bar + 1)..];
+        }
+    }
+
+    [System.Diagnostics.CodeAnalysis.DoesNotReturn]
+    private static void ThrowRepeatedKey(string key) =>
+        throw new ArgumentException($"An item with the same key has already been added. Key: {key}");
 
     private static long ReadNameIdxOffset(FileStream fs, BinaryReader br)
     {
