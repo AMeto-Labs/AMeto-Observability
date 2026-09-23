@@ -161,10 +161,20 @@ internal static class MetricReader
 
         public bool Keeps(long ts) => ts >= FromNano && ts <= ToNano;
 
-        /// <summary>Whether every point a file whose header spans [min, max] can hold is in range —
-        /// a sizing hint only (a v3 point reads back up to a millisecond below the header's min).</summary>
-        public bool Covers(long minNano, long maxNano) =>
-            FromNano == long.MinValue ? ToNano >= maxNano : FromNano <= minNano - 1_000_000 && ToNano >= maxNano;
+        /// <summary>
+        /// The share of a file spanning [min, max] (its header's range) that the window keeps: 1 when
+        /// it covers the file, else the overlapping fraction of the span. A SIZING HINT for a series'
+        /// point list and nothing else — a v3 point reads back up to a millisecond below the header's
+        /// min, and a series may span less than its file — so no answer depends on it.
+        /// </summary>
+        public double Share(long minNano, long maxNano)
+        {
+            if (FromNano == long.MinValue ? ToNano >= maxNano : FromNano <= minNano - 1_000_000 && ToNano >= maxNano) return 1;
+            if (maxNano <= minNano) return 1;
+            long lo = Math.Max(FromNano, minNano), hi = Math.Min(ToNano, maxNano);
+            if (hi < lo) return 0;
+            return ((double)hi - lo + 1) / ((double)maxNano - minNano + 1);
+        }
     }
 
     private static IEnumerable<MetricSeries> Read(string filePath, string? metricName, ReadWindow window, CancellationToken ct)
@@ -209,7 +219,7 @@ internal static class MetricReader
         // gets the same nothing, without the file being inflated to find that out.)
         if (metricName is not null && !fileMetric.Equals(metricName, StringComparison.OrdinalIgnoreCase)) yield break;
 
-        bool covers = window.Covers(minNano, maxNano);
+        double share = window.Share(minNano, maxNano);
 
         // Reset to after header (28 bytes)
         fs.Seek(28, SeekOrigin.Begin);
@@ -249,7 +259,7 @@ internal static class MetricReader
                     {
                         ct.ThrowIfCancellationRequested();
                         int start  = offset;
-                        var series = DeserializeNext(fileMetric, raw, offset, rawLen, deltaMs: true, in window, covers, out offset, out int key);
+                        var series = DeserializeNext(fileMetric, raw, offset, rawLen, deltaMs: true, in window, share, out offset, out int key);
                         if (series is not null) yield return (start, key, series);
                     }
                 }
@@ -260,7 +270,7 @@ internal static class MetricReader
                         ct.ThrowIfCancellationRequested();
                         if (position < 0 || position >= rawLen)
                             throw new InvalidDataException($"Series position {position} is outside the block of {filePath}");
-                        var series = DeserializeNext(fileMetric, raw, (int)position, rawLen, deltaMs: true, in window, covers, out _, out int key);
+                        var series = DeserializeNext(fileMetric, raw, (int)position, rawLen, deltaMs: true, in window, share, out _, out int key);
                         if (series is not null) yield return (position, key, series);
                     }
                 }
@@ -307,7 +317,7 @@ internal static class MetricReader
                     FileBounds.RequireLengthFits(rawLen, MaxBlockBytes, $"Series {i} uncompressed", filePath);
                     raw = ArrayPool<byte>.Shared.Rent(rawLen);
                     LZ4Pickler.Unpickle(comp.AsSpan(0, (int)compSize), raw.AsSpan(0, rawLen));
-                    series = DeserializeNext(fileMetric, raw, 0, rawLen, deltaMs: false, in window, covers, out _, out key);
+                    series = DeserializeNext(fileMetric, raw, 0, rawLen, deltaMs: false, in window, share, out _, out key);
                 }
                 finally
                 {
@@ -331,16 +341,16 @@ internal static class MetricReader
     /// </summary>
     private static MetricSeries? DeserializeNext(
         string metricName, byte[] raw, int offset, int length, bool deltaMs,
-        in ReadWindow window, bool covers, out int next, out int key)
+        in ReadWindow window, double share, out int next, out int key)
     {
         var r = new MessagePackReader(new ReadOnlyMemory<byte>(raw, offset, length - offset));
-        var series = DeserializeSeries(metricName, ref r, deltaMs, in window, covers, out key);
+        var series = DeserializeSeries(metricName, ref r, deltaMs, in window, share, out key);
         next = offset + (int)r.Consumed;
         return series;
     }
 
     private static MetricSeries? DeserializeSeries(
-        string metricName, ref MessagePackReader r, bool deltaMs, in ReadWindow window, bool covers, out int keyIndex)
+        string metricName, ref MessagePackReader r, bool deltaMs, in ReadWindow window, double share, out int keyIndex)
     {
         int fields = r.ReadMapHeader();
 
@@ -397,7 +407,7 @@ internal static class MetricReader
                     keyIndex = keyOf(new SeriesKey(metricName, kind, unit, labels));
                     if (keyIndex >= window.PointsBelow) { r.Skip(); continue; }   // not this pass's
                 }
-                points = deltaMs ? ReadPointsV3(ref r, in window, covers) : ReadPointsV2(ref r, in window, covers);
+                points = deltaMs ? ReadPointsV3(ref r, in window, share) : ReadPointsV2(ref r, in window, share);
             }
             else r.Skip();
         }
@@ -565,16 +575,17 @@ internal static class MetricReader
     /// array per full point as they always did, and a point nobody asked for costs no
     /// allocation.</para>
     /// </summary>
-    private static List<MetricDataPoint> ReadPointsV3(ref MessagePackReader r, in ReadWindow window, bool covers)
+    private static List<MetricDataPoint> ReadPointsV3(ref MessagePackReader r, in ReadWindow window, double share)
     {
         // A MessagePack array header is a number out of the file like any other: the block it
         // lives in is bounded, but the header can still claim far more points than the block
         // holds, and a capacity is reserved before a single one is read. Reserve modestly and
-        // let the list grow into whatever is really there — and reserve at all only when the
-        // whole file is inside the window, since otherwise the header says nothing about how
-        // many of its points will be kept.
+        // let the list grow into whatever is really there — scaled by the share of the file the
+        // window keeps (ReadWindow.Share): the header counts every point, and a window that
+        // keeps a third of the file reserving for all of it wastes two thirds, while reserving
+        // nothing pays the list's doubling copies instead.
         int count  = r.ReadArrayHeader();
-        var pts    = new List<MetricDataPoint>(covers ? FileBounds.PreallocFor(count, heapBytesPerElement: 64) : 0);
+        var pts    = new List<MetricDataPoint>(FileBounds.PreallocFor(share >= 1 ? count : (long)(count * share) + 1, heapBytesPerElement: 64));
         long ms    = 0;
         long    cnt = 0;
         double  sum = 0;
@@ -629,10 +640,10 @@ internal static class MetricReader
     }
 
     /// <summary>v2 points: absolute nanosecond timestamps; always 5 fields. Only the window's are stored.</summary>
-    private static List<MetricDataPoint> ReadPointsV2(ref MessagePackReader r, in ReadWindow window, bool covers)
+    private static List<MetricDataPoint> ReadPointsV2(ref MessagePackReader r, in ReadWindow window, double share)
     {
         int count = r.ReadArrayHeader();
-        var pts   = new List<MetricDataPoint>(covers ? FileBounds.PreallocFor(count, heapBytesPerElement: 64) : 0);
+        var pts   = new List<MetricDataPoint>(FileBounds.PreallocFor(share >= 1 ? count : (long)(count * share) + 1, heapBytesPerElement: 64));
         for (int i = 0; i < count; i++)
         {
             int n = r.ReadArrayHeader(); // 5 fields in v2
