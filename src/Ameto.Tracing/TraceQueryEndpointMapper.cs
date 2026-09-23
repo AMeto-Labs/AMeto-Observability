@@ -502,8 +502,28 @@ public static class TraceQueryEndpointMapper
     ///   <item>the HOT TIER is walked in full on every page, by both fetchers. A descending
     ///   cursor does not shorten that walk at all — it only makes more spans fail the range test
     ///   inside it, and on the list path each surviving span still costs a MergeSpanInto
-    ///   (dictionary probe, HashSet add, field writes) inside the read lock.</item>
+    ///   (dictionary probe, HashSet add, field writes) — outside the read lock since 5de1c8f; the
+    ///   TraceQL path (<c>SearchSpansAsync</c>) still walks the tier and the in-flight flush
+    ///   snapshot under it. Measured (Release, a 49 000-span hot tier, ten spans a trace, 500-row
+    ///   pages of the filter list walking down the window): 3.0, 2.7, 2.5, 2.2, 1.9, 1.4 MB and
+    ///   10.6, 9.2, 13.5, 7.4, 6.0, 5.0 ms for pages 0-5 — falling only as the window loses
+    ///   traces to merge, never below the cost of the walk itself.</item>
     /// </list>
+    /// <para>NOT MEMOISED, and a memo keyed on the tier generation cannot be made to serve this —
+    /// the question was put by the plan (issue #83, TS "SSE hot-tier re-walk") and the answer is
+    /// recorded here so it is not asked again. What a page computes is a function of its WINDOW:
+    /// <c>MergeSpanInto</c> only merges spans inside <c>[from, pageTo]</c>, so a trace straddling
+    /// the ceiling contributes a different summary on every page, and every page of a stream has a
+    /// different ceiling. A memo keyed on (window, filters, cold array, unflushed generation, hot
+    /// count) — the key <c>TraceStorageEngine</c> already uses for its aggregate memo — is exact
+    /// and would never hit here: the window moves every page, and on a live server the hot count
+    /// moves between any two pages as well. A memo keyed on the tier alone would have to hold
+    /// every trace's spans to re-derive a window's summary from them, which is the walk again with
+    /// a copy of the tier on top. What would actually cut the cost is inside the engine, which this
+    /// file does not own: an index of the unflushed spans by start time, extended per append and
+    /// rebuilt per generation, so a page visits only the spans of its own window, and a hot-tier
+    /// merge bounded like the cold one instead of merging every in-window trace to return
+    /// <c>limit</c> of them.</para>
     /// <para>So the cost is bounded by the number of pages, not independent of it, and the
     /// per-page scan budget (<c>max(limit*5, 500)</c> merged summaries) is a budget on the MERGE,
     /// not on the reading: <c>MaxSpansPerPass</c> lets one compacted segment hold 200 000 spans,
