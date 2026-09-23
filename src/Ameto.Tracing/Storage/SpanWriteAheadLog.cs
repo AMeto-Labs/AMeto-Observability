@@ -218,10 +218,14 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
     /// or re-initialising a file whose spans exist nowhere else.</para>
     ///
     /// <para><b>ROLLING BACK is not symmetric.</b> A release older than v2 treats a v2 log as a
-    /// foreign file (any version but its own) and re-initialises it in place. After a CLEAN stop
-    /// that costs nothing — the final flush has already drained the log into a segment. After an
-    /// UNCLEAN stop the spans the log held and no segment did are lost by the rollback. Operators
-    /// are told so in docs/CONFIGURATION.md ("Upgrading and rolling back").</para>
+    /// foreign file (any version but its own) and re-initialises it in place. That costs nothing
+    /// only after a CLEAN stop whose final flush FINISHED — one that logged neither of
+    /// <c>TraceStorageEngine.DisposeCoreAsync</c>'s Errors, "The final span flush did not finish
+    /// within {Budget}s — the WAL replays the tier on the next start" and "Final span flush failed
+    /// — the WAL replays the tier next start". A stop that logged either left the tier in this log,
+    /// and so does an UNCLEAN stop; either way the spans the log held and no segment did are lost
+    /// by the rollback. Operators are told so, with the text to search for, in
+    /// docs/CONFIGURATION.md ("Upgrading and rolling back").</para>
     /// </summary>
     public static SpanWriteAheadLog Open(string filePath, long initialCapacity = DefaultCapacity, ILogger? logger = null) =>
         Open(filePath, initialCapacity, MemoryBudgets.TraceHotTierCapBytes, logger);
