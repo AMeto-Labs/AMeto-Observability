@@ -1724,17 +1724,22 @@ internal static class TraceDetailJson
         public bool         Boolean;
         public long         Integer;
         public double       Float;
+        public int          Last;                      // on a key's FIRST copy: the index of its last
+        public bool         Repeat;                    // a later copy of a key already seen
     }
 
     /// <summary>Pairs located on the stack; a larger map rents.</summary>
     private const int StackPairs = 32;
 
     /// <summary>
-    /// Past this many pairs the fast path declines. Duplicate detection below is pairwise, which
-    /// is nothing at the eight to thirty attributes a span carries and quadratic past them; a map
-    /// that large takes the reference path, whose dictionary is linear.
+    /// Past this many pairs the fast path declines and the reference path's dictionary takes the
+    /// map. Not a cost limit any more — duplicate detection is a hash probe per key (see
+    /// <see cref="FindCopies"/>) — but a bound on what is rented for one span.
     /// </summary>
     private const int MaxFastPairs = 256;
+
+    /// <summary>Probe slots on the stack; a larger map rents. Twice <see cref="StackPairs"/>.</summary>
+    private const int StackSlots = 64;
 
     /// <summary>
     /// The map straight from its bytes. FALSE — with nothing written — when this path cannot
@@ -1775,13 +1780,21 @@ internal static class TraceDetailJson
         if (count < 0)            { WriteEmptyMap(w); return true; }
         if (count > MaxFastPairs) return false;
 
+        // Open addressing at no more than half full: a power of two at least twice the pair count.
+        int slots = Math.Max(8, (int)System.Numerics.BitOperations.RoundUpToPowerOf2((uint)count * 2));
+
         AttrPair[]? rented = null;
+        int[]?      rentedSlots = null;
         Span<AttrPair> pairs = count <= StackPairs
             ? stackalloc AttrPair[StackPairs]
             : (rented = ArrayPool<AttrPair>.Shared.Rent(count));
+        Span<int> table = slots <= StackSlots
+            ? stackalloc int[StackSlots]
+            : (rentedSlots = ArrayPool<int>.Shared.Rent(slots));
         try
         {
             pairs = pairs[..count];
+            table = table[..slots];
             var bytes = blob.Span;
             switch (Walk(ref reader, bytes, pairs))
             {
@@ -1795,24 +1808,62 @@ internal static class TraceDetailJson
             // back would open a second object where a property name is due, and the writer's own
             // state check would replace the real failure with an InvalidOperationException
             // (TraceDetailJsonFaultTests).
+            FindCopies(bytes, pairs, table);
+
             w.WriteStartObject();
             for (int i = 0; i < count; i++)
             {
+                if (pairs[i].Repeat) continue;   // written at its first copy, with its last copy's value
                 var key = bytes.Slice(pairs[i].KeyStart, pairs[i].KeyLength);
-                if (IndexOfKey(pairs, bytes, key, 0, i) >= 0) continue;   // written at its first copy
-
-                int last = i;
-                for (int j = count - 1; j > i; j--)
-                    if (KeyEquals(pairs[j], bytes, key)) { last = j; break; }
-
-                WriteValue(w, key, bytes, in pairs[last]);
+                WriteValue(w, key, bytes, in pairs[pairs[i].Last]);
             }
             w.WriteEndObject();
             return true;
         }
         finally
         {
-            if (rented is not null) ArrayPool<AttrPair>.Shared.Return(rented);
+            if (rented is not null)      ArrayPool<AttrPair>.Shared.Return(rented);
+            if (rentedSlots is not null) ArrayPool<int>.Shared.Return(rentedSlots);
+        }
+    }
+
+    /// <summary>
+    /// Links every key's copies in ONE pass: a hash of the key's UTF-8 bytes into an open-addressed
+    /// table of first-copy indexes, so the first copy of a key learns the index of its LAST copy
+    /// and every later copy is marked a repeat — where a dictionary indexer leaves them. It was a
+    /// pairwise scan, ~n² key comparisons per span: at 256 attributes with keys of one length,
+    /// 6x the old decode's cost (review of WP9, finding 1). Byte equality is key equality here
+    /// because an ill-formed key has already declined the map (see <see cref="TryWriteBlob"/>);
+    /// a nil key and the empty key are both empty spans, and meet.
+    /// </summary>
+    private static void FindCopies(ReadOnlySpan<byte> bytes, Span<AttrPair> pairs, Span<int> table)
+    {
+        table.Clear();
+        int mask = table.Length - 1;
+        for (int i = 0; i < pairs.Length; i++)
+        {
+            var key = bytes.Slice(pairs[i].KeyStart, pairs[i].KeyLength);
+            var hash = new HashCode();
+            hash.AddBytes(key);
+            int slot = hash.ToHashCode() & mask;
+            while (true)
+            {
+                int entry = table[slot];
+                if (entry == 0)
+                {
+                    table[slot]   = i + 1;   // 0 is "empty", so indexes are stored one up
+                    pairs[i].Last = i;
+                    break;
+                }
+                int first = entry - 1;
+                if (KeyEquals(pairs[first], bytes, key))
+                {
+                    pairs[first].Last = i;
+                    pairs[i].Repeat   = true;
+                    break;
+                }
+                slot = (slot + 1) & mask;
+            }
         }
     }
 
@@ -1878,14 +1929,6 @@ internal static class TraceDetailJson
 
     private static bool KeyEquals(in AttrPair p, ReadOnlySpan<byte> bytes, ReadOnlySpan<byte> key) =>
         p.KeyLength == key.Length && bytes.Slice(p.KeyStart, p.KeyLength).SequenceEqual(key);
-
-    private static int IndexOfKey(ReadOnlySpan<AttrPair> pairs, ReadOnlySpan<byte> bytes,
-                                  ReadOnlySpan<byte> key, int from, int to)
-    {
-        for (int j = from; j < to; j++)
-            if (KeyEquals(pairs[j], bytes, key)) return j;
-        return -1;
-    }
 
     private static void WriteValue(Utf8JsonWriter w, ReadOnlySpan<byte> key, ReadOnlySpan<byte> bytes, in AttrPair p)
     {

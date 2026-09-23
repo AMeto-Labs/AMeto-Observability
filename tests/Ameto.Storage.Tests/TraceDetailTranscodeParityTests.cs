@@ -71,13 +71,14 @@ public sealed class TraceDetailTranscodeParityTests(ITestOutputHelper output)
 
     // ── The generator ────────────────────────────────────────────────────────
 
-    private static void WriteKey(ref MessagePackWriter w, Random rng, bool illFormed)
+    private static void WriteKey(ref MessagePackWriter w, Random rng, bool illFormed, bool wide)
     {
         int roll = rng.Next(100);
         if (roll < 4)      { w.WriteNil(); return; }                                  // the "" key, again
         if (illFormed && roll < 7)  { w.WriteString([(byte)'k', 0xFF]); return; }  // ill-formed: the fast path declines the map
         if (illFormed && roll < 9)  { w.WriteString([(byte)'k', 0xFE]); return; }  // ...decodes to the SAME key
         if (illFormed && roll < 11) { w.WriteString([0xC3]); return; }                  // truncated sequence
+        if (wide && roll >= 50) { w.Write("key." + rng.Next(0, 400)); return; }             // many distinct keys: probe collisions
         w.Write(KeyPool[rng.Next(KeyPool.Length)]);
     }
 
@@ -128,7 +129,9 @@ public sealed class TraceDetailTranscodeParityTests(ITestOutputHelper output)
         }
         else
         {
-            int pairs = shape < 6 ? rng.Next(257, 300) : rng.Next(0, 40);          // past the fast path's limit
+            int pairs = shape < 6  ? rng.Next(257, 300)                              // past the fast path's limit
+                      : shape < 14 ? rng.Next(40, 257)                               // rented pairs and probe table
+                      :              rng.Next(0, 40);
             bool fatal  = rng.Next(20) == 0;
             int  intKey = rng.Next(25) == 0 && pairs > 0 ? rng.Next(pairs) : -1;   // one non-string key: whole map {}
             bool illFormedKeys = rng.Next(10) == 0;
@@ -136,7 +139,7 @@ public sealed class TraceDetailTranscodeParityTests(ITestOutputHelper output)
             for (int i = 0; i < pairs; i++)
             {
                 if (i == intKey) { w.Write(7L); w.Write("int key"); continue; }
-                WriteKey(ref w, rng, illFormedKeys);
+                WriteKey(ref w, rng, illFormedKeys, wide: pairs > 32);
                 WriteValue(ref w, rng, allowFatal: fatal);
             }
         }
