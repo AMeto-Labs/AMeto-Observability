@@ -388,4 +388,17 @@ public sealed class MetricIngestBatchTests : IAsyncLifetime
         await scheduled!;
         Assert.Equal(0, engine.HotPointCount);
     }
+
+    /// <summary>
+    /// The engine's log replays through <see cref="MetricLabelInterner.Shared"/> — the interner the
+    /// OTLP parsers intern into. <c>MetricWriteAheadLog.Open</c> takes an optional interner so the
+    /// replay facts can run on a private one; an engine that passed its own would still pass every
+    /// replay fact while keeping a second copy of every label the live path already holds.
+    /// </summary>
+    [Fact]
+    public void The_engine_replays_through_the_interner_the_parsers_intern_into()
+    {
+        var engine = NewEngine(Path.Combine(_dir, "shared-interner"), SmallLog);
+        Assert.Same(MetricLabelInterner.Shared, engine.WalForTest.Interner);
+    }
 }
