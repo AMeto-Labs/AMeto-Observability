@@ -78,19 +78,6 @@ internal static class TraceSummarySidecar
     /// <summary>Volume grid resolution — 10 s. Sparse, so idle gaps cost nothing.</summary>
     public const long GridNanos = 10_000_000_000L;
 
-    /// <summary>
-    /// THE SHARED LISTS, not a third copy — see HttpSemconvKeys. This writer is the COLD source of
-    /// the very row the trace list builds from a hot span: <c>TraceSummary.RootMethod</c> and
-    /// <c>RootPath</c> are read back by <c>TraceStorageEngine.MergeSummaryInto</c> and become the
-    /// list row's <c>HttpMethod</c>/<c>HttpPath</c> — exactly where <c>MergeSpanInto</c> puts them
-    /// while the trace is still in the hot tier. A private copy here means the SAME trace shows a
-    /// path before its tier flushes and an empty one after: the drift issue #83 removed from the
-    /// two hot readers, left alive on the flush path. Adding a key means adding it to
-    /// <see cref="HttpSemconvKeys"/>, and all three readers get it.
-    /// </summary>
-    private static readonly string[] MethodKeys = HttpSemconvKeys.MethodKeys;
-    private static readonly string[] PathKeys   = HttpSemconvKeys.PathKeys;
-
     // ── Writer ──────────────────────────────────────────────────────────────────
 
     public static void Write(string baseTrcPath, IList<SpanRecord> spans, string? outputPath = null)
@@ -147,8 +134,28 @@ internal static class TraceSummarySidecar
                 a.RootHttpStatus = s.HttpStatusCode;
                 a.RootName       = s.Name;
                 a.RootService    = s.ServiceName;
-                a.RootMethod     = HttpSemconvKeys.GetAttr(s.Attributes, MethodKeys);
-                a.RootPath       = HttpSemconvKeys.GetAttr(s.Attributes, PathKeys);
+
+                // READ OUT OF THE BLOB, NOT OUT OF A DECODE OF IT — TS#7(f).
+                //
+                // This used to be `GetAttr(s.Attributes, …)`, and on a record that holds a blob
+                // `Attributes` IS the lazy decode: a Dictionary, a key string and a box per
+                // attribute, ~987 B for an ordinary eight-attribute span against the blob's 375 B.
+                // The flush already decodes every blob once, on this thread, to feed the bloom
+                // (SpanWriter.TryAddAttrBlobToBloom); this was a second decode of every ROOT, and
+                // the worse kind — SpanRecord memoises it, and these records are the snapshot
+                // TraceStorageEngine keeps serving queries from (`_flushingSpans`) until the
+                // publish, so each dictionary stayed attached for the rest of the flush.
+                //
+                // `Resolve` answers both questions in one non-decoding walk and allocates only the
+                // strings it returns; a record with no blob (a dictionary-built one) still goes
+                // through GetAttr. Same answers by construction — key order, first non-null value
+                // wins, last copy of a key wins, ToString() text — and the golden .tracesum hash in
+                // TraceFlushProbe, whose roots carry every value shape including a truncated blob,
+                // holds that to the byte. It is also the helper the trace list and TraceQL's row
+                // builder use, so the three readers of a trace row cannot drift apart again.
+                HttpSemconvKeys.Resolve(s, out string rootMethod, out string rootPath);
+                a.RootMethod     = rootMethod;
+                a.RootPath       = rootPath;
             }
         }
 

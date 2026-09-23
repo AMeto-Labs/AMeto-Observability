@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Diagnostics;
+using System.Reflection;
 using System.Security.Cryptography;
 using Ameto.Tracing;
 using Ameto.Tracing.Storage;
@@ -352,6 +353,76 @@ public sealed class TraceFlushProbe : IDisposable
         Assert.Equal((uint)Children, edge.CallCount);
     }
 
+    /// <summary>
+    /// TS#7(f): WHAT THE SUMMARY SIDECAR LEAVES BEHIND ON THE RECORDS IT READ — which, before this
+    /// item, was a decoded attribute dictionary per ROOT SPAN, and the reason the item is about
+    /// resident memory rather than about microseconds.
+    ///
+    /// <para><c>GetAttr(s.Attributes, …)</c> makes the ask the first touch of the record's blob, so
+    /// the lazy decode runs right there — a Dictionary, a key string and a box per attribute, ~987 B
+    /// against the blob's 375 B for an eight-attribute span — and <c>SpanRecord</c> MEMOISES it. The
+    /// records are the flush snapshot, which <c>TraceStorageEngine._flushingSpans</c> holds and
+    /// serves queries from until the flush publishes, so every one of those dictionaries stays live
+    /// for the rest of the flush. <c>HttpSemconvKeys.Resolve</c> answers both questions from the
+    /// bytes and attaches nothing.</para>
+    ///
+    /// <para>THE GATE IS THE MEMO ITSELF, NOT A HEAP FIGURE. What the item removes is a decoded
+    /// dictionary left attached to a record, so the fact asserted is that no record with a blob
+    /// has been decoded — read off <c>SpanRecord</c>'s own memo flag, which is exactly what the
+    /// lazy accessor sets and exactly what pins the dictionary. A retained-bytes gate (two full
+    /// compacting collects, subtracted) was tried first and is printed below as the figure the
+    /// item is about, but it is process-wide: on this machine it read 0 B and 262 KB for the fixed
+    /// code in two sessions, and 397 KB and 659 KB for the defect. A gate with that much noise in it
+    /// would fail on an unrelated test's finaliser, or pass beside a real regression.</para>
+    ///
+    /// <para>The corpus is FRESH — a record that has already been asked for its attributes has
+    /// already paid, and would hide the whole effect.</para>
+    /// </summary>
+    [Fact]
+    public void The_summary_sidecar_leaves_no_decoded_attributes_on_the_records()
+    {
+        // Private by design — SpanRecord exposes no "have you decoded" and should not grow one for
+        // a test. Found by name and asserted found, so a rename fails HERE, loudly, rather than
+        // turning the gate below into a count of nothing.
+        var decodedFlag = typeof(SpanRecord).GetField("_decoded", BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(decodedFlag);
+
+        // Warm the JIT on a throwaway corpus, so the measured write is not paying for it.
+        TraceSummarySidecar.Write(Path.Combine(NewDir("sum-warm"), "w.trc"), BuildCorpus(2_000));
+
+        var fresh = BuildCorpus();
+        string path = Path.Combine(NewDir("sum-retained"), "p.trc");
+
+        GC.Collect(2, GCCollectionMode.Forced, blocking: true);
+        GC.WaitForPendingFinalizers();
+        long before = GC.GetTotalMemory(forceFullCollection: true);
+        long a0     = GC.GetAllocatedBytesForCurrentThread();
+
+        TraceSummarySidecar.Write(path, fresh);
+
+        long allocated = GC.GetAllocatedBytesForCurrentThread() - a0;
+        long retained  = GC.GetTotalMemory(forceFullCollection: true) - before;
+        GC.KeepAlive(fresh);   // the point of the measurement: the snapshot is still live
+
+        int roots = 0, rootsWithBlob = 0, decoded = 0;
+        foreach (var s in fresh)
+        {
+            if (s.ParentSpanId.IsEmpty) roots++;
+            if (s.AttributesBytes.IsEmpty) continue;   // no blob: its dictionary was handed in, not decoded
+            if (s.ParentSpanId.IsEmpty) rootsWithBlob++;
+            if ((bool)decodedFlag.GetValue(s)!) decoded++;
+        }
+
+        _out.WriteLine($".tracesum over {Spans:N0} fresh spans ({roots:N0} roots, {rootsWithBlob:N0} with a blob): "
+                     + $"{allocated:N0} B allocated, {retained:N0} B still attached afterwards, "
+                     + $"{decoded:N0} records decoded");
+
+        // Every root with a blob is a record the sidecar reads method and path from; before this
+        // item each of them came out of the write carrying a decoded dictionary.
+        Assert.True(rootsWithBlob > 0, "the corpus has no root with a blob — the gate below would be vacuous");
+        Assert.Equal(0, decoded);
+    }
+
     // ── The probe ───────────────────────────────────────────────────────────────
 
     /// <summary>
@@ -370,17 +441,17 @@ public sealed class TraceFlushProbe : IDisposable
     [Fact]
     public void Flush_cost_per_span()
     {
-        var corpus = BuildCorpus();
+        // Warm: JIT the writer, the sidecars, msgpack and LZ4 before anything is measured — on a
+        // corpus of its own. See Measure for why no measured call may share it.
+        var warm = BuildCorpus();
+        SpanWriter.Write(NewDir("warm"), warm);
+        ServiceGraphSidecar.Write(Path.Combine(NewDir("warm-g"), "w.trc"), warm);
+        TraceSummarySidecar.Write(Path.Combine(NewDir("warm-s"), "w.trc"), warm);
 
-        // Warm: JIT the writer, the sidecars, msgpack and LZ4 before anything is measured.
-        SpanWriter.Write(NewDir("warm"), corpus);
-        ServiceGraphSidecar.Write(Path.Combine(NewDir("warm-g"), "w.trc"), corpus);
-        TraceSummarySidecar.Write(Path.Combine(NewDir("warm-s"), "w.trc"), corpus);
-
-        var whole   = Measure("SpanWriter.Write  (v3)", d => SpanWriter.Write(d, corpus));
-        var wholeV4 = Measure("SpanWriter.Write  (v4)", d => SpanWriter.Write(d, corpus, version: SpanWriter.NewestVersion));
-        var graph   = Measure(".svcgraph", d => ServiceGraphSidecar.Write(Path.Combine(d, "p.trc"), corpus));
-        var summary = Measure(".tracesum", d => TraceSummarySidecar.Write(Path.Combine(d, "p.trc"), corpus));
+        var whole   = Measure("SpanWriter.Write  (v3)", static (d, c) => SpanWriter.Write(d, c));
+        var wholeV4 = Measure("SpanWriter.Write  (v4)", static (d, c) => SpanWriter.Write(d, c, version: SpanWriter.NewestVersion));
+        var graph   = Measure(".svcgraph", static (d, c) => ServiceGraphSidecar.Write(Path.Combine(d, "p.trc"), c));
+        var summary = Measure(".tracesum", static (d, c) => TraceSummarySidecar.Write(Path.Combine(d, "p.trc"), c));
 
         _out.WriteLine($"FLUSH of {Spans:N0} spans, {SpansPerTrace} spans/trace, {ServiceNames.Length} services");
         _out.WriteLine("");
@@ -404,9 +475,17 @@ public sealed class TraceFlushProbe : IDisposable
 
     private readonly record struct Sample(double Micros, long Allocated, long Loh);
 
-    private Sample Measure(string label, Action<string> flush)
+    /// <summary>
+    /// One measured call over a FRESH corpus, built before the window opens. A record memoises its
+    /// attribute decode, so a corpus that an earlier call already walked arrives pre-paid: until
+    /// TS#7(f) the <c>.tracesum</c> figure was taken over the records the warm-up had decoded, and
+    /// showed the decode it existed to remove as costing nothing. A real flush sees every record
+    /// exactly once, which is what a fresh corpus reproduces.
+    /// </summary>
+    private Sample Measure(string label, Action<string, List<SpanRecord>> flush)
     {
-        string dir = NewDir(label.Replace(' ', '-').Replace('.', '-').Replace('(', '-').Replace(')', '-'));
+        string dir    = NewDir(label.Replace(' ', '-').Replace('.', '-').Replace('(', '-').Replace(')', '-'));
+        var    corpus = BuildCorpus();
 
         GC.Collect(2, GCCollectionMode.Forced, blocking: true);
         GC.WaitForPendingFinalizers();
@@ -415,7 +494,7 @@ public sealed class TraceFlushProbe : IDisposable
         long loh0 = GC.GetGCMemoryInfo().GenerationInfo[^1].SizeAfterBytes;
         long a0   = GC.GetAllocatedBytesForCurrentThread();
         var  sw   = Stopwatch.StartNew();
-        flush(dir);
+        flush(dir, corpus);
         sw.Stop();
         long allocated = GC.GetAllocatedBytesForCurrentThread() - a0;
         long loh       = GC.GetGCMemoryInfo().GenerationInfo[^1].SizeAfterBytes - loh0;
