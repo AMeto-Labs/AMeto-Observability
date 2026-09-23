@@ -761,6 +761,11 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
             }
             finally { _snapshotLock.ExitReadLock(); }
 
+            // A log growth this batch claimed runs HERE, outside the snapshot lock, so the
+            // threshold flush's write lock is never held off by a file extension. See
+            // MetricWriteAheadLog.WantsPreGrowLocked.
+            _wal.PreGrowIfClaimed();
+
             if (droppedFuture > 0) ReportFutureDrops(droppedFuture, "ingest");
 
             if (resolved is not null)

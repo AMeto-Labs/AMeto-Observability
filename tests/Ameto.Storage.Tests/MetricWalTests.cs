@@ -2095,11 +2095,10 @@ public sealed class MetricWalTests : IAsyncLifetime
     public void Poisoned_head_is_reconciled_and_shrunk_at_open()
     {
         var wal = OpenWal(4 * 1024);
-        for (int i = 0; i < 300; i++)                       // ~14 KB of entries: grows 4 → 16 KiB
+        for (int i = 0; i < 300; i++)                       // ~14 KB of entries: grows 4 → 32 KiB (the last rung pre-grown)
             Append(wal, Scalar("cpu", 1_000 + i, i));
         wal.Dispose();
-        // 16 KiB, or 32 if the background pre-grow (a quarter left) ran before Dispose.
-        Assert.InRange(new FileInfo(WalPath).Length, 32 + 16 * 1024, 32 + 32 * 1024);
+        Assert.Equal(32 + 32 * 1024, new FileInfo(WalPath).Length);   // 16 KiB, then pre-grown a rung at 3/4 full
 
         using (var fs = new FileStream(WalPath, FileMode.Open, FileAccess.ReadWrite))
         {
@@ -2414,11 +2413,10 @@ public sealed class MetricWalTests : IAsyncLifetime
     public void A_grown_file_with_a_rotted_magic_shrinks_at_reopen()
     {
         var wal = OpenWal(4 * 1024);
-        for (int i = 0; i < 300; i++)                       // grows 4 → 16 KiB
+        for (int i = 0; i < 300; i++)                       // grows 4 → 32 KiB (the last rung pre-grown)
             Append(wal, Scalar("cpu", 1_000 + i, i));
         wal.Dispose();
-        // 16 KiB, or 32 if the background pre-grow (a quarter left) ran before Dispose.
-        Assert.InRange(new FileInfo(WalPath).Length, 32 + 16 * 1024, 32 + 32 * 1024);
+        Assert.Equal(32 + 32 * 1024, new FileInfo(WalPath).Length);   // 16 KiB, then pre-grown a rung at 3/4 full
 
         using (var fs = new FileStream(WalPath, FileMode.Open, FileAccess.ReadWrite))
         {

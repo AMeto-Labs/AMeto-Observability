@@ -649,9 +649,12 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// cannot drift.
     /// </summary>
     public void Append(MetricIngestItem item, in MetricDataPoint point)
-        => AppendCore(MemoryMarshal.CreateReadOnlySpan(ref item, 1),
-                      MemoryMarshal.CreateReadOnlySpan(ref Unsafe.AsRef(in point), 1),
-                      default, 0);
+    {
+        AppendCore(MemoryMarshal.CreateReadOnlySpan(ref item, 1),
+                   MemoryMarshal.CreateReadOnlySpan(ref Unsafe.AsRef(in point), 1),
+                   default, 0);
+        PreGrowIfClaimed();
+    }
 
     /// <summary>
     /// Logs a whole ingest batch under ONE acquisition of the write lock.
@@ -688,6 +691,7 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
             long epoch = SeriesEpoch;
             for (int i = 0; i < items.Length; i++) rented[i] = ResolveSeries(items[i]);
             AppendResolved(items, rented.AsSpan(0, items.Length), epoch);
+            PreGrowIfClaimed();
         }
         finally { ArrayPool<uint>.Shared.Return(rented); }
     }
@@ -722,7 +726,14 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// </summary>
     public long SeriesEpoch => Volatile.Read(ref _seriesEpoch);
 
-    /// <inheritdoc cref="Append(ReadOnlySpan{MetricIngestItem})"/>
+    /// <summary>
+    /// <see cref="Append(ReadOnlySpan{MetricIngestItem})"/> over series the caller resolved with
+    /// <see cref="ResolveSeries"/>. <b>It does not grow the log ahead of need</b> — it only claims
+    /// that growth (<see cref="WantsPreGrowLocked"/>); the caller runs it with
+    /// <see cref="PreGrowIfClaimed"/> once it holds none of its OWN locks. The engine calls this
+    /// under its snapshot read lock, and a growth run there held off the threshold flush's write
+    /// lock for the length of a file extension.
+    /// </summary>
     public void AppendResolved(ReadOnlySpan<MetricIngestItem> items, ReadOnlySpan<uint> resolved, long epoch)
     {
         OnSeriesResolvedForTest?.Invoke();
@@ -755,7 +766,6 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
         while (true)
         {
             long needed;
-            bool written = false, preGrow = false;
             lock (_writeLock)
             {
                 if (_disposed) return;                      // shutdown race — dropping is correct
@@ -767,15 +777,10 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
                 if (needed <= _capacity)
                 {
                     WriteBatchLocked(items, points, preResolved, resolvedAtEpoch);
-                    written = true;
-                    preGrow = WantsPreGrowLocked();
+                    // Claimed here, RUN by the caller once it holds no lock: see AppendResolved.
+                    WantsPreGrowLocked();
+                    return;
                 }
-            }
-
-            if (written)
-            {
-                if (preGrow) SchedulePreGrow();
-                return;
             }
 
             // Did not fit. Grow OUTSIDE the write lock — every other thread whose batch fits keeps
@@ -1346,11 +1351,11 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// </summary>
     private readonly Lock _resizeLock = new();
 
-    /// <summary>1 while a background pre-grow is queued or running. See <see cref="SchedulePreGrow"/>.</summary>
+    /// <summary>1 while a pre-grow is claimed or running. See <see cref="WantsPreGrowLocked"/>.</summary>
     private int _preGrowQueued;
 
     /// <summary>
-    /// The capacity a background pre-grow last FAILED at, so a full disk is tried once per
+    /// The capacity a pre-grow last FAILED at, so a full disk is tried once per
     /// capacity rather than once per append; the synchronous path still tries, and throws, when a
     /// batch genuinely does not fit. -1 = none. Under <c>_writeLock</c>.
     /// </summary>
@@ -1372,8 +1377,9 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// (<c>MetricWalGrowthProbe</c>). Now the new, larger mapping is built beside the old one,
     /// outside the write lock — two mappings of one file are coherent — and the write lock is
     /// held only to swap the pointer. Every entry is written under the write lock through
-    /// <c>_ptr</c>, so after the swap nothing can still be using the old view, and it is released
-    /// outside the lock too.</para>
+    /// <c>_ptr</c>, so after the swap nothing can still be using the old view — which is RETIRED,
+    /// not unmapped, because unmapping a big dirty view stalls every thread's page faults; see
+    /// <see cref="_retired"/>.</para>
     ///
     /// <para><b>A failure leaves the log as it was.</b> The old mapping is never unmapped until a
     /// new one exists, so a full disk (the moment a log grows) now fails the append that needed
@@ -1413,13 +1419,14 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
 
             OnGrowMappedForTest?.Invoke();
 
-            MemoryMappedFile?         oldMmf;
-            MemoryMappedViewAccessor? oldView;
             lock (_writeLock)
             {
                 if (_disposed) return;                      // finally releases the new mapping
-                oldMmf    = _mmf;
-                oldView   = _accessor;
+
+                // The old mapping is RETIRED, not released: see _retired for what unmapping it
+                // here cost every other thread.
+                if (_mmf is not null && _accessor is not null)
+                    (_retired ??= []).Add((_mmf, _accessor));
                 _mmf      = mmf;
                 _accessor = view;
                 _ptr      = ptr;
@@ -1427,13 +1434,6 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
                 mmf  = null;                                // owned by the log now
                 view = null;
             }
-
-            if (oldView is not null)
-            {
-                try { oldView.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
-                oldView.Dispose();
-            }
-            oldMmf?.Dispose();
         }
         finally
         {
@@ -1447,20 +1447,39 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     }
 
     /// <summary>
-    /// A quarter of the log left: grow it now, in the background, while there is room for the
-    /// appends that arrive meanwhile — so under steady ingest no append waits for a growth at
-    /// all. Caller holds <c>_writeLock</c>; claims the one pre-grow slot if it answers true.
+    /// A quarter of the log left: CLAIM a growth, to be run while there is still room for the
+    /// appends that arrive meanwhile — so under steady ingest only the one call that crossed the
+    /// mark pays for a growth, after its own batch is down, and every other thread keeps
+    /// appending into the quarter that is left. Caller holds <c>_writeLock</c>. The claim is run
+    /// by <see cref="PreGrowIfClaimed"/>, which the public appends call on their way out and the
+    /// engine calls once it has left its snapshot read lock.
+    ///
+    /// <para>On the caller's thread and outside every lock, deliberately. On the thread pool it
+    /// was background work racing the log's disposal and competing with the engine's own
+    /// threshold flush for pool threads, and it made the file's size after a burst depend on
+    /// scheduling; under the engine's snapshot read lock it would hold the flush's write lock off
+    /// for the length of a file extension. What it does NOT fix: on a CPU-starved box a
+    /// single-threaded ingest loop that never blocks can outrun the scheduled flush, and a growth
+    /// is one of the few places such a loop used to block. MetricBudgetWiringTests' histogram fact,
+    /// which reads the point at which the tier drains, is sensitive to exactly that under
+    /// <c>start /affinity 3</c> on a loaded machine.</para>
     /// </summary>
-    private bool WantsPreGrowLocked()
+    private void WantsPreGrowLocked()
     {
         long cap = _capacity;
-        if (cap - _writeOffset >= cap / 4 || cap == _preGrowFailedAt || _preGrowQueued != 0) return false;
+        if (cap - _writeOffset >= cap / 4 || cap == _preGrowFailedAt || _preGrowQueued != 0) return;
         _preGrowQueued = 1;
-        return true;
     }
 
-    private void SchedulePreGrow() =>
-        ThreadPool.UnsafeQueueUserWorkItem(static wal => wal.PreGrow(), this, preferLocal: false);
+    /// <summary>
+    /// Runs a growth an append claimed (<see cref="WantsPreGrowLocked"/>), if there is one. Call
+    /// holding NO lock of your own. A failure is logged, once per capacity, and never thrown: the
+    /// appends that claimed it are already down.
+    /// </summary>
+    public void PreGrowIfClaimed()
+    {
+        if (Volatile.Read(ref _preGrowQueued) != 0) PreGrow();
+    }
 
     private void PreGrow()
     {
@@ -1512,6 +1531,30 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
         _accessor = null;
         _mmf      = null;
         _ptr      = null;
+        ReleaseRetired();
+    }
+
+    /// <summary>
+    /// The mappings <see cref="GrowTo"/> swapped out, still mapped. Unmapping a large dirty view
+    /// is the expensive half of a growth — measured 3 ms at 16 MiB rising to 27 ms at 192 MiB —
+    /// and it stalls every OTHER thread's page faults in the process for its length, the new
+    /// view's included, so doing it at the swap put the whole stall back. They cost address
+    /// space and page tables only (their pages ARE the new view's pages: one file), and they go
+    /// in <see cref="Unmap"/> — at the commit that empties and shrinks the log, which already
+    /// stops ingest to remap, or at disposal. Under <c>_writeLock</c>.
+    /// </summary>
+    private List<(MemoryMappedFile Mmf, MemoryMappedViewAccessor View)>? _retired;
+
+    private void ReleaseRetired()
+    {
+        if (_retired is null) return;
+        foreach (var (mmf, view) in _retired)
+        {
+            try { view.SafeMemoryMappedViewHandle.ReleasePointer(); } catch { }
+            view.Dispose();
+            mmf.Dispose();
+        }
+        _retired = null;
     }
 
     // ── Dispose ──────────────────────────────────────────────────────────────
