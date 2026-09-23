@@ -437,63 +437,188 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     private readonly ushort                                    _segmentVersion;
     private readonly bool                                      _indexEnabled;
 
-    private const int HotFlushThreshold    = 50_000;  // spans before flush
+    /// <summary>
+    /// Spans before a flush is forced, WHATEVER THEY WEIGH — the count half of
+    /// <c>max(spanCount ≥ this, hotBytes ≥ budget)</c>. The byte half is
+    /// <see cref="_hotTierBudgetBytes"/>, and on a host with room for its cap the two meet at the
+    /// ordinary eight-attribute span: 27 MB is 50 000 of them (see
+    /// <see cref="MemoryBudgets.TraceHotTierCapBytes"/>). The count stays as a ceiling of its own
+    /// because some of what a span costs is not in its bytes — a trace-index entry, a list slot —
+    /// and a flood of attribute-less spans must not buy a tier of millions of them.
+    /// </summary>
+    private const int HotFlushThreshold    = 50_000;
+
+    // ── Memory budgets (TS#3) ────────────────────────────────────────────────
+    //
+    // A SPAN COUNT IS THE WRONG UNIT, and the comments below this block said so for most of the
+    // engine's life: the same 50 000-span tier was 27 MB of ordinary spans and 250-500 MB of
+    // spans carrying a SQL statement or a stack, and a 512 MB stand got exactly the caps a 64 GB
+    // box got. The tier now flushes on bytes as well as on a count, and compaction plans and
+    // loads against bytes; the budgets come from TracesOptions, which defaults them to
+    // MemoryBudgets' trace shares — min(the old constant, a share of the managed-heap limit).
 
     /// <summary>
-    /// A cold segment smaller than this is a compaction candidate.
+    /// What one span costs the hot tier beyond its attribute blob: the <see cref="SpanRecord"/>,
+    /// its slot in <c>_hotSpans</c>, its share of <c>_traceIdx</c>, and the blob array's own
+    /// header. <c>TraceHotTierProbe</c> measures an attribute-less span at 140 B retained and an
+    /// eight-attribute one (375-byte blob) at 532 B, so 160 + the blob length prices the ordinary
+    /// span at 535 B — within 1 % of what it weighs — and 27 MB at 50 467 of them, just past the
+    /// count cap, so a large host still flushes on the count.
     ///
-    /// <para>IT HAS TO BE ABOVE <see cref="HotFlushThreshold"/>, AND FOR MOST OF THIS ENGINE'S LIFE
-    /// IT WAS BELOW IT. At 10 000 against a flush that writes 50 000, the segment an ordinary flush
-    /// produces was never a candidate: never a seed, never in a batch, never merged with anything
-    /// until retention deleted it. Segment count therefore grew with ingest and never fell, and
-    /// since a trace lookup consults every cold segment, that count is the multiplier on the cost
-    /// of opening any trace. On a quiet install <see cref="MaxHotAge"/> alone put a floor of
-    /// twenty-four new segments a day under it.</para>
-    ///
-    /// <para>PEAK MEMORY DOES NOT MOVE WITH THIS NUMBER — but only because raising it exposed that
-    /// the cap was in the wrong place, and the cap was moved. <see cref="MaxSpansPerPass"/> was
-    /// enforced by the LOADER, which stopped once it had ALREADY read that many spans and so
-    /// overshot by whatever the last segment held: at most 10 000 before, at most 50 000 after.
-    /// <see cref="SelectCompactionBatch"/> now applies it while it plans, so a batch of four
-    /// fifty-thousand-span segments holds exactly the two hundred thousand a batch of twenty
-    /// ten-thousand-span ones did.</para>
-    ///
-    /// <para>That cap is also the real ceiling on how much this buys: four ordinary segments become
-    /// one, and the result — a hundred and fifty to two hundred thousand spans — is above this
-    /// threshold and stops merging. So it is roughly a fourfold cut in segment count, not more.
-    /// Going further means a merge that streams instead of materialising every span, which is a
-    /// change to a crash-safety-critical path and belongs in its own piece of work.</para>
+    /// <para>THE NAME AND THE SERVICE ARE NOT CHARGED, deliberately, although the plan sketched
+    /// <c>nameLen + serviceLen + attrLen</c>. Both are shared strings in the tier — the service
+    /// by construction, one per resource block, and both through the intern pools — so charging
+    /// them per span would count one string fifty thousand times; and a length-only sum would
+    /// have missed the ~140 B a span costs with no bytes at all, which is a quarter of the
+    /// ordinary span.</para>
     /// </summary>
-    private const int CompactionThreshold  = 60_000;
+    internal const int HotSpanOverheadBytes = 160;
+
+    /// <summary>A span's weight in the hot tier's byte budget. See <see cref="HotSpanOverheadBytes"/>.</summary>
+    internal static long HotSpanBytes(int attributeBytes) => HotSpanOverheadBytes + (long)attributeBytes;
+
+    /// <summary>
+    /// What a span weighs once a compaction pass has read it back out of a segment, beyond its
+    /// blob — calibrated so the ordinary span (375-byte blob) is 608 B, which is what
+    /// <see cref="MemoryBudgets.TraceMergeCapBytes"/> was: 73 MB over the 120 000 spans a pass
+    /// always held, and what <c>TraceCompactionMemoryProbe</c> still measures (607 B/span retained,
+    /// Release, at this commit; one cold run of it read 661). Keeping the cap's own calibration is
+    /// also what makes a host with room for the cap plan EXACTLY the pairs it planned in spans —
+    /// see <see cref="EstimatedSegmentBytes"/>.
+    /// </summary>
+    internal const int ReadBackSpanOverheadBytes = 233;
+
+    /// <summary>A span's weight in a compaction pass. See <see cref="ReadBackSpanOverheadBytes"/>.</summary>
+    internal static long ReadBackSpanBytes(int attributeBytes) => ReadBackSpanOverheadBytes + (long)attributeBytes;
+
+    /// <summary>The read-back weight of a run of spans — what a segment of exactly these would cost a pass.</summary>
+    internal static long ReadBackBytesOf(ReadOnlySpan<SpanRecord> spans)
+    {
+        long bytes = (long)spans.Length * ReadBackSpanOverheadBytes;
+        foreach (var s in spans) bytes += s.AttributesBytes.Length;
+        return bytes;
+    }
+
+    /// <summary>
+    /// The spans a pass held when it was capped in spans, and the figure the merge cap is 73 MB
+    /// of. A segment of unknown weight is priced at <c>cap / this</c> per span.
+    /// </summary>
+    private const int SpansPerPassAtCap = 120_000;
+
+    /// <summary>
+    /// A segment's read-back weight: measured when this process wrote it, else priced from its span
+    /// count at the merge cap's own per-span figure — <c>SpanCount × 73 MB / 120 000</c>, which
+    /// makes the byte planner, on a host whose budget is the cap, admit and pair EXACTLY the
+    /// segments the 60 000 / 120 000-span planner did (<c>CompactionThresholdTests</c>).
+    /// </summary>
+    internal static long EstimatedSegmentBytes(SpanSegmentInfo s) =>
+        s.WeightBytes > 0 ? s.WeightBytes : (long)s.SpanCount * MemoryBudgets.TraceMergeCapBytes / SpansPerPassAtCap;
+
+    /// <summary>
+    /// The byte half of the flush trigger — <see cref="TracesOptions.HotTierMaxBytes"/>, by default
+    /// <see cref="MemoryBudgets.TraceHotTierBytes"/>: 27 MB on a large host, ~20 MB on the 512 MB
+    /// stand (5 % of its 384 MB heap limit).
+    /// </summary>
+    private readonly long _hotTierBudgetBytes;
+
+    /// <summary>
+    /// One compaction pass's working set — <see cref="TracesOptions.MergeBudgetBytes"/>, by default
+    /// <see cref="MemoryBudgets.TraceMergeBytes"/>: 73 MB on a large host, ~24 MB on the stand.
+    /// The candidate threshold is half of it (<see cref="CompactionThresholdBytesFor"/>).
+    /// </summary>
+    private readonly long _mergeBudgetBytes;
+
+    /// <summary>Bytes the live tier holds, by <see cref="HotSpanBytes"/>. Under the write lock.</summary>
+    private long _hotBytes;
+
+    /// <summary>
+    /// What the detached snapshot held when it left the tier, so a failed flush that puts the
+    /// snapshot back puts its bytes back with it. Under the write lock.
+    /// </summary>
+    private long _flushingBytes;
+
+    /// <summary>Test hook: the live tier's bytes by <see cref="HotSpanBytes"/>.</summary>
+    internal long HotBytesForTest { get { _lock.EnterReadLock(); try { return _hotBytes; } finally { _lock.ExitReadLock(); } } }
+
+    /// <summary>Test hook: the byte half of the flush trigger this engine was built with.</summary>
+    internal long HotTierBudgetBytesForTest => _hotTierBudgetBytes;
+
+    /// <summary>Test hook: one compaction pass's byte budget this engine was built with.</summary>
+    internal long MergeBudgetBytesForTest => _mergeBudgetBytes;
+
+    /// <summary>
+    /// A cold segment weighing less than this is a compaction candidate: HALF the pass budget, so
+    /// the two largest candidates always fit one pass together — see the history below, told in
+    /// the spans it was once written in. On a host with room for the cap that is 36.5 MB =
+    /// 60 000 ordinary spans, the old threshold exactly.
+    ///
+    /// <para><b>ON A HOST WHOSE PASS BUDGET IS SMALL, A FULL FLUSH IS NOT A CANDIDATE, AND THAT IS
+    /// THE BUDGET SPEAKING.</b> The 512 MB stand's pass budget is 6 % of a 384 MB heap limit,
+    /// 24 MB, and its tier budget 5 %, 20 MB — a pass there can afford 1.2 tiers read back, not
+    /// the two a pair of full flushes needs. So the stand merges its small segments (the timed
+    /// flushes of a quiet hour) and leaves full ones as they are: one ~20 MB segment per tier,
+    /// which is one pass's worth either way. Shrinking the tier to half a pass would let full
+    /// flushes pair up, produce the same number of segments at rest, and pay a second rewrite of
+    /// every span to get there.</para>
+    /// </summary>
+    internal static long CompactionThresholdBytesFor(long mergeBudgetBytes) => mergeBudgetBytes / 2;
+
+    // ── THE THRESHOLD AND THE PASS CAP, AS THEY WERE WRITTEN — in spans. Kept because the byte budgets above
+    // inherit every constraint these taught, and CompactionThresholdTests still speaks in them: on a host whose
+    // pass budget is the cap, 36.5 MB and 73 MB ARE 60 000 and 120 000 ordinary spans (EstimatedSegmentBytes). ──
+    // THE HISTORY OF THE THRESHOLD, in the unit it was written in. A cold segment smaller than
+    // 60 000 spans was a compaction candidate.
+    //
+    // <para>IT HAS TO BE ABOVE <see cref="HotFlushThreshold"/>, AND FOR MOST OF THIS ENGINE'S LIFE
+    // IT WAS BELOW IT. At 10 000 against a flush that writes 50 000, the segment an ordinary flush
+    // produces was never a candidate: never a seed, never in a batch, never merged with anything
+    // until retention deleted it. Segment count therefore grew with ingest and never fell, and
+    // since a trace lookup consults every cold segment, that count is the multiplier on the cost
+    // of opening any trace. On a quiet install <see cref="MaxHotAge"/> alone put a floor of
+    // twenty-four new segments a day under it.</para>
+    //
+    // <para>PEAK MEMORY DOES NOT MOVE WITH THIS NUMBER — but only because raising it exposed that
+    // the cap was in the wrong place, and the cap was moved. <see cref="MaxSpansPerPass"/> was
+    // enforced by the LOADER, which stopped once it had ALREADY read that many spans and so
+    // overshot by whatever the last segment held: at most 10 000 before, at most 50 000 after.
+    // <see cref="SelectCompactionBatch"/> now applies it while it plans, so a batch of four
+    // fifty-thousand-span segments holds exactly the two hundred thousand a batch of twenty
+    // ten-thousand-span ones did.</para>
+    //
+    // <para>That cap is also the real ceiling on how much this buys: four ordinary segments become
+    // one, and the result — a hundred and fifty to two hundred thousand spans — is above this
+    // threshold and stops merging. So it is roughly a fourfold cut in segment count, not more.
+    // Going further means a merge that streams instead of materialising every span, which is a
+    // change to a crash-safety-critical path and belongs in its own piece of work.</para>
+    //   [CompactionThreshold was 60 000 spans.]
 
     private const int MaxSegmentsPerPass   = 20;       // merge at most N oldest small segments per run
 
-    /// <summary>
-    /// Hard cap on spans loaded into memory per merge pass — the whole memory story of compaction,
-    /// since <c>CompactOnePass</c> materialises every span it merges.
-    ///
-    /// <para>EXACTLY TWO FULL-SIZE CANDIDATES, and the equality is the point rather than a round
-    /// number. Below it the largest tier cannot merge at all — two 59 999-span segments would not
-    /// fit and would sit there forever — and above it the pass just costs more for no extra
-    /// progress, because a third candidate of that size cannot be admitted either way. So the cap
-    /// is DERIVED from <see cref="CompactionThreshold"/> and moves with it.</para>
-    ///
-    /// <para>LOWERED FROM 200 000, because raising the threshold changed how often this is reached
-    /// even though it did not change the number. <c>SpanSearchBoundTests</c> measures an ordinary
-    /// eight-attribute OTel span at about 1 749 bytes live: 200 000 is roughly 350 MB, and on the
-    /// 512 MB deployment this branch exists to keep alive that is most of the process. It used to
-    /// be unreachable in practice for the worst possible reason — a 50 000-span flush was not a
-    /// candidate, so nothing an install produced at volume ever merged. Fixing that made the peak
-    /// routine. 120 000 is about 210 MB, and the price is that ordinary segments merge two at a
-    /// time instead of four: a twofold cut in segment count per pass instead of fourfold, which is
-    /// a cost the trace-id index has largely stopped charging for.</para>
-    ///
-    /// <para>A SPAN COUNT IS THE WRONG UNIT and this only makes it a smaller wrong unit — the same
-    /// 120 000 is 24 MB of bare spans or 210 MB of attribute-heavy ones. The real fix is a byte
-    /// budget, or a merge that streams instead of materialising, and both are changes to a
-    /// crash-safety-critical path that belong in their own piece of work.</para>
-    /// </summary>
-    private const int MaxSpansPerPass      = 2 * CompactionThreshold;
+    // Hard cap on spans loaded into memory per merge pass — the whole memory story of compaction,
+    // since <c>CompactOnePass</c> materialises every span it merges.
+    //
+    // <para>EXACTLY TWO FULL-SIZE CANDIDATES, and the equality is the point rather than a round
+    // number. Below it the largest tier cannot merge at all — two 59 999-span segments would not
+    // fit and would sit there forever — and above it the pass just costs more for no extra
+    // progress, because a third candidate of that size cannot be admitted either way. So the cap
+    // is DERIVED from <see cref="CompactionThreshold"/> and moves with it.</para>
+    //
+    // <para>LOWERED FROM 200 000, because raising the threshold changed how often this is reached
+    // even though it did not change the number. <c>SpanSearchBoundTests</c> measures an ordinary
+    // eight-attribute OTel span at about 1 749 bytes live: 200 000 is roughly 350 MB, and on the
+    // 512 MB deployment this branch exists to keep alive that is most of the process. It used to
+    // be unreachable in practice for the worst possible reason — a 50 000-span flush was not a
+    // candidate, so nothing an install produced at volume ever merged. Fixing that made the peak
+    // routine. 120 000 is about 210 MB, and the price is that ordinary segments merge two at a
+    // time instead of four: a twofold cut in segment count per pass instead of fourfold, which is
+    // a cost the trace-id index has largely stopped charging for.</para>
+    //
+    // <para>A SPAN COUNT IS THE WRONG UNIT and this only makes it a smaller wrong unit — the same
+    // 120 000 is 24 MB of bare spans or 210 MB of attribute-heavy ones. The real fix is a byte
+    // budget, or a merge that streams instead of materialising, and both are changes to a
+    // crash-safety-critical path that belong in their own piece of work.</para> [The byte
+    // budget is the budgets block above (TS#3); the streaming merge is still its own work.]
+    //   [MaxSpansPerPass was 2 x CompactionThreshold = 120 000 spans.]
 
     // ── Flush policy ──────────────────────────────────────────────────────────
     // Durability belongs to the WAL, not to the segment writer, so a timed flush no
@@ -525,9 +650,20 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// startup and stops new ones being made — the operator-reachable rollback. See
     /// <c>TracesOptions.IndexEnabled</c>.
     /// </param>
+    /// <param name="options">
+    /// The memory knobs — <see cref="TracesOptions.HotTierMaxBytes"/> and
+    /// <see cref="TracesOptions.MergeBudgetBytes"/>. Null, or unset knobs, take
+    /// <see cref="MemoryBudgets"/>' trace shares of THIS process's limits, read once here.
+    /// </param>
     public TraceStorageEngine(string dataDir, ILogger<TraceStorageEngine> logger,
-                              bool writeSegmentFormatV4 = false, bool indexEnabled = true)
+                              bool writeSegmentFormatV4 = false, bool indexEnabled = true,
+                              TracesOptions? options = null)
     {
+        options ??= new TracesOptions();
+        var budgets = MemoryBudgets.Current();
+        _hotTierBudgetBytes = options.HotTierMaxBytesFor(budgets);
+        _mergeBudgetBytes   = options.MergeBudgetBytesFor(budgets);
+
         _segmentVersion = writeSegmentFormatV4 ? SpanWriter.NewestVersion : SpanWriter.DefaultVersion;
         _indexEnabled   = indexEnabled;
         _dataDir = dataDir;
@@ -809,7 +945,10 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                         taken += appended;
                     }
 
-                    if (_hotSpans.Count >= HotFlushThreshold)
+                    // max(spanCount ≥ N, hotBytes ≥ budget): whichever the tier reaches first. The
+                    // count bounds what a span costs beyond its bytes; the bytes bound what a
+                    // span carrying a SQL statement or a stack would otherwise make of 50 000.
+                    if (_hotSpans.Count >= HotFlushThreshold || _hotBytes >= _hotTierBudgetBytes)
                         TryStartFlushLocked();
                     _insideWriteHoldForTest?.Invoke(taken);
                 }
@@ -951,6 +1090,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
 
         int offset = _hotSpans.Count;
         _hotSpans.Add(record);
+        _hotBytes += HotSpanBytes(item.AttributesBytes.Length);
 
         if (!_traceIdx.TryGetValue(item.TraceId, out var offsets))
         {
@@ -2122,6 +2262,8 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         _hotSpans = new List<SpanRecord>();
         _traceIdx.Clear();
         _hotSince = null;
+        _flushingBytes = _hotBytes;       // travels with the snapshot, back into the tier if it fails
+        _hotBytes      = 0;
         _flushInProgress = true;
         _flushingSpans   = snapshot;
         _unflushedGeneration++;           // the tier was swapped, not appended to: see AggregateKey
@@ -2182,6 +2324,9 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                                     onNamed:      path => _publishingSegmentPath = path,
                                     onTraceIndex: map  => traceIndex = map,
                                     version:      _segmentVersion);
+            // Weighed while the spans are still at hand, so the compaction planner prices this
+            // segment by what it holds rather than by its span count.
+            info = info.WithWeight(ReadBackBytesOf(CollectionsMarshal.AsSpan(snapshot)));
         }
         catch (Exception ex) { failure = ex; }
 
@@ -2272,6 +2417,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                     RestoreSnapshotLocked(snapshot);
                 }
                 _flushingSpans = null;            // the segment (or the restored tier) now carries them
+                _flushingBytes = 0;
                 _unflushedGeneration++;
             }
             finally { _lock.ExitWriteLock(); }
@@ -2353,6 +2499,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         combined.AddRange(snapshot);
         combined.AddRange(_hotSpans);
         _hotSpans = combined;
+        _hotBytes += _flushingBytes;      // the snapshot's bytes come back with its spans
         _unflushedGeneration++;
 
         _traceIdx.Clear();
@@ -3035,13 +3182,27 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// merge and a span is rewritten O(log) times instead of O(n).</para>
     ///
     /// Empty result = nothing worth compacting.
+    ///
+    /// <para><b>IN BYTES</b> (TS#3). A candidate weighs less than
+    /// <see cref="CompactionThresholdBytesFor"/> the pass budget, and a batch stops before its
+    /// weight would pass the budget. A segment's weight is <see cref="EstimatedSegmentBytes"/>:
+    /// measured when this process wrote it, else priced from its span count at the cap's own
+    /// per-span figure — so on a host whose budget IS the cap, this admits and pairs exactly the
+    /// segments the 60 000 / 120 000-span planner did. The size TIER stays in spans: it bounds
+    /// how often a span is rewritten, which is a matter of counts, not of memory.</para>
     /// </summary>
-    internal static List<SpanSegmentInfo> SelectCompactionBatch(SpanSegmentInfo[] segments)
+    /// <remarks>This overload plans against the cap — a host with room for it.</remarks>
+    internal static List<SpanSegmentInfo> SelectCompactionBatch(SpanSegmentInfo[] segments) =>
+        SelectCompactionBatch(segments, MemoryBudgets.TraceMergeCapBytes);
+
+    /// <inheritdoc cref="SelectCompactionBatch(SpanSegmentInfo[])"/>
+    internal static List<SpanSegmentInfo> SelectCompactionBatch(SpanSegmentInfo[] segments, long mergeBudgetBytes)
     {
         const long MaxSpanNanos = 24L * 3600 * 1_000_000_000; // 24 h
 
+        long thresholdBytes = CompactionThresholdBytesFor(mergeBudgetBytes);
         var candidates = segments
-            .Where(s => s.SpanCount < CompactionThreshold || s.FormatVersion < 3)
+            .Where(s => EstimatedSegmentBytes(s) < thresholdBytes || s.FormatVersion < 3)
             .OrderBy(s => s.MinStartNano)
             .ToList();
 
@@ -3060,7 +3221,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             // segment held — invisible while candidates were capped at 10 000 spans, and a quarter
             // of the budget once they can be 50 000. A batch that describes more than a pass may
             // hold is not a plan; it is a number the loader has to argue with.
-            long batchSpans = seed.SpanCount;
+            long batchBytes = EstimatedSegmentBytes(seed);
 
             for (int j = i + 1; j < candidates.Count && batch.Count < MaxSegmentsPerPass; j++)
             {
@@ -3077,9 +3238,10 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                 // selecting nothing at all.
                 if (s.MaxStartNano - windowStart > MaxSpanNanos) continue;
                 if (TierOf(s.SpanCount) != tier) continue;                // wrong magnitude
-                if (batchSpans + s.SpanCount > MaxSpansPerPass) break;    // past what a pass may hold
+                long weight = EstimatedSegmentBytes(s);
+                if (batchBytes + weight > mergeBudgetBytes) break;         // past what a pass may hold
                 batch.Add(s);
-                batchSpans += s.SpanCount;
+                batchBytes += weight;
             }
 
             if (batch.Count >= 2) return batch;
@@ -3112,17 +3274,26 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         // left the segments un-compacted — so they piled up and every pass failed worse.
         // Legacy-v2 files are selected regardless of size so old data migrates to the
         // v3 format (and shrinks) in the background.
-        var small = SelectCompactionBatch(_coldSegments);
+        var small = SelectCompactionBatch(_coldSegments, _mergeBudgetBytes);
         if (small.Count == 0) return false;
 
-        var allSpans  = new List<SpanRecord>();
-        var processed = new List<SpanSegmentInfo>(small.Count);
+        var  allSpans    = new List<SpanRecord>();
+        var  processed   = new List<SpanSegmentInfo>(small.Count);
+        long loadedBytes = 0;
         foreach (var seg in small)
         {
-            if (allSpans.Count >= MaxSpansPerPass) break;   // memory cap reached — stop taking more
+            // THE LOADER'S OWN GUARD, IN BYTES, AS WELL AS THE PLAN. The plan is exact for a
+            // segment this process wrote and weighed; one found on disk at startup is priced from
+            // its span count, and a segment of spans carrying SQL statements weighs ten times that
+            // estimate. So the pass stops taking segments once what it has ACTUALLY read reaches
+            // the budget — overshooting by at most the last segment, which the tier's own byte
+            // budget bounds for anything a flush wrote.
+            if (loadedBytes >= _mergeBudgetBytes) break;
             try
             {
+                int before = allSpans.Count;
                 allSpans.AddRange(SpanReader.ReadAll(seg.FilePath));
+                loadedBytes += ReadBackBytesOf(CollectionsMarshal.AsSpan(allSpans)[before..]);
                 processed.Add(seg);
             }
             catch (Exception ex) { _logger.LogWarning(ex, "Compaction: failed to read {File}", seg.FilePath); }
@@ -3140,7 +3311,8 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             Dictionary<TraceId, List<uint>>? mergedTraceIndex = null;
             var merged = SpanWriter.Write(_dataDir, allSpans, recoverable: false,
                                           onTraceIndex: map => mergedTraceIndex = map,
-                                          version: _segmentVersion);
+                                          version: _segmentVersion)
+                                   .WithWeight(loadedBytes);   // weighed as it was read
             _logger.LogInformation("Compacted {Count} small segments → {File} ({Spans} spans)",
                 processed.Count, Path.GetFileName(merged.FilePath), allSpans.Count);
 
@@ -4424,6 +4596,19 @@ public sealed class SpanSegmentInfo
     /// </summary>
     public ulong    SegmentId { get; init; }
 
+    /// <summary>
+    /// What this segment's spans weigh once a compaction pass has read them back, in bytes —
+    /// known for a segment THIS process wrote (the flush and the merge weigh what they wrote,
+    /// see <c>TraceStorageEngine.ReadBackSpanBytes</c>), 0 for one found on disk at startup.
+    ///
+    /// <para>0 is not "empty": the planner then estimates the weight from <see cref="SpanCount"/>
+    /// at the per-span figure the merge budget was calibrated on, which is exactly the arithmetic
+    /// the span-count planner did — so a restart plans the way the old engine did, and the loader's
+    /// own byte guard is what bounds a pass whose spans turn out heavier than that. Nothing on disk
+    /// records it; a format change for a planning hint was not worth its one-way door.</para>
+    /// </summary>
+    public long WeightBytes { get; init; }
+
     /// <summary>The same segment, named. Used where the id is learned after the file was read.</summary>
     public SpanSegmentInfo WithSegmentId(ulong id) => new()
     {
@@ -4436,5 +4621,21 @@ public sealed class SpanSegmentInfo
         HeaderRangeSuspect = HeaderRangeSuspect,
         LastWriteNano      = LastWriteNano,
         SegmentId          = id,
+        WeightBytes        = WeightBytes,
+    };
+
+    /// <summary>The same segment, weighed. Used where the writer has just told us what it wrote.</summary>
+    public SpanSegmentInfo WithWeight(long weightBytes) => new()
+    {
+        FilePath           = FilePath,
+        MinStartNano       = MinStartNano,
+        MaxStartNano       = MaxStartNano,
+        SpanCount          = SpanCount,
+        Services           = Services,
+        FormatVersion      = FormatVersion,
+        HeaderRangeSuspect = HeaderRangeSuspect,
+        LastWriteNano      = LastWriteNano,
+        SegmentId          = SegmentId,
+        WeightBytes        = weightBytes,
     };
 }

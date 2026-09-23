@@ -411,6 +411,71 @@ public sealed class TracesOptions
     /// backfill re-indexes, at whatever pace <see cref="IndexBackfill"/> allows.</para>
     /// </summary>
     public bool IndexEnabled { get; init; } = true;
+
+    // ── Memory ────────────────────────────────────────────────────────────────
+    //
+    // THE SPAN COUNTS THESE REPLACE were the same numbers on a 512 MB container and a 64 GB host:
+    // a 50 000-span hot tier, a 120 000-span compaction pass and a 65 536-slot ring, whatever a
+    // span weighed. An ordinary eight-attribute span is ~540 B in the tier; one carrying a SQL
+    // statement or a stack is 5-10 KB, so the same 50 000 was 27 MB or 500 MB. Every default
+    // below is min(what it has always been, a share of what this process may use), so a host with
+    // room for the caps behaves exactly as it did.
+
+    /// <summary>
+    /// Bytes the trace hot tier may hold before a flush is forced, counted as the tier's own
+    /// estimate of each span it takes in (<c>TraceStorageEngine.HotSpanBytes</c>: a fixed
+    /// per-span cost plus the attribute blob). Whichever comes first — this or the 50 000-span
+    /// cap — flushes. Unset: <see cref="MemoryBudgets.TraceHotTierBytes"/>, a share of the
+    /// managed-heap limit capped at the 27 MB that IS 50 000 ordinary spans, so a large host
+    /// flushes on the cadence it always did.
+    /// </summary>
+    public long? HotTierMaxBytes { get; init; }
+
+    /// <summary>
+    /// Bytes one compaction pass may materialise — the spans of every segment it merges, read
+    /// back. The planner admits segments against it, and the pass stops loading once it is
+    /// spent. A segment is a compaction candidate below half of it, so the largest two
+    /// candidates always fit one pass. Unset: <see cref="MemoryBudgets.TraceMergeBytes"/>, capped
+    /// at the 73 MB that is the 120 000 spans a pass always held.
+    /// </summary>
+    public long? MergeBudgetBytes { get; init; }
+
+    /// <summary>
+    /// Slots in the span ingest ring. Rounded up to a power of two and clamped to
+    /// [1 024, 4 194 304]. Unset: 65 536, what the ring has always had. This used to be
+    /// unreachable: the ring was registered with its parameterless constructor.
+    /// </summary>
+    public int? RingCapacity { get; init; }
+
+    /// <summary>The ring's slot count when nothing is configured.</summary>
+    public const int DefaultRingCapacity = 1 << 16;
+
+    private const int MinRingCapacity = 1 << 10;
+    private const int MaxRingCapacity = 1 << 22;
+
+    /// <inheritdoc cref="HotTierMaxBytes"/>
+    public long EffectiveHotTierMaxBytes => HotTierMaxBytesFor(MemoryBudgets.Current());
+
+    /// <summary>
+    /// The pure function behind <see cref="EffectiveHotTierMaxBytes"/>, so the arithmetic can be
+    /// checked at 384 MB and 64 GB without a machine of each — the shape
+    /// <see cref="MetricsOptions.HotTierBytesFor"/> already has.
+    /// </summary>
+    public long HotTierMaxBytesFor(in MemoryBudgets budgets) =>
+        HotTierMaxBytes is { } explicitBytes && explicitBytes > 0 ? explicitBytes : budgets.TraceHotTierBytes;
+
+    /// <inheritdoc cref="MergeBudgetBytes"/>
+    public long EffectiveMergeBudgetBytes => MergeBudgetBytesFor(MemoryBudgets.Current());
+
+    /// <inheritdoc cref="MergeBudgetBytes"/>
+    public long MergeBudgetBytesFor(in MemoryBudgets budgets) =>
+        MergeBudgetBytes is { } explicitBytes && explicitBytes > 0 ? explicitBytes : budgets.TraceMergeBytes;
+
+    /// <inheritdoc cref="RingCapacity"/>
+    public int EffectiveRingCapacity =>
+        (int)System.Numerics.BitOperations.RoundUpToPowerOf2(
+            (uint)Math.Clamp(RingCapacity is { } slots && slots > 0 ? slots : DefaultRingCapacity,
+                             MinRingCapacity, MaxRingCapacity));
 }
 
 /// <summary>

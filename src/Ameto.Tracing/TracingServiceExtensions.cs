@@ -63,7 +63,8 @@ public static class TracingServiceExtensions
                 Path.Combine(dataDirectory, "traces"),
                 sp.GetRequiredService<ILogger<TraceStorageEngine>>(),
                 writeSegmentFormatV4,
-                indexEnabled));
+                indexEnabled,
+                TracesOptionsFrom(sp)));
 
         // FIRST, SO IT STOPS LAST. Hosted services are stopped in reverse registration order, so
         // this one's StopAsync — the engine's teardown — runs after the drainer has handed over
@@ -76,7 +77,9 @@ public static class TracingServiceExtensions
         // into a half-torn engine.
         services.AddHostedService<TraceStorageHostedService>();
 
-        services.AddSingleton<SpanRingBuffer>();
+        // THE CAPACITY FROM CONFIG. This was AddSingleton<SpanRingBuffer>() — the parameterless
+        // constructor — so Traces:RingCapacity could not have reached the ring even had it existed.
+        services.AddSingleton(static sp => new SpanRingBuffer(TracesOptionsFrom(sp).EffectiveRingCapacity));
         services.AddSingleton<SpanIngestionEndpoint>();
         services.AddSingleton<ISpanIngester>(sp => sp.GetRequiredService<SpanIngestionEndpoint>());
         services.AddSingleton<ITraceProvider>(sp => sp.GetRequiredService<TraceStorageEngine>());
@@ -92,6 +95,15 @@ public static class TracingServiceExtensions
 
         return services;
     }
+
+    /// <summary>
+    /// The <c>Ameto:Traces</c> section, from the <see cref="ServerOptions"/> the host registers —
+    /// read here rather than passed in, so the memory knobs reach the engine and the ring without
+    /// widening <see cref="AddAmetoTracing"/>'s signature. A container without one (a test that
+    /// registers tracing alone) gets the defaults, which are <see cref="MemoryBudgets"/>' shares.
+    /// </summary>
+    internal static TracesOptions TracesOptionsFrom(IServiceProvider sp) =>
+        sp.GetService<ServerOptions>()?.Traces ?? new TracesOptions();
 }
 
 /// <summary>

@@ -36,6 +36,9 @@ internal sealed class SpanRingBuffer : IDisposable
     public Task WaitForItemsAsync(int timeoutMs, CancellationToken ct) =>
         _signal.WaitAsync(timeoutMs, ct);
 
+    /// <summary>Slots — <c>Traces:RingCapacity</c>, rounded up to a power of two.</summary>
+    public int Capacity => _slots.Length;
+
     /// <summary>Returns a value in [0, 1] representing how full the buffer is.</summary>
     public double FillFraction
     {
