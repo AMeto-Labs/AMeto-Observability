@@ -203,12 +203,12 @@ public sealed class TraceFlushProbe : IDisposable
         // THE DELETED CODE, VERBATIM, as the reference: this is SpanWriter.Write's first three
         // lines at cb5780e. Measured while it runs, because what it costs IS the item.
         GC.Collect(2, GCCollectionMode.Forced, blocking: true);
-        long loh0 = GC.GetGCMemoryInfo().GenerationInfo[^1].SizeAfterBytes;
+        long loh0 = LohAfterLastFullGc();
         long a0   = GC.GetAllocatedBytesForCurrentThread();
         var ordered = new List<SpanRecord>(corpus);
         ordered.Sort(static (a, b) => a.StartTimeUnixNano.CompareTo(b.StartTimeUnixNano));
         long copyAlloc = GC.GetAllocatedBytesForCurrentThread() - a0;
-        long copyLoh   = GC.GetGCMemoryInfo().GenerationInfo[^1].SizeAfterBytes - loh0;
+        long copyLoh   = LohAllocatedSince(loh0);
 
         _out.WriteLine($"the copy TS#7(a) removed: {copyAlloc:N0} B allocated, "
                      + $"{copyLoh:N0} B of it LOH, for {Large:N0} spans "
@@ -434,7 +434,8 @@ public sealed class TraceFlushProbe : IDisposable
     ///
     /// <para>ALLOCATION IS PER-THREAD (<c>GC.GetAllocatedBytesForCurrentThread</c>): the flush is
     /// synchronous here, so every byte of it is billed to this thread and xUnit's output drain on
-    /// another one cannot get into the figure. The LOH delta is process-wide — there is no
+    /// another one cannot get into the figure. The LOH figure is what the window put on the
+    /// large-object heap (see <see cref="LohAllocatedSince"/>) and is process-wide — there is no
     /// per-thread equivalent — so it admits whatever else the runtime does in the window; it is
     /// printed as a trend, never asserted.</para>
     /// </summary>
@@ -491,14 +492,51 @@ public sealed class TraceFlushProbe : IDisposable
         GC.WaitForPendingFinalizers();
         GC.Collect(2, GCCollectionMode.Forced, blocking: true);
 
-        long loh0 = GC.GetGCMemoryInfo().GenerationInfo[^1].SizeAfterBytes;
+        long loh0 = LohAfterLastFullGc();
         long a0   = GC.GetAllocatedBytesForCurrentThread();
         var  sw   = Stopwatch.StartNew();
         flush(dir, corpus);
         sw.Stop();
         long allocated = GC.GetAllocatedBytesForCurrentThread() - a0;
-        long loh       = GC.GetGCMemoryInfo().GenerationInfo[^1].SizeAfterBytes - loh0;
+        long loh       = LohAllocatedSince(loh0);
         return new Sample(sw.Elapsed.TotalMicroseconds, allocated, loh);
+    }
+
+    // ── LOH, measured as allocated rather than as left over ─────────────────────
+    //
+    // ALL THREE PARTS OF THE OLD FIGURE WERE WRONG, and it read 0,00 MB for every flush —
+    // including the 400 KB array TS#7(a) removed, which is as plainly LOH as an allocation gets.
+    // It read `GenerationInfo[^1]`, and GenerationInfo is gen0, gen1, gen2, LOH, POH: the LAST
+    // entry is the pinned-object heap. It read `SizeAfterBytes` of whatever GC had last run — the
+    // one BEFORE the window, since nothing inside it collected — so the delta was a GC's figure
+    // subtracted from itself. And a generation's SIZE includes its fragmentation, so an array
+    // placed in a free gap the previous collection left moves nothing: the first repair (the right
+    // index, a GC after the window) still read 0 B for that same array whenever the test ran after
+    // another one, and 400 KB when it ran alone.
+    //
+    // What is counted instead is OBJECT bytes — size minus fragmentation. The LOH is only ever
+    // collected by a gen2 GC, so between two of them nothing leaves it; a forced full collection
+    // AFTER the window sees, at entry, the objects the previous full collection left plus every
+    // object allocated there since — which is the window, because the probes run serially (the
+    // assembly disables test parallelisation) and force a full collection immediately before it.
+    // Still process-wide, so still printed and never asserted.
+
+    /// <summary>Index of the large-object heap in <see cref="GCMemoryInfo.GenerationInfo"/>.</summary>
+    private const int LohIndex = 3;
+
+    /// <summary>Object bytes on the LOH as the last full blocking collection left it.</summary>
+    private static long LohAfterLastFullGc()
+    {
+        var loh = GC.GetGCMemoryInfo(GCKind.FullBlocking).GenerationInfo[LohIndex];
+        return loh.SizeAfterBytes - loh.FragmentationAfterBytes;
+    }
+
+    /// <summary>Object bytes put on the LOH since <paramref name="lohObjectsAfterLastFullGc"/> was read.</summary>
+    private static long LohAllocatedSince(long lohObjectsAfterLastFullGc)
+    {
+        GC.Collect(2, GCCollectionMode.Forced, blocking: true);
+        var loh = GC.GetGCMemoryInfo(GCKind.FullBlocking).GenerationInfo[LohIndex];
+        return loh.SizeBeforeBytes - loh.FragmentationBeforeBytes - lohObjectsAfterLastFullGc;
     }
 
     private void Print(string label, in Sample s) =>
