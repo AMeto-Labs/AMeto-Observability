@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Collections.Concurrent;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using K4os.Compression.LZ4;
 using MessagePack;
 using Microsoft.Extensions.Logging;
@@ -2507,9 +2508,43 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     /// The rollup's transform of one series' gathered points: ordered by timestamp, then
     /// <see cref="Downsample"/>d into <paramref name="bucketSize"/> buckets. What reaches the
     /// <c>.mts</c> files a rollup writes — <c>MetricDownsampleGoldenTests</c> pins it.
+    ///
+    /// <para>The order is a STABLE sort by timestamp, as <c>OrderBy</c> was: equal timestamps keep
+    /// the order the sources were read in, which decides the last bit of a gauge's average and
+    /// which of two equal counter points a bucket keeps. The gathered list is already in order
+    /// whenever the series lives in one source file (the common case — the writer emits sorted
+    /// points), and then nothing is copied at all; otherwise a copy is sorted and the caller's list
+    /// is left as it was, as the LINQ chain left it.</para>
     /// </summary>
     internal static List<MetricDataPoint> RollupPoints(List<MetricDataPoint> pts, TimeSpan bucketSize, MetricKind kind) =>
-        Downsample(pts.OrderBy(p => p.TimestampUnixNano).ToList(), bucketSize, kind).ToList();
+        Downsample(IsSortedByTimestamp(CollectionsMarshal.AsSpan(pts)) ? pts : StableSortedByTimestamp(pts), bucketSize, kind);
+
+    private static bool IsSortedByTimestamp(ReadOnlySpan<MetricDataPoint> pts)
+    {
+        for (int i = 1; i < pts.Length; i++)
+            if (pts[i].TimestampUnixNano < pts[i - 1].TimestampUnixNano) return false;
+        return true;
+    }
+
+    /// <summary>
+    /// A copy of <paramref name="pts"/> ordered by timestamp, ties in input order — the order
+    /// <c>OrderBy</c> gives. (timestamp, input index) pairs are unique, so an unstable sort of
+    /// them IS the stable order; the pair array is rented.
+    /// </summary>
+    private static List<MetricDataPoint> StableSortedByTimestamp(List<MetricDataPoint> pts)
+    {
+        var src  = CollectionsMarshal.AsSpan(pts);
+        var keys = ArrayPool<(long Ts, int Index)>.Shared.Rent(src.Length);
+        try
+        {
+            for (int i = 0; i < src.Length; i++) keys[i] = (src[i].TimestampUnixNano, i);
+            Array.Sort(keys, 0, src.Length);
+            var sorted = new List<MetricDataPoint>(src.Length);
+            for (int i = 0; i < src.Length; i++) sorted.Add(src[keys[i].Index]);
+            return sorted;
+        }
+        finally { ArrayPool<(long, int)>.Shared.Return(keys); }
+    }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -2548,41 +2583,147 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     ///   later rate/quantile computation. Averaging would corrupt them.</item>
     ///   <item>Gauge: average within the bucket.</item>
     /// </list>
+    ///
+    /// <para><b>One forward pass, and the answer the LINQ chain gave, to the bit.</b> It was
+    /// <c>GroupBy</c> + <c>Select</c> + an inner <c>OrderBy</c> + <c>Last</c> / <c>Average</c> /
+    /// <c>Sum</c> + <c>OrderBy</c> + <c>ToList</c> — five iterators, a grouping per bucket and a
+    /// list per series, on every stepped query and every rollup. What each link decided, and what
+    /// stands in for it here (<c>MetricDownsampleGoldenTests</c> pins every line):</para>
+    /// <list type="bullet">
+    /// <item>the key is <c>ts / b * b</c>, truncating toward zero, and a step under a millisecond
+    /// divides by zero on the first point (never on empty input) — the same expression;</item>
+    /// <item>counter / histogram keep the greatest timestamp, the LATER of equal greatest ones
+    /// (<c>OrderBy</c> is stable, then <c>Last</c>) — a <c>&gt;=</c> in input order;</item>
+    /// <item><c>Average</c> seeds its sum with the first value and adds the rest in input order,
+    /// <c>Sum</c> seeds with +0.0 (a lone -0.0 averages to -0.0 and sums to +0.0), and the long sum
+    /// is <c>checked</c> — the same seeds, the same order, the same <c>checked</c>;</item>
+    /// <item>buckets come out in key order — which a sorted input (every caller's: the hot tier,
+    /// the files, the rollup's sort) already is, so the pass emits them as it closes them. Input
+    /// whose keys go backwards takes <see cref="DownsampleUnsorted"/>, which groups by a stable
+    /// sort on the key so each bucket still sees its points in input order.</item>
+    /// </list>
     /// </summary>
-    internal static IReadOnlyList<MetricDataPoint> Downsample(
+    internal static List<MetricDataPoint> Downsample(
         IReadOnlyList<MetricDataPoint> points,
         TimeSpan step,
         MetricKind kind)
     {
         long bucketNanos = (long)step.TotalMilliseconds * 1_000_000L;
-        bool takeLast = kind is MetricKind.Counter or MetricKind.Histogram;
+        bool takeLast    = kind is MetricKind.Counter or MetricKind.Histogram;
+        if (points.Count == 0) return [];
 
-        return points
-            .GroupBy(p => p.TimestampUnixNano / bucketNanos * bucketNanos)
-            .Select(g =>
+        MetricDataPoint[]? rented = null;
+        ReadOnlySpan<MetricDataPoint> all;
+        if (points is List<MetricDataPoint> list) all = CollectionsMarshal.AsSpan(list);
+        else if (points is MetricDataPoint[] array) all = array;
+        else
+        {
+            rented = ArrayPool<MetricDataPoint>.Shared.Rent(points.Count);
+            for (int i = 0; i < points.Count; i++) rented[i] = points[i];
+            all = rented.AsSpan(0, points.Count);
+        }
+
+        try
+        {
+            // Sized to the buckets the span can hold, when the ends say so; never above the point
+            // count, which is the most buckets there can be.
+            long firstKey = all[0].TimestampUnixNano / bucketNanos * bucketNanos;
+            long lastKey  = all[^1].TimestampUnixNano / bucketNanos * bucketNanos;
+            int  capacity = all.Length;
+            if (bucketNanos > 0 && lastKey >= firstKey && (lastKey - firstKey) / bucketNanos < all.Length)
+                capacity = (int)((lastKey - firstKey) / bucketNanos) + 1;
+
+            var result = new List<MetricDataPoint>(Math.Min(capacity, all.Length));
+            int start = 0;
+            long key  = firstKey;
+            for (int i = 1; i <= all.Length; i++)
             {
-                if (takeLast)
-                {
-                    var last = g.OrderBy(p => p.TimestampUnixNano).Last();
-                    return new MetricDataPoint
-                    {
-                        TimestampUnixNano = g.Key,
-                        Value             = last.Value,
-                        Count             = last.Count,
-                        Sum               = last.Sum,
-                        BucketCounts      = last.BucketCounts,
-                    };
-                }
-                return new MetricDataPoint
-                {
-                    TimestampUnixNano = g.Key,
-                    Value             = g.Average(p => p.Value),
-                    Count             = g.Sum(p => p.Count),
-                    Sum               = g.Sum(p => p.Sum),
-                };
-            })
-            .OrderBy(p => p.TimestampUnixNano)
-            .ToList();
+                long next = i < all.Length ? all[i].TimestampUnixNano / bucketNanos * bucketNanos : 0;
+                if (i < all.Length && next == key) continue;
+                if (i < all.Length && next < key) return DownsampleUnsorted(all, bucketNanos, takeLast);
+
+                result.Add(Reduce(all[start..i], key, takeLast));
+                start = i;
+                key   = next;
+            }
+            return result;
+        }
+        finally
+        {
+            if (rented is not null) ArrayPool<MetricDataPoint>.Shared.Return(rented, clearArray: true);
+        }
+    }
+
+    /// <summary>One bucket's points, in input order, reduced by the kind's rule. See <see cref="Downsample"/>.</summary>
+    private static MetricDataPoint Reduce(ReadOnlySpan<MetricDataPoint> bucket, long key, bool takeLast)
+    {
+        if (takeLast)
+        {
+            int best = 0;
+            for (int i = 1; i < bucket.Length; i++)
+                if (bucket[i].TimestampUnixNano >= bucket[best].TimestampUnixNano) best = i;
+            ref readonly var last = ref bucket[best];
+            return new MetricDataPoint
+            {
+                TimestampUnixNano = key,
+                Value             = last.Value,
+                Count             = last.Count,
+                Sum               = last.Sum,
+                BucketCounts      = last.BucketCounts,
+            };
+        }
+
+        double value = bucket[0].Value;           // Average's seed: the first element
+        long   count = 0;                         // Sum's seed: zero
+        double sum   = 0.0;
+        for (int i = 0; i < bucket.Length; i++)
+        {
+            if (i > 0) value += bucket[i].Value;
+            count = checked(count + bucket[i].Count);
+            sum  += bucket[i].Sum;
+        }
+        return new MetricDataPoint
+        {
+            TimestampUnixNano = key,
+            Value             = value / bucket.Length,
+            Count             = count,
+            Sum               = sum,
+        };
+    }
+
+    /// <summary>
+    /// The general case of <see cref="Downsample"/>, for input whose bucket keys go backwards —
+    /// which no caller in this engine produces, and which must still answer what <c>GroupBy</c>
+    /// answered: buckets in key order, each reducing its points in INPUT order. A stable sort on
+    /// (key, input index) gives exactly that grouping. The pair array is rented.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static List<MetricDataPoint> DownsampleUnsorted(ReadOnlySpan<MetricDataPoint> all, long bucketNanos, bool takeLast)
+    {
+        var order  = ArrayPool<(long Key, int Index)>.Shared.Rent(all.Length);
+        var bucket = ArrayPool<MetricDataPoint>.Shared.Rent(all.Length);
+        try
+        {
+            for (int i = 0; i < all.Length; i++) order[i] = (all[i].TimestampUnixNano / bucketNanos * bucketNanos, i);
+            Array.Sort(order, 0, all.Length);
+
+            var result = new List<MetricDataPoint>(all.Length);
+            int start  = 0;
+            for (int i = 1; i <= all.Length; i++)
+            {
+                if (i < all.Length && order[i].Key == order[start].Key) continue;
+                int n = i - start;
+                for (int j = 0; j < n; j++) bucket[j] = all[order[start + j].Index];
+                result.Add(Reduce(bucket.AsSpan(0, n), order[start].Key, takeLast));
+                start = i;
+            }
+            return result;
+        }
+        finally
+        {
+            ArrayPool<(long, int)>.Shared.Return(order);
+            ArrayPool<MetricDataPoint>.Shared.Return(bucket, clearArray: true);
+        }
     }
 
     private void LoadColdSegments()
