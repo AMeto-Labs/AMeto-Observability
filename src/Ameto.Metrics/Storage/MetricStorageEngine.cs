@@ -2449,7 +2449,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     }
 
     /// <summary>Sorts by timestamp and drops duplicate-timestamp points (last wins).</summary>
-    private static List<MetricDataPoint> DedupeByTimestamp(List<MetricDataPoint> pts)
+    internal static List<MetricDataPoint> DedupeByTimestamp(List<MetricDataPoint> pts)
     {
         pts.Sort(static (a, b) => a.TimestampUnixNano.CompareTo(b.TimestampUnixNano));
         var result = new List<MetricDataPoint>(pts.Count);
@@ -2479,8 +2479,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                 // hundreds of MB while it is rewritten.
                 var newInfos = RewriteMetricInChunks(
                     group.ToList(), targetGranularity,
-                    (pts, kind) => Downsample(
-                        pts.OrderBy(p => p.TimestampUnixNano).ToList(), bucketSize, kind).ToList());
+                    (pts, kind) => RollupPoints(pts, bucketSize, kind));
 
                 if (!TryEnterColdWrite()) return;      // closed mid-pass: leave both sets on disk
                 try
@@ -2503,6 +2502,14 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
             }
         }
     }
+
+    /// <summary>
+    /// The rollup's transform of one series' gathered points: ordered by timestamp, then
+    /// <see cref="Downsample"/>d into <paramref name="bucketSize"/> buckets. What reaches the
+    /// <c>.mts</c> files a rollup writes — <c>MetricDownsampleGoldenTests</c> pins it.
+    /// </summary>
+    internal static List<MetricDataPoint> RollupPoints(List<MetricDataPoint> pts, TimeSpan bucketSize, MetricKind kind) =>
+        Downsample(pts.OrderBy(p => p.TimestampUnixNano).ToList(), bucketSize, kind).ToList();
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -2542,7 +2549,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     ///   <item>Gauge: average within the bucket.</item>
     /// </list>
     /// </summary>
-    private static IReadOnlyList<MetricDataPoint> Downsample(
+    internal static IReadOnlyList<MetricDataPoint> Downsample(
         IReadOnlyList<MetricDataPoint> points,
         TimeSpan step,
         MetricKind kind)
