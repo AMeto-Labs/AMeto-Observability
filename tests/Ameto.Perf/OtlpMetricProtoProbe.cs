@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using Ameto.Metrics;
 using Ameto.Otel;
 using Xunit;
 using Xunit.Abstractions;
@@ -25,10 +26,18 @@ public sealed class OtlpMetricProtoProbe
         byte[] payload = OtlpProtoPayloads.Metrics_Realistic();
         int points = OtlpProtoPayloads.Metrics * OtlpProtoPayloads.PointsEach;
 
+        // Both paths through ONE private interner of the production size — the parser's
+        // parameterless overloads are exactly these calls with MetricLabelInterner.Shared, which
+        // never evicts. Measured through Shared, the guard below read how full the REST of this
+        // assembly had made it: a full pool hands every label out as a fresh string, and the
+        // span parser lands at ~875 B/point, 7.4x under the DOM path, with nothing wrong in it.
+        var interner = new MetricLabelInterner(MetricLabelInterner.DefaultMaxStrings,
+                                               MetricLabelInterner.DefaultLabelSetSlots);
+
         for (int i = 0; i < 20; i++)                                  // warm JIT + pools
         {
-            OtlpMetricMapper.Map(OtlpProtoDecoder.DecodeMetrics(payload, payload.Length));
-            OtlpMetricProtoParser.Parse(payload);
+            OtlpMetricMapper.Map(OtlpProtoDecoder.DecodeMetrics(payload, payload.Length), interner);
+            OtlpMetricProtoParser.Parse(payload, interner);
         }
 
         const int iters = 200;
@@ -37,8 +46,8 @@ public sealed class OtlpMetricProtoProbe
         // of a noisy run measures the neighbours. Allocation is deterministic and takes the
         // minimum too, which is the steady state once every string has been interned.
         var (domMs, domBytes) = Best(iters, () =>
-            OtlpMetricMapper.Map(OtlpProtoDecoder.DecodeMetrics(payload, payload.Length)));
-        var (spanMs, spanBytes) = Best(iters, () => OtlpMetricProtoParser.Parse(payload));
+            OtlpMetricMapper.Map(OtlpProtoDecoder.DecodeMetrics(payload, payload.Length), interner));
+        var (spanMs, spanBytes) = Best(iters, () => OtlpMetricProtoParser.Parse(payload, interner));
 
         double domNs   = domMs  * 1_000_000.0 / points;
         double spanNs  = spanMs * 1_000_000.0 / points;

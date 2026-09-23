@@ -296,17 +296,27 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// <summary>Bytes of point data currently held. Diagnostics and tests only.</summary>
     public long WrittenBytes { get { lock (_writeLock) return _writeOffset; } }
 
-    private MetricWriteAheadLog(string filePath, ILogger? logger)
+    /// <summary>
+    /// What the pool's strings and label sets are replayed through: <see cref="MetricLabelInterner.Shared"/>,
+    /// the instance the OTLP parsers use, unless <see cref="Open"/> was handed another — which
+    /// only a test does, so that what it checks about the replay does not hang on how full the
+    /// rest of its process has made the shared one.
+    /// </summary>
+    internal MetricLabelInterner Interner { get; }
+
+    private MetricWriteAheadLog(string filePath, ILogger? logger, MetricLabelInterner? interner)
     {
         _filePath = filePath;
         _poolPath = filePath + ".pool";
         _logger   = logger;
+        Interner  = interner ?? MetricLabelInterner.Shared;
     }
 
     public static MetricWriteAheadLog Open(string filePath, long initialCapacity = DefaultCapacity,
-                                           ILogger? logger = null, Action<long>? beforeResize = null)
+                                           ILogger? logger = null, Action<long>? beforeResize = null,
+                                           MetricLabelInterner? interner = null)
     {
-        var wal = new MetricWriteAheadLog(filePath, logger);
+        var wal = new MetricWriteAheadLog(filePath, logger, interner);
         // Armed before OpenOrCreate, or the open-time shrink would be the one resize the seam
         // cannot reach — and its double-failure path is exactly what needs the coverage.
         wal.BeforeResize = beforeResize;
@@ -1301,7 +1311,7 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
                 // very strings — and, when they are all pooled, the very label set — that the
                 // live path builds for it: its SeriesKey then matches the next live point by
                 // reference, and the process does not keep a second copy of every label.
-                var interner = MetricLabelInterner.Shared;
+                var interner = Interner;
                 var r = new SpanCursor(body);
                 var kind = (MetricKind)r.ReadByte();
                 string name = r.ReadString(interner, out _);
@@ -1351,8 +1361,17 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// </summary>
     private readonly Lock _resizeLock = new();
 
-    /// <summary>1 while a pre-grow is claimed or running. See <see cref="WantsPreGrowLocked"/>.</summary>
+    /// <summary>
+    /// <see cref="PreGrowNone"/>, <see cref="PreGrowClaimed"/> (an append crossed the mark, under
+    /// <c>_writeLock</c>) or <see cref="PreGrowRunning"/> (one caller took the claim in
+    /// <see cref="PreGrowIfClaimed"/> and is running it). Only that caller clears it, and no new
+    /// claim is made until it has. See <see cref="WantsPreGrowLocked"/>.
+    /// </summary>
     private int _preGrowQueued;
+
+    private const int PreGrowNone    = 0;
+    private const int PreGrowClaimed = 1;
+    private const int PreGrowRunning = 2;
 
     /// <summary>
     /// The capacity a pre-grow last FAILED at, so a full disk is tried once per
@@ -1366,6 +1385,13 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// use — the window in which other appends must keep going. Null in production.
     /// </summary>
     internal Action? OnGrowMappedForTest;
+
+    /// <summary>
+    /// Test seam fired on the calling thread as it enters the pre-grow, before
+    /// <c>_resizeLock</c> — i.e. by the one call that owns a claimed growth, and by nobody else.
+    /// Null in production.
+    /// </summary>
+    internal Action? OnPreGrowForTest;
 
     /// <summary>
     /// Grows the mapped capacity to at least <paramref name="needed"/> bytes of data. <b>Caller
@@ -1448,11 +1474,12 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
 
     /// <summary>
     /// A quarter of the log left: CLAIM a growth, to be run while there is still room for the
-    /// appends that arrive meanwhile — so under steady ingest only the one call that crossed the
-    /// mark pays for a growth, after its own batch is down, and every other thread keeps
-    /// appending into the quarter that is left. Caller holds <c>_writeLock</c>. The claim is run
-    /// by <see cref="PreGrowIfClaimed"/>, which the public appends call on their way out and the
-    /// engine calls once it has left its snapshot read lock.
+    /// appends that arrive meanwhile — so under steady ingest ONE call pays for a growth, after
+    /// its own batch is down, and every other thread keeps appending into the quarter that is
+    /// left. Caller holds <c>_writeLock</c>. The claim is taken and run by
+    /// <see cref="PreGrowIfClaimed"/>, which the public appends call on their way out and the
+    /// engine calls once it has left its snapshot read lock; see there for why "one" needed the
+    /// claim to be taken rather than just read.
     ///
     /// <para>On the caller's thread and outside every lock, deliberately. On the thread pool it
     /// was background work racing the log's disposal and competing with the engine's own
@@ -1468,24 +1495,37 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     private void WantsPreGrowLocked()
     {
         long cap = _capacity;
-        if (cap - _writeOffset >= cap / 4 || cap == _preGrowFailedAt || _preGrowQueued != 0) return;
-        _preGrowQueued = 1;
+        if (cap - _writeOffset >= cap / 4 || cap == _preGrowFailedAt || _preGrowQueued != PreGrowNone) return;
+        _preGrowQueued = PreGrowClaimed;
     }
 
     /// <summary>
-    /// Runs a growth an append claimed (<see cref="WantsPreGrowLocked"/>), if there is one. Call
-    /// holding NO lock of your own. A failure is logged, once per capacity, and never thrown: the
-    /// appends that claimed it are already down.
+    /// Runs a growth an append claimed (<see cref="WantsPreGrowLocked"/>), if there is one and
+    /// nobody has taken it yet. Call holding NO lock of your own. A failure is logged, once per
+    /// capacity, and never thrown: the appends that claimed it are already down.
+    ///
+    /// <para><b>Taken, not merely seen.</b> This read "a growth is wanted" and went to run it, so
+    /// while one call was inside the growth — holding <c>_resizeLock</c> for the length of a file
+    /// extension — every other append on its way out read the same flag, entered the pre-grow
+    /// and queued on that lock, only to find the room already made. The call that crossed the
+    /// mark was meant to be the only one that paid; every call that finished during the growth
+    /// paid too. Now the claim moves 1 → 2 by compare-exchange and only the call that moved it
+    /// runs the growth and clears it; the rest read 2, or lose the exchange, and walk past.
+    /// Which call wins is whichever gets here first after the claim — normally the claimant
+    /// itself, and exactly one either way.</para>
     /// </summary>
     public void PreGrowIfClaimed()
     {
-        if (Volatile.Read(ref _preGrowQueued) != 0) PreGrow();
+        if (Volatile.Read(ref _preGrowQueued) == PreGrowClaimed
+            && Interlocked.CompareExchange(ref _preGrowQueued, PreGrowRunning, PreGrowClaimed) == PreGrowClaimed)
+            PreGrow();
     }
 
     private void PreGrow()
     {
         try
         {
+            OnPreGrowForTest?.Invoke();
             lock (_resizeLock)
             {
                 long needed;
@@ -1506,7 +1546,7 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
                 }
             }
         }
-        finally { Volatile.Write(ref _preGrowQueued, 0); }
+        finally { Volatile.Write(ref _preGrowQueued, PreGrowNone); }   // the owner's to clear, and only the owner runs this
     }
 
     /// <summary>

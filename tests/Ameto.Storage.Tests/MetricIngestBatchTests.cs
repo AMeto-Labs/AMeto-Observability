@@ -312,4 +312,80 @@ public sealed class MetricIngestBatchTests : IAsyncLifetime
             Assert.Same(canonical[series[1] - '0'], ex.Labels);
         }
     }
+
+    /// <summary>
+    /// THE CROSSING SCHEDULES ITS FLUSH BEFORE IT PAYS FOR ANYTHING ELSE. A batch that takes the
+    /// tier over its threshold AND the log past its 3/4 mark owes three things on its way out of
+    /// <c>Ingest</c>: the threshold flush, the log's pre-grow (a file extension) and the exemplar
+    /// pass. The flush is the one another thread runs, so it is scheduled first and the other two
+    /// follow on this thread. Judged at the engine's own scheduling seam, on the ingest thread: at
+    /// that instant this thread has not grown the log and no exemplar pass has run. The flush is
+    /// parked at its snapshot so its commit cannot empty the log under the pre-grow; afterwards
+    /// both have still happened, in this same call. Revert to checking the threshold last and the
+    /// seam sees one growth and one exemplar pass already paid.
+    /// </summary>
+    [Fact]
+    public async Task A_crossing_schedules_its_flush_before_the_growth_and_exemplars_it_also_owes()
+    {
+        string dir = Path.Combine(_dir, "crossing-order");
+        var engine = NewEngine(dir, new MetricsOptions
+        {
+            HotTierBytes    = 100_000,        // 1 563 scalar points at 64 B
+            MinFlushBytes   = 100_000,
+            WalInitialBytes = 128 * 1024,     // 2 730 entries of 48 B; the 3/4 mark at 2 048
+        });
+
+        int me = Environment.CurrentManagedThreadId;
+        int grownHere = 0;                                     // this thread's growths only
+        engine.WalForTest.OnGrowMappedForTest = () =>
+        {
+            if (Environment.CurrentManagedThreadId == me) grownHere++;
+        };
+
+        using var releaseFlush = new ManualResetEventSlim();
+        engine.OnSnapshotTakenForTest = () => releaseFlush.Wait();
+
+        Task? scheduled = null;
+        int  grownAtSchedule           = -1;
+        long exemplarPassesAtSchedule  = -1;
+        engine.OnThresholdFlushScheduledForTest = t =>
+        {
+            scheduled                = t;
+            grownAtSchedule          = grownHere;
+            exemplarPassesAtSchedule = engine.ExemplarPasses;
+        };
+
+        // 2 100 points: 100 800 B of log (past the 98 304 mark, inside 131 072) and 134 400 B of
+        // tier (past 100 000) — one call crosses both. The first carries an exemplar.
+        long now   = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+        var  batch = new MetricIngestItem[2_100];
+        for (int i = 0; i < batch.Length; i++)
+            batch[i] = Scalar("crossing.metric", now - batch.Length + i, i, Labels(("s", (i & 7).ToString())));
+        batch[0] = new MetricIngestItem
+        {
+            Name              = batch[0].Name,
+            Kind              = batch[0].Kind,
+            Unit              = batch[0].Unit,
+            Labels            = batch[0].Labels,
+            TimestampUnixNano = batch[0].TimestampUnixNano,
+            ScalarValue       = batch[0].ScalarValue,
+            Exemplars         = [new MetricExemplar { TimestampUnixNano = batch[0].TimestampUnixNano, Value = 1 }],
+        };
+
+        try
+        {
+            engine.Ingest(batch);
+
+            Assert.NotNull(scheduled);
+            Assert.True(grownAtSchedule == 0 && exemplarPassesAtSchedule == 0,
+                $"the crossing scheduled its flush only after paying for {grownAtSchedule} growth(s) and "
+              + $"{exemplarPassesAtSchedule} exemplar pass(es)");
+            Assert.Equal(1, grownHere);                        // both still paid, in this call
+            Assert.Equal(1, engine.ExemplarPasses);
+        }
+        finally { releaseFlush.Set(); }
+
+        await scheduled!;
+        Assert.Equal(0, engine.HotPointCount);
+    }
 }

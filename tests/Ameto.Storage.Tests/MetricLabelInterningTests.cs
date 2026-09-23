@@ -153,14 +153,28 @@ public sealed class MetricLabelInterningTests : IDisposable
         Assert.Equal(Build(("value-0", "value-9")), set);
     }
 
+    /// <summary>
+    /// The log replays through the interner the live path interns into, and a replayed series
+    /// holds that interner's own instances — strings and, all of them pooled, the label set.
+    ///
+    /// <para>In two halves, so that neither hangs on how full the REST of the assembly has made
+    /// <see cref="MetricLabelInterner.Shared"/>: it never evicts, and once full it hands the replay
+    /// fresh strings, and a single "replayed name is Shared's instance" assert then failed for a
+    /// reason outside this fact. The wiring is pinned by reference (the log's default interner IS
+    /// the parsers' <c>Shared</c>); the replay through a private interner of the production size.</para>
+    /// </summary>
     [Fact]
     public void A_replayed_series_holds_the_strings_the_live_path_interns()
     {
         string walPath = Path.Combine(_dir, "metrics.wal");
+        var interner   = new MetricLabelInterner(MetricLabelInterner.DefaultMaxStrings,
+                                                 MetricLabelInterner.DefaultLabelSetSlots);
 
         // Appended from private copies, so nothing about the WRITE side made them canonical.
         using (var wal = MetricWriteAheadLog.Open(walPath, 1L * 1024 * 1024))
         {
+            Assert.Same(MetricLabelInterner.Shared, wal.Interner);   // what production replays through
+
             wal.Append(new MetricIngestItem
             {
                 Name              = Fresh("replayed.metric"),
@@ -172,14 +186,16 @@ public sealed class MetricLabelInterningTests : IDisposable
             }, new MetricDataPoint { TimestampUnixNano = 1_785_300_000_000_000_000L, Value = 1 });
         }
 
-        using var reopened = MetricWriteAheadLog.Open(walPath, 1L * 1024 * 1024);
+        using var reopened = MetricWriteAheadLog.Open(walPath, 1L * 1024 * 1024, interner: interner);
         var points = reopened.ReadAll(out int unresolved);
         Assert.Equal(0, unresolved);
         var p = Assert.Single(points);
 
-        var shared = MetricLabelInterner.Shared;
-        Assert.Same(shared.Intern("replayed.metric"), p.Name);
-        Assert.Same(shared.Intern("replay.key"),      p.Labels.KeyAt(0));
-        Assert.Same(shared.Intern("replay-value"),    p.Labels.ValueAt(0));
+        // What the live path gets for the same text from the same interner.
+        Assert.Same(interner.Intern("replayed.metric"), p.Name);
+        Assert.Same(interner.Intern("ms"),              p.Unit);
+        Assert.Same(interner.Intern("replay.key"),      p.Labels.KeyAt(0));
+        Assert.Same(interner.Intern("replay-value"),    p.Labels.ValueAt(0));
+        Assert.Same(ViaInterner(interner, ("replay.key", "replay-value")), p.Labels);
     }
 }
