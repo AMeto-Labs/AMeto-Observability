@@ -1,5 +1,6 @@
 using Ameto.Core;
 using System.Buffers;
+using System.Runtime.CompilerServices;
 using K4os.Compression.LZ4;
 using MessagePack;
 
@@ -221,7 +222,7 @@ internal static class MetricReader
             // case; here it is the empty span and matches none either — its value is skipped.
             ReadOnlySpan<byte> key = ReadKey(ref r);
             if      (key.SequenceEqual("k"u8))    kind   = (MetricKind)r.ReadByte();
-            else if (key.SequenceEqual("u"u8))    unit   = r.ReadString() ?? string.Empty;
+            else if (key.SequenceEqual("u"u8))    unit   = ReadInterned(ref r, MetricLabelInterner.Shared, out _);
             else if (key.SequenceEqual("lbs"u8))  labels = ReadLabels(ref r);
             else if (key.SequenceEqual("bnds"u8)) bounds = ReadBounds(ref r);
             else if (key.SequenceEqual("pts"u8))  points = deltaMs ? ReadPointsV3(ref r) : ReadPointsV2(ref r);
@@ -308,6 +309,46 @@ internal static class MetricReader
         // whole and asked for 2.1 billion slots, 34 GB of references, before one pair was read.
         FileBounds.RequireCountFits(count, r.Sequence.Length - r.Consumed,
             fileBytesPerElement: 2, "Label set", "the series block");
+        if (count > MaxInternedLabelStrings / 2) return ReadLabelsUninterned(ref r, count);
+
+        // THROUGH THE SHARED INTERNER, as the OTLP parsers and the WAL replay already are (WP6 of
+        // issue #83 left this reader out: it was not that package's file). A cold read used to
+        // decode a fresh string for every key and value of every series it touched — ten strings
+        // and a label set per five-label series, per query, per rollup chunk, per catalog seed —
+        // for text the process already holds: the series a query reads back are, almost always,
+        // the series ingest is still sending. Resolved from the UTF-8 in place, a pooled string
+        // costs nothing, and a label set whose strings are all pooled comes back as the very
+        // instance the hot tier and the WAL hold. Bounded as the interner is (see
+        // MetricLabelInterner): past its cap a string is simply built, as before, and a label set
+        // over an unpooled string is built fresh — equal by value either way.
+        var interner = MetricLabelInterner.Shared;
+        int n        = count * 2;
+        var kv       = ArrayPool<string>.Shared.Rent(MaxInternedLabelStrings);
+        Span<int> ids = stackalloc int[MaxInternedLabelStrings];
+        try
+        {
+            for (int i = 0; i < n; i++) kv[i] = ReadInterned(ref r, interner, out ids[i]);
+            return interner.GetLabelSet(kv.AsSpan(0, n), ids[..n]);
+        }
+        finally
+        {
+            kv.AsSpan(0, n).Clear();
+            ArrayPool<string>.Shared.Return(kv);
+        }
+    }
+
+    /// <summary>
+    /// Strings in the largest label set this reader resolves through the interner. A set bigger
+    /// than that — legal, never seen from a real exporter — is decoded the way every set used to
+    /// be, so the scratch the common case rents stays a constant.
+    /// </summary>
+    private const int MaxInternedLabelStrings = 128;
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static LabelSet ReadLabelsUninterned(ref MessagePackReader r, int count)
+    {
+        FileBounds.RequireCountFits(count, r.Sequence.Length - r.Consumed,
+            fileBytesPerElement: 2, "Label set", "the series block");
         int cap   = FileBounds.PreallocFor(count, heapBytesPerElement: 16);
         var pairs = new List<KeyValuePair<string, string>>(cap);
         for (int i = 0; i < count; i++)
@@ -317,6 +358,21 @@ internal static class MetricReader
             pairs.Add(new KeyValuePair<string, string>(k, v));
         }
         return new LabelSet(pairs);
+    }
+
+    /// <summary>
+    /// A msgpack string through <paramref name="interner"/>, from its UTF-8 bytes in place — the
+    /// text <c>ReadString() ?? string.Empty</c> gave (the interner decodes exactly as
+    /// <c>Encoding.UTF8.GetString</c> does), and its interner id for the label-set lookup. Nil is
+    /// the empty string, as it was.
+    /// </summary>
+    private static string ReadInterned(ref MessagePackReader r, MetricLabelInterner interner, out int id)
+    {
+        if (r.TryReadNil()) { id = MetricLabelInterner.EmptyStringId; return string.Empty; }
+        string value;
+        if (r.TryReadStringSpan(out ReadOnlySpan<byte> utf8)) id = interner.Intern(utf8, out value);
+        else                                                   id = interner.Intern(r.ReadString() ?? string.Empty, out value);
+        return value;
     }
 
     /// <summary>
