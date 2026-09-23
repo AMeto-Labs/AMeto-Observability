@@ -349,7 +349,7 @@ public sealed class SpanWalV2Tests : IDisposable
     /// CommitFlush), which the engine keeps away from its readers instead: pinned by the next fact.
     /// </summary>
     [Fact]
-    public void The_header_drive_flush_does_not_hold_the_append_lock()
+    public async Task The_header_drive_flush_does_not_hold_the_append_lock()
     {
         using var wal = SpanWriteAheadLog.Open(WalPath);
         AppendAll(wal, 5);
@@ -376,7 +376,7 @@ public sealed class SpanWalV2Tests : IDisposable
         probe.Start();
         probe.Join();
         release.Set();
-        commit.Wait(TimeSpan.FromSeconds(30));
+        await commit.WaitAsync(TimeSpan.FromSeconds(30));
 
         Assert.True(appendable, "the append lock was held across the header's drive flush");
     }
@@ -389,7 +389,7 @@ public sealed class SpanWalV2Tests : IDisposable
     /// query of the hot tier would sit out the fsync.
     /// </summary>
     [Fact]
-    public void A_drainer_waiting_for_the_log_does_not_hold_the_engine_lock()
+    public async Task A_drainer_waiting_for_the_log_does_not_hold_the_engine_lock()
     {
         using var engine = new TraceStorageEngine(_dir, NullLogger<TraceStorageEngine>.Instance);
         var wal = engine.WalForTest;
@@ -408,9 +408,9 @@ public sealed class SpanWalV2Tests : IDisposable
         }
         wal._appendWaitingForTest = null;
 
-        Assert.True(writer.Wait(TimeSpan.FromSeconds(30)));
+        int taken = await writer.WaitAsync(TimeSpan.FromSeconds(30));
         Assert.True(readerGotIn, "the drainer held the engine's write lock while it waited for the log");
-        Assert.Equal(2, writer.Result);
+        Assert.Equal(2, taken);
         Assert.Equal(2, wal.ReadAll().Count);
     }
 

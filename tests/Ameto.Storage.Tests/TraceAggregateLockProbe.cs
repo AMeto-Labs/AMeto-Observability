@@ -573,8 +573,10 @@ public sealed class TraceAggregateLockTests : IDisposable
         engine._aggregateMemoTicks = 0;
         await engine.GetAggregateStatsAsync(From, To);                              // warm
 
+#pragma warning disable xUnit1031 // synchronous ON PURPOSE: the per-thread counter must see the whole call
         long a0 = GC.GetAllocatedBytesForCurrentThread();
         var stats = engine.GetAggregateStatsAsync(From, To).GetAwaiter().GetResult();
+#pragma warning restore xUnit1031
         long allocated = GC.GetAllocatedBytesForCurrentThread() - a0;
 
         Assert.Equal(10_000, SpanTotal(stats));
