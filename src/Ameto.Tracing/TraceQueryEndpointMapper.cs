@@ -244,21 +244,8 @@ public static class TraceQueryEndpointMapper
         });
 
         // GET /api/traces/{traceId}/flamegraph
-        group.MapGet("/api/traces/{traceId}/flamegraph", async (HttpContext ctx, string traceId) =>
-        {
-            if (!TraceId.TryParseHex(traceId, out var tid))
-            {
-                ctx.Response.StatusCode = 400;
-                return;
-            }
-            var provider = ctx.RequestServices.GetRequiredService<ITraceProvider>();
-            var spans    = await CollectSpansRawAsync(provider, tid, ctx.RequestAborted);
-
-            if (spans.Count == 0) { ctx.Response.StatusCode = 404; return; }
-
-            var flame = BuildFlamegraph(spans);
-            await ctx.Response.WriteAsJsonAsync(flame);
-        });
+        group.MapGet("/api/traces/{traceId}/flamegraph",
+            static (HttpContext ctx, string traceId) => WriteFlamegraphAsync(ctx, traceId));
 
         // GET /api/traces/index — what the trace-id index is doing, and whether it is finished.
         //
@@ -275,20 +262,47 @@ public static class TraceQueryEndpointMapper
         });
 
         // GET /api/traces/{traceId}
-        group.MapGet("/api/traces/{traceId}", async (HttpContext ctx, string traceId) =>
-        {
-            if (!TraceId.TryParseHex(traceId, out var tid))
-            {
-                ctx.Response.StatusCode = 400;
-                return;
-            }
-            var provider = ctx.RequestServices.GetRequiredService<ITraceProvider>();
-            var spans    = new List<SpanDto>();
-            await foreach (var s in provider.GetTraceAsync(tid, ctx.RequestAborted))
-                spans.Add(SpanDto.From(s));
+        group.MapGet("/api/traces/{traceId}",
+            static (HttpContext ctx, string traceId) => WriteTraceDetailAsync(ctx, traceId));
+    }
 
-            await ctx.Response.WriteAsJsonAsync(spans);
-        });
+    // ── Trace detail and flame graph ──────────────────────────────────────────
+
+    /// <summary>
+    /// <c>GET /api/traces/{traceId}</c>: every span of one trace, in start order. A method rather
+    /// than a lambda in <see cref="MapTraceEndpoints"/> so <c>TraceDetailAllocProbe</c> can drive
+    /// the handler itself over a <c>DefaultHttpContext</c>, without a host.
+    /// </summary>
+    internal static async Task WriteTraceDetailAsync(HttpContext ctx, string traceId)
+    {
+        if (!TraceId.TryParseHex(traceId, out var tid))
+        {
+            ctx.Response.StatusCode = 400;
+            return;
+        }
+        var provider = ctx.RequestServices.GetRequiredService<ITraceProvider>();
+        var spans    = new List<SpanDto>();
+        await foreach (var s in provider.GetTraceAsync(tid, ctx.RequestAborted))
+            spans.Add(SpanDto.From(s));
+
+        await ctx.Response.WriteAsJsonAsync(spans);
+    }
+
+    /// <summary><c>GET /api/traces/{traceId}/flamegraph</c> — see <see cref="WriteTraceDetailAsync"/>.</summary>
+    internal static async Task WriteFlamegraphAsync(HttpContext ctx, string traceId)
+    {
+        if (!TraceId.TryParseHex(traceId, out var tid))
+        {
+            ctx.Response.StatusCode = 400;
+            return;
+        }
+        var provider = ctx.RequestServices.GetRequiredService<ITraceProvider>();
+        var spans    = await CollectSpansRawAsync(provider, tid, ctx.RequestAborted);
+
+        if (spans.Count == 0) { ctx.Response.StatusCode = 404; return; }
+
+        var flame = BuildFlamegraph(spans);
+        await ctx.Response.WriteAsJsonAsync(flame);
     }
 
     // ── SSE streaming ─────────────────────────────────────────────────────────
