@@ -105,8 +105,8 @@ public sealed class MetricQueryAllocProbe
 
             var raw      = Measure(() => Drain(engine.QueryAsync(Metric, from, to)));
             var rawLean  = Measure(() => Drain(engine.QueryAsync(Metric, from, to, null, null, MetricPointFields.NoBuckets)));
-            var stepped  = Measure(() => Drain(engine.QueryAsync(Metric, from, to, TimeSpan.FromMinutes(1))));
-            var recent   = Measure(() => Drain(engine.QueryAsync(Metric, from.AddMinutes(11), to)));
+            var stepped  = Measure(() => Drain(engine.QueryAsync(Metric, from, to, TimeSpan.FromMinutes(1), null, MetricPointFields.NoBuckets)));
+            var recent   = Measure(() => Drain(engine.QueryAsync(Metric, from.AddMinutes(11), to, null, null, MetricPointFields.NoBuckets)));
             var rate     = Measure(() => Sync(agg.QueryAsync(new MetricQueryRequest
             {
                 Metric = Metric, From = from, To = to, Aggregation = MetricAggregation.Rate, GroupBy = ["service.name"],
@@ -123,10 +123,10 @@ public sealed class MetricQueryAllocProbe
 
             _out.WriteLine($"COLD QUERY  {SeriesCount:N0} histogram series x {PointsPerSeries} points = {stored:N0} points, " +
                            $"{files.Count} .mts file(s), {disk / 1024.0:N1} KB on disk; best of {Runs}");
-            Print("QueryAsync raw (no step)       ", raw, stored);
-            Print("QueryAsync raw, no buckets     ", rawLean, stored);
-            Print("QueryAsync raw, step 1m        ", stepped, stored);
-            Print("QueryAsync raw, last 5 minutes ", recent, stored);
+            Print("QueryAsync raw, all fields     ", raw, stored);
+            Print("raw as GET /api/metrics/{name}  ", rawLean, stored);
+            Print("  ... with step=1m             ", stepped, stored);
+            Print("  ... last 5 minutes           ", recent, stored);
             Print("Aggregator Rate by service.name", rate, stored);
             Print("Aggregator Quantile p95        ", quantile, stored);
             Print("Aggregator Last + method=GET   ", last, stored);
@@ -139,8 +139,28 @@ public sealed class MetricQueryAllocProbe
             Assert.Equal((10, 10L * (PointsPerSeries - 1)), (rate.Series, rate.Points));
             Assert.Equal((SeriesCount, (long)SeriesCount * (PointsPerSeries - 1)), (quantile.Series, quantile.Points));
             Assert.Equal((SeriesCount / Methods.Length, (long)SeriesCount / Methods.Length), (last.Series, last.Points));
+
+            // THE GUARD (issue #83's plan: bytes < 64 x points, per STORED point the query walks).
+            // Stated as overhead: a query whose answer CARRIES histogram bucket arrays — the raw
+            // all-fields read, and the quantile, which reads them to compute anything — is charged
+            // for everything beyond those arrays, which are the data it was asked for (16 buckets:
+            // a 24-byte header and 128 bytes of counts per point); the quantile's own answer (a
+            // point per step per series) is data too. Every other query is charged in full. At
+            // db5cdd1 these were 239..518 B/point.
+            const long BucketArrayBytes = 24 + 16 * sizeof(long);
+            Guard("raw, all fields", raw.Bytes - stored * BucketArrayBytes, stored);
+            Guard("raw endpoint",    rawLean.Bytes, stored);
+            Guard("step 1m",         stepped.Bytes, stored);
+            Guard("last 5 minutes",  recent.Bytes, stored);
+            Guard("rate by service", rate.Bytes, stored);
+            Guard("quantile",        quantile.Bytes - stored * BucketArrayBytes - quantile.Points * 40, stored);
+            Guard("last + filter",   last.Bytes, stored);
         }
         finally { try { Directory.Delete(dir, true); } catch { } }
+
+        static void Guard(string what, long bytes, long points) =>
+            Assert.True(bytes < 64 * points,
+                $"{what}: {bytes:N0} B over {points:N0} stored points = {(double)bytes / points:N1} B/point, past the 64 B/point guard");
     }
 
     /// <summary>Hands the aggregator the same fragments on every query — the merge, measured alone.</summary>
