@@ -114,6 +114,12 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// <summary>Test seam: the teardown is about to wait for open readers. Only fires when there is one.</summary>
     internal Action? _onWaitingForReaders;
 
+    /// <summary>
+    /// Test seam: the teardown has just shut the door, so from here every read answers empty — the
+    /// moment at which a consumer still running (the alert evaluator) would read "no spans".
+    /// </summary>
+    internal Action? _onWritesClosedForTest;
+
     /// <summary>Test hook: heavy phases in flight (see <see cref="_heavyPhases"/>).</summary>
     internal int HeavyPhasesInFlight => Volatile.Read(ref _heavyPhases);
 
@@ -4180,6 +4186,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         //    those loads would let a phase start after shutdown had stopped counting.
         Interlocked.Exchange(ref _writesClosed, 1);
         Interlocked.MemoryBarrier();
+        _onWritesClosedForTest?.Invoke();
 
         // ── Wait for heavy phases. Only a phase that passed the close check is counted, so from
         //    here the number can only fall.

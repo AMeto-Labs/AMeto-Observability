@@ -160,23 +160,8 @@ bool enableAlerts  = builder.Configuration.GetValue("Ameto:Alerts:Enabled",  tru
 if (enableAlerts && (!enableMetrics || !enableTracing))
     enableAlerts = false;
 
-// Alert rules store + evaluator
-if (enableAlerts)
-{
-    // Serialise alert channels by runtime type so their (masked) fields reach the client.
-    builder.Services.ConfigureHttpJsonOptions(o =>
-        o.SerializerOptions.Converters.Add(new Ameto.Server.AlertChannelResponseConverter()));
-
-    // Reversible encryption for channel secrets (bot tokens, SMTP passwords, webhook auth headers).
-    builder.Services.AddSingleton<Ameto.Core.ISecretProtector>(sp =>
-        Ameto.Core.SecretProtectorFactory.Create(
-            serverOptions.DataDirectory,
-            builder.Configuration["Ameto:MasterKey"],
-            path => sp.GetRequiredService<ILogger<Ameto.Core.AesGcmSecretProtector>>().LogWarning(
-                "Secret protector: generated a new master key at {Path}. For production set AMETO__MasterKey and keep it off the data volume.",
-                path)));
-    builder.Services.AddAmetoAlerts(serverOptions.DataDirectory);
-}
+// The alert rules store and evaluator are registered BELOW tracing, metrics and replication —
+// see the block after AddAmetoReplication for why the position is the point.
 
 // Set when Ameto:Traces:IndexBackfill is not one of the three names; reported once the logger
 // exists, because a setting that quietly did the opposite of what was typed is worth saying aloud.
@@ -214,6 +199,33 @@ if (enableMetrics)
 
 var repOpts = builder.Configuration.GetSection("Ameto:Replication").Get<ReplicationOptions>() ?? new ReplicationOptions();
 builder.Services.AddAmetoReplication(repOpts);
+
+// Alert rules store + evaluator.
+//
+// LAST OF THE SUBSYSTEMS, SO IT STOPS FIRST. Hosted services stop in reverse registration order,
+// and the trace and metric engines answer EMPTY once their teardown has closed them — the right
+// answer for a late HTTP query, and a value of 0 to the evaluator, which resolves every firing
+// "> threshold" rule (an Ok notification, an Ok state persisted) for an incident still burning.
+// Registered beside the enable flags, where it used to be, the evaluator stopped after both engines
+// and ticked through their teardowns — the trace one waits up to 30 s for a compaction. Nothing
+// else depends on the position: DI resolves a singleton wherever it was registered.
+// AlertShutdownTests pins the order; the evaluator also refuses to act once the host is stopping.
+if (enableAlerts)
+{
+    // Serialise alert channels by runtime type so their (masked) fields reach the client.
+    builder.Services.ConfigureHttpJsonOptions(o =>
+        o.SerializerOptions.Converters.Add(new Ameto.Server.AlertChannelResponseConverter()));
+
+    // Reversible encryption for channel secrets (bot tokens, SMTP passwords, webhook auth headers).
+    builder.Services.AddSingleton<Ameto.Core.ISecretProtector>(sp =>
+        Ameto.Core.SecretProtectorFactory.Create(
+            serverOptions.DataDirectory,
+            builder.Configuration["Ameto:MasterKey"],
+            path => sp.GetRequiredService<ILogger<Ameto.Core.AesGcmSecretProtector>>().LogWarning(
+                "Secret protector: generated a new master key at {Path}. For production set AMETO__MasterKey and keep it off the data volume.",
+                path)));
+    builder.Services.AddAmetoAlerts(serverOptions.DataDirectory);
+}
 
 // ── Kestrel ───────────────────────────────────────────────────────────────────
 // Listeners are configured explicitly rather than through UseUrls, because UseUrls has no
