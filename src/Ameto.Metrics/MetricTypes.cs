@@ -1,4 +1,5 @@
 using System.Text;
+using Ameto.Core;
 
 namespace Ameto.Metrics;
 
@@ -19,12 +20,26 @@ public enum MetricKind : byte
 /// Immutable, comparable set of label key-value pairs.
 /// Stored sorted by key, then by value, so two identical label sets have the same hash
 /// regardless of the order their pairs arrived in.
+///
+/// <para><b>One interleaved <c>string[]</c> — k0, v0, k1, v1, … — not an array of pairs.</b>
+/// The bytes are the same (two references a pair either way); what the flat shape buys is that
+/// the pairs are plain spans of strings to the code that builds, sorts and compares them, with
+/// no tuple copies and no comparison delegate.</para>
+///
+/// <para><b>Equality compares references first and values second, and must.</b> Label sets
+/// built by the OTLP parsers hold strings canonicalised by <see cref="MetricLabelInterner"/>,
+/// so two of them for the same series compare pointer by pointer — or are the very same
+/// instance. Label sets rebuilt from disk (the metric WAL, <c>MetricReader</c>) or built by a
+/// caller from its own strings hold uninterned copies, and they have to equal an interned set
+/// with the same text: the hash is therefore computed from the VALUES (ordinal), never from
+/// identities, and a reference miss falls through to an ordinal compare.</para>
 /// </summary>
 public sealed class LabelSet : IEquatable<LabelSet>
 {
     public static readonly LabelSet Empty = new([]);
 
-    private readonly (string Key, string Value)[] _labels;
+    /// <summary>Interleaved k0, v0, k1, v1, … sorted by key, then value (ordinal).</summary>
+    private readonly string[] _kv;
     private readonly int _hash;
 
     public LabelSet(IEnumerable<KeyValuePair<string, string>> labels)
@@ -34,50 +49,191 @@ public sealed class LabelSet : IEquatable<LabelSet>
         // EnumerableSorter, its index array and a comparison delegate for EVERY label set,
         // and a label set is built per ingested point AND again per series on every rollup
         // chunk pass. An allocation trace put that chain at ~10 MB/min on an idle server.
+        string[] kv;
         if (labels is ICollection<KeyValuePair<string, string>> c)
         {
-            _labels = new (string Key, string Value)[c.Count];
+            kv = new string[c.Count * 2];
             int i = 0;
-            foreach (var kv in labels) _labels[i++] = (kv.Key, kv.Value);
+            foreach (var p in labels) { kv[i++] = p.Key; kv[i++] = p.Value; }
             // Count and enumeration can disagree if the source is mutated concurrently.
             // Yielding MORE throws above, which is loud and fine; yielding fewer would leave
             // trailing (null, null) pairs that sort and hash without complaining — a
             // silently wrong LabelSet. Trim instead.
-            if (i != _labels.Length) Array.Resize(ref _labels, i);
+            if (i != kv.Length) Array.Resize(ref kv, i);
         }
         else
         {
-            var list = new List<(string Key, string Value)>();
-            foreach (var kv in labels) list.Add((kv.Key, kv.Value));
-            _labels = list.ToArray();
+            var list = new List<string>();
+            foreach (var p in labels) { list.Add(p.Key); list.Add(p.Value); }
+            kv = list.ToArray();
         }
 
         // Ordered by key, then value. OrderBy was stable, so duplicate keys used to keep
         // their arrival order and two equal label sets built from differently-ordered input
         // hashed differently; comparing the value as well makes the layout canonical.
-        Array.Sort(_labels, static (a, b) =>
-        {
-            int k = string.CompareOrdinal(a.Key, b.Key);
-            return k != 0 ? k : string.CompareOrdinal(a.Value, b.Value);
-        });
+        SortInterleaved(kv, default);
 
-        var h = new HashCode();
-        foreach (var (k, v) in _labels)
-        {
-            h.Add(k, StringComparer.Ordinal);
-            h.Add(v, StringComparer.Ordinal);
-        }
-        _hash = h.ToHashCode();
+        _kv   = kv;
+        _hash = ComputeHash(kv);
     }
 
-    public IReadOnlyList<(string Key, string Value)> Pairs => _labels;
+    /// <summary>Takes ownership of an already-sorted interleaved array and its value hash.</summary>
+    private LabelSet(string[] sortedKv, int hash)
+    {
+        _kv   = sortedKv;
+        _hash = hash;
+    }
+
+    /// <summary>
+    /// A label set over a COPY of <paramref name="sortedInterleaved"/>, which must already be in
+    /// canonical order (see <see cref="SortInterleaved"/>). The factory the interner uses on a
+    /// miss; everything else goes through the constructor, which sorts.
+    /// </summary>
+    internal static LabelSet FromSorted(ReadOnlySpan<string> sortedInterleaved) =>
+        sortedInterleaved.IsEmpty ? Empty : new LabelSet(sortedInterleaved.ToArray(), ComputeHash(sortedInterleaved));
+
+    /// <summary>
+    /// The value hash — the SAME function the pair-array layout used, over the same sequence,
+    /// so nothing that relied on its distribution moves. Per process only (<see cref="HashCode"/>
+    /// is randomly seeded); nothing persists it.
+    /// </summary>
+    private static int ComputeHash(ReadOnlySpan<string> kv)
+    {
+        var h = new HashCode();
+        for (int i = 0; i < kv.Length; i++) h.Add(kv[i], StringComparer.Ordinal);
+        return h.ToHashCode();
+    }
+
+    /// <summary>
+    /// Sorts interleaved pairs by key, then value, ordinal — moving <paramref name="ids"/> (one
+    /// per string, or empty) in step. Insertion sort: a label set is a handful of pairs that
+    /// usually arrive in the exporter's own fixed order, so this is n - 1 compares on the
+    /// common input and no delegate on any. Large sets (never seen from a real exporter, but
+    /// legal) fall back to one <see cref="Array.Sort{T}(T[], Comparison{T})"/> over a pair array.
+    /// </summary>
+    internal static void SortInterleaved(Span<string> kv, Span<int> ids)
+    {
+        int n = kv.Length >> 1;
+        if (n < 2) return;
+        if (n > 64) { SortLarge(kv, ids); return; }
+
+        for (int i = 1; i < n; i++)
+        {
+            string k = kv[2 * i], v = kv[2 * i + 1];
+            int ik = ids.IsEmpty ? 0 : ids[2 * i], iv = ids.IsEmpty ? 0 : ids[2 * i + 1];
+            int j = i - 1;
+            while (j >= 0 && ComparePair(kv[2 * j], kv[2 * j + 1], k, v) > 0)
+            {
+                kv[2 * j + 2] = kv[2 * j];
+                kv[2 * j + 3] = kv[2 * j + 1];
+                if (!ids.IsEmpty) { ids[2 * j + 2] = ids[2 * j]; ids[2 * j + 3] = ids[2 * j + 1]; }
+                j--;
+            }
+            kv[2 * j + 2] = k;
+            kv[2 * j + 3] = v;
+            if (!ids.IsEmpty) { ids[2 * j + 2] = ik; ids[2 * j + 3] = iv; }
+        }
+    }
+
+    [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+    private static void SortLarge(Span<string> kv, Span<int> ids)
+    {
+        int n = kv.Length >> 1;
+        var pairs = new (string Key, string Value, int KeyId, int ValueId)[n];
+        for (int i = 0; i < n; i++)
+            pairs[i] = (kv[2 * i], kv[2 * i + 1],
+                        ids.IsEmpty ? 0 : ids[2 * i], ids.IsEmpty ? 0 : ids[2 * i + 1]);
+        Array.Sort(pairs, static (a, b) => ComparePair(a.Key, a.Value, b.Key, b.Value));
+        for (int i = 0; i < n; i++)
+        {
+            kv[2 * i] = pairs[i].Key;
+            kv[2 * i + 1] = pairs[i].Value;
+            if (!ids.IsEmpty) { ids[2 * i] = pairs[i].KeyId; ids[2 * i + 1] = pairs[i].ValueId; }
+        }
+    }
+
+    private static int ComparePair(string ak, string av, string bk, string bv)
+    {
+        int k = string.CompareOrdinal(ak, bk);
+        return k != 0 ? k : string.CompareOrdinal(av, bv);
+    }
+
+    /// <summary>Number of pairs.</summary>
+    public int Count => _kv.Length >> 1;
+
+    public string KeyAt(int index)   => _kv[2 * index];
+    public string ValueAt(int index) => _kv[2 * index + 1];
+
+    /// <summary>The pairs as one interleaved, canonically ordered span: k0, v0, k1, v1, ….</summary>
+    public ReadOnlySpan<string> Interleaved => _kv;
+
+    /// <summary>
+    /// The pairs, for callers that want a list. A thin view over the interleaved array, built per
+    /// call — 24 bytes; the ingest path uses <see cref="GetEnumerator"/> / <see cref="KeyAt"/>
+    /// instead and allocates nothing.
+    /// </summary>
+    public IReadOnlyList<(string Key, string Value)> Pairs => _kv.Length == 0 ? [] : new PairList(_kv);
+
+    /// <summary>Allocation-free <c>foreach (var (key, value) in labels)</c>.</summary>
+    public PairEnumerator GetEnumerator() => new(_kv);
+
+    public struct PairEnumerator
+    {
+        private readonly string[] _kv;
+        private int _i;
+
+        internal PairEnumerator(string[] kv) { _kv = kv; _i = -2; }
+
+        public bool MoveNext() => (_i += 2) < _kv.Length;
+        public readonly (string Key, string Value) Current => (_kv[_i], _kv[_i + 1]);
+    }
+
+    private sealed class PairList(string[] kv) : IReadOnlyList<(string Key, string Value)>
+    {
+        public int Count => kv.Length >> 1;
+        public (string Key, string Value) this[int index] =>
+            (uint)index < (uint)Count ? (kv[2 * index], kv[2 * index + 1])
+                                      : throw new ArgumentOutOfRangeException(nameof(index));
+
+        public IEnumerator<(string Key, string Value)> GetEnumerator()
+        {
+            for (int i = 0; i + 1 < kv.Length; i += 2) yield return (kv[i], kv[i + 1]);
+        }
+
+        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+    }
+
+    /// <summary>
+    /// Whether this set holds exactly these interleaved, canonically ordered strings BY
+    /// REFERENCE — the interner's hit test. A value-equal set of other instances answers false,
+    /// which costs the caller one redundant label set and never a wrong one.
+    /// </summary>
+    internal bool SameReferences(ReadOnlySpan<string> sortedInterleaved)
+    {
+        var kv = _kv;
+        if (kv.Length != sortedInterleaved.Length) return false;
+        for (int i = 0; i < kv.Length; i++)
+            if (!ReferenceEquals(kv[i], sortedInterleaved[i])) return false;
+        return true;
+    }
 
     public bool Equals(LabelSet? other)
     {
-        if (other is null || _labels.Length != other._labels.Length) return false;
-        for (int i = 0; i < _labels.Length; i++)
-            if (_labels[i].Key != other._labels[i].Key || _labels[i].Value != other._labels[i].Value)
-                return false;
+        if (ReferenceEquals(this, other)) return true;
+        // The cached hashes first: both are value hashes, so a mismatch is a proof of
+        // inequality and costs one compare instead of a string walk.
+        if (other is null || _hash != other._hash) return false;
+
+        var a = _kv;
+        var b = other._kv;
+        if (a.Length != b.Length) return false;
+        for (int i = 0; i < a.Length; i++)
+        {
+            string x = a[i], y = b[i];
+            // Canonical strings match by reference; an uninterned one (from disk, from a caller,
+            // or past the interner's cap) is compared by value, ordinal.
+            if (!ReferenceEquals(x, y) && !string.Equals(x, y)) return false;
+        }
         return true;
     }
 
@@ -86,12 +242,155 @@ public sealed class LabelSet : IEquatable<LabelSet>
 
     public override string ToString()
     {
-        if (_labels.Length == 0) return "{}";
+        if (_kv.Length == 0) return "{}";
         var sb = new StringBuilder("{");
-        foreach (var (k, v) in _labels)
-            sb.Append(k).Append('=').Append('"').Append(v).Append('"').Append(',');
+        for (int i = 0; i + 1 < _kv.Length; i += 2)
+            sb.Append(_kv[i]).Append('=').Append('"').Append(_kv[i + 1]).Append('"').Append(',');
         sb[^1] = '}';
         return sb.ToString();
+    }
+}
+
+/// <summary>
+/// Canonical instances of metric label strings and label sets, so the ingest path stops
+/// materialising a fresh copy of text the process already holds.
+///
+/// <para><b>Why.</b> An OTLP export re-sends every series every interval. A 500-point batch
+/// decoded 8 000 label strings of which 26 were distinct — 99.7 % duplicates, ~900 B per point,
+/// and the survivors promoted to gen2 because a <see cref="LabelSet"/> is retained by the hot
+/// tier, the WAL's series registry, the catalog and the exemplar rings. Strings go through a
+/// <see cref="StringInternPool"/> keyed by their UTF-8 bytes, which answers a hit with the
+/// pooled instance and allocates nothing; label sets whose every string is pooled go through a
+/// small lock-free cache keyed by those strings' pool ids, which answers a hit with the label
+/// set built the first time.</para>
+///
+/// <para><b>Bounded, and degrading rather than dropping.</b> The string pool holds at most
+/// <see cref="DefaultMaxStrings"/> distinct strings for the life of the process and does not
+/// intern one longer than <see cref="MaxInternedUtf8Bytes"/> — worst case ≈ 16 384 ×
+/// (≤ 278 B string + ~56 B of dictionary entry and slot) ≈ 5.5 MB, whatever the label
+/// cardinality. Past the cap every new string is a plain <c>new string</c>, exactly what the
+/// parser allocated before, and <see cref="StringInternPool.PoolExhausted"/> fires once. The
+/// label-set cache is a fixed <see cref="DefaultLabelSetSlots"/>-slot table that overwrites on
+/// collision, so it never grows and a series nobody sends any more is simply displaced. A point
+/// is never refused by either: a miss costs its allocation, not its data.</para>
+///
+/// <para>Its own pool, not <see cref="StringInternPool.Shared"/>: that one indexes log message
+/// templates, and a high-cardinality label saturating it would make every later log event
+/// carry its own template string.</para>
+/// </summary>
+public sealed class MetricLabelInterner
+{
+    public const int DefaultMaxStrings     = 16_384;
+    public const int DefaultLabelSetSlots  = 8_192;
+
+    /// <summary>
+    /// Longer strings are materialised, not pooled: a value that long is an id or a message,
+    /// not a dimension that repeats, and the pool keeps what it holds for the life of the
+    /// process. Measured in UTF-8 bytes on the byte path and in chars on the string path; for
+    /// ASCII the two agree, and where they do not the only cost is one path pooling a string
+    /// the other does not — equality is by value either way.
+    /// </summary>
+    public const int MaxInternedUtf8Bytes  = 128;
+
+    /// <summary>The process-wide instance the OTLP parsers and the WAL replay share.</summary>
+    public static readonly MetricLabelInterner Shared = new(DefaultMaxStrings, DefaultLabelSetSlots);
+
+    private readonly StringInternPool _strings;
+    private readonly LabelSet?[]      _sets;
+    private readonly int              _mask;
+
+    public MetricLabelInterner(int maxStrings, int labelSetSlots)
+    {
+        _strings = new StringInternPool(maxStrings);
+        int slots = (int)System.Numerics.BitOperations.RoundUpToPowerOf2((uint)Math.Max(labelSetSlots, 2));
+        _sets = new LabelSet?[slots];
+        _mask = slots - 1;
+    }
+
+    /// <summary>The underlying string pool — for its cap and its <c>PoolExhausted</c> event.</summary>
+    public StringInternPool Strings => _strings;
+
+    /// <summary>
+    /// The id <c>Intern</c> answers for the empty string. <see cref="string.Empty"/> is one
+    /// instance already, so it is canonical without a pool entry, and a label set holding an
+    /// empty value stays cacheable. Never a real pool id: those stop at the pool's cap.
+    /// </summary>
+    public const int EmptyStringId = int.MaxValue;
+
+    /// <summary>
+    /// The canonical string for these UTF-8 bytes, and its id: a pool id,
+    /// <see cref="EmptyStringId"/> for empty input, or -1 when the string is not pooled — too
+    /// long, or the pool is full — in which case <paramref name="value"/> is a fresh string.
+    /// Invalid UTF-8 decodes exactly as <c>Encoding.UTF8.GetString</c> does, U+FFFD per invalid
+    /// sequence. Allocation-free on a hit.
+    /// </summary>
+    public int Intern(ReadOnlySpan<byte> utf8, out string value)
+    {
+        if (utf8.IsEmpty) { value = string.Empty; return EmptyStringId; }
+        if (utf8.Length > MaxInternedUtf8Bytes) { value = Encoding.UTF8.GetString(utf8); return -1; }
+        return _strings.Intern(utf8, out value);
+    }
+
+    /// <summary>As <see cref="Intern(ReadOnlySpan{byte}, out string)"/>, for a string the caller
+    /// already holds: answers the pooled instance, or <paramref name="s"/> itself.</summary>
+    public int Intern(string s, out string value)
+    {
+        if (s.Length == 0) { value = string.Empty; return EmptyStringId; }
+        if (s.Length > MaxInternedUtf8Bytes) { value = s; return -1; }
+        return _strings.Intern(s, out value);
+    }
+
+    /// <summary>The canonical instance of <paramref name="s"/> (or <paramref name="s"/> itself when
+    /// it is not pooled). For names and units, which a <c>SeriesKey</c> holds for the series'
+    /// life.</summary>
+    public string Intern(string s)
+    {
+        Intern(s, out string value);
+        return value;
+    }
+
+    /// <summary>
+    /// The label set for interleaved pairs <paramref name="kv"/> (k0, v0, k1, v1, … in any order),
+    /// with <paramref name="ids"/> holding each string's pool id from <c>Intern</c>. Both spans are
+    /// sorted in place, in step, into canonical order.
+    ///
+    /// <para>When every id is a real one, the set is looked up by those ids in a fixed table and a
+    /// set holding the very same instances is returned as is — the steady state, since an exporter
+    /// re-sends the same series every interval. Otherwise, or on a miss, a new set is built; on a
+    /// miss it is also published into the table, displacing whatever held the slot.</para>
+    /// </summary>
+    public LabelSet GetLabelSet(Span<string> kv, Span<int> ids)
+    {
+        if (kv.IsEmpty) return LabelSet.Empty;
+        if (ids.Length != kv.Length || (kv.Length & 1) != 0)
+            throw new ArgumentException("one id per string, and whole pairs", nameof(ids));
+        LabelSet.SortInterleaved(kv, ids);
+
+        uint h = 2166136261;
+        for (int i = 0; i < ids.Length; i++)
+        {
+            int id = ids[i];
+            if (id < 0) return LabelSet.FromSorted(kv);   // not all pooled: no identity to key on
+            h = (h ^ (uint)id) * 16777619;
+        }
+        h ^= h >> 15; h *= 0x2C1B3C6D; h ^= h >> 12;
+
+        var sets = _sets;
+        int a = (int)(h & (uint)_mask);
+        int b = (int)((h >> 16 | h << 16) & (uint)_mask);
+
+        var hit = Volatile.Read(ref sets[a]);
+        if (hit is not null && hit.SameReferences(kv)) return hit;
+        hit = Volatile.Read(ref sets[b]);
+        if (hit is not null && hit.SameReferences(kv)) return hit;
+
+        var created = LabelSet.FromSorted(kv);
+        // Two choices, no relocation: an empty slot if either is, else the first. A race here
+        // costs a redundant label set, never a wrong one — a reader tests every string of a
+        // candidate before it keeps it.
+        int target = Volatile.Read(ref sets[a]) is null || Volatile.Read(ref sets[b]) is not null ? a : b;
+        Volatile.Write(ref sets[target], created);
+        return created;
     }
 }
 
@@ -129,6 +428,29 @@ public sealed class MetricIngestItem
 
     /// <summary>Sampled exemplars linking individual measurements to traces (may be null).</summary>
     public MetricExemplar[]? Exemplars   { get; init; }
+
+    /// <summary>
+    /// The stored form of this item — THE one definition of it.
+    ///
+    /// <para>The write-ahead log and the hot tier must agree on it to the bit, and they used to
+    /// agree by the ingest loop computing it once and handing the same struct to both. Once the
+    /// log takes a whole batch under one lock (see <c>MetricWriteAheadLog.Append(ReadOnlySpan&lt;
+    /// MetricIngestItem&gt;)</c>) the two no longer share a call frame, and carrying a 40-byte
+    /// struct per point through a pooled side array to keep them together cost more in memory
+    /// traffic than the lock acquisitions the batch saved — measured at +140 ns/point on one
+    /// thread. Deriving it twice from the item, which is in cache either way, costs a few field
+    /// reads; having it written down once is what keeps the two derivations the same.</para>
+    /// </summary>
+    internal MetricDataPoint ToDataPoint() => new()
+    {
+        TimestampUnixNano = TimestampUnixNano,
+        Value             = Kind == MetricKind.Histogram
+                                ? (HistogramCount > 0 ? HistogramSum / HistogramCount : 0)
+                                : ScalarValue,
+        Count             = HistogramCount,
+        Sum               = HistogramSum,
+        BucketCounts      = BucketCounts,   // preserved for real percentiles + heatmap
+    };
 }
 
 /// <summary>

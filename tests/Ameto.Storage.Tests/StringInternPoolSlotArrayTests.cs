@@ -1,5 +1,5 @@
 using System.Reflection;
-using Ameto.Storage;
+using Ameto.Core;
 
 namespace Ameto.Storage.Tests;
 

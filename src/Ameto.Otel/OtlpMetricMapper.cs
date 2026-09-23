@@ -6,34 +6,75 @@ namespace Ameto.Otel;
 /// <summary>
 /// Maps an OTLP <see cref="ExportMetricsServiceRequest"/> (JSON model) to
 /// a flat list of <see cref="MetricIngestItem"/> ready for ingestion.
+///
+/// <para>The JSON twin of <see cref="OtlpMetricProtoParser"/>, and canonicalised the same way:
+/// the deserialiser has already paid for its strings, but what the ingest path KEEPS — names,
+/// units, label keys and values, label sets — is swapped for the
+/// <see cref="MetricLabelInterner"/>'s instances, so a series fed over JSON holds the same
+/// objects a protobuf-fed one does and the per-point copies die young.</para>
 /// </summary>
 public static class OtlpMetricMapper
 {
-    public static List<MetricIngestItem> Map(ExportMetricsServiceRequest request)
+    /// <summary>One point's labels, interleaved, with their interner ids — see
+    /// <see cref="MetricLabelInterner.GetLabelSet"/>. Per <see cref="Map"/> call.</summary>
+    private sealed class LabelScratch(MetricLabelInterner interner)
     {
-        var result = new List<MetricIngestItem>();
+        public readonly MetricLabelInterner Interner = interner;
+        public string[] Kv  = new string[32];
+        public int[]    Ids = new int[32];
+        public int      Used;
+
+        public void Add(string key, int keyId, string value, int valueId)
+        {
+            if (Used + 2 > Kv.Length)
+            {
+                Array.Resize(ref Kv,  Kv.Length * 2);
+                Array.Resize(ref Ids, Ids.Length * 2);
+            }
+            Kv[Used] = key;   Ids[Used] = keyId;   Used++;
+            Kv[Used] = value; Ids[Used] = valueId; Used++;
+        }
+
+        public void Add(string key, string value)
+        {
+            int keyId   = Interner.Intern(key,   out key);
+            int valueId = Interner.Intern(value, out value);
+            Add(key, keyId, value, valueId);
+        }
+    }
+
+    public static List<MetricIngestItem> Map(ExportMetricsServiceRequest request) =>
+        Map(request, MetricLabelInterner.Shared);
+
+    public static List<MetricIngestItem> Map(ExportMetricsServiceRequest request, MetricLabelInterner interner)
+    {
+        var result  = new List<MetricIngestItem>();
+        var scratch = new LabelScratch(interner);
 
         foreach (var rm in request.ResourceMetrics ?? [])
         {
             string? serviceName = ExtractServiceName(rm.Resource?.Attributes);
+            if (serviceName is not null) serviceName = interner.Intern(serviceName);
             var resLabels       = ExtractResourceLabels(rm.Resource?.Attributes);
             foreach (var sm in rm.ScopeMetrics ?? [])
             foreach (var metric in sm.Metrics ?? [])
             {
                 if (metric.Name is null) continue;
+                string name = interner.Intern(metric.Name);
+                string unit = interner.Intern(metric.Unit ?? "");
 
                 if (metric.Gauge is not null)
-                    MapNumberPoints(metric.Name, metric.Unit ?? "", MetricKind.Gauge,
-                        metric.Gauge.DataPoints, serviceName, resLabels, result);
+                    MapNumberPoints(name, unit, MetricKind.Gauge,
+                        metric.Gauge.DataPoints, serviceName, resLabels, scratch, result);
 
                 else if (metric.Sum is not null)
-                    MapNumberPoints(metric.Name, metric.Unit ?? "",
+                    MapNumberPoints(name, unit,
                         metric.Sum.IsMonotonic ? MetricKind.Counter : MetricKind.Gauge,
-                        metric.Sum.DataPoints, serviceName, resLabels, result);
+                        metric.Sum.DataPoints, serviceName, resLabels, scratch, result);
 
                 else if (metric.Histogram is not null)
-                    MapHistogramPoints(metric.Name, metric.Unit ?? "",
-                        metric.Histogram.DataPoints, serviceName, resLabels, result);
+                    MapHistogramPoints(name, unit,
+                        metric.Histogram.DataPoints, serviceName, resLabels, scratch, result);
             }
         }
 
@@ -98,6 +139,7 @@ public static class OtlpMetricMapper
         List<OtlpNumberDataPoint>?               points,
         string?                                  serviceName,
         List<KeyValuePair<string, string>>?      resLabels,
+        LabelScratch                             scratch,
         List<MetricIngestItem>                   result)
     {
         foreach (var dp in points ?? [])
@@ -110,7 +152,7 @@ public static class OtlpMetricMapper
                 Name              = name,
                 Unit              = unit,
                 Kind              = kind,
-                Labels            = ExtractLabels(dp.Attributes, serviceName, resLabels),
+                Labels            = ExtractLabels(dp.Attributes, serviceName, resLabels, scratch),
                 TimestampUnixNano = OtlpTraceMapper.ParseNanoString(dp.TimeUnixNano),
                 ScalarValue       = value,
             });
@@ -123,6 +165,7 @@ public static class OtlpMetricMapper
         List<OtlpHistogramDataPoint>?            points,
         string?                                  serviceName,
         List<KeyValuePair<string, string>>?      resLabels,
+        LabelScratch                             scratch,
         List<MetricIngestItem>                   result)
     {
         foreach (var dp in points ?? [])
@@ -172,7 +215,7 @@ public static class OtlpMetricMapper
                 Name              = name,
                 Unit              = unit,
                 Kind              = MetricKind.Histogram,
-                Labels            = ExtractLabels(dp.Attributes, serviceName, resLabels),
+                Labels            = ExtractLabels(dp.Attributes, serviceName, resLabels, scratch),
                 TimestampUnixNano = OtlpTraceMapper.ParseNanoString(dp.TimeUnixNano),
                 HistogramCount    = count,
                 HistogramSum      = dp.Sum ?? 0,
@@ -184,16 +227,12 @@ public static class OtlpMetricMapper
     }
 
     private static LabelSet ExtractLabels(
-        List<OtlpKeyValue>? attrs, string? serviceName = null,
-        List<KeyValuePair<string, string>>? resLabels = null)
+        List<OtlpKeyValue>? attrs, string? serviceName,
+        List<KeyValuePair<string, string>>? resLabels, LabelScratch scratch)
     {
-        var capacity = (attrs?.Count ?? 0) + (serviceName is not null ? 1 : 0) + (resLabels?.Count ?? 0);
-        if (capacity == 0) return LabelSet.Empty;
-
-        // for loop — avoids two LINQ iterator object allocations per data point
-        var pairs = new List<KeyValuePair<string, string>>(capacity);
+        scratch.Used = 0;
         if (serviceName is not null)
-            pairs.Add(new KeyValuePair<string, string>("service.name", serviceName));
+            scratch.Add("service.name", serviceName);
         if (attrs is not null)
         for (int i = 0; i < attrs.Count; i++)
         {
@@ -201,19 +240,25 @@ public static class OtlpMetricMapper
             if (kv.Key is null || kv.Value is null) continue;
             var sv = FormatLabelValue(kv.Value);
             if (sv is not null)
-                pairs.Add(new KeyValuePair<string, string>(kv.Key, sv));
+                scratch.Add(kv.Key, sv);
         }
 
         // Allow-listed resource labels — point attributes win on key collision.
         if (resLabels is not null)
+        {
             for (int i = 0; i < resLabels.Count; i++)
             {
+                // Against everything added so far, resource labels included: a resource that
+                // repeats a key keeps its first value, as the pair-list shape always did.
                 bool exists = false;
-                for (int j = 0; j < pairs.Count; j++)
-                    if (pairs[j].Key == resLabels[i].Key) { exists = true; break; }
-                if (!exists) pairs.Add(resLabels[i]);
+                for (int j = 0; j < scratch.Used; j += 2)
+                    if (scratch.Kv[j] == resLabels[i].Key) { exists = true; break; }
+                if (!exists) scratch.Add(resLabels[i].Key, resLabels[i].Value);
             }
+        }
 
-        return pairs.Count == 0 ? LabelSet.Empty : new LabelSet(pairs);
+        return scratch.Used == 0
+            ? LabelSet.Empty
+            : scratch.Interner.GetLabelSet(scratch.Kv.AsSpan(0, scratch.Used), scratch.Ids.AsSpan(0, scratch.Used));
     }
 }

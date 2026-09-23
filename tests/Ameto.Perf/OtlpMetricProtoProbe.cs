@@ -33,9 +33,12 @@ public sealed class OtlpMetricProtoProbe
 
         const int iters = 200;
 
-        var (domMs, domBytes) = Measure(iters, () =>
+        // BEST of five runs, each over the same 200 iterations: this box is shared, and the mean
+        // of a noisy run measures the neighbours. Allocation is deterministic and takes the
+        // minimum too, which is the steady state once every string has been interned.
+        var (domMs, domBytes) = Best(iters, () =>
             OtlpMetricMapper.Map(OtlpProtoDecoder.DecodeMetrics(payload, payload.Length)));
-        var (spanMs, spanBytes) = Measure(iters, () => OtlpMetricProtoParser.Parse(payload));
+        var (spanMs, spanBytes) = Best(iters, () => OtlpMetricProtoParser.Parse(payload));
 
         double domNs   = domMs  * 1_000_000.0 / points;
         double spanNs  = spanMs * 1_000_000.0 / points;
@@ -51,9 +54,24 @@ public sealed class OtlpMetricProtoProbe
                      + $"| {1_000_000.0 / spanNs:F0} k points/s/core");
         _out.WriteLine($"gain           : {domNs / spanNs:F1}x faster, {domB / spanB:F1}x less allocated");
 
-        // Guard against the DOM path creeping back onto the protobuf hot path.
-        Assert.True(spanBytes * 3 < domBytes,
-            $"expected >=3x less allocation, got dom={domBytes} span={spanBytes}");
+        // Guard against the DOM path creeping back onto the protobuf hot path — and, since label
+        // text is interned, against a fresh string per label creeping back into the span parser:
+        // that alone put it at 1 199 B/point, 5.6x under the DOM path; interned it is ~174.
+        Assert.True(spanBytes * 8 < domBytes,
+            $"expected >=8x less allocation, got dom={domBytes} span={spanBytes}");
+    }
+
+    private static (double MsPerIter, long Bytes) Best(int iters, Action body)
+    {
+        double ms    = double.MaxValue;
+        long   bytes = long.MaxValue;
+        for (int run = 0; run < 5; run++)
+        {
+            var (m, b) = Measure(iters, body);
+            if (m < ms)    ms    = m;
+            if (b < bytes) bytes = b;
+        }
+        return (ms, bytes);
     }
 
     private static (double MsPerIter, long Bytes) Measure(int iters, Action body)
