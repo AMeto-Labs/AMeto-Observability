@@ -193,6 +193,14 @@ public sealed class TraceDetailAllocProbe : IDisposable
         Assert.True(detOwn < Spans * 16,
             $"GET /api/traces/{{id}} allocated {detOwn:N0} B of its own for {Spans:N0} spans — the "
             + "detail is building per-span objects again (a DTO, a dictionary, value strings)");
+
+        // THE GATE ON THE FLAME GRAPH. Before TS#11: 495-519 B per span of its own (991 120-1 039 120
+        // B per request) — two dictionaries, a List per span, LINQ per node, an id string and two
+        // boxed enums. What must stay is what the response is made of: a FlamegraphNode (80 B), its
+        // id string (56 B), children arrays and the span list the builder reads — 168 B per span.
+        Assert.True(flameOwn < Spans * 256,
+            $"GET .../flamegraph allocated {flameOwn:N0} B of its own for {Spans:N0} spans — the builder "
+            + "is indexing the trace through dictionaries and per-span lists again");
     }
 
     private static long LiveBytes()
