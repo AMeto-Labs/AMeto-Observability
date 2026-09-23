@@ -1458,11 +1458,12 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
     /// was background work racing the log's disposal and competing with the engine's own
     /// threshold flush for pool threads, and it made the file's size after a burst depend on
     /// scheduling; under the engine's snapshot read lock it would hold the flush's write lock off
-    /// for the length of a file extension. What it does NOT fix: on a CPU-starved box a
+    /// for the length of a file extension. What it does NOT change: on a CPU-starved box a
     /// single-threaded ingest loop that never blocks can outrun the scheduled flush, and a growth
-    /// is one of the few places such a loop used to block. MetricBudgetWiringTests' histogram fact,
-    /// which reads the point at which the tier drains, is sensitive to exactly that under
-    /// <c>start /affinity 3</c> on a loaded machine.</para>
+    /// is one of the few places such a loop used to block — by accident of the log's size, never
+    /// as a bound. MetricBudgetWiringTests' histogram fact read the point at which the tier
+    /// drained and leaned on that accident; it now stops at the crossing the engine reports
+    /// (<c>MetricStorageEngine.OnThresholdFlushScheduledForTest</c>).</para>
     /// </summary>
     private void WantsPreGrowLocked()
     {

@@ -173,6 +173,20 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     /// </summary>
     internal Action? OnFlushGateBlockedForTest;
 
+    /// <summary>
+    /// Test seam: invoked with a threshold flush's task on the thread that scheduled it, once the
+    /// task is registered and free to start — so for a byte-threshold crossing, inside the
+    /// <see cref="Ingest"/> call that crossed. It is how a test learns WHICH batch the engine
+    /// judged over budget, and gets the flush that judgement started to await.
+    ///
+    /// <para>The alternative a test has is the drain, and the drain is a scheduler measurement:
+    /// the flush runs on the thread pool, so a single-threaded ingest loop that never blocks keeps
+    /// filling the tier until a pool thread reaches the snapshot — milliseconds, and on a starved
+    /// pair of cores tens of thousands of points past the crossing. Null in production; read once
+    /// per scheduled flush, never per point.</para>
+    /// </summary>
+    internal Action<Task>? OnThresholdFlushScheduledForTest;
+
     // ── Hot tier ─────────────────────────────────────────────────────────────
     private readonly ConcurrentDictionary<SeriesKey, HotSeries> _hot = new();
 
@@ -1061,6 +1075,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
             TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
 
         gate.SetResult();   // registered — the flush may start
+        OnThresholdFlushScheduledForTest?.Invoke(flush);
         return flush;
     }
 

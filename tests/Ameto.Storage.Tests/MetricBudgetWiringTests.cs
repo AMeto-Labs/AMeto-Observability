@@ -407,10 +407,10 @@ public sealed class MetricBudgetWiringTests
 
     /// <summary>
     /// The engine spends the budget it was given, in bytes, and a histogram point costs what it
-    /// weighs. This drives the REAL trigger — points go in until the engine's own threshold
-    /// flush drains the tier — rather than reading the counter the change added, because a
-    /// threshold that still counted points would keep that counter perfectly and flush at the
-    /// wrong time anyway.
+    /// weighs. This drives the REAL trigger — points go in until the engine itself schedules its
+    /// threshold flush, and that flush drains the tier — rather than reading the counter the
+    /// change added, because a threshold that still counted points would keep that counter
+    /// perfectly and flush at the wrong time anyway.
     /// </summary>
     [Fact]
     public async Task A_histogram_reaches_the_configured_budget_in_far_fewer_points_than_a_gauge()
@@ -419,8 +419,8 @@ public sealed class MetricBudgetWiringTests
         Directory.CreateDirectory(dir);
         try
         {
-            // 1 MB of tier: ~16 400 gauge points or ~4 800 histogram points, so the handful that
-            // arrive while the scheduled flush reaches its snapshot cannot blur the ratio.
+            // 1 MB of tier: 16 384 gauge points or 4 855 histogram points, 3.4x apart. Nothing
+            // arrives while the scheduled flush reaches its snapshot, so nothing blurs the ratio.
             var options = new MetricsOptions { HotTierBytes = 1 * MB, WalInitialBytes = 1 * MB };
 
             int gaugePoints     = await PointsUntilTheEngineFlushes(dir, options, histogram: false);
@@ -436,20 +436,35 @@ public sealed class MetricBudgetWiringTests
     }
 
     /// <summary>
-    /// Points in, one at a time, until the engine's own threshold flush has drained the tier.
-    /// The drop is the signal: nothing else empties it, and it needs no timer.
+    /// Points in, one at a time, until the engine itself judges the tier over budget — the
+    /// ingest call that SCHEDULES the threshold flush — and then that flush, awaited, drains it.
+    ///
+    /// <para><b>The judgement is what is counted, not the drain.</b> This used to read the point
+    /// at which the tier emptied, but the flush runs on the thread pool and this loop never
+    /// blocks, so it kept ingesting until a pool thread reached the snapshot: the count was the
+    /// crossing plus the scheduler's delay. Two-core pinned (<c>start /affinity 3</c>) that delay
+    /// was worth up to 48 734 histogram points against a 4 855-point crossing, and 68 653 gauge
+    /// points against 16 384 on the base. The base passed anyway only because its log grew INSIDE
+    /// the append lock and the loop stalled there — at 5 958 histogram points, the 1 MB log full —
+    /// which let the flush in; the pre-grow moved that stall ahead of the crossing and the fact
+    /// failed 4 in 10. (The base with an 8 MB log fails 5 in 10 the same way, stalling at 47 663.)
+    /// Now nothing is ingested while the flush the crossing started is in flight, so the figure
+    /// is the engine's threshold and nothing else.</para>
     /// </summary>
     private static async Task<int> PointsUntilTheEngineFlushes(string root, MetricsOptions options, bool histogram)
     {
         string dir = Path.Combine(root, histogram ? "h" : "g");
         await using var engine = new MetricStorageEngine(dir, NullLogger<MetricStorageEngine>.Instance, options);
 
+        // Set on this thread, inside the Ingest call whose batch crossed the threshold.
+        Task? scheduled = null;
+        engine.OnThresholdFlushScheduledForTest = t => scheduled = t;
+
         long baseNano = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
         var  bounds   = new double[15];
         for (int i = 0; i < bounds.Length; i++) bounds[i] = i + 1;
 
         var one = new MetricIngestItem[1];
-        int peak = 0;
         for (int n = 1; n <= 200_000; n++)
         {
             one[0] = histogram
@@ -473,10 +488,14 @@ public sealed class MetricBudgetWiringTests
                     ScalarValue       = n,
                 };
             engine.Ingest(one);
+            if (scheduled is null) continue;
 
-            int live = engine.HotPointCount;
-            if (live < peak) return peak;      // the flush this crossing scheduled has drained it
-            peak = live;
+            // The engine's own threshold, at this point. Its flush is still the REAL trigger and
+            // the real drain — the loop only stops feeding it while it runs.
+            await scheduled;
+            Assert.True(engine.HotPointCount == 0,
+                $"the flush the engine scheduled after {n:N0} points left {engine.HotPointCount:N0} in the tier");
+            return n;
         }
 
         Assert.Fail("200 000 points did not make a 1 MB tier flush — the threshold is not being reached");
