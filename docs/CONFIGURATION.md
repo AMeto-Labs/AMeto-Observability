@@ -337,6 +337,16 @@ The certificate is hot-reloaded on every new TLS handshake — replace the `.pfx
 
 ---
 
+## Upgrading and rolling back: on-disk formats
+
+### Span write-ahead log (`traces/spans.wal`), v1 → v2
+
+The span WAL gained a CRC32C per entry (format v2). The first start of a release that writes v2 **upgrades** an existing v1 log in place — every span it holds is kept and replayed. If that upgrade cannot complete (a full disk, or an antivirus scanner holding the copy open), the server still starts: the log stays v1 for that run, an Error is logged, and the upgrade is retried at the next start.
+
+**Rolling back is not symmetric.** A release older than v2 does not know the v2 layout: it treats `spans.wal` as a foreign file and **re-initialises it**. After a *clean* stop that costs nothing — the final flush has already drained the log into a segment. After an *unclean* stop (crash, kill, power loss), the spans the log held and no segment did are **lost** by the rollback. To roll back safely, stop the newer release cleanly first; if it did not stop cleanly, start it once more and stop it cleanly before downgrading.
+
+---
+
 ## Full `config.yml` reference
 
 ```yaml

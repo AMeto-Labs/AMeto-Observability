@@ -732,6 +732,68 @@ public sealed class SpanWalTests : IDisposable
     }
 
     /// <summary>
+    /// A WRITER QUEUED BEHIND A HOLD GETS IN BEFORE THE NEXT ONE — the same barging, on the other
+    /// side of the lock. The engine's other writers are the flush that publishes a segment and the
+    /// compaction and retention passes that swap the cold set; the hand-off used to look only at
+    /// <c>WaitingReadCount</c>, so one of them queued behind a busy drainer was woken at every exit
+    /// and beaten back in at every re-entry, for as long as ingest stayed busy — a flush publish,
+    /// and with it the WAL commit and the hot tier's release, deferred by load. Here a writer queues
+    /// on the engine lock from inside the first hold, blocked on the lock itself; by the second hold
+    /// it must have been in and out. The hand-off budget is a hang guard, so nothing is decided by
+    /// time. Without the writer half of the hand-off, the second hold begins with it still queued.
+    /// </summary>
+    [Fact]
+    public void A_writer_queued_behind_a_hold_gets_in_before_the_next_one()
+    {
+        int perHold = TraceStorageEngine.MaxSpansPerWriteHold;
+        using var engine = new TraceStorageEngine(_dir, NullLogger<TraceStorageEngine>.Instance);
+        engine._readerHandoffTicks = System.Diagnostics.Stopwatch.Frequency * 30;   // a hang guard, not a timer
+
+        var items = new SpanIngestItem[3 * perHold];
+        for (int i = 0; i < items.Length; i++) items[i] = Item(i, BaseNano + i * 1_000L);
+
+        // WARM THE PATH BETWEEN TWO HOLDS FIRST. On a cold engine the first gap between holds is
+        // where the hand-off is JIT-compiled, and a compile is hundreds of microseconds — ample time
+        // for a woken writer to take the lock, so the barging this fact is about never happens and
+        // the fact passes with no hand-off at all. Measured: 16 of 16 runs green without the fix,
+        // cold; warm, the drainer re-enters ahead of the queued writer.
+        var warm = new SpanIngestItem[2 * perHold];
+        for (int i = 0; i < warm.Length; i++) warm[i] = Item(10_000 + i, BaseNano - 1_000_000_000L + i * 1_000L);
+        Assert.Equal(warm.Length, engine.WriteSpans(warm));
+
+        using var writerWasIn = new ManualResetEventSlim();
+        Thread? writer        = null;
+        bool queued           = false;
+        bool inBySecondHold   = false;
+        engine._insideWriteHoldForTest = taken =>
+        {
+            if (taken == perHold)
+            {
+                var rw = engine.LockForTest;
+                writer = new Thread(() =>
+                {
+                    rw.EnterWriteLock();
+                    writerWasIn.Set();
+                    rw.ExitWriteLock();
+                }) { IsBackground = true };
+                writer.Start();
+                // Blocked behind THIS hold, in the lock's own wait — not merely started.
+                queued = SpinWait.SpinUntil(() => rw.WaitingWriteCount > 0, TimeSpan.FromSeconds(30));
+            }
+            else if (taken == 2 * perHold)
+            {
+                inBySecondHold = writerWasIn.IsSet;
+            }
+        };
+
+        Assert.Equal(items.Length, engine.WriteSpans(items));
+        Assert.True(writer!.Join(TimeSpan.FromSeconds(30)));
+
+        Assert.True(queued, "setup: the writer never queued on the engine lock");
+        Assert.True(inBySecondHold, "the next hold began with a writer still queued behind the last one");
+    }
+
+    /// <summary>
     /// A BATCH INTO A DISPOSED LOG THROWS. The engine's gate refuses a batch before the log sees it,
     /// so reaching a disposed log is a broken gate — and the single-span <c>Append</c>'s silent
     /// <c>return</c> is exactly the queryable-but-unrecoverable shape that gate exists to end: the

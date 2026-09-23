@@ -108,11 +108,26 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// </summary>
     internal TimeSpan _shutdownWaitBudget = TimeSpan.FromSeconds(30);
 
+    /// <summary>
+    /// Test seam: when set, the shutdown budget is spent when THIS is cancelled rather than
+    /// <see cref="_shutdownWaitBudget"/> after the teardown begins. The budget is one span of time
+    /// the final flush and both waits share, so on a clock a slow final flush decides how much of it
+    /// the heavy-phase wait gets — a test that means to judge the wait cannot let a disk's fsync
+    /// latency decide that. Never set in production.
+    /// </summary>
+    internal CancellationTokenSource? _shutdownBudgetForTest;
+
     /// <summary>Test seam: the teardown is about to wait for running heavy phases. Only fires when there is one.</summary>
     internal Action? _onWaitingForHeavyPhases;
 
     /// <summary>Test seam: the teardown is about to wait for open readers. Only fires when there is one.</summary>
     internal Action? _onWaitingForReaders;
+
+    /// <summary>
+    /// Test seam: the teardown has just shut the door, so from here every read answers empty — the
+    /// moment at which a consumer still running (the alert evaluator) would read "no spans".
+    /// </summary>
+    internal Action? _onWritesClosedForTest;
 
     /// <summary>Test hook: heavy phases in flight (see <see cref="_heavyPhases"/>).</summary>
     internal int HeavyPhasesInFlight => Volatile.Read(ref _heavyPhases);
@@ -561,7 +576,9 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         // sequential walk of one mmap'd file bounded by the flush thresholds, so it costs
         // milliseconds even at the 50k ceiling.
         _walPath = Path.Combine(dataDir, "spans.wal");
-        _wal = SpanWriteAheadLog.Open(_walPath);
+        // A v1 log whose upgrade cannot complete opens as v1 rather than throwing out of here —
+        // a throw from this constructor fails the host (see SpanWriteAheadLog.Open).
+        _wal = SpanWriteAheadLog.Open(_walPath, logger: logger);
         RecoverFromWal();
     }
 
@@ -734,7 +751,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// keeps nearly all of the amortisation (the locks are paid once per 128 spans instead of
     /// once per span) and gives the reader a quarter of the worst-case wait. A cap alone is not
     /// enough, though: holds back to back leave a sleeping reader no gap to wake into, so between
-    /// two holds <see cref="LetQueuedReadersIn"/> hands the lock to any reader already queued.</para>
+    /// two holds <see cref="LetQueuedWaitersIn"/> hands the lock to any reader or writer already queued.</para>
     ///
     /// <para>WHAT ONE HOLD STILL GUARANTEES. The log's generation stamps are taken inside the
     /// same engine hold as the hot-tier insert, and a flush's <c>BeginFlush</c> can only run
@@ -800,7 +817,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                 {
                     _lock.ExitWriteLock();
                 }
-                LetQueuedReadersIn();
+                LetQueuedWaitersIn();
                 _afterWriteHoldForTest?.Invoke(taken);
             }
         }
@@ -840,8 +857,8 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     }
 
     /// <summary>
-    /// The longest <see cref="WriteSpans"/> waits, after a hold, for readers that queued up behind it
-    /// to get in — 100 µs, about one hold. See <see cref="LetQueuedReadersIn"/>.
+    /// The longest <see cref="WriteSpans"/> waits, after a hold, for readers or a writer that queued
+    /// up behind it to get in — 100 µs, about one hold. See <see cref="LetQueuedWaitersIn"/>.
     /// </summary>
     internal static readonly long ReaderHandoffTicks = System.Diagnostics.Stopwatch.Frequency / 10_000;
 
@@ -867,13 +884,24 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// writer preference. So readers and the drainer alternate in groups, and a reader waits for at
     /// most one hold instead of for the whole backlog. Bounded, because a queued reader may have been
     /// cancelled or descheduled, and the drainer must not idle for a reader that is not coming.</para>
+    ///
+    /// <para>A QUEUED WRITER IS BARGED THE SAME WAY, and is let in the same way. The engine's other
+    /// writers are the flush publishing a segment and the compaction and retention passes swapping
+    /// the cold set. <c>ReaderWriterLockSlim</c> wakes one of them when the drainer exits, and the
+    /// drainer's next <c>EnterWriteLock</c> can take the lock before the woken thread does (measured:
+    /// 5 of 5 warm runs, <c>A_writer_queued_behind_a_hold_gets_in_before_the_next_one</c>), so a flush
+    /// publish — and the WAL commit and tier release behind it — waited for ingest to go quiet. The
+    /// spin ends when the waiting-writer count falls below what it was: the woken writer has left its
+    /// wait, and with the drainer outside the lock nothing stands between it and the lock.</para>
     /// </summary>
-    private void LetQueuedReadersIn()
+    private void LetQueuedWaitersIn()
     {
-        if (_lock.WaitingReadCount == 0) return;
+        int writersQueued = _lock.WaitingWriteCount;
+        if (writersQueued == 0 && _lock.WaitingReadCount == 0) return;
         long deadline = System.Diagnostics.Stopwatch.GetTimestamp() + _readerHandoffTicks;
         var  spin     = new SpinWait();
-        while (_lock.WaitingReadCount > 0 && _lock.CurrentReadCount == 0)
+        while ((writersQueued > 0 && _lock.WaitingWriteCount >= writersQueued)          // none of them in yet
+            || (_lock.WaitingReadCount > 0 && _lock.CurrentReadCount == 0))              // no reader in yet
         {
             if (System.Diagnostics.Stopwatch.GetTimestamp() >= deadline) return;
             spin.SpinOnce(sleep1Threshold: -1);   // never Sleep(1): a millisecond is ten holds
@@ -4153,18 +4181,32 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// improvement on it. The engine is left allocated with an Error naming what is still
     /// running — the process is on its way out, and a leaked lock for its last second costs
     /// nothing.</para>
+    ///
+    /// <para>ONE BUDGET, AND THE FINAL FLUSH SPENDS IT TOO — deliberately. What the budget bounds is
+    /// how long this teardown holds up the host's stop, and that is one number however the time is
+    /// divided. A slow final flush leaving the heavy-phase wait little or nothing is the right
+    /// trade: running out is SAFE by construction (the engine is left frozen, not freed, and the WAL
+    /// replays whatever the flush did not commit), and a disk slow enough to eat the budget in a
+    /// flush is the same disk the wedged compaction is on. A fresh budget per wait would double the
+    /// worst-case stop to a minute — twice what the host allots its whole shutdown, and far past a
+    /// container runtime's kill — to reach the same frozen state later. So the budget stays shared, and is a token rather
+    /// than a deadline only so that a test can decide the instant it is spent
+    /// (<see cref="_shutdownBudgetForTest"/>) instead of a disk's fsync latency deciding it.</para>
     /// </summary>
     private async Task DisposeCoreAsync()
     {
-        long deadline = Environment.TickCount64 + (long)_shutdownWaitBudget.TotalMilliseconds;
+        using var clockBudget = _shutdownBudgetForTest is null
+            ? new CancellationTokenSource(_shutdownWaitBudget > TimeSpan.Zero ? _shutdownWaitBudget : TimeSpan.Zero)
+            : null;
+        CancellationToken budget = (clockBudget ?? _shutdownBudgetForTest!).Token;
 
         // ── Final flush, BEFORE the close, so it goes through the ordinary heavy-phase path.
         //    It waits out an in-flight background flush and then drains the tier — a clean stop
         //    commits the WAL and leaves nothing to replay. A failure leaves every span in the
         //    log (Abandon keeps its generation live). Off this thread and bounded, because the
         //    wait inside it is a blocking Task.Wait on whatever flush is already running.
-        try { await Task.Run(FlushHotTier).WaitAsync(Until(deadline)).ConfigureAwait(false); }
-        catch (TimeoutException)
+        try { await Task.Run(FlushHotTier).WaitAsync(budget).ConfigureAwait(false); }
+        catch (OperationCanceledException) when (budget.IsCancellationRequested)
         {
             _logger.LogError(
                 "The final span flush did not finish within {Budget}s — the WAL replays the tier "
@@ -4180,6 +4222,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         //    those loads would let a phase start after shutdown had stopped counting.
         Interlocked.Exchange(ref _writesClosed, 1);
         Interlocked.MemoryBarrier();
+        _onWritesClosedForTest?.Invoke();
 
         // ── Wait for heavy phases. Only a phase that passed the close check is counted, so from
         //    here the number can only fall.
@@ -4190,7 +4233,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         if (Volatile.Read(ref _heavyPhases) != 0)
         {
             _onWaitingForHeavyPhases?.Invoke();
-            phasesEnded = await CompletesBy(heavyDrained.Task, deadline).ConfigureAwait(false);
+            phasesEnded = await CompletesBy(heavyDrained.Task, budget).ConfigureAwait(false);
         }
 
         // ── Wait for callers inside the engine: a query still scanning, a span still between
@@ -4202,7 +4245,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         if (Volatile.Read(ref _activeReaders) != 0)
         {
             _onWaitingForReaders?.Invoke();
-            callersEnded = await CompletesBy(readersDrained.Task, deadline).ConfigureAwait(false);
+            callersEnded = await CompletesBy(readersDrained.Task, budget).ConfigureAwait(false);
         }
 
         if (!phasesEnded || !callersEnded)
@@ -4226,20 +4269,16 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         finally { _wal.Dispose(); ResourcesFreedForTest = true; }
     }
 
-    /// <summary>True if <paramref name="task"/> completes by the <see cref="Environment.TickCount64"/> deadline.</summary>
-    private static async Task<bool> CompletesBy(Task task, long deadline)
+    /// <summary>True if <paramref name="task"/> completes before the shutdown <paramref name="budget"/> is spent.</summary>
+    private static async Task<bool> CompletesBy(Task task, CancellationToken budget)
     {
         try
         {
-            await task.WaitAsync(Until(deadline)).ConfigureAwait(false);
+            await task.WaitAsync(budget).ConfigureAwait(false);
             return true;
         }
-        catch (TimeoutException) { return false; }
+        catch (OperationCanceledException) when (budget.IsCancellationRequested) { return false; }
     }
-
-    /// <summary>What is left of the shutdown budget, never negative.</summary>
-    private static TimeSpan Until(long deadline) =>
-        TimeSpan.FromMilliseconds(Math.Max(0, deadline - Environment.TickCount64));
 
     // ── IRetentionTarget ───────────────────────────────────────────────────
 

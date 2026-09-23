@@ -2,6 +2,7 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.IO.MemoryMappedFiles;
+using Microsoft.Extensions.Logging;
 using Ameto.Core;
 
 namespace Ameto.Tracing.Storage;
@@ -167,6 +168,14 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
     /// <summary>Set by <see cref="OpenOrCreate"/> when the file on disk is a v1 log; <see cref="Open(string, long)"/> upgrades it.</summary>
     private bool _legacyV1;
 
+    /// <summary>
+    /// The entry stride this log reads and appends: <see cref="EntryHeaderSize"/> with a checksum
+    /// (v2), or — only for a v1 log whose upgrade could not be committed, see
+    /// <see cref="StayV1"/> — <see cref="EntryHeaderSizeV1"/> without one.
+    /// </summary>
+    private int  _entryHeaderSize = EntryHeaderSize;
+    private bool _checksummed     = true;
+
     // ── Open-flush state (see BeginFlush/CommitFlush) ────────────────────────
     private bool _flushOpen;          // one flush at a time — the engine serialises them
     private long _flushBoundary;      // bytes belonging to the generation being flushed
@@ -196,40 +205,141 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
     /// rewritten entry for entry as v2 into <c>spans.wal.upgrade.tmp</c> (each entry's bytes
     /// verbatim, now with its checksum), fsynced, and moved over the original. The move is the
     /// commit point: a crash before it leaves the v1 file untouched and the next start upgrades it
-    /// again; a crash after it leaves a complete v2 file. A failure to write the copy (a full disk)
-    /// throws out of here with the v1 file left exactly as it was — nothing is dropped to make the
-    /// open succeed.</para>
+    /// again; a crash after it leaves a complete v2 file.</para>
+    ///
+    /// <para><b>AN UPGRADE THAT CANNOT COMPLETE DOES NOT STOP THE SERVER.</b> This runs in the trace
+    /// engine's constructor, where a throw fails the host — once, on every existing install, at the
+    /// first start after the upgrade. The rename is retried briefly (an antivirus scanner holding the
+    /// fresh copy open is the sharing violation seen on Windows); if the copy cannot be written (a
+    /// full disk) or the rename still fails, the log is opened AS v1, in place, untouched: every span
+    /// it holds replays, new spans are appended in the v1 layout, the error is logged, and the
+    /// upgrade is tried again at the next start. That is exactly the log the previous release ran
+    /// with — no checksum — for one more process lifetime; the alternatives were refusing to start,
+    /// or re-initialising a file whose spans exist nowhere else.</para>
+    ///
+    /// <para><b>ROLLING BACK is not symmetric.</b> A release older than v2 treats a v2 log as a
+    /// foreign file (any version but its own) and re-initialises it in place. After a CLEAN stop
+    /// that costs nothing — the final flush has already drained the log into a segment. After an
+    /// UNCLEAN stop the spans the log held and no segment did are lost by the rollback. Operators
+    /// are told so in docs/CONFIGURATION.md ("Upgrading and rolling back").</para>
     /// </summary>
-    public static SpanWriteAheadLog Open(string filePath, long initialCapacity = DefaultCapacity) =>
-        Open(filePath, initialCapacity, MemoryBudgets.TraceHotTierCapBytes);
+    public static SpanWriteAheadLog Open(string filePath, long initialCapacity = DefaultCapacity, ILogger? logger = null) =>
+        Open(filePath, initialCapacity, MemoryBudgets.TraceHotTierCapBytes, logger);
 
-    /// <summary>As <see cref="Open(string, long)"/>, with the growth step a test can make small.</summary>
-    internal static SpanWriteAheadLog Open(string filePath, long initialCapacity, long growthStepCap)
+    /// <summary>As <see cref="Open(string, long, ILogger)"/>, with the growth step and the upgrade's I/O a test can replace.</summary>
+    internal static SpanWriteAheadLog Open(string filePath, long initialCapacity, long growthStepCap,
+                                           ILogger? logger = null, UpgradeIo? io = null)
     {
+        io ??= UpgradeIo.Default;
+        string tmp = filePath + UpgradeSuffix;
+
         var wal = new SpanWriteAheadLog(filePath, growthStepCap);
         try { wal.OpenOrCreate(initialCapacity); }
         catch { wal.Dispose(); throw; }
-        if (!wal._legacyV1) return wal;
 
-        string tmp = filePath + UpgradeSuffix;
+        if (!wal._legacyV1)
+        {
+            // A STALE COPY from an upgrade that died before its rename. Never the only copy of
+            // anything: until the rename the v1 log is authoritative, and the rename is atomic. A v1
+            // log re-truncates it below; beside a v2 log it is 8 MB+ of garbage nobody would remove.
+            DeleteQuietly(tmp);
+            return wal;
+        }
+
         long capacity;
         try
         {
             capacity = wal.WriteUpgradedCopy(tmp);
         }
-        catch
+        catch (Exception ex)
         {
-            wal.Dispose();
-            try { File.Delete(tmp); } catch { /* best-effort: the next attempt truncates it */ }
-            throw;
+            DeleteQuietly(tmp);
+            logger?.LogError(ex,
+                "The span WAL at {Path} is a v1 log and its v2 copy could not be written; it stays v1 "
+              + "(no per-entry checksum) for this run, every span in it replays, and the upgrade is "
+              + "retried at the next start", filePath);
+            return wal.StayV1();
         }
         wal.Dispose();                                   // the mapping has to go before the file can
-        File.Move(tmp, filePath, overwrite: true);       // THE COMMIT POINT of the upgrade
+
+        // THE COMMIT POINT of the upgrade.
+        if (TryMoveWithRetry(tmp, filePath, io) is { } moveFailure)
+        {
+            DeleteQuietly(tmp);
+            logger?.LogError(moveFailure,
+                "The span WAL at {Path} could not be replaced by its v2 copy after {Attempts} attempts; "
+              + "it stays v1 (no per-entry checksum) for this run, every span in it replays, and the "
+              + "upgrade is retried at the next start", filePath, MoveRetryDelays.Length + 1);
+
+            // Whatever is at the path now — the rename is atomic, so it is the v1 log as it was.
+            var legacy = new SpanWriteAheadLog(filePath, growthStepCap);
+            try { legacy.OpenOrCreate(initialCapacity); }
+            catch { legacy.Dispose(); throw; }
+            return legacy._legacyV1 ? legacy.StayV1() : legacy;
+        }
 
         var upgraded = new SpanWriteAheadLog(filePath, growthStepCap);
         try { upgraded.OpenOrCreate(capacity); }
         catch { upgraded.Dispose(); throw; }
         return upgraded;
+    }
+
+    /// <summary>
+    /// The pauses between the rename's attempts: six attempts over ~0.8 s. Long enough for a scanner
+    /// to let go of a file it opened on creation, short enough that a rename which will never succeed
+    /// costs a start less than a second.
+    /// </summary>
+    private static readonly TimeSpan[] MoveRetryDelays =
+    [
+        TimeSpan.FromMilliseconds(25), TimeSpan.FromMilliseconds(50), TimeSpan.FromMilliseconds(100),
+        TimeSpan.FromMilliseconds(200), TimeSpan.FromMilliseconds(400),
+    ];
+
+    /// <summary>The rename, retried on the I/O failures a transient holder causes. Null on success, else the last failure.</summary>
+    private static Exception? TryMoveWithRetry(string from, string to, UpgradeIo io)
+    {
+        for (int attempt = 0; ; attempt++)
+        {
+            try
+            {
+                io.Move(from, to);
+                return null;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                if (attempt >= MoveRetryDelays.Length) return ex;
+                io.Wait(MoveRetryDelays[attempt]);
+            }
+        }
+    }
+
+    private static void DeleteQuietly(string path)
+    {
+        try { File.Delete(path); } catch { /* best-effort: an upgrade truncates it, and it replays nothing */ }
+    }
+
+    /// <summary>
+    /// Keeps this v1 log as v1 for the life of the process: reads and appends use the v1 stride, no
+    /// checksum is written or checked. Everything else — generations, the two-phase flush, the
+    /// terminator — is byte-for-byte the same in both versions, which is what makes this safe.
+    /// </summary>
+    private SpanWriteAheadLog StayV1()
+    {
+        _entryHeaderSize = EntryHeaderSizeV1;
+        _checksummed     = false;
+        return this;
+    }
+
+    /// <summary>
+    /// The upgrade's rename and the pause between its attempts, as a seam: a test fails the rename
+    /// (the sharing violation of production) and waits for nothing. Production uses <see cref="Default"/>.
+    /// </summary>
+    internal sealed class UpgradeIo
+    {
+        public static readonly UpgradeIo Default = new();
+
+        public Action<string, string> Move { get; init; } = static (from, to) => File.Move(from, to, overwrite: true);
+        public Action<TimeSpan>       Wait { get; init; } = static d => Thread.Sleep(d);
     }
 
     private void OpenOrCreate(long initialCapacity)
@@ -439,8 +549,9 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
         if (nameUtf8.Length    > ushort.MaxValue) nameUtf8    = default;
         if (serviceUtf8.Length > ushort.MaxValue) serviceUtf8 = default;
 
-        int  payload   = nameUtf8.Length + serviceUtf8.Length + attrs.Length;
-        long entrySize = (long)EntryHeaderSize + payload;
+        int  headerSize = _entryHeaderSize;              // v2, unless the upgrade could not commit
+        int  payload    = nameUtf8.Length + serviceUtf8.Length + attrs.Length;
+        long entrySize  = (long)headerSize + payload;
         EnsureCapacityLocked(_writeOffset + entrySize);
 
         byte* dest = _ptr + FileHeaderSize + _writeOffset;
@@ -462,7 +573,7 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
         eh.Status            = (byte)status;
         eh.Generation        = _generation;
 
-        byte* p = dest + EntryHeaderSize;
+        byte* p = dest + headerSize;
         nameUtf8.CopyTo(new Span<byte>(p, nameUtf8.Length));       p += nameUtf8.Length;
         serviceUtf8.CopyTo(new Span<byte>(p, serviceUtf8.Length)); p += serviceUtf8.Length;
         attrs.CopyTo(new Span<byte>(p, attrs.Length));
@@ -470,9 +581,12 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
         // THE CHECKSUM LAST, over the bytes where they now sit: the 64 header bytes and the
         // payload after the CRC slot. Computed from the map rather than from the sources, so it
         // vouches for what a replay will read, not for what this method meant to write.
-        uint crc = Crc32c.Append(0, new ReadOnlySpan<byte>(dest, ChecksummedHeaderBytes));
-        crc      = Crc32c.Append(crc, new ReadOnlySpan<byte>(dest + EntryHeaderSize, payload));
-        Unsafe.WriteUnaligned(dest + ChecksummedHeaderBytes, crc);
+        if (_checksummed)
+        {
+            uint crc = Crc32c.Append(0, new ReadOnlySpan<byte>(dest, ChecksummedHeaderBytes));
+            crc      = Crc32c.Append(crc, new ReadOnlySpan<byte>(dest + headerSize, payload));
+            Unsafe.WriteUnaligned(dest + ChecksummedHeaderBytes, crc);
+        }
 
         _writeOffset += entrySize;
         Unsafe.AsRef<WalFileHeader>(_ptr).WriteOffset = FileHeaderSize + _writeOffset;
@@ -708,7 +822,7 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
             long end = _writeOffset;
             long total;
 
-            while ((total = EntryAt(pos, end, EntryHeaderSize, checksummed: true)) > 0)
+            while ((total = EntryAt(pos, end, _entryHeaderSize, _checksummed)) > 0)
             {
                 byte* src = _ptr + FileHeaderSize + pos;
                 ref var eh = ref Unsafe.AsRef<SpanWalEntryHeader>(src);
@@ -723,7 +837,7 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
                 uint committed = Unsafe.AsRef<WalFileHeader>(_ptr).Generation;
                 if (eh.Generation == committed || eh.Generation == Next(committed))
                 {
-                    byte* p = src + EntryHeaderSize;
+                    byte* p = src + _entryHeaderSize;
                     string name = eh.NameLength    > 0 ? Encoding.UTF8.GetString(p, eh.NameLength)    : string.Empty;
                     p += eh.NameLength;
                     string svc  = eh.ServiceLength > 0 ? Encoding.UTF8.GetString(p, eh.ServiceLength) : string.Empty;

@@ -67,7 +67,7 @@ public sealed class TraceAggregateLockProbe : IDisposable
     /// Five shapes of the same ingest: <c>CallSize</c> spans per engine call, <c>PerHold</c> per lock hold,
     /// and whether the hand-off between holds runs. "per span (old)" is the drainer before this change
     /// — a hold per span, nothing yielded. "no hand-off" is the batch without
-    /// <c>LetQueuedReadersIn</c>: the arm that shows why it exists, because its readers starve.
+    /// <c>LetQueuedWaitersIn</c>: the arm that shows why it exists, because its readers starve.
     /// </summary>
     private static readonly WriteArm[] Arms =
     [

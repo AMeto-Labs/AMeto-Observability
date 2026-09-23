@@ -51,6 +51,20 @@ public sealed class AlertEvaluator : IAsyncDisposable
     // host shutdown (see DisposeAsync).
     private int _disposed;
 
+    /// <summary>Completed when the first DisposeAsync has finished; every later caller awaits it.</summary>
+    private readonly TaskCompletionSource _disposeCompleted =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>
+    /// 1 once the host has begun stopping (<see cref="StopEvaluating"/>) or this evaluator is being
+    /// disposed. From then on no cycle starts and — the half that matters — no value already being
+    /// computed is APPLIED: the engines behind it are about to answer empty, and an empty answer is
+    /// a 0 that resolves every firing "&gt;" rule. See <see cref="EvaluateAllAsync"/>.
+    /// </summary>
+    private int _stopping;
+
+    private bool IsStopping => Volatile.Read(ref _stopping) != 0;
+
     public AlertEvaluator(
         AlertRuleStore store, AlertDispatcher dispatcher, AlertPersistence persist,
         IQueryExecutor logQuery, StorageEngine storage,
@@ -222,16 +236,45 @@ public sealed class AlertEvaluator : IAsyncDisposable
     /// </summary>
     internal Task EvaluateOnceAsync(CancellationToken ct = default) => EvaluateAllAsync(ct);
 
+    /// <summary>Test hook: true once the eval loop has ended — no further tick can land.</summary>
+    internal bool LoopEndedForTest => _loop.IsCompleted;
+
+    /// <summary>
+    /// The host is stopping: finish nothing, start nothing. Called from
+    /// <see cref="Microsoft.Extensions.Hosting.IHostApplicationLifetime.ApplicationStopping"/>,
+    /// which fires before any hosted service — so before any engine this reads — begins to stop.
+    /// The loop is cancelled too, but cancelling it is not enough on its own: a cycle already past
+    /// its delay runs to the end, and the trace path ignores the token.
+    /// </summary>
+    internal void StopEvaluating()
+    {
+        Interlocked.Exchange(ref _stopping, 1);
+        try { _cts.Cancel(); }
+        catch (ObjectDisposedException) { /* already disposed: the loop is gone */ }
+    }
+
     private async Task EvaluateAllAsync(CancellationToken ct)
     {
         var now = DateTimeOffset.UtcNow;
         foreach (var rule in _store.GetAll())
         {
+            if (IsStopping) return;
             if (!rule.Enabled) { _states.TryRemove(rule.Id, out _); continue; }
             try
             {
                 double value = await ComputeValueAsync(rule, now, ct);
+
+                // CHECKED AFTER THE VALUE, NOT ONLY BEFORE THE CYCLE. An engine closes only after
+                // _stopping is set (ApplicationStopping, or this evaluator's own disposal, precedes
+                // every engine's StopAsync), so a value read out of a closed engine is always seen
+                // here with the flag up. Checking only at the top of the cycle left the case that
+                // matters: a tick that began while the host was running and read its 0 after.
+                if (IsStopping) return;
                 Transition(rule, value, now);
+            }
+            catch (OperationCanceledException) when (IsStopping)
+            {
+                return;   // a scan cut short by the stop, not a failing rule
             }
             catch (Exception ex)
             {
@@ -605,11 +648,23 @@ public sealed class AlertEvaluator : IAsyncDisposable
         // Idempotent: AlertsHostedService disposes this from both StopAsync and
         // its own DisposeAsync, and the DI container disposes the singleton too.
         // Cancelling/disposing the CTS twice throws ObjectDisposedException.
-        if (System.Threading.Interlocked.Exchange(ref _disposed, 1) != 0) return;
+        //
+        // The later callers WAIT for the first rather than returning on the exchange. Returning
+        // let a second stopper (app.Run()'s chain beside the host's own, say) walk on to the
+        // engines' teardown while the first was still awaiting a cycle in flight here.
+        if (System.Threading.Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            await _disposeCompleted.Task.ConfigureAwait(false);
+            return;
+        }
 
-        _cts.Cancel();
-        try { await _loop; } catch (OperationCanceledException) { }
-        _cts.Dispose();
+        try
+        {
+            StopEvaluating();
+            try { await _loop.ConfigureAwait(false); } catch (OperationCanceledException) { }
+            _cts.Dispose();
+        }
+        finally { _disposeCompleted.TrySetResult(); }
     }
 
     private sealed class MutableState
