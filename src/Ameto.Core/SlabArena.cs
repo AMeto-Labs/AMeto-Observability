@@ -1,14 +1,14 @@
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
-namespace Ameto.Ingestion;
+namespace Ameto.Core;
 
 /// <summary>
 /// The ingest payload arena: one contiguous address range whose pages are paid for only as
 /// the buffer actually grows into them.
 ///
 /// <para>Why this exists. The arena is sized to the back-pressure ceiling — 512 MB by default —
-/// on the assumption stated in <see cref="IngestionRingBuffer"/> that it is "reserved virtual
+/// on the assumption stated in <c>IngestionRingBuffer</c> that it is "reserved virtual
 /// memory; only pages actually written become resident". That is true of
 /// <c>NativeMemory.Alloc</c> on Linux, where a large malloc is an anonymous mmap and pages fault
 /// in lazily. It is NOT true on Windows: a block that large goes straight to
@@ -35,6 +35,19 @@ namespace Ameto.Ingestion;
 /// which is the thing this work package is removing — to reclaim memory that a LIFO free list
 /// will ask for again on the next burst of the same size. The high-water mark IS the residency,
 /// and it is the true peak, not the ceiling.</para>
+///
+/// <para><b>Why it lives in Ameto.Core, and why it is still <c>internal</c>.</b> It was written
+/// for the log ring and lived beside it in <c>Ameto.Ingestion</c>; the span ring needs the same
+/// reserve-then-commit arena, and <c>Ameto.Tracing</c> does not (and must not) reference the log
+/// ingestion module. Moving it down to the one assembly both reference is the only home that
+/// serves both. It stays <c>internal</c>, with <c>InternalsVisibleTo</c> for exactly the
+/// assemblies that use it — the two rings and the three test files that drive its hooks —
+/// because every one of those callers reaches members that are internal ON PURPOSE:
+/// <see cref="SimulateCommitFailure"/> is a test hook, the <c>reserve: false</c> overload of
+/// <c>Create</c> exists so Windows can take the Linux path in a test, and
+/// <see cref="PageAlignInward"/> / <see cref="DisableHugePages"/> are internal so the decision
+/// arithmetic is testable on every platform. Making the TYPE public would have published the
+/// allocation surface and still left every test needing <c>InternalsVisibleTo</c> for the rest.</para>
 /// </summary>
 internal sealed unsafe class SlabArena : IDisposable
 {

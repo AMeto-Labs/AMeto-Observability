@@ -23,6 +23,14 @@
     <!-- BoundedByteArrayPool: its depth and byte caps are testable with small numbers only by
          constructing one, which the process-wide IngestBufferPool cannot be asked to do. -->
     <InternalsVisibleTo Include="Ameto.Core.Tests" />
+    <!-- SlabArena: the reserve-then-commit payload arena, shared by the log ring
+         (Ameto.Ingestion) and the span ring (Ameto.Tracing). Internal on purpose — its callers
+         reach test hooks and platform-decision helpers that must not become public surface — so
+         each assembly that uses it is named here, and the Perf probes that drive its commit and
+         huge-page hooks with it (Integration.Tests is granted above). -->
+    <InternalsVisibleTo Include="Ameto.Ingestion" />
+    <InternalsVisibleTo Include="Ameto.Tracing" />
+    <InternalsVisibleTo Include="Ameto.Perf" />
   </ItemGroup>
 
 </Project>
