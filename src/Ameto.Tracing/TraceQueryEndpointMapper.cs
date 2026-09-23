@@ -1740,16 +1740,22 @@ internal static class TraceDetailJson
     /// The map straight from its bytes. FALSE — with nothing written — when this path cannot
     /// PROVE it would write what the reference path writes, and the caller then takes that path:
     /// <list type="bullet">
-    ///   <item>the map will not decode: <see cref="SpanAttributeBlob.Decode"/> answers null and the
-    ///   reference path writes <c>{}</c>. The walk below makes the SAME reader calls
-    ///   <c>Decode</c> does — nil-or-string keys, <c>ReadInt64</c> for every integer (which throws
-    ///   past <c>long.MaxValue</c>), <c>Skip</c> for everything it boxes as null — so it throws
-    ///   exactly where Decode does, and declines rather than guess at what Decode would say;</item>
     ///   <item>a key that is not valid UTF-8: two DIFFERENT byte strings can decode to the SAME key
     ///   (every ill-formed sequence becomes U+FFFD), which the dictionary folds into one entry and a
     ///   byte comparison would not;</item>
     ///   <item>more than <see cref="MaxFastPairs"/> pairs.</item>
     /// </list>
+    ///
+    /// <para>A MAP THAT WILL NOT DECODE IS ANSWERED HERE, as <c>{}</c>, and not declined. The walk
+    /// makes the SAME reader calls <see cref="SpanAttributeBlob.Decode"/> makes, in its order —
+    /// nil-or-string keys, <c>ReadInt64</c> for every integer (which throws past
+    /// <c>long.MaxValue</c>), <c>Skip</c> for everything it boxes as null — so it throws exactly
+    /// where Decode throws, and Decode's answer to a throw is null, which the reference path writes
+    /// as <c>{}</c>. Declining bought nothing but a SECOND exception per span per request — the
+    /// walk's, then Decode's — where the DTO path paid one (and memoised it on a hot record); an
+    /// exception is most of what such a span costs (<c>TraceDetailJsonFaultTests</c> counts them).
+    /// The fuzz (<c>TraceDetailTranscodeParityTests</c>, ~17% of its spans undecodable) holds the two
+    /// answers equal.</para>
     ///
     /// <para>What it then writes: each key once, at the position of its FIRST copy, with the value of
     /// its LAST — which is where a dictionary indexer leaves them — and each value as the text
@@ -1765,7 +1771,8 @@ internal static class TraceDetailJson
         var reader = new MessagePackReader(blob);
         int count;
         try   { count = reader.ReadMapHeader(); }
-        catch { return false; }   // not a map, or torn in its header: Decode answers null
+        catch { count = -1; }     // not a map, or torn in its header: Decode answers null
+        if (count < 0)            { WriteEmptyMap(w); return true; }
         if (count > MaxFastPairs) return false;
 
         AttrPair[]? rented = null;
@@ -1776,7 +1783,11 @@ internal static class TraceDetailJson
         {
             pairs = pairs[..count];
             var bytes = blob.Span;
-            if (Walk(ref reader, bytes, pairs) != WalkResult.Walked) return false;
+            switch (Walk(ref reader, bytes, pairs))
+            {
+                case WalkResult.IllFormedKey: return false;
+                case WalkResult.Undecodable:  WriteEmptyMap(w); return true;   // Decode's null
+            }
 
             // NOTHING BELOW IS CAUGHT. Only the walk may turn a throw into a decline — a throw there
             // means the blob will not decode, and nothing has been written. A throw from here on is
@@ -1806,6 +1817,13 @@ internal static class TraceDetailJson
     }
 
     private enum WalkResult { Walked, IllFormedKey, Undecodable }
+
+    /// <summary>What the reference path writes for a map Decode answers null to.</summary>
+    private static void WriteEmptyMap(Utf8JsonWriter w)
+    {
+        w.WriteStartObject();
+        w.WriteEndObject();
+    }
 
     /// <summary>
     /// Locates every pair, making the reader calls <see cref="SpanAttributeBlob.Decode"/> makes, in

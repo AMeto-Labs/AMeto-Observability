@@ -60,4 +60,55 @@ public sealed class TraceDetailJsonFaultTests
         Assert.IsType<IOException>(ex);
         Assert.Equal("the output failed", ex.Message);
     }
+
+    // ── A map that will not decode is decided once ───────────────────────────
+
+    private delegate void BlobWriter(ref MessagePackWriter w);
+
+    private static byte[] Blob(BlobWriter write)
+    {
+        var buf = new ArrayBufferWriter<byte>();
+        var w   = new MessagePackWriter(buf);
+        write(ref w);
+        w.Flush();
+        return buf.WrittenSpan.ToArray();
+    }
+
+    public static TheoryData<string, byte[]> Undecodable() => new()
+    {
+        { "torn",            Blob(static (ref MessagePackWriter w) => { w.WriteMapHeader(3); w.Write("a"); w.Write("b"); }) },
+        { "integer key",     Blob(static (ref MessagePackWriter w) => { w.WriteMapHeader(2); w.Write("a"); w.Write("b"); w.Write(7L); w.Write("c"); }) },
+        { "uint64 too big",  Blob(static (ref MessagePackWriter w) => { w.WriteMapHeader(2); w.Write("a"); w.Write("b"); w.Write("big"); w.WriteUInt64(ulong.MaxValue); }) },
+        { "not a map",       Blob(static (ref MessagePackWriter w) => { w.WriteArrayHeader(1); w.Write(1L); }) },
+    };
+
+    /// <summary>
+    /// The walk makes Decode's reader calls in Decode's order, so it throws exactly where Decode
+    /// would — and Decode's answer to a throw is null, which the reference path writes as <c>{}</c>.
+    /// Declining to that path therefore bought nothing but a SECOND exception per span per request
+    /// (the walk's, then Decode's), where the DTO path paid one, memoised on a hot record. The walk's
+    /// verdict is now the answer: <c>{}</c>, one exception.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(Undecodable))]
+    public void A_map_that_will_not_decode_is_written_empty_after_one_exception_not_two(string shape, byte[] blob)
+    {
+        var span   = new SpanRecord { AttributesBytes = blob };
+        var buf    = new ArrayBufferWriter<byte>();
+        int thread = Environment.CurrentManagedThreadId;
+        int thrown = 0;
+        EventHandler<System.Runtime.ExceptionServices.FirstChanceExceptionEventArgs> count =
+            (_, _) => { if (Environment.CurrentManagedThreadId == thread) Interlocked.Increment(ref thrown); };
+
+        AppDomain.CurrentDomain.FirstChanceException += count;
+        try
+        {
+            using var w = new Utf8JsonWriter(buf, new JsonWriterOptions { Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping });
+            TraceDetailJson.WriteAttributes(w, span);
+        }
+        finally { AppDomain.CurrentDomain.FirstChanceException -= count; }
+
+        Assert.Equal("{}", System.Text.Encoding.UTF8.GetString(buf.WrittenSpan));
+        Assert.True(thrown == 1, $"{shape}: {thrown} exception(s) thrown to write one empty map");
+    }
 }
