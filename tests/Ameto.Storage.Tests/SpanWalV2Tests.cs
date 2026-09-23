@@ -4,8 +4,10 @@ using System.Text;
 using Ameto.Core;
 using Ameto.Tracing;
 using Ameto.Tracing.Storage;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Xunit.Abstractions;
+using LogLevel = Microsoft.Extensions.Logging.LogLevel;
 
 namespace Ameto.Storage.Tests;
 
@@ -258,19 +260,25 @@ public sealed class SpanWalV2Tests : IDisposable
     }
 
     /// <summary>
-    /// AN UPGRADE THAT CANNOT WRITE ITS COPY LEAVES THE v1 LOG EXACTLY AS IT WAS, and says so by
-    /// throwing — it does not re-initialise the file to make the open succeed. The copy is blocked
-    /// here by a directory squatting on its path (the full disk of production, reproducibly). Once
-    /// the obstacle is gone the next open upgrades and replays everything.
+    /// AN UPGRADE THAT CANNOT WRITE ITS COPY LEAVES THE v1 LOG EXACTLY AS IT WAS — and OPENS IT, as
+    /// v1: it neither re-initialises the file to make the open succeed nor throws out of it. A throw
+    /// here is a throw out of the trace engine's constructor, which fails the host: one full disk at
+    /// the first start after an upgrade and the server does not come up. The copy is blocked by a
+    /// directory squatting on its path (the full disk of production, reproducibly). Once the
+    /// obstacle is gone the next open upgrades and replays everything.
     /// </summary>
     [Fact]
-    public void A_failed_upgrade_leaves_the_v1_log_untouched()
+    public void A_failed_upgrade_leaves_the_v1_log_untouched_and_opens_it_as_v1()
     {
         WriteV1Log(headerGeneration: 3, (Item(0), 3), (Item(1), 3));
         byte[] before = File.ReadAllBytes(WalPath);
         Directory.CreateDirectory(WalPath + SpanWriteAheadLog.UpgradeSuffix);
 
-        Assert.ThrowsAny<Exception>(() => SpanWriteAheadLog.Open(WalPath).Dispose());
+        using (var wal = SpanWriteAheadLog.Open(WalPath))
+        {
+            Assert.Equal((ushort)1, wal.HeaderForTest.Version);
+            Assert.Equal([100UL, 101UL], wal.ReadAll().Select(static s => s.SpanId.RawValue));
+        }
 
         // Byte for byte what it was — the open may have extended the file to its mapped size, with
         // zeroes, and that is all it may have done.
@@ -280,7 +288,143 @@ public sealed class SpanWalV2Tests : IDisposable
         Assert.True(after.AsSpan(before.Length).IndexOfAnyExcept((byte)0) < 0);
 
         Directory.Delete(WalPath + SpanWriteAheadLog.UpgradeSuffix);
-        Assert.Equal(2, Reopen().Count);
+        using (var wal = SpanWriteAheadLog.Open(WalPath))
+        {
+            Assert.Equal((ushort)2, wal.HeaderForTest.Version);
+            Assert.Equal(2, wal.ReadAll().Count);
+        }
+    }
+
+    /// <summary>
+    /// THE SERVER COMES UP. The same blocked upgrade, one level up: the trace engine's constructor —
+    /// the call a host start makes — succeeds, replays the v1 spans into the hot tier, and takes new
+    /// spans. Before, the WAL's throw propagated out of the constructor and the host failed to start.
+    /// </summary>
+    [Fact]
+    public void An_engine_over_a_v1_log_that_cannot_be_upgraded_still_starts_and_replays_it()
+    {
+        long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() * 1_000_000L;
+        var a = Item(0); var b = Item(1);
+        WriteV1Log(headerGeneration: 3,
+            (new SpanIngestItem { TraceId = a.TraceId, SpanId = a.SpanId, StartTimeUnixNano = now - 2_000_000_000L,
+                                  DurationNanos = 1, Name = a.Name, ServiceName = a.ServiceName, AttributesBytes = [] }, 3),
+            (new SpanIngestItem { TraceId = b.TraceId, SpanId = b.SpanId, StartTimeUnixNano = now - 1_000_000_000L,
+                                  DurationNanos = 1, Name = b.Name, ServiceName = b.ServiceName, AttributesBytes = [] }, 3));
+        Directory.CreateDirectory(WalPath + SpanWriteAheadLog.UpgradeSuffix);
+
+        using var engine = new TraceStorageEngine(_dir, NullLogger<TraceStorageEngine>.Instance);
+
+        Assert.Single(engine.GetTraceAsync(a.TraceId).ToBlockingEnumerable());
+        Assert.Single(engine.GetTraceAsync(b.TraceId).ToBlockingEnumerable());
+        Assert.True(engine.WriteSpan(Item(2)));
+    }
+
+    /// <summary>
+    /// A RENAME THAT NEVER SUCCEEDS — the antivirus scanner that will not let go of the fresh copy —
+    /// is retried a bounded number of times and then given up on: the log opens AS v1, in place,
+    /// replays every live span, and takes appends in the v1 layout that a restart (which retries the
+    /// upgrade) reads back. The copy is removed, and the failure is logged as an Error. Before, the
+    /// rename's exception went straight out of the open: the host did not start.
+    /// </summary>
+    [Fact]
+    public void A_v1_log_whose_rename_keeps_failing_opens_as_v1_and_loses_nothing()
+    {
+        WriteV1Log(headerGeneration: 7, (Item(0), 6), (Item(1), 7), (Item(2), 8));
+        int moves = 0, waits = 0;
+        var io = new SpanWriteAheadLog.UpgradeIo
+        {
+            Move = (_, _) => { moves++; throw new IOException("The process cannot access the file because it is being used by another process."); },
+            Wait = _ => waits++,
+        };
+        var log = new CapturingLogger();
+
+        using (var wal = SpanWriteAheadLog.Open(WalPath, 8 * 1024 * 1024, 1 << 20, log, io))
+        {
+            Assert.Equal((ushort)1, wal.HeaderForTest.Version);
+            Assert.Equal([101UL, 102UL], wal.ReadAll().Select(static s => s.SpanId.RawValue));
+            wal.Append(Item(3));
+            Assert.Equal([101UL, 102UL, 103UL], wal.ReadAll().Select(static s => s.SpanId.RawValue));
+        }
+
+        Assert.Equal(6, moves);                             // bounded: five pauses, six attempts
+        Assert.Equal(5, waits);
+        Assert.False(File.Exists(WalPath + SpanWriteAheadLog.UpgradeSuffix));
+        Assert.Contains(log.Entries, static e => e.Level == LogLevel.Error && e.Exception is IOException);
+
+        // The next start, with the scanner gone: upgraded, and the span appended as v1 came along.
+        using (var wal = SpanWriteAheadLog.Open(WalPath))
+        {
+            Assert.Equal((ushort)2, wal.HeaderForTest.Version);
+            Assert.Equal([101UL, 102UL, 103UL], wal.ReadAll().Select(static s => s.SpanId.RawValue));
+        }
+    }
+
+    /// <summary>
+    /// A RENAME THAT FAILS TWICE AND THEN SUCCEEDS is an upgrade, not a v1 fallback: the retry is the
+    /// point. No timer decides it — the seam's pause is a counter.
+    /// </summary>
+    [Fact]
+    public void A_v1_log_whose_rename_fails_transiently_is_upgraded_on_a_retry()
+    {
+        WriteV1Log(headerGeneration: 7, (Item(1), 7), (Item(2), 7));
+        int moves = 0, waits = 0;
+        var io = new SpanWriteAheadLog.UpgradeIo
+        {
+            Move = (from, to) =>
+            {
+                if (++moves <= 2) throw new UnauthorizedAccessException("Access to the path is denied.");
+                File.Move(from, to, overwrite: true);
+            },
+            Wait = _ => waits++,
+        };
+        var log = new CapturingLogger();
+
+        using (var wal = SpanWriteAheadLog.Open(WalPath, 8 * 1024 * 1024, 1 << 20, log, io))
+        {
+            Assert.Equal((ushort)2, wal.HeaderForTest.Version);
+            Assert.Equal([101UL, 102UL], wal.ReadAll().Select(static s => s.SpanId.RawValue));
+        }
+
+        Assert.Equal(3, moves);
+        Assert.Equal(2, waits);
+        Assert.False(File.Exists(WalPath + SpanWriteAheadLog.UpgradeSuffix));
+        Assert.DoesNotContain(log.Entries, static e => e.Level >= LogLevel.Warning);
+    }
+
+    /// <summary>
+    /// A STALE COPY from an upgrade that died before its rename is removed. Beside a v2 log it is
+    /// garbage that nothing else would ever delete; beside a v1 log the upgrade overwrites it.
+    /// </summary>
+    [Fact]
+    public void A_stale_upgrade_copy_from_an_earlier_crash_is_removed()
+    {
+        using (var wal = SpanWriteAheadLog.Open(WalPath)) wal.Append(Item(0));
+        File.WriteAllBytes(WalPath + SpanWriteAheadLog.UpgradeSuffix, new byte[4096]);
+
+        Assert.Single(Reopen());
+        Assert.False(File.Exists(WalPath + SpanWriteAheadLog.UpgradeSuffix));
+
+        // …and beside a v1 log, a half-written copy does not stop the upgrade.
+        WriteV1Log(headerGeneration: 2, (Item(4), 2));
+        File.WriteAllBytes(WalPath + SpanWriteAheadLog.UpgradeSuffix, [1, 2, 3]);
+        using (var wal = SpanWriteAheadLog.Open(WalPath))
+        {
+            Assert.Equal((ushort)2, wal.HeaderForTest.Version);
+            Assert.Equal([104UL], wal.ReadAll().Select(static s => s.SpanId.RawValue));
+        }
+        Assert.False(File.Exists(WalPath + SpanWriteAheadLog.UpgradeSuffix));
+    }
+
+    private sealed class CapturingLogger : ILogger
+    {
+        public readonly List<(LogLevel Level, Exception? Exception)> Entries = [];
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(LogLevel logLevel) => true;
+        public void Log<TState>(LogLevel logLevel, Microsoft.Extensions.Logging.EventId eventId, TState state, Exception? exception,
+                                Func<TState, Exception?, string> formatter)
+        {
+            lock (Entries) Entries.Add((logLevel, exception));
+        }
     }
 
     // ── What a commit forces to disk ─────────────────────────────────────────

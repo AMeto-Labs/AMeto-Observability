@@ -567,7 +567,9 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         // sequential walk of one mmap'd file bounded by the flush thresholds, so it costs
         // milliseconds even at the 50k ceiling.
         _walPath = Path.Combine(dataDir, "spans.wal");
-        _wal = SpanWriteAheadLog.Open(_walPath);
+        // A v1 log whose upgrade cannot complete opens as v1 rather than throwing out of here —
+        // a throw from this constructor fails the host (see SpanWriteAheadLog.Open).
+        _wal = SpanWriteAheadLog.Open(_walPath, logger: logger);
         RecoverFromWal();
     }
 
