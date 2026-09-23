@@ -171,6 +171,58 @@ public sealed class MetricResponseShapeTests : IClassFixture<MetricResponseShape
         }
     }
 
+    /// <summary>
+    /// An answer far past the writer's flush threshold (~14.7 KB): 600 series x 40 points, some
+    /// 1.7 MB of JSON, so the raw endpoint sends it in many flushes while it is still reading
+    /// series, and the query endpoint writes it from a list. Its bytes must be what the old path —
+    /// DTOs through reflection over ASP.NET Core's JsonOptions — wrote; that path is rebuilt here
+    /// as the oracle, since a golden string of 1.7 MB would say nothing a reader could check.
+    /// </summary>
+    private static IEnumerable<MetricSeries> BigAnswer()
+    {
+        for (int s = 0; s < 600; s++)
+        {
+            var pts = new MetricDataPoint[40];
+            for (int p = 0; p < pts.Length; p++)
+                pts[p] = P(T0 + p * 15 * S, s * 0.1 + p / 3.0, count: p, sum: p * 0.7);
+            yield return Series("shape.big", s % 3 == 0 ? MetricKind.Histogram : MetricKind.Gauge, "ms",
+                L("service.name", "svc-" + (s % 7).ToString(CultureInfo.InvariantCulture),
+                  "route", "/r/" + s.ToString(CultureInfo.InvariantCulture) + "?q=<x>&y='z'",
+                  "note", "Сервис " + (s % 5).ToString(CultureInfo.InvariantCulture)),
+                null, pts);
+        }
+    }
+
+    private static string OracleOf(IEnumerable<MetricSeries> series)
+    {
+        var options = new System.Text.Json.JsonSerializerOptions(System.Text.Json.JsonSerializerDefaults.Web)
+        {
+            Encoder          = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+            TypeInfoResolver = new System.Text.Json.Serialization.Metadata.DefaultJsonTypeInfoResolver(),
+        };
+        var dtos = series.Select(s => new MetricSeriesDto
+        {
+            Name   = s.Name,
+            Kind   = s.Kind.ToString(),
+            Unit   = s.Unit,
+            Labels = s.Labels.Pairs.ToDictionary(t => t.Key, t => t.Value),
+            Points = s.Points.Select(p => new MetricPointDto { Ts = p.TimestampUnixNano, Value = p.Value, Count = p.Count, Sum = p.Sum }).ToList(),
+        }).ToList();
+        return System.Text.Json.JsonSerializer.Serialize(dtos, options);
+    }
+
+    [Theory]
+    [InlineData("GET",  "/api/metrics/shape.big", null)]
+    [InlineData("POST", "/api/metrics/query",     """{"metric":"shape.big"}""")]
+    public async Task A_large_answer_streams_the_bytes_the_serializer_wrote(string method, string url, string? body)
+    {
+        string actual   = await Exchange(method, url, body);
+        string expected = "200 application/json; charset=utf-8\n" + OracleOf(BigAnswer());
+        Assert.True(expected.Length > 1_000_000, $"the fixture is only {expected.Length} chars — no longer past many flushes");
+        Assert.Equal(expected.Length, actual.Length);
+        Assert.Equal(expected, actual);
+    }
+
     private static string Literal(string name, string actual) =>
         "[\"" + name + "\"] = \"" + actual.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", "\\n") + "\",";
 
@@ -342,6 +394,10 @@ public sealed class MetricResponseShapeTests : IClassFixture<MetricResponseShape
 
                 case "shape.dup":
                     yield return Series("shape.dup", MetricKind.Gauge, "", L("k", "v1", "k", "v2"), null, P(T0, 1));
+                    break;
+
+                case "shape.big":
+                    foreach (var s in BigAnswer()) yield return s;
                     break;
             }
         }

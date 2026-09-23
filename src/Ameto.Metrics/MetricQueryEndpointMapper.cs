@@ -10,16 +10,25 @@ public static class MetricQueryEndpointMapper
 {
     public static void MapMetricEndpoints(this WebApplication app)
     {
+        // Every answer below is either written by MetricSeriesJson (the series) or serialized through
+        // MetricJson.Web (everything else): source-generated metadata over the options ASP.NET Core's
+        // JsonOptions used — see MetricJson for why never MetricJson.Default. MetricResponseShapeTests
+        // pins every endpoint's bytes to what reflection over those options answered.
+
         // GET /api/metrics/names?prefix=
         app.MapGet("/api/metrics/names", (IMetricQuery query, string? prefix) =>
-            Results.Json(query.GetMetricNames(string.IsNullOrEmpty(prefix) ? null : prefix).ToList())
-        ).RequireAuthorization(ViewPolicies.Metrics);
+        {
+            var names = query.GetMetricNames(string.IsNullOrEmpty(prefix) ? null : prefix);
+            return Results.Json(names as List<string> ?? new List<string>(names), MetricJson.Web.ListString);
+        }).RequireAuthorization(ViewPolicies.Metrics);
 
         // GET /api/metrics/catalog?search=
         app.MapGet("/api/metrics/catalog", (IMetricCatalog catalog, string? search) =>
         {
-            var entries = catalog.GetCatalog(string.IsNullOrWhiteSpace(search) ? null : search)
-                .Select(e => new MetricCatalogDto
+            var found   = catalog.GetCatalog(string.IsNullOrWhiteSpace(search) ? null : search);
+            var entries = new List<MetricCatalogDto>(found.Count);
+            foreach (var e in found)
+                entries.Add(new MetricCatalogDto
                 {
                     Name        = e.Name,
                     Type        = e.Kind.ToString(),
@@ -27,40 +36,39 @@ public static class MetricQueryEndpointMapper
                     LabelKeys   = e.LabelKeys,
                     Cardinality = e.Cardinality,
                     LastSeenMs  = e.LastSeenMs,
-                })
-                .ToList();
-            return Results.Json(entries);
+                });
+            return Results.Json(entries, MetricJson.Web.ListMetricCatalogDto);
         }).RequireAuthorization(ViewPolicies.Metrics);
 
         // GET /api/metrics/{name}/labels
         app.MapGet("/api/metrics/{name}/labels", (IMetricCatalog catalog, string name) =>
-            Results.Json(catalog.GetLabelKeys(name))
+            Results.Json(catalog.GetLabelKeys(name), MetricJson.Web.IReadOnlyListString)
         ).RequireAuthorization(ViewPolicies.Metrics);
 
         // GET /api/metrics/{name}/labels/{key}/values
         app.MapGet("/api/metrics/{name}/labels/{key}/values", (IMetricCatalog catalog, string name, string key) =>
-            Results.Json(catalog.GetLabelValues(name, key))
+            Results.Json(catalog.GetLabelValues(name, key), MetricJson.Web.IReadOnlyListString)
         ).RequireAuthorization(ViewPolicies.Metrics);
 
         // POST /api/metrics/query  — server-side typed aggregation
         app.MapPost("/api/metrics/query", async (HttpContext ctx, IMetricAggregator agg) =>
         {
             MetricQueryDto? dto;
-            try { dto = await ctx.Request.ReadFromJsonAsync<MetricQueryDto>(ctx.RequestAborted); }
+            try { dto = await ctx.Request.ReadFromJsonAsync(MetricJson.Web.MetricQueryDto, ctx.RequestAborted); }
             catch { return Results.BadRequest("Invalid JSON"); }
 
             if (dto is null || string.IsNullOrWhiteSpace(dto.Metric))
                 return Results.BadRequest("'metric' is required");
 
             var series = await agg.QueryAsync(ToRequest(dto), ctx.RequestAborted);
-            return Results.Json(series.Select(ToDto).ToList());
+            return MetricSeriesJson.Array(series);
         }).RequireAuthorization(ViewPolicies.Metrics);
 
         // POST /api/metrics/expr  — binary metric expression (A op B)
         app.MapPost("/api/metrics/expr", async (HttpContext ctx, IMetricAggregator agg) =>
         {
             MetricExprDto? dto;
-            try { dto = await ctx.Request.ReadFromJsonAsync<MetricExprDto>(ctx.RequestAborted); }
+            try { dto = await ctx.Request.ReadFromJsonAsync(MetricJson.Web.MetricExprDto, ctx.RequestAborted); }
             catch { return Results.BadRequest("Invalid JSON"); }
             if (dto?.Left is null || dto.Right is null) return Results.BadRequest("'left' and 'right' are required");
 
@@ -73,7 +81,7 @@ public static class MetricQueryEndpointMapper
                 Name  = dto.Name,
             };
             var series = await agg.EvalExprAsync(req, ctx.RequestAborted);
-            return Results.Json(ToDto(series));
+            return MetricSeriesJson.Single(series);
         }).RequireAuthorization(ViewPolicies.Metrics);
 
         // GET /api/metrics/{name}/heatmap?from=&to=&step=&filters=k:v,k2:v2
@@ -84,13 +92,16 @@ public static class MetricQueryEndpointMapper
             var step = ParseStep(ctx.Request.Query["step"]);
             var filters = ParseFilters(ctx.Request.Query["filters"]);
 
-            var hm = await agg.HeatmapAsync(name, from, to, step, filters, ctx.RequestAborted);
+            var hm      = await agg.HeatmapAsync(name, from, to, step, filters, ctx.RequestAborted);
+            var columns = new HeatmapColumnDto[hm.Columns.Length];
+            for (int i = 0; i < columns.Length; i++)
+                columns[i] = new HeatmapColumnDto { Ts = hm.Columns[i].Ts, Counts = hm.Columns[i].Counts };
             return Results.Json(new HeatmapDto
             {
                 Bounds  = hm.Bounds,
                 Unit    = hm.Unit,
-                Columns = hm.Columns.Select(c => new HeatmapColumnDto { Ts = c.Ts, Counts = c.Counts }).ToArray(),
-            });
+                Columns = columns,
+            }, MetricJson.Web.HeatmapDto);
         }).RequireAuthorization(ViewPolicies.Metrics);
 
         // GET /api/metrics/{name}/exemplars?from=&to=&filters=k:v&limit=
@@ -101,32 +112,30 @@ public static class MetricQueryEndpointMapper
             var filters = ParseFilters(ctx.Request.Query["filters"]);
             int limit   = int.TryParse(ctx.Request.Query["limit"], out var l) ? Math.Clamp(l, 1, 1000) : 200;
 
-            var result = store.GetExemplars(name, from, to, filters, limit)
-                .Select(e => new ExemplarDto
+            var found  = store.GetExemplars(name, from, to, filters, limit);
+            var result = new List<ExemplarDto>(found.Count);
+            foreach (var e in found)
+                result.Add(new ExemplarDto
                 {
                     Ts      = e.TimestampUnixNano,
                     Value   = e.Value,
                     TraceId = e.TraceId,
                     SpanId  = e.SpanId,
-                    Labels  = e.Labels.Pairs.ToDictionary(t => t.Key, t => t.Value),
-                })
-                .ToList();
-            return Results.Json(result);
+                    Labels  = LabelDictionary(e.Labels),
+                });
+            return Results.Json(result, MetricJson.Web.ListExemplarDto);
         }).RequireAuthorization(ViewPolicies.Metrics);
 
         // GET /api/metrics/{name}?from=&to=&step=  — raw series (no aggregation)
-        app.MapGet("/api/metrics/{name}", async (HttpContext ctx, IMetricQuery query, string name) =>
+        app.MapGet("/api/metrics/{name}", (HttpContext ctx, IMetricQuery query, string name) =>
         {
             var from = ParseDate(ctx.Request.Query["from"]);
             var to   = ParseDate(ctx.Request.Query["to"]);
             var step = ParseStep(ctx.Request.Query["step"]);
 
-            var result = new List<MetricSeriesDto>();
-            // The answer carries ts / value / count / sum only, so the storage need build no bucket arrays.
-            await foreach (var s in query.QueryAsync(name, from, to, step, null, MetricPointFields.NoBuckets))
-                result.Add(ToDto(s));
-
-            return Results.Json(result);
+            // Each series is written as storage produces it; none is held once written. The answer
+            // carries ts / value / count / sum only, so the storage need build no bucket arrays.
+            return MetricSeriesJson.Array(query.QueryAsync(name, from, to, step, null, MetricPointFields.NoBuckets, ctx.RequestAborted));
         }).RequireAuthorization(ViewPolicies.Metrics);
     }
 
@@ -145,20 +154,17 @@ public static class MetricQueryEndpointMapper
         TopK        = dto.Topk,
     };
 
-    private static MetricSeriesDto ToDto(MetricSeries s) => new()
+    /// <summary>
+    /// A label set as the DTO's dictionary, in the set's order — what <c>Pairs.ToDictionary</c>
+    /// built, without the pair view and the LINQ iterator. <see cref="Dictionary{TKey, TValue}.Add"/>
+    /// refuses a repeated or null key exactly as it did inside ToDictionary.
+    /// </summary>
+    private static Dictionary<string, string> LabelDictionary(LabelSet labels)
     {
-        Name   = s.Name,
-        Kind   = s.Kind.ToString(),
-        Unit   = s.Unit,
-        Labels = s.Labels.Pairs.ToDictionary(t => t.Key, t => t.Value),
-        Points = s.Points.Select(p => new MetricPointDto
-        {
-            Ts    = p.TimestampUnixNano,
-            Value = p.Value,
-            Count = p.Count,
-            Sum   = p.Sum,
-        }).ToList(),
-    };
+        var dict = new Dictionary<string, string>(labels.Count);
+        for (int i = 0; i < labels.Count; i++) dict.Add(labels.KeyAt(i), labels.ValueAt(i));
+        return dict;
+    }
 
     private static DateTimeOffset? ParseDate(string? s) =>
         DateTimeOffset.TryParse(s, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var v) ? v : null;
