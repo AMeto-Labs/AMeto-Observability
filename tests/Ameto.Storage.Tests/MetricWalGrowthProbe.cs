@@ -94,7 +94,7 @@ public sealed class MetricWalGrowthProbe
     /// parked growth itself, so the reverted code fails instead of hanging.
     /// </summary>
     [Fact]
-    public void A_fitting_append_walks_past_a_pre_grow_another_call_is_running()
+    public async Task A_fitting_append_walks_past_a_pre_grow_another_call_is_running()
     {
         string dir = Path.Combine(Path.GetTempPath(), "ameto-mwalpregrow-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(dir);
@@ -136,7 +136,7 @@ public sealed class MetricWalGrowthProbe
             }
             finally { release.Set(); }
 
-            crosser.Wait();
+            await crosser;
             wal.OnGrowMappedForTest = null;
             wal.OnPreGrowForTest    = null;
             Assert.Equal(1, grows);
