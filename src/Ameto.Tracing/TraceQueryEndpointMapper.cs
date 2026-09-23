@@ -1,4 +1,7 @@
+using System.Buffers;
+using System.Text.Json;
 using System.Text.Json.Serialization;
+using MessagePack;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
@@ -272,6 +275,26 @@ public static class TraceQueryEndpointMapper
     /// <c>GET /api/traces/{traceId}</c>: every span of one trace, in start order. A method rather
     /// than a lambda in <see cref="MapTraceEndpoints"/> so <c>TraceDetailAllocProbe</c> can drive
     /// the handler itself over a <c>DefaultHttpContext</c>, without a host.
+    ///
+    /// <para>WRITTEN, NOT SERIALISED. Each span goes straight from the record into the response —
+    /// ids as hex into the writer, the attribute map transcoded out of its msgpack bytes by
+    /// <see cref="TraceDetailJson"/> — where it used to become a <see cref="SpanDto"/> with three id
+    /// strings, a <c>Dictionary&lt;string,string&gt;</c> and a string per attribute value, all of
+    /// them buffered in a list until the last span arrived, and then walked back out by the
+    /// reflection serialiser. On a hot-tier trace that route also DECODED the blob through
+    /// <see cref="SpanRecord.Attributes"/>, which memoises the dictionary on the record — so one
+    /// look at a trace left every one of its spans ~1.5 KB heavier in the live tier until it
+    /// flushed (<c>TraceDetailAllocProbe.A_trace_detail_does_not_inflate_the_hot_tier_it_read</c>).</para>
+    ///
+    /// <para>THE BYTES ARE THE OLD BYTES, pinned by <c>TraceDetailShapeTests</c>: the same property
+    /// names and order, every attribute value still the STRING <c>ToString()</c> gave it under the
+    /// request's culture, and the host's JSON encoder (see <see cref="TraceDetailJson.WriterOptions"/>).
+    /// </para>
+    ///
+    /// <para>STREAMED, and nothing is written before the first span arrives: the provider does all
+    /// of its reading before it yields anything (it sorts the union of both tiers), so a lookup
+    /// that fails still fails before the response has started — a 500, as before — and once a span
+    /// is in hand the rest are already in memory.</para>
     /// </summary>
     internal static async Task WriteTraceDetailAsync(HttpContext ctx, string traceId)
     {
@@ -281,11 +304,32 @@ public static class TraceQueryEndpointMapper
             return;
         }
         var provider = ctx.RequestServices.GetRequiredService<ITraceProvider>();
-        var spans    = new List<SpanDto>();
-        await foreach (var s in provider.GetTraceAsync(tid, ctx.RequestAborted))
-            spans.Add(SpanDto.From(s));
+        var body     = ctx.Response.BodyWriter;
 
-        await ctx.Response.WriteAsJsonAsync(spans);
+        Utf8JsonWriter? json    = null;
+        long            flushed = 0;
+        try
+        {
+            await foreach (var s in provider.GetTraceAsync(tid, ctx.RequestAborted))
+            {
+                json ??= TraceDetailJson.BeginArray(ctx);
+                TraceDetailJson.WriteSpan(json, s);
+
+                if (json.BytesCommitted + json.BytesPending - flushed < TraceDetailJson.FlushThresholdBytes)
+                    continue;
+                json.Flush();
+                flushed = json.BytesCommitted;
+                // No token, as WriteAsJsonAsync passed none that could fail a write: a client that
+                // has gone completes the pipe, and that is the signal to stop writing.
+                if ((await body.FlushAsync()).IsCompleted) return;
+            }
+
+            json ??= TraceDetailJson.BeginArray(ctx);
+            json.WriteEndArray();
+            json.Flush();
+            await body.FlushAsync();
+        }
+        finally { json?.Dispose(); }
     }
 
     /// <summary><c>GET /api/traces/{traceId}/flamegraph</c> — see <see cref="WriteTraceDetailAsync"/>.</summary>
@@ -1314,6 +1358,347 @@ public sealed class SpanDto
         HttpStatusCode    = s.HttpStatusCode,
         Attributes        = s.Attributes?.ToDictionary(kv => kv.Key, kv => kv.Value?.ToString() ?? string.Empty) ?? [],
     };
+}
+
+/// <summary>
+/// THE TRACE DETAIL'S WIRE FORMAT, WRITTEN BY HAND — byte for byte what serialising a
+/// <c>List&lt;SpanDto&gt;</c> through the host's JSON options produced, without the DTO, its
+/// dictionary, or a string per attribute value. <c>TraceDetailShapeTests</c> pins the bytes over
+/// every attribute shape, both tiers and two cultures; <c>TraceDetailTranscodeParityTests</c> holds
+/// <see cref="WriteSpan"/> to <see cref="SpanDto.From"/> over seeded random blobs.
+/// </summary>
+internal static class TraceDetailJson
+{
+    /// <summary>
+    /// How much of the response may sit in the pipe before it is flushed — what
+    /// <c>JsonSerializer.SerializeAsync</c> buffered, near enough (16 KB × 0.9), so the socket sees
+    /// the same rhythm of writes it always did.
+    /// </summary>
+    internal const int FlushThresholdBytes = 16 * 1024;
+
+    /// <summary>What <c>WriteAsJsonAsync</c> sets, and so what the client has always been sent.</summary>
+    private const string ContentType = "application/json; charset=utf-8";
+
+    private static readonly JsonEncodedText PTraceId           = JsonEncodedText.Encode("traceId");
+    private static readonly JsonEncodedText PSpanId            = JsonEncodedText.Encode("spanId");
+    private static readonly JsonEncodedText PParentSpanId      = JsonEncodedText.Encode("parentSpanId");
+    private static readonly JsonEncodedText PStartTimeUnixNano = JsonEncodedText.Encode("startTimeUnixNano");
+    private static readonly JsonEncodedText PDurationNanos     = JsonEncodedText.Encode("durationNanos");
+    private static readonly JsonEncodedText PName              = JsonEncodedText.Encode("name");
+    private static readonly JsonEncodedText PServiceName       = JsonEncodedText.Encode("serviceName");
+    private static readonly JsonEncodedText PKind              = JsonEncodedText.Encode("kind");
+    private static readonly JsonEncodedText PStatus            = JsonEncodedText.Encode("status");
+    private static readonly JsonEncodedText PHttpStatusCode    = JsonEncodedText.Encode("httpStatusCode");
+    private static readonly JsonEncodedText PAttributes        = JsonEncodedText.Encode("attributes");
+
+    /// <summary>
+    /// The enum names, as <c>ToString()</c> spells them, for every DEFINED value — derived from the
+    /// enums rather than typed out, so a renamed member cannot put a different word on the wire
+    /// than the DTO did. An undefined value (a producer can send kind 9) is rare and takes
+    /// <c>ToString()</c> itself, which prints its number.
+    /// </summary>
+    private static readonly JsonEncodedText[] KindNames   = EnumNames<SpanKind>();
+    private static readonly JsonEncodedText[] StatusNames = EnumNames<SpanStatusCode>();
+
+    private static JsonEncodedText[] EnumNames<T>() where T : struct, Enum
+    {
+        var values = Enum.GetValues<T>();
+        int max = 0;
+        foreach (var v in values) max = Math.Max(max, Convert.ToInt32(v, System.Globalization.CultureInfo.InvariantCulture));
+        var names = new JsonEncodedText[max + 1];
+        for (int i = 0; i <= max; i++)
+            names[i] = JsonEncodedText.Encode(((T)Enum.ToObject(typeof(T), i)).ToString());
+        return names;
+    }
+
+    /// <summary>The fallback for a host with no <c>JsonOptions</c> registered — what
+    /// <c>WriteAsJsonAsync</c> falls back to as well: a fresh <c>JsonOptions</c>' serializer
+    /// options, whose encoder is ASP.NET Core's relaxed one.</summary>
+    private static readonly JsonSerializerOptions FallbackOptions =
+        new Microsoft.AspNetCore.Http.Json.JsonOptions().SerializerOptions;
+
+    /// <summary>
+    /// THE HOST'S ENCODER AND LAYOUT, taken from the options <c>WriteAsJsonAsync</c> resolves — not
+    /// System.Text.Json's defaults, and not a source-generated context's. ASP.NET Core's HTTP JSON
+    /// options carry <c>JavaScriptEncoder.UnsafeRelaxedJsonEscaping</c>, under which <c>&lt;</c>,
+    /// <c>&amp;</c>, <c>'</c> and non-ASCII text go out as UTF-8 rather than as <c>\uXXXX</c>; the
+    /// default encoder would change the bytes of every span with a non-ASCII name or value. The
+    /// property names and their order are this type's own and fixed: they ARE the contract.
+    /// </summary>
+    internal static JsonWriterOptions WriterOptions(HttpContext ctx) => WriterOptions(HostOptions(ctx));
+
+    /// <summary>The serializer options <c>WriteAsJsonAsync</c> would have used for this request.</summary>
+    internal static JsonSerializerOptions HostOptions(HttpContext ctx) =>
+        ctx.RequestServices?.GetService<Microsoft.Extensions.Options.IOptions<Microsoft.AspNetCore.Http.Json.JsonOptions>>()
+            ?.Value?.SerializerOptions
+     ?? FallbackOptions;
+
+    /// <summary>The writer settings of <paramref name="o"/> that change bytes: encoder and layout.</summary>
+    internal static JsonWriterOptions WriterOptions(JsonSerializerOptions o) => new()
+    {
+        Encoder         = o.Encoder,
+        Indented        = o.WriteIndented,
+        IndentCharacter = o.IndentCharacter,
+        IndentSize      = o.IndentSize,
+        NewLine         = o.NewLine,
+    };
+
+    /// <summary>Sets the content type, opens a writer on the response body and writes <c>[</c>.</summary>
+    internal static Utf8JsonWriter BeginArray(HttpContext ctx)
+    {
+        ctx.Response.ContentType = ContentType;
+        var json = new Utf8JsonWriter(ctx.Response.BodyWriter, WriterOptions(ctx));
+        json.WriteStartArray();
+        return json;
+    }
+
+    /// <summary>One span, exactly as <c>SpanDto.From(s)</c> serialised.</summary>
+    internal static void WriteSpan(Utf8JsonWriter w, SpanRecord s)
+    {
+        Span<byte> hex = stackalloc byte[32];
+
+        w.WriteStartObject();
+        FormatHex(s.TraceId, hex);
+        w.WriteString(PTraceId, hex);
+        FormatHex(s.SpanId.RawValue, hex[..16]);
+        w.WriteString(PSpanId, hex[..16]);
+        FormatHex(s.ParentSpanId.RawValue, hex[..16]);
+        w.WriteString(PParentSpanId, hex[..16]);
+        w.WriteNumber(PStartTimeUnixNano, s.StartTimeUnixNano);
+        w.WriteNumber(PDurationNanos,     s.DurationNanos);
+        w.WriteString(PName,              s.Name);
+        w.WriteString(PServiceName,       s.ServiceName);
+        WriteEnum(w, PKind,   (byte)s.Kind,   KindNames,   s.Kind);
+        WriteEnum(w, PStatus, (byte)s.Status, StatusNames, s.Status);
+        w.WriteNumber(PHttpStatusCode, (int)s.HttpStatusCode);
+        w.WritePropertyName(PAttributes);
+        WriteAttributes(w, s);
+        w.WriteEndObject();
+    }
+
+    private static void WriteEnum<T>(Utf8JsonWriter w, JsonEncodedText property, byte value,
+                                     JsonEncodedText[] names, T boxedOnlyWhenUndefined) where T : struct, Enum
+    {
+        if (value < names.Length) w.WriteString(property, names[value]);
+        else                      w.WriteString(property, boxedOnlyWhenUndefined.ToString());
+    }
+
+    private static ReadOnlySpan<byte> HexDigits => "0123456789abcdef"u8;
+
+    /// <summary><c>SpanId.ToString()</c> — <c>{value:x16}</c> — as UTF-8, into the caller's stack.</summary>
+    internal static void FormatHex(ulong value, Span<byte> dest16)
+    {
+        for (int i = 15; i >= 0; i--)
+        {
+            dest16[i] = HexDigits[(int)(value & 0xF)];
+            value >>= 4;
+        }
+    }
+
+    /// <summary><c>TraceId.ToString()</c> — high half then low half, each <c>x16</c>.</summary>
+    internal static void FormatHex(TraceId id, Span<byte> dest32)
+    {
+        Span<byte> raw = stackalloc byte[16];
+        id.WriteTo(raw);
+        FormatHex(System.Buffers.Binary.BinaryPrimitives.ReadUInt64BigEndian(raw),      dest32[..16]);
+        FormatHex(System.Buffers.Binary.BinaryPrimitives.ReadUInt64BigEndian(raw[8..]), dest32[16..]);
+    }
+
+    // ── The attribute map ─────────────────────────────────────────────────────
+
+    /// <summary>
+    /// The attribute map as the DTO's <c>Dictionary&lt;string,string&gt;</c> serialised: the map
+    /// <see cref="SpanAttributeBlob.Decode"/> builds, each value as <c>ToString()</c> of the box it
+    /// decodes to, <c>""</c> for null, and <c>{}</c> when there is no map or it will not decode.
+    ///
+    /// <para>READ FROM THE BYTES, NEVER FROM <see cref="SpanRecord.Attributes"/> for a record that
+    /// has them: that property memoises its decode on the record, and a hot-tier record belongs to
+    /// the tier. A record with no bytes is one built from a dictionary (test fixtures) or one with
+    /// no attributes, and takes the dictionary it has.</para>
+    /// </summary>
+    internal static void WriteAttributes(Utf8JsonWriter w, SpanRecord s)
+    {
+        var blob = s.AttributesBytes;
+        if (blob.IsEmpty)                   { WriteDecoded(w, s.Attributes); return; }
+        if (TryWriteBlob(w, blob))          return;
+        WriteDecoded(w, SpanAttributeBlob.Decode(blob));   // not memoised: Decode, not .Attributes
+    }
+
+    /// <summary>
+    /// THE REFERENCE PATH, and the one every shape the fast path declines takes: the dictionary,
+    /// in its own order, each value through <c>ToString()</c>. Exact by construction — it is the
+    /// old code minus the copy <c>ToDictionary</c> made of a map it then only enumerated.
+    /// </summary>
+    private static void WriteDecoded(Utf8JsonWriter w, IReadOnlyDictionary<string, object?>? attrs)
+    {
+        w.WriteStartObject();
+        if (attrs is not null)
+            foreach (var kv in attrs)
+                w.WriteString(kv.Key, kv.Value?.ToString() ?? string.Empty);
+        w.WriteEndObject();
+    }
+
+    /// <summary>One pair of the map, located in the blob. Unmanaged, so it can live on the stack.</summary>
+    private struct AttrPair
+    {
+        public int          KeyStart, KeyLength;       // a nil key is the empty key: length 0
+        public int          ValueStart, ValueLength;   // Kind == Utf8String
+        public SpanAttrKind Kind;
+        public bool         Boolean;
+        public long         Integer;
+        public double       Float;
+    }
+
+    /// <summary>Pairs located on the stack; a larger map rents.</summary>
+    private const int StackPairs = 32;
+
+    /// <summary>
+    /// Past this many pairs the fast path declines. Duplicate detection below is pairwise, which
+    /// is nothing at the eight to thirty attributes a span carries and quadratic past them; a map
+    /// that large takes the reference path, whose dictionary is linear.
+    /// </summary>
+    private const int MaxFastPairs = 256;
+
+    /// <summary>
+    /// The map straight from its bytes. FALSE — with nothing written — when this path cannot
+    /// PROVE it would write what the reference path writes, and the caller then takes that path:
+    /// <list type="bullet">
+    ///   <item>the map will not decode: <see cref="SpanAttributeBlob.Decode"/> answers null and the
+    ///   reference path writes <c>{}</c>. The walk below makes the SAME reader calls
+    ///   <c>Decode</c> does — nil-or-string keys, <c>ReadInt64</c> for every integer (which throws
+    ///   past <c>long.MaxValue</c>), <c>Skip</c> for everything it boxes as null — so it throws
+    ///   exactly where Decode does, and declines rather than guess at what Decode would say;</item>
+    ///   <item>a key that is not valid UTF-8: two DIFFERENT byte strings can decode to the SAME key
+    ///   (every ill-formed sequence becomes U+FFFD), which the dictionary folds into one entry and a
+    ///   byte comparison would not;</item>
+    ///   <item>more than <see cref="MaxFastPairs"/> pairs.</item>
+    /// </list>
+    ///
+    /// <para>What it then writes: each key once, at the position of its FIRST copy, with the value of
+    /// its LAST — which is where a dictionary indexer leaves them — and each value as the text
+    /// <c>ToString()</c> gives its box: a string as decoded (an ill-formed one through the decoder,
+    /// so its U+FFFD land where they did), an integer and a double through
+    /// <see cref="IUtf8SpanFormattable"/> with the CURRENT culture — the same call
+    /// <c>long.ToString()</c> and <c>double.ToString()</c> make — a bool as <c>True</c> /
+    /// <c>False</c>, and nil, arrays, maps, binary and extensions as <c>""</c>. Trailing bytes after
+    /// the map are ignored, as Decode ignores them.</para>
+    /// </summary>
+    internal static bool TryWriteBlob(Utf8JsonWriter w, ReadOnlyMemory<byte> blob)
+    {
+        AttrPair[]? rented = null;
+        try
+        {
+            var reader = new MessagePackReader(blob);
+            int count  = reader.ReadMapHeader();
+            if (count > MaxFastPairs) return false;
+
+            Span<AttrPair> pairs = count <= StackPairs
+                ? stackalloc AttrPair[StackPairs]
+                : (rented = ArrayPool<AttrPair>.Shared.Rent(count));
+            var bytes = blob.Span;
+
+            for (int i = 0; i < count; i++)
+            {
+                ref var p = ref pairs[i];
+                p = default;
+
+                // ReadString's rules for the key: nil is the empty key, a string is its bytes, and
+                // anything else throws.
+                if (!reader.TryReadNil())
+                {
+                    long len = reader.ReadStringSequence()!.Value.Length;
+                    p.KeyLength = (int)len;
+                    p.KeyStart  = (int)(reader.Consumed - len);
+                    if (!System.Text.Unicode.Utf8.IsValid(bytes.Slice(p.KeyStart, p.KeyLength)))
+                        return false;
+                }
+
+                // SpanAttributeBlob.ReadBoxedValue's rules for the value, call for call.
+                switch (reader.NextMessagePackType)
+                {
+                    case MessagePackType.String:
+                    {
+                        long len = reader.ReadStringSequence()!.Value.Length;
+                        p.Kind        = SpanAttrKind.Utf8String;
+                        p.ValueLength = (int)len;
+                        p.ValueStart  = (int)(reader.Consumed - len);
+                        break;
+                    }
+                    case MessagePackType.Integer: p.Kind = SpanAttrKind.Integer; p.Integer = reader.ReadInt64();   break;
+                    case MessagePackType.Float:   p.Kind = SpanAttrKind.Float;   p.Float   = reader.ReadDouble();  break;
+                    case MessagePackType.Boolean: p.Kind = SpanAttrKind.Boolean; p.Boolean = reader.ReadBoolean(); break;
+                    case MessagePackType.Nil:     p.Kind = SpanAttrKind.Null;    reader.ReadNil();                 break;
+                    default:                      p.Kind = SpanAttrKind.Other;   reader.Skip();                    break;
+                }
+            }
+
+            w.WriteStartObject();
+            for (int i = 0; i < count; i++)
+            {
+                var key = bytes.Slice(pairs[i].KeyStart, pairs[i].KeyLength);
+                if (IndexOfKey(pairs, bytes, key, 0, i) >= 0) continue;   // written at its first copy
+
+                int last = i;
+                for (int j = count - 1; j > i; j--)
+                    if (KeyEquals(pairs[j], bytes, key)) { last = j; break; }
+
+                WriteValue(w, key, bytes, in pairs[last]);
+            }
+            w.WriteEndObject();
+            return true;
+        }
+        catch
+        {
+            return false;   // nothing written: the throw can only come from the walk above
+        }
+        finally
+        {
+            if (rented is not null) ArrayPool<AttrPair>.Shared.Return(rented);
+        }
+    }
+
+    private static bool KeyEquals(in AttrPair p, ReadOnlySpan<byte> bytes, ReadOnlySpan<byte> key) =>
+        p.KeyLength == key.Length && bytes.Slice(p.KeyStart, p.KeyLength).SequenceEqual(key);
+
+    private static int IndexOfKey(ReadOnlySpan<AttrPair> pairs, ReadOnlySpan<byte> bytes,
+                                  ReadOnlySpan<byte> key, int from, int to)
+    {
+        for (int j = from; j < to; j++)
+            if (KeyEquals(pairs[j], bytes, key)) return j;
+        return -1;
+    }
+
+    private static void WriteValue(Utf8JsonWriter w, ReadOnlySpan<byte> key, ReadOnlySpan<byte> bytes, in AttrPair p)
+    {
+        switch (p.Kind)
+        {
+            case SpanAttrKind.Utf8String:
+            {
+                var v = bytes.Slice(p.ValueStart, p.ValueLength);
+                if (System.Text.Unicode.Utf8.IsValid(v)) w.WriteString(key, v);
+                else                                     w.WriteString(key, System.Text.Encoding.UTF8.GetString(v));
+                break;
+            }
+            case SpanAttrKind.Integer: WriteFormatted(w, key, p.Integer); break;
+            case SpanAttrKind.Float:   WriteFormatted(w, key, p.Float);   break;
+            case SpanAttrKind.Boolean: w.WriteString(key, p.Boolean ? "True"u8 : "False"u8); break;
+            default:                   w.WriteString(key, ReadOnlySpan<byte>.Empty); break;
+        }
+    }
+
+    /// <summary>
+    /// <c>value.ToString()</c> as UTF-8 on the stack: <c>TryFormat</c> with no format and no
+    /// provider is the call <c>ToString()</c> makes — the current culture's NumberFormatInfo — so
+    /// "0,375" on a ru-KZ host stays "0,375" (issue #86 is a decision for the client, not for this
+    /// writer). A culture whose symbols do not fit the buffer takes <c>ToString()</c> itself.
+    /// </summary>
+    private static void WriteFormatted<T>(Utf8JsonWriter w, ReadOnlySpan<byte> key, T value)
+        where T : struct, IUtf8SpanFormattable
+    {
+        Span<byte> text = stackalloc byte[128];
+        if (value.TryFormat(text, out int n, default, provider: null)) w.WriteString(key, text[..n]);
+        else                                                           w.WriteString(key, value.ToString());
+    }
 }
 
 /// <summary>Single node in a trace flamegraph tree.</summary>
