@@ -96,6 +96,10 @@ public sealed class FileBoundsConventionTests
           + "the same `take`",
         ["MetricStorageEngine.cs:var copy = new List<MetricDataPoint>(_points)"] =
             "a copy of an in-memory list",
+        ["MetricStorageEngine.cs:var slice = new List<MetricDataPoint>(hi - lo)"] =
+            "hi and lo are binary-search indices into the hot series' own in-memory point list",
+        ["MetricStorageEngine.cs:var result = new List<MetricDataPoint>(count)"] =
+            "count is the number of the hot series' own in-memory points found in range, counted above",
         // COPY CONSTRUCTORS, NOT CAPACITIES. `new List<T>(someCollection)` and
         // `new List<T>(someCount)` are one shape to a textual scan and opposites in fact — the
         // first copies what is already in memory, the second reserves for a number a file may have
