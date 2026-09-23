@@ -285,7 +285,14 @@ internal sealed class TraceIndexStore : IDisposable
             // bloom is native memory.
             lock (_gate)
             {
-                foreach (var r in _open.Values) if (r.TryAcquire()) held.Add(r);
+                // ROOM FIRST, THEN HOLDS. A hold taken and then lost to an Add that grows the list
+                // and throws (out of memory) is a reader the finally cannot see, so cannot Release:
+                // its bloom — native memory — is never freed, nor its file deleted. The per-call
+                // list this replaced was sized to the run count before the first TryAcquire; the
+                // thread's pooled list is sized here, where a failure still holds nothing.
+                var open = _open;
+                held.EnsureCapacity(open.Count);
+                foreach (var r in open.Values) if (r.TryAcquire()) held.Add(r);
 
                 // TAKEN HERE, WITH THE READERS, AND NOT BUILT PER LOOKUP. This is the set the caller
                 // uses as its proof, and it describes exactly the runs pinned on the line above,
