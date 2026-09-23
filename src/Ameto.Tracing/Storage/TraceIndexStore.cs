@@ -25,9 +25,47 @@ namespace Ameto.Tracing.Storage;
 /// allocation on the common path where the index is not in use.</para>
 /// </param>
 internal readonly record struct TraceIndexAnswer(
-    List<TraceIndexHit> Hits,
+    TraceIndexHits      Hits,
     HashSet<ulong>?     Unanswerable,
     HashSet<ulong>?     AnsweredFor);
+
+/// <summary>
+/// The hits of one lookup: read-only, and EMPTY rather than null by default — so a caller that
+/// holds a <c>default(TraceIndexAnswer)</c> (the index switched off) can walk it like any other.
+///
+/// <para>A struct over an exact-size array rather than the <c>List</c> it replaced, which every
+/// lookup used to allocate — a bloom miss included — to hand back nothing. A miss now hands back
+/// <c>default</c>, a hit the one array the answer is made of. Read-only because an empty answer
+/// is no longer a fresh object: anything a caller could append to would have to be.</para>
+/// </summary>
+internal readonly struct TraceIndexHits : IReadOnlyList<TraceIndexHit>
+{
+    private readonly TraceIndexHit[]? _hits;
+
+    public TraceIndexHits(TraceIndexHit[] hits) => _hits = hits;
+
+    public int Count => _hits?.Length ?? 0;
+
+    public TraceIndexHit this[int index] => (_hits ?? [])[index];
+
+    /// <summary>The pattern <c>foreach</c> binds to: a plain struct, no allocation, no ref struct.</summary>
+    public Enumerator GetEnumerator() => new(_hits);
+
+    IEnumerator<TraceIndexHit> IEnumerable<TraceIndexHit>.GetEnumerator() =>
+        ((IEnumerable<TraceIndexHit>)(_hits ?? [])).GetEnumerator();
+
+    System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() =>
+        ((IEnumerable<TraceIndexHit>)this).GetEnumerator();
+
+    public struct Enumerator(TraceIndexHit[]? hits)
+    {
+        private int _i = -1;
+
+        public bool MoveNext() => hits is not null && ++_i < hits.Length;
+
+        public readonly TraceIndexHit Current => hits![_i];
+    }
+}
 
 /// <summary>
 /// THE OPEN RUNS, AND THE ONE QUESTION THE READ PATH ASKS THEM.
@@ -216,32 +254,49 @@ internal sealed class TraceIndexStore : IDisposable
     /// </summary>
     public TraceIndexAnswer Lookup(TraceId traceId)
     {
-        // PINNED UNDER THE GATE, so nothing can retire and free a reader between taking the
-        // snapshot and using it. A lookup holds each reader across bloom probes and a 4 KB block
-        // read — milliseconds — and the store used to dispose dropped readers immediately, whose
-        // bloom is native memory.
-        List<TraceIndexReader> held;
-        HashSet<ulong>         answeredFor;
-        lock (_gate)
-        {
-            var open = _open;
-            held = new List<TraceIndexReader>(open.Count);
-            foreach (var r in open.Values) if (r.TryAcquire()) held.Add(r);
+        // THE TWO WORKING LISTS ARE THE THREAD'S, NOT THE LOOKUP'S — the pinned readers and the
+        // hits being collected, which every lookup used to allocate afresh, a bloom miss included
+        // (a List sized by the run count plus a List of two, ~150 B, on every trace detail and on
+        // both passes of GetTraceAsync). Taken OUT of the slot for the length of the call, so a
+        // lookup that re-entered on this thread would get fresh lists instead of ones in use.
+        //
+        // THEY NEVER CARRY A READER PAST THIS CALL, and that is the whole safety argument. The
+        // refcount — TryAcquire / Release / Retire — is the only thing keeping a reader's bloom
+        // (native memory) alive under a lookup; a pooled list that kept its references after
+        // Release would pin retired readers' managed objects for the thread's life, and a list that
+        // kept its COUNT would hand the next lookup on this thread a reader it never acquired —
+        // one that may already be freed, whose Lookup answers Unreadable and drops every segment it
+        // covers to a full scan. So the finally releases, then CLEARS (List.Clear on a reference
+        // type zeroes the array), then puts back. TraceIndexLookupPoolTests retires a run through
+        // the seam while the list holds it and checks all three: freed, unreachable, never asked.
+        var held = t_held ?? new List<TraceIndexReader>();
+        var hits = t_hits ?? new List<TraceIndexHit>();
+        t_held = null;
+        t_hits = null;
 
-            // TAKEN HERE, WITH THE READERS, AND NOT BUILT PER LOOKUP. This is the set the caller
-            // uses as its proof, and it describes exactly the runs pinned on the line above,
-            // because Publish assigns both in one statement under this lock. Unioning the runs'
-            // CoveredSegments here instead allocated a HashSet on the SUCCESS path of every
-            // lookup — a bloom miss is NotPresent, not Unreadable, so it happened whether or not
-            // anything went wrong — where the check it replaced was one hash probe.
-            answeredFor = _coveredByOpen;
-        }
-
-        var hits = new List<TraceIndexHit>(2);
         HashSet<ulong>? unanswerable = null;
-        ulong key = TraceIndexFile.KeyOf(traceId);
         try
         {
+            HashSet<ulong> answeredFor;
+
+            // PINNED UNDER THE GATE, so nothing can retire and free a reader between taking the
+            // snapshot and using it. A lookup holds each reader across bloom probes and a 4 KB block
+            // read — milliseconds — and the store used to dispose dropped readers immediately, whose
+            // bloom is native memory.
+            lock (_gate)
+            {
+                foreach (var r in _open.Values) if (r.TryAcquire()) held.Add(r);
+
+                // TAKEN HERE, WITH THE READERS, AND NOT BUILT PER LOOKUP. This is the set the caller
+                // uses as its proof, and it describes exactly the runs pinned on the line above,
+                // because Publish assigns both in one statement under this lock. Unioning the runs'
+                // CoveredSegments here instead allocated a HashSet on the SUCCESS path of every
+                // lookup — a bloom miss is NotPresent, not Unreadable, so it happened whether or not
+                // anything went wrong — where the check it replaced was one hash probe.
+                answeredFor = _coveredByOpen;
+            }
+
+            ulong key = TraceIndexFile.KeyOf(traceId);
             foreach (var r in held)
             {
                 if (r.Lookup(key, hits) != TraceIndexOutcome.Unreadable) continue;
@@ -257,11 +312,31 @@ internal sealed class TraceIndexStore : IDisposable
                               + "segment(s) it covers are read rather than skipped",
                               r.Path, r.CoveredSegments.Length);
             }
-        }
-        finally { foreach (var r in held) r.Release(); }
 
-        return new TraceIndexAnswer(hits, unanswerable, answeredFor);
+            // The answer's own array, exactly sized, and only when there is something in it.
+            return new TraceIndexAnswer(
+                hits.Count == 0 ? default : new TraceIndexHits(hits.ToArray()),
+                unanswerable, answeredFor);
+        }
+        finally
+        {
+            foreach (var r in held) r.Release();
+            held.Clear();
+            hits.Clear();
+            if (held.Capacity <= MaxPooledCapacity) t_held = held;
+            if (hits.Capacity <= MaxPooledCapacity) t_hits = hits;
+        }
     }
+
+    /// <summary>The calling thread's working lists for <see cref="Lookup"/> — see there.</summary>
+    [ThreadStatic] private static List<TraceIndexReader>? t_held;
+    [ThreadStatic] private static List<TraceIndexHit>?    t_hits;
+
+    /// <summary>
+    /// A list grown past this by one unusual lookup (thousands of runs, a trace id shared by
+    /// thousands of index entries) is dropped rather than kept for the thread's life.
+    /// </summary>
+    private const int MaxPooledCapacity = 256;
 
     /// <summary>True when any run is open at all — the read path skips its work entirely if not.</summary>
     public bool HasRuns => _open.Count > 0;
