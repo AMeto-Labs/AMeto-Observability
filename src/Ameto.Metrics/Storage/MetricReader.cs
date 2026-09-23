@@ -104,6 +104,10 @@ internal static class MetricReader
     public static IEnumerable<MetricSeries> ReadAllSync(string filePath) =>
         Read(filePath, metricName: null, ReadWindow.All, CancellationToken.None);
 
+    /// <summary>As <see cref="ReadAllSync(string)"/>, with label text looked up in <paramref name="interner"/> — for tests.</summary>
+    internal static IEnumerable<MetricSeries> ReadAllSync(string filePath, MetricLabelInterner interner) =>
+        Read(filePath, metricName: null, new ReadWindow(long.MinValue, long.MaxValue, null, buckets: true, interner: interner), CancellationToken.None);
+
     // ── The rewrite's reads (RewriteMetricInChunks) ───────────────────────────
 
     /// <summary>
@@ -137,7 +141,8 @@ internal static class MetricReader
     /// </summary>
     internal readonly struct ReadWindow(
         long fromNano, long toNano, IReadOnlyDictionary<string, string>? matchers, bool buckets,
-        bool labels = true, Func<SeriesKey, int>? keyOf = null, int pointsBelow = int.MaxValue)
+        bool labels = true, Func<SeriesKey, int>? keyOf = null, int pointsBelow = int.MaxValue,
+        MetricLabelInterner? interner = null)
     {
         public static ReadWindow All => new(long.MinValue, long.MaxValue, null, buckets: true);
 
@@ -158,6 +163,10 @@ internal static class MetricReader
 
         /// <summary>With <see cref="KeyOf"/>: points are decoded only for key indices below this.</summary>
         public int PointsBelow { get; } = pointsBelow;
+
+        /// <summary>Where label text is looked up (never added): <see cref="MetricLabelInterner.Shared"/>
+        /// unless a test hands its own.</summary>
+        public MetricLabelInterner Interner { get; } = interner ?? MetricLabelInterner.Shared;
 
         public bool Keeps(long ts) => ts >= FromNano && ts <= ToNano;
 
@@ -382,14 +391,14 @@ internal static class MetricReader
             }
             else if (key.SequenceEqual("u"u8))
             {
-                if (window.Labels) unit = ReadInterned(ref r, MetricLabelInterner.Shared, out _);
+                if (window.Labels) unit = ReadPooled(ref r, window.Interner, out _);
                 else               r.Skip();
                 have |= HaveUnit;
             }
             else if (key.SequenceEqual("lbs"u8))
             {
                 if (!window.Labels) { r.Skip(); continue; }
-                labels = ReadLabels(ref r);
+                labels = ReadLabels(ref r, window.Interner);
                 have  |= HaveLabels;
                 // Rejected here, before the points the writer puts after the labels: the rest of
                 // the map is walked, not decoded, so the reader ends where the next series starts.
@@ -479,7 +488,7 @@ internal static class MetricReader
         return b;
     }
 
-    private static LabelSet ReadLabels(ref MessagePackReader r)
+    private static LabelSet ReadLabels(ref MessagePackReader r, MetricLabelInterner interner)
     {
         int count = r.ReadMapHeader();
         // THE SAME RULE AS EVERY OTHER READER HERE, and this site went four rounds without it for a
@@ -497,24 +506,22 @@ internal static class MetricReader
             fileBytesPerElement: 2, "Label set", "the series block");
         if (count > MaxInternedLabelStrings / 2) return ReadLabelsUninterned(ref r, count);
 
-        // THROUGH THE SHARED INTERNER, as the OTLP parsers and the WAL replay already are (WP6 of
-        // issue #83 left this reader out: it was not that package's file). A cold read used to
-        // decode a fresh string for every key and value of every series it touched — ten strings
-        // and a label set per five-label series, per query, per rollup chunk, per catalog seed —
-        // for text the process already holds: the series a query reads back are, almost always,
-        // the series ingest is still sending. Resolved from the UTF-8 in place, a pooled string
-        // costs nothing, and a label set whose strings are all pooled comes back as the very
-        // instance the hot tier and the WAL hold. Bounded as the interner is (see
-        // MetricLabelInterner): past its cap a string is simply built, as before, and a label set
-        // over an unpooled string is built fresh — equal by value either way.
-        var interner = MetricLabelInterner.Shared;
+        // RESOLVED AGAINST THE SHARED INTERNER, LOOKUP ONLY. The OTLP parsers and the WAL replay
+        // put live text into MetricLabelInterner.Shared; the series a query reads back are, almost
+        // always, series ingest is still sending, so their strings and label sets are already
+        // there, and a read that finds them hands back those instances and allocates nothing for
+        // them. A read that does NOT find them builds its own — and adds nothing: the pool never
+        // evicts, and a cold read is the one reader that meets every DEAD value of the retention
+        // window (the catalog seed reads every .mts at startup), so interning here filled the
+        // pool at boot and left every series started afterwards to be ingested uninterned.
+        // Equal by value either way.
         int n        = count * 2;
         var kv       = ArrayPool<string>.Shared.Rent(MaxInternedLabelStrings);
         Span<int> ids = stackalloc int[MaxInternedLabelStrings];
         try
         {
-            for (int i = 0; i < n; i++) kv[i] = ReadInterned(ref r, interner, out ids[i]);
-            return interner.GetLabelSet(kv.AsSpan(0, n), ids[..n]);
+            for (int i = 0; i < n; i++) kv[i] = ReadPooled(ref r, interner, out ids[i]);
+            return interner.LookupLabelSet(kv.AsSpan(0, n), ids[..n]);
         }
         finally
         {
@@ -547,17 +554,17 @@ internal static class MetricReader
     }
 
     /// <summary>
-    /// A msgpack string through <paramref name="interner"/>, from its UTF-8 bytes in place — the
-    /// text <c>ReadString() ?? string.Empty</c> gave (the interner decodes exactly as
-    /// <c>Encoding.UTF8.GetString</c> does), and its interner id for the label-set lookup. Nil is
-    /// the empty string, as it was.
+    /// A msgpack string looked up in <paramref name="interner"/> from its UTF-8 bytes in place —
+    /// the pooled instance and its id when the text is live, else a fresh string and -1, and
+    /// nothing added (see <see cref="MetricLabelInterner.Lookup"/>). The text is what
+    /// <c>ReadString() ?? string.Empty</c> gave; nil is the empty string, as it was.
     /// </summary>
-    private static string ReadInterned(ref MessagePackReader r, MetricLabelInterner interner, out int id)
+    private static string ReadPooled(ref MessagePackReader r, MetricLabelInterner interner, out int id)
     {
         if (r.TryReadNil()) { id = MetricLabelInterner.EmptyStringId; return string.Empty; }
         string value;
-        if (r.TryReadStringSpan(out ReadOnlySpan<byte> utf8)) id = interner.Intern(utf8, out value);
-        else                                                   id = interner.Intern(r.ReadString() ?? string.Empty, out value);
+        if (r.TryReadStringSpan(out ReadOnlySpan<byte> utf8)) id = interner.Lookup(utf8, out value);
+        else { value = r.ReadString() ?? string.Empty; id = -1; }   // a segmented sequence: never built here
         return value;
     }
 

@@ -46,14 +46,12 @@ public sealed class MetricQueryAllocProbe
         var items = new List<(SeriesKey, HotSeries)>(SeriesCount);
         for (int s = 0; s < SeriesCount; s++)
         {
-            var labels = new LabelSet(new Dictionary<string, string>
-            {
-                ["service.name"]              = "svc-" + (s % 10).ToString(CultureInfo.InvariantCulture),
-                ["http.route"]                = "/api/v1/resource" + (s % 20).ToString(CultureInfo.InvariantCulture),
-                ["http.request.method"]       = Methods[s % Methods.Length],
-                ["http.response.status_code"] = s % 7 == 0 ? "500" : "200",
-                ["server.address"]            = "host-" + (s / 20).ToString(CultureInfo.InvariantCulture),
-            });
+            var labels = LiveLabels(
+                "service.name",              "svc-" + (s % 10).ToString(CultureInfo.InvariantCulture),
+                "http.route",                "/api/v1/resource" + (s % 20).ToString(CultureInfo.InvariantCulture),
+                "http.request.method",       Methods[s % Methods.Length],
+                "http.response.status_code", s % 7 == 0 ? "500" : "200",
+                "server.address",            "host-" + (s / 20).ToString(CultureInfo.InvariantCulture));
 
             var pts     = new List<MetricDataPoint>(PointsPerSeries);
             var cum     = new long[Bounds.Length + 1];
@@ -79,6 +77,25 @@ public sealed class MetricQueryAllocProbe
             items.Add((new SeriesKey(Metric, MetricKind.Histogram, "s", labels), new HotSeries(pts, Bounds)));
         }
         return MetricWriter.Write(dir, items, MetricGranularity.Raw);
+    }
+
+    /// <summary>
+    /// A label set as a LIVE series has it: every string pooled in <see cref="MetricLabelInterner.Shared"/>
+    /// and the set published in its table, which is what the OTLP parsers do on ingest. The corpus
+    /// models what the alert evaluator reads — series that are still being sent — so a cold read
+    /// finds them there (the reader only LOOKS UP; it never adds). Fails loudly if the process-wide
+    /// pool is already too full to hold them, rather than measuring an uninterned read.
+    /// </summary>
+    private static LabelSet LiveLabels(params string[] kv)
+    {
+        var strings = new string[kv.Length];
+        var ids     = new int[kv.Length];
+        for (int i = 0; i < kv.Length; i++)
+        {
+            ids[i] = MetricLabelInterner.Shared.Intern(kv[i], out strings[i]);
+            Assert.True(ids[i] >= 0, $"the shared metric label pool could not pool '{kv[i]}' (full?) — the probe models live series");
+        }
+        return MetricLabelInterner.Shared.GetLabelSet(strings, ids);
     }
 
     private readonly record struct Cost(long Bytes, double Ms, int Series, long Points);

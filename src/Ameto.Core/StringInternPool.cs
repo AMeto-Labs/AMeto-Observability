@@ -194,6 +194,49 @@ public sealed class StringInternPool
         return Claim(template, out canonical);
     }
 
+    /// <summary>
+    /// LOOKUP ONLY: the pool's instance of <paramref name="chars"/> and its index when the pool
+    /// already holds that text, else false. Nothing is claimed, added or signalled on a miss —
+    /// for a reader of text that may not be live (a cold file, where every dead value ever
+    /// written would otherwise take a slot this never-evicting pool keeps for the life of the
+    /// process). Allocation-free either way.
+    /// </summary>
+    public bool TryGet(ReadOnlySpan<char> chars, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out string? canonical, out int index)
+    {
+        var lookup = _stringToIndex.GetAlternateLookup<ReadOnlySpan<char>>();
+        if (lookup.TryGetValue(chars, out string? existing, out index))
+        {
+            canonical = existing;
+            return true;
+        }
+        canonical = null;
+        index     = -1;
+        return false;
+    }
+
+    /// <summary>
+    /// As <see cref="TryGet(ReadOnlySpan{char}, out string?, out int)"/>, for UTF-8 — decoded
+    /// exactly as <see cref="Intern(ReadOnlySpan{byte}, out string)"/> decodes it. Empty input
+    /// is not in the pool (<see cref="Intern(ReadOnlySpan{byte}, out string)"/> never pools it).
+    /// </summary>
+    public bool TryGet(ReadOnlySpan<byte> utf8, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out string? canonical, out int index)
+    {
+        if (utf8.IsEmpty) { canonical = null; index = -1; return false; }
+
+        int charCount = System.Text.Encoding.UTF8.GetCharCount(utf8);
+        char[]? rented = charCount > 512 ? System.Buffers.ArrayPool<char>.Shared.Rent(charCount) : null;
+        Span<char> chars = rented ?? stackalloc char[charCount];
+        System.Text.Encoding.UTF8.GetChars(utf8, chars);
+        try { return TryGet(chars[..charCount], out canonical, out index); }
+        finally
+        {
+            if (rented is not null) System.Buffers.ArrayPool<char>.Shared.Return(rented);
+        }
+    }
+
+    /// <summary>Indices claimed so far, capped at <see cref="MaxPoolSize"/> — how full the pool is.</summary>
+    public int ClaimedCount => Math.Min(Volatile.Read(ref _nextIndex), _maxPoolSize);
+
     public string Get(int index)
     {
         var slots = _indexToString;            // one volatile read; index the copy taken
