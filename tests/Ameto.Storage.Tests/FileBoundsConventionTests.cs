@@ -77,8 +77,8 @@ public sealed class FileBoundsConventionTests
             "expectedLen is a call-site constant (8 or 16, an id width), never a file field",
         ["MetricStorageEngine.cs:public ExemplarRing(int capacity) => _buf = new ExemplarSample[capacity]"] =
             "the ring is a hot-tier structure sized by config; nothing reads it back off disk",
-        ["MetricStorageEngine.cs:var outArr = new ExemplarSample[_count]"] =
-            "_count is the ring's own occupancy, bounded by the capacity above",
+        ["MetricStorageEngine.cs:heap ??= new ExemplarSample[size]"] =
+            "size is Math.Min(the caller's limit, the ring's own occupancy), bounded by the capacity above",
         ["MetricWriteAheadLog.cs:var snapshot = new byte[kept]"] =
             "kept is Math.Min(orphaned, 4 MiB) on the line above — already clamped by a literal",
         ["MetricWriteAheadLog.cs:buckets = new long[eh.BucketCount]"] =

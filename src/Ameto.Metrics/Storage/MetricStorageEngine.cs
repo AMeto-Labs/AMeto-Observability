@@ -850,83 +850,132 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         string?       lastName = null;
         ExemplarRing? lastRing = null;
 
-        for (int i = 0; i < items.Length; i++)
+        // THE RUN: consecutive exemplars bound for one ring, handed over with ONE slot claim
+        // (ExemplarRing.AddRange) instead of one interlocked add each. Rented, and cleared of
+        // what it held before it goes back — an entry references a label set.
+        ExemplarSample[]? run      = null;
+        int               runCount = 0;
+        ExemplarRing?     runRing  = null;
+        try
         {
-            var item = items[i];
-
-            // See MaxFutureSkewNanos. A refused point's exemplars are stamped by the same
-            // broken clock, and GetExemplars sorts newest-first — an admitted far-future
-            // exemplar would sort to the TOP of every answer until the ring rotates it out.
-            if (item.TimestampUnixNano > futureLimit) continue;
-            if (item.Exemplars is not { Length: > 0 } exs) continue;
-
-            // TAKEN AND CLEARED IN ONE STEP, HERE AND NOT BELOW, because the slot has to be
-            // cleared on every way out of this iteration and there are three of them (a refused
-            // ring, a full ring table, and the ordinary path). The ingest loop writes a slot
-            // exactly when both tests above pass, so this is precisely the written set — which
-            // is what lets the caller return the array without a memset of all 16 384 slots.
-            var series = resolved[i];
-            resolved[i] = null;
-
-            ExemplarRing? ring;
-            if (ReferenceEquals(item.Name, lastName))
+            for (int i = 0; i < items.Length; i++)
             {
-                ring = lastRing;
-                if (ring is null) continue;                 // the same name, refused above
-            }
-            else if (!_exemplars.TryGetValue(item.Name, out ring))
-            {
-                // The ring cap is checked before GetOrAdd creates one: past it a NEW name is
-                // refused, while names that already have a ring keep working. GetOrAdd's factory
-                // can run more than once under contention, so the count is the gate, not the
-                // allocation.
-                if (ExemplarRingsFull())
+                var item = items[i];
+
+                // See MaxFutureSkewNanos. A refused point's exemplars are stamped by the same
+                // broken clock, and GetExemplars sorts newest-first — an admitted far-future
+                // exemplar would sort to the TOP of every answer until the ring rotates it out.
+                if (item.TimestampUnixNano > futureLimit) continue;
+                if (item.Exemplars is not { Length: > 0 } exs) continue;
+
+                // TAKEN AND CLEARED IN ONE STEP, HERE AND NOT BELOW, because the slot has to be
+                // cleared on every way out of this iteration and there are three of them (a refused
+                // ring, a full ring table, and the ordinary path). The ingest loop writes a slot
+                // exactly when both tests above pass, so this is precisely the written set — which
+                // is what lets the caller return the array without a memset of all 16 384 slots.
+                var series = resolved[i];
+                resolved[i] = null;
+
+                ExemplarRing? ring;
+                if (ReferenceEquals(item.Name, lastName))
                 {
-                    Interlocked.Increment(ref _exemplarMetricsRefused);
-                    lastName = item.Name;
-                    lastRing = null;
-                    continue;
+                    ring = lastRing;
+                    if (ring is null) continue;                 // the same name, refused above
                 }
-                ring = _exemplars.GetOrAdd(item.Name, static (_, s) => new ExemplarRing(s), _exemplarsPerMetric);
-            }
-            lastName = item.Name;
-            lastRing = ring;
-
-            // THE SERIES' CANONICAL LABEL SET, NOT THE POINT'S OWN INSTANCE. A ring entry is the
-            // one piece of metric memory nothing prunes, ages out, sheds or counts, and it used
-            // to be handed `item.Labels` — the LabelSet the OTLP parser builds FRESH for every
-            // data point (~480 B for the five-label HTTP shape, strings included). Nothing else
-            // keeps that instance: `_hot` keeps only the first batch's key, `_meta` keeps only
-            // the first instance of each string, and `MetricDataPoint` carries no labels at all.
-            // So from the second batch on the ring was the sole owner of one distinct label set
-            // per exemplar, and an entry cost 860 B weighed against a budget divisor of
-            // MetricsOptions.ExemplarBytes = 208 — every derived ring 4.1x the budget it was
-            // sized against, inside the heap this whole package exists to fit.
-            //
-            // The ingest loop filed this very point into that series and left the reference in
-            // `resolved`, so there is nothing to look up: the second _hot probe this used to do
-            // re-hashed a SeriesKey the caller had just hashed. Holding the reference is also
-            // stricter than the lookup was — a stale sweep between the two passes could make the
-            // lookup miss and fall back to the point's own (uncanonical, uniquely owned) set.
-            var labels = series is not null ? series.Labels : item.Labels;
-
-            foreach (var ex in exs)
-            {
-                // The exemplar's OWN clock, not the point's: OTLP parses time_unix_nano per
-                // exemplar, so a sane point can carry a 2116-stamped exemplar — and the skip
-                // above, keyed on the point, would wave it straight through to the top of
-                // every newest-first answer.
-                if (ex.TimestampUnixNano > futureLimit) continue;
-                ring.Add(new ExemplarSample
+                else if (!_exemplars.TryGetValue(item.Name, out ring))
                 {
-                    TimestampUnixNano = ex.TimestampUnixNano,
-                    Value             = ex.Value,
-                    TraceId           = ex.TraceId,
-                    SpanId            = ex.SpanId,
-                    Labels            = labels,
-                });
+                    // The ring cap is checked before GetOrAdd creates one: past it a NEW name is
+                    // refused, while names that already have a ring keep working. GetOrAdd's factory
+                    // can run more than once under contention, so the count is the gate, not the
+                    // allocation.
+                    if (ExemplarRingsFull())
+                    {
+                        Interlocked.Increment(ref _exemplarMetricsRefused);
+                        lastName = item.Name;
+                        lastRing = null;
+                        continue;
+                    }
+                    ring = _exemplars.GetOrAdd(item.Name, static (_, s) => new ExemplarRing(s), _exemplarsPerMetric);
+                }
+                lastName = item.Name;
+                lastRing = ring;
+
+                // THE SERIES' CANONICAL LABEL SET, NOT THE POINT'S OWN INSTANCE. A ring entry is the
+                // one piece of metric memory nothing prunes, ages out, sheds or counts, and it used
+                // to be handed `item.Labels` — the LabelSet the OTLP parser builds FRESH for every
+                // data point (~480 B for the five-label HTTP shape, strings included). Nothing else
+                // keeps that instance: `_hot` keeps only the first batch's key, `_meta` keeps only
+                // the first instance of each string, and `MetricDataPoint` carries no labels at all.
+                // So from the second batch on the ring was the sole owner of one distinct label set
+                // per exemplar, and an entry cost 860 B weighed against a budget divisor of
+                // MetricsOptions.ExemplarBytes = 208 — every derived ring 4.1x the budget it was
+                // sized against, inside the heap this whole package exists to fit.
+                //
+                // The ingest loop filed this very point into that series and left the reference in
+                // `resolved`, so there is nothing to look up: the second _hot probe this used to do
+                // re-hashed a SeriesKey the caller had just hashed. Holding the reference is also
+                // stricter than the lookup was — a stale sweep between the two passes could make the
+                // lookup miss and fall back to the point's own (uncanonical, uniquely owned) set.
+                var labels = series is not null ? series.Labels : item.Labels;
+
+                if (!ReferenceEquals(ring, runRing))
+                {
+                    if (runCount > 0) FlushExemplarRun(runRing!, run!, ref runCount);
+                    runRing = ring;
+                }
+
+                foreach (var ex in exs)
+                {
+                    // The exemplar's OWN clock, not the point's: OTLP parses time_unix_nano per
+                    // exemplar, so a sane point can carry a 2116-stamped exemplar — and the skip
+                    // above, keyed on the point, would wave it straight through to the top of
+                    // every newest-first answer.
+                    if (ex.TimestampUnixNano > futureLimit) continue;
+
+                    run ??= ArrayPool<ExemplarSample>.Shared.Rent(64);
+                    if (runCount == run.Length)
+                    {
+                        // A run as long as the ring cannot keep more than the ring holds anyway.
+                        if (runCount >= ring.Capacity) FlushExemplarRun(ring, run, ref runCount);
+                        else
+                        {
+                            var bigger = ArrayPool<ExemplarSample>.Shared.Rent(run.Length * 2);
+                            run.AsSpan(0, runCount).CopyTo(bigger);
+                            Array.Clear(run, 0, runCount);
+                            ArrayPool<ExemplarSample>.Shared.Return(run);
+                            run = bigger;
+                        }
+                    }
+
+                    run[runCount++] = new ExemplarSample
+                    {
+                        TimestampUnixNano = ex.TimestampUnixNano,
+                        Value             = ex.Value,
+                        TraceId           = ex.TraceId,
+                        SpanId            = ex.SpanId,
+                        Labels            = labels,
+                    };
+                }
+            }
+
+            if (runCount > 0) FlushExemplarRun(runRing!, run!, ref runCount);
+        }
+        finally
+        {
+            if (run is not null)
+            {
+                Array.Clear(run, 0, runCount);
+                ArrayPool<ExemplarSample>.Shared.Return(run);
             }
         }
+    }
+
+    /// <summary>Hands a run to its ring and empties it. See <see cref="ExemplarRing.AddRange"/>.</summary>
+    private static void FlushExemplarRun(ExemplarRing ring, ExemplarSample[] run, ref int runCount)
+    {
+        ring.AddRange(run.AsSpan(0, runCount));
+        Array.Clear(run, 0, runCount);
+        runCount = 0;
     }
 
     /// <summary>
@@ -1244,15 +1293,66 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         long fromNano = from.HasValue ? from.Value.ToUnixTimeMilliseconds() * 1_000_000L : long.MinValue;
         long toNano   = to.HasValue   ? to.Value.ToUnixTimeMilliseconds()   * 1_000_000L : long.MaxValue;
 
-        var result = new List<ExemplarSample>(Math.Min(limit, 256));
-        foreach (var ex in ring.Snapshot())
+        // THE NEWEST `limit` MATCHES, kept in a min-heap on the timestamp while the ring is walked
+        // IN PLACE — no copy of the ring (see ExemplarRing), no list of every match, no sort of
+        // it, no GetRange copy of the sorted list. Walked newest sequence first: arrival is close
+        // to timestamp order, so once the heap is full nearly every older entry fails the one
+        // comparison against its minimum and costs nothing more.
+        if (limit <= 0) return [];
+        long written = ring.Written;
+        long oldest  = Math.Max(0, written - ring.Capacity);
+        int  size    = (int)Math.Min(limit, written - oldest);
+        ExemplarSample[]? heap = null;                     // on the first match: a miss allocates nothing
+        int  n       = 0;
+
+        for (long seq = written - 1; seq >= oldest; seq--)
         {
+            if (ring.At(seq) is not { } ex) continue;       // claimed, not yet written
             if (ex.TimestampUnixNano < fromNano || ex.TimestampUnixNano > toNano) continue;
+            if (n == size && ex.TimestampUnixNano <= heap![0].TimestampUnixNano) continue;
             if (!MatchesLabels(ex.Labels, filters)) continue;
-            result.Add(ex);
+
+            heap ??= new ExemplarSample[size];
+            if (n < size) { heap[n] = ex; SiftUp(heap, n++); }
+            else          { heap[0] = ex; SiftDown(heap, n); }
         }
-        result.Sort(static (a, b) => b.TimestampUnixNano.CompareTo(a.TimestampUnixNano)); // newest first
-        return result.Count > limit ? result.GetRange(0, limit) : result;
+
+        if (heap is null) return [];
+        Array.Sort(heap, 0, n, NewestFirst.Instance);
+        if (n == size) return heap;
+        return heap.AsSpan(0, n).ToArray();
+
+        static void SiftUp(ExemplarSample[] h, int i)
+        {
+            while (i > 0)
+            {
+                int parent = (i - 1) >> 1;
+                if (h[parent].TimestampUnixNano <= h[i].TimestampUnixNano) break;
+                (h[parent], h[i]) = (h[i], h[parent]);
+                i = parent;
+            }
+        }
+
+        static void SiftDown(ExemplarSample[] h, int count)
+        {
+            int i = 0;
+            while (true)
+            {
+                int l = 2 * i + 1, r = l + 1, least = i;
+                if (l < count && h[l].TimestampUnixNano < h[least].TimestampUnixNano) least = l;
+                if (r < count && h[r].TimestampUnixNano < h[least].TimestampUnixNano) least = r;
+                if (least == i) return;
+                (h[least], h[i]) = (h[i], h[least]);
+                i = least;
+            }
+        }
+    }
+
+    /// <summary>Newest timestamp first — the order <see cref="GetExemplars"/> answers in. A singleton, so no delegate per call.</summary>
+    private sealed class NewestFirst : IComparer<ExemplarSample>
+    {
+        public static readonly NewestFirst Instance = new();
+        public int Compare(ExemplarSample? a, ExemplarSample? b) => b!.TimestampUnixNano.CompareTo(a!.TimestampUnixNano);
     }
 
     // ── IMetricQuery ──────────────────────────────────────────────────────────
@@ -2679,39 +2779,66 @@ internal readonly record struct SeriesKey(
 
 /// <summary>
 /// Fixed-capacity circular buffer of exemplars for one metric (newest overwrite oldest).
-/// Thread-safe; exemplars are recent correlation hints, not durable history.
+/// Exemplars are recent correlation hints, not durable history — which is what lets this be
+/// lock-free.
+///
+/// <para><b>No monitor.</b> <see cref="Add"/> took a <c>lock</c> per exemplar, and every ingest
+/// thread carrying exemplars for one instrument queued on it (measured 15.8 ns/add alone, 250
+/// ns/add each at four threads). A writer now claims its slots with ONE <c>Interlocked.Add</c> on
+/// a running sequence — one per run of same-metric exemplars in a batch, see
+/// <see cref="AddRange"/> — and publishes each entry with a reference store. Slot = sequence mod
+/// capacity. Two writers a whole lap apart can land on one slot in either order, so the ring may
+/// keep the older of the two: for a sampling hint that is the same answer a slightly different
+/// arrival order would have given.</para>
+///
+/// <para><b>No copy on read.</b> <c>Snapshot()</c> copied all of the ring (4 000 slots, 32 KB) per
+/// <c>GET /exemplars</c> before the filter threw most of it away. Readers now walk the slots in
+/// place through <see cref="Written"/> and <see cref="At"/>, newest first. A slot claimed but not
+/// yet written reads as null (first lap) or as the entry a lap older, and a walk that a full lap
+/// of writers overtakes sees newer entries in some slots — each slot is read once, so never one
+/// entry twice.</para>
 /// </summary>
 internal sealed class ExemplarRing
 {
-    private readonly ExemplarSample[] _buf;
-    private readonly object _lock = new();
-    private int _count;
-    private int _head; // next write index
+    private readonly ExemplarSample?[] _buf;
 
-    public ExemplarRing(int capacity) => _buf = new ExemplarSample[capacity];
+    /// <summary>Exemplars ever claimed; the next one goes to <c>_next % capacity</c>.</summary>
+    private long _next;
+
+    public ExemplarRing(int capacity) => _buf = new ExemplarSample?[capacity];
+
+    public int Capacity => _buf.Length;
+
+    /// <summary>Sequence numbers handed out so far: the ring holds <c>[Written - Capacity, Written)</c>.</summary>
+    public long Written => Volatile.Read(ref _next);
+
+    /// <summary>The entry in sequence <paramref name="seq"/>'s slot, or null if none is there yet.</summary>
+    public ExemplarSample? At(long seq) => Volatile.Read(ref _buf[(int)(seq % _buf.Length)]);
 
     public void Add(ExemplarSample s)
     {
-        lock (_lock)
-        {
-            _buf[_head] = s;
-            _head = (_head + 1) % _buf.Length;
-            if (_count < _buf.Length) _count++;
-        }
+        long seq = Interlocked.Increment(ref _next) - 1;
+        Volatile.Write(ref _buf[(int)(seq % _buf.Length)], s);
     }
 
-    public ExemplarSample[] Snapshot()
+    /// <summary>Claims <paramref name="samples"/>.Length slots with one interlocked add and fills them in order.</summary>
+    public void AddRange(ReadOnlySpan<ExemplarSample> samples)
     {
-        lock (_lock)
-        {
-            var outArr = new ExemplarSample[_count];
-            for (int i = 0; i < _count; i++)
-            {
-                int idx = (_head - _count + i + _buf.Length) % _buf.Length;
-                outArr[i] = _buf[idx];
-            }
-            return outArr;
-        }
+        if (samples.IsEmpty) return;
+        long first = Interlocked.Add(ref _next, samples.Length) - samples.Length;
+
+        // Only the last lap's worth can survive; writing the rest would be overwritten by this call.
+        int skip = Math.Max(0, samples.Length - _buf.Length);
+        for (int i = skip; i < samples.Length; i++)
+            Volatile.Write(ref _buf[(int)((first + i) % _buf.Length)], samples[i]);
+    }
+
+    /// <summary>Every entry held, oldest sequence first. Tests and diagnostics.</summary>
+    public void ForEach<TState>(TState state, Action<TState, ExemplarSample> visit)
+    {
+        long written = Written;
+        for (long seq = Math.Max(0, written - _buf.Length); seq < written; seq++)
+            if (At(seq) is { } s) visit(state, s);
     }
 }
 
