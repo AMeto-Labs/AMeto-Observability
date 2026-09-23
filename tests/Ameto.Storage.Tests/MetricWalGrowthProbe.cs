@@ -20,6 +20,9 @@ public sealed class MetricWalGrowthProbe
     private readonly ITestOutputHelper _out;
     public MetricWalGrowthProbe(ITestOutputHelper output) => _out = output;
 
+    /// <summary>Pre-grow entries on THIS thread (<c>OnPreGrowForTest</c>), read back by each probe worker.</summary>
+    [ThreadStatic] private static int t_preGrows;
+
     private const int Threads        = 4;
     private const int BatchPoints    = 500;
     private const int BatchesPerThread = 1_400;   // 4 x 1 400 x 500 x 48 B = 134 MB: 8 -> 16 -> 32 -> 64 -> 128 -> 256 MiB
@@ -80,6 +83,75 @@ public sealed class MetricWalGrowthProbe
         finally { try { Directory.Delete(dir, true); } catch { } }
     }
 
+    /// <summary>
+    /// ONE CALL RUNS A CLAIMED PRE-GROW; EVERY OTHER WALKS PAST IT. The batch that crosses the
+    /// log's 3/4 mark claims a growth and runs it on its way out, parked here inside it
+    /// (<c>OnGrowMappedForTest</c>, holding <c>_resizeLock</c>). A second batch then FITS — it
+    /// claimed nothing — and must return without entering the pre-grow at all: the claim flag
+    /// read "somebody wants a growth", and every caller that saw it went and queued on
+    /// <c>_resizeLock</c> behind the one already growing. Judged on THIS thread's own count of
+    /// entries into the pre-grow (<c>OnPreGrowForTest</c>); on a failure the seam releases the
+    /// parked growth itself, so the reverted code fails instead of hanging.
+    /// </summary>
+    [Fact]
+    public void A_fitting_append_walks_past_a_pre_grow_another_call_is_running()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "ameto-mwalpregrow-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            using var wal = MetricWriteAheadLog.Open(Path.Combine(dir, "metrics.wal"), 64 * 1024);
+            wal.Append(Batch("fill", 1_000));             // 48 000 B of 65 536: 17 536 left, above the 16 384 mark
+
+            using var parked  = new ManualResetEventSlim();
+            using var release = new ManualResetEventSlim();
+            int grows = 0;
+            wal.OnGrowMappedForTest = () =>
+            {
+                if (Interlocked.Increment(ref grows) != 1) return;
+                parked.Set();
+                release.Wait();
+            };
+
+            int me = Environment.CurrentManagedThreadId;
+            int enteredHere = 0;                           // written by this thread only
+            wal.OnPreGrowForTest = () =>
+            {
+                if (Environment.CurrentManagedThreadId != me) return;
+                enteredHere++;
+                release.Set();                             // never leave the reverted code hanging
+            };
+
+            // 100 points: 52 800 B, 12 736 left — under the mark, so this call claims the growth
+            // and, having claimed it, runs it and parks inside it.
+            var crosser = Task.Factory.StartNew(() => wal.Append(Batch("cross", 100)),
+                                                TaskCreationOptions.LongRunning);
+            try
+            {
+                Assert.True(parked.Wait(TimeSpan.FromSeconds(30)), "setup: the crossing batch never reached its pre-grow");
+
+                wal.Append(Batch("fits", 10));             // 53 280 B: fits, claims nothing
+                Assert.True(enteredHere == 0,
+                    "an append that fitted and claimed nothing entered the pre-grow another call was running");
+            }
+            finally { release.Set(); }
+
+            crosser.Wait();
+            wal.OnGrowMappedForTest = null;
+            wal.OnPreGrowForTest    = null;
+            Assert.Equal(1, grows);
+
+            var all = wal.ReadAll(out int unresolved);
+            Assert.Equal(0, unresolved);
+            Assert.Equal(1_110, all.Count);
+            Assert.Equal("fill",  all[999].Name);
+            Assert.Equal("cross", all[1_000].Name);
+            Assert.Equal("cross", all[1_099].Name);
+            Assert.Equal("fits",  all[1_100].Name);
+        }
+        finally { try { Directory.Delete(dir, true); } catch { } }
+    }
+
     private static MetricIngestItem[] Batch(string name, int points)
     {
         var batch = new MetricIngestItem[points];
@@ -122,6 +194,10 @@ public sealed class MetricWalGrowthProbe
 
             var maxTicks = new long[Threads];
             var slow     = new int[Threads];
+            var preGrows = new int[Threads];
+            int growths  = 0;
+            wal.OnPreGrowForTest    = static () => t_preGrows++;
+            wal.OnGrowMappedForTest = () => Interlocked.Increment(ref growths);
             var start    = new Barrier(Threads + 1);
             var workers  = new Thread[Threads];
             for (int t = 0; t < Threads; t++)
@@ -143,6 +219,7 @@ public sealed class MetricWalGrowthProbe
                     }
                     maxTicks[me] = max;
                     slow[me]     = over;
+                    preGrows[me] = t_preGrows;
                 });
                 workers[t].Start();
             }
@@ -151,14 +228,16 @@ public sealed class MetricWalGrowthProbe
             start.SignalAndWait();
             foreach (var w in workers) w.Join();
             wall.Stop();
+            wal.OnPreGrowForTest    = null;
+            wal.OnGrowMappedForTest = null;
 
             long points = (long)Threads * BatchesPerThread * BatchPoints;
             _out.WriteLine($"WAL GROWTH  {Threads} threads x {BatchesPerThread} batches x {BatchPoints} points, 8 MiB start, "
-                         + $"{wal.WrittenBytes / 1048576.0:F0} MiB written");
+                         + $"{wal.WrittenBytes / 1048576.0:F0} MiB written, {growths} growths");
             _out.WriteLine($"  wall {wall.Elapsed.TotalMilliseconds:F0} ms, {points / wall.Elapsed.TotalSeconds / 1e6:F2} M points/s");
             for (int t = 0; t < Threads; t++)
                 _out.WriteLine($"  thread {t}: slowest append {maxTicks[t] * 1000.0 / Stopwatch.Frequency,8:F2} ms, "
-                             + $"{slow[t],4} appends over 1 ms");
+                             + $"{slow[t],4} appends over 1 ms, entered the pre-grow {preGrows[t],3} times");
 
             Assert.True(wal.WrittenBytes >= points * 48);
         }
