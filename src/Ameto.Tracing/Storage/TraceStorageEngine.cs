@@ -751,7 +751,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// keeps nearly all of the amortisation (the locks are paid once per 128 spans instead of
     /// once per span) and gives the reader a quarter of the worst-case wait. A cap alone is not
     /// enough, though: holds back to back leave a sleeping reader no gap to wake into, so between
-    /// two holds <see cref="LetQueuedReadersIn"/> hands the lock to any reader already queued.</para>
+    /// two holds <see cref="LetQueuedWaitersIn"/> hands the lock to any reader or writer already queued.</para>
     ///
     /// <para>WHAT ONE HOLD STILL GUARANTEES. The log's generation stamps are taken inside the
     /// same engine hold as the hot-tier insert, and a flush's <c>BeginFlush</c> can only run
@@ -817,7 +817,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                 {
                     _lock.ExitWriteLock();
                 }
-                LetQueuedReadersIn();
+                LetQueuedWaitersIn();
                 _afterWriteHoldForTest?.Invoke(taken);
             }
         }
@@ -857,8 +857,8 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     }
 
     /// <summary>
-    /// The longest <see cref="WriteSpans"/> waits, after a hold, for readers that queued up behind it
-    /// to get in — 100 µs, about one hold. See <see cref="LetQueuedReadersIn"/>.
+    /// The longest <see cref="WriteSpans"/> waits, after a hold, for readers or a writer that queued
+    /// up behind it to get in — 100 µs, about one hold. See <see cref="LetQueuedWaitersIn"/>.
     /// </summary>
     internal static readonly long ReaderHandoffTicks = System.Diagnostics.Stopwatch.Frequency / 10_000;
 
@@ -884,13 +884,24 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// writer preference. So readers and the drainer alternate in groups, and a reader waits for at
     /// most one hold instead of for the whole backlog. Bounded, because a queued reader may have been
     /// cancelled or descheduled, and the drainer must not idle for a reader that is not coming.</para>
+    ///
+    /// <para>A QUEUED WRITER IS BARGED THE SAME WAY, and is let in the same way. The engine's other
+    /// writers are the flush publishing a segment and the compaction and retention passes swapping
+    /// the cold set. <c>ReaderWriterLockSlim</c> wakes one of them when the drainer exits, and the
+    /// drainer's next <c>EnterWriteLock</c> can take the lock before the woken thread does (measured:
+    /// 5 of 5 warm runs, <c>A_writer_queued_behind_a_hold_gets_in_before_the_next_one</c>), so a flush
+    /// publish — and the WAL commit and tier release behind it — waited for ingest to go quiet. The
+    /// spin ends when the waiting-writer count falls below what it was: the woken writer has left its
+    /// wait, and with the drainer outside the lock nothing stands between it and the lock.</para>
     /// </summary>
-    private void LetQueuedReadersIn()
+    private void LetQueuedWaitersIn()
     {
-        if (_lock.WaitingReadCount == 0) return;
+        int writersQueued = _lock.WaitingWriteCount;
+        if (writersQueued == 0 && _lock.WaitingReadCount == 0) return;
         long deadline = System.Diagnostics.Stopwatch.GetTimestamp() + _readerHandoffTicks;
         var  spin     = new SpinWait();
-        while (_lock.WaitingReadCount > 0 && _lock.CurrentReadCount == 0)
+        while ((writersQueued > 0 && _lock.WaitingWriteCount >= writersQueued)          // none of them in yet
+            || (_lock.WaitingReadCount > 0 && _lock.CurrentReadCount == 0))              // no reader in yet
         {
             if (System.Diagnostics.Stopwatch.GetTimestamp() >= deadline) return;
             spin.SpinOnce(sleep1Threshold: -1);   // never Sleep(1): a millisecond is ten holds
