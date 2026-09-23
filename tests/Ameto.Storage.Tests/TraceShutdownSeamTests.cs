@@ -125,6 +125,19 @@ public sealed class TraceShutdownSeamTests : IDisposable
     /// path is closed but the log is still mapped, so the old failure is reachable and visible:
     /// <c>Append</c> would return silently and the very next line would put the span in the hot
     /// tier. The refusal has to happen ABOVE both halves — the span must be in neither.
+    ///
+    /// <para>THE FINAL FLUSH IS OVER BEFORE THE SEAM READS THE LOG, and on a clock it need not have
+    /// been. "Nothing appended" is read as two samples of the log's size around the refused writes,
+    /// and the final flush of the 20 spans filled here ends by COMMITTING that log — its size drops
+    /// to zero. This fact used to run the teardown on a 250 ms clock budget, the one the flush
+    /// spends too: a flush that overran it (a slow fsync) was abandoned but kept running, the
+    /// heavy-phase wait began beside it, and its commit could land between the two samples
+    /// (forced: the flush parked at its segment write past the 250 ms and released inside the seam
+    /// read "Expected: 1740, Actual: 0"). So the budget is the test's, exactly as in the wedged-
+    /// compaction fact below, and the clock budget is zero: were the clock in charge, the flush
+    /// would be abandoned before it began. The flush is parked at its segment write to prove the
+    /// seam waits for it however long it takes, and the seam records that the compaction is the
+    /// only heavy phase left when it runs.</para>
     /// </summary>
     [Fact]
     public async Task A_span_arriving_after_the_close_lands_in_neither_the_log_nor_the_hot_tier()
@@ -144,14 +157,26 @@ public sealed class TraceShutdownSeamTests : IDisposable
         await wedge.Task.WaitAsync(HangGuard);
         Assert.Equal(1, engine.HeavyPhasesInFlight);
 
+        // The final flush, parked inside its segment write: the slow fsync, held open.
+        var flushParked   = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var flushReleased = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var flushReleaseOnExit = Seam.ReleasedOnExit(flushReleased);
+        engine._beforeSegmentWrite = () =>
+        {
+            flushParked.TrySetResult();
+            flushReleased.Task.GetAwaiter().GetResult();
+        };
+
         bool accepted = true;
         int  batchTaken = -1;
         long walBefore = -1, walAfter = -1;
         int lateTraceSpans = -1;
+        int phasesAtSeam   = -1;
         var atWait = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         engine._onWaitingForHeavyPhases = () =>
         {
             Assert.True(engine.WritesClosedForTest);
+            phasesAtSeam = engine.HeavyPhasesInFlight;
             walBefore = engine.WalWrittenBytesForTest;
             accepted  = engine.WriteSpan(Span(9_999));
             batchTaken = engine.WriteSpans([Span(9_997), Span(9_998)]);   // the drainer's shape
@@ -159,11 +184,20 @@ public sealed class TraceShutdownSeamTests : IDisposable
             lateTraceSpans = engine.GetTraceAsync(Span(9_999).TraceId).ToBlockingEnumerable().Count();
             atWait.TrySetResult();
         };
-        engine._shutdownWaitBudget = TimeSpan.FromMilliseconds(250);
+        using var budget = new CancellationTokenSource();   // never spent: the teardown ends on its own below
+        engine._shutdownBudgetForTest = budget;
+        engine._shutdownWaitBudget    = TimeSpan.Zero;
 
         var dispose = engine.DisposeAsync().AsTask();
+
+        // However long the flush takes, the seam waits for it: the budget is not spent.
+        await flushParked.Task.WaitAsync(HangGuard);
+        Assert.False(atWait.Task.IsCompleted, "the teardown reached the heavy-phase wait while the final flush was still running");
+        flushReleased.TrySetResult();
+
         await atWait.Task.WaitAsync(HangGuard);
 
+        Assert.Equal(1, phasesAtSeam);              // the compaction alone: no flush left to commit the log under the seam
         Assert.False(accepted);                     // refused, and the caller is told
         Assert.Equal(0, batchTaken);                // a batch is refused whole, never split across the close
         Assert.Equal(walBefore, walAfter);          // nothing appended
@@ -172,6 +206,7 @@ public sealed class TraceShutdownSeamTests : IDisposable
         released.TrySetResult();
         await compaction.WaitAsync(HangGuard);
         await dispose.WaitAsync(HangGuard);
+        Assert.True(engine.ResourcesFreedForTest, "the teardown ran out of a budget the test never spent");
     }
 
     // ── The heavy-phase wait ──────────────────────────────────────────────────
