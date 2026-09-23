@@ -775,6 +775,22 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
             }
             finally { _snapshotLock.ExitReadLock(); }
 
+            // THE FLUSH FIRST, the moment the batch is visible: it is the one piece of what this
+            // call owes that another thread does, so every microsecond spent here before it is a
+            // microsecond the tier sits over its budget with nobody draining it. It used to come
+            // last, behind the pre-grow below (a file extension) and the exemplar pass. Neither
+            // needs it later: the pre-grow serialises with the flush's commit on the log's
+            // _resizeLock and re-checks the room under it (a commit that emptied the log first
+            // simply leaves nothing to grow), and the exemplar rings are not part of the flush.
+            // OnThresholdFlushScheduledForTest still fires inside this call.
+            if (hotBytes >= _hotFlushBytes
+                && System.Threading.Interlocked.CompareExchange(ref _thresholdFlushScheduled, 1, 0) == 0)
+            {
+                // Discarded, necessarily — an ingest call cannot wait on a flush. What the flush
+                // has to say about itself is therefore said by the continuation inside, not here.
+                _ = ScheduleThresholdFlush();
+            }
+
             // A log growth this batch claimed runs HERE, outside the snapshot lock, so the
             // threshold flush's write lock is never held off by a file extension. See
             // MetricWriteAheadLog.WantsPreGrowLocked.
@@ -786,14 +802,6 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
             {
                 AddExemplars(items, futureLimit, resolved);
                 exemplarsConsumed = true;   // every ordinal it read, it also cleared
-            }
-
-            if (hotBytes >= _hotFlushBytes
-                && System.Threading.Interlocked.CompareExchange(ref _thresholdFlushScheduled, 1, 0) == 0)
-            {
-                // Discarded, necessarily — an ingest call cannot wait on a flush. What the flush
-                // has to say about itself is therefore said by the continuation inside, not here.
-                _ = ScheduleThresholdFlush();
             }
 
             return droppedFuture;
