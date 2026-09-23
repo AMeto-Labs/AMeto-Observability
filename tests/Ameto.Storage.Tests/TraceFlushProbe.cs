@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Diagnostics;
+using System.Globalization;
 using System.Reflection;
 using System.Security.Cryptography;
 using Ameto.Tracing;
@@ -88,18 +89,44 @@ public sealed class TraceFlushProbe : IDisposable
     // ── The golden constants ────────────────────────────────────────────────────
     //
     // SHA-256 of each file SpanWriter.Write produced for BuildCorpus() at cb5780e — the merge of
-    // wave 1, the writer as WP5 found it. Recomputed by running this test against those sources.
+    // wave 1, the writer as WP5 found it. Recomputed by running this test against those sources
+    // (at 4cb9686, which is cb5780e's writer plus this file) under the INVARIANT culture; the two
+    // .trc constants were first recorded under ru-KZ and read D1BD639A… and FBFA3819….
 
-    private const string V3Trc      = "D1BD639AC454E4F9AEBAE599953DC39A57503142CE707F54F4F68072E688EB0A";
+    private const string V3Trc      = "81564E1FC2731519ABB87046EAB30D2EE23DDF5B7C96839261009FFDB992AA11";
     private const string V3Stats    = "FAF48AB485397E0F3B65E3ADCE5413D6B8702E8AB8E3A044214D5CD0CB79C423";
     private const string V3SvcGraph = "44BE43D931468E9C74F5177BA89CAA5D252FA87FDF744AA98BA4F848C56C5A9F";
     private const string V3TraceSum = "BB5C2FD272B3D86F3DB50870847F530601D234AE373A33D4AD0FD524FA54C773";
-    private const string V4Trc      = "FBFA38194D919859E6B443601C6640650789BD13616A686EC9AA6EEF476A8262";
+    private const string V4Trc      = "7D35320374B43D8BB9F8F3314B2B55A4137583772D5C182C927B9CA5C2868880";
 
-    [Fact]
-    public void The_flush_still_produces_the_pre_change_bytes_v3()
+    // THE HASHES ARE OVER BYTES THAT DEPEND ON THE MACHINE'S CULTURE, and that is why every golden
+    // fact runs twice, under two ambient cultures that disagree about the decimal separator.
+    //
+    // The .trc carries a bloom per block, and SpanBloom hashes `value.ToString()` — the CURRENT
+    // culture's ToString. The corpus has doubles (`sampling.ratio`, `latency.ms`) and floats
+    // (`backoff.seconds`), so on a ru-KZ box 0.375 enters the bloom as "0,375" and on an en-US
+    // one as "0.375": the same corpus, two different files. The constants above were first
+    // recorded on a ru-KZ machine, and CI asserts them on windows-latest, which is en-US — red
+    // there for a writer nobody had touched. The sidecars do not format a number through the
+    // culture and hashed the same under both.
+    //
+    // FlushAndHash therefore pins the invariant culture around the write, and the constants are
+    // the invariant ones, recorded again from the writer at 4cb9686 (cb5780e's writer, before
+    // WP5) with that pin in place. Running each fact under both ambient cultures is what keeps
+    // the pin honest: take it out and the ru-KZ case goes red on every machine, CI included,
+    // instead of only on the machines that happen to disagree with whoever recorded last.
+    //
+    // This pins the TEST, not the product. The server's own flush still formats with whatever
+    // culture its host runs under — see SpanBloom.
+
+    [Theory]
+    [InlineData("ru-KZ")]
+    [InlineData("en-US")]
+    public void The_flush_still_produces_the_pre_change_bytes_v3(string ambientCulture)
     {
-        var h = FlushAndHash(SpanWriter.DefaultVersion, "golden-v3");
+        // The literal, not SpanWriter.DefaultVersion: this fact pins the v3 file, and a change to
+        // the default must not quietly turn it into a second v4 fact.
+        var h = UnderCulture(ambientCulture, () => FlushAndHash(3, "golden-v3"));
 
         _out.WriteLine($".trc      {h.TrcLength,10:N0} B  {h.Trc}");
         _out.WriteLine($".stats    {h.StatsLength,10:N0} B  {h.Stats}");
@@ -116,10 +143,12 @@ public sealed class TraceFlushProbe : IDisposable
     /// The v4 <c>.trc</c> only — the three sidecars do not know the format version and are already
     /// pinned above, so hashing them twice would pin nothing new.
     /// </summary>
-    [Fact]
-    public void The_flush_still_produces_the_pre_change_bytes_v4()
+    [Theory]
+    [InlineData("ru-KZ")]
+    [InlineData("en-US")]
+    public void The_flush_still_produces_the_pre_change_bytes_v4(string ambientCulture)
     {
-        var h = FlushAndHash(SpanWriter.NewestVersion, "golden-v4");
+        var h = UnderCulture(ambientCulture, () => FlushAndHash(4, "golden-v4"));
         _out.WriteLine($".trc      {h.TrcLength,10:N0} B  {h.Trc}");
         Assert.Equal(V4Trc, h.Trc);
     }
@@ -874,10 +903,18 @@ public sealed class TraceFlushProbe : IDisposable
         string SvcGraph, long SvcGraphLength,
         string TraceSum, long TraceSumLength);
 
+    /// <summary>
+    /// Writes the corpus and hashes the four files, with the INVARIANT culture pinned around the
+    /// write — the bloom inside the .trc hashes culture-formatted numbers (see the note above the
+    /// golden facts). <c>SpanWriter.Write</c> runs start to finish on the calling thread (no task,
+    /// no pool hop), so pinning this thread's culture covers every format it performs.
+    /// </summary>
     private Hashes FlushAndHash(ushort version, string label)
     {
         string dir  = NewDir(label);
-        string trc  = SpanWriter.Write(dir, BuildCorpus(), version: version).FilePath;
+        var corpus  = BuildCorpus();
+        string trc  = UnderCulture(CultureInfo.InvariantCulture.Name,
+                                   () => SpanWriter.Write(dir, corpus, version: version).FilePath);
         string bas  = Path.Combine(dir, Path.GetFileNameWithoutExtension(trc));
 
         return new Hashes(
@@ -885,6 +922,15 @@ public sealed class TraceFlushProbe : IDisposable
             Sha(bas + ".stats"),       new FileInfo(bas + ".stats").Length,
             Sha(bas + ".svcgraph"),    new FileInfo(bas + ".svcgraph").Length,
             Sha(bas + ".tracesum"),    new FileInfo(bas + ".tracesum").Length);
+    }
+
+    /// <summary>Runs <paramref name="body"/> with this thread's culture set, and puts it back.</summary>
+    private static T UnderCulture<T>(string culture, Func<T> body)
+    {
+        var saved = CultureInfo.CurrentCulture;
+        CultureInfo.CurrentCulture = CultureInfo.GetCultureInfo(culture);
+        try { return body(); }
+        finally { CultureInfo.CurrentCulture = saved; }
     }
 
     private static string Sha(string path) =>
