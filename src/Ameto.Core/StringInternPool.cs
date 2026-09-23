@@ -15,18 +15,43 @@ namespace Ameto.Core;
 /// slot holds either its string or null (not yet interned in that copy).
 /// Maximum pool size is capped to prevent unbounded growth (eviction is not implemented —
 /// templates are typically low-cardinality).
+///
+/// <para>The cap is per instance. <see cref="Shared"/> keeps the 65 536 the logs tier has
+/// always had; a caller interning a different population — metric label keys and values —
+/// builds its own pool with its own bound, so a high-cardinality label cannot saturate the
+/// pool log templates are indexed in (every event past that point would carry its own
+/// template string, permanently).</para>
 /// </summary>
 public sealed class StringInternPool
 {
-    private const int MaxPoolSize  = 65536;
+    /// <summary>The cap <see cref="Shared"/> and the parameterless constructor use.</summary>
+    public const int DefaultMaxPoolSize = 65536;
     private const int InitialSlots = 1024;
 
+    private readonly int                               _maxPoolSize;
+    private readonly int                               _initialSlots;
     private readonly ConcurrentDictionary<string, int> _stringToIndex = new(StringComparer.Ordinal);
-    private volatile string?[]                         _indexToString  = new string?[InitialSlots];
+    private volatile string?[]                         _indexToString;
     private readonly Lock                              _slotLock       = new();
     private          int                               _nextIndex      = 0;
 
     public static readonly StringInternPool Shared = new();
+
+    public StringInternPool() : this(DefaultMaxPoolSize) { }
+
+    /// <param name="maxPoolSize">How many distinct strings this pool will ever hold. Past it
+    /// every miss is answered with a fresh, unpooled string (index -1) and
+    /// <see cref="PoolExhausted"/> fires once.</param>
+    public StringInternPool(int maxPoolSize)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(maxPoolSize, 1);
+        _maxPoolSize   = maxPoolSize;
+        _initialSlots  = Math.Min(InitialSlots, maxPoolSize);
+        _indexToString = new string?[_initialSlots];
+    }
+
+    /// <summary>The most distinct strings this pool holds before it stops pooling.</summary>
+    public int MaxPoolSize => _maxPoolSize;
 
     /// <summary>
     /// Raised once, the first time the pool saturates. Past that point every event carries
@@ -64,7 +89,7 @@ public sealed class StringInternPool
 
         // Fast reject once saturated, so a saturated pool's misses do not keep incrementing
         // the counter (a stream of new templates could carry it round to negative ids).
-        if (_nextIndex >= MaxPoolSize)
+        if (_nextIndex >= _maxPoolSize)
             return Exhausted();
 
         // The cap is checked AGAIN on the index actually claimed: two threads missing
@@ -73,7 +98,7 @@ public sealed class StringInternPool
         // the number of threads racing at the boundary; each overshooter answers -1 and
         // never touches the map.
         int newIdx = System.Threading.Interlocked.Increment(ref _nextIndex) - 1;
-        if (newIdx >= MaxPoolSize)
+        if (newIdx >= _maxPoolSize)
             return Exhausted();
 
         if (_stringToIndex.TryAdd(template, newIdx))
@@ -178,7 +203,7 @@ public sealed class StringInternPool
     private int Exhausted()
     {
         if (Interlocked.Exchange(ref _exhaustedSignalled, 1) == 0)
-            PoolExhausted?.Invoke(MaxPoolSize);
+            PoolExhausted?.Invoke(_maxPoolSize);
         return -1; // pool full — caller stores -1, template resolved differently
     }
 
@@ -189,11 +214,11 @@ public sealed class StringInternPool
     /// </summary>
     private void SetSlot(int index, string template)
     {
-        // The growth loop below is bounded by MaxPoolSize; an index at or past it would
+        // The growth loop below is bounded by the cap; an index at or past it would
         // spin it for ever — under the lock, with ingest behind it. No such id is ever
         // handed out (Claim re-checks the cap on the claimed index), so this is a guard,
         // not a path.
-        if ((uint)index >= MaxPoolSize) return;
+        if ((uint)index >= (uint)_maxPoolSize) return;
 
         lock (_slotLock)
         {
@@ -201,7 +226,7 @@ public sealed class StringInternPool
             if (index >= slots.Length)
             {
                 int newLen = slots.Length;
-                while (newLen <= index) newLen = Math.Min(newLen * 2, MaxPoolSize);
+                while (newLen <= index) newLen = Math.Min(newLen * 2, _maxPoolSize);
                 var bigger = new string?[newLen];
                 slots.AsSpan().CopyTo(bigger);
                 bigger[index]  = template;
@@ -217,7 +242,7 @@ public sealed class StringInternPool
     /// <summary>Restores a known index→template mapping during WAL recovery.</summary>
     public void ForceIntern(int index, string template)
     {
-        // The array is bounded by MaxPoolSize; an id beyond it was never handed out by this
+        // The array is bounded by the cap; an id beyond it was never handed out by this
         // pool (Intern stops at the cap), so only the reverse map is kept for it.
         _stringToIndex[template] = index;
         SetSlot(index, template);   // guarded inside for an id beyond the cap
@@ -233,7 +258,7 @@ public sealed class StringInternPool
     public void Clear()
     {
         _stringToIndex.Clear();
-        lock (_slotLock) _indexToString = new string?[InitialSlots];
+        lock (_slotLock) _indexToString = new string?[_initialSlots];
         System.Threading.Interlocked.Exchange(ref _nextIndex, 0);
         System.Threading.Interlocked.Exchange(ref _exhaustedSignalled, 0);
     }

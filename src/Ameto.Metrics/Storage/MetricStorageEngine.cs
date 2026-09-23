@@ -1107,7 +1107,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         meta.Kind = item.Kind;
         if (!string.IsNullOrEmpty(item.Unit)) meta.Unit = item.Unit;
 
-        foreach (var (k, v) in item.Labels.Pairs)
+        foreach (var (k, v) in item.Labels)
         {
             var values = meta.LabelValues.GetOrAdd(k, static _ => new ConcurrentDictionary<string, byte>(StringComparer.Ordinal));
             // ContainsKey first: ConcurrentDictionary.Count acquires EVERY lock in the
@@ -2414,7 +2414,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                     if (!string.IsNullOrEmpty(s.Unit)) meta.Unit = s.Unit;
                     long lastMs = (s.Points.Count > 0 ? s.Points[^1].TimestampUnixNano : seg.MaxNano) / 1_000_000L;
                     if (lastMs > meta.LastSeenMs) meta.LastSeenMs = lastMs;
-                    foreach (var (k, v) in s.Labels.Pairs)
+                    foreach (var (k, v) in s.Labels)
                     {
                         var values = meta.LabelValues.GetOrAdd(k, static _ => new ConcurrentDictionary<string, byte>(StringComparer.Ordinal));
                         if (values.Count < _maxLabelValuesPerKey) values.TryAdd(v, 0);

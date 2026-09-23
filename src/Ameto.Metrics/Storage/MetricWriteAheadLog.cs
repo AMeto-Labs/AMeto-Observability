@@ -817,12 +817,12 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
         body.WriteString(key.Name);
         body.WriteString(key.Unit);
 
-        var pairs = key.Labels.Pairs;
-        body.WriteUInt16((ushort)Math.Min(pairs.Count, ushort.MaxValue));
-        for (int i = 0; i < pairs.Count && i < ushort.MaxValue; i++)
+        var labels = key.Labels;
+        body.WriteUInt16((ushort)Math.Min(labels.Count, ushort.MaxValue));
+        for (int i = 0; i < labels.Count && i < ushort.MaxValue; i++)
         {
-            body.WriteString(pairs[i].Key);
-            body.WriteString(pairs[i].Value);
+            body.WriteString(labels.KeyAt(i));
+            body.WriteString(labels.ValueAt(i));
         }
 
         int boundsLen = bounds is null ? 0 : Math.Min(bounds.Length, ushort.MaxValue);
@@ -1251,19 +1251,21 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
                 try { fs.ReadExactly(body); }
                 catch (EndOfStreamException) { break; }          // genuinely truncated tail
 
+                // Through the same interner the OTLP parsers use, so a replayed series holds the
+                // very strings — and, when they are all pooled, the very label set — that the
+                // live path builds for it: its SeriesKey then matches the next live point by
+                // reference, and the process does not keep a second copy of every label.
+                var interner = MetricLabelInterner.Shared;
                 var r = new SpanCursor(body);
                 var kind = (MetricKind)r.ReadByte();
-                string name = r.ReadString();
-                string unit = r.ReadString();
+                string name = r.ReadString(interner, out _);
+                string unit = r.ReadString(interner, out _);
 
                 int labelCount = r.ReadUInt16();
-                var pairs = new KeyValuePair<string, string>[labelCount];
-                for (int i = 0; i < labelCount; i++)
-                {
-                    string k = r.ReadString();
-                    string v = r.ReadString();
-                    pairs[i] = new KeyValuePair<string, string>(k, v);
-                }
+                var kv  = new string[labelCount * 2];
+                var ids = new int[labelCount * 2];
+                for (int i = 0; i < kv.Length; i++)
+                    kv[i] = r.ReadString(interner, out ids[i]);
 
                 int boundsLen = r.ReadUInt16();
                 double[]? bounds = null;
@@ -1273,7 +1275,7 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
                     for (int i = 0; i < boundsLen; i++) bounds[i] = r.ReadDouble();
                 }
 
-                map[index]  = new PoolEntry(name, kind, unit, new LabelSet(pairs), bounds);
+                map[index]  = new PoolEntry(name, kind, unit, interner.GetLabelSet(kv, ids), bounds);
                 cleanEnd    = fs.Position;   // this record parsed whole; the boundary is here
             }
         }
@@ -1410,11 +1412,18 @@ internal sealed unsafe class MetricWriteAheadLog : IDisposable
             return v;
         }
 
-        public string ReadString()
+        /// <summary>The string, resolved through <paramref name="interner"/> (which decodes
+        /// exactly as <c>Encoding.UTF8.GetString</c> did); <paramref name="id"/> is its interner id.</summary>
+        public string ReadString(MetricLabelInterner interner, out int id)
         {
             int n = ReadUInt16();
-            if (n == 0 || _pos + n > _data.Length) { _pos = Math.Min(_pos + n, _data.Length); return string.Empty; }
-            var s = Encoding.UTF8.GetString(_data.Slice(_pos, n));
+            if (n == 0 || _pos + n > _data.Length)
+            {
+                _pos = Math.Min(_pos + n, _data.Length);
+                id   = MetricLabelInterner.EmptyStringId;
+                return string.Empty;
+            }
+            id = interner.Intern(_data.Slice(_pos, n), out string s);
             _pos += n;
             return s;
         }
