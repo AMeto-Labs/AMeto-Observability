@@ -216,6 +216,12 @@ internal sealed unsafe partial class SpanWriteAheadLog : IDisposable
     /// upgrade is tried again at the next start. That is exactly the log the previous release ran
     /// with — no checksum — for one more process lifetime; the alternatives were refusing to start,
     /// or re-initialising a file whose spans exist nowhere else.</para>
+    ///
+    /// <para><b>ROLLING BACK is not symmetric.</b> A release older than v2 treats a v2 log as a
+    /// foreign file (any version but its own) and re-initialises it in place. After a CLEAN stop
+    /// that costs nothing — the final flush has already drained the log into a segment. After an
+    /// UNCLEAN stop the spans the log held and no segment did are lost by the rollback. Operators
+    /// are told so in docs/CONFIGURATION.md ("Upgrading and rolling back").</para>
     /// </summary>
     public static SpanWriteAheadLog Open(string filePath, long initialCapacity = DefaultCapacity, ILogger? logger = null) =>
         Open(filePath, initialCapacity, MemoryBudgets.TraceHotTierCapBytes, logger);
