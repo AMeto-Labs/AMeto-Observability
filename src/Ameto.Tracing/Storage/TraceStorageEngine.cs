@@ -15,7 +15,7 @@ namespace Ameto.Tracing.Storage;
 /// Cold tier: flushed as <c>.trc</c> files by <see cref="SpanWriter"/>
 /// when the hot segment reaches its size/time threshold.
 /// </summary>
-public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IServiceGraphProvider, ITraceSummaryProvider, IRetentionTarget, IDisposable
+public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IServiceGraphProvider, ITraceSummaryProvider, IRetentionTarget, IAsyncDisposable, IDisposable
 {
     // ── Hot tier ─────────────────────────────────────────────────────────────
     // _hotSpans is SWAPPED at flush start (the snapshot goes to the writer, a fresh list
@@ -43,10 +43,141 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     // cold scan must not adopt it while _flushingSpans still holds the same spans.
     private volatile string? _publishingSegmentPath;
 
-    // 0 = live, 1 = disposed. Guards against multiple Dispose calls: the engine
-    // is registered as several singleton interfaces, so the DI container captures
-    // and disposes the same instance more than once at shutdown.
+    // ── Shutdown gate ────────────────────────────────────────────────────────
+    //
+    // Ported from Ameto.Storage.StorageEngine, which closed this exact shape first. Before it
+    // there were three `_disposed` reads in three and a half thousand lines, and every one of the
+    // following was true at once: the engine is registered under six singleton interfaces, so the
+    // container disposes it six times and callers 2-6 returned on the exchange WHILE caller 1 was
+    // still inside a multi-hundred-millisecond flush; compaction, retention, the index backfill
+    // and the index merge checked nothing, so they could unlink .trc files and reopen index runs
+    // after the teardown had freed the lock they take; and SpanWriteAheadLog.Append answered a
+    // post-dispose append with `return;` while the very next line still put the span in the hot
+    // tier — durable nowhere and queryable at once.
+
+    /// <summary>
+    /// 0 = live, 1 = disposed. The exchange that elects ONE teardown; the other five callers
+    /// await <see cref="_disposeCompleted"/> rather than returning into a half-torn engine.
+    /// </summary>
     private int _disposed;
+
+    /// <summary>
+    /// Completed when the teardown has finished. Awaited by every later disposer — the container
+    /// holds this instance under six interfaces and a hosted service disposes it as well.
+    /// </summary>
+    private readonly TaskCompletionSource _disposeCompleted =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>
+    /// 1 once <see cref="DisposeCoreAsync"/> has shut the door: <see cref="WriteSpan"/> refuses,
+    /// no NEW heavy phase starts, and no NEW reader enters. Set with a full fence, because the
+    /// other half of every one of those handshakes is a lock-free read.
+    ///
+    /// <para>It gates reads as well as writes on purpose. Kestrel outlives the hosted services —
+    /// the metrics engine learned this the same way — so a trace query really does arrive after
+    /// the teardown, and the honest answer is an empty page, not an
+    /// <see cref="ObjectDisposedException"/> out of the middle of a response.</para>
+    /// </summary>
+    private int _writesClosed;
+
+    /// <summary>
+    /// Phases that hold something the teardown frees: a flush publishing a segment, a compaction
+    /// rewriting the catalog and unlinking its sources, a retention pass, the index backfill, an
+    /// index merge, the cold scan. Raised only by a phase that passed the close check, so once
+    /// <see cref="_writesClosed"/> is set it can only fall.
+    /// </summary>
+    private int _heavyPhases;
+
+    /// <summary>Installed by the teardown; completed by the decrement that takes <see cref="_heavyPhases"/> to zero.</summary>
+    private TaskCompletionSource? _heavyPhasesDrained;
+
+    /// <summary>
+    /// Callers inside the engine's lock-taking surface: the six read paths AND the write path.
+    /// Writers count here too because <c>_lock.Dispose()</c> is what the count protects, and a
+    /// span arriving one instruction before it is exactly as fatal as a query.
+    /// </summary>
+    private int _activeReaders;
+
+    /// <summary>Installed by the teardown; completed by the release that takes <see cref="_activeReaders"/> to zero.</summary>
+    private TaskCompletionSource? _readersDrained;
+
+    /// <summary>
+    /// Shared by both waits. Running out of it leaves the lock, the index and the log ALLOCATED,
+    /// with an Error naming what is still running — freeing them under a wedged compaction is the
+    /// use-after-free this gate exists to prevent, and a hung shutdown is not an improvement on it.
+    /// </summary>
+    internal TimeSpan _shutdownWaitBudget = TimeSpan.FromSeconds(30);
+
+    /// <summary>Test seam: the teardown is about to wait for running heavy phases. Only fires when there is one.</summary>
+    internal Action? _onWaitingForHeavyPhases;
+
+    /// <summary>Test seam: the teardown is about to wait for open readers. Only fires when there is one.</summary>
+    internal Action? _onWaitingForReaders;
+
+    /// <summary>Test hook: heavy phases in flight (see <see cref="_heavyPhases"/>).</summary>
+    internal int HeavyPhasesInFlight => Volatile.Read(ref _heavyPhases);
+
+    /// <summary>Test hook: callers inside the engine (see <see cref="_activeReaders"/>).</summary>
+    internal int ActiveReadersForTest => Volatile.Read(ref _activeReaders);
+
+    /// <summary>Test hook: true once the teardown has shut the write path.</summary>
+    internal bool WritesClosedForTest => Volatile.Read(ref _writesClosed) != 0;
+
+    /// <summary>
+    /// Test hook: true once the teardown has actually freed the lock, the index and the log.
+    /// FALSE is the interesting value — it is how a test sees "left frozen" rather than
+    /// inferring it from a file handle the OS may or may not have released yet.
+    /// </summary>
+    internal bool ResourcesFreedForTest { get; private set; }
+
+    /// <summary>Test hook: bytes the span WAL currently holds. A refused span must not move it.</summary>
+    internal long WalWrittenBytesForTest => _wal.WrittenBytes;
+
+    /// <summary>
+    /// Test seam: called on the compaction thread with the heavy-phase slot ALREADY claimed and
+    /// before any merging starts. Blocking in it is the wedged compaction the shutdown budget
+    /// exists for — the one heavy phase this engine cannot reach through a flush seam, because
+    /// nothing in the teardown joins it.
+    /// </summary>
+    internal Action? _inCompactionRunForTest;
+
+    /// <summary>
+    /// Claims a heavy-phase slot, or refuses because the teardown has begun. The re-check after
+    /// the increment is not belt-and-braces: the teardown samples the counter AFTER setting the
+    /// flag, so a phase that incremented on the other side of that store would run unwatched.
+    /// </summary>
+    private bool TryBeginHeavyPhase()
+    {
+        if (Volatile.Read(ref _writesClosed) != 0) return false;
+        Interlocked.Increment(ref _heavyPhases);
+        if (Volatile.Read(ref _writesClosed) == 0) return true;
+        EndHeavyPhase();
+        return false;
+    }
+
+    /// <summary>Releases a heavy-phase slot and wakes the teardown if it was the last one.</summary>
+    private void EndHeavyPhase()
+    {
+        if (Interlocked.Decrement(ref _heavyPhases) == 0)
+            Volatile.Read(ref _heavyPhasesDrained)?.TrySetResult();
+    }
+
+    /// <summary>Enters the engine as a reader or a writer, or refuses because the teardown has begun.</summary>
+    private bool TryEnterEngine()
+    {
+        if (Volatile.Read(ref _writesClosed) != 0) return false;
+        Interlocked.Increment(ref _activeReaders);
+        if (Volatile.Read(ref _writesClosed) == 0) return true;
+        ExitEngine();
+        return false;
+    }
+
+    /// <summary>Leaves the engine and wakes the teardown if it was the last caller inside.</summary>
+    private void ExitEngine()
+    {
+        if (Interlocked.Decrement(ref _activeReaders) == 0)
+            Volatile.Read(ref _readersDrained)?.TrySetResult();
+    }
 
     // ── Cold tier ─────────────────────────────────────────────────────────────
     private readonly string                                    _dataDir;
@@ -562,25 +693,204 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
 
     // ── Ingestion (called by SpanDrainer) ─────────────────────────────────────
 
-    internal void WriteSpan(SpanIngestItem item)
+    /// <summary>
+    /// Takes one span into the log and the hot tier. Returns false when the teardown has closed
+    /// the write path — the caller keeps the span, exactly as it keeps one the ring refused.
+    /// A batch of one: <see cref="WriteSpans"/> is the path, this is its single-span spelling.
+    /// </summary>
+    internal bool WriteSpan(SpanIngestItem item) =>
+        WriteSpans(new ReadOnlySpan<SpanIngestItem>(in item)) == 1;
+
+    /// <summary>
+    /// The most spans taken under ONE hold of the engine's write lock (and of the log's append
+    /// lock inside it). See <see cref="WriteSpans"/> for why a drained batch is split at all.
+    /// </summary>
+    internal const int MaxSpansPerWriteHold = 128;
+
+    /// <summary>Test/probe seam: <see cref="MaxSpansPerWriteHold"/>, overridable so a probe can price the cap.</summary>
+    internal int _maxSpansPerWriteHold = MaxSpansPerWriteHold;
+
+    /// <summary>
+    /// Test seam: called after each write-lock hold of <see cref="WriteSpans"/> is RELEASED, with
+    /// the number of spans the call has taken so far. A reader can run from inside it — which is
+    /// the property the cap exists for.
+    /// </summary>
+    internal Action<int>? _afterWriteHoldForTest;
+
+    /// <summary>
+    /// Takes a drained batch into the log and the hot tier: ONE engine write lock and ONE log
+    /// append lock per <see cref="MaxSpansPerWriteHold"/> spans, instead of both locks — four
+    /// interlocked round trips and a point at which a reader could interleave — per span.
+    /// Returns how many spans were taken: all of them, or 0 when the teardown has closed the
+    /// write path (the gate is checked once, above both halves, so a batch is never split
+    /// across the close). A log failure part-way throws AFTER the spans already logged have
+    /// joined the hot tier, so the log and the tier still hold exactly the same spans.
+    ///
+    /// <para>WHY THE BATCH IS SPLIT. A write-lock hold is a wait for every reader:
+    /// <c>ReaderWriterLockSlim</c> lets a waiting writer block new readers, so a point lookup
+    /// that arrives behind the drainer waits out the whole hold. The drainer hands over up to
+    /// 512 spans; one hold for all of them is ~150 µs on the eight-attribute shape, 128 of them
+    /// ~40 µs. <c>TraceAggregateLockProbe</c> prices both against a concurrent reader: the cap
+    /// keeps nearly all of the amortisation (the locks are paid once per 128 spans instead of
+    /// once per span) and gives the reader a quarter of the worst-case wait. A cap alone is not
+    /// enough, though: holds back to back leave a sleeping reader no gap to wake into, so between
+    /// two holds <see cref="LetQueuedReadersIn"/> hands the lock to any reader already queued.</para>
+    ///
+    /// <para>WHAT ONE HOLD STILL GUARANTEES. The log's generation stamps are taken inside the
+    /// same engine hold as the hot-tier insert, and a flush's <c>BeginFlush</c> can only run
+    /// under that lock too — so no flush can open between a span's append and its insert, and
+    /// the stamp is still exactly what decides whether the span is replayed. The flush trigger
+    /// moves to the end of each hold, so a tier can pass <see cref="HotFlushThreshold"/> by at
+    /// most one hold's worth of spans before the flush starts.</para>
+    ///
+    /// <para>REFUSED BEFORE THE APPEND, AND THAT IS THE FIX FROM THE SHUTDOWN GATE. The log used
+    /// to answer a post-dispose append with <c>return;</c>, silently, while the very next line
+    /// still added the span to the hot tier: unrecoverable and queryable at the same instant.
+    /// One gate above both halves is the only arrangement in which the two cannot disagree.</para>
+    /// </summary>
+    internal int WriteSpans(ReadOnlySpan<SpanIngestItem> items)
     {
-        _lock.EnterWriteLock();
+        if (items.IsEmpty) return 0;
+        if (!TryEnterEngine()) return 0;
+        int taken = 0;
         try
         {
-            // Write-ahead: the span is durable before it is queryable. Held under the same
-            // write lock as the hot tier so a flush's Begin can never interleave with an
-            // append — that ordering is what makes the generation stamps trustworthy.
-            _wal.Append(item);
-            AddToHotTierLocked(item);
+            int perHold = Math.Max(1, _maxSpansPerWriteHold);
+            while (taken < items.Length)
+            {
+                var chunk    = items.Slice(taken, Math.Min(perHold, items.Length - taken));
+                int appended = 0;
+                _lock.EnterWriteLock();
+                try
+                {
+                    // The log's append lock, taken WITHOUT waiting while the engine lock is held:
+                    // the one holder that keeps it for long is CommitFlush's persistence barrier
+                    // (a drive flush, up to milliseconds), and waiting for it in here would hold
+                    // every reader of the hot tier behind that fsync. So on a busy log the engine
+                    // lock is let go, the wait happens outside it, and the hold starts over.
+                    // Nothing was taken yet, so starting over changes nothing.
+                    SpanWriteAheadLog.AppendScope scope;
+                    while (!_wal.TryEnterAppendScope(out scope))
+                    {
+                        _lock.ExitWriteLock();
+                        try { _wal.WaitUntilAppendable(); }
+                        finally { _lock.EnterWriteLock(); }
+                    }
 
-            if (_hotSpans.Count >= HotFlushThreshold)
-                TryStartFlushLocked();
+                    // Write-ahead: every span is in the log before it is queryable. If the log
+                    // fails part-way, the spans it did take still join the tier — the finally —
+                    // and the ones it did not stay out of both.
+                    try
+                    {
+                        for (; appended < chunk.Length; appended++)
+                            AppendTranscoded(in scope, chunk[appended]);
+                    }
+                    finally
+                    {
+                        scope.Dispose();
+                        for (int i = 0; i < appended; i++) AddToHotTierLocked(chunk[i]);
+                        taken += appended;
+                    }
+
+                    if (_hotSpans.Count >= HotFlushThreshold)
+                        TryStartFlushLocked();
+                    _insideWriteHoldForTest?.Invoke(taken);
+                }
+                finally
+                {
+                    _lock.ExitWriteLock();
+                }
+                LetQueuedReadersIn();
+                _afterWriteHoldForTest?.Invoke(taken);
+            }
+        }
+        finally { ExitEngine(); }
+        return taken;
+    }
+
+    /// <summary>
+    /// One span into a held log scope. The log takes UTF-8 and the ingest item still carries
+    /// strings, so the name and service are transcoded HERE, into the stack (or a pooled buffer
+    /// for a pathological name), and handed over as bytes. When the ingest path hands UTF-8
+    /// through (WP8) this transcode goes away and the log does not change.
+    /// </summary>
+    internal static void AppendTranscoded(in SpanWriteAheadLog.AppendScope scope, SpanIngestItem item)
+    {
+        string name    = item.Name        ?? string.Empty;
+        string service = item.ServiceName ?? string.Empty;
+
+        // UTF-8 never needs more than 3 bytes per UTF-16 unit (a surrogate pair is 4 for 2).
+        int maxBytes = (name.Length + service.Length) * 3;
+        byte[]? rented = null;
+        Span<byte> buf = maxBytes <= 1024
+            ? stackalloc byte[1024]
+            : (rented = System.Buffers.ArrayPool<byte>.Shared.Rent((name.Length + service.Length) * 3));
+        try
+        {
+            int n = System.Text.Encoding.UTF8.GetBytes(name, buf);
+            int s = System.Text.Encoding.UTF8.GetBytes(service, buf[n..]);
+            scope.Append(item.TraceId, item.SpanId, item.ParentSpanId, item.StartTimeUnixNano, item.DurationNanos,
+                         item.Kind, item.Status, item.HttpStatusCode,
+                         buf[..n], buf.Slice(n, s), item.AttributesBytes);
         }
         finally
         {
-            _lock.ExitWriteLock();
+            if (rented is not null) System.Buffers.ArrayPool<byte>.Shared.Return(rented);
         }
     }
+
+    /// <summary>
+    /// The longest <see cref="WriteSpans"/> waits, after a hold, for readers that queued up behind it
+    /// to get in — 100 µs, about one hold. See <see cref="LetQueuedReadersIn"/>.
+    /// </summary>
+    internal static readonly long ReaderHandoffTicks = System.Diagnostics.Stopwatch.Frequency / 10_000;
+
+    /// <summary>Test seam: <see cref="ReaderHandoffTicks"/>, so a test can make the hand-off wait as long as its reader needs.</summary>
+    internal long _readerHandoffTicks = ReaderHandoffTicks;
+
+    /// <summary>
+    /// Called between two write holds: if readers are queued on the engine lock, spins — never
+    /// sleeps — until one of them is in, or until <see cref="ReaderHandoffTicks"/> has passed.
+    ///
+    /// <para>WITHOUT IT A READER STARVES FOR AS LONG AS THE DRAINER IS BUSY, and that was measured,
+    /// not assumed: <c>TraceAggregateLockProbe</c> completed ONE point lookup in 29 ms of batched
+    /// ingest, against 881 with a hold per span. <c>ReaderWriterLockSlim</c> wakes the queued
+    /// readers when a writer exits, but a woken reader needs microseconds to run and the drainer
+    /// re-enters within nanoseconds — the lock has no fairness to stop it barging. A hold per span
+    /// hid this because the gaps between holds were as frequent as the holds, and a SPINNING reader
+    /// caught one; holds of 128 back to back leave no gap a sleeping reader can reach. Under
+    /// sustained overload, which is when the drainer never parks, the trace UI would stop answering.
+    /// </para>
+    ///
+    /// <para>ONE READER IN IS ENOUGH. The next <c>EnterWriteLock</c> then waits for it — and for every
+    /// reader the same wake-up let in — while blocking NEW readers, which is the lock's ordinary
+    /// writer preference. So readers and the drainer alternate in groups, and a reader waits for at
+    /// most one hold instead of for the whole backlog. Bounded, because a queued reader may have been
+    /// cancelled or descheduled, and the drainer must not idle for a reader that is not coming.</para>
+    /// </summary>
+    private void LetQueuedReadersIn()
+    {
+        if (_lock.WaitingReadCount == 0) return;
+        long deadline = System.Diagnostics.Stopwatch.GetTimestamp() + _readerHandoffTicks;
+        var  spin     = new SpinWait();
+        while (_lock.WaitingReadCount > 0 && _lock.CurrentReadCount == 0)
+        {
+            if (System.Diagnostics.Stopwatch.GetTimestamp() >= deadline) return;
+            spin.SpinOnce(sleep1Threshold: -1);   // never Sleep(1): a millisecond is ten holds
+        }
+    }
+
+    /// <summary>Test hook: the engine lock itself, so a test can queue a reader on it at an exact point.</summary>
+    internal ReaderWriterLockSlim LockForTest => _lock;
+
+    /// <summary>Test seam: called INSIDE each write hold of <see cref="WriteSpans"/>, after the spans joined the tier.</summary>
+    internal Action<int>? _insideWriteHoldForTest;
+
+    /// <summary>
+    /// Test hook: the live log. Lets a test hold the log and the hot tier side by side — the pair
+    /// the write path must keep equal — and reach the log's own seams.
+    /// </summary>
+    internal SpanWriteAheadLog WalForTest => _wal;
 
     /// <summary>
     /// Materialises a span into the hot tier and its trace index. Shared by live ingest
@@ -626,7 +936,26 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
 
     // ── Query ─────────────────────────────────────────────────────────────────
 
+    /// <summary>
+    /// The read paths are wrapped rather than gated in place, so the count is raised for the
+    /// whole ENUMERATION and not merely for the call that returns the iterator. A trace detail
+    /// is read lazily out of cold segments; a reader counted only at the first MoveNext would
+    /// leave the teardown free to dispose the lock between two of them.
+    /// </summary>
     public async IAsyncEnumerable<SpanRecord> GetTraceAsync(
+        TraceId traceId,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    {
+        if (!TryEnterEngine()) yield break;   // shut down: an empty trace, not an ObjectDisposedException
+        try
+        {
+            await foreach (var s in GetTraceCoreAsync(traceId, ct).ConfigureAwait(false))
+                yield return s;
+        }
+        finally { ExitEngine(); }
+    }
+
+    private async IAsyncEnumerable<SpanRecord> GetTraceCoreAsync(
         TraceId traceId,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
@@ -1344,6 +1673,32 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         SpanScanFloor?    scanFloor        = null,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
     {
+        if (!TryEnterEngine()) yield break;
+        try
+        {
+            await foreach (var s in SearchSpansCoreAsync(from, to, serviceName, spanName, status,
+                                                         minDurationNanos, maxDurationNanos,
+                                                         httpStatusCode, limit, attrHints,
+                                                         scanFloor, ct).ConfigureAwait(false))
+                yield return s;
+        }
+        finally { ExitEngine(); }
+    }
+
+    private async IAsyncEnumerable<SpanRecord> SearchSpansCoreAsync(
+        DateTimeOffset?   from,
+        DateTimeOffset?   to,
+        string?           serviceName,
+        string?           spanName,
+        SpanStatusCode?   status,
+        long?             minDurationNanos,
+        long?             maxDurationNanos,
+        short?            httpStatusCode,
+        int               limit,
+        IReadOnlyList<AttrHint>? attrHints,
+        SpanScanFloor?    scanFloor,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct)
+    {
         long fromNano = from.HasValue ? from.Value.ToUnixTimeMilliseconds() * 1_000_000L : long.MinValue;
         long toNano   = to.HasValue   ? to.Value.ToUnixTimeMilliseconds()   * 1_000_000L : long.MaxValue;
 
@@ -1658,6 +2013,18 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// </summary>
     internal void FlushHotTier()
     {
+        // A heavy phase for its whole duration — it publishes a segment and commits the log,
+        // which is precisely what the teardown must not free the lock underneath. Refused once
+        // shutdown has begun: the teardown has already taken the final flush, and a second one
+        // arriving from the drainer's own disposal (DI decides which of the two runs first) would
+        // be racing it for the same tier.
+        if (!TryBeginHeavyPhase()) return;
+        try { FlushHotTierCore(); }
+        finally { EndHeavyPhase(); }
+    }
+
+    private void FlushHotTierCore()
+    {
         while (true)
         {
             Task? inflight;
@@ -1729,22 +2096,31 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         _hotSince = null;
         _flushInProgress = true;
         _flushingSpans   = snapshot;
+        _unflushedGeneration++;           // the tier was swapped, not appended to: see AggregateKey
         return snapshot;
     }
 
     /// <summary>
     /// Starts a background flush unless one is already running — or the engine is shutting
-    /// down. The disposed check is the FENCE that lets Dispose free the lock safely: without
-    /// it a span arriving between Dispose's final drain and <c>_lock.Dispose()</c> could
-    /// start a flush that publishes its segment and then faults trying to commit the WAL,
+    /// down. <see cref="TryBeginHeavyPhase"/> is the FENCE that lets the teardown free the lock
+    /// safely: without it a span arriving between the final drain and <c>_lock.Dispose()</c>
+    /// could start a flush that publishes its segment and then faults trying to commit the WAL,
     /// leaving a segment on disk whose spans the log still replays — permanent duplicates.
     /// Spans refused here stay in the hot tier AND in the WAL, so the next start replays them.
     /// </summary>
     private void TryStartFlushLocked()
     {
-        if (Volatile.Read(ref _disposed) != 0 || _flushInProgress || _hotSpans.Count == 0) return;
+        if (_flushInProgress || _hotSpans.Count == 0) return;
+        // The slot is claimed BEFORE the tier is detached. Claimed after, there would be an
+        // instant in which the spans are in neither tier and nothing counts the task that holds
+        // them — the one state the teardown must never mistake for quiet.
+        if (!TryBeginHeavyPhase()) return;
         var snapshot = TakeSnapshotLocked();
-        _flushTask = Task.Run(() => CompleteFlush(snapshot));
+        _flushTask = Task.Run(() =>
+        {
+            try     { CompleteFlush(snapshot); }
+            finally { EndHeavyPhase(); }
+        });
     }
 
     /// <summary>
@@ -1868,6 +2244,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                     RestoreSnapshotLocked(snapshot);
                 }
                 _flushingSpans = null;            // the segment (or the restored tier) now carries them
+                _unflushedGeneration++;
             }
             finally { _lock.ExitWriteLock(); }
 
@@ -1948,6 +2325,7 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         combined.AddRange(snapshot);
         combined.AddRange(_hotSpans);
         _hotSpans = combined;
+        _unflushedGeneration++;
 
         _traceIdx.Clear();
         for (int i = 0; i < _hotSpans.Count; i++)
@@ -1969,6 +2347,13 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// segments flushed while the scan was running.
     /// </summary>
     internal void LoadColdSegments()
+    {
+        if (!TryBeginHeavyPhase()) return;
+        try { LoadColdSegmentsCore(); }
+        finally { EndHeavyPhase(); }
+    }
+
+    private void LoadColdSegmentsCore()
     {
         var sw     = System.Diagnostics.Stopwatch.StartNew();
         var loaded = new List<SpanSegmentInfo>();
@@ -2222,7 +2607,12 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// with no id is invisible to the catalog, to retention's accounting and to any future feature
     /// that needs identity, whether or not anything is indexing it.</para>
     /// </summary>
-    internal void AdoptUnnamedSegments() => AdoptUnnamedSegments(_coldSegments);
+    internal void AdoptUnnamedSegments()
+    {
+        if (!TryBeginHeavyPhase()) return;
+        try { AdoptUnnamedSegments(_coldSegments); }
+        finally { EndHeavyPhase(); }
+    }
 
     private void AdoptUnnamedSegments(SpanSegmentInfo[] segs)
     {
@@ -2287,6 +2677,13 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     internal bool CompactIndexOnce(CancellationToken ct = default)
     {
         if (!_indexEnabled) return false;
+        if (!TryBeginHeavyPhase()) return false;
+        try { return CompactIndexOnceCore(ct); }
+        finally { EndHeavyPhase(); }
+    }
+
+    private bool CompactIndexOnceCore(CancellationToken ct)
+    {
         var batch = TraceIndexCompactor.SelectMergeBatch(_manifest.Runs);
         if (batch.Count == 0) return false;
 
@@ -2383,6 +2780,13 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     internal bool BackfillNextSegment(CancellationToken ct = default)
     {
         if (!_indexEnabled) return false;
+        if (!TryBeginHeavyPhase()) return false;
+        try { return BackfillNextSegmentCore(ct); }
+        finally { EndHeavyPhase(); }
+    }
+
+    private bool BackfillNextSegmentCore(CancellationToken ct)
+    {
         var segs = _coldSegments;
 
         SpanSegmentInfo? next = null;
@@ -2566,12 +2970,23 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// </summary>
     internal void CompactSmallSegments()
     {
-        const int MaxPasses = 500;   // safety valve, ~10k merged segments per run
-        int passes = 0;
-        while (CompactOnePass() && ++passes < MaxPasses) { }
-        if (passes > 0)
-            _logger.LogInformation("Compaction run finished: {Passes} pass(es), {Count} cold segments remain",
-                passes, _coldSegments.Length);
+        // ONE heavy phase for the whole run, not one per pass. A merge that wedges wedges inside
+        // a pass, and the teardown has to see it as busy for as long as it is — a per-pass count
+        // would show zero in the gap between two passes and let the lock go under the next one.
+        // TraceCompactionWorker starts this with Task.Run(..., ct), and ct does not stop a pass
+        // once it has begun: this counter is what shutdown actually waits on.
+        if (!TryBeginHeavyPhase()) return;
+        try
+        {
+            _inCompactionRunForTest?.Invoke();   // test seam: parks a run inside its heavy phase
+            const int MaxPasses = 500;   // safety valve, ~10k merged segments per run
+            int passes = 0;
+            while (CompactOnePass() && ++passes < MaxPasses) { }
+            if (passes > 0)
+                _logger.LogInformation("Compaction run finished: {Passes} pass(es), {Count} cold segments remain",
+                    passes, _coldSegments.Length);
+        }
+        finally { EndHeavyPhase(); }
     }
 
     /// <summary>
@@ -2788,76 +3203,218 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
 
     // ── ITraceStatsProvider ────────────────────────────────────────────────────
 
+    // ── Aggregates off the read lock (TS#6) ───────────────────────────────────
+    //
+    // The four aggregate reads — per-service stats, the service graph, the volume sparkline and
+    // the trace list — used to walk every unflushed span INSIDE the read lock: up to two flush
+    // thresholds' worth, with a uint[19] allocated per span for the stats and the graph and a
+    // copy of the whole tier for the graph's two passes. Every one of those milliseconds is a
+    // wait for the drainer, whose write hold ReaderWriterLockSlim queues behind any reader already
+    // in. Now the lock is held only to take the view below and the cold array; the passes run
+    // after it is released, accumulating into one histogram per service or edge.
+
+    /// <summary>
+    /// The unflushed spans as two runs — the detached flush snapshot, then the live tier — taken
+    /// UNDER the read lock and walked AFTER it. Taking it is O(1) and allocates nothing.
+    ///
+    /// <para><b>WHY A RUN IS SAFE TO WALK WITHOUT THE LOCK.</b> Each is a prefix of a
+    /// <c>List&lt;SpanRecord&gt;</c>'s backing array, and nothing ever writes inside that prefix:
+    /// <c>_hotSpans</c> only grows (an <c>Add</c> writes past the captured count, or into a NEW
+    /// array, leaving this one as it was); a flush SWAPS it for a fresh list instead of clearing it,
+    /// and <see cref="RestoreSnapshotLocked"/> builds a new list too; the detached snapshot is never
+    /// mutated — the segment writer sorts a copy (<c>SpanWriter.Write</c>), which readers already
+    /// rely on when they take <see cref="_flushingSpans"/> lock-free. A <c>SpanRecord</c> is
+    /// init-only. So the elements a run covers cannot change while it is walked.</para>
+    /// </summary>
+    private readonly ref struct UnflushedRuns(ReadOnlySpan<SpanRecord> flushing, ReadOnlySpan<SpanRecord> hot)
+    {
+        public readonly ReadOnlySpan<SpanRecord> Flushing = flushing;
+        public readonly ReadOnlySpan<SpanRecord> Hot      = hot;
+    }
+
+    /// <summary>See <see cref="UnflushedRuns"/>. Caller holds the read lock.</summary>
+    private UnflushedRuns UnflushedRunsLocked() => new(
+        _flushingSpans is { } flushing ? CollectionsMarshal.AsSpan(flushing) : default,
+        CollectionsMarshal.AsSpan(_hotSpans));
+
+    /// <summary>
+    /// Bumped (under the write lock) whenever the unflushed spans change other than by an append:
+    /// a flush detaching the tier, a failed flush restoring it, a publish dropping the snapshot.
+    /// Together with the live tier's count and the cold array's identity it names one state of
+    /// everything an aggregate reads — the memo key below.
+    /// </summary>
+    private long _unflushedGeneration;
+
+    /// <summary>
+    /// What an aggregate was computed over: the window, the cold array (every change to the cold
+    /// tier publishes a NEW array, so identity is enough), and the unflushed state. Two calls with
+    /// equal keys would read exactly the same spans and sidecars.
+    /// </summary>
+    private readonly record struct AggregateKey(
+        long FromMs, long ToMs, SpanSegmentInfo[] Cold, long UnflushedGeneration, int HotCount);
+
+    private sealed class AggregateMemo<T>(AggregateKey key, T value, long storedAt)
+    {
+        public readonly AggregateKey Key      = key;
+        public readonly T            Value    = value;
+        public readonly long         StoredAt = storedAt;
+    }
+
+    /// <summary>
+    /// How long a memoised aggregate is served, 1 s. The key is exact, so this is not a staleness
+    /// bound — an append changes the key at once — but a bound on how long one result (and a cold
+    /// sidecar that failed to read into it) is kept.
+    /// </summary>
+    internal long _aggregateMemoTicks = System.Diagnostics.Stopwatch.Frequency;
+
+    private AggregateMemo<IReadOnlyList<ServiceSegmentStats>>? _statsMemo;
+    private AggregateMemo<ServiceGraphDto>?                    _graphMemo;
+
+    /// <summary>
+    /// Test seam: called at the start of each aggregate's pass over the unflushed spans, with the
+    /// read lock already released — a test asserts from inside it that the calling thread holds no
+    /// read lock. Names the aggregate.
+    /// </summary>
+    internal Action<string>? _aggregatePassForTest;
+
+    private bool TryMemo<T>(AggregateMemo<T>? memo, in AggregateKey key, out T value)
+    {
+        if (memo is not null && memo.Key == key
+            && System.Diagnostics.Stopwatch.GetTimestamp() - memo.StoredAt < _aggregateMemoTicks)
+        {
+            value = memo.Value;
+            return true;
+        }
+        value = default!;
+        return false;
+    }
+
+    private static AggregateMemo<T> NewMemo<T>(in AggregateKey key, T value) =>
+        new(key, value, System.Diagnostics.Stopwatch.GetTimestamp());
+
+    /// <summary>One service's running totals. The histogram is this accumulator's own array — never a sidecar's.</summary>
+    private sealed class ServiceAcc
+    {
+        public readonly uint[] Buckets = new uint[HistogramBuckets.Count];
+        public uint Spans, Errors;
+        public long MinDur = long.MaxValue, MaxDur = long.MinValue;
+    }
+
+    /// <summary>One directed edge's running totals. Same ownership rule as <see cref="ServiceAcc"/>.</summary>
+    private sealed class EdgeAcc
+    {
+        public readonly uint[] Buckets = new uint[HistogramBuckets.Count];
+        public uint Calls, Errors;
+    }
+
+    private static ServiceAcc AccFor(Dictionary<string, ServiceAcc> agg, string service)
+    {
+        ref var slot = ref CollectionsMarshal.GetValueRefOrAddDefault(agg, service, out _);
+        return slot ??= new ServiceAcc();
+    }
+
+    private static EdgeAcc EdgeFor(Dictionary<(string, string), EdgeAcc> agg, string from, string to)
+    {
+        ref var slot = ref CollectionsMarshal.GetValueRefOrAddDefault(agg, (from, to), out _);
+        return slot ??= new EdgeAcc();
+    }
+
+    /// <summary>
+    /// Adds the in-window spans of a run to the per-service totals, in place: a bucket increment
+    /// where there used to be a <c>new uint[19]</c> per span. Runs of one service skip the lookup.
+    /// </summary>
+    private static void AccumulateStats(
+        Dictionary<string, ServiceAcc> agg, ReadOnlySpan<SpanRecord> spans, long fromNano, long toNano)
+    {
+        string?     lastService = null;
+        ServiceAcc? last        = null;
+        foreach (var s in spans)
+        {
+            if (s.StartTimeUnixNano < fromNano || s.StartTimeUnixNano > toNano) continue;
+            if (!ReferenceEquals(s.ServiceName, lastService))
+            {
+                lastService = s.ServiceName;
+                last        = AccFor(agg, lastService);
+            }
+            var a = last!;
+            a.Spans++;
+            if (s.Status == SpanStatusCode.Error) a.Errors++;
+            if (s.DurationNanos < a.MinDur) a.MinDur = s.DurationNanos;
+            if (s.DurationNanos > a.MaxDur) a.MaxDur = s.DurationNanos;
+            a.Buckets[BucketIndex(s.DurationNanos)]++;
+        }
+    }
+
     public Task<IReadOnlyList<ServiceSegmentStats>> GetAggregateStatsAsync(
         DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default)
+    {
+        if (!TryEnterEngine()) return Task.FromResult<IReadOnlyList<ServiceSegmentStats>>([]);
+        try { return Task.FromResult(GetAggregateStatsCore(from, to)); }
+        finally { ExitEngine(); }   // the core is synchronous to its last statement
+    }
+
+    private IReadOnlyList<ServiceSegmentStats> GetAggregateStatsCore(DateTimeOffset from, DateTimeOffset to)
     {
         long fromNano = from.ToUnixTimeMilliseconds() * 1_000_000L;
         long toNano   = to.ToUnixTimeMilliseconds()   * 1_000_000L;
 
-        // Accumulator: service name → mutable bucket array + counters
-        var agg = new Dictionary<string, (uint[] Buckets, uint Spans, uint Errors, long MinDur, long MaxDur)>(
-            StringComparer.OrdinalIgnoreCase);
-
-        void Merge(ServiceSegmentStats s)
-        {
-            if (!agg.TryGetValue(s.ServiceName, out var a))
-            {
-                var b = new uint[HistogramBuckets.Count];
-                a = (b, 0, 0, long.MaxValue, long.MinValue);
-            }
-            for (int i = 0; i < HistogramBuckets.Count; i++) a.Buckets[i] += s.Buckets[i];
-            a.Spans  += s.SpanCount;
-            a.Errors += s.ErrorCount;
-            if (s.MinDurationNanos < a.MinDur) a.MinDur = s.MinDurationNanos;
-            if (s.MaxDurationNanos > a.MaxDur) a.MaxDur = s.MaxDurationNanos;
-            agg[s.ServiceName] = a;
-        }
-
-        // Hot tier — compute on demand (≤50K spans, fast). The cold array is snapshotted
-        // under the SAME lock hold: taken separately, a flush publishing in between would
-        // be counted twice (once from the in-flight snapshot, once from its sidecar).
+        // The cold array and the unflushed view come from ONE hold: taken separately, a flush
+        // publishing in between would be counted twice (once from the detached snapshot, once from
+        // its sidecar). That is all the lock is held for.
         SpanSegmentInfo[] statsSegs;
+        UnflushedRuns     runs;
+        AggregateKey      key;
         _lock.EnterReadLock();
         try
         {
             statsSegs = _coldSegments;
-            foreach (var s in UnflushedSpansLocked())
-            {
-                if (s.StartTimeUnixNano < fromNano || s.StartTimeUnixNano > toNano) continue;
-                Merge(new ServiceSegmentStats
-                {
-                    ServiceName      = s.ServiceName,
-                    SpanCount        = 1,
-                    ErrorCount       = s.Status == SpanStatusCode.Error ? 1u : 0u,
-                    MinDurationNanos = s.DurationNanos,
-                    MaxDurationNanos = s.DurationNanos,
-                    Buckets          = BucketOf(s.DurationNanos),
-                });
-            }
+            runs      = UnflushedRunsLocked();
+            key       = new(from.ToUnixTimeMilliseconds(), to.ToUnixTimeMilliseconds(),
+                            statsSegs, _unflushedGeneration, _hotSpans.Count);
         }
         finally { _lock.ExitReadLock(); }
 
-        // Cold tier — read .stats sidecar files only (no span deserialization)
+        if (TryMemo(_statsMemo, in key, out var memoised)) return memoised;
+
+        _aggregatePassForTest?.Invoke(nameof(GetAggregateStatsAsync));
+        var agg = new Dictionary<string, ServiceAcc>(StringComparer.OrdinalIgnoreCase);
+        AccumulateStats(agg, runs.Flushing, fromNano, toNano);
+        AccumulateStats(agg, runs.Hot,      fromNano, toNano);
+
+        // Cold tier — the .stats sidecars only (no span deserialisation). Their arrays are ADDED
+        // into this call's own accumulators, never adopted: a sidecar's array must not become a
+        // total that the next segment is then summed into.
         foreach (var seg in statsSegs)
         {
             if (seg.MaxStartNano < fromNano || seg.MinStartNano > toNano) continue;
             foreach (var s in SpanReader.ReadStats(seg.FilePath))
-                Merge(s);
+            {
+                var a = AccFor(agg, s.ServiceName);
+                var b = s.Buckets;
+                for (int i = 0; i < HistogramBuckets.Count; i++) a.Buckets[i] += b[i];
+                a.Spans  += s.SpanCount;
+                a.Errors += s.ErrorCount;
+                if (s.MinDurationNanos < a.MinDur) a.MinDur = s.MinDurationNanos;
+                if (s.MaxDurationNanos > a.MaxDur) a.MaxDur = s.MaxDurationNanos;
+            }
         }
 
         var result = new List<ServiceSegmentStats>(agg.Count);
-        foreach (var (name, (buckets, spans, errors, minDur, maxDur)) in agg)
+        foreach (var (name, a) in agg)
             result.Add(new ServiceSegmentStats
             {
                 ServiceName      = name,
-                SpanCount        = spans,
-                ErrorCount       = errors,
-                MinDurationNanos = minDur == long.MaxValue ? 0 : minDur,
-                MaxDurationNanos = maxDur == long.MinValue ? 0 : maxDur,
-                Buckets          = buckets,
+                SpanCount        = a.Spans,
+                ErrorCount       = a.Errors,
+                MinDurationNanos = a.MinDur == long.MaxValue ? 0 : a.MinDur,
+                MaxDurationNanos = a.MaxDur == long.MinValue ? 0 : a.MaxDur,
+                Buckets          = a.Buckets,
             });
 
-        return Task.FromResult<IReadOnlyList<ServiceSegmentStats>>(result);
+        // SHARED between callers for as long as it is memoised: every consumer (the stats and
+        // latency endpoints, the alert evaluator, the graph's nodes) only reads it.
+        _statsMemo = NewMemo(in key, (IReadOnlyList<ServiceSegmentStats>)result);
+        return result;
     }
 
     // ── IServiceGraphProvider ──────────────────────────────────────────────────
@@ -2865,111 +3422,130 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     public Task<ServiceGraphDto> GetServiceGraphAsync(
         DateTimeOffset from, DateTimeOffset to, CancellationToken ct = default)
     {
+        if (!TryEnterEngine()) return Task.FromResult(new ServiceGraphDto());
+        try { return Task.FromResult(GetServiceGraphCore(from, to)); }
+        finally { ExitEngine(); }
+    }
+
+    /// <summary>Records each in-window span's service by span id — the parents an edge is drawn from.</summary>
+    private static void IndexServices(
+        Dictionary<SpanId, string> spanSvc, ReadOnlySpan<SpanRecord> spans, long fromNano, long toNano)
+    {
+        foreach (var s in spans)
+            if (s.StartTimeUnixNano >= fromNano && s.StartTimeUnixNano <= toNano)
+                spanSvc[s.SpanId] = s.ServiceName;
+    }
+
+    /// <summary>Adds an edge for every in-window span whose parent is known and in another service, in place.</summary>
+    private static void AccumulateEdges(
+        Dictionary<(string, string), EdgeAcc> edges, Dictionary<SpanId, string> spanSvc,
+        ReadOnlySpan<SpanRecord> spans, long fromNano, long toNano)
+    {
+        foreach (var s in spans)
+        {
+            if (s.StartTimeUnixNano < fromNano || s.StartTimeUnixNano > toNano) continue;
+            if (s.ParentSpanId.IsEmpty) continue;
+            if (!spanSvc.TryGetValue(s.ParentSpanId, out var psvc)) continue;
+            if (string.Equals(psvc, s.ServiceName, StringComparison.Ordinal)) continue;
+            var e = EdgeFor(edges, psvc, s.ServiceName);
+            e.Calls++;
+            if (s.Status == SpanStatusCode.Error) e.Errors++;
+            e.Buckets[BucketIndex(s.DurationNanos)]++;
+        }
+    }
+
+    private ServiceGraphDto GetServiceGraphCore(DateTimeOffset from, DateTimeOffset to)
+    {
         long fromNano = from.ToUnixTimeMilliseconds() * 1_000_000L;
         long toNano   = to.ToUnixTimeMilliseconds()   * 1_000_000L;
 
-        // Accumulate edges: (from, to) → (calls, errors, buckets)
-        var edgeAgg = new Dictionary<(string, string), (uint Calls, uint Errors, uint[] Buckets)>(32);
-
-        void MergeEdge(string f, string t, uint calls, uint errors, uint[] buckets)
-        {
-            var key = (f, t);
-            if (!edgeAgg.TryGetValue(key, out var acc))
-                acc = (0, 0, new uint[HistogramBuckets.Count]);
-            acc.Calls  += calls;
-            acc.Errors += errors;
-            for (int i = 0; i < HistogramBuckets.Count; i++) acc.Buckets[i] += buckets[i];
-            edgeAgg[key] = acc;
-        }
-
-        // Hot tier: derive edges on-demand (all spans in memory, accurate). Includes the
-        // in-flight flush snapshot, and snapshots the cold array under the same hold — see
-        // GetAggregateStatsAsync for why both halves must come from one instant.
+        // Includes the in-flight flush snapshot, and takes the cold array under the same hold —
+        // see GetAggregateStatsCore for why both halves must come from one instant.
         SpanSegmentInfo[] graphSegs;
+        UnflushedRuns     runs;
+        AggregateKey      key;
         _lock.EnterReadLock();
         try
         {
             graphSegs = _coldSegments;
-            if (UnflushedCountLocked() > 0)
-            {
-                // Materialised ONCE. The graph needs two passes — parents have to be known
-                // before edges can be drawn — and calling the iterator twice allocated a second
-                // one for no reason, inside the read lock, in the window that is effectively
-                // permanent when flushes run back to back.
-                var unflushed = new List<SpanRecord>(UnflushedCountLocked());
-                unflushed.AddRange(UnflushedSpansLocked());
-
-                var spanSvc = new Dictionary<SpanId, string>(unflushed.Count);
-                foreach (var s in unflushed)
-                    if (s.StartTimeUnixNano >= fromNano && s.StartTimeUnixNano <= toNano)
-                        spanSvc[s.SpanId] = s.ServiceName;
-
-                foreach (var s in unflushed)
-                {
-                    if (s.StartTimeUnixNano < fromNano || s.StartTimeUnixNano > toNano) continue;
-                    if (s.ParentSpanId.IsEmpty) continue;
-                    if (!spanSvc.TryGetValue(s.ParentSpanId, out var psvc)) continue;
-                    if (string.Equals(psvc, s.ServiceName, StringComparison.Ordinal)) continue;
-                    MergeEdge(psvc, s.ServiceName, 1,
-                              s.Status == SpanStatusCode.Error ? 1u : 0u,
-                              BucketOf(s.DurationNanos));
-                }
-            }
+            runs      = UnflushedRunsLocked();
+            key       = new(from.ToUnixTimeMilliseconds(), to.ToUnixTimeMilliseconds(),
+                            graphSegs, _unflushedGeneration, _hotSpans.Count);
         }
         finally { _lock.ExitReadLock(); }
 
-        // Cold tier — read .svcgraph sidecars (no span deserialization)
+        if (TryMemo(_graphMemo, in key, out var memoised)) return memoised;
+
+        _aggregatePassForTest?.Invoke(nameof(GetServiceGraphAsync));
+        var edgeAgg = new Dictionary<(string, string), EdgeAcc>(32);
+
+        // Two passes over the unflushed spans — parents must be known before edges can be drawn —
+        // straight over the two runs, where the locked version first copied the whole tier into a
+        // list so that it could walk it twice.
+        if (runs.Flushing.Length + runs.Hot.Length > 0)
+        {
+            var spanSvc = new Dictionary<SpanId, string>(runs.Flushing.Length + runs.Hot.Length);
+            IndexServices(spanSvc, runs.Flushing, fromNano, toNano);
+            IndexServices(spanSvc, runs.Hot,      fromNano, toNano);
+            AccumulateEdges(edgeAgg, spanSvc, runs.Flushing, fromNano, toNano);
+            AccumulateEdges(edgeAgg, spanSvc, runs.Hot,      fromNano, toNano);
+        }
+
+        // Cold tier — read .svcgraph sidecars (no span deserialization). Added, never adopted.
         foreach (var seg in graphSegs)
         {
             if (seg.MaxStartNano < fromNano || seg.MinStartNano > toNano) continue;
             foreach (var e in ServiceGraphSidecar.ReadEdges(seg.FilePath))
-                MergeEdge(e.From, e.To, e.CallCount, e.ErrorCount, e.Buckets);
+            {
+                var acc = EdgeFor(edgeAgg, e.From, e.To);
+                acc.Calls  += e.CallCount;
+                acc.Errors += e.ErrorCount;
+                var b = e.Buckets;
+                for (int i = 0; i < HistogramBuckets.Count; i++) acc.Buckets[i] += b[i];
+            }
         }
 
-        // Build edges list
-        var edgeDtos = new List<ServiceEdgeDto>(edgeAgg.Count);
-        foreach (var ((from2, to2), (calls, errors, buckets)) in edgeAgg)
-            edgeDtos.Add(new ServiceEdgeDto
-            {
-                From      = from2,
-                To        = to2,
-                CallCount = calls,
-                ErrorCount= errors,
-                ErrorRate = calls > 0 ? (double)errors / calls : 0,
-                P95Ms     = HistogramBuckets.Percentile(buckets, 0.95),
-            });
-
-        // Derive nodes from edges + stats provider
-        // Union all service names from edges
+        var edgeDtos  = new ServiceEdgeDto[edgeAgg.Count];
         var nodeNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var e in edgeDtos) { nodeNames.Add(e.From); nodeNames.Add(e.To); }
+        int k = 0;
+        foreach (var ((from2, to2), e) in edgeAgg)
+        {
+            edgeDtos[k++] = new ServiceEdgeDto
+            {
+                From       = from2,
+                To         = to2,
+                CallCount  = e.Calls,
+                ErrorCount = e.Errors,
+                ErrorRate  = e.Calls > 0 ? (double)e.Errors / e.Calls : 0,
+                P95Ms      = HistogramBuckets.Percentile(e.Buckets, 0.95),
+            };
+            nodeNames.Add(from2);
+            nodeNames.Add(to2);
+        }
 
-        // Load per-service stats for node metrics (reuse existing stats aggregation)
-        // We call GetAggregateStatsAsync synchronously since it's Task.FromResult internally
-        var statsTask = GetAggregateStatsAsync(from, to, ct);
-        var statsMap  = new Dictionary<string, ServiceSegmentStats>(StringComparer.OrdinalIgnoreCase);
-        // statsTask is already completed (Task.FromResult)
-        foreach (var s in statsTask.Result)
+        // Node metrics from the per-service stats — the same window, so on a dashboard that asked
+        // for the stats first this is the memoised result rather than a second pass over the tier.
+        var statsMap = new Dictionary<string, ServiceSegmentStats>(StringComparer.OrdinalIgnoreCase);
+        foreach (var s in GetAggregateStatsCore(from, to))
             statsMap[s.ServiceName] = s;
 
-        var nodeDtos = new List<ServiceNodeDto>(nodeNames.Count);
+        var nodeDtos = new ServiceNodeDto[nodeNames.Count];
+        k = 0;
         foreach (var name in nodeNames)
         {
             statsMap.TryGetValue(name, out var st);
-            nodeDtos.Add(new ServiceNodeDto
+            nodeDtos[k++] = new ServiceNodeDto
             {
                 ServiceName = name,
                 SpanCount   = st?.SpanCount ?? 0,
                 ErrorRate   = st is { SpanCount: > 0 } ? (double)st.ErrorCount / st.SpanCount : 0,
                 P95Ms       = st is not null ? HistogramBuckets.Percentile(st.Buckets, 0.95) : 0,
-            });
+            };
         }
 
-        return Task.FromResult(new ServiceGraphDto
-        {
-            Nodes = [.. nodeDtos],
-            Edges = [.. edgeDtos],
-        });
+        var graph = new ServiceGraphDto { Nodes = nodeDtos, Edges = edgeDtos };
+        _graphMemo = NewMemo(in key, graph);
+        return graph;
     }
 
     // ── ITraceSummaryProvider ──────────────────────────────────────────────────
@@ -2986,6 +3562,14 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// </summary>
     public async Task<TraceVolume> GetTraceVolumeAsync(
         DateTimeOffset from, DateTimeOffset to, int buckets, CancellationToken ct = default)
+    {
+        if (!TryEnterEngine()) return new TraceVolume();
+        try { return await GetTraceVolumeCoreAsync(from, to, buckets, ct).ConfigureAwait(false); }
+        finally { ExitEngine(); }
+    }
+
+    private async Task<TraceVolume> GetTraceVolumeCoreAsync(
+        DateTimeOffset from, DateTimeOffset to, int buckets, CancellationToken ct)
     {
         long fromNano  = from.ToUnixTimeMilliseconds() * 1_000_000L;
         long toNano    = to.ToUnixTimeMilliseconds()   * 1_000_000L;
@@ -3006,23 +3590,32 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             errorTraces += (int)errors;
         }
 
-        // Snapshot cold segments + aggregate hot tier under one short read-lock.
+        // The cold array and the unflushed view under one short read-lock; the grouping after it.
+        // Includes the in-flight flush snapshot: without it a refresh mid-build shows a dip in the
+        // sparkline exactly where the newest traces are.
         SpanSegmentInfo[] segs;
+        UnflushedRuns     runs;
+        int               hotTraces;
         _lock.EnterReadLock();
         try
         {
-            segs = _coldSegments.ToArray();
-
-            // Includes the in-flight flush snapshot: without it a refresh mid-build shows a
-            // dip in the sparkline exactly where the newest traces are.
-            if (UnflushedCountLocked() > 0)
-            {
-                var hot = new Dictionary<TraceId, HotVolAcc>(_traceIdx.Count);
-                foreach (var s in UnflushedSpansLocked()) AccumulateVolume(hot, s);
-                foreach (var a in hot.Values) Add(a.HasRoot ? a.RootStart : a.Earliest, 1, a.Err ? 1u : 0u);
-            }
+            segs      = _coldSegments;       // published whole and never mutated: no copy needed
+            runs      = UnflushedRunsLocked();
+            hotTraces = _traceIdx.Count;
         }
         finally { _lock.ExitReadLock(); }
+
+        if (runs.Flushing.Length + runs.Hot.Length > 0)
+        {
+            _aggregatePassForTest?.Invoke(nameof(GetTraceVolumeAsync));
+            // Presized to the live trace index's count, read under the lock above: an in-memory
+            // figure, not a file field (the FileBounds scan cannot tell a captured local apart).
+            var hot = new Dictionary<TraceId, HotVolAcc>();
+            hot.EnsureCapacity(hotTraces);
+            foreach (var s in runs.Flushing) AccumulateVolume(hot, s);
+            foreach (var s in runs.Hot)      AccumulateVolume(hot, s);
+            foreach (var a in hot.Values) Add(a.HasRoot ? a.RootStart : a.Earliest, 1, a.Err ? 1u : 0u);
+        }
 
         long half = TraceSummarySidecar.GridNanos / 2;
         foreach (var seg in segs)
@@ -3082,6 +3675,29 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         int              limit,
         CancellationToken ct = default)
     {
+        // An empty page, not a half-read one: Capped stays false because nothing was abandoned
+        // part-way — there is no storage left to abandon.
+        if (!TryEnterEngine()) return new TraceListPage([], false, long.MinValue);
+        try
+        {
+            return await GetTraceListCoreAsync(from, to, serviceName, spanName, status,
+                                               minDurationNanos, maxDurationNanos, limit, ct)
+                        .ConfigureAwait(false);
+        }
+        finally { ExitEngine(); }
+    }
+
+    private async Task<TraceListPage> GetTraceListCoreAsync(
+        DateTimeOffset   from,
+        DateTimeOffset   to,
+        string?          serviceName,
+        string?          spanName,
+        SpanStatusCode?  status,
+        long?            minDurationNanos,
+        long?            maxDurationNanos,
+        int              limit,
+        CancellationToken ct)
+    {
         _beforeTraceListScan?.Invoke(ct);
 
         long fromNano = from.ToUnixTimeMilliseconds() * 1_000_000L;
@@ -3090,24 +3706,28 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
 
         var merged = new Dictionary<TraceId, MergedTrace>(scanCap);
 
-        // Hot tier — group live spans (newest data) under read-lock. Snapshot cold too.
-        // The snapshot is taken AS IT IS: `_coldSegments` is maintained sorted by MaxStartNano
-        // DESCENDING wherever it is built, so neither this walk nor SearchSpansAsync has to
-        // clone-and-sort an array of every segment on the box on every page of every stream.
+        // The cold array and the unflushed view under one short read-lock; the grouping of the live
+        // spans after it (see UnflushedRuns). The cold snapshot is taken AS IT IS: `_coldSegments`
+        // is maintained sorted by MaxStartNano DESCENDING wherever it is built, so neither this walk
+        // nor SearchSpansAsync has to clone-and-sort an array of every segment on the box on every
+        // page of every stream.
         SpanSegmentInfo[] segs;
+        UnflushedRuns     runs;
         _lock.EnterReadLock();
         try
         {
             segs = _coldSegments;
-            // Includes the in-flight flush snapshot — otherwise the newest rows disappear
-            // from the trace list for the duration of every segment build.
-            foreach (var s in UnflushedSpansLocked())
-            {
-                if (s.StartTimeUnixNano < fromNano || s.StartTimeUnixNano > toNano) continue;
-                MergeSpanInto(merged, s);
-            }
+            runs = UnflushedRunsLocked();
         }
         finally { _lock.ExitReadLock(); }
+
+        // Includes the in-flight flush snapshot — otherwise the newest rows disappear from the
+        // trace list for the duration of every segment build.
+        if (runs.Flushing.Length + runs.Hot.Length > 0) _aggregatePassForTest?.Invoke(nameof(GetTraceListAsync));
+        foreach (var s in runs.Flushing)
+            if (s.StartTimeUnixNano >= fromNano && s.StartTimeUnixNano <= toNano) MergeSpanInto(merged, s);
+        foreach (var s in runs.Hot)
+            if (s.StartTimeUnixNano >= fromNano && s.StartTimeUnixNano <= toNano) MergeSpanInto(merged, s);
 
         // THE HEIGHT ABOVE WHICH THIS PAGE SETTLED ITS WINDOW — never a minimum over what it
         // merged, and the difference is the whole finding. Cold segments OVERLAP in time, so one
@@ -3479,44 +4099,163 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         };
     }
 
-    private static uint[] BucketOf(long durationNanos)
+    /// <summary>
+    /// The histogram bounds, read ONCE. <c>HistogramBuckets.Bounds</c> is a <c>ReadOnlySpan&lt;long&gt;</c> property
+    /// over <c>new long[] { ... }</c>, and measured it allocates on every access: 72 B per
+    /// <c>HistogramBuckets.IndexOf</c>, 720 KB for the stats pass over 10 000 spans. The values still come
+    /// from that one list; only the access is cached.
+    /// </summary>
+    private static readonly long[] BucketBounds = HistogramBuckets.Bounds.ToArray();
+
+    /// <summary><c>HistogramBuckets.IndexOf</c> without the allocation — see <see cref="BucketBounds"/>.</summary>
+    private static int BucketIndex(long durationNanos)
     {
-        var b = new uint[HistogramBuckets.Count];
-        b[HistogramBuckets.IndexOf(durationNanos)] = 1;
-        return b;
+        var bounds = BucketBounds;
+        for (int i = 0; i < bounds.Length; i++)
+            if (durationNanos < bounds[i]) return i;
+        return bounds.Length;
     }
 
-    public void Dispose()
+    /// <summary>
+    /// The teardown. One caller runs it; the other five — the container holds this instance
+    /// under six interfaces, and <c>TraceStorageHostedService</c> disposes it as well — await it.
+    /// Returning early on the exchange is what let a test fixture delete the data directory, or
+    /// a process exit, run on top of a flush that was still writing a segment.
+    /// </summary>
+    public async ValueTask DisposeAsync()
     {
-        // The store fences new background flushes (TryStartFlushLocked refuses once it is
-        // set), so after the drain below no task can still be holding the lock we free.
-        if (System.Threading.Interlocked.Exchange(ref _disposed, 1) != 0) return;
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            await _disposeCompleted.Task.ConfigureAwait(false);
+            return;
+        }
 
-        // Waits out an in-flight background flush, then drains the tier synchronously —
-        // a clean stop commits the WAL and leaves nothing to replay. If the final flush
-        // fails, the WAL still holds every span (Abandon keeps its generation live).
-        try { FlushHotTier(); }
-        catch (Exception ex) { _logger.LogError(ex, "Final span flush failed — the WAL replays the tier next start"); }
+        try { await DisposeCoreAsync().ConfigureAwait(false); }
+        finally { _disposeCompleted.TrySetResult(); }
+    }
 
-        // The WAL's disposal carries the log's last fsync, so nothing above may be allowed
-        // to skip it. ReaderWriterLockSlim.Dispose throws if a thread still holds or waits
-        // on the lock — a retention pass, a compaction or a straggling query can — and that
-        // throw used to take the WAL's close with it. The lock's own resources are trivial;
-        // the log's durability is not.
-        // The index holds native memory (the bloom bits) behind every open run, so it is released
-        // whatever else fails below.
+    /// <summary>
+    /// The synchronous bridge, kept because <see cref="IDisposable"/> is how most of this
+    /// engine's callers still stop it. It blocks on the same teardown; nothing on that path
+    /// captures a synchronisation context, so there is none to deadlock against.
+    /// </summary>
+    public void Dispose() => DisposeAsync().AsTask().GetAwaiter().GetResult();
+
+    /// <summary>
+    /// In the order the lifetime invariant needs: final flush (while writes are still open, so
+    /// it is an ordinary heavy phase and the wait below covers it) → close the door on writes,
+    /// new heavy phases and new readers → wait out running heavy phases → wait out callers
+    /// inside the engine → free the lock, the index and the log. Both waits share one budget.
+    ///
+    /// <para>RUNNING OUT OF THE BUDGET FREES NOTHING. A compaction wedged on a network volume is
+    /// still holding <c>_lock</c>, <c>_index</c> and the manifest; disposing them underneath it
+    /// is the use-after-free this gate exists to prevent, and hanging the host instead is not an
+    /// improvement on it. The engine is left allocated with an Error naming what is still
+    /// running — the process is on its way out, and a leaked lock for its last second costs
+    /// nothing.</para>
+    /// </summary>
+    private async Task DisposeCoreAsync()
+    {
+        long deadline = Environment.TickCount64 + (long)_shutdownWaitBudget.TotalMilliseconds;
+
+        // ── Final flush, BEFORE the close, so it goes through the ordinary heavy-phase path.
+        //    It waits out an in-flight background flush and then drains the tier — a clean stop
+        //    commits the WAL and leaves nothing to replay. A failure leaves every span in the
+        //    log (Abandon keeps its generation live). Off this thread and bounded, because the
+        //    wait inside it is a blocking Task.Wait on whatever flush is already running.
+        try { await Task.Run(FlushHotTier).WaitAsync(Until(deadline)).ConfigureAwait(false); }
+        catch (TimeoutException)
+        {
+            _logger.LogError(
+                "The final span flush did not finish within {Budget}s — the WAL replays the tier "
+              + "on the next start", _shutdownWaitBudget.TotalSeconds);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Final span flush failed — the WAL replays the tier next start");
+        }
+
+        // ── Close the door. A full fence: the other half of each handshake (WriteSpan,
+        //    TryBeginHeavyPhase, TryEnterEngine) is a lock-free read, and a store sinking below
+        //    those loads would let a phase start after shutdown had stopped counting.
+        Interlocked.Exchange(ref _writesClosed, 1);
+        Interlocked.MemoryBarrier();
+
+        // ── Wait for heavy phases. Only a phase that passed the close check is counted, so from
+        //    here the number can only fall.
+        bool phasesEnded = true;
+        var heavyDrained = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Volatile.Write(ref _heavyPhasesDrained, heavyDrained);
+        Interlocked.MemoryBarrier();   // the decrement's read of the source must see it, or this read must see the zero
+        if (Volatile.Read(ref _heavyPhases) != 0)
+        {
+            _onWaitingForHeavyPhases?.Invoke();
+            phasesEnded = await CompletesBy(heavyDrained.Task, deadline).ConfigureAwait(false);
+        }
+
+        // ── Wait for callers inside the engine: a query still scanning, a span still between
+        //    EnterWriteLock and ExitWriteLock.
+        bool callersEnded = true;
+        var readersDrained = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Volatile.Write(ref _readersDrained, readersDrained);
+        Interlocked.MemoryBarrier();
+        if (Volatile.Read(ref _activeReaders) != 0)
+        {
+            _onWaitingForReaders?.Invoke();
+            callersEnded = await CompletesBy(readersDrained.Task, deadline).ConfigureAwait(false);
+        }
+
+        if (!phasesEnded || !callersEnded)
+        {
+            _logger.LogError(
+                "Shutdown: {Phases} trace heavy phase(s) and {Callers} caller(s) still inside the "
+              + "engine after {Budget}s — the engine lock, the trace-id index and the span WAL are "
+              + "left frozen rather than freed under them",
+                Volatile.Read(ref _heavyPhases), Volatile.Read(ref _activeReaders),
+                _shutdownWaitBudget.TotalSeconds);
+            return;
+        }
+
+        // ── Free. The index holds native memory (the bloom bits) behind every open run, so it
+        //    goes whatever else fails; the WAL's disposal carries the log's last fsync, so
+        //    nothing above may be allowed to skip it.
         try { _index.Dispose(); } catch (Exception ex) { _logger.LogWarning(ex, "Trace index store failed to close"); }
 
         try { _lock.Dispose(); }
         catch (SynchronizationLockException ex) { _logger.LogWarning(ex, "Trace engine lock still in use at shutdown — left to the finalizer"); }
-        finally { _wal.Dispose(); }
+        finally { _wal.Dispose(); ResourcesFreedForTest = true; }
     }
+
+    /// <summary>True if <paramref name="task"/> completes by the <see cref="Environment.TickCount64"/> deadline.</summary>
+    private static async Task<bool> CompletesBy(Task task, long deadline)
+    {
+        try
+        {
+            await task.WaitAsync(Until(deadline)).ConfigureAwait(false);
+            return true;
+        }
+        catch (TimeoutException) { return false; }
+    }
+
+    /// <summary>What is left of the shutdown budget, never negative.</summary>
+    private static TimeSpan Until(long deadline) =>
+        TimeSpan.FromMilliseconds(Math.Max(0, deadline - Environment.TickCount64));
 
     // ── IRetentionTarget ───────────────────────────────────────────────────
 
     public string RetentionKey => "traces";
 
     public Task<int> PruneAsync(TimeSpan ttl, CancellationToken ct = default)
+    {
+        // RetentionService holds this engine as an IRetentionTarget and can call at any time,
+        // including after the teardown — where it used to unlink .trc files through a disposed
+        // lock. Gated, a late pass is a no-op and the next start expires the same segments.
+        if (!TryBeginHeavyPhase()) return Task.FromResult(0);
+        try { return PruneCore(ttl, ct); }
+        finally { EndHeavyPhase(); }
+    }
+
+    private Task<int> PruneCore(TimeSpan ttl, CancellationToken ct)
     {
         var cutoffNano = DateTimeOffset.UtcNow.Subtract(ttl).ToUnixTimeMilliseconds() * 1_000_000L;
 

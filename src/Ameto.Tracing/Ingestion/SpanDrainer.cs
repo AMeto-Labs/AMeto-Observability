@@ -32,7 +32,9 @@ internal sealed class SpanDrainer : IAsyncDisposable
 
     private DateTime _lastFlush = DateTime.UtcNow;
 
-    private readonly SpanIngestItem?[] _batch = new SpanIngestItem?[BatchSize];
+    // Non-nullable so a slice of it is the ReadOnlySpan<SpanIngestItem> WriteSpans takes; the
+    // drain fills [0, count) and clears it again after every hand-over.
+    private readonly SpanIngestItem[] _batch = new SpanIngestItem[BatchSize];
 
     public SpanDrainer(
         SpanRingBuffer ring,
@@ -62,16 +64,23 @@ internal sealed class SpanDrainer : IAsyncDisposable
 
             try
             {
-                for (int i = 0; i < count; i++)
-                {
-                    var item = _batch[i]!;
-                    _storage.WriteSpan(item);
-                    _batch[i] = null;
-                }
+                // ONE call per drained batch: the engine takes its write lock and the log's
+                // append lock once per hold (see TraceStorageEngine.WriteSpans), not per span.
+                int taken = _storage.WriteSpans(new ReadOnlySpan<SpanIngestItem>(_batch, 0, count));
+                // The engine has closed its write path. Every further span would be refused
+                // too, so stop draining rather than spinning the ring empty into a closed
+                // engine — and say so once, with the count, instead of once per span.
+                if (taken < count) { ReportRefused(count - taken); return; }
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "SpanDrainer: error writing batch of {Count} spans", count);
+            }
+            finally
+            {
+                // The ring's references go either way: a span the engine took is in the tier, and
+                // one it failed on is reported above — neither may be kept alive by this array.
+                Array.Clear(_batch, 0, count);
             }
 
             MaybeFlush();
@@ -82,13 +91,23 @@ internal sealed class SpanDrainer : IAsyncDisposable
         do
         {
             remaining = _ring.TryDequeueMany(_batch, BatchSize);
-            for (int i = 0; i < remaining; i++)
-            {
-                _storage.WriteSpan(_batch[i]!);
-                _batch[i] = null;
-            }
+            if (remaining == 0) break;
+            int taken;
+            try { taken = _storage.WriteSpans(new ReadOnlySpan<SpanIngestItem>(_batch, 0, remaining)); }
+            finally { Array.Clear(_batch, 0, remaining); }
+            if (taken < remaining) { ReportRefused(remaining - taken); return; }
         } while (remaining > 0);
     }
+
+    /// <summary>
+    /// Says, once, that the engine stopped taking spans. It is not an error: the spans were
+    /// never durable, the refusal is what keeps them from being queryable-but-unrecoverable,
+    /// and by this point the process is going down anyway.
+    /// </summary>
+    private void ReportRefused(int dropped) =>
+        _logger.LogWarning(
+            "SpanDrainer: the trace engine has closed its write path — {Dropped} span(s) from "
+          + "this batch, and whatever is still in the ring, were not stored", dropped);
 
     /// <summary>Asks the engine to flush if the hot tier is due, every <see cref="FlushCheckInterval"/>.</summary>
     private void MaybeFlush()

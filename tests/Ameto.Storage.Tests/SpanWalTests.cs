@@ -591,4 +591,175 @@ public sealed class SpanWalTests : IDisposable
         Assert.Empty(reopened.ReadAll());                                // clean stop: all cold
         reopened.Dispose();
     }
+
+    // ── The batched write path (TS#4) ─────────────────────────────────────────
+    //
+    // The drainer hands the engine up to 512 spans at a time, and the engine takes them in holds
+    // of TraceStorageEngine.MaxSpansPerWriteHold: one engine write lock and one log append lock
+    // per hold, not per span. Two properties are what make that safe, and each is pinned here.
+
+    /// <summary>
+    /// A READER CAN GET IN BETWEEN TWO HOLDS. One hold for a whole drained batch would make every
+    /// point lookup that lands behind the drainer wait for all of it; the cap exists so that it
+    /// waits for a hold's worth at most. Judged at the seam that runs after each hold is released:
+    /// the first one must come with a hold's worth of spans taken, not the whole batch, and a
+    /// query run from inside it — on another thread, so it needs the read lock for real — must
+    /// see exactly those spans and no more.
+    /// </summary>
+    [Fact]
+    public void A_drained_batch_is_taken_in_holds_a_reader_can_get_between()
+    {
+        const int Batch = 300;
+        int perHold = TraceStorageEngine.MaxSpansPerWriteHold;
+        Assert.True(Batch > 2 * perHold, "the batch has to span at least three holds");
+
+        using var engine = new TraceStorageEngine(_dir, NullLogger<TraceStorageEngine>.Instance);
+
+        var items = new SpanIngestItem[Batch];
+        for (int i = 0; i < Batch; i++) items[i] = Item(i, BaseNano + i * 1_000L);
+
+        var takenAfterHold = new List<int>();
+        int seenMidBatch   = -1;
+        engine._afterWriteHoldForTest = taken =>
+        {
+            takenAfterHold.Add(taken);
+            if (takenAfterHold.Count != 1) return;
+            // The writer is between holds right now. A reader on another thread must get the read
+            // lock and find the first hold's spans — the batch is visibly half-taken.
+            var read = Task.Run(() => engine.SearchSpansAsync(limit: 10_000).ToBlockingEnumerable().Count());
+            Assert.True(read.Wait(TimeSpan.FromSeconds(30)), "a reader could not get in between two holds");
+            seenMidBatch = read.Result;
+        };
+
+        Assert.Equal(Batch, engine.WriteSpans(items));
+
+        Assert.Equal(perHold, takenAfterHold[0]);                       // a hold, not the batch
+        Assert.Equal(perHold, seenMidBatch);                            // and the reader saw exactly it
+        Assert.Equal((Batch + perHold - 1) / perHold, takenAfterHold.Count);
+        Assert.Equal(Batch, takenAfterHold[^1]);
+        Assert.Equal(Batch, engine.SearchSpansAsync(limit: 10_000).ToBlockingEnumerable().Count());
+    }
+
+    /// <summary>
+    /// THE LOG AND THE TIER HOLD THE SAME SPANS EVEN WHEN THE LOG FAILS PART-WAY THROUGH A BATCH.
+    /// A hold appends a run of spans to the log before any of them joins the tier; if the log
+    /// throws on the fourth, the three it took are durable and must be queryable, and the rest
+    /// must be in neither. Adding the whole chunk to the tier would make seven spans queryable
+    /// that no restart can bring back; adding none would hide three the next restart replays.
+    /// </summary>
+    [Fact]
+    public void A_log_failure_part_way_through_a_batch_leaves_the_log_and_the_tier_holding_the_same_spans()
+    {
+        using var engine = new TraceStorageEngine(_dir, NullLogger<TraceStorageEngine>.Instance);
+
+        var items = new SpanIngestItem[10];
+        for (int i = 0; i < items.Length; i++) items[i] = Item(i, BaseNano + i * 1_000L);
+
+        engine.WalForTest._beforeBatchEntryForTest = index =>
+        {
+            if (index == 3) throw new IOException("injected: the log refused its fourth entry");
+        };
+        Assert.Throws<IOException>(() => engine.WriteSpans(items));
+        engine.WalForTest._beforeBatchEntryForTest = null;
+
+        var inTier = engine.SearchSpansAsync(limit: 1_000).ToBlockingEnumerable()
+                           .Select(static s => s.SpanId.RawValue).Order().ToArray();
+        var inLog  = engine.WalForTest.ReadAll()
+                           .Select(static s => s.SpanId.RawValue).Order().ToArray();
+
+        Assert.Equal([100UL, 101UL, 102UL], inLog);                     // the three it took
+        Assert.Equal(inLog, inTier);                                    // and exactly those are queryable
+
+        // And the path is not wedged by the failure: the rest goes in whole.
+        Assert.Equal(7, engine.WriteSpans(items.AsSpan(3)));
+        Assert.Equal(10, engine.WalForTest.ReadAll().Count);
+        Assert.Equal(10, engine.SearchSpansAsync(limit: 1_000).ToBlockingEnumerable().Count());
+    }
+
+    /// <summary>
+    /// A READER QUEUED BEHIND A HOLD GETS IN BEFORE THE NEXT ONE. Holds back to back leave no gap:
+    /// <c>ReaderWriterLockSlim</c> wakes a queued reader when the writer exits, and the drainer is
+    /// back inside the lock long before the woken thread runs. <c>TraceAggregateLockProbe</c>
+    /// measured it at ONE point lookup completed in 29 ms of batched ingest. So a reader is queued
+    /// on the engine lock from inside the first hold — blocked for real, on the lock itself — and
+    /// by the second hold it must have been in and out.
+    ///
+    /// <para>The hand-off's budget is raised to a hang guard so the test decides nothing by time:
+    /// the writer spins until the reader is in, however long the reader's thread takes to wake on
+    /// a loaded box. Removing the hand-off fails it — the second hold runs with the reader still
+    /// queued.</para>
+    /// </summary>
+    [Fact]
+    public void A_reader_queued_behind_a_hold_gets_in_before_the_next_one()
+    {
+        int perHold = TraceStorageEngine.MaxSpansPerWriteHold;
+        using var engine = new TraceStorageEngine(_dir, NullLogger<TraceStorageEngine>.Instance);
+        engine._readerHandoffTicks = System.Diagnostics.Stopwatch.Frequency * 30;   // a hang guard, not a timer
+
+        var items = new SpanIngestItem[3 * perHold];
+        for (int i = 0; i < items.Length; i++) items[i] = Item(i, BaseNano + i * 1_000L);
+
+        using var readerWasIn = new ManualResetEventSlim();
+        Thread? reader        = null;
+        bool queued           = false;
+        bool inBySecondHold   = false;
+        engine._insideWriteHoldForTest = taken =>
+        {
+            if (taken == perHold)
+            {
+                var rw = engine.LockForTest;
+                reader = new Thread(() =>
+                {
+                    rw.EnterReadLock();
+                    readerWasIn.Set();
+                    rw.ExitReadLock();
+                }) { IsBackground = true };
+                reader.Start();
+                // Blocked behind THIS hold, in the lock's own wait — not merely started.
+                queued = SpinWait.SpinUntil(() => rw.WaitingReadCount > 0, TimeSpan.FromSeconds(30));
+            }
+            else if (taken == 2 * perHold)
+            {
+                inBySecondHold = readerWasIn.IsSet;
+            }
+        };
+
+        Assert.Equal(items.Length, engine.WriteSpans(items));
+        Assert.True(reader!.Join(TimeSpan.FromSeconds(30)));
+
+        Assert.True(queued, "setup: the reader never queued on the engine lock");
+        Assert.True(inBySecondHold, "the next hold began with a reader still queued behind the last one");
+    }
+
+    /// <summary>
+    /// A BATCH INTO A DISPOSED LOG THROWS. The engine's gate refuses a batch before the log sees it,
+    /// so reaching a disposed log is a broken gate — and the single-span <c>Append</c>'s silent
+    /// <c>return</c> is exactly the queryable-but-unrecoverable shape that gate exists to end: the
+    /// engine would add the batch to the hot tier believing the log had it.
+    /// </summary>
+    [Fact]
+    public void A_batch_into_a_disposed_log_throws_instead_of_dropping_it()
+    {
+        var wal = SpanWriteAheadLog.Open(WalPath);
+        wal.Dispose();
+
+        Assert.Throws<ObjectDisposedException>(() => { using var scope = wal.EnterAppendScope(); });
+        Assert.Throws<ObjectDisposedException>(() =>
+        {
+            if (wal.TryEnterAppendScope(out var scope)) scope.Dispose();
+        });
+    }
+}
+
+/// <summary>
+/// The single-span spelling the tests use. The log takes UTF-8; the engine transcodes an ingest
+/// item at its call site (<see cref="TraceStorageEngine.AppendTranscoded"/>), and so does this.
+/// </summary>
+internal static class SpanWalTestExtensions
+{
+    public static void Append(this SpanWriteAheadLog wal, SpanIngestItem item)
+    {
+        using var scope = wal.EnterAppendScope();
+        TraceStorageEngine.AppendTranscoded(in scope, item);
+    }
 }

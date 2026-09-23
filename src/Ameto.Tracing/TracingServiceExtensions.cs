@@ -65,6 +65,17 @@ public static class TracingServiceExtensions
                 writeSegmentFormatV4,
                 indexEnabled));
 
+        // FIRST, SO IT STOPS LAST. Hosted services are stopped in reverse registration order, so
+        // this one's StopAsync — the engine's teardown — runs after the drainer has handed over
+        // its last batch and after both background workers have been asked to stop. Registered
+        // anywhere later it would tear the engine down underneath the drainer that is still
+        // feeding it, and the drainer's spans would be refused rather than stored.
+        //
+        // The container disposes the engine as well, under each of the six interfaces it is
+        // registered as; those calls await the teardown this one started instead of returning
+        // into a half-torn engine.
+        services.AddHostedService<TraceStorageHostedService>();
+
         services.AddSingleton<SpanRingBuffer>();
         services.AddSingleton<SpanIngestionEndpoint>();
         services.AddSingleton<ISpanIngester>(sp => sp.GetRequiredService<SpanIngestionEndpoint>());
@@ -189,6 +200,24 @@ internal sealed class TraceIndexBackfillWorker(
             catch (OperationCanceledException) { return; }
         }
     }
+}
+
+/// <summary>
+/// The engine's teardown, on the host's schedule rather than the container's. Registered first so
+/// it stops last; <c>StopAsync</c> is awaited by the host, which the container's disposal of a
+/// singleton is not — and the trace engine's teardown ends in a segment build and an fsync.
+/// </summary>
+internal sealed class TraceStorageHostedService : IHostedService, IAsyncDisposable
+{
+    private readonly TraceStorageEngine _engine;
+
+    public TraceStorageHostedService(TraceStorageEngine engine) => _engine = engine;
+
+    public Task StartAsync(CancellationToken ct) => Task.CompletedTask;
+
+    public async Task StopAsync(CancellationToken ct) => await _engine.DisposeAsync();
+
+    public async ValueTask DisposeAsync() => await _engine.DisposeAsync();
 }
 
 internal sealed class SpanDrainerService : IHostedService, IAsyncDisposable
