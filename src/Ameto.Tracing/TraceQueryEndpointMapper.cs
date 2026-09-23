@@ -1762,19 +1762,61 @@ internal static class TraceDetailJson
     /// </summary>
     internal static bool TryWriteBlob(Utf8JsonWriter w, ReadOnlyMemory<byte> blob)
     {
+        var reader = new MessagePackReader(blob);
+        int count;
+        try   { count = reader.ReadMapHeader(); }
+        catch { return false; }   // not a map, or torn in its header: Decode answers null
+        if (count > MaxFastPairs) return false;
+
         AttrPair[]? rented = null;
+        Span<AttrPair> pairs = count <= StackPairs
+            ? stackalloc AttrPair[StackPairs]
+            : (rented = ArrayPool<AttrPair>.Shared.Rent(count));
         try
         {
-            var reader = new MessagePackReader(blob);
-            int count  = reader.ReadMapHeader();
-            if (count > MaxFastPairs) return false;
-
-            Span<AttrPair> pairs = count <= StackPairs
-                ? stackalloc AttrPair[StackPairs]
-                : (rented = ArrayPool<AttrPair>.Shared.Rent(count));
+            pairs = pairs[..count];
             var bytes = blob.Span;
+            if (Walk(ref reader, bytes, pairs) != WalkResult.Walked) return false;
 
+            // NOTHING BELOW IS CAUGHT. Only the walk may turn a throw into a decline — a throw there
+            // means the blob will not decode, and nothing has been written. A throw from here on is
+            // the WRITER's (its output failed, say), with a half-written object behind it: falling
+            // back would open a second object where a property name is due, and the writer's own
+            // state check would replace the real failure with an InvalidOperationException
+            // (TraceDetailJsonFaultTests).
+            w.WriteStartObject();
             for (int i = 0; i < count; i++)
+            {
+                var key = bytes.Slice(pairs[i].KeyStart, pairs[i].KeyLength);
+                if (IndexOfKey(pairs, bytes, key, 0, i) >= 0) continue;   // written at its first copy
+
+                int last = i;
+                for (int j = count - 1; j > i; j--)
+                    if (KeyEquals(pairs[j], bytes, key)) { last = j; break; }
+
+                WriteValue(w, key, bytes, in pairs[last]);
+            }
+            w.WriteEndObject();
+            return true;
+        }
+        finally
+        {
+            if (rented is not null) ArrayPool<AttrPair>.Shared.Return(rented);
+        }
+    }
+
+    private enum WalkResult { Walked, IllFormedKey, Undecodable }
+
+    /// <summary>
+    /// Locates every pair, making the reader calls <see cref="SpanAttributeBlob.Decode"/> makes, in
+    /// its order — so it throws exactly where Decode throws, and that is reported as
+    /// <see cref="WalkResult.Undecodable"/>. Writes nothing.
+    /// </summary>
+    private static WalkResult Walk(ref MessagePackReader reader, ReadOnlySpan<byte> bytes, scoped Span<AttrPair> pairs)
+    {
+        try
+        {
+            for (int i = 0; i < pairs.Length; i++)
             {
                 ref var p = ref pairs[i];
                 p = default;
@@ -1787,7 +1829,7 @@ internal static class TraceDetailJson
                     p.KeyLength = (int)len;
                     p.KeyStart  = (int)(reader.Consumed - len);
                     if (!System.Text.Unicode.Utf8.IsValid(bytes.Slice(p.KeyStart, p.KeyLength)))
-                        return false;
+                        return WalkResult.IllFormedKey;
                 }
 
                 // SpanAttributeBlob.ReadBoxedValue's rules for the value, call for call.
@@ -1808,29 +1850,11 @@ internal static class TraceDetailJson
                     default:                      p.Kind = SpanAttrKind.Other;   reader.Skip();                    break;
                 }
             }
-
-            w.WriteStartObject();
-            for (int i = 0; i < count; i++)
-            {
-                var key = bytes.Slice(pairs[i].KeyStart, pairs[i].KeyLength);
-                if (IndexOfKey(pairs, bytes, key, 0, i) >= 0) continue;   // written at its first copy
-
-                int last = i;
-                for (int j = count - 1; j > i; j--)
-                    if (KeyEquals(pairs[j], bytes, key)) { last = j; break; }
-
-                WriteValue(w, key, bytes, in pairs[last]);
-            }
-            w.WriteEndObject();
-            return true;
+            return WalkResult.Walked;
         }
         catch
         {
-            return false;   // nothing written: the throw can only come from the walk above
-        }
-        finally
-        {
-            if (rented is not null) ArrayPool<AttrPair>.Shared.Return(rented);
+            return WalkResult.Undecodable;
         }
     }
 
