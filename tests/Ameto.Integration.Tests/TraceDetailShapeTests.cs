@@ -14,7 +14,8 @@ namespace Ameto.Integration.Tests;
 /// THE WIRE SHAPE OF <c>GET /api/traces/{id}</c> AND <c>GET /api/traces/{id}/flamegraph</c>, BYTE
 /// FOR BYTE, as the unchanged endpoint produced it — captured before either response was taken off
 /// its <c>Dictionary</c>-per-span DTO and its reflection serialiser, so that rewrite has something
-/// exact to be held to.
+/// exact to be held to. <c>GET /api/traces/compare</c>, which serialises the same DTO for two traces
+/// at once, is pinned the same way — captured on its unchanged code after the other two had moved.
 ///
 /// <para>The Angular client reads these two bodies directly (the waterfall, the span details pane,
 /// the flame graph), and nothing else on the server pins them: every attribute value arrives as a
@@ -372,6 +373,58 @@ public sealed class TraceDetailShapeTests : IClassFixture<AmetoWebAppFactory>
         Assert.Empty(body);
     }
 
+    // ── The compare view ─────────────────────────────────────────────────────
+
+    /// <summary>Its own traces: the detail fact's trace carries an empty span id, which is never
+    /// deduplicated, so writing it a second time into the same host would change that fact's body.</summary>
+    private static readonly TraceId CompareA = new(0xC0C0A00000000001UL, 0x00000000000000A1UL);
+    private static readonly TraceId CompareB = new(0xC0C0B00000000002UL, 0x00000000000000B2UL);
+
+    private static readonly byte[] SmallMixed = Blob(static (ref MessagePackWriter w) =>
+    {
+        w.WriteMapHeader(8);
+        w.Write("s");   w.Write("x <&> ü");
+        w.Write("i");   w.Write(-5L);
+        w.Write("d");   w.Write(0.375);
+        w.Write("big"); w.Write(1e20);
+        w.Write("b");   w.Write(true);
+        w.Write("n");   w.WriteNil();
+        w.Write("dup"); w.Write(1L);
+        w.Write("dup"); w.Write(2L);
+    });
+
+    private void WriteCompareTraces()
+    {
+        long a = Anchor + 120_000 * Ms;   // two minutes after the detail trace
+        Write(CompareA, 0xAA01, 0,      a,          40 * Ms, "compare root", "сервис", SpanKind.Server, SpanStatusCode.Ok,    200, SmallMixed);
+        Write(CompareA, 0xAA02, 0xAA01, a + 1 * Ms, 10 * Ms, "compare child", "db",    SpanKind.Client, SpanStatusCode.Error,   0, BigUnsigned);
+        Write(CompareB, 0xBB01, 0,      a + 2 * Ms,  5 * Ms, "other root",    "x",     SpanKind.Server, SpanStatusCode.Unset,   0, []);
+    }
+
+    [Fact]
+    public async Task The_compare_body_is_byte_for_byte_what_it_was_hot_and_cold()
+    {
+        WriteCompareTraces();
+        string both    = $"/api/traces/compare?a={Id(CompareA)}&b={Id(CompareB)}";
+        string unknown = $"/api/traces/compare?a={Id(CompareB)}&b={Id(new TraceId(0x0123456789ABCDEFUL, 0x1111111111111111UL))}";
+
+        async Task Check(string tier)
+        {
+            await AssertBodyAsync(both,    CultureInfo.InvariantCulture, Joined(CompareInvariant), $"{tier}, compare, invariant");
+            await AssertBodyAsync(both,    Odd,                          Joined(CompareOdd),       $"{tier}, compare, odd culture");
+            await AssertBodyAsync(unknown, CultureInfo.InvariantCulture, Joined(CompareUnknown),   $"{tier}, compare with an unknown trace");
+        }
+
+        await Check("hot");
+        _traces.FlushHotTier();
+        Assert.True(_traces.ColdSegmentCountForTest > 0, "the flush wrote no segment");
+        await Check("cold");
+
+        var (status, _, body) = await GetAsync("/api/traces/compare?a=zz&b=yy", CultureInfo.InvariantCulture);
+        Assert.Equal(HttpStatusCode.BadRequest, status);
+        Assert.Equal("'a' and 'b' must be valid 32-char hex trace IDs", Encoding.UTF8.GetString(body));
+    }
+
     // ── The flame graph ──────────────────────────────────────────────────────
 
     [Fact]
@@ -527,5 +580,36 @@ public sealed class TraceDetailShapeTests : IClassFixture<AmetoWebAppFactory>
     private const string FlameEarlyOrphanBody = """
         {"spanId":"0000000000000031","name":"real root <&>","service":"сервис","kind":"Server","status":"Ok","totalMs":20,"selfMs":7.654,"children":[
         {"spanId":"0000000000000032","name":"only child","service":"x","kind":"Client","status":"Error","totalMs":12.346,"selfMs":12.346,"children":[]}]}
+        """;
+
+    private const string CompareInvariant = """
+        {"traceA":[{"traceId":"c0c0a0000000000100000000000000a1","spanId":"000000000000aa01","parentSpanId":"0000000000000000","startTimeUnixNano":4102444920000000000,"durationNanos":40000000,"name":"compare root","serviceName":"сервис","kind":"Server","status":"Ok","httpStatusCode":200,"attributes":{
+        "s":"x <&> ü",
+        "i":"-5",
+        "d":"0.375",
+        "big":"1E+20",
+        "b":"True",
+        "n":"",
+        "dup":"2"}},
+        {"traceId":"c0c0a0000000000100000000000000a1","spanId":"000000000000aa02","parentSpanId":"000000000000aa01","startTimeUnixNano":4102444920001000000,"durationNanos":10000000,"name":"compare child","serviceName":"db","kind":"Client","status":"Error","httpStatusCode":0,"attributes":{}}],
+        "traceB":[{"traceId":"c0c0b0000000000200000000000000b2","spanId":"000000000000bb01","parentSpanId":"0000000000000000","startTimeUnixNano":4102444920002000000,"durationNanos":5000000,"name":"other root","serviceName":"x","kind":"Server","status":"Unset","httpStatusCode":0,"attributes":{}}]}
+        """;
+
+    private const string CompareOdd = """
+        {"traceA":[{"traceId":"c0c0a0000000000100000000000000a1","spanId":"000000000000aa01","parentSpanId":"0000000000000000","startTimeUnixNano":4102444920000000000,"durationNanos":40000000,"name":"compare root","serviceName":"сервис","kind":"Server","status":"Ok","httpStatusCode":200,"attributes":{
+        "s":"x <&> ü",
+        "i":"−5",
+        "d":"0,375",
+        "big":"1E⁺20",
+        "b":"True",
+        "n":"",
+        "dup":"2"}},
+        {"traceId":"c0c0a0000000000100000000000000a1","spanId":"000000000000aa02","parentSpanId":"000000000000aa01","startTimeUnixNano":4102444920001000000,"durationNanos":10000000,"name":"compare child","serviceName":"db","kind":"Client","status":"Error","httpStatusCode":0,"attributes":{}}],
+        "traceB":[{"traceId":"c0c0b0000000000200000000000000b2","spanId":"000000000000bb01","parentSpanId":"0000000000000000","startTimeUnixNano":4102444920002000000,"durationNanos":5000000,"name":"other root","serviceName":"x","kind":"Server","status":"Unset","httpStatusCode":0,"attributes":{}}]}
+        """;
+
+    private const string CompareUnknown = """
+        {"traceA":[{"traceId":"c0c0b0000000000200000000000000b2","spanId":"000000000000bb01","parentSpanId":"0000000000000000","startTimeUnixNano":4102444920002000000,"durationNanos":5000000,"name":"other root","serviceName":"x","kind":"Server","status":"Unset","httpStatusCode":0,"attributes":{}}],
+        "traceB":[]}
         """;
 }
