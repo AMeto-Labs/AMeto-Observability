@@ -763,12 +763,31 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                 _lock.EnterWriteLock();
                 try
                 {
+                    // The log's append lock, taken WITHOUT waiting while the engine lock is held:
+                    // the one holder that keeps it for long is CommitFlush's persistence barrier
+                    // (a drive flush, up to milliseconds), and waiting for it in here would hold
+                    // every reader of the hot tier behind that fsync. So on a busy log the engine
+                    // lock is let go, the wait happens outside it, and the hold starts over.
+                    // Nothing was taken yet, so starting over changes nothing.
+                    SpanWriteAheadLog.AppendScope scope;
+                    while (!_wal.TryEnterAppendScope(out scope))
+                    {
+                        _lock.ExitWriteLock();
+                        try { _wal.WaitUntilAppendable(); }
+                        finally { _lock.EnterWriteLock(); }
+                    }
+
                     // Write-ahead: every span is in the log before it is queryable. If the log
                     // fails part-way, the spans it did take still join the tier — the finally —
                     // and the ones it did not stay out of both.
-                    try { _wal.AppendBatch(chunk, ref appended); }
+                    try
+                    {
+                        for (; appended < chunk.Length; appended++)
+                            AppendTranscoded(in scope, chunk[appended]);
+                    }
                     finally
                     {
+                        scope.Dispose();
                         for (int i = 0; i < appended; i++) AddToHotTierLocked(chunk[i]);
                         taken += appended;
                     }
@@ -787,6 +806,37 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
         }
         finally { ExitEngine(); }
         return taken;
+    }
+
+    /// <summary>
+    /// One span into a held log scope. The log takes UTF-8 and the ingest item still carries
+    /// strings, so the name and service are transcoded HERE, into the stack (or a pooled buffer
+    /// for a pathological name), and handed over as bytes. When the ingest path hands UTF-8
+    /// through (WP8) this transcode goes away and the log does not change.
+    /// </summary>
+    internal static void AppendTranscoded(in SpanWriteAheadLog.AppendScope scope, SpanIngestItem item)
+    {
+        string name    = item.Name        ?? string.Empty;
+        string service = item.ServiceName ?? string.Empty;
+
+        // UTF-8 never needs more than 3 bytes per UTF-16 unit (a surrogate pair is 4 for 2).
+        int maxBytes = (name.Length + service.Length) * 3;
+        byte[]? rented = null;
+        Span<byte> buf = maxBytes <= 1024
+            ? stackalloc byte[1024]
+            : (rented = System.Buffers.ArrayPool<byte>.Shared.Rent((name.Length + service.Length) * 3));
+        try
+        {
+            int n = System.Text.Encoding.UTF8.GetBytes(name, buf);
+            int s = System.Text.Encoding.UTF8.GetBytes(service, buf[n..]);
+            scope.Append(item.TraceId, item.SpanId, item.ParentSpanId, item.StartTimeUnixNano, item.DurationNanos,
+                         item.Kind, item.Status, item.HttpStatusCode,
+                         buf[..n], buf.Slice(n, s), item.AttributesBytes);
+        }
+        finally
+        {
+            if (rented is not null) System.Buffers.ArrayPool<byte>.Shared.Return(rented);
+        }
     }
 
     /// <summary>

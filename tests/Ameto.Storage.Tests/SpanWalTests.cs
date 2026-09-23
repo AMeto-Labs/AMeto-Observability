@@ -743,9 +743,23 @@ public sealed class SpanWalTests : IDisposable
         var wal = SpanWriteAheadLog.Open(WalPath);
         wal.Dispose();
 
-        int appended = 0;
-        Assert.Throws<ObjectDisposedException>(
-            () => wal.AppendBatch([Item(0, BaseNano), Item(1, BaseNano + 1)], ref appended));
-        Assert.Equal(0, appended);
+        Assert.Throws<ObjectDisposedException>(() => { using var scope = wal.EnterAppendScope(); });
+        Assert.Throws<ObjectDisposedException>(() =>
+        {
+            if (wal.TryEnterAppendScope(out var scope)) scope.Dispose();
+        });
+    }
+}
+
+/// <summary>
+/// The single-span spelling the tests use. The log takes UTF-8; the engine transcodes an ingest
+/// item at its call site (<see cref="TraceStorageEngine.AppendTranscoded"/>), and so does this.
+/// </summary>
+internal static class SpanWalTestExtensions
+{
+    public static void Append(this SpanWriteAheadLog wal, SpanIngestItem item)
+    {
+        using var scope = wal.EnterAppendScope();
+        TraceStorageEngine.AppendTranscoded(in scope, item);
     }
 }
