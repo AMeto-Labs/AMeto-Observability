@@ -106,25 +106,7 @@ public static class TraceQueryEndpointMapper
         });
 
         // GET /api/traces/compare?a={traceId}&b={traceId}
-        group.MapGet("/api/traces/compare", async (HttpContext ctx) =>
-        {
-            var provider = ctx.RequestServices.GetRequiredService<ITraceProvider>();
-            string? aHex = ctx.Request.Query["a"];
-            string? bHex = ctx.Request.Query["b"];
-
-            if (!TraceId.TryParseHex(aHex, out var tidA) || !TraceId.TryParseHex(bHex, out var tidB))
-            {
-                ctx.Response.StatusCode = 400;
-                await ctx.Response.WriteAsync("'a' and 'b' must be valid 32-char hex trace IDs");
-                return;
-            }
-
-            var taskA = CollectSpansAsync(provider, tidA, ctx.RequestAborted);
-            var taskB = CollectSpansAsync(provider, tidB, ctx.RequestAborted);
-            await Task.WhenAll(taskA, taskB);
-
-            await ctx.Response.WriteAsJsonAsync(new { traceA = taskA.Result, traceB = taskB.Result });
-        });
+        group.MapGet("/api/traces/compare", static (HttpContext ctx) => WriteCompareAsync(ctx));
 
         // GET /api/traces/service-graph?from=&to=
         group.MapGet("/api/traces/service-graph", async (HttpContext ctx) =>
@@ -330,6 +312,27 @@ public static class TraceQueryEndpointMapper
             await body.FlushAsync();
         }
         finally { json?.Dispose(); }
+    }
+
+    /// <summary><c>GET /api/traces/compare?a=&amp;b=</c> — see <see cref="WriteTraceDetailAsync"/>.</summary>
+    internal static async Task WriteCompareAsync(HttpContext ctx)
+    {
+        var provider = ctx.RequestServices.GetRequiredService<ITraceProvider>();
+        string? aHex = ctx.Request.Query["a"];
+        string? bHex = ctx.Request.Query["b"];
+
+        if (!TraceId.TryParseHex(aHex, out var tidA) || !TraceId.TryParseHex(bHex, out var tidB))
+        {
+            ctx.Response.StatusCode = 400;
+            await ctx.Response.WriteAsync("'a' and 'b' must be valid 32-char hex trace IDs");
+            return;
+        }
+
+        var taskA = CollectSpansAsync(provider, tidA, ctx.RequestAborted);
+        var taskB = CollectSpansAsync(provider, tidB, ctx.RequestAborted);
+        await Task.WhenAll(taskA, taskB);
+
+        await ctx.Response.WriteAsJsonAsync(new { traceA = taskA.Result, traceB = taskB.Result });
     }
 
     /// <summary><c>GET /api/traces/{traceId}/flamegraph</c> — see <see cref="WriteTraceDetailAsync"/>.</summary>
