@@ -266,7 +266,7 @@ public static class TraceQueryEndpointMapper
     /// reflection serialiser. On a hot-tier trace that route also DECODED the blob through
     /// <see cref="SpanRecord.Attributes"/>, which memoises the dictionary on the record — so one
     /// look at a trace left every one of its spans ~1.5 KB heavier in the live tier until it
-    /// flushed (<c>TraceDetailAllocProbe.A_trace_detail_does_not_inflate_the_hot_tier_it_read</c>).</para>
+    /// flushed (<c>TraceDetailAllocProbe.A_trace_detail_or_compare_does_not_inflate_the_hot_tier_it_read</c>).</para>
     ///
     /// <para>THE BYTES ARE THE OLD BYTES, pinned by <c>TraceDetailShapeTests</c>: the same property
     /// names and order, every attribute value still the STRING <c>ToString()</c> gave it under the
@@ -1256,8 +1256,10 @@ public static class TraceQueryEndpointMapper
     /// deep traces draw is a behaviour the client would see — a fix, not a performance change — so
     /// it is reported, not taken here. A source-generated context was not taken either: byte parity
     /// needs the host's encoder (UnsafeRelaxedJsonEscaping), which a context's attribute options
-    /// cannot carry, and the probe puts the serialiser's own share of this request at almost
-    /// nothing against the build it follows.</para>
+    /// cannot carry; and of the 336 208 B this request allocates of its own for 2 000 spans
+    /// (<c>TraceDetailAllocProbe</c>), the nodes, their id strings, the children arrays and the
+    /// span list account for 333 000 B of it (80 + 56 per node, 56 per parent, 33 008 of list),
+    /// leaving ~3 KB for the serialiser and the state machines — nothing left to buy back.</para>
     /// </summary>
     internal static FlamegraphNode? BuildFlamegraph(List<SpanRecord> spans)
     {
