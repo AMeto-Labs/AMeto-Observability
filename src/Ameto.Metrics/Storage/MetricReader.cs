@@ -104,11 +104,40 @@ internal static class MetricReader
     public static IEnumerable<MetricSeries> ReadAllSync(string filePath) =>
         Read(filePath, metricName: null, ReadWindow.All, CancellationToken.None);
 
+    // ── The rewrite's reads (RewriteMetricInChunks) ───────────────────────────
+
+    /// <summary>
+    /// The rewrite's first pass over one source: every series in file order, each with its
+    /// POSITION (where <see cref="ReadAt"/> finds it again) and its key index from
+    /// <paramref name="keyOf"/>, which numbers keys as they are met. Only a series whose key index
+    /// is below <paramref name="pointsBelow"/> has its points decoded — the rewrite's first chunk,
+    /// gathered in the same pass; every other series is decoded up to its identity and bucket
+    /// bounds, and its points are walked past.
+    /// </summary>
+    internal static IEnumerable<(long Position, int Key, MetricSeries Series)> ReadForRewrite(
+        string filePath, Func<SeriesKey, int> keyOf, int pointsBelow) =>
+        ReadCore(filePath, metricName: null,
+                 new ReadWindow(long.MinValue, long.MaxValue, null, buckets: true, labels: true, keyOf, pointsBelow),
+                 at: null, CancellationToken.None);
+
+    /// <summary>
+    /// The series at <paramref name="positions"/> (as <see cref="ReadForRewrite"/> reported them,
+    /// ascending), in that order, with their points and bucket bounds — and NOT their labels or
+    /// unit, which the rewrite already holds from its first pass. A v3 file is inflated once and
+    /// each series decoded where it starts; a v2 file's other series are not even inflated.
+    /// </summary>
+    internal static IEnumerable<(long Position, int Key, MetricSeries Series)> ReadAt(string filePath, List<long> positions) =>
+        ReadCore(filePath, metricName: null,
+                 new ReadWindow(long.MinValue, long.MaxValue, null, buckets: true, labels: false),
+                 at: positions, CancellationToken.None);
+
     /// <summary>
     /// What a read keeps: points in <c>[FromNano, ToNano]</c> (inclusive, as the range test always
     /// was), from series whose labels pass <see cref="Matchers"/> when there are any.
     /// </summary>
-    internal readonly struct ReadWindow(long fromNano, long toNano, IReadOnlyDictionary<string, string>? matchers, bool buckets)
+    internal readonly struct ReadWindow(
+        long fromNano, long toNano, IReadOnlyDictionary<string, string>? matchers, bool buckets,
+        bool labels = true, Func<SeriesKey, int>? keyOf = null, int pointsBelow = int.MaxValue)
     {
         public static ReadWindow All => new(long.MinValue, long.MaxValue, null, buckets: true);
 
@@ -121,6 +150,15 @@ internal static class MetricReader
         /// with every check a build makes, and nothing is built.</summary>
         public bool Buckets { get; } = buckets;
 
+        /// <summary>Whether labels and unit are decoded. False only for <see cref="ReadAt"/>.</summary>
+        public bool Labels { get; } = labels;
+
+        /// <summary>The rewrite's key numbering (<see cref="ReadForRewrite"/>); null for every other read.</summary>
+        public Func<SeriesKey, int>? KeyOf { get; } = keyOf;
+
+        /// <summary>With <see cref="KeyOf"/>: points are decoded only for key indices below this.</summary>
+        public int PointsBelow { get; } = pointsBelow;
+
         public bool Keeps(long ts) => ts >= FromNano && ts <= ToNano;
 
         /// <summary>Whether every point a file whose header spans [min, max] can hold is in range —
@@ -130,6 +168,19 @@ internal static class MetricReader
     }
 
     private static IEnumerable<MetricSeries> Read(string filePath, string? metricName, ReadWindow window, CancellationToken ct)
+    {
+        foreach (var (_, _, series) in ReadCore(filePath, metricName, window, at: null, ct))
+            yield return series;
+    }
+
+    /// <summary>
+    /// The one reading loop: every series of the file in order (<paramref name="at"/> null), or the
+    /// series at the given positions — for v3 an offset in the inflated block, for v2 the file
+    /// offset of the series' own block. Each series comes with its position and its rewrite key
+    /// index (-1 outside a rewrite read).
+    /// </summary>
+    private static IEnumerable<(long Position, int Key, MetricSeries Series)> ReadCore(
+        string filePath, string? metricName, ReadWindow window, List<long>? at, CancellationToken ct)
     {
         using var fs = OpenRead(filePath);
         using var br = new BinaryReader(fs);
@@ -191,12 +242,27 @@ internal static class MetricReader
                 raw = ArrayPool<byte>.Shared.Rent(rawLen);
                 LZ4Pickler.Unpickle(comp.AsSpan(0, (int)compSize), raw.AsSpan(0, rawLen));
 
-                int offset = 0;
-                for (int i = 0; i < seriesCount && offset < rawLen; i++)
+                if (at is null)
                 {
-                    ct.ThrowIfCancellationRequested();
-                    var series = DeserializeNext(fileMetric, raw, offset, rawLen, deltaMs: true, in window, covers, out offset);
-                    if (series is not null) yield return series;
+                    int offset = 0;
+                    for (int i = 0; i < seriesCount && offset < rawLen; i++)
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        int start  = offset;
+                        var series = DeserializeNext(fileMetric, raw, offset, rawLen, deltaMs: true, in window, covers, out offset, out int key);
+                        if (series is not null) yield return (start, key, series);
+                    }
+                }
+                else
+                {
+                    foreach (long position in at)
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        if (position < 0 || position >= rawLen)
+                            throw new InvalidDataException($"Series position {position} is outside the block of {filePath}");
+                        var series = DeserializeNext(fileMetric, raw, (int)position, rawLen, deltaMs: true, in window, covers, out _, out int key);
+                        if (series is not null) yield return (position, key, series);
+                    }
                 }
             }
             finally
@@ -207,10 +273,25 @@ internal static class MetricReader
         }
         else
         {
-            // v2: per-series LZ4 blocks.
-            for (int i = 0; i < seriesCount && fs.Position < nameIdxOffset; i++)
+            // v2: per-series LZ4 blocks — walked in order, or sought one by one.
+            int visited = 0;
+            while (true)
             {
+                long position;
+                if (at is null)
+                {
+                    if (visited >= seriesCount || fs.Position >= nameIdxOffset) break;
+                    position = fs.Position;
+                }
+                else
+                {
+                    if (visited >= at.Count) break;
+                    position = at[visited];
+                    fs.Seek(position, SeekOrigin.Begin);
+                }
+                int i = visited++;
                 ct.ThrowIfCancellationRequested();
+
                 br.ReadUInt32(); // uncompSize
                 uint compSize = br.ReadUInt32();
                 FileBounds.RequireLengthFits(compSize, fs.Length - fs.Position, $"Series {i} block", filePath);
@@ -218,6 +299,7 @@ internal static class MetricReader
                 byte[] comp = ArrayPool<byte>.Shared.Rent((int)compSize);
                 byte[]? raw = null;
                 MetricSeries? series;
+                int key;
                 try
                 {
                     fs.ReadExactly(comp, 0, (int)compSize);
@@ -225,7 +307,7 @@ internal static class MetricReader
                     FileBounds.RequireLengthFits(rawLen, MaxBlockBytes, $"Series {i} uncompressed", filePath);
                     raw = ArrayPool<byte>.Shared.Rent(rawLen);
                     LZ4Pickler.Unpickle(comp.AsSpan(0, (int)compSize), raw.AsSpan(0, rawLen));
-                    series = DeserializeNext(fileMetric, raw, 0, rawLen, deltaMs: false, in window, covers, out _);
+                    series = DeserializeNext(fileMetric, raw, 0, rawLen, deltaMs: false, in window, covers, out _, out key);
                 }
                 finally
                 {
@@ -233,7 +315,7 @@ internal static class MetricReader
                     if (raw is not null) ArrayPool<byte>.Shared.Return(raw);
                 }
 
-                if (series is not null) yield return series;
+                if (series is not null) yield return (position, key, series);
             }
         }
     }
@@ -249,16 +331,16 @@ internal static class MetricReader
     /// </summary>
     private static MetricSeries? DeserializeNext(
         string metricName, byte[] raw, int offset, int length, bool deltaMs,
-        in ReadWindow window, bool covers, out int next)
+        in ReadWindow window, bool covers, out int next, out int key)
     {
         var r = new MessagePackReader(new ReadOnlyMemory<byte>(raw, offset, length - offset));
-        var series = DeserializeSeries(metricName, ref r, deltaMs, in window, covers);
+        var series = DeserializeSeries(metricName, ref r, deltaMs, in window, covers, out key);
         next = offset + (int)r.Consumed;
         return series;
     }
 
     private static MetricSeries? DeserializeSeries(
-        string metricName, ref MessagePackReader r, bool deltaMs, in ReadWindow window, bool covers)
+        string metricName, ref MessagePackReader r, bool deltaMs, in ReadWindow window, bool covers, out int keyIndex)
     {
         int fields = r.ReadMapHeader();
 
@@ -267,6 +349,14 @@ internal static class MetricReader
         LabelSet   labels  = LabelSet.Empty;
         double[]?  bounds  = null;
         List<MetricDataPoint>? points = null;
+        keyIndex = -1;
+
+        // The rewrite's key can be taken once kind, unit and labels are in hand — which, in the
+        // order the writer emits a series (k, u, lbs, bnds, pts, cnt), is before its points. A map
+        // in any other order is still read correctly: its points are decoded and its key is taken
+        // at the end.
+        const int HaveKind = 1, HaveUnit = 2, HaveLabels = 4, HaveIdentity = HaveKind | HaveUnit | HaveLabels;
+        int have = 0;
 
         for (int i = 0; i < fields; i++)
         {
@@ -275,11 +365,22 @@ internal static class MetricReader
             // moment the switch had looked at it. A nil key read as null there and matched no
             // case; here it is the empty span and matches none either — its value is skipped.
             ReadOnlySpan<byte> key = ReadKey(ref r);
-            if      (key.SequenceEqual("k"u8))    kind   = (MetricKind)r.ReadByte();
-            else if (key.SequenceEqual("u"u8))    unit   = ReadInterned(ref r, MetricLabelInterner.Shared, out _);
+            if (key.SequenceEqual("k"u8))
+            {
+                kind  = (MetricKind)r.ReadByte();
+                have |= HaveKind;
+            }
+            else if (key.SequenceEqual("u"u8))
+            {
+                if (window.Labels) unit = ReadInterned(ref r, MetricLabelInterner.Shared, out _);
+                else               r.Skip();
+                have |= HaveUnit;
+            }
             else if (key.SequenceEqual("lbs"u8))
             {
+                if (!window.Labels) { r.Skip(); continue; }
                 labels = ReadLabels(ref r);
+                have  |= HaveLabels;
                 // Rejected here, before the points the writer puts after the labels: the rest of
                 // the map is walked, not decoded, so the reader ends where the next series starts.
                 if (window.Matchers is not null && !MatchesLabels(labels, window.Matchers))
@@ -289,10 +390,20 @@ internal static class MetricReader
                 }
             }
             else if (key.SequenceEqual("bnds"u8)) bounds = ReadBounds(ref r);
-            else if (key.SequenceEqual("pts"u8))  points = deltaMs ? ReadPointsV3(ref r, in window, covers) : ReadPointsV2(ref r, in window, covers);
+            else if (key.SequenceEqual("pts"u8))
+            {
+                if (window.KeyOf is { } keyOf && (have & HaveIdentity) == HaveIdentity)
+                {
+                    keyIndex = keyOf(new SeriesKey(metricName, kind, unit, labels));
+                    if (keyIndex >= window.PointsBelow) { r.Skip(); continue; }   // not this pass's
+                }
+                points = deltaMs ? ReadPointsV3(ref r, in window, covers) : ReadPointsV2(ref r, in window, covers);
+            }
             else r.Skip();
         }
         points ??= [];
+        if (window.KeyOf is { } lateKeyOf && keyIndex < 0)
+            keyIndex = lateKeyOf(new SeriesKey(metricName, kind, unit, labels));
 
         // v3 stores idle histogram points (count=0, sum=0, all buckets 0) in the
         // slim scalar shape; reconstruct their all-zero bucket arrays here so the

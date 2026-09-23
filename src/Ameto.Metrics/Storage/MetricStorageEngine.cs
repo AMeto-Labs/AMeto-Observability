@@ -2404,74 +2404,121 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     /// Rewrites ONE metric's source files, transforming each series' points, with the
     /// retained <em>point</em> volume bounded by <see cref="SeriesChunk"/> series. That
     /// is the bound that matters — points are what scale with time and dominate the
-    /// heap. It is NOT fully independent of cardinality: <c>keys</c>/<c>seen</c>/
-    /// <c>bounds</c> below hold one entry per series for the whole rewrite (a key is a
-    /// name + kind + unit + <see cref="LabelSet"/>, tens of bytes, so 40k series cost
-    /// single-digit MB against the hundreds of MB of points this avoids).
+    /// heap. It is NOT fully independent of cardinality: the key list, its index and the
+    /// bounds hold one entry per series for the whole rewrite, and each source's series
+    /// positions one long and one int per series (a key is a name + kind + unit +
+    /// <see cref="LabelSet"/>, tens of bytes, so 40k series cost single-digit MB against the
+    /// hundreds of MB of points this avoids).
     ///
-    /// <para>A metric with more series than the chunk is processed in several passes:
-    /// pass 0 collects the key set (its points are decoded one series at a time by
-    /// <see cref="MetricReader"/> and dropped immediately), then each chunk re-reads the
-    /// sources and keeps only its own series. Chunk boundaries are deliberately NOT
-    /// aligned to source files even though <see cref="SeriesChunk"/> equals the writer's
-    /// per-file cap: file membership is insertion order at write time, so the same series
-    /// lands in different file slots across time windows, and the sources being merged
-    /// here are of mixed vintage (pre-cap files carry unbounded series counts). Pairing
-    /// by file index would silently split a series across two outputs. Re-reading costs
-    /// LZ4 decompression on a background path — cheaper than retaining hundreds of MB and
-    /// paying for it in blocking gen2 collections. The reader rents its compressed and
-    /// decompressed buffers from <see cref="System.Buffers.ArrayPool{T}"/>, so the extra
-    /// passes do not churn the LOH (this process runs workstation GC, which never
-    /// compacts it). Metrics that fit in one chunk read each file exactly once.</para>
+    /// <para>Chunks are key-ordered: the keys are numbered in the order they are first met
+    /// across the sources, and chunk <c>n</c> is keys <c>[n x 512, (n + 1) x 512)</c>. Chunk
+    /// boundaries are deliberately NOT aligned to source files even though
+    /// <see cref="SeriesChunk"/> equals the writer's per-file cap: file membership is insertion
+    /// order at write time, so the same series lands in different file slots across time
+    /// windows, and the sources being merged here are of mixed vintage (pre-cap files carry
+    /// unbounded series counts). Pairing by file index would silently split a series across two
+    /// outputs.</para>
+    ///
+    /// <para><b>Each source is DECODED once for its identities, not once per chunk.</b> The first
+    /// pass reads every source in full order — numbering the keys, gathering bucket bounds,
+    /// recording where each series sits (<see cref="MetricReader.ReadForRewrite"/>), and
+    /// decoding the points of the first chunk's series only, which it keeps: so a metric that fits
+    /// in one chunk is read exactly once. Every later chunk goes back only to the sources that
+    /// hold one of its series, and reads only those series, at their recorded positions, without
+    /// their labels (<see cref="MetricReader.ReadAt"/>). It used to re-open, re-inflate and fully
+    /// decode every source for every chunk — every label string of every series re-materialised,
+    /// only to throw away the series the chunk did not want — after a first pass that had decoded
+    /// every point just to learn the keys. The reader rents its compressed and decompressed
+    /// buffers from <see cref="System.Buffers.ArrayPool{T}"/>, so the passes do not churn the LOH
+    /// (this process runs workstation GC, which never compacts it).</para>
+    ///
+    /// <para>What is written is what the per-chunk re-read wrote, byte for byte: the same chunks,
+    /// the same series order within one (first seen), the same points in the same order (sources
+    /// in order, series in file order), the same bounds (the last non-null seen), the same key text.
+    /// <c>MetricDownsampleGoldenTests</c> pins the output files.</para>
     /// </summary>
     internal List<MetricSegmentInfo> RewriteMetricInChunks(
         List<MetricSegmentInfo> segs,
         MetricGranularity       target,
         Func<List<MetricDataPoint>, MetricKind, List<MetricDataPoint>> transform)
     {
-        // ── Pass 0: key set + bucket bounds (no points retained) ───────────────
-        var keys   = new List<SeriesKey>();
-        var seen   = new HashSet<SeriesKey>();
-        var bounds = new Dictionary<SeriesKey, double[]?>();
+        // ── Pass 0: key set + bucket bounds + positions, and the first chunk's points ────────
+        var keys    = new List<SeriesKey>();
+        var index   = new Dictionary<SeriesKey, int>();
+        var bounds  = new List<double[]?>();
+        var first   = new List<List<MetricDataPoint>?>();
+        var located = new List<(string Path, List<long> Positions, List<int> Keys)>(segs.Count);
+
+        Func<SeriesKey, int> keyOf = key =>
+        {
+            if (index.TryGetValue(key, out int k)) return k;
+            k = keys.Count;
+            index[key] = k;
+            keys.Add(key);
+            bounds.Add(null);
+            return k;
+        };
+
         foreach (var seg in segs)
-            foreach (var s in MetricReader.ReadAllSync(seg.FilePath))
+        {
+            var positions = new List<long>();
+            var keyOrder  = new List<int>();
+            foreach (var (position, k, s) in MetricReader.ReadForRewrite(seg.FilePath, keyOf, SeriesChunk))
             {
-                var key = new SeriesKey(s.Name, s.Kind, s.Unit, s.Labels);
-                if (seen.Add(key)) keys.Add(key);
-                if (s.BucketBounds is not null) bounds[key] = s.BucketBounds;
+                positions.Add(position);
+                keyOrder.Add(k);
+                if (s.BucketBounds is not null) bounds[k] = s.BucketBounds;
+                if (k < SeriesChunk)
+                {
+                    while (first.Count <= k) first.Add(null);
+                    (first[k] ??= []).AddRange(s.Points);
+                }
             }
+            located.Add((seg.FilePath, positions, keyOrder));
+        }
         if (keys.Count == 0) return [];
 
         var written = new List<MetricSegmentInfo>();
-        for (int off = 0; off < keys.Count; off += SeriesChunk)
+        WriteChunk(0, first);
+
+        // ── Every later chunk: only its series, at their positions ───────────────────────────
+        for (int off = SeriesChunk; off < keys.Count; off += SeriesChunk)
         {
-            int take  = Math.Min(SeriesChunk, keys.Count - off);
-            // Single-chunk metric: no filtering needed, one pass over the files.
-            var wanted = keys.Count <= SeriesChunk
-                ? null
-                : new HashSet<SeriesKey>(keys.GetRange(off, take));
-
-            var acc = new Dictionary<SeriesKey, List<MetricDataPoint>>(take);
-            foreach (var seg in segs)
-                foreach (var s in MetricReader.ReadAllSync(seg.FilePath))
+            int take = Math.Min(SeriesChunk, keys.Count - off);
+            var acc  = new List<MetricDataPoint>?[Math.Min(SeriesChunk, keys.Count - off)];
+            foreach (var (path, positions, keyOrder) in located)
+            {
+                var at    = new List<long>();
+                var atKey = new List<int>();
+                for (int j = 0; j < positions.Count; j++)
                 {
-                    var key = new SeriesKey(s.Name, s.Kind, s.Unit, s.Labels);
-                    if (wanted is not null && !wanted.Contains(key)) continue;
-                    if (!acc.TryGetValue(key, out var pts))
-                    {
-                        pts = new List<MetricDataPoint>();
-                        acc[key] = pts;
-                    }
-                    pts.AddRange(s.Points);
+                    int k = keyOrder[j];
+                    if (k < off || k >= off + take) continue;
+                    at.Add(positions[j]);
+                    atKey.Add(k);
                 }
+                if (at.Count == 0) continue;     // nothing of this chunk lives here: not even opened
 
-            var batch = new List<(SeriesKey, HotSeries)>(acc.Count);
-            foreach (var (key, pts) in acc)
-                batch.Add((key, new HotSeries(transform(pts, key.Kind), bounds.GetValueOrDefault(key))));
-
-            if (batch.Count > 0) written.AddRange(MetricWriter.Write(_dataDir, batch, target));
+                int n = 0;
+                foreach (var (_, _, s) in MetricReader.ReadAt(path, at))
+                    (acc[atKey[n++] - off] ??= []).AddRange(s.Points);
+            }
+            WriteChunk(off, acc);
         }
         return written;
+
+        // One chunk's series, in key order, to its output file(s).
+        void WriteChunk(int off, IReadOnlyList<List<MetricDataPoint>?> points)
+        {
+            var batch = new List<(SeriesKey, HotSeries)>(points.Count);
+            for (int i = 0; i < points.Count; i++)
+            {
+                if (points[i] is not { } pts) continue;
+                var key = keys[off + i];
+                batch.Add((key, new HotSeries(transform(pts, key.Kind), bounds[off + i])));
+            }
+            if (batch.Count > 0) written.AddRange(MetricWriter.Write(_dataDir, batch, target));
+        }
     }
 
     /// <summary>Sorts by timestamp and drops duplicate-timestamp points (last wins).</summary>
