@@ -64,7 +64,11 @@ internal static class ServiceGraphSidecar
         // last-writer-wins for a duplicated span id whichever side builds it, so the same map.
         if (spanSvc is null)
         {
-            spanSvc = new Dictionary<SpanId, string>(count);
+            // Sized by `spans.Count`, not by the `count` local holding the same number: the
+            // file-bounds convention scan (FileBoundsConventionTests) reads this file for its
+            // reader half, and `.Count` is how it recognises a size taken from memory rather than
+            // from a file. Renaming it to a local is what made that scan fail at 7a3b416.
+            spanSvc = new Dictionary<SpanId, string>(spans.Count);
             for (int i = 0; i < count; i++)
             {
                 var s = spans[i];

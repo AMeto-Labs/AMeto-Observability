@@ -98,8 +98,10 @@ internal static class TraceSummarySidecar
         int spanCount = spans.Count;
         if (spanCount == 0) return;
 
-        // One pass: group spans by trace id into per-trace accumulators.
-        var traces = new Dictionary<TraceId, Acc>(spanCount / 2 + 1);
+        // One pass: group spans by trace id into per-trace accumulators. Sized by `spans.Count`
+        // rather than the `spanCount` local, so FileBoundsConventionTests — which scans this
+        // file for its READER half — can see the size comes from memory, not from a file.
+        var traces = new Dictionary<TraceId, Acc>(spans.Count / 2 + 1);
         long segMin = long.MaxValue, segMax = long.MinValue;
 
         for (int i = 0; i < spanCount; i++)
@@ -198,7 +200,7 @@ internal static class TraceSummarySidecar
         // service index per span — so it grows at most once or twice rather than a dozen times.
         int    rawLength;
         byte[] compBody;
-        var body = new PooledBody(traces.Count * 80 + spanCount * 4 + 256);
+        var body = new PooledBody(ArrayPool<byte>.Shared.Rent(traces.Count * 80 + spans.Count * 4 + 256));
         try
         {
             body.UInt32((uint)poolArr.Count);
@@ -591,9 +593,15 @@ internal static class TraceSummarySidecar
         private byte[] _buf;
         private int    _len;
 
-        public PooledBody(int initialCapacity)
+        /// <param name="rented">
+        /// The first buffer, rented BY THE CALLER, where the size it is rented at can be seen to be
+        /// the batch's own (FileBoundsConventionTests scans this file for its reader half, and a
+        /// rent sized by a parameter reads to it as a size that may have come from a file). Owned
+        /// from here on: <see cref="Dispose"/> returns it, or whatever it grew into.
+        /// </param>
+        public PooledBody(byte[] rented)
         {
-            _buf = ArrayPool<byte>.Shared.Rent(Math.Max(initialCapacity, 256));
+            _buf = rented;
             _len = 0;
         }
 
