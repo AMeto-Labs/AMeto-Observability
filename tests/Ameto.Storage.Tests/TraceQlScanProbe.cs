@@ -193,8 +193,9 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
     /// <see cref="MeasuredPasses"/>; and the row's two id strings cost
     /// 144 B/row or 216 B/row depending on whether the runtime has an optimised body for the
     /// interpolated-string handler (worth +72 000 B, seen in 1 full Debug suite run in 5 and in
-    /// every measured pass of it), so they are measured in the same run and subtracted from both
-    /// the figure and the baseline. The gate's own comment carries both measurements.</para>
+    /// every measured pass of it), so they are measured IMMEDIATELY BEFORE AND AFTER EVERY PASS
+    /// and subtracted from that pass — and a pass across which the runtime changed its mind is not
+    /// read at all. The gate's own comment carries the measurements.</para>
     ///
     /// <para>Restore the <c>params string[]</c> signature and its literal arguments at
     /// <c>TraceQLExecutor.cs:BuildRow</c> and this fails at 104 B a row above the gate.</para>
@@ -292,21 +293,60 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
         // over: a page that yields can resume on the very thread it left, passing the check with
         // half its work billed elsewhere, and its failure message blames threads for what is
         // really a changed execution shape.
+        //
+        // EVERY PASS CARRIES ITS OWN ID-STRING CONTROL, taken immediately before it and immediately
+        // after it, and a pass is read only when the two agree. Why the row's two id strings are
+        // subtracted at all is the long note above the gate below; why the control brackets EACH
+        // pass instead of being taken once after all of them is that the term it cancels is the
+        // runtime's CURRENT choice of code for the interpolation handler, and the runtime can change
+        // that choice at any moment — a promotion is decided and installed off this thread. A
+        // control taken after the pages cancelled what the handler cost when the CONTROL ran, not
+        // what it cost when the page ran: promote the handler between the two and the unchanged
+        // tree read 1 035 B/row against a gate of 1 015 (forced under DOTNET_ReadyToRun=0 by
+        // spinning TraceId.ToString until the boxes stopped, right after the page loop: every page
+        // pass boxed at 1 179 408 B, the control unboxed at 144 B/row), and the message blamed
+        // BuildRow's key lists for it.
+        //
+        // Bracketed, a promotion can only land INSIDE one pass's brackets or BETWEEN passes. Inside,
+        // the two brackets disagree — by 72 B/row when it lands in the page — and that pass is not
+        // read; between, both neighbours are consistent. No sequence of promotions takes the handler
+        // from boxing to not boxing and back (tier 1 is final), so no pass can see it boxed on both
+        // sides and unboxed in the middle: a pass that is read can over-state its row, never
+        // under-state it. BracketTolerance absorbs what a GC landing inside a bracket adds to it;
+        // the smaller bracket is the one without that GC, and it is the one subtracted. (A GC in
+        // BOTH brackets of one pass could under-state that pass by at most the tolerance — 8 B
+        // against a 52 B margin and a 104 B defect.)
+        const int    MaxPasses        = MeasuredPasses + 3;   // a promotion spoils at most one pass
+        const double BracketTolerance = 8;                    // B/row: 20× the measured +384 B of a GC in a window
         long           allocated = long.MaxValue;
+        double         perRow    = double.MaxValue;
+        double         idsPerRow = double.NaN;
+        int            steady    = 0;
         bool           ranHere   = true;
         TraceQueryPage page      = default;
-        for (int pass = 0; pass < MeasuredPasses; pass++)
+        for (int pass = 0; pass < MaxPasses && steady < MeasuredPasses; pass++)
         {
-            int  gen0     = GC.CollectionCount(0);
-            long before   = GC.GetAllocatedBytesForCurrentThread();
-            var  pageTask = TraceQLExecutor.ExecuteAsync(engine, pred, from, to, Rows, CancellationToken.None);
-            ranHere      &= pageTask.IsCompleted;   // read BEFORE the await: nothing has resumed yet
-            page          = await pageTask;
-            long a        = GC.GetAllocatedBytesForCurrentThread() - before;
-            int  gcs      = GC.CollectionCount(0) - gen0;
-            _out.WriteLine($"              pass {pass}: {a:N0} B ({a / (double)Rows:N0} B/row)"
-                         + (gcs > 0 ? $"   ({gcs} gen0 collection(s) inside the window)" : ""));
-            if (a < allocated) allocated = a;
+            double idsBefore = MeasureRowIdStringsPerRow(Rows);
+            int    gen0      = GC.CollectionCount(0);
+            long   before    = GC.GetAllocatedBytesForCurrentThread();
+            var    pageTask  = TraceQLExecutor.ExecuteAsync(engine, pred, from, to, Rows, CancellationToken.None);
+            ranHere         &= pageTask.IsCompleted;   // read BEFORE the await: nothing has resumed yet
+            page             = await pageTask;
+            long   a         = GC.GetAllocatedBytesForCurrentThread() - before;
+            int    gcs       = GC.CollectionCount(0) - gen0;
+            double idsAfter  = MeasureRowIdStringsPerRow(Rows);
+
+            bool   agree = Math.Abs(idsAfter - idsBefore) <= BracketTolerance;
+            double ids   = Math.Min(idsBefore, idsAfter);
+            double net   = a / (double)Rows - ids;
+            _out.WriteLine($"              pass {pass}: {a:N0} B ({a / (double)Rows:N0} B/row), id strings "
+                         + $"{idsBefore:N0} -> {idsAfter:N0} B/row, row {net:N0} B"
+                         + (gcs > 0 ? $"   ({gcs} gen0 collection(s) inside the window)" : "")
+                         + (agree ? "" : "   (the handler changed code across this pass: not read)"));
+            if (!agree) continue;
+
+            steady++;
+            if (net < perRow) { perRow = net; allocated = a; idsPerRow = ids; }
         }
 
         Assert.True(ranHere,
@@ -317,8 +357,14 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
             + "the gate — and note that ITestOutputHelper.WriteLine costs 6 288 B on another "
             + "thread per printed line, so that baseline has to be taken the same way.");
 
+        Assert.True(steady > 0,
+            $"the id strings' cost changed across every one of {MaxPasses} measured passes, so no pass "
+            + "can be read net of them. A promotion of the interpolation handler spoils one pass; "
+            + "every pass spoiled means the control itself is unstable — find out why before "
+            + "touching the gate.");
+
         _out.WriteLine($"TRACEQL PAGE  {Rows:N0} rows, one root span each, warm, best of "
-                     + $"{MeasuredPasses}: {allocated:N0} B ({allocated / (double)Rows:N0} B/row)");
+                     + $"{steady} steady pass(es): {allocated:N0} B ({allocated / (double)Rows:N0} B/row)");
 
         Assert.Equal(Rows, page.Rows.Count);
         Assert.Equal("GET",              page.Rows[0].HttpMethod);
@@ -343,7 +389,7 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
         _out.WriteLine($"              two params key arrays weigh {defectPerRow:N0} B/row here");
         Assert.InRange(defectPerRow, 40, 200);   // the calibration itself must have measured something
 
-        // WHAT THE ROW'S TWO ID STRINGS COST, MEASURED IN THE SAME RUN, because that is the one
+        // WHAT THE ROW'S TWO ID STRINGS COST, MEASURED AROUND THE SAME PASS, because that is the one
         // part of the figure the RUNTIME gets to choose — and it chose differently often enough to
         // turn this gate red on an unchanged tree.
         //
@@ -370,8 +416,9 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
         // verdict below still came out at 874,976 B/row and green.)
         //
         // SO THE GATE MEASURES THE ROW WITHOUT THEM. The page builds exactly one TraceId string and
-        // one SpanId string per row, so subtracting what that pair costs IN THIS RUN removes both
-        // the strings and whatever the runtime decided to box around them. What is left is the
+        // one SpanId string per row, so subtracting what that pair costs AROUND THE PASS removes both
+        // the strings and whatever the runtime decided to box around them (the loop above says why
+        // around the pass and not merely in the same run). What is left is the
         // row's own TraceRowDto, service set and services array: 874,976 B/row in Debug and
         // 874,368 B/row in Release — and 874,976 again with the boxes present, identical to the
         // byte, which is the check that the two ToString calls are the whole of the variable term.
@@ -389,14 +436,12 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
         // A_traceql_page_does_not_inflate_the_hot_tier_it_paged_over measures 368 B per root span
         // left on the tier where the dictionary left 1 545, i.e. 1 177 B of permanent tier memory
         // bought for 88 B of per-page allocation.
-        double idsPerRow = MeasureRowIdStringsPerRow(Rows);
-        _out.WriteLine($"              a row's two id strings weigh {idsPerRow:N0} B/row here "
+        _out.WriteLine($"              a row's two id strings weigh {idsPerRow:N0} B/row around the pass read "
                      + $"({(idsPerRow >= 200 ? "boxed: the handler is running unoptimised" : "unboxed")})");
         Assert.InRange(idsPerRow, 144, 400);   // 144 is the two strings themselves; anything less is a mis-measurement
 
         const double Baseline = 963;   // the Debug figure less the id strings, rounded up to the byte
         double gate   = Baseline + defectPerRow / 2;
-        double perRow = allocated / (double)Rows - idsPerRow;
 
         Assert.True(perRow < gate,
             $"a returned row cost {perRow:N0} B beyond its two id strings, against a gate of "
@@ -740,8 +785,12 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
     /// <para>88 + 56 = 144 B of string, plus 0 or 72 B of boxing depending on whether the runtime
     /// is running an optimised body of <c>DefaultInterpolatedStringHandler.AppendFormatted&lt;ulong&gt;</c>
     /// — see the gate's comment for the measurement and for why that is not this test's business to
-    /// judge. Measured the same way the page is, best of <see cref="MeasuredPasses"/>, so a gen0
-    /// collection cannot inflate the control and deflate the verdict.</para>
+    /// judge.</para>
+    ///
+    /// <para>ONE PASS, NOT A BEST OF SEVERAL: it is a bracket, and what a bracket must report is the
+    /// handler's code at the edge of the page it sits next to. A minimum over several passes would
+    /// read whichever end of a promotion was cheaper. A gen0 collection inside it can only inflate
+    /// it, which the caller handles by comparing the two brackets and subtracting the smaller.</para>
     ///
     /// <para><c>Escape</c> keeps the two strings alive past the loop body, exactly as the row they
     /// are written into would.</para>
@@ -752,16 +801,10 @@ public sealed class TraceQlScanProbe : IClassFixture<ColdSpanSegmentFixture>, ID
         var span  = new SpanId(1);
         Escape(trace.ToString(), span.ToString());   // jit, and the interpolation handler's pooled buffer
 
-        long best = long.MaxValue;
-        for (int pass = 0; pass < MeasuredPasses; pass++)
-        {
-            long before = GC.GetAllocatedBytesForCurrentThread();
-            for (int i = 0; i < rows; i++)
-                Escape(trace.ToString(), span.ToString());
-            long a = GC.GetAllocatedBytesForCurrentThread() - before;
-            if (a < best) best = a;
-        }
-        return best / (double)rows;
+        long before = GC.GetAllocatedBytesForCurrentThread();
+        for (int i = 0; i < rows; i++)
+            Escape(trace.ToString(), span.ToString());
+        return (GC.GetAllocatedBytesForCurrentThread() - before) / (double)rows;
     }
 
     private static int _sink;
