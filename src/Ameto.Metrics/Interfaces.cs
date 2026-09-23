@@ -44,6 +44,22 @@ public interface IMetricQuery
         CancellationToken  ct          = default);
 
     /// <summary>
+    /// <see cref="QueryAsync(string, DateTimeOffset?, DateTimeOffset?, TimeSpan?, IReadOnlyDictionary{string, string}?, CancellationToken)"/>
+    /// for a caller that reads only <paramref name="fields"/> of each point. A hint, never a
+    /// filter on what comes back: storage MAY leave the fields the caller does not read unset,
+    /// and an implementation that ignores it (this default) is correct.
+    /// </summary>
+    IAsyncEnumerable<MetricSeries> QueryAsync(
+        string             metricName,
+        DateTimeOffset?    from,
+        DateTimeOffset?    to,
+        TimeSpan?          step,
+        IReadOnlyDictionary<string, string>? labelMatchers,
+        MetricPointFields  fields,
+        CancellationToken  ct = default)
+        => QueryAsync(metricName, from, to, step, labelMatchers, ct);
+
+    /// <summary>
     /// Returns the latest value for every time series of the given metric
     /// (useful for dashboards and gauges).
     /// </summary>
@@ -51,6 +67,24 @@ public interface IMetricQuery
         string            metricName,
         IReadOnlyDictionary<string, string>? labelMatchers = null,
         CancellationToken ct = default);
+}
+
+/// <summary>
+/// Which fields of a <see cref="MetricDataPoint"/> a query's caller will read — see the
+/// <c>fields</c> overload of <see cref="IMetricQuery.QueryAsync(string, DateTimeOffset?, DateTimeOffset?, TimeSpan?, IReadOnlyDictionary{string, string}?, MetricPointFields, CancellationToken)"/>.
+/// </summary>
+public enum MetricPointFields : byte
+{
+    /// <summary>Every field, the histogram bucket counts included.</summary>
+    All = 0,
+
+    /// <summary>
+    /// Everything but <see cref="MetricDataPoint.BucketCounts"/>. A histogram point's bucket array
+    /// is most of what a cold read allocates for it (a 16-bucket array is 152 bytes; the rest of
+    /// the point is 40), and only a quantile or a heatmap reads it — a raw series, a rate, a last
+    /// value or a grouped reduction never does.
+    /// </summary>
+    NoBuckets = 1,
 }
 
 /// <summary>

@@ -73,15 +73,29 @@ internal static class MetricReader
     /// <para>The name test is made once per file: every series in a <c>.mts</c> carries the one
     /// name in its index, which is what the per-series test compared.</para>
     /// </summary>
+    public static IAsyncEnumerable<MetricSeries> ReadAsync(
+        string filePath,
+        string metricName,
+        long   fromNano,
+        long   toNano,
+        IReadOnlyDictionary<string, string>? labelMatchers,
+        CancellationToken ct) =>
+        ReadAsync(filePath, metricName, fromNano, toNano, labelMatchers, buckets: true, ct);
+
+    /// <summary>
+    /// As the overload above; with <paramref name="buckets"/> false, histogram points come back
+    /// without their bucket arrays (<see cref="MetricPointFields.NoBuckets"/>).
+    /// </summary>
     public static async IAsyncEnumerable<MetricSeries> ReadAsync(
         string filePath,
         string metricName,
         long   fromNano,
         long   toNano,
         IReadOnlyDictionary<string, string>? labelMatchers,
+        bool   buckets,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct)
     {
-        foreach (var series in Read(filePath, metricName, new ReadWindow(fromNano, toNano, labelMatchers), ct))
+        foreach (var series in Read(filePath, metricName, new ReadWindow(fromNano, toNano, labelMatchers, buckets), ct))
             if (series.Points.Count > 0) yield return series;
         await Task.CompletedTask;
     }
@@ -94,13 +108,18 @@ internal static class MetricReader
     /// What a read keeps: points in <c>[FromNano, ToNano]</c> (inclusive, as the range test always
     /// was), from series whose labels pass <see cref="Matchers"/> when there are any.
     /// </summary>
-    internal readonly struct ReadWindow(long fromNano, long toNano, IReadOnlyDictionary<string, string>? matchers)
+    internal readonly struct ReadWindow(long fromNano, long toNano, IReadOnlyDictionary<string, string>? matchers, bool buckets)
     {
-        public static ReadWindow All => new(long.MinValue, long.MaxValue, null);
+        public static ReadWindow All => new(long.MinValue, long.MaxValue, null, buckets: true);
 
         public long FromNano { get; } = fromNano;
         public long ToNano   { get; } = toNano;
         public IReadOnlyDictionary<string, string>? Matchers { get; } = matchers;
+
+        /// <summary>Whether histogram points get their bucket arrays. False for a caller that said it
+        /// will not read them (<see cref="MetricPointFields.NoBuckets"/>): the arrays are walked past
+        /// with every check a build makes, and nothing is built.</summary>
+        public bool Buckets { get; } = buckets;
 
         public bool Keeps(long ts) => ts >= FromNano && ts <= ToNano;
 
@@ -279,7 +298,7 @@ internal static class MetricReader
         // slim scalar shape; reconstruct their all-zero bucket arrays here so the
         // roundtrip is lossless and delta chains in the aggregator stay intact.
         // One shared array per series — nothing downstream mutates BucketCounts.
-        if (deltaMs && kind == MetricKind.Histogram && bounds is not null && points.Count > 0)
+        if (deltaMs && window.Buckets && kind == MetricKind.Histogram && bounds is not null && points.Count > 0)
         {
             long[]? zeros = null;
             for (int i = 0; i < points.Count; i++)
@@ -467,14 +486,14 @@ internal static class MetricReader
                 {
                     buckets = null; // state set but no buckets recorded
                 }
-                else if (keep)
+                else if (keep && window.Buckets)
                 {
                     buckets = ReadBuckets(ref r);
                 }
                 else
                 {
                     buckets   = null;
-                    pendingAt = r.Consumed;
+                    pendingAt = window.Buckets ? r.Consumed : -1;
                     SkipBuckets(ref r);
                 }
             }
@@ -518,7 +537,7 @@ internal static class MetricReader
                 {
                     // scalar point — no buckets
                 }
-                else if (keep)
+                else if (keep && window.Buckets)
                 {
                     buckets = ReadBuckets(ref r);
                 }

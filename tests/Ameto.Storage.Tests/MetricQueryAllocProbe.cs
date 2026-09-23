@@ -104,6 +104,7 @@ public sealed class MetricQueryAllocProbe
             var to   = from.AddHours(1);
 
             var raw      = Measure(() => Drain(engine.QueryAsync(Metric, from, to)));
+            var rawLean  = Measure(() => Drain(engine.QueryAsync(Metric, from, to, null, null, MetricPointFields.NoBuckets)));
             var stepped  = Measure(() => Drain(engine.QueryAsync(Metric, from, to, TimeSpan.FromMinutes(1))));
             var recent   = Measure(() => Drain(engine.QueryAsync(Metric, from.AddMinutes(11), to)));
             var rate     = Measure(() => Sync(agg.QueryAsync(new MetricQueryRequest
@@ -123,6 +124,7 @@ public sealed class MetricQueryAllocProbe
             _out.WriteLine($"COLD QUERY  {SeriesCount:N0} histogram series x {PointsPerSeries} points = {stored:N0} points, " +
                            $"{files.Count} .mts file(s), {disk / 1024.0:N1} KB on disk; best of {Runs}");
             Print("QueryAsync raw (no step)       ", raw, stored);
+            Print("QueryAsync raw, no buckets     ", rawLean, stored);
             Print("QueryAsync raw, step 1m        ", stepped, stored);
             Print("QueryAsync raw, last 5 minutes ", recent, stored);
             Print("Aggregator Rate by service.name", rate, stored);
@@ -131,6 +133,7 @@ public sealed class MetricQueryAllocProbe
 
             // The answers, so a cheaper query is still the same query.
             Assert.Equal((SeriesCount, stored), (raw.Series, raw.Points));
+            Assert.Equal((SeriesCount, stored), (rawLean.Series, rawLean.Points));
             Assert.Equal((SeriesCount, (long)SeriesCount * 15), (stepped.Series, stepped.Points));
             Assert.Equal((SeriesCount, (long)SeriesCount * 20), (recent.Series, recent.Points));
             Assert.Equal((10, 10L * (PointsPerSeries - 1)), (rate.Series, rate.Points));

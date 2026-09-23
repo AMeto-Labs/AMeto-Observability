@@ -12,12 +12,36 @@ public sealed class MetricAggregator : IMetricAggregator
 
     public MetricAggregator(IMetricQuery query) => _query = query;
 
-    public async Task<IReadOnlyList<MetricSeries>> QueryAsync(
+    public Task<IReadOnlyList<MetricSeries>> QueryAsync(
         MetricQueryRequest request,
-        CancellationToken  ct = default)
+        CancellationToken  ct = default) =>
+        QueryAsync(request, valuesOnly: false, ct);
+
+    /// <summary>
+    /// The point fields an aggregation's work and ANSWER can touch, so storage builds no bucket
+    /// arrays for one that never reads them (<see cref="MetricPointFields.NoBuckets"/>): a rate
+    /// reads the cumulative Count, a last value and every grouped reduction build fresh points
+    /// from Value, and none of those answers carries a bucket array. A quantile needs them; so do
+    /// the answers that ARE the stored points — no aggregation, and a reduction without a
+    /// group-by, which hands a lone series back as it came (see <see cref="ReduceByTimestamp"/>) —
+    /// unless the caller will only read values (<paramref name="valuesOnly"/>, the expression).
+    /// </summary>
+    private static MetricPointFields FieldsFor(MetricQueryRequest request, bool valuesOnly) => request.Aggregation switch
+    {
+        MetricAggregation.Quantile => MetricPointFields.All,
+        MetricAggregation.Rate or MetricAggregation.Increase or MetricAggregation.Last => MetricPointFields.NoBuckets,
+        MetricAggregation.None => valuesOnly ? MetricPointFields.NoBuckets : MetricPointFields.All,
+        _ => valuesOnly || request.GroupBy is { Length: > 0 } ? MetricPointFields.NoBuckets : MetricPointFields.All,
+    };
+
+    private async Task<IReadOnlyList<MetricSeries>> QueryAsync(
+        MetricQueryRequest request,
+        bool               valuesOnly,
+        CancellationToken  ct)
     {
         var fragments = new List<MetricSeries>();
-        await foreach (var s in _query.QueryAsync(request.Metric, request.From, request.To, request.Step, request.Filters, ct))
+        await foreach (var s in _query.QueryAsync(request.Metric, request.From, request.To, request.Step, request.Filters,
+                                                  FieldsFor(request, valuesOnly), ct))
             fragments.Add(s);
         if (fragments.Count == 0) return [];
 
@@ -46,8 +70,9 @@ public sealed class MetricAggregator : IMetricAggregator
 
     public async Task<MetricSeries> EvalExprAsync(MetricExprRequest req, CancellationToken ct = default)
     {
-        var left  = SumToSingle(await QueryAsync(req.Left, ct));
-        var right = SumToSingle(await QueryAsync(req.Right, ct));
+        // Values only: SumToSingle reads nothing else of either side.
+        var left  = SumToSingle(await QueryAsync(req.Left, valuesOnly: true, ct));
+        var right = SumToSingle(await QueryAsync(req.Right, valuesOnly: true, ct));
 
         // Align by timestamp (left drives the grid; right value looked up, else carried).
         var rightByTs = new Dictionary<long, double>(right.Count);

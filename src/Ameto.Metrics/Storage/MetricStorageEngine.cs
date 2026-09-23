@@ -1437,12 +1437,28 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
             prefix is null || name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
     }
 
-    public async IAsyncEnumerable<MetricSeries> QueryAsync(
+    public IAsyncEnumerable<MetricSeries> QueryAsync(
         string             metricName,
         DateTimeOffset?    from         = null,
         DateTimeOffset?    to           = null,
         TimeSpan?          step         = null,
         IReadOnlyDictionary<string, string>? labelMatchers = null,
+        CancellationToken  ct           = default) =>
+        QueryAsync(metricName, from, to, step, labelMatchers, MetricPointFields.All, ct);
+
+    /// <summary>
+    /// The query, for a caller that reads only <paramref name="fields"/>. With
+    /// <see cref="MetricPointFields.NoBuckets"/> the COLD read builds no bucket arrays (the hot
+    /// tier's points carry references to arrays that exist anyway, and are left as they are) —
+    /// every other field, series and point is the same answer.
+    /// </summary>
+    public async IAsyncEnumerable<MetricSeries> QueryAsync(
+        string             metricName,
+        DateTimeOffset?    from,
+        DateTimeOffset?    to,
+        TimeSpan?          step,
+        IReadOnlyDictionary<string, string>? labelMatchers,
+        MetricPointFields  fields,
         [EnumeratorCancellation] CancellationToken ct = default)
     {
         long fromNano = from.HasValue ? from.Value.ToUnixTimeMilliseconds() * 1_000_000L : long.MinValue;
@@ -1495,7 +1511,8 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         foreach (var seg in coldCandidates)
         {
             ct.ThrowIfCancellationRequested();
-            await foreach (var series in MetricReader.ReadAsync(seg.FilePath, metricName, fromNano, toNano, labelMatchers, ct))
+            await foreach (var series in MetricReader.ReadAsync(seg.FilePath, metricName, fromNano, toNano, labelMatchers,
+                                                                buckets: fields != MetricPointFields.NoBuckets, ct))
             {
                 // The reader's series is already this query's answer — its points are the ones in
                 // range, in a list nothing else holds — so without a step it is handed on as is.

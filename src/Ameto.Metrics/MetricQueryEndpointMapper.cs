@@ -122,7 +122,8 @@ public static class MetricQueryEndpointMapper
             var step = ParseStep(ctx.Request.Query["step"]);
 
             var result = new List<MetricSeriesDto>();
-            await foreach (var s in query.QueryAsync(name, from, to, step))
+            // The answer carries ts / value / count / sum only, so the storage need build no bucket arrays.
+            await foreach (var s in query.QueryAsync(name, from, to, step, null, MetricPointFields.NoBuckets))
                 result.Add(ToDto(s));
 
             return Results.Json(result);

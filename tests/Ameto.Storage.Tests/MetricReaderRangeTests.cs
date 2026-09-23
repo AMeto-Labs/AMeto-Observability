@@ -91,21 +91,31 @@ public sealed class MetricReaderRangeTests : IDisposable
         Assert.Equal(500, warm);
 
         long before = GC.GetAllocatedBytesForCurrentThread();
-        int n = 0;
-        var e = MetricReader.ReadAsync(file, "range.h", from, to, null, CancellationToken.None).GetAsyncEnumerator();
-        while (true)
-        {
-            var next = e.MoveNextAsync();
-            Assert.True(next.IsCompleted);            // no await inside: every byte lands on this thread
-            if (!next.Result) break;
-            n += e.Current.Points.Count;
-        }
-        await e.DisposeAsync();
+        int n = DrainOnThisThread(MetricReader.ReadAsync(file, "range.h", from, to, null, CancellationToken.None));
         long bytes = GC.GetAllocatedBytesForCurrentThread() - before;
 
         Assert.Equal(500, n);
         // Decoded whole and then filtered, the 59 dropped points of each series were 40 B in a list
         // plus a 56 B bucket array each, twice over with the copy: ~10 KB a series, 5 MB here.
         Assert.True(bytes < 1_000_000, $"a one-point-per-series read of 500 series allocated {bytes:N0} B");
+    }
+
+    /// <summary>Points in an async read that never awaits, walked synchronously so every byte it allocates is on this thread.</summary>
+    private static int DrainOnThisThread(IAsyncEnumerable<MetricSeries> read)
+    {
+        int n = 0;
+        var e = read.GetAsyncEnumerator();
+        try
+        {
+            while (true)
+            {
+                var next = e.MoveNextAsync();
+                Assert.True(next.IsCompleted);            // no await inside: every byte lands on this thread
+                if (!next.Result) break;
+                n += e.Current.Points.Count;
+            }
+        }
+        finally { Assert.True(e.DisposeAsync().IsCompleted); }
+        return n;
     }
 }
