@@ -161,8 +161,17 @@ public enum SpanStatusCode : byte
 }
 
 /// <summary>
-/// Fixed-size header stored in the ring buffer and hot-tier NativeMemory array.
-/// Total: 72 bytes.
+/// A span's fixed part — 72 bytes, no references — as the ingest ring carries it (TI#3). Its
+/// variable part (name, service and attribute blob, UTF-8 / msgpack) lives in the ring's payload
+/// arena at <see cref="PayloadArenaOffset"/>, in that order.
+///
+/// <para><b>It was dead code until the ring.</b> Written for "the ring buffer and hot-tier
+/// NativeMemory array" and referenced nowhere; its first user reshaped the four reserved ints to
+/// what a slot actually needs. The NAME travels as bytes, not as a pool index: names can be
+/// high-cardinality, their pool is shed at every flush (<see cref="SpanStringPools"/>), and an
+/// index carried through a ring past a shed would name another string. The SERVICE travels as
+/// both — the pool's index, which the drainer resolves with an array load, and its bytes, which
+/// the write-ahead log needs anyway — because the service pool is never shed.</para>
 /// </summary>
 [StructLayout(LayoutKind.Sequential, Pack = 1, Size = 72)]
 public struct SpanHeader
@@ -182,26 +191,29 @@ public struct SpanHeader
     /// <summary>Span duration in nanoseconds.</summary>
     public long    DurationNanos;           // 8 bytes
 
-    /// <summary>Offset of the span name in the string intern pool.</summary>
-    public int     NamePoolIndex;           // 4 bytes
+    /// <summary>UTF-8 bytes of the span name — the first bytes of the payload.</summary>
+    public int     NameByteLength;          // 4 bytes
 
-    /// <summary>Offset of the service name in the string intern pool.</summary>
+    /// <summary>The service's index in the service intern pool, or -1 when it has none (a full pool, an empty name).</summary>
     public int     ServiceNamePoolIndex;    // 4 bytes
 
-    /// <summary>Byte offset of the msgpack attributes blob in the payload arena.</summary>
-    public int     AttributesArenaOffset;   // 4 bytes
+    /// <summary>Where the payload (name, service, attributes) starts in the ring's arena; -1 when it is held apart (larger than a chunk).</summary>
+    public int     PayloadArenaOffset;      // 4 bytes
 
-    /// <summary>Byte length of the msgpack attributes blob.</summary>
+    /// <summary>Byte length of the msgpack attributes blob — the last bytes of the payload.</summary>
     public int     AttributesByteLength;    // 4 bytes
+
+    /// <summary>UTF-8 bytes of the service name — between the name and the attributes.</summary>
+    public int     ServiceByteLength;       // 4 bytes
 
     public SpanKind       Kind;             // 1 byte
     public SpanStatusCode Status;           // 1 byte
-    public byte           Flags;            // 1 byte (reserved)
-    private byte          _pad;             // 1 byte
 
     /// <summary>Promoted HTTP response status code (0 = not set). Avoids msgpack attr scan on filter.</summary>
     public short          HttpStatusCode;   // 2 bytes
-    private short         _pad2;            // 2 bytes — keeps Size = 76
+
+    /// <summary>The whole payload: name, service and attributes.</summary>
+    public readonly int PayloadByteLength => NameByteLength + ServiceByteLength + AttributesByteLength;
 
     public static int SizeOf => Unsafe.SizeOf<SpanHeader>();
 }

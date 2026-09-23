@@ -1,4 +1,3 @@
-using MessagePack;
 using Microsoft.Extensions.Logging;
 using Ameto.Tracing.Storage;
 
@@ -7,6 +6,12 @@ namespace Ameto.Tracing.Ingestion;
 /// <summary>
 /// Drains the <see cref="SpanRingBuffer"/> and writes spans to
 /// <see cref="TraceStorageEngine"/> in batches.
+///
+/// <para><b>A drained batch is headers and arena windows</b> (TI#3): the ring hands over each span's
+/// 72-byte header and keeps its payload reserved; the engine appends the payload's UTF-8 to the
+/// log as it lies, copies the blob out for the tier and resolves the name and service into pool
+/// strings; and only then does this give the payloads back (<see cref="SpanRingBuffer.Release"/>),
+/// whatever happened in between.</para>
 /// </summary>
 internal sealed class SpanDrainer : IAsyncDisposable
 {
@@ -32,19 +37,57 @@ internal sealed class SpanDrainer : IAsyncDisposable
 
     private DateTime _lastFlush = DateTime.UtcNow;
 
-    // Non-nullable so a slice of it is the ReadOnlySpan<SpanIngestItem> WriteSpans takes; the
-    // drain fills [0, count) and clears it again after every hand-over.
-    private readonly SpanIngestItem[] _batch = new SpanIngestItem[BatchSize];
+    // One drained run: the headers copied out of the ring, and the payloads kept apart from the
+    // arena (larger than a chunk) — both reused batch after batch, both holding no reference to a
+    // tier once the run is released.
+    private readonly SpanHeader[]      _headers  = new SpanHeader[BatchSize];
+    private readonly byte[]?[]         _apart    = new byte[]?[BatchSize];
+    private readonly ServiceIndexCache _services = new();
 
     public SpanDrainer(
         SpanRingBuffer ring,
         TraceStorageEngine storage,
         ILogger<SpanDrainer> logger)
+        : this(ring, storage, logger, startLoop: true)
+    {
+    }
+
+    /// <param name="startLoop">False for a test that drives <see cref="DrainOnce"/> itself.</param>
+    internal SpanDrainer(SpanRingBuffer ring, TraceStorageEngine storage, ILogger<SpanDrainer> logger, bool startLoop)
     {
         _ring    = ring;
         _storage = storage;
         _logger  = logger;
-        _drainTask = Task.Run(DrainLoopAsync);
+        _drainTask = startLoop ? Task.Run(DrainLoopAsync) : Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// One drained run through the engine: dequeue, write, release. Returns how many spans came
+    /// out of the ring and, in <paramref name="taken"/>, how many the engine took (fewer only once
+    /// its write path has closed). A throw from the engine propagates AFTER the payloads are
+    /// released.
+    /// </summary>
+    internal int DrainOnce(out int taken)
+    {
+        taken = 0;
+        int count = _ring.TryDequeueMany(_headers, _apart);
+        if (count == 0) return 0;
+        try
+        {
+            // ONE call per drained batch: the engine takes its write lock and the log's append
+            // lock once per hold (see TraceStorageEngine.WriteRaw), not per span.
+            var batch = _ring.Drained(new ReadOnlySpan<SpanHeader>(_headers, 0, count),
+                                      new ReadOnlySpan<byte[]?>(_apart, 0, count), _services);
+            taken = _storage.WriteRaw(ref batch);
+        }
+        finally
+        {
+            // Whatever the engine did, the arena under this run goes back now: everything the tier
+            // keeps was copied out of it inside WriteRaw.
+            _ring.Release(new ReadOnlySpan<SpanHeader>(_headers, 0, count));
+            Array.Clear(_apart, 0, count);
+        }
+        return count;
     }
 
     private async Task DrainLoopAsync()
@@ -52,7 +95,18 @@ internal sealed class SpanDrainer : IAsyncDisposable
         var ct = _cts.Token;
         while (!ct.IsCancellationRequested)
         {
-            int count = _ring.TryDequeueMany(_batch, BatchSize);
+            int count, taken;
+            try
+            {
+                count = DrainOnce(out taken);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "SpanDrainer: error writing a drained batch");
+                MaybeFlush();
+                continue;
+            }
+
             if (count == 0)
             {
                 MaybeFlush();
@@ -62,41 +116,21 @@ internal sealed class SpanDrainer : IAsyncDisposable
                 continue;
             }
 
-            try
-            {
-                // ONE call per drained batch: the engine takes its write lock and the log's
-                // append lock once per hold (see TraceStorageEngine.WriteSpans), not per span.
-                int taken = _storage.WriteSpans(new ReadOnlySpan<SpanIngestItem>(_batch, 0, count));
-                // The engine has closed its write path. Every further span would be refused
-                // too, so stop draining rather than spinning the ring empty into a closed
-                // engine — and say so once, with the count, instead of once per span.
-                if (taken < count) { ReportRefused(count - taken); return; }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "SpanDrainer: error writing batch of {Count} spans", count);
-            }
-            finally
-            {
-                // The ring's references go either way: a span the engine took is in the tier, and
-                // one it failed on is reported above — neither may be kept alive by this array.
-                Array.Clear(_batch, 0, count);
-            }
+            // The engine has closed its write path. Every further span would be refused
+            // too, so stop draining rather than spinning the ring empty into a closed
+            // engine — and say so once, with the count, instead of once per span.
+            if (taken < count) { ReportRefused(count - taken); return; }
 
             MaybeFlush();
         }
 
         // Drain remaining items before shutdown
-        int remaining;
-        do
+        while (true)
         {
-            remaining = _ring.TryDequeueMany(_batch, BatchSize);
+            int remaining = DrainOnce(out int taken);
             if (remaining == 0) break;
-            int taken;
-            try { taken = _storage.WriteSpans(new ReadOnlySpan<SpanIngestItem>(_batch, 0, remaining)); }
-            finally { Array.Clear(_batch, 0, remaining); }
             if (taken < remaining) { ReportRefused(remaining - taken); return; }
-        } while (remaining > 0);
+        }
     }
 
     /// <summary>

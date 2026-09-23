@@ -86,10 +86,13 @@ public static class TracingServiceExtensions
         services.AddSingleton(static sp =>
         {
             var traces = TracesOptionsFrom(sp);
-            return new SpanRingBuffer(traces.EffectiveRingCapacity, traces.EffectiveRingMaxBytes);
+            return new SpanRingBuffer(traces.EffectiveRingCapacity, traces.EffectiveRingMaxBytes,
+                                      sp.GetRequiredService<SpanStringPools>());
         });
         services.AddSingleton<SpanIngestionEndpoint>();
         services.AddSingleton<ISpanIngester>(sp => sp.GetRequiredService<SpanIngestionEndpoint>());
+        // The raw sink the OTLP/HTTP parsers stream into — the same endpoint, the same ring.
+        services.AddSingleton<ISpanSink>(sp => sp.GetRequiredService<SpanIngestionEndpoint>());
         services.AddSingleton<ITraceProvider>(sp => sp.GetRequiredService<TraceStorageEngine>());
         services.AddSingleton<ITraceStatsProvider>(sp => sp.GetRequiredService<TraceStorageEngine>());
         services.AddSingleton<IServiceGraphProvider>(sp => sp.GetRequiredService<TraceStorageEngine>());

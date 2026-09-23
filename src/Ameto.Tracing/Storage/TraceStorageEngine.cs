@@ -932,16 +932,56 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     /// </summary>
     internal int WriteSpans(ReadOnlySpan<SpanIngestItem> items)
     {
-        if (items.IsEmpty) return 0;
+        var batch = new ItemSpanBatch(items);
+        try     { return WriteBatch(ref batch); }
+        finally { batch.Dispose(); }
+    }
+
+    /// <summary>
+    /// THE DRAINER'S DOOR (TI#3): a batch taken out of the raw span ring, its payload still in the
+    /// ring's arena. Everything <see cref="WriteSpans"/> says holds, and one thing more — nothing the
+    /// tier keeps points into the arena: <see cref="ISpanBatch.AttributesForTier"/> copies the blob
+    /// out and the name and service become pool strings, all BEFORE the drainer releases the batch.
+    /// That is what keeps the lock-free aggregate passes (which walk captured
+    /// <see cref="SpanRecord"/>s long after the lock is gone) clear of the arena's reuse.
+    /// </summary>
+    internal int WriteRaw<TBatch>(ref TBatch batch) where TBatch : ISpanBatch, allows ref struct =>
+        WriteBatch(ref batch);
+
+    /// <summary>
+    /// The one write core. Per hold: the tier's strings and blob copies are resolved OUTSIDE the
+    /// lock (an intern lookup and a copy per span have no business in a hold every reader waits
+    /// out), then the log and the tier take them under ONE hold, exactly as before.
+    /// </summary>
+    private int WriteBatch<TBatch>(ref TBatch batch) where TBatch : ISpanBatch, allows ref struct
+    {
+        int count = batch.Count;
+        if (count == 0) return 0;
         if (!TryEnterEngine()) return 0;
         int taken = 0;
+
+        // A hold is at most 4 096 spans whatever a probe sets (the production cap is 128), so the
+        // per-hold scratch is bounded by a literal the convention scan can read.
+        int perHold = Math.Clamp(_maxSpansPerWriteHold, 1, 4_096);
+        int scratch = Math.Min(perHold, count);
+        string[] names    = System.Buffers.ArrayPool<string>.Shared.Rent(Math.Min(scratch, 4_096));
+        string[] services = System.Buffers.ArrayPool<string>.Shared.Rent(Math.Min(scratch, 4_096));
+        var      blobs    = System.Buffers.ArrayPool<ReadOnlyMemory<byte>>.Shared.Rent(Math.Min(scratch, 4_096));
+        bool[]   pooled   = System.Buffers.ArrayPool<bool>.Shared.Rent(Math.Min(2 * scratch, 8_192));
         try
         {
-            int perHold = Math.Max(1, _maxSpansPerWriteHold);
-            while (taken < items.Length)
+            while (taken < count)
             {
-                var chunk    = items.Slice(taken, Math.Min(perHold, items.Length - taken));
+                int n        = Math.Min(perHold, count - taken);
                 int appended = 0;
+
+                for (int j = 0; j < n; j++)
+                {
+                    names[j]    = batch.Name(taken + j, _pools, out pooled[2 * j]);
+                    services[j] = batch.Service(taken + j, _pools, out pooled[2 * j + 1]);
+                    blobs[j]    = batch.AttributesForTier(taken + j);
+                }
+
                 _lock.EnterWriteLock();
                 try
                 {
@@ -962,15 +1002,26 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                     // Write-ahead: every span is in the log before it is queryable. If the log
                     // fails part-way, the spans it did take still join the tier — the finally —
                     // and the ones it did not stay out of both.
+                    // THE LOG TAKES THE BYTES AS THEY ARRIVED: the ring's UTF-8 name and service go
+                    // straight to the UTF-8 append overload, with no string in between (the
+                    // item adapter transcodes its strings once, into scratch, for the tests).
                     try
                     {
-                        for (; appended < chunk.Length; appended++)
-                            AppendTranscoded(in scope, chunk[appended]);
+                        for (; appended < n; appended++)
+                        {
+                            int i = taken + appended;
+                            var h = batch.Header(i);
+                            scope.Append(h.TraceId, h.SpanId, h.ParentSpanId, h.StartTimeUnixNano, h.DurationNanos,
+                                         h.Kind, h.Status, h.HttpStatusCode,
+                                         batch.NameUtf8(i), batch.ServiceUtf8(i), batch.Attributes(i));
+                        }
                     }
                     finally
                     {
                         scope.Dispose();
-                        for (int i = 0; i < appended; i++) AddToHotTierLocked(chunk[i]);
+                        for (int j = 0; j < appended; j++)
+                            AddToHotTierLocked(batch.Header(taken + j), names[j], pooled[2 * j],
+                                               services[j], pooled[2 * j + 1], blobs[j]);
                         taken += appended;
                     }
 
@@ -989,15 +1040,26 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
                 _afterWriteHoldForTest?.Invoke(taken);
             }
         }
-        finally { ExitEngine(); }
+        finally
+        {
+            Array.Clear(names, 0, scratch);    // the pool must not keep a tier's strings alive
+            Array.Clear(services, 0, scratch);
+            Array.Clear(blobs, 0, scratch);
+            System.Buffers.ArrayPool<string>.Shared.Return(names);
+            System.Buffers.ArrayPool<string>.Shared.Return(services);
+            System.Buffers.ArrayPool<ReadOnlyMemory<byte>>.Shared.Return(blobs);
+            System.Buffers.ArrayPool<bool>.Shared.Return(pooled);
+            ExitEngine();
+        }
         return taken;
     }
 
     /// <summary>
-    /// One span into a held log scope. The log takes UTF-8 and the ingest item still carries
-    /// strings, so the name and service are transcoded HERE, into the stack (or a pooled buffer
-    /// for a pathological name), and handed over as bytes. When the ingest path hands UTF-8
-    /// through (WP8) this transcode goes away and the log does not change.
+    /// One span into a held log scope, from an ingest ITEM: the log takes UTF-8 and the item
+    /// carries strings, so the name and service are transcoded here, into the stack (or a pooled
+    /// buffer for a pathological name). The production path no longer comes through here — the
+    /// drainer hands the ring's UTF-8 straight to the log (<see cref="WriteRaw"/>) — and it stays
+    /// for the WAL tests' single-span helper, which appends an item the way the engine once did.
     /// </summary>
     internal static void AppendTranscoded(in SpanWriteAheadLog.AppendScope scope, SpanIngestItem item)
     {
@@ -1089,29 +1151,34 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
     internal SpanWriteAheadLog WalForTest => _wal;
 
     /// <summary>
-    /// Materialises a span into the hot tier and its trace index. Shared by live ingest
-    /// and WAL replay — replay must not append to the log it is reading from.
+    /// Materialises a span into the hot tier and its trace index — the ONE insert, shared by live
+    /// ingest (either door: the ring's raw batches and the item adapter) and WAL replay. Replay
+    /// must not append to the log it is reading from, so it comes in here directly.
+    ///
+    /// <para><paramref name="attributes"/> is memory the tier keeps for the tier's whole life —
+    /// the item's own array, or a copy taken out of the ring's arena. Never a view of the arena:
+    /// the lock-free aggregate passes read these records after the lock is gone, and an arena
+    /// chunk is reused the instant its last span is drained.</para>
     /// </summary>
-    private void AddToHotTierLocked(SpanIngestItem item)
+    private void AddToHotTierLocked(
+        in SpanHeader h, string name, bool namePooled, string service, bool servicePooled,
+        ReadOnlyMemory<byte> attributes)
     {
-        // ONE STRING PER DISTINCT NAME AND SERVICE IN THE TIER (TI#5), the pool's shared instance
-        // rather than the fresh copy every span arrives with. A full pool hands the span's own
-        // string back and the span is kept all the same; the budget then charges that string.
-        string name    = _pools.Name(item.Name ?? string.Empty, out bool namePooled);
-        string service = _pools.Service(item.ServiceName ?? string.Empty, out bool servicePooled);
-
         var record = new SpanRecord
         {
-            TraceId           = item.TraceId,
-            SpanId            = item.SpanId,
-            ParentSpanId      = item.ParentSpanId,
-            StartTimeUnixNano = item.StartTimeUnixNano,
-            DurationNanos     = item.DurationNanos,
+            TraceId           = h.TraceId,
+            SpanId            = h.SpanId,
+            ParentSpanId      = h.ParentSpanId,
+            StartTimeUnixNano = h.StartTimeUnixNano,
+            DurationNanos     = h.DurationNanos,
+            // ONE STRING PER DISTINCT NAME AND SERVICE IN THE TIER (TI#5), the pool's shared
+            // instance rather than the fresh copy every span arrives with. A full pool hands the
+            // span's own string back and the span is kept all the same; the budget then charges it.
             Name              = name,
             ServiceName       = service,
-            Kind              = item.Kind,
-            Status            = item.Status,
-            HttpStatusCode    = item.HttpStatusCode,  // promoted — no attrs deserialization
+            Kind              = h.Kind,
+            Status            = h.Status,
+            HttpStatusCode    = h.HttpStatusCode,  // promoted — no attrs deserialization
 
             // THE BLOB, NOT A DICTIONARY, AND THAT IS WHAT THIS LOCK HOLD IS. The mapper already
             // produced these bytes; inflating them here into a Dictionary plus a string per key
@@ -1120,24 +1187,45 @@ public sealed class TraceStorageEngine : ITraceProvider, ITraceStatsProvider, IS
             // reproduce a map nothing on the ingest path ever reads. SpanRecord.Attributes decodes
             // it on demand at the four sites that do (TraceQL, GetAttr on ROOT spans, the trace
             // detail DTO), and the flush hands the same bytes to SpanWriter untouched.
-            AttributesBytes   = item.AttributesBytes,
+            AttributesBytes   = attributes,
         };
 
         int offset = _hotSpans.Count;
         _hotSpans.Add(record);
-        _hotBytes += HotSpanBytes(item.AttributesBytes.Length)
+        _hotBytes += HotSpanBytes(attributes.Length)
                    + (namePooled    ? 0 : SpanStringPools.UnpooledStringBytes(name))
                    + (servicePooled ? 0 : SpanStringPools.UnpooledStringBytes(service));
 
-        if (!_traceIdx.TryGetValue(item.TraceId, out var offsets))
+        if (!_traceIdx.TryGetValue(h.TraceId, out var offsets))
         {
             offsets = new List<int>(4);
-            _traceIdx[item.TraceId] = offsets;
+            _traceIdx[h.TraceId] = offsets;
         }
         offsets.Add(offset);
 
         _hotSince ??= DateTime.UtcNow;
     }
+
+    /// <summary>A replayed item, through the one insert: interned exactly as live ingest is.</summary>
+    private void AddToHotTierLocked(SpanIngestItem item)
+    {
+        string name    = _pools.Name(item.Name ?? string.Empty, out bool namePooled);
+        string service = _pools.Service(item.ServiceName ?? string.Empty, out bool servicePooled);
+        AddToHotTierLocked(HeaderOf(item), name, namePooled, service, servicePooled, item.AttributesBytes ?? []);
+    }
+
+    /// <summary>An item's fixed fields as a <see cref="SpanHeader"/> — the lengths and arena fields are the ring's and stay 0.</summary>
+    internal static SpanHeader HeaderOf(SpanIngestItem item) => new()
+    {
+        TraceId           = item.TraceId,
+        SpanId            = item.SpanId,
+        ParentSpanId      = item.ParentSpanId,
+        StartTimeUnixNano = item.StartTimeUnixNano,
+        DurationNanos     = item.DurationNanos,
+        Kind              = item.Kind,
+        Status            = item.Status,
+        HttpStatusCode    = item.HttpStatusCode,
+    };
 
     // ── Query ─────────────────────────────────────────────────────────────────
 
@@ -4679,4 +4767,92 @@ public sealed class SpanSegmentInfo
         SegmentId          = SegmentId,
         WeightBytes        = weightBytes,
     };
+}
+
+/// <summary>
+/// A run of spans the write path takes into the log and the hot tier — the ONE shape the engine
+/// consumes (TI#3), whichever door the spans came through: the raw ring's drained batch, or the
+/// item adapter the tests and the WAL-era callers use. Implemented by <c>ref struct</c>s and
+/// consumed through a generic constraint, so no batch is ever boxed.
+/// </summary>
+internal interface ISpanBatch
+{
+    int Count { get; }
+
+    /// <summary>The span's fixed fields; only ids, times, kind, status and HTTP status are read.</summary>
+    SpanHeader Header(int i);
+
+    /// <summary>The name as UTF-8 — valid until the next <see cref="NameUtf8"/> call on this batch.</summary>
+    ReadOnlySpan<byte> NameUtf8(int i);
+
+    /// <summary>The service as UTF-8 — valid until the next <see cref="ServiceUtf8"/> call on this batch.</summary>
+    ReadOnlySpan<byte> ServiceUtf8(int i);
+
+    /// <summary>The msgpack attribute blob, for the log.</summary>
+    ReadOnlySpan<byte> Attributes(int i);
+
+    /// <summary>The name as the tier keeps it: through the pools.</summary>
+    string Name(int i, SpanStringPools pools, out bool pooled);
+
+    /// <summary>The service as the tier keeps it: through the pools.</summary>
+    string Service(int i, SpanStringPools pools, out bool pooled);
+
+    /// <summary>
+    /// The blob as the tier keeps it — memory that lives as long as the record does. A batch whose
+    /// bytes live in memory that is REUSED (the ring's arena) must copy here; see
+    /// <c>TraceStorageEngine.WriteRaw</c> for why.
+    /// </summary>
+    ReadOnlyMemory<byte> AttributesForTier(int i);
+}
+
+/// <summary>
+/// <see cref="SpanIngestItem"/>s as a <see cref="ISpanBatch"/>: the names and services are the items'
+/// strings, transcoded to UTF-8 into pooled scratch for the log (one buffer for names, one for
+/// services, so both are valid at the append); the blob is the item's own array.
+/// </summary>
+internal ref struct ItemSpanBatch : ISpanBatch
+{
+    private readonly ReadOnlySpan<SpanIngestItem> _items;
+    private byte[]? _nameScratch;
+    private byte[]? _serviceScratch;
+
+    public ItemSpanBatch(ReadOnlySpan<SpanIngestItem> items) => _items = items;
+
+    public readonly int Count => _items.Length;
+
+    public readonly SpanHeader Header(int i) => TraceStorageEngine.HeaderOf(_items[i]);
+
+    public ReadOnlySpan<byte> NameUtf8(int i)    => Utf8(_items[i].Name, ref _nameScratch);
+
+    public ReadOnlySpan<byte> ServiceUtf8(int i) => Utf8(_items[i].ServiceName, ref _serviceScratch);
+
+    public readonly ReadOnlySpan<byte> Attributes(int i) => _items[i].AttributesBytes;
+
+    public readonly string Name(int i, SpanStringPools pools, out bool pooled) =>
+        pools.Name(_items[i].Name ?? string.Empty, out pooled);
+
+    public readonly string Service(int i, SpanStringPools pools, out bool pooled) =>
+        pools.Service(_items[i].ServiceName ?? string.Empty, out pooled);
+
+    public readonly ReadOnlyMemory<byte> AttributesForTier(int i) => _items[i].AttributesBytes ?? [];
+
+    private static ReadOnlySpan<byte> Utf8(string? s, scoped ref byte[]? scratch)
+    {
+        if (string.IsNullOrEmpty(s)) return default;
+        int max = System.Text.Encoding.UTF8.GetMaxByteCount(s.Length);
+        if (scratch is null || scratch.Length < max)
+        {
+            if (scratch is not null) System.Buffers.ArrayPool<byte>.Shared.Return(scratch);
+            scratch = System.Buffers.ArrayPool<byte>.Shared.Rent(Math.Max(256, (s.Length + 1) * 3));
+        }
+        int n = System.Text.Encoding.UTF8.GetBytes(s, scratch);
+        return scratch.AsSpan(0, n);
+    }
+
+    public void Dispose()
+    {
+        if (_nameScratch    is not null) System.Buffers.ArrayPool<byte>.Shared.Return(_nameScratch);
+        if (_serviceScratch is not null) System.Buffers.ArrayPool<byte>.Shared.Return(_serviceScratch);
+        _nameScratch = _serviceScratch = null;
+    }
 }

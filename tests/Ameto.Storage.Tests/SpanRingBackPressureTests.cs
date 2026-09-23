@@ -29,7 +29,7 @@ public sealed class SpanRingBackPressureTests
     {
         using var ring = new SpanRingBuffer(capacity: 1_024, maxBytes: 100_000);
         var heavy = Span(0, blobBytes: 10_000);
-        long weight = SpanRingBuffer.RingBytes(heavy);
+        long weight = SpanRingBuffer.PayloadBytes(heavy);
 
         int accepted = 0;
         for (int i = 0; i < 1_024; i++)
@@ -50,9 +50,11 @@ public sealed class SpanRingBackPressureTests
         while (ring.TryEnqueue(Span(0, blobBytes: 10_000))) { }
         Assert.False(ring.TryEnqueue(Span(1, blobBytes: 10_000)));   // spent
 
-        var dest  = new SpanIngestItem?[4];
-        int taken = ring.TryDequeueMany(dest, 4);
+        var headers = new SpanHeader[4];
+        var apart   = new byte[]?[4];
+        int taken   = ring.TryDequeueMany(headers, apart);
         Assert.Equal(4, taken);
+        ring.Release(headers);                                       // what the drainer does once it has copied them
 
         // Four spans' worth came back, and exactly that much fits again.
         for (int i = 0; i < 4; i++) Assert.True(ring.TryEnqueue(Span(2 + i, blobBytes: 10_000)));
@@ -62,12 +64,12 @@ public sealed class SpanRingBackPressureTests
     [Fact]
     public void A_span_refused_for_want_of_a_slot_gives_its_bytes_back()
     {
-        using var ring = new SpanRingBuffer(capacity: 4, maxBytes: long.MaxValue);
+        using var ring = new SpanRingBuffer(capacity: 4, maxBytes: 1024 * 1024);
         var s = Span(0, blobBytes: 1_000);
         for (int i = 0; i < 4; i++) Assert.True(ring.TryEnqueue(s));
 
         Assert.False(ring.TryEnqueue(s));                             // every slot taken
-        Assert.Equal(4 * SpanRingBuffer.RingBytes(s), ring.BytesInFlight);
+        Assert.Equal(4 * SpanRingBuffer.PayloadBytes(s), ring.BytesInFlight);
         Assert.Equal(0, ring.RefusedForBytes);
     }
 
@@ -81,7 +83,7 @@ public sealed class SpanRingBackPressureTests
         for (int i = 0; i < batch.Length; i++) batch[i] = Span(i, blobBytes: 10_000);
 
         Assert.False(endpoint.TryIngest(batch, out int accepted));
-        Assert.Equal((int)(100_000 / SpanRingBuffer.RingBytes(batch[0])), accepted);
+        Assert.Equal((int)(100_000 / SpanRingBuffer.PayloadBytes(batch[0])), accepted);
         Assert.Equal(batch.Length - accepted, endpoint.RefusedSpans);
     }
 
@@ -101,10 +103,10 @@ public sealed class SpanRingBackPressureTests
         long standBudget = o.RingMaxBytesFor(stand);
         var ordinary = Span(0, blobBytes: 375);
         _out.WriteLine($"ring budget: large {largeBudget / (double)MB:F1} MB, stand {standBudget / (double)MB:F1} MB; "
-                     + $"an ordinary span weighs {SpanRingBuffer.RingBytes(ordinary)} B");
+                     + $"an ordinary span weighs {SpanRingBuffer.PayloadBytes(ordinary)} B");
 
         Assert.Equal((long)TracesOptions.DefaultRingCapacity * TracesOptions.OrdinaryRingSpanBytes, largeBudget);
-        Assert.True(largeBudget / SpanRingBuffer.RingBytes(ordinary) >= TracesOptions.DefaultRingCapacity,
+        Assert.True(largeBudget / SpanRingBuffer.PayloadBytes(ordinary) >= TracesOptions.DefaultRingCapacity,
             "a large host's ring no longer holds its 65 536 ordinary spans");
         Assert.InRange(standBudget, 27 * 1000 * 1000, 28 * 1000 * 1000);
 

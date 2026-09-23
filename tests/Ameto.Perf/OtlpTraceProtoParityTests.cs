@@ -59,6 +59,55 @@ public sealed class OtlpTraceProtoParityTests
         Assert.False(attrs.ContainsKey("messaging.operation"));
     }
 
+    /// <summary>
+    /// THE SERVICE IS INTERNED ONCE PER RESOURCE BLOCK (TI#5): two hundred spans under one resource,
+    /// one call — the log parser's <c>InternService</c> / <c>ServiceIdx</c> shape — and every span
+    /// carries the index of exactly its own service bytes (the capturing sink checks that per span).
+    /// </summary>
+    [Fact]
+    public void RawSink_InternsTheServiceOncePerResourceBlock()
+    {
+        var sink = new CapturingSpanSink();
+        var (ingested, _) = OtlpTraceProtoParser.Parse(OtlpProtoPayloads.Traces_Realistic(200, nestedAttr: false), sink);
+
+        Assert.Equal(200, ingested);
+        Assert.Equal(1, sink.InternCalls);
+        Assert.All(sink.Spans, static s => Assert.Equal(0, s.ServiceIdx));
+    }
+
+    /// <summary>
+    /// THE SINK IS ONLY EVER HANDED VALID UTF-8. A name and a service carrying invalid sequences
+    /// reach the sink as the bytes of the text the DOM path stored (U+FFFD per invalid sequence) —
+    /// the capturing sink asserts validity on every call, and the bytes are compared with the DOM's.
+    /// </summary>
+    [Fact]
+    public void RawSink_GetsValidUtf8_ForAnInvalidNameAndService()
+    {
+        byte[] badService = [(byte)'s', (byte)'v', (byte)'c', 0xFE];
+        byte[] badName    = [(byte)'G', 0xE0, 0x80, (byte)'T'];
+        byte[] payload = OtlpProtoPayloads.Msg(c =>
+            OtlpProtoPayloads.Nested(c, 1, OtlpProtoPayloads.Msg(rs =>
+            {
+                OtlpProtoPayloads.Nested(rs, 1, OtlpProtoPayloads.Msg(res =>
+                    OtlpProtoPayloads.Nested(res, 1, RawStringAttr("service.name"u8.ToArray(), badService))));
+                OtlpProtoPayloads.Nested(rs, 2, OtlpProtoPayloads.Msg(ss => OtlpProtoPayloads.Nested(ss, 2, OtlpProtoPayloads.Msg(sp =>
+                {
+                    sp.WriteTag(1, Google.Protobuf.WireFormat.WireType.LengthDelimited);
+                    sp.WriteBytes(Google.Protobuf.ByteString.CopyFrom(Convert.FromHexString("0af7651916cd43dd8448eb211c80319c")));
+                    sp.WriteTag(2, Google.Protobuf.WireFormat.WireType.LengthDelimited);
+                    sp.WriteBytes(Google.Protobuf.ByteString.CopyFrom(Convert.FromHexString("b7ad6b7169203331")));
+                    RawString(sp, 5, badName);
+                }))));
+            })));
+
+        var sink = new CapturingSpanSink();
+        OtlpTraceProtoParser.Parse(payload, sink);
+        var d = Assert.Single(ViaDom(payload));
+        sink.AssertMatches([d]);
+        Assert.Contains('�', d.Name);
+        Assert.Contains('�', d.ServiceName);
+    }
+
     [Fact]
     public void MatchesDomPath_OnEmptyBatch()
     {
@@ -192,9 +241,21 @@ public sealed class OtlpTraceProtoParityTests
 
     private static ulong TraceHi(TraceId id) => id.High;
 
+    /// <summary>
+    /// RETARGETED AT THE RAW SINK (TI#3): every payload is parsed TWICE — into the
+    /// <see cref="CapturingSpanSink"/>, which records the bytes the ring would be handed and compares
+    /// them with the DOM path byte for byte, and through the list-returning overload the gRPC
+    /// receiver uses — and both must match the DOM.
+    /// </summary>
     private static List<SpanIngestItem> AssertSame(byte[] payload)
     {
-        var dom    = ViaDom(payload);
+        var dom  = ViaDom(payload);
+        var sink = new CapturingSpanSink();
+        var (ingested, refused) = OtlpTraceProtoParser.Parse(payload, sink);
+        var raw = sink.AssertMatches(dom);
+        Assert.Equal((dom.Count, 0), (ingested, refused));
+        Assert.Equal(1, sink.EndBatches);
+
         var parsed = OtlpTraceProtoParser.Parse(payload);
 
         Assert.Equal(dom.Count, parsed.Count);
@@ -220,4 +281,17 @@ public sealed class OtlpTraceProtoParityTests
         }
         return parsed;
     }
+
+    /// <summary>A length-delimited field holding arbitrary bytes: WriteString cannot produce invalid UTF-8.</summary>
+    private static void RawString(Google.Protobuf.CodedOutputStream c, int field, byte[] bytes)
+    {
+        c.WriteTag(field, Google.Protobuf.WireFormat.WireType.LengthDelimited);
+        c.WriteBytes(Google.Protobuf.ByteString.CopyFrom(bytes));
+    }
+
+    private static byte[] RawStringAttr(byte[] key, byte[] value) => OtlpProtoPayloads.Msg(c =>
+    {
+        RawString(c, 1, key);
+        OtlpProtoPayloads.Nested(c, 2, OtlpProtoPayloads.Msg(v => RawString(v, 1, value)));
+    });
 }
