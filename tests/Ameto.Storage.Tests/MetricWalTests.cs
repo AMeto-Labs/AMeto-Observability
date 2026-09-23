@@ -2098,7 +2098,8 @@ public sealed class MetricWalTests : IAsyncLifetime
         for (int i = 0; i < 300; i++)                       // ~14 KB of entries: grows 4 → 16 KiB
             Append(wal, Scalar("cpu", 1_000 + i, i));
         wal.Dispose();
-        Assert.Equal(32 + 16 * 1024, new FileInfo(WalPath).Length);
+        // 16 KiB, or 32 if the background pre-grow (a quarter left) ran before Dispose.
+        Assert.InRange(new FileInfo(WalPath).Length, 32 + 16 * 1024, 32 + 32 * 1024);
 
         using (var fs = new FileStream(WalPath, FileMode.Open, FileAccess.ReadWrite))
         {
@@ -2416,7 +2417,8 @@ public sealed class MetricWalTests : IAsyncLifetime
         for (int i = 0; i < 300; i++)                       // grows 4 → 16 KiB
             Append(wal, Scalar("cpu", 1_000 + i, i));
         wal.Dispose();
-        Assert.Equal(32 + 16 * 1024, new FileInfo(WalPath).Length);
+        // 16 KiB, or 32 if the background pre-grow (a quarter left) ran before Dispose.
+        Assert.InRange(new FileInfo(WalPath).Length, 32 + 16 * 1024, 32 + 32 * 1024);
 
         using (var fs = new FileStream(WalPath, FileMode.Open, FileAccess.ReadWrite))
         {
