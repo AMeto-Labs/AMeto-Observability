@@ -175,6 +175,29 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
 
     // ── Hot tier ─────────────────────────────────────────────────────────────
     private readonly ConcurrentDictionary<SeriesKey, HotSeries> _hot = new();
+
+    /// <summary>
+    /// THE SAME SERIES, FILED BY METRIC NAME — so <see cref="QueryAsync"/> and
+    /// <see cref="GetLatestAsync"/> walk their own metric and nothing else. They used to walk every
+    /// series of every metric in <see cref="_hot"/> with a per-character case-insensitive compare
+    /// per entry; the alert evaluator runs one per enabled rule every 15 s.
+    ///
+    /// <para>Keyed case-insensitively because that is how the query matched names. It is kept
+    /// exactly in step with <see cref="_hot"/> by the only three places that change it: a series
+    /// is filed on its first point (<see cref="IndexSeries"/>, one flag read per point after that),
+    /// the failed-write restore files what it re-creates, and eviction
+    /// (<see cref="TryEvictLocked"/>) takes the very instance it took out of <c>_hot</c>. Eviction
+    /// and restore hold <c>_snapshotLock</c>'s write lock and ingest holds it shared, so no
+    /// series can be evicted between its creation and its filing. A name's inner table stays
+    /// behind when its last series goes: the catalog (<c>_meta</c>) keeps every name for the life
+    /// of the process anyway, and an empty table is a few hundred bytes.</para>
+    /// </summary>
+    private readonly ConcurrentDictionary<string, ConcurrentDictionary<SeriesKey, HotSeries>> _hotByName =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>What a query walks for a name the hot tier has never filed.</summary>
+    private static readonly ConcurrentDictionary<SeriesKey, HotSeries> EmptyHotIndex = new();
+
     private          int  _hotPointCount;
 
     /// <summary>
@@ -247,6 +270,10 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     /// ever grew, because nothing removed a key once a series had been seen.
     /// </summary>
     internal int HotSeriesCount => _hot.Count;
+
+    /// <summary>Test hook: series filed under <paramref name="metricName"/> in the name index.</summary>
+    internal int IndexedSeriesCount(string metricName) =>
+        _hotByName.TryGetValue(metricName, out var byName) ? byName.Count : 0;
 
     /// <summary>Test hook: series the stale sweep has evicted since start.</summary>
     internal long StaleSeriesEvicted => Volatile.Read(ref _staleSeriesEvicted);
@@ -1051,11 +1078,26 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     {
         var key = new SeriesKey(item.Name, item.Kind, item.Unit, item.Labels);
         series  = _hot.GetOrAdd(key, static k => new HotSeries(k.Labels));
+        if (!series.Indexed) IndexSeries(in key, series);
 
         series.Append(point, item.BucketBounds, nowUtcTicks);
         UpdateMeta(item, series);
 
         return EstimatedPointBytes(in point);
+    }
+
+    /// <summary>
+    /// Files a series in <see cref="_hotByName"/> — once per series life, not per point. Two
+    /// threads first seeing the same new series both get here and both store the same instance;
+    /// the store is an overwrite so that is idempotent. Call under <c>_snapshotLock</c> (read or
+    /// write), which is what keeps eviction out of the window between the <c>_hot</c> insert and
+    /// this.
+    /// </summary>
+    private void IndexSeries(in SeriesKey key, HotSeries series)
+    {
+        var byName = _hotByName.GetOrAdd(key.Name, static _ => new ConcurrentDictionary<SeriesKey, HotSeries>());
+        byName[key]    = series;
+        series.Indexed = true;
     }
 
     /// <summary>
@@ -1277,10 +1319,11 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         long fromNano = from.HasValue ? from.Value.ToUnixTimeMilliseconds() * 1_000_000L : long.MinValue;
         long toNano   = to.HasValue   ? to.Value.ToUnixTimeMilliseconds()   * 1_000_000L : long.MaxValue;
 
-        // Hot tier
-        foreach (var (key, series) in _hot)
+        // Hot tier — this metric's series only; see _hotByName. Matched case-insensitively, as the
+        // scan over every series of every metric was.
+        _hotByName.TryGetValue(metricName, out var byName);
+        foreach (var (key, series) in byName ?? EmptyHotIndex)
         {
-            if (!key.Name.Equals(metricName, StringComparison.OrdinalIgnoreCase)) continue;
             if (!MatchesLabels(key.Labels, labelMatchers)) continue;
             ct.ThrowIfCancellationRequested();
 
@@ -1338,9 +1381,10 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
         IReadOnlyDictionary<string, string>? labelMatchers = null,
         [EnumeratorCancellation] CancellationToken ct = default)
     {
-        foreach (var (key, series) in _hot)
+        // This metric's series only — see _hotByName. Matched case-insensitively, as the scan was.
+        if (!_hotByName.TryGetValue(metricName, out var byName)) yield break;
+        foreach (var (key, series) in byName)
         {
-            if (!key.Name.Equals(metricName, StringComparison.OrdinalIgnoreCase)) continue;
             if (!MatchesLabels(key.Labels, labelMatchers)) continue;
             ct.ThrowIfCancellationRequested();
 
@@ -1587,6 +1631,7 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
                             // appending into one while reading the other sound. GetOrAdd rather
                             // than a lookup because the stale sweep above may have evicted the key.
                             var live = _hot.GetOrAdd(key, static k => new HotSeries(k.Labels));
+                            if (!live.Indexed) IndexSeries(in key, live);
                             foreach (var p in snap.GetPoints(long.MinValue, long.MaxValue))
                             {
                                 live.Append(p, snap.Bounds, nowTicks);
@@ -1745,8 +1790,16 @@ public sealed class MetricStorageEngine : IMetricIngester, IMetricQuery, IMetric
     /// Takes the key out only while it still maps to the very object that was found empty, and
     /// only while it IS empty — see the class remarks above for why both halves matter.
     /// </summary>
-    private bool TryEvictLocked(SeriesKey key, HotSeries series) =>
-        series.PointCount == 0 && _hot.TryRemove(new KeyValuePair<SeriesKey, HotSeries>(key, series));
+    private bool TryEvictLocked(SeriesKey key, HotSeries series)
+    {
+        if (series.PointCount != 0 || !_hot.TryRemove(new KeyValuePair<SeriesKey, HotSeries>(key, series)))
+            return false;
+
+        // The same compare-and-remove on the name index: the instance just evicted, and only it.
+        if (_hotByName.TryGetValue(key.Name, out var byName))
+            byName.TryRemove(new KeyValuePair<SeriesKey, HotSeries>(key, series));
+        return true;
+    }
 
     /// <summary>
     /// What a sweep says about itself, AT THE PRICE OF WHAT IT SAYS WHEN NOBODY IS LISTENING.
@@ -2762,10 +2815,20 @@ internal sealed class HotSeries
         Labels  = labels;
     }
 
+    /// <summary>
+    /// A series over a list somebody else built — the drain's snapshot, the rollup's batch, a
+    /// test's. Nothing says that list is in order (a drained one is in ARRIVAL order), and
+    /// <see cref="GetPoints"/> is how <c>MetricWriter</c> reads it, so the order is established
+    /// here with one pass, not assumed.
+    /// </summary>
     public HotSeries(List<MetricDataPoint> points, double[]? bounds = null)
     {
         _points = points;
         Bounds  = bounds;
+
+        ReadOnlySpan<MetricDataPoint> all = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(points);
+        for (int i = 1; i < all.Length; i++)
+            if (all[i].TimestampUnixNano < all[i - 1].TimestampUnixNano) { _outOfOrder = true; break; }
     }
 
     /// <summary>
@@ -2794,11 +2857,29 @@ internal sealed class HotSeries
     /// <summary>Points held right now — 0 immediately after a <see cref="Drain"/>.</summary>
     public int PointCount { get { lock (_lock) return _points.Count; } }
 
+    /// <summary>
+    /// Filed in the engine's name index. Set once, under <c>_snapshotLock</c>, and never cleared:
+    /// an evicted series is a dead object and its re-creation is a new one. Not volatile — a thread
+    /// that misses another's write files the same instance a second time, which is idempotent.
+    /// </summary>
+    public bool Indexed { get; set; }
+
+    /// <summary>
+    /// Some point in <see cref="_points"/> is older than one appended before it. Points arrive in
+    /// the order <c>Ingest</c> sees them, which is chronological for a single exporter and not for
+    /// two interleaving on one series (or a retried batch), so <see cref="GetPoints"/> can only
+    /// binary-search the range while this is false. Cleared by <see cref="Drain"/>, which starts an
+    /// empty list. Read and written under <see cref="_lock"/>.
+    /// </summary>
+    private bool _outOfOrder;
+
     public void Append(MetricDataPoint p, double[]? bounds, long nowUtcTicks)
     {
         lock (_lock)
         {
             if (bounds is not null && Bounds is null) Bounds = bounds;
+            int n = _points.Count;
+            if (n > 0 && p.TimestampUnixNano < _points[n - 1].TimestampUnixNano) _outOfOrder = true;
             _points.Add(p);
         }
         Volatile.Write(ref _lastAppendUtcTicks, nowUtcTicks);
@@ -2827,18 +2908,79 @@ internal sealed class HotSeries
         lock (_lock)
         {
             var drained = _points;
-            _points = new List<MetricDataPoint>(Math.Min(drained.Count, MaxCarriedCapacity));
+            _points     = new List<MetricDataPoint>(Math.Min(drained.Count, MaxCarriedCapacity));
+            _outOfOrder = false;
             return drained;
         }
     }
 
+    /// <summary>
+    /// The points in <c>[fromNano, toNano]</c>, oldest first, in a list the caller owns — the
+    /// query's answer and the writer's input (<c>MetricWriter</c>) alike.
+    ///
+    /// <para>This was <c>Where().OrderBy().ToList()</c> under the series lock: a filter over every
+    /// point, a full stable sort of a list that is ALREADY in order for every exporter alone on its
+    /// series, and a list grown by doubling. Now, while no append has gone backwards
+    /// (<see cref="_outOfOrder"/>), the range is found with two binary searches and copied once
+    /// into a list of exactly its size. An out-of-order series takes the slow path, which keeps
+    /// the old answer exactly: the in-range points ordered by timestamp, ties in arrival order.</para>
+    /// </summary>
     public List<MetricDataPoint> GetPoints(long fromNano, long toNano)
     {
         lock (_lock)
-            return _points
-                .Where(p => p.TimestampUnixNano >= fromNano && p.TimestampUnixNano <= toNano)
-                .OrderBy(p => p.TimestampUnixNano)
-                .ToList();
+        {
+            ReadOnlySpan<MetricDataPoint> all = System.Runtime.InteropServices.CollectionsMarshal.AsSpan(_points);
+            if (_outOfOrder) return SortedSlice(all, fromNano, toNano);
+
+            int lo = FirstAtOrAfter(all, fromNano);
+            int hi = toNano == long.MaxValue ? all.Length : FirstAtOrAfter(all, toNano + 1);
+            if (hi <= lo) return [];
+
+            var slice = new List<MetricDataPoint>(hi - lo);
+            slice.AddRange(all[lo..hi]);
+            return slice;
+        }
+    }
+
+    /// <summary>First index whose timestamp is at or after <paramref name="nano"/>; the span is sorted.</summary>
+    private static int FirstAtOrAfter(ReadOnlySpan<MetricDataPoint> sorted, long nano)
+    {
+        int lo = 0, hi = sorted.Length;
+        while (lo < hi)
+        {
+            int mid = (int)((uint)(lo + hi) >> 1);
+            if (sorted[mid].TimestampUnixNano < nano) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo;
+    }
+
+    /// <summary>
+    /// The out-of-order path: filter, then sort STABLY — by (timestamp, arrival index), which is
+    /// the order <c>OrderBy</c> gave — without LINQ. Allocates the key array; it is the exception.
+    /// </summary>
+    private static List<MetricDataPoint> SortedSlice(ReadOnlySpan<MetricDataPoint> all, long fromNano, long toNano)
+    {
+        int count = 0;
+        for (int i = 0; i < all.Length; i++)
+        {
+            long ts = all[i].TimestampUnixNano;
+            if (ts >= fromNano && ts <= toNano) count++;
+        }
+        if (count == 0) return [];
+
+        var keys = new (long Ts, int Arrival)[count];
+        int k = 0;
+        for (int i = 0; i < all.Length; i++)
+        {
+            long ts = all[i].TimestampUnixNano;
+            if (ts >= fromNano && ts <= toNano) keys[k++] = (ts, i);
+        }
+        Array.Sort(keys);   // (Ts, Arrival) is unique, so an unstable sort yields the stable order
+
+        var result = new List<MetricDataPoint>(count);
+        for (int i = 0; i < keys.Length; i++) result.Add(all[keys[i].Arrival]);
+        return result;
     }
 
     public MetricDataPoint? GetLatest()
